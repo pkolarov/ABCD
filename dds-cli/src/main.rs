@@ -186,6 +186,7 @@ fn handle_group(action: GroupAction, data_dir: &PathBuf) {
                 revokes: None,
                 iat: now_epoch(),
                 exp: Some(now_epoch() + 365 * 86400),
+                body_type: None, body_cbor: None,
             };
             let token = dds_core::token::Token::sign(payload, &voucher.signing_key).unwrap();
             store.put_token(&token).unwrap();
@@ -208,6 +209,7 @@ fn handle_group(action: GroupAction, data_dir: &PathBuf) {
                 revokes: Some(jti.clone()),
                 iat: now_epoch(),
                 exp: None,
+                body_type: None, body_cbor: None,
             };
             let token = dds_core::token::Token::sign(payload, &revoker.signing_key).unwrap();
             store.put_token(&token).unwrap();

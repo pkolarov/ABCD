@@ -53,6 +53,7 @@ mod tests {
             } else {
                 Some(9999)
             },
+            body_type: None, body_cbor: None,
         };
         let token = Token::sign(payload, &ident.signing_key).unwrap();
         (ident, token)

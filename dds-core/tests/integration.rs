@@ -26,6 +26,7 @@ fn attest(ident: &Identity) -> Token {
             revokes: None,
             iat: 1000,
             exp: Some(9999),
+            body_type: None, body_cbor: None,
         },
         &ident.signing_key,
     )
@@ -47,6 +48,7 @@ fn vouch(voucher: &Identity, subject: &Identity, purpose: &str, subject_token: &
             revokes: None,
             iat: 1000,
             exp: Some(9999),
+            body_type: None, body_cbor: None,
         },
         &voucher.signing_key,
     )
@@ -68,6 +70,7 @@ fn revoke(revoker: &Identity, target_jti: &str) -> Token {
             revokes: Some(target_jti.to_string()),
             iat: 2000,
             exp: None,
+            body_type: None, body_cbor: None,
         },
         &revoker.signing_key,
     )
@@ -286,6 +289,7 @@ fn test_hybrid_identity_full_lifecycle() {
             kind: TokenKind::Attest,
             purpose: None, vch_iss: None, vch_sum: None, revokes: None,
             iat: 1000, exp: Some(9999),
+            body_type: None, body_cbor: None,
         },
         |msg| root.sign(msg),
     ).unwrap();
@@ -312,6 +316,7 @@ fn test_hybrid_identity_full_lifecycle() {
             vch_sum: Some(user_attest.payload_hash()),
             revokes: None,
             iat: 1000, exp: Some(9999),
+            body_type: None, body_cbor: None,
         },
         |msg| root.sign(msg),
     ).unwrap();

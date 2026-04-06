@@ -196,6 +196,7 @@ mod tests {
                 revokes: None,
                 iat: 1000,
                 exp: Some(9999),
+                body_type: None, body_cbor: None,
             },
             &user.signing_key,
         )
@@ -214,6 +215,7 @@ mod tests {
                 revokes: None,
                 iat: 1000,
                 exp: Some(9999),
+                body_type: None, body_cbor: None,
             },
             &root.signing_key,
         )

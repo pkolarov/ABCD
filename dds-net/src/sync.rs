@@ -267,6 +267,7 @@ mod tests {
                 revokes: None,
                 iat: 1000,
                 exp: Some(9999),
+                body_type: None, body_cbor: None,
             },
             &ident.signing_key,
         )
@@ -375,6 +376,7 @@ mod tests {
                 revokes: Some("vouch-1".to_string()),
                 iat: 2000,
                 exp: None,
+                body_type: None, body_cbor: None,
             },
             &admin.signing_key,
         )
@@ -410,6 +412,7 @@ mod tests {
                 revokes: None,
                 iat: 2000,
                 exp: None,
+                body_type: None, body_cbor: None,
             },
             &user.signing_key,
         )

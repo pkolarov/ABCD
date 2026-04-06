@@ -1,0 +1,19 @@
+[package]
+name = "dds-domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DDS domain-specific typed documents that ride inside TokenPayload body"
+
+[features]
+default = ["pq"]
+pq = ["dds-core/pq"]
+
+[dependencies]
+dds-core = { workspace = true }
+serde = { workspace = true, features = ["std", "derive"] }
+ciborium = { workspace = true }
+serde_bytes = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

@@ -6,14 +6,20 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "dds_node"
+path = "src/lib.rs"
+
 [[bin]]
 name = "dds-node"
 path = "src/main.rs"
 
 [dependencies]
 dds-core = { workspace = true }
+dds-domain = { path = "../dds-domain" }
 dds-store = { workspace = true }
 dds-net = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true, features = ["std", "derive"] }
 ciborium = { workspace = true }
@@ -21,10 +27,9 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 home = "0.5"
+rand = { workspace = true }
 futures = { workspace = true }
 libp2p = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-serde_json = { workspace = true }
-clap = { workspace = true }

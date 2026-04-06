@@ -183,6 +183,28 @@ impl TrustGraph {
         })
     }
 
+    /// Get all purposes a subject has been vouched for (by trusted vouchers).
+    pub fn purposes_for(
+        &self,
+        subject_urn: &str,
+        trusted_roots: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        self.vouches
+            .values()
+            .filter(|t| {
+                t.payload.vch_iss.as_deref() == Some(subject_urn)
+                    && !self.revoked.contains(&t.payload.jti)
+                    && self.validate_chain(&t.payload.iss, trusted_roots).is_ok()
+            })
+            .filter_map(|t| t.payload.purpose.clone())
+            .collect()
+    }
+
+    /// Total number of tokens in the trust graph.
+    pub fn token_count(&self) -> usize {
+        self.attestations.len() + self.vouches.len() + self.revoked.len()
+    }
+
     /// Get the number of attestations.
     pub fn attestation_count(&self) -> usize {
         self.attestations.len()
@@ -252,6 +274,7 @@ mod tests {
             revokes: None,
             iat: 1000,
             exp: Some(9999),
+            body_type: None, body_cbor: None,
         };
         Token::sign(payload, &ident.signing_key).unwrap()
     }
@@ -275,6 +298,7 @@ mod tests {
             revokes: None,
             iat: 1000,
             exp: Some(9999),
+            body_type: None, body_cbor: None,
         };
         Token::sign(payload, &voucher.signing_key).unwrap()
     }
@@ -292,6 +316,7 @@ mod tests {
             revokes: Some(String::from(target_jti)),
             iat: 2000,
             exp: None,
+            body_type: None, body_cbor: None,
         };
         Token::sign(payload, &revoker.signing_key).unwrap()
     }
@@ -309,6 +334,7 @@ mod tests {
             revokes: None,
             iat: 2000,
             exp: None,
+            body_type: None, body_cbor: None,
         };
         Token::sign(payload, &ident.signing_key).unwrap()
     }

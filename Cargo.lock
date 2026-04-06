@@ -686,6 +686,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dds-domain"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "dds-core",
+ "rand 0.8.5",
+ "serde",
+ "serde_bytes",
+]
+
+[[package]]
 name = "dds-ffi"
 version = "0.1.0"
 dependencies = [
@@ -717,13 +728,14 @@ name = "dds-node"
 version = "0.1.0"
 dependencies = [
  "ciborium",
- "clap",
  "dds-core",
+ "dds-domain",
  "dds-net",
  "dds-store",
  "futures",
  "home",
  "libp2p",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "tempfile",

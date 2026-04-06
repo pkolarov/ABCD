@@ -74,6 +74,18 @@ pub struct TokenPayload {
     /// Expiration timestamp (Unix seconds). None for revocations and burns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exp: Option<u64>,
+
+    // ---- Opaque extension body ----
+    // Domain-specific data rides inside the signed envelope.
+    // Core never interprets these; dds-domain provides typed wrappers.
+
+    /// Body type URI (e.g. "dds:user-auth-attestation", "dds:device-join").
+    /// When present, `body_cbor` must also be set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_type: Option<String>,
+    /// CBOR-encoded domain-specific payload (signed along with all other fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_cbor: Option<Vec<u8>>,
 }
 
 /// A signed Vouchsafe token: payload + signature (scheme-aware).
@@ -268,6 +280,7 @@ mod tests {
             revokes: None,
             iat: 1714605000,
             exp: Some(1746141000),
+            body_type: None, body_cbor: None,
         }
     }
 
@@ -349,6 +362,7 @@ mod tests {
             revokes: None,
             iat: 1714606000,
             exp: Some(1746142000),
+            body_type: None, body_cbor: None,
         };
 
         let vouch = Token::sign(vouch_payload, &admin.signing_key).unwrap();
@@ -371,6 +385,7 @@ mod tests {
             revokes: None,
             iat: 1714606000,
             exp: Some(1746142000),
+            body_type: None, body_cbor: None,
         };
         let err = Token::sign(payload, &admin.signing_key).unwrap_err();
         assert_eq!(err, TokenError::VouchMissingFields);
@@ -393,6 +408,7 @@ mod tests {
             revokes: Some(String::from("vouch-jti-1")),
             iat: 1714608000,
             exp: None, // Revocations must not expire
+            body_type: None, body_cbor: None,
         };
 
         let token = Token::sign(revoke_payload, &admin.signing_key).unwrap();
@@ -416,6 +432,7 @@ mod tests {
             revokes: Some(String::from("target-jti")),
             iat: 1714608000,
             exp: Some(9999999999), // not allowed
+            body_type: None, body_cbor: None,
         };
         let err = Token::sign(payload, &admin.signing_key).unwrap_err();
         assert_eq!(err, TokenError::RevocationMustNotExpire);
@@ -437,6 +454,7 @@ mod tests {
             revokes: None, // missing
             iat: 1714608000,
             exp: None,
+            body_type: None, body_cbor: None,
         };
         let err = Token::sign(payload, &admin.signing_key).unwrap_err();
         assert_eq!(err, TokenError::RevokeMissingTarget);
@@ -458,6 +476,7 @@ mod tests {
             revokes: None,
             iat: 1714608000,
             exp: None,
+            body_type: None, body_cbor: None,
         };
 
         let token = Token::sign(payload, &user.signing_key).unwrap();
@@ -480,6 +499,7 @@ mod tests {
             revokes: None,
             iat: 1714608000,
             exp: Some(9999999999),
+            body_type: None, body_cbor: None,
         };
         let err = Token::sign(payload, &user.signing_key).unwrap_err();
         assert_eq!(err, TokenError::RevocationMustNotExpire);

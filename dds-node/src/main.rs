@@ -1,14 +1,11 @@
 //! DDS node entry point — starts the P2P node, storage, and local API.
 
-mod config;
-mod node;
-
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::NodeConfig;
-use crate::node::DdsNode;
+use dds_node::config::NodeConfig;
+use dds_node::node::DdsNode;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

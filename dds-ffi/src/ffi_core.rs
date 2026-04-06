@@ -122,6 +122,7 @@ pub extern "C" fn dds_token_create_attest(config_json: *const c_char, out: *mut 
         purpose: config["purpose"].as_str().map(String::from),
         vch_iss: None, vch_sum: None, revokes: None,
         iat: now_epoch(), exp: Some(now_epoch() + 365 * 86400),
+        body_type: None, body_cbor: None,
     };
     let token = match Token::sign(payload, &ident.signing_key) {
         Ok(t) => t, Err(e) => return write_err(out, DDS_ERR_TOKEN, &e.to_string()),

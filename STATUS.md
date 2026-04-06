@@ -8,21 +8,22 @@
 | Metric | Value |
 |---|---|
 | **Rust version** | 1.94.1 (stable) |
-| **Workspace crates** | 6 |
-| **Total tests** | 186 (173 Rust + 13 Python) |
-| **Tests passing** | 186 ✅ |
+| **Workspace crates** | 7 |
+| **Total tests** | 202 (189 Rust + 13 Python) |
+| **Tests passing** | 202 ✅ |
 | **Tests failing** | 0 |
 
 ## Crate Status
 
 | Crate | Design Ref | Status | Tests | Notes |
 |---|---|---|---|---|
-| **dds-core** | §12 | 🟢 Complete | 114 | Identity, tokens, CRDTs, trust, policy, crypto (hybrid PQ), integration tests |
+| **dds-core** | §12 | 🟢 Complete | 114 | Identity, tokens (with extensible body), CRDTs, trust, policy, crypto (hybrid PQ) |
+| **dds-domain** | §14 | 🟢 Complete | 11 | 6 typed documents: UserAuth, DeviceJoin, WindowsPolicy, Software, ServicePrincipal, Session |
 | **dds-store** | §12 | 🟢 Complete | 15 | Traits + MemoryBackend + RedbBackend |
 | **dds-net** | §12 | 🟢 Complete | 19 | Transport, gossip, discovery, sync protocol |
-| **dds-node** | §12 | � Complete | 4 | Config, event loop, swarm lifecycle, gossip/sync ingestion |
-| **dds-ffi** | §12, §14.2–14.3 | � Complete | 12 | C ABI: identity, token, policy, version + 12 Rust tests |
-| **dds-cli** | §12 | � Complete | 9 | Smoke tests (help, create, hybrid, show, invalid URN, policy, status, vouch+status, vouch+revoke) |
+| **dds-node** | §12 | 🟢 Complete | 9 | Config, event loop, local authority service (enrollment, sessions, policy, status) |
+| **dds-ffi** | §12, §14.2–14.3 | 🟢 Complete | 12 | C ABI: identity, token, policy, version + 12 Rust tests |
+| **dds-cli** | §12 | 🟢 Complete | 9 | CLI smoke tests (help, create, hybrid, show, vouch, revoke, status, policy) |
 
 ## Module Detail — dds-core
 
@@ -62,6 +63,19 @@
 |---|---|---|---|---|
 | `config` | §12 | ✅ Done | 4 | `NodeConfig`, `NetworkConfig`, `ConfigError` |
 | `node` | §12 | ✅ Done | 0 | `DdsNode`, event loop, gossip/sync ingestion |
+| `service` | §12, §14 | ✅ Done | 5 | `LocalService`, enrollment, sessions, policy resolution, status |
+
+## Module Detail — dds-domain
+
+| Document Type | body_type | Tests | Use Case |
+|---|---|---|---|
+| `UserAuthAttestation` | `dds:user-auth-attestation` | 2 | FIDO2/passkey enrollment |
+| `DeviceJoinDocument` | `dds:device-join` | 2 | Device enrollment, TPM attestation |
+| `WindowsPolicyDocument` | `dds:windows-policy` | 1 | GPO-equivalent policy distribution |
+| `SoftwareAssignment` | `dds:software-assignment` | 1 | App/package deployment manifests |
+| `ServicePrincipalDocument` | `dds:service-principal` | 1 | Machine/service identity |
+| `SessionDocument` | `dds:session` | 2 | Short-lived auth session (< 1ms check) |
+| Cross-type safety | — | 2 | Wrong type returns None, no body returns None |
 
 ## Module Detail — dds-cli
 
@@ -152,11 +166,11 @@ FIDO2 hardware authenticators (YubiKey, passkeys, TPMs) only produce Ed25519 or 
 
 ## Next Steps
 
-All 6 crates are 🟢 Complete. Remaining hardening work:
+All 7 crates are 🟢 Complete. Remaining hardening work:
 
 1. **CI benchmarks** (§10.9) — criterion + dhat for perf budgets
-2. **Integration tests** — Multi-node sync, revocation propagation, network partition
+2. **Multi-node integration tests** — Network partition, revocation propagation
 3. **Cross-platform CI** — Windows, Android (cargo-ndk), iOS, embedded (thumbv7em)
 4. **Persistent identity storage** — Encrypt-at-rest for node keys
-5. **Local API server** — JSON-RPC/REST endpoint on dds-node for client apps
-6. **FIDO2 integration** — WebAuthn attestation flow for leaf identities
+5. **HTTP API server** — JSON-RPC/REST on dds-node for client apps
+6. **FIDO2 attestation verification** — Parse and validate WebAuthn attestation objects
