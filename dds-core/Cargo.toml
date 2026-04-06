@@ -26,3 +26,6 @@ pqcrypto-traits = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand = { workspace = true }
+ciborium = { workspace = true }
+dds-store = { workspace = true }
+dds-net = { workspace = true }

@@ -662,6 +662,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -670,6 +671,8 @@ version = "0.1.0"
 dependencies = [
  "base32",
  "ciborium",
+ "dds-net",
+ "dds-store",
  "ed25519-dalek",
  "heapless 0.8.0",
  "pqcrypto-mldsa",

@@ -154,6 +154,10 @@ fn handle_identity(action: IdentityAction) {
 }
 
 fn handle_group(action: GroupAction, data_dir: &PathBuf) {
+    std::fs::create_dir_all(data_dir).unwrap_or_else(|e| {
+        eprintln!("Failed to create data dir {}: {e}", data_dir.display());
+        std::process::exit(1);
+    });
     let db_path = data_dir.join("directory.redb");
     let mut store = match RedbBackend::open(&db_path) {
         Ok(s) => s,
@@ -177,8 +181,8 @@ fn handle_group(action: GroupAction, data_dir: &PathBuf) {
                 sub: user.clone(),
                 kind: dds_core::token::TokenKind::Vouch,
                 purpose: Some(purpose.clone()),
-                vch_iss: Some(user),
-                vch_sum: None,
+                vch_iss: Some(user.clone()),
+                vch_sum: Some(format!("cli-vouch-{}", uuid_v4())),
                 revokes: None,
                 iat: now_epoch(),
                 exp: Some(now_epoch() + 365 * 86400),

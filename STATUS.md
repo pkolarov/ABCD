@@ -9,20 +9,20 @@
 |---|---|
 | **Rust version** | 1.94.1 (stable) |
 | **Workspace crates** | 6 |
-| **Total tests** | 147 |
-| **Tests passing** | 147 ✅ |
+| **Total tests** | 168 |
+| **Tests passing** | 168 ✅ |
 | **Tests failing** | 0 |
 
 ## Crate Status
 
 | Crate | Design Ref | Status | Tests | Notes |
 |---|---|---|---|---|
-| **dds-core** | §12 | 🟢 Complete | 109 | Identity, tokens, CRDTs, trust, policy, crypto (hybrid PQ) |
+| **dds-core** | §12 | 🟢 Complete | 114 | Identity, tokens, CRDTs, trust, policy, crypto (hybrid PQ), integration tests |
 | **dds-store** | §12 | 🟢 Complete | 15 | Traits + MemoryBackend + RedbBackend |
 | **dds-net** | §12 | 🟢 Complete | 19 | Transport, gossip, discovery, sync protocol |
 | **dds-node** | §12 | � Complete | 4 | Config, event loop, swarm lifecycle, gossip/sync ingestion |
-| **dds-ffi** | §12, §14.2–14.3 | � Complete | 0 | C ABI exports (identity, version, URN parse); no runtime tests (FFI) |
-| **dds-cli** | §12 | � Complete | 0 | Identity create/show, group vouch/revoke, policy check, status |
+| **dds-ffi** | §12, §14.2–14.3 | � Complete | 7 | C ABI exports + unit tests (create, hybrid, parse URN, version, roundtrip, null-free) |
+| **dds-cli** | §12 | � Complete | 9 | Smoke tests (help, create, hybrid, show, invalid URN, policy, status, vouch+status, vouch+revoke) |
 
 ## Module Detail — dds-core
 
@@ -83,6 +83,16 @@
 | `dds_identity_parse_urn` | URN validation | `(urn, out) -> i32` |
 | `dds_version` | Library version | `(out) -> i32` |
 | `dds_free_string` | Free returned strings | `(ptr)` |
+
+## Integration Tests
+
+| Test | Crates Exercised | What It Validates |
+|---|---|---|
+| `test_full_trust_chain_lifecycle` | core (identity, token, trust) | root→admin→user chain, vouch, revoke breaks chain, admin survives |
+| `test_policy_evaluation_end_to_end` | core (identity, token, trust, policy) | Policy allow/deny with trust graph, outsider denied, wrong resource/action denied |
+| `test_token_store_roundtrip` | core + store | CBOR serialize→store→retrieve→deserialize→validate signature |
+| `test_two_node_sync` | core + store + net (sync) | Two DAGs exchange summaries, compute missing ops, apply payloads, merge |
+| `test_hybrid_identity_full_lifecycle` | core (crypto, identity, token, trust) | Hybrid PQ root vouches classical user, mixed-scheme trust chain |
 
 ## Cryptography Status
 
