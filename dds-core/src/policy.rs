@@ -186,7 +186,7 @@ mod tests {
         let user_token = Token::sign(
             TokenPayload {
                 iss: user.id.to_urn(),
-                iss_key: user.verifying_key().to_bytes(),
+                iss_key: user.public_key.clone(),
                 jti: String::from("attest-user"),
                 sub: user.id.to_urn(),
                 kind: TokenKind::Attest,
@@ -204,7 +204,7 @@ mod tests {
         let vouch = Token::sign(
             TokenPayload {
                 iss: root.id.to_urn(),
-                iss_key: root.verifying_key().to_bytes(),
+                iss_key: root.public_key.clone(),
                 jti: String::from("vouch-backend"),
                 sub: user.id.to_urn(),
                 kind: TokenKind::Vouch,

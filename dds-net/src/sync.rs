@@ -257,7 +257,7 @@ mod tests {
         Token::sign(
             TokenPayload {
                 iss: ident.id.to_urn(),
-                iss_key: ident.verifying_key().to_bytes(),
+                iss_key: ident.public_key.clone(),
                 jti: format!("attest-{}", ident.id.label()),
                 sub: ident.id.to_urn(),
                 kind: TokenKind::Attest,
@@ -365,7 +365,7 @@ mod tests {
         let revoke_token = Token::sign(
             TokenPayload {
                 iss: admin.id.to_urn(),
-                iss_key: admin.verifying_key().to_bytes(),
+                iss_key: admin.public_key.clone(),
                 jti: "revoke-1".to_string(),
                 sub: "target".to_string(),
                 kind: TokenKind::Revoke,
@@ -400,7 +400,7 @@ mod tests {
         let burn_token = Token::sign(
             TokenPayload {
                 iss: user.id.to_urn(),
-                iss_key: user.verifying_key().to_bytes(),
+                iss_key: user.public_key.clone(),
                 jti: "burn-1".to_string(),
                 sub: user.id.to_urn(),
                 kind: TokenKind::Burn,

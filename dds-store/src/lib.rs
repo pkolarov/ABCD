@@ -27,7 +27,7 @@ mod tests {
         let ident = Identity::generate(label, &mut OsRng);
         let payload = TokenPayload {
             iss: ident.id.to_urn(),
-            iss_key: ident.verifying_key().to_bytes(),
+            iss_key: ident.public_key.clone(),
             jti: format!("jti-{label}"),
             sub: format!("sub-{label}"),
             kind,

@@ -9,15 +9,15 @@
 |---|---|
 | **Rust version** | 1.94.1 (stable) |
 | **Workspace crates** | 6 |
-| **Total tests** | 140 |
-| **Tests passing** | 140 ✅ |
+| **Total tests** | 143 |
+| **Tests passing** | 143 ✅ |
 | **Tests failing** | 0 |
 
 ## Crate Status
 
 | Crate | Design Ref | Status | Tests | Notes |
 |---|---|---|---|---|
-| **dds-core** | §12 | 🟢 Core complete | 106 | Identity, tokens, CRDTs, trust, policy, crypto (hybrid PQ) |
+| **dds-core** | §12 | 🟢 Core complete | 109 | Identity, tokens, CRDTs, trust, policy, crypto (hybrid PQ) |
 | **dds-store** | §12 | 🟢 Core complete | 15 | Traits + MemoryBackend + RedbBackend |
 | **dds-net** | §12 | 🟢 Core complete | 19 | Transport, gossip, discovery, sync protocol |
 | **dds-node** | §12 | 🔴 Stub only | 0 | Entry point placeholder |
@@ -89,11 +89,20 @@
 | iOS ARM64 | 🔲 Not tested | |
 | Embedded (Cortex-M) | 🔲 Not tested | Needs no_std validation |
 
+## FIDO2 / WebAuthn Compatibility
+
+FIDO2 hardware authenticators (YubiKey, passkeys, TPMs) only produce Ed25519 or ECDSA-P256 signatures — no PQ support yet (IANA registered ML-DSA COSE IDs in April 2025, but no hardware ships it). Our design accommodates this:
+
+- **FIDO2 leaf identities** use `SchemeId::Ed25519` (classical only)
+- **Trust roots and admins** use `SchemeId::HybridEdMldsa65` (quantum-safe)
+- **Trust chain**: PQ-hybrid root → PQ-hybrid admin → classical FIDO2 leaf
+- Quantum resistance flows from the vouch chain, not the leaf authenticator
+- When FIDO2 hardware adds ML-DSA, leaf identities upgrade seamlessly
+
 ## Next Steps
 
-1. **Migrate identity + token modules** to use `crypto::PublicKeyBundle` / `SignatureBundle`
-2. **CI benchmarks** (§10.9) — criterion + dhat
-3. **dds-node** — Main binary with config, local API, swarm event loop
-4. **dds-cli** — Identity creation, group management, diagnostics
-5. **dds-ffi** — UniFFI definitions for C#/Swift/Kotlin bindings
-6. **Integration tests** — Multi-node sync, revocation propagation
+1. **CI benchmarks** (§10.9) — criterion + dhat
+2. **dds-node** — Main binary with config, local API, swarm event loop
+3. **dds-cli** — Identity creation, group management, diagnostics
+4. **dds-ffi** — UniFFI definitions for C#/Swift/Kotlin bindings
+5. **Integration tests** — Multi-node sync, revocation propagation

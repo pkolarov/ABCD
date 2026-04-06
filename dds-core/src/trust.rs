@@ -242,7 +242,7 @@ mod tests {
     fn make_attest(ident: &Identity) -> Token {
         let payload = TokenPayload {
             iss: ident.id.to_urn(),
-            iss_key: ident.verifying_key().to_bytes(),
+            iss_key: ident.public_key.clone(),
             jti: format!("attest-{}", ident.id.label()),
             sub: ident.id.to_urn(),
             kind: TokenKind::Attest,
@@ -265,7 +265,7 @@ mod tests {
     ) -> Token {
         let payload = TokenPayload {
             iss: voucher.id.to_urn(),
-            iss_key: voucher.verifying_key().to_bytes(),
+            iss_key: voucher.public_key.clone(),
             jti: String::from(jti),
             sub: target.id.to_urn(),
             kind: TokenKind::Vouch,
@@ -282,7 +282,7 @@ mod tests {
     fn make_revoke(revoker: &Identity, target_jti: &str) -> Token {
         let payload = TokenPayload {
             iss: revoker.id.to_urn(),
-            iss_key: revoker.verifying_key().to_bytes(),
+            iss_key: revoker.public_key.clone(),
             jti: format!("revoke-{}", target_jti),
             sub: String::from("revoke-sub"),
             kind: TokenKind::Revoke,
@@ -299,7 +299,7 @@ mod tests {
     fn make_burn(ident: &Identity) -> Token {
         let payload = TokenPayload {
             iss: ident.id.to_urn(),
-            iss_key: ident.verifying_key().to_bytes(),
+            iss_key: ident.public_key.clone(),
             jti: format!("burn-{}", ident.id.label()),
             sub: ident.id.to_urn(),
             kind: TokenKind::Burn,

@@ -10,10 +10,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::crypto::{PublicKeyBundle, SignatureBundle};
 use crate::identity::VouchsafeId;
 
 /// The type of a Vouchsafe token.
@@ -49,9 +49,8 @@ impl fmt::Display for TokenKind {
 pub struct TokenPayload {
     /// Issuer identity URN.
     pub iss: String,
-    /// Issuer's Ed25519 public key (32 bytes).
-    #[serde(with = "serde_bytes_array")]
-    pub iss_key: [u8; 32],
+    /// Issuer's public key bundle (scheme-aware: Ed25519 or hybrid).
+    pub iss_key: PublicKeyBundle,
     /// Unique token identifier.
     pub jti: String,
     /// Subject identifier (what this token is about).
@@ -77,19 +76,25 @@ pub struct TokenPayload {
     pub exp: Option<u64>,
 }
 
-/// A signed Vouchsafe token: payload + Ed25519 signature.
+/// A signed Vouchsafe token: payload + signature (scheme-aware).
 #[derive(Debug, Clone)]
 pub struct Token {
     pub payload: TokenPayload,
     /// CBOR-encoded payload bytes (the signed data).
     payload_bytes: Vec<u8>,
-    /// Ed25519 signature over `payload_bytes`.
-    signature: Signature,
+    /// Signature over `payload_bytes` (Ed25519 or hybrid).
+    signature: SignatureBundle,
 }
 
 impl Token {
-    /// Create and sign a token from a payload and signing key.
-    pub fn sign(payload: TokenPayload, signing_key: &SigningKey) -> Result<Self, TokenError> {
+    /// Create and sign a token from a payload and a signing function.
+    ///
+    /// The `sign_fn` receives the CBOR-encoded payload bytes and returns a `SignatureBundle`.
+    /// Use `Identity::sign()` or `HybridIdentity::sign()` to produce the closure.
+    pub fn create<F>(payload: TokenPayload, sign_fn: F) -> Result<Self, TokenError>
+    where
+        F: FnOnce(&[u8]) -> SignatureBundle,
+    {
         // Validate: revocations and burns MUST NOT have exp
         if matches!(payload.kind, TokenKind::Revoke | TokenKind::Burn) && payload.exp.is_some() {
             return Err(TokenError::RevocationMustNotExpire);
@@ -106,7 +111,7 @@ impl Token {
         }
 
         let payload_bytes = cbor_encode(&payload)?;
-        let signature = signing_key.sign(&payload_bytes);
+        let signature = sign_fn(&payload_bytes);
 
         Ok(Self {
             payload,
@@ -115,12 +120,15 @@ impl Token {
         })
     }
 
+    /// Convenience: create and sign with an Ed25519 signing key (classical).
+    pub fn sign(payload: TokenPayload, signing_key: &ed25519_dalek::SigningKey) -> Result<Self, TokenError> {
+        let classical = crate::crypto::Ed25519Only::from_bytes(&signing_key.to_bytes());
+        Self::create(payload, |msg| classical.sign(msg))
+    }
+
     /// Verify the token's signature against the embedded issuer public key.
     pub fn verify_signature(&self) -> Result<(), TokenError> {
-        let verifying_key = VerifyingKey::from_bytes(&self.payload.iss_key)
-            .map_err(|_| TokenError::InvalidPublicKey)?;
-        verifying_key
-            .verify(&self.payload_bytes, &self.signature)
+        crate::crypto::verify(&self.payload.iss_key, &self.payload_bytes, &self.signature)
             .map_err(|_| TokenError::InvalidSignature)
     }
 
@@ -128,9 +136,7 @@ impl Token {
     pub fn verify_issuer_binding(&self) -> Result<(), TokenError> {
         let id = VouchsafeId::from_urn(&self.payload.iss)
             .map_err(|_| TokenError::InvalidIssuerUrn)?;
-        let verifying_key = VerifyingKey::from_bytes(&self.payload.iss_key)
-            .map_err(|_| TokenError::InvalidPublicKey)?;
-        if !id.verify_binding(&verifying_key) {
+        if !id.verify_binding_bundle(&self.payload.iss_key) {
             return Err(TokenError::IssuerKeyMismatch);
         }
         Ok(())
@@ -153,7 +159,7 @@ impl Token {
     pub fn to_cbor(&self) -> Result<Vec<u8>, TokenError> {
         let wire = TokenWire {
             payload: self.payload_bytes.clone(),
-            signature: self.signature.to_bytes(),
+            signature: cbor_encode(&self.signature)?,
         };
         cbor_encode(&wire)
     }
@@ -162,8 +168,7 @@ impl Token {
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, TokenError> {
         let wire: TokenWire = cbor_decode(bytes)?;
         let payload: TokenPayload = cbor_decode(&wire.payload)?;
-        let signature =
-            Signature::from_bytes(&wire.signature);
+        let signature: SignatureBundle = cbor_decode(&wire.signature)?;
 
         Ok(Self {
             payload,
@@ -172,8 +177,8 @@ impl Token {
         })
     }
 
-    /// Get the signature.
-    pub fn signature(&self) -> &Signature {
+    /// Get the signature bundle.
+    pub fn signature(&self) -> &SignatureBundle {
         &self.signature
     }
 }
@@ -183,23 +188,9 @@ impl Token {
 struct TokenWire {
     #[serde(with = "serde_bytes")]
     payload: Vec<u8>,
-    #[serde(with = "serde_bytes_64")]
-    signature: [u8; 64],
-}
-
-/// Serde helper for fixed-size [u8; 32] as bytes.
-mod serde_bytes_array {
-    use alloc::vec::Vec;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
-        serde_bytes::Bytes::new(bytes.as_slice()).serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
-        let v: Vec<u8> = <serde_bytes::ByteBuf as Deserialize>::deserialize(d)?.into_vec();
-        v.as_slice().try_into().map_err(serde::de::Error::custom)
-    }
+    /// CBOR-encoded SignatureBundle (variable size: classical ~70B, hybrid ~3.4KB).
+    #[serde(with = "serde_bytes")]
+    signature: Vec<u8>,
 }
 
 /// Helper: CBOR encode.
@@ -256,20 +247,7 @@ impl fmt::Display for TokenError {
     }
 }
 
-/// Serde helper for fixed-size [u8; 64] as bytes.
-mod serde_bytes_64 {
-    use alloc::vec::Vec;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    pub fn serialize<S: Serializer>(bytes: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
-        serde_bytes::Bytes::new(bytes.as_slice()).serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
-        let v: Vec<u8> = <serde_bytes::ByteBuf as Deserialize>::deserialize(d)?.into_vec();
-        v.as_slice().try_into().map_err(serde::de::Error::custom)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -280,7 +258,7 @@ mod tests {
     fn make_attest_payload(ident: &Identity) -> TokenPayload {
         TokenPayload {
             iss: ident.id.to_urn(),
-            iss_key: ident.verifying_key().to_bytes(),
+            iss_key: ident.public_key.clone(),
             jti: String::from("test-jti-1"),
             sub: String::from("test-sub-1"),
             kind: TokenKind::Attest,
@@ -310,7 +288,7 @@ mod tests {
 
         // Sign with alice's key but put bob's key in the payload
         let mut payload = make_attest_payload(&alice);
-        payload.iss_key = bob.verifying_key().to_bytes();
+        payload.iss_key = bob.public_key.clone();
 
         // This will sign with alice's key but the payload says bob's key
         let token = Token::sign(payload, &alice.signing_key).unwrap();
@@ -325,7 +303,7 @@ mod tests {
 
         // Use alice's URN but bob's key
         let mut payload = make_attest_payload(&alice);
-        payload.iss_key = bob.verifying_key().to_bytes();
+        payload.iss_key = bob.public_key.clone();
         // Sign with bob so signature is valid against bob's key
         let token = Token::sign(payload, &bob.signing_key).unwrap();
         // Signature valid, but issuer URN doesn't match the key
@@ -361,7 +339,7 @@ mod tests {
         // Admin vouches for user
         let vouch_payload = TokenPayload {
             iss: admin.id.to_urn(),
-            iss_key: admin.verifying_key().to_bytes(),
+            iss_key: admin.public_key.clone(),
             jti: String::from("vouch-jti-1"),
             sub: String::from("test-sub-1"),
             kind: TokenKind::Vouch,
@@ -383,7 +361,7 @@ mod tests {
         let admin = Identity::generate("admin", &mut OsRng);
         let payload = TokenPayload {
             iss: admin.id.to_urn(),
-            iss_key: admin.verifying_key().to_bytes(),
+            iss_key: admin.public_key.clone(),
             jti: String::from("vouch-jti"),
             sub: String::from("sub"),
             kind: TokenKind::Vouch,
@@ -405,7 +383,7 @@ mod tests {
 
         let revoke_payload = TokenPayload {
             iss: admin.id.to_urn(),
-            iss_key: admin.verifying_key().to_bytes(),
+            iss_key: admin.public_key.clone(),
             jti: String::from("revoke-jti"),
             sub: String::from("user-sub"),
             kind: TokenKind::Revoke,
@@ -428,7 +406,7 @@ mod tests {
 
         let payload = TokenPayload {
             iss: admin.id.to_urn(),
-            iss_key: admin.verifying_key().to_bytes(),
+            iss_key: admin.public_key.clone(),
             jti: String::from("revoke-jti"),
             sub: String::from("sub"),
             kind: TokenKind::Revoke,
@@ -449,7 +427,7 @@ mod tests {
 
         let payload = TokenPayload {
             iss: admin.id.to_urn(),
-            iss_key: admin.verifying_key().to_bytes(),
+            iss_key: admin.public_key.clone(),
             jti: String::from("revoke-jti"),
             sub: String::from("sub"),
             kind: TokenKind::Revoke,
@@ -470,7 +448,7 @@ mod tests {
 
         let payload = TokenPayload {
             iss: user.id.to_urn(),
-            iss_key: user.verifying_key().to_bytes(),
+            iss_key: user.public_key.clone(),
             jti: String::from("burn-jti"),
             sub: user.id.to_urn(),
             kind: TokenKind::Burn,
@@ -492,7 +470,7 @@ mod tests {
         let user = Identity::generate("user", &mut OsRng);
         let payload = TokenPayload {
             iss: user.id.to_urn(),
-            iss_key: user.verifying_key().to_bytes(),
+            iss_key: user.public_key.clone(),
             jti: String::from("burn-jti"),
             sub: user.id.to_urn(),
             kind: TokenKind::Burn,
