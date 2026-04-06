@@ -8,169 +8,195 @@
 | Metric | Value |
 |---|---|
 | **Rust version** | 1.94.1 (stable) |
+| **Edition** | 2024 |
 | **Workspace crates** | 7 |
-| **Total tests** | 202 (189 Rust + 13 Python) |
-| **Tests passing** | 202 ✅ |
-| **Tests failing** | 0 |
+| **Rust LOC** | 7,618 |
+| **Rust tests** | 189 |
+| **Python tests** | 13 |
+| **Total tests** | 202 ✅ all passing |
+| **Shared library** | libdds\_ffi.dylib (739 KB) |
 
 ## Crate Status
 
-| Crate | Design Ref | Status | Tests | Notes |
+| Crate | Design Ref | Status | Tests | Summary |
 |---|---|---|---|---|
-| **dds-core** | §12 | 🟢 Complete | 114 | Identity, tokens (with extensible body), CRDTs, trust, policy, crypto (hybrid PQ) |
-| **dds-domain** | §14 | 🟢 Complete | 11 | 6 typed documents: UserAuth, DeviceJoin, WindowsPolicy, Software, ServicePrincipal, Session |
-| **dds-store** | §12 | 🟢 Complete | 15 | Traits + MemoryBackend + RedbBackend |
-| **dds-net** | §12 | 🟢 Complete | 19 | Transport, gossip, discovery, sync protocol |
-| **dds-node** | §12 | 🟢 Complete | 9 | Config, event loop, local authority service (enrollment, sessions, policy, status) |
-| **dds-ffi** | §12, §14.2–14.3 | 🟢 Complete | 12 | C ABI: identity, token, policy, version + 12 Rust tests |
-| **dds-cli** | §12 | 🟢 Complete | 9 | CLI smoke tests (help, create, hybrid, show, vouch, revoke, status, policy) |
+| **dds-core** | §3–§9 | 🟢 Done | 114 | Crypto, identity, tokens (extensible body), CRDTs, trust graph, policy engine |
+| **dds-domain** | §14 | 🟢 Done | 11 | 6 typed domain documents embedded in token body |
+| **dds-store** | §6 | 🟢 Done | 15 | Storage traits, MemoryBackend, RedbBackend (ACID) |
+| **dds-net** | §5 | 🟢 Done | 19 | libp2p transport, gossipsub, Kademlia, mDNS, delta-sync |
+| **dds-node** | §12 | 🟢 Done | 9 | Config, P2P event loop, local authority service |
+| **dds-ffi** | §14.2–14.3 | 🟢 Done | 12 | C ABI (cdylib): identity, token, policy, version |
+| **dds-cli** | §12 | 🟢 Done | 9 | Identity, group, policy, status subcommands |
 
 ## Module Detail — dds-core
 
-| Module | Design Ref | Status | Tests | Key Types |
-|---|---|---|---|---|
-| `crypto::classical` | §13.1 | ✅ Done | 5 | `Ed25519Only`, `verify_ed25519()` |
-| `crypto::hybrid` | §13.1 (extended) | ✅ Done | 7 | `HybridEdMldsa`, `verify_hybrid()` |
-| `crypto::traits` | — | ✅ Done | — | `SchemeId`, `PublicKeyBundle`, `SignatureBundle`, `verify()` |
-| `identity` | §3, §4.1 | ✅ Done | 12 | `VouchsafeId`, `Identity` |
-| `token` | §4.1–4.4 | ✅ Done | 15 | `Token`, `TokenPayload`, `TokenKind` |
-| `crdt::lww_register` | §5.1 | ✅ Done | 11 | `LwwRegister<T>` |
-| `crdt::twop_set` | §5.2 | ✅ Done | 13 | `TwoPSet<T>` |
-| `crdt::causal_dag` | §5.3 | ✅ Done | 17 | `CausalDag`, `Operation` |
-| `trust` | §4.3, §6 | ✅ Done | 14 | `TrustGraph` |
-| `policy` | §7 | ✅ Done | 12 | `PolicyEngine`, `PolicyRule`, `PolicyDecision` |
-
-## Module Detail — dds-store
-
-| Module | Design Ref | Status | Tests | Key Types |
-|---|---|---|---|---|
-| `traits` | §12 | ✅ Done | — | `TokenStore`, `RevocationStore`, `OperationStore`, `DirectoryStore` |
-| `memory_backend` | §12, §14.4 | ✅ Done | 7 | `MemoryBackend` |
-| `redb_backend` | §13.2 | ✅ Done | 8 | `RedbBackend` |
-
-## Module Detail — dds-net
-
-| Module | Design Ref | Status | Tests | Key Types |
-|---|---|---|---|---|
-| `transport` | §13.3, §14.1 | ✅ Done | 0 | `DdsBehaviour`, `SwarmConfig`, `build_swarm()` |
-| `gossip` | §8 | ✅ Done | 7 | `DdsTopic`, `DdsTopicSet`, `GossipMessage` |
-| `discovery` | §8 | ✅ Done | 3 | `add_bootstrap_peer()`, `parse_peer_multiaddr()` |
-| `sync` | §8.2, §10.6 | ✅ Done | 9 | `StateSummary`, `SyncMessage`, `apply_sync_payloads()` |
-
-## Module Detail — dds-node
-
-| Module | Design Ref | Status | Tests | Key Types |
-|---|---|---|---|---|
-| `config` | §12 | ✅ Done | 4 | `NodeConfig`, `NetworkConfig`, `ConfigError` |
-| `node` | §12 | ✅ Done | 0 | `DdsNode`, event loop, gossip/sync ingestion |
-| `service` | §12, §14 | ✅ Done | 5 | `LocalService`, enrollment, sessions, policy resolution, status |
+| Module | §Ref | Tests | Key Types |
+|---|---|---|---|
+| `crypto::classical` | §13.1 | 5 | `Ed25519Only`, `verify_ed25519()` |
+| `crypto::hybrid` | §13.1+ | 7 | `HybridEdMldsa`, `verify_hybrid()` |
+| `crypto::traits` | — | — | `SchemeId`, `PublicKeyBundle`, `SignatureBundle`, `verify()` |
+| `identity` | §3 | 12 | `VouchsafeId`, `Identity` |
+| `token` | §4 | 15 | `Token`, `TokenPayload` (with extensible `body_type`+`body_cbor`), `TokenKind` |
+| `crdt::lww_register` | §5.1 | 11 | `LwwRegister<T>` |
+| `crdt::twop_set` | §5.2 | 13 | `TwoPSet<T>` |
+| `crdt::causal_dag` | §5.3 | 17 | `CausalDag`, `Operation` |
+| `trust` | §6 | 14 | `TrustGraph`, `validate_chain()`, `purposes_for()` |
+| `policy` | §7 | 12 | `PolicyEngine`, `PolicyRule`, `PolicyDecision` |
+| integration tests | — | 5 | Full trust lifecycle, policy E2E, store roundtrip, two-node sync, hybrid PQ |
 
 ## Module Detail — dds-domain
 
-| Document Type | body_type | Tests | Use Case |
+| Document | `body_type` | Tests | Purpose |
 |---|---|---|---|
-| `UserAuthAttestation` | `dds:user-auth-attestation` | 2 | FIDO2/passkey enrollment |
-| `DeviceJoinDocument` | `dds:device-join` | 2 | Device enrollment, TPM attestation |
-| `WindowsPolicyDocument` | `dds:windows-policy` | 1 | GPO-equivalent policy distribution |
+| `UserAuthAttestation` | `dds:user-auth-attestation` | 2 | FIDO2/passkey user enrollment |
+| `DeviceJoinDocument` | `dds:device-join` | 2 | Device enrollment + TPM attestation |
+| `WindowsPolicyDocument` | `dds:windows-policy` | 1 | GPO-equivalent policy (scope, settings, enforcement) |
 | `SoftwareAssignment` | `dds:software-assignment` | 1 | App/package deployment manifests |
-| `ServicePrincipalDocument` | `dds:service-principal` | 1 | Machine/service identity |
-| `SessionDocument` | `dds:session` | 2 | Short-lived auth session (< 1ms check) |
-| Cross-type safety | — | 2 | Wrong type returns None, no body returns None |
+| `ServicePrincipalDocument` | `dds:service-principal` | 1 | Machine/service identity registration |
+| `SessionDocument` | `dds:session` | 2 | Short-lived auth session (< 1 ms local check) |
+| Cross-type safety | — | 2 | Wrong type → None, no body → None |
 
-## Module Detail — dds-cli
+All documents implement `DomainDocument` trait: `embed()` / `extract()` from `TokenPayload`.
 
-| Subcommand | Design Ref | Status | Key Operations |
-|---|---|---|---|
-| `identity create` | §3 | ✅ Done | Classical + hybrid identity generation |
-| `identity show` | §3 | ✅ Done | URN parse and display |
-| `group vouch` | §4.2 | ✅ Done | Create vouch token, store |
-| `group revoke` | §4.3 | ✅ Done | Create revoke token, mark revoked |
-| `policy check` | §7 | ✅ Done | Offline policy evaluation |
-| `status` | — | ✅ Done | Store diagnostics (token/revocation/burn counts) |
+## Module Detail — dds-store
 
-## Module Detail — dds-ffi
+| Module | Tests | Key Types |
+|---|---|---|
+| `traits` | — | `TokenStore`, `RevocationStore`, `OperationStore`, `DirectoryStore` |
+| `memory_backend` | 7 | `MemoryBackend` (in-process, for tests and embedded) |
+| `redb_backend` | 8 | `RedbBackend` (ACID persistent, zero-copy) |
+
+## Module Detail — dds-net
+
+| Module | Tests | Key Types |
+|---|---|---|
+| `transport` | 0 | `DdsBehaviour`, `SwarmConfig`, `build_swarm()` |
+| `gossip` | 7 | `DdsTopic`, `DdsTopicSet`, `GossipMessage` |
+| `discovery` | 3 | `add_bootstrap_peer()`, `parse_peer_multiaddr()` |
+| `sync` | 9 | `StateSummary`, `SyncMessage`, `apply_sync_payloads()` |
+
+## Module Detail — dds-node
+
+| Module | Tests | Key Types |
+|---|---|---|
+| `config` | 4 | `NodeConfig`, `NetworkConfig` (TOML) |
+| `node` | 0 | `DdsNode` — swarm event loop, gossip/sync ingestion |
+| `service` | 5 | `LocalService` — enrollment, sessions, policy resolution, status |
+
+## Module Detail — dds-ffi (C ABI)
 
 | Export | Purpose | Signature |
 |---|---|---|
-| `dds_identity_create` | Classical identity | `(label, out) -> i32` |
-| `dds_identity_create_hybrid` | Hybrid PQ identity | `(label, out) -> i32` (feature-gated) |
-| `dds_identity_parse_urn` | URN validation | `(urn, out) -> i32` |
-| `dds_token_create_attest` | Create attestation token | `(config_json, out) -> i32` |
-| `dds_token_validate` | Validate token from CBOR hex | `(token_hex, out) -> i32` |
-| `dds_policy_evaluate` | Evaluate policy decision | `(config_json, out) -> i32` |
-| `dds_version` | Library version | `(out) -> i32` |
-| `dds_free_string` | Free returned strings | `(ptr)` |
+| `dds_identity_create` | Classical Ed25519 identity | `(label, out) → i32` |
+| `dds_identity_create_hybrid` | Hybrid Ed25519+ML-DSA-65 | `(label, out) → i32` |
+| `dds_identity_parse_urn` | Parse/validate URN | `(urn, out) → i32` |
+| `dds_token_create_attest` | Sign attestation token | `(json, out) → i32` |
+| `dds_token_validate` | Validate token from CBOR hex | `(hex, out) → i32` |
+| `dds_policy_evaluate` | Policy decision with trust graph | `(json, out) → i32` |
+| `dds_version` | Library version | `(out) → i32` |
+| `dds_free_string` | Free returned strings | `(ptr) → void` |
+
+## Module Detail — dds-cli
+
+| Subcommand | Tests | What It Does |
+|---|---|---|
+| `identity create [--hybrid]` | 2 | Generate classical or hybrid PQ identity |
+| `identity show <urn>` | 2 | Parse and display URN components |
+| `group vouch` | 2 | Create vouch token, persist to store |
+| `group revoke` | 1 | Revoke a vouch by JTI |
+| `policy check` | 1 | Offline policy evaluation |
+| `status` | 1 | Store diagnostics (tokens, revocations, burns) |
 
 ## Platform Integrations
 
-| Platform | Language | Binding Type | Wrapper | Tests | Status |
+| Platform | Language | Mechanism | Wrapper | Tests | Verified |
 |---|---|---|---|---|---|
-| **Any** | C | Header (`dds.h`) | `bindings/c/dds.h` | — | ✅ Complete |
-| **Linux/macOS** | Python | ctypes | `bindings/python/dds.py` | 13 (pytest) | ✅ Tested |
-| **Windows** | C# | P/Invoke | `bindings/csharp/DDS.cs` | 11 (NUnit) | ✅ Written |
-| **Android** | Kotlin | JNA | `bindings/kotlin/.../DDS.kt` | 10 (JUnit5) | ✅ Written |
-| **iOS/macOS** | Swift | C module | `bindings/swift/.../DDS.swift` | 10 (XCTest) | ✅ Written |
+| **Any** | C | Header | `bindings/c/dds.h` | — | ✅ |
+| **Linux/macOS** | Python | ctypes | `bindings/python/dds.py` | 13 pytest | ✅ Runs against .dylib |
+| **Windows** | C# | P/Invoke | `bindings/csharp/DDS.cs` | 11 NUnit | Written |
+| **Android** | Kotlin | JNA | `bindings/kotlin/.../DDS.kt` | 10 JUnit5 | Written |
+| **iOS/macOS** | Swift | C module | `bindings/swift/.../DDS.swift` | 10 XCTest | Written |
 
-## Integration Tests
+## Cryptography
 
-| Test | Crates Exercised | What It Validates |
+| Algorithm | Purpose | Crate | Key | Sig |
+|---|---|---|---|---|
+| Ed25519 | Classical signatures | ed25519-dalek 2.2 | 32 B | 64 B |
+| ML-DSA-65 (FIPS 204) | Post-quantum signatures | pqcrypto-mldsa 0.1.2 | 1,952 B | 3,309 B |
+| Hybrid Ed25519+ML-DSA-65 | Composite quantum-safe | both | 1,984 B | 3,373 B |
+| SHA-256 | ID hashing | sha2 0.10 | — | 32 B |
+
+Feature-flagged: `pq` on by default. Hybrid signs with both; verification requires both to pass.
+Classical-only available for embedded/`no_std` targets.
+
+## FIDO2 / WebAuthn
+
+- FIDO2 leaf identities use `Ed25519` (hardware limitation — no PQ authenticators ship yet)
+- Trust roots and admins use `HybridEdMldsa65` (quantum-safe)
+- Trust chain: PQ root → PQ admin → classical FIDO2 leaf
+- Quantum resistance flows from the vouch chain, not the leaf authenticator
+- `UserAuthAttestation` document type carries FIDO2 attestation objects inside signed tokens
+
+## Cross-Platform Build Status
+
+| Target | Status | Notes |
 |---|---|---|
-| `test_full_trust_chain_lifecycle` | core (identity, token, trust) | root→admin→user chain, vouch, revoke breaks chain, admin survives |
-| `test_policy_evaluation_end_to_end` | core (identity, token, trust, policy) | Policy allow/deny with trust graph, outsider denied, wrong resource/action denied |
-| `test_token_store_roundtrip` | core + store | CBOR serialize→store→retrieve→deserialize→validate signature |
-| `test_two_node_sync` | core + store + net (sync) | Two DAGs exchange summaries, compute missing ops, apply payloads, merge |
-| `test_hybrid_identity_full_lifecycle` | core (crypto, identity, token, trust) | Hybrid PQ root vouches classical user, mixed-scheme trust chain |
+| macOS ARM64 (aarch64-apple-darwin) | ✅ Builds + tests | Current dev host |
+| Linux x86\_64 | ✅ Expected to build | Standard Rust target |
+| Windows x86\_64 | 🔲 Untested | Needs CI |
+| Android ARM64 (aarch64-linux-android) | 🔲 Untested | Needs cargo-ndk |
+| iOS ARM64 (aarch64-apple-ios) | 🔲 Untested | Needs Xcode toolchain |
+| Embedded (thumbv7em-none-eabihf) | 🔲 Untested | `no_std` core only |
 
-## Cryptography Status
-
-| Algorithm | Purpose | Status | Crate | Key Size | Sig Size |
-|---|---|---|---|---|---|
-| **Ed25519** | Classical signatures | ✅ Integrated | ed25519-dalek 2.2 | 32 B | 64 B |
-| **ML-DSA-65** (FIPS 204) | Post-quantum signatures | ✅ Integrated | pqcrypto-mldsa 0.1.2 | 1,952 B | 3,309 B |
-| **Hybrid Ed25519+ML-DSA-65** | Composite quantum-safe | ✅ Integrated | Both above | 1,984 B | 3,373 B |
-| **SHA-256** | ID derivation, hashing | ✅ Integrated | sha2 0.10 | — | 32 B |
-
-**Crypto architecture**: Feature-flagged (`pq` feature, on by default). Hybrid signs with both schemes; verification requires both to pass. Classical-only mode available for embedded/no_std targets without `pq` feature.
-
-## Performance Budgets (Design §10)
+## Performance Budgets (§10)
 
 | KPI | Target | Status |
 |---|---|---|
-| Local auth decision (Tier 3) | ≤ 1 ms | 🔲 Not yet benchmarked |
-| Ed25519 verify throughput | ≥ 50K ops/sec | 🔲 Not yet benchmarked |
-| CRDT merge (single op) | ≤ 0.05 ms p99 | 🔲 Not yet benchmarked |
-| Peak heap 1K entries | ≤ 5 MB | 🔲 Not yet benchmarked |
-| `dds-core` binary (thumbv7em) | ≤ 512 KB | 🔲 Not yet benchmarked |
-| Idle gossip bandwidth | ≤ 2 KB/sec | 🔲 Not yet benchmarked |
+| Local auth decision | ≤ 1 ms | 🔲 Needs criterion benchmark |
+| Ed25519 verify throughput | ≥ 50K ops/sec | 🔲 Needs criterion benchmark |
+| CRDT merge (single op) | ≤ 0.05 ms p99 | 🔲 Needs criterion benchmark |
+| Peak heap (1K entries) | ≤ 5 MB | 🔲 Needs dhat profiling |
+| dds-core binary (Cortex-M) | ≤ 512 KB | 🔲 Needs cross-compile |
+| Idle gossip bandwidth | ≤ 2 KB/sec | 🔲 Needs network test |
 
-## Cross-Platform (Design §14)
+## What's Next
 
-| Platform | Status | Notes |
-|---|---|---|
-| Linux x86_64 | ✅ Compiles & tests | Primary dev platform |
-| macOS ARM64 | ✅ Compiles & tests | Current build host |
-| Windows x86_64 | 🔲 Not tested | |
-| Android ARM64 | 🔲 Not tested | Needs cargo-ndk |
-| iOS ARM64 | 🔲 Not tested | |
-| Embedded (Cortex-M) | 🔲 Not tested | Needs no_std validation |
+All 7 crates are functionally complete. The following work is ordered by impact and dependency:
 
-## FIDO2 / WebAuthn Compatibility
+### Phase 1 — Production Hardening (high priority)
 
-FIDO2 hardware authenticators (YubiKey, passkeys, TPMs) only produce Ed25519 or ECDSA-P256 signatures — no PQ support yet (IANA registered ML-DSA COSE IDs in April 2025, but no hardware ships it). Our design accommodates this:
+1. **HTTP/JSON-RPC API on dds-node** — Expose `LocalService` (enrollment, session issuance, policy check, status) over a localhost HTTP endpoint so platform clients (C#, Swift, Kotlin, Python) can call the node without embedding libp2p. This is the critical integration point for real deployments.
 
-- **FIDO2 leaf identities** use `SchemeId::Ed25519` (classical only)
-- **Trust roots and admins** use `SchemeId::HybridEdMldsa65` (quantum-safe)
-- **Trust chain**: PQ-hybrid root → PQ-hybrid admin → classical FIDO2 leaf
-- Quantum resistance flows from the vouch chain, not the leaf authenticator
-- When FIDO2 hardware adds ML-DSA, leaf identities upgrade seamlessly
+2. **FIDO2 attestation verification** — Currently `UserAuthAttestation` stores raw attestation bytes but does not parse/verify them. Add a `fido2` module (or crate) that validates WebAuthn attestation objects (packed, TPM, none formats), extracts the credential public key, and verifies the attestation signature chain.
 
-## Next Steps
+3. **Persistent node identity** — The node generates a new identity on each start. Store the node signing key encrypted-at-rest (using OS keyring or a passphrase-derived key) so the node maintains a stable identity across restarts.
 
-All 7 crates are 🟢 Complete. Remaining hardening work:
+4. **CI pipeline** — GitHub Actions workflow: `cargo test --workspace`, `cargo clippy`, `cargo fmt --check`, Python binding tests. Add cross-compile jobs for Windows, Android (cargo-ndk), and `thumbv7em-none-eabihf` (no\_std smoke).
 
-1. **CI benchmarks** (§10.9) — criterion + dhat for perf budgets
-2. **Multi-node integration tests** — Network partition, revocation propagation
-3. **Cross-platform CI** — Windows, Android (cargo-ndk), iOS, embedded (thumbv7em)
-4. **Persistent identity storage** — Encrypt-at-rest for node keys
-5. **HTTP API server** — JSON-RPC/REST on dds-node for client apps
-6. **FIDO2 attestation verification** — Parse and validate WebAuthn attestation objects
+### Phase 2 — Operational Readiness
+
+5. **Performance benchmarks** — criterion benches for Ed25519 verify, hybrid verify, CRDT merge, policy evaluation, SessionDocument issue+validate. dhat heap profiler for memory budgets. Wire results into CI as regression gates.
+
+6. **Multi-node integration tests** — Spin up 3+ in-process nodes, verify gossip propagation, revocation propagation, network partition recovery, and DAG convergence. Test with simulated clock for expiry behavior.
+
+7. **Windows Credential Provider** — C# credential provider DLL that calls dds-node's HTTP API during Windows logon. This is the §14.2 "replaces AD" proof point: user authenticates with passkey, node issues a SessionDocument, credential provider grants logon.
+
+8. **Token expiry enforcement** — Add a background task in dds-node that periodically scans for expired tokens/sessions and removes them from the trust graph. Currently tokens have `exp` but nothing enforces it at runtime.
+
+### Phase 3 — Enterprise Features
+
+9. **WindowsPolicyDocument distribution** — End-to-end flow: admin creates a policy document, signs it, gossip propagates to target devices, dds-node on each device evaluates scope + applies settings (registry keys, security policy).
+
+10. **SoftwareAssignment workflow** — Admin publishes a software assignment, devices poll/receive via gossip, local agent downloads package, verifies SHA-256, installs silently. Needs a local agent service on managed devices.
+
+11. **Audit log** — Append-only signed log of all trust graph mutations (attest, vouch, revoke, burn) for compliance. Each entry signed by the node that performed the action. Syncable via gossip.
+
+12. **ECDSA-P256 support** — Some FIDO2 authenticators only support P-256. Add as a third `SchemeId` variant with hybrid option `Ed25519+ECDSA-P256+ML-DSA-65`.
+
+### Phase 4 — Scale
+
+13. **Sharded Kademlia** — For deployments > 10K nodes, shard the DHT by org-unit to reduce gossip fan-out and Kademlia routing table size.
+
+14. **Delegation depth limits** — Add configurable max vouch chain depth (e.g. root → admin → user = depth 2) to bound trust graph traversal and prevent unbounded delegation.
+
+15. **Offline enrollment** — Generate enrollment tokens that can be carried on USB/QR to air-gapped devices. Device presents token to local node, node verifies signature and creates attestation without network.
