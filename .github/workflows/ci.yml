@@ -82,6 +82,15 @@ jobs:
       - run: cargo install cargo-ndk
       - run: cargo ndk -t arm64-v8a build -p dds-ffi --release
 
+  benches:
+    name: cargo bench --no-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench --workspace --no-run
+
   cross-embedded:
     name: cross-compile thumbv7em-none-eabihf
     runs-on: ubuntu-latest

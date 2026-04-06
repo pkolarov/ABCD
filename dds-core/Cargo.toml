@@ -29,3 +29,16 @@ rand = { workspace = true }
 ciborium = { workspace = true }
 dds-store = { workspace = true }
 dds-net = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "crypto_verify"
+harness = false
+
+[[bench]]
+name = "crdt_merge"
+harness = false
+
+[[bench]]
+name = "policy_eval"
+harness = false

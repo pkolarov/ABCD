@@ -200,6 +200,39 @@ impl TrustGraph {
             .collect()
     }
 
+    /// Remove a token from the trust graph by JTI.
+    ///
+    /// Returns `true` if a token (attestation or vouch) with the given
+    /// JTI was found and removed, `false` otherwise. Also clears any
+    /// revocation entry under that JTI. Used by the expiry sweeper to
+    /// drop expired tokens.
+    pub fn remove_token(&mut self, jti: &str) -> bool {
+        let mut removed = false;
+        if self.attestations.remove(jti).is_some() {
+            removed = true;
+        }
+        if self.vouches.remove(jti).is_some() {
+            removed = true;
+        }
+        if self.revoked.remove(jti) {
+            removed = true;
+        }
+        removed
+    }
+
+    /// Iterate over all (jti, exp) tuples for attestations and vouches.
+    /// `exp` is `None` if the token has no expiry.
+    pub fn token_expiries(&self) -> Vec<(String, Option<u64>)> {
+        let mut out = Vec::new();
+        for (jti, t) in &self.attestations {
+            out.push((jti.clone(), t.payload.exp));
+        }
+        for (jti, t) in &self.vouches {
+            out.push((jti.clone(), t.payload.exp));
+        }
+        out
+    }
+
     /// Total number of tokens in the trust graph.
     pub fn token_count(&self) -> usize {
         self.attestations.len() + self.vouches.len() + self.revoked.len()
@@ -550,6 +583,36 @@ mod tests {
         assert!(!format!("{}", TrustError::ChainTooDeep(5)).is_empty());
         assert!(!format!("{}", TrustError::IdentityBurned(String::from("x"))).is_empty());
         assert!(!format!("{}", TrustError::TokenValidation(String::from("bad"))).is_empty());
+    }
+
+    #[test]
+    fn test_remove_token() {
+        let mut g = TrustGraph::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let user = Identity::generate("user", &mut OsRng);
+        let user_token = make_attest(&user);
+        let vouch = make_vouch(&root, &user, &user_token, "group:dev", "vouch-1");
+        g.add_token(user_token).unwrap();
+        g.add_token(vouch).unwrap();
+        assert_eq!(g.vouch_count(), 1);
+
+        assert!(g.remove_token("vouch-1"));
+        assert_eq!(g.vouch_count(), 0);
+        // chain no longer validates
+        let roots = roots_with(&root.id.to_urn());
+        assert!(g.validate_chain(&user.id.to_urn(), &roots).is_err());
+        // idempotent
+        assert!(!g.remove_token("vouch-1"));
+    }
+
+    #[test]
+    fn test_token_expiries() {
+        let mut g = TrustGraph::new();
+        let user = Identity::generate("user", &mut OsRng);
+        g.add_token(make_attest(&user)).unwrap();
+        let exps = g.token_expiries();
+        assert_eq!(exps.len(), 1);
+        assert_eq!(exps[0].1, Some(9999));
     }
 
     #[test]

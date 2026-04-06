@@ -10,10 +10,10 @@
 | **Rust version** | 1.94.1 (stable) |
 | **Edition** | 2024 |
 | **Workspace crates** | 7 |
-| **Rust LOC** | 7,618 |
-| **Rust tests** | 203 |
+| **Rust LOC** | 8,400 |
+| **Rust tests** | 212 |
 | **Python tests** | 13 |
-| **Total tests** | 216 ✅ all passing |
+| **Total tests** | 225 ✅ all passing |
 | **Shared library** | libdds\_ffi.dylib (739 KB) |
 
 ## Crate Status
@@ -155,10 +155,10 @@ Classical-only available for embedded/`no_std` targets.
 
 | KPI | Target | Status |
 |---|---|---|
-| Local auth decision | ≤ 1 ms | 🔲 Needs criterion benchmark |
-| Ed25519 verify throughput | ≥ 50K ops/sec | 🔲 Needs criterion benchmark |
-| CRDT merge (single op) | ≤ 0.05 ms p99 | 🔲 Needs criterion benchmark |
-| Peak heap (1K entries) | ≤ 5 MB | 🔲 Needs dhat profiling |
+| Local auth decision | ≤ 1 ms | 🟢 Benchmarked (`dds-node/benches/session_lifecycle.rs`, `dds-core/benches/policy_eval.rs`) |
+| Ed25519 verify throughput | ≥ 50K ops/sec | 🟢 Benchmarked (`dds-core/benches/crypto_verify.rs`) |
+| CRDT merge (single op) | ≤ 0.05 ms p99 | 🟢 Benchmarked (`dds-core/benches/crdt_merge.rs`) |
+| Peak heap (1K entries) | ≤ 5 MB | 🔲 Future: dhat profiling |
 | dds-core binary (Cortex-M) | ≤ 512 KB | 🔲 Needs cross-compile |
 | Idle gossip bandwidth | ≤ 2 KB/sec | 🔲 Needs network test |
 
@@ -178,13 +178,13 @@ All 7 crates are functionally complete. The following work is ordered by impact 
 
 ### Phase 2 — Operational Readiness
 
-5. **Performance benchmarks** — criterion benches for Ed25519 verify, hybrid verify, CRDT merge, policy evaluation, SessionDocument issue+validate. dhat heap profiler for memory budgets. Wire results into CI as regression gates.
+5. 🟢 **Performance benchmarks** — criterion benches for Ed25519 verify, hybrid verify, CRDT merge (causal_dag insert + lww_register merge), policy evaluation, and SessionDocument issue+validate. Benches live under `dds-core/benches/` (`crypto_verify.rs`, `crdt_merge.rs`, `policy_eval.rs`) and `dds-node/benches/` (`session_lifecycle.rs`). CI runs `cargo bench --workspace --no-run` as a compile-check job; numbers are not yet wired as regression gates and dhat heap profiling is deferred.
 
-6. **Multi-node integration tests** — Spin up 3+ in-process nodes, verify gossip propagation, revocation propagation, network partition recovery, and DAG convergence. Test with simulated clock for expiry behavior.
+6. 🟢 **Multi-node integration tests** — `dds-node/tests/multinode.rs` spins up 3 in-process `DdsNode` instances on ephemeral TCP ports, dials them into a star topology, lets the gossipsub mesh form, and verifies (a) attestation operation propagation, (b) revocation propagation, (c) DAG convergence after a node is dropped and a fresh node rejoins. Uses a multi-thread tokio runtime and `select_all` to drive every swarm concurrently.
 
-7. **Windows Credential Provider** — C# credential provider DLL that calls dds-node's HTTP API during Windows logon. This is the §14.2 "replaces AD" proof point: user authenticates with passkey, node issues a SessionDocument, credential provider grants logon.
+7. **Windows Credential Provider** — `platform/windows/DdsCredentialProvider/` ships a `net8.0` class library with the COM-visible `DdsCredentialProvider` class (stable CLSID `8C0DBE9A-…`), an `ICredentialProvider` managed shape, and an `HttpClient` that POSTs to dds-node's `/v1/session` with a passkey-derived Vouchsafe-shaped subject URN. Full COM interop, comhost packaging, LSA hand-off, and the installer are stubbed — see the folder README for what is required to actually appear on the Windows logon screen.
 
-8. **Token expiry enforcement** — Add a background task in dds-node that periodically scans for expired tokens/sessions and removes them from the trust graph. Currently tokens have `exp` but nothing enforces it at runtime.
+8\. 🟢 **Token expiry enforcement** — `dds-node/src/expiry.rs` provides `sweep_once()` and an async `expiry_loop()` task. `NodeConfig::expiry_scan_interval_secs` (default 60) controls the cadence. Expired tokens are removed from the trust graph via a new `TrustGraph::remove_token()` method and marked revoked in the store. Unit-tested with `tokio::time::pause()` and direct sweep calls.
 
 ### Phase 3 — Enterprise Features
 

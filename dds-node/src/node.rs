@@ -266,6 +266,16 @@ impl DdsNode {
         info!(urn = %token.payload.iss, "identity burned");
     }
 
+    /// Run a single token-expiry sweep using the current system time.
+    /// Public so the binary or tests can drive it on demand.
+    pub fn sweep_expired(&mut self) -> crate::expiry::SweepStats {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        crate::expiry::sweep_once(&mut self.trust_graph, &mut self.store, now)
+    }
+
     /// Get the number of connected peers.
     pub fn connected_peers(&self) -> usize {
         self.swarm.connected_peers().count()
