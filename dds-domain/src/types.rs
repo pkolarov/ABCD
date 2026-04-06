@@ -1,6 +1,6 @@
 //! Typed domain documents — each serializes to CBOR for `TokenPayload::body_cbor`.
 
-use crate::{body_types, DomainDocument};
+use crate::{DomainDocument, body_types};
 use serde::{Deserialize, Serialize};
 
 // ============================================================
@@ -127,7 +127,6 @@ pub enum Enforcement {
 impl DomainDocument for WindowsPolicyDocument {
     const BODY_TYPE: &'static str = body_types::WINDOWS_POLICY;
 }
-
 
 // ============================================================
 // 4. SoftwareAssignment — app/package deployment manifest

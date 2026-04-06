@@ -78,7 +78,6 @@ pub struct TokenPayload {
     // ---- Opaque extension body ----
     // Domain-specific data rides inside the signed envelope.
     // Core never interprets these; dds-domain provides typed wrappers.
-
     /// Body type URI (e.g. "dds:user-auth-attestation", "dds:device-join").
     /// When present, `body_cbor` must also be set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,7 +132,10 @@ impl Token {
     }
 
     /// Convenience: create and sign with an Ed25519 signing key (classical).
-    pub fn sign(payload: TokenPayload, signing_key: &ed25519_dalek::SigningKey) -> Result<Self, TokenError> {
+    pub fn sign(
+        payload: TokenPayload,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<Self, TokenError> {
         let classical = crate::crypto::Ed25519Only::from_bytes(&signing_key.to_bytes());
         Self::create(payload, |msg| classical.sign(msg))
     }
@@ -146,8 +148,8 @@ impl Token {
 
     /// Verify that the issuer URN is cryptographically bound to the issuer key.
     pub fn verify_issuer_binding(&self) -> Result<(), TokenError> {
-        let id = VouchsafeId::from_urn(&self.payload.iss)
-            .map_err(|_| TokenError::InvalidIssuerUrn)?;
+        let id =
+            VouchsafeId::from_urn(&self.payload.iss).map_err(|_| TokenError::InvalidIssuerUrn)?;
         if !id.verify_binding_bundle(&self.payload.iss_key) {
             return Err(TokenError::IssuerKeyMismatch);
         }
@@ -259,8 +261,6 @@ impl fmt::Display for TokenError {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,7 +280,8 @@ mod tests {
             revokes: None,
             iat: 1714605000,
             exp: Some(1746141000),
-            body_type: None, body_cbor: None,
+            body_type: None,
+            body_cbor: None,
         }
     }
 
@@ -362,7 +363,8 @@ mod tests {
             revokes: None,
             iat: 1714606000,
             exp: Some(1746142000),
-            body_type: None, body_cbor: None,
+            body_type: None,
+            body_cbor: None,
         };
 
         let vouch = Token::sign(vouch_payload, &admin.signing_key).unwrap();
@@ -385,7 +387,8 @@ mod tests {
             revokes: None,
             iat: 1714606000,
             exp: Some(1746142000),
-            body_type: None, body_cbor: None,
+            body_type: None,
+            body_cbor: None,
         };
         let err = Token::sign(payload, &admin.signing_key).unwrap_err();
         assert_eq!(err, TokenError::VouchMissingFields);
@@ -408,7 +411,8 @@ mod tests {
             revokes: Some(String::from("vouch-jti-1")),
             iat: 1714608000,
             exp: None, // Revocations must not expire
-            body_type: None, body_cbor: None,
+            body_type: None,
+            body_cbor: None,
         };
 
         let token = Token::sign(revoke_payload, &admin.signing_key).unwrap();
@@ -432,7 +436,8 @@ mod tests {
             revokes: Some(String::from("target-jti")),
             iat: 1714608000,
             exp: Some(9999999999), // not allowed
-            body_type: None, body_cbor: None,
+            body_type: None,
+            body_cbor: None,
         };
         let err = Token::sign(payload, &admin.signing_key).unwrap_err();
         assert_eq!(err, TokenError::RevocationMustNotExpire);
@@ -454,7 +459,8 @@ mod tests {
             revokes: None, // missing
             iat: 1714608000,
             exp: None,
-            body_type: None, body_cbor: None,
+            body_type: None,
+            body_cbor: None,
         };
         let err = Token::sign(payload, &admin.signing_key).unwrap_err();
         assert_eq!(err, TokenError::RevokeMissingTarget);
@@ -476,7 +482,8 @@ mod tests {
             revokes: None,
             iat: 1714608000,
             exp: None,
-            body_type: None, body_cbor: None,
+            body_type: None,
+            body_cbor: None,
         };
 
         let token = Token::sign(payload, &user.signing_key).unwrap();
@@ -499,7 +506,8 @@ mod tests {
             revokes: None,
             iat: 1714608000,
             exp: Some(9999999999),
-            body_type: None, body_cbor: None,
+            body_type: None,
+            body_cbor: None,
         };
         let err = Token::sign(payload, &user.signing_key).unwrap_err();
         assert_eq!(err, TokenError::RevocationMustNotExpire);

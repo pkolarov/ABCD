@@ -4,9 +4,11 @@ use dds_core::identity::Identity;
 use dds_core::policy::{Effect, PolicyRule};
 use dds_core::token::{Token, TokenKind, TokenPayload};
 use dds_core::trust::TrustGraph;
+use dds_domain::fido2::build_none_attestation;
 use dds_domain::{DeviceJoinDocument, DomainDocument, SessionDocument, UserAuthAttestation};
 use dds_node::service::*;
 use dds_store::MemoryBackend;
+use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::collections::BTreeSet;
 
@@ -21,15 +23,23 @@ fn make_service() -> (Identity, LocalService<MemoryBackend>) {
     let mut graph = TrustGraph::new();
     let root_attest = Token::sign(
         TokenPayload {
-            iss: root.id.to_urn(), iss_key: root.public_key.clone(),
-            jti: "attest-root".into(), sub: root.id.to_urn(),
-            kind: TokenKind::Attest, purpose: None,
-            vch_iss: None, vch_sum: None, revokes: None,
-            iat: 1000, exp: Some(9999),
-            body_type: None, body_cbor: None,
+            iss: root.id.to_urn(),
+            iss_key: root.public_key.clone(),
+            jti: "attest-root".into(),
+            sub: root.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1000,
+            exp: Some(9999),
+            body_type: None,
+            body_cbor: None,
         },
         &root.signing_key,
-    ).unwrap();
+    )
+    .unwrap();
     graph.add_token(root_attest).unwrap();
 
     let store = MemoryBackend::new();
@@ -42,15 +52,19 @@ fn make_service() -> (Identity, LocalService<MemoryBackend>) {
 #[test]
 fn test_enroll_user() {
     let (_root, mut svc) = make_service();
-    let result = svc.enroll_user(EnrollUserRequest {
-        label: "alice".into(),
-        credential_id: "cred-123".into(),
-        attestation_object: vec![0xA1, 0x01],
-        client_data_hash: vec![0xBB; 32],
-        rp_id: "example.com".into(),
-        display_name: "Alice".into(),
-        authenticator_type: "platform".into(),
-    }).unwrap();
+    let cred_sk = SigningKey::generate(&mut OsRng);
+    let attestation = build_none_attestation("example.com", b"cred-123", &cred_sk.verifying_key());
+    let result = svc
+        .enroll_user(EnrollUserRequest {
+            label: "alice".into(),
+            credential_id: "cred-123".into(),
+            attestation_object: attestation,
+            client_data_hash: vec![0xBB; 32],
+            rp_id: "example.com".into(),
+            display_name: "Alice".into(),
+            authenticator_type: "platform".into(),
+        })
+        .unwrap();
 
     assert!(result.urn.starts_with("urn:vouchsafe:alice."));
     assert!(result.jti.starts_with("attest-"));
@@ -59,29 +73,50 @@ fn test_enroll_user() {
     // Verify token is valid and contains the attestation
     let token = Token::from_cbor(&result.token_cbor).unwrap();
     assert!(token.validate().is_ok());
-    let doc = UserAuthAttestation::extract(&token.payload).unwrap().unwrap();
+    let doc = UserAuthAttestation::extract(&token.payload)
+        .unwrap()
+        .unwrap();
     assert_eq!(doc.credential_id, "cred-123");
     assert_eq!(doc.rp_id, "example.com");
 }
 
 #[test]
+fn test_enroll_user_rejects_invalid_attestation() {
+    let (_root, mut svc) = make_service();
+    let result = svc.enroll_user(EnrollUserRequest {
+        label: "alice".into(),
+        credential_id: "cred-123".into(),
+        attestation_object: vec![0x00, 0x01, 0x02],
+        client_data_hash: vec![0xBB; 32],
+        rp_id: "example.com".into(),
+        display_name: "Alice".into(),
+        authenticator_type: "platform".into(),
+    });
+    assert!(result.is_err());
+}
+
+#[test]
 fn test_enroll_device() {
     let (_root, mut svc) = make_service();
-    let result = svc.enroll_device(EnrollDeviceRequest {
-        label: "laptop-01".into(),
-        device_id: "HW-ABC".into(),
-        hostname: "workstation-01".into(),
-        os: "Windows 11".into(),
-        os_version: "24H2".into(),
-        tpm_ek_hash: Some("sha256:tpmhash".into()),
-        org_unit: Some("engineering".into()),
-        tags: vec!["developer".into(), "laptop".into()],
-    }).unwrap();
+    let result = svc
+        .enroll_device(EnrollDeviceRequest {
+            label: "laptop-01".into(),
+            device_id: "HW-ABC".into(),
+            hostname: "workstation-01".into(),
+            os: "Windows 11".into(),
+            os_version: "24H2".into(),
+            tpm_ek_hash: Some("sha256:tpmhash".into()),
+            org_unit: Some("engineering".into()),
+            tags: vec!["developer".into(), "laptop".into()],
+        })
+        .unwrap();
 
     assert!(result.urn.starts_with("urn:vouchsafe:laptop-01."));
     let token = Token::from_cbor(&result.token_cbor).unwrap();
     assert!(token.validate().is_ok());
-    let doc = DeviceJoinDocument::extract(&token.payload).unwrap().unwrap();
+    let doc = DeviceJoinDocument::extract(&token.payload)
+        .unwrap()
+        .unwrap();
     assert_eq!(doc.device_id, "HW-ABC");
     assert_eq!(doc.hostname, "workstation-01");
     assert_eq!(doc.tags, vec!["developer", "laptop"]);
@@ -92,14 +127,16 @@ fn test_enroll_device() {
 #[test]
 fn test_issue_session() {
     let (_root, mut svc) = make_service();
-    let result = svc.issue_session(SessionRequest {
-        subject_urn: "urn:vouchsafe:alice.hash".into(),
-        device_urn: Some("urn:vouchsafe:laptop.hash".into()),
-        requested_resources: vec!["repo:main".into()],
-        duration_secs: 300,
-        mfa_verified: true,
-        tls_binding: None,
-    }).unwrap();
+    let result = svc
+        .issue_session(SessionRequest {
+            subject_urn: "urn:vouchsafe:alice.hash".into(),
+            device_urn: Some("urn:vouchsafe:laptop.hash".into()),
+            requested_resources: vec!["repo:main".into()],
+            duration_secs: 300,
+            mfa_verified: true,
+            tls_binding: None,
+        })
+        .unwrap();
 
     assert!(result.session_id.starts_with("sess-"));
     assert!(result.expires_at > 0);

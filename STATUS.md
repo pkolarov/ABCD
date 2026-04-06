@@ -11,9 +11,9 @@
 | **Edition** | 2024 |
 | **Workspace crates** | 7 |
 | **Rust LOC** | 7,618 |
-| **Rust tests** | 189 |
+| **Rust tests** | 203 |
 | **Python tests** | 13 |
-| **Total tests** | 202 ✅ all passing |
+| **Total tests** | 216 ✅ all passing |
 | **Shared library** | libdds\_ffi.dylib (739 KB) |
 
 ## Crate Status
@@ -24,7 +24,8 @@
 | **dds-domain** | §14 | 🟢 Done | 11 | 6 typed domain documents embedded in token body |
 | **dds-store** | §6 | 🟢 Done | 15 | Storage traits, MemoryBackend, RedbBackend (ACID) |
 | **dds-net** | §5 | 🟢 Done | 19 | libp2p transport, gossipsub, Kademlia, mDNS, delta-sync |
-| **dds-node** | §12 | 🟢 Done | 9 | Config, P2P event loop, local authority service |
+| **dds-node** | §12 | 🟢 Done | 18 | Config, P2P event loop, local authority service, HTTP API, encrypted persistent identity |
+| **dds-domain** (fido2) | §14 | 🟢 Done | (incl. above) | WebAuthn attestation parser/verifier (none + packed/Ed25519) |
 | **dds-ffi** | §14.2–14.3 | 🟢 Done | 12 | C ABI (cdylib): identity, token, policy, version |
 | **dds-cli** | §12 | 🟢 Done | 9 | Identity, group, policy, status subcommands |
 
@@ -81,7 +82,9 @@ All documents implement `DomainDocument` trait: `embed()` / `extract()` from `To
 |---|---|---|
 | `config` | 4 | `NodeConfig`, `NetworkConfig` (TOML) |
 | `node` | 0 | `DdsNode` — swarm event loop, gossip/sync ingestion |
-| `service` | 5 | `LocalService` — enrollment, sessions, policy resolution, status |
+| `service` | 6 | `LocalService` — enrollment (with FIDO2 verification), sessions, policy resolution, status |
+| `http` | 5 | `axum` router exposing `LocalService` over `/v1/*` JSON endpoints |
+| `identity_store` | 3 | Encrypted-at-rest persistent node identity (Argon2id + ChaCha20Poly1305) |
 
 ## Module Detail — dds-ffi (C ABI)
 
@@ -165,13 +168,13 @@ All 7 crates are functionally complete. The following work is ordered by impact 
 
 ### Phase 1 — Production Hardening (high priority)
 
-1. **HTTP/JSON-RPC API on dds-node** — Expose `LocalService` (enrollment, session issuance, policy check, status) over a localhost HTTP endpoint so platform clients (C#, Swift, Kotlin, Python) can call the node without embedding libp2p. This is the critical integration point for real deployments.
+1. 🟢 **HTTP/JSON-RPC API on dds-node** — `dds-node/src/http.rs` exposes `LocalService` over a localhost axum server. Endpoints: `POST /v1/enroll/user`, `POST /v1/enroll/device`, `POST /v1/session`, `POST /v1/policy/evaluate`, `GET /v1/status`. JSON request/response types with serde, base64-encoded binary fields. 5 integration tests via reqwest against an in-process server.
 
-2. **FIDO2 attestation verification** — Currently `UserAuthAttestation` stores raw attestation bytes but does not parse/verify them. Add a `fido2` module (or crate) that validates WebAuthn attestation objects (packed, TPM, none formats), extracts the credential public key, and verifies the attestation signature chain.
+2. 🟢 **FIDO2 attestation verification** — `dds-domain/src/fido2.rs` parses WebAuthn attestation objects with `ciborium`, supports `none` and `packed` (Ed25519 self-attestation) formats, extracts the COSE_Key credential public key, and verifies the attestation signature. `LocalService::enroll_user` rejects enrollment whose attestation fails to verify (`ServiceError::Fido2`). Built without webauthn-rs to keep the dependency footprint small; full attestation chains (TPM, x5c) are deliberately deferred. 5 unit tests cover round-trips, bad signature, garbage input, unsupported format.
 
-3. **Persistent node identity** — The node generates a new identity on each start. Store the node signing key encrypted-at-rest (using OS keyring or a passphrase-derived key) so the node maintains a stable identity across restarts.
+3. 🟢 **Persistent node identity** — `dds-node/src/identity_store.rs` loads or generates the node Ed25519 signing key on startup and persists it to `<data_dir>/node_key.bin` (or the new `identity_path` config field). When `DDS_NODE_PASSPHRASE` is set, the file is encrypted with ChaCha20-Poly1305 using a 32-byte key derived from the passphrase via Argon2id (19 MiB, 2 iters); otherwise the key is stored unencrypted with a warning log. Versioned CBOR on-disk format. 3 tests cover plain roundtrip, encrypted roundtrip with wrong-passphrase rejection, and load-or-create idempotency.
 
-4. **CI pipeline** — GitHub Actions workflow: `cargo test --workspace`, `cargo clippy`, `cargo fmt --check`, Python binding tests. Add cross-compile jobs for Windows, Android (cargo-ndk), and `thumbv7em-none-eabihf` (no\_std smoke).
+4. 🟢 **CI pipeline** — `.github/workflows/ci.yml` runs `cargo test --workspace --all-features`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, and the python binding pytest suite. Cross-compile jobs check `x86_64-pc-windows-gnu` (mingw-w64), `aarch64-linux-android` (cargo-ndk + setup-ndk), and `thumbv7em-none-eabihf` (`dds-core --no-default-features` smoke).
 
 ### Phase 2 — Operational Readiness
 

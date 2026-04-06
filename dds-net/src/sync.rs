@@ -245,8 +245,8 @@ mod tests {
     use dds_core::crdt::causal_dag::Operation;
     use dds_core::identity::Identity;
     use dds_core::token::{Token, TokenKind, TokenPayload};
-    use dds_store::traits::{RevocationStore, TokenStore};
     use dds_store::MemoryBackend;
+    use dds_store::traits::{RevocationStore, TokenStore};
     use rand::rngs::OsRng;
 
     fn make_identity(label: &str) -> Identity {
@@ -267,7 +267,8 @@ mod tests {
                 revokes: None,
                 iat: 1000,
                 exp: Some(9999),
-                body_type: None, body_cbor: None,
+                body_type: None,
+                body_cbor: None,
             },
             &ident.signing_key,
         )
@@ -376,7 +377,8 @@ mod tests {
                 revokes: Some("vouch-1".to_string()),
                 iat: 2000,
                 exp: None,
-                body_type: None, body_cbor: None,
+                body_type: None,
+                body_cbor: None,
             },
             &admin.signing_key,
         )
@@ -412,7 +414,8 @@ mod tests {
                 revokes: None,
                 iat: 2000,
                 exp: None,
-                body_type: None, body_cbor: None,
+                body_type: None,
+                body_cbor: None,
             },
             &user.signing_key,
         )

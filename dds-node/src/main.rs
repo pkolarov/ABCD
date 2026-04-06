@@ -5,6 +5,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use dds_node::config::NodeConfig;
+use dds_node::identity_store;
 use dds_node::node::DdsNode;
 
 #[tokio::main]
@@ -31,6 +32,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut node = DdsNode::init(config)?;
     node.start()?;
+
+    // Load (or generate + persist) the long-lived node signing identity.
+    // Encrypted at rest if DDS_NODE_PASSPHRASE is set.
+    std::fs::create_dir_all(&node.config.data_dir).ok();
+    let identity_path = node.config.identity_key_path();
+    let node_identity = identity_store::load_or_create(&identity_path, "dds-node")?;
+    info!(urn = %node_identity.id.to_urn(), path = %identity_path.display(), "loaded node identity");
 
     info!(peer_id = %node.peer_id, "DDS node running — press Ctrl+C to stop");
 

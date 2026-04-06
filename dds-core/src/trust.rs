@@ -48,7 +48,9 @@ impl TrustGraph {
 
     /// Add a token to the trust graph. Validates the token before adding.
     pub fn add_token(&mut self, token: Token) -> Result<(), TrustError> {
-        token.validate().map_err(|e| TrustError::TokenValidation(e.to_string()))?;
+        token
+            .validate()
+            .map_err(|e| TrustError::TokenValidation(e.to_string()))?;
 
         let iss = &token.payload.iss;
         if self.burned.contains(iss) {
@@ -177,9 +179,7 @@ impl TrustGraph {
             t.payload.vch_iss.as_deref() == Some(subject_urn)
                 && !self.revoked.contains(&t.payload.jti)
                 && t.payload.purpose.as_deref() == Some(purpose)
-                && self
-                    .validate_chain(&t.payload.iss, trusted_roots)
-                    .is_ok()
+                && self.validate_chain(&t.payload.iss, trusted_roots).is_ok()
         })
     }
 
@@ -274,7 +274,8 @@ mod tests {
             revokes: None,
             iat: 1000,
             exp: Some(9999),
-            body_type: None, body_cbor: None,
+            body_type: None,
+            body_cbor: None,
         };
         Token::sign(payload, &ident.signing_key).unwrap()
     }
@@ -298,7 +299,8 @@ mod tests {
             revokes: None,
             iat: 1000,
             exp: Some(9999),
-            body_type: None, body_cbor: None,
+            body_type: None,
+            body_cbor: None,
         };
         Token::sign(payload, &voucher.signing_key).unwrap()
     }
@@ -316,7 +318,8 @@ mod tests {
             revokes: Some(String::from(target_jti)),
             iat: 2000,
             exp: None,
-            body_type: None, body_cbor: None,
+            body_type: None,
+            body_cbor: None,
         };
         Token::sign(payload, &revoker.signing_key).unwrap()
     }
@@ -334,7 +337,8 @@ mod tests {
             revokes: None,
             iat: 2000,
             exp: None,
-            body_type: None, body_cbor: None,
+            body_type: None,
+            body_cbor: None,
         };
         Token::sign(payload, &ident.signing_key).unwrap()
     }
@@ -544,12 +548,8 @@ mod tests {
     fn test_trust_error_display() {
         assert!(!format!("{}", TrustError::NoValidChain).is_empty());
         assert!(!format!("{}", TrustError::ChainTooDeep(5)).is_empty());
-        assert!(
-            !format!("{}", TrustError::IdentityBurned(String::from("x"))).is_empty()
-        );
-        assert!(
-            !format!("{}", TrustError::TokenValidation(String::from("bad"))).is_empty()
-        );
+        assert!(!format!("{}", TrustError::IdentityBurned(String::from("x"))).is_empty());
+        assert!(!format!("{}", TrustError::TokenValidation(String::from("bad"))).is_empty());
     }
 
     #[test]

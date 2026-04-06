@@ -30,7 +30,9 @@ impl MemoryBackend {
     }
 
     fn serialize_token(token: &Token) -> StoreResult<Vec<u8>> {
-        token.to_cbor().map_err(|e| StoreError::Serde(e.to_string()))
+        token
+            .to_cbor()
+            .map_err(|e| StoreError::Serde(e.to_string()))
     }
 
     fn deserialize_token(bytes: &[u8]) -> StoreResult<Token> {

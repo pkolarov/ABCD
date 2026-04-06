@@ -6,14 +6,14 @@
 //! The hash is computed over `PublicKeyBundle.bytes`, which works for both
 //! classical Ed25519 (32B) and hybrid Ed25519+ML-DSA-65 (1,984B) keys.
 
-use alloc::string::String;
 use alloc::format;
+use alloc::string::String;
 use core::fmt;
 
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 
-use crate::crypto::{PublicKeyBundle, SignatureBundle, SchemeId};
+use crate::crypto::{PublicKeyBundle, SchemeId, SignatureBundle};
 
 /// The URN prefix for all Vouchsafe identities.
 const URN_PREFIX: &str = "urn:vouchsafe:";
@@ -70,9 +70,7 @@ impl VouchsafeId {
             .strip_prefix(URN_PREFIX)
             .ok_or(IdentityError::InvalidUrn)?;
 
-        let (label, hash) = rest
-            .rsplit_once('.')
-            .ok_or(IdentityError::InvalidUrn)?;
+        let (label, hash) = rest.rsplit_once('.').ok_or(IdentityError::InvalidUrn)?;
 
         if label.is_empty() || hash.is_empty() {
             return Err(IdentityError::InvalidUrn);
@@ -148,7 +146,10 @@ impl Identity {
 
     /// Generate a new hybrid (Ed25519 + ML-DSA-65) identity.
     #[cfg(feature = "pq")]
-    pub fn generate_hybrid<R: rand_core::CryptoRngCore>(label: &str, rng: &mut R) -> HybridIdentity {
+    pub fn generate_hybrid<R: rand_core::CryptoRngCore>(
+        label: &str,
+        rng: &mut R,
+    ) -> HybridIdentity {
         let hybrid = crate::crypto::HybridEdMldsa::generate(rng);
         let public_key = hybrid.public_key_bundle();
         let id = VouchsafeId::from_public_key(label, &public_key);
@@ -166,7 +167,11 @@ impl Identity {
             bytes: signing_key.verifying_key().to_bytes().to_vec(),
         };
         let id = VouchsafeId::from_public_key(label, &public_key);
-        Self { id, signing_key, public_key }
+        Self {
+            id,
+            signing_key,
+            public_key,
+        }
     }
 
     /// Get the verifying (public) key.
@@ -280,22 +285,34 @@ mod tests {
 
     #[test]
     fn test_from_urn_invalid_no_prefix() {
-        assert_eq!(VouchsafeId::from_urn("invalid:alice.hash"), Err(IdentityError::InvalidUrn));
+        assert_eq!(
+            VouchsafeId::from_urn("invalid:alice.hash"),
+            Err(IdentityError::InvalidUrn)
+        );
     }
 
     #[test]
     fn test_from_urn_invalid_no_dot() {
-        assert_eq!(VouchsafeId::from_urn("urn:vouchsafe:alicehash"), Err(IdentityError::InvalidUrn));
+        assert_eq!(
+            VouchsafeId::from_urn("urn:vouchsafe:alicehash"),
+            Err(IdentityError::InvalidUrn)
+        );
     }
 
     #[test]
     fn test_from_urn_invalid_empty_label() {
-        assert_eq!(VouchsafeId::from_urn("urn:vouchsafe:.hash"), Err(IdentityError::InvalidUrn));
+        assert_eq!(
+            VouchsafeId::from_urn("urn:vouchsafe:.hash"),
+            Err(IdentityError::InvalidUrn)
+        );
     }
 
     #[test]
     fn test_from_urn_invalid_empty_hash() {
-        assert_eq!(VouchsafeId::from_urn("urn:vouchsafe:alice."), Err(IdentityError::InvalidUrn));
+        assert_eq!(
+            VouchsafeId::from_urn("urn:vouchsafe:alice."),
+            Err(IdentityError::InvalidUrn)
+        );
     }
 
     #[test]

@@ -196,7 +196,8 @@ mod tests {
                 revokes: None,
                 iat: 1000,
                 exp: Some(9999),
-                body_type: None, body_cbor: None,
+                body_type: None,
+                body_cbor: None,
             },
             &user.signing_key,
         )
@@ -215,7 +216,8 @@ mod tests {
                 revokes: None,
                 iat: 1000,
                 exp: Some(9999),
-                body_type: None, body_cbor: None,
+                body_type: None,
+                body_cbor: None,
             },
             &root.signing_key,
         )
@@ -241,8 +243,13 @@ mod tests {
             actions: vec![String::from("read"), String::from("write")],
         });
 
-        let decision =
-            engine.evaluate(&user.id.to_urn(), "repo:main-service", "read", &graph, &roots);
+        let decision = engine.evaluate(
+            &user.id.to_urn(),
+            "repo:main-service",
+            "read",
+            &graph,
+            &roots,
+        );
         assert!(decision.is_allowed());
     }
 
@@ -251,13 +258,15 @@ mod tests {
         let (graph, _root, user, roots) = setup_trust_graph();
         let engine = PolicyEngine::new(); // no rules
 
-        let decision =
-            engine.evaluate(&user.id.to_urn(), "repo:main-service", "read", &graph, &roots);
-        assert!(decision.is_denied());
-        assert_eq!(
-            decision,
-            PolicyDecision::Denied(DenyReason::NoMatchingRule)
+        let decision = engine.evaluate(
+            &user.id.to_urn(),
+            "repo:main-service",
+            "read",
+            &graph,
+            &roots,
         );
+        assert!(decision.is_denied());
+        assert_eq!(decision, PolicyDecision::Denied(DenyReason::NoMatchingRule));
     }
 
     #[test]
@@ -271,8 +280,13 @@ mod tests {
             actions: vec![String::from("read")],
         });
 
-        let decision =
-            engine.evaluate(&user.id.to_urn(), "repo:main-service", "read", &graph, &roots);
+        let decision = engine.evaluate(
+            &user.id.to_urn(),
+            "repo:main-service",
+            "read",
+            &graph,
+            &roots,
+        );
         assert_eq!(
             decision,
             PolicyDecision::Denied(DenyReason::InsufficientPurpose)
@@ -290,12 +304,14 @@ mod tests {
             actions: vec![String::from("read")], // only read
         });
 
-        let decision =
-            engine.evaluate(&user.id.to_urn(), "repo:main-service", "delete", &graph, &roots);
-        assert_eq!(
-            decision,
-            PolicyDecision::Denied(DenyReason::NoMatchingRule)
+        let decision = engine.evaluate(
+            &user.id.to_urn(),
+            "repo:main-service",
+            "delete",
+            &graph,
+            &roots,
         );
+        assert_eq!(decision, PolicyDecision::Denied(DenyReason::NoMatchingRule));
     }
 
     #[test]
@@ -309,12 +325,14 @@ mod tests {
             actions: vec![String::from("read")],
         });
 
-        let decision =
-            engine.evaluate(&user.id.to_urn(), "repo:main-service", "read", &graph, &roots);
-        assert_eq!(
-            decision,
-            PolicyDecision::Denied(DenyReason::NoMatchingRule)
+        let decision = engine.evaluate(
+            &user.id.to_urn(),
+            "repo:main-service",
+            "read",
+            &graph,
+            &roots,
         );
+        assert_eq!(decision, PolicyDecision::Denied(DenyReason::NoMatchingRule));
     }
 
     #[test]
@@ -334,8 +352,13 @@ mod tests {
             actions: vec![String::from("read")],
         });
 
-        let decision =
-            engine.evaluate(&user.id.to_urn(), "repo:main-service", "read", &graph, &roots);
+        let decision = engine.evaluate(
+            &user.id.to_urn(),
+            "repo:main-service",
+            "read",
+            &graph,
+            &roots,
+        );
         assert!(decision.is_denied());
         assert!(matches!(
             decision,
@@ -378,9 +401,7 @@ mod tests {
     fn test_deny_reason_display() {
         assert!(!format!("{}", DenyReason::NoMatchingRule).is_empty());
         assert!(!format!("{}", DenyReason::InsufficientPurpose).is_empty());
-        assert!(
-            !format!("{}", DenyReason::ExplicitDeny(String::from("x"))).is_empty()
-        );
+        assert!(!format!("{}", DenyReason::ExplicitDeny(String::from("x"))).is_empty());
     }
 
     #[test]

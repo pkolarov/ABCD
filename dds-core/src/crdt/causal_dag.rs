@@ -162,10 +162,8 @@ impl CausalDag {
         }
 
         // Collect missing ops and sort topologically
-        let mut to_insert: Vec<&Operation> = missing
-            .iter()
-            .filter_map(|id| other.ops.get(id))
-            .collect();
+        let mut to_insert: Vec<&Operation> =
+            missing.iter().filter_map(|id| other.ops.get(id)).collect();
 
         // Simple topological sort: insert ops whose deps are all satisfied
         let mut count = 0;
@@ -186,9 +184,7 @@ impl CausalDag {
         }
 
         if !to_insert.is_empty() {
-            return Err(DagError::MissingDependency(
-                to_insert[0].deps[0].clone(),
-            ));
+            return Err(DagError::MissingDependency(to_insert[0].deps[0].clone()));
         }
 
         Ok(count)
@@ -253,7 +249,7 @@ mod tests {
     #[test]
     fn test_insert_root() {
         let mut dag = CausalDag::new();
-        assert_eq!(dag.insert(op("a", vec![])).unwrap(), true);
+        assert!(dag.insert(op("a", vec![])).unwrap());
         assert_eq!(dag.len(), 1);
         assert!(dag.heads().contains("a"));
     }
@@ -262,7 +258,7 @@ mod tests {
     fn test_insert_duplicate_idempotent() {
         let mut dag = CausalDag::new();
         dag.insert(op("a", vec![])).unwrap();
-        assert_eq!(dag.insert(op("a", vec![])).unwrap(), false);
+        assert!(!dag.insert(op("a", vec![])).unwrap());
         assert_eq!(dag.len(), 1);
     }
 

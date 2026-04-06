@@ -81,6 +81,7 @@ impl<T: Ord + Clone> TwoPSet<T> {
     /// Merge another 2P-Set into this one (CRDT merge).
     /// - add_set = union of both add_sets
     /// - remove_set = union of both remove_sets
+    ///
     /// Remove-wins: anything in the merged remove_set is excluded.
     pub fn merge(&mut self, other: &Self) {
         for e in &other.add_set {
@@ -189,7 +190,10 @@ mod tests {
         set.add(String::from("charlie"));
         set.remove(String::from("bob"));
         let members: alloc::vec::Vec<_> = set.members().cloned().collect();
-        assert_eq!(members, vec![String::from("alice"), String::from("charlie")]);
+        assert_eq!(
+            members,
+            vec![String::from("alice"), String::from("charlie")]
+        );
     }
 
     #[test]

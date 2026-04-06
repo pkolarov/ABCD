@@ -95,8 +95,8 @@ pub fn verify_hybrid(
     super::classical::verify_ed25519(ed_pk_bytes, message, ed_sig_bytes)?;
 
     // Verify ML-DSA-65
-    let pq_pk = mldsa65::PublicKey::from_bytes(pq_pk_bytes)
-        .map_err(|_| CryptoError::InvalidPublicKey)?;
+    let pq_pk =
+        mldsa65::PublicKey::from_bytes(pq_pk_bytes).map_err(|_| CryptoError::InvalidPublicKey)?;
     let pq_sig = mldsa65::DetachedSignature::from_bytes(pq_sig_bytes)
         .map_err(|_| CryptoError::InvalidSignature)?;
     mldsa65::verify_detached_signature(&pq_sig, message, &pq_pk)
@@ -104,7 +104,6 @@ pub fn verify_hybrid(
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -172,7 +171,7 @@ mod tests {
         let key = HybridEdMldsa::generate(&mut OsRng);
         let pk = key.public_key_bundle();
         let sig = key.sign(b"test");
-        assert_eq!(pk.bytes.len(), 1984);  // 32 + 1952
+        assert_eq!(pk.bytes.len(), 1984); // 32 + 1952
         assert_eq!(sig.bytes.len(), 3373); // 64 + 3309
     }
 

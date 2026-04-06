@@ -26,7 +26,8 @@ fn attest(ident: &Identity) -> Token {
             revokes: None,
             iat: 1000,
             exp: Some(9999),
-            body_type: None, body_cbor: None,
+            body_type: None,
+            body_cbor: None,
         },
         &ident.signing_key,
     )
@@ -48,7 +49,8 @@ fn vouch(voucher: &Identity, subject: &Identity, purpose: &str, subject_token: &
             revokes: None,
             iat: 1000,
             exp: Some(9999),
-            body_type: None, body_cbor: None,
+            body_type: None,
+            body_cbor: None,
         },
         &voucher.signing_key,
     )
@@ -70,7 +72,8 @@ fn revoke(revoker: &Identity, target_jti: &str) -> Token {
             revokes: Some(target_jti.to_string()),
             iat: 2000,
             exp: None,
-            body_type: None, body_cbor: None,
+            body_type: None,
+            body_cbor: None,
         },
         &revoker.signing_key,
     )
@@ -110,7 +113,7 @@ fn test_full_trust_chain_lifecycle() {
     assert!(graph.has_purpose(&user.id.to_urn(), "dds:group:developers", &roots));
 
     // Now revoke admin's vouch for user
-    let revoke_token = revoke(&admin, &admin_vouches_user.payload.jti.as_str());
+    let revoke_token = revoke(&admin, admin_vouches_user.payload.jti.as_str());
     graph.add_token(revoke_token).unwrap();
 
     // User should no longer be trusted
@@ -164,7 +167,10 @@ fn test_policy_evaluation_end_to_end() {
 
     // Outsider should be denied (not in group:backend)
     let decision = engine.evaluate(&outsider.id.to_urn(), "repo:main", "read", &graph, &roots);
-    assert!(decision.is_denied(), "outsider should be denied: {decision}");
+    assert!(
+        decision.is_denied(),
+        "outsider should be denied: {decision}"
+    );
 
     // Dev should be denied for unknown resource
     let decision = engine.evaluate(&dev.id.to_urn(), "repo:other", "read", &graph, &roots);
@@ -199,7 +205,10 @@ fn test_token_store_roundtrip() {
     assert_eq!(retrieved.payload.jti, token.payload.jti);
     assert_eq!(retrieved.payload.iss, token.payload.iss);
     assert_eq!(retrieved.payload.kind, token.payload.kind);
-    assert_eq!(retrieved.payload.iss_key.scheme, token.payload.iss_key.scheme);
+    assert_eq!(
+        retrieved.payload.iss_key.scheme,
+        token.payload.iss_key.scheme
+    );
     assert_eq!(retrieved.payload.iss_key.bytes, token.payload.iss_key.bytes);
 }
 
@@ -208,7 +217,7 @@ fn test_token_store_roundtrip() {
 // ============================================================
 #[test]
 fn test_two_node_sync() {
-    use dds_net::sync::{apply_sync_payloads, build_summary, compute_missing_ops, SyncPayload};
+    use dds_net::sync::{SyncPayload, apply_sync_payloads, build_summary, compute_missing_ops};
     use dds_store::MemoryBackend;
 
     let alice = Identity::generate("alice", &mut OsRng);
@@ -217,8 +226,20 @@ fn test_two_node_sync() {
     // Node A has ops a1, a2
     let mut dag_a = CausalDag::new();
     let mut store_a = MemoryBackend::new();
-    let op_a1 = Operation { id: "a1".into(), author: "alice".into(), deps: vec![], data: vec![1], timestamp: 1 };
-    let op_a2 = Operation { id: "a2".into(), author: "alice".into(), deps: vec!["a1".into()], data: vec![2], timestamp: 2 };
+    let op_a1 = Operation {
+        id: "a1".into(),
+        author: "alice".into(),
+        deps: vec![],
+        data: vec![1],
+        timestamp: 1,
+    };
+    let op_a2 = Operation {
+        id: "a2".into(),
+        author: "alice".into(),
+        deps: vec!["a1".into()],
+        data: vec![2],
+        timestamp: 2,
+    };
     dag_a.insert(op_a1.clone()).unwrap();
     dag_a.insert(op_a2.clone()).unwrap();
 
@@ -228,7 +249,13 @@ fn test_two_node_sync() {
     // Node B has ops b1
     let mut dag_b = CausalDag::new();
     let mut store_b = MemoryBackend::new();
-    let op_b1 = Operation { id: "b1".into(), author: "bob".into(), deps: vec![], data: vec![3], timestamp: 1 };
+    let op_b1 = Operation {
+        id: "b1".into(),
+        author: "bob".into(),
+        deps: vec![],
+        data: vec![3],
+        timestamp: 1,
+    };
     dag_b.insert(op_b1.clone()).unwrap();
 
     let tok_b = attest(&bob);
@@ -254,8 +281,14 @@ fn test_two_node_sync() {
     }
 
     let payloads: Vec<SyncPayload> = vec![
-        SyncPayload { op_bytes: serialize_op(&op_a1), token_bytes: tok_a.to_cbor().unwrap() },
-        SyncPayload { op_bytes: serialize_op(&op_a2), token_bytes: tok_a.to_cbor().unwrap() },
+        SyncPayload {
+            op_bytes: serialize_op(&op_a1),
+            token_bytes: tok_a.to_cbor().unwrap(),
+        },
+        SyncPayload {
+            op_bytes: serialize_op(&op_a2),
+            token_bytes: tok_a.to_cbor().unwrap(),
+        },
     ];
 
     // Apply on B
@@ -287,16 +320,25 @@ fn test_hybrid_identity_full_lifecycle() {
             jti: "attest-pq-root".into(),
             sub: root.id.to_urn(),
             kind: TokenKind::Attest,
-            purpose: None, vch_iss: None, vch_sum: None, revokes: None,
-            iat: 1000, exp: Some(9999),
-            body_type: None, body_cbor: None,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1000,
+            exp: Some(9999),
+            body_type: None,
+            body_cbor: None,
         },
         |msg| root.sign(msg),
-    ).unwrap();
+    )
+    .unwrap();
 
     // Verify hybrid token
     assert!(root_attest.validate().is_ok());
-    assert_eq!(root_attest.payload.iss_key.scheme, SchemeId::HybridEdMldsa65);
+    assert_eq!(
+        root_attest.payload.iss_key.scheme,
+        SchemeId::HybridEdMldsa65
+    );
 
     // User attestation with classical key
     let user_attest = attest(&user);
@@ -315,11 +357,14 @@ fn test_hybrid_identity_full_lifecycle() {
             vch_iss: Some(user.id.to_urn()),
             vch_sum: Some(user_attest.payload_hash()),
             revokes: None,
-            iat: 1000, exp: Some(9999),
-            body_type: None, body_cbor: None,
+            iat: 1000,
+            exp: Some(9999),
+            body_type: None,
+            body_cbor: None,
         },
         |msg| root.sign(msg),
-    ).unwrap();
+    )
+    .unwrap();
     assert!(vouch_token.validate().is_ok());
 
     // Build trust graph and verify chain

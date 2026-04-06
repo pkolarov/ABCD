@@ -113,24 +113,23 @@ impl DdsNode {
 
         match event {
             SwarmEvent::Behaviour(DdsBehaviourEvent::Gossipsub(
-                libp2p::gossipsub::Event::Message {
-                    message, ..
-                },
+                libp2p::gossipsub::Event::Message { message, .. },
             )) => {
                 self.handle_gossip_message(&message.topic, &message.data);
             }
-            SwarmEvent::Behaviour(DdsBehaviourEvent::Mdns(
-                libp2p::mdns::Event::Discovered(peers),
-            )) => {
+            SwarmEvent::Behaviour(DdsBehaviourEvent::Mdns(libp2p::mdns::Event::Discovered(
+                peers,
+            ))) => {
                 for (peer_id, addr) in peers {
                     info!(%peer_id, %addr, "mDNS: discovered peer");
-                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    self.swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(&peer_id, addr);
                     dds_net::discovery::add_mdns_peer(&mut self.swarm, peer_id);
                 }
             }
-            SwarmEvent::Behaviour(DdsBehaviourEvent::Mdns(
-                libp2p::mdns::Event::Expired(peers),
-            )) => {
+            SwarmEvent::Behaviour(DdsBehaviourEvent::Mdns(libp2p::mdns::Event::Expired(peers))) => {
                 for (peer_id, _addr) in peers {
                     info!(%peer_id, "mDNS: peer expired");
                     dds_net::discovery::remove_mdns_peer(&mut self.swarm, peer_id);
@@ -167,7 +166,13 @@ impl DdsNode {
         };
 
         match (topic, msg) {
-            (DdsTopic::Operations(_), GossipMessage::DirectoryOp { op_bytes, token_bytes }) => {
+            (
+                DdsTopic::Operations(_),
+                GossipMessage::DirectoryOp {
+                    op_bytes,
+                    token_bytes,
+                },
+            ) => {
                 self.ingest_operation(&op_bytes, &token_bytes);
             }
             (DdsTopic::Revocations(_), GossipMessage::Revocation { token_bytes }) => {
@@ -185,11 +190,17 @@ impl DdsNode {
     fn ingest_operation(&mut self, op_bytes: &[u8], token_bytes: &[u8]) {
         let op: dds_core::crdt::causal_dag::Operation = match ciborium::from_reader(op_bytes) {
             Ok(op) => op,
-            Err(e) => { error!("op deserialize: {e}"); return; }
+            Err(e) => {
+                error!("op deserialize: {e}");
+                return;
+            }
         };
         let token = match Token::from_cbor(token_bytes) {
             Ok(t) => t,
-            Err(e) => { error!("token deserialize: {e}"); return; }
+            Err(e) => {
+                error!("token deserialize: {e}");
+                return;
+            }
         };
         if let Err(e) = token.validate() {
             warn!("token validation failed: {e}");
@@ -212,7 +223,10 @@ impl DdsNode {
     fn ingest_revocation(&mut self, token_bytes: &[u8]) {
         let token = match Token::from_cbor(token_bytes) {
             Ok(t) => t,
-            Err(e) => { error!("revoke token deserialize: {e}"); return; }
+            Err(e) => {
+                error!("revoke token deserialize: {e}");
+                return;
+            }
         };
         if let Err(e) = token.validate() {
             warn!("revocation validation failed: {e}");
@@ -233,7 +247,10 @@ impl DdsNode {
     fn ingest_burn(&mut self, token_bytes: &[u8]) {
         let token = match Token::from_cbor(token_bytes) {
             Ok(t) => t,
-            Err(e) => { error!("burn token deserialize: {e}"); return; }
+            Err(e) => {
+                error!("burn token deserialize: {e}");
+                return;
+            }
         };
         if let Err(e) = token.validate() {
             warn!("burn validation failed: {e}");
@@ -267,6 +284,12 @@ impl DdsNode {
         action: &str,
         policy_engine: &dds_core::policy::PolicyEngine,
     ) -> dds_core::policy::PolicyDecision {
-        policy_engine.evaluate(subject_urn, resource, action, &self.trust_graph, &self.trusted_roots)
+        policy_engine.evaluate(
+            subject_urn,
+            resource,
+            action,
+            &self.trust_graph,
+            &self.trusted_roots,
+        )
     }
 }

@@ -20,6 +20,12 @@ pub struct NodeConfig {
     /// Trusted root identity URNs.
     #[serde(default)]
     pub trusted_roots: Vec<String>,
+
+    /// Optional explicit path to the persistent node identity file.
+    /// Defaults to `<data_dir>/node_key.bin`. The file is encrypted with
+    /// `DDS_NODE_PASSPHRASE` if that environment variable is set.
+    #[serde(default)]
+    pub identity_path: Option<PathBuf>,
 }
 
 /// Network settings.
@@ -94,12 +100,12 @@ fn default_idle_timeout() -> u64 {
 impl NodeConfig {
     /// Load config from a TOML file.
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::Io(e.to_string()))?;
+        let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(e.to_string()))?;
         toml::from_str(&content).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
     /// Load config from a TOML string.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, ConfigError> {
         toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))
     }
@@ -111,7 +117,9 @@ impl NodeConfig {
 
     /// Path to the node identity key file.
     pub fn identity_key_path(&self) -> PathBuf {
-        self.data_dir.join("node_key.bin")
+        self.identity_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("node_key.bin"))
     }
 }
 
@@ -139,16 +147,20 @@ mod tests {
 
     #[test]
     fn test_parse_minimal_config() {
-        let config = NodeConfig::from_str(r#"
+        let config = NodeConfig::from_str(
+            r#"
             org_hash = "abc123"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert_eq!(config.org_hash, "abc123");
         assert!(config.network.mdns_enabled);
     }
 
     #[test]
     fn test_parse_full_config() {
-        let config = NodeConfig::from_str(r#"
+        let config = NodeConfig::from_str(
+            r#"
             org_hash = "abc123"
             data_dir = "/tmp/dds-test"
             trusted_roots = ["urn:vouchsafe:root.hash1"]
@@ -160,7 +172,9 @@ mod tests {
             heartbeat_secs = 10
             idle_timeout_secs = 120
             api_addr = "127.0.0.1:6661"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert_eq!(config.data_dir, PathBuf::from("/tmp/dds-test"));
         assert_eq!(config.trusted_roots.len(), 1);
         assert_eq!(config.network.listen_addr, "/ip4/10.0.1.1/tcp/9000");
@@ -170,10 +184,13 @@ mod tests {
 
     #[test]
     fn test_db_path() {
-        let config = NodeConfig::from_str(r#"
+        let config = NodeConfig::from_str(
+            r#"
             org_hash = "test"
             data_dir = "/data/dds"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert_eq!(config.db_path(), PathBuf::from("/data/dds/directory.redb"));
     }
 

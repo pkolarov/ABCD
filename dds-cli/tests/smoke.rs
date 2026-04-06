@@ -71,10 +71,14 @@ fn test_identity_show_invalid() {
 fn test_policy_check() {
     let output = dds_cli()
         .args([
-            "policy", "check",
-            "--user", "urn:vouchsafe:bob.hash",
-            "--resource", "repo:main",
-            "--action", "read",
+            "policy",
+            "check",
+            "--user",
+            "urn:vouchsafe:bob.hash",
+            "--resource",
+            "repo:main",
+            "--action",
+            "read",
         ])
         .output()
         .unwrap();
@@ -104,16 +108,26 @@ fn test_group_vouch_and_status() {
     // Vouch
     let output = dds_cli()
         .args([
-            "--data-dir", data_dir,
-            "group", "vouch",
-            "--as-label", "admin",
-            "--user", "urn:vouchsafe:bob.fakehash",
-            "--purpose", "group:backend",
+            "--data-dir",
+            data_dir,
+            "group",
+            "vouch",
+            "--as-label",
+            "admin",
+            "--user",
+            "urn:vouchsafe:bob.fakehash",
+            "--purpose",
+            "group:backend",
         ])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "vouch failed: stdout={}, stderr={}", String::from_utf8_lossy(&output.stdout), stderr);
+    assert!(
+        output.status.success(),
+        "vouch failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Vouch created"));
     assert!(stdout.contains("group:backend"));
@@ -136,11 +150,16 @@ fn test_group_vouch_then_revoke() {
     // Vouch first
     let output = dds_cli()
         .args([
-            "--data-dir", data_dir,
-            "group", "vouch",
-            "--as-label", "admin",
-            "--user", "urn:vouchsafe:carol.hash",
-            "--purpose", "group:dev",
+            "--data-dir",
+            data_dir,
+            "group",
+            "vouch",
+            "--as-label",
+            "admin",
+            "--user",
+            "urn:vouchsafe:carol.hash",
+            "--purpose",
+            "group:dev",
         ])
         .output()
         .unwrap();
@@ -153,10 +172,14 @@ fn test_group_vouch_then_revoke() {
     // Revoke
     let output = dds_cli()
         .args([
-            "--data-dir", data_dir,
-            "group", "revoke",
-            "--as-label", "admin",
-            "--jti", jti,
+            "--data-dir",
+            data_dir,
+            "group",
+            "revoke",
+            "--as-label",
+            "admin",
+            "--jti",
+            jti,
         ])
         .output()
         .unwrap();

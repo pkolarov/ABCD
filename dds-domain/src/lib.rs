@@ -14,6 +14,7 @@
 //! | `ServicePrincipalDocument` | `dds:service-principal` | Machine/service identity |
 //! | `SessionDocument` | `dds:session` | Short-lived auth session |
 
+pub mod fido2;
 pub mod types;
 
 pub use types::*;
@@ -38,15 +39,13 @@ pub trait DomainDocument: serde::Serialize + serde::de::DeserializeOwned {
     /// Serialize this document to CBOR bytes.
     fn to_cbor(&self) -> Result<Vec<u8>, DomainError> {
         let mut buf = Vec::new();
-        ciborium::into_writer(self, &mut buf)
-            .map_err(|e| DomainError::Serialize(e.to_string()))?;
+        ciborium::into_writer(self, &mut buf).map_err(|e| DomainError::Serialize(e.to_string()))?;
         Ok(buf)
     }
 
     /// Deserialize from CBOR bytes.
     fn from_cbor(bytes: &[u8]) -> Result<Self, DomainError> {
-        ciborium::from_reader(bytes)
-            .map_err(|e| DomainError::Deserialize(e.to_string()))
+        ciborium::from_reader(bytes).map_err(|e| DomainError::Deserialize(e.to_string()))
     }
 
     /// Embed this document into a token payload's body fields.
@@ -60,9 +59,7 @@ pub trait DomainDocument: serde::Serialize + serde::de::DeserializeOwned {
     /// Returns `None` if body_type doesn't match; `Err` if CBOR decode fails.
     fn extract(payload: &TokenPayload) -> Result<Option<Self>, DomainError> {
         match (&payload.body_type, &payload.body_cbor) {
-            (Some(bt), Some(cbor)) if bt == Self::BODY_TYPE => {
-                Ok(Some(Self::from_cbor(cbor)?))
-            }
+            (Some(bt), Some(cbor)) if bt == Self::BODY_TYPE => Ok(Some(Self::from_cbor(cbor)?)),
             (Some(_), _) => Ok(None), // different body type
             (None, _) => Ok(None),    // no body
         }
@@ -82,8 +79,9 @@ impl std::fmt::Display for DomainError {
         match self {
             DomainError::Serialize(e) => write!(f, "serialize: {e}"),
             DomainError::Deserialize(e) => write!(f, "deserialize: {e}"),
-            DomainError::InvalidBodyType { expected, got } =>
-                write!(f, "body_type mismatch: expected {expected}, got {got}"),
+            DomainError::InvalidBodyType { expected, got } => {
+                write!(f, "body_type mismatch: expected {expected}, got {got}")
+            }
         }
     }
 }

@@ -140,10 +140,7 @@ mod tests {
             topics.revocations.topic_string(),
             "/dds/v1/org/abc123hash/revocations"
         );
-        assert_eq!(
-            topics.burns.topic_string(),
-            "/dds/v1/org/abc123hash/burns"
-        );
+        assert_eq!(topics.burns.topic_string(), "/dds/v1/org/abc123hash/burns");
     }
 
     #[test]

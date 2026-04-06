@@ -5,10 +5,10 @@
 
 use clap::{Parser, Subcommand};
 use dds_core::identity::Identity;
-use dds_store::traits::*;
 use dds_store::RedbBackend;
+use dds_store::traits::*;
 use rand::rngs::OsRng;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "dds", about = "Decentralized Directory Service CLI")]
@@ -136,20 +136,18 @@ fn handle_identity(action: IdentityAction) {
                 println!("  PubKey: {} bytes", ident.public_key.bytes.len());
             }
         }
-        IdentityAction::Show { urn } => {
-            match dds_core::identity::VouchsafeId::from_urn(&urn) {
-                Ok(id) => {
-                    println!("Identity:");
-                    println!("  Label: {}", id.label());
-                    println!("  Hash:  {}", id.hash());
-                    println!("  URN:   {}", id.to_urn());
-                }
-                Err(e) => {
-                    eprintln!("Invalid URN: {e}");
-                    std::process::exit(1);
-                }
+        IdentityAction::Show { urn } => match dds_core::identity::VouchsafeId::from_urn(&urn) {
+            Ok(id) => {
+                println!("Identity:");
+                println!("  Label: {}", id.label());
+                println!("  Hash:  {}", id.hash());
+                println!("  URN:   {}", id.to_urn());
             }
-        }
+            Err(e) => {
+                eprintln!("Invalid URN: {e}");
+                std::process::exit(1);
+            }
+        },
     }
 }
 
@@ -186,7 +184,8 @@ fn handle_group(action: GroupAction, data_dir: &PathBuf) {
                 revokes: None,
                 iat: now_epoch(),
                 exp: Some(now_epoch() + 365 * 86400),
-                body_type: None, body_cbor: None,
+                body_type: None,
+                body_cbor: None,
             };
             let token = dds_core::token::Token::sign(payload, &voucher.signing_key).unwrap();
             store.put_token(&token).unwrap();
@@ -209,7 +208,8 @@ fn handle_group(action: GroupAction, data_dir: &PathBuf) {
                 revokes: Some(jti.clone()),
                 iat: now_epoch(),
                 exp: None,
-                body_type: None, body_cbor: None,
+                body_type: None,
+                body_cbor: None,
             };
             let token = dds_core::token::Token::sign(payload, &revoker.signing_key).unwrap();
             store.put_token(&token).unwrap();
@@ -236,7 +236,7 @@ fn handle_policy(action: PolicyAction) {
     }
 }
 
-fn handle_status(data_dir: &PathBuf) {
+fn handle_status(data_dir: &Path) {
     let db_path = data_dir.join("directory.redb");
     if !db_path.exists() {
         println!("No store found at {}", db_path.display());
@@ -282,11 +282,21 @@ fn uuid_v4() -> String {
     let bytes: [u8; 16] = rng.r#gen();
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5],
-        (bytes[6] & 0x0f) | 0x40, bytes[7],
-        (bytes[8] & 0x3f) | 0x80, bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        (bytes[6] & 0x0f) | 0x40,
+        bytes[7],
+        (bytes[8] & 0x3f) | 0x80,
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
     )
 }
-

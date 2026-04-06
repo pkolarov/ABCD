@@ -12,9 +12,9 @@ use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
 use libp2p::{
-    gossipsub, identify, kad, mdns, noise,
+    PeerId, gossipsub, identify, kad, mdns, noise,
     swarm::{NetworkBehaviour, Swarm},
-    tcp, yamux, PeerId,
+    tcp, yamux,
 };
 
 /// Combined network behaviour for DDS nodes.
@@ -54,7 +54,9 @@ impl Default for SwarmConfig {
 /// Build a DDS swarm with the given configuration.
 ///
 /// Returns the `Swarm` and the local `PeerId`.
-pub fn build_swarm(config: SwarmConfig) -> Result<(Swarm<DdsBehaviour>, PeerId), Box<dyn std::error::Error>> {
+pub fn build_swarm(
+    config: SwarmConfig,
+) -> Result<(Swarm<DdsBehaviour>, PeerId), Box<dyn std::error::Error>> {
     let swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -95,10 +97,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<(Swarm<DdsBehaviour>, PeerId),
             let kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
 
             // mDNS
-            let mdns = mdns::tokio::Behaviour::new(
-                mdns::Config::default(),
-                peer_id,
-            )?;
+            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
 
             // Identify
             let identify = identify::Behaviour::new(identify::Config::new(
@@ -113,7 +112,9 @@ pub fn build_swarm(config: SwarmConfig) -> Result<(Swarm<DdsBehaviour>, PeerId),
                 identify,
             })
         })?
-        .with_swarm_config(|c: libp2p::swarm::Config| c.with_idle_connection_timeout(config.idle_timeout))
+        .with_swarm_config(|c: libp2p::swarm::Config| {
+            c.with_idle_connection_timeout(config.idle_timeout)
+        })
         .build();
 
     let peer_id = *swarm.local_peer_id();

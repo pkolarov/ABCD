@@ -6,7 +6,6 @@
 //! - Return: i32 error code (DDS_OK = 0, negative = error)
 //! - Caller frees returned strings with `dds_free_string`
 
-use dds_core::crypto::SchemeId;
 use dds_core::identity::{Identity, VouchsafeId};
 use dds_core::policy::{Effect, PolicyEngine, PolicyRule};
 use dds_core::token::{Token, TokenKind, TokenPayload};
@@ -58,44 +57,77 @@ fn write_str(out: *mut *mut c_char, s: &str) -> i32 {
 // ============================================================
 
 /// Generate a classical (Ed25519) identity. Returns JSON.
+///
+/// # Safety
+/// `label` must be a valid NUL-terminated C string. `out` must be a valid pointer
+/// to a `*mut c_char` location that this function may write to.
 #[unsafe(no_mangle)]
-pub extern "C" fn dds_identity_create(label: *const c_char, out: *mut *mut c_char) -> i32 {
-    let label = match read_cstr(label) { Ok(s) => s, Err(e) => return e };
+pub unsafe extern "C" fn dds_identity_create(label: *const c_char, out: *mut *mut c_char) -> i32 {
+    let label = match read_cstr(label) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let ident = Identity::generate(label, &mut OsRng);
-    write_json(out, serde_json::json!({
-        "urn": ident.id.to_urn(),
-        "scheme": format!("{}", ident.public_key.scheme),
-        "pubkey_len": ident.public_key.bytes.len(),
-        "signing_key_hex": hex::encode(ident.signing_key.to_bytes()),
-    }))
+    write_json(
+        out,
+        serde_json::json!({
+            "urn": ident.id.to_urn(),
+            "scheme": format!("{}", ident.public_key.scheme),
+            "pubkey_len": ident.public_key.bytes.len(),
+            "signing_key_hex": hex::encode(ident.signing_key.to_bytes()),
+        }),
+    )
 }
 
 /// Generate a hybrid (Ed25519+ML-DSA-65) identity. Returns JSON.
+///
+/// # Safety
+/// `label` must be a valid NUL-terminated C string. `out` must be a valid writable
+/// pointer to a `*mut c_char` location.
 #[cfg(feature = "pq")]
 #[unsafe(no_mangle)]
-pub extern "C" fn dds_identity_create_hybrid(label: *const c_char, out: *mut *mut c_char) -> i32 {
-    let label = match read_cstr(label) { Ok(s) => s, Err(e) => return e };
+pub unsafe extern "C" fn dds_identity_create_hybrid(
+    label: *const c_char,
+    out: *mut *mut c_char,
+) -> i32 {
+    let label = match read_cstr(label) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let ident = Identity::generate_hybrid(label, &mut OsRng);
-    write_json(out, serde_json::json!({
-        "urn": ident.id.to_urn(),
-        "scheme": format!("{}", ident.public_key.scheme),
-        "pubkey_len": ident.public_key.bytes.len(),
-    }))
+    write_json(
+        out,
+        serde_json::json!({
+            "urn": ident.id.to_urn(),
+            "scheme": format!("{}", ident.public_key.scheme),
+            "pubkey_len": ident.public_key.bytes.len(),
+        }),
+    )
 }
 
 /// Parse and validate a Vouchsafe URN. Returns JSON.
+///
+/// # Safety
+/// `urn` must be a valid NUL-terminated C string. `out` must be a valid writable
+/// pointer to a `*mut c_char` location.
 #[unsafe(no_mangle)]
-pub extern "C" fn dds_identity_parse_urn(urn: *const c_char, out: *mut *mut c_char) -> i32 {
-    let urn_str = match read_cstr(urn) { Ok(s) => s, Err(e) => return e };
+pub unsafe extern "C" fn dds_identity_parse_urn(urn: *const c_char, out: *mut *mut c_char) -> i32 {
+    let urn_str = match read_cstr(urn) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let id = match VouchsafeId::from_urn(urn_str) {
         Ok(id) => id,
         Err(_) => return DDS_ERR_INVALID_INPUT,
     };
-    write_json(out, serde_json::json!({
-        "label": id.label(),
-        "hash": id.hash(),
-        "urn": id.to_urn(),
-    }))
+    write_json(
+        out,
+        serde_json::json!({
+            "label": id.label(),
+            "hash": id.hash(),
+            "urn": id.to_urn(),
+        }),
+    )
 }
 
 // ============================================================
@@ -105,75 +137,140 @@ pub extern "C" fn dds_identity_parse_urn(urn: *const c_char, out: *mut *mut c_ch
 /// Create and sign an attestation token. Input: JSON config. Output: JSON token.
 /// Input JSON: { "label": "alice" } — creates identity + self-attestation.
 /// Output JSON: { "jti", "urn", "token_cbor_hex", "payload_hash" }
+///
+/// # Safety
+/// `config_json` must be a valid NUL-terminated C string. `out` must be a valid
+/// writable pointer to a `*mut c_char` location.
 #[unsafe(no_mangle)]
-pub extern "C" fn dds_token_create_attest(config_json: *const c_char, out: *mut *mut c_char) -> i32 {
-    let config_str = match read_cstr(config_json) { Ok(s) => s, Err(e) => return e };
+pub unsafe extern "C" fn dds_token_create_attest(
+    config_json: *const c_char,
+    out: *mut *mut c_char,
+) -> i32 {
+    let config_str = match read_cstr(config_json) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let config: serde_json::Value = match serde_json::from_str(config_str) {
-        Ok(v) => v, Err(_) => return DDS_ERR_INVALID_INPUT,
+        Ok(v) => v,
+        Err(_) => return DDS_ERR_INVALID_INPUT,
     };
     let label = match config["label"].as_str() {
-        Some(s) => s, None => return DDS_ERR_INVALID_INPUT,
+        Some(s) => s,
+        None => return DDS_ERR_INVALID_INPUT,
     };
     let ident = Identity::generate(label, &mut OsRng);
     let payload = TokenPayload {
-        iss: ident.id.to_urn(), iss_key: ident.public_key.clone(),
+        iss: ident.id.to_urn(),
+        iss_key: ident.public_key.clone(),
         jti: format!("attest-{}", ident.id.label()),
-        sub: ident.id.to_urn(), kind: TokenKind::Attest,
+        sub: ident.id.to_urn(),
+        kind: TokenKind::Attest,
         purpose: config["purpose"].as_str().map(String::from),
-        vch_iss: None, vch_sum: None, revokes: None,
-        iat: now_epoch(), exp: Some(now_epoch() + 365 * 86400),
-        body_type: None, body_cbor: None,
+        vch_iss: None,
+        vch_sum: None,
+        revokes: None,
+        iat: now_epoch(),
+        exp: Some(now_epoch() + 365 * 86400),
+        body_type: None,
+        body_cbor: None,
     };
     let token = match Token::sign(payload, &ident.signing_key) {
-        Ok(t) => t, Err(e) => return write_err(out, DDS_ERR_TOKEN, &e.to_string()),
+        Ok(t) => t,
+        Err(e) => return write_err(out, DDS_ERR_TOKEN, &e.to_string()),
     };
     let cbor = match token.to_cbor() {
-        Ok(b) => hex::encode(b), Err(e) => return write_err(out, DDS_ERR_TOKEN, &e.to_string()),
+        Ok(b) => hex::encode(b),
+        Err(e) => return write_err(out, DDS_ERR_TOKEN, &e.to_string()),
     };
-    write_json(out, serde_json::json!({
-        "jti": token.payload.jti,
-        "urn": ident.id.to_urn(),
-        "token_cbor_hex": cbor,
-        "payload_hash": token.payload_hash(),
-    }))
+    write_json(
+        out,
+        serde_json::json!({
+            "jti": token.payload.jti,
+            "urn": ident.id.to_urn(),
+            "token_cbor_hex": cbor,
+            "payload_hash": token.payload_hash(),
+        }),
+    )
 }
 
-
 /// Validate a token from CBOR hex. Returns JSON with validation result.
+///
+/// # Safety
+/// `token_hex` must be a valid NUL-terminated C string. `out` must be a valid
+/// writable pointer to a `*mut c_char` location.
 #[unsafe(no_mangle)]
-pub extern "C" fn dds_token_validate(token_hex: *const c_char, out: *mut *mut c_char) -> i32 {
-    let hex_str = match read_cstr(token_hex) { Ok(s) => s, Err(e) => return e };
+pub unsafe extern "C" fn dds_token_validate(
+    token_hex: *const c_char,
+    out: *mut *mut c_char,
+) -> i32 {
+    let hex_str = match read_cstr(token_hex) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let bytes = match hex::decode(hex_str) {
-        Ok(b) => b, Err(_) => return DDS_ERR_INVALID_INPUT,
+        Ok(b) => b,
+        Err(_) => return DDS_ERR_INVALID_INPUT,
     };
     let token = match Token::from_cbor(&bytes) {
-        Ok(t) => t, Err(e) => return write_err(out, DDS_ERR_TOKEN, &e.to_string()),
+        Ok(t) => t,
+        Err(e) => return write_err(out, DDS_ERR_TOKEN, &e.to_string()),
     };
     match token.validate() {
-        Ok(()) => write_json(out, serde_json::json!({
-            "valid": true, "jti": token.payload.jti,
-            "iss": token.payload.iss, "kind": format!("{:?}", token.payload.kind),
-        })),
-        Err(e) => write_json(out, serde_json::json!({
-            "valid": false, "jti": token.payload.jti,
-            "iss": token.payload.iss, "error": e.to_string(),
-        })),
+        Ok(()) => write_json(
+            out,
+            serde_json::json!({
+                "valid": true, "jti": token.payload.jti,
+                "iss": token.payload.iss, "kind": format!("{:?}", token.payload.kind),
+            }),
+        ),
+        Err(e) => write_json(
+            out,
+            serde_json::json!({
+                "valid": false, "jti": token.payload.jti,
+                "iss": token.payload.iss, "error": e.to_string(),
+            }),
+        ),
     }
 }
 
 /// Evaluate a policy decision. Input/output: JSON strings.
+///
+/// # Safety
+/// `config_json` must be a valid NUL-terminated C string. `out` must be a valid
+/// writable pointer to a `*mut c_char` location.
 #[unsafe(no_mangle)]
-pub extern "C" fn dds_policy_evaluate(config_json: *const c_char, out: *mut *mut c_char) -> i32 {
-    let config_str = match read_cstr(config_json) { Ok(s) => s, Err(e) => return e };
-    let config: serde_json::Value = match serde_json::from_str(config_str) {
-        Ok(v) => v, Err(_) => return DDS_ERR_INVALID_INPUT,
+pub unsafe extern "C" fn dds_policy_evaluate(
+    config_json: *const c_char,
+    out: *mut *mut c_char,
+) -> i32 {
+    let config_str = match read_cstr(config_json) {
+        Ok(s) => s,
+        Err(e) => return e,
     };
-    let subject = match config["subject_urn"].as_str() { Some(s) => s, None => return DDS_ERR_INVALID_INPUT };
-    let resource = match config["resource"].as_str() { Some(s) => s, None => return DDS_ERR_INVALID_INPUT };
-    let action = match config["action"].as_str() { Some(s) => s, None => return DDS_ERR_INVALID_INPUT };
+    let config: serde_json::Value = match serde_json::from_str(config_str) {
+        Ok(v) => v,
+        Err(_) => return DDS_ERR_INVALID_INPUT,
+    };
+    let subject = match config["subject_urn"].as_str() {
+        Some(s) => s,
+        None => return DDS_ERR_INVALID_INPUT,
+    };
+    let resource = match config["resource"].as_str() {
+        Some(s) => s,
+        None => return DDS_ERR_INVALID_INPUT,
+    };
+    let action = match config["action"].as_str() {
+        Some(s) => s,
+        None => return DDS_ERR_INVALID_INPUT,
+    };
 
-    let roots: BTreeSet<String> = config["trusted_roots"].as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+    let roots: BTreeSet<String> = config["trusted_roots"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut graph = TrustGraph::new();
@@ -181,7 +278,9 @@ pub extern "C" fn dds_policy_evaluate(config_json: *const c_char, out: *mut *mut
         for tok_hex in tokens {
             if let Some(s) = tok_hex.as_str() {
                 if let Ok(bytes) = hex::decode(s) {
-                    if let Ok(token) = Token::from_cbor(&bytes) { let _ = graph.add_token(token); }
+                    if let Ok(token) = Token::from_cbor(&bytes) {
+                        let _ = graph.add_token(token);
+                    }
                 }
             }
         }
@@ -190,37 +289,74 @@ pub extern "C" fn dds_policy_evaluate(config_json: *const c_char, out: *mut *mut
     let mut engine = PolicyEngine::new();
     if let Some(rules) = config["rules"].as_array() {
         for r in rules {
-            let effect = match r["effect"].as_str() { Some("Allow") => Effect::Allow, Some("Deny") => Effect::Deny, _ => continue };
-            let rp = match r["required_purpose"].as_str() { Some(s) => s.to_string(), None => continue };
-            let res = match r["resource"].as_str() { Some(s) => s.to_string(), None => continue };
-            let acts: Vec<String> = r["actions"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            let effect = match r["effect"].as_str() {
+                Some("Allow") => Effect::Allow,
+                Some("Deny") => Effect::Deny,
+                _ => continue,
+            };
+            let rp = match r["required_purpose"].as_str() {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let res = match r["resource"].as_str() {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let acts: Vec<String> = r["actions"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            engine.add_rule(PolicyRule { effect, required_purpose: rp, resource: res, actions: acts });
+            engine.add_rule(PolicyRule {
+                effect,
+                required_purpose: rp,
+                resource: res,
+                actions: acts,
+            });
         }
     }
 
     let decision = engine.evaluate(subject, resource, action, &graph, &roots);
-    write_json(out, serde_json::json!({
-        "decision": if decision.is_allowed() { "ALLOW" } else { "DENY" },
-        "reason": format!("{decision}"),
-    }))
+    write_json(
+        out,
+        serde_json::json!({
+            "decision": if decision.is_allowed() { "ALLOW" } else { "DENY" },
+            "reason": format!("{decision}"),
+        }),
+    )
 }
 
 /// Free a string allocated by DDS FFI functions.
+///
+/// # Safety
+/// `s` must be either null or a pointer previously returned by a DDS FFI
+/// function via its `out` parameter, and not already freed.
 #[unsafe(no_mangle)]
-pub extern "C" fn dds_free_string(s: *mut c_char) {
-    if !s.is_null() { unsafe { let _ = CString::from_raw(s); } }
+pub unsafe extern "C" fn dds_free_string(s: *mut c_char) {
+    if !s.is_null() {
+        unsafe {
+            let _ = CString::from_raw(s);
+        }
+    }
 }
 
 /// Get the DDS library version.
+///
+/// # Safety
+/// `out` must be a valid writable pointer to a `*mut c_char` location.
 #[unsafe(no_mangle)]
-pub extern "C" fn dds_version(out: *mut *mut c_char) -> i32 {
+pub unsafe extern "C" fn dds_version(out: *mut *mut c_char) -> i32 {
     write_str(out, env!("CARGO_PKG_VERSION"))
 }
 
 fn now_epoch() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn write_err(out: *mut *mut c_char, code: i32, msg: &str) -> i32 {
