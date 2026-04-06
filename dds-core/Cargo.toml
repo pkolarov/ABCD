@@ -19,3 +19,7 @@ ciborium = { workspace = true }
 uuid = { workspace = true }
 heapless = { workspace = true }
 rand_core = { workspace = true }
+serde_bytes = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
