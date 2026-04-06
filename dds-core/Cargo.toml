@@ -7,8 +7,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["std"]
+default = ["std", "pq"]
 std = ["ed25519-dalek/std", "sha2/std", "serde/std", "uuid/std"]
+pq = ["pqcrypto-mldsa", "pqcrypto-traits"]
 
 [dependencies]
 ed25519-dalek = { workspace = true }
@@ -20,6 +21,8 @@ uuid = { workspace = true }
 heapless = { workspace = true }
 rand_core = { workspace = true }
 serde_bytes = { workspace = true }
+pqcrypto-mldsa = { workspace = true, optional = true }
+pqcrypto-traits = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand = { workspace = true }
