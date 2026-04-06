@@ -15,6 +15,16 @@ dds-core = { workspace = true }
 dds-store = { workspace = true }
 dds-net = { workspace = true }
 tokio = { workspace = true }
-serde = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["std", "derive"] }
+ciborium = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+home = "0.5"
+futures = { workspace = true }
+libp2p = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
 serde_json = { workspace = true }
 clap = { workspace = true }

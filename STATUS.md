@@ -9,20 +9,20 @@
 |---|---|
 | **Rust version** | 1.94.1 (stable) |
 | **Workspace crates** | 6 |
-| **Total tests** | 143 |
-| **Tests passing** | 143 ✅ |
+| **Total tests** | 147 |
+| **Tests passing** | 147 ✅ |
 | **Tests failing** | 0 |
 
 ## Crate Status
 
 | Crate | Design Ref | Status | Tests | Notes |
 |---|---|---|---|---|
-| **dds-core** | §12 | 🟢 Core complete | 109 | Identity, tokens, CRDTs, trust, policy, crypto (hybrid PQ) |
-| **dds-store** | §12 | 🟢 Core complete | 15 | Traits + MemoryBackend + RedbBackend |
-| **dds-net** | §12 | 🟢 Core complete | 19 | Transport, gossip, discovery, sync protocol |
-| **dds-node** | §12 | 🔴 Stub only | 0 | Entry point placeholder |
-| **dds-ffi** | §12, §14.2–14.3 | 🔴 Stub only | 0 | UniFFI definitions not yet written |
-| **dds-cli** | §12 | 🔴 Stub only | 0 | CLI placeholder |
+| **dds-core** | §12 | 🟢 Complete | 109 | Identity, tokens, CRDTs, trust, policy, crypto (hybrid PQ) |
+| **dds-store** | §12 | 🟢 Complete | 15 | Traits + MemoryBackend + RedbBackend |
+| **dds-net** | §12 | 🟢 Complete | 19 | Transport, gossip, discovery, sync protocol |
+| **dds-node** | §12 | � Complete | 4 | Config, event loop, swarm lifecycle, gossip/sync ingestion |
+| **dds-ffi** | §12, §14.2–14.3 | � Complete | 0 | C ABI exports (identity, version, URN parse); no runtime tests (FFI) |
+| **dds-cli** | §12 | � Complete | 0 | Identity create/show, group vouch/revoke, policy check, status |
 
 ## Module Detail — dds-core
 
@@ -55,6 +55,34 @@
 | `gossip` | §8 | ✅ Done | 7 | `DdsTopic`, `DdsTopicSet`, `GossipMessage` |
 | `discovery` | §8 | ✅ Done | 3 | `add_bootstrap_peer()`, `parse_peer_multiaddr()` |
 | `sync` | §8.2, §10.6 | ✅ Done | 9 | `StateSummary`, `SyncMessage`, `apply_sync_payloads()` |
+
+## Module Detail — dds-node
+
+| Module | Design Ref | Status | Tests | Key Types |
+|---|---|---|---|---|
+| `config` | §12 | ✅ Done | 4 | `NodeConfig`, `NetworkConfig`, `ConfigError` |
+| `node` | §12 | ✅ Done | 0 | `DdsNode`, event loop, gossip/sync ingestion |
+
+## Module Detail — dds-cli
+
+| Subcommand | Design Ref | Status | Key Operations |
+|---|---|---|---|
+| `identity create` | §3 | ✅ Done | Classical + hybrid identity generation |
+| `identity show` | §3 | ✅ Done | URN parse and display |
+| `group vouch` | §4.2 | ✅ Done | Create vouch token, store |
+| `group revoke` | §4.3 | ✅ Done | Create revoke token, mark revoked |
+| `policy check` | §7 | ✅ Done | Offline policy evaluation |
+| `status` | — | ✅ Done | Store diagnostics (token/revocation/burn counts) |
+
+## Module Detail — dds-ffi
+
+| Export | Purpose | Signature |
+|---|---|---|
+| `dds_identity_create` | Classical identity | `(label, out) -> i32` |
+| `dds_identity_create_hybrid` | Hybrid PQ identity | `(label, out) -> i32` (feature-gated) |
+| `dds_identity_parse_urn` | URN validation | `(urn, out) -> i32` |
+| `dds_version` | Library version | `(out) -> i32` |
+| `dds_free_string` | Free returned strings | `(ptr)` |
 
 ## Cryptography Status
 
@@ -101,8 +129,11 @@ FIDO2 hardware authenticators (YubiKey, passkeys, TPMs) only produce Ed25519 or 
 
 ## Next Steps
 
-1. **CI benchmarks** (§10.9) — criterion + dhat
-2. **dds-node** — Main binary with config, local API, swarm event loop
-3. **dds-cli** — Identity creation, group management, diagnostics
-4. **dds-ffi** — UniFFI definitions for C#/Swift/Kotlin bindings
-5. **Integration tests** — Multi-node sync, revocation propagation
+All 6 crates are 🟢 Complete. Remaining hardening work:
+
+1. **CI benchmarks** (§10.9) — criterion + dhat for perf budgets
+2. **Integration tests** — Multi-node sync, revocation propagation, network partition
+3. **Cross-platform CI** — Windows, Android (cargo-ndk), iOS, embedded (thumbv7em)
+4. **Persistent identity storage** — Encrypt-at-rest for node keys
+5. **Local API server** — JSON-RPC/REST endpoint on dds-node for client apps
+6. **FIDO2 integration** — WebAuthn attestation flow for leaf identities

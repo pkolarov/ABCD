@@ -48,6 +48,9 @@ postcard = { version = "1", features = ["alloc"] }
 futures = "0.3"
 tracing = "0.1"
 
+# Config & Serialization
+toml = "0.8"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
