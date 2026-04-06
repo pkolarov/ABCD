@@ -1,0 +1,21 @@
+[package]
+name = "dds-core"
+description = "DDS core library — identity, tokens, CRDTs, policy engine (no_std compatible)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+std = ["ed25519-dalek/std", "sha2/std", "serde/std", "uuid/std"]
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+base32 = { workspace = true }
+serde = { workspace = true }
+ciborium = { workspace = true }
+uuid = { workspace = true }
+heapless = { workspace = true }
+rand_core = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name = "dds-node"
+description = "DDS full node binary — all layers combined"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dds-node"
+path = "src/main.rs"
+
+[dependencies]
+dds-core = { workspace = true }
+dds-store = { workspace = true }
+dds-net = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true }
+clap = { workspace = true }

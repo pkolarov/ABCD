@@ -1,0 +1,13 @@
+[package]
+name = "dds-ffi"
+description = "DDS FFI layer — UniFFI bindings for C#, Swift, Kotlin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+dds-core = { workspace = true }

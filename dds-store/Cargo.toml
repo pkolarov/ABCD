@@ -1,0 +1,13 @@
+[package]
+name = "dds-store"
+description = "DDS storage layer — redb backend and storage abstractions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dds-core = { workspace = true }
+redb = { workspace = true }
+serde = { workspace = true, features = ["std"] }
+postcard = { workspace = true }
