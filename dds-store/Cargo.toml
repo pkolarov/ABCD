@@ -10,4 +10,9 @@ rust-version.workspace = true
 dds-core = { workspace = true }
 redb = { workspace = true }
 serde = { workspace = true, features = ["std"] }
+ciborium = { workspace = true }
 postcard = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+tempfile = "3"
