@@ -11,5 +11,11 @@ dds-core = { workspace = true }
 dds-store = { workspace = true }
 libp2p = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
 serde = { workspace = true, features = ["std"] }
 ciborium = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+tracing-subscriber = "0.3"

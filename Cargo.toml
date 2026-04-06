@@ -32,7 +32,7 @@ rand_core = { version = "0.6", default-features = false }
 redb = "2"
 
 # Networking
-libp2p = { version = "0.55", features = ["gossipsub", "kad", "mdns", "noise", "tcp", "quic", "tokio", "macros", "identify"] }
+libp2p = { version = "0.55", features = ["gossipsub", "kad", "mdns", "noise", "tcp", "quic", "yamux", "tokio", "macros", "identify"] }
 tokio = { version = "1", features = ["full"] }
 
 # Auth
@@ -41,6 +41,10 @@ webauthn-rs = "0.5"
 # Serialization
 serde_json = "1"
 postcard = { version = "1", features = ["alloc"] }
+
+# Async
+futures = "0.3"
+tracing = "0.1"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
