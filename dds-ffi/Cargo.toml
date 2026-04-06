@@ -18,3 +18,4 @@ dds-core = { workspace = true }
 dds-store = { workspace = true }
 rand = { workspace = true }
 serde_json = { workspace = true }
+hex = "0.4"

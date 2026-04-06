@@ -1,0 +1,5 @@
+module CDDS {
+    header "dds.h"
+    link "dds_ffi"
+    export *
+}

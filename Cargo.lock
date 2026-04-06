@@ -691,6 +691,7 @@ version = "0.1.0"
 dependencies = [
  "dds-core",
  "dds-store",
+ "hex",
  "rand 0.8.5",
  "serde_json",
 ]

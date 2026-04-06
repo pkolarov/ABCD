@@ -9,8 +9,8 @@
 |---|---|
 | **Rust version** | 1.94.1 (stable) |
 | **Workspace crates** | 6 |
-| **Total tests** | 168 |
-| **Tests passing** | 168 ✅ |
+| **Total tests** | 186 (173 Rust + 13 Python) |
+| **Tests passing** | 186 ✅ |
 | **Tests failing** | 0 |
 
 ## Crate Status
@@ -21,7 +21,7 @@
 | **dds-store** | §12 | 🟢 Complete | 15 | Traits + MemoryBackend + RedbBackend |
 | **dds-net** | §12 | 🟢 Complete | 19 | Transport, gossip, discovery, sync protocol |
 | **dds-node** | §12 | � Complete | 4 | Config, event loop, swarm lifecycle, gossip/sync ingestion |
-| **dds-ffi** | §12, §14.2–14.3 | � Complete | 7 | C ABI exports + unit tests (create, hybrid, parse URN, version, roundtrip, null-free) |
+| **dds-ffi** | §12, §14.2–14.3 | � Complete | 12 | C ABI: identity, token, policy, version + 12 Rust tests |
 | **dds-cli** | §12 | � Complete | 9 | Smoke tests (help, create, hybrid, show, invalid URN, policy, status, vouch+status, vouch+revoke) |
 
 ## Module Detail — dds-core
@@ -81,8 +81,21 @@
 | `dds_identity_create` | Classical identity | `(label, out) -> i32` |
 | `dds_identity_create_hybrid` | Hybrid PQ identity | `(label, out) -> i32` (feature-gated) |
 | `dds_identity_parse_urn` | URN validation | `(urn, out) -> i32` |
+| `dds_token_create_attest` | Create attestation token | `(config_json, out) -> i32` |
+| `dds_token_validate` | Validate token from CBOR hex | `(token_hex, out) -> i32` |
+| `dds_policy_evaluate` | Evaluate policy decision | `(config_json, out) -> i32` |
 | `dds_version` | Library version | `(out) -> i32` |
 | `dds_free_string` | Free returned strings | `(ptr)` |
+
+## Platform Integrations
+
+| Platform | Language | Binding Type | Wrapper | Tests | Status |
+|---|---|---|---|---|---|
+| **Any** | C | Header (`dds.h`) | `bindings/c/dds.h` | — | ✅ Complete |
+| **Linux/macOS** | Python | ctypes | `bindings/python/dds.py` | 13 (pytest) | ✅ Tested |
+| **Windows** | C# | P/Invoke | `bindings/csharp/DDS.cs` | 11 (NUnit) | ✅ Written |
+| **Android** | Kotlin | JNA | `bindings/kotlin/.../DDS.kt` | 10 (JUnit5) | ✅ Written |
+| **iOS/macOS** | Swift | C module | `bindings/swift/.../DDS.swift` | 10 (XCTest) | ✅ Written |
 
 ## Integration Tests
 
