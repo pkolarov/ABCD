@@ -181,6 +181,11 @@ Inspired by Minima's Merkle Mountain Range approach:
 - A **root hash** of the MMR tree summarizes the entire directory state, enabling efficient integrity checks
 - Storage target: **< 50MB** for a typical organizational directory (thousands of entries)
 
+### 5.6 Cryptographic Audit Log
+
+DDS includes an append-only cryptographic audit log to record all trust graph mutations (attest, vouch, revoke, burn) for compliance and forensic tracing. Each entry is signed by the node that performed the action and synced via gossipsub.
+To minimize network overhead and storage growth, the audit log is an **opt-in** feature. It must be explicitly enabled in the domain configuration (`domain.toml` or `DomainConfig`) during domain creation. If disabled, nodes converge on the final directory state without retaining the full historical sequence of operations.
+
 ---
 
 ## 6. P2P Network Layer
@@ -648,6 +653,7 @@ All libraries below are open source, mature (1.0+ or production-deployed), and a
 | Library | Version | Purpose | Downloads | License | `no_std` |
 |---|---|---|---|---|---|
 | **ed25519-dalek** | 2.2.x | Ed25519 signing & verification | 112M+ | BSD-3 | ✅ |
+| **p256** | 0.13.x | ECDSA-P256 for FIDO2 compatibility | 30M+ | MIT/Apache-2.0 | ✅ |
 | **sha2** | 0.10.x | SHA-256 for Vouchsafe ID derivation | 150M+ | MIT/Apache-2.0 | ✅ |
 | **base32** | 0.5.x | Base32 encoding for Vouchsafe URNs | 15M+ | MIT/Apache-2.0 | ✅ |
 | **serde** | 1.x | Serialization framework | 400M+ | MIT/Apache-2.0 | ✅ |

@@ -21,6 +21,8 @@ pub enum DdsTopic {
     Revocations(String, String),
     /// Burn-only channel (highest priority).
     Burns(String, String),
+    /// Audit log channel.
+    AuditLog(String, String),
 }
 
 impl DdsTopic {
@@ -31,7 +33,8 @@ impl DdsTopic {
         DdsTopicSet {
             operations: DdsTopic::Operations(d.clone(), o.clone()),
             revocations: DdsTopic::Revocations(d.clone(), o.clone()),
-            burns: DdsTopic::Burns(d, o),
+            burns: DdsTopic::Burns(d.clone(), o.clone()),
+            audit_log: DdsTopic::AuditLog(d, o),
         }
     }
 
@@ -41,6 +44,7 @@ impl DdsTopic {
             DdsTopic::Operations(d, o) => format!("/dds/v1/dom/{d}/org/{o}/ops"),
             DdsTopic::Revocations(d, o) => format!("/dds/v1/dom/{d}/org/{o}/revocations"),
             DdsTopic::Burns(d, o) => format!("/dds/v1/dom/{d}/org/{o}/burns"),
+            DdsTopic::AuditLog(d, o) => format!("/dds/v1/dom/{d}/org/{o}/audit"),
         }
     }
 
@@ -56,6 +60,7 @@ pub struct DdsTopicSet {
     pub operations: DdsTopic,
     pub revocations: DdsTopic,
     pub burns: DdsTopic,
+    pub audit_log: DdsTopic,
 }
 
 impl DdsTopicSet {
@@ -63,20 +68,28 @@ impl DdsTopicSet {
     pub fn subscribe_all(
         &self,
         gossipsub: &mut gossipsub::Behaviour,
+        audit_log_enabled: bool,
     ) -> Result<(), gossipsub::SubscriptionError> {
         gossipsub.subscribe(&self.operations.to_ident_topic())?;
         gossipsub.subscribe(&self.revocations.to_ident_topic())?;
         gossipsub.subscribe(&self.burns.to_ident_topic())?;
+        if audit_log_enabled {
+            gossipsub.subscribe(&self.audit_log.to_ident_topic())?;
+        }
         Ok(())
     }
 
     /// Get all topic hashes for matching incoming messages.
-    pub fn topic_hashes(&self) -> Vec<gossipsub::TopicHash> {
-        vec![
+    pub fn topic_hashes(&self, audit_log_enabled: bool) -> Vec<gossipsub::TopicHash> {
+        let mut hashes = vec![
             self.operations.to_ident_topic().hash(),
             self.revocations.to_ident_topic().hash(),
             self.burns.to_ident_topic().hash(),
-        ]
+        ];
+        if audit_log_enabled {
+            hashes.push(self.audit_log.to_ident_topic().hash());
+        }
+        hashes
     }
 
     /// Determine which DdsTopic a message belongs to based on its topic hash.
@@ -87,6 +100,8 @@ impl DdsTopicSet {
             Some(&self.revocations)
         } else if *hash == self.burns.to_ident_topic().hash() {
             Some(&self.burns)
+        } else if *hash == self.audit_log.to_ident_topic().hash() {
+            Some(&self.audit_log)
         } else {
             None
         }
@@ -112,6 +127,11 @@ pub enum GossipMessage {
     Burn {
         /// CBOR-encoded burn Token.
         token_bytes: Vec<u8>,
+    },
+    /// An audit log entry.
+    AuditLog {
+        /// CBOR-encoded AuditLogEntry.
+        entry_bytes: Vec<u8>,
     },
 }
 
@@ -190,7 +210,7 @@ mod tests {
     #[test]
     fn test_topic_hashes_count() {
         let topics = DdsTopic::for_domain_org(TEST_DOMAIN, TEST_ORG);
-        assert_eq!(topics.topic_hashes().len(), 3);
+        assert_eq!(topics.topic_hashes(false).len(), 3);
     }
 
     #[test]

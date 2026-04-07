@@ -735,6 +735,7 @@ async fn spawn_node(org: &str) -> Result<(DdsNode, TempDir), Box<dyn std::error:
             id: domain.id.to_string(),
             pubkey: dds_domain::domain::to_hex(&domain.pubkey),
             admission_path: None,
+            audit_log_enabled: false,
         },
         trusted_roots: Vec::new(),
         identity_path: None,
@@ -743,7 +744,7 @@ async fn spawn_node(org: &str) -> Result<(DdsNode, TempDir), Box<dyn std::error:
     let mut node = DdsNode::init(cfg, p2p_keypair)?;
     node.swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
     node.topics
-        .subscribe_all(&mut node.swarm.behaviour_mut().gossipsub)?;
+        .subscribe_all(&mut node.swarm.behaviour_mut().gossipsub, false)?;
     Ok((node, dir))
 }
 

@@ -18,3 +18,5 @@ pub mod identity;
 pub mod policy;
 pub mod token;
 pub mod trust;
+
+pub mod audit;

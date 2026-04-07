@@ -3,25 +3,25 @@
 //! Subcommands (hand-rolled, no clap dependency):
 //!
 //! - `dds-node init-domain --name <NAME> --dir <DIR>`
-//!     Genesis ceremony. Creates a fresh domain Ed25519 keypair, writes
-//!     `<DIR>/domain.toml` (public — share with siblings) and
-//!     `<DIR>/domain_key.bin` (secret — keep safe; encrypted with
-//!     `DDS_DOMAIN_PASSPHRASE` if set). Stage 2 will replace the secret
-//!     half with a FIDO2-backed signer.
+//!   Genesis ceremony. Creates a fresh domain Ed25519 keypair, writes
+//!   `<DIR>/domain.toml` (public — share with siblings) and
+//!   `<DIR>/domain_key.bin` (secret — keep safe; encrypted with
+//!   `DDS_DOMAIN_PASSPHRASE` if set). Stage 2 will replace the secret
+//!   half with a FIDO2-backed signer.
 //!
 //! - `dds-node gen-node-key --data-dir <DIR>`
-//!     Generates the persistent libp2p keypair and prints the resulting
-//!     `PeerId`. Run this on a sibling machine to discover the peer id
-//!     that the admin needs in order to issue an admission cert.
+//!   Generates the persistent libp2p keypair and prints the resulting
+//!   `PeerId`. Run this on a sibling machine to discover the peer id
+//!   that the admin needs in order to issue an admission cert.
 //!
 //! - `dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--out FILE] [--ttl-days N]`
-//!     The admin signs an admission cert for a sibling node's peer id.
-//!     Ship the resulting cert to the sibling and place it at
-//!     `<data_dir>/admission.cbor`.
+//!   The admin signs an admission cert for a sibling node's peer id.
+//!   Ship the resulting cert to the sibling and place it at
+//!   `<data_dir>/admission.cbor`.
 //!
 //! - `dds-node run [config.toml]`
-//!     Default action. Loads config, verifies admission cert, runs the
-//!     P2P node.
+//!   Default action. Loads config, verifies admission cert, runs the
+//!   P2P node.
 
 use std::path::{Path, PathBuf};
 use tracing::info;

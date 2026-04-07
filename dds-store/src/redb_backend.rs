@@ -7,8 +7,9 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
+use dds_core::audit::AuditLogEntry;
 use dds_core::crdt::causal_dag::Operation;
 use dds_core::token::{Token, TokenKind};
 
@@ -19,6 +20,7 @@ const TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("tokens");
 const REVOKED: TableDefinition<&str, &[u8]> = TableDefinition::new("revoked");
 const BURNED: TableDefinition<&str, &[u8]> = TableDefinition::new("burned");
 const OPERATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("operations");
+const AUDIT_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("audit_log");
 
 /// redb-backed persistent storage.
 pub struct RedbBackend {
@@ -46,6 +48,9 @@ impl RedbBackend {
                 .map_err(|e| StoreError::Io(e.to_string()))?;
             let _ = write_txn
                 .open_table(OPERATIONS)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            let _ = write_txn
+                .open_table(AUDIT_LOG)
                 .map_err(|e| StoreError::Io(e.to_string()))?;
         }
         write_txn
@@ -322,6 +327,48 @@ impl OperationStore for RedbBackend {
     fn missing_operations(&self, remote_ids: &BTreeSet<String>) -> StoreResult<Vec<String>> {
         let local = self.operation_ids()?;
         Ok(remote_ids.difference(&local).cloned().collect())
+    }
+}
+impl AuditStore for RedbBackend {
+    fn append_audit_entry(&mut self, entry: &AuditLogEntry) -> StoreResult<()> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(entry, &mut buf).map_err(|e| StoreError::Serde(e.to_string()))?;
+
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        {
+            let mut table = write_txn
+                .open_table(AUDIT_LOG)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            let next_id = table.len().unwrap_or(0);
+            table
+                .insert(next_id, buf.as_slice())
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list_audit_entries(&self) -> StoreResult<Vec<AuditLogEntry>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        let table = read_txn
+            .open_table(AUDIT_LOG)
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        let mut result = Vec::new();
+        for entry in table.iter().map_err(|e| StoreError::Io(e.to_string()))? {
+            let (_, value) = entry.map_err(|e| StoreError::Io(e.to_string()))?;
+            let audit_entry: AuditLogEntry = ciborium::from_reader(value.value())
+                .map_err(|e| StoreError::Serde(e.to_string()))?;
+            result.push(audit_entry);
+        }
+        Ok(result)
     }
 }
 

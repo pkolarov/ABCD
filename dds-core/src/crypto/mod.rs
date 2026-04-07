@@ -13,11 +13,17 @@
 //! - Without `pq` — Only classical Ed25519 is available
 
 pub mod classical;
+pub mod ecdsa;
 #[cfg(feature = "pq")]
 pub mod hybrid;
+#[cfg(feature = "pq")]
+pub mod triple_hybrid;
 pub mod traits;
 
 pub use classical::Ed25519Only;
+pub use ecdsa::EcdsaP256Only;
 #[cfg(feature = "pq")]
 pub use hybrid::HybridEdMldsa;
+#[cfg(feature = "pq")]
+pub use triple_hybrid::TripleHybridEdEcdsaMldsa65;
 pub use traits::*;

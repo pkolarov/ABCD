@@ -114,7 +114,7 @@ impl DdsNode {
 
         // Subscribe to org topics
         self.topics
-            .subscribe_all(&mut self.swarm.behaviour_mut().gossipsub)?;
+            .subscribe_all(&mut self.swarm.behaviour_mut().gossipsub, self.config.domain.audit_log_enabled)?;
 
         // Add bootstrap peers
         for addr_str in &self.config.network.bootstrap_peers {
@@ -222,6 +222,9 @@ impl DdsNode {
             (DdsTopic::Burns(..), GossipMessage::Burn { token_bytes }) => {
                 self.ingest_burn(&token_bytes);
             }
+            (DdsTopic::AuditLog(..), GossipMessage::AuditLog { entry_bytes }) => {
+                self.ingest_audit(&entry_bytes);
+            }
             _ => {
                 warn!("message type mismatch for topic");
             }
@@ -305,6 +308,16 @@ impl DdsNode {
             error!("store burn error: {e}");
         }
         info!(urn = %token.payload.iss, "identity burned");
+    }
+
+    fn ingest_audit(&mut self, entry_bytes: &[u8]) {
+        if !self.config.domain.audit_log_enabled {
+            return;
+        }
+        if let Ok(entry) = ciborium::from_reader::<dds_core::audit::AuditLogEntry, _>(entry_bytes) {
+            let _ = self.store.append_audit_entry(&entry);
+            info!(action = %entry.action, node = %entry.node_urn, "audit log entry appended");
+        }
     }
 
     /// Run a single token-expiry sweep using the current system time.

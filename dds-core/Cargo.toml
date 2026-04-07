@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [features]
 default = ["std", "pq"]
-std = ["ed25519-dalek/std", "sha2/std", "serde/std", "uuid/std"]
+std = ["ed25519-dalek/std", "p256/std", "sha2/std", "serde/std", "uuid/std"]
 pq = ["pqcrypto-mldsa", "pqcrypto-traits"]
 
 [dependencies]
@@ -23,6 +23,7 @@ rand_core = { workspace = true }
 serde_bytes = { workspace = true }
 pqcrypto-mldsa = { workspace = true, optional = true }
 pqcrypto-traits = { workspace = true, optional = true }
+p256 = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

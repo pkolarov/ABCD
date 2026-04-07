@@ -215,12 +215,14 @@ Typed payloads embedded inside signed tokens via `body_type` + `body_cbor`:
 | Scheme | Algorithm | Standard | Key Size | Sig Size |
 |---|---|---|---|---|
 | Classical | Ed25519 | RFC 8032 | 32 B | 64 B |
+| Classical | ECDSA-P256 | FIPS 186-4 | 65 B | 64 B |
 | Post-Quantum | ML-DSA-65 | FIPS 204 | 1,952 B | 3,309 B |
 | **Hybrid (default)** | Ed25519 + ML-DSA-65 | IETF composite | **1,984 B** | **3,373 B** |
+| **Triple-Hybrid** | Ed25519 + ECDSA-P256 + ML-DSA-65 | Max compat | **2,049 B** | **3,437 B** |
 
 Both signatures are always produced and both must verify. Feature-flagged (`pq`, on by default). Disable for embedded: `cargo build --no-default-features --features std`
 
-FIDO2 leaf identities use classical Ed25519 (hardware limitation). Trust roots use hybrid. Quantum resistance flows from the vouch chain.
+FIDO2 leaf identities use classical Ed25519 or ECDSA-P256 (hardware limitation). Trust roots use hybrid. Quantum resistance flows from the vouch chain.
 
 ## `no_std`
 

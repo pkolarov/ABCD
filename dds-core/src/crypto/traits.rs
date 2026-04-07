@@ -9,15 +9,21 @@ use serde::{Deserialize, Serialize};
 pub enum SchemeId {
     /// Classical Ed25519 only.
     Ed25519,
+    /// ECDSA P-256 only (for FIDO2 hardware compatibility).
+    EcdsaP256,
     /// Hybrid Ed25519 + ML-DSA-65 (FIPS 204).
     HybridEdMldsa65,
+    /// Triple-Hybrid Ed25519 + ECDSA-P256 + ML-DSA-65.
+    TripleHybridEdEcdsaMldsa65,
 }
 
 impl fmt::Display for SchemeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SchemeId::Ed25519 => write!(f, "Ed25519"),
+            SchemeId::EcdsaP256 => write!(f, "ECDSA-P256"),
             SchemeId::HybridEdMldsa65 => write!(f, "Ed25519+ML-DSA-65"),
+            SchemeId::TripleHybridEdEcdsaMldsa65 => write!(f, "Ed25519+ECDSA-P256+ML-DSA-65"),
         }
     }
 }
@@ -81,11 +87,20 @@ pub fn verify(
         SchemeId::Ed25519 => {
             super::classical::verify_ed25519(&public_key.bytes, message, &signature.bytes)
         }
+        SchemeId::EcdsaP256 => {
+            super::ecdsa::verify_ecdsa_p256(&public_key.bytes, message, &signature.bytes)
+        }
         #[cfg(feature = "pq")]
         SchemeId::HybridEdMldsa65 => {
             super::hybrid::verify_hybrid(&public_key.bytes, message, &signature.bytes)
         }
         #[cfg(not(feature = "pq"))]
         SchemeId::HybridEdMldsa65 => Err(CryptoError::PqNotAvailable),
+        #[cfg(feature = "pq")]
+        SchemeId::TripleHybridEdEcdsaMldsa65 => {
+            super::triple_hybrid::verify_triple_hybrid(&public_key.bytes, message, &signature.bytes)
+        }
+        #[cfg(not(feature = "pq"))]
+        SchemeId::TripleHybridEdEcdsaMldsa65 => Err(CryptoError::PqNotAvailable),
     }
 }

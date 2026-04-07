@@ -62,6 +62,10 @@ pub struct DomainConfig {
     /// `<data_dir>/admission.cbor`.
     #[serde(default)]
     pub admission_path: Option<PathBuf>,
+    /// Opt-in flag to enable the append-only cryptographic audit log.
+    /// If false (default), nodes discard historical operations once they are applied to the directory CRDTs.
+    #[serde(default = "default_false")]
+    pub audit_log_enabled: bool,
 }
 
 /// Network settings.
@@ -120,6 +124,10 @@ fn default_listen_addr() -> String {
 fn default_api_addr() -> String {
     "127.0.0.1:5551".to_string()
 }
+fn default_false() -> bool {
+    false
+}
+
 
 fn default_true() -> bool {
     true

@@ -64,6 +64,7 @@ async fn spawn_node(org: &str) -> (DdsNode, TempDir) {
             id: domain.id.to_string(),
             pubkey: dds_domain::domain::to_hex(&domain.pubkey),
             admission_path: None,
+            audit_log_enabled: false,
         },
         trusted_roots: Vec::new(),
         identity_path: None,
@@ -76,7 +77,7 @@ async fn spawn_node(org: &str) -> (DdsNode, TempDir) {
         .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
         .unwrap();
     node.topics
-        .subscribe_all(&mut node.swarm.behaviour_mut().gossipsub)
+        .subscribe_all(&mut node.swarm.behaviour_mut().gossipsub, false)
         .unwrap();
     (node, dir)
 }

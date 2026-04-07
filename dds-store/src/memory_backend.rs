@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use dds_core::audit::AuditLogEntry;
 use dds_core::crdt::causal_dag::Operation;
 use dds_core::token::{Token, TokenKind};
 
@@ -17,6 +18,7 @@ pub struct MemoryBackend {
     revoked: BTreeSet<String>,
     burned: BTreeSet<String>,
     operations: BTreeMap<String, Vec<u8>>,
+    audit_log: Vec<Vec<u8>>,
 }
 
 impl MemoryBackend {
@@ -26,6 +28,7 @@ impl MemoryBackend {
             revoked: BTreeSet::new(),
             burned: BTreeSet::new(),
             operations: BTreeMap::new(),
+            audit_log: Vec::new(),
         }
     }
 
@@ -168,4 +171,19 @@ impl OperationStore for MemoryBackend {
     }
 }
 
+impl AuditStore for MemoryBackend {
+    fn append_audit_entry(&mut self, entry: &AuditLogEntry) -> StoreResult<()> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(entry, &mut buf).map_err(|e| StoreError::Serde(e.to_string()))?;
+        self.audit_log.push(buf);
+        Ok(())
+    }
+
+    fn list_audit_entries(&self) -> StoreResult<Vec<AuditLogEntry>> {
+        self.audit_log
+            .iter()
+            .map(|bytes| ciborium::from_reader(bytes.as_slice()).map_err(|e| StoreError::Serde(e.to_string())))
+            .collect()
+    }
+}
 impl DirectoryStore for MemoryBackend {}

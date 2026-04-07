@@ -6,6 +6,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use dds_core::audit::AuditLogEntry;
 use dds_core::crdt::causal_dag::Operation;
 use dds_core::token::{Token, TokenKind};
 
@@ -97,5 +98,14 @@ pub trait OperationStore {
     fn missing_operations(&self, remote_ids: &BTreeSet<String>) -> StoreResult<Vec<String>>;
 }
 
+/// Audit log storage — stores append-only cryptographic audit log entries.
+pub trait AuditStore {
+    /// Append an audit log entry.
+    fn append_audit_entry(&mut self, entry: &AuditLogEntry) -> StoreResult<()>;
+
+    /// Retrieve all audit log entries, optionally sorted by timestamp.
+    fn list_audit_entries(&self) -> StoreResult<Vec<AuditLogEntry>>;
+}
+
 /// Combined directory store — convenience trait bundling all stores.
-pub trait DirectoryStore: TokenStore + RevocationStore + OperationStore {}
+pub trait DirectoryStore: TokenStore + RevocationStore + OperationStore + AuditStore {}

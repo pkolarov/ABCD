@@ -127,8 +127,10 @@ All documents implement `DomainDocument` trait: `embed()` / `extract()` from `To
 | Algorithm | Purpose | Crate | Key | Sig |
 |---|---|---|---|---|
 | Ed25519 | Classical signatures | ed25519-dalek 2.2 | 32 B | 64 B |
+| ECDSA-P256 | FIDO2 hardware compatibility | p256 0.13 | 64 B | 64 B |
 | ML-DSA-65 (FIPS 204) | Post-quantum signatures | pqcrypto-mldsa 0.1.2 | 1,952 B | 3,309 B |
 | Hybrid Ed25519+ML-DSA-65 | Composite quantum-safe | both | 1,984 B | 3,373 B |
+| Triple-Hybrid | Ed25519+ECDSA-P256+ML-DSA-65 | multiple | 2,048 B | 3,437 B |
 | SHA-256 | ID hashing | sha2 0.10 | — | 32 B |
 
 Feature-flagged: `pq` on by default. Hybrid signs with both; verification requires both to pass.
@@ -223,9 +225,9 @@ All 7 crates are functionally complete. The following work is ordered by impact 
 
 10. **SoftwareAssignment workflow** — Admin publishes a software assignment, devices poll/receive via gossip, local agent downloads package, verifies SHA-256, installs silently. Needs a local agent service on managed devices.
 
-11. **Audit log** — Append-only signed log of all trust graph mutations (attest, vouch, revoke, burn) for compliance. Each entry signed by the node that performed the action. Syncable via gossip.
+11. 🟢 **Audit log** — Append-only signed log of all trust graph mutations (attest, vouch, revoke, burn) for compliance. Each entry signed by the node that performed the action. Syncable via gossip. Opt-in feature enabled via `domain.toml` or `DomainConfig` during domain creation to minimize network overhead.
 
-12. **ECDSA-P256 support** — Some FIDO2 authenticators only support P-256. Add as a third `SchemeId` variant with hybrid option `Ed25519+ECDSA-P256+ML-DSA-65`.
+12. 🟢 **ECDSA-P256 support** — Some FIDO2 authenticators only support P-256. Added as a third `SchemeId` variant with triple-hybrid option `Ed25519+ECDSA-P256+ML-DSA-65`.
 
 ### Phase 4 — Scale
 

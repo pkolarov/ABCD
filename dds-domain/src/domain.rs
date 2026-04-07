@@ -42,7 +42,7 @@ pub fn to_hex(bytes: &[u8]) -> String {
 }
 
 pub fn from_hex(s: &str) -> Result<Vec<u8>, DomainError> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(DomainError::Parse("hex length must be even".into()));
     }
     let mut out = Vec::with_capacity(s.len() / 2);
@@ -273,10 +273,10 @@ impl AdmissionCert {
         if self.body.peer_id != expected_peer_id {
             return Err(DomainError::Mismatch("peer_id mismatch".into()));
         }
-        if let Some(exp) = self.body.expires_at {
-            if now > exp {
-                return Err(DomainError::Expired);
-            }
+        if let Some(exp) = self.body.expires_at
+            && now > exp
+        {
+            return Err(DomainError::Expired);
         }
         if self.signature.len() != 64 {
             return Err(DomainError::Signature(format!(
