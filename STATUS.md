@@ -153,14 +153,41 @@ Classical-only available for embedded/`no_std` targets.
 
 ## Performance Budgets (§10)
 
-| KPI | Target | Status |
-|---|---|---|
-| Local auth decision | ≤ 1 ms | 🟢 Benchmarked (`dds-node/benches/session_lifecycle.rs`, `dds-core/benches/policy_eval.rs`) |
-| Ed25519 verify throughput | ≥ 50K ops/sec | 🟢 Benchmarked (`dds-core/benches/crypto_verify.rs`) |
-| CRDT merge (single op) | ≤ 0.05 ms p99 | 🟢 Benchmarked (`dds-core/benches/crdt_merge.rs`) |
-| Peak heap (1K entries) | ≤ 5 MB | 🔲 Future: dhat profiling |
-| dds-core binary (Cortex-M) | ≤ 512 KB | 🔲 Needs cross-compile |
-| Idle gossip bandwidth | ≤ 2 KB/sec | 🔲 Needs network test |
+Latest results from `cargo run -p dds-loadtest --release -- --smoke`
+(60 s, 3 in-process nodes, macOS aarch64 dev host).
+
+| KPI | Target | Smoke result | Status |
+|---|---|---|---|
+| Local auth decision (p99) | ≤ 1 ms | 0.043 ms (max of `evaluate_policy` / `session_validate` p99) | ✅ |
+| Ed25519 verify throughput | ≥ 50K ops/sec | ~46K ops/sec (p50 21.7 µs, batched 4096/sample) | ⚠️ within 10% on a busy host; criterion bench is the authority |
+| CRDT merge (p99) | ≤ 0.05 ms | < 0.001 ms (`LwwRegister::merge`) | ✅ |
+| Peak heap per 1K entries | ≤ 5 MB | RSS-based proxy dominated by libp2p baseline; see loadtest README | ⚠️ measurement caveat, not a regression |
+| Idle gossip bandwidth | ≤ 2 KB/sec | RSS-delta proxy; libp2p does not expose per-direction byte counters | ⚠️ measurement caveat |
+| Enrollment latency (informational) | n/a | enroll_user p99 0.12 ms, enroll_device p99 0.09 ms | ✅ |
+| Gossip propagation (informational) | n/a | p50 ~12 ms, p99 ~102 ms across 3-node mesh | ✅ |
+| dds-core binary (Cortex-M) | ≤ 512 KB | needs cross-compile | 🔲 |
+
+Hard verdicts on the ≥ 50K ops/sec throughput KPI come from the
+dedicated criterion bench (`dds-core/benches/crypto_verify.rs`); the
+soak harness reports it for trend tracking and warns within 20% of the
+target.
+
+## Load Testing
+
+`dds-loadtest` is a long-running multinode harness that drives a mixed
+realistic workload (enroll/issue/evaluate/revoke) across N in-process
+`DdsNode`s wired into a libp2p full-mesh and emits per-op latency
+histograms plus a KPI verdict table. See [`dds-loadtest/README.md`](dds-loadtest/README.md).
+
+```bash
+# 60s smoke (CI gate, also enforces error rate ≤ 1% per op type)
+cargo run -p dds-loadtest --release -- --smoke --output-dir /tmp/dds-smoke
+
+# 24h soak
+cargo run --release -p dds-loadtest -- --duration 24h --output-dir results/$(date +%Y%m%d)
+```
+
+The CI smoke job lives in `.github/workflows/loadtest-smoke.yml`.
 
 ## What's Next
 

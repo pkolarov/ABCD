@@ -8,6 +8,7 @@ members = [
     "dds-node",
     "dds-ffi",
     "dds-cli",
+    "dds-loadtest",
 ]
 
 [workspace.package]

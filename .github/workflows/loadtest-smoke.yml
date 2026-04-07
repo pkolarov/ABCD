@@ -1,0 +1,30 @@
+name: loadtest-smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: dds-loadtest --smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run 60s smoke
+        run: |
+          cargo run --release -p dds-loadtest -- \
+              --smoke \
+              --output-dir loadtest-results
+      - name: Upload summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dds-loadtest-smoke
+          path: loadtest-results/
