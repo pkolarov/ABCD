@@ -17,6 +17,10 @@ pub struct NodeConfig {
     /// Organization root hash this node serves.
     pub org_hash: String,
 
+    /// Domain this node belongs to. Required — a node without a domain
+    /// has no place on the network and cannot be admitted to one.
+    pub domain: DomainConfig,
+
     /// Trusted root identity URNs.
     #[serde(default)]
     pub trusted_roots: Vec<String>,
@@ -36,6 +40,28 @@ pub struct NodeConfig {
 
 fn default_expiry_scan_interval() -> u64 {
     60
+}
+
+/// Domain identity for this node. The `name` is a display label; the `id`
+/// (a `dds-dom:` URN) is the cryptographic source of truth, and `pubkey` is
+/// the Ed25519 verifying key whose hash equals `id`.
+///
+/// At startup the node loads the admission certificate from
+/// `admission_path` (default `<data_dir>/admission.cbor`) and verifies that
+/// it was signed by `pubkey` and applies to this node's libp2p `PeerId`.
+/// If verification fails the node refuses to start.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainConfig {
+    /// Human-readable domain name (e.g. "acme.com"). Display only.
+    pub name: String,
+    /// `dds-dom:<base32>` form of the domain id.
+    pub id: String,
+    /// Hex-encoded 32-byte Ed25519 public key for the domain.
+    pub pubkey: String,
+    /// Path to the admission certificate. Defaults to
+    /// `<data_dir>/admission.cbor`.
+    #[serde(default)]
+    pub admission_path: Option<PathBuf>,
 }
 
 /// Network settings.
@@ -131,6 +157,19 @@ impl NodeConfig {
             .clone()
             .unwrap_or_else(|| self.data_dir.join("node_key.bin"))
     }
+
+    /// Path to the persistent libp2p keypair file.
+    pub fn p2p_key_path(&self) -> PathBuf {
+        self.data_dir.join("p2p_key.bin")
+    }
+
+    /// Path to the admission certificate file.
+    pub fn admission_path(&self) -> PathBuf {
+        self.domain
+            .admission_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("admission.cbor"))
+    }
 }
 
 /// Configuration errors.
@@ -155,26 +194,36 @@ impl std::error::Error for ConfigError {}
 mod tests {
     use super::*;
 
+    const DOMAIN_TOML: &str = r#"
+[domain]
+name = "test.local"
+id = "dds-dom:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
+"#;
+
     #[test]
     fn test_parse_minimal_config() {
-        let config = NodeConfig::from_str(
-            r#"
-            org_hash = "abc123"
-        "#,
-        )
-        .unwrap();
+        let toml = format!(r#"org_hash = "abc123"{DOMAIN_TOML}"#);
+        let config = NodeConfig::from_str(&toml).unwrap();
         assert_eq!(config.org_hash, "abc123");
         assert!(config.network.mdns_enabled);
+        assert_eq!(config.domain.name, "test.local");
+    }
+
+    #[test]
+    fn test_missing_domain_section_fails() {
+        let result = NodeConfig::from_str(r#"org_hash = "abc123""#);
+        assert!(result.is_err(), "config without [domain] must fail");
     }
 
     #[test]
     fn test_parse_full_config() {
-        let config = NodeConfig::from_str(
+        let toml = format!(
             r#"
             org_hash = "abc123"
             data_dir = "/tmp/dds-test"
             trusted_roots = ["urn:vouchsafe:root.hash1"]
-
+            {DOMAIN_TOML}
             [network]
             listen_addr = "/ip4/10.0.1.1/tcp/9000"
             bootstrap_peers = ["/ip4/10.0.1.2/tcp/4001/p2p/12D3KooWTest"]
@@ -182,9 +231,9 @@ mod tests {
             heartbeat_secs = 10
             idle_timeout_secs = 120
             api_addr = "127.0.0.1:6661"
-        "#,
-        )
-        .unwrap();
+        "#
+        );
+        let config = NodeConfig::from_str(&toml).unwrap();
         assert_eq!(config.data_dir, PathBuf::from("/tmp/dds-test"));
         assert_eq!(config.trusted_roots.len(), 1);
         assert_eq!(config.network.listen_addr, "/ip4/10.0.1.1/tcp/9000");
@@ -194,14 +243,19 @@ mod tests {
 
     #[test]
     fn test_db_path() {
-        let config = NodeConfig::from_str(
+        let toml = format!(
             r#"
             org_hash = "test"
             data_dir = "/data/dds"
-        "#,
-        )
-        .unwrap();
+            {DOMAIN_TOML}
+        "#
+        );
+        let config = NodeConfig::from_str(&toml).unwrap();
         assert_eq!(config.db_path(), PathBuf::from("/data/dds/directory.redb"));
+        assert_eq!(
+            config.admission_path(),
+            PathBuf::from("/data/dds/admission.cbor")
+        );
     }
 
     #[test]

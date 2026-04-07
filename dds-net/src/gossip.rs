@@ -1,40 +1,46 @@
 //! Gossipsub topic management for directory operation propagation.
 //!
 //! Topics follow the structure:
-//! - `/dds/v1/org/<org-hash>/ops` — All operations for an org
-//! - `/dds/v1/org/<org-hash>/revocations` — Dedicated revocation channel
-//! - `/dds/v1/org/<org-hash>/burns` — Identity burns (highest priority)
+//! - `/dds/v1/dom/<dom-tag>/org/<org-hash>/ops` — All operations for an org
+//! - `/dds/v1/dom/<dom-tag>/org/<org-hash>/revocations` — Revocations
+//! - `/dds/v1/dom/<dom-tag>/org/<org-hash>/burns` — Identity burns
+//!
+//! The `dom-tag` is the bare base32 encoding of the `DomainId` and provides
+//! a second layer of cross-domain isolation on top of the libp2p protocol
+//! string namespacing in [`crate::transport`].
 
 use libp2p::gossipsub;
 use serde::{Deserialize, Serialize};
 
-/// DDS gossipsub topic types.
+/// DDS gossipsub topic types. Each variant carries `(domain_tag, org_hash)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DdsTopic {
-    /// General directory operations for an org.
-    Operations(String),
+    /// General directory operations for an (domain, org) pair.
+    Operations(String, String),
     /// Revocation-only channel (high priority).
-    Revocations(String),
+    Revocations(String, String),
     /// Burn-only channel (highest priority).
-    Burns(String),
+    Burns(String, String),
 }
 
 impl DdsTopic {
-    /// Create topics for a given org root hash.
-    pub fn for_org(org_hash: &str) -> DdsTopicSet {
+    /// Create the topic set for a given domain tag and org root hash.
+    pub fn for_domain_org(domain_tag: &str, org_hash: &str) -> DdsTopicSet {
+        let d = domain_tag.to_string();
+        let o = org_hash.to_string();
         DdsTopicSet {
-            operations: DdsTopic::Operations(org_hash.to_string()),
-            revocations: DdsTopic::Revocations(org_hash.to_string()),
-            burns: DdsTopic::Burns(org_hash.to_string()),
+            operations: DdsTopic::Operations(d.clone(), o.clone()),
+            revocations: DdsTopic::Revocations(d.clone(), o.clone()),
+            burns: DdsTopic::Burns(d, o),
         }
     }
 
     /// Get the gossipsub topic string.
     pub fn topic_string(&self) -> String {
         match self {
-            DdsTopic::Operations(org) => format!("/dds/v1/org/{org}/ops"),
-            DdsTopic::Revocations(org) => format!("/dds/v1/org/{org}/revocations"),
-            DdsTopic::Burns(org) => format!("/dds/v1/org/{org}/burns"),
+            DdsTopic::Operations(d, o) => format!("/dds/v1/dom/{d}/org/{o}/ops"),
+            DdsTopic::Revocations(d, o) => format!("/dds/v1/dom/{d}/org/{o}/revocations"),
+            DdsTopic::Burns(d, o) => format!("/dds/v1/dom/{d}/org/{o}/burns"),
         }
     }
 
@@ -127,40 +133,54 @@ impl GossipMessage {
 mod tests {
     use super::*;
 
+    const TEST_DOMAIN: &str = "domtag";
     const TEST_ORG: &str = "abc123hash";
 
     #[test]
     fn test_topic_strings() {
-        let topics = DdsTopic::for_org(TEST_ORG);
+        let topics = DdsTopic::for_domain_org(TEST_DOMAIN, TEST_ORG);
         assert_eq!(
             topics.operations.topic_string(),
-            "/dds/v1/org/abc123hash/ops"
+            "/dds/v1/dom/domtag/org/abc123hash/ops"
         );
         assert_eq!(
             topics.revocations.topic_string(),
-            "/dds/v1/org/abc123hash/revocations"
+            "/dds/v1/dom/domtag/org/abc123hash/revocations"
         );
-        assert_eq!(topics.burns.topic_string(), "/dds/v1/org/abc123hash/burns");
+        assert_eq!(
+            topics.burns.topic_string(),
+            "/dds/v1/dom/domtag/org/abc123hash/burns"
+        );
+    }
+
+    #[test]
+    fn test_topics_isolated_per_domain() {
+        let a = DdsTopic::for_domain_org("acme", TEST_ORG);
+        let b = DdsTopic::for_domain_org("globex", TEST_ORG);
+        assert_ne!(
+            a.operations.to_ident_topic().hash(),
+            b.operations.to_ident_topic().hash()
+        );
     }
 
     #[test]
     fn test_identify_topic() {
-        let topics = DdsTopic::for_org(TEST_ORG);
+        let topics = DdsTopic::for_domain_org(TEST_DOMAIN, TEST_ORG);
         let ops_hash = topics.operations.to_ident_topic().hash();
         let rev_hash = topics.revocations.to_ident_topic().hash();
         let burn_hash = topics.burns.to_ident_topic().hash();
 
         assert!(matches!(
             topics.identify_topic(&ops_hash),
-            Some(DdsTopic::Operations(_))
+            Some(DdsTopic::Operations(..))
         ));
         assert!(matches!(
             topics.identify_topic(&rev_hash),
-            Some(DdsTopic::Revocations(_))
+            Some(DdsTopic::Revocations(..))
         ));
         assert!(matches!(
             topics.identify_topic(&burn_hash),
-            Some(DdsTopic::Burns(_))
+            Some(DdsTopic::Burns(..))
         ));
 
         let unknown = gossipsub::IdentTopic::new("unknown").hash();
@@ -169,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_topic_hashes_count() {
-        let topics = DdsTopic::for_org(TEST_ORG);
+        let topics = DdsTopic::for_domain_org(TEST_DOMAIN, TEST_ORG);
         assert_eq!(topics.topic_hashes().len(), 3);
     }
 

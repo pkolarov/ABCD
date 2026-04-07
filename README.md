@@ -131,7 +131,61 @@ dds_free_string(out);
 | mDNS | UDP multicast | Local network zero-config discovery |
 | DDS Sync | libp2p streams | Delta-sync for state convergence |
 
-Topics: `/dds/v1/org/<org-hash>/{ops,revocations,burns}`
+Protocol strings and topics are namespaced per **domain** (see below):
+- `/dds/kad/1.0.0/<domain-tag>` — Kademlia
+- `/dds/id/1.0.0/<domain-tag>` — Identify
+- `/dds/v1/dom/<domain-tag>/org/<org-hash>/{ops,revocations,burns}` — gossipsub topics
+
+Nodes from different DDS domains cannot complete a libp2p handshake at all.
+
+### Domains (`dds-domain`)
+
+A **domain** is a cryptographic realm that DDS nodes belong to (e.g.
+`acme.com`). Two mechanisms keep domains separate and admission-controlled:
+
+1. **Protocol isolation** — the domain id is baked into the libp2p protocol
+   strings (above), so nodes from `acme.com` and `globex.com` running on the
+   same network never form a connection.
+2. **Admission certificates** — within a domain, only nodes holding an
+   `AdmissionCert` signed by the **domain key** are valid. The cert binds
+   a libp2p `PeerId` to a `DomainId` and is verified at node startup.
+
+The domain key is an Ed25519 keypair created on the first node ("genesis")
+and used to sign admission certs for sibling nodes. **Stage 1** (current)
+holds the secret in software, encrypted at rest with `DDS_DOMAIN_PASSPHRASE`
+(Argon2id + ChaCha20-Poly1305). **Stage 2** will move the secret onto a
+FIDO2 authenticator via the `DomainSigner` trait, with no other code changes
+required.
+
+#### Bootstrapping a domain
+
+```bash
+# 1. Genesis ceremony — admin creates the domain on their machine.
+DDS_DOMAIN_PASSPHRASE=… dds-node init-domain --name acme.com --dir ./acme
+# Writes acme/domain.toml (public, share with siblings)
+# Writes acme/domain_key.bin (secret, keep safe)
+
+# 2. On a sibling node machine — generate its libp2p identity, print PeerId.
+dds-node gen-node-key --data-dir ~/.dds
+# → peer_id: 12D3KooW…
+
+# 3. Admin signs an admission cert for that PeerId.
+DDS_DOMAIN_PASSPHRASE=… dds-node admit \
+    --domain-key ./acme/domain_key.bin \
+    --domain     ./acme/domain.toml \
+    --peer-id    12D3KooW… \
+    --out        admission.cbor \
+    --ttl-days   365
+
+# 4. Ship admission.cbor to the sibling, place at ~/.dds/admission.cbor,
+#    write a dds.toml that references the public domain info, then run.
+dds-node run dds.toml
+```
+
+A node refuses to start without a valid admission certificate matching its
+own peer id and the configured domain pubkey.
+
+Topics: `/dds/v1/dom/<domain-tag>/org/<org-hash>/{ops,revocations,burns}`
 
 ### Local Authority Service (`dds-node`)
 

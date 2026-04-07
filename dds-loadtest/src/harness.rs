@@ -641,7 +641,7 @@ fn ingest_gossip(
     };
     match (topic, msg) {
         (
-            DdsTopic::Operations(_),
+            DdsTopic::Operations(..),
             GossipMessage::DirectoryOp {
                 op_bytes,
                 token_bytes,
@@ -668,7 +668,7 @@ fn ingest_gossip(
                 }
             }
         }
-        (DdsTopic::Revocations(_), GossipMessage::Revocation { token_bytes }) => {
+        (DdsTopic::Revocations(..), GossipMessage::Revocation { token_bytes }) => {
             let token = match Token::from_cbor(&token_bytes) {
                 Ok(t) => t,
                 Err(_) => return,
@@ -706,8 +706,21 @@ async fn pump_many(nodes: &mut [DdsNode], dur: Duration, metrics: &Metrics, prob
 
 async fn spawn_node(org: &str) -> Result<(DdsNode, TempDir), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().to_path_buf();
+
+    let dkey = dds_domain::DomainKey::from_secret_bytes("loadtest.local", [7u8; 32]);
+    let domain = dkey.domain();
+
+    let p2p_keypair = libp2p::identity::Keypair::generate_ed25519();
+    let peer_id = libp2p::PeerId::from(p2p_keypair.public());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let cert = dkey.issue_admission(peer_id.to_string(), now, None);
+    dds_node::domain_store::save_admission_cert(&data_dir.join("admission.cbor"), &cert)?;
+
     let cfg = NodeConfig {
-        data_dir: dir.path().to_path_buf(),
+        data_dir,
         network: NetworkConfig {
             listen_addr: "/ip4/127.0.0.1/tcp/0".to_string(),
             bootstrap_peers: Vec::new(),
@@ -717,11 +730,17 @@ async fn spawn_node(org: &str) -> Result<(DdsNode, TempDir), Box<dyn std::error:
             api_addr: "127.0.0.1:0".to_string(),
         },
         org_hash: org.to_string(),
+        domain: dds_node::config::DomainConfig {
+            name: domain.name.clone(),
+            id: domain.id.to_string(),
+            pubkey: dds_domain::domain::to_hex(&domain.pubkey),
+            admission_path: None,
+        },
         trusted_roots: Vec::new(),
         identity_path: None,
         expiry_scan_interval_secs: 60,
     };
-    let mut node = DdsNode::init(cfg)?;
+    let mut node = DdsNode::init(cfg, p2p_keypair)?;
     node.swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
     node.topics
         .subscribe_all(&mut node.swarm.behaviour_mut().gossipsub)?;

@@ -836,10 +836,12 @@ dependencies = [
 name = "dds-domain"
 version = "0.1.0"
 dependencies = [
+ "base32",
  "ciborium",
  "dds-core",
  "ed25519-dalek",
  "rand 0.8.5",
+ "rand_core 0.6.4",
  "serde",
  "serde_bytes",
  "sha2",

@@ -16,6 +16,8 @@ ciborium = { workspace = true }
 serde_bytes = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["std"] }
 sha2 = { workspace = true, features = ["std"] }
+base32 = { workspace = true }
+rand_core = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

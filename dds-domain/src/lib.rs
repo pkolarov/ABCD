@@ -14,9 +14,11 @@
 //! | `ServicePrincipalDocument` | `dds:service-principal` | Machine/service identity |
 //! | `SessionDocument` | `dds:session` | Short-lived auth session |
 
+pub mod domain;
 pub mod fido2;
 pub mod types;
 
+pub use domain::{AdmissionBody, AdmissionCert, Domain, DomainId, DomainKey, DomainSigner};
 pub use types::*;
 
 use dds_core::token::TokenPayload;

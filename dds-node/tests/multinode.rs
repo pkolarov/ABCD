@@ -32,8 +32,24 @@ use tokio::time::{Instant, sleep, timeout};
 /// the listen address picked once it's listening.
 async fn spawn_node(org: &str) -> (DdsNode, TempDir) {
     let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().to_path_buf();
+
+    // Shared test domain — all multinode-test nodes belong to it.
+    let dkey = dds_domain::DomainKey::from_secret_bytes("test.local", [42u8; 32]);
+    let domain = dkey.domain();
+
+    // Generate the libp2p keypair, derive peer id, write an admission cert.
+    let p2p_keypair = libp2p::identity::Keypair::generate_ed25519();
+    let peer_id = libp2p::PeerId::from(p2p_keypair.public());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let cert = dkey.issue_admission(peer_id.to_string(), now, None);
+    dds_node::domain_store::save_admission_cert(&data_dir.join("admission.cbor"), &cert).unwrap();
+
     let cfg = NodeConfig {
-        data_dir: dir.path().to_path_buf(),
+        data_dir,
         network: NetworkConfig {
             listen_addr: "/ip4/127.0.0.1/tcp/0".to_string(),
             bootstrap_peers: Vec::new(),
@@ -43,11 +59,17 @@ async fn spawn_node(org: &str) -> (DdsNode, TempDir) {
             api_addr: "127.0.0.1:0".to_string(),
         },
         org_hash: org.to_string(),
+        domain: dds_node::config::DomainConfig {
+            name: domain.name.clone(),
+            id: domain.id.to_string(),
+            pubkey: dds_domain::domain::to_hex(&domain.pubkey),
+            admission_path: None,
+        },
         trusted_roots: Vec::new(),
         identity_path: None,
         expiry_scan_interval_secs: 60,
     };
-    let mut node = DdsNode::init(cfg).expect("init node");
+    let mut node = DdsNode::init(cfg, p2p_keypair).expect("init node");
     // Listen + subscribe to topics. We bypass `start()` to avoid
     // bootstrap-peer parsing on an empty list.
     node.swarm
@@ -124,7 +146,7 @@ fn ingest_gossip(node: &mut DdsNode, topic_hash: &libp2p::gossipsub::TopicHash, 
     };
     match (topic, msg) {
         (
-            DdsTopic::Operations(_),
+            DdsTopic::Operations(..),
             GossipMessage::DirectoryOp {
                 op_bytes,
                 token_bytes,
@@ -142,7 +164,7 @@ fn ingest_gossip(node: &mut DdsNode, topic_hash: &libp2p::gossipsub::TopicHash, 
                 }
             }
         }
-        (DdsTopic::Revocations(_), GossipMessage::Revocation { token_bytes }) => {
+        (DdsTopic::Revocations(..), GossipMessage::Revocation { token_bytes }) => {
             if let Ok(token) = Token::from_cbor(&token_bytes) {
                 if token.validate().is_ok() {
                     let _ = node.trust_graph.add_token(token.clone());

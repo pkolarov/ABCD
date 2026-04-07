@@ -35,29 +35,47 @@ pub struct DdsBehaviour {
 pub struct SwarmConfig {
     /// Gossipsub heartbeat interval.
     pub heartbeat_interval: Duration,
-    /// Kademlia protocol name.
-    pub kad_protocol: String,
+    /// Domain protocol tag — bare base32 of the `DomainId`. Used to namespace
+    /// libp2p protocol strings so nodes from different DDS domains cannot
+    /// complete a handshake. Pass an empty string only in tests that bypass
+    /// the domain layer.
+    pub domain_tag: String,
     /// Idle connection timeout.
     pub idle_timeout: Duration,
+}
+
+impl SwarmConfig {
+    /// Kademlia protocol name for this domain.
+    pub fn kad_protocol(&self) -> String {
+        format!("/dds/kad/1.0.0/{}", self.domain_tag)
+    }
+    /// Identify protocol name for this domain.
+    pub fn identify_protocol(&self) -> String {
+        format!("/dds/id/1.0.0/{}", self.domain_tag)
+    }
 }
 
 impl Default for SwarmConfig {
     fn default() -> Self {
         Self {
             heartbeat_interval: Duration::from_secs(5),
-            kad_protocol: "/dds/kad/1.0.0".to_string(),
+            domain_tag: "default".to_string(),
             idle_timeout: Duration::from_secs(60),
         }
     }
 }
 
-/// Build a DDS swarm with the given configuration.
+/// Build a DDS swarm with the given configuration and a pre-existing
+/// libp2p identity (so the `PeerId` is stable across restarts).
 ///
 /// Returns the `Swarm` and the local `PeerId`.
 pub fn build_swarm(
     config: SwarmConfig,
+    keypair: libp2p::identity::Keypair,
 ) -> Result<(Swarm<DdsBehaviour>, PeerId), Box<dyn std::error::Error>> {
-    let swarm = libp2p::SwarmBuilder::with_new_identity()
+    let kad_protocol = config.kad_protocol();
+    let identify_protocol = config.identify_protocol();
+    let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -89,7 +107,7 @@ pub fn build_swarm(
 
             // Kademlia DHT
             let mut kad_config = kad::Config::new(
-                libp2p::StreamProtocol::try_from_owned(config.kad_protocol.clone())
+                libp2p::StreamProtocol::try_from_owned(kad_protocol.clone())
                     .map_err(|e| std::io::Error::other(format!("invalid protocol: {e}")))?,
             );
             kad_config.set_query_timeout(Duration::from_secs(30));
@@ -101,7 +119,7 @@ pub fn build_swarm(
 
             // Identify
             let identify = identify::Behaviour::new(identify::Config::new(
-                "/dds/id/1.0.0".to_string(),
+                identify_protocol.clone(),
                 key.public(),
             ));
 
@@ -121,7 +139,54 @@ pub fn build_swarm(
     Ok((swarm, peer_id))
 }
 
-/// Build a DDS swarm with default configuration.
+/// Build a DDS swarm with default configuration and a fresh ephemeral
+/// libp2p identity. Convenience for tests only — production code should
+/// build the swarm with a persistent keypair so the `PeerId` is stable.
 pub fn build_default_swarm() -> Result<(Swarm<DdsBehaviour>, PeerId), Box<dyn std::error::Error>> {
-    build_swarm(SwarmConfig::default())
+    build_swarm(SwarmConfig::default(), libp2p::identity::Keypair::generate_ed25519())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_strings_include_domain_tag() {
+        let cfg = SwarmConfig {
+            heartbeat_interval: Duration::from_secs(1),
+            domain_tag: "abc123".into(),
+            idle_timeout: Duration::from_secs(10),
+        };
+        assert_eq!(cfg.kad_protocol(), "/dds/kad/1.0.0/abc123");
+        assert_eq!(cfg.identify_protocol(), "/dds/id/1.0.0/abc123");
+    }
+
+    #[test]
+    fn different_domain_tags_yield_distinct_protocols() {
+        let a = SwarmConfig {
+            heartbeat_interval: Duration::from_secs(1),
+            domain_tag: "acme".into(),
+            idle_timeout: Duration::from_secs(10),
+        };
+        let b = SwarmConfig {
+            heartbeat_interval: Duration::from_secs(1),
+            domain_tag: "globex".into(),
+            idle_timeout: Duration::from_secs(10),
+        };
+        assert_ne!(a.kad_protocol(), b.kad_protocol());
+        assert_ne!(a.identify_protocol(), b.identify_protocol());
+    }
+
+    #[test]
+    fn build_swarm_with_explicit_keypair_is_stable() {
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let expected_peer = libp2p::PeerId::from(kp.public());
+        let cfg = SwarmConfig {
+            heartbeat_interval: Duration::from_secs(1),
+            domain_tag: "test".into(),
+            idle_timeout: Duration::from_secs(10),
+        };
+        let (_swarm, peer_id) = build_swarm(cfg, kp).unwrap();
+        assert_eq!(peer_id, expected_peer);
+    }
 }

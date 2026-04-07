@@ -14,6 +14,8 @@ use futures::StreamExt;
 use libp2p::{Multiaddr, PeerId, Swarm};
 use tracing::{error, info, warn};
 
+use dds_domain::{DomainId, domain::from_hex};
+
 use crate::config::NodeConfig;
 
 /// The running DDS node state.
@@ -29,29 +31,68 @@ pub struct DdsNode {
 }
 
 impl DdsNode {
-    /// Initialize a new node from config.
-    pub fn init(config: NodeConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Initialize a new node from config and a pre-existing libp2p
+    /// keypair. The keypair must be persistent across restarts so that the
+    /// node's `PeerId` is stable — it is bound by the admission cert.
+    pub fn init(
+        config: NodeConfig,
+        keypair: libp2p::identity::Keypair,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // Ensure data directory exists
         std::fs::create_dir_all(&config.data_dir)?;
+
+        // Parse domain id and pubkey from config (fail fast on bad config).
+        let domain_id = DomainId::parse(&config.domain.id)?;
+        let pubkey_bytes = from_hex(&config.domain.pubkey)?;
+        if pubkey_bytes.len() != 32 {
+            return Err(format!(
+                "domain.pubkey: expected 32 bytes, got {}",
+                pubkey_bytes.len()
+            )
+            .into());
+        }
+        let mut domain_pubkey = [0u8; 32];
+        domain_pubkey.copy_from_slice(&pubkey_bytes);
+        // Sanity: pubkey must hash to the configured id.
+        if DomainId::from_pubkey(&domain_pubkey) != domain_id {
+            return Err("domain.pubkey does not hash to domain.id".into());
+        }
 
         // Open storage
         let store = RedbBackend::open(config.db_path())?;
 
-        // Build swarm
+        // Build swarm with the persistent libp2p identity.
         let swarm_config = SwarmConfig {
             heartbeat_interval: Duration::from_secs(config.network.heartbeat_secs),
-            kad_protocol: "/dds/kad/1.0.0".to_string(),
+            domain_tag: domain_id.protocol_tag(),
             idle_timeout: Duration::from_secs(config.network.idle_timeout_secs),
         };
-        let (swarm, peer_id) = dds_net::transport::build_swarm(swarm_config)?;
+        let (swarm, peer_id) = dds_net::transport::build_swarm(swarm_config, keypair)?;
+
+        // Verify the admission certificate before doing anything else.
+        let admission_path = config.admission_path();
+        let cert = crate::domain_store::load_admission_cert(&admission_path).map_err(|e| {
+            format!(
+                "failed to load admission cert from {}: {e} — \
+                 a node cannot join a domain without an admission cert signed by the domain key",
+                admission_path.display()
+            )
+        })?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        cert.verify(&domain_pubkey, &domain_id, &peer_id.to_string(), now)
+            .map_err(|e| format!("admission cert verification failed: {e}"))?;
+        info!(domain = %config.domain.name, %peer_id, "admission cert verified");
 
         // Build trusted roots set
         let trusted_roots: BTreeSet<String> = config.trusted_roots.iter().cloned().collect();
 
-        // Create topics for the org
-        let topics = DdsTopic::for_org(&config.org_hash);
+        // Create topics for the (domain, org) pair.
+        let topics = DdsTopic::for_domain_org(&domain_id.protocol_tag(), &config.org_hash);
 
-        info!(%peer_id, org = %config.org_hash, "DDS node initialized");
+        info!(%peer_id, domain = %config.domain.name, org = %config.org_hash, "DDS node initialized");
 
         Ok(Self {
             swarm,
@@ -167,7 +208,7 @@ impl DdsNode {
 
         match (topic, msg) {
             (
-                DdsTopic::Operations(_),
+                DdsTopic::Operations(..),
                 GossipMessage::DirectoryOp {
                     op_bytes,
                     token_bytes,
@@ -175,10 +216,10 @@ impl DdsNode {
             ) => {
                 self.ingest_operation(&op_bytes, &token_bytes);
             }
-            (DdsTopic::Revocations(_), GossipMessage::Revocation { token_bytes }) => {
+            (DdsTopic::Revocations(..), GossipMessage::Revocation { token_bytes }) => {
                 self.ingest_revocation(&token_bytes);
             }
-            (DdsTopic::Burns(_), GossipMessage::Burn { token_bytes }) => {
+            (DdsTopic::Burns(..), GossipMessage::Burn { token_bytes }) => {
                 self.ingest_burn(&token_bytes);
             }
             _ => {
