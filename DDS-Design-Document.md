@@ -194,15 +194,33 @@ DDS uses **libp2p** as the networking substrate:
 - **mDNS** — Local network peer discovery for zero-config LAN operation
 - **Noise protocol** — Transport encryption for all peer connections
 
-### 6.2 Topic Structure
+### 6.2 Domain Isolation & Topic Structure
 
-Directory operations are published to Gossipsub topics organized by scope:
+DDS nodes belong to a **domain** — a cryptographic realm identified by
+`DomainId = sha256(domain_pubkey)`, displayed as `dds-dom:<base32>`. Nodes
+from different domains cannot peer at all: the domain tag is baked into
+the libp2p protocol strings, so handshakes between mismatched domains fail
+during protocol negotiation.
 
 ```
-/dds/v1/org/<org-root-hash>/ops          — All operations for an org
-/dds/v1/org/<org-root-hash>/ou/<ou-name>  — Scoped to an OU
-/dds/v1/org/<org-root-hash>/revocations   — Dedicated revocation channel
-/dds/v1/org/<org-root-hash>/burns         — Identity burns (high priority)
+/dds/kad/1.0.0/<domain-tag>               — Kademlia
+/dds/id/1.0.0/<domain-tag>                — Identify
+```
+
+Within a domain, only nodes holding an **admission certificate** signed by
+the domain key may join. The cert binds the node's libp2p `PeerId` to the
+`DomainId` and is verified at startup. The domain key is created on the
+first node ("genesis"); in Stage 1 it is held in software (encrypted at
+rest with `DDS_DOMAIN_PASSPHRASE`), and in Stage 2 it will move onto a
+FIDO2 authenticator via the `DomainSigner` trait.
+
+Directory operations are published to Gossipsub topics organized by
+(domain, org) scope:
+
+```
+/dds/v1/dom/<domain-tag>/org/<org-root-hash>/ops          — All operations for an org
+/dds/v1/dom/<domain-tag>/org/<org-root-hash>/revocations  — Dedicated revocation channel
+/dds/v1/dom/<domain-tag>/org/<org-root-hash>/burns        — Identity burns (high priority)
 ```
 
 - Revocations and burns are propagated on **separate high-priority topics** to ensure rapid dissemination
