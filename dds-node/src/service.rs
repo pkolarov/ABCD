@@ -7,6 +7,7 @@
 //! - **Policy resolution**: evaluate access decisions against the trust graph
 //! - **Status reporting**: health, sync state, peer count, trust stats
 
+use base64::Engine;
 use dds_core::identity::Identity;
 use dds_core::policy::{PolicyEngine, PolicyRule};
 use dds_core::token::{Token, TokenKind, TokenPayload};
@@ -96,7 +97,7 @@ pub struct LocalService<S: TokenStore + dds_store::traits::RevocationStore> {
     /// Policy engine with loaded rules.
     policy_engine: PolicyEngine,
     /// Trust graph reference.
-    trust_graph: TrustGraph,
+    pub trust_graph: TrustGraph,
     /// Trusted root URNs.
     trusted_roots: BTreeSet<String>,
     /// Storage backend.
@@ -143,13 +144,24 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
         &mut self,
         req: EnrollUserRequest,
     ) -> Result<EnrollmentResult, ServiceError> {
+        let mut credential_id = req.credential_id.clone();
         if self.verify_fido2 {
-            dds_domain::fido2::verify_attestation(&req.attestation_object, &req.client_data_hash)
+            let parsed = dds_domain::fido2::verify_attestation(&req.attestation_object, &req.client_data_hash)
                 .map_err(|e| ServiceError::Fido2(e.to_string()))?;
+
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(req.rp_id.as_bytes());
+            let computed_rp_hash = hasher.finalize();
+            if computed_rp_hash.as_slice() != parsed.rp_id_hash {
+                return Err(ServiceError::Fido2("rp_id hash mismatch".to_string()));
+            }
+            credential_id = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(&parsed.credential_id);
         }
         let user_ident = Identity::generate(&req.label, &mut rand::rngs::OsRng);
         let doc = UserAuthAttestation {
-            credential_id: req.credential_id,
+            credential_id,
             attestation_object: req.attestation_object,
             client_data_hash: req.client_data_hash,
             rp_id: req.rp_id,
@@ -216,9 +228,23 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
     /// Issue a short-lived session token.
     pub fn issue_session(&mut self, req: SessionRequest) -> Result<SessionResult, ServiceError> {
         // Resolve granted purposes from trust graph
-        let granted = self
+        let granted: BTreeSet<String> = self
             .trust_graph
             .purposes_for(&req.subject_urn, &self.trusted_roots);
+
+        if granted.is_empty() {
+            return Err(ServiceError::Domain(
+                "subject has no granted purposes; cannot issue session".to_string(),
+            ));
+        }
+
+        // Intersect requested resources with granted purposes — only authorize
+        // resources that the trust graph actually grants.
+        let authorized_resources: Vec<String> = req
+            .requested_resources
+            .into_iter()
+            .filter(|r| granted.contains(r))
+            .collect();
 
         let session_id = format!("sess-{:016x}", rand_u64());
         let expires_at = now_epoch() + req.duration_secs;
@@ -228,7 +254,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             subject_urn: req.subject_urn.clone(),
             device_urn: req.device_urn,
             granted_purposes: granted.into_iter().collect(),
-            authorized_resources: req.requested_resources,
+            authorized_resources,
             session_start: now_epoch(),
             duration_secs: req.duration_secs,
             mfa_verified: req.mfa_verified,

@@ -338,7 +338,15 @@ pub unsafe extern "C" fn dds_policy_evaluate(
 pub unsafe extern "C" fn dds_free_string(s: *mut c_char) {
     if !s.is_null() {
         unsafe {
-            let _ = CString::from_raw(s);
+            let cs = CString::from_raw(s);
+            // Zeroize the buffer before dropping to avoid leaving secrets in memory.
+            let bytes = cs.into_bytes_with_nul();
+            let mut v = bytes;
+            for b in v.iter_mut() {
+                // Use volatile write to prevent the compiler from optimizing this away.
+                std::ptr::write_volatile(b as *mut u8, 0);
+            }
+            drop(v);
         }
     }
 }

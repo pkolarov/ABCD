@@ -23,6 +23,7 @@ const OPERATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("operation
 const AUDIT_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("audit_log");
 
 /// redb-backed persistent storage.
+#[derive(Clone)]
 pub struct RedbBackend {
     db: Arc<Database>,
 }

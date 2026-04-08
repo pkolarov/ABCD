@@ -21,8 +21,8 @@ pub struct TrustGraph {
     attestations: BTreeMap<String, Token>,
     /// All vouch tokens by JTI.
     vouches: BTreeMap<String, Token>,
-    /// Set of revoked JTIs.
-    revoked: BTreeSet<String>,
+    /// Map of revoked JTI -> issuer URN of the revoker.
+    revocations: BTreeMap<String, String>,
     /// Set of burned identity URNs.
     burned: BTreeSet<String>,
     /// Maximum chain depth for trust evaluation.
@@ -35,7 +35,7 @@ impl TrustGraph {
         Self {
             attestations: BTreeMap::new(),
             vouches: BTreeMap::new(),
-            revoked: BTreeSet::new(),
+            revocations: BTreeMap::new(),
             burned: BTreeSet::new(),
             max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
         }
@@ -46,10 +46,14 @@ impl TrustGraph {
         self.max_chain_depth = depth;
     }
 
-    /// Add a token to the trust graph. Validates the token before adding.
+    /// Add a token to the trust graph. Validates signature and issuer binding
+    /// (but not expiry — expired tokens are handled during evaluation and sweep).
     pub fn add_token(&mut self, token: Token) -> Result<(), TrustError> {
         token
-            .validate()
+            .verify_signature()
+            .map_err(|e| TrustError::TokenValidation(e.to_string()))?;
+        token
+            .verify_issuer_binding()
             .map_err(|e| TrustError::TokenValidation(e.to_string()))?;
 
         let iss = &token.payload.iss;
@@ -66,7 +70,33 @@ impl TrustGraph {
             }
             TokenKind::Revoke => {
                 if let Some(ref target_jti) = token.payload.revokes {
-                    self.revoked.insert(target_jti.clone());
+                    // Only accept revocation if revoker issued the target token,
+                    // or if target is not yet known (store for deferred check).
+                    let revoker_iss = token.payload.iss.clone();
+                    let authorized = self
+                        .attestations
+                        .get(target_jti)
+                        .map(|t| t.payload.iss == revoker_iss)
+                        .unwrap_or(false)
+                        || self
+                            .vouches
+                            .get(target_jti)
+                            .map(|t| t.payload.iss == revoker_iss)
+                            .unwrap_or(false);
+
+                    if !authorized {
+                        // Check if the target is unknown yet — reject outright
+                        let target_known = self.attestations.contains_key(target_jti)
+                            || self.vouches.contains_key(target_jti);
+                        if target_known {
+                            return Err(TrustError::Unauthorized(
+                                "revoker is not the issuer of the target token".into(),
+                            ));
+                        }
+                    }
+
+                    self.revocations
+                        .insert(target_jti.clone(), revoker_iss);
                 }
             }
             TokenKind::Burn => {
@@ -81,21 +111,82 @@ impl TrustGraph {
                     .map(|(jti, _)| jti.clone())
                     .collect();
                 for jti in to_revoke {
-                    self.revoked.insert(jti);
+                    self.revocations.insert(jti, iss_owned.clone());
                 }
             }
         }
         Ok(())
     }
 
-    /// Check if a JTI has been revoked.
+    /// Check if a JTI has been revoked by an authorized revoker.
+    /// A revocation is valid if the revoker is the same identity that issued the target token.
     pub fn is_revoked(&self, jti: &str) -> bool {
-        self.revoked.contains(jti)
+        if let Some(revoker_iss) = self.revocations.get(jti) {
+            // Check if revoker matches issuer of target
+            if let Some(target) = self.attestations.get(jti) {
+                return target.payload.iss == *revoker_iss;
+            }
+            if let Some(target) = self.vouches.get(jti) {
+                return target.payload.iss == *revoker_iss;
+            }
+            // Target not found — revocation is pending
+            return true;
+        }
+        false
     }
 
     /// Check if an identity URN has been burned.
     pub fn is_burned(&self, urn: &str) -> bool {
         self.burned.contains(urn)
+    }
+
+    /// Check if a token is expired based on current system time.
+    #[cfg(feature = "std")]
+    fn is_expired(token: &Token) -> bool {
+        if let Some(exp) = token.payload.exp {
+            if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                return now.as_secs() > exp;
+            }
+        }
+        false
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn is_expired(_token: &Token) -> bool {
+        false
+    }
+
+    /// Sweep expired tokens from the trust graph. Returns the JTIs of removed tokens.
+    #[cfg(feature = "std")]
+    pub fn sweep_expired(&mut self) -> Vec<String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let expired_attestations: Vec<String> = self
+            .attestations
+            .iter()
+            .filter(|(_, t)| t.payload.exp.map_or(false, |exp| now > exp))
+            .map(|(jti, _)| jti.clone())
+            .collect();
+        for jti in &expired_attestations {
+            self.attestations.remove(jti);
+        }
+
+        let expired_vouches: Vec<String> = self
+            .vouches
+            .iter()
+            .filter(|(_, t)| t.payload.exp.map_or(false, |exp| now > exp))
+            .map(|(jti, _)| jti.clone())
+            .collect();
+        for jti in &expired_vouches {
+            self.vouches.remove(jti);
+        }
+
+        let mut all_expired = expired_attestations;
+        all_expired.extend(expired_vouches);
+        all_expired
     }
 
     /// Validate a trust chain from a subject back to a trusted root.
@@ -138,7 +229,8 @@ impl TrustGraph {
             .values()
             .filter(|t| {
                 t.payload.vch_iss.as_deref() == Some(current_urn)
-                    && !self.revoked.contains(&t.payload.jti)
+                    && !self.is_revoked(&t.payload.jti)
+                    && !Self::is_expired(t)
             })
             .collect();
 
@@ -146,9 +238,30 @@ impl TrustGraph {
             return Err(TrustError::NoValidChain);
         }
 
+        // Resolve the target token (attestation of current_urn) for vch_sum verification
+        let target_token = self.attestations.values().find(|t| t.payload.iss == current_urn);
+
         // Try each vouch — if any leads to a trusted root, the chain is valid
         let mut last_err = TrustError::NoValidChain;
         for vouch in vouches_for_current {
+            // Enforce vch_sum: if the vouch specifies a hash, it must match the target
+            if let Some(ref expected_hash) = vouch.payload.vch_sum {
+                if let Some(target) = target_token {
+                    let actual_hash = target.payload_hash();
+                    if *expected_hash != actual_hash {
+                        last_err = TrustError::VouchHashMismatch {
+                            expected: expected_hash.clone(),
+                            got: actual_hash,
+                        };
+                        continue;
+                    }
+                }
+                // If target token is unknown, we cannot verify — skip this vouch
+                else {
+                    continue;
+                }
+            }
+
             let voucher_urn = &vouch.payload.iss;
             chain.push(vouch.payload.jti.clone());
 
@@ -174,12 +287,28 @@ impl TrustGraph {
         purpose: &str,
         trusted_roots: &BTreeSet<String>,
     ) -> bool {
-        // Find vouches for this subject with matching purpose
+        let target_token = self.attestations.values().find(|t| t.payload.iss == subject_urn);
+
         self.vouches.values().any(|t| {
-            t.payload.vch_iss.as_deref() == Some(subject_urn)
-                && !self.revoked.contains(&t.payload.jti)
-                && t.payload.purpose.as_deref() == Some(purpose)
-                && self.validate_chain(&t.payload.iss, trusted_roots).is_ok()
+            if t.payload.vch_iss.as_deref() != Some(subject_urn)
+                || self.is_revoked(&t.payload.jti)
+                || Self::is_expired(t)
+                || t.payload.purpose.as_deref() != Some(purpose)
+            {
+                return false;
+            }
+            // Enforce vch_sum
+            if let Some(ref expected_hash) = t.payload.vch_sum {
+                match target_token {
+                    Some(target) => {
+                        if target.payload_hash() != *expected_hash {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            self.validate_chain(&t.payload.iss, trusted_roots).is_ok()
         })
     }
 
@@ -189,12 +318,29 @@ impl TrustGraph {
         subject_urn: &str,
         trusted_roots: &BTreeSet<String>,
     ) -> BTreeSet<String> {
+        let target_token = self.attestations.values().find(|t| t.payload.iss == subject_urn);
+
         self.vouches
             .values()
             .filter(|t| {
-                t.payload.vch_iss.as_deref() == Some(subject_urn)
-                    && !self.revoked.contains(&t.payload.jti)
-                    && self.validate_chain(&t.payload.iss, trusted_roots).is_ok()
+                if t.payload.vch_iss.as_deref() != Some(subject_urn)
+                    || self.is_revoked(&t.payload.jti)
+                    || Self::is_expired(t)
+                {
+                    return false;
+                }
+                // Enforce vch_sum
+                if let Some(ref expected_hash) = t.payload.vch_sum {
+                    match target_token {
+                        Some(target) => {
+                            if target.payload_hash() != *expected_hash {
+                                return false;
+                            }
+                        }
+                        None => return false,
+                    }
+                }
+                self.validate_chain(&t.payload.iss, trusted_roots).is_ok()
             })
             .filter_map(|t| t.payload.purpose.clone())
             .collect()
@@ -214,7 +360,7 @@ impl TrustGraph {
         if self.vouches.remove(jti).is_some() {
             removed = true;
         }
-        if self.revoked.remove(jti) {
+        if self.revocations.remove(jti).is_some() {
             removed = true;
         }
         removed
@@ -235,7 +381,7 @@ impl TrustGraph {
 
     /// Total number of tokens in the trust graph.
     pub fn token_count(&self) -> usize {
-        self.attestations.len() + self.vouches.len() + self.revoked.len()
+        self.attestations.len() + self.vouches.len() + self.revocations.len()
     }
 
     /// Get the number of attestations.
@@ -250,7 +396,7 @@ impl TrustGraph {
 
     /// Get the number of revoked JTIs.
     pub fn revocation_count(&self) -> usize {
-        self.revoked.len()
+        self.revocations.len()
     }
 }
 
@@ -271,6 +417,10 @@ pub enum TrustError {
     NoValidChain,
     /// The identity has been permanently burned.
     IdentityBurned(String),
+    /// The operation is not authorized.
+    Unauthorized(String),
+    /// The vouch hash does not match the target token.
+    VouchHashMismatch { expected: String, got: String },
 }
 
 impl fmt::Display for TrustError {
@@ -282,6 +432,10 @@ impl fmt::Display for TrustError {
             }
             TrustError::NoValidChain => write!(f, "no valid trust chain to a trusted root"),
             TrustError::IdentityBurned(urn) => write!(f, "identity has been burned: {}", urn),
+            TrustError::Unauthorized(msg) => write!(f, "unauthorized: {}", msg),
+            TrustError::VouchHashMismatch { expected, got } => {
+                write!(f, "vouch hash mismatch: expected {}, got {}", expected, got)
+            }
         }
     }
 }
@@ -306,7 +460,7 @@ mod tests {
             vch_sum: None,
             revokes: None,
             iat: 1000,
-            exp: Some(9999),
+            exp: Some(4102444800), // 2100-01-01
             body_type: None,
             body_cbor: None,
         };
@@ -331,7 +485,7 @@ mod tests {
             vch_sum: Some(target_token.payload_hash()),
             revokes: None,
             iat: 1000,
-            exp: Some(9999),
+            exp: Some(4102444800), // 2100-01-01
             body_type: None,
             body_cbor: None,
         };
@@ -612,12 +766,162 @@ mod tests {
         g.add_token(make_attest(&user)).unwrap();
         let exps = g.token_expiries();
         assert_eq!(exps.len(), 1);
-        assert_eq!(exps[0].1, Some(9999));
+        assert_eq!(exps[0].1, Some(4102444800));
     }
 
     #[test]
     fn test_default() {
         let g: TrustGraph = TrustGraph::default();
         assert_eq!(g.attestation_count(), 0);
+    }
+
+    #[test]
+    fn test_unauthorized_revocation_rejected() {
+        let mut graph = TrustGraph::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let user = Identity::generate("user", &mut OsRng);
+        let attacker = Identity::generate("attacker", &mut OsRng);
+
+        // Add user's attestation (issued by user)
+        let attest = make_attest(&user);
+        graph.add_token(attest).unwrap();
+
+        // Attacker tries to revoke user's attestation
+        let payload = TokenPayload {
+            iss: attacker.id.to_urn(),
+            iss_key: attacker.public_key.clone(),
+            jti: "revoke-attack".into(),
+            sub: "revoke-sub".into(),
+            kind: TokenKind::Revoke,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: Some(format!("attest-{}", user.id.label())),
+            iat: 2000,
+            exp: None,
+            body_type: None,
+            body_cbor: None,
+        };
+        let revoke = Token::sign(payload, &attacker.signing_key).unwrap();
+        let result = graph.add_token(revoke);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), TrustError::Unauthorized(_)));
+    }
+
+    #[test]
+    fn test_authorized_revocation_accepted() {
+        let mut graph = TrustGraph::new();
+        let user = Identity::generate("user", &mut OsRng);
+
+        let attest = make_attest(&user);
+        let jti = attest.payload.jti.clone();
+        graph.add_token(attest).unwrap();
+
+        // User revokes their own attestation
+        let revoke = make_revoke(&user, &jti);
+        assert!(graph.add_token(revoke).is_ok());
+        assert!(graph.is_revoked(&jti));
+    }
+
+    #[test]
+    fn test_vch_sum_mismatch_breaks_chain() {
+        let mut graph = TrustGraph::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let user = Identity::generate("user", &mut OsRng);
+
+        let attest = make_attest(&user);
+        graph.add_token(attest).unwrap();
+
+        // Vouch with WRONG hash
+        let payload = TokenPayload {
+            iss: root.id.to_urn(),
+            iss_key: root.public_key.clone(),
+            jti: "vouch-bad-hash".into(),
+            sub: user.id.to_urn(),
+            kind: TokenKind::Vouch,
+            purpose: None,
+            vch_iss: Some(user.id.to_urn()),
+            vch_sum: Some("deadbeef-wrong-hash".into()),
+            revokes: None,
+            iat: 1000,
+            exp: Some(4102444800),
+            body_type: None,
+            body_cbor: None,
+        };
+        let vouch = Token::sign(payload, &root.signing_key).unwrap();
+        graph.add_token(vouch).unwrap();
+
+        let roots: BTreeSet<String> = [root.id.to_urn()].into();
+        let result = graph.validate_chain(&user.id.to_urn(), &roots);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vch_sum_correct_passes_chain() {
+        let mut graph = TrustGraph::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let user = Identity::generate("user", &mut OsRng);
+
+        let attest = make_attest(&user);
+        let correct_hash = attest.payload_hash();
+        graph.add_token(attest).unwrap();
+
+        // Vouch with CORRECT hash
+        let payload = TokenPayload {
+            iss: root.id.to_urn(),
+            iss_key: root.public_key.clone(),
+            jti: "vouch-good-hash".into(),
+            sub: user.id.to_urn(),
+            kind: TokenKind::Vouch,
+            purpose: None,
+            vch_iss: Some(user.id.to_urn()),
+            vch_sum: Some(correct_hash),
+            revokes: None,
+            iat: 1000,
+            exp: Some(4102444800),
+            body_type: None,
+            body_cbor: None,
+        };
+        let vouch = Token::sign(payload, &root.signing_key).unwrap();
+        graph.add_token(vouch).unwrap();
+
+        let roots: BTreeSet<String> = [root.id.to_urn()].into();
+        let result = graph.validate_chain(&user.id.to_urn(), &roots);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_expired_vouch_ignored_in_walk_chain() {
+        let mut graph = TrustGraph::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let user = Identity::generate("user", &mut OsRng);
+
+        let attest = make_attest(&user);
+        let hash = attest.payload_hash();
+        graph.add_token(attest.clone()).unwrap();
+
+        // Vouch with already-expired timestamp
+        let payload = TokenPayload {
+            iss: root.id.to_urn(),
+            iss_key: root.public_key.clone(),
+            jti: "vouch-expired".into(),
+            sub: user.id.to_urn(),
+            kind: TokenKind::Vouch,
+            purpose: None,
+            vch_iss: Some(user.id.to_urn()),
+            vch_sum: Some(hash),
+            revokes: None,
+            iat: 1000,
+            exp: Some(1), // epoch second 1 — expired
+            body_type: None,
+            body_cbor: None,
+        };
+        let vouch = Token::sign(payload, &root.signing_key).unwrap();
+        graph.add_token(vouch).unwrap();
+
+        let roots: BTreeSet<String> = [root.id.to_urn()].into();
+        // Should fail because the only vouch is expired
+        let result = graph.validate_chain(&user.id.to_urn(), &roots);
+        assert!(result.is_err());
     }
 }

@@ -17,7 +17,7 @@ fn make_payload(ident: &Identity) -> TokenPayload {
         vch_sum: None,
         revokes: None,
         iat: 1000,
-        exp: Some(9999),
+        exp: Some(4102444800),
         body_type: None,
         body_cbor: None,
     }

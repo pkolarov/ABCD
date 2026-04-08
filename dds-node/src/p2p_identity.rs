@@ -63,7 +63,7 @@ pub fn save(path: &Path, kp: &Keypair) -> Result<(), P2pIdentityError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| P2pIdentityError::Io(e.to_string()))?;
     }
-    let proto = kp
+    let mut proto = kp
         .to_protobuf_encoding()
         .map_err(|e| P2pIdentityError::Libp2p(e.to_string()))?;
 
@@ -79,6 +79,7 @@ pub fn save(path: &Path, kp: &Keypair) -> Result<(), P2pIdentityError> {
                 .encrypt(Nonce::from_slice(&nonce), proto.as_slice())
                 .map_err(|e| P2pIdentityError::Crypto(e.to_string()))?;
             key.zeroize();
+            proto.zeroize();
             vec![
                 (
                     CborValue::Text("v".into()),
@@ -141,7 +142,7 @@ pub fn load(path: &Path) -> Result<Keypair, P2pIdentityError> {
     }
     let key_field = key_field.ok_or_else(|| P2pIdentityError::Format("missing key".into()))?;
 
-    let proto = match version {
+    let mut proto = match version {
         Some(v) if v == VERSION_PLAIN as i64 => key_field,
         Some(v) if v == VERSION_ENCRYPTED as i64 => {
             let pass = std::env::var(PASSPHRASE_ENV).map_err(|_| {
@@ -166,7 +167,10 @@ pub fn load(path: &Path) -> Result<Keypair, P2pIdentityError> {
         }
     };
 
-    Keypair::from_protobuf_encoding(&proto).map_err(|e| P2pIdentityError::Libp2p(e.to_string()))
+    let result = Keypair::from_protobuf_encoding(&proto)
+        .map_err(|e| P2pIdentityError::Libp2p(e.to_string()));
+    proto.zeroize();
+    result
 }
 
 fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; 32], P2pIdentityError> {

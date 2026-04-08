@@ -24,6 +24,7 @@
 //!   P2P node.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -31,9 +32,11 @@ use dds_domain::domain::to_hex;
 use dds_domain::DomainKey;
 use dds_node::config::NodeConfig;
 use dds_node::domain_store;
+use dds_node::http;
 use dds_node::identity_store;
 use dds_node::node::DdsNode;
 use dds_node::p2p_identity;
+use dds_node::service::LocalService;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -181,13 +184,34 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let peer_id = libp2p::PeerId::from(p2p_keypair.public());
     info!(%peer_id, p2p_key = %p2p_path.display(), "loaded libp2p identity");
 
-    let mut node = DdsNode::init(config, p2p_keypair)?;
+    let mut node = DdsNode::init(config.clone(), p2p_keypair)?;
     node.start()?;
 
     // Long-lived node signing identity (Vouchsafe-shaped, separate from libp2p).
     let identity_path = node.config.identity_key_path();
     let node_identity = identity_store::load_or_create(&identity_path, "dds-node")?;
     info!(urn = %node_identity.id.to_urn(), path = %identity_path.display(), "loaded node identity");
+
+    // Start the local HTTP API server alongside the P2P node.
+    let api_addr = config.network.api_addr.clone();
+    let trusted_roots = config.trusted_roots.iter().cloned().collect();
+    let api_store = node.store.clone();
+    let api_trust_graph = node.trust_graph.clone();
+    let svc = LocalService::new(
+        node_identity,
+        api_trust_graph,
+        trusted_roots,
+        api_store,
+    );
+    let shared_svc = Arc::new(tokio::sync::Mutex::new(svc));
+    let node_info = http::NodeInfo {
+        peer_id: node.peer_id.to_string(),
+    };
+    tokio::spawn(async move {
+        if let Err(e) = http::serve(&api_addr, shared_svc, node_info).await {
+            tracing::error!("HTTP API server error: {e}");
+        }
+    });
 
     info!(peer_id = %node.peer_id, "DDS node running — press Ctrl+C to stop");
     node.run().await

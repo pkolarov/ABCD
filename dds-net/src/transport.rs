@@ -24,8 +24,8 @@ pub struct DdsBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     /// Kademlia DHT for peer discovery and routing.
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
-    /// mDNS for local network peer discovery.
-    pub mdns: mdns::tokio::Behaviour,
+    /// mDNS for local network peer discovery (toggleable via config).
+    pub mdns: libp2p::swarm::behaviour::toggle::Toggle<mdns::tokio::Behaviour>,
     /// Identify protocol for exchanging peer metadata.
     pub identify: identify::Behaviour,
 }
@@ -42,6 +42,8 @@ pub struct SwarmConfig {
     pub domain_tag: String,
     /// Idle connection timeout.
     pub idle_timeout: Duration,
+    /// Whether mDNS is enabled for local network discovery.
+    pub mdns_enabled: bool,
 }
 
 impl SwarmConfig {
@@ -61,6 +63,7 @@ impl Default for SwarmConfig {
             heartbeat_interval: Duration::from_secs(5),
             domain_tag: "default".to_string(),
             idle_timeout: Duration::from_secs(60),
+            mdns_enabled: true,
         }
     }
 }
@@ -114,8 +117,14 @@ pub fn build_swarm(
             let store = kad::store::MemoryStore::new(peer_id);
             let kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
 
-            // mDNS
-            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
+            // mDNS (conditionally enabled)
+            let mdns = if config.mdns_enabled {
+                libp2p::swarm::behaviour::toggle::Toggle::from(Some(
+                    mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?,
+                ))
+            } else {
+                libp2p::swarm::behaviour::toggle::Toggle::from(None)
+            };
 
             // Identify
             let identify = identify::Behaviour::new(identify::Config::new(
@@ -156,6 +165,7 @@ mod tests {
             heartbeat_interval: Duration::from_secs(1),
             domain_tag: "abc123".into(),
             idle_timeout: Duration::from_secs(10),
+            mdns_enabled: false,
         };
         assert_eq!(cfg.kad_protocol(), "/dds/kad/1.0.0/abc123");
         assert_eq!(cfg.identify_protocol(), "/dds/id/1.0.0/abc123");
@@ -167,11 +177,13 @@ mod tests {
             heartbeat_interval: Duration::from_secs(1),
             domain_tag: "acme".into(),
             idle_timeout: Duration::from_secs(10),
+            mdns_enabled: false,
         };
         let b = SwarmConfig {
             heartbeat_interval: Duration::from_secs(1),
             domain_tag: "globex".into(),
             idle_timeout: Duration::from_secs(10),
+            mdns_enabled: false,
         };
         assert_ne!(a.kad_protocol(), b.kad_protocol());
         assert_ne!(a.identify_protocol(), b.identify_protocol());
@@ -185,6 +197,7 @@ mod tests {
             heartbeat_interval: Duration::from_secs(1),
             domain_tag: "test".into(),
             idle_timeout: Duration::from_secs(10),
+            mdns_enabled: false,
         };
         let (_swarm, peer_id) = build_swarm(cfg, kp).unwrap();
         assert_eq!(peer_id, expected_peer);

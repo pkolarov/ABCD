@@ -229,13 +229,12 @@ fn make_attest_token(label: &str, jti: &str) -> (Identity, Token) {
     (id, t)
 }
 
-fn make_revoke(target_jti: &str) -> Token {
-    let id = Identity::generate("revoker", &mut OsRng);
+fn make_revoke(target_jti: &str, issuer: &Identity) -> Token {
     let payload = TokenPayload {
-        iss: id.id.to_urn(),
-        iss_key: id.public_key.clone(),
+        iss: issuer.id.to_urn(),
+        iss_key: issuer.public_key.clone(),
         jti: format!("rev-{target_jti}"),
-        sub: id.id.to_urn(),
+        sub: issuer.id.to_urn(),
         kind: TokenKind::Revoke,
         purpose: None,
         vch_iss: None,
@@ -246,7 +245,7 @@ fn make_revoke(target_jti: &str) -> Token {
         body_type: None,
         body_cbor: None,
     };
-    Token::sign(payload, &id.signing_key).unwrap()
+    Token::sign(payload, &issuer.signing_key).unwrap()
 }
 
 fn op_for(token: &Token) -> Operation {
@@ -354,14 +353,14 @@ async fn revocation_propagates_three_nodes() {
 
     // Pre-seed an attestation on every node directly so the revocation
     // has something to target.
-    let (_id, token) = make_attest_token("bob", "att-bob-1");
+    let (bob_id, token) = make_attest_token("bob", "att-bob-1");
     for n in nodes.iter_mut() {
         n.trust_graph.add_token(token.clone()).unwrap();
         use dds_store::traits::TokenStore;
         n.store.put_token(&token).unwrap();
     }
 
-    let revoke = make_revoke("att-bob-1");
+    let revoke = make_revoke("att-bob-1", &bob_id);
     publish_revocation(&mut nodes[1], &revoke);
 
     let deadline = Instant::now() + Duration::from_secs(15);

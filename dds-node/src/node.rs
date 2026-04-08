@@ -66,6 +66,7 @@ impl DdsNode {
             heartbeat_interval: Duration::from_secs(config.network.heartbeat_secs),
             domain_tag: domain_id.protocol_tag(),
             idle_timeout: Duration::from_secs(config.network.idle_timeout_secs),
+            mdns_enabled: config.network.mdns_enabled,
         };
         let (swarm, peer_id) = dds_net::transport::build_swarm(swarm_config, keypair)?;
 
@@ -141,11 +142,30 @@ impl DdsNode {
         Ok(())
     }
 
-    /// Run the main event loop. Processes swarm events until shutdown.
+    /// Run the main event loop. Processes swarm events and periodic expiry sweeps.
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let interval_secs = self.config.expiry_scan_interval_secs;
+        let mut expiry_interval = tokio::time::interval(
+            std::time::Duration::from_secs(interval_secs),
+        );
+        // The first tick completes immediately; consume it.
+        expiry_interval.tick().await;
+
         loop {
-            let event = self.swarm.select_next_some().await;
-            self.handle_swarm_event(event);
+            tokio::select! {
+                event = self.swarm.select_next_some() => {
+                    self.handle_swarm_event(event);
+                }
+                _ = expiry_interval.tick() => {
+                    let expired = self.trust_graph.sweep_expired();
+                    for jti in &expired {
+                        let _ = self.store.revoke(jti);
+                    }
+                    if !expired.is_empty() {
+                        info!(count = expired.len(), "swept expired tokens");
+                    }
+                }
+            }
         }
     }
 

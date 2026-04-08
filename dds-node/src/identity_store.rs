@@ -77,7 +77,7 @@ pub fn save(path: &Path, ident: &Identity) -> Result<(), IdentityStoreError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| IdentityStoreError::Io(e.to_string()))?;
     }
-    let key_bytes = ident.signing_key.to_bytes();
+    let mut key_bytes = ident.signing_key.to_bytes();
     let label = ident.id.label().to_string();
 
     let map = match std::env::var(PASSPHRASE_ENV) {
@@ -92,6 +92,7 @@ pub fn save(path: &Path, ident: &Identity) -> Result<(), IdentityStoreError> {
                 .encrypt(Nonce::from_slice(&nonce_bytes), key_bytes.as_ref())
                 .map_err(|e| IdentityStoreError::Crypto(e.to_string()))?;
             key.zeroize();
+            key_bytes.zeroize();
             vec![
                 (
                     CborValue::Text("v".into()),
@@ -114,7 +115,7 @@ pub fn save(path: &Path, ident: &Identity) -> Result<(), IdentityStoreError> {
                 "{PASSPHRASE_ENV} not set; node identity will be stored unencrypted at {}",
                 path.display()
             );
-            vec![
+            let v = vec![
                 (
                     CborValue::Text("v".into()),
                     CborValue::Integer(VERSION_PLAIN.into()),
@@ -124,7 +125,9 @@ pub fn save(path: &Path, ident: &Identity) -> Result<(), IdentityStoreError> {
                     CborValue::Text("key".into()),
                     CborValue::Bytes(key_bytes.to_vec()),
                 ),
-            ]
+            ];
+            key_bytes.zeroize();
+            v
         }
     };
     let mut buf = Vec::new();
@@ -163,7 +166,7 @@ pub fn load(path: &Path) -> Result<Identity, IdentityStoreError> {
     let label = label.ok_or_else(|| IdentityStoreError::Format("missing label".into()))?;
     let key_field = key_field.ok_or_else(|| IdentityStoreError::Format("missing key".into()))?;
 
-    let raw = match version {
+    let mut raw = match version {
         Some(v) if v == VERSION_PLAIN as i64 => {
             if key_field.len() != 32 {
                 return Err(IdentityStoreError::Format("plain key wrong length".into()));
@@ -182,17 +185,19 @@ pub fn load(path: &Path) -> Result<Identity, IdentityStoreError> {
             let nonce = nonce.ok_or_else(|| IdentityStoreError::Format("missing nonce".into()))?;
             let mut key = derive_key(pass.as_bytes(), &salt)?;
             let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-            let pt = cipher
+            let mut pt = cipher
                 .decrypt(Nonce::from_slice(&nonce), key_field.as_ref())
                 .map_err(|e| IdentityStoreError::Crypto(format!("decrypt: {e}")))?;
             key.zeroize();
             if pt.len() != 32 {
+                pt.zeroize();
                 return Err(IdentityStoreError::Format(
                     "decrypted key wrong length".into(),
                 ));
             }
             let mut k = [0u8; 32];
             k.copy_from_slice(&pt);
+            pt.zeroize();
             k
         }
         other => {
@@ -203,6 +208,7 @@ pub fn load(path: &Path) -> Result<Identity, IdentityStoreError> {
     };
 
     let signing_key = SigningKey::from_bytes(&raw);
+    raw.zeroize();
     Ok(Identity::from_signing_key(&label, signing_key))
 }
 

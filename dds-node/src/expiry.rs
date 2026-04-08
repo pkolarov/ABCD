@@ -113,14 +113,19 @@ mod tests {
         let mut store = MemoryBackend::new();
 
         let expired = make_token("expired", Some(100));
-        let live = make_token("live", Some(10_000));
+        let live = make_token("live", Some(4102444800));
         let no_exp = make_token("noexp", None);
 
         graph.add_token(expired.clone()).unwrap();
         graph.add_token(live.clone()).unwrap();
         graph.add_token(no_exp.clone()).unwrap();
 
-        let stats = sweep_once(&mut graph, &mut store, 500);
+        // Use current time so that token with exp=100 is expired
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let stats = sweep_once(&mut graph, &mut store, now);
         assert_eq!(stats.scanned, 3);
         assert_eq!(stats.expired, 1);
 

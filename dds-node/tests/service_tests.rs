@@ -33,7 +33,7 @@ fn make_service() -> (Identity, LocalService<MemoryBackend>) {
             vch_sum: None,
             revokes: None,
             iat: 1000,
-            exp: Some(9999),
+            exp: Some(4102444800),
             body_type: None,
             body_cbor: None,
         },
@@ -76,7 +76,8 @@ fn test_enroll_user() {
     let doc = UserAuthAttestation::extract(&token.payload)
         .unwrap()
         .unwrap();
-    assert_eq!(doc.credential_id, "cred-123");
+    // credential_id is now base64url-encoded from the parsed attestation object
+    assert_eq!(doc.credential_id, "Y3JlZC0xMjM");
     assert_eq!(doc.rp_id, "example.com");
 }
 
@@ -126,10 +127,55 @@ fn test_enroll_device() {
 
 #[test]
 fn test_issue_session() {
-    let (_root, mut svc) = make_service();
+    let (root, mut svc) = make_service();
+
+    // Create alice's attestation and a vouch from root with purpose "repo:main"
+    let alice = Identity::generate("alice", &mut OsRng);
+    let alice_attest = Token::sign(
+        TokenPayload {
+            iss: alice.id.to_urn(),
+            iss_key: alice.public_key.clone(),
+            jti: "attest-alice".into(),
+            sub: alice.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1000,
+            exp: Some(4102444800),
+            body_type: None,
+            body_cbor: None,
+        },
+        &alice.signing_key,
+    )
+    .unwrap();
+    svc.trust_graph.add_token(alice_attest.clone()).unwrap();
+
+    let vouch = Token::sign(
+        TokenPayload {
+            iss: root.id.to_urn(),
+            iss_key: root.public_key.clone(),
+            jti: "vouch-alice-repo".into(),
+            sub: alice.id.to_urn(),
+            kind: TokenKind::Vouch,
+            purpose: Some("repo:main".into()),
+            vch_iss: Some(alice.id.to_urn()),
+            vch_sum: Some(alice_attest.payload_hash()),
+            revokes: None,
+            iat: 1000,
+            exp: Some(4102444800),
+            body_type: None,
+            body_cbor: None,
+        },
+        &root.signing_key,
+    )
+    .unwrap();
+    svc.trust_graph.add_token(vouch).unwrap();
+
     let result = svc
         .issue_session(SessionRequest {
-            subject_urn: "urn:vouchsafe:alice.hash".into(),
+            subject_urn: alice.id.to_urn(),
             device_urn: Some("urn:vouchsafe:laptop.hash".into()),
             requested_resources: vec!["repo:main".into()],
             duration_secs: 300,

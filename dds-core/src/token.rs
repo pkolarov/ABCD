@@ -156,10 +156,20 @@ impl Token {
         Ok(())
     }
 
-    /// Full validation: signature + issuer binding.
+    /// Full validation: signature + issuer binding + expiry check.
     pub fn validate(&self) -> Result<(), TokenError> {
         self.verify_signature()?;
         self.verify_issuer_binding()?;
+
+        #[cfg(feature = "std")]
+        if let Some(exp) = self.payload.exp {
+            if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                if now.as_secs() > exp {
+                    return Err(TokenError::Expired(self.payload.jti.clone()));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -237,6 +247,7 @@ pub enum TokenError {
     RevokeMissingTarget,
     SerializationError,
     DeserializationError,
+    Expired(alloc::string::String),
 }
 
 impl fmt::Display for TokenError {
@@ -257,6 +268,7 @@ impl fmt::Display for TokenError {
             }
             TokenError::SerializationError => write!(f, "CBOR serialization failed"),
             TokenError::DeserializationError => write!(f, "CBOR deserialization failed"),
+            TokenError::Expired(jti) => write!(f, "token {} is expired", jti),
         }
     }
 }
@@ -279,7 +291,7 @@ mod tests {
             vch_sum: None,
             revokes: None,
             iat: 1714605000,
-            exp: Some(1746141000),
+            exp: Some(4102444800), // 2100-01-01
             body_type: None,
             body_cbor: None,
         }
@@ -362,7 +374,7 @@ mod tests {
             vch_sum: Some(user_token.payload_hash()),
             revokes: None,
             iat: 1714606000,
-            exp: Some(1746142000),
+            exp: Some(4102444800), // 2100-01-01
             body_type: None,
             body_cbor: None,
         };
@@ -386,7 +398,7 @@ mod tests {
             vch_sum: None, // missing
             revokes: None,
             iat: 1714606000,
-            exp: Some(1746142000),
+            exp: Some(4102444800), // 2100-01-01
             body_type: None,
             body_cbor: None,
         };
@@ -489,6 +501,73 @@ mod tests {
         let token = Token::sign(payload, &user.signing_key).unwrap();
         assert!(token.validate().is_ok());
         assert_eq!(token.payload.kind, TokenKind::Burn);
+    }
+
+    #[test]
+    fn test_validate_rejects_expired_token() {
+        let user = Identity::generate("user", &mut OsRng);
+        let payload = TokenPayload {
+            iss: user.id.to_urn(),
+            iss_key: user.public_key.clone(),
+            jti: String::from("expired-jti"),
+            sub: user.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1000,
+            exp: Some(1), // epoch second 1 — long past
+            body_type: None,
+            body_cbor: None,
+        };
+        let token = Token::sign(payload, &user.signing_key).unwrap();
+        let err = token.validate().unwrap_err();
+        assert!(matches!(err, TokenError::Expired(_)));
+    }
+
+    #[test]
+    fn test_validate_accepts_future_expiry() {
+        let user = Identity::generate("user", &mut OsRng);
+        let payload = TokenPayload {
+            iss: user.id.to_urn(),
+            iss_key: user.public_key.clone(),
+            jti: String::from("future-jti"),
+            sub: user.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1000,
+            exp: Some(4102444800), // 2100-01-01
+            body_type: None,
+            body_cbor: None,
+        };
+        let token = Token::sign(payload, &user.signing_key).unwrap();
+        assert!(token.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_accepts_no_expiry() {
+        let user = Identity::generate("user", &mut OsRng);
+        let payload = TokenPayload {
+            iss: user.id.to_urn(),
+            iss_key: user.public_key.clone(),
+            jti: String::from("no-exp-jti"),
+            sub: user.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1000,
+            exp: None,
+            body_type: None,
+            body_cbor: None,
+        };
+        let token = Token::sign(payload, &user.signing_key).unwrap();
+        assert!(token.validate().is_ok());
     }
 
     #[test]

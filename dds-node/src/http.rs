@@ -328,7 +328,7 @@ mod tests {
                 vch_sum: None,
                 revokes: None,
                 iat: 1000,
-                exp: Some(9999),
+                exp: Some(4102444800),
                 body_type: None,
                 body_cbor: None,
             },
@@ -445,7 +445,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_session_endpoint() {
+    async fn test_session_endpoint_rejects_no_purposes() {
+        // Session request for a subject with no granted purposes should fail.
         let state = make_state();
         let base = spawn_server(state).await;
         let req = SessionRequestJson {
@@ -462,9 +463,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: SessionResponse = resp.json().await.unwrap();
-        assert!(body.session_id.starts_with("sess-"));
-        assert!(body.expires_at > 0);
+        // Without valid vouches, the session should be rejected (500 = domain error).
+        assert_eq!(resp.status(), 500);
     }
 }
