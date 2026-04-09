@@ -480,3 +480,112 @@ async fn dag_converges_after_partition() {
         rejoiner.dag.len()
     );
 }
+
+/// Drive several nodes concurrently for `dur`, routing every event
+/// through `DdsNode::handle_swarm_event` (the production handler) so
+/// the new request_response sync protocol fires. This is the harness
+/// path used by the B6 regression tests below.
+async fn pump_many_production(nodes: &mut [&mut DdsNode], dur: Duration) {
+    let deadline = Instant::now() + dur;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let futs: Vec<_> = nodes
+            .iter_mut()
+            .map(|n| Box::pin(n.swarm.select_next_some()))
+            .collect();
+        match timeout(remaining, futures::future::select_all(futs)).await {
+            Ok((event, idx, _rest)) => {
+                nodes[idx].handle_swarm_event(event);
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Regression gate for B6 (the 2026-04-09 chaos soak finding).
+///
+/// Before the sync protocol was wired in, gossipsub-only delivery left
+/// a fresh / rejoined node permanently behind on any op published while
+/// it was offline. The soak measured 16 of 29 chaos rejoin attempts
+/// timing out at 5 minutes with as little as 19% of missing tokens
+/// recovered.
+///
+/// This test proves the request_response sync protocol catches up the
+/// missing window: nodes A and B publish ops, then C connects fresh
+/// (no shared past) and must converge to A/B's state purely via sync,
+/// without any gossip publish happening after C connects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejoined_node_catches_up_via_sync_protocol() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Nodes A and B form a 2-node cluster and publish two ops.
+    let (mut a, _ad) = spawn_node("multinode-sync").await;
+    let (mut b, _bd) = spawn_node("multinode-sync").await;
+    let a_addr = wait_for_listen(&mut a).await;
+    let b_addr = wait_for_listen(&mut b).await;
+    let a_pid = a.peer_id;
+    let b_pid = b.peer_id;
+    connect(&mut a, b_pid, b_addr.clone());
+    connect(&mut b, a_pid, a_addr.clone());
+    {
+        let mut refs: Vec<&mut DdsNode> = vec![&mut a, &mut b];
+        pump_many_production(&mut refs, MESH_FORMATION_TIMEOUT).await;
+    }
+
+    let (_id1, t1) = make_attest_token("alice", "sync-1");
+    let op1 = op_for(&t1);
+    publish_attest(&mut a, &op1, &t1);
+    let (_id2, t2) = make_attest_token("bob", "sync-2");
+    let op2 = op_for(&t2);
+    publish_attest(&mut b, &op2, &t2);
+
+    // Pump until both ops are visible on A and B.
+    let deadline = Instant::now() + PROPAGATION_TIMEOUT;
+    while Instant::now() < deadline {
+        {
+            let mut refs: Vec<&mut DdsNode> = vec![&mut a, &mut b];
+            pump_many_production(&mut refs, Duration::from_millis(200)).await;
+        }
+        if a.dag.contains(&op1.id)
+            && a.dag.contains(&op2.id)
+            && b.dag.contains(&op1.id)
+            && b.dag.contains(&op2.id)
+        {
+            break;
+        }
+    }
+    assert!(a.dag.contains(&op1.id) && a.dag.contains(&op2.id), "A missing ops");
+    assert!(b.dag.contains(&op1.id) && b.dag.contains(&op2.id), "B missing ops");
+
+    // C joins fresh — no shared past. Under gossipsub-only delivery, C
+    // would never see op1 or op2 because they were published before
+    // its mesh subscription. With the sync protocol, the on-connect
+    // sync request must pull both ops in.
+    let (mut c, _cd) = spawn_node("multinode-sync").await;
+    let c_addr = wait_for_listen(&mut c).await;
+    let c_pid = c.peer_id;
+    connect(&mut c, a_pid, a_addr);
+    connect(&mut c, b_pid, b_addr);
+    connect(&mut a, c_pid, c_addr.clone());
+    connect(&mut b, c_pid, c_addr);
+
+    // Drive all three nodes. NO additional publish happens after this
+    // — convergence is purely the sync protocol's job.
+    let deadline = Instant::now() + PROPAGATION_TIMEOUT;
+    while Instant::now() < deadline {
+        {
+            let mut refs: Vec<&mut DdsNode> = vec![&mut a, &mut b, &mut c];
+            pump_many_production(&mut refs, Duration::from_millis(200)).await;
+        }
+        if c.dag.contains(&op1.id) && c.dag.contains(&op2.id) {
+            return;
+        }
+    }
+    panic!(
+        "rejoined node C did not converge via sync protocol — \
+         this is the B6 regression. C dag size: {}, has op1={}, has op2={}",
+        c.dag.len(),
+        c.dag.contains(&op1.id),
+        c.dag.contains(&op2.id),
+    );
+}

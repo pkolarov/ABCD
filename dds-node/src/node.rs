@@ -1,23 +1,36 @@
 //! DDS node: ties together storage, trust, networking, and sync.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use dds_core::crdt::causal_dag::CausalDag;
+use dds_core::crdt::causal_dag::{CausalDag, Operation};
 use dds_core::token::Token;
 use dds_core::trust::TrustGraph;
 use dds_net::gossip::{DdsTopic, DdsTopicSet, GossipMessage};
+use dds_net::sync::{
+    SyncPayload, SyncRequest, SyncResponse, apply_sync_payloads_with_graph,
+};
 use dds_net::transport::{DdsBehaviour, DdsBehaviourEvent, SwarmConfig};
 use dds_store::RedbBackend;
 use dds_store::traits::*;
 use futures::StreamExt;
+use libp2p::request_response::{Event as RrEvent, Message as RrMessage};
 use libp2p::{Multiaddr, PeerId, Swarm};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use dds_domain::{DomainId, domain::from_hex};
 
 use crate::config::NodeConfig;
+
+/// How often we proactively sync against every connected peer as a
+/// backstop against gossip drops. The on-connect sync handles fresh
+/// rejoin convergence; this catches steady-state divergence.
+const ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Minimum gap between two outbound sync requests to the same peer.
+/// Throttles the on-connect storm when libp2p reconnects flap.
+const SYNC_PER_PEER_COOLDOWN: Duration = Duration::from_secs(15);
 
 /// The running DDS node state.
 ///
@@ -37,6 +50,13 @@ pub struct DdsNode {
     pub trusted_roots: BTreeSet<String>,
     pub topics: DdsTopicSet,
     pub config: NodeConfig,
+    /// In-memory cache of live `SyncPayload`s, keyed by operation id.
+    /// Built up at gossip-ingest time so the anti-entropy responder can
+    /// reply without re-deriving op→token mapping at lookup time.
+    /// Resolves B6 (the gossip-only delivery gap from the chaos soak).
+    sync_payloads: BTreeMap<String, SyncPayload>,
+    /// Per-peer "last outbound sync" timestamp for the cooldown throttle.
+    sync_last_outbound: BTreeMap<PeerId, Instant>,
 }
 
 impl DdsNode {
@@ -113,6 +133,8 @@ impl DdsNode {
             trusted_roots,
             topics,
             config,
+            sync_payloads: BTreeMap::new(),
+            sync_last_outbound: BTreeMap::new(),
         })
     }
 
@@ -151,7 +173,8 @@ impl DdsNode {
         Ok(())
     }
 
-    /// Run the main event loop. Processes swarm events and periodic expiry sweeps.
+    /// Run the main event loop. Processes swarm events, periodic expiry
+    /// sweeps, and periodic anti-entropy sync against connected peers.
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let interval_secs = self.config.expiry_scan_interval_secs;
         let mut expiry_interval = tokio::time::interval(
@@ -159,6 +182,13 @@ impl DdsNode {
         );
         // The first tick completes immediately; consume it.
         expiry_interval.tick().await;
+
+        // Anti-entropy backstop: periodically pull from every connected
+        // peer so we converge even when gossip drops messages or a
+        // node missed a window. The on-connect sync covers fresh
+        // rejoins; this catches steady-state divergence.
+        let mut anti_entropy = tokio::time::interval(ANTI_ENTROPY_INTERVAL);
+        anti_entropy.tick().await;
 
         loop {
             tokio::select! {
@@ -177,11 +207,20 @@ impl DdsNode {
                         info!(count = expired.len(), "swept expired tokens");
                     }
                 }
+                _ = anti_entropy.tick() => {
+                    let peers: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
+                    for peer in peers {
+                        self.try_sync_with(peer);
+                    }
+                }
             }
         }
     }
 
-    fn handle_swarm_event(&mut self, event: libp2p::swarm::SwarmEvent<DdsBehaviourEvent>) {
+    /// Apply one swarm event using the production ingest path (gossip,
+    /// sync, mDNS, lifecycle). Public so integration tests can drive
+    /// the same code path that `run()` uses.
+    pub fn handle_swarm_event(&mut self, event: libp2p::swarm::SwarmEvent<DdsBehaviourEvent>) {
         use libp2p::swarm::SwarmEvent;
 
         match event {
@@ -208,14 +247,23 @@ impl DdsNode {
                     dds_net::discovery::remove_mdns_peer(&mut self.swarm, peer_id);
                 }
             }
+            SwarmEvent::Behaviour(DdsBehaviourEvent::Sync(sync_event)) => {
+                self.handle_sync_event(sync_event);
+            }
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!(%address, "listening on");
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 info!(%peer_id, "connection established");
+                // Pull anything we might have missed while we were
+                // disconnected from this peer (or never knew about).
+                self.try_sync_with(peer_id);
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 info!(%peer_id, "connection closed");
+                // Drop the cooldown so a fresh reconnect immediately
+                // re-syncs without waiting out the throttle.
+                self.sync_last_outbound.remove(&peer_id);
             }
             _ => {}
         }
@@ -292,11 +340,34 @@ impl DdsNode {
         if let Err(e) = self.store.put_token(&token) {
             error!("store error: {e}");
         }
+        let op_id = op.id.clone();
+        let op_for_cache = op.clone();
         match self.dag.insert(op) {
-            Ok(true) => info!(jti = %token.payload.jti, "ingested new operation"),
+            Ok(true) => {
+                info!(jti = %token.payload.jti, "ingested new operation");
+                self.cache_sync_payload(&op_id, &op_for_cache, token_bytes);
+            }
             Ok(false) => {} // duplicate
             Err(e) => warn!("DAG insert failed: {e}"),
         }
+    }
+
+    /// Insert an op + its backing token bytes into the sync payload cache
+    /// so the anti-entropy responder can serve it back to peers without
+    /// reconstructing the (op, token) pair from scratch. Called from both
+    /// the gossip ingest path and the sync-applied path.
+    fn cache_sync_payload(&mut self, op_id: &str, op: &Operation, token_bytes: &[u8]) {
+        let mut op_bytes = Vec::new();
+        if ciborium::into_writer(op, &mut op_bytes).is_err() {
+            return;
+        }
+        self.sync_payloads.insert(
+            op_id.to_string(),
+            SyncPayload {
+                op_bytes,
+                token_bytes: token_bytes.to_vec(),
+            },
+        );
     }
 
     fn ingest_revocation(&mut self, token_bytes: &[u8]) {
@@ -364,6 +435,116 @@ impl DdsNode {
         if let Ok(entry) = ciborium::from_reader::<dds_core::audit::AuditLogEntry, _>(entry_bytes) {
             let _ = self.store.append_audit_entry(&entry);
             info!(action = %entry.action, node = %entry.node_urn, "audit log entry appended");
+        }
+    }
+
+    // ---------- anti-entropy sync (B6) ----------
+
+    /// Build the response to an inbound sync request: every cached
+    /// payload whose op_id is *not* in the requester's `known_op_ids`.
+    fn build_sync_response(&self, req: &SyncRequest) -> SyncResponse {
+        let payloads: Vec<SyncPayload> = self
+            .sync_payloads
+            .iter()
+            .filter(|(id, _)| !req.known_op_ids.contains(id.as_str()))
+            .map(|(_, payload)| payload.clone())
+            .collect();
+        SyncResponse {
+            payloads,
+            complete: true,
+        }
+    }
+
+    /// Build a sync request from local DAG state.
+    fn build_sync_request(&self) -> SyncRequest {
+        SyncRequest {
+            known_op_ids: self.dag.operation_ids(),
+            heads: self.dag.heads().clone(),
+        }
+    }
+
+    /// Send a sync request to a peer, respecting the per-peer cooldown.
+    /// No-op if the peer was contacted within `SYNC_PER_PEER_COOLDOWN`.
+    fn try_sync_with(&mut self, peer: PeerId) {
+        let now = Instant::now();
+        if let Some(prev) = self.sync_last_outbound.get(&peer) {
+            if now.duration_since(*prev) < SYNC_PER_PEER_COOLDOWN {
+                return;
+            }
+        }
+        let req = self.build_sync_request();
+        let req_id = self.swarm.behaviour_mut().sync.send_request(&peer, req);
+        self.sync_last_outbound.insert(peer, now);
+        debug!(%peer, ?req_id, "sync: sent request");
+    }
+
+    /// Apply an inbound sync response: merge into trust graph + DAG +
+    /// store, and cache the payloads for future serving to other peers.
+    fn handle_sync_response(&mut self, peer: PeerId, resp: SyncResponse) {
+        if resp.payloads.is_empty() {
+            debug!(%peer, "sync: peer reported no diff");
+            return;
+        }
+        let payloads = resp.payloads;
+        let result = {
+            let mut g = self.trust_graph.write().expect("trust_graph poisoned");
+            apply_sync_payloads_with_graph(&payloads, &mut self.dag, &mut self.store, &mut g)
+        };
+        // Repopulate the sync cache so the next inbound request from
+        // some other peer can serve these payloads onward.
+        for payload in &payloads {
+            if let Ok(op) = ciborium::from_reader::<Operation, _>(payload.op_bytes.as_slice()) {
+                let id = op.id.clone();
+                self.sync_payloads.insert(id, payload.clone());
+            }
+        }
+        info!(
+            %peer,
+            ops_merged = result.ops_merged,
+            tokens_stored = result.tokens_stored,
+            revocations_applied = result.revocations_applied,
+            burns_applied = result.burns_applied,
+            err_count = result.errors.len(),
+            "sync: applied response"
+        );
+    }
+
+    /// Handle one libp2p `request_response` event for the sync protocol.
+    fn handle_sync_event(
+        &mut self,
+        event: RrEvent<SyncRequest, SyncResponse>,
+    ) {
+        match event {
+            RrEvent::Message { peer, message, .. } => match message {
+                RrMessage::Request {
+                    request,
+                    channel,
+                    ..
+                } => {
+                    let response = self.build_sync_response(&request);
+                    let payload_count = response.payloads.len();
+                    if let Err(_) = self
+                        .swarm
+                        .behaviour_mut()
+                        .sync
+                        .send_response(channel, response)
+                    {
+                        warn!(%peer, "sync: failed to send response (channel closed)");
+                    } else {
+                        debug!(%peer, payload_count, "sync: served request");
+                    }
+                }
+                RrMessage::Response { response, .. } => {
+                    self.handle_sync_response(peer, response);
+                }
+            },
+            RrEvent::OutboundFailure { peer, error, .. } => {
+                debug!(%peer, %error, "sync: outbound failure");
+            }
+            RrEvent::InboundFailure { peer, error, .. } => {
+                debug!(%peer, %error, "sync: inbound failure");
+            }
+            RrEvent::ResponseSent { .. } => {}
         }
     }
 

@@ -1,0 +1,2174 @@
+{
+  "duration_secs": 1800,
+  "nodes": 5,
+  "kpis": [
+    {
+      "name": "Local auth decision (p99)",
+      "target": "≤ 1 ms",
+      "measured": "0.050 ms",
+      "status": "Pass",
+      "note": "max(evaluate_policy, session_validate) p99"
+    },
+    {
+      "name": "Ed25519 verify throughput",
+      "target": "≥ 50,000 ops/sec",
+      "measured": "53975 ops/sec (p50 18.53 µs)",
+      "status": "Pass",
+      "note": "18000 samples"
+    },
+    {
+      "name": "CRDT merge (p99)",
+      "target": "≤ 0.05 ms",
+      "measured": "0.0000 ms",
+      "status": "Pass",
+      "note": "single insert into CausalDag"
+    },
+    {
+      "name": "Peak heap per 1K entries",
+      "target": "≤ 5 MB / 1K entries",
+      "measured": "17.94 MB / 1K (RSS 77545472 B, 4123 entries)",
+      "status": "Warn",
+      "note": "RSS-based; includes whole-process baseline"
+    },
+    {
+      "name": "Idle gossip bandwidth (median)",
+      "target": "≤ 2 KB/sec",
+      "measured": "11469 B/sec",
+      "status": "Warn",
+      "note": "process-wide RSS proxy — see README"
+    },
+    {
+      "name": "Enrollment latency (enroll_user p99)",
+      "target": "informational",
+      "measured": "0.14 ms",
+      "status": "Pass",
+      "note": "249 ok / 0 err"
+    },
+    {
+      "name": "Gossip propagation (p99)",
+      "target": "informational",
+      "measured": "105 ms",
+      "status": "Pass",
+      "note": "3268 samples"
+    },
+    {
+      "name": "Rejoin convergence (p99)",
+      "target": "no timeouts",
+      "measured": "p50 36.5 s / p99 144.0 s",
+      "status": "Pass",
+      "note": "14 ok / 0 timeouts"
+    },
+    {
+      "name": "Revocation propagation (p99)",
+      "target": "informational",
+      "measured": "no samples",
+      "status": "Skip",
+      "note": "0 samples"
+    }
+  ],
+  "metrics": {
+    "generated_at": 1775763033,
+    "ops": {
+      "crdt_merge": {
+        "count": 18000,
+        "ok": 18000,
+        "err": 0,
+        "p50_ns": 1,
+        "p90_ns": 42,
+        "p99_ns": 42,
+        "max_ns": 4375,
+        "mean_ns": 18
+      },
+      "ed25519_verify": {
+        "count": 18000,
+        "ok": 18000,
+        "err": 0,
+        "p50_ns": 18527,
+        "p90_ns": 18831,
+        "p99_ns": 19599,
+        "max_ns": 36607,
+        "mean_ns": 18557
+      },
+      "enroll_device": {
+        "count": 500,
+        "ok": 500,
+        "err": 0,
+        "p50_ns": 98303,
+        "p90_ns": 134655,
+        "p99_ns": 150143,
+        "max_ns": 164351,
+        "mean_ns": 103760
+      },
+      "enroll_user": {
+        "count": 249,
+        "ok": 249,
+        "err": 0,
+        "p50_ns": 93951,
+        "p90_ns": 114687,
+        "p99_ns": 136703,
+        "max_ns": 229887,
+        "mean_ns": 96524
+      },
+      "evaluate_policy": {
+        "count": 356012,
+        "ok": 356012,
+        "err": 0,
+        "p50_ns": 3043,
+        "p90_ns": 3751,
+        "p99_ns": 4627,
+        "max_ns": 1933311,
+        "mean_ns": 3190
+      },
+      "gossip_propagation": {
+        "count": 3268,
+        "ok": 3268,
+        "err": 0,
+        "p50_ns": 15245311,
+        "p90_ns": 22446079,
+        "p99_ns": 105250815,
+        "max_ns": 126746623,
+        "mean_ns": 16894378
+      },
+      "issue_session": {
+        "count": 89001,
+        "ok": 89001,
+        "err": 0,
+        "p50_ns": 27007,
+        "p90_ns": 54527,
+        "p99_ns": 101567,
+        "max_ns": 5017599,
+        "mean_ns": 34447
+      },
+      "rejoin_convergence": {
+        "count": 14,
+        "ok": 14,
+        "err": 0,
+        "p50_ns": 36507222015,
+        "p90_ns": 142539227135,
+        "p99_ns": 144015622143,
+        "max_ns": 144015622143,
+        "mean_ns": 48567203260
+      },
+      "revocation_propagation": {
+        "count": 0,
+        "ok": 0,
+        "err": 0,
+        "p50_ns": 0,
+        "p90_ns": 0,
+        "p99_ns": 0,
+        "max_ns": 0,
+        "mean_ns": 0
+      },
+      "revoke": {
+        "count": 2,
+        "ok": 2,
+        "err": 0,
+        "p50_ns": 209,
+        "p90_ns": 250,
+        "p99_ns": 250,
+        "max_ns": 250,
+        "mean_ns": 229
+      },
+      "session_validate": {
+        "count": 89001,
+        "ok": 89001,
+        "err": 0,
+        "p50_ns": 27055,
+        "p90_ns": 38239,
+        "p99_ns": 49759,
+        "max_ns": 2271231,
+        "mean_ns": 29611
+      }
+    },
+    "gauges": [
+      {
+        "elapsed_secs": 0,
+        "rss_bytes": 39813120,
+        "trust_graph_tokens": [
+          1,
+          0,
+          0,
+          0,
+          0
+        ],
+        "store_tokens": [
+          1,
+          0,
+          0,
+          0,
+          0
+        ],
+        "gossip_tx_bytes_per_sec": 1327104.0,
+        "connected_peers": [
+          2,
+          3,
+          2,
+          2,
+          3
+        ],
+        "online": [
+          true,
+          false,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 30,
+        "rss_bytes": 40796160,
+        "trust_graph_tokens": [
+          16,
+          0,
+          15,
+          15,
+          15
+        ],
+        "store_tokens": [
+          16,
+          0,
+          15,
+          15,
+          15
+        ],
+        "gossip_tx_bytes_per_sec": 32768.0,
+        "connected_peers": [
+          2,
+          0,
+          1,
+          1,
+          2
+        ],
+        "online": [
+          true,
+          false,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 60,
+        "rss_bytes": 45498368,
+        "trust_graph_tokens": [
+          31,
+          2,
+          30,
+          30,
+          30
+        ],
+        "store_tokens": [
+          31,
+          2,
+          30,
+          30,
+          30
+        ],
+        "gossip_tx_bytes_per_sec": 156740.26666666666,
+        "connected_peers": [
+          3,
+          4,
+          2,
+          2,
+          3
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 90,
+        "rss_bytes": 45842432,
+        "trust_graph_tokens": [
+          46,
+          17,
+          45,
+          45,
+          45
+        ],
+        "store_tokens": [
+          46,
+          17,
+          45,
+          45,
+          45
+        ],
+        "gossip_tx_bytes_per_sec": 11468.8,
+        "connected_peers": [
+          3,
+          4,
+          2,
+          2,
+          3
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 120,
+        "rss_bytes": 46252032,
+        "trust_graph_tokens": [
+          61,
+          32,
+          60,
+          60,
+          60
+        ],
+        "store_tokens": [
+          61,
+          32,
+          60,
+          60,
+          60
+        ],
+        "gossip_tx_bytes_per_sec": 13653.333333333334,
+        "connected_peers": [
+          3,
+          4,
+          2,
+          2,
+          3
+        ],
+        "online": [
+          false,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 150,
+        "rss_bytes": 46497792,
+        "trust_graph_tokens": [
+          61,
+          48,
+          75,
+          75,
+          75
+        ],
+        "store_tokens": [
+          61,
+          48,
+          75,
+          75,
+          75
+        ],
+        "gossip_tx_bytes_per_sec": 8192.0,
+        "connected_peers": [
+          0,
+          3,
+          2,
+          1,
+          2
+        ],
+        "online": [
+          false,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 180,
+        "rss_bytes": 48332800,
+        "trust_graph_tokens": [
+          72,
+          62,
+          90,
+          90,
+          90
+        ],
+        "store_tokens": [
+          72,
+          62,
+          90,
+          90,
+          90
+        ],
+        "gossip_tx_bytes_per_sec": 61166.933333333334,
+        "connected_peers": [
+          4,
+          4,
+          3,
+          2,
+          3
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 210,
+        "rss_bytes": 48644096,
+        "trust_graph_tokens": [
+          87,
+          77,
+          105,
+          105,
+          105
+        ],
+        "store_tokens": [
+          87,
+          77,
+          105,
+          105,
+          105
+        ],
+        "gossip_tx_bytes_per_sec": 10376.533333333333,
+        "connected_peers": [
+          4,
+          4,
+          3,
+          2,
+          3
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 240,
+        "rss_bytes": 48971776,
+        "trust_graph_tokens": [
+          102,
+          92,
+          120,
+          120,
+          120
+        ],
+        "store_tokens": [
+          102,
+          92,
+          120,
+          120,
+          120
+        ],
+        "gossip_tx_bytes_per_sec": 10922.666666666666,
+        "connected_peers": [
+          4,
+          4,
+          3,
+          2,
+          3
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          false
+        ]
+      },
+      {
+        "elapsed_secs": 270,
+        "rss_bytes": 49168384,
+        "trust_graph_tokens": [
+          117,
+          107,
+          135,
+          135,
+          121
+        ],
+        "store_tokens": [
+          117,
+          107,
+          135,
+          135,
+          121
+        ],
+        "gossip_tx_bytes_per_sec": 6553.6,
+        "connected_peers": [
+          3,
+          3,
+          2,
+          2,
+          0
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          false
+        ]
+      },
+      {
+        "elapsed_secs": 300,
+        "rss_bytes": 51200000,
+        "trust_graph_tokens": [
+          132,
+          122,
+          150,
+          150,
+          132
+        ],
+        "store_tokens": [
+          132,
+          122,
+          150,
+          150,
+          132
+        ],
+        "gossip_tx_bytes_per_sec": 67720.53333333334,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 330,
+        "rss_bytes": 51593216,
+        "trust_graph_tokens": [
+          147,
+          137,
+          165,
+          165,
+          147
+        ],
+        "store_tokens": [
+          147,
+          137,
+          165,
+          165,
+          147
+        ],
+        "gossip_tx_bytes_per_sec": 13107.2,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 360,
+        "rss_bytes": 51920896,
+        "trust_graph_tokens": [
+          162,
+          152,
+          180,
+          180,
+          162
+        ],
+        "store_tokens": [
+          162,
+          152,
+          180,
+          180,
+          162
+        ],
+        "gossip_tx_bytes_per_sec": 10922.666666666666,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          false,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 390,
+        "rss_bytes": 52314112,
+        "trust_graph_tokens": [
+          162,
+          168,
+          195,
+          195,
+          177
+        ],
+        "store_tokens": [
+          162,
+          168,
+          195,
+          195,
+          177
+        ],
+        "gossip_tx_bytes_per_sec": 13107.2,
+        "connected_peers": [
+          0,
+          3,
+          3,
+          3,
+          3
+        ],
+        "online": [
+          false,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 420,
+        "rss_bytes": 55164928,
+        "trust_graph_tokens": [
+          167,
+          182,
+          210,
+          210,
+          192
+        ],
+        "store_tokens": [
+          167,
+          182,
+          210,
+          210,
+          192
+        ],
+        "gossip_tx_bytes_per_sec": 95027.2,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 450,
+        "rss_bytes": 55574528,
+        "trust_graph_tokens": [
+          182,
+          197,
+          225,
+          225,
+          207
+        ],
+        "store_tokens": [
+          182,
+          197,
+          225,
+          225,
+          207
+        ],
+        "gossip_tx_bytes_per_sec": 13653.333333333334,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 480,
+        "rss_bytes": 55853056,
+        "trust_graph_tokens": [
+          197,
+          212,
+          240,
+          240,
+          222
+        ],
+        "store_tokens": [
+          197,
+          212,
+          240,
+          240,
+          222
+        ],
+        "gossip_tx_bytes_per_sec": 9284.266666666666,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          false
+        ]
+      },
+      {
+        "elapsed_secs": 510,
+        "rss_bytes": 56164352,
+        "trust_graph_tokens": [
+          212,
+          227,
+          255,
+          255,
+          223
+        ],
+        "store_tokens": [
+          212,
+          227,
+          255,
+          255,
+          223
+        ],
+        "gossip_tx_bytes_per_sec": 10376.533333333333,
+        "connected_peers": [
+          3,
+          3,
+          3,
+          3,
+          0
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          false
+        ]
+      },
+      {
+        "elapsed_secs": 540,
+        "rss_bytes": 59572224,
+        "trust_graph_tokens": [
+          227,
+          242,
+          270,
+          270,
+          235
+        ],
+        "store_tokens": [
+          227,
+          242,
+          270,
+          270,
+          235
+        ],
+        "gossip_tx_bytes_per_sec": 113595.73333333334,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 570,
+        "rss_bytes": 59834368,
+        "trust_graph_tokens": [
+          242,
+          257,
+          285,
+          285,
+          250
+        ],
+        "store_tokens": [
+          242,
+          257,
+          285,
+          285,
+          250
+        ],
+        "gossip_tx_bytes_per_sec": 8738.133333333333,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 600,
+        "rss_bytes": 60178432,
+        "trust_graph_tokens": [
+          257,
+          272,
+          300,
+          300,
+          265
+        ],
+        "store_tokens": [
+          257,
+          272,
+          300,
+          300,
+          265
+        ],
+        "gossip_tx_bytes_per_sec": 11468.8,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          false,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 630,
+        "rss_bytes": 60473344,
+        "trust_graph_tokens": [
+          272,
+          287,
+          311,
+          315,
+          280
+        ],
+        "store_tokens": [
+          272,
+          287,
+          311,
+          315,
+          280
+        ],
+        "gossip_tx_bytes_per_sec": 9830.4,
+        "connected_peers": [
+          4,
+          3,
+          3,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          false,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 660,
+        "rss_bytes": 60866560,
+        "trust_graph_tokens": [
+          287,
+          302,
+          326,
+          330,
+          295
+        ],
+        "store_tokens": [
+          287,
+          302,
+          326,
+          330,
+          295
+        ],
+        "gossip_tx_bytes_per_sec": 13107.2,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 690,
+        "rss_bytes": 61210624,
+        "trust_graph_tokens": [
+          302,
+          317,
+          341,
+          345,
+          310
+        ],
+        "store_tokens": [
+          302,
+          317,
+          341,
+          345,
+          310
+        ],
+        "gossip_tx_bytes_per_sec": 11468.8,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 720,
+        "rss_bytes": 61472768,
+        "trust_graph_tokens": [
+          317,
+          332,
+          356,
+          360,
+          325
+        ],
+        "store_tokens": [
+          317,
+          332,
+          356,
+          360,
+          325
+        ],
+        "gossip_tx_bytes_per_sec": 8738.133333333333,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          false,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 750,
+        "rss_bytes": 61800448,
+        "trust_graph_tokens": [
+          332,
+          333,
+          371,
+          375,
+          340
+        ],
+        "store_tokens": [
+          332,
+          333,
+          371,
+          375,
+          340
+        ],
+        "gossip_tx_bytes_per_sec": 10922.666666666666,
+        "connected_peers": [
+          3,
+          0,
+          3,
+          3,
+          3
+        ],
+        "online": [
+          true,
+          false,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 780,
+        "rss_bytes": 62095360,
+        "trust_graph_tokens": [
+          347,
+          339,
+          386,
+          390,
+          355
+        ],
+        "store_tokens": [
+          347,
+          339,
+          386,
+          390,
+          355
+        ],
+        "gossip_tx_bytes_per_sec": 9830.4,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 810,
+        "rss_bytes": 62472192,
+        "trust_graph_tokens": [
+          362,
+          354,
+          401,
+          405,
+          370
+        ],
+        "store_tokens": [
+          362,
+          354,
+          401,
+          405,
+          370
+        ],
+        "gossip_tx_bytes_per_sec": 12561.066666666668,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 840,
+        "rss_bytes": 62881792,
+        "trust_graph_tokens": [
+          377,
+          369,
+          416,
+          420,
+          385
+        ],
+        "store_tokens": [
+          377,
+          369,
+          416,
+          420,
+          385
+        ],
+        "gossip_tx_bytes_per_sec": 13653.333333333334,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          false,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 870,
+        "rss_bytes": 63062016,
+        "trust_graph_tokens": [
+          392,
+          370,
+          431,
+          435,
+          400
+        ],
+        "store_tokens": [
+          392,
+          370,
+          431,
+          435,
+          400
+        ],
+        "gossip_tx_bytes_per_sec": 6007.466666666666,
+        "connected_peers": [
+          3,
+          0,
+          3,
+          3,
+          3
+        ],
+        "online": [
+          true,
+          false,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 900,
+        "rss_bytes": 64126976,
+        "trust_graph_tokens": [
+          407,
+          374,
+          446,
+          450,
+          415
+        ],
+        "store_tokens": [
+          407,
+          374,
+          446,
+          450,
+          415
+        ],
+        "gossip_tx_bytes_per_sec": 35498.666666666664,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 930,
+        "rss_bytes": 64454656,
+        "trust_graph_tokens": [
+          422,
+          389,
+          461,
+          465,
+          430
+        ],
+        "store_tokens": [
+          422,
+          389,
+          461,
+          465,
+          430
+        ],
+        "gossip_tx_bytes_per_sec": 10922.666666666666,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 960,
+        "rss_bytes": 64716800,
+        "trust_graph_tokens": [
+          437,
+          404,
+          476,
+          480,
+          445
+        ],
+        "store_tokens": [
+          437,
+          404,
+          476,
+          480,
+          445
+        ],
+        "gossip_tx_bytes_per_sec": 8738.133333333333,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          false,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 990,
+        "rss_bytes": 64897024,
+        "trust_graph_tokens": [
+          452,
+          419,
+          477,
+          495,
+          460
+        ],
+        "store_tokens": [
+          452,
+          419,
+          477,
+          495,
+          460
+        ],
+        "gossip_tx_bytes_per_sec": 6007.466666666666,
+        "connected_peers": [
+          3,
+          3,
+          0,
+          3,
+          3
+        ],
+        "online": [
+          true,
+          true,
+          false,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1020,
+        "rss_bytes": 65257472,
+        "trust_graph_tokens": [
+          467,
+          434,
+          487,
+          510,
+          475
+        ],
+        "store_tokens": [
+          467,
+          434,
+          487,
+          510,
+          475
+        ],
+        "gossip_tx_bytes_per_sec": 12014.933333333332,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1050,
+        "rss_bytes": 65650688,
+        "trust_graph_tokens": [
+          482,
+          449,
+          502,
+          525,
+          490
+        ],
+        "store_tokens": [
+          482,
+          449,
+          502,
+          525,
+          490
+        ],
+        "gossip_tx_bytes_per_sec": 13107.2,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1080,
+        "rss_bytes": 65929216,
+        "trust_graph_tokens": [
+          497,
+          464,
+          517,
+          540,
+          505
+        ],
+        "store_tokens": [
+          497,
+          464,
+          517,
+          540,
+          505
+        ],
+        "gossip_tx_bytes_per_sec": 9284.266666666666,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          false,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1110,
+        "rss_bytes": 66224128,
+        "trust_graph_tokens": [
+          512,
+          479,
+          518,
+          555,
+          520
+        ],
+        "store_tokens": [
+          512,
+          479,
+          518,
+          555,
+          520
+        ],
+        "gossip_tx_bytes_per_sec": 9830.4,
+        "connected_peers": [
+          3,
+          3,
+          0,
+          3,
+          3
+        ],
+        "online": [
+          true,
+          true,
+          false,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1140,
+        "rss_bytes": 66568192,
+        "trust_graph_tokens": [
+          527,
+          494,
+          519,
+          570,
+          535
+        ],
+        "store_tokens": [
+          527,
+          494,
+          519,
+          570,
+          535
+        ],
+        "gossip_tx_bytes_per_sec": 11468.8,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1170,
+        "rss_bytes": 66977792,
+        "trust_graph_tokens": [
+          542,
+          509,
+          534,
+          585,
+          550
+        ],
+        "store_tokens": [
+          542,
+          509,
+          534,
+          585,
+          550
+        ],
+        "gossip_tx_bytes_per_sec": 13653.333333333334,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1200,
+        "rss_bytes": 67305472,
+        "trust_graph_tokens": [
+          557,
+          524,
+          549,
+          600,
+          565
+        ],
+        "store_tokens": [
+          557,
+          524,
+          549,
+          600,
+          565
+        ],
+        "gossip_tx_bytes_per_sec": 10922.666666666666,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          false
+        ]
+      },
+      {
+        "elapsed_secs": 1230,
+        "rss_bytes": 68796416,
+        "trust_graph_tokens": [
+          572,
+          539,
+          564,
+          615,
+          568
+        ],
+        "store_tokens": [
+          572,
+          539,
+          564,
+          615,
+          568
+        ],
+        "gossip_tx_bytes_per_sec": 49698.13333333333,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          false
+        ]
+      },
+      {
+        "elapsed_secs": 1260,
+        "rss_bytes": 69173248,
+        "trust_graph_tokens": [
+          587,
+          554,
+          579,
+          630,
+          583
+        ],
+        "store_tokens": [
+          587,
+          554,
+          579,
+          630,
+          583
+        ],
+        "gossip_tx_bytes_per_sec": 12561.066666666668,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1290,
+        "rss_bytes": 69484544,
+        "trust_graph_tokens": [
+          602,
+          569,
+          594,
+          645,
+          598
+        ],
+        "store_tokens": [
+          602,
+          569,
+          594,
+          645,
+          598
+        ],
+        "gossip_tx_bytes_per_sec": 10376.533333333333,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1320,
+        "rss_bytes": 69828608,
+        "trust_graph_tokens": [
+          617,
+          584,
+          609,
+          660,
+          613
+        ],
+        "store_tokens": [
+          617,
+          584,
+          609,
+          660,
+          613
+        ],
+        "gossip_tx_bytes_per_sec": 11468.8,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          false,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1350,
+        "rss_bytes": 69976064,
+        "trust_graph_tokens": [
+          617,
+          600,
+          624,
+          675,
+          628
+        ],
+        "store_tokens": [
+          617,
+          600,
+          624,
+          675,
+          628
+        ],
+        "gossip_tx_bytes_per_sec": 4915.2,
+        "connected_peers": [
+          0,
+          3,
+          3,
+          3,
+          3
+        ],
+        "online": [
+          false,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1380,
+        "rss_bytes": 71548928,
+        "trust_graph_tokens": [
+          625,
+          614,
+          639,
+          690,
+          643
+        ],
+        "store_tokens": [
+          625,
+          614,
+          639,
+          690,
+          643
+        ],
+        "gossip_tx_bytes_per_sec": 52428.8,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1410,
+        "rss_bytes": 71958528,
+        "trust_graph_tokens": [
+          640,
+          629,
+          654,
+          705,
+          658
+        ],
+        "store_tokens": [
+          640,
+          629,
+          654,
+          705,
+          658
+        ],
+        "gossip_tx_bytes_per_sec": 13653.333333333334,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1440,
+        "rss_bytes": 72220672,
+        "trust_graph_tokens": [
+          655,
+          644,
+          669,
+          720,
+          673
+        ],
+        "store_tokens": [
+          655,
+          644,
+          669,
+          720,
+          673
+        ],
+        "gossip_tx_bytes_per_sec": 8738.133333333333,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          false,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1470,
+        "rss_bytes": 72499200,
+        "trust_graph_tokens": [
+          670,
+          659,
+          684,
+          721,
+          688
+        ],
+        "store_tokens": [
+          670,
+          659,
+          684,
+          721,
+          688
+        ],
+        "gossip_tx_bytes_per_sec": 9284.266666666666,
+        "connected_peers": [
+          3,
+          3,
+          3,
+          0,
+          3
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          false,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1500,
+        "rss_bytes": 72826880,
+        "trust_graph_tokens": [
+          685,
+          674,
+          699,
+          731,
+          703
+        ],
+        "store_tokens": [
+          685,
+          674,
+          699,
+          731,
+          703
+        ],
+        "gossip_tx_bytes_per_sec": 10922.666666666666,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1530,
+        "rss_bytes": 73187328,
+        "trust_graph_tokens": [
+          700,
+          689,
+          714,
+          746,
+          718
+        ],
+        "store_tokens": [
+          700,
+          689,
+          714,
+          746,
+          718
+        ],
+        "gossip_tx_bytes_per_sec": 12014.933333333332,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1560,
+        "rss_bytes": 73580544,
+        "trust_graph_tokens": [
+          715,
+          704,
+          729,
+          761,
+          733
+        ],
+        "store_tokens": [
+          715,
+          704,
+          729,
+          761,
+          733
+        ],
+        "gossip_tx_bytes_per_sec": 13107.2,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          false
+        ]
+      },
+      {
+        "elapsed_secs": 1590,
+        "rss_bytes": 73728000,
+        "trust_graph_tokens": [
+          730,
+          719,
+          744,
+          776,
+          734
+        ],
+        "store_tokens": [
+          730,
+          719,
+          744,
+          776,
+          734
+        ],
+        "gossip_tx_bytes_per_sec": 4915.2,
+        "connected_peers": [
+          3,
+          3,
+          3,
+          3,
+          0
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          false
+        ]
+      },
+      {
+        "elapsed_secs": 1620,
+        "rss_bytes": 75907072,
+        "trust_graph_tokens": [
+          745,
+          734,
+          759,
+          791,
+          739
+        ],
+        "store_tokens": [
+          745,
+          734,
+          759,
+          791,
+          739
+        ],
+        "gossip_tx_bytes_per_sec": 72635.73333333334,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1650,
+        "rss_bytes": 76185600,
+        "trust_graph_tokens": [
+          760,
+          749,
+          774,
+          806,
+          754
+        ],
+        "store_tokens": [
+          760,
+          749,
+          774,
+          806,
+          754
+        ],
+        "gossip_tx_bytes_per_sec": 9284.266666666666,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1680,
+        "rss_bytes": 76611584,
+        "trust_graph_tokens": [
+          775,
+          764,
+          789,
+          821,
+          769
+        ],
+        "store_tokens": [
+          775,
+          764,
+          789,
+          821,
+          769
+        ],
+        "gossip_tx_bytes_per_sec": 14199.466666666667,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          false
+        ]
+      },
+      {
+        "elapsed_secs": 1710,
+        "rss_bytes": 76775424,
+        "trust_graph_tokens": [
+          790,
+          779,
+          804,
+          836,
+          770
+        ],
+        "store_tokens": [
+          790,
+          779,
+          804,
+          836,
+          770
+        ],
+        "gossip_tx_bytes_per_sec": 5461.333333333333,
+        "connected_peers": [
+          3,
+          3,
+          3,
+          3,
+          0
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          false
+        ]
+      },
+      {
+        "elapsed_secs": 1740,
+        "rss_bytes": 77168640,
+        "trust_graph_tokens": [
+          805,
+          794,
+          819,
+          851,
+          779
+        ],
+        "store_tokens": [
+          805,
+          794,
+          819,
+          851,
+          779
+        ],
+        "gossip_tx_bytes_per_sec": 13107.2,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "elapsed_secs": 1770,
+        "rss_bytes": 77545472,
+        "trust_graph_tokens": [
+          820,
+          809,
+          834,
+          866,
+          794
+        ],
+        "store_tokens": [
+          820,
+          809,
+          834,
+          866,
+          794
+        ],
+        "gossip_tx_bytes_per_sec": 12561.066666666668,
+        "connected_peers": [
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "online": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      }
+    ]
+  },
+  "chaos": {
+    "enabled": true,
+    "pause_events": 15,
+    "rejoin_events": 15,
+    "interval_secs": 120,
+    "offline_secs": 45,
+    "max_fraction": 0.34
+  }
+}
