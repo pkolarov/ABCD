@@ -15,6 +15,7 @@ use dds_core::trust::TrustGraph;
 use dds_domain::{DeviceJoinDocument, DomainDocument, SessionDocument, UserAuthAttestation};
 use dds_store::traits::*;
 use std::collections::BTreeSet;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Request to enroll a user via FIDO2 attestation.
@@ -91,13 +92,19 @@ pub struct PolicyResult {
 }
 
 /// The local authority service.
+///
+/// `trust_graph` is shared (`Arc<RwLock<TrustGraph>>`) with the owning
+/// `DdsNode` so gossip-received tokens are visible to query-time hot
+/// paths without rebuilding from the store on every call. See B5b in
+/// STATUS.md and the doc on `LocalService::new` for the history.
 pub struct LocalService<S: TokenStore + dds_store::traits::RevocationStore> {
     /// Node signing identity (used to issue tokens).
     node_identity: Identity,
     /// Policy engine with loaded rules.
     policy_engine: PolicyEngine,
-    /// Trust graph reference.
-    pub trust_graph: TrustGraph,
+    /// Trust graph (shared with the owning `DdsNode` when the service is
+    /// run alongside a swarm; otherwise solely owned by the service).
+    pub trust_graph: Arc<RwLock<TrustGraph>>,
     /// Trusted root URNs.
     trusted_roots: BTreeSet<String>,
     /// Storage backend.
@@ -110,13 +117,30 @@ pub struct LocalService<S: TokenStore + dds_store::traits::RevocationStore> {
 
 impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
     /// Create a new local service.
+    ///
+    /// Rehydrates the in-memory `trust_graph` from any tokens already
+    /// present in `store`, then keeps it in sync via the enrollment paths
+    /// (`enroll_user`, `enroll_device`) that mutate both. This is the
+    /// source of truth for query-time hot paths (`evaluate_policy`,
+    /// `issue_session`, `status`).
+    ///
+    /// **Multi-writer caveat**: if the store is shared with a writer
+    /// outside this `LocalService` (e.g. a `DdsNode` swarm event loop
+    /// writing gossip-received tokens to the same redb file), those
+    /// out-of-band writes are *not* automatically reflected here. The
+    /// caller is responsible for routing such writes through
+    /// `LocalService` (via the enrollment APIs or a future
+    /// `ingest_token` API). The 2026-04-09 chaos soak found that the
+    /// previous "rebuild trust graph from store on every query" pattern
+    /// turned this hidden assumption into a 10-ms `evaluate_policy`
+    /// p99 — a 10× §10 budget violation. See B5b in STATUS.md.
     pub fn new(
         node_identity: Identity,
-        trust_graph: TrustGraph,
+        trust_graph: Arc<RwLock<TrustGraph>>,
         trusted_roots: BTreeSet<String>,
         store: S,
     ) -> Self {
-        Self {
+        let mut svc = Self {
             node_identity,
             policy_engine: PolicyEngine::new(),
             trust_graph,
@@ -124,7 +148,70 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             store,
             start_time: now_epoch(),
             verify_fido2: true,
+        };
+        // Best-effort rehydration: pull any pre-existing tokens from the
+        // store into the in-memory graph. Only relevant when the store
+        // already contains state from a prior run or external seeding
+        // (e.g. http_binary_e2e's `seed_store`). Errors are logged via
+        // the returned `ServiceError` form, but `new` is infallible by
+        // contract — bad tokens in the store would also have failed the
+        // old per-query rebuild, so we drop them silently here too.
+        let _ = svc.rehydrate_from_store();
+        svc
+    }
+
+    /// Rehydrate the in-memory trust graph from the store. Called from
+    /// `new()` and exposed for tests / future use cases that need to
+    /// re-sync after external store mutations. Returns the number of
+    /// tokens absorbed, or an error if the store cannot be read.
+    pub fn rehydrate_from_store(&mut self) -> Result<usize, ServiceError> {
+        let store_has_state = self.store.count_tokens(None).unwrap_or(0) > 0
+            || !self.store.revoked_set().unwrap_or_default().is_empty()
+            || !self.store.burned_set().unwrap_or_default().is_empty();
+        if !store_has_state {
+            return Ok(0);
         }
+
+        let jtis = self
+            .store
+            .list_tokens(None)
+            .map_err(|e| ServiceError::Store(e.to_string()))?;
+        let mut tokens = Vec::with_capacity(jtis.len());
+        for jti in jtis {
+            let token = self
+                .store
+                .get_token(&jti)
+                .map_err(|e| ServiceError::Store(e.to_string()))?;
+            tokens.push(token);
+        }
+        // Sort by kind so attestations are inserted before vouches
+        // (vouches with vch_sum need their target attestation present),
+        // and revocations / burns last.
+        tokens.sort_by_key(|token| match token.payload.kind {
+            TokenKind::Attest => 0,
+            TokenKind::Vouch => 1,
+            TokenKind::Revoke => 2,
+            TokenKind::Burn => 3,
+        });
+
+        let mut absorbed = 0usize;
+        let mut g = self
+            .trust_graph
+            .write()
+            .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+        for token in tokens {
+            // The graph's add_token re-validates signatures; duplicate
+            // inserts are a no-op. We log and skip on rejection rather
+            // than failing the whole rehydrate — bad tokens in the store
+            // would also have failed the old per-query rebuild.
+            if let Err(e) = g.add_token(token) {
+                tracing::warn!("rehydrate_from_store: skipping token: {e}");
+                continue;
+            }
+            absorbed += 1;
+        }
+        let _ = g.sweep_expired();
+        Ok(absorbed)
     }
 
     /// Disable FIDO2 attestation verification (for test scenarios that
@@ -180,7 +267,13 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
         self.store
             .put_token(&token)
             .map_err(|e| ServiceError::Store(e.to_string()))?;
-        let _ = self.trust_graph.add_token(token.clone());
+        {
+            let mut g = self
+                .trust_graph
+                .write()
+                .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+            let _ = g.add_token(token.clone());
+        }
 
         Ok(EnrollmentResult {
             urn: user_ident.id.to_urn(),
@@ -216,7 +309,13 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
         self.store
             .put_token(&token)
             .map_err(|e| ServiceError::Store(e.to_string()))?;
-        let _ = self.trust_graph.add_token(token.clone());
+        {
+            let mut g = self
+                .trust_graph
+                .write()
+                .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+            let _ = g.add_token(token.clone());
+        }
 
         Ok(EnrollmentResult {
             urn: device_ident.id.to_urn(),
@@ -227,10 +326,18 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
 
     /// Issue a short-lived session token.
     pub fn issue_session(&mut self, req: SessionRequest) -> Result<SessionResult, ServiceError> {
-        // Resolve granted purposes from trust graph
-        let granted: BTreeSet<String> = self
-            .trust_graph
-            .purposes_for(&req.subject_urn, &self.trusted_roots);
+        // Use the shared in-memory trust graph directly via a read lock.
+        // It is the source of truth — see `LocalService::new` doc for
+        // the multi-writer contract. Previously this rebuilt from the
+        // store on every call, which made `evaluate_policy` p99 climb
+        // to 10 ms in the 2026-04-09 chaos soak (B5b).
+        let granted: BTreeSet<String> = {
+            let g = self
+                .trust_graph
+                .read()
+                .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+            g.purposes_for(&req.subject_urn, &self.trusted_roots)
+        };
 
         if granted.is_empty() {
             return Err(ServiceError::Domain(
@@ -293,38 +400,56 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
     }
 
     /// Evaluate a policy decision.
-    pub fn evaluate_policy(&self, subject_urn: &str, resource: &str, action: &str) -> PolicyResult {
-        let decision = self.policy_engine.evaluate(
-            subject_urn,
-            resource,
-            action,
-            &self.trust_graph,
-            &self.trusted_roots,
-        );
-        PolicyResult {
+    pub fn evaluate_policy(
+        &self,
+        subject_urn: &str,
+        resource: &str,
+        action: &str,
+    ) -> Result<PolicyResult, ServiceError> {
+        // Shared in-memory trust graph is the source of truth (see B5b
+        // note on `LocalService::new`); take a read lock for the eval.
+        let g = self
+            .trust_graph
+            .read()
+            .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+        let decision =
+            self.policy_engine
+                .evaluate(subject_urn, resource, action, &g, &self.trusted_roots);
+        Ok(PolicyResult {
             allowed: decision.is_allowed(),
             reason: format!("{decision}"),
-        }
+        })
     }
 
     /// Get node status.
-    pub fn status(&self, peer_id: &str, connected_peers: usize, dag_ops: usize) -> NodeStatus {
-        NodeStatus {
+    pub fn status(
+        &self,
+        peer_id: &str,
+        connected_peers: usize,
+        dag_ops: usize,
+    ) -> Result<NodeStatus, ServiceError> {
+        let trust_graph_tokens = self
+            .trust_graph
+            .read()
+            .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?
+            .token_count();
+        Ok(NodeStatus {
             peer_id: peer_id.to_string(),
             connected_peers,
             dag_operations: dag_ops,
-            trust_graph_tokens: self.trust_graph.token_count(),
+            trust_graph_tokens,
             trusted_roots: self.trusted_roots.len(),
             store_tokens: self.store.count_tokens(None).unwrap_or(0),
             store_revoked: self.store.revoked_set().map(|s| s.len()).unwrap_or(0),
             store_burned: self.store.burned_set().map(|s| s.len()).unwrap_or(0),
             uptime_secs: now_epoch() - self.start_time,
-        }
+        })
     }
 
-    /// Access the trust graph mutably.
-    pub fn trust_graph_mut(&mut self) -> &mut TrustGraph {
-        &mut self.trust_graph
+    /// Get a clone of the shared trust graph handle. Callers can take a
+    /// read or write lock as needed.
+    pub fn trust_graph_handle(&self) -> Arc<RwLock<TrustGraph>> {
+        Arc::clone(&self.trust_graph)
     }
 
     /// Access the store mutably.
@@ -351,6 +476,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             body_cbor: None,
         }
     }
+
 }
 
 /// Service errors.
@@ -359,6 +485,7 @@ pub enum ServiceError {
     Token(String),
     Domain(String),
     Store(String),
+    Trust(String),
     Policy(String),
     Fido2(String),
 }
@@ -369,6 +496,7 @@ impl std::fmt::Display for ServiceError {
             ServiceError::Token(e) => write!(f, "token error: {e}"),
             ServiceError::Domain(e) => write!(f, "domain error: {e}"),
             ServiceError::Store(e) => write!(f, "store error: {e}"),
+            ServiceError::Trust(e) => write!(f, "trust error: {e}"),
             ServiceError::Policy(e) => write!(f, "policy error: {e}"),
             ServiceError::Fido2(e) => write!(f, "fido2 error: {e}"),
         }

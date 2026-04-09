@@ -1,6 +1,7 @@
 //! DDS node: ties together storage, trust, networking, and sync.
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use dds_core::crdt::causal_dag::CausalDag;
@@ -19,12 +20,20 @@ use dds_domain::{DomainId, domain::from_hex};
 use crate::config::NodeConfig;
 
 /// The running DDS node state.
+///
+/// `trust_graph` is shared (`Arc<RwLock<TrustGraph>>`) so the swarm event
+/// loop and the `LocalService` HTTP API can both observe gossip-received
+/// tokens. Before this fix the two had cloned-but-divergent graphs and
+/// `LocalService` had to rebuild from the store on every query — which
+/// the 2026-04-09 chaos soak found drove `evaluate_policy` p99 to 10 ms
+/// (see B5b). The lock is read-heavy: every query reads, only the swarm
+/// gossip handlers and enrollment paths write.
 pub struct DdsNode {
     pub swarm: Swarm<DdsBehaviour>,
     pub peer_id: PeerId,
     pub store: RedbBackend,
     pub dag: CausalDag,
-    pub trust_graph: TrustGraph,
+    pub trust_graph: Arc<RwLock<TrustGraph>>,
     pub trusted_roots: BTreeSet<String>,
     pub topics: DdsTopicSet,
     pub config: NodeConfig,
@@ -100,7 +109,7 @@ impl DdsNode {
             peer_id,
             store,
             dag: CausalDag::new(),
-            trust_graph: TrustGraph::new(),
+            trust_graph: Arc::new(RwLock::new(TrustGraph::new())),
             trusted_roots,
             topics,
             config,
@@ -157,7 +166,10 @@ impl DdsNode {
                     self.handle_swarm_event(event);
                 }
                 _ = expiry_interval.tick() => {
-                    let expired = self.trust_graph.sweep_expired();
+                    let expired = {
+                        let mut g = self.trust_graph.write().expect("trust_graph poisoned");
+                        g.sweep_expired()
+                    };
                     for jti in &expired {
                         let _ = self.store.revoke(jti);
                     }
@@ -270,9 +282,12 @@ impl DdsNode {
             warn!("token validation failed: {e}");
             return;
         }
-        if let Err(e) = self.trust_graph.add_token(token.clone()) {
-            warn!("trust graph rejected token: {e}");
-            return;
+        {
+            let mut g = self.trust_graph.write().expect("trust_graph poisoned");
+            if let Err(e) = g.add_token(token.clone()) {
+                warn!("trust graph rejected token: {e}");
+                return;
+            }
         }
         if let Err(e) = self.store.put_token(&token) {
             error!("store error: {e}");
@@ -296,9 +311,15 @@ impl DdsNode {
             warn!("revocation validation failed: {e}");
             return;
         }
-        if let Err(e) = self.trust_graph.add_token(token.clone()) {
-            warn!("trust graph rejected revocation: {e}");
-            return;
+        {
+            let mut g = self.trust_graph.write().expect("trust_graph poisoned");
+            if let Err(e) = g.add_token(token.clone()) {
+                warn!("trust graph rejected revocation: {e}");
+                return;
+            }
+        }
+        if let Err(e) = self.store.put_token(&token) {
+            error!("store error: {e}");
         }
         if let Some(ref target) = token.payload.revokes {
             if let Err(e) = self.store.revoke(target) {
@@ -320,9 +341,15 @@ impl DdsNode {
             warn!("burn validation failed: {e}");
             return;
         }
-        if let Err(e) = self.trust_graph.add_token(token.clone()) {
-            warn!("trust graph rejected burn: {e}");
-            return;
+        {
+            let mut g = self.trust_graph.write().expect("trust_graph poisoned");
+            if let Err(e) = g.add_token(token.clone()) {
+                warn!("trust graph rejected burn: {e}");
+                return;
+            }
+        }
+        if let Err(e) = self.store.put_token(&token) {
+            error!("store error: {e}");
         }
         if let Err(e) = self.store.burn(&token.payload.iss) {
             error!("store burn error: {e}");
@@ -347,7 +374,8 @@ impl DdsNode {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        crate::expiry::sweep_once(&mut self.trust_graph, &mut self.store, now)
+        let mut g = self.trust_graph.write().expect("trust_graph poisoned");
+        crate::expiry::sweep_once(&mut g, &mut self.store, now)
     }
 
     /// Get the number of connected peers.
@@ -368,11 +396,12 @@ impl DdsNode {
         action: &str,
         policy_engine: &dds_core::policy::PolicyEngine,
     ) -> dds_core::policy::PolicyDecision {
+        let g = self.trust_graph.read().expect("trust_graph poisoned");
         policy_engine.evaluate(
             subject_urn,
             resource,
             action,
-            &self.trust_graph,
+            &g,
             &self.trusted_roots,
         )
     }

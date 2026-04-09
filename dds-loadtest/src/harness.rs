@@ -32,20 +32,21 @@ use ed25519_dalek::{Signature, Verifier};
 use futures::StreamExt;
 use libp2p::Multiaddr;
 use libp2p::swarm::SwarmEvent;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tempfile::TempDir;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tokio::time::{Interval, MissedTickBehavior, interval, timeout};
 use tracing::{info, warn};
 
 use crate::Cli;
 use crate::metrics::{GaugeSample, Metrics};
-use crate::report::{Summary, compute_kpis, write_snapshot, write_summary};
+use crate::report::{ChaosSummary, Summary, compute_kpis, write_snapshot, write_summary};
 use crate::workload::Synth;
 
-/// In-flight gossip propagation probe — sent on node 0, awaited on the rest.
+/// In-flight gossip propagation probe — sent on a chosen anchor, awaited on the rest.
 struct Probe {
     op_id: String,
     publish_at: Instant,
@@ -53,7 +54,85 @@ struct Probe {
     is_revocation: bool,
 }
 
-pub async fn run(cli: Cli, stop: Arc<Notify>) -> Result<(), Box<dyn std::error::Error>> {
+/// In-flight rejoin convergence probe — set when a paused node returns.
+/// Convergence = node's trust_graph token_count reaching the target captured
+/// at the moment of rejoin (median across the still-online peers).
+struct RejoinProbe {
+    node_idx: usize,
+    rejoined_at: Instant,
+    target_tokens: usize,
+}
+
+/// Chaos layer state — owns the random walk that pauses/resumes nodes.
+struct ChaosState {
+    enabled: bool,
+    /// Per-node online flag.
+    online: Vec<bool>,
+    /// When each currently-offline node should rejoin.
+    offline_until: Vec<Option<Instant>>,
+    /// Saved listen addrs from mesh formation, used for redial on rejoin.
+    addrs: Vec<Multiaddr>,
+    /// Saved peer ids for redial / explicit-peer add on rejoin.
+    pids: Vec<libp2p::PeerId>,
+    interval: Duration,
+    offline_dur: Duration,
+    max_fraction: f64,
+    rng: StdRng,
+    pending_rejoins: Vec<RejoinProbe>,
+    /// Counters for the summary footer.
+    pause_events: u64,
+    rejoin_events: u64,
+}
+
+impl ChaosState {
+    fn new(
+        enabled: bool,
+        n: usize,
+        addrs: Vec<Multiaddr>,
+        pids: Vec<libp2p::PeerId>,
+        interval: Duration,
+        offline_dur: Duration,
+        max_fraction: f64,
+        seed: u64,
+    ) -> Self {
+        Self {
+            enabled,
+            online: vec![true; n],
+            offline_until: vec![None; n],
+            addrs,
+            pids,
+            interval,
+            offline_dur,
+            max_fraction,
+            rng: StdRng::seed_from_u64(seed.wrapping_add(0xC4A05)),
+            pending_rejoins: Vec::new(),
+            pause_events: 0,
+            rejoin_events: 0,
+        }
+    }
+
+    fn online_indices(&self) -> Vec<usize> {
+        self.online
+            .iter()
+            .enumerate()
+            .filter_map(|(i, on)| if *on { Some(i) } else { None })
+            .collect()
+    }
+
+    fn offline_count(&self) -> usize {
+        self.online.iter().filter(|o| !**o).count()
+    }
+
+    fn pick_anchor(&self) -> Option<usize> {
+        // Pick the lowest-index online node as the publish anchor for probes.
+        self.online.iter().position(|on| *on)
+    }
+}
+
+pub async fn run(
+    cli: Cli,
+    mut stop: watch::Receiver<bool>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let nodes_count = cli.effective_nodes();
     let duration = cli.effective_duration();
     info!(
@@ -109,25 +188,50 @@ pub async fn run(cli: Cli, stop: Arc<Notify>) -> Result<(), Box<dyn std::error::
     .await;
     info!("mesh formed");
 
+    // ---- chaos layer state (idle if --chaos not set) ----
+    let mut chaos = ChaosState::new(
+        cli.chaos_enabled(),
+        nodes_count,
+        addrs.clone(),
+        pids.clone(),
+        cli.chaos_interval_dur(),
+        cli.chaos_offline_dur(),
+        cli.chaos_max_fraction.clamp(0.0, 0.9),
+        cli.seed,
+    );
+    if chaos.enabled {
+        info!(
+            interval_secs = chaos.interval.as_secs(),
+            offline_secs = chaos.offline_dur.as_secs(),
+            max_fraction = chaos.max_fraction,
+            "chaos layer enabled"
+        );
+    }
+
     // ---- per-node LocalServices (MemoryBackend, isolated from the swarm
     //      RedbBackend so we can measure local-op KPIs without disk I/O).
+    // Each service has its own trusted root identity, retained so the
+    // harness can sign vouch tokens that grant purposes to enrolled users
+    // (otherwise issue_session fails because purposes_for() is empty).
     let mut services: Vec<LocalService<MemoryBackend>> = Vec::with_capacity(nodes_count);
+    let mut roots_per_node: Vec<Identity> = Vec::with_capacity(nodes_count);
     for i in 0..nodes_count {
         let ident = Identity::generate(&format!("node-{i}"), &mut rand::rngs::OsRng);
         let root = Identity::generate(&format!("root-{i}"), &mut rand::rngs::OsRng);
         let mut roots = BTreeSet::new();
         roots.insert(root.id.to_urn());
-        let graph = TrustGraph::new();
+        let graph = std::sync::Arc::new(std::sync::RwLock::new(TrustGraph::new()));
         let mut svc = LocalService::new(ident, graph, roots, MemoryBackend::new());
-        // skip FIDO2 verify? We *want* to measure it — leave on. The
-        // synthetic builder produces valid `none` attestations.
+        // FIDO2 verify is on (we want to measure it). The synthetic builder
+        // produces valid `none` attestations.
         svc.add_policy_rule(PolicyRule {
             effect: Effect::Allow,
-            required_purpose: "dds:directory-entry".into(),
+            required_purpose: "repo:proj".into(),
             resource: "repo:proj".into(),
             actions: vec!["read".into(), "write".into()],
         });
         services.push(svc);
+        roots_per_node.push(root);
     }
 
     // ---- workload state ----
@@ -155,6 +259,10 @@ pub async fn run(cli: Cli, stop: Arc<Notify>) -> Result<(), Box<dyn std::error::
     let mut snap_iv = make_interval(Duration::from_secs(15 * 60));
     // Expiry sweep — short cadence so the trust graph stays bounded.
     let mut expiry_iv = make_interval(Duration::from_secs(30));
+    // Chaos: pick a node to flip every chaos_interval (jittered).
+    let mut chaos_iv = make_interval(chaos.interval.max(Duration::from_secs(1)));
+    // Rejoin check: poll convergence + scheduled rejoins every 500 ms.
+    let mut rejoin_iv = make_interval(Duration::from_millis(500));
 
     // Carry-overs for fractional ops.
     let mut acc_user = 0.0f64;
@@ -175,12 +283,21 @@ pub async fn run(cli: Cli, stop: Arc<Notify>) -> Result<(), Box<dyn std::error::
     tokio::pin!(dur_sleep);
 
     info!("entering main loop");
+    // Pre-check the initial stop value (in case shutdown raced ahead).
+    if *stop.borrow() {
+        info!("shutdown requested before main loop entry");
+        return Ok(());
+    }
     loop {
         tokio::select! {
             biased;
-            _ = stop.notified() => {
-                info!("shutdown requested");
-                break;
+            res = stop.changed() => {
+                // `changed()` resolves on a state change OR sender drop.
+                // In both cases the right move is to wind down.
+                if res.is_err() || *stop.borrow() {
+                    info!("shutdown requested");
+                    break;
+                }
             }
             _ = &mut dur_sleep => {
                 info!("duration elapsed");
@@ -199,25 +316,38 @@ pub async fn run(cli: Cli, stop: Arc<Notify>) -> Result<(), Box<dyn std::error::
                 let n_eval = acc_eval as u64; acc_eval -= n_eval as f64;
                 let n_rev = acc_rev as u64; acc_rev -= n_rev as f64;
 
-                for _ in 0..n_user {
-                    let idx = round_robin(&mut synth_seq(&mut synth), nodes_count);
-                    do_enroll_user(&mut services[idx], &mut synth, &metrics, &mut user_urns_per_node[idx]);
-                }
-                for _ in 0..n_dev {
-                    let idx = round_robin(&mut synth_seq(&mut synth), nodes_count);
-                    do_enroll_device(&mut services[idx], &mut synth, &metrics);
-                }
-                for _ in 0..n_sess {
-                    let idx = round_robin(&mut synth_seq(&mut synth), nodes_count);
-                    do_issue_session(&mut services[idx], &mut synth, &metrics, &user_urns_per_node[idx]);
-                }
-                for _ in 0..n_eval {
-                    let idx = round_robin(&mut synth_seq(&mut synth), nodes_count);
-                    do_eval_policy(&services[idx], &metrics, &user_urns_per_node[idx]);
-                }
-                for _ in 0..n_rev {
-                    let idx = round_robin(&mut synth_seq(&mut synth), nodes_count);
-                    do_revoke_local(&mut services[idx], &metrics, &mut user_urns_per_node[idx]);
+                let online = if chaos.enabled {
+                    chaos.online_indices()
+                } else {
+                    (0..nodes_count).collect()
+                };
+                if !online.is_empty() {
+                    for _ in 0..n_user {
+                        let idx = pick_online(&online, &mut synth_seq(&mut synth));
+                        do_enroll_user(
+                            &mut services[idx],
+                            &roots_per_node[idx],
+                            &mut synth,
+                            &metrics,
+                            &mut user_urns_per_node[idx],
+                        );
+                    }
+                    for _ in 0..n_dev {
+                        let idx = pick_online(&online, &mut synth_seq(&mut synth));
+                        do_enroll_device(&mut services[idx], &mut synth, &metrics);
+                    }
+                    for _ in 0..n_sess {
+                        let idx = pick_online(&online, &mut synth_seq(&mut synth));
+                        do_issue_session(&mut services[idx], &mut synth, &metrics, &user_urns_per_node[idx]);
+                    }
+                    for _ in 0..n_eval {
+                        let idx = pick_online(&online, &mut synth_seq(&mut synth));
+                        do_eval_policy(&services[idx], &metrics, &user_urns_per_node[idx]);
+                    }
+                    for _ in 0..n_rev {
+                        let idx = pick_online(&online, &mut synth_seq(&mut synth));
+                        do_revoke_local(&mut services[idx], &metrics, &mut user_urns_per_node[idx]);
+                    }
                 }
 
                 // Sample CRDT merge + ed25519 verify on every tick (cheap).
@@ -225,10 +355,20 @@ pub async fn run(cli: Cli, stop: Arc<Notify>) -> Result<(), Box<dyn std::error::
                 sample_ed25519(&metrics);
             }
             _ = probe_iv.tick() => {
-                publish_probe(&mut nodes, &metrics, &mut probes, false);
+                publish_probe(&mut nodes, &metrics, &mut probes, false, &chaos);
             }
             _ = revoke_probe_iv.tick() => {
-                publish_probe(&mut nodes, &metrics, &mut probes, true);
+                publish_probe(&mut nodes, &metrics, &mut probes, true, &chaos);
+            }
+            _ = chaos_iv.tick() => {
+                if chaos.enabled {
+                    chaos_step(&mut nodes, &mut chaos);
+                }
+            }
+            _ = rejoin_iv.tick() => {
+                if chaos.enabled {
+                    chaos_check_rejoins(&mut nodes, &mut chaos, &metrics);
+                }
             }
             _ = gauge_iv.tick() => {
                 let elapsed = started.elapsed().as_secs();
@@ -240,7 +380,10 @@ pub async fn run(cli: Cli, stop: Arc<Notify>) -> Result<(), Box<dyn std::error::
                 let rss = sys.process(pid).map(|p| p.memory()).unwrap_or(0);
                 let delta_rss = rss.saturating_sub(last_rss);
                 last_rss = rss;
-                let trust: Vec<usize> = nodes.iter().map(|n| n.trust_graph.token_count()).collect();
+                let trust: Vec<usize> = nodes
+                    .iter()
+                    .map(|n| n.trust_graph.read().unwrap().token_count())
+                    .collect();
                 // LocalService doesn't expose a store accessor we can
                 // count cheaply; use the dds-node store as a proxy.
                 use dds_store::traits::TokenStore;
@@ -248,6 +391,7 @@ pub async fn run(cli: Cli, stop: Arc<Notify>) -> Result<(), Box<dyn std::error::
                     .iter()
                     .map(|n| n.store.count_tokens(None).unwrap_or(0))
                     .collect();
+                let conn: Vec<usize> = nodes.iter().map(|n| n.connected_peers()).collect();
                 // gossip-bandwidth proxy: change in RSS / 30s. Real net byte
                 // counters aren't exposed by libp2p; documented limitation.
                 let bw = delta_rss as f64 / 30.0;
@@ -257,6 +401,8 @@ pub async fn run(cli: Cli, stop: Arc<Notify>) -> Result<(), Box<dyn std::error::
                     trust_graph_tokens: trust,
                     store_tokens: store,
                     gossip_tx_bytes_per_sec: bw,
+                    connected_peers: conn,
+                    online: chaos.online.clone(),
                 });
             }
             _ = log_iv.tick() => {
@@ -313,6 +459,14 @@ pub async fn run(cli: Cli, stop: Arc<Notify>) -> Result<(), Box<dyn std::error::
         nodes: nodes_count,
         kpis: kpis.clone(),
         metrics: snap,
+        chaos: ChaosSummary {
+            enabled: chaos.enabled,
+            pause_events: chaos.pause_events,
+            rejoin_events: chaos.rejoin_events,
+            interval_secs: chaos.interval.as_secs(),
+            offline_secs: chaos.offline_dur.as_secs(),
+            max_fraction: chaos.max_fraction,
+        },
     };
     write_summary(&cli.output_dir, &summary)?;
     info!("wrote summary to {}", cli.output_dir.display());
@@ -348,6 +502,7 @@ pub async fn run(cli: Cli, stop: Arc<Notify>) -> Result<(), Box<dyn std::error::
 
 fn do_enroll_user(
     svc: &mut LocalService<MemoryBackend>,
+    root: &Identity,
     synth: &mut Synth,
     metrics: &Metrics,
     user_urns: &mut Vec<String>,
@@ -359,8 +514,67 @@ fn do_enroll_user(
     match res {
         Ok(r) => {
             metrics.record("enroll_user", dt, true);
-            // Cap user pool to keep memory bounded over a 24h soak.
-            if user_urns.len() < 2000 {
+            // Sign a vouch from the trusted root → user with purpose
+            // `repo:proj`. Without this, purposes_for() returns empty and
+            // every subsequent issue_session for this user fails.
+            //
+            // Token::create() requires Vouch tokens to carry both vch_iss
+            // and vch_sum (payload hash of the user's attestation token),
+            // so decode the just-issued attestation to compute the hash.
+            let attest = match Token::from_cbor(&r.token_cbor) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let vouch_payload = TokenPayload {
+                iss: root.id.to_urn(),
+                iss_key: root.public_key.clone(),
+                jti: format!("vouch-{}", r.jti),
+                sub: r.urn.clone(),
+                kind: TokenKind::Vouch,
+                purpose: Some("repo:proj".into()),
+                vch_iss: Some(r.urn.clone()),
+                vch_sum: Some(attest.payload_hash()),
+                revokes: None,
+                iat: now,
+                // 1 hour expiry — so the per-node `expiry_loop` reclaims
+                // these as fast as new ones land, the trust graph reaches
+                // steady state, and the soak measures realistic behavior.
+                // The earlier 365-day expiry caused the 2026-04-09 soak's
+                // graph to grow monotonically and contaminated the §10
+                // KPI verdict (B5 was real, but B5 + monotonic growth
+                // were entangled in the same number).
+                exp: Some(now + 3600),
+                body_type: None,
+                body_cbor: None,
+            };
+            match Token::sign(vouch_payload, &root.signing_key) {
+                Ok(vouch) => {
+                    // Persist to the store (so a restart can rehydrate)
+                    // and mirror to the shared in-memory graph (so the
+                    // very next issue_session sees it). The trust graph
+                    // is the source of truth for hot paths now (B5b);
+                    // the store no longer drives per-query rebuilds.
+                    use dds_store::traits::TokenStore;
+                    let _ = svc.store_mut().put_token(&vouch);
+                    let _ = svc
+                        .trust_graph_handle()
+                        .write()
+                        .unwrap()
+                        .add_token(vouch);
+                }
+                Err(e) => warn!("vouch sign failed: {e}"),
+            }
+            // Cap the user pool well below one hour's worth of enrollments
+            // (default 500/h ⇒ ~8/min, so 300 ≈ 36 min). Combined with the
+            // 1-hour vouch expiry, this means we never try to issue
+            // sessions against users whose vouch has been expired by the
+            // sweeper, so the soak stays at steady state instead of
+            // accumulating ghost users.
+            if user_urns.len() < 300 {
                 user_urns.push(r.urn);
             } else {
                 let i = (r.jti.len()) % user_urns.len();
@@ -391,10 +605,11 @@ fn do_issue_session(
     metrics: &Metrics,
     user_urns: &[String],
 ) {
-    let subj = if let Some(u) = user_urns.last() {
-        u.clone()
-    } else {
-        "urn:vouchsafe:nobody.aaaa".to_string()
+    // No users enrolled on this node yet — skip rather than record a
+    // guaranteed failure. The session pacer ramps up as enrollments land.
+    let subj = match user_urns.last() {
+        Some(u) => u.clone(),
+        None => return,
     };
     let req = synth.session_request(subj);
     let t0 = Instant::now();
@@ -420,10 +635,11 @@ fn do_issue_session(
 }
 
 fn do_eval_policy(svc: &LocalService<MemoryBackend>, metrics: &Metrics, user_urns: &[String]) {
-    let subj = user_urns
-        .last()
-        .cloned()
-        .unwrap_or_else(|| "urn:vouchsafe:nobody.aaaa".into());
+    // Skip when the node has no users yet — same reasoning as do_issue_session.
+    let subj = match user_urns.last() {
+        Some(u) => u.clone(),
+        None => return,
+    };
     let t0 = Instant::now();
     let _ = svc.evaluate_policy(&subj, "repo:proj", "read");
     metrics.record("evaluate_policy", t0.elapsed(), true);
@@ -490,8 +706,32 @@ fn publish_probe(
     metrics: &Metrics,
     probes: &mut Vec<Probe>,
     revocation: bool,
+    chaos: &ChaosState,
 ) {
     if nodes.len() < 2 {
+        return;
+    }
+    // Pick the first online node as the publish anchor; if everything is
+    // offline (shouldn't happen — chaos enforces a min) bail.
+    let anchor_idx = if chaos.enabled {
+        match chaos.pick_anchor() {
+            Some(i) => i,
+            None => return,
+        }
+    } else {
+        0
+    };
+    // Awaiting set is *online* peers that are not the anchor.
+    let awaiting: BTreeSet<usize> = if chaos.enabled {
+        chaos
+            .online_indices()
+            .into_iter()
+            .filter(|i| *i != anchor_idx)
+            .collect()
+    } else {
+        (0..nodes.len()).filter(|i| *i != anchor_idx).collect()
+    };
+    if awaiting.is_empty() {
         return;
     }
     // Build a synthetic attestation token signed by a fresh identity.
@@ -533,7 +773,7 @@ fn publish_probe(
     };
 
     let publish_at = Instant::now();
-    let n0 = &mut nodes[0];
+    let n0 = &mut nodes[anchor_idx];
     if revocation {
         let msg = GossipMessage::Revocation { token_bytes };
         if let Ok(cbor) = msg.to_cbor() {
@@ -541,11 +781,15 @@ fn publish_probe(
             let _ = n0.swarm.behaviour_mut().gossipsub.publish(topic, cbor);
         }
         // Mirror locally on publisher.
-        let _ = n0.trust_graph.add_token(token.clone());
+        let _ = n0
+            .trust_graph
+            .write()
+            .unwrap()
+            .add_token(token.clone());
         probes.push(Probe {
             op_id: jti,
             publish_at,
-            awaiting: (1..nodes.len()).collect(),
+            awaiting: awaiting.clone(),
             is_revocation: true,
         });
         let _ = metrics; // recorded on receive
@@ -569,14 +813,18 @@ fn publish_probe(
             let topic = n0.topics.operations.to_ident_topic();
             let _ = n0.swarm.behaviour_mut().gossipsub.publish(topic, cbor);
         }
-        let _ = n0.trust_graph.add_token(token.clone());
+        let _ = n0
+            .trust_graph
+            .write()
+            .unwrap()
+            .add_token(token.clone());
         use dds_store::traits::TokenStore;
         let _ = n0.store.put_token(&token);
         let _ = n0.dag.insert(op.clone());
         probes.push(Probe {
             op_id: op.id,
             publish_at,
-            awaiting: (1..nodes.len()).collect(),
+            awaiting,
             is_revocation: false,
         });
     }
@@ -656,7 +904,11 @@ fn ingest_gossip(
                 Err(_) => return,
             };
             if token.validate().is_ok() {
-                let _ = nodes[idx].trust_graph.add_token(token.clone());
+                let _ = nodes[idx]
+                    .trust_graph
+                    .write()
+                    .unwrap()
+                    .add_token(token.clone());
                 use dds_store::traits::TokenStore;
                 let _ = nodes[idx].store.put_token(&token);
                 let _ = nodes[idx].dag.insert(op.clone());
@@ -674,7 +926,11 @@ fn ingest_gossip(
                 Err(_) => return,
             };
             if token.validate().is_ok() {
-                let _ = nodes[idx].trust_graph.add_token(token.clone());
+                let _ = nodes[idx]
+                    .trust_graph
+                    .write()
+                    .unwrap()
+                    .add_token(token.clone());
                 if let Some(target) = token.payload.revokes.clone() {
                     use dds_store::traits::RevocationStore;
                     let _ = nodes[idx].store.revoke(&target);
@@ -769,9 +1025,9 @@ fn make_interval(d: Duration) -> Interval {
     iv
 }
 
-/// Round-robin selection threaded through a counter inside the synth.
-fn round_robin(seq: &mut u64, n: usize) -> usize {
-    let v = (*seq as usize) % n.max(1);
+/// Round-robin selection over a precomputed list of online indices.
+fn pick_online(online: &[usize], seq: &mut u64) -> usize {
+    let v = online[(*seq as usize) % online.len()];
     *seq = seq.wrapping_add(1);
     v
 }
@@ -783,6 +1039,158 @@ fn synth_seq(s: &mut Synth) -> u64 {
     let _ = s;
     static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+// ---------- chaos layer ----------
+
+/// One step of the chaos walk: pick a node to pause if we are below the
+/// max-offline cap, or do nothing this tick.
+fn chaos_step(nodes: &mut [DdsNode], chaos: &mut ChaosState) {
+    let n = nodes.len();
+    if n < 3 {
+        return; // pointless with fewer than 3 nodes (need quorum)
+    }
+    let max_offline =
+        ((n as f64) * chaos.max_fraction).floor() as usize;
+    let max_offline = max_offline.max(1).min(n.saturating_sub(2));
+    if chaos.offline_count() >= max_offline {
+        return;
+    }
+    // Pick a random online node.
+    let online: Vec<usize> = chaos.online_indices();
+    if online.len() <= 2 {
+        return; // never pause when ≤ 2 nodes are reachable
+    }
+    let pick = online[chaos.rng.gen_range(0..online.len())];
+    pause_node(nodes, chaos, pick);
+}
+
+/// Pause a node: disconnect from peers, mark offline, schedule rejoin.
+fn pause_node(nodes: &mut [DdsNode], chaos: &mut ChaosState, idx: usize) {
+    let connected: Vec<libp2p::PeerId> =
+        nodes[idx].swarm.connected_peers().copied().collect();
+    let mut closed = 0usize;
+    for pid in connected {
+        if nodes[idx].swarm.disconnect_peer_id(pid).is_ok() {
+            closed += 1;
+        }
+    }
+    chaos.online[idx] = false;
+    // Jitter offline duration ±25% so we don't sync rejoins.
+    let base = chaos.offline_dur.as_secs_f64();
+    let jitter = chaos.rng.gen_range(0.75..1.25);
+    let dur = Duration::from_secs_f64(base * jitter);
+    chaos.offline_until[idx] = Some(Instant::now() + dur);
+    chaos.pause_events += 1;
+    info!(
+        node = idx,
+        closed_conns = closed,
+        offline_secs = dur.as_secs(),
+        offline_total = chaos.offline_count(),
+        "chaos: paused node"
+    );
+}
+
+/// Periodic rejoin check: bring back any node whose offline window elapsed
+/// and tick the convergence probes for already-rejoined nodes.
+fn chaos_check_rejoins(nodes: &mut [DdsNode], chaos: &mut ChaosState, metrics: &Metrics) {
+    let now = Instant::now();
+    // 1. Resume any node whose offline window has expired.
+    let to_resume: Vec<usize> = (0..nodes.len())
+        .filter(|i| {
+            !chaos.online[*i]
+                && chaos
+                    .offline_until
+                    .get(*i)
+                    .and_then(|o| *o)
+                    .is_some_and(|t| t <= now)
+        })
+        .collect();
+    for idx in to_resume {
+        resume_node(nodes, chaos, idx);
+    }
+
+    // 2. Tick convergence probes — any rejoin probe whose target tokens have
+    //    been seen is closed and recorded.
+    let mut converged: Vec<usize> = Vec::new();
+    for (slot, p) in chaos.pending_rejoins.iter().enumerate() {
+        let cur = nodes[p.node_idx]
+            .trust_graph
+            .read()
+            .unwrap()
+            .token_count();
+        if cur >= p.target_tokens {
+            metrics.record("rejoin_convergence", p.rejoined_at.elapsed(), true);
+            info!(
+                node = p.node_idx,
+                target = p.target_tokens,
+                converged_in_secs = p.rejoined_at.elapsed().as_secs_f64(),
+                "chaos: rejoin convergence reached"
+            );
+            converged.push(slot);
+        } else if p.rejoined_at.elapsed() > Duration::from_secs(300) {
+            // Time out probes after 5 min so memory stays bounded.
+            metrics.record("rejoin_convergence", p.rejoined_at.elapsed(), false);
+            warn!(
+                node = p.node_idx,
+                target = p.target_tokens,
+                have = cur,
+                "chaos: rejoin convergence TIMED OUT after 300s"
+            );
+            converged.push(slot);
+        }
+    }
+    // Drain converged probes (reverse order so indices stay valid).
+    for slot in converged.into_iter().rev() {
+        chaos.pending_rejoins.swap_remove(slot);
+    }
+}
+
+/// Resume a node: re-add explicit peers, redial, capture target token count.
+fn resume_node(nodes: &mut [DdsNode], chaos: &mut ChaosState, idx: usize) {
+    // Capture the median trust-graph token count across the still-online
+    // peers — this is the convergence target for the rejoining node.
+    let mut online_counts: Vec<usize> = chaos
+        .online_indices()
+        .into_iter()
+        .map(|i| nodes[i].trust_graph.read().unwrap().token_count())
+        .collect();
+    online_counts.sort_unstable();
+    let target = if online_counts.is_empty() {
+        0
+    } else {
+        online_counts[online_counts.len() / 2]
+    };
+
+    // Re-add explicit peers and redial. Skip self.
+    let n = nodes.len();
+    for j in 0..n {
+        if j == idx {
+            continue;
+        }
+        let pid = chaos.pids[j];
+        let addr = chaos.addrs[j].clone();
+        let node = &mut nodes[idx];
+        node.swarm.behaviour_mut().gossipsub.add_explicit_peer(&pid);
+        node.swarm
+            .behaviour_mut()
+            .kademlia
+            .add_address(&pid, addr.clone());
+        let _ = node.swarm.dial(addr);
+    }
+    chaos.online[idx] = true;
+    chaos.offline_until[idx] = None;
+    chaos.rejoin_events += 1;
+    chaos.pending_rejoins.push(RejoinProbe {
+        node_idx: idx,
+        rejoined_at: Instant::now(),
+        target_tokens: target,
+    });
+    info!(
+        node = idx,
+        target_tokens = target,
+        "chaos: resumed node, awaiting convergence"
+    );
 }
 
 // Silence dead-code in this file (some helpers used only in select branches).

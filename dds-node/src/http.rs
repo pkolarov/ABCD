@@ -270,7 +270,7 @@ where
     S: TokenStore + RevocationStore + Send + Sync + 'static,
 {
     let svc = state.svc.lock().await;
-    let r = svc.evaluate_policy(&req.subject_urn, &req.resource, &req.action);
+    let r = svc.evaluate_policy(&req.subject_urn, &req.resource, &req.action)?;
     Ok(Json(r))
 }
 
@@ -279,7 +279,7 @@ where
     S: TokenStore + RevocationStore + Send + Sync + 'static,
 {
     let svc = state.svc.lock().await;
-    Ok(Json(svc.status(&state.info.peer_id, 0, 0)))
+    Ok(Json(svc.status(&state.info.peer_id, 0, 0)?))
 }
 
 /// Bind and serve the HTTP API on `addr` until the future is dropped.
@@ -336,7 +336,8 @@ mod tests {
         )
         .unwrap();
         graph.add_token(attest).unwrap();
-        let svc = LocalService::new(node_ident, graph, roots, MemoryBackend::new());
+        let shared_graph = std::sync::Arc::new(std::sync::RwLock::new(graph));
+        let svc = LocalService::new(node_ident, shared_graph, roots, MemoryBackend::new());
         AppState {
             svc: Arc::new(Mutex::new(svc)),
             info: NodeInfo {

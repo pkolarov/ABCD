@@ -22,6 +22,7 @@ pub const OP_NAMES: &[&str] = &[
     "crdt_merge",
     "gossip_propagation",
     "revocation_propagation",
+    "rejoin_convergence",
 ];
 
 /// Per-op histogram + error/op counter pair.
@@ -34,9 +35,9 @@ pub struct OpStats {
 
 impl OpStats {
     fn new() -> Self {
-        // Up to 60 s in ns, 3 sig figs.
+        // Up to 600 s in ns, 3 sig figs (rejoin_convergence can exceed 60s).
         Self {
-            hist: Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).expect("hist bounds"),
+            hist: Histogram::<u64>::new_with_bounds(1, 600_000_000_000, 3).expect("hist bounds"),
             ok: 0,
             err: 0,
         }
@@ -51,6 +52,12 @@ pub struct GaugeSample {
     pub trust_graph_tokens: Vec<usize>,
     pub store_tokens: Vec<usize>,
     pub gossip_tx_bytes_per_sec: f64,
+    /// Number of currently-connected peers per node (real libp2p metric).
+    #[serde(default)]
+    pub connected_peers: Vec<usize>,
+    /// Whether each node is logically online from the chaos layer's POV.
+    #[serde(default)]
+    pub online: Vec<bool>,
 }
 
 #[derive(Default)]

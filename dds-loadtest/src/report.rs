@@ -43,12 +43,24 @@ impl KpiStatus {
     }
 }
 
+#[derive(Debug, Serialize, Default)]
+pub struct ChaosSummary {
+    pub enabled: bool,
+    pub pause_events: u64,
+    pub rejoin_events: u64,
+    pub interval_secs: u64,
+    pub offline_secs: u64,
+    pub max_fraction: f64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Summary {
     pub duration_secs: u64,
     pub nodes: usize,
     pub kpis: Vec<KpiVerdict>,
     pub metrics: MetricsSnapshot,
+    #[serde(default)]
+    pub chaos: ChaosSummary,
 }
 
 /// Compute KPI verdicts from a metrics snapshot.
@@ -222,6 +234,34 @@ pub fn compute_kpis(snap: &MetricsSnapshot) -> Vec<KpiVerdict> {
             note: format!("{} samples", o.count),
         });
     }
+    if let Some(o) = snap.ops.get("rejoin_convergence") {
+        if o.count == 0 {
+            out.push(skip(
+                "Rejoin convergence (p99)",
+                "informational",
+                "no chaos events",
+            ));
+        } else {
+            // FAIL only on convergence-probe errors (timeout); pass otherwise.
+            let status = if o.err > 0 {
+                KpiStatus::Fail
+            } else {
+                KpiStatus::Pass
+            };
+            out.push(KpiVerdict {
+                name: "Rejoin convergence (p99)".into(),
+                target: "no timeouts".into(),
+                measured: format!(
+                    "p50 {:.1} s / p99 {:.1} s",
+                    o.p50_ns as f64 / 1e9,
+                    o.p99_ns as f64 / 1e9
+                ),
+                status,
+                note: format!("{} ok / {} timeouts", o.ok, o.err),
+            });
+        }
+    }
+
     if let Some(o) = snap.ops.get("revocation_propagation") {
         let status = if o.count == 0 {
             KpiStatus::Skip
@@ -300,7 +340,20 @@ pub fn render_md(s: &Summary) -> String {
     let mut out = String::new();
     out.push_str("# DDS Load Test Summary\n\n");
     out.push_str(&format!("- Duration: {} s\n", s.duration_secs));
-    out.push_str(&format!("- Nodes:    {}\n\n", s.nodes));
+    out.push_str(&format!("- Nodes:    {}\n", s.nodes));
+    if s.chaos.enabled {
+        out.push_str(&format!(
+            "- Chaos:    enabled — interval={}s, offline={}s, max_fraction={:.2}, paused={}, rejoined={}\n",
+            s.chaos.interval_secs,
+            s.chaos.offline_secs,
+            s.chaos.max_fraction,
+            s.chaos.pause_events,
+            s.chaos.rejoin_events,
+        ));
+    } else {
+        out.push_str("- Chaos:    disabled\n");
+    }
+    out.push('\n');
     out.push_str("## KPI Verdicts (§10)\n\n");
     out.push_str("| KPI | Target | Measured | Status | Note |\n");
     out.push_str("|---|---|---|---|---|\n");

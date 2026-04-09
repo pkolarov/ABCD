@@ -36,6 +36,9 @@ use zeroize::Zeroize;
 /// Environment variable name for the optional disk-encryption passphrase.
 pub const PASSPHRASE_ENV: &str = "DDS_NODE_PASSPHRASE";
 
+#[cfg(test)]
+pub(crate) static PASSPHRASE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const VERSION_PLAIN: u8 = 1;
 const VERSION_ENCRYPTED: u8 = 2;
 
@@ -227,14 +230,11 @@ fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; 32], IdentityStoreE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_plain_roundtrip() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = PASSPHRASE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::remove_var(PASSPHRASE_ENV) };
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("node_key.bin");
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_encrypted_roundtrip() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = PASSPHRASE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::set_var(PASSPHRASE_ENV, "correct horse battery staple") };
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("node_key.bin");
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_load_or_create_persists_across_calls() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = PASSPHRASE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::remove_var(PASSPHRASE_ENV) };
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("node_key.bin");

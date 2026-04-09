@@ -187,15 +187,13 @@ fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; 32], P2pIdentityErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity_store::PASSPHRASE_ENV_LOCK;
     use libp2p::PeerId;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn plain_roundtrip_stable_peer_id() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = PASSPHRASE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::remove_var(PASSPHRASE_ENV) };
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("p2p_key.bin");
@@ -208,7 +206,7 @@ mod tests {
 
     #[test]
     fn encrypted_roundtrip() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = PASSPHRASE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::set_var(PASSPHRASE_ENV, "passphrase-x") };
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("p2p_key.bin");

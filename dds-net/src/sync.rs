@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 
 use dds_core::crdt::causal_dag::{CausalDag, DagError, Operation};
 use dds_core::token::{Token, TokenKind};
+use dds_core::trust::TrustGraph;
 use dds_store::traits::{DirectoryStore, StoreError};
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +52,31 @@ pub struct SyncPayload {
     pub op_bytes: Vec<u8>,
     /// CBOR-encoded Token backing this operation.
     pub token_bytes: Vec<u8>,
+}
+
+/// One-shot pull-sync request sent over `request_response`.
+///
+/// The requester ships its complete set of known operation IDs; the
+/// responder replies with every payload it has that the requester does
+/// not. Simpler than the multi-round protocol modeled by `SyncMessage`
+/// (which is kept around for the staged tests in this module) and easier
+/// to reason about under churn — every sync exchange is independent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncRequest {
+    pub known_op_ids: BTreeSet<String>,
+    /// Heads of the local DAG, included for diagnostics / divergence
+    /// detection on the responder side. Currently informational.
+    pub heads: BTreeSet<String>,
+}
+
+/// One-shot pull-sync response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncResponse {
+    pub payloads: Vec<SyncPayload>,
+    /// Whether the responder believes it sent everything the requester
+    /// was missing. Reserved for future paginated transfers; currently
+    /// always `true` because we ship the full diff in one message.
+    pub complete: bool,
 }
 
 impl SyncMessage {
@@ -229,6 +255,141 @@ pub fn apply_sync_payloads(
         retry = remaining;
     }
 
+    if !retry.is_empty() {
+        result.errors.push(format!(
+            "{} ops could not be merged (missing deps)",
+            retry.len()
+        ));
+    }
+
+    result
+}
+
+/// Same as `apply_sync_payloads`, but also feeds successfully-applied
+/// tokens into the supplied `TrustGraph`. This is the variant the
+/// production node uses now that the in-memory trust graph is the
+/// source of truth for query-time hot paths (post-B5b). Errors from
+/// `TrustGraph::add_token` are recorded but non-fatal — the gossip
+/// pipeline already revalidates everything from the store on restart,
+/// and a single rejected token shouldn't drop the rest of the batch.
+pub fn apply_sync_payloads_with_graph(
+    payloads: &[SyncPayload],
+    dag: &mut CausalDag,
+    store: &mut dyn DirectoryStore,
+    trust_graph: &mut TrustGraph,
+) -> SyncResult {
+    let mut result = SyncResult::default();
+
+    let mut items: Vec<(Operation, Token)> = Vec::new();
+    for payload in payloads {
+        let op: Operation = match ciborium::from_reader(payload.op_bytes.as_slice()) {
+            Ok(op) => op,
+            Err(e) => {
+                result.errors.push(format!("op deserialize: {e}"));
+                continue;
+            }
+        };
+        let token = match Token::from_cbor(&payload.token_bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                result.errors.push(format!("token deserialize: {e}"));
+                continue;
+            }
+        };
+        if let Err(e) = token.validate() {
+            result.errors.push(format!("token validation: {e}"));
+            continue;
+        }
+        items.push((op, token));
+    }
+
+    // Sort: Burns first, then Revocations, then Attests, then Vouches.
+    // Vouches must come after their target attestations to satisfy
+    // vch_sum verification on insert.
+    items.sort_by_key(|(_, t)| match t.payload.kind {
+        TokenKind::Burn => 0,
+        TokenKind::Revoke => 1,
+        TokenKind::Attest => 2,
+        TokenKind::Vouch => 3,
+    });
+
+    for (op, token) in &items {
+        // Persist to the store.
+        match store.put_token(token) {
+            Ok(()) => result.tokens_stored += 1,
+            Err(e) => {
+                result.errors.push(format!("token store: {e}"));
+                continue;
+            }
+        }
+
+        // Feed the trust graph.
+        if let Err(e) = trust_graph.add_token(token.clone()) {
+            // Duplicate or replay — log but don't bail; we still want
+            // to apply revocations/burns and the DAG insert.
+            result
+                .errors
+                .push(format!("trust graph add: {e}"));
+        }
+
+        // Apply revocation / burn side effects on the store.
+        match token.payload.kind {
+            TokenKind::Revoke => {
+                if let Some(ref target_jti) = token.payload.revokes {
+                    if !store.is_revoked(target_jti) {
+                        if let Err(e) = store.revoke(target_jti) {
+                            result.errors.push(format!("revoke: {e}"));
+                        } else {
+                            result.revocations_applied += 1;
+                        }
+                    }
+                }
+            }
+            TokenKind::Burn => {
+                let urn = &token.payload.iss;
+                if !store.is_burned(urn) {
+                    if let Err(e) = store.burn(urn) {
+                        result.errors.push(format!("burn: {e}"));
+                    } else {
+                        result.burns_applied += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Insert into the DAG.
+        match dag.insert(op.clone()) {
+            Ok(true) => result.ops_merged += 1,
+            Ok(false) => {} // duplicate
+            Err(DagError::MissingDependency(_)) => {
+                // Retried below.
+            }
+        }
+    }
+
+    // Retry pass for ops with deps that landed later in the same batch.
+    let mut retry: Vec<&Operation> = items
+        .iter()
+        .filter(|(op, _)| !dag.contains(&op.id))
+        .map(|(op, _)| op)
+        .collect();
+    let mut progress = true;
+    while progress && !retry.is_empty() {
+        progress = false;
+        let mut remaining = Vec::new();
+        for op in retry {
+            match dag.insert(op.clone()) {
+                Ok(true) => {
+                    result.ops_merged += 1;
+                    progress = true;
+                }
+                Ok(false) => {}
+                Err(_) => remaining.push(op),
+            }
+        }
+        retry = remaining;
+    }
     if !retry.is_empty() {
         result.errors.push(format!(
             "{} ops could not be merged (missing deps)",

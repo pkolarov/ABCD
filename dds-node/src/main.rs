@@ -192,11 +192,13 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let node_identity = identity_store::load_or_create(&identity_path, "dds-node")?;
     info!(urn = %node_identity.id.to_urn(), path = %identity_path.display(), "loaded node identity");
 
-    // Start the local HTTP API server alongside the P2P node.
+    // Start the local HTTP API server alongside the P2P node. Share the
+    // trust graph handle (Arc clone) so the swarm event loop and the
+    // HTTP service observe the same in-memory state — fixes B5b.
     let api_addr = config.network.api_addr.clone();
     let trusted_roots = config.trusted_roots.iter().cloned().collect();
     let api_store = node.store.clone();
-    let api_trust_graph = node.trust_graph.clone();
+    let api_trust_graph = std::sync::Arc::clone(&node.trust_graph);
     let svc = LocalService::new(
         node_identity,
         api_trust_graph,

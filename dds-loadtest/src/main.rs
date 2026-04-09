@@ -9,11 +9,9 @@ mod report;
 mod workload;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use tokio::sync::Notify;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug, Clone)]
@@ -58,6 +56,24 @@ pub struct Cli {
     /// Smoke mode: short run (60s) with 3 nodes — used by CI.
     #[arg(long, default_value_t = false)]
     pub smoke: bool,
+
+    /// Enable chaos layer: randomly pause/resume nodes to simulate
+    /// offline/rejoin churn. Disabled in smoke mode.
+    #[arg(long, default_value_t = false)]
+    pub chaos: bool,
+
+    /// Mean interval between chaos events (humantime), e.g. `90s`, `5m`.
+    #[arg(long, default_value = "90s")]
+    pub chaos_interval: String,
+
+    /// Mean offline duration per paused node (humantime), e.g. `30s`, `2m`.
+    #[arg(long, default_value = "45s")]
+    pub chaos_offline: String,
+
+    /// Maximum fraction of nodes that may be offline at once (0.0..1.0).
+    /// Hard cap: never pause the last reachable node.
+    #[arg(long, default_value_t = 0.34)]
+    pub chaos_max_fraction: f64,
 }
 
 impl Cli {
@@ -73,6 +89,18 @@ impl Cli {
     pub fn effective_nodes(&self) -> usize {
         if self.smoke { 3 } else { self.nodes.max(1) }
     }
+
+    pub fn chaos_enabled(&self) -> bool {
+        self.chaos && !self.smoke
+    }
+
+    pub fn chaos_interval_dur(&self) -> Duration {
+        humantime::parse_duration(&self.chaos_interval).unwrap_or(Duration::from_secs(90))
+    }
+
+    pub fn chaos_offline_dur(&self) -> Duration {
+        humantime::parse_duration(&self.chaos_offline).unwrap_or(Duration::from_secs(45))
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -87,14 +115,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     std::fs::create_dir_all(&cli.output_dir)?;
 
-    let stop = Arc::new(Notify::new());
-    let stop_sig = stop.clone();
+    // Watch channel instead of Notify: `Notify::notify_waiters()` only
+    // wakes *current* waiters, so a SIGINT racing with the select loop
+    // (e.g. arriving between iterations) is silently dropped. A watch
+    // channel keeps the state, so the next `changed().await` resolves
+    // immediately. The 2026-04-09 soak hit this race during shutdown.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             tracing::warn!("ctrl-c received; shutting down");
-            stop_sig.notify_waiters();
+            let _ = stop_tx.send(true);
         }
     });
 
-    harness::run(cli, stop).await
+    harness::run(cli, stop_rx).await
 }

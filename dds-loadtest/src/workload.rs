@@ -104,11 +104,13 @@ impl Synth {
     }
 
     pub fn session_request(&mut self, subject_urn: String) -> SessionRequest {
-        let s = self.next_seq();
+        let _ = self.next_seq();
         SessionRequest {
             subject_urn,
             device_urn: None,
-            requested_resources: vec![format!("repo:proj-{}", s % 32)],
+            // Must match the purpose granted by the harness's vouch token,
+            // otherwise authorized_resources comes back empty.
+            requested_resources: vec!["repo:proj".into()],
             // 5 min — short, so the expiry sweep can keep the graph bounded.
             duration_secs: 300,
             mfa_verified: true,

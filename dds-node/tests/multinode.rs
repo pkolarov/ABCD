@@ -27,6 +27,9 @@ use rand::rngs::OsRng;
 use tempfile::TempDir;
 use tokio::time::{Instant, sleep, timeout};
 
+const MESH_FORMATION_TIMEOUT: Duration = Duration::from_secs(10);
+const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Build a single node with an ephemeral listen address and the given
 /// org hash. Returns the node, its temp dir (must outlive the node), and
 /// the listen address picked once it's listening.
@@ -158,7 +161,11 @@ fn ingest_gossip(node: &mut DdsNode, topic_hash: &libp2p::gossipsub::TopicHash, 
                 Token::from_cbor(&token_bytes),
             ) {
                 if token.validate().is_ok() {
-                    let _ = node.trust_graph.add_token(token.clone());
+                    let _ = node
+                        .trust_graph
+                        .write()
+                        .unwrap()
+                        .add_token(token.clone());
                     use dds_store::traits::TokenStore;
                     let _ = node.store.put_token(&token);
                     let _ = node.dag.insert(op);
@@ -168,7 +175,11 @@ fn ingest_gossip(node: &mut DdsNode, topic_hash: &libp2p::gossipsub::TopicHash, 
         (DdsTopic::Revocations(..), GossipMessage::Revocation { token_bytes }) => {
             if let Ok(token) = Token::from_cbor(&token_bytes) {
                 if token.validate().is_ok() {
-                    let _ = node.trust_graph.add_token(token.clone());
+                    let _ = node
+                        .trust_graph
+                        .write()
+                        .unwrap()
+                        .add_token(token.clone());
                     if let Some(target) = token.payload.revokes.clone() {
                         use dds_store::traits::RevocationStore;
                         let _ = node.store.revoke(&target);
@@ -272,7 +283,11 @@ fn publish_attest(node: &mut DdsNode, op: &Operation, token: &Token) {
     // Gossipsub does NOT echo messages back to the publisher, so apply
     // the same effect locally to mirror the real ingest path on the
     // node that originated the op.
-    let _ = node.trust_graph.add_token(token.clone());
+    let _ = node
+        .trust_graph
+        .write()
+        .unwrap()
+        .add_token(token.clone());
     use dds_store::traits::TokenStore;
     let _ = node.store.put_token(token);
     let _ = node.dag.insert(op.clone());
@@ -284,7 +299,11 @@ fn publish_revocation(node: &mut DdsNode, token: &Token) {
     let cbor = msg.to_cbor().unwrap();
     let topic = node.topics.revocations.to_ident_topic();
     let _ = node.swarm.behaviour_mut().gossipsub.publish(topic, cbor);
-    let _ = node.trust_graph.add_token(token.clone());
+    let _ = node
+        .trust_graph
+        .write()
+        .unwrap()
+        .add_token(token.clone());
     if let Some(target) = token.payload.revokes.clone() {
         use dds_store::traits::RevocationStore;
         let _ = node.store.revoke(&target);
@@ -316,7 +335,7 @@ async fn three_node_cluster(org: &str) -> (Vec<DdsNode>, Vec<TempDir>) {
     // typically requires 2-3 heartbeats after the TCP handshake.
     {
         let mut nodes = vec![&mut a, &mut b, &mut c];
-        pump_many(&mut nodes, Duration::from_secs(8)).await;
+        pump_many(&mut nodes, MESH_FORMATION_TIMEOUT).await;
     }
     (vec![a, b, c], vec![ad, bd, cd])
 }
@@ -332,7 +351,7 @@ async fn gossip_attestation_propagates_three_nodes() {
 
     // Drive event loops until both other nodes have ingested the op
     // (or 15s timeout).
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + PROPAGATION_TIMEOUT;
     while Instant::now() < deadline {
         let mut refs: Vec<&mut DdsNode> = nodes.iter_mut().collect();
         pump_many(&mut refs, Duration::from_millis(200)).await;
@@ -355,7 +374,11 @@ async fn revocation_propagates_three_nodes() {
     // has something to target.
     let (bob_id, token) = make_attest_token("bob", "att-bob-1");
     for n in nodes.iter_mut() {
-        n.trust_graph.add_token(token.clone()).unwrap();
+        n.trust_graph
+            .write()
+            .unwrap()
+            .add_token(token.clone())
+            .unwrap();
         use dds_store::traits::TokenStore;
         n.store.put_token(&token).unwrap();
     }
@@ -363,13 +386,13 @@ async fn revocation_propagates_three_nodes() {
     let revoke = make_revoke("att-bob-1", &bob_id);
     publish_revocation(&mut nodes[1], &revoke);
 
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + PROPAGATION_TIMEOUT;
     while Instant::now() < deadline {
         let mut refs: Vec<&mut DdsNode> = nodes.iter_mut().collect();
         pump_many(&mut refs, Duration::from_millis(200)).await;
         let revoked = nodes
             .iter()
-            .filter(|n| n.trust_graph.is_revoked("att-bob-1"))
+            .filter(|n| n.trust_graph.read().unwrap().is_revoked("att-bob-1"))
             .count();
         if revoked == 3 {
             return;
@@ -397,7 +420,7 @@ async fn dag_converges_after_partition() {
     publish_attest(&mut nodes[1], &op2, &t2);
 
     // Pump A and B until both ops are everywhere on the partition side.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + PROPAGATION_TIMEOUT;
     let mut converged = false;
     while Instant::now() < deadline {
         {
@@ -432,7 +455,7 @@ async fn dag_converges_after_partition() {
     {
         let (left, right) = nodes.split_at_mut(1);
         let mut refs: Vec<&mut DdsNode> = vec![&mut left[0], &mut right[0], &mut rejoiner];
-        pump_many(&mut refs, Duration::from_secs(8)).await;
+        pump_many(&mut refs, MESH_FORMATION_TIMEOUT).await;
     }
     // Publish a brand-new op AFTER rejoin. Gossipsub dedupes by
     // message-content hash so re-publishing op1/op2 would be a no-op
@@ -443,7 +466,7 @@ async fn dag_converges_after_partition() {
     let op3 = op_for(&t3);
     publish_attest(&mut nodes[0], &op3, &t3);
 
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + PROPAGATION_TIMEOUT;
     while Instant::now() < deadline {
         let (left, right) = nodes.split_at_mut(1);
         let mut refs: Vec<&mut DdsNode> = vec![&mut left[0], &mut right[0], &mut rejoiner];

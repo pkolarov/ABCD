@@ -12,10 +12,12 @@ use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
 use libp2p::{
-    PeerId, gossipsub, identify, kad, mdns, noise,
+    PeerId, StreamProtocol, gossipsub, identify, kad, mdns, noise, request_response,
     swarm::{NetworkBehaviour, Swarm},
     tcp, yamux,
 };
+
+use crate::sync::{SyncRequest, SyncResponse};
 
 /// Combined network behaviour for DDS nodes.
 #[derive(NetworkBehaviour)]
@@ -28,6 +30,14 @@ pub struct DdsBehaviour {
     pub mdns: libp2p::swarm::behaviour::toggle::Toggle<mdns::tokio::Behaviour>,
     /// Identify protocol for exchanging peer metadata.
     pub identify: identify::Behaviour,
+    /// Anti-entropy / catch-up sync over libp2p `request_response`.
+    /// Lets a node that missed gossip messages (offline window, slow
+    /// peer, message loss) pull the diff from any connected peer. The
+    /// in-memory protocol is `SyncRequest`/`SyncResponse` defined in
+    /// `dds_net::sync`; the wire format is CBOR via the built-in codec.
+    /// Resolves B6 (the gossipsub-only delivery gap surfaced by the
+    /// 2026-04-09 chaos soak).
+    pub sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
 }
 
 /// Configuration for building a DDS swarm.
@@ -55,6 +65,12 @@ impl SwarmConfig {
     pub fn identify_protocol(&self) -> String {
         format!("/dds/id/1.0.0/{}", self.domain_tag)
     }
+    /// Anti-entropy sync protocol name for this domain. Domain-tagged so
+    /// nodes from different DDS domains can never complete a sync
+    /// exchange (matches the isolation guarantee for kad/identify).
+    pub fn sync_protocol(&self) -> String {
+        format!("/dds/sync/1.0.0/{}", self.domain_tag)
+    }
 }
 
 impl Default for SwarmConfig {
@@ -78,6 +94,7 @@ pub fn build_swarm(
 ) -> Result<(Swarm<DdsBehaviour>, PeerId), Box<dyn std::error::Error>> {
     let kad_protocol = config.kad_protocol();
     let identify_protocol = config.identify_protocol();
+    let sync_protocol = config.sync_protocol();
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -132,11 +149,24 @@ pub fn build_swarm(
                 key.public(),
             ));
 
+            // Anti-entropy sync (request_response over CBOR). Both sides
+            // are full participants — every node can serve a sync
+            // request from any other node in its domain.
+            let sync = request_response::cbor::Behaviour::<SyncRequest, SyncResponse>::new(
+                [(
+                    StreamProtocol::try_from_owned(sync_protocol.clone())
+                        .map_err(|e| std::io::Error::other(format!("invalid protocol: {e}")))?,
+                    request_response::ProtocolSupport::Full,
+                )],
+                request_response::Config::default(),
+            );
+
             Ok(DdsBehaviour {
                 gossipsub,
                 kademlia,
                 mdns,
                 identify,
+                sync,
             })
         })?
         .with_swarm_config(|c: libp2p::swarm::Config| {

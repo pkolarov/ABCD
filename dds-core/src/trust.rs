@@ -15,6 +15,14 @@ use crate::token::{Token, TokenKind};
 pub const DEFAULT_MAX_CHAIN_DEPTH: usize = 5;
 
 /// The trust graph: stores tokens and revocations, and validates trust chains.
+///
+/// Two secondary indices keep query paths sublinear in the total token
+/// count: `vouches_by_subject` maps the subject URN of each vouch to the
+/// JTIs of vouches that vouch for it, and `attestations_by_iss` maps an
+/// issuer URN to the JTIs of its attestation tokens. Without these,
+/// `purposes_for` / `walk_chain` / `has_purpose` were O(V) per call and
+/// blew the §10 ≤ 1 ms KPI at ~1K vouches in the soak. The indices are
+/// maintained alongside `add_token`, `remove_token`, and `sweep_expired`.
 #[derive(Debug, Clone)]
 pub struct TrustGraph {
     /// All attestation tokens by JTI.
@@ -27,6 +35,14 @@ pub struct TrustGraph {
     burned: BTreeSet<String>,
     /// Maximum chain depth for trust evaluation.
     max_chain_depth: usize,
+    /// Secondary index: subject URN (the `vch_iss` of a vouch) → set of
+    /// vouch JTIs that vouch for it. Used by `walk_chain`, `purposes_for`,
+    /// and `has_purpose` to avoid scanning every vouch in the graph.
+    vouches_by_subject: BTreeMap<String, BTreeSet<String>>,
+    /// Secondary index: attestation issuer URN → set of attestation JTIs
+    /// for that issuer. Used to look up the target attestation token for
+    /// `vch_sum` verification without scanning every attestation.
+    attestations_by_iss: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl TrustGraph {
@@ -38,6 +54,8 @@ impl TrustGraph {
             revocations: BTreeMap::new(),
             burned: BTreeSet::new(),
             max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
+            vouches_by_subject: BTreeMap::new(),
+            attestations_by_iss: BTreeMap::new(),
         }
     }
 
@@ -63,10 +81,22 @@ impl TrustGraph {
 
         match token.payload.kind {
             TokenKind::Attest => {
-                self.attestations.insert(token.payload.jti.clone(), token);
+                let jti = token.payload.jti.clone();
+                let iss = token.payload.iss.clone();
+                self.attestations.insert(jti.clone(), token);
+                self.attestations_by_iss.entry(iss).or_default().insert(jti);
             }
             TokenKind::Vouch => {
-                self.vouches.insert(token.payload.jti.clone(), token);
+                let jti = token.payload.jti.clone();
+                // Vouch::create enforces vch_iss is Some, so this clone
+                // is safe — but we tolerate None defensively.
+                if let Some(subject) = token.payload.vch_iss.clone() {
+                    self.vouches_by_subject
+                        .entry(subject)
+                        .or_default()
+                        .insert(jti.clone());
+                }
+                self.vouches.insert(jti, token);
             }
             TokenKind::Revoke => {
                 if let Some(ref target_jti) = token.payload.revokes {
@@ -171,7 +201,9 @@ impl TrustGraph {
             .map(|(jti, _)| jti.clone())
             .collect();
         for jti in &expired_attestations {
-            self.attestations.remove(jti);
+            if let Some(t) = self.attestations.remove(jti) {
+                self.unindex_attestation(&t.payload.iss, jti);
+            }
         }
 
         let expired_vouches: Vec<String> = self
@@ -181,7 +213,11 @@ impl TrustGraph {
             .map(|(jti, _)| jti.clone())
             .collect();
         for jti in &expired_vouches {
-            self.vouches.remove(jti);
+            if let Some(t) = self.vouches.remove(jti) {
+                if let Some(ref subject) = t.payload.vch_iss {
+                    self.unindex_vouch(subject, jti);
+                }
+            }
         }
 
         let mut all_expired = expired_attestations;
@@ -223,23 +259,20 @@ impl TrustGraph {
             return Ok(());
         }
 
-        // Find vouches that vouch for this identity
+        // Find vouches that vouch for this identity via the secondary
+        // index — O(vouches-for-this-subject) instead of O(total-vouches).
         let vouches_for_current: Vec<&Token> = self
-            .vouches
-            .values()
-            .filter(|t| {
-                t.payload.vch_iss.as_deref() == Some(current_urn)
-                    && !self.is_revoked(&t.payload.jti)
-                    && !Self::is_expired(t)
-            })
+            .vouches_for_subject(current_urn)
+            .filter(|t| !self.is_revoked(&t.payload.jti) && !Self::is_expired(t))
             .collect();
 
         if vouches_for_current.is_empty() {
             return Err(TrustError::NoValidChain);
         }
 
-        // Resolve the target token (attestation of current_urn) for vch_sum verification
-        let target_token = self.attestations.values().find(|t| t.payload.iss == current_urn);
+        // Resolve the target token (attestation of current_urn) for
+        // vch_sum verification — O(1) via the attestation index.
+        let target_token = self.attestation_for_iss(current_urn);
 
         // Try each vouch — if any leads to a trusted root, the chain is valid
         let mut last_err = TrustError::NoValidChain;
@@ -279,6 +312,32 @@ impl TrustGraph {
         Err(last_err)
     }
 
+    /// Iterate over all vouches whose `vch_iss` equals `subject_urn`.
+    /// Uses the `vouches_by_subject` index for O(matches) lookup. The
+    /// returned iterator silently skips index entries whose underlying
+    /// token has been removed (defensive — shouldn't happen if the index
+    /// is maintained correctly).
+    fn vouches_for_subject<'a>(
+        &'a self,
+        subject_urn: &str,
+    ) -> impl Iterator<Item = &'a Token> {
+        self.vouches_by_subject
+            .get(subject_urn)
+            .into_iter()
+            .flat_map(|jtis| jtis.iter())
+            .filter_map(move |jti| self.vouches.get(jti))
+    }
+
+    /// Look up an attestation token by issuer URN. Returns the first
+    /// attestation registered for the issuer (matching the existing
+    /// `find()` semantics) via the `attestations_by_iss` index.
+    fn attestation_for_iss(&self, iss: &str) -> Option<&Token> {
+        self.attestations_by_iss
+            .get(iss)
+            .and_then(|jtis| jtis.iter().next())
+            .and_then(|jti| self.attestations.get(jti))
+    }
+
     /// Check if a subject has a valid trust chain to any trusted root
     /// with a specific purpose.
     pub fn has_purpose(
@@ -287,11 +346,10 @@ impl TrustGraph {
         purpose: &str,
         trusted_roots: &BTreeSet<String>,
     ) -> bool {
-        let target_token = self.attestations.values().find(|t| t.payload.iss == subject_urn);
+        let target_token = self.attestation_for_iss(subject_urn);
 
-        self.vouches.values().any(|t| {
-            if t.payload.vch_iss.as_deref() != Some(subject_urn)
-                || self.is_revoked(&t.payload.jti)
+        self.vouches_for_subject(subject_urn).any(|t| {
+            if self.is_revoked(&t.payload.jti)
                 || Self::is_expired(t)
                 || t.payload.purpose.as_deref() != Some(purpose)
             {
@@ -318,15 +376,11 @@ impl TrustGraph {
         subject_urn: &str,
         trusted_roots: &BTreeSet<String>,
     ) -> BTreeSet<String> {
-        let target_token = self.attestations.values().find(|t| t.payload.iss == subject_urn);
+        let target_token = self.attestation_for_iss(subject_urn);
 
-        self.vouches
-            .values()
+        self.vouches_for_subject(subject_urn)
             .filter(|t| {
-                if t.payload.vch_iss.as_deref() != Some(subject_urn)
-                    || self.is_revoked(&t.payload.jti)
-                    || Self::is_expired(t)
-                {
+                if self.is_revoked(&t.payload.jti) || Self::is_expired(t) {
                     return false;
                 }
                 // Enforce vch_sum
@@ -351,19 +405,41 @@ impl TrustGraph {
     /// Returns `true` if a token (attestation or vouch) with the given
     /// JTI was found and removed, `false` otherwise. Also clears any
     /// revocation entry under that JTI. Used by the expiry sweeper to
-    /// drop expired tokens.
+    /// drop expired tokens. Maintains the secondary indices.
     pub fn remove_token(&mut self, jti: &str) -> bool {
         let mut removed = false;
-        if self.attestations.remove(jti).is_some() {
+        if let Some(t) = self.attestations.remove(jti) {
+            self.unindex_attestation(&t.payload.iss, jti);
             removed = true;
         }
-        if self.vouches.remove(jti).is_some() {
+        if let Some(t) = self.vouches.remove(jti) {
+            if let Some(ref subject) = t.payload.vch_iss {
+                self.unindex_vouch(subject, jti);
+            }
             removed = true;
         }
         if self.revocations.remove(jti).is_some() {
             removed = true;
         }
         removed
+    }
+
+    fn unindex_attestation(&mut self, iss: &str, jti: &str) {
+        if let Some(set) = self.attestations_by_iss.get_mut(iss) {
+            set.remove(jti);
+            if set.is_empty() {
+                self.attestations_by_iss.remove(iss);
+            }
+        }
+    }
+
+    fn unindex_vouch(&mut self, subject: &str, jti: &str) {
+        if let Some(set) = self.vouches_by_subject.get_mut(subject) {
+            set.remove(jti);
+            if set.is_empty() {
+                self.vouches_by_subject.remove(subject);
+            }
+        }
     }
 
     /// Iterate over all (jti, exp) tuples for attestations and vouches.
@@ -923,5 +999,87 @@ mod tests {
         // Should fail because the only vouch is expired
         let result = graph.validate_chain(&user.id.to_urn(), &roots);
         assert!(result.is_err());
+    }
+
+    /// Regression gate for B5 (the 2026-04-09 chaos soak finding):
+    /// `purposes_for` and `walk_chain` previously scanned every vouch in
+    /// the graph on every call, which made `evaluate_policy` p99 climb
+    /// from 0.5 ms (500 vouches) → 10.8 ms (14K vouches) over a 2.5h
+    /// soak — well past the §10 ≤ 1 ms KPI.
+    ///
+    /// This test builds a graph with 10,000 unrelated vouches plus one
+    /// real vouch chain, then asserts that `purposes_for` resolves the
+    /// real subject in well under the §10 budget. With the secondary
+    /// indices the lookup is O(matches-for-subject), independent of the
+    /// 10K bystanders. Without the indices, this test fails.
+    #[test]
+    fn test_purposes_for_scales_to_10k_vouches() {
+        use std::time::Instant;
+
+        let root = Identity::generate("perf-root", &mut OsRng);
+        let target = Identity::generate("perf-target", &mut OsRng);
+        let target_attest = make_attest(&target);
+        let target_urn = target.id.to_urn();
+        let real_vouch = make_vouch(
+            &root,
+            &target,
+            &target_attest,
+            "perf:resource",
+            "vouch-perf-real",
+        );
+
+        let mut graph = TrustGraph::new();
+        graph.add_token(target_attest).unwrap();
+        graph.add_token(real_vouch).unwrap();
+
+        // Insert 10,000 unrelated vouches that target other identities,
+        // so the only way to find the real one is via the index. Each
+        // bystander has its own (root, target) pair so the chain stays
+        // valid for the bystanders too — we don't want to short-circuit
+        // on validation errors.
+        for i in 0..10_000 {
+            let bystand_root = Identity::generate(&format!("br-{i}"), &mut OsRng);
+            let bystand_target = Identity::generate(&format!("bt-{i}"), &mut OsRng);
+            let bystand_attest = make_attest(&bystand_target);
+            let bystand_vouch = make_vouch(
+                &bystand_root,
+                &bystand_target,
+                &bystand_attest,
+                "noise:resource",
+                &format!("vouch-bystander-{i}"),
+            );
+            graph.add_token(bystand_attest).unwrap();
+            graph.add_token(bystand_vouch).unwrap();
+        }
+        assert_eq!(graph.vouch_count(), 10_001);
+
+        let roots = roots_with(&root.id.to_urn());
+
+        // Warm up — the first call exercises any lazy state.
+        let _ = graph.purposes_for(&target_urn, &roots);
+
+        // Measure: 1000 lookups, take the worst.
+        let mut worst = std::time::Duration::ZERO;
+        for _ in 0..1000 {
+            let t0 = Instant::now();
+            let purposes = graph.purposes_for(&target_urn, &roots);
+            let dt = t0.elapsed();
+            assert!(purposes.contains("perf:resource"));
+            if dt > worst {
+                worst = dt;
+            }
+        }
+
+        // §10 budget for the entire local auth decision is 1 ms — give
+        // `purposes_for` 0.5 ms of that, leaving headroom for the rest of
+        // `evaluate_policy`. With the index this should land in single-
+        // digit µs (3 µs on the 2026-04-09 dev host); without it, the
+        // chaos soak measured > 10 ms at 14K vouches.
+        assert!(
+            worst < std::time::Duration::from_micros(500),
+            "purposes_for worst-case took {:?} on a 10K-vouch graph — \
+             B5 regression: trust graph queries are no longer sublinear",
+            worst
+        );
     }
 }

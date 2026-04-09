@@ -11,6 +11,7 @@ use dds_store::MemoryBackend;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::collections::BTreeSet;
+use std::sync::{Arc, RwLock};
 
 fn make_service() -> (Identity, LocalService<MemoryBackend>) {
     let node_ident = Identity::generate("test-node", &mut OsRng);
@@ -43,7 +44,8 @@ fn make_service() -> (Identity, LocalService<MemoryBackend>) {
     graph.add_token(root_attest).unwrap();
 
     let store = MemoryBackend::new();
-    let svc = LocalService::new(node_ident, graph, trusted_roots, store);
+    let shared_graph = Arc::new(RwLock::new(graph));
+    let svc = LocalService::new(node_ident, shared_graph, trusted_roots, store);
     (root, svc)
 }
 
@@ -150,7 +152,7 @@ fn test_issue_session() {
         &alice.signing_key,
     )
     .unwrap();
-    svc.trust_graph.add_token(alice_attest.clone()).unwrap();
+    svc.trust_graph.write().unwrap().add_token(alice_attest.clone()).unwrap();
 
     let vouch = Token::sign(
         TokenPayload {
@@ -171,7 +173,7 @@ fn test_issue_session() {
         &root.signing_key,
     )
     .unwrap();
-    svc.trust_graph.add_token(vouch).unwrap();
+    svc.trust_graph.write().unwrap().add_token(vouch).unwrap();
 
     let result = svc
         .issue_session(SessionRequest {
@@ -211,7 +213,9 @@ fn test_policy_evaluation() {
     });
 
     // No trust chain → deny
-    let result = svc.evaluate_policy("urn:vouchsafe:alice.hash", "repo:main", "read");
+    let result = svc
+        .evaluate_policy("urn:vouchsafe:alice.hash", "repo:main", "read")
+        .unwrap();
     assert!(!result.allowed);
 }
 
@@ -220,7 +224,7 @@ fn test_policy_evaluation() {
 #[test]
 fn test_node_status() {
     let (_root, svc) = make_service();
-    let status = svc.status("12D3KooWTest", 3, 42);
+    let status = svc.status("12D3KooWTest", 3, 42).unwrap();
     assert_eq!(status.peer_id, "12D3KooWTest");
     assert_eq!(status.connected_peers, 3);
     assert_eq!(status.dag_operations, 42);

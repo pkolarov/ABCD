@@ -15,7 +15,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyDescriptionAttribute(("DDS Windows Credential Provider — talks to a local dds-node HTTP API to authentic" +
     "ate via passkey-derived subjects."))]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+ec304c08160d1b2b82ff35227836d4794d735064")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+f225e57b4cb9cbcea4d05dac78dfa058fecd7b6a")]
 [assembly: System.Reflection.AssemblyProductAttribute("DdsCredentialProvider")]
 [assembly: System.Reflection.AssemblyTitleAttribute("DdsCredentialProvider")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
