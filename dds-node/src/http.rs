@@ -10,6 +10,8 @@
 //! - `POST /v1/enroll/user`     -> EnrollmentResponse
 //! - `POST /v1/enroll/device`   -> EnrollmentResponse
 //! - `POST /v1/session`         -> SessionResponse
+//! - `POST /v1/session/assert`  -> SessionResponse (from FIDO2 assertion)
+//! - `GET  /v1/enrolled-users`  -> EnrolledUsersResponse
 //! - `POST /v1/policy/evaluate` -> PolicyResponse
 //! - `GET  /v1/status`          -> StatusResponse
 
@@ -27,8 +29,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::service::{
-    ApplicableSoftware, ApplicableWindowsPolicy, AppliedReport, EnrollDeviceRequest,
-    EnrollUserRequest, LocalService, NodeStatus, PolicyResult, ServiceError, SessionRequest,
+    ApplicableSoftware, ApplicableWindowsPolicy, AppliedReport, AssertionSessionRequest,
+    EnrollDeviceRequest, EnrollUserRequest, EnrolledUser, LocalService, NodeStatus, PolicyResult,
+    ServiceError, SessionRequest,
 };
 use dds_store::traits::{RevocationStore, TokenStore};
 
@@ -68,6 +71,8 @@ where
         .route("/v1/enroll/user", post(enroll_user::<S>))
         .route("/v1/enroll/device", post(enroll_device::<S>))
         .route("/v1/session", post(issue_session::<S>))
+        .route("/v1/session/assert", post(issue_session_assert::<S>))
+        .route("/v1/enrolled-users", get(list_enrolled_users::<S>))
         .route("/v1/policy/evaluate", post(evaluate_policy::<S>))
         .route("/v1/status", get(status::<S>))
         .route("/v1/windows/policies", get(list_windows_policies::<S>))
@@ -135,6 +140,23 @@ pub struct PolicyRequestJson {
     pub subject_urn: String,
     pub resource: String,
     pub action: String,
+}
+
+// ---------- Credential Provider types (Phase III) ----------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AssertionSessionRequestJson {
+    pub subject_urn: Option<String>,
+    pub credential_id: String,
+    pub client_data_hash: String,
+    pub authenticator_data: String,
+    pub signature: String,
+    pub duration_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EnrolledUsersResponse {
+    pub users: Vec<EnrolledUser>,
 }
 
 // ---------- Windows applier types (Phase 3 items 9–10) ----------
@@ -305,6 +327,44 @@ where
     Ok(Json(svc.status(&state.info.peer_id, 0, 0)?))
 }
 
+// ---------- Credential Provider handlers (Phase III) ----------
+
+async fn issue_session_assert<S>(
+    State(state): State<AppState<S>>,
+    Json(req): Json<AssertionSessionRequestJson>,
+) -> Result<Json<SessionResponse>, HttpError>
+where
+    S: TokenStore + RevocationStore + Send + Sync + 'static,
+{
+    let internal = AssertionSessionRequest {
+        subject_urn: req.subject_urn,
+        credential_id: req.credential_id,
+        client_data_hash: b64_decode(&req.client_data_hash, "client_data_hash")?,
+        authenticator_data: b64_decode(&req.authenticator_data, "authenticator_data")?,
+        signature: b64_decode(&req.signature, "signature")?,
+        duration_secs: req.duration_secs,
+    };
+    let mut svc = state.svc.lock().await;
+    let r = svc.issue_session_from_assertion(internal)?;
+    Ok(Json(SessionResponse {
+        session_id: r.session_id,
+        token_cbor_b64: b64_encode(&r.token_cbor),
+        expires_at: r.expires_at,
+    }))
+}
+
+async fn list_enrolled_users<S>(
+    State(state): State<AppState<S>>,
+    Query(q): Query<DeviceUrnQuery>,
+) -> Result<Json<EnrolledUsersResponse>, HttpError>
+where
+    S: TokenStore + RevocationStore + Send + Sync + 'static,
+{
+    let svc = state.svc.lock().await;
+    let users = svc.list_enrolled_users(&q.device_urn)?;
+    Ok(Json(EnrolledUsersResponse { users }))
+}
+
 // ---------- Windows applier handlers (Phase 3 items 9–10) ----------
 
 async fn list_windows_policies<S>(
@@ -369,9 +429,19 @@ mod tests {
     use dds_store::MemoryBackend;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+    use sha2::Digest;
     use std::collections::BTreeSet;
 
+    struct TestState {
+        app: AppState<MemoryBackend>,
+        root: Identity,
+    }
+
     fn make_state() -> AppState<MemoryBackend> {
+        make_state_with_root().app
+    }
+
+    fn make_state_with_root() -> TestState {
         let node_ident = Identity::generate("test-node", &mut OsRng);
         let root = Identity::generate("root", &mut OsRng);
         let mut roots = BTreeSet::new();
@@ -399,12 +469,51 @@ mod tests {
         graph.add_token(attest).unwrap();
         let shared_graph = std::sync::Arc::new(std::sync::RwLock::new(graph));
         let svc = LocalService::new(node_ident, shared_graph, roots, MemoryBackend::new());
-        AppState {
-            svc: Arc::new(Mutex::new(svc)),
-            info: NodeInfo {
-                peer_id: "12D3KooWUnit".into(),
+        TestState {
+            app: AppState {
+                svc: Arc::new(Mutex::new(svc)),
+                info: NodeInfo {
+                    peer_id: "12D3KooWUnit".into(),
+                },
             },
+            root,
         }
+    }
+
+    /// Add a vouch from root granting a purpose to the subject URN.
+    /// Looks up the subject's attestation token in the graph to get the
+    /// vch_sum hash required by the trust graph.
+    async fn vouch_user(state: &AppState<MemoryBackend>, root: &Identity, subject_urn: &str) {
+        let svc = state.svc.lock().await;
+        let mut g = svc.trust_graph.write().unwrap();
+
+        // Find the subject's attestation token to get its payload hash.
+        let attest_hash = g
+            .attestations_iter()
+            .find(|t| t.payload.sub == subject_urn)
+            .map(|t| t.payload_hash())
+            .expect("subject attestation not found in graph");
+
+        let vouch = Token::sign(
+            TokenPayload {
+                iss: root.id.to_urn(),
+                iss_key: root.public_key.clone(),
+                jti: format!("vouch-{subject_urn}"),
+                sub: subject_urn.to_string(),
+                kind: TokenKind::Vouch,
+                purpose: Some("dds:session".to_string()),
+                vch_iss: Some(subject_urn.to_string()),
+                vch_sum: Some(attest_hash),
+                revokes: None,
+                iat: 1000,
+                exp: Some(4102444800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &root.signing_key,
+        )
+        .unwrap();
+        g.add_token(vouch).unwrap();
     }
 
     async fn spawn_server(state: AppState<MemoryBackend>) -> String {
@@ -412,6 +521,14 @@ mod tests {
             .route("/v1/enroll/user", post(enroll_user::<MemoryBackend>))
             .route("/v1/enroll/device", post(enroll_device::<MemoryBackend>))
             .route("/v1/session", post(issue_session::<MemoryBackend>))
+            .route(
+                "/v1/session/assert",
+                post(issue_session_assert::<MemoryBackend>),
+            )
+            .route(
+                "/v1/enrolled-users",
+                get(list_enrolled_users::<MemoryBackend>),
+            )
             .route(
                 "/v1/policy/evaluate",
                 post(evaluate_policy::<MemoryBackend>),
@@ -539,6 +656,230 @@ mod tests {
             .unwrap();
         // Without valid vouches, the session should be rejected (500 = domain error).
         assert_eq!(resp.status(), 500);
+    }
+
+    // ----------------------------------------------------------------
+    // Credential Provider endpoints (Phase III)
+    // ----------------------------------------------------------------
+
+    /// Enroll a user via attestation, then authenticate via assertion
+    /// and verify a session is issued. End-to-end CP flow.
+    #[tokio::test]
+    async fn test_session_assert_ed25519_roundtrip() {
+        use dds_domain::fido2::{build_assertion_auth_data, build_none_attestation};
+        use ed25519_dalek::Signer;
+
+        let ts = make_state_with_root();
+        let state = ts.app;
+        let base = spawn_server(state.clone()).await;
+
+        // 1. Enroll a user with an Ed25519 credential.
+        let sk = SigningKey::generate(&mut OsRng);
+        let cred_id = b"cred-assert-test";
+        let attestation = build_none_attestation("dds.local", cred_id, &sk.verifying_key());
+        // enroll_user base64url-encodes the raw credential_id from the
+        // attestation object, so the stored credential_id in the trust
+        // graph is base64url(b"cred-assert-test"), not the raw string.
+        let cred_id_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(cred_id);
+        let enroll_req = EnrollUserRequestJson {
+            label: "bob".into(),
+            credential_id: cred_id_b64.clone(),
+            attestation_object_b64: b64_encode(&attestation),
+            client_data_hash_b64: b64_encode(&[0u8; 32]),
+            rp_id: "dds.local".into(),
+            display_name: "Bob".into(),
+            authenticator_type: "platform".into(),
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/enroll/user"))
+            .json(&enroll_req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let enrolled: EnrollmentResponse = resp.json().await.unwrap();
+
+        // 1b. Root vouches for the enrolled user so they have purposes.
+        vouch_user(&state, &ts.root, &enrolled.urn).await;
+
+        // 2. Build a FIDO2 assertion signed by the same key.
+        let auth_data = build_assertion_auth_data("dds.local", 1);
+        let cdh = sha2::Sha256::digest(b"test-client-data-json");
+        let mut signed_msg = Vec::new();
+        signed_msg.extend_from_slice(&auth_data);
+        signed_msg.extend_from_slice(&cdh);
+        let sig = sk.sign(&signed_msg);
+
+        // 3. POST /v1/session/assert — use the base64url credential_id
+        //    that matches what enroll_user stored in the trust graph.
+        let assert_req = AssertionSessionRequestJson {
+            subject_urn: Some(enrolled.urn.clone()),
+            credential_id: cred_id_b64,
+            client_data_hash: b64_encode(&cdh),
+            authenticator_data: b64_encode(&auth_data),
+            signature: b64_encode(&sig.to_bytes()),
+            duration_secs: Some(1800),
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/session/assert"))
+            .json(&assert_req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "session/assert failed");
+        let session: SessionResponse = resp.json().await.unwrap();
+        assert!(session.session_id.starts_with("sess-"));
+        assert!(!session.token_cbor_b64.is_empty());
+    }
+
+    /// Assertion with wrong key should be rejected.
+    #[tokio::test]
+    async fn test_session_assert_rejects_wrong_key() {
+        use dds_domain::fido2::{build_assertion_auth_data, build_none_attestation};
+        use ed25519_dalek::Signer;
+
+        let state = make_state();
+        let base = spawn_server(state).await;
+
+        // Enroll with key A.
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let cred_bytes = b"cred-wrong";
+        let attestation = build_none_attestation("dds.local", cred_bytes, &sk_a.verifying_key());
+        let cred_id_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred_bytes);
+        let enroll_req = EnrollUserRequestJson {
+            label: "carol".into(),
+            credential_id: cred_id_b64.clone(),
+            attestation_object_b64: b64_encode(&attestation),
+            client_data_hash_b64: b64_encode(&[0u8; 32]),
+            rp_id: "dds.local".into(),
+            display_name: "Carol".into(),
+            authenticator_type: "platform".into(),
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/enroll/user"))
+            .json(&enroll_req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // Sign assertion with key B (wrong key).
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let auth_data = build_assertion_auth_data("dds.local", 1);
+        let cdh = [0xABu8; 32];
+        let mut signed_msg = Vec::new();
+        signed_msg.extend_from_slice(&auth_data);
+        signed_msg.extend_from_slice(&cdh);
+        let sig = sk_b.sign(&signed_msg);
+
+        let assert_req = AssertionSessionRequestJson {
+            subject_urn: None,
+            credential_id: cred_id_b64,
+            client_data_hash: b64_encode(&cdh),
+            authenticator_data: b64_encode(&auth_data),
+            signature: b64_encode(&sig.to_bytes()),
+            duration_secs: None,
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/session/assert"))
+            .json(&assert_req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    /// Assertion with unknown credential_id should be rejected.
+    #[tokio::test]
+    async fn test_session_assert_rejects_unknown_credential() {
+        use dds_domain::fido2::build_assertion_auth_data;
+        use ed25519_dalek::Signer;
+
+        let state = make_state();
+        let base = spawn_server(state).await;
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let auth_data = build_assertion_auth_data("dds.local", 1);
+        let cdh = [0u8; 32];
+        let mut signed_msg = Vec::new();
+        signed_msg.extend_from_slice(&auth_data);
+        signed_msg.extend_from_slice(&cdh);
+        let sig = sk.sign(&signed_msg);
+
+        let assert_req = AssertionSessionRequestJson {
+            subject_urn: None,
+            credential_id: "nonexistent-cred".into(),
+            client_data_hash: b64_encode(&cdh),
+            authenticator_data: b64_encode(&auth_data),
+            signature: b64_encode(&sig.to_bytes()),
+            duration_secs: None,
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/session/assert"))
+            .json(&assert_req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    /// GET /v1/enrolled-users returns enrolled user attestations.
+    #[tokio::test]
+    async fn test_enrolled_users_endpoint() {
+        use dds_domain::fido2::build_none_attestation;
+
+        let state = make_state();
+        let base = spawn_server(state).await;
+
+        // Initially empty.
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/v1/enrolled-users"))
+            .query(&[("device_urn", "")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: EnrolledUsersResponse = resp.json().await.unwrap();
+        assert_eq!(body.users.len(), 0);
+
+        // Enroll two users.
+        for (name, cred) in [("alice", "cred-a"), ("bob", "cred-b")] {
+            let sk = SigningKey::generate(&mut OsRng);
+            let attestation = build_none_attestation("dds.local", cred.as_bytes(), &sk.verifying_key());
+            let cred_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred.as_bytes());
+            let enroll_req = EnrollUserRequestJson {
+                label: name.into(),
+                credential_id: cred_b64,
+                attestation_object_b64: b64_encode(&attestation),
+                client_data_hash_b64: b64_encode(&[0u8; 32]),
+                rp_id: "dds.local".into(),
+                display_name: name.to_uppercase(),
+                authenticator_type: "platform".into(),
+            };
+            let resp = reqwest::Client::new()
+                .post(format!("{base}/v1/enroll/user"))
+                .json(&enroll_req)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+        }
+
+        // Now should return 2 users.
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/v1/enrolled-users"))
+            .query(&[("device_urn", "")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: EnrolledUsersResponse = resp.json().await.unwrap();
+        assert_eq!(body.users.len(), 2);
+        let names: Vec<&str> = body.users.iter().map(|u| u.display_name.as_str()).collect();
+        assert!(names.contains(&"ALICE"));
+        assert!(names.contains(&"BOB"));
+        assert!(body.users.iter().all(|u| !u.credential_id.is_empty()));
     }
 
     // ----------------------------------------------------------------

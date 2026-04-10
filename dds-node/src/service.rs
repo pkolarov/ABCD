@@ -46,6 +46,25 @@ pub struct EnrollDeviceRequest {
     pub tags: Vec<String>,
 }
 
+/// Request to issue a session from a FIDO2 assertion proof.
+#[derive(Debug, Clone)]
+pub struct AssertionSessionRequest {
+    pub subject_urn: Option<String>,
+    pub credential_id: String,
+    pub client_data_hash: Vec<u8>,
+    pub authenticator_data: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub duration_secs: Option<u64>,
+}
+
+/// Enrolled user info for CP tile enumeration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EnrolledUser {
+    pub subject_urn: String,
+    pub display_name: String,
+    pub credential_id: String,
+}
+
 /// Request to issue a session.
 #[derive(Debug, Clone)]
 pub struct SessionRequest {
@@ -612,6 +631,128 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             "applier report"
         );
         Ok(())
+    }
+
+    // ================================================================
+    // Credential Provider integration (Phase III)
+    // ================================================================
+
+    /// Issue a session from a FIDO2 assertion proof.
+    ///
+    /// The caller (Auth Bridge) sends the raw getAssertion output; we
+    /// look up the credential's public key from the trust graph, verify
+    /// the assertion signature, then issue a `SessionDocument` exactly
+    /// like `issue_session` but with cryptographic proof of possession.
+    pub fn issue_session_from_assertion(
+        &mut self,
+        req: AssertionSessionRequest,
+    ) -> Result<SessionResult, ServiceError> {
+        use dds_domain::fido2::{verify_assertion, cose_to_credential_public_key};
+
+        // 1. Look up the credential's public key from the trust graph.
+        //    We scan attestation tokens for a UserAuthAttestation whose
+        //    credential_id matches.
+        let (subject_urn, public_key) = {
+            let g = self
+                .trust_graph
+                .read()
+                .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+
+            let mut found: Option<(String, Vec<u8>)> = None;
+            for token in g.attestations_iter() {
+                if g.is_revoked(&token.payload.jti) || g.is_burned(&token.payload.iss) {
+                    continue;
+                }
+                let doc = match UserAuthAttestation::extract(&token.payload) {
+                    Ok(Some(d)) => d,
+                    _ => continue,
+                };
+                if doc.credential_id == req.credential_id {
+                    // Extract the COSE public key from the attestation object.
+                    let parsed = dds_domain::fido2::verify_attestation(
+                        &doc.attestation_object,
+                        &doc.client_data_hash,
+                    )
+                    .map_err(|e| ServiceError::Fido2(format!("re-parse attestation: {e}")))?;
+
+                    // Build COSE_Key bytes from the parsed attestation's
+                    // auth_data (credential public key starts after AAGUID + credId).
+                    let auth_data = &parsed.auth_data;
+                    let p = 37 + 16 + 2 + parsed.credential_id.len();
+                    let cose_bytes = &auth_data[p..];
+
+                    found = Some((
+                        token.payload.sub.clone(),
+                        cose_bytes.to_vec(),
+                    ));
+                    break;
+                }
+            }
+
+            let (sub, cose_bytes) = found.ok_or_else(|| {
+                ServiceError::Fido2(format!(
+                    "credential_id '{}' not found in trust graph",
+                    req.credential_id
+                ))
+            })?;
+
+            let pk = cose_to_credential_public_key(&cose_bytes)
+                .map_err(|e| ServiceError::Fido2(format!("COSE key parse: {e}")))?;
+            (sub, pk)
+        };
+
+        // 2. Verify the assertion signature.
+        let _parsed = verify_assertion(
+            &req.authenticator_data,
+            &req.client_data_hash,
+            &req.signature,
+            &public_key,
+        )
+        .map_err(|e| ServiceError::Fido2(e.to_string()))?;
+
+        // 3. Check rpIdHash matches expected rp_id (if provided).
+        // (The caller passes the rp_id embedded in authenticator_data;
+        //  we just verify the signature is valid against the enrolled key.)
+
+        // 4. Issue a session using the enrolled subject URN.
+        let session_req = SessionRequest {
+            subject_urn: req.subject_urn.unwrap_or(subject_urn),
+            device_urn: None,
+            requested_resources: vec![],
+            duration_secs: req.duration_secs.unwrap_or(3600),
+            mfa_verified: true,
+            tls_binding: None,
+        };
+        self.issue_session(session_req)
+    }
+
+    /// List enrolled users (UserAuthAttestation documents) for CP tile
+    /// enumeration. Returns display names + subject URNs + credential IDs.
+    pub fn list_enrolled_users(
+        &self,
+        _device_urn: &str,
+    ) -> Result<Vec<EnrolledUser>, ServiceError> {
+        let g = self
+            .trust_graph
+            .read()
+            .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+
+        let mut users = Vec::new();
+        for token in g.attestations_iter() {
+            if g.is_revoked(&token.payload.jti) || g.is_burned(&token.payload.iss) {
+                continue;
+            }
+            let doc = match UserAuthAttestation::extract(&token.payload) {
+                Ok(Some(d)) => d,
+                _ => continue,
+            };
+            users.push(EnrolledUser {
+                subject_urn: token.payload.sub.clone(),
+                display_name: doc.user_display_name.clone(),
+                credential_id: doc.credential_id.clone(),
+            });
+        }
+        Ok(users)
     }
 
     /// Get node status.

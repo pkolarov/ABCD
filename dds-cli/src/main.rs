@@ -8,6 +8,7 @@ use dds_core::identity::Identity;
 use dds_store::RedbBackend;
 use dds_store::traits::*;
 use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -40,6 +41,14 @@ enum Commands {
     },
     /// Store diagnostics.
     Status,
+    /// Credential Provider operations (requires running dds-node).
+    Cp {
+        #[command(subcommand)]
+        action: CpAction,
+        /// dds-node HTTP API base URL.
+        #[arg(long, default_value = "http://127.0.0.1:5551")]
+        node_url: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -85,6 +94,37 @@ enum GroupAction {
 }
 
 #[derive(Subcommand)]
+enum CpAction {
+    /// List enrolled users (calls GET /v1/enrolled-users).
+    EnrolledUsers {
+        /// Device URN filter (empty = all).
+        #[arg(long, default_value = "")]
+        device_urn: String,
+    },
+    /// Issue a session from a FIDO2 assertion (calls POST /v1/session/assert).
+    SessionAssert {
+        /// FIDO2 credential ID (base64url).
+        #[arg(long)]
+        credential_id: String,
+        /// Base64-encoded authenticatorData.
+        #[arg(long)]
+        authenticator_data: String,
+        /// Base64-encoded SHA-256(clientDataJSON).
+        #[arg(long)]
+        client_data_hash: String,
+        /// Base64-encoded assertion signature.
+        #[arg(long)]
+        signature: String,
+        /// Override subject URN (default: looked up from credential).
+        #[arg(long)]
+        subject_urn: Option<String>,
+        /// Session duration in seconds.
+        #[arg(long, default_value = "3600")]
+        duration_secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
 enum PolicyAction {
     /// Check if a subject can perform an action.
     Check {
@@ -100,7 +140,8 @@ enum PolicyAction {
     },
 }
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
@@ -108,6 +149,7 @@ fn main() {
         Commands::Group { action } => handle_group(action, &cli.data_dir),
         Commands::Policy { action } => handle_policy(action),
         Commands::Status => handle_status(&cli.data_dir),
+        Commands::Cp { action, node_url } => handle_cp(action, &node_url).await,
     }
 }
 
@@ -274,6 +316,113 @@ fn now_epoch() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+// ---- Credential Provider commands ----
+
+#[derive(Debug, Serialize)]
+struct SessionAssertRequest {
+    subject_urn: Option<String>,
+    credential_id: String,
+    client_data_hash: String,
+    authenticator_data: String,
+    signature: String,
+    duration_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionResponse {
+    session_id: String,
+    token_cbor_b64: String,
+    expires_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnrolledUser {
+    subject_urn: String,
+    display_name: String,
+    credential_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnrolledUsersResponse {
+    users: Vec<EnrolledUser>,
+}
+
+async fn handle_cp(action: CpAction, node_url: &str) {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    match action {
+        CpAction::EnrolledUsers { device_urn } => {
+            let url = format!("{node_url}/v1/enrolled-users");
+            let resp = client
+                .get(&url)
+                .query(&[("device_urn", &device_urn)])
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let body: EnrolledUsersResponse = r.json().await.unwrap();
+                    if body.users.is_empty() {
+                        println!("No enrolled users.");
+                    } else {
+                        println!("{} enrolled user(s):", body.users.len());
+                        for u in &body.users {
+                            println!("  {} ({})", u.display_name, u.subject_urn);
+                            println!("    credential_id: {}", u.credential_id);
+                        }
+                    }
+                }
+                Ok(r) => {
+                    eprintln!("Error: HTTP {} — {}", r.status(), r.text().await.unwrap_or_default());
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("Error: cannot reach dds-node at {node_url}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        CpAction::SessionAssert {
+            credential_id,
+            authenticator_data,
+            client_data_hash,
+            signature,
+            subject_urn,
+            duration_secs,
+        } => {
+            let url = format!("{node_url}/v1/session/assert");
+            let body = SessionAssertRequest {
+                subject_urn,
+                credential_id,
+                client_data_hash,
+                authenticator_data,
+                signature,
+                duration_secs: Some(duration_secs),
+            };
+            let resp = client.post(&url).json(&body).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let session: SessionResponse = r.json().await.unwrap();
+                    println!("Session issued:");
+                    println!("  session_id:  {}", session.session_id);
+                    println!("  expires_at:  {}", session.expires_at);
+                    println!("  token (b64): {}...", &session.token_cbor_b64[..64.min(session.token_cbor_b64.len())]);
+                }
+                Ok(r) => {
+                    eprintln!("Error: HTTP {} — {}", r.status(), r.text().await.unwrap_or_default());
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("Error: cannot reach dds-node at {node_url}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 }
 
 fn uuid_v4() -> String {

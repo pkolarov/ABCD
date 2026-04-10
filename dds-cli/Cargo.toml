@@ -19,8 +19,11 @@ dds-core = { workspace = true }
 dds-store = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
-serde = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["std", "derive"] }
 rand = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

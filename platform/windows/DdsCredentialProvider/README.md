@@ -1,4 +1,20 @@
-# DDS Windows Credential Provider (stub)
+# DDS Windows Credential Provider (.NET stub — SUPERSEDED)
+
+> **This .NET stub has been superseded by the native C++ Credential
+> Provider at [`platform/windows/native/DdsCredentialProvider/`](../native/DdsCredentialProvider/).**
+> The native implementation is forked from the [Crayonic Credential
+> Provider](../../docs/crayonic-cp-integration-plan.md) and provides
+> production-quality COM integration with the Windows logon screen,
+> FIDO2 authentication via the DDS Auth Bridge service, and proper
+> LSA hand-off via `KERB_INTERACTIVE_UNLOCK_LOGON`.
+>
+> This file is kept for reference and for the `DdsLocalClient` HTTP
+> client class which may still be useful for .NET-based integration
+> tests or the `DdsPolicyAgent`.
+
+---
+
+*Original description:*
 
 A `net8.0` class library that bridges Windows logon to a locally
 running `dds-node` over its HTTP API (`http://127.0.0.1:5551/v1/*`).

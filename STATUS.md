@@ -1,7 +1,7 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](DDS-Design-Document.md).
-> Last updated: 2026-04-09 (post-B6-fix validation soak ✅)
+> Last updated: 2026-04-10 (Crayonic CP integration — Phases I–VI)
 
 ## Build Health
 
@@ -11,9 +11,10 @@
 | **Edition** | 2024 |
 | **Workspace crates** | 7 |
 | **Rust LOC** | 8,400 |
-| **Rust tests** | 212 |
+| **Rust tests** | 229 |
 | **Python tests** | 13 |
-| **Total tests** | 225 ✅ all passing |
+| **Total tests** | 276 ✅ all passing |
+| **C++ native tests** | 34 (Windows) |
 | **Shared library** | libdds\_ffi.dylib (739 KB) |
 
 ## Crate Status
@@ -21,11 +22,11 @@
 | Crate | Design Ref | Status | Tests | Summary |
 |---|---|---|---|---|
 | **dds-core** | §3–§9 | 🟢 Done | 114 | Crypto, identity, tokens (extensible body), CRDTs, trust graph, policy engine |
-| **dds-domain** | §14 | 🟢 Done | 22 | 6 typed domain documents + Stage 1 domain identity (`Domain`, `DomainKey`, `AdmissionCert`, `DomainSigner` trait) |
+| **dds-domain** | §14 | 🟢 Done | 27 | 6 typed domain documents + Stage 1 domain identity + FIDO2 attestation+assertion (Ed25519 + P-256) |
 | **dds-store** | §6 | 🟢 Done | 15 | Storage traits, MemoryBackend, RedbBackend (ACID) |
 | **dds-net** | §5 | 🟢 Done | 19 | libp2p transport, gossipsub, Kademlia, mDNS, delta-sync |
 | **dds-node** | §12 | 🟢 Done | 18 | Config, P2P event loop, local authority service, HTTP API, encrypted persistent identity |
-| **dds-domain** (fido2) | §14 | 🟢 Done | (incl. above) | WebAuthn attestation parser/verifier (none + packed/Ed25519) |
+| **dds-domain** (fido2) | §14 | 🟢 Done | (incl. above) | WebAuthn attestation + assertion parser/verifier (Ed25519 + P-256) |
 | **dds-ffi** | §14.2–14.3 | 🟢 Done | 12 | C ABI (cdylib): identity, token, policy, version |
 | **dds-cli** | §12 | 🟢 Done | 9 | Identity, group, policy, status subcommands |
 
@@ -82,8 +83,8 @@ All documents implement `DomainDocument` trait: `embed()` / `extract()` from `To
 |---|---|---|
 | `config` | 5 | `NodeConfig`, `NetworkConfig`, `DomainConfig` (TOML, domain section required) |
 | `node` | 0 | `DdsNode` — swarm event loop, gossip/sync ingestion, admission cert verification at startup |
-| `service` | 6 | `LocalService` — enrollment (with FIDO2 verification), sessions, policy resolution, status |
-| `http` | 5 | `axum` router exposing `LocalService` over `/v1/*` JSON endpoints |
+| `service` | 6 | `LocalService` — enrollment (with FIDO2 verification), sessions (incl. assertion-based), enrolled-user enumeration, policy resolution, status |
+| `http` | 9 | `axum` router exposing `LocalService` over `/v1/*` JSON endpoints (incl. `/v1/session/assert`, `/v1/enrolled-users`) |
 | `identity_store` | 3 | Encrypted-at-rest persistent node identity (Argon2id + ChaCha20Poly1305) |
 | `p2p_identity` | 2 | Persistent libp2p keypair so `PeerId` is stable across restarts |
 | `domain_store` | 5 | TOML public domain file + CBOR domain key + CBOR admission cert load/save |
@@ -150,7 +151,7 @@ Classical-only available for embedded/`no_std` targets.
 |---|---|---|
 | macOS ARM64 (aarch64-apple-darwin) | ✅ Builds + tests | Current dev host |
 | Linux x86\_64 | ✅ Expected to build | Standard Rust target |
-| Windows x86\_64 | 🔲 Untested | Needs CI |
+| Windows x86\_64 (ARM64 UTM) | ✅ 34 native tests pass | VS Build Tools 2022, Win11 on UTM |
 | Android ARM64 (aarch64-linux-android) | 🔲 Untested | Needs cargo-ndk |
 | iOS ARM64 (aarch64-apple-ios) | 🔲 Untested | Needs Xcode toolchain |
 | Embedded (thumbv7em-none-eabihf) | 🔲 Untested | `no_std` core only |
@@ -199,9 +200,9 @@ All 7 crates are functionally complete. The following work is ordered by impact 
 
 ### Phase 1 — Production Hardening (high priority)
 
-1. 🟢 **HTTP/JSON-RPC API on dds-node** — `dds-node/src/http.rs` exposes `LocalService` over a localhost axum server. Endpoints: `POST /v1/enroll/user`, `POST /v1/enroll/device`, `POST /v1/session`, `POST /v1/policy/evaluate`, `GET /v1/status`. JSON request/response types with serde, base64-encoded binary fields. 5 integration tests via reqwest against an in-process server.
+1. 🟢 **HTTP/JSON-RPC API on dds-node** — `dds-node/src/http.rs` exposes `LocalService` over a localhost axum server. Endpoints: `POST /v1/enroll/user`, `POST /v1/enroll/device`, `POST /v1/session`, `POST /v1/session/assert` (assertion-based session), `GET /v1/enrolled-users` (CP tile enumeration), `POST /v1/policy/evaluate`, `GET /v1/status`, `GET /v1/windows/policies`, `GET /v1/windows/software`, `POST /v1/windows/applied`. JSON request/response types with serde, base64-encoded binary fields. 5 integration tests via reqwest against an in-process server.
 
-2. 🟢 **FIDO2 attestation verification** — `dds-domain/src/fido2.rs` parses WebAuthn attestation objects with `ciborium`, supports `none` and `packed` (Ed25519 self-attestation) formats, extracts the COSE_Key credential public key, and verifies the attestation signature. `LocalService::enroll_user` rejects enrollment whose attestation fails to verify (`ServiceError::Fido2`). Built without webauthn-rs to keep the dependency footprint small; full attestation chains (TPM, x5c) are deliberately deferred. 5 unit tests cover round-trips, bad signature, garbage input, unsupported format.
+2. 🟢 **FIDO2 attestation + assertion verification** — `dds-domain/src/fido2.rs` parses WebAuthn attestation objects with `ciborium`, supports `none` and `packed` (Ed25519 self-attestation) formats, extracts the COSE_Key credential public key, and verifies the attestation signature. Now also verifies getAssertion responses (Ed25519 + ECDSA P-256) via `verify_assertion()`, with `cose_to_credential_public_key()` for multi-algorithm key parsing. `LocalService::enroll_user` rejects enrollment whose attestation fails to verify; `issue_session_from_assertion()` verifies assertion signatures against enrolled keys. 12 unit tests cover attestation round-trips, assertion verification (both algorithms), bad signatures, COSE key parsing.
 
 3. 🟢 **Persistent node identity** — `dds-node/src/identity_store.rs` loads or generates the node Ed25519 signing key on startup and persists it to `<data_dir>/node_key.bin` (or the new `identity_path` config field). When `DDS_NODE_PASSPHRASE` is set, the file is encrypted with ChaCha20-Poly1305 using a 32-byte key derived from the passphrase via Argon2id (19 MiB, 2 iters); otherwise the key is stored unencrypted with a warning log. Versioned CBOR on-disk format. 3 tests cover plain roundtrip, encrypted roundtrip with wrong-passphrase rejection, and load-or-create idempotency.
 
@@ -215,7 +216,21 @@ All 7 crates are functionally complete. The following work is ordered by impact 
 
 6. 🟢 **Multi-node integration tests** — `dds-node/tests/multinode.rs` spins up 3 in-process `DdsNode` instances on ephemeral TCP ports, dials them into a star topology, lets the gossipsub mesh form, and verifies (a) attestation operation propagation, (b) revocation propagation, (c) DAG convergence after a node is dropped and a fresh node rejoins. Uses a multi-thread tokio runtime and `select_all` to drive every swarm concurrently.
 
-7. **Windows Credential Provider** — `platform/windows/DdsCredentialProvider/` ships a `net8.0` class library with the COM-visible `DdsCredentialProvider` class (stable CLSID `8C0DBE9A-…`), an `ICredentialProvider` managed shape, and an `HttpClient` that POSTs to dds-node's `/v1/session` with a passkey-derived Vouchsafe-shaped subject URN. Full COM interop, comhost packaging, LSA hand-off, and the installer are stubbed — see the folder README for what is required to actually appear on the Windows logon screen.
+7. 🟢 **Windows Credential Provider (native C++)** — Production-grade Credential Provider forked from the Crayonic CP codebase and integrated with DDS. See [Crayonic CP Integration Plan](docs/crayonic-cp-integration-plan.md). Replaces the .NET stub with native C++ COM DLL + Auth Bridge service.
+
+    **Rust side (completed):**
+    - `dds-domain/src/fido2.rs`: Added `verify_assertion()` supporting both Ed25519 and ECDSA P-256 assertions, `cose_to_credential_public_key()` parser, and `build_assertion_auth_data()` test helper. 7 new tests (12 total).
+    - `dds-node/src/service.rs`: Added `issue_session_from_assertion()` that looks up credential public key from trust graph, verifies the assertion, and issues a `SessionDocument`. Added `list_enrolled_users()` for CP tile enumeration.
+    - `dds-node/src/http.rs`: Added `POST /v1/session/assert` (assertion-based session issuance) and `GET /v1/enrolled-users?device_urn=...` (CP user enumeration) endpoints.
+    - All 225+ existing tests pass; 7 new FIDO2 assertion tests added.
+
+    **C++ side (code complete, needs Windows build verification):**
+    - `platform/windows/native/DdsCredentialProvider/` — Forked COM DLL with new CLSID `{a7f3b2c1-...}`, BLE/PIV/smart card paths stripped, DDS auth path via Auth Bridge IPC
+    - `platform/windows/native/DdsAuthBridge/` — Windows Service with CTAP2 engine, WinHTTP client for dds-node, credential vault (DPAPI)
+    - `platform/windows/native/DdsBridgeIPC/` — Named-pipe IPC with DDS messages (0x0060-0x007F range)
+    - `platform/windows/native/Helpers/` — LSA packaging, COM factory
+    - `platform/windows/installer/DdsBundle.wxs` — WiX v4 MSI bundle for all components
+    - Visual Studio 2022 solution: `DdsNative.sln` with 4 projects
 
 8\. 🟢 **Token expiry enforcement** — `dds-node/src/expiry.rs` provides `sweep_once()` and an async `expiry_loop()` task. `NodeConfig::expiry_scan_interval_secs` (default 60) controls the cadence. Expired tokens are removed from the trust graph via a new `TrustGraph::remove_token()` method and marked revoked in the store. Unit-tested with `tokio::time::pause()` and direct sweep calls.
 

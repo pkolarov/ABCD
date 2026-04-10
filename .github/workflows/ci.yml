@@ -101,3 +101,45 @@ jobs:
           targets: thumbv7em-none-eabihf
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p dds-core --no-default-features --target thumbv7em-none-eabihf
+
+  windows-native:
+    name: windows native components
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- Rust workspace (MSVC target) ----
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc
+      - name: Build Rust workspace (x86_64-pc-windows-msvc)
+        run: cargo build --workspace --target x86_64-pc-windows-msvc
+      - name: Test Rust workspace (x86_64-pc-windows-msvc)
+        run: cargo test --workspace --target x86_64-pc-windows-msvc
+
+      # ---- C++ native components (MSBuild) ----
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+      - name: Build C++ native solution (x64 Debug)
+        run: msbuild platform\windows\native\DdsNative.sln /p:Configuration=Debug /p:Platform=x64 /m
+
+      # ---- C++ unit tests ----
+      - name: Build C++ native tests
+        working-directory: platform\windows\native\Tests
+        run: .\build_tests.bat
+      - name: Run C++ native tests
+        working-directory: platform\windows\native\Tests
+        run: .\run_all_tests.bat
+
+      # ---- .NET DdsPolicyAgent ----
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Build DdsPolicyAgent
+        run: dotnet build platform\windows\DdsPolicyAgent\DdsPolicyAgent.csproj -c Debug
+      - name: Test DdsPolicyAgent
+        run: dotnet test platform\windows\DdsPolicyAgent.Tests\DdsPolicyAgent.Tests.csproj -c Debug --no-restore

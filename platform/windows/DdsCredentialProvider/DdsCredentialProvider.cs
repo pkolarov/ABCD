@@ -1,7 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
-// DDS Windows Credential Provider — minimum-viable shape.
+// DDS Windows Credential Provider — .NET STUB (SUPERSEDED)
 //
+// *** This .NET stub has been superseded by the native C++ Credential
+// *** Provider at platform/windows/native/DdsCredentialProvider/.
+// *** The native implementation is forked from the Crayonic Credential
+// *** Provider and provides production-quality COM integration, BLE/FIDO2
+// *** auth via the DDS Auth Bridge service, and proper LSA hand-off.
+// ***
+// *** This file is kept for reference and for the DdsLocalClient HTTP
+// *** client which may still be useful for .NET integration tests.
+//
+// ORIGINAL DESCRIPTION:
 // This file is intentionally a *stub* of the Windows Credential
 // Provider COM surface. We declare the COM-visible types with the
 // expected GUIDs and the `ICredentialProvider` shape, but we do NOT
