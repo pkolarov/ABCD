@@ -3,3 +3,7 @@
 *.swp
 *.swo
 .DS_Store
+
+# .NET build artifacts
+**/bin/
+**/obj/
