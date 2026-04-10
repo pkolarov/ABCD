@@ -1,9 +1,7 @@
 //! Triple-Hybrid Ed25519 + ECDSA-P256 + ML-DSA-65 signing scheme.
 
-use alloc::vec::Vec;
 use ed25519_dalek::{Signer, SigningKey as EdSigningKey};
-use p256::ecdsa::signature::Signer as P256Signer;
-use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey};
+use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 use pqcrypto_mldsa::mldsa65;
 use pqcrypto_traits::sign::{DetachedSignature, PublicKey as PqPublicKey};
 

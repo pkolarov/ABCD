@@ -139,9 +139,272 @@ fn test_windows_policy_roundtrip() {
                 value: SettingValue::List(vec!["password".into(), "123456".into()]),
             },
         ],
+        windows: None,
     };
     let cbor = doc.to_cbor().unwrap();
     assert_eq!(WindowsPolicyDocument::from_cbor(&cbor).unwrap(), doc);
+}
+
+// ----------------------------------------------------------------
+// 3a. WindowsSettings typed bundle (Phase 3 item 9 — applier inputs)
+// ----------------------------------------------------------------
+
+#[test]
+fn test_windows_settings_default_is_empty() {
+    let s = WindowsSettings::default();
+    assert!(s.registry.is_empty());
+    assert!(s.local_accounts.is_empty());
+    assert!(s.password_policy.is_none());
+    assert!(s.services.is_empty());
+}
+
+#[test]
+fn test_registry_value_variants_roundtrip() {
+    // Each REG_* variant must serialize and deserialize losslessly.
+    let cases = vec![
+        RegistryValue::String("hello".into()),
+        RegistryValue::ExpandString("%SystemRoot%\\System32".into()),
+        RegistryValue::Dword(0xDEAD_BEEF),
+        RegistryValue::Qword(0x0123_4567_89AB_CDEF),
+        RegistryValue::MultiString(vec!["a".into(), "b".into(), "c".into()]),
+        RegistryValue::Binary(vec![0x00, 0xFF, 0xCA, 0xFE]),
+    ];
+    for v in cases {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&v, &mut buf).unwrap();
+        let decoded: RegistryValue = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(decoded, v);
+    }
+}
+
+#[test]
+fn test_registry_directive_set_and_delete() {
+    let set = RegistryDirective {
+        hive: RegistryHive::LocalMachine,
+        key: "SOFTWARE\\Policies\\Microsoft\\Windows\\System".into(),
+        name: Some("DisableCMD".into()),
+        value: Some(RegistryValue::Dword(1)),
+        action: RegistryAction::Set,
+    };
+    let del = RegistryDirective {
+        hive: RegistryHive::LocalMachine,
+        key: "SOFTWARE\\Policies\\Example".into(),
+        name: None,
+        value: None,
+        action: RegistryAction::Delete,
+    };
+    for d in [set, del] {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&d, &mut buf).unwrap();
+        let back: RegistryDirective = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(back, d);
+    }
+}
+
+#[test]
+fn test_account_directive_minimal_and_full() {
+    let minimal = AccountDirective {
+        username: "alice".into(),
+        action: AccountAction::Create,
+        full_name: None,
+        description: None,
+        groups: vec![],
+        password_never_expires: None,
+    };
+    let full = AccountDirective {
+        username: "bob".into(),
+        action: AccountAction::Create,
+        full_name: Some("Bob Builder".into()),
+        description: Some("Service account for nightly builds".into()),
+        groups: vec!["Administrators".into(), "Remote Desktop Users".into()],
+        password_never_expires: Some(true),
+    };
+    for d in [minimal, full] {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&d, &mut buf).unwrap();
+        let back: AccountDirective = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(back, d);
+    }
+}
+
+#[test]
+fn test_password_policy_partial_set() {
+    // Half the knobs configured, half left as `None`. The applier
+    // must treat `None` as "leave the existing value alone".
+    let p = PasswordPolicy {
+        min_length: Some(14),
+        max_age_days: None,
+        min_age_days: Some(1),
+        history_size: Some(24),
+        complexity_required: Some(true),
+        lockout_threshold: None,
+        lockout_duration_minutes: None,
+    };
+    let mut buf = Vec::new();
+    ciborium::into_writer(&p, &mut buf).unwrap();
+    let back: PasswordPolicy = ciborium::from_reader(buf.as_slice()).unwrap();
+    assert_eq!(back, p);
+    assert!(back.max_age_days.is_none());
+    assert_eq!(back.min_length, Some(14));
+}
+
+#[test]
+fn test_service_directive_all_actions() {
+    for (action, start_type) in [
+        (ServiceAction::Configure, Some(ServiceStartType::Automatic)),
+        (ServiceAction::Start, Some(ServiceStartType::Automatic)),
+        (ServiceAction::Stop, Some(ServiceStartType::Disabled)),
+        (ServiceAction::Configure, None),
+    ] {
+        let d = ServiceDirective {
+            name: "wuauserv".into(),
+            display_name: Some("Windows Update".into()),
+            start_type,
+            action,
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&d, &mut buf).unwrap();
+        let back: ServiceDirective = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(back, d);
+    }
+}
+
+#[test]
+fn test_windows_policy_with_typed_bundle_roundtrip() {
+    // Combined doc: free-form `settings` AND typed `windows` bundle
+    // populated. Both must survive a round-trip and the bundle must
+    // come back exactly equal.
+    let doc = WindowsPolicyDocument {
+        policy_id: "security/baseline".into(),
+        display_name: "Workstation Baseline".into(),
+        version: 7,
+        enforcement: Enforcement::Enforce,
+        scope: PolicyScope {
+            device_tags: vec!["workstation".into()],
+            org_units: vec!["engineering".into()],
+            identity_urns: vec![],
+        },
+        settings: vec![PolicySetting {
+            key: "audit.power_events".into(),
+            value: SettingValue::Bool(true),
+        }],
+        windows: Some(WindowsSettings {
+            registry: vec![RegistryDirective {
+                hive: RegistryHive::LocalMachine,
+                key: "SOFTWARE\\Policies\\Microsoft\\Windows\\System".into(),
+                name: Some("DisableCMD".into()),
+                value: Some(RegistryValue::Dword(1)),
+                action: RegistryAction::Set,
+            }],
+            local_accounts: vec![AccountDirective {
+                username: "ddsadmin".into(),
+                action: AccountAction::Create,
+                full_name: Some("DDS Admin".into()),
+                description: None,
+                groups: vec!["Administrators".into()],
+                password_never_expires: Some(true),
+            }],
+            password_policy: Some(PasswordPolicy {
+                min_length: Some(14),
+                complexity_required: Some(true),
+                ..Default::default()
+            }),
+            services: vec![ServiceDirective {
+                name: "RemoteRegistry".into(),
+                display_name: None,
+                start_type: Some(ServiceStartType::Disabled),
+                action: ServiceAction::Stop,
+            }],
+        }),
+    };
+
+    let cbor = doc.to_cbor().unwrap();
+    let back = WindowsPolicyDocument::from_cbor(&cbor).unwrap();
+    assert_eq!(back, doc);
+    let bundle = back.windows.expect("typed bundle preserved");
+    assert_eq!(bundle.registry.len(), 1);
+    assert_eq!(bundle.local_accounts[0].username, "ddsadmin");
+    assert_eq!(bundle.password_policy.unwrap().min_length, Some(14));
+    assert_eq!(bundle.services[0].action, ServiceAction::Stop);
+}
+
+#[test]
+fn test_windows_policy_backward_compat_decodes_old_shape() {
+    // A token signed against the *old* WindowsPolicyDocument shape
+    // (no `windows` field at all) must still deserialize today, with
+    // `windows: None`. We simulate the old shape with a struct that
+    // matches it exactly and re-encode through ciborium.
+    #[derive(serde::Serialize)]
+    struct LegacyWindowsPolicyDocument {
+        policy_id: String,
+        display_name: String,
+        version: u64,
+        scope: PolicyScope,
+        settings: Vec<PolicySetting>,
+        enforcement: Enforcement,
+    }
+    let legacy = LegacyWindowsPolicyDocument {
+        policy_id: "legacy".into(),
+        display_name: "Legacy Policy".into(),
+        version: 1,
+        scope: PolicyScope {
+            device_tags: vec![],
+            org_units: vec![],
+            identity_urns: vec![],
+        },
+        settings: vec![PolicySetting {
+            key: "k".into(),
+            value: SettingValue::Str("v".into()),
+        }],
+        enforcement: Enforcement::Audit,
+    };
+    let mut buf = Vec::new();
+    ciborium::into_writer(&legacy, &mut buf).unwrap();
+
+    // Decode with the new struct shape — must succeed and report
+    // `windows = None`.
+    let new_shape = WindowsPolicyDocument::from_cbor(&buf).unwrap();
+    assert_eq!(new_shape.policy_id, "legacy");
+    assert!(new_shape.windows.is_none());
+    assert_eq!(new_shape.settings.len(), 1);
+}
+
+#[test]
+fn test_windows_policy_with_bundle_in_signed_token() {
+    // End-to-end: typed bundle survives the full embed → sign → validate
+    // → extract round-trip through TokenPayload, not just the raw CBOR.
+    let ident = Identity::generate("policy-issuer", &mut OsRng);
+    let mut payload = make_payload(&ident);
+    let doc = WindowsPolicyDocument {
+        policy_id: "security/lockout".into(),
+        display_name: "Account Lockout".into(),
+        version: 1,
+        enforcement: Enforcement::Enforce,
+        scope: PolicyScope {
+            device_tags: vec!["all".into()],
+            org_units: vec![],
+            identity_urns: vec![],
+        },
+        settings: vec![],
+        windows: Some(WindowsSettings {
+            password_policy: Some(PasswordPolicy {
+                lockout_threshold: Some(5),
+                lockout_duration_minutes: Some(30),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    };
+    doc.embed(&mut payload).unwrap();
+    let token = Token::sign(payload, &ident.signing_key).unwrap();
+    assert!(token.validate().is_ok());
+
+    let extracted = WindowsPolicyDocument::extract(&token.payload)
+        .unwrap()
+        .unwrap();
+    let pp = extracted.windows.unwrap().password_policy.unwrap();
+    assert_eq!(pp.lockout_threshold, Some(5));
+    assert_eq!(pp.lockout_duration_minutes, Some(30));
 }
 
 // ============================================================

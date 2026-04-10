@@ -1,6 +1,5 @@
 //! ECDSA P-256 signing scheme.
 
-use alloc::vec::Vec;
 use p256::ecdsa::signature::{Signer, Verifier};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 

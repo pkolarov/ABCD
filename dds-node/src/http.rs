@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::service::{
-    EnrollDeviceRequest, EnrollUserRequest, LocalService, NodeStatus, PolicyResult, ServiceError,
-    SessionRequest,
+    ApplicableSoftware, ApplicableWindowsPolicy, AppliedReport, EnrollDeviceRequest,
+    EnrollUserRequest, LocalService, NodeStatus, PolicyResult, ServiceError, SessionRequest,
 };
 use dds_store::traits::{RevocationStore, TokenStore};
 
@@ -70,6 +70,9 @@ where
         .route("/v1/session", post(issue_session::<S>))
         .route("/v1/policy/evaluate", post(evaluate_policy::<S>))
         .route("/v1/status", get(status::<S>))
+        .route("/v1/windows/policies", get(list_windows_policies::<S>))
+        .route("/v1/windows/software", get(list_windows_software::<S>))
+        .route("/v1/windows/applied", post(record_windows_applied::<S>))
         .with_state(state)
 }
 
@@ -132,6 +135,26 @@ pub struct PolicyRequestJson {
     pub subject_urn: String,
     pub resource: String,
     pub action: String,
+}
+
+// ---------- Windows applier types (Phase 3 items 9–10) ----------
+
+/// Query string for the two windows-listing endpoints.
+#[derive(Debug, Deserialize)]
+pub struct DeviceUrnQuery {
+    pub device_urn: String,
+}
+
+/// Response wrapping a list of windows policies for a device.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WindowsPoliciesResponse {
+    pub policies: Vec<ApplicableWindowsPolicy>,
+}
+
+/// Response wrapping a list of software assignments for a device.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WindowsSoftwareResponse {
+    pub software: Vec<ApplicableSoftware>,
 }
 
 // ---------- error type ----------
@@ -282,6 +305,44 @@ where
     Ok(Json(svc.status(&state.info.peer_id, 0, 0)?))
 }
 
+// ---------- Windows applier handlers (Phase 3 items 9–10) ----------
+
+async fn list_windows_policies<S>(
+    State(state): State<AppState<S>>,
+    Query(q): Query<DeviceUrnQuery>,
+) -> Result<Json<WindowsPoliciesResponse>, HttpError>
+where
+    S: TokenStore + RevocationStore + Send + Sync + 'static,
+{
+    let svc = state.svc.lock().await;
+    let policies = svc.list_applicable_windows_policies(&q.device_urn)?;
+    Ok(Json(WindowsPoliciesResponse { policies }))
+}
+
+async fn list_windows_software<S>(
+    State(state): State<AppState<S>>,
+    Query(q): Query<DeviceUrnQuery>,
+) -> Result<Json<WindowsSoftwareResponse>, HttpError>
+where
+    S: TokenStore + RevocationStore + Send + Sync + 'static,
+{
+    let svc = state.svc.lock().await;
+    let software = svc.list_applicable_software(&q.device_urn)?;
+    Ok(Json(WindowsSoftwareResponse { software }))
+}
+
+async fn record_windows_applied<S>(
+    State(state): State<AppState<S>>,
+    Json(report): Json<AppliedReport>,
+) -> Result<StatusCode, HttpError>
+where
+    S: TokenStore + RevocationStore + Send + Sync + 'static,
+{
+    let svc = state.svc.lock().await;
+    svc.record_applied(&report)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
 /// Bind and serve the HTTP API on `addr` until the future is dropped.
 pub async fn serve<S>(
     addr: &str,
@@ -356,6 +417,18 @@ mod tests {
                 post(evaluate_policy::<MemoryBackend>),
             )
             .route("/v1/status", get(status::<MemoryBackend>))
+            .route(
+                "/v1/windows/policies",
+                get(list_windows_policies::<MemoryBackend>),
+            )
+            .route(
+                "/v1/windows/software",
+                get(list_windows_software::<MemoryBackend>),
+            )
+            .route(
+                "/v1/windows/applied",
+                post(record_windows_applied::<MemoryBackend>),
+            )
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -466,5 +539,199 @@ mod tests {
             .unwrap();
         // Without valid vouches, the session should be rejected (500 = domain error).
         assert_eq!(resp.status(), 500);
+    }
+
+    // ----------------------------------------------------------------
+    // Windows applier endpoints (Phase 3 items 9–10)
+    // ----------------------------------------------------------------
+
+    /// Seed the test state with a device join + a policy and software
+    /// assignment that target it via the `dev-machine` tag, then return
+    /// the device URN. Used by the three windows endpoint tests below.
+    async fn seed_windows_state(state: &AppState<MemoryBackend>) -> String {
+        use crate::service::EnrollDeviceRequest;
+        use dds_core::token::{Token, TokenKind, TokenPayload};
+        use dds_domain::{
+            DomainDocument, Enforcement, InstallAction, PolicyScope, RegistryAction,
+            RegistryDirective, RegistryHive, RegistryValue, SoftwareAssignment, WindowsPolicyDocument,
+            WindowsSettings,
+        };
+
+        // Enroll the target device.
+        let device_urn = {
+            let mut svc = state.svc.lock().await;
+            svc.set_verify_fido2(false);
+            svc.enroll_device(EnrollDeviceRequest {
+                label: "ws".into(),
+                device_id: "hw-1".into(),
+                hostname: "ws-1".into(),
+                os: "Windows 10".into(),
+                os_version: "1809".into(),
+                tpm_ek_hash: None,
+                org_unit: None,
+                tags: vec!["dev-machine".into()],
+            })
+            .unwrap()
+            .urn
+        };
+
+        // Mint a self-signed admin identity that publishes the policy
+        // and software docs into the trust graph. Mirrors the in-tree
+        // pattern from `service::windows_applier_tests`.
+        let admin = Identity::generate("admin", &mut OsRng);
+        let mut payload = TokenPayload {
+            iss: admin.id.to_urn(),
+            iss_key: admin.public_key.clone(),
+            jti: "p-baseline".into(),
+            sub: admin.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1_700_000_000,
+            exp: Some(4_102_444_800),
+            body_type: None,
+            body_cbor: None,
+        };
+        let policy = WindowsPolicyDocument {
+            policy_id: "security/baseline".into(),
+            display_name: "Baseline".into(),
+            version: 1,
+            enforcement: Enforcement::Enforce,
+            scope: PolicyScope {
+                device_tags: vec!["dev-machine".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            settings: vec![],
+            windows: Some(WindowsSettings {
+                registry: vec![RegistryDirective {
+                    hive: RegistryHive::LocalMachine,
+                    key: "SOFTWARE\\Test".into(),
+                    name: Some("Enabled".into()),
+                    value: Some(RegistryValue::Dword(1)),
+                    action: RegistryAction::Set,
+                }],
+                ..Default::default()
+            }),
+        };
+        policy.embed(&mut payload).unwrap();
+        let policy_token = Token::sign(payload, &admin.signing_key).unwrap();
+
+        let mut sw_payload = TokenPayload {
+            iss: admin.id.to_urn(),
+            iss_key: admin.public_key.clone(),
+            jti: "sw-editor".into(),
+            sub: admin.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1_700_000_000,
+            exp: Some(4_102_444_800),
+            body_type: None,
+            body_cbor: None,
+        };
+        let pkg = SoftwareAssignment {
+            package_id: "com.example.editor".into(),
+            display_name: "Editor".into(),
+            version: "1.0.0".into(),
+            source: "https://cdn.example.com/editor-1.0.0.msi".into(),
+            sha256: "deadbeef".into(),
+            action: InstallAction::Install,
+            scope: PolicyScope {
+                device_tags: vec!["dev-machine".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            silent: true,
+            pre_install_script: None,
+            post_install_script: None,
+        };
+        pkg.embed(&mut sw_payload).unwrap();
+        let sw_token = Token::sign(sw_payload, &admin.signing_key).unwrap();
+
+        let svc = state.svc.lock().await;
+        let mut g = svc.trust_graph.write().unwrap();
+        g.add_token(policy_token).unwrap();
+        g.add_token(sw_token).unwrap();
+        device_urn
+    }
+
+    #[tokio::test]
+    async fn test_windows_policies_endpoint_returns_typed_bundle() {
+        let state = make_state();
+        let device_urn = seed_windows_state(&state).await;
+        let base = spawn_server(state).await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/v1/windows/policies"))
+            .query(&[("device_urn", &device_urn)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: WindowsPoliciesResponse = resp.json().await.unwrap();
+        assert_eq!(body.policies.len(), 1);
+        assert_eq!(body.policies[0].document.policy_id, "security/baseline");
+        let bundle = body.policies[0].document.windows.as_ref().unwrap();
+        assert_eq!(bundle.registry.len(), 1);
+        assert_eq!(bundle.registry[0].key, "SOFTWARE\\Test");
+    }
+
+    #[tokio::test]
+    async fn test_windows_software_endpoint_filters_by_scope() {
+        let state = make_state();
+        let device_urn = seed_windows_state(&state).await;
+        let base = spawn_server(state).await;
+
+        // Matching device → 1 hit.
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/v1/windows/software"))
+            .query(&[("device_urn", &device_urn)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: WindowsSoftwareResponse = resp.json().await.unwrap();
+        assert_eq!(body.software.len(), 1);
+        assert_eq!(body.software[0].document.package_id, "com.example.editor");
+
+        // Unknown device URN (not enrolled, so no tags) → 0 hits.
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/v1/windows/software"))
+            .query(&[("device_urn", "urn:vouchsafe:nobody.zzz")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: WindowsSoftwareResponse = resp.json().await.unwrap();
+        assert_eq!(body.software.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_windows_applied_endpoint_accepts_report() {
+        let state = make_state();
+        let base = spawn_server(state).await;
+        let report = AppliedReport {
+            device_urn: "urn:vouchsafe:dev.xxx".into(),
+            target_id: "security/baseline".into(),
+            version: "1".into(),
+            status: crate::service::AppliedStatus::Ok,
+            directives: vec!["registry: HKLM\\SOFTWARE\\Test\\Enabled = 1".into()],
+            error: None,
+            applied_at: 1_700_000_000,
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/windows/applied"))
+            .json(&report)
+            .send()
+            .await
+            .unwrap();
+        // 202 Accepted — the report is logged; persistent applier audit
+        // is intentionally a v2 follow-up (see service.rs::record_applied).
+        assert_eq!(resp.status(), 202);
     }
 }

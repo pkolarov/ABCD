@@ -221,13 +221,117 @@ All 7 crates are functionally complete. The following work is ordered by impact 
 
 ### Phase 3 — Enterprise Features
 
-9. **WindowsPolicyDocument distribution** — End-to-end flow: admin creates a policy document, signs it, gossip propagates to target devices, dds-node on each device evaluates scope + applies settings (registry keys, security policy).
+9. **WindowsPolicyDocument distribution** — End-to-end flow: admin creates a policy document, signs it, gossip propagates to target devices, dds-node on each device evaluates scope + applies settings (registry keys, security policy). **Plan landed 2026-04-09 — see [Windows Policy Applier Plan](#windows-policy-applier-plan-phase-3-items-910) below. Phase A in flight.**
 
-10. **SoftwareAssignment workflow** — Admin publishes a software assignment, devices poll/receive via gossip, local agent downloads package, verifies SHA-256, installs silently. Needs a local agent service on managed devices.
+10. **SoftwareAssignment workflow** — Admin publishes a software assignment, devices poll/receive via gossip, local agent downloads package, verifies SHA-256, installs silently. Needs a local agent service on managed devices. **Plan landed 2026-04-09 — see Plan section below.**
 
-11. 🟢 **Audit log** — Append-only signed log of all trust graph mutations (attest, vouch, revoke, burn) for compliance. Each entry signed by the node that performed the action. Syncable via gossip. Opt-in feature enabled via `domain.toml` or `DomainConfig` during domain creation to minimize network overhead.
+11\. 🟢 **Audit log** — Append-only signed log of all trust graph mutations (attest, vouch, revoke, burn) for compliance. Each entry signed by the node that performed the action. Syncable via gossip. Opt-in feature enabled via `domain.toml` or `DomainConfig` during domain creation to minimize network overhead.
 
-12. 🟢 **ECDSA-P256 support** — Some FIDO2 authenticators only support P-256. Added as a third `SchemeId` variant with triple-hybrid option `Ed25519+ECDSA-P256+ML-DSA-65`.
+12\. 🟢 **ECDSA-P256 support** — Some FIDO2 authenticators only support P-256. Added as a third `SchemeId` variant with triple-hybrid option `Ed25519+ECDSA-P256+ML-DSA-65`.
+
+### Windows Policy Applier Plan (Phase 3 items 9–10)
+
+Items 9 and 10 above split into *distribution* (already solved by gossip + the
+existing trust graph) plus *enforcement* (not solved — `dds-node` is a pure
+directory service and never calls Win32). Enforcement is delivered as a new
+Windows Service running alongside `dds-node` on the managed device.
+
+#### Architecture
+
+A new **`DdsPolicyAgent`** Windows Service (.NET 8 worker, `LocalSystem`)
+polls `dds-node`'s loopback HTTP API once a minute for `WindowsPolicyDocument`
+and `SoftwareAssignment` documents scoped to *this* device, then applies them
+via four pluggable enforcers: **Registry / Account / PasswordPolicy /
+SoftwareInstall**. State is persisted under `%ProgramData%\DDS\applied-state.json`
+for idempotency, and outcomes are reported back to `dds-node` for audit. The
+agent ships in the same WiX MSI bundle as `dds-node.exe` and the existing
+`DdsCredentialProvider`, so installing one binary brings up the full Windows
+integration.
+
+`dds-node` itself stays a pure directory service — only the agent is
+Windows-specific. The same `dds-node` binary continues to run unchanged on
+macOS/Linux/embedded.
+
+#### v1 scope decisions (locked 2026-04-09)
+
+| Decision | Choice | Reason |
+| --- | --- | --- |
+| Service identity | `LocalSystem` | Required for HKLM writes + local account creation |
+| Domain-joined machines | Out of scope v1 — refuse + log | AD-replacement is a Phase 4 conversation |
+| Packaging | Single WiX MSI bundle (node + agent + credprov) | One install resolves B1 atomically |
+| Pre/post install scripts | Trust on document signature | Authenticode-script PKI deferred |
+| `WindowsSettings` typed bundle | **Alongside** existing `Vec<PolicySetting>` | Don't break existing tests; free-form list is the escape hatch |
+| OS floor | Windows 10 1809+ | Pilot target |
+| Secrets / passwords | DPAPI-local random; `SecretReleaseDocument` deferred to v2 | No on-the-wire plaintext |
+| Propagation cadence | Poll `/v1/windows/*` every 60 s | GPO-class change cadence; SSE deferred |
+
+#### Component layout
+
+```text
+platform/windows/
+├── DdsCredentialProvider/        # exists — logon, untouched
+├── DdsPolicyAgent/               # NEW — worker service
+│   ├── Worker.cs                 # poll loop, dispatch
+│   ├── Client/DdsNodeClient.cs   # GET /v1/windows/* + POST /v1/windows/applied
+│   ├── State/AppliedStateStore.cs# %ProgramData%\DDS\applied-state.json
+│   └── Enforcers/
+│       ├── RegistryEnforcer.cs       # Microsoft.Win32.Registry, allowlisted hives
+│       ├── AccountEnforcer.cs        # netapi32, refuse on domain-joined
+│       ├── PasswordPolicyEnforcer.cs # secedit / NetUserModalsSet
+│       └── SoftwareInstaller.cs      # msiexec / Add-AppxPackage / EXE
+└── installer/                    # NEW — WiX v4 MSI bundle (signed)
+```
+
+Rust side (smaller surface):
+
+```text
+dds-domain/src/types.rs            # add WindowsSettings typed bundle
+dds-node/src/service.rs            # list_applicable_windows_policies(device_urn)
+dds-node/src/http.rs               # GET /v1/windows/policies, /v1/windows/software,
+                                   #     POST /v1/windows/applied
+```
+
+#### Domain-type extension
+
+`WindowsPolicyDocument` gains an optional `windows: Option<WindowsSettings>`
+field. The existing `settings: Vec<PolicySetting>` stays as the forward-compat
+escape hatch. `WindowsSettings` carries:
+
+- `registry: Vec<RegistryDirective>`  — hive, key, name, kind, value, action
+- `local_accounts: Vec<AccountDirective>` — name, action, full_name, groups
+- `password_policy: Option<PasswordPolicy>` — min_len, complexity, lockout
+- `services: Vec<ServiceDirective>` — name, start_type, action
+
+`SoftwareAssignment` is already typed enough — kept as-is for v1.
+
+#### `dds-node` API additions
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/v1/windows/policies?device_urn=...` | List `WindowsPolicyDocument` tokens whose `scope` matches the given device URN |
+| `GET` | `/v1/windows/software?device_urn=...` | Same for `SoftwareAssignment` |
+| `POST` | `/v1/windows/applied` | Agent reports per-directive outcome → audit log |
+
+The agent trusts dds-node's pre-filtered list — both run as different
+identities on the same loopback, and dds-node already verifies signatures
+against `trusted_roots` on ingest. This avoids embedding `dds-ffi` in the
+agent.
+
+#### Phasing
+
+| Phase | Scope | Exit criteria |
+| --- | --- | --- |
+| **A** | Extend `WindowsPolicyDocument` with `WindowsSettings` typed bundle | `cargo test -p dds-domain` green; existing tests untouched |
+| **B** | Three new `dds-node` HTTP endpoints + `LocalService::list_applicable_*` | reqwest tests in `dds-node/src/http.rs` cover scope matching + audit POST |
+| **C** | `DdsPolicyAgent` skeleton: Worker host, config, `DdsNodeClient`, `AppliedStateStore`, log-only | `dotnet test` green for state-store + client |
+| **D** | `RegistryEnforcer` + first end-to-end on Windows CI | One full e2e on the Windows runner |
+| **E** | `AccountEnforcer` (refuse on domain-joined) + `PasswordPolicyEnforcer` | Mocked unit tests + one e2e per enforcer |
+| **F** | `SoftwareInstaller` for MSI → MSIX → EXE; SHA-256 verify; uninstall lookup | E2e installs + uninstalls a known-good test MSI |
+| **G** | WiX bundle, Authenticode signing scaffolding, service registration. **Resolves B1.** | MSI builds in CI; manual install brings up both services |
+| **H** | `windows-latest` CI job runs the full integration suite. **Resolves B2 for Windows.** | CI green end-to-end |
+
+A and B can land together (one Rust PR). C–F land per-enforcer. G+H land as
+the final shipping PR.
 
 ## Path to Production
 

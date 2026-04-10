@@ -523,11 +523,12 @@ impl DdsNode {
                 } => {
                     let response = self.build_sync_response(&request);
                     let payload_count = response.payloads.len();
-                    if let Err(_) = self
+                    if self
                         .swarm
                         .behaviour_mut()
                         .sync
                         .send_response(channel, response)
+                        .is_err()
                     {
                         warn!(%peer, "sync: failed to send response (channel closed)");
                     } else {

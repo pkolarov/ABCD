@@ -85,6 +85,7 @@ struct ChaosState {
 }
 
 impl ChaosState {
+    #[allow(clippy::too_many_arguments)] // chaos config — collapsing into a struct would just hide the same fields
     fn new(
         enabled: bool,
         n: usize,

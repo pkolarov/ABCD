@@ -75,10 +75,19 @@ pub struct WindowsPolicyDocument {
     pub version: u64,
     /// Target scope: device tags, org units, or identity URNs.
     pub scope: PolicyScope,
-    /// Policy settings as key-value pairs (typed).
+    /// Free-form policy settings as key-value pairs. Forward-compatible
+    /// escape hatch — appliers fall back to this for any directive not
+    /// covered by the typed `windows` bundle below.
     pub settings: Vec<PolicySetting>,
     /// Enforcement mode.
     pub enforcement: Enforcement,
+    /// Strongly-typed Windows-specific directives. The Windows policy
+    /// applier reads this for known directives (registry, accounts,
+    /// password policy, services); unknown settings still flow through
+    /// `settings`. Backward-compatible: pre-existing tokens without
+    /// this field deserialize as `None` thanks to `serde(default)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<WindowsSettings>,
 }
 
 /// Who this policy targets.
@@ -122,6 +131,204 @@ pub enum Enforcement {
     Enforce,
     /// Disabled (policy exists but is not applied).
     Disabled,
+}
+
+// ----------------------------------------------------------------
+// Strongly-typed Windows directives (for `WindowsPolicyDocument::windows`).
+//
+// These are the inputs the Windows policy applier (`DdsPolicyAgent`)
+// consumes. They live in dds-domain rather than the agent so that:
+//   1. The wire shape is locked at the directory layer — admin tools
+//      (`dds-cli`, future web UI) and the agent share one definition.
+//   2. Non-Windows nodes can still gossip and store the documents
+//      without pulling in any Win32 dependency.
+// The applier itself is .NET; it consumes these via the `dds-node`
+// HTTP API as JSON, so every variant must serialize cleanly to both
+// CBOR (for the trust graph) and JSON (for the API). All variants
+// here are flat enums or plain structs — no untagged or transparent
+// representations.
+// ----------------------------------------------------------------
+
+/// Strongly-typed Windows policy directives. Lives alongside the
+/// free-form `WindowsPolicyDocument::settings` list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct WindowsSettings {
+    /// Registry directives, applied in document order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registry: Vec<RegistryDirective>,
+    /// Local Windows account directives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_accounts: Vec<AccountDirective>,
+    /// Local password policy. `None` = leave existing policy unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_policy: Option<PasswordPolicy>,
+    /// Windows service directives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<ServiceDirective>,
+}
+
+/// Registry hive (mirrors Win32 `HKEY_*` predefined handles).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RegistryHive {
+    /// `HKEY_LOCAL_MACHINE`.
+    LocalMachine,
+    /// `HKEY_CURRENT_USER` — note: a `LocalSystem` applier writes its
+    /// own profile here, not the interactive user's. Use sparingly.
+    CurrentUser,
+    /// `HKEY_USERS`.
+    Users,
+    /// `HKEY_CLASSES_ROOT`.
+    ClassesRoot,
+}
+
+/// Registry value type (subset of Win32 `REG_*`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum RegistryValue {
+    /// `REG_SZ`.
+    String(String),
+    /// `REG_EXPAND_SZ`.
+    ExpandString(String),
+    /// `REG_DWORD` (32-bit unsigned).
+    Dword(u32),
+    /// `REG_QWORD` (64-bit unsigned).
+    Qword(u64),
+    /// `REG_MULTI_SZ`.
+    MultiString(Vec<String>),
+    /// `REG_BINARY`.
+    Binary(#[serde(with = "serde_bytes")] Vec<u8>),
+}
+
+/// What to do with a registry entry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RegistryAction {
+    /// Create or overwrite the named value.
+    Set,
+    /// Remove the value. If `name` is `None`, remove the entire key
+    /// (and the agent should refuse if the key has subkeys, to avoid
+    /// accidental wide-blast deletes).
+    Delete,
+}
+
+/// One registry directive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RegistryDirective {
+    pub hive: RegistryHive,
+    /// Subkey path under `hive`, e.g.
+    /// `SOFTWARE\Policies\Microsoft\Windows\System`. No leading
+    /// backslash, no hive prefix.
+    pub key: String,
+    /// Value name. `None` means the `(Default)` value of the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Value to set. Required for `Action::Set`, ignored for `Delete`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<RegistryValue>,
+    pub action: RegistryAction,
+}
+
+/// What to do with a local Windows account.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AccountAction {
+    /// Create the account if it does not exist (idempotent).
+    Create,
+    /// Delete the account if it exists.
+    Delete,
+    /// Disable the account but keep its profile.
+    Disable,
+    /// Re-enable a previously disabled account.
+    Enable,
+}
+
+/// Local Windows account directive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AccountDirective {
+    /// SAM account name (e.g. `"alice"`). Length and character rules
+    /// are enforced by the applier, not the document.
+    pub username: String,
+    pub action: AccountAction,
+    /// Display name shown in `lusrmgr.msc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_name: Option<String>,
+    /// Description / comment shown in `lusrmgr.msc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Local groups the account should be a member of. The applier
+    /// is responsible for adding-without-removing existing memberships
+    /// the directive does not name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    /// If `Some(true)`, set `PASSWORD_NEVER_EXPIRES`. `None` = leave
+    /// existing flag unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_never_expires: Option<bool>,
+}
+
+/// Local password policy directive. All fields optional — `None` =
+/// leave that knob untouched. Empty `PasswordPolicy{}` is a no-op.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PasswordPolicy {
+    /// Minimum password length, characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u32>,
+    /// Maximum password age, days. `0` = passwords never expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_days: Option<u32>,
+    /// Minimum password age, days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_age_days: Option<u32>,
+    /// Number of remembered previous passwords (history).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_size: Option<u32>,
+    /// Require Windows complexity rules (upper + lower + digit + symbol).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity_required: Option<bool>,
+    /// Failed-attempt threshold before lockout. `0` = lockout disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lockout_threshold: Option<u32>,
+    /// Lockout duration, minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lockout_duration_minutes: Option<u32>,
+}
+
+/// Service start type (mirrors `SC_START_TYPE`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ServiceStartType {
+    /// `SERVICE_BOOT_START`.
+    Boot,
+    /// `SERVICE_SYSTEM_START`.
+    System,
+    /// `SERVICE_AUTO_START`.
+    Automatic,
+    /// `SERVICE_DEMAND_START`.
+    Manual,
+    /// `SERVICE_DISABLED`.
+    Disabled,
+}
+
+/// What to do with a Windows service.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ServiceAction {
+    /// Configure the service (start type / display name) but don't
+    /// touch its current run state.
+    Configure,
+    /// Configure + ensure the service is running.
+    Start,
+    /// Configure + ensure the service is stopped.
+    Stop,
+}
+
+/// Windows service directive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServiceDirective {
+    /// Service short name (e.g. `"wuauserv"`).
+    pub name: String,
+    /// Optional display name to set on the service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Start type to set. `None` = leave existing start type unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_type: Option<ServiceStartType>,
+    pub action: ServiceAction,
 }
 
 impl DomainDocument for WindowsPolicyDocument {

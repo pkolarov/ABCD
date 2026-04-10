@@ -8,6 +8,7 @@
 //! Targets the §10 KPI of <= 1 ms local auth decision.
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, RwLock};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use dds_core::identity::Identity;
@@ -22,7 +23,10 @@ fn bench_session_issue_and_validate(c: &mut Criterion) {
     let node = Identity::generate("bench-node", &mut OsRng);
     let user = Identity::generate("bench-user", &mut OsRng);
     let user_urn = user.id.to_urn();
-    let trust = TrustGraph::new();
+    // Post-B5b, `LocalService::new` takes a shared `Arc<RwLock<TrustGraph>>`
+    // so the swarm event loop and the service share one in-memory graph.
+    // The bench has no swarm, so the Arc lives only as long as the service.
+    let trust = Arc::new(RwLock::new(TrustGraph::new()));
     let roots: BTreeSet<String> = BTreeSet::new();
     let store = MemoryBackend::new();
     let mut svc = LocalService::new(node, trust, roots, store);

@@ -197,7 +197,7 @@ impl TrustGraph {
         let expired_attestations: Vec<String> = self
             .attestations
             .iter()
-            .filter(|(_, t)| t.payload.exp.map_or(false, |exp| now > exp))
+            .filter(|(_, t)| t.payload.exp.is_some_and(|exp| now > exp))
             .map(|(jti, _)| jti.clone())
             .collect();
         for jti in &expired_attestations {
@@ -209,7 +209,7 @@ impl TrustGraph {
         let expired_vouches: Vec<String> = self
             .vouches
             .iter()
-            .filter(|(_, t)| t.payload.exp.map_or(false, |exp| now > exp))
+            .filter(|(_, t)| t.payload.exp.is_some_and(|exp| now > exp))
             .map(|(jti, _)| jti.clone())
             .collect();
         for jti in &expired_vouches {
@@ -473,6 +473,21 @@ impl TrustGraph {
     /// Get the number of revoked JTIs.
     pub fn revocation_count(&self) -> usize {
         self.revocations.len()
+    }
+
+    /// Iterate over every attestation token currently in the graph.
+    /// Order is implementation-defined.
+    ///
+    /// Used by callers that need to walk all attestations to find
+    /// ones embedding a specific domain document type — for example
+    /// the Windows policy applier path in `dds-node` walks every
+    /// attestation looking for `WindowsPolicyDocument` /
+    /// `SoftwareAssignment` bodies scoped to a given device URN.
+    /// Hot paths (`purposes_for`, `has_purpose`) still go through
+    /// the secondary indices, so adding callers here does not
+    /// regress the §10 ≤ 1 ms policy budget.
+    pub fn attestations_iter(&self) -> impl Iterator<Item = &Token> + '_ {
+        self.attestations.values()
     }
 }
 
@@ -854,7 +869,7 @@ mod tests {
     #[test]
     fn test_unauthorized_revocation_rejected() {
         let mut graph = TrustGraph::new();
-        let root = Identity::generate("root", &mut OsRng);
+        let _root = Identity::generate("root", &mut OsRng);
         let user = Identity::generate("user", &mut OsRng);
         let attacker = Identity::generate("attacker", &mut OsRng);
 
