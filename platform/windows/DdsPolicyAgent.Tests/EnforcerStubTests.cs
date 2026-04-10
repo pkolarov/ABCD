@@ -34,9 +34,10 @@ public class EnforcerStubTests
     }
 
     [Fact]
-    public async Task AccountEnforcer_returns_skipped_with_changes()
+    public async Task AccountEnforcer_creates_user_in_enforce_mode()
     {
-        var e = new AccountEnforcer(NullLogger<AccountEnforcer>.Instance);
+        var ops = new InMemoryAccountOperations();
+        var e = new AccountEnforcer(ops, NullLogger<AccountEnforcer>.Instance);
         var directive = JsonDocument.Parse("""
         [
             {"username":"alice","action":"Create"}
@@ -44,25 +45,30 @@ public class EnforcerStubTests
         """).RootElement;
 
         var outcome = await e.ApplyAsync(directive, EnforcementMode.Enforce);
-        Assert.Equal(EnforcementStatus.Skipped, outcome.Status);
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
         Assert.NotNull(outcome.Changes);
         Assert.Single(outcome.Changes);
         Assert.Contains("alice", outcome.Changes[0]);
+        Assert.True(ops.UserExists("alice"));
     }
 
     [Fact]
-    public async Task PasswordPolicyEnforcer_returns_skipped_with_changes()
+    public async Task PasswordPolicyEnforcer_sets_knobs_in_enforce_mode()
     {
-        var e = new PasswordPolicyEnforcer(NullLogger<PasswordPolicyEnforcer>.Instance);
+        var ops = new InMemoryPasswordPolicyOperations();
+        var e = new PasswordPolicyEnforcer(ops, NullLogger<PasswordPolicyEnforcer>.Instance);
         var directive = JsonDocument.Parse("""
         {"min_length":14,"complexity_required":true,"lockout_threshold":null}
         """).RootElement;
 
         var outcome = await e.ApplyAsync(directive, EnforcementMode.Enforce);
-        Assert.Equal(EnforcementStatus.Skipped, outcome.Status);
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
         Assert.NotNull(outcome.Changes);
         // lockout_threshold is null => skipped, so 2 changes
         Assert.Equal(2, outcome.Changes.Count);
+        var state = ops.GetCurrent();
+        Assert.Equal((uint)14, state.MinLength);
+        Assert.True(state.ComplexityRequired);
     }
 
     [Fact]

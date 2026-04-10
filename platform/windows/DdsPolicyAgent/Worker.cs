@@ -31,6 +31,9 @@ public sealed class Worker : BackgroundService
     private readonly IEnforcer _passwordPolicyEnforcer;
     private readonly IEnforcer _softwareInstaller;
 
+    // Accept concrete enforcer types so the DI container resolves them
+    // directly. The IEnforcer fields allow the dispatch loop to call
+    // them uniformly.
     public Worker(
         IDdsNodeClient client,
         IAppliedStateStore stateStore,

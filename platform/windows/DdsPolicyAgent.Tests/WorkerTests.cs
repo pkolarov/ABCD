@@ -44,8 +44,8 @@ public class WorkerTests
             client, stateStore, config,
             NullLogger<Worker>.Instance,
             new RegistryEnforcer(new InMemoryRegistryOperations(), NullLogger<RegistryEnforcer>.Instance),
-            new AccountEnforcer(NullLogger<AccountEnforcer>.Instance),
-            new PasswordPolicyEnforcer(NullLogger<PasswordPolicyEnforcer>.Instance),
+            new AccountEnforcer(new InMemoryAccountOperations(), NullLogger<AccountEnforcer>.Instance),
+            new PasswordPolicyEnforcer(new InMemoryPasswordPolicyOperations(), NullLogger<PasswordPolicyEnforcer>.Instance),
             new SoftwareInstaller(NullLogger<SoftwareInstaller>.Instance));
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
