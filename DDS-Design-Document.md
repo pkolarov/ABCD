@@ -1,7 +1,7 @@
 # Decentralized Directory Service (DDS) — Design Document
 
-**Version:** 0.1 (Draft)
-**Date:** 2026-04-06
+**Version:** 0.2 (Draft)
+**Date:** 2026-04-10
 
 ---
 
@@ -378,7 +378,11 @@ To prevent resource exhaustion in trust graph evaluation:
 | Domain Controller | Every node is a full node (Minima pattern) |
 | LDAP directory | CRDT-based directory store with Vouchsafe tokens |
 | Kerberos authentication | FIDO2 + Vouchsafe attestation tokens |
-| Group Policy Objects (GPO) | Policy attestation tokens with purpose scoping |
+| Group Policy Objects (GPO) | `WindowsPolicyDocument` with typed `WindowsSettings` bundle (§14.5.1) |
+| GPO enforcement (registry, security policy) | `DdsPolicyAgent` Windows Service with pluggable enforcers (§14.5.4) |
+| Software deployment (SCCM/Intune) | `SoftwareAssignment` document + `SoftwareInstaller` enforcer (§14.5.1) |
+| Local account management | `AccountEnforcer` via `AccountDirective` with domain-join guard (§14.5.5) |
+| Password policy (Fine-Grained) | `PasswordPolicyEnforcer` via `PasswordPolicy` directive (§14.5.1) |
 | Organizational Units | Purpose-filtered delegation chains |
 | Group membership | Vouch tokens from authorized admins |
 | Trust relationships (cross-domain) | Cross-org vouches between root identities |
@@ -386,7 +390,8 @@ To prevent resource exhaustion in trust graph evaluation:
 | Sites and subnets | Gossipsub topic partitioning + mDNS for local discovery |
 | FSMO roles | No equivalent needed — no single-master operations; all ops are CRDT-mergeable |
 | DNS integration | Kademlia DHT for name resolution |
-| Schema | Token format defined by `kind` and `purpose` conventions |
+| Schema | Token format defined by `kind` and `purpose` conventions + typed domain documents |
+| Windows logon (Credential Provider) | `DdsCredentialProvider` COM class — passkey → session via dds-node (§14.5) |
 
 ---
 
@@ -620,7 +625,15 @@ dds/
 │   └── Cargo.toml
 │
 └── platform/
-    ├── windows/                  C# client via uniffi-bindgen-cs
+    ├── windows/
+    │   ├── DdsCredentialProvider/    C# COM credential provider for Windows logon
+    │   ├── DdsPolicyAgent/           .NET 8 worker service — policy enforcement
+    │   │   ├── Client/               HTTP client for dds-node /v1/windows/* API
+    │   │   ├── Config/               Agent configuration model
+    │   │   ├── State/                Applied-state persistence (idempotency)
+    │   │   └── Enforcers/            Registry, Account, PasswordPolicy, Software
+    │   ├── DdsPolicyAgent.Tests/     xUnit tests (cross-platform via InMemory* doubles)
+    │   └── installer/                WiX v4 MSI bundle (planned)
     ├── android/                  Kotlin wrapper via UniFFI
     ├── ios/                      Swift wrapper via UniFFI
     └── embedded/                 no_std integration examples (Embassy)
@@ -787,6 +800,308 @@ fn check_access(state: &DirectoryState, requester_token: &[u8], resource: &str) 
     engine.evaluate(&token, resource, "read")
 }
 ```
+
+### 14.5 Windows Platform — Policy Enforcement Architecture
+
+DDS replaces Active Directory Group Policy with a decentralized, gossip-propagated
+policy model. The enforcement architecture separates concerns across three components
+that run on each managed Windows device:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Managed Windows Device                                      │
+│                                                              │
+│  ┌──────────────────────────┐  ┌──────────────────────────┐  │
+│  │      dds-node            │  │  DdsCredentialProvider    │  │
+│  │  (Rust, LocalSystem)     │  │  (.NET 8, COM-visible)   │  │
+│  │                          │  │                          │  │
+│  │  • Trust graph           │  │  Logon → /v1/session     │  │
+│  │  • Policy evaluation     │  │  Passkey → URN → session │  │
+│  │  • Gossip + sync         │  └──────────┬───────────────┘  │
+│  │  • HTTP API on 127.0.0.1 │             │                  │
+│  └──────────┬───────────────┘             │                  │
+│             │ loopback HTTP               │                  │
+│  ┌──────────┴───────────────┐             │                  │
+│  │    DdsPolicyAgent        │             │                  │
+│  │  (.NET 8, LocalSystem)   │             │                  │
+│  │                          ├─────────────┘                  │
+│  │  Poll /v1/windows/*      │                                │
+│  │  every 60s               │                                │
+│  │                          │                                │
+│  │  ┌──────────────────┐    │                                │
+│  │  │ Registry Enforcer│    │                                │
+│  │  │ Account Enforcer │    │                                │
+│  │  │ Password Policy  │    │                                │
+│  │  │ Software Install │    │                                │
+│  │  └──────────────────┘    │                                │
+│  │                          │                                │
+│  │  State: %ProgramData%    │                                │
+│  │         \DDS\applied-    │                                │
+│  │         state.json       │                                │
+│  └──────────────────────────┘                                │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Separation of concerns:**
+
+| Component | Language | Runs as | Responsibility |
+| --- | --- | --- | --- |
+| `dds-node` | Rust | Windows Service (LocalSystem) | Directory service: trust graph, gossip, sync, policy evaluation, HTTP API |
+| `DdsPolicyAgent` | .NET 8 | Windows Service (LocalSystem) | Enforcement: poll dds-node, dispatch to enforcers, report outcomes |
+| `DdsCredentialProvider` | .NET 8 | COM in-proc (LogonUI) | Windows logon: passkey → session via `/v1/session` |
+
+`dds-node` never calls Win32 APIs — it is the same binary on all platforms. Only
+`DdsPolicyAgent` contains Windows-specific enforcement code. This separation means
+the directory layer can be tested, soak-tested, and deployed on Linux/macOS without
+pulling in any Windows dependency.
+
+#### 14.5.1 Domain Document Types for Enforcement
+
+Two domain document types (defined in `dds-domain/src/types.rs`) carry the
+enforcement payload through the trust graph:
+
+**WindowsPolicyDocument** (`body_type: "dds:windows-policy"`):
+
+```
+WindowsPolicyDocument
+├── policy_id: String          # e.g. "security/password-policy"
+├── display_name: String
+├── version: u64               # monotonically increasing
+├── scope: PolicyScope         # who this targets
+│   ├── device_tags: [String]  # e.g. ["workstation", "developer"]
+│   ├── org_units: [String]    # e.g. ["engineering"]
+│   └── identity_urns: [String]# direct device URN targeting
+├── settings: [PolicySetting]  # free-form key/value (escape hatch)
+├── enforcement: Enforcement   # Audit | Enforce | Disabled
+└── windows: Option<WindowsSettings>   # strongly-typed bundle
+    ├── registry: [RegistryDirective]
+    │   ├── hive: RegistryHive         # LocalMachine | CurrentUser | Users | ClassesRoot
+    │   ├── key: String                # e.g. "SOFTWARE\Policies\Microsoft\Windows\System"
+    │   ├── name: Option<String>       # value name, None = (Default)
+    │   ├── value: Option<RegistryValue># String | ExpandString | Dword | Qword | MultiString | Binary
+    │   └── action: RegistryAction     # Set | Delete
+    ├── local_accounts: [AccountDirective]
+    │   ├── username: String
+    │   ├── action: AccountAction      # Create | Delete | Disable | Enable
+    │   ├── full_name: Option<String>
+    │   ├── description: Option<String>
+    │   ├── groups: [String]           # additive membership
+    │   └── password_never_expires: Option<bool>
+    ├── password_policy: Option<PasswordPolicy>
+    │   ├── min_length: Option<u32>
+    │   ├── max_age_days: Option<u32>
+    │   ├── min_age_days: Option<u32>
+    │   ├── history_size: Option<u32>
+    │   ├── complexity_required: Option<bool>
+    │   ├── lockout_threshold: Option<u32>
+    │   └── lockout_duration_minutes: Option<u32>
+    └── services: [ServiceDirective]
+        ├── name: String               # e.g. "RemoteRegistry"
+        ├── display_name: Option<String>
+        ├── start_type: Option<ServiceStartType>  # Boot | System | Automatic | Manual | Disabled
+        └── action: ServiceAction      # Configure | Start | Stop
+```
+
+**SoftwareAssignment** (`body_type: "dds:software-assignment"`):
+
+```
+SoftwareAssignment
+├── package_id: String         # e.g. "com.example.editor"
+├── display_name: String
+├── version: String
+├── source: String             # download URL or content hash
+├── sha256: String             # package integrity verification
+├── action: InstallAction      # Install | Uninstall | Update
+├── scope: PolicyScope         # same scope model as WindowsPolicyDocument
+├── silent: bool
+├── pre_install_script: Option<String>
+└── post_install_script: Option<String>
+```
+
+Both types are signed Vouchsafe attestation tokens. The trust graph validates
+signatures against `trusted_roots` on ingest — the agent never needs to
+re-verify. `WindowsPolicyDocument::windows` is `Option` with `serde(default)`
+so tokens signed against the pre-Phase-A schema (no `windows` field)
+deserialize correctly as `windows: None`.
+
+#### 14.5.2 Scope Matching
+
+The scope model determines which devices receive which policies:
+
+| Scope Configuration | Matches |
+| --- | --- |
+| Empty scope (all three fields empty) | Every device (global policy) |
+| `device_tags: ["workstation"]` | Any device whose `DeviceJoinDocument.tags` contains `"workstation"` |
+| `org_units: ["engineering"]` | Any device whose `DeviceJoinDocument.org_unit` is `"engineering"` |
+| `identity_urns: ["urn:vouchsafe:device.xxx"]` | That specific device only |
+| Multiple fields populated | **Any-of** — matches if any one criterion is satisfied |
+
+The scope filter runs server-side in `dds-node` (via `LocalService::list_applicable_windows_policies`),
+not in the agent. This keeps the trust/scope logic in one Rust codebase and means the
+.NET agent never needs to embed `dds-ffi`.
+
+#### 14.5.3 dds-node HTTP API — Applier Endpoints
+
+Three new endpoints on the existing localhost HTTP server (`127.0.0.1:5551`):
+
+| Method | Path | Request | Response |
+| --- | --- | --- | --- |
+| `GET` | `/v1/windows/policies?device_urn=...` | Query string | `{ "policies": [{ "jti", "issuer", "iat", "document": WindowsPolicyDocument }] }` |
+| `GET` | `/v1/windows/software?device_urn=...` | Query string | `{ "software": [{ "jti", "issuer", "iat", "document": SoftwareAssignment }] }` |
+| `POST` | `/v1/windows/applied` | `AppliedReport` JSON body | `202 Accepted` |
+
+The `AppliedReport` structure:
+
+```json
+{
+  "device_urn": "urn:vouchsafe:device.xxx",
+  "target_id": "security/baseline",
+  "version": "7",
+  "status": "ok",
+  "directives": ["Set LocalMachine\\SOFTWARE\\Policies\\...\\Enabled = 1"],
+  "error": null,
+  "applied_at": 1712640000
+}
+```
+
+#### 14.5.4 DdsPolicyAgent — Enforcer Architecture
+
+The agent is a .NET 8 `BackgroundService` (runs as a Windows Service via
+`Microsoft.Extensions.Hosting.WindowsServices`). Its poll loop:
+
+1. `GET /v1/windows/policies?device_urn=$self` — fetch all policies scoped to this device
+2. For each policy, compute `SHA-256(document_json)` — compare to `applied-state.json`
+3. If unchanged → skip (idempotent)
+4. If new or changed → dispatch `WindowsSettings` bundle to enforcers
+5. `POST /v1/windows/applied` — report outcome per directive
+6. Repeat for `/v1/windows/software`
+7. Sleep 60 seconds, repeat
+
+**Enforcer interface:**
+
+```csharp
+public interface IEnforcer
+{
+    string Name { get; }
+    Task<EnforcementOutcome> ApplyAsync(
+        JsonElement directive,
+        EnforcementMode mode,  // Audit | Enforce
+        CancellationToken ct = default);
+}
+
+public sealed record EnforcementOutcome(
+    EnforcementStatus Status,  // Ok | Failed | Skipped
+    string? Error = null,
+    IReadOnlyList<string>? Changes = null);
+```
+
+Each enforcer is backed by a testable interface that abstracts the Win32 surface:
+
+| Enforcer | Interface | Win32 Implementation | Test Double |
+| --- | --- | --- | --- |
+| `RegistryEnforcer` | `IRegistryOperations` | `Microsoft.Win32.Registry` | `InMemoryRegistryOperations` |
+| `AccountEnforcer` | `IAccountOperations` | `netapi32` P/Invoke / `DirectoryServices.AccountManagement` | `InMemoryAccountOperations` |
+| `PasswordPolicyEnforcer` | `IPasswordPolicyOperations` | `secedit` / `NetUserModalsSet` | `InMemoryPasswordPolicyOperations` |
+| `SoftwareInstaller` | (direct) | `msiexec` / `Add-AppxPackage` / process exec | (log-only stub) |
+
+All Win32 implementations carry `[SupportedOSPlatform("windows")]`. The DI
+container selects the real or in-memory implementation based on the platform,
+so the full enforcer logic (idempotency, audit mode, error handling) is
+testable on macOS/Linux via `dotnet test`.
+
+#### 14.5.5 Security Controls
+
+**Registry allowlist:** The `RegistryEnforcer` restricts writes to three
+HKLM subkey prefixes:
+
+- `SOFTWARE\Policies\*` — standard GPO location
+- `SOFTWARE\DDS\*` — DDS-specific configuration
+- `SYSTEM\CurrentControlSet\Services\*` — service configuration
+
+Writes to any other path (including non-HKLM hives) are refused with
+`EnforcementStatus.Failed`. This limits blast radius if a compromised
+`dds-node` pushes a malicious policy.
+
+**Domain-join guard:** The `AccountEnforcer` refuses all local-account
+operations when `IAccountOperations.IsDomainJoined()` returns true. This
+prevents conflicts with AD-managed accounts on domain-joined machines
+(v1 scope decision — AD-replacement is deferred to Phase 4).
+
+**Password handling:** Passwords are never carried in `WindowsPolicyDocument`
+or `SoftwareAssignment`. When the `AccountEnforcer` creates a local account,
+it generates a random password and stores it DPAPI-protected in the local
+state directory. A future `SecretReleaseDocument` type (encrypted to the
+device URN's public key) is planned for v2.
+
+**Script trust:** Pre/post install scripts in `SoftwareAssignment` are
+trusted based on the document's Vouchsafe signature (the admin who signed
+the token is the trust anchor). Authenticode-signed-script requirements are
+deferred until a code-signing PKI is available.
+
+#### 14.5.6 Idempotency & Applied State
+
+The agent persists `%ProgramData%\DDS\applied-state.json`:
+
+```json
+{
+  "policies": {
+    "security/password-policy": {
+      "version": "7",
+      "content_hash": "sha256:...",
+      "applied_at": 1712640000,
+      "status": "ok"
+    }
+  },
+  "software": {
+    "com.example.editor": {
+      "version": "1.4.2",
+      "content_hash": "sha256:...",
+      "applied_at": 1712640123,
+      "status": "ok"
+    }
+  }
+}
+```
+
+On each poll cycle, the agent computes `SHA-256(document_json)` and compares
+to the stored `content_hash`. If unchanged, the policy is skipped entirely.
+This ensures:
+
+- **Restart safety** — the agent picks up where it left off
+- **No re-application churn** — unchanged policies are not re-applied
+- **Version tracking** — the agent knows which version it last applied
+
+The state file is written atomically (write to `.tmp`, then rename).
+ACL: `LocalSystem` write, `Administrators` read, `Users` no access.
+
+#### 14.5.7 Packaging & Deployment
+
+A single **WiX v4 MSI bundle** ships all three Windows components:
+
+| Component | Install Path | Registered As |
+| --- | --- | --- |
+| `dds-node.exe` | `C:\Program Files\DDS\` | Windows Service `DdsNode` |
+| `DdsPolicyAgent.exe` | `C:\Program Files\DDS\` | Windows Service `DdsPolicyAgent` |
+| `DdsCredentialProvider.comhost.dll` | `C:\Program Files\DDS\` | COM CLSID `{8C0DBE9A-5E27-4DDA-9A4B-3B5C8A6E2A11}` |
+| `appsettings.json` | `C:\Program Files\DDS\` | Agent configuration |
+| State directory | `%ProgramData%\DDS\` | ACL: LocalSystem write, Admins read |
+
+The MSI bundle resolves production blocker **B1** (Windows Credential Provider
+stubbed) and partially resolves **B2** (cross-platform builds untested for
+Windows) by being the first artifact that builds and runs all three components
+together.
+
+#### 14.5.8 Enforcement Modes
+
+| Mode | Behavior |
+| --- | --- |
+| `Enforce` | Read current state → compute delta → apply via Win32 → report outcome |
+| `Audit` | Read current state → compute delta → log what *would* change → report as `[AUDIT]` |
+| `Disabled` | Filtered out server-side by `dds-node` — never reaches the agent |
+
+Audit mode is the recommended rollout strategy: publish policies in `Audit`
+first, review the agent logs, then flip to `Enforce` by publishing a new
+version of the same `policy_id` with `enforcement: Enforce`.
 
 ---
 
