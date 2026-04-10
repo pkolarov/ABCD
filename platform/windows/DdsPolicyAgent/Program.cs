@@ -27,7 +27,19 @@ builder.Services.AddHttpClient<IDdsNodeClient, DdsNodeClient>((sp, http) =>
     http.Timeout = TimeSpan.FromSeconds(10);
 });
 
-// Register enforcers (all log-only stubs in Phase C).
+// Registry operations: real Win32 on Windows, no-op elsewhere.
+if (OperatingSystem.IsWindows())
+{
+    builder.Services.AddSingleton<IRegistryOperations, WindowsRegistryOperations>();
+}
+else
+{
+    // Non-Windows: inject a stub that logs. Useful for dev/testing
+    // on macOS/Linux where Microsoft.Win32.Registry isn't available.
+    builder.Services.AddSingleton<IRegistryOperations, InMemoryRegistryOperations>();
+}
+
+// Register enforcers.
 builder.Services.AddSingleton<RegistryEnforcer>();
 builder.Services.AddSingleton<AccountEnforcer>();
 builder.Services.AddSingleton<PasswordPolicyEnforcer>();

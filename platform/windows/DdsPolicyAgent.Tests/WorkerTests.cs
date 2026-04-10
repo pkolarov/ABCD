@@ -43,7 +43,7 @@ public class WorkerTests
         var worker = new Worker(
             client, stateStore, config,
             NullLogger<Worker>.Instance,
-            new RegistryEnforcer(NullLogger<RegistryEnforcer>.Instance),
+            new RegistryEnforcer(new InMemoryRegistryOperations(), NullLogger<RegistryEnforcer>.Instance),
             new AccountEnforcer(NullLogger<AccountEnforcer>.Instance),
             new PasswordPolicyEnforcer(NullLogger<PasswordPolicyEnforcer>.Instance),
             new SoftwareInstaller(NullLogger<SoftwareInstaller>.Instance));

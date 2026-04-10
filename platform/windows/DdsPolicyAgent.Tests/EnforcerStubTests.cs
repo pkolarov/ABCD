@@ -14,20 +14,23 @@ namespace DDS.PolicyAgent.Tests;
 public class EnforcerStubTests
 {
     [Fact]
-    public async Task RegistryEnforcer_returns_skipped_with_changes()
+    public async Task RegistryEnforcer_audit_mode_returns_ok_with_changes()
     {
-        var e = new RegistryEnforcer(NullLogger<RegistryEnforcer>.Instance);
+        var ops = new InMemoryRegistryOperations();
+        var e = new RegistryEnforcer(ops, NullLogger<RegistryEnforcer>.Instance);
         var directive = JsonDocument.Parse("""
         [
-            {"hive":"LocalMachine","key":"SOFTWARE\\Test","name":"Enabled","value":{"Dword":1},"action":"Set"}
+            {"hive":"LocalMachine","key":"SOFTWARE\\Policies\\Test","name":"Enabled","value":{"Dword":1},"action":"Set"}
         ]
         """).RootElement;
 
-        var outcome = await e.ApplyAsync(directive, EnforcementMode.Enforce);
-        Assert.Equal(EnforcementStatus.Skipped, outcome.Status);
+        var outcome = await e.ApplyAsync(directive, EnforcementMode.Audit);
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
         Assert.NotNull(outcome.Changes);
         Assert.Single(outcome.Changes);
-        Assert.Contains("Set", outcome.Changes[0]);
+        Assert.Contains("AUDIT", outcome.Changes[0]);
+        // Audit mode must NOT write to the registry
+        Assert.Equal(0, ops.Count);
     }
 
     [Fact]
