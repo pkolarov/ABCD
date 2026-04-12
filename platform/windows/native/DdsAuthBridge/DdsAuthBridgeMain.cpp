@@ -445,12 +445,11 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     // Step 5: Return DDS_AUTH_COMPLETE with session token
     // Build response with session token. Password will be added once
     // hmac-secret decryption is implemented.
-    IPC_RESP_AUTH_RESULT result = {};
+    IPC_RESP_DDS_AUTH_COMPLETE result = {};
     result.success = TRUE;
-    result.authMethod = IPC_AUTH_METHOD::FIDO2;
-    wcsncpy_s(result.sid, pOp->userSid.c_str(), _TRUNCATE);
+    wcsncpy_s(result.username, pOp->userSid.c_str(), _TRUNCATE);
     // result.password would be filled from the decrypted vault entry
-    wcscpy_s(result.message, L"DDS authentication succeeded (session established)");
+    // result.session_token would be filled from the dds-node response
 
     m_pipeServer.SendResponse(pOp->pClientCtx, IPC_MSG::DDS_AUTH_COMPLETE, pOp->seqId,
         reinterpret_cast<const BYTE*>(&result), sizeof(result));
@@ -525,7 +524,7 @@ BOOL CDdsAuthBridgeMain::HandleGetStatus(
     resp.serviceRunning  = TRUE;
     resp.deviceConnected = FALSE; // No BLE device manager
     resp.batteryLevel    = -1;
-    resp.transport       = TRANSPORT::NONE;
+    resp.transport       = 0; // No hardware transport (DDS is cloud-mediated)
 
     wcscpy_s(resp.deviceName, L"DDS Auth Bridge (no hardware device)");
 

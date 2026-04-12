@@ -22,7 +22,7 @@ rust-version = "1.85"
 # Core (no_std compatible)
 ed25519-dalek = { version = "2.2", default-features = false, features = ["alloc", "rand_core"] }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
-pqcrypto-mldsa = "0.1"
+pqcrypto-mldsa = { version = "0.1", default-features = false, features = ["std"] }
 pqcrypto-traits = "0.3"
 sha2 = { version = "0.10", default-features = false }
 base32 = "0.5"

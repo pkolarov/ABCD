@@ -125,6 +125,7 @@ namespace IPC_ERROR
     constexpr UINT32 PIV_ERROR          = 12;
     constexpr UINT32 DDS_API_ERROR      = 13;
     constexpr UINT32 DDS_TOKEN_EXPIRED  = 14;
+    constexpr UINT32 AUTH_CANCELLED     = 15;
 }
 
 // ============================================================================

@@ -10,8 +10,8 @@
 #pragma once
 
 #include <windows.h>
-#include "../CrayonicBridgeIPC/ipc_pipe_server.h"
-#include "../CrayonicBridgeIPC/ipc_messages.h"
+#include "../DdsBridgeIPC/ipc_pipe_server.h"
+#include "../DdsBridgeIPC/ipc_messages.h"
 #include "Configuration.h"
 #include "CredentialVault.h"
 #include "DdsNodeHttpClient.h"
