@@ -1,0 +1,33 @@
+# Build output
+**/build/
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.idb
+*.ilk
+*.log
+*.tlog/
+*.recipe
+*.iobj
+*.ipdb
+*.tar.gz
+
+# Logs and diagnostic output
+*_out.txt
+*_err.txt
+*_err*.txt
+
+# IDE
+.vs/
+*.vcxproj.user
+*.suo
+
+# macOS metadata
+._*
+.DS_Store
+
+# Temp
+*.orig
