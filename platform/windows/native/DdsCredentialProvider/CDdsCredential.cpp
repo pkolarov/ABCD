@@ -24,7 +24,8 @@ static CDdsBridgeClient g_ddsBridgeClient;
 CDdsCredential::CDdsCredential():
     _cRef(1),
     _pCredProvCredentialEvents(NULL),
-    _pszSubjectUrn(nullptr)
+    _pszSubjectUrn(nullptr),
+    _pszCredentialId(nullptr)
 {
     OutputDebugString(L"CDdsCredential()\n");
     DllAddRef();
@@ -46,6 +47,7 @@ CDdsCredential::~CDdsCredential()
     }
 
     CoTaskMemFree(_pszSubjectUrn);
+    CoTaskMemFree(_pszCredentialId);
 
     DllRelease();
 }
@@ -92,6 +94,11 @@ HRESULT CDdsCredential::Initialize(
     if (SUCCEEDED(hr) && pwzSubjectUrn && pwzSubjectUrn[0] != L'\0')
     {
         hr = SHStrDupW(pwzSubjectUrn, &_pszSubjectUrn);
+    }
+    // Store the credential ID (passed via pwzUsernameInfo from tile enumeration)
+    if (SUCCEEDED(hr) && pwzUsernameInfo && pwzUsernameInfo[0] != L'\0')
+    {
+        hr = SHStrDupW(pwzUsernameInfo, &_pszCredentialId);
     }
 
     return S_OK;
@@ -389,7 +396,7 @@ HRESULT CDdsCredential::GetSerializationDds(
 
     DdsBridgeAuthResult authResult = g_ddsBridgeClient.AuthenticateDds(
         _pszSubjectUrn,
-        nullptr,           // credentialId — let bridge resolve
+        _pszCredentialId ? _pszCredentialId : L"",
         L"dds.local",      // rpId
         60000,             // 60 second timeout
         progressCb

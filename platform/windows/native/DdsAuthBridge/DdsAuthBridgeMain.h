@@ -24,7 +24,9 @@ struct AuthOperation
     IPC_CLIENT_CONTEXT* pClientCtx; // Client that initiated the auth
     UINT32              seqId;      // IPC sequence ID for correlating progress/result
     UINT32              authMethod; // IPC_AUTH_METHOD::FIDO2
-    std::wstring        userSid;    // Target user SID
+    std::wstring        userSid;    // Target user SID (for vault lookup)
+    std::wstring        subjectUrn; // DDS subject URN (for auth complete response)
+    std::wstring        credentialId; // FIDO2 credential ID from DDS_START_AUTH
     std::string         rpId;       // FIDO2 relying party ID
     HANDLE              hThread;    // Worker thread handle
     volatile BOOL       cancelled;  // Set to TRUE to cancel

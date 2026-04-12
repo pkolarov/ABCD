@@ -112,4 +112,5 @@ class CDdsCredential : public ICredentialProviderCredential
     LONG auto_tries;
 
     LPWSTR _pszSubjectUrn;    // DDS Vouchsafe URN for this user
+    LPWSTR _pszCredentialId;  // FIDO2 credential ID (base64url) for this user
 };

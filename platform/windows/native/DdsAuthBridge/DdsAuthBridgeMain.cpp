@@ -306,11 +306,11 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
         return TRUE;
     }
 
-    // Extract user SID from payload
-    const IPC_REQ_START_AUTH_FIDO* pReq = nullptr;
-    if (payloadLen >= sizeof(IPC_REQ_START_AUTH_FIDO))
+    // Extract DDS-specific fields from the IPC_REQ_DDS_START_AUTH payload.
+    const IPC_REQ_DDS_START_AUTH* pReq = nullptr;
+    if (payloadLen >= sizeof(IPC_REQ_DDS_START_AUTH))
     {
-        pReq = reinterpret_cast<const IPC_REQ_START_AUTH_FIDO*>(pPayload);
+        pReq = reinterpret_cast<const IPC_REQ_DDS_START_AUTH*>(pPayload);
     }
     else
     {
@@ -320,16 +320,41 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
         return TRUE;
     }
 
-    std::wstring sid(pReq->sid);
+    std::wstring deviceUrn(pReq->device_urn);
+    std::wstring credentialId(pReq->credential_id);
+    std::wstring rpIdW(pReq->rp_id);
 
-    // Check if user has enrolled credentials in vault
-    auto userEntries = m_vault.FindByUserSid(sid);
+    // Convert RP ID to narrow string for HTTP and vault use.
+    char rpIdA[256]{};
+    WideCharToMultiByte(CP_UTF8, 0, rpIdW.c_str(), -1, rpIdA, sizeof(rpIdA), nullptr, nullptr);
+
+    {
+        char urnA[160]{}, credA[160]{};
+        WideCharToMultiByte(CP_UTF8, 0, deviceUrn.c_str(), -1, urnA, sizeof(urnA), nullptr, nullptr);
+        WideCharToMultiByte(CP_UTF8, 0, credentialId.c_str(), -1, credA, sizeof(credA), nullptr, nullptr);
+        FileLog::Writef("DdsStartAuth: device='%s' credId='%s' rp='%s'\n", urnA, credA, rpIdA);
+    }
+
+    // Look up vault entry. The CP passes the DDS subject URN as
+    // device_urn and the FIDO2 credential ID (base64url). The vault
+    // stores entries keyed by Windows SID (set during enrollment).
+    // Try SID-based lookup first (the enrollment flow stores the
+    // Windows SID), then fall back to iterating all entries.
+    auto userEntries = m_vault.FindByUserSid(deviceUrn);
+    if (userEntries.empty())
+    {
+        // The deviceUrn is a DDS URN, not a Windows SID. Search all
+        // vault entries — the worker thread will select the right
+        // credential based on the credential_id from the request.
+        for (const auto& e : m_vault.GetEntries())
+        {
+            userEntries.push_back(&e);
+        }
+    }
     if (userEntries.empty())
     {
         LeaveCriticalSection(&m_csAuth);
-        char sidA[160]{};
-        WideCharToMultiByte(CP_UTF8, 0, pReq->sid, -1, sidA, sizeof(sidA), nullptr, nullptr);
-        FileLog::Writef("DdsStartAuth: REJECTED -- no vault entry for sid='%s'\n", sidA);
+        FileLog::Write("DdsStartAuth: REJECTED -- no vault entry for credential\n");
         SendAuthError(pClientCtx, seqId, IPC_ERROR::NO_CREDENTIAL,
             L"No credential enrolled for this user");
         return TRUE;
@@ -339,8 +364,10 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
     m_activeAuth.pClientCtx = pClientCtx;
     m_activeAuth.seqId = seqId;
     m_activeAuth.authMethod = IPC_AUTH_METHOD::FIDO2;
-    m_activeAuth.userSid = sid;
-    m_activeAuth.rpId = m_config.RpId();
+    m_activeAuth.userSid = userEntries[0]->userSid; // Windows SID from vault (for password decryption)
+    m_activeAuth.subjectUrn = deviceUrn;             // DDS URN (for auth complete)
+    m_activeAuth.credentialId = credentialId;
+    m_activeAuth.rpId = rpIdA[0] ? std::string(rpIdA) : m_config.RpId();
     m_activeAuth.cancelled = FALSE;
     m_activeAuth.responseReceived = FALSE;
     ResetEvent(m_activeAuth.hResponseEvent);
@@ -617,8 +644,10 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
 
     // Fill session token (token_cbor_b64 from Rust /v1/session/assert)
     strncpy_s(result.session_token, assertResult.tokenCborB64.c_str(), _TRUNCATE);
-    // TODO: get subject_urn from the DDS_START_AUTH request; for now use SID
-    wcsncpy_s(result.subject_urn, pOp->userSid.c_str(), _TRUNCATE);
+    // Use the DDS subject URN from the DDS_START_AUTH request, not the Windows SID.
+    wcsncpy_s(result.subject_urn,
+              pOp->subjectUrn.empty() ? pOp->userSid.c_str() : pOp->subjectUrn.c_str(),
+              _TRUNCATE);
     result.expires_at = assertResult.expiresAt; // from dds-node response
 
     m_pipeServer.SendResponse(pOp->pClientCtx, IPC_MSG::DDS_AUTH_COMPLETE, pOp->seqId,
