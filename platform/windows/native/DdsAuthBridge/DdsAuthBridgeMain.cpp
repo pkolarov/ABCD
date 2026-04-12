@@ -46,6 +46,37 @@ static std::string Base64UrlEncode(const uint8_t* data, size_t len)
     return out;
 }
 
+static std::vector<uint8_t> Base64UrlDecode(const std::string& input)
+{
+    std::string b64 = input;
+    for (auto& c : b64) { if (c == '-') c = '+'; else if (c == '_') c = '/'; }
+    while (b64.size() % 4 != 0) b64.push_back('=');
+    static const int T[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+        52,53,54,55,56,57,58,59,60,61,-1,-1,-1, 0,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+    };
+    std::vector<uint8_t> out;
+    out.reserve(b64.size() * 3 / 4);
+    for (size_t i = 0; i + 3 < b64.size(); i += 4)
+    {
+        int a = T[(unsigned char)b64[i]];
+        int b = T[(unsigned char)b64[i+1]];
+        int c = T[(unsigned char)b64[i+2]];
+        int d = T[(unsigned char)b64[i+3]];
+        if (a < 0 || b < 0) break;
+        out.push_back((uint8_t)((a << 2) | (b >> 4)));
+        if (c >= 0) out.push_back((uint8_t)(((b & 0xF) << 4) | (c >> 2)));
+        if (d >= 0) out.push_back((uint8_t)(((c & 3) << 6) | d));
+    }
+    return out;
+}
+
 CDdsAuthBridgeMain::CDdsAuthBridgeMain()
     : m_hStopEvent(NULL)
     , m_bInitialized(FALSE)
@@ -335,37 +366,37 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
         FileLog::Writef("DdsStartAuth: device='%s' credId='%s' rp='%s'\n", urnA, credA, rpIdA);
     }
 
-    // Look up vault entry. The CP passes the DDS subject URN as
-    // device_urn and the FIDO2 credential ID (base64url). The vault
-    // stores entries keyed by Windows SID (set during enrollment).
-    // Try SID-based lookup first (the enrollment flow stores the
-    // Windows SID), then fall back to iterating all entries.
-    auto userEntries = m_vault.FindByUserSid(deviceUrn);
-    if (userEntries.empty())
+    // Look up vault entry by the credential_id from the request.
+    // The credential_id is base64url-encoded; the vault stores raw bytes.
+    const VaultEntry* pMatchedEntry = nullptr;
     {
-        // The deviceUrn is a DDS URN, not a Windows SID. Search all
-        // vault entries — the worker thread will select the right
-        // credential based on the credential_id from the request.
-        for (const auto& e : m_vault.GetEntries())
-        {
-            userEntries.push_back(&e);
-        }
+        // Convert wide credential_id to narrow UTF-8 for base64url decode
+        char credIdNarrow[256]{};
+        WideCharToMultiByte(CP_UTF8, 0, credentialId.c_str(), -1,
+                            credIdNarrow, sizeof(credIdNarrow), nullptr, nullptr);
+        std::vector<uint8_t> credIdBytes = Base64UrlDecode(std::string(credIdNarrow));
+        if (!credIdBytes.empty())
+            pMatchedEntry = m_vault.FindByCredentialId(credIdBytes);
     }
-    if (userEntries.empty())
+
+    if (!pMatchedEntry)
     {
         LeaveCriticalSection(&m_csAuth);
-        FileLog::Write("DdsStartAuth: REJECTED -- no vault entry for credential\n");
+        FileLog::Write("DdsStartAuth: REJECTED -- no vault entry matches credential_id\n");
         SendAuthError(pClientCtx, seqId, IPC_ERROR::NO_CREDENTIAL,
-            L"No credential enrolled for this user");
+            L"No credential enrolled matching the requested credential ID");
         return TRUE;
     }
 
-    // Set up auth operation
+    FileLog::Writef("DdsStartAuth: matched vault entry sid='%ls' credIdLen=%zu\n",
+                    pMatchedEntry->userSid.c_str(), pMatchedEntry->credentialId.size());
+
+    // Set up auth operation using the matched vault entry
     m_activeAuth.pClientCtx = pClientCtx;
     m_activeAuth.seqId = seqId;
     m_activeAuth.authMethod = IPC_AUTH_METHOD::FIDO2;
-    m_activeAuth.userSid = userEntries[0]->userSid; // Windows SID from vault (for password decryption)
-    m_activeAuth.subjectUrn = deviceUrn;             // DDS URN (for auth complete)
+    m_activeAuth.userSid = pMatchedEntry->userSid;   // Windows SID from vault (for password decryption + SID resolve)
+    m_activeAuth.subjectUrn = deviceUrn;              // DDS subject URN (for auth complete response)
     m_activeAuth.credentialId = credentialId;
     m_activeAuth.rpId = rpIdA[0] ? std::string(rpIdA) : m_config.RpId();
     m_activeAuth.cancelled = FALSE;
@@ -476,19 +507,38 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     FileLog::Writef("DdsAuth.worker: seqId=%u begin (rpId='%s')\n",
                     pOp->seqId, pOp->rpId.c_str());
 
-    // Step 1: Find vault entry
-    auto userEntries = m_vault.FindByUserSid(pOp->userSid);
-    if (userEntries.empty())
+    // Step 1: Find the specific vault entry matching the requested credential.
+    // Use the credential_id from the DDS_START_AUTH request to select the
+    // exact credential, not just the first one for a given SID.
+    const VaultEntry* pVaultEntry = nullptr;
     {
-        FileLog::Write("DdsAuth.worker: vault lookup failed (race?)\n");
+        char credIdNarrow[256]{};
+        WideCharToMultiByte(CP_UTF8, 0, pOp->credentialId.c_str(), -1,
+                            credIdNarrow, sizeof(credIdNarrow), nullptr, nullptr);
+        std::vector<uint8_t> credIdBytes = Base64UrlDecode(std::string(credIdNarrow));
+        if (!credIdBytes.empty())
+            pVaultEntry = m_vault.FindByCredentialId(credIdBytes);
+    }
+
+    if (!pVaultEntry)
+    {
+        // Fall back to SID-based lookup (shouldn't happen if HandleDdsStartAuth matched)
+        auto userEntries = m_vault.FindByUserSid(pOp->userSid);
+        if (!userEntries.empty())
+            pVaultEntry = userEntries[0];
+    }
+
+    if (!pVaultEntry)
+    {
+        FileLog::Write("DdsAuth.worker: vault lookup failed -- no matching credential\n");
         SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::NO_CREDENTIAL,
             L"No credential found for user");
         return;
     }
 
-    const VaultEntry* pVaultEntry = userEntries[0];
-    FileLog::Writef("DdsAuth.worker: using vault entry (credIdLen=%zu rp='%s')\n",
-                    pVaultEntry->credentialId.size(), pVaultEntry->rpId.c_str());
+    FileLog::Writef("DdsAuth.worker: using vault entry (credIdLen=%zu rp='%s' sid='%ls')\n",
+                    pVaultEntry->credentialId.size(), pVaultEntry->rpId.c_str(),
+                    pVaultEntry->userSid.c_str());
 
     // Step 2: Build and send DDS_AUTH_CHALLENGE to CP
     IPC_RESP_DDS_AUTH_CHALLENGE challenge = {};
