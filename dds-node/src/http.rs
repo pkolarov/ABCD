@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::service::{
+    AdminSetupRequest, AdminVouchRequest,
     ApplicableMacOsPolicy, ApplicableSoftware, ApplicableWindowsPolicy, AppliedReport,
     AssertionSessionRequest, EnrollDeviceRequest, EnrollUserRequest, EnrolledUser, LocalService,
     NodeStatus, PolicyResult, ServiceError, SessionRequest,
@@ -75,6 +76,8 @@ where
         .route("/v1/session", post(issue_session::<S>))
         .route("/v1/session/assert", post(issue_session_assert::<S>))
         .route("/v1/enrolled-users", get(list_enrolled_users::<S>))
+        .route("/v1/admin/setup", post(admin_setup::<S>))
+        .route("/v1/admin/vouch", post(admin_vouch::<S>))
         .route("/v1/policy/evaluate", post(evaluate_policy::<S>))
         .route("/v1/status", get(status::<S>))
         .route("/v1/windows/policies", get(list_windows_policies::<S>))
@@ -157,6 +160,23 @@ pub struct AssertionSessionRequestJson {
     pub authenticator_data: String,
     pub signature: String,
     pub duration_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdminVouchRequestJson {
+    pub subject_urn: String,
+    pub credential_id: String,
+    pub authenticator_data: String,
+    pub client_data_hash: String,
+    pub signature: String,
+    pub purpose: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdminVouchResponseJson {
+    pub vouch_jti: String,
+    pub subject_urn: String,
+    pub admin_urn: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -380,6 +400,59 @@ where
     let svc = state.svc.lock().await;
     let users = svc.list_enrolled_users(&q.device_urn)?;
     Ok(Json(EnrolledUsersResponse { users }))
+}
+
+// ---------- Admin enrollment + vouch handlers ----------
+
+async fn admin_setup<S>(
+    State(state): State<AppState<S>>,
+    Json(req): Json<EnrollUserRequestJson>,
+) -> Result<Json<EnrollmentResponse>, HttpError>
+where
+    S: TokenStore + RevocationStore + Send + Sync + 'static,
+{
+    let attestation_object = b64_decode(&req.attestation_object_b64, "attestation_object_b64")?;
+    let client_data_hash = b64_decode(&req.client_data_hash_b64, "client_data_hash_b64")?;
+    let internal = AdminSetupRequest {
+        label: req.label,
+        credential_id: req.credential_id,
+        attestation_object,
+        client_data_hash,
+        rp_id: req.rp_id,
+        display_name: req.display_name,
+        authenticator_type: req.authenticator_type,
+    };
+    let mut svc = state.svc.lock().await;
+    let r = svc.admin_setup(internal)?;
+    Ok(Json(EnrollmentResponse {
+        urn: r.urn,
+        jti: r.jti,
+        token_cbor_b64: b64_encode(&r.token_cbor),
+    }))
+}
+
+async fn admin_vouch<S>(
+    State(state): State<AppState<S>>,
+    Json(req): Json<AdminVouchRequestJson>,
+) -> Result<Json<AdminVouchResponseJson>, HttpError>
+where
+    S: TokenStore + RevocationStore + Send + Sync + 'static,
+{
+    let internal = AdminVouchRequest {
+        subject_urn: req.subject_urn,
+        credential_id: req.credential_id,
+        client_data_hash: b64_decode(&req.client_data_hash, "client_data_hash")?,
+        authenticator_data: b64_decode(&req.authenticator_data, "authenticator_data")?,
+        signature: b64_decode(&req.signature, "signature")?,
+        purpose: req.purpose,
+    };
+    let mut svc = state.svc.lock().await;
+    let r = svc.admin_vouch(internal)?;
+    Ok(Json(AdminVouchResponseJson {
+        vouch_jti: r.vouch_jti,
+        subject_urn: r.subject_urn,
+        admin_urn: r.admin_urn,
+    }))
 }
 
 // ---------- Windows applier handlers (Phase 3 items 9–10) ----------

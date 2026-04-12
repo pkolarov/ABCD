@@ -18,6 +18,7 @@ use dds_domain::{
 };
 use dds_store::traits::*;
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -57,12 +58,38 @@ pub struct AssertionSessionRequest {
     pub duration_secs: Option<u64>,
 }
 
+/// Request to register an admin identity with FIDO2 proof-of-possession.
+/// Reuses the same fields as EnrollUserRequest — the only difference is
+/// that the generated signing key is persisted for future vouch operations.
+pub type AdminSetupRequest = EnrollUserRequest;
+
+/// Request for an admin to vouch for (approve) an enrolled user.
+#[derive(Debug, Clone)]
+pub struct AdminVouchRequest {
+    pub subject_urn: String,
+    pub credential_id: String,
+    pub client_data_hash: Vec<u8>,
+    pub authenticator_data: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub purpose: Option<String>,
+}
+
+/// Result of an admin vouch operation.
+#[derive(Debug)]
+pub struct AdminVouchResult {
+    pub vouch_jti: String,
+    pub subject_urn: String,
+    pub admin_urn: String,
+}
+
 /// Enrolled user info for CP tile enumeration.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EnrolledUser {
     pub subject_urn: String,
     pub display_name: String,
     pub credential_id: String,
+    #[serde(default)]
+    pub vouched: bool,
 }
 
 /// Request to issue a session.
@@ -213,6 +240,8 @@ pub struct LocalService<S: TokenStore + dds_store::traits::RevocationStore> {
     trusted_roots: BTreeSet<String>,
     /// Storage backend.
     store: S,
+    /// Data directory for admin key storage (None in test/bench contexts).
+    data_dir: Option<PathBuf>,
     /// Node start time.
     start_time: u64,
     /// Whether to verify FIDO2 attestation on enroll_user.
@@ -250,6 +279,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             trust_graph,
             trusted_roots,
             store,
+            data_dir: None,
             start_time: now_epoch(),
             verify_fido2: true,
         };
@@ -323,6 +353,11 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
     /// leave this enabled.
     pub fn set_verify_fido2(&mut self, verify: bool) {
         self.verify_fido2 = verify;
+    }
+
+    /// Set the data directory for admin key storage.
+    pub fn set_data_dir(&mut self, path: PathBuf) {
+        self.data_dir = Some(path);
     }
 
     /// Add a policy rule.
@@ -799,10 +834,12 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
                 Ok(Some(d)) => d,
                 _ => continue,
             };
+            let vouched = !g.purposes_for(&token.payload.sub, &self.trusted_roots).is_empty();
             users.push(EnrolledUser {
                 subject_urn: token.payload.sub.clone(),
                 display_name: doc.user_display_name.clone(),
                 credential_id: doc.credential_id.clone(),
+                vouched,
             });
         }
         Ok(users)
@@ -842,6 +879,341 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
     /// Access the store mutably.
     pub fn store_mut(&mut self) -> &mut S {
         &mut self.store
+    }
+
+    // ---- admin enrollment + vouch ----
+
+    /// Register an admin identity. Enrolls the admin as a user (FIDO2
+    /// attestation), then persists the generated Ed25519 signing key to
+    /// `<data_dir>/admin_keys/` encrypted with AES-256-GCM keyed from
+    /// the node's own signing key. The admin's URN is added to the
+    /// in-memory `trusted_roots` set.
+    pub fn admin_setup(
+        &mut self,
+        req: AdminSetupRequest,
+    ) -> Result<EnrollmentResult, ServiceError> {
+        // Step 1: enroll the admin exactly like a normal user.
+        // We need the generated identity to persist the signing key,
+        // so we inline the enrollment logic here.
+        let mut credential_id = req.credential_id.clone();
+        if self.verify_fido2 {
+            let parsed = dds_domain::fido2::verify_attestation(
+                &req.attestation_object,
+                &req.client_data_hash,
+            )
+            .map_err(|e| ServiceError::Fido2(e.to_string()))?;
+
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(req.rp_id.as_bytes());
+            let computed_rp_hash = hasher.finalize();
+            if computed_rp_hash.as_slice() != parsed.rp_id_hash {
+                return Err(ServiceError::Fido2("rp_id hash mismatch".to_string()));
+            }
+            credential_id =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&parsed.credential_id);
+        }
+
+        let admin_ident = Identity::generate(&req.label, &mut rand::rngs::OsRng);
+        let admin_urn = admin_ident.id.to_urn();
+
+        let doc = UserAuthAttestation {
+            credential_id,
+            attestation_object: req.attestation_object,
+            client_data_hash: req.client_data_hash,
+            rp_id: req.rp_id,
+            user_display_name: req.display_name,
+            authenticator_type: req.authenticator_type,
+        };
+        let mut payload = self.make_attest_payload(&admin_ident);
+        doc.embed(&mut payload)
+            .map_err(|e| ServiceError::Domain(e.to_string()))?;
+
+        let token = Token::sign(payload, &admin_ident.signing_key)
+            .map_err(|e| ServiceError::Token(e.to_string()))?;
+        let cbor = token
+            .to_cbor()
+            .map_err(|e| ServiceError::Token(e.to_string()))?;
+        self.store
+            .put_token(&token)
+            .map_err(|e| ServiceError::Store(e.to_string()))?;
+        {
+            let mut g = self
+                .trust_graph
+                .write()
+                .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+            let _ = g.add_token(token.clone());
+        }
+
+        // Step 2: persist the admin signing key (encrypted).
+        self.store_admin_key(&admin_urn, &admin_ident.signing_key)?;
+
+        // Step 3: add to trusted_roots in memory.
+        self.trusted_roots.insert(admin_urn.clone());
+        tracing::info!(admin_urn = %admin_urn, "admin identity registered and added to trusted roots");
+
+        Ok(EnrollmentResult {
+            urn: admin_urn,
+            jti: token.payload.jti.clone(),
+            token_cbor: cbor,
+        })
+    }
+
+    /// Admin vouches for an enrolled user. The admin proves presence via
+    /// FIDO2 assertion. The node verifies the assertion, checks admin is a
+    /// trusted root, loads the admin's persisted signing key, and signs a
+    /// Vouch token granting the subject the requested purpose.
+    pub fn admin_vouch(
+        &mut self,
+        req: AdminVouchRequest,
+    ) -> Result<AdminVouchResult, ServiceError> {
+        use dds_domain::fido2::{cose_to_credential_public_key, verify_assertion};
+
+        // 1. Look up admin credential in trust graph (same as session assertion).
+        let (admin_urn, public_key) = {
+            let g = self
+                .trust_graph
+                .read()
+                .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+
+            let mut found: Option<(String, Vec<u8>)> = None;
+            for token in g.attestations_iter() {
+                if g.is_revoked(&token.payload.jti) || g.is_burned(&token.payload.iss) {
+                    continue;
+                }
+                let doc = match UserAuthAttestation::extract(&token.payload) {
+                    Ok(Some(d)) => d,
+                    _ => continue,
+                };
+                if doc.credential_id == req.credential_id {
+                    let parsed = dds_domain::fido2::verify_attestation(
+                        &doc.attestation_object,
+                        &doc.client_data_hash,
+                    )
+                    .map_err(|e| ServiceError::Fido2(format!("re-parse attestation: {e}")))?;
+                    let auth_data = &parsed.auth_data;
+                    let p = 37 + 16 + 2 + parsed.credential_id.len();
+                    let cose_bytes = &auth_data[p..];
+                    found = Some((token.payload.sub.clone(), cose_bytes.to_vec()));
+                    break;
+                }
+            }
+
+            let (sub, cose_bytes) = found.ok_or_else(|| {
+                ServiceError::Fido2(format!(
+                    "admin credential_id '{}' not found in trust graph",
+                    req.credential_id
+                ))
+            })?;
+
+            let pk = cose_to_credential_public_key(&cose_bytes)
+                .map_err(|e| ServiceError::Fido2(format!("COSE key parse: {e}")))?;
+            (sub, pk)
+        };
+
+        // 2. Verify FIDO2 assertion (proves admin touched authenticator).
+        let _parsed = verify_assertion(
+            &req.authenticator_data,
+            &req.client_data_hash,
+            &req.signature,
+            &public_key,
+        )
+        .map_err(|e| ServiceError::Fido2(e.to_string()))?;
+
+        // 3. Check admin is a trusted root.
+        if !self.trusted_roots.contains(&admin_urn) {
+            return Err(ServiceError::Trust(format!(
+                "identity '{}' is not a trusted root",
+                admin_urn
+            )));
+        }
+
+        // 4. Load admin's persisted signing key.
+        let admin_signing_key = self.load_admin_key(&admin_urn)?;
+
+        // 5. Find the subject's attestation token to compute vch_sum.
+        let (subject_attest_iss, subject_attest_hash) = {
+            let g = self
+                .trust_graph
+                .read()
+                .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+
+            let mut found: Option<(String, String)> = None;
+            for token in g.attestations_iter() {
+                if token.payload.sub == req.subject_urn {
+                    found = Some((
+                        token.payload.iss.clone(),
+                        token.payload_hash(),
+                    ));
+                    break;
+                }
+            }
+            found.ok_or_else(|| {
+                ServiceError::Trust(format!(
+                    "no attestation found for subject '{}'",
+                    req.subject_urn
+                ))
+            })?
+        };
+
+        // 6. Build and sign the vouch token.
+        let purpose = req.purpose.unwrap_or_else(|| "dds:session".to_string());
+        let vouch_jti = format!("vouch-{}", rand_u64());
+        let admin_public_key = dds_core::crypto::PublicKeyBundle {
+            scheme: dds_core::crypto::SchemeId::Ed25519,
+            bytes: admin_signing_key.verifying_key().to_bytes().to_vec(),
+        };
+
+        let vouch_payload = TokenPayload {
+            iss: admin_urn.clone(),
+            iss_key: admin_public_key,
+            jti: vouch_jti.clone(),
+            sub: req.subject_urn.clone(),
+            kind: TokenKind::Vouch,
+            purpose: Some(purpose),
+            vch_iss: Some(subject_attest_iss),
+            vch_sum: Some(subject_attest_hash),
+            revokes: None,
+            iat: now_epoch(),
+            exp: Some(now_epoch() + 365 * 86400),
+            body_type: None,
+            body_cbor: None,
+        };
+
+        let vouch_token = Token::sign(vouch_payload, &admin_signing_key)
+            .map_err(|e| ServiceError::Token(e.to_string()))?;
+        self.store
+            .put_token(&vouch_token)
+            .map_err(|e| ServiceError::Store(e.to_string()))?;
+        {
+            let mut g = self
+                .trust_graph
+                .write()
+                .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+            let _ = g.add_token(vouch_token);
+        }
+
+        // Zeroize the admin signing key bytes.
+        drop(admin_signing_key);
+
+        tracing::info!(
+            admin = %admin_urn,
+            subject = %req.subject_urn,
+            jti = %vouch_jti,
+            "admin vouched for user"
+        );
+
+        Ok(AdminVouchResult {
+            vouch_jti,
+            subject_urn: req.subject_urn,
+            admin_urn,
+        })
+    }
+
+    // ---- admin key persistence ----
+
+    /// Persist an admin's Ed25519 signing key encrypted with AES-256-GCM.
+    /// The encryption key is derived from SHA-256(node_signing_key || "admin-key-wrap").
+    fn store_admin_key(
+        &self,
+        admin_urn: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(), ServiceError> {
+        let data_dir = self.data_dir.as_ref().ok_or_else(|| {
+            ServiceError::Store("data_dir not set — cannot persist admin keys".to_string())
+        })?;
+        let dir = data_dir.join("admin_keys");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| ServiceError::Store(format!("create admin_keys dir: {e}")))?;
+
+        let wrap_key = self.admin_wrap_key();
+        let plaintext = signing_key.to_bytes();
+
+        // Generate random IV (12 bytes) and encrypt with AES-256-GCM.
+        let iv: [u8; 12] = {
+            let mut buf = [0u8; 12];
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(&mut buf);
+            buf
+        };
+
+        use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead, Nonce};
+        let cipher = Aes256Gcm::new_from_slice(&wrap_key)
+            .map_err(|e| ServiceError::Store(format!("AES key init: {e}")))?;
+        let nonce = Nonce::from_slice(&iv);
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext.as_ref())
+            .map_err(|e| ServiceError::Store(format!("AES encrypt: {e}")))?;
+
+        // Write: iv (12) || ciphertext+tag (32+16=48)
+        let urn_hash = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(admin_urn.as_bytes()))
+        };
+        let path = dir.join(format!("{urn_hash}.key"));
+        let mut blob = Vec::with_capacity(12 + ciphertext.len());
+        blob.extend_from_slice(&iv);
+        blob.extend_from_slice(&ciphertext);
+        std::fs::write(&path, &blob)
+            .map_err(|e| ServiceError::Store(format!("write admin key: {e}")))?;
+
+        tracing::debug!(path = %path.display(), "persisted admin signing key");
+        Ok(())
+    }
+
+    /// Load an admin's Ed25519 signing key from encrypted storage.
+    fn load_admin_key(
+        &self,
+        admin_urn: &str,
+    ) -> Result<ed25519_dalek::SigningKey, ServiceError> {
+        let data_dir = self.data_dir.as_ref().ok_or_else(|| {
+            ServiceError::Store("data_dir not set — cannot load admin keys".to_string())
+        })?;
+        let urn_hash = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(admin_urn.as_bytes()))
+        };
+        let path = data_dir.join("admin_keys").join(format!("{urn_hash}.key"));
+        let blob = std::fs::read(&path)
+            .map_err(|e| ServiceError::Store(format!("read admin key {}: {e}", path.display())))?;
+        if blob.len() < 12 + 32 {
+            return Err(ServiceError::Store("admin key file too short".to_string()));
+        }
+
+        let iv = &blob[..12];
+        let ciphertext = &blob[12..];
+
+        let wrap_key = self.admin_wrap_key();
+        use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead, Nonce};
+        let cipher = Aes256Gcm::new_from_slice(&wrap_key)
+            .map_err(|e| ServiceError::Store(format!("AES key init: {e}")))?;
+        let nonce = Nonce::from_slice(iv);
+        let plaintext = cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| ServiceError::Store(format!("AES decrypt admin key: {e}")))?;
+
+        if plaintext.len() != 32 {
+            return Err(ServiceError::Store(format!(
+                "decrypted admin key is {} bytes, expected 32",
+                plaintext.len()
+            )));
+        }
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(&plaintext);
+        Ok(ed25519_dalek::SigningKey::from_bytes(&key_bytes))
+    }
+
+    /// Derive the AES-256 wrapping key for admin key storage from the
+    /// node's own Ed25519 signing key.
+    fn admin_wrap_key(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.node_identity.signing_key.to_bytes());
+        hasher.update(b"admin-key-wrap");
+        let result = hasher.finalize();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&result);
+        key
     }
 
     // ---- internal ----

@@ -166,6 +166,138 @@ DdsEnrolledUsersResult CDdsNodeHttpClient::GetEnrolledUsers(const std::string& d
 }
 
 // ============================================================================
+// POST /v1/enroll/user
+// ============================================================================
+
+DdsEnrollResult CDdsNodeHttpClient::PostEnrollUser(const std::string& enrollJson)
+{
+    DdsEnrollResult result = {};
+    result.success = false;
+
+    FileLog::Writef("DdsNodeHttpClient: POST /v1/enroll/user (bodyLen=%zu)\n",
+                    enrollJson.size());
+
+    std::string responseBody;
+    DWORD httpStatus = SendRequest(L"POST", L"/v1/enroll/user",
+                                   &enrollJson, responseBody);
+
+    if (httpStatus == 0)
+    {
+        result.errorMessage = "Connection to dds-node failed (is it running?)";
+        return result;
+    }
+
+    FileLog::Writef("DdsNodeHttpClient: POST /v1/enroll/user -> HTTP %lu\n", httpStatus);
+
+    if (httpStatus == 200)
+    {
+        result.success = true;
+        result.urn = JsonGetString(responseBody, "urn");
+        result.jti = JsonGetString(responseBody, "jti");
+    }
+    else
+    {
+        result.errorMessage = JsonGetString(responseBody, "error");
+        if (result.errorMessage.empty())
+        {
+            char buf[64];
+            sprintf_s(buf, "dds-node returned HTTP %lu", httpStatus);
+            result.errorMessage = buf;
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
+// POST /v1/admin/setup
+// ============================================================================
+
+DdsAdminSetupResult CDdsNodeHttpClient::PostAdminSetup(const std::string& setupJson)
+{
+    DdsAdminSetupResult result = {};
+    result.success = false;
+
+    FileLog::Writef("DdsNodeHttpClient: POST /v1/admin/setup (bodyLen=%zu)\n",
+                    setupJson.size());
+
+    std::string responseBody;
+    DWORD httpStatus = SendRequest(L"POST", L"/v1/admin/setup",
+                                   &setupJson, responseBody);
+
+    if (httpStatus == 0)
+    {
+        result.errorMessage = "Connection to dds-node failed (is it running?)";
+        return result;
+    }
+
+    FileLog::Writef("DdsNodeHttpClient: POST /v1/admin/setup -> HTTP %lu\n", httpStatus);
+
+    if (httpStatus == 200)
+    {
+        result.success = true;
+        result.adminUrn = JsonGetString(responseBody, "urn");
+    }
+    else
+    {
+        result.errorMessage = JsonGetString(responseBody, "error");
+        if (result.errorMessage.empty())
+        {
+            char buf[64];
+            sprintf_s(buf, "dds-node returned HTTP %lu", httpStatus);
+            result.errorMessage = buf;
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
+// POST /v1/admin/vouch
+// ============================================================================
+
+DdsAdminVouchResult CDdsNodeHttpClient::PostAdminVouch(const std::string& vouchJson)
+{
+    DdsAdminVouchResult result = {};
+    result.success = false;
+
+    FileLog::Writef("DdsNodeHttpClient: POST /v1/admin/vouch (bodyLen=%zu)\n",
+                    vouchJson.size());
+
+    std::string responseBody;
+    DWORD httpStatus = SendRequest(L"POST", L"/v1/admin/vouch",
+                                   &vouchJson, responseBody);
+
+    if (httpStatus == 0)
+    {
+        result.errorMessage = "Connection to dds-node failed (is it running?)";
+        return result;
+    }
+
+    FileLog::Writef("DdsNodeHttpClient: POST /v1/admin/vouch -> HTTP %lu\n", httpStatus);
+
+    if (httpStatus == 200)
+    {
+        result.success = true;
+        result.vouchJti = JsonGetString(responseBody, "vouch_jti");
+        result.subjectUrn = JsonGetString(responseBody, "subject_urn");
+        result.adminUrn = JsonGetString(responseBody, "admin_urn");
+    }
+    else
+    {
+        result.errorMessage = JsonGetString(responseBody, "error");
+        if (result.errorMessage.empty())
+        {
+            char buf[64];
+            sprintf_s(buf, "dds-node returned HTTP %lu", httpStatus);
+            result.errorMessage = buf;
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
 // WinHTTP transport
 // ============================================================================
 

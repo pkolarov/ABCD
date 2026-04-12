@@ -278,7 +278,8 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let trusted_roots = config.trusted_roots.iter().cloned().collect();
     let api_store = node.store.clone();
     let api_trust_graph = std::sync::Arc::clone(&node.trust_graph);
-    let svc = LocalService::new(node_identity, api_trust_graph, trusted_roots, api_store);
+    let mut svc = LocalService::new(node_identity, api_trust_graph, trusted_roots, api_store);
+    svc.set_data_dir(config.data_dir.clone());
     let shared_svc = Arc::new(tokio::sync::Mutex::new(svc));
     let node_info = http::NodeInfo {
         peer_id: node.peer_id.to_string(),

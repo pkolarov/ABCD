@@ -39,6 +39,33 @@ struct DdsEnrolledUsersResult
     std::string errorMessage;
 };
 
+// Result of POST /v1/enroll/user
+struct DdsEnrollResult
+{
+    bool        success;
+    std::string urn;
+    std::string jti;
+    std::string errorMessage;
+};
+
+// Result of POST /v1/admin/setup
+struct DdsAdminSetupResult
+{
+    bool        success;
+    std::string adminUrn;
+    std::string errorMessage;
+};
+
+// Result of POST /v1/admin/vouch
+struct DdsAdminVouchResult
+{
+    bool        success;
+    std::string vouchJti;
+    std::string subjectUrn;
+    std::string adminUrn;
+    std::string errorMessage;
+};
+
 class CDdsNodeHttpClient
 {
 public:
@@ -63,6 +90,23 @@ public:
     //
     // Retrieves the list of users enrolled on this device from dds-node.
     DdsEnrolledUsersResult GetEnrolledUsers(const std::string& deviceUrn);
+
+    // POST /v1/enroll/user
+    //
+    // Enrolls a user with FIDO2 attestation. enrollJson must contain:
+    //   label, credential_id, attestation_object_b64, client_data_hash_b64,
+    //   rp_id, display_name, authenticator_type
+    DdsEnrollResult PostEnrollUser(const std::string& enrollJson);
+
+    // POST /v1/admin/setup
+    //
+    // Registers an admin identity. Same JSON format as PostEnrollUser.
+    DdsAdminSetupResult PostAdminSetup(const std::string& setupJson);
+
+    // POST /v1/admin/vouch
+    //
+    // Admin vouches for an enrolled user via FIDO2 assertion proof.
+    DdsAdminVouchResult PostAdminVouch(const std::string& vouchJson);
 
 private:
     std::wstring m_host;

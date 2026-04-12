@@ -1,0 +1,8 @@
+// DdsTrayAgent.rc — resource script
+
+#include "resource.h"
+#include <winres.h>
+
+// Use a standard Windows shield icon as placeholder.
+// Replace with a custom dds_tray.ico when available.
+IDI_TRAYICON ICON "dds_tray.ico"
