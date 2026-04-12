@@ -28,8 +28,8 @@ use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use dds_domain::domain::to_hex;
 use dds_domain::DomainKey;
+use dds_domain::domain::to_hex;
 use dds_node::config::NodeConfig;
 use dds_node::domain_store;
 use dds_node::http;
@@ -108,7 +108,10 @@ fn cmd_init_domain(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("  name:        {}", domain.name);
     println!("  id:          {}", domain.id);
     println!("  pubkey:      {}", to_hex(&domain.pubkey));
-    println!("  domain.toml: {} (share with siblings)", domain_path.display());
+    println!(
+        "  domain.toml: {} (share with siblings)",
+        domain_path.display()
+    );
     println!("  domain_key:  {} (keep secret)", key_path.display());
     Ok(())
 }
@@ -199,12 +202,7 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let trusted_roots = config.trusted_roots.iter().cloned().collect();
     let api_store = node.store.clone();
     let api_trust_graph = std::sync::Arc::clone(&node.trust_graph);
-    let svc = LocalService::new(
-        node_identity,
-        api_trust_graph,
-        trusted_roots,
-        api_store,
-    );
+    let svc = LocalService::new(node_identity, api_trust_graph, trusted_roots, api_store);
     let shared_svc = Arc::new(tokio::sync::Mutex::new(svc));
     let node_info = http::NodeInfo {
         peer_id: node.peer_id.to_string(),

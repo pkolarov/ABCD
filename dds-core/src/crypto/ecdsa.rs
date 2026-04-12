@@ -20,19 +20,20 @@ impl EcdsaP256Only {
 
     /// Reconstruct from raw secret key bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
-        let signing_key = SigningKey::from_slice(bytes).map_err(|_| CryptoError::InvalidPublicKey)?;
+        let signing_key =
+            SigningKey::from_slice(bytes).map_err(|_| CryptoError::InvalidPublicKey)?;
         Ok(Self { signing_key })
     }
 
     /// Get the public key bundle.
     pub fn public_key_bundle(&self) -> PublicKeyBundle {
         let verifying_key = self.signing_key.verifying_key();
-        // Use compressed SEC1 encoding (33 bytes) or uncompressed (65 bytes). 
+        // Use compressed SEC1 encoding (33 bytes) or uncompressed (65 bytes).
         // We'll use uncompressed to be safe, or just let to_sec1_bytes default.
-        // to_sec1_bytes() on VerifyingKey returns compressed if the key was compressed, 
+        // to_sec1_bytes() on VerifyingKey returns compressed if the key was compressed,
         // but default is uncompressed usually. Let's use uncompressed explicit:
         let bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
-        
+
         PublicKeyBundle {
             scheme: SchemeId::EcdsaP256,
             bytes,
@@ -57,8 +58,7 @@ pub fn verify_ecdsa_p256(
 ) -> Result<(), CryptoError> {
     let vk = VerifyingKey::from_sec1_bytes(public_key_bytes)
         .map_err(|_| CryptoError::InvalidPublicKey)?;
-    let sig = Signature::from_slice(signature_bytes)
-        .map_err(|_| CryptoError::InvalidSignature)?;
+    let sig = Signature::from_slice(signature_bytes).map_err(|_| CryptoError::InvalidSignature)?;
     vk.verify(message, &sig)
         .map_err(|_| CryptoError::InvalidSignature)
 }

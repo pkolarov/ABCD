@@ -202,7 +202,9 @@ fn verify_packed(
     match credential_pk {
         CredentialPublicKey::Ed25519(vk) => {
             if alg != Some(COSE_ALG_EDDSA) {
-                return Err(Fido2Error::Unsupported(format!("packed alg={alg:?} for Ed25519 key")));
+                return Err(Fido2Error::Unsupported(format!(
+                    "packed alg={alg:?} for Ed25519 key"
+                )));
             }
             let signature = Ed25519Signature::from_slice(&sig)
                 .map_err(|e| Fido2Error::KeyError(e.to_string()))?;
@@ -211,7 +213,9 @@ fn verify_packed(
         }
         CredentialPublicKey::P256(vk) => {
             if alg != Some(COSE_ALG_ES256) {
-                return Err(Fido2Error::Unsupported(format!("packed alg={alg:?} for P-256 key")));
+                return Err(Fido2Error::Unsupported(format!(
+                    "packed alg={alg:?} for P-256 key"
+                )));
             }
             let signature = P256Signature::from_der(&sig)
                 .or_else(|_| P256Signature::from_slice(&sig))
@@ -314,8 +318,8 @@ pub fn verify_assertion(
 /// Parse a COSE_Key from CBOR into a `CredentialPublicKey`.
 /// Supports Ed25519 (kty=1, alg=-8) and P-256 (kty=2, alg=-7).
 pub fn cose_to_credential_public_key(cose_bytes: &[u8]) -> Result<CredentialPublicKey, Fido2Error> {
-    let value: CborValue =
-        ciborium::from_reader(cose_bytes).map_err(|e| Fido2Error::Cbor(format!("COSE_Key: {e}")))?;
+    let value: CborValue = ciborium::from_reader(cose_bytes)
+        .map_err(|e| Fido2Error::Cbor(format!("COSE_Key: {e}")))?;
     let map = value
         .as_map()
         .ok_or_else(|| Fido2Error::Format("COSE_Key not a map".into()))?;
@@ -376,9 +380,7 @@ pub fn cose_to_credential_public_key(cose_bytes: &[u8]) -> Result<CredentialPubl
                 .map_err(|e| Fido2Error::KeyError(format!("P-256: {e}")))?;
             Ok(CredentialPublicKey::P256(vk))
         }
-        _ => Err(Fido2Error::Unsupported(format!(
-            "kty={kty:?} alg={alg:?}"
-        ))),
+        _ => Err(Fido2Error::Unsupported(format!("kty={kty:?} alg={alg:?}"))),
     }
 }
 
@@ -553,11 +555,7 @@ pub fn build_packed_self_attestation_p256(
     out
 }
 
-fn build_auth_data_p256(
-    rp_id: &str,
-    credential_id: &[u8],
-    pk: &P256VerifyingKey,
-) -> Vec<u8> {
+fn build_auth_data_p256(rp_id: &str, credential_id: &[u8], pk: &P256VerifyingKey) -> Vec<u8> {
     let rp_id_hash = Sha256::digest(rp_id.as_bytes());
     let mut out = Vec::new();
     out.extend_from_slice(&rp_id_hash);
@@ -582,14 +580,8 @@ fn build_auth_data_p256(
             CborValue::Integer((-1).into()),
             CborValue::Integer(1.into()),
         ), // crv=P-256
-        (
-            CborValue::Integer((-2).into()),
-            CborValue::Bytes(x),
-        ), // x
-        (
-            CborValue::Integer((-3).into()),
-            CborValue::Bytes(y),
-        ), // y
+        (CborValue::Integer((-2).into()), CborValue::Bytes(x)),       // x
+        (CborValue::Integer((-3).into()), CborValue::Bytes(y)),       // y
     ];
     ciborium::into_writer(&CborValue::Map(cose), &mut out).unwrap();
     out
@@ -805,9 +797,18 @@ mod tests {
 
         let cose: Vec<(CborValue, CborValue)> = vec![
             (CborValue::Integer(1.into()), CborValue::Integer(1.into())), // kty=OKP
-            (CborValue::Integer(3.into()), CborValue::Integer(COSE_ALG_EDDSA.into())), // alg
-            (CborValue::Integer((-1).into()), CborValue::Integer(6.into())), // crv=Ed25519
-            (CborValue::Integer((-2).into()), CborValue::Bytes(vk.to_bytes().to_vec())),
+            (
+                CborValue::Integer(3.into()),
+                CborValue::Integer(COSE_ALG_EDDSA.into()),
+            ), // alg
+            (
+                CborValue::Integer((-1).into()),
+                CborValue::Integer(6.into()),
+            ), // crv=Ed25519
+            (
+                CborValue::Integer((-2).into()),
+                CborValue::Bytes(vk.to_bytes().to_vec()),
+            ),
         ];
         let mut bytes = Vec::new();
         ciborium::into_writer(&CborValue::Map(cose), &mut bytes).unwrap();
@@ -828,8 +829,14 @@ mod tests {
         let cose: Vec<(CborValue, CborValue)> = vec![
             (CborValue::Integer(2.into()), CborValue::Integer(2.into())), // kty=EC2 (wrong — should be key 1)
             (CborValue::Integer(1.into()), CborValue::Integer(2.into())), // kty=EC2
-            (CborValue::Integer(3.into()), CborValue::Integer(COSE_ALG_ES256.into())), // alg
-            (CborValue::Integer((-1).into()), CborValue::Integer(1.into())), // crv=P-256
+            (
+                CborValue::Integer(3.into()),
+                CborValue::Integer(COSE_ALG_ES256.into()),
+            ), // alg
+            (
+                CborValue::Integer((-1).into()),
+                CborValue::Integer(1.into()),
+            ), // crv=P-256
             (CborValue::Integer((-2).into()), CborValue::Bytes(x)),
             (CborValue::Integer((-3).into()), CborValue::Bytes(y)),
         ];

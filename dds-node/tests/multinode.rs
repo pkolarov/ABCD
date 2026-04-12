@@ -161,11 +161,7 @@ fn ingest_gossip(node: &mut DdsNode, topic_hash: &libp2p::gossipsub::TopicHash, 
                 Token::from_cbor(&token_bytes),
             ) {
                 if token.validate().is_ok() {
-                    let _ = node
-                        .trust_graph
-                        .write()
-                        .unwrap()
-                        .add_token(token.clone());
+                    let _ = node.trust_graph.write().unwrap().add_token(token.clone());
                     use dds_store::traits::TokenStore;
                     let _ = node.store.put_token(&token);
                     let _ = node.dag.insert(op);
@@ -175,11 +171,7 @@ fn ingest_gossip(node: &mut DdsNode, topic_hash: &libp2p::gossipsub::TopicHash, 
         (DdsTopic::Revocations(..), GossipMessage::Revocation { token_bytes }) => {
             if let Ok(token) = Token::from_cbor(&token_bytes) {
                 if token.validate().is_ok() {
-                    let _ = node
-                        .trust_graph
-                        .write()
-                        .unwrap()
-                        .add_token(token.clone());
+                    let _ = node.trust_graph.write().unwrap().add_token(token.clone());
                     if let Some(target) = token.payload.revokes.clone() {
                         use dds_store::traits::RevocationStore;
                         let _ = node.store.revoke(&target);
@@ -283,11 +275,7 @@ fn publish_attest(node: &mut DdsNode, op: &Operation, token: &Token) {
     // Gossipsub does NOT echo messages back to the publisher, so apply
     // the same effect locally to mirror the real ingest path on the
     // node that originated the op.
-    let _ = node
-        .trust_graph
-        .write()
-        .unwrap()
-        .add_token(token.clone());
+    let _ = node.trust_graph.write().unwrap().add_token(token.clone());
     use dds_store::traits::TokenStore;
     let _ = node.store.put_token(token);
     let _ = node.dag.insert(op.clone());
@@ -299,11 +287,7 @@ fn publish_revocation(node: &mut DdsNode, token: &Token) {
     let cbor = msg.to_cbor().unwrap();
     let topic = node.topics.revocations.to_ident_topic();
     let _ = node.swarm.behaviour_mut().gossipsub.publish(topic, cbor);
-    let _ = node
-        .trust_graph
-        .write()
-        .unwrap()
-        .add_token(token.clone());
+    let _ = node.trust_graph.write().unwrap().add_token(token.clone());
     if let Some(target) = token.payload.revokes.clone() {
         use dds_store::traits::RevocationStore;
         let _ = node.store.revoke(&target);
@@ -554,8 +538,14 @@ async fn rejoined_node_catches_up_via_sync_protocol() {
             break;
         }
     }
-    assert!(a.dag.contains(&op1.id) && a.dag.contains(&op2.id), "A missing ops");
-    assert!(b.dag.contains(&op1.id) && b.dag.contains(&op2.id), "B missing ops");
+    assert!(
+        a.dag.contains(&op1.id) && a.dag.contains(&op2.id),
+        "A missing ops"
+    );
+    assert!(
+        b.dag.contains(&op1.id) && b.dag.contains(&op2.id),
+        "B missing ops"
+    );
 
     // C joins fresh — no shared past. Under gossipsub-only delivery, C
     // would never see op1 or op2 because they were published before

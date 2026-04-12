@@ -234,7 +234,9 @@ mod tests {
 
     #[test]
     fn test_plain_roundtrip() {
-        let _g = PASSPHRASE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = PASSPHRASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::remove_var(PASSPHRASE_ENV) };
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("node_key.bin");
@@ -246,7 +248,9 @@ mod tests {
 
     #[test]
     fn test_encrypted_roundtrip() {
-        let _g = PASSPHRASE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = PASSPHRASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::set_var(PASSPHRASE_ENV, "correct horse battery staple") };
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("node_key.bin");
@@ -268,7 +272,9 @@ mod tests {
 
     #[test]
     fn test_load_or_create_persists_across_calls() {
-        let _g = PASSPHRASE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = PASSPHRASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::remove_var(PASSPHRASE_ENV) };
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("node_key.bin");

@@ -244,7 +244,9 @@ pub fn save_admission_cert(path: &Path, cert: &AdmissionCert) -> Result<(), Doma
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| DomainStoreError::Io(e.to_string()))?;
     }
-    let bytes = cert.to_cbor().map_err(|e| DomainStoreError::Cbor(e.to_string()))?;
+    let bytes = cert
+        .to_cbor()
+        .map_err(|e| DomainStoreError::Cbor(e.to_string()))?;
     std::fs::write(path, &bytes).map_err(|e| DomainStoreError::Io(e.to_string()))?;
     Ok(())
 }

@@ -381,6 +381,8 @@ To prevent resource exhaustion in trust graph evaluation:
 | Group Policy Objects (GPO) | `WindowsPolicyDocument` with typed `WindowsSettings` bundle (§14.5.1) |
 | GPO enforcement (registry, security policy) | `DdsPolicyAgent` Windows Service with pluggable enforcers (§14.5.4) |
 | Software deployment (SCCM/Intune) | `SoftwareAssignment` document + `SoftwareInstaller` enforcer (§14.5.1) |
+| Linux fleet policy / config management | `LinuxPolicyDocument` + `DdsPolicyAgent.Linux` + systemd/PAM bridges (§14.6) |
+| macOS device configuration / profile management | `MacOsPolicyDocument` + `DdsPolicyAgent.MacOS` + launchd/Authorization Services bridges (§14.7) |
 | Local account management | `AccountEnforcer` via `AccountDirective` with domain-join guard (§14.5.5) |
 | Password policy (Fine-Grained) | `PasswordPolicyEnforcer` via `PasswordPolicy` directive (§14.5.1) |
 | Organizational Units | Purpose-filtered delegation chains |
@@ -634,6 +636,20 @@ dds/
     │   │   └── Enforcers/            Registry, Account, PasswordPolicy, Software
     │   ├── DdsPolicyAgent.Tests/     xUnit tests (cross-platform via InMemory* doubles)
     │   └── installer/                WiX v4 MSI bundle (planned)
+    ├── linux/
+    │   ├── DdsPolicyAgent/           .NET 8 worker service — Linux policy enforcement
+    │   │   ├── Client/               HTTP client for dds-node /v1/linux/* API
+    │   │   ├── State/                Applied-state persistence in /var/lib/dds
+    │   │   └── Enforcers/            Sysctl, Files, Accounts, Systemd, SSH, Software
+    │   ├── pam_dds/                  PAM module / helper bridge for local auth (planned)
+    │   └── packaging/                .deb / .rpm / systemd unit assets (planned)
+    ├── macos/
+    │   ├── DdsPolicyAgent/           .NET 8 launchd daemon — macOS policy enforcement
+    │   │   ├── Client/               HTTP client for dds-node /v1/macos/* API
+    │   │   ├── State/                Applied-state persistence in /Library/Application Support/DDS
+    │   │   └── Enforcers/            Preferences, Accounts, launchd, Profiles, Software
+    │   ├── DdsLoginBridge/           Authorization Services / session bootstrap bridge (planned)
+    │   └── packaging/                pkgbuild/productbuild/notarization assets (planned)
     ├── android/                  Kotlin wrapper via UniFFI
     ├── ios/                      Swift wrapper via UniFFI
     └── embedded/                 no_std integration examples (Embassy)
@@ -716,12 +732,18 @@ All libraries below are open source, mature (1.0+ or production-deployed), and a
 
 | Platform | Runtime | Networking | Storage | Auth | Build Tooling |
 |---|---|---|---|---|---|
-| **Linux x86_64/ARM** | tokio | rust-libp2p (TCP+QUIC) | redb | webauthn-rs | `cargo build` |
-| **macOS x86_64/ARM** | tokio | rust-libp2p (TCP+QUIC) | redb | webauthn-rs | `cargo build` |
-| **Windows x86_64** | tokio | rust-libp2p (TCP+QUIC) | redb | webauthn-rs | `cargo build --target x86_64-pc-windows-msvc` |
+| **Linux x86_64/ARM** | tokio | rust-libp2p (TCP+QUIC) | redb | webauthn-rs + PAM/SSH bridge | `cargo build` + `dotnet publish` |
+| **macOS x86_64/ARM** | tokio | rust-libp2p (TCP+QUIC) | redb | webauthn-rs + LocalAuthentication / Authorization bridge | `cargo build` + `dotnet publish` |
+| **Windows x86_64** | tokio | rust-libp2p (TCP+QUIC) | redb | webauthn-rs + Credential Provider bridge | `cargo build --target x86_64-pc-windows-msvc` + `dotnet publish` |
 | **Android (ARM64)** | tokio | rust-libp2p (TCP+QUIC) | redb | Platform FIDO2 | `cargo ndk -t arm64-v8a` |
 | **iOS (ARM64)** | tokio | rust-libp2p (TCP+QUIC) | redb | Platform FIDO2 | `cargo build --target aarch64-apple-ios` |
 | **Embedded RTOS** | Embassy | Custom transport | In-memory | N/A (pre-provisioned) | `cargo build --target thumbv7em-none-eabihf` |
+
+For the three managed desktop/server platforms, DDS uses the same core pattern:
+
+- `dds-node` stays a portable Rust daemon with trust graph, sync, and localhost API;
+- an OS-specific privileged agent polls localhost for applicable policy/software;
+- optional login/auth bridges integrate DDS sessions into the platform's local auth stack.
 
 ### 14.2 Rust Core + Native Shell Pattern
 
@@ -1102,6 +1124,419 @@ together.
 Audit mode is the recommended rollout strategy: publish policies in `Audit`
 first, review the agent logs, then flip to `Enforce` by publishing a new
 version of the same `policy_id` with `enforcement: Enforce`.
+
+### 14.6 Linux Platform — Managed Device Architecture
+
+Linux support follows the same high-level split as Windows:
+
+- `dds-node` is the portable Rust daemon;
+- `DdsPolicyAgent.Linux` is the privileged applier;
+- optional PAM/SSH bridges connect DDS sessions to local authentication paths.
+
+The important design decision is that DDS does **not** try to encode every Linux
+distribution quirk into `dds-node`.
+All distro-specific behavior stays in the Linux agent and its enforcers.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Managed Linux Device                                        │
+│                                                              │
+│  ┌──────────────────────────┐  ┌──────────────────────────┐  │
+│  │      dds-node            │  │       pam_dds           │  │
+│  │   (Rust, systemd)        │  │   (PAM / sshd hook)     │  │
+│  │                          │  │                         │  │
+│  │  • Trust graph           │  │  login / sudo / ssh     │  │
+│  │  • Policy evaluation     │  │  → /v1/session          │  │
+│  │  • Gossip + sync         │  └──────────┬──────────────┘  │
+│  │  • HTTP API on 127.0.0.1 │             │                 │
+│  └──────────┬───────────────┘             │                 │
+│             │ loopback HTTP               │                 │
+│  ┌──────────┴───────────────┐             │                 │
+│  │  DdsPolicyAgent.Linux    │             │                 │
+│  │ (.NET 8, root/systemd)   │             │                 │
+│  │                          ├─────────────┘                 │
+│  │  Poll /v1/linux/*        │                               │
+│  │  every 60s               │                               │
+│  │                          │                               │
+│  │  ┌──────────────────┐    │                               │
+│  │  │ Sysctl Enforcer  │    │                               │
+│  │  │ File Enforcer    │    │                               │
+│  │  │ Account Enforcer │    │                               │
+│  │  │ Systemd Enforcer │    │                               │
+│  │  │ SSH Enforcer     │    │                               │
+│  │  │ Software Install │    │                               │
+│  │  └──────────────────┘    │                               │
+│  │                          │                               │
+│  │  State: /var/lib/dds     │                               │
+│  └──────────────────────────┘                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+#### 14.6.1 Linux Domain Document Types
+
+Linux policy uses the same envelope conventions as Windows:
+
+- signed Vouchsafe attestation token;
+- `PolicyScope` for targeting;
+- `Enforcement` for audit/enforce/disabled;
+- optional strongly-typed OS bundle plus free-form `settings` escape hatch.
+
+**LinuxPolicyDocument** (`body_type: "dds:linux-policy"`):
+
+```
+LinuxPolicyDocument
+├── policy_id: String
+├── display_name: String
+├── version: u64
+├── scope: PolicyScope
+├── settings: [PolicySetting]
+├── enforcement: Enforcement
+└── linux: Option<LinuxSettings>
+    ├── sysctl: [SysctlDirective]
+    │   ├── key: String               # e.g. "net.ipv4.ip_forward"
+    │   ├── value: String
+    │   └── action: SysctlAction      # Set | Delete
+    ├── files: [ManagedFileDirective]
+    │   ├── path: String              # allowlisted paths only
+    │   ├── owner: Option<String>
+    │   ├── group: Option<String>
+    │   ├── mode: Option<String>      # e.g. "0644"
+    │   ├── content: Option<String>   # literal or rendered template
+    │   ├── sha256: Option<String>
+    │   └── action: FileAction        # Write | Delete
+    ├── local_accounts: [PosixAccountDirective]
+    │   ├── username: String
+    │   ├── uid: Option<u32>
+    │   ├── primary_group: Option<String>
+    │   ├── supplementary_groups: [String]
+    │   ├── shell: Option<String>
+    │   ├── home: Option<String>
+    │   ├── locked: Option<bool>
+    │   └── action: PosixAccountAction # Create | Delete | Lock | Unlock | Modify
+    ├── services: [SystemdDirective]
+    │   ├── name: String              # unit name, e.g. "sshd.service"
+    │   ├── enabled: Option<bool>
+    │   ├── state: Option<UnitState>  # Started | Stopped | Restarted
+    │   └── action: UnitAction        # Configure | Mask | Unmask
+    └── ssh: Option<SshdPolicy>
+        ├── password_authentication: Option<bool>
+        ├── permit_root_login: Option<String>
+        ├── pubkey_authentication: Option<bool>
+        ├── allow_users: [String]
+        └── allow_groups: [String]
+```
+
+`SoftwareAssignment` remains shared across platforms.
+On Linux, the agent resolves `SoftwareAssignment.source` into one of:
+
+- distro package repo operation (`apt`, `dnf`, `zypper`);
+- direct signed package artifact (`.deb`, `.rpm`);
+- pinned tarball / binary drop into an allowlisted install root.
+
+#### 14.6.2 dds-node HTTP API — Linux Endpoints
+
+The Linux agent mirrors the Windows polling pattern with Linux-namespaced endpoints:
+
+| Method | Path | Request | Response |
+| --- | --- | --- | --- |
+| `GET` | `/v1/linux/policies?device_urn=...` | Query string | `{ "policies": [{ "jti", "issuer", "iat", "document": LinuxPolicyDocument }] }` |
+| `GET` | `/v1/linux/software?device_urn=...` | Query string | `{ "software": [{ "jti", "issuer", "iat", "document": SoftwareAssignment }] }` |
+| `POST` | `/v1/linux/applied` | `AppliedReport` JSON body | `202 Accepted` |
+
+Server-side scope matching stays in Rust.
+The Linux agent never embeds the trust graph or vouch validation logic.
+
+#### 14.6.3 DdsPolicyAgent.Linux — Enforcer Model
+
+`DdsPolicyAgent.Linux` is a .NET 8 worker running as `root` under `systemd`.
+The cross-platform agent core is shared with Windows/macOS where practical:
+
+- same poll loop;
+- same applied-state hashing and idempotency model;
+- same audit/enforce/disabled semantics;
+- different enforcer implementations selected by OS.
+
+Linux-specific enforcers:
+
+| Enforcer | Backend | Notes |
+| --- | --- | --- |
+| `SysctlEnforcer` | `/etc/sysctl.d/*.conf` + `sysctl --system` | Avoids ephemeral-only writes to `/proc/sys` |
+| `ManagedFileEnforcer` | atomic temp-write + rename + `chmod`/`chown` | Only allowlisted paths |
+| `PosixAccountEnforcer` | `useradd`, `usermod`, `groupadd`, `passwd -l/-u` | Local accounts only |
+| `SystemdEnforcer` | `systemctl` / D-Bus | Service enable/disable/restart |
+| `SshdEnforcer` | managed drop-in under `/etc/ssh/sshd_config.d/` + reload | No direct in-place edits to vendor file |
+| `SoftwareInstaller` | distro package manager abstraction | Backend chosen from host capability |
+
+Persisted state lives at `/var/lib/dds/applied-state.json`.
+Config lives under `/etc/dds/`.
+Logs go to `journald`.
+
+#### 14.6.4 Linux Security Controls
+
+**Filesystem allowlist:** `ManagedFileEnforcer` only writes under:
+
+- `/etc/dds/`
+- `/etc/ssh/sshd_config.d/`
+- `/etc/sysctl.d/`
+- `/etc/systemd/system/`
+- `/usr/local/lib/dds/`
+
+Writes to `/etc/passwd`, `/etc/shadow`, `/boot`, `/usr/bin`, or arbitrary user
+home directories are forbidden.
+
+**Account-source guard:** If the host is joined to an external directory source
+through SSSD, `realmd`, LDAP, or AD integration, local-account directives are
+rejected by default unless the agent is explicitly configured with
+`allowLocalAccountMutationWhenDomainJoined=true`.
+
+**Package trust:** Direct package/file installs require:
+
+- a pinned `sha256` in `SoftwareAssignment`;
+- an allowlisted source URL or repository;
+- optional GPG signature verification when the backend supports it.
+
+**Privilege minimization:** `pam_dds` talks only to localhost `dds-node` and
+never parses trust-graph data itself.
+The policy agent runs as `root`, but enforcers are narrowly scoped and path-restricted.
+
+#### 14.6.5 Linux Login And SSH Integration
+
+Linux gives DDS more than one auth surface:
+
+- console / display-manager login via PAM;
+- `sudo` elevation via PAM;
+- SSH via PAM and optional `AuthorizedKeysCommand` integration.
+
+The v1 design is conservative:
+
+- DDS authenticates and authorizes **existing local accounts**;
+- it does not synthesize NSS users on the fly;
+- a policy document can map a DDS identity URN to one or more local POSIX accounts.
+
+`pam_dds.so` flow:
+
+1. User selects or enters a local username.
+2. PAM module asks local `dds-node` for a DDS session based on WebAuthn/FIDO2 evidence.
+3. `dds-node` evaluates trust + policy locally.
+4. If allowed, PAM returns success and emits the DDS session metadata for downstream auditing.
+
+This gives Linux near-parity with the Windows Credential Provider idea without
+requiring the DDS core to know anything about PAM internals.
+
+#### 14.6.6 Packaging And Deployment
+
+Linux packaging targets:
+
+- `.deb` for Debian/Ubuntu family;
+- `.rpm` for RHEL/Fedora/SUSE family;
+- systemd units for `dds-node.service` and `dds-policy-agent.service`;
+- optional `pam_dds.so` installed under the platform PAM module directory.
+
+State paths:
+
+- config: `/etc/dds/`
+- database: `/var/lib/dds/store.redb`
+- agent state: `/var/lib/dds/applied-state.json`
+- logs: `journald`
+
+### 14.7 macOS Platform — Managed Device Architecture
+
+macOS follows the same control-plane split as Windows and Linux, but the actual
+enforcement surface is different:
+
+- `dds-node` remains the portable Rust daemon;
+- `DdsPolicyAgent.MacOS` runs as a privileged `launchd` daemon;
+- login integration uses macOS security frameworks rather than a Windows-style credential provider.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Managed macOS Device                                        │
+│                                                              │
+│  ┌──────────────────────────┐  ┌──────────────────────────┐  │
+│  │      dds-node            │  │    DdsLoginBridge       │  │
+│  │ (Rust, LaunchDaemon)     │  │ (Authorization bridge)  │  │
+│  │                          │  │                         │  │
+│  │  • Trust graph           │  │  login / unlock /       │  │
+│  │  • Policy evaluation     │  │  privileged action      │  │
+│  │  • Gossip + sync         │  │  → /v1/session          │  │
+│  │  • HTTP API on 127.0.0.1 │  └──────────┬──────────────┘  │
+│  └──────────┬───────────────┘             │                 │
+│             │ loopback HTTP               │                 │
+│  ┌──────────┴───────────────┐             │                 │
+│  │  DdsPolicyAgent.MacOS    │             │                 │
+│  │(.NET 8, root/launchd)    │             │                 │
+│  │                          ├─────────────┘                 │
+│  │  Poll /v1/macos/*        │                               │
+│  │  every 60s               │                               │
+│  │                          │                               │
+│  │  ┌──────────────────┐    │                               │
+│  │  │ Preferences      │    │                               │
+│  │  │ Accounts         │    │                               │
+│  │  │ launchd          │    │                               │
+│  │  │ Profiles         │    │                               │
+│  │  │ Software Install │    │                               │
+│  │  └──────────────────┘    │                               │
+│  │                          │                               │
+│  │  State: /Library/        │                               │
+│  │  Application Support/DDS │                               │
+│  └──────────────────────────┘                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+#### 14.7.1 macOS Domain Document Types
+
+**MacOsPolicyDocument** (`body_type: "dds:macos-policy"`):
+
+```
+MacOsPolicyDocument
+├── policy_id: String
+├── display_name: String
+├── version: u64
+├── scope: PolicyScope
+├── settings: [PolicySetting]
+├── enforcement: Enforcement
+└── macos: Option<MacOsSettings>
+    ├── preferences: [PreferenceDirective]
+    │   ├── domain: String            # e.g. "com.apple.screensaver"
+    │   ├── key: String
+    │   ├── value: JsonValue
+    │   ├── scope: PreferenceScope    # System | UserTemplate
+    │   └── action: PreferenceAction  # Set | Delete
+    ├── local_accounts: [MacAccountDirective]
+    │   ├── username: String
+    │   ├── full_name: Option<String>
+    │   ├── shell: Option<String>
+    │   ├── admin: Option<bool>
+    │   ├── hidden: Option<bool>
+    │   └── action: MacAccountAction  # Create | Delete | Disable | Enable | Modify
+    ├── launchd: [LaunchdDirective]
+    │   ├── label: String
+    │   ├── plist_path: String
+    │   ├── enabled: Option<bool>
+    │   └── action: LaunchdAction     # Load | Unload | Kickstart | Configure
+    └── profiles: [ProfileDirective]
+        ├── identifier: String
+        ├── display_name: String
+        ├── payload_sha256: String
+        ├── mobileconfig_b64: String
+        └── action: ProfileAction     # Install | Remove
+```
+
+`SoftwareAssignment` is also reused on macOS.
+Supported install forms:
+
+- signed `.pkg` installer;
+- `softwareupdate` item;
+- pinned application bundle artifact copied into an allowlisted install root.
+
+Homebrew support is explicitly **out of the core design path** for v1 because it
+adds a user-space package manager dependency that is not standard on enterprise
+macOS fleets.
+
+#### 14.7.2 dds-node HTTP API — macOS Endpoints
+
+| Method | Path | Request | Response |
+| --- | --- | --- | --- |
+| `GET` | `/v1/macos/policies?device_urn=...` | Query string | `{ "policies": [{ "jti", "issuer", "iat", "document": MacOsPolicyDocument }] }` |
+| `GET` | `/v1/macos/software?device_urn=...` | Query string | `{ "software": [{ "jti", "issuer", "iat", "document": SoftwareAssignment }] }` |
+| `POST` | `/v1/macos/applied` | `AppliedReport` JSON body | `202 Accepted` |
+
+The same server-side scope matching and token validation model is reused.
+
+#### 14.7.3 DdsPolicyAgent.MacOS — Enforcer Model
+
+`DdsPolicyAgent.MacOS` is a self-contained .NET 8 worker registered as a
+`LaunchDaemon`.
+It reuses the same hash-based idempotency logic as Windows/Linux, but its
+enforcers call macOS-native surfaces:
+
+| Enforcer | Backend | Notes |
+| --- | --- | --- |
+| `PreferenceEnforcer` | plist / CFPreferences / `defaults` | Writes system or user-template managed preferences |
+| `MacAccountEnforcer` | `sysadminctl`, `dscl`, `dseditgroup` | Local account lifecycle only |
+| `LaunchdEnforcer` | `launchctl` + managed plist files | Service and agent configuration |
+| `ProfileEnforcer` | `profiles` / managed payload install | Only payload classes installable by a local privileged agent |
+| `SoftwareInstaller` | `/usr/sbin/installer`, `softwareupdate` | Requires signature/hash verification |
+
+Persisted state lives at:
+
+- `/Library/Application Support/DDS/applied-state.json`
+- `/Library/Application Support/DDS/store.redb`
+
+Daemon configuration is installed under `/Library/Application Support/DDS/config/`
+with launchd plists in `/Library/LaunchDaemons/`.
+
+#### 14.7.4 macOS Security Controls
+
+**SIP / TCC boundary:** DDS does not attempt to disable System Integrity Protection,
+edit the TCC database directly, or bypass user-consent requirements.
+Any setting that requires MDM-only entitlement or explicit user approval remains
+out of scope for v1.
+
+**Filesystem allowlist:** The macOS agent may only manage:
+
+- `/Library/Application Support/DDS/`
+- `/Library/Managed Preferences/`
+- `/Library/LaunchDaemons/`
+- `/Library/LaunchAgents/`
+- `/usr/local/lib/dds/`
+
+It does not rewrite arbitrary application bundles or protected system locations.
+
+**Directory-binding guard:** If the host is bound to Active Directory, Open Directory,
+or another external account source, local account mutation is disabled by default.
+
+**Package trust:** `.pkg` installs require:
+
+- a pinned `sha256`;
+- Developer ID signature verification when available;
+- an allowlisted source.
+
+Unsigned DMG scripting and arbitrary shell bootstrap installers are out of scope.
+
+#### 14.7.5 macOS Login Integration
+
+macOS is not Windows.
+There is no direct analog to the Windows Credential Provider that can replace the
+entire login path without running into FileVault, Secure Token, and platform
+security constraints.
+
+So the design is phased:
+
+- **v1:** macOS management parity only — policy enforcement, software deployment,
+  local account management, and DDS session bootstrap **after** OS login.
+- **v2:** `DdsLoginBridge` can integrate DDS-issued sessions into Authorization
+  Services for privileged actions, screen unlock, or app-specific SSO where the
+  platform allows it.
+- **Deferred:** replacing FileVault pre-boot authentication or the full loginwindow
+  path is explicitly out of scope until a safe, supportable Apple-approved path exists.
+
+This keeps the platform story honest.
+macOS can be managed similarly to Windows in policy/software/device terms, but
+interactive login replacement should not be promised casually.
+
+#### 14.7.6 Packaging And Deployment
+
+macOS packaging targets:
+
+- notarized `.pkg` containing `dds-node`, `DdsPolicyAgent.MacOS`, and launchd plists;
+- `pkgbuild` + `productbuild` pipeline;
+- code signing with Developer ID Application + Developer ID Installer identities.
+
+State paths:
+
+- config: `/Library/Application Support/DDS/config/`
+- database: `/Library/Application Support/DDS/store.redb`
+- agent state: `/Library/Application Support/DDS/applied-state.json`
+- daemon plists: `/Library/LaunchDaemons/`
+
+Operationally, the macOS rollout model is:
+
+1. install signed package;
+2. register launch daemons;
+3. enroll device with DDS;
+4. apply policies in `Audit` mode first;
+5. move selected policies to `Enforce`.
 
 ---
 

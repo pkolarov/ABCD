@@ -125,8 +125,7 @@ impl TrustGraph {
                         }
                     }
 
-                    self.revocations
-                        .insert(target_jti.clone(), revoker_iss);
+                    self.revocations.insert(target_jti.clone(), revoker_iss);
                 }
             }
             TokenKind::Burn => {
@@ -317,10 +316,7 @@ impl TrustGraph {
     /// returned iterator silently skips index entries whose underlying
     /// token has been removed (defensive — shouldn't happen if the index
     /// is maintained correctly).
-    fn vouches_for_subject<'a>(
-        &'a self,
-        subject_urn: &str,
-    ) -> impl Iterator<Item = &'a Token> {
+    fn vouches_for_subject<'a>(&'a self, subject_urn: &str) -> impl Iterator<Item = &'a Token> {
         self.vouches_by_subject
             .get(subject_urn)
             .into_iter()

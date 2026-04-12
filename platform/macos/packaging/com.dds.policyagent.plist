@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.dds.policyagent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/usr/local/share/dotnet/dotnet</string>
+      <string>/usr/local/lib/dds/DdsPolicyAgent.MacOS.dll</string>
+      <string>--contentRoot</string>
+      <string>/Library/Application Support/DDS</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Library/Application Support/DDS</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/dds-policyagent.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/dds-policyagent.err</string>
+  </dict>
+</plist>

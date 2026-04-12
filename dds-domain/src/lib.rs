@@ -10,6 +10,7 @@
 //! | `UserAuthAttestation` | `dds:user-auth-attestation` | FIDO2/passkey enrollment |
 //! | `DeviceJoinDocument` | `dds:device-join` | Device enrollment |
 //! | `WindowsPolicyDocument` | `dds:windows-policy` | GPO-equivalent policy |
+//! | `MacOsPolicyDocument` | `dds:macos-policy` | macOS managed-device policy |
 //! | `SoftwareAssignment` | `dds:software-assignment` | App deployment manifests |
 //! | `ServicePrincipalDocument` | `dds:service-principal` | Machine/service identity |
 //! | `SessionDocument` | `dds:session` | Short-lived auth session |
@@ -28,6 +29,7 @@ pub mod body_types {
     pub const USER_AUTH_ATTESTATION: &str = "dds:user-auth-attestation";
     pub const DEVICE_JOIN: &str = "dds:device-join";
     pub const WINDOWS_POLICY: &str = "dds:windows-policy";
+    pub const MACOS_POLICY: &str = "dds:macos-policy";
     pub const SOFTWARE_ASSIGNMENT: &str = "dds:software-assignment";
     pub const SERVICE_PRINCIPAL: &str = "dds:service-principal";
     pub const SESSION: &str = "dds:session";

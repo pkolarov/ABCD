@@ -152,7 +152,11 @@ fn test_issue_session() {
         &alice.signing_key,
     )
     .unwrap();
-    svc.trust_graph.write().unwrap().add_token(alice_attest.clone()).unwrap();
+    svc.trust_graph
+        .write()
+        .unwrap()
+        .add_token(alice_attest.clone())
+        .unwrap();
 
     let vouch = Token::sign(
         TokenPayload {

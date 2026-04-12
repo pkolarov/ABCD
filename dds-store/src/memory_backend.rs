@@ -182,7 +182,10 @@ impl AuditStore for MemoryBackend {
     fn list_audit_entries(&self) -> StoreResult<Vec<AuditLogEntry>> {
         self.audit_log
             .iter()
-            .map(|bytes| ciborium::from_reader(bytes.as_slice()).map_err(|e| StoreError::Serde(e.to_string())))
+            .map(|bytes| {
+                ciborium::from_reader(bytes.as_slice())
+                    .map_err(|e| StoreError::Serde(e.to_string()))
+            })
             .collect()
     }
 }

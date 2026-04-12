@@ -14,6 +14,8 @@
 //! - `GET  /v1/enrolled-users`  -> EnrolledUsersResponse
 //! - `POST /v1/policy/evaluate` -> PolicyResponse
 //! - `GET  /v1/status`          -> StatusResponse
+//! - `GET  /v1/windows/policies` / `/software` / `POST /applied`
+//! - `GET  /v1/macos/policies` / `/software` / `POST /applied`
 
 use std::sync::Arc;
 
@@ -29,9 +31,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::service::{
-    ApplicableSoftware, ApplicableWindowsPolicy, AppliedReport, AssertionSessionRequest,
-    EnrollDeviceRequest, EnrollUserRequest, EnrolledUser, LocalService, NodeStatus, PolicyResult,
-    ServiceError, SessionRequest,
+    ApplicableMacOsPolicy, ApplicableSoftware, ApplicableWindowsPolicy, AppliedReport,
+    AssertionSessionRequest, EnrollDeviceRequest, EnrollUserRequest, EnrolledUser, LocalService,
+    NodeStatus, PolicyResult, ServiceError, SessionRequest,
 };
 use dds_store::traits::{RevocationStore, TokenStore};
 
@@ -78,6 +80,9 @@ where
         .route("/v1/windows/policies", get(list_windows_policies::<S>))
         .route("/v1/windows/software", get(list_windows_software::<S>))
         .route("/v1/windows/applied", post(record_windows_applied::<S>))
+        .route("/v1/macos/policies", get(list_macos_policies::<S>))
+        .route("/v1/macos/software", get(list_macos_software::<S>))
+        .route("/v1/macos/applied", post(record_macos_applied::<S>))
         .with_state(state)
 }
 
@@ -173,9 +178,21 @@ pub struct WindowsPoliciesResponse {
     pub policies: Vec<ApplicableWindowsPolicy>,
 }
 
+/// Response wrapping a list of macOS policies for a device.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MacOsPoliciesResponse {
+    pub policies: Vec<ApplicableMacOsPolicy>,
+}
+
 /// Response wrapping a list of software assignments for a device.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WindowsSoftwareResponse {
+    pub software: Vec<ApplicableSoftware>,
+}
+
+/// Response wrapping a list of software assignments for a macOS device.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MacOsSoftwareResponse {
     pub software: Vec<ApplicableSoftware>,
 }
 
@@ -403,6 +420,42 @@ where
     Ok(StatusCode::ACCEPTED)
 }
 
+async fn list_macos_policies<S>(
+    State(state): State<AppState<S>>,
+    Query(q): Query<DeviceUrnQuery>,
+) -> Result<Json<MacOsPoliciesResponse>, HttpError>
+where
+    S: TokenStore + RevocationStore + Send + Sync + 'static,
+{
+    let svc = state.svc.lock().await;
+    let policies = svc.list_applicable_macos_policies(&q.device_urn)?;
+    Ok(Json(MacOsPoliciesResponse { policies }))
+}
+
+async fn list_macos_software<S>(
+    State(state): State<AppState<S>>,
+    Query(q): Query<DeviceUrnQuery>,
+) -> Result<Json<MacOsSoftwareResponse>, HttpError>
+where
+    S: TokenStore + RevocationStore + Send + Sync + 'static,
+{
+    let svc = state.svc.lock().await;
+    let software = svc.list_applicable_software(&q.device_urn)?;
+    Ok(Json(MacOsSoftwareResponse { software }))
+}
+
+async fn record_macos_applied<S>(
+    State(state): State<AppState<S>>,
+    Json(report): Json<AppliedReport>,
+) -> Result<StatusCode, HttpError>
+where
+    S: TokenStore + RevocationStore + Send + Sync + 'static,
+{
+    let svc = state.svc.lock().await;
+    svc.record_applied(&report)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
 /// Bind and serve the HTTP API on `addr` until the future is dropped.
 pub async fn serve<S>(
     addr: &str,
@@ -546,6 +599,18 @@ mod tests {
                 "/v1/windows/applied",
                 post(record_windows_applied::<MemoryBackend>),
             )
+            .route(
+                "/v1/macos/policies",
+                get(list_macos_policies::<MemoryBackend>),
+            )
+            .route(
+                "/v1/macos/software",
+                get(list_macos_software::<MemoryBackend>),
+            )
+            .route(
+                "/v1/macos/applied",
+                post(record_macos_applied::<MemoryBackend>),
+            )
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -680,8 +745,7 @@ mod tests {
         // enroll_user base64url-encodes the raw credential_id from the
         // attestation object, so the stored credential_id in the trust
         // graph is base64url(b"cred-assert-test"), not the raw string.
-        let cred_id_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(cred_id);
+        let cred_id_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred_id);
         let enroll_req = EnrollUserRequestJson {
             label: "bob".into(),
             credential_id: cred_id_b64.clone(),
@@ -846,7 +910,8 @@ mod tests {
         // Enroll two users.
         for (name, cred) in [("alice", "cred-a"), ("bob", "cred-b")] {
             let sk = SigningKey::generate(&mut OsRng);
-            let attestation = build_none_attestation("dds.local", cred.as_bytes(), &sk.verifying_key());
+            let attestation =
+                build_none_attestation("dds.local", cred.as_bytes(), &sk.verifying_key());
             let cred_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred.as_bytes());
             let enroll_req = EnrollUserRequestJson {
                 label: name.into(),
@@ -894,8 +959,8 @@ mod tests {
         use dds_core::token::{Token, TokenKind, TokenPayload};
         use dds_domain::{
             DomainDocument, Enforcement, InstallAction, PolicyScope, RegistryAction,
-            RegistryDirective, RegistryHive, RegistryValue, SoftwareAssignment, WindowsPolicyDocument,
-            WindowsSettings,
+            RegistryDirective, RegistryHive, RegistryValue, SoftwareAssignment,
+            WindowsPolicyDocument, WindowsSettings,
         };
 
         // Enroll the target device.
@@ -1001,6 +1066,117 @@ mod tests {
         device_urn
     }
 
+    /// Seed the test state with a macOS device join + a macOS policy and
+    /// software assignment that target it via the `mac-laptop` tag.
+    async fn seed_macos_state(state: &AppState<MemoryBackend>) -> String {
+        use crate::service::EnrollDeviceRequest;
+        use dds_core::token::{Token, TokenKind, TokenPayload};
+        use dds_domain::{
+            DomainDocument, Enforcement, InstallAction, MacOsPolicyDocument, MacOsSettings,
+            PolicyScope, PreferenceAction, PreferenceDirective, PreferenceScope,
+            SoftwareAssignment,
+        };
+        use serde_json::json;
+
+        let device_urn = {
+            let mut svc = state.svc.lock().await;
+            svc.set_verify_fido2(false);
+            svc.enroll_device(EnrollDeviceRequest {
+                label: "mac".into(),
+                device_id: "hw-mac-1".into(),
+                hostname: "mbp-1".into(),
+                os: "macOS".into(),
+                os_version: "15.4".into(),
+                tpm_ek_hash: None,
+                org_unit: Some("engineering".into()),
+                tags: vec!["mac-laptop".into()],
+            })
+            .unwrap()
+            .urn
+        };
+
+        let admin = Identity::generate("admin-mac", &mut OsRng);
+        let mut payload = TokenPayload {
+            iss: admin.id.to_urn(),
+            iss_key: admin.public_key.clone(),
+            jti: "mac-policy-baseline".into(),
+            sub: admin.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1_700_000_000,
+            exp: Some(4_102_444_800),
+            body_type: None,
+            body_cbor: None,
+        };
+        let policy = MacOsPolicyDocument {
+            policy_id: "security/screensaver".into(),
+            display_name: "Screensaver".into(),
+            version: 3,
+            enforcement: Enforcement::Audit,
+            scope: PolicyScope {
+                device_tags: vec!["mac-laptop".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            settings: vec![],
+            macos: Some(MacOsSettings {
+                preferences: vec![PreferenceDirective {
+                    domain: "com.apple.screensaver".into(),
+                    key: "idleTime".into(),
+                    value: Some(json!(600)),
+                    scope: PreferenceScope::System,
+                    action: PreferenceAction::Set,
+                }],
+                ..Default::default()
+            }),
+        };
+        policy.embed(&mut payload).unwrap();
+        let policy_token = Token::sign(payload, &admin.signing_key).unwrap();
+
+        let mut sw_payload = TokenPayload {
+            iss: admin.id.to_urn(),
+            iss_key: admin.public_key.clone(),
+            jti: "mac-sw-editor".into(),
+            sub: admin.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1_700_000_000,
+            exp: Some(4_102_444_800),
+            body_type: None,
+            body_cbor: None,
+        };
+        let pkg = SoftwareAssignment {
+            package_id: "com.example.maceditor".into(),
+            display_name: "Mac Editor".into(),
+            version: "2.1.0".into(),
+            source: "https://cdn.example.com/editor-2.1.0.pkg".into(),
+            sha256: "cafebabe".into(),
+            action: InstallAction::Install,
+            scope: PolicyScope {
+                device_tags: vec!["mac-laptop".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            silent: true,
+            pre_install_script: None,
+            post_install_script: None,
+        };
+        pkg.embed(&mut sw_payload).unwrap();
+        let sw_token = Token::sign(sw_payload, &admin.signing_key).unwrap();
+
+        let svc = state.svc.lock().await;
+        let mut g = svc.trust_graph.write().unwrap();
+        g.add_token(policy_token).unwrap();
+        g.add_token(sw_token).unwrap();
+        device_urn
+    }
+
     #[tokio::test]
     async fn test_windows_policies_endpoint_returns_typed_bundle() {
         let state = make_state();
@@ -1073,6 +1249,80 @@ mod tests {
             .unwrap();
         // 202 Accepted — the report is logged; persistent applier audit
         // is intentionally a v2 follow-up (see service.rs::record_applied).
+        assert_eq!(resp.status(), 202);
+    }
+
+    #[tokio::test]
+    async fn test_macos_policies_endpoint_returns_typed_bundle() {
+        let state = make_state();
+        let device_urn = seed_macos_state(&state).await;
+        let base = spawn_server(state).await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/v1/macos/policies"))
+            .query(&[("device_urn", &device_urn)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: MacOsPoliciesResponse = resp.json().await.unwrap();
+        assert_eq!(body.policies.len(), 1);
+        assert_eq!(body.policies[0].document.policy_id, "security/screensaver");
+        let bundle = body.policies[0].document.macos.as_ref().unwrap();
+        assert_eq!(bundle.preferences.len(), 1);
+        assert_eq!(bundle.preferences[0].domain, "com.apple.screensaver");
+    }
+
+    #[tokio::test]
+    async fn test_macos_software_endpoint_filters_by_scope() {
+        let state = make_state();
+        let device_urn = seed_macos_state(&state).await;
+        let base = spawn_server(state).await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/v1/macos/software"))
+            .query(&[("device_urn", &device_urn)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: MacOsSoftwareResponse = resp.json().await.unwrap();
+        assert_eq!(body.software.len(), 1);
+        assert_eq!(
+            body.software[0].document.package_id,
+            "com.example.maceditor"
+        );
+
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/v1/macos/software"))
+            .query(&[("device_urn", "urn:vouchsafe:nobody.zzz")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: MacOsSoftwareResponse = resp.json().await.unwrap();
+        assert_eq!(body.software.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_macos_applied_endpoint_accepts_report() {
+        let state = make_state();
+        let base = spawn_server(state).await;
+        let report = AppliedReport {
+            device_urn: "urn:vouchsafe:mac.xxx".into(),
+            target_id: "security/screensaver".into(),
+            version: "3".into(),
+            status: crate::service::AppliedStatus::Skipped,
+            directives: vec!["preference: com.apple.screensaver idleTime".into()],
+            error: None,
+            applied_at: 1_700_000_000,
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/macos/applied"))
+            .json(&report)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 202);
     }
 }

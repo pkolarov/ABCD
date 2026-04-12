@@ -13,8 +13,8 @@ use dds_core::policy::{PolicyEngine, PolicyRule};
 use dds_core::token::{Token, TokenKind, TokenPayload};
 use dds_core::trust::TrustGraph;
 use dds_domain::{
-    DeviceJoinDocument, DomainDocument, Enforcement, PolicyScope, SessionDocument,
-    SoftwareAssignment, UserAuthAttestation, WindowsPolicyDocument,
+    DeviceJoinDocument, DomainDocument, Enforcement, MacOsPolicyDocument, PolicyScope,
+    SessionDocument, SoftwareAssignment, UserAuthAttestation, WindowsPolicyDocument,
 };
 use dds_store::traits::*;
 use std::collections::BTreeSet;
@@ -114,15 +114,15 @@ pub struct PolicyResult {
 }
 
 // ----------------------------------------------------------------
-// Windows applier surface (Phase 3 items 9–10)
+// Platform applier surface (Windows + macOS)
 //
 // `LocalService` exposes scope-filtered lists of `WindowsPolicyDocument`
-// and `SoftwareAssignment` for the loopback HTTP API the off-process
-// `DdsPolicyAgent` consumes. The agent itself is .NET; we keep the
-// scope-matching logic on the Rust side so that policy decisions stay
-// in one place and so non-Windows nodes can still answer the query
-// (the agent runs on the same box, but a future MDM dashboard might
-// query this from a control-plane node).
+// / `MacOsPolicyDocument` and `SoftwareAssignment` for the loopback
+// HTTP API the off-process `DdsPolicyAgent` consumes. The agent itself
+// is .NET; we keep the scope-matching logic on the Rust side so that
+// policy decisions stay in one place and so non-platform nodes can
+// still answer the query (the agent runs on the same box, but a future
+// MDM dashboard might query this from a control-plane node).
 //
 // `record_applied` is the agent's report-back path; for v1 we log via
 // `tracing::info!` so the existing observability stack picks it up.
@@ -138,6 +138,15 @@ pub struct ApplicableWindowsPolicy {
     pub issuer: String,
     pub iat: u64,
     pub document: WindowsPolicyDocument,
+}
+
+/// One `MacOsPolicyDocument` packaged for the agent.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ApplicableMacOsPolicy {
+    pub jti: String,
+    pub issuer: String,
+    pub iat: u64,
+    pub document: MacOsPolicyDocument,
 }
 
 /// One `SoftwareAssignment` packaged for the agent.
@@ -328,8 +337,11 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
     ) -> Result<EnrollmentResult, ServiceError> {
         let mut credential_id = req.credential_id.clone();
         if self.verify_fido2 {
-            let parsed = dds_domain::fido2::verify_attestation(&req.attestation_object, &req.client_data_hash)
-                .map_err(|e| ServiceError::Fido2(e.to_string()))?;
+            let parsed = dds_domain::fido2::verify_attestation(
+                &req.attestation_object,
+                &req.client_data_hash,
+            )
+            .map_err(|e| ServiceError::Fido2(e.to_string()))?;
 
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
@@ -338,8 +350,8 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             if computed_rp_hash.as_slice() != parsed.rp_id_hash {
                 return Err(ServiceError::Fido2("rp_id hash mismatch".to_string()));
             }
-            credential_id = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(&parsed.credential_id);
+            credential_id =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&parsed.credential_id);
         }
         let user_ident = Identity::generate(&req.label, &mut rand::rngs::OsRng);
         let doc = UserAuthAttestation {
@@ -572,6 +584,50 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
         Ok(out)
     }
 
+    /// List every `MacOsPolicyDocument` whose scope matches the given
+    /// device URN. Skips revoked, burned, and `Disabled` documents.
+    /// Scope semantics are identical to
+    /// `list_applicable_windows_policies`.
+    pub fn list_applicable_macos_policies(
+        &self,
+        device_urn: &str,
+    ) -> Result<Vec<ApplicableMacOsPolicy>, ServiceError> {
+        let g = self
+            .trust_graph
+            .read()
+            .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+
+        let (device_tags, device_ou) = device_targeting_facts(&g, device_urn);
+
+        let mut out = Vec::new();
+        for token in g.attestations_iter() {
+            if g.is_revoked(&token.payload.jti) || g.is_burned(&token.payload.iss) {
+                continue;
+            }
+            let doc = match MacOsPolicyDocument::extract(&token.payload) {
+                Ok(Some(d)) => d,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(jti = %token.payload.jti, "macos policy decode failed: {e}");
+                    continue;
+                }
+            };
+            if matches!(doc.enforcement, Enforcement::Disabled) {
+                continue;
+            }
+            if !scope_matches(&doc.scope, device_urn, &device_tags, device_ou.as_deref()) {
+                continue;
+            }
+            out.push(ApplicableMacOsPolicy {
+                jti: token.payload.jti.clone(),
+                issuer: token.payload.iss.clone(),
+                iat: token.payload.iat,
+                document: doc,
+            });
+        }
+        Ok(out)
+    }
+
     /// List every `SoftwareAssignment` whose scope matches the given
     /// device URN. Skips revoked / burned tokens. Same scope rules as
     /// `list_applicable_windows_policies`. Phase 3 item 10.
@@ -647,7 +703,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
         &mut self,
         req: AssertionSessionRequest,
     ) -> Result<SessionResult, ServiceError> {
-        use dds_domain::fido2::{verify_assertion, cose_to_credential_public_key};
+        use dds_domain::fido2::{cose_to_credential_public_key, verify_assertion};
 
         // 1. Look up the credential's public key from the trust graph.
         //    We scan attestation tokens for a UserAuthAttestation whose
@@ -681,10 +737,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
                     let p = 37 + 16 + 2 + parsed.credential_id.len();
                     let cose_bytes = &auth_data[p..];
 
-                    found = Some((
-                        token.payload.sub.clone(),
-                        cose_bytes.to_vec(),
-                    ));
+                    found = Some((token.payload.sub.clone(), cose_bytes.to_vec()));
                     break;
                 }
             }
@@ -810,7 +863,6 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             body_cbor: None,
         }
     }
-
 }
 
 /// Service errors.
@@ -861,10 +913,7 @@ fn rand_u64() -> u64 {
 /// `DeviceJoinDocument` on this node, both come back empty/None — the
 /// device can still be targeted by `identity_urns` but not by tags or
 /// org units.
-fn device_targeting_facts(
-    g: &TrustGraph,
-    device_urn: &str,
-) -> (Vec<String>, Option<String>) {
+fn device_targeting_facts(g: &TrustGraph, device_urn: &str) -> (Vec<String>, Option<String>) {
     for token in g.attestations_iter() {
         if token.payload.iss != device_urn {
             continue;
@@ -887,9 +936,7 @@ fn scope_matches(
     device_tags: &[String],
     device_org_unit: Option<&str>,
 ) -> bool {
-    if scope.identity_urns.is_empty()
-        && scope.device_tags.is_empty()
-        && scope.org_units.is_empty()
+    if scope.identity_urns.is_empty() && scope.device_tags.is_empty() && scope.org_units.is_empty()
     {
         return true;
     }
@@ -912,16 +959,19 @@ fn scope_matches(
 }
 
 #[cfg(test)]
-mod windows_applier_tests {
+mod platform_applier_tests {
     use super::*;
     use dds_core::token::TokenPayload;
     use dds_domain::{
-        AccountAction, AccountDirective, DeviceJoinDocument, PasswordPolicy, PolicyScope,
-        RegistryAction, RegistryDirective, RegistryHive, RegistryValue, SoftwareAssignment,
-        WindowsPolicyDocument, WindowsSettings,
+        AccountAction, AccountDirective, DeviceJoinDocument, LaunchdAction, LaunchdDirective,
+        MacAccountAction, MacAccountDirective, MacOsPolicyDocument, MacOsSettings, PasswordPolicy,
+        PolicyScope, PreferenceAction, PreferenceDirective, PreferenceScope, ProfileAction,
+        ProfileDirective, RegistryAction, RegistryDirective, RegistryHive, RegistryValue,
+        SoftwareAssignment, WindowsPolicyDocument, WindowsSettings,
     };
     use dds_store::MemoryBackend;
     use rand::rngs::OsRng;
+    use serde_json::json;
     use std::sync::{Arc, RwLock};
 
     fn setup() -> (LocalService<MemoryBackend>, Identity, BTreeSet<String>) {
@@ -1006,6 +1056,27 @@ mod windows_applier_tests {
         }
     }
 
+    fn baseline_macos_policy(id: &str, scope: PolicyScope) -> MacOsPolicyDocument {
+        MacOsPolicyDocument {
+            policy_id: id.into(),
+            display_name: "macOS Test".into(),
+            version: 1,
+            enforcement: Enforcement::Enforce,
+            scope,
+            settings: vec![],
+            macos: Some(MacOsSettings {
+                preferences: vec![PreferenceDirective {
+                    domain: "com.apple.screensaver".into(),
+                    key: "idleTime".into(),
+                    value: Some(json!(600)),
+                    scope: PreferenceScope::System,
+                    action: PreferenceAction::Set,
+                }],
+                ..Default::default()
+            }),
+        }
+    }
+
     #[test]
     fn windows_policy_global_scope_matches_every_device() {
         let (mut svc, admin, _) = setup();
@@ -1019,11 +1090,7 @@ mod windows_applier_tests {
             },
         );
         let token = attest_with_body(&admin, "policy-global", &policy);
-        svc.trust_graph
-            .write()
-            .unwrap()
-            .add_token(token)
-            .unwrap();
+        svc.trust_graph.write().unwrap().add_token(token).unwrap();
 
         let hits = svc.list_applicable_windows_policies(&device_urn).unwrap();
         assert_eq!(hits.len(), 1);
@@ -1046,11 +1113,7 @@ mod windows_applier_tests {
             },
         );
         let token = attest_with_body(&admin, "policy-ws", &policy);
-        svc.trust_graph
-            .write()
-            .unwrap()
-            .add_token(token)
-            .unwrap();
+        svc.trust_graph.write().unwrap().add_token(token).unwrap();
 
         assert_eq!(
             svc.list_applicable_windows_policies(&dev_workstation)
@@ -1127,10 +1190,7 @@ mod windows_applier_tests {
             .add_token(attest_with_body(&admin, "p-dis", &policy))
             .unwrap();
 
-        assert_eq!(
-            svc.list_applicable_windows_policies(&dev).unwrap().len(),
-            0
-        );
+        assert_eq!(svc.list_applicable_windows_policies(&dev).unwrap().len(), 0);
     }
 
     #[test]
@@ -1230,10 +1290,7 @@ mod windows_applier_tests {
             .add_token(policy_token)
             .unwrap();
 
-        assert_eq!(
-            svc.list_applicable_windows_policies(&dev).unwrap().len(),
-            1
-        );
+        assert_eq!(svc.list_applicable_windows_policies(&dev).unwrap().len(), 1);
 
         // Revoke the policy: same issuer signs a Revoke targeting
         // the policy JTI. The trust graph drops it from the listing.
@@ -1260,10 +1317,7 @@ mod windows_applier_tests {
         .unwrap();
         svc.trust_graph.write().unwrap().add_token(revoke).unwrap();
 
-        assert_eq!(
-            svc.list_applicable_windows_policies(&dev).unwrap().len(),
-            0
-        );
+        assert_eq!(svc.list_applicable_windows_policies(&dev).unwrap().len(), 0);
     }
 
     #[test]
@@ -1312,7 +1366,98 @@ mod windows_applier_tests {
         assert_eq!(hits.len(), 1);
         let bundle = hits[0].document.windows.as_ref().unwrap();
         assert_eq!(bundle.local_accounts[0].username, "ddsadmin");
-        assert_eq!(bundle.password_policy.as_ref().unwrap().min_length, Some(14));
+        assert_eq!(
+            bundle.password_policy.as_ref().unwrap().min_length,
+            Some(14)
+        );
+    }
+
+    #[test]
+    fn macos_policy_tag_scope_matches_only_tagged_devices() {
+        let (mut svc, admin, _) = setup();
+        let dev_mac = enroll_device(&mut svc, "mac-1", vec!["mac-laptop".into()], None);
+        let dev_other = enroll_device(&mut svc, "win-1", vec!["workstation".into()], None);
+
+        let policy = baseline_macos_policy(
+            "p:mac-laptops",
+            PolicyScope {
+                device_tags: vec!["mac-laptop".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-mac", &policy))
+            .unwrap();
+
+        assert_eq!(
+            svc.list_applicable_macos_policies(&dev_mac).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            svc.list_applicable_macos_policies(&dev_other)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn typed_macos_settings_survive_listing_round_trip() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "mac-typed", vec!["mac-laptop".into()], None);
+
+        let policy = MacOsPolicyDocument {
+            policy_id: "p:mac-typed".into(),
+            display_name: "Typed macOS".into(),
+            version: 2,
+            enforcement: Enforcement::Audit,
+            scope: PolicyScope {
+                device_tags: vec!["mac-laptop".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            settings: vec![],
+            macos: Some(MacOsSettings {
+                local_accounts: vec![MacAccountDirective {
+                    username: "alice".into(),
+                    action: MacAccountAction::Create,
+                    full_name: Some("Alice Example".into()),
+                    shell: Some("/bin/zsh".into()),
+                    admin: Some(true),
+                    hidden: Some(false),
+                }],
+                launchd: vec![LaunchdDirective {
+                    label: "com.dds.agent".into(),
+                    plist_path: "/Library/LaunchDaemons/com.dds.agent.plist".into(),
+                    enabled: Some(true),
+                    action: LaunchdAction::Configure,
+                }],
+                profiles: vec![ProfileDirective {
+                    identifier: "com.dds.test".into(),
+                    display_name: "DDS Test".into(),
+                    payload_sha256: "sha256:test".into(),
+                    mobileconfig_b64: "SGVsbG8=".into(),
+                    action: ProfileAction::Install,
+                }],
+                ..Default::default()
+            }),
+        };
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-mac-typed", &policy))
+            .unwrap();
+
+        let hits = svc.list_applicable_macos_policies(&dev).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(matches!(hits[0].document.enforcement, Enforcement::Audit));
+        let bundle = hits[0].document.macos.as_ref().unwrap();
+        assert_eq!(bundle.local_accounts[0].username, "alice");
+        assert_eq!(bundle.launchd[0].label, "com.dds.agent");
+        assert_eq!(bundle.profiles[0].identifier, "com.dds.test");
     }
 
     // Silence the unused-import warning when only some helpers are

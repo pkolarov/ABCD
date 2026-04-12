@@ -17,8 +17,8 @@ use dds_node::http::{
 use dds_node::node::DdsNode;
 use dds_node::p2p_identity;
 use dds_node::service::{NodeStatus, PolicyResult};
-use dds_store::traits::TokenStore;
 use dds_store::RedbBackend;
+use dds_store::traits::TokenStore;
 use ed25519_dalek::SigningKey;
 use futures::StreamExt;
 use libp2p::{Multiaddr, PeerId, Swarm};
@@ -307,7 +307,11 @@ impl Publisher {
             }
         });
 
-        Self { _dir: dir, tx, task }
+        Self {
+            _dir: dir,
+            tx,
+            task,
+        }
     }
 
     fn publish_operation(&self, token: Token) {
@@ -328,7 +332,10 @@ impl Drop for Publisher {
 fn connect(swarm: &mut Swarm<dds_net::transport::DdsBehaviour>, peer_id: PeerId, addr: &str) {
     let addr: Multiaddr = addr.parse().unwrap();
     swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-    swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+    swarm
+        .behaviour_mut()
+        .kademlia
+        .add_address(&peer_id, addr.clone());
     swarm.dial(addr).unwrap();
 }
 
@@ -362,7 +369,10 @@ async fn wait_for_status(client: &Client, api_url: &str) -> NodeStatus {
                 return resp.json().await.unwrap();
             }
         }
-        assert!(Instant::now() < deadline, "timed out waiting for {api_url}/v1/status");
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {api_url}/v1/status"
+        );
         sleep(Duration::from_millis(200)).await;
     }
 }
@@ -399,7 +409,10 @@ async fn wait_for_session_success(
         if resp.status().is_success() {
             return resp.json().await.unwrap();
         }
-        assert!(Instant::now() < deadline, "timed out waiting for session success on {api_url}");
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for session success on {api_url}"
+        );
         sleep(Duration::from_millis(250)).await;
     }
 }
@@ -411,7 +424,10 @@ async fn wait_for_session_failure(client: &Client, api_url: &str, subject_urn: &
         if !resp.status().is_success() {
             return;
         }
-        assert!(Instant::now() < deadline, "timed out waiting for session failure on {api_url}");
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for session failure on {api_url}"
+        );
         sleep(Duration::from_millis(250)).await;
     }
 }
@@ -423,7 +439,13 @@ async fn binary_http_api_end_to_end() {
     let root = Identity::generate("root", &mut OsRng);
     let alice = Identity::generate("alice", &mut OsRng);
     let alice_attest = make_attest(&alice, "att-alice-http-e2e");
-    let alice_vouch = make_vouch(&root, &alice, &alice_attest, "repo:main", "vouch-alice-http-e2e");
+    let alice_vouch = make_vouch(
+        &root,
+        &alice,
+        &alice_attest,
+        "repo:main",
+        "vouch-alice-http-e2e",
+    );
 
     let fixture = write_node_fixture(
         "single-node",
@@ -451,7 +473,9 @@ async fn binary_http_api_end_to_end() {
     assert!(session_resp.status().is_success());
     let session: SessionResponse = session_resp.json().await.unwrap();
     let session_token = Token::from_cbor(&decode_b64(&session.token_cbor_b64)).unwrap();
-    let session_doc = SessionDocument::extract(&session_token.payload).unwrap().unwrap();
+    let session_doc = SessionDocument::extract(&session_token.payload)
+        .unwrap()
+        .unwrap();
     assert_eq!(session_doc.subject_urn, alice.id.to_urn());
     assert_eq!(session_doc.granted_purposes, vec!["repo:main"]);
     assert_eq!(session_doc.authorized_resources, vec!["repo:main"]);
@@ -488,12 +512,15 @@ async fn binary_http_api_end_to_end() {
     assert!(device_resp.status().is_success());
     let device: EnrollmentResponse = device_resp.json().await.unwrap();
     let device_token = Token::from_cbor(&decode_b64(&device.token_cbor_b64)).unwrap();
-    let device_doc = DeviceJoinDocument::extract(&device_token.payload).unwrap().unwrap();
+    let device_doc = DeviceJoinDocument::extract(&device_token.payload)
+        .unwrap()
+        .unwrap();
     assert_eq!(device_doc.device_id, "HW-123");
     assert_eq!(device_doc.hostname, "workstation-01");
 
     let cred_sk = SigningKey::generate(&mut OsRng);
-    let attestation = build_none_attestation("example.com", b"cred-http-e2e", &cred_sk.verifying_key());
+    let attestation =
+        build_none_attestation("example.com", b"cred-http-e2e", &cred_sk.verifying_key());
     let user_resp = client
         .post(format!("{}/v1/enroll/user", node.fixture.api_url))
         .json(&EnrollUserRequestJson {
@@ -511,7 +538,9 @@ async fn binary_http_api_end_to_end() {
     assert!(user_resp.status().is_success());
     let user: EnrollmentResponse = user_resp.json().await.unwrap();
     let user_token = Token::from_cbor(&decode_b64(&user.token_cbor_b64)).unwrap();
-    let user_doc = UserAuthAttestation::extract(&user_token.payload).unwrap().unwrap();
+    let user_doc = UserAuthAttestation::extract(&user_token.payload)
+        .unwrap()
+        .unwrap();
     assert_eq!(user_doc.rp_id, "example.com");
     assert_eq!(user_doc.credential_id, "Y3JlZC1odHRwLWUyZQ");
 
@@ -564,8 +593,10 @@ async fn binary_nodes_converge_on_gossip_and_revocation() {
     publisher.publish_operation(alice_attest);
     publisher.publish_operation(alice_vouch.clone());
 
-    let session_a = wait_for_session_success(&client, &node_a.fixture.api_url, &alice.id.to_urn()).await;
-    let session_b = wait_for_session_success(&client, &node_b.fixture.api_url, &alice.id.to_urn()).await;
+    let session_a =
+        wait_for_session_success(&client, &node_a.fixture.api_url, &alice.id.to_urn()).await;
+    let session_b =
+        wait_for_session_success(&client, &node_b.fixture.api_url, &alice.id.to_urn()).await;
     for session in [session_a, session_b] {
         let token = Token::from_cbor(&decode_b64(&session.token_cbor_b64)).unwrap();
         let doc = SessionDocument::extract(&token.payload).unwrap().unwrap();

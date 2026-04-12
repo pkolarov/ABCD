@@ -377,7 +377,11 @@ async fn handle_cp(action: CpAction, node_url: &str) {
                     }
                 }
                 Ok(r) => {
-                    eprintln!("Error: HTTP {} — {}", r.status(), r.text().await.unwrap_or_default());
+                    eprintln!(
+                        "Error: HTTP {} — {}",
+                        r.status(),
+                        r.text().await.unwrap_or_default()
+                    );
                     std::process::exit(1);
                 }
                 Err(e) => {
@@ -410,10 +414,17 @@ async fn handle_cp(action: CpAction, node_url: &str) {
                     println!("Session issued:");
                     println!("  session_id:  {}", session.session_id);
                     println!("  expires_at:  {}", session.expires_at);
-                    println!("  token (b64): {}...", &session.token_cbor_b64[..64.min(session.token_cbor_b64.len())]);
+                    println!(
+                        "  token (b64): {}...",
+                        &session.token_cbor_b64[..64.min(session.token_cbor_b64.len())]
+                    );
                 }
                 Ok(r) => {
-                    eprintln!("Error: HTTP {} — {}", r.status(), r.text().await.unwrap_or_default());
+                    eprintln!(
+                        "Error: HTTP {} — {}",
+                        r.status(),
+                        r.text().await.unwrap_or_default()
+                    );
                     std::process::exit(1);
                 }
                 Err(e) => {

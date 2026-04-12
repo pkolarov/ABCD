@@ -84,8 +84,8 @@ impl DomainId {
         let body = s
             .strip_prefix(DOMAIN_ID_PREFIX)
             .ok_or_else(|| DomainError::Parse(format!("missing '{DOMAIN_ID_PREFIX}' prefix")))?;
-        let bytes = base32::decode(B32, body)
-            .ok_or_else(|| DomainError::Parse("invalid base32".into()))?;
+        let bytes =
+            base32::decode(B32, body).ok_or_else(|| DomainError::Parse("invalid base32".into()))?;
         if bytes.len() != 32 {
             return Err(DomainError::Parse(format!(
                 "expected 32 bytes, got {}",
@@ -248,8 +248,7 @@ pub struct AdmissionCert {
 impl AdmissionCert {
     pub fn to_cbor(&self) -> Result<Vec<u8>, DomainError> {
         let mut buf = Vec::new();
-        ciborium::into_writer(self, &mut buf)
-            .map_err(|e| DomainError::Serialize(e.to_string()))?;
+        ciborium::into_writer(self, &mut buf).map_err(|e| DomainError::Serialize(e.to_string()))?;
         Ok(buf)
     }
 

@@ -39,10 +39,10 @@ zeroize = "1"
 base64 = "0.22"
 ed25519-dalek = { workspace = true, features = ["std"] }
 sha2.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
 tokio = { workspace = true, features = ["full", "test-util"] }
 ed25519-dalek = { workspace = true, features = ["std"] }
 criterion = { workspace = true }

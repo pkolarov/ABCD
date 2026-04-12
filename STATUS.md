@@ -1,7 +1,7 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](DDS-Design-Document.md).
-> Last updated: 2026-04-10 (Crayonic CP integration — Phases I–VI)
+> Last updated: 2026-04-11 (macOS two-machine e2e harness)
 
 ## Build Health
 
@@ -13,16 +13,25 @@
 | **Rust LOC** | 8,400 |
 | **Rust tests** | 229 |
 | **Python tests** | 13 |
-| **Total tests** | 276 ✅ all passing |
+| **Total tests** | 280 ✅ all passing |
 | **C++ native tests** | 34 (Windows) |
 | **Shared library** | libdds\_ffi.dylib (739 KB) |
+
+Verification note (2026-04-10):
+- `cargo test -p dds-domain` passed
+- `dotnet build` + `dotnet test` for `platform/macos/DdsPolicyAgent*` passed
+- macOS .NET suite is now `17/17` passing after swapping to host-backed backend implementations
+- targeted macOS `dds-node` unit/http paths passed as part of `cargo test -p dds-node`
+- `dds-node/tests/multinode.rs` is not currently green on this host: `dag_converges_after_partition` and `rejoined_node_catches_up_via_sync_protocol` still fail
+- `cargo build -p dds-node --bin dds-node --bin dds-macos-e2e` passed
+- `zsh -n platform/macos/e2e/*.sh` passed
 
 ## Crate Status
 
 | Crate | Design Ref | Status | Tests | Summary |
 |---|---|---|---|---|
 | **dds-core** | §3–§9 | 🟢 Done | 114 | Crypto, identity, tokens (extensible body), CRDTs, trust graph, policy engine |
-| **dds-domain** | §14 | 🟢 Done | 27 | 6 typed domain documents + Stage 1 domain identity + FIDO2 attestation+assertion (Ed25519 + P-256) |
+| **dds-domain** | §14 | 🟢 Done | 29 | 7 typed domain documents + Stage 1 domain identity + FIDO2 attestation+assertion (Ed25519 + P-256) |
 | **dds-store** | §6 | 🟢 Done | 15 | Storage traits, MemoryBackend, RedbBackend (ACID) |
 | **dds-net** | §5 | 🟢 Done | 19 | libp2p transport, gossipsub, Kademlia, mDNS, delta-sync |
 | **dds-node** | §12 | 🟢 Done | 18 | Config, P2P event loop, local authority service, HTTP API, encrypted persistent identity |
@@ -53,6 +62,7 @@
 | `UserAuthAttestation` | `dds:user-auth-attestation` | 2 | FIDO2/passkey user enrollment |
 | `DeviceJoinDocument` | `dds:device-join` | 2 | Device enrollment + TPM attestation |
 | `WindowsPolicyDocument` | `dds:windows-policy` | 1 | GPO-equivalent policy (scope, settings, enforcement) |
+| `MacOsPolicyDocument` | `dds:macos-policy` | 2 | macOS managed-device policy (preferences, accounts, launchd, profiles) |
 | `SoftwareAssignment` | `dds:software-assignment` | 1 | App/package deployment manifests |
 | `ServicePrincipalDocument` | `dds:service-principal` | 1 | Machine/service identity registration |
 | `SessionDocument` | `dds:session` | 2 | Short-lived auth session (< 1 ms local check) |
@@ -122,6 +132,14 @@ All documents implement `DomainDocument` trait: `embed()` / `extract()` from `To
 | **Windows** | C# | P/Invoke | `bindings/csharp/DDS.cs` | 11 NUnit | Written |
 | **Android** | Kotlin | JNA | `bindings/kotlin/.../DDS.kt` | 10 JUnit5 | Written |
 | **iOS/macOS** | Swift | C module | `bindings/swift/.../DDS.swift` | 10 XCTest | Written |
+
+### Managed Platform Agents
+
+| Platform | Path | Status | Verified | Notes |
+|---|---|---|---|---|
+| **Windows** | `platform/windows/` | 🟡 In progress | Mixed | Native credential provider + auth bridge + policy agent code present; Windows build/installer validation remains |
+| **macOS** | `platform/macos/` | 🟡 In progress | ✅ .NET build + 17 tests | `DdsPolicyAgent.MacOS` worker, localhost client, state store, launchd plist, host-backed preference/account/launchd/profile/software backends, and Rust `/v1/macos/*` API path landed |
+| **Linux** | `platform/linux/` | ⚪ Planned | n/a | Design-only at this point; no agent code in tree yet |
 
 ## Cryptography
 
@@ -200,7 +218,7 @@ All 7 crates are functionally complete. The following work is ordered by impact 
 
 ### Phase 1 — Production Hardening (high priority)
 
-1. 🟢 **HTTP/JSON-RPC API on dds-node** — `dds-node/src/http.rs` exposes `LocalService` over a localhost axum server. Endpoints: `POST /v1/enroll/user`, `POST /v1/enroll/device`, `POST /v1/session`, `POST /v1/session/assert` (assertion-based session), `GET /v1/enrolled-users` (CP tile enumeration), `POST /v1/policy/evaluate`, `GET /v1/status`, `GET /v1/windows/policies`, `GET /v1/windows/software`, `POST /v1/windows/applied`. JSON request/response types with serde, base64-encoded binary fields. 5 integration tests via reqwest against an in-process server.
+1. 🟢 **HTTP/JSON-RPC API on dds-node** — `dds-node/src/http.rs` exposes `LocalService` over a localhost axum server. Endpoints: `POST /v1/enroll/user`, `POST /v1/enroll/device`, `POST /v1/session`, `POST /v1/session/assert` (assertion-based session), `GET /v1/enrolled-users` (CP tile enumeration), `POST /v1/policy/evaluate`, `GET /v1/status`, `GET /v1/windows/policies`, `GET /v1/windows/software`, `POST /v1/windows/applied`, `GET /v1/macos/policies`, `GET /v1/macos/software`, `POST /v1/macos/applied`. JSON request/response types with serde, base64-encoded binary fields. reqwest integration tests cover both Windows and macOS applier endpoints against an in-process server.
 
 2. 🟢 **FIDO2 attestation + assertion verification** — `dds-domain/src/fido2.rs` parses WebAuthn attestation objects with `ciborium`, supports `none` and `packed` (Ed25519 self-attestation) formats, extracts the COSE_Key credential public key, and verifies the attestation signature. Now also verifies getAssertion responses (Ed25519 + ECDSA P-256) via `verify_assertion()`, with `cose_to_credential_public_key()` for multi-algorithm key parsing. `LocalService::enroll_user` rejects enrollment whose attestation fails to verify; `issue_session_from_assertion()` verifies assertion signatures against enrolled keys. 12 unit tests cover attestation round-trips, assertion verification (both algorithms), bad signatures, COSE key parsing.
 
@@ -243,6 +261,8 @@ All 7 crates are functionally complete. The following work is ordered by impact 
 11\. 🟢 **Audit log** — Append-only signed log of all trust graph mutations (attest, vouch, revoke, burn) for compliance. Each entry signed by the node that performed the action. Syncable via gossip. Opt-in feature enabled via `domain.toml` or `DomainConfig` during domain creation to minimize network overhead.
 
 12\. 🟢 **ECDSA-P256 support** — Some FIDO2 authenticators only support P-256. Added as a third `SchemeId` variant with triple-hybrid option `Ed25519+ECDSA-P256+ML-DSA-65`.
+
+13. **macOS managed-device platform** — First working slice landed on 2026-04-10. `dds-domain` now has `MacOsPolicyDocument`; `dds-node` exposes `/v1/macos/policies`, `/v1/macos/software`, and `/v1/macos/applied`; `platform/macos/DdsPolicyAgent` now builds and tests. Remaining work is listed in the macOS status section below.
 
 ### Windows Policy Applier Plan (Phase 3 items 9–10)
 
@@ -347,6 +367,34 @@ agent.
 
 A and B can land together (one Rust PR). C–F land per-enforcer. G+H land as
 the final shipping PR.
+
+### macOS Managed Device Status (2026-04-10)
+
+Completed:
+
+- `dds-domain` gained `MacOsPolicyDocument` (`dds:macos-policy`) plus typed `MacOsSettings` directives for preferences, local accounts, launchd jobs, and configuration profiles.
+- `dds-node/src/service.rs` now exposes `list_applicable_macos_policies()` using the same scope semantics as Windows policy distribution.
+- `dds-node/src/http.rs` now exposes `GET /v1/macos/policies`, `GET /v1/macos/software`, and `POST /v1/macos/applied`.
+- Rust tests were added for macOS document round-trip, service scope matching, typed-bundle round-trip, and HTTP endpoint coverage.
+- `platform/macos/DdsPolicyAgent/` landed as a .NET worker with config binding, `dds-node` HTTP client, applied-state persistence, worker poll loop, and a launchd plist template.
+- `Program.cs` now registers host-backed macOS backends by default through a shared command runner instead of the previous in-memory DI registrations.
+- Managed preferences now persist real plist state through `plutil`; launchd now persists label-to-plist bindings and drives `launchctl`; profiles now use `profiles`; software install/update now uses hash-checked package staging with `pkgutil` + `installer`; local account operations now target `dscl` / `pwpolicy` / `dseditgroup` / `sysadminctl`.
+- `platform/macos/README.md` and `platform/macos/appsettings.e2e.sample.json` now document a staged macOS end-to-end path with temp-rooted preferences/launchd/package cache directories.
+- `dds-node/src/bin/dds-macos-e2e.rs` now provides a real two-machine macOS harness: live policy/software publish into the DDS mesh, local summary collection, and merged result comparison.
+- `platform/macos/e2e/` now contains runbook and wrapper scripts for machine init, node config generation, package staging, device enrollment, agent startup, result collection, result comparison, and cleanup.
+- `platform/macos/DdsPolicyAgent.Tests/` now has 17 passing .NET tests covering state-store behavior, worker startup guardrails, in-memory enforcers, real plist round-trips, and command-backed launchd/profile/software flows.
+- `ABCD.sln` now includes the macOS policy-agent projects.
+
+Still TODO:
+
+- Run the new two-machine macOS harness on two real Macs and capture the first comparison artifact as a baseline.
+- Add a reproducible seeded `dds-node` fixture or smoke harness so the macOS agent e2e path can be run with one command instead of manual state seeding.
+- Validate real host behavior for the account and profile backends on a disposable macOS machine; those code paths are now implemented but still only covered by command-level tests.
+- Decide how to model safe package uninstall/remove recipes. Generic `.pkg` uninstall remains intentionally unsupported.
+- Implement `DdsLoginBridge` / Authorization Services integration for post-login privileged workflows. Full loginwindow / FileVault replacement is still explicitly out of scope.
+- Package the macOS agent as a signed/notarized `.pkg` and validate launchd installation, upgrade, and uninstall flows.
+- Decide whether Linux should share a common policy-agent core library with macOS/Windows or remain as three mostly separate worker implementations.
+- Investigate and stabilize the unrelated `dds-node` multinode failures (`dag_converges_after_partition`, `rejoined_node_catches_up_via_sync_protocol`) before claiming the whole node test matrix is green on this host.
 
 ## Path to Production
 

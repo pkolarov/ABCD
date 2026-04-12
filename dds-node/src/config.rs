@@ -128,7 +128,6 @@ fn default_false() -> bool {
     false
 }
 
-
 fn default_true() -> bool {
     true
 }

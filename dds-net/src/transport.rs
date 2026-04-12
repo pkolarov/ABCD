@@ -136,9 +136,10 @@ pub fn build_swarm(
 
             // mDNS (conditionally enabled)
             let mdns = if config.mdns_enabled {
-                libp2p::swarm::behaviour::toggle::Toggle::from(Some(
-                    mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?,
-                ))
+                libp2p::swarm::behaviour::toggle::Toggle::from(Some(mdns::tokio::Behaviour::new(
+                    mdns::Config::default(),
+                    peer_id,
+                )?))
             } else {
                 libp2p::swarm::behaviour::toggle::Toggle::from(None)
             };
@@ -182,7 +183,10 @@ pub fn build_swarm(
 /// libp2p identity. Convenience for tests only — production code should
 /// build the swarm with a persistent keypair so the `PeerId` is stable.
 pub fn build_default_swarm() -> Result<(Swarm<DdsBehaviour>, PeerId), Box<dyn std::error::Error>> {
-    build_swarm(SwarmConfig::default(), libp2p::identity::Keypair::generate_ed25519())
+    build_swarm(
+        SwarmConfig::default(),
+        libp2p::identity::Keypair::generate_ed25519(),
+    )
 }
 
 #[cfg(test)]

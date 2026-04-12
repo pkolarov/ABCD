@@ -336,7 +336,155 @@ impl DomainDocument for WindowsPolicyDocument {
 }
 
 // ============================================================
-// 4. SoftwareAssignment — app/package deployment manifest
+// 4. MacOsPolicyDocument — macOS managed-device policy
+// ============================================================
+
+/// A policy document distributed to managed macOS devices.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MacOsPolicyDocument {
+    /// Policy identifier (e.g. "security/screensaver").
+    pub policy_id: String,
+    /// Policy display name.
+    pub display_name: String,
+    /// Policy version (monotonically increasing).
+    pub version: u64,
+    /// Target scope: device tags, org units, or identity URNs.
+    pub scope: PolicyScope,
+    /// Free-form policy settings as key-value pairs. Forward-compatible
+    /// escape hatch for directives not yet represented in `macos`.
+    pub settings: Vec<PolicySetting>,
+    /// Enforcement mode.
+    pub enforcement: Enforcement,
+    /// Strongly-typed macOS-specific directives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos: Option<MacOsSettings>,
+}
+
+/// Strongly-typed macOS policy directives.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct MacOsSettings {
+    /// Managed preference writes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preferences: Vec<PreferenceDirective>,
+    /// Local account directives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_accounts: Vec<MacAccountDirective>,
+    /// launchd job directives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launchd: Vec<LaunchdDirective>,
+    /// Configuration profile directives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<ProfileDirective>,
+}
+
+/// Where a preference should be applied.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PreferenceScope {
+    /// System-wide managed preference.
+    System,
+    /// New-user template preference.
+    UserTemplate,
+}
+
+/// What to do with a managed preference.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PreferenceAction {
+    /// Create or overwrite the key.
+    Set,
+    /// Remove the key.
+    Delete,
+}
+
+/// One macOS managed preference directive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PreferenceDirective {
+    /// Preference domain, e.g. `com.apple.screensaver`.
+    pub domain: String,
+    /// Preference key inside the domain.
+    pub key: String,
+    /// Arbitrary JSON-compatible value. Required for `Set`, ignored for `Delete`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    /// Target preference scope.
+    pub scope: PreferenceScope,
+    /// Set or delete.
+    pub action: PreferenceAction,
+}
+
+/// What to do with a local macOS account.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MacAccountAction {
+    Create,
+    Delete,
+    Disable,
+    Enable,
+    Modify,
+}
+
+/// Local macOS account directive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MacAccountDirective {
+    pub username: String,
+    pub action: MacAccountAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<bool>,
+}
+
+/// What to do with a launchd job.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LaunchdAction {
+    Load,
+    Unload,
+    Kickstart,
+    Configure,
+}
+
+/// One launchd directive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LaunchdDirective {
+    /// launchd label (e.g. `com.dds.policyagent`).
+    pub label: String,
+    /// Path to the plist defining the job.
+    pub plist_path: String,
+    /// Desired enablement state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    pub action: LaunchdAction,
+}
+
+/// What to do with a configuration profile.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProfileAction {
+    Install,
+    Remove,
+}
+
+/// One configuration profile directive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProfileDirective {
+    /// Payload identifier, e.g. `com.example.screensaver`.
+    pub identifier: String,
+    /// Human-readable profile name.
+    pub display_name: String,
+    /// SHA-256 of the raw `.mobileconfig` payload.
+    pub payload_sha256: String,
+    /// Base64-encoded `.mobileconfig` bytes.
+    pub mobileconfig_b64: String,
+    pub action: ProfileAction,
+}
+
+impl DomainDocument for MacOsPolicyDocument {
+    const BODY_TYPE: &'static str = body_types::MACOS_POLICY;
+}
+
+// ============================================================
+// 5. SoftwareAssignment — app/package deployment manifest
 // ============================================================
 
 /// A software package assignment for managed devices.
@@ -376,7 +524,7 @@ impl DomainDocument for SoftwareAssignment {
 }
 
 // ============================================================
-// 5. ServicePrincipalDocument — machine/service identity
+// 6. ServicePrincipalDocument — machine/service identity
 // ============================================================
 
 /// A service principal (machine identity) registration.
@@ -406,7 +554,7 @@ impl DomainDocument for ServicePrincipalDocument {
 }
 
 // ============================================================
-// 6. SessionDocument — short-lived auth session
+// 7. SessionDocument — short-lived auth session
 // ============================================================
 
 /// A short-lived session token for < 1ms local validation.
@@ -436,4 +584,91 @@ pub struct SessionDocument {
 
 impl DomainDocument for SessionDocument {
     const BODY_TYPE: &'static str = body_types::SESSION;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DomainDocument;
+    use dds_core::token::TokenPayload;
+    use serde_json::json;
+
+    fn empty_payload() -> TokenPayload {
+        TokenPayload {
+            iss: "urn:vouchsafe:test.abc".into(),
+            iss_key: dds_core::crypto::PublicKeyBundle {
+                scheme: dds_core::crypto::SchemeId::Ed25519,
+                bytes: vec![0u8; 32],
+            },
+            jti: "test-jti".into(),
+            sub: "urn:vouchsafe:test.abc".into(),
+            kind: dds_core::token::TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1,
+            exp: Some(2),
+            body_type: None,
+            body_cbor: None,
+        }
+    }
+
+    #[test]
+    fn macos_policy_embed_extract_round_trip() {
+        let doc = MacOsPolicyDocument {
+            policy_id: "security/screensaver".into(),
+            display_name: "Screensaver".into(),
+            version: 7,
+            scope: PolicyScope {
+                device_tags: vec!["mac-laptop".into()],
+                org_units: vec!["engineering".into()],
+                identity_urns: vec![],
+            },
+            settings: vec![],
+            enforcement: Enforcement::Audit,
+            macos: Some(MacOsSettings {
+                preferences: vec![PreferenceDirective {
+                    domain: "com.apple.screensaver".into(),
+                    key: "idleTime".into(),
+                    value: Some(json!(600)),
+                    scope: PreferenceScope::System,
+                    action: PreferenceAction::Set,
+                }],
+                launchd: vec![LaunchdDirective {
+                    label: "com.dds.policyagent".into(),
+                    plist_path: "/Library/LaunchDaemons/com.dds.policyagent.plist".into(),
+                    enabled: Some(true),
+                    action: LaunchdAction::Configure,
+                }],
+                ..Default::default()
+            }),
+        };
+
+        let mut payload = empty_payload();
+        doc.embed(&mut payload).unwrap();
+
+        let extracted = MacOsPolicyDocument::extract(&payload).unwrap().unwrap();
+        assert_eq!(extracted, doc);
+    }
+
+    #[test]
+    fn macos_policy_extract_returns_none_for_other_body_type() {
+        let doc = WindowsPolicyDocument {
+            policy_id: "win".into(),
+            display_name: "Windows".into(),
+            version: 1,
+            scope: PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            settings: vec![],
+            enforcement: Enforcement::Enforce,
+            windows: None,
+        };
+        let mut payload = empty_payload();
+        doc.embed(&mut payload).unwrap();
+        assert!(MacOsPolicyDocument::extract(&payload).unwrap().is_none());
+    }
 }

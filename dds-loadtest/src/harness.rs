@@ -561,11 +561,7 @@ fn do_enroll_user(
                     // the store no longer drives per-query rebuilds.
                     use dds_store::traits::TokenStore;
                     let _ = svc.store_mut().put_token(&vouch);
-                    let _ = svc
-                        .trust_graph_handle()
-                        .write()
-                        .unwrap()
-                        .add_token(vouch);
+                    let _ = svc.trust_graph_handle().write().unwrap().add_token(vouch);
                 }
                 Err(e) => warn!("vouch sign failed: {e}"),
             }
@@ -782,11 +778,7 @@ fn publish_probe(
             let _ = n0.swarm.behaviour_mut().gossipsub.publish(topic, cbor);
         }
         // Mirror locally on publisher.
-        let _ = n0
-            .trust_graph
-            .write()
-            .unwrap()
-            .add_token(token.clone());
+        let _ = n0.trust_graph.write().unwrap().add_token(token.clone());
         probes.push(Probe {
             op_id: jti,
             publish_at,
@@ -814,11 +806,7 @@ fn publish_probe(
             let topic = n0.topics.operations.to_ident_topic();
             let _ = n0.swarm.behaviour_mut().gossipsub.publish(topic, cbor);
         }
-        let _ = n0
-            .trust_graph
-            .write()
-            .unwrap()
-            .add_token(token.clone());
+        let _ = n0.trust_graph.write().unwrap().add_token(token.clone());
         use dds_store::traits::TokenStore;
         let _ = n0.store.put_token(&token);
         let _ = n0.dag.insert(op.clone());
@@ -1051,8 +1039,7 @@ fn chaos_step(nodes: &mut [DdsNode], chaos: &mut ChaosState) {
     if n < 3 {
         return; // pointless with fewer than 3 nodes (need quorum)
     }
-    let max_offline =
-        ((n as f64) * chaos.max_fraction).floor() as usize;
+    let max_offline = ((n as f64) * chaos.max_fraction).floor() as usize;
     let max_offline = max_offline.max(1).min(n.saturating_sub(2));
     if chaos.offline_count() >= max_offline {
         return;
@@ -1068,8 +1055,7 @@ fn chaos_step(nodes: &mut [DdsNode], chaos: &mut ChaosState) {
 
 /// Pause a node: disconnect from peers, mark offline, schedule rejoin.
 fn pause_node(nodes: &mut [DdsNode], chaos: &mut ChaosState, idx: usize) {
-    let connected: Vec<libp2p::PeerId> =
-        nodes[idx].swarm.connected_peers().copied().collect();
+    let connected: Vec<libp2p::PeerId> = nodes[idx].swarm.connected_peers().copied().collect();
     let mut closed = 0usize;
     for pid in connected {
         if nodes[idx].swarm.disconnect_peer_id(pid).is_ok() {
@@ -1115,11 +1101,7 @@ fn chaos_check_rejoins(nodes: &mut [DdsNode], chaos: &mut ChaosState, metrics: &
     //    been seen is closed and recorded.
     let mut converged: Vec<usize> = Vec::new();
     for (slot, p) in chaos.pending_rejoins.iter().enumerate() {
-        let cur = nodes[p.node_idx]
-            .trust_graph
-            .read()
-            .unwrap()
-            .token_count();
+        let cur = nodes[p.node_idx].trust_graph.read().unwrap().token_count();
         if cur >= p.target_tokens {
             metrics.record("rejoin_convergence", p.rejoined_at.elapsed(), true);
             info!(

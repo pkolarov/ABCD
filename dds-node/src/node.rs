@@ -8,9 +8,7 @@ use dds_core::crdt::causal_dag::{CausalDag, Operation};
 use dds_core::token::Token;
 use dds_core::trust::TrustGraph;
 use dds_net::gossip::{DdsTopic, DdsTopicSet, GossipMessage};
-use dds_net::sync::{
-    SyncPayload, SyncRequest, SyncResponse, apply_sync_payloads_with_graph,
-};
+use dds_net::sync::{SyncPayload, SyncRequest, SyncResponse, apply_sync_payloads_with_graph};
 use dds_net::transport::{DdsBehaviour, DdsBehaviourEvent, SwarmConfig};
 use dds_store::RedbBackend;
 use dds_store::traits::*;
@@ -145,8 +143,10 @@ impl DdsNode {
         self.swarm.listen_on(listen_addr)?;
 
         // Subscribe to org topics
-        self.topics
-            .subscribe_all(&mut self.swarm.behaviour_mut().gossipsub, self.config.domain.audit_log_enabled)?;
+        self.topics.subscribe_all(
+            &mut self.swarm.behaviour_mut().gossipsub,
+            self.config.domain.audit_log_enabled,
+        )?;
 
         // Add bootstrap peers
         for addr_str in &self.config.network.bootstrap_peers {
@@ -177,9 +177,8 @@ impl DdsNode {
     /// sweeps, and periodic anti-entropy sync against connected peers.
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let interval_secs = self.config.expiry_scan_interval_secs;
-        let mut expiry_interval = tokio::time::interval(
-            std::time::Duration::from_secs(interval_secs),
-        );
+        let mut expiry_interval =
+            tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         // The first tick completes immediately; consume it.
         expiry_interval.tick().await;
 
@@ -510,16 +509,11 @@ impl DdsNode {
     }
 
     /// Handle one libp2p `request_response` event for the sync protocol.
-    fn handle_sync_event(
-        &mut self,
-        event: RrEvent<SyncRequest, SyncResponse>,
-    ) {
+    fn handle_sync_event(&mut self, event: RrEvent<SyncRequest, SyncResponse>) {
         match event {
             RrEvent::Message { peer, message, .. } => match message {
                 RrMessage::Request {
-                    request,
-                    channel,
-                    ..
+                    request, channel, ..
                 } => {
                     let response = self.build_sync_response(&request);
                     let payload_count = response.payloads.len();
@@ -579,12 +573,6 @@ impl DdsNode {
         policy_engine: &dds_core::policy::PolicyEngine,
     ) -> dds_core::policy::PolicyDecision {
         let g = self.trust_graph.read().expect("trust_graph poisoned");
-        policy_engine.evaluate(
-            subject_urn,
-            resource,
-            action,
-            &g,
-            &self.trusted_roots,
-        )
+        policy_engine.evaluate(subject_urn, resource, action, &g, &self.trusted_roots)
     }
 }

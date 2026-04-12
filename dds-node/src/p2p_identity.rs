@@ -193,7 +193,9 @@ mod tests {
 
     #[test]
     fn plain_roundtrip_stable_peer_id() {
-        let _g = PASSPHRASE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = PASSPHRASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::remove_var(PASSPHRASE_ENV) };
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("p2p_key.bin");
@@ -206,7 +208,9 @@ mod tests {
 
     #[test]
     fn encrypted_roundtrip() {
-        let _g = PASSPHRASE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = PASSPHRASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::set_var(PASSPHRASE_ENV, "passphrase-x") };
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("p2p_key.bin");

@@ -37,7 +37,12 @@ impl TripleHybridEdEcdsaMldsa65 {
     pub fn public_key_bundle(&self) -> PublicKeyBundle {
         let mut bytes = Vec::with_capacity(ED25519_PK_LEN + P256_PK_LEN + MLDSA65_PK_LEN);
         bytes.extend_from_slice(&self.ed_key.verifying_key().to_bytes());
-        bytes.extend_from_slice(self.p256_key.verifying_key().to_encoded_point(false).as_bytes());
+        bytes.extend_from_slice(
+            self.p256_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
         bytes.extend_from_slice(self.pq_pk.as_bytes());
         PublicKeyBundle {
             scheme: SchemeId::TripleHybridEdEcdsaMldsa65,
@@ -83,7 +88,8 @@ pub fn verify_triple_hybrid(
     super::classical::verify_ed25519(ed_pk_bytes, message, ed_sig_bytes)?;
     super::ecdsa::verify_ecdsa_p256(p256_pk_bytes, message, p256_sig_bytes)?;
 
-    let pq_pk = mldsa65::PublicKey::from_bytes(pq_pk_bytes).map_err(|_| CryptoError::InvalidPublicKey)?;
+    let pq_pk =
+        mldsa65::PublicKey::from_bytes(pq_pk_bytes).map_err(|_| CryptoError::InvalidPublicKey)?;
     let pq_sig = mldsa65::DetachedSignature::from_bytes(pq_sig_bytes)
         .map_err(|_| CryptoError::InvalidSignature)?;
     mldsa65::verify_detached_signature(&pq_sig, message, &pq_pk)

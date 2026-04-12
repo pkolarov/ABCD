@@ -327,9 +327,7 @@ pub fn apply_sync_payloads_with_graph(
         if let Err(e) = trust_graph.add_token(token.clone()) {
             // Duplicate or replay — log but don't bail; we still want
             // to apply revocations/burns and the DAG insert.
-            result
-                .errors
-                .push(format!("trust graph add: {e}"));
+            result.errors.push(format!("trust graph add: {e}"));
         }
 
         // Apply revocation / burn side effects on the store.
