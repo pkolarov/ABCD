@@ -228,14 +228,15 @@ GetAssertionResult CWebAuthnHelper::GetAssertionHmacSecret(
     allowList.cCredentials = 1;
     allowList.pCredentials = &allowCred;
 
-    // hmac-secret extension with salt
+    // hmac-secret salt via the dedicated pHmacSecretSaltValues field
+    // (available from OPTIONS_VERSION_6+, current SDK is v9).
     WEBAUTHN_HMAC_SECRET_SALT hmacSalt = {};
     hmacSalt.cbFirst = (DWORD)salt.size();
     hmacSalt.pbFirst = const_cast<PBYTE>(salt.data());
 
     WEBAUTHN_CRED_WITH_HMAC_SECRET_SALT credSalt = {};
-    credSalt.cbCredId = (DWORD)credentialId.size();
-    credSalt.pbCredId = const_cast<PBYTE>(credentialId.data());
+    credSalt.cbCredID = (DWORD)credentialId.size();
+    credSalt.pbCredID = const_cast<PBYTE>(credentialId.data());
     credSalt.pHmacSecretSalt = &hmacSalt;
 
     WEBAUTHN_HMAC_SECRET_SALT_VALUES saltValues = {};
@@ -243,19 +244,13 @@ GetAssertionResult CWebAuthnHelper::GetAssertionHmacSecret(
     saltValues.cCredWithHmacSecretSaltList = 1;
     saltValues.pCredWithHmacSecretSaltList = &credSalt;
 
-    WEBAUTHN_EXTENSION hmacExt = {};
-    hmacExt.pwszExtensionIdentifier = WEBAUTHN_EXTENSIONS_IDENTIFIER_HMAC_SECRET;
-    hmacExt.cbExtension = sizeof(saltValues);
-    hmacExt.pvExtension = &saltValues;
-
     // Options
     WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS options = {};
     options.dwVersion = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_CURRENT_VERSION;
     options.dwTimeoutMilliseconds = 60000;
     options.CredentialList = allowList;
     options.dwUserVerificationRequirement = WEBAUTHN_USER_VERIFICATION_REQUIREMENT_DISCOURAGED;
-    options.Extensions.cExtensions = 1;
-    options.Extensions.pExtensions = &hmacExt;
+    options.pHmacSecretSaltValues = &saltValues;
 
     PWEBAUTHN_ASSERTION pAssertion = nullptr;
     HRESULT hr = WebAuthNAuthenticatorGetAssertion(

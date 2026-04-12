@@ -12,6 +12,7 @@
 #include "DdsAuthBridgeMain.h"
 #include "EventLogger.h"
 #include "FileLog.h"
+#include <ctime>
 #include <string.h>
 #include <lm.h>          // NetGetJoinInformation
 #include <sddl.h>        // ConvertStringSidToSidW
