@@ -83,11 +83,14 @@ pub struct AdminVouchResult {
 }
 
 /// Enrolled user info for CP tile enumeration.
+///
+/// `credential_id` is intentionally omitted from the public response
+/// to avoid leaking credential identifiers to any local process.
+/// The CP obtains the credential_id from the WebAuthn API directly.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EnrolledUser {
     pub subject_urn: String,
     pub display_name: String,
-    pub credential_id: String,
     #[serde(default)]
     pub vouched: bool,
 }
@@ -425,10 +428,45 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
     }
 
     /// Enroll a device.
+    ///
+    /// **Security note**: tags and org_unit are self-attested by the
+    /// enrolling device. They are used for policy scope matching. A
+    /// future version should require admin-signed device enrollment
+    /// to prevent a rogue local process from claiming privileged tags.
     pub fn enroll_device(
         &mut self,
         req: EnrollDeviceRequest,
     ) -> Result<EnrollmentResult, ServiceError> {
+        // Validate tags: reject empty, overly long, or control-char tags.
+        for tag in &req.tags {
+            if tag.is_empty() || tag.len() > 128 || tag.chars().any(|c| c.is_control()) {
+                return Err(ServiceError::Domain(format!(
+                    "invalid tag: must be 1-128 printable characters, got {:?}",
+                    tag
+                )));
+            }
+        }
+        if req.tags.len() > 32 {
+            return Err(ServiceError::Domain(
+                "too many tags: maximum 32".to_string(),
+            ));
+        }
+        if let Some(ref ou) = req.org_unit {
+            if ou.is_empty() || ou.len() > 128 || ou.chars().any(|c| c.is_control()) {
+                return Err(ServiceError::Domain(format!(
+                    "invalid org_unit: must be 1-128 printable characters, got {:?}",
+                    ou
+                )));
+            }
+        }
+
+        tracing::info!(
+            label = %req.label,
+            tags = ?req.tags,
+            org_unit = ?req.org_unit,
+            "enrolling device (tags/org_unit are self-attested)"
+        );
+
         let device_ident = Identity::generate(&req.label, &mut rand::rngs::OsRng);
         let doc = DeviceJoinDocument {
             device_id: req.device_id,
@@ -496,7 +534,9 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             .collect();
 
         let session_id = format!("sess-{:016x}", rand_u64());
-        let expires_at = now_epoch() + req.duration_secs;
+        // Cap session lifetime to 24 hours to limit blast radius of stolen tokens.
+        let capped_duration = req.duration_secs.min(86400);
+        let expires_at = now_epoch() + capped_duration;
 
         let doc = SessionDocument {
             session_id: session_id.clone(),
@@ -505,7 +545,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             granted_purposes: granted.into_iter().collect(),
             authorized_resources,
             session_start: now_epoch(),
-            duration_secs: req.duration_secs,
+            duration_secs: capped_duration,
             mfa_verified: req.mfa_verified,
             tls_binding: req.tls_binding,
         };
@@ -789,8 +829,8 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             (sub, pk)
         };
 
-        // 2. Verify the assertion signature.
-        let _parsed = verify_assertion(
+        // 2. Verify the assertion signature and enforce WebAuthn flags.
+        let parsed = verify_assertion(
             &req.authenticator_data,
             &req.client_data_hash,
             &req.signature,
@@ -798,17 +838,25 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
         )
         .map_err(|e| ServiceError::Fido2(e.to_string()))?;
 
-        // 3. Check rpIdHash matches expected rp_id (if provided).
-        // (The caller passes the rp_id embedded in authenticator_data;
-        //  we just verify the signature is valid against the enrolled key.)
+        // Enforce user-presence (UP) flag — authenticator must confirm
+        // the user is physically present (touch / biometric).
+        if !parsed.user_present {
+            return Err(ServiceError::Fido2(
+                "assertion failed: user_present (UP) flag not set".into(),
+            ));
+        }
 
-        // 4. Issue a session using the enrolled subject URN.
+        // 3. Issue a session bound to the enrolled subject URN.
+        //    The caller's subject_urn is IGNORED — the session is always
+        //    issued for the identity that owns the verified credential.
+        //    mfa_verified reflects the actual user_verified (UV) flag
+        //    from the authenticator, not a caller-supplied claim.
         let session_req = SessionRequest {
-            subject_urn: req.subject_urn.unwrap_or(subject_urn),
+            subject_urn,
             device_urn: None,
             requested_resources: vec![],
-            duration_secs: req.duration_secs.unwrap_or(3600),
-            mfa_verified: true,
+            duration_secs: req.duration_secs.unwrap_or(3600).min(86400),
+            mfa_verified: parsed.user_verified,
             tls_binding: None,
         };
         self.issue_session(session_req)
@@ -838,7 +886,6 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             users.push(EnrolledUser {
                 subject_urn: token.payload.sub.clone(),
                 display_name: doc.user_display_name.clone(),
-                credential_id: doc.credential_id.clone(),
                 vouched,
             });
         }

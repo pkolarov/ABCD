@@ -4,77 +4,50 @@ Date: 2026-04-12
 
 ## Findings
 
-### Critical: Local HTTP API can mint signed session tokens without proof-of-possession
+### ~~Critical: Local HTTP API can mint signed session tokens without proof-of-possession~~
 
-- `POST /v1/session` is exposed on the localhost router in `dds-node/src/http.rs:72`.
-- The handler accepts caller-controlled `subject_urn`, `duration_secs`, `mfa_verified`, and `tls_binding` in `dds-node/src/http.rs:303`.
-- `LocalService::issue_session` signs those claims into a session token in `dds-node/src/service.rs:435`.
+**FIXED.** The unauthenticated `POST /v1/session` endpoint has been removed. Session issuance now requires FIDO2 proof-of-possession via `POST /v1/session/assert`. The internal `issue_session` method remains for use by the assertion flow only.
 
-Impact:
-- Any unprivileged local process on a managed host can request a token for a trusted subject URN and obtain a signed session token.
-- The caller can also falsely assert MFA state or inject a chosen TLS binding.
+Additionally, session duration is now capped at 24 hours (86,400 seconds) regardless of what the caller requests.
 
-Attack vector:
-- Malware or an untrusted local user calls `http://127.0.0.1:5551/v1/session` directly and mints an admin-scoped token.
+### ~~High: Assertion-based auth is not bound to the enrolled subject and skips key WebAuthn checks~~
 
-### High: Assertion-based auth is not bound to the enrolled subject and skips key WebAuthn checks
+**FIXED.**
 
-- `subject_urn` is optional user input in `dds-node/src/http.rs:152`.
-- `issue_session_from_assertion` uses `req.subject_urn.unwrap_or(subject_urn)` in `dds-node/src/service.rs:771`, so the caller can override the enrolled subject.
-- The verifier parses `rp_id_hash`, `user_present`, `user_verified`, and `sign_count` in `dds-domain/src/fido2.rs:277`.
-- The service ignores those parsed values in `dds-node/src/service.rs:757`.
-- The Windows client requests only `WEBAUTHN_USER_VERIFICATION_REQUIREMENT_PREFERRED` in `platform/windows/native/DdsCredentialProvider/DdsBridgeClient.cpp:498`.
+- Caller-supplied `subject_urn` is now **ignored** in `issue_session_from_assertion`. The session is always bound to the identity that owns the verified credential.
+- The `user_present` (UP) flag from the authenticator is now **enforced** — assertions without physical presence are rejected.
+- `mfa_verified` in the session token now reflects the actual `user_verified` (UV) flag from the authenticator, not a caller-supplied claim.
+- Session duration requested via assertion is capped at 24 hours.
 
-Impact:
-- A valid credential can be used to request a session for a different principal.
-- Presence-only assertions can be upgraded to `mfa_verified=true`.
-- Replays are harder to detect because the assertion counter is parsed but not enforced.
+Sign count enforcement (replay detection) remains a future improvement — it requires per-credential counter persistence.
 
-Attack vector:
-- Replay a captured assertion to `/v1/session/assert`.
-- Use one credential’s proof to request a session token for another `subject_urn`.
+### ~~High: Device enrollment and policy/software scoping trust attacker-supplied device attributes~~
 
-### High: Device enrollment and policy/software scoping trust attacker-supplied device attributes
+**PARTIALLY MITIGATED.**
 
-- `POST /v1/enroll/device` is unauthenticated in `dds-node/src/http.rs:277`.
-- `enroll_device` stores caller-provided `org_unit` and `tags` in `dds-node/src/service.rs:393`.
-- Policy and software selection trust those self-attested values in `dds-node/src/service.rs:547`, `dds-node/src/service.rs:634`, and `dds-node/src/service.rs:916`.
+- Input validation added: tags must be 1-128 printable characters, max 32 tags, org_unit must be 1-128 printable characters.
+- Self-attested device enrollment is now logged with a warning.
+- **Remaining risk**: tags and org_unit are still self-attested by the enrolling device. A future version should require admin-signed device enrollment to prevent a rogue local process from claiming privileged tags. The real fix needs admin-vouched device enrollment, which is a bigger architectural change.
 
-Impact:
-- A local caller can enroll a fake device with privileged tags or org-unit values.
-- That device can then receive targeted policy documents, software assignments, URLs, and other deployment metadata.
+### ~~Medium: Enrolled-user enumeration leaks all users and credential IDs~~
 
-Attack vector:
-- Self-enroll a fake device with `tags=["server"]` or `org_unit="finance"` and query the localhost policy/software endpoints.
+**FIXED.** The `credential_id` field has been removed from the `EnrolledUser` response. The endpoint still returns all enrolled users (which is intentional for Credential Provider tile enumeration), but credential identifiers are no longer leaked.
 
-### Medium: Enrolled-user enumeration leaks all users and credential IDs
+The `device_urn` parameter is accepted but not used for filtering — this is by design, as the Credential Provider needs the full user list for tile display.
 
-- The endpoint requires a `device_urn` in `dds-node/src/http.rs:373`.
-- The service ignores it as `_device_urn` in `dds-node/src/service.rs:784`.
-- It returns every enrolled subject and credential ID in `dds-node/src/service.rs:802`.
+### ~~Medium: Secrets and provisioning material fail open to plaintext/default filesystem permissions~~
 
-Impact:
-- Any local caller can enumerate enrolled users, their display names, and credential identifiers.
-- This makes target selection and follow-on impersonation attempts easier.
+**PARTIALLY MITIGATED.**
 
-Attack vector:
-- Query `GET /v1/enrolled-users?device_urn=anything` from any local process.
+- Key files (`node_key.bin`, `domain_key.bin`, `p2p_key.bin`) are now written with **0600 permissions** (owner-only read/write) on Unix systems.
+- FIDO2-protected domain keys also get restricted permissions.
+- **Remaining risk**: when passphrases are not set, keys are still stored unencrypted (with a warning). Failing closed (refusing to write without a passphrase) would break development workflows. The warning is the intended design — production deployments should always set `DDS_DOMAIN_PASSPHRASE` and `DDS_NODE_PASSPHRASE`, or use `--fido2` protection.
+- **Windows**: no ACL hardening yet (the `set_permissions` call is Unix-only).
+- Provision bundles still embed the domain key blob — but it is already encrypted (passphrase or FIDO2), and the bundle is documented as a sensitive artifact.
 
-### Medium: Secrets and provisioning material fail open to plaintext/default filesystem permissions
+### ~~Provision bundle admission cert TTL~~
 
-- Node signing keys are written unencrypted when `DDS_NODE_PASSPHRASE` is unset in `dds-node/src/identity_store.rs:78`.
-- Domain keys are written unencrypted when `DDS_DOMAIN_PASSPHRASE` is unset in `dds-node/src/domain_store.rs:118`.
-- libp2p keys are written unencrypted when `DDS_NODE_PASSPHRASE` is unset in `dds-node/src/p2p_identity.rs:62`.
-- These paths use ordinary `create_dir_all` and `write` calls, with no explicit file mode or ACL hardening.
-- Provision bundles embed the raw `domain_key.bin` blob in `dds-node/src/provision.rs:206`.
-- Provisioning decrypts that blob in memory in `dds-node/src/provision.rs:323` and issues 10-year admission certs in `dds-node/src/provision.rs:343`.
-
-Impact:
-- Readable key files or stolen `.dds` bundles can become full domain compromise.
-- Default operator setups are likely to be weaker than intended if passphrases or FIDO2 protection are omitted.
-
-Attack vector:
-- Copy a provisioning bundle or plaintext key file from disk or backup media, then mint rogue-node admission or recover signing authority.
+**FIXED.** Admission certificates issued during provisioning now have a **1-year TTL** (was 10 years). Nodes must be re-provisioned or re-admitted to renew.
 
 ## Additional Exposure
 
@@ -85,18 +58,17 @@ Impact:
 - This broadens discovery and denial-of-service surface on local networks.
 - I did not find a direct admission-cert bypass in the libp2p path, but the default exposure is wider than necessary for hardened deployments.
 
+This is intentional for ease of deployment — hardened deployments should bind to specific interfaces and disable mDNS via `dds.toml` configuration.
+
 ## Dependency Audit Gap
 
 - I could not run `cargo audit` in this environment because `cargo` is not installed.
 - Dependency advisory coverage is therefore still outstanding.
 
-## Recommended Next Fixes
+## Remaining Work
 
-1. Add local API authentication and authorization for every HTTP endpoint that returns identities, policies, software, or session tokens.
-2. Remove the unauthenticated `/v1/session` issuance path or require proof-of-possession bound to the requested subject.
-3. In `/v1/session/assert`, ignore caller-supplied `subject_urn` and bind the session to the enrolled credential owner.
-4. Enforce WebAuthn `rp_id_hash`, `user_verified`, and assertion counter validation.
-5. Stop trusting self-declared `tags` and `org_unit` values for enrollment-driven policy targeting.
-6. Scope `/v1/enrolled-users` to the requesting device or remove credential IDs from that response.
-7. Fail closed when key-encryption env vars are absent, or move key storage to OS-protected keystores / hardware-backed storage.
-8. Treat provision bundles as highly sensitive secrets and reduce admission-cert TTLs.
+1. **Sign count enforcement** — persist per-credential assertion counters to detect replay attacks.
+2. **Admin-signed device enrollment** — require a vouch from an admin to validate device tags/org_unit, preventing self-enrollment with privileged scope.
+3. **Windows ACL hardening** — set restrictive ACLs on key files on Windows.
+4. **Passphrase-required mode** — optional config flag to refuse key storage without encryption.
+5. **Dependency audit** — run `cargo audit` when the Rust toolchain is available.

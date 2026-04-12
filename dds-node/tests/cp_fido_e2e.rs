@@ -366,7 +366,6 @@ async fn cp_fido2_ed25519_full_lifecycle() {
     let users: EnrolledUsersResponse = list_resp.json().await.unwrap();
     assert_eq!(users.users.len(), 1, "expected exactly 1 enrolled user");
     assert_eq!(users.users[0].display_name, "Alice (E2E Test)");
-    assert_eq!(users.users[0].credential_id, stored_cred_id);
 
     // ── 4. Authenticate via FIDO2 assertion ─────────────────────────
     //

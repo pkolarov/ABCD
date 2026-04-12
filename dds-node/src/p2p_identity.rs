@@ -114,7 +114,18 @@ pub fn save(path: &Path, kp: &Keypair) -> Result<(), P2pIdentityError> {
     ciborium::into_writer(&CborValue::Map(map), &mut buf)
         .map_err(|e| P2pIdentityError::Cbor(e.to_string()))?;
     std::fs::write(path, &buf).map_err(|e| P2pIdentityError::Io(e.to_string()))?;
+    set_owner_only_permissions(path);
     Ok(())
+}
+
+/// Best-effort: restrict file to owner-only read/write (0o600 on Unix).
+fn set_owner_only_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = std::fs::set_permissions(path, perms);
+    }
 }
 
 pub fn load(path: &Path) -> Result<Keypair, P2pIdentityError> {

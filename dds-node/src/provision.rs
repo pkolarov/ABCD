@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ciborium::value::Value as CborValue;
 use dds_domain::domain::{from_hex, to_hex, DomainId};
-use dds_domain::{Domain, DomainKey};
+use dds_domain::Domain;
 use zeroize::Zeroize;
 
 use crate::{domain_store, identity_store, p2p_identity};
@@ -341,7 +341,7 @@ pub fn run_provision(
     println!("  Peer ID: {peer_id}");
 
     let now = now_epoch();
-    let ttl = 10 * 365 * 86400; // 10 years
+    let ttl = 365 * 86400; // 1 year — re-provision or re-admit to renew
     let cert = domain_key.issue_admission(peer_id.to_string(), now, Some(now + ttl));
 
     // Zeroize domain key — never touches disk on this machine

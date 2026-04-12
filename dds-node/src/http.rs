@@ -9,7 +9,6 @@
 //! Endpoints:
 //! - `POST /v1/enroll/user`     -> EnrollmentResponse
 //! - `POST /v1/enroll/device`   -> EnrollmentResponse
-//! - `POST /v1/session`         -> SessionResponse
 //! - `POST /v1/session/assert`  -> SessionResponse (from FIDO2 assertion)
 //! - `GET  /v1/enrolled-users`  -> EnrolledUsersResponse
 //! - `POST /v1/policy/evaluate` -> PolicyResponse
@@ -34,7 +33,7 @@ use crate::service::{
     AdminSetupRequest, AdminVouchRequest,
     ApplicableMacOsPolicy, ApplicableSoftware, ApplicableWindowsPolicy, AppliedReport,
     AssertionSessionRequest, EnrollDeviceRequest, EnrollUserRequest, EnrolledUser, LocalService,
-    NodeStatus, PolicyResult, ServiceError, SessionRequest,
+    NodeStatus, PolicyResult, ServiceError,
 };
 use dds_store::traits::{RevocationStore, TokenStore};
 
@@ -73,7 +72,10 @@ where
     Router::new()
         .route("/v1/enroll/user", post(enroll_user::<S>))
         .route("/v1/enroll/device", post(enroll_device::<S>))
-        .route("/v1/session", post(issue_session::<S>))
+        // NOTE: The unauthenticated POST /v1/session endpoint has been
+        // removed. Session issuance now requires FIDO2 proof-of-possession
+        // via /v1/session/assert. The internal `issue_session` method is
+        // still available for use by `issue_session_from_assertion`.
         .route("/v1/session/assert", post(issue_session_assert::<S>))
         .route("/v1/enrolled-users", get(list_enrolled_users::<S>))
         .route("/v1/admin/setup", post(admin_setup::<S>))
@@ -320,29 +322,10 @@ where
     }))
 }
 
-async fn issue_session<S>(
-    State(state): State<AppState<S>>,
-    Json(req): Json<SessionRequestJson>,
-) -> Result<Json<SessionResponse>, HttpError>
-where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
-{
-    let internal = SessionRequest {
-        subject_urn: req.subject_urn,
-        device_urn: req.device_urn,
-        requested_resources: req.requested_resources,
-        duration_secs: req.duration_secs,
-        mfa_verified: req.mfa_verified,
-        tls_binding: req.tls_binding,
-    };
-    let mut svc = state.svc.lock().await;
-    let r = svc.issue_session(internal)?;
-    Ok(Json(SessionResponse {
-        session_id: r.session_id,
-        token_cbor_b64: b64_encode(&r.token_cbor),
-        expires_at: r.expires_at,
-    }))
-}
+// The unauthenticated `issue_session` HTTP handler has been removed.
+// Session issuance now requires FIDO2 proof-of-possession via
+// POST /v1/session/assert. The `SessionRequestJson` type is kept
+// for internal use by the assertion flow.
 
 async fn evaluate_policy<S>(
     State(state): State<AppState<S>>,
@@ -646,7 +629,6 @@ mod tests {
         let app = Router::new()
             .route("/v1/enroll/user", post(enroll_user::<MemoryBackend>))
             .route("/v1/enroll/device", post(enroll_device::<MemoryBackend>))
-            .route("/v1/session", post(issue_session::<MemoryBackend>))
             .route(
                 "/v1/session/assert",
                 post(issue_session_assert::<MemoryBackend>),
@@ -774,8 +756,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_session_endpoint_rejects_no_purposes() {
-        // Session request for a subject with no granted purposes should fail.
+    async fn test_session_endpoint_removed() {
+        // The unauthenticated POST /v1/session endpoint has been removed.
+        // Session issuance now requires FIDO2 proof via /v1/session/assert.
         let state = make_state();
         let base = spawn_server(state).await;
         let req = SessionRequestJson {
@@ -792,8 +775,8 @@ mod tests {
             .send()
             .await
             .unwrap();
-        // Without valid vouches, the session should be rejected (500 = domain error).
-        assert_eq!(resp.status(), 500);
+        // Endpoint removed — expect 404 Not Found.
+        assert_eq!(resp.status(), 404);
     }
 
     // ----------------------------------------------------------------
@@ -1017,7 +1000,6 @@ mod tests {
         let names: Vec<&str> = body.users.iter().map(|u| u.display_name.as_str()).collect();
         assert!(names.contains(&"ALICE"));
         assert!(names.contains(&"BOB"));
-        assert!(body.users.iter().all(|u| !u.credential_id.is_empty()));
     }
 
     // ----------------------------------------------------------------
