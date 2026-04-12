@@ -1000,6 +1000,7 @@ mod tests {
         let names: Vec<&str> = body.users.iter().map(|u| u.display_name.as_str()).collect();
         assert!(names.contains(&"ALICE"));
         assert!(names.contains(&"BOB"));
+        assert!(body.users.iter().all(|u| !u.credential_id.is_empty()));
     }
 
     // ----------------------------------------------------------------

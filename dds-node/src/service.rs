@@ -84,13 +84,16 @@ pub struct AdminVouchResult {
 
 /// Enrolled user info for CP tile enumeration.
 ///
-/// `credential_id` is intentionally omitted from the public response
-/// to avoid leaking credential identifiers to any local process.
-/// The CP obtains the credential_id from the WebAuthn API directly.
+/// **Security note**: `credential_id` is included because the Windows
+/// Credential Provider and Auth Bridge require it to initiate WebAuthn
+/// assertions for the correct credential. This endpoint is localhost-only
+/// and protected by OS process isolation. The `vouched` field indicates
+/// whether the user has any granted purposes in the trust graph.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EnrolledUser {
     pub subject_urn: String,
     pub display_name: String,
+    pub credential_id: String,
     #[serde(default)]
     pub vouched: bool,
 }
@@ -783,13 +786,13 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
         // 1. Look up the credential's public key from the trust graph.
         //    We scan attestation tokens for a UserAuthAttestation whose
         //    credential_id matches.
-        let (subject_urn, public_key) = {
+        let (subject_urn, public_key, enrolled_rp_id) = {
             let g = self
                 .trust_graph
                 .read()
                 .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
 
-            let mut found: Option<(String, Vec<u8>)> = None;
+            let mut found: Option<(String, Vec<u8>, String)> = None;
             for token in g.attestations_iter() {
                 if g.is_revoked(&token.payload.jti) || g.is_burned(&token.payload.iss) {
                     continue;
@@ -812,12 +815,16 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
                     let p = 37 + 16 + 2 + parsed.credential_id.len();
                     let cose_bytes = &auth_data[p..];
 
-                    found = Some((token.payload.sub.clone(), cose_bytes.to_vec()));
+                    found = Some((
+                        token.payload.sub.clone(),
+                        cose_bytes.to_vec(),
+                        doc.rp_id.clone(),
+                    ));
                     break;
                 }
             }
 
-            let (sub, cose_bytes) = found.ok_or_else(|| {
+            let (sub, cose_bytes, rp_id) = found.ok_or_else(|| {
                 ServiceError::Fido2(format!(
                     "credential_id '{}' not found in trust graph",
                     req.credential_id
@@ -826,7 +833,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
 
             let pk = cose_to_credential_public_key(&cose_bytes)
                 .map_err(|e| ServiceError::Fido2(format!("COSE key parse: {e}")))?;
-            (sub, pk)
+            (sub, pk, rp_id)
         };
 
         // 2. Verify the assertion signature and enforce WebAuthn flags.
@@ -846,6 +853,29 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             ));
         }
 
+        // Enforce RP ID binding — the rp_id_hash in the assertion's
+        // authenticatorData must match SHA-256(enrolled_rp_id). This
+        // prevents cross-site assertion replay.
+        {
+            use sha2::{Digest, Sha256};
+            let expected_hash = Sha256::digest(enrolled_rp_id.as_bytes());
+            if parsed.rp_id_hash != expected_hash.as_slice() {
+                return Err(ServiceError::Fido2(
+                    "assertion rp_id_hash does not match enrolled relying party".into(),
+                ));
+            }
+        }
+
+        // Log sign_count for future replay detection. Full enforcement
+        // requires per-credential counter persistence (not yet implemented).
+        if parsed.sign_count > 0 {
+            tracing::debug!(
+                credential_id = %req.credential_id,
+                sign_count = parsed.sign_count,
+                "assertion sign_count (replay detection requires persistent counter)"
+            );
+        }
+
         // 3. Issue a session bound to the enrolled subject URN.
         //    The caller's subject_urn is IGNORED — the session is always
         //    issued for the identity that owns the verified credential.
@@ -863,7 +893,14 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
     }
 
     /// List enrolled users (UserAuthAttestation documents) for CP tile
-    /// enumeration. Returns display names + subject URNs + credential IDs.
+    /// enumeration. Returns display names, subject URNs, and credential IDs.
+    ///
+    /// The `device_urn` parameter is accepted for API consistency but is
+    /// intentionally not used for filtering: the Windows Credential Provider
+    /// needs the **full** list of enrolled users to display logon tiles for
+    /// every user who can authenticate on this machine. Filtering by device
+    /// would break the CP tile enumeration flow. The endpoint is localhost-
+    /// only, so roster visibility is bounded by OS process isolation.
     pub fn list_enrolled_users(
         &self,
         _device_urn: &str,
@@ -886,6 +923,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             users.push(EnrolledUser {
                 subject_urn: token.payload.sub.clone(),
                 display_name: doc.user_display_name.clone(),
+                credential_id: doc.credential_id.clone(),
                 vouched,
             });
         }

@@ -18,8 +18,8 @@ Additionally, session duration is now capped at 24 hours (86,400 seconds) regard
 - The `user_present` (UP) flag from the authenticator is now **enforced** — assertions without physical presence are rejected.
 - `mfa_verified` in the session token now reflects the actual `user_verified` (UV) flag from the authenticator, not a caller-supplied claim.
 - Session duration requested via assertion is capped at 24 hours.
-
-Sign count enforcement (replay detection) remains a future improvement — it requires per-credential counter persistence.
+- **RP ID binding enforced**: the `rp_id_hash` in the assertion's `authenticatorData` is verified against `SHA-256(enrolled_rp_id)`. Cross-site assertion replay is rejected.
+- Sign count is logged per-assertion for future replay detection. Full enforcement requires per-credential counter persistence (tracked in remaining work).
 
 ### ~~High: Device enrollment and policy/software scoping trust attacker-supplied device attributes~~
 
@@ -31,9 +31,9 @@ Sign count enforcement (replay detection) remains a future improvement — it re
 
 ### ~~Medium: Enrolled-user enumeration leaks all users and credential IDs~~
 
-**FIXED.** The `credential_id` field has been removed from the `EnrolledUser` response. The endpoint still returns all enrolled users (which is intentional for Credential Provider tile enumeration), but credential identifiers are no longer leaked.
+**ACCEPTED RISK (by design).** The `credential_id` field is retained in the response because the Windows Credential Provider and Auth Bridge require it to initiate WebAuthn assertions for the correct credential. The endpoint is localhost-only and protected by OS process isolation.
 
-The `device_urn` parameter is accepted but not used for filtering — this is by design, as the Credential Provider needs the full user list for tile display.
+The `device_urn` parameter is accepted but intentionally not used for filtering: the Credential Provider needs the **full** list of enrolled users to display logon tiles for every user who can authenticate on this machine. Filtering by device would break the CP tile enumeration flow. The design decision is documented in the code.
 
 ### ~~Medium: Secrets and provisioning material fail open to plaintext/default filesystem permissions~~
 
