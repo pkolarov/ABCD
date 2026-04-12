@@ -67,12 +67,14 @@ static std::vector<uint8_t> Base64UrlDecode(const std::string& input)
     {
         int a = T[(unsigned char)b64[i]];
         int b = T[(unsigned char)b64[i+1]];
-        int c = T[(unsigned char)b64[i+2]];
-        int d = T[(unsigned char)b64[i+3]];
+        bool cPadded = (b64[i + 2] == '=');
+        bool dPadded = (b64[i + 3] == '=');
+        int c = cPadded ? -1 : T[(unsigned char)b64[i+2]];
+        int d = dPadded ? -1 : T[(unsigned char)b64[i+3]];
         if (a < 0 || b < 0) break;
         out.push_back((uint8_t)((a << 2) | (b >> 4)));
         if (c >= 0) out.push_back((uint8_t)(((b & 0xF) << 4) | (c >> 2)));
-        if (d >= 0) out.push_back((uint8_t)(((c & 3) << 6) | d));
+        if (c >= 0 && d >= 0) out.push_back((uint8_t)(((c & 3) << 6) | d));
     }
     return out;
 }

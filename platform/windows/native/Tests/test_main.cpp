@@ -79,6 +79,7 @@ struct DdsTestRegistrar
 
 #include "test_ipc_messages.cpp"
 #include "test_dds_auth.cpp"
+#include "test_dds_bridge_selection.cpp"
 
 // ============================================================================
 // main -- run all tests, print summary
