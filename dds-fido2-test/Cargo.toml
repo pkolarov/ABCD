@@ -1,0 +1,20 @@
+[package]
+name = "dds-fido2-test"
+description = "Interactive FIDO2 enrollment + authentication test against dds-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dds-fido2-test"
+path = "src/main.rs"
+
+[dependencies]
+ctap-hid-fido2 = "3.5"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["rt", "macros"] }
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true }
+base64 = "0.22"
+sha2 = { workspace = true }
+rand = { workspace = true }

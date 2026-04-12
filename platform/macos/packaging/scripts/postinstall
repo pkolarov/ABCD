@@ -1,0 +1,33 @@
+#!/bin/zsh
+# DDS Platform — postinstall script
+# Creates required directories and sets permissions.
+# Does NOT start services — bootstrap script does that after config.
+set -e
+
+DDS_ROOT="/Library/Application Support/DDS"
+
+mkdir -p "${DDS_ROOT}/node-data"
+mkdir -p "${DDS_ROOT}/state"
+mkdir -p "${DDS_ROOT}/packages"
+mkdir -p "${DDS_ROOT}/profiles"
+mkdir -p "${DDS_ROOT}/ManagedPreferences"
+mkdir -p "${DDS_ROOT}/UserTemplatePreferences"
+mkdir -p "${DDS_ROOT}/LaunchDaemons"
+mkdir -p "${DDS_ROOT}/LaunchAgents"
+mkdir -p /var/log/dds
+
+chown -R root:wheel "${DDS_ROOT}"
+chmod 750 "${DDS_ROOT}"
+
+# Copy config template if no config exists yet
+if [[ ! -f "${DDS_ROOT}/dds.toml" ]]; then
+  cp "${DDS_ROOT}/dds.toml.template" "${DDS_ROOT}/dds.toml.template" 2>/dev/null || true
+fi
+
+# Copy production appsettings if not present
+if [[ ! -f "${DDS_ROOT}/appsettings.json" ]]; then
+  cp /usr/local/lib/dds/appsettings.json "${DDS_ROOT}/appsettings.json" 2>/dev/null || true
+fi
+
+echo "DDS Platform installed. Run: sudo dds-bootstrap-domain"
+exit 0

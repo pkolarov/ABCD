@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>DDS Platform for macOS</title>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64,x86_64"/>
+    <domains enable_localSystem="true"/>
+    <choices-outline>
+        <line choice="com.dds.platform"/>
+    </choices-outline>
+    <choice id="com.dds.platform"
+            title="DDS Platform"
+            description="DDS node, policy agent, and credential provider tools.">
+        <pkg-ref id="com.dds.platform"/>
+    </choice>
+    <pkg-ref id="com.dds.platform"
+             version="0.1.0"
+             onConclusion="none">dds-platform-component.pkg</pkg-ref>
+</installer-gui-script>

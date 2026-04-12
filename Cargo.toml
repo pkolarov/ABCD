@@ -9,6 +9,7 @@ members = [
     "dds-ffi",
     "dds-cli",
     "dds-loadtest",
+    "dds-fido2-test",
 ]
 
 [workspace.package]

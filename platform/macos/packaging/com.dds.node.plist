@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dds.node</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/dds-node</string>
+    <string>run</string>
+    <string>/Library/Application Support/DDS/dds.toml</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Library/Application Support/DDS</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>Disabled</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/var/log/dds/dds-node.out</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/dds/dds-node.err</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUST_LOG</key>
+    <string>info</string>
+  </dict>
+</dict>
+</plist>

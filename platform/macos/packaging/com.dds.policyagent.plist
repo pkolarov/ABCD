@@ -7,8 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-      <string>/usr/local/share/dotnet/dotnet</string>
-      <string>/usr/local/lib/dds/DdsPolicyAgent.MacOS.dll</string>
+      <string>/usr/local/lib/dds/DdsPolicyAgent.MacOS</string>
       <string>--contentRoot</string>
       <string>/Library/Application Support/DDS</string>
     </array>
@@ -20,6 +19,9 @@
     <true/>
 
     <key>KeepAlive</key>
+    <true/>
+
+    <key>Disabled</key>
     <true/>
 
     <key>StandardOutPath</key>

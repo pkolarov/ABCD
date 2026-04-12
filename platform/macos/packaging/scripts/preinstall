@@ -1,0 +1,9 @@
+#!/bin/zsh
+# DDS Platform — preinstall script
+# Gracefully stop existing services before upgrade.
+set -e
+
+launchctl bootout system/com.dds.node 2>/dev/null || true
+launchctl bootout system/com.dds.policyagent 2>/dev/null || true
+
+exit 0
