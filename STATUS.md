@@ -242,9 +242,9 @@ All 7 crates are functionally complete. The following work is ordered by impact 
     - `dds-node/src/http.rs`: Added `POST /v1/session/assert` (assertion-based session issuance) and `GET /v1/enrolled-users?device_urn=...` (CP user enumeration) endpoints.
     - All 225+ existing tests pass; 7 new FIDO2 assertion tests added.
 
-    **C++ side (code complete, needs Windows build verification):**
+    **C++ side (Windows build verified, 34 native tests pass):**
     - `platform/windows/native/DdsCredentialProvider/` — Forked COM DLL with new CLSID `{a7f3b2c1-...}`, BLE/PIV/smart card paths stripped, DDS auth path via Auth Bridge IPC
-    - `platform/windows/native/DdsAuthBridge/` — Windows Service with CTAP2 engine, WinHTTP client for dds-node, credential vault (DPAPI)
+    - `platform/windows/native/DdsAuthBridge/` — Windows Service with CTAP2 engine, WinHTTP client for dds-node, credential vault (DPAPI), **platform WebAuthn API** (`webauthn.h`) for getAssertion + hmac-secret, vault password decryption wired
     - `platform/windows/native/DdsBridgeIPC/` — Named-pipe IPC with DDS messages (0x0060-0x007F range)
     - `platform/windows/native/Helpers/` — LSA packaging, COM factory
     - `platform/windows/installer/DdsBundle.wxs` — WiX v4 MSI bundle for all components

@@ -15,8 +15,225 @@
 #include <string.h>
 #include <lm.h>          // NetGetJoinInformation
 #include <sddl.h>        // ConvertStringSidToSidW
+#include <webauthn.h>     // WebAuthNAuthenticatorGetAssertion (Win10 1903+)
 #pragma comment(lib, "netapi32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "webauthn.lib")
+
+// ============================================================================
+// Base64url encoding helper (for credential ID and assertion fields)
+// ============================================================================
+static std::string Base64Encode(const BYTE* data, DWORD len)
+{
+    static const char kTable[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((len * 4 + 2) / 3);
+    for (DWORD i = 0; i < len; i += 3)
+    {
+        DWORD val = (DWORD)data[i] << 16;
+        if (i + 1 < len) val |= (DWORD)data[i + 1] << 8;
+        if (i + 2 < len) val |= data[i + 2];
+        out += kTable[(val >> 18) & 0x3F];
+        out += kTable[(val >> 12) & 0x3F];
+        out += (i + 1 < len) ? kTable[(val >> 6) & 0x3F] : '=';
+        out += (i + 2 < len) ? kTable[val & 0x3F] : '=';
+    }
+    return out;
+}
+
+// ============================================================================
+// Platform WebAuthn getAssertion with hmac-secret extension.
+//
+// Uses the Windows 10 1903+ WebAuthn API (webauthn.h) to:
+//   1. Prompt the user for biometric/PIN via Windows Hello
+//   2. Perform a FIDO2 getAssertion
+//   3. Extract authenticatorData, signature, and hmac-secret output
+//
+// Returns TRUE on success; fills out assertion fields and hmac-secret key.
+// ============================================================================
+struct WebAuthnAssertionResult
+{
+    std::vector<BYTE> authenticatorData;
+    std::vector<BYTE> signature;
+    std::vector<BYTE> clientDataHash;
+    std::vector<BYTE> hmacSecretOutput;   // 32 bytes from hmac-secret extension
+    bool              success = false;
+    std::string       errorMessage;
+};
+
+static WebAuthnAssertionResult CallPlatformWebAuthn(
+    _In_ const std::vector<BYTE>& credentialId,
+    _In_ const std::string& rpId,
+    _In_ const std::vector<BYTE>& hmacSalt,
+    _In_ volatile BOOL* pCancelled)
+{
+    WebAuthnAssertionResult result;
+
+    // Check API availability
+    DWORD apiVersion = WebAuthNGetApiVersionNumber();
+    FileLog::Writef("WebAuthn: API version %lu\n", apiVersion);
+    if (apiVersion < WEBAUTHN_API_VERSION_1)
+    {
+        result.errorMessage = "WebAuthn API not available on this system";
+        return result;
+    }
+
+    // --- Build clientDataJSON + hash ---
+    // For platform assertion within a service context, we build a minimal
+    // clientDataJSON. The hash is what gets signed by the authenticator.
+    std::string clientDataJson = "{\"type\":\"webauthn.get\","
+        "\"challenge\":\"DDS-local-auth\","
+        "\"origin\":\"https://dds.local\"}";
+    // SHA-256 hash of clientDataJSON
+    BYTE cdHash[32];
+    {
+        BCRYPT_ALG_HANDLE hAlg = NULL;
+        BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0);
+        BCRYPT_HASH_HANDLE hHash = NULL;
+        BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0);
+        BCryptHashData(hHash, (PUCHAR)clientDataJson.data(),
+                       (ULONG)clientDataJson.size(), 0);
+        BCryptFinishHash(hHash, cdHash, sizeof(cdHash), 0);
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+    }
+    result.clientDataHash.assign(cdHash, cdHash + 32);
+
+    // --- Relying party ---
+    std::wstring rpIdW(rpId.begin(), rpId.end());
+    WEBAUTHN_RP_ENTITY_INFORMATION rpInfo = {};
+    rpInfo.dwVersion = WEBAUTHN_RP_ENTITY_INFORMATION_CURRENT_VERSION;
+    rpInfo.pwszId = rpIdW.c_str();
+    rpInfo.pwszName = L"DDS";
+
+    // --- Client data ---
+    WEBAUTHN_CLIENT_DATA clientData = {};
+    clientData.dwVersion = WEBAUTHN_CLIENT_DATA_CURRENT_VERSION;
+    clientData.cbClientDataJSON = (DWORD)clientDataJson.size();
+    clientData.pbClientDataJSON = (BYTE*)clientDataJson.data();
+    clientData.pwszHashAlgId = WEBAUTHN_HASH_ALGORITHM_SHA_256;
+
+    // --- Allowed credential ---
+    WEBAUTHN_CREDENTIAL credDesc = {};
+    credDesc.dwVersion = WEBAUTHN_CREDENTIAL_CURRENT_VERSION;
+    credDesc.cbId = (DWORD)credentialId.size();
+    credDesc.pbId = (BYTE*)credentialId.data();
+    credDesc.pwszCredentialType = WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY;
+
+    WEBAUTHN_CREDENTIALS allowCreds = {};
+    allowCreds.cCredentials = 1;
+    allowCreds.pCredentials = &credDesc;
+
+    // --- hmac-secret extension ---
+    // The hmac-secret extension sends a salt to the authenticator.
+    // The authenticator returns HMAC-SHA-256(credRandom, salt) which
+    // is deterministic per credential + salt, giving us a stable 32-byte key.
+    WEBAUTHN_HMAC_SECRET_SALT hmacSaltStruct = {};
+    hmacSaltStruct.cbFirst = (DWORD)hmacSalt.size();
+    hmacSaltStruct.pbFirst = (BYTE*)hmacSalt.data();
+    // pbSecond/cbSecond left NULL — we only need one salt output.
+
+    WEBAUTHN_CRED_WITH_HMAC_SECRET_SALT credHmac = {};
+    credHmac.cbCredId = (DWORD)credentialId.size();
+    credHmac.pbCredId = (BYTE*)credentialId.data();
+    credHmac.pHmacSecretSalt = &hmacSaltStruct;
+
+    WEBAUTHN_HMAC_SECRET_SALT_VALUES hmacSaltValues = {};
+    hmacSaltValues.pGlobalHmacSalt = &hmacSaltStruct;
+    hmacSaltValues.cCredWithHmacSecretSaltList = 1;
+    hmacSaltValues.pCredWithHmacSecretSaltList = &credHmac;
+
+    WEBAUTHN_EXTENSION hmacExt = {};
+    hmacExt.pwszExtensionIdentifier = WEBAUTHN_EXTENSIONS_IDENTIFIER_HMAC_SECRET;
+    hmacExt.cbExtension = sizeof(hmacSaltValues);
+    hmacExt.pvExtension = &hmacSaltValues;
+
+    WEBAUTHN_EXTENSIONS extensions = {};
+    extensions.cExtensions = 1;
+    extensions.pExtensions = &hmacExt;
+
+    // --- Assertion options ---
+    WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS options = {};
+    options.dwVersion = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_CURRENT_VERSION;
+    options.dwTimeoutMilliseconds = 60000; // 60-second user interaction timeout
+    options.CredentialList = allowCreds;
+    options.Extensions = extensions;
+    options.dwAuthenticatorAttachment = WEBAUTHN_AUTHENTICATOR_ATTACHMENT_ANY;
+    options.dwUserVerificationRequirement = WEBAUTHN_USER_VERIFICATION_REQUIREMENT_PREFERRED;
+
+    // Cancellation support
+    WEBAUTHN_CANCELLATION_ID cancelId = {};
+    if (WebAuthNGetCancellationId(&cancelId) == S_OK)
+    {
+        options.pCancellationId = &cancelId;
+    }
+
+    // --- Call the platform API ---
+    FileLog::Write("WebAuthn: calling WebAuthNAuthenticatorGetAssertion...\n");
+
+    PWEBAUTHN_ASSERTION pAssertion = NULL;
+    HWND hWnd = GetForegroundWindow();
+    if (!hWnd) hWnd = GetDesktopWindow();
+
+    HRESULT hr = WebAuthNAuthenticatorGetAssertion(
+        hWnd,
+        rpIdW.c_str(),
+        &clientData,
+        &options,
+        &pAssertion
+    );
+
+    if (FAILED(hr) || pAssertion == NULL)
+    {
+        if (*pCancelled)
+        {
+            result.errorMessage = "Authentication cancelled by user";
+        }
+        else
+        {
+            wchar_t* errStr = WebAuthNGetErrorName(hr);
+            char errBuf[256];
+            snprintf(errBuf, sizeof(errBuf), "WebAuthn getAssertion failed: 0x%08lX (%ls)",
+                     (unsigned long)hr, errStr ? errStr : L"unknown");
+            result.errorMessage = errBuf;
+        }
+        FileLog::Writef("WebAuthn: FAILED — %s\n", result.errorMessage.c_str());
+        return result;
+    }
+
+    // --- Extract results ---
+    result.authenticatorData.assign(
+        pAssertion->pbAuthenticatorData,
+        pAssertion->pbAuthenticatorData + pAssertion->cbAuthenticatorData);
+    result.signature.assign(
+        pAssertion->pbSignature,
+        pAssertion->pbSignature + pAssertion->cbSignature);
+
+    FileLog::Writef("WebAuthn: OK — authDataLen=%lu sigLen=%lu\n",
+                    pAssertion->cbAuthenticatorData, pAssertion->cbSignature);
+
+    // --- Extract hmac-secret output from extensions ---
+    if (pAssertion->pHmacSecret &&
+        pAssertion->pHmacSecret->cbFirst >= 32)
+    {
+        result.hmacSecretOutput.assign(
+            pAssertion->pHmacSecret->pbFirst,
+            pAssertion->pHmacSecret->pbFirst + 32);
+        FileLog::Writef("WebAuthn: hmac-secret output OK (%lu bytes)\n",
+                        pAssertion->pHmacSecret->cbFirst);
+    }
+    else
+    {
+        FileLog::Write("WebAuthn: WARNING — no hmac-secret output in response\n");
+        // This happens if the authenticator doesn't support hmac-secret.
+        // Password decryption will fail, but session token issuance can proceed.
+    }
+
+    result.success = true;
+    WebAuthNFreeAssertion(pAssertion);
+    return result;
+}
 
 CDdsAuthBridgeMain::CDdsAuthBridgeMain()
     : m_hStopEvent(NULL)
@@ -379,19 +596,20 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     SendAuthProgress(pOp->pClientCtx, pOp->seqId,
         IPC_AUTH_STATE::PROCESSING, L"Contacting authenticator...");
 
-    // TODO: Call platform WebAuthn API (webauthn.h / WebAuthNAuthenticatorGetAssertion)
-    // to perform a FIDO2 getAssertion with hmac-secret extension.
-    // For now, this is a stub -- the assertion proof is empty.
-    //
-    // When implemented, this will:
-    //   a) Build a WebAuthn getAssertion request with the credential ID
-    //      from the vault entry and hmac-secret extension with the stored salt.
-    //   b) The platform will prompt the user for biometric/PIN via Windows Hello.
-    //   c) On success, we get authenticatorData + signature + hmac-secret output.
-    //
-    // Placeholder assertion JSON:
-    std::string assertionJson = "{\"stub\": true}";
-    FileLog::Write("DdsAuth.worker: TODO -- platform WebAuthn getAssertion not yet implemented\n");
+    // Step 3: Call platform WebAuthn API for getAssertion + hmac-secret
+    WebAuthnAssertionResult webauthn = CallPlatformWebAuthn(
+        pVaultEntry->credentialId,
+        pOp->rpId,
+        pVaultEntry->salt,
+        &pOp->cancelled);
+
+    if (!webauthn.success)
+    {
+        wchar_t errMsg[256];
+        swprintf_s(errMsg, L"%hs", webauthn.errorMessage.c_str());
+        SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::AUTH_FAILED, errMsg);
+        return;
+    }
 
     if (pOp->cancelled)
     {
@@ -399,9 +617,25 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
         return;
     }
 
-    // Step 3: POST assertion proof to dds-node
+    // Step 4: POST assertion proof to dds-node for server-side verification
     SendAuthProgress(pOp->pClientCtx, pOp->seqId,
         IPC_AUTH_STATE::PROCESSING, L"Verifying assertion with DDS node...");
+
+    // Build JSON payload with base64-encoded assertion fields.
+    std::string credIdB64 = Base64Encode(pVaultEntry->credentialId.data(),
+                                          (DWORD)pVaultEntry->credentialId.size());
+    std::string authDataB64 = Base64Encode(webauthn.authenticatorData.data(),
+                                            (DWORD)webauthn.authenticatorData.size());
+    std::string sigB64 = Base64Encode(webauthn.signature.data(),
+                                       (DWORD)webauthn.signature.size());
+    std::string cdhB64 = Base64Encode(webauthn.clientDataHash.data(),
+                                       (DWORD)webauthn.clientDataHash.size());
+
+    std::string assertionJson = "{\"credential_id\":\"" + credIdB64 +
+        "\",\"authenticator_data\":\"" + authDataB64 +
+        "\",\"signature\":\"" + sigB64 +
+        "\",\"client_data_hash\":\"" + cdhB64 +
+        "\",\"duration_secs\":3600}";
 
     DdsAssertResult assertResult = m_httpClient.PostSessionAssert(assertionJson);
 
@@ -425,32 +659,78 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
         return;
     }
 
-    // Step 4: Decrypt password from vault using hmac-secret
-    // TODO: Use the actual hmac-secret output from the platform WebAuthn response.
-    // For now, this will fail because we don't have the real hmac-secret key.
-    // When WebAuthn is implemented, the hmac-secret output (32 bytes) will be
-    // used here to decrypt the password.
-    //
-    // Placeholder: skip decryption for now; a real implementation will:
-    //   std::wstring password;
-    //   if (!CCredentialVault::DecryptPassword(hmacKey.data(), hmacKey.size(),
-    //                                          *pVaultEntry, password))
-    //   {
-    //       SendAuthError(...);
-    //       return;
-    //   }
+    // Step 5: Decrypt password from vault using hmac-secret output
+    std::wstring password;
+    if (!webauthn.hmacSecretOutput.empty())
+    {
+        if (!m_vault.DecryptPassword(
+                webauthn.hmacSecretOutput.data(),
+                (DWORD)webauthn.hmacSecretOutput.size(),
+                *pVaultEntry, password))
+        {
+            FileLog::Write("DdsAuth.worker: vault password decryption FAILED\n");
+            SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::AUTH_FAILED,
+                L"Failed to decrypt Windows password from vault");
+            return;
+        }
+        FileLog::Write("DdsAuth.worker: vault password decrypted OK\n");
+    }
+    else
+    {
+        FileLog::Write("DdsAuth.worker: no hmac-secret — password unavailable "
+                        "(session-only auth)\n");
+        // Session token was issued by dds-node; password-less logon requires
+        // a custom LSA AP (v2). For now, the tile will show an error when LSA
+        // rejects the empty password.
+    }
 
-    FileLog::Write("DdsAuth.worker: TODO -- password decryption requires real hmac-secret output\n");
+    // Clear hmac-secret key material immediately
+    SecureZeroMemory(webauthn.hmacSecretOutput.data(),
+                     webauthn.hmacSecretOutput.size());
 
-    // Step 5: Return DDS_AUTH_COMPLETE with session token
-    // Build response with session token. Password will be added once
-    // hmac-secret decryption is implemented.
-    IPC_RESP_AUTH_RESULT result = {};
+    // Step 6: Return DDS_AUTH_COMPLETE with password + session token
+    IPC_RESP_DDS_AUTH_COMPLETE result = {};
     result.success = TRUE;
-    result.authMethod = IPC_AUTH_METHOD::FIDO2;
-    wcsncpy_s(result.sid, pOp->userSid.c_str(), _TRUNCATE);
-    // result.password would be filled from the decrypted vault entry
-    wcscpy_s(result.message, L"DDS authentication succeeded (session established)");
+
+    // Resolve domain + username from the Windows SID
+    {
+        WCHAR compName[MAX_COMPUTERNAME_LENGTH + 1];
+        DWORD compLen = ARRAYSIZE(compName);
+        if (GetComputerNameW(compName, &compLen))
+            wcsncpy_s(result.domain, compName, _TRUNCATE);
+        else
+            wcscpy_s(result.domain, L".");
+
+        // Look up account name from SID
+        PSID pSid = NULL;
+        if (ConvertStringSidToSidW(pOp->userSid.c_str(), &pSid))
+        {
+            WCHAR userName[256], domainName[256];
+            DWORD userLen = ARRAYSIZE(userName), domLen = ARRAYSIZE(domainName);
+            SID_NAME_USE sidUse;
+            if (LookupAccountSidW(NULL, pSid, userName, &userLen,
+                                  domainName, &domLen, &sidUse))
+            {
+                wcsncpy_s(result.username, userName, _TRUNCATE);
+                // Prefer domain from LookupAccountSid if available
+                if (domainName[0] != L'\0')
+                    wcsncpy_s(result.domain, domainName, _TRUNCATE);
+            }
+            LocalFree(pSid);
+        }
+    }
+
+    if (!password.empty())
+    {
+        wcsncpy_s(result.password, password.c_str(), _TRUNCATE);
+        SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
+    }
+
+    // Copy session token and subject URN
+    strncpy_s(result.session_token, assertResult.sessionToken.c_str(), _TRUNCATE);
+    // TODO: get subject_urn from the DDS_START_AUTH request; for now use SID
+    wcsncpy_s(result.subject_urn, pOp->userSid.c_str(), _TRUNCATE);
+    result.expires_at = (UINT64)time(NULL) + 3600; // 1 hour from now
 
     m_pipeServer.SendResponse(pOp->pClientCtx, IPC_MSG::DDS_AUTH_COMPLETE, pOp->seqId,
         reinterpret_cast<const BYTE*>(&result), sizeof(result));
