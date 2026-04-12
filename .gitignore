@@ -1,9 +1,41 @@
 /target
 
-*.swp
-*.swo
-.DS_Store
-
 # .NET build artifacts
 **/bin/
 **/obj/
+
+# Native build output
+**/build/
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.idb
+*.ilk
+*.log
+*.tlog/
+*.recipe
+*.iobj
+*.ipdb
+*.tar.gz
+
+# Logs and diagnostic output
+*_out.txt
+*_err.txt
+*_err*.txt
+
+# IDE
+.vs/
+*.vcxproj.user
+*.suo
+
+# Editor temp files
+*.swp
+*.swo
+*.orig
+
+# macOS metadata
+.DS_Store
+._*
