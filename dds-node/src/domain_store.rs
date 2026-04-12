@@ -178,6 +178,13 @@ pub fn save_domain_key(path: &Path, key: &DomainKey) -> Result<(), DomainStoreEr
 
 pub fn load_domain_key(path: &Path) -> Result<DomainKey, DomainStoreError> {
     let bytes = std::fs::read(path).map_err(|e| DomainStoreError::Io(e.to_string()))?;
+    load_domain_key_from_bytes(&bytes)
+}
+
+/// Load a domain key from raw CBOR bytes (already in memory).
+/// Used by the provisioning flow to decrypt a domain key embedded
+/// in a provision bundle without writing it to disk first.
+pub fn load_domain_key_from_bytes(bytes: &[u8]) -> Result<DomainKey, DomainStoreError> {
     let value: CborValue =
         ciborium::from_reader(&bytes[..]).map_err(|e| DomainStoreError::Cbor(e.to_string()))?;
     let map = value

@@ -1,13 +1,35 @@
 # Adding a Second Node to a DDS Domain
 
-After bootstrapping the first node (macOS) with `dds-bootstrap-domain`,
-follow these steps to add a second node (macOS or Windows).
+## Option A: One-File Provisioning (Recommended)
 
-Nodes on the same LAN auto-discover each other via **mDNS** — no manual
-address configuration needed. Just provide the domain config and
-admission certificate.
+After bootstrapping, a `provision.dds` file is created automatically.
+Copy it to a USB stick. On the new machine, plug in the USB stick and
+the admin's FIDO2 key, then:
 
-## On the first (macOS) node
+**macOS:**
+
+```bash
+sudo dds-node provision /Volumes/USB/provision.dds
+# Touch FIDO2 key → node provisioned, started, enrolled
+```
+
+**Windows (admin cmd):**
+
+```cmd
+dds-node.exe provision E:\provision.dds
+REM Touch FIDO2 key → node provisioned, started, enrolled
+```
+
+That's it. One file, one command, one touch. The node auto-discovers
+other nodes on the LAN via mDNS, and enrolled users sync via gossip.
+
+---
+
+## Option B: Manual Provisioning
+
+For environments where the provision bundle approach doesn't fit.
+
+### On the first (macOS) node
 
 ### 1. Generate a node key on the second machine
 

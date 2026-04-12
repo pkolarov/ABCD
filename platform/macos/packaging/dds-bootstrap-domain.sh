@@ -74,6 +74,14 @@ if [[ -n "${DOMAIN_PASSPHRASE}" ]]; then
 fi
 "${NODE_BIN}" init-domain --name "${DOMAIN_NAME}" --dir "${NODE_DATA}" ${FIDO2_FLAG} | tee "${NODE_DATA}/init-domain.out"
 
+# Create provision bundle for sibling nodes
+echo "  Creating provision bundle..."
+"${NODE_BIN}" create-provision-bundle \
+  --dir "${NODE_DATA}" \
+  --org "${ORG_HASH}" \
+  --out "${DDS_ROOT}/provision.dds"
+echo "  Bundle: ${DDS_ROOT}/provision.dds"
+
 # Parse domain info from domain.toml
 DOMAIN_ID="$(awk -F'= ' '/^id = / { gsub(/"/, "", $2); print $2 }' "${NODE_DATA}/domain.toml")"
 DOMAIN_PUBKEY="$(awk -F'= ' '/^pubkey = / { gsub(/"/, "", $2); print $2 }' "${NODE_DATA}/domain.toml")"
@@ -192,12 +200,14 @@ echo ""
 echo "  Domain key: ${NODE_DATA}/domain_key.bin (KEEP SAFE)"
 echo "  Config:     ${DDS_ROOT}/dds.toml"
 echo ""
+echo "  Provision bundle: ${DDS_ROOT}/provision.dds"
+echo ""
 echo "  Next steps:"
 echo "    1. Enroll an admin:  sudo dds-enroll-admin"
-echo "    2. Add another node: sudo dds-admit-node"
+echo "    2. Add another node: copy provision.dds to USB, then on new machine:"
+echo "       sudo dds-node provision /path/to/provision.dds"
 echo ""
-echo "  Second nodes on the same LAN will auto-discover this node"
-echo "  via mDNS — no manual address configuration needed."
+echo "  Nodes on the same LAN auto-discover each other via mDNS."
 echo ""
 
 # Save bootstrap info for other scripts

@@ -36,6 +36,7 @@ use dds_node::http;
 use dds_node::identity_store;
 use dds_node::node::DdsNode;
 use dds_node::p2p_identity;
+use dds_node::provision;
 use dds_node::service::LocalService;
 
 #[tokio::main]
@@ -53,10 +54,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "init-domain" => cmd_init_domain(&args[1..]),
         "gen-node-key" => cmd_gen_node_key(&args[1..]),
         "admit" => cmd_admit(&args[1..]),
+        "create-provision-bundle" => cmd_create_bundle(&args[1..]),
+        "provision" => cmd_provision(&args[1..]),
         "run" => cmd_run(&args[1..]).await,
         // Back-compat: if first arg looks like a config path (or there are no args)
         // treat it as `run <arg>`.
-        s if s.ends_with(".toml") || !s.starts_with('-') => cmd_run(&args).await,
+        s if s.ends_with(".toml") || s.ends_with(".dds") || !s.starts_with('-') => {
+            if s.ends_with(".dds") {
+                cmd_provision(&args)
+            } else {
+                cmd_run(&args).await
+            }
+        }
         _ => {
             print_usage();
             std::process::exit(2);
@@ -67,9 +76,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn print_usage() {
     eprintln!(
         "Usage:
-  dds-node init-domain --name <NAME> --dir <DIR>
+  dds-node init-domain --name <NAME> --dir <DIR> [--fido2]
   dds-node gen-node-key --data-dir <DIR>
   dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--out <FILE>] [--ttl-days <N>]
+  dds-node create-provision-bundle --dir <DIR> --org <ORG> [--out <FILE>]
+  dds-node provision <BUNDLE.dds> [--data-dir <DIR>] [--no-start]
   dds-node run [config.toml]"
     );
 }
@@ -180,6 +191,52 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         println!("  expires:   never");
     }
     println!("  out:       {}", out.display());
+    Ok(())
+}
+
+fn cmd_create_bundle(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = PathBuf::from(require_flag(args, "--dir")?);
+    let org = require_flag(args, "--org")?;
+    let out = PathBuf::from(flag(args, "--out").unwrap_or("provision.dds"));
+
+    provision::create_bundle(&dir, org, &out)?;
+    println!("Provision bundle created:");
+    println!("  file: {}", out.display());
+    println!("  Copy to USB stick, then on a new machine:");
+    println!("  sudo dds-node provision {}", out.display());
+    Ok(())
+}
+
+fn cmd_provision(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let bundle_path = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(PathBuf::from)
+        .ok_or("provision requires a bundle path (e.g., provision.dds)")?;
+    let data_dir = flag(args, "--data-dir").map(PathBuf::from);
+    let no_start = args.iter().any(|a| a == "--no-start");
+
+    let summary = provision::run_provision(
+        &bundle_path,
+        data_dir.as_deref(),
+        !no_start,
+    )?;
+
+    println!();
+    println!("============================================================");
+    println!("  Node Provisioned");
+    println!("============================================================");
+    println!();
+    println!("  Domain:     {} ({})", summary.domain_name, summary.domain_id);
+    println!("  Peer ID:    {}", summary.peer_id);
+    if let Some(urn) = &summary.device_urn {
+        println!("  Device URN: {urn}");
+    }
+    println!("  Data dir:   {}", summary.data_dir.display());
+    println!("  Config:     {}", summary.config_path.display());
+    println!();
+    println!("  The node will auto-discover other nodes on the LAN via mDNS.");
+    println!("  Enrolled users will sync via gossip within ~60 seconds.");
     Ok(())
 }
 
