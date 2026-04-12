@@ -1,10 +1,10 @@
 # DDS — Decentralized Directory Service
 
-A peer-to-peer identity and access management system built in Rust. DDS enables offline-capable authentication and authorization using cryptographically signed tokens, CRDTs for conflict-free replication, and libp2p for peer-to-peer networking.
+A peer-to-peer identity and access management system built in Rust. DDS provides offline-capable authentication and authorization using cryptographically signed tokens, CRDTs for conflict-free replication, and libp2p for peer-to-peer networking.
 
-**Quantum-resistant by default** — all signatures use hybrid Ed25519 + ML-DSA-65 (FIPS 204).
+**Quantum-resistant by default** — hybrid Ed25519 + ML-DSA-65 (FIPS 204) signatures.
 
-**202 tests** (189 Rust + 13 Python) · 7 crates · 7,618 lines of Rust · 5 platform bindings
+**9 crates · 22,000 lines of Rust · 5 platform bindings**
 
 ## Quick Start
 
@@ -12,7 +12,7 @@ A peer-to-peer identity and access management system built in Rust. DDS enables 
 # Build everything
 cargo build --workspace
 
-# Run all 189 Rust tests
+# Run all Rust tests
 cargo test --workspace
 
 # Build the shared library for platform bindings
@@ -20,19 +20,35 @@ cargo build -p dds-ffi --release
 
 # Run Python binding tests (requires shared lib)
 python3 -m pytest bindings/python/test_dds.py -v
-
-# Run the CLI
-cargo run -p dds-cli -- identity create alice
-cargo run -p dds-cli -- identity create quantum-bob --hybrid
-cargo run -p dds-cli -- status
 ```
+
+## Documentation
+
+| Document | Audience | Description |
+|---|---|---|
+| **[DDS Admin Guide](docs/DDS-Admin-Guide.md)** | Administrators | Domain setup, node deployment, user enrollment, policy, monitoring |
+| **[DDS Developer Guide](docs/DDS-Developer-Guide.md)** | Developers | End-to-end walkthrough of how DDS works under the hood |
+| **[Design Document](docs/DDS-Design-Document.md)** | Architects | Formal specification (§1–§14): identity, CRDTs, P2P, tokens, policy, trust |
+| **[Implementation Whitepaper](docs/DDS-Implementation-Whitepaper.md)** | Engineers | Technical deep-dive on implementation choices and performance budgets |
+| **[STATUS.md](STATUS.md)** | Contributors | Module-by-module implementation tracker with test counts |
+
+### Platform-Specific
+
+| Document | Description |
+|---|---|
+| [Windows Credential Provider](docs/crayonic-cp-integration-plan.md) | C++ CP integration plan (Crayonic fork) |
+| [Windows E2E](platform/windows/e2e/README.md) | Windows smoke test: node + CP + policy agent |
+| [macOS Platform](platform/macos/README.md) | macOS policy agent and installer |
+| [macOS E2E](platform/macos/e2e/README.md) | Two-machine macOS mesh validation |
+| [Second Node](platform/macos/packaging/SECOND-NODE.md) | Adding nodes to an existing domain |
+| [Load Test](dds-loadtest/README.md) | Soak/smoke harness and KPI verdicts |
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────┐
 │               dds-node  /  dds-cli              │
-│          (binaries — node + CLI)                │
+│          (binaries — node daemon + CLI)          │
 ├─────────────┬──────────────┬────────────────────┤
 │  dds-domain │   dds-net    │     dds-ffi        │
 │ (typed docs)│  (libp2p)    │  (C ABI cdylib)    │
@@ -48,17 +64,42 @@ cargo run -p dds-cli -- status
 
 ## Crates
 
-| Crate | Type | Tests | Purpose |
-|---|---|---|---|
-| `dds-core` | lib (`no_std`) | 114 | Crypto, identity, tokens (extensible body), CRDTs, trust graph, policy engine |
-| `dds-domain` | lib | 11 | 6 typed domain documents: auth, device, policy, software, service, session |
-| `dds-store` | lib | 15 | Storage traits + MemoryBackend + RedbBackend (ACID) |
-| `dds-net` | lib | 19 | libp2p transport, gossipsub, Kademlia, mDNS, delta-sync |
-| `dds-node` | lib + bin | 9 | P2P daemon + local authority service (enrollment, sessions, policy, status) |
-| `dds-ffi` | cdylib | 12 | C ABI for Python/C#/Swift/Kotlin bindings |
-| `dds-cli` | bin | 9 | CLI: identity, group, policy, status |
+| Crate | Type | Purpose |
+|---|---|---|
+| `dds-core` | lib (`no_std`) | Crypto, identity, tokens (extensible body), CRDTs, trust graph, policy engine |
+| `dds-domain` | lib | Typed domain documents: auth, device, policy, software, service, session |
+| `dds-store` | lib | Storage traits + MemoryBackend + RedbBackend (ACID) |
+| `dds-net` | lib | libp2p transport, gossipsub, Kademlia, mDNS, delta-sync |
+| `dds-node` | lib + bin | P2P daemon + local authority HTTP API |
+| `dds-ffi` | cdylib | C ABI for Python/C#/Swift/Kotlin bindings |
+| `dds-cli` | bin | CLI: identity, group, policy, status |
+| `dds-loadtest` | bin | Multi-node load/soak test harness |
+| `dds-fido2-test` | bin | WebAuthn testing utility |
 
 ## Interfaces
+
+### Node Daemon (`dds-node`)
+
+```bash
+# Genesis ceremony — create a new DDS domain
+dds-node init-domain --name acme.com --dir ./acme [--fido2]
+
+# Generate node identity and print PeerId
+dds-node gen-node-key --data-dir ~/.dds
+
+# Issue admission cert for a sibling node
+dds-node admit --domain-key ./acme/domain_key.bin --domain ./acme/domain.toml \
+    --peer-id 12D3KooW… [--out admission.cbor] [--ttl-days 365]
+
+# Create a single-file provisioning bundle
+dds-node create-provision-bundle --dir ./acme --org acme [--out provision.dds]
+
+# Provision a new node from bundle (one command, one touch)
+dds-node provision bundle.dds [--data-dir ~/.dds] [--no-start]
+
+# Start the node
+dds-node run [config.toml]
+```
 
 ### CLI (`dds-cli`)
 
@@ -81,6 +122,20 @@ dds policy check --user urn:vouchsafe:bob.<hash> --resource repo:main --action r
 dds status
 ```
 
+### HTTP API (`dds-node`, localhost:5551)
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/v1/enroll/user` | FIDO2/passkey user enrollment |
+| `POST` | `/v1/enroll/device` | Device enrollment + hardware attestation |
+| `POST` | `/v1/session` | Issue short-lived session token |
+| `POST` | `/v1/session/assert` | Issue session from FIDO2 assertion |
+| `GET` | `/v1/enrolled-users` | List enrolled users |
+| `POST` | `/v1/policy/evaluate` | Offline policy evaluation |
+| `GET` | `/v1/status` | Node diagnostics (peers, DAG, trust) |
+| `GET` | `/v1/windows/policies` | Windows policy for this device |
+| `GET` | `/v1/macos/policies` | macOS policy for this device |
+
 ### Rust API (`dds-core` + `dds-domain`)
 
 ```rust
@@ -102,7 +157,7 @@ let token = Token::sign(payload, &identity.signing_key)?;
 let decision = engine.evaluate(&user_urn, "repo:main", "read", &trust_graph, &roots);
 ```
 
-### FFI (`dds-ffi`) — C ABI for all platforms
+### FFI — C ABI for all platforms (`dds-ffi`)
 
 ```c
 #include "dds.h"
@@ -117,98 +172,10 @@ dds_free_string(out);
 | Platform | Language | Wrapper | Tests |
 |---|---|---|---|
 | Any | C | `bindings/c/dds.h` | — |
-| Linux/macOS | Python (ctypes) | `bindings/python/dds.py` | 13 ✅ |
+| Linux/macOS | Python (ctypes) | `bindings/python/dds.py` | 13 |
 | Windows | C# (P/Invoke) | `bindings/csharp/DDS.cs` | 11 |
 | Android | Kotlin (JNA) | `bindings/kotlin/.../DDS.kt` | 10 |
 | iOS/macOS | Swift (C module) | `bindings/swift/.../DDS.swift` | 10 |
-
-### P2P Network (`dds-net`)
-
-| Protocol | Transport | Purpose |
-|---|---|---|
-| Gossipsub | TCP/QUIC + Noise | Directory operation broadcast |
-| Kademlia DHT | TCP/QUIC + Noise | Peer discovery and routing |
-| mDNS | UDP multicast | Local network zero-config discovery |
-| DDS Sync | libp2p streams | Delta-sync for state convergence |
-
-Protocol strings and topics are namespaced per **domain** (see below):
-- `/dds/kad/1.0.0/<domain-tag>` — Kademlia
-- `/dds/id/1.0.0/<domain-tag>` — Identify
-- `/dds/v1/dom/<domain-tag>/org/<org-hash>/{ops,revocations,burns}` — gossipsub topics
-
-Nodes from different DDS domains cannot complete a libp2p handshake at all.
-
-### Domains (`dds-domain`)
-
-A **domain** is a cryptographic realm that DDS nodes belong to (e.g.
-`acme.com`). Two mechanisms keep domains separate and admission-controlled:
-
-1. **Protocol isolation** — the domain id is baked into the libp2p protocol
-   strings (above), so nodes from `acme.com` and `globex.com` running on the
-   same network never form a connection.
-2. **Admission certificates** — within a domain, only nodes holding an
-   `AdmissionCert` signed by the **domain key** are valid. The cert binds
-   a libp2p `PeerId` to a `DomainId` and is verified at node startup.
-
-The domain key is an Ed25519 keypair created on the first node ("genesis")
-and used to sign admission certs for sibling nodes. **Stage 1** (current)
-holds the secret in software, encrypted at rest with `DDS_DOMAIN_PASSPHRASE`
-(Argon2id + ChaCha20-Poly1305). **Stage 2** will move the secret onto a
-FIDO2 authenticator via the `DomainSigner` trait, with no other code changes
-required.
-
-#### Bootstrapping a domain
-
-```bash
-# 1. Genesis ceremony — admin creates the domain on their machine.
-DDS_DOMAIN_PASSPHRASE=… dds-node init-domain --name acme.com --dir ./acme
-# Writes acme/domain.toml (public, share with siblings)
-# Writes acme/domain_key.bin (secret, keep safe)
-
-# 2. On a sibling node machine — generate its libp2p identity, print PeerId.
-dds-node gen-node-key --data-dir ~/.dds
-# → peer_id: 12D3KooW…
-
-# 3. Admin signs an admission cert for that PeerId.
-DDS_DOMAIN_PASSPHRASE=… dds-node admit \
-    --domain-key ./acme/domain_key.bin \
-    --domain     ./acme/domain.toml \
-    --peer-id    12D3KooW… \
-    --out        admission.cbor \
-    --ttl-days   365
-
-# 4. Ship admission.cbor to the sibling, place at ~/.dds/admission.cbor,
-#    write a dds.toml that references the public domain info, then run.
-dds-node run dds.toml
-```
-
-A node refuses to start without a valid admission certificate matching its
-own peer id and the configured domain pubkey.
-
-Topics: `/dds/v1/dom/<domain-tag>/org/<org-hash>/{ops,revocations,burns}`
-
-### Local Authority Service (`dds-node`)
-
-`dds-node` runs as a local service providing:
-
-- **User enrollment** — FIDO2/passkey attestation → signed `UserAuthAttestation` token
-- **Device enrollment** — Hardware ID/TPM → signed `DeviceJoinDocument` token
-- **Session issuance** — Resolves trust graph → short-lived `SessionDocument` (< 1ms check)
-- **Policy resolution** — Evaluates access against trust graph + policy rules
-- **Status reporting** — Peer count, DAG operations, trust stats
-
-### Domain Documents (`dds-domain`)
-
-Typed payloads embedded inside signed tokens via `body_type` + `body_cbor`:
-
-| Document | Use Case |
-|---|---|
-| `UserAuthAttestation` | FIDO2/passkey user enrollment |
-| `DeviceJoinDocument` | Device enrollment + TPM attestation |
-| `WindowsPolicyDocument` | GPO-equivalent policy distribution |
-| `SoftwareAssignment` | App/package deployment manifest |
-| `ServicePrincipalDocument` | Machine/service identity |
-| `SessionDocument` | Short-lived auth session |
 
 ## Cryptography
 
@@ -227,12 +194,6 @@ FIDO2 leaf identities use classical Ed25519 or ECDSA-P256 (hardware limitation).
 ## `no_std`
 
 `dds-core` compiles without the Rust standard library (`#![no_std]` + `alloc`), enabling deployment on bare-metal embedded targets (Cortex-M), UEFI firmware, WebAssembly, and TPM co-processors. Higher-level crates (`dds-store`, `dds-net`, `dds-node`) use `std`.
-
-## Project Status
-
-See [STATUS.md](STATUS.md) for detailed progress, module tables, and proposed next steps.
-
-See [DDS-Design-Document.md](DDS-Design-Document.md) for the full design specification.
 
 ## License
 

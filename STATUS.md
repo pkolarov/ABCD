@@ -1,6 +1,6 @@
 # DDS Implementation Status
 
-> Auto-updated tracker referencing [DDS-Design-Document.md](DDS-Design-Document.md).
+> Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
 > Last updated: 2026-04-12 (single-file provisioning + FIDO2 domain key)
 
 ## Build Health

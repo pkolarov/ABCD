@@ -1285,7 +1285,7 @@ Two of the §10 KPIs are currently measured by **proxy** rather than directly:
 - **Peak heap** uses whole-process RSS, which always overstates the true cost because it includes the libp2p runtime baseline (~30 MB)
 - **Idle bandwidth** uses RSS-delta over time, because libp2p doesn't expose per-direction network counters
 
-For pilot deployments these proxies are good enough — we know the *trend* is flat and the *order of magnitude* is right. Before general availability we plan to wire up `dhat` for real heap profiling and a custom transport wrapper for real byte counters. See risk **R5** in [STATUS.md](STATUS.md) for details.
+For pilot deployments these proxies are good enough — we know the *trend* is flat and the *order of magnitude* is right. Before general availability we plan to wire up `dhat` for real heap profiling and a custom transport wrapper for real byte counters. See risk **R5** in [STATUS.md](../STATUS.md) for details.
 
 ### The TL;DR
 

@@ -1,4 +1,4 @@
-# macOS Platform Slice
+. # macOS Platform Slice
 
 `platform/macos/` now contains a real macOS policy agent, not just a worker shell.
 
