@@ -54,12 +54,6 @@ read -s DOMAIN_PASSPHRASE
 echo ""
 [[ -n "${DOMAIN_PASSPHRASE}" ]] || { echo "Passphrase required" >&2; exit 1; }
 
-# Detect this machine's IP for the bootstrap peer multiaddr
-LOCAL_IP="$(ipconfig getifaddr en0 2>/dev/null || echo "127.0.0.1")"
-printf "Advertise IP for this node [${LOCAL_IP}]: "
-read USER_IP
-[[ -n "${USER_IP}" ]] && LOCAL_IP="${USER_IP}"
-
 echo ""
 echo "[1/7] Creating domain '${DOMAIN_NAME}'..."
 mkdir -p "${NODE_DATA}"
@@ -171,8 +165,6 @@ echo "[7/7] Starting policy agent..."
 launchctl enable system/com.dds.policyagent 2>/dev/null || true
 launchctl bootstrap system /Library/LaunchDaemons/com.dds.policyagent.plist 2>/dev/null || true
 
-MULTIADDR="/ip4/${LOCAL_IP}/tcp/4001/p2p/${PEER_ID}"
-
 echo ""
 echo "============================================================"
 echo "  DDS Domain Bootstrap Complete"
@@ -182,7 +174,6 @@ echo "  Domain:     ${DOMAIN_NAME}"
 echo "  Domain ID:  ${DOMAIN_ID}"
 echo "  Device URN: ${DEVICE_URN}"
 echo "  Peer ID:    ${PEER_ID}"
-echo "  Multiaddr:  ${MULTIADDR}"
 echo ""
 echo "  Domain key: ${NODE_DATA}/domain_key.bin (KEEP SAFE)"
 echo "  Config:     ${DDS_ROOT}/dds.toml"
@@ -191,9 +182,8 @@ echo "  Next steps:"
 echo "    1. Enroll an admin:  sudo dds-enroll-admin"
 echo "    2. Add another node: sudo dds-admit-node"
 echo ""
-echo "  For a second node (e.g., Windows), provide:"
-echo "    - domain.toml:  ${NODE_DATA}/domain.toml"
-echo "    - Multiaddr:    ${MULTIADDR}"
+echo "  Second nodes on the same LAN will auto-discover this node"
+echo "  via mDNS — no manual address configuration needed."
 echo ""
 
 # Save bootstrap info for other scripts
@@ -204,6 +194,4 @@ DOMAIN_PUBKEY=${DOMAIN_PUBKEY}
 ORG_HASH=${ORG_HASH}
 DEVICE_URN=${DEVICE_URN}
 PEER_ID=${PEER_ID}
-LOCAL_IP=${LOCAL_IP}
-MULTIADDR=${MULTIADDR}
 EOF

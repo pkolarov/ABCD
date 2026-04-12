@@ -15,6 +15,7 @@
 
 SHELL := /bin/zsh
 .DEFAULT_GOAL := pkg
+export PATH := $(HOME)/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$(PATH)
 
 # ---- Configuration ----
 ARCH          ?= $(shell uname -m)

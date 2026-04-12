@@ -3,17 +3,13 @@
 After bootstrapping the first node (macOS) with `dds-bootstrap-domain`,
 follow these steps to add a second node (macOS or Windows).
 
+Nodes on the same LAN auto-discover each other via **mDNS** — no manual
+address configuration needed. Just provide the domain config and
+admission certificate.
+
 ## On the first (macOS) node
 
-### 1. Get this node's multiaddr
-
-```bash
-cat "/Library/Application Support/DDS/bootstrap.env"
-# Note the MULTIADDR line, e.g.:
-# MULTIADDR=/ip4/192.168.1.10/tcp/4001/p2p/12D3KooWXXXXXX
-```
-
-### 2. Generate a node key on the second machine
+### 1. Generate a node key on the second machine
 
 **macOS:**
 ```bash
@@ -70,21 +66,22 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.dds.node.plist
    ```
 
 2. **Edit node config** (`C:\ProgramData\DDS\dds.toml`):
+
    ```toml
    data_dir = "C:\\ProgramData\\DDS\\node-data"
    org_hash = "acme"  # same as first node
-   trusted_roots = []  # will be populated via gossip
+   trusted_roots = []  # synced via gossip
 
    [network]
    listen_addr = "/ip4/0.0.0.0/tcp/4001"
-   bootstrap_peers = ["/ip4/192.168.1.10/tcp/4001/p2p/12D3KooWXXXXXX"]
+   bootstrap_peers = []  # mDNS handles LAN discovery
    mdns_enabled = true
    api_addr = "127.0.0.1:5551"
 
    [domain]
-   name = "acme.corp"
-   id = "dds-dom:XXXX"
-   pubkey = "XXXX"
+   name = "acme.corp"       # from domain.toml
+   id = "dds-dom:XXXX"      # from domain.toml
+   pubkey = "XXXX"           # from domain.toml
    admission_path = "C:\\ProgramData\\DDS\\node-data\\admission.cbor"
    ```
 
