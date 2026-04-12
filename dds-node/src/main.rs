@@ -93,6 +93,7 @@ fn require_flag<'a>(args: &'a [String], name: &str) -> Result<&'a str, Box<dyn s
 fn cmd_init_domain(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let name = require_flag(args, "--name")?;
     let dir = PathBuf::from(require_flag(args, "--dir")?);
+    let use_fido2 = args.iter().any(|a| a == "--fido2");
     std::fs::create_dir_all(&dir)?;
 
     let mut rng = rand::rngs::OsRng;
@@ -102,7 +103,22 @@ fn cmd_init_domain(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let domain_path = dir.join("domain.toml");
     let key_path = dir.join("domain_key.bin");
     domain_store::save_domain_file(&domain_path, &domain)?;
-    domain_store::save_domain_key(&key_path, &key)?;
+
+    if use_fido2 {
+        #[cfg(feature = "fido2")]
+        {
+            println!("Protecting domain key with FIDO2 authenticator...");
+            domain_store::save_domain_key_fido2(&key_path, &key)?;
+            println!("  Domain key is FIDO2-protected (no passphrase needed)");
+        }
+        #[cfg(not(feature = "fido2"))]
+        {
+            eprintln!("Error: --fido2 requires dds-node built with --features fido2");
+            std::process::exit(1);
+        }
+    } else {
+        domain_store::save_domain_key(&key_path, &key)?;
+    }
 
     println!("Domain created:");
     println!("  name:        {}", domain.name);
@@ -113,6 +129,9 @@ fn cmd_init_domain(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         domain_path.display()
     );
     println!("  domain_key:  {} (keep secret)", key_path.display());
+    if use_fido2 {
+        println!("  protection:  FIDO2 hardware key (touch to unlock)");
+    }
     Ok(())
 }
 

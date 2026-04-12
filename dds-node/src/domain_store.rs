@@ -26,6 +26,11 @@ use zeroize::Zeroize;
 pub const DOMAIN_PASSPHRASE_ENV: &str = "DDS_DOMAIN_PASSPHRASE";
 const VERSION_PLAIN: u8 = 1;
 const VERSION_ENCRYPTED: u8 = 2;
+/// Version 3: domain key encrypted with FIDO2 hmac-secret output.
+/// The CBOR map stores `credential_id` (bytes) and `hmac_salt` (bytes)
+/// alongside the encrypted key. No passphrase needed — touch the
+/// FIDO2 key to decrypt.
+const VERSION_FIDO2: u8 = 3;
 
 #[derive(Debug)]
 pub enum DomainStoreError {
@@ -231,6 +236,53 @@ pub fn load_domain_key(path: &Path) -> Result<DomainKey, DomainStoreError> {
             k.copy_from_slice(&pt);
             k
         }
+        #[cfg(feature = "fido2")]
+        Some(v) if v == VERSION_FIDO2 as i64 => {
+            let cred_id = map
+                .iter()
+                .find_map(|(k, v)| {
+                    if k.as_text() == Some("credential_id") {
+                        v.as_bytes().cloned()
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| DomainStoreError::Format("missing credential_id".into()))?;
+            let hmac_salt = map
+                .iter()
+                .find_map(|(k, v)| {
+                    if k.as_text() == Some("hmac_salt") {
+                        v.as_bytes().cloned()
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| DomainStoreError::Format("missing hmac_salt".into()))?;
+            let salt = salt.ok_or_else(|| DomainStoreError::Format("missing salt".into()))?;
+            let nonce = nonce.ok_or_else(|| DomainStoreError::Format("missing nonce".into()))?;
+
+            tracing::info!("Domain key is FIDO2-protected — touch your key to unlock");
+            let hmac_key = fido2_hmac_secret(&cred_id, &hmac_salt)?;
+            let mut k = derive_key(&hmac_key, &salt)?;
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(&k));
+            let pt = cipher
+                .decrypt(Nonce::from_slice(&nonce), key_field.as_ref())
+                .map_err(|e| DomainStoreError::Crypto(format!("decrypt: {e}")))?;
+            k.zeroize();
+            if pt.len() != 32 {
+                return Err(DomainStoreError::Format("decrypted key wrong length".into()));
+            }
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&pt);
+            k
+        }
+        #[cfg(not(feature = "fido2"))]
+        Some(v) if v == VERSION_FIDO2 as i64 => {
+            return Err(DomainStoreError::Crypto(
+                "domain key is FIDO2-protected but dds-node was built without --features fido2"
+                    .into(),
+            ));
+        }
         other => {
             return Err(DomainStoreError::Format(format!(
                 "unknown version {other:?}"
@@ -254,6 +306,152 @@ pub fn save_admission_cert(path: &Path, cert: &AdmissionCert) -> Result<(), Doma
 pub fn load_admission_cert(path: &Path) -> Result<AdmissionCert, DomainStoreError> {
     let bytes = std::fs::read(path).map_err(|e| DomainStoreError::Io(e.to_string()))?;
     AdmissionCert::from_cbor(&bytes).map_err(|e| DomainStoreError::Cbor(e.to_string()))
+}
+
+/// Save the domain key encrypted with FIDO2 hmac-secret (version 3).
+///
+/// Creates a FIDO2 credential on the hardware key, uses the hmac-secret
+/// extension output to derive an encryption key, and stores the encrypted
+/// Ed25519 domain key alongside the credential_id and hmac_salt.
+///
+/// No passphrase needed — touch the FIDO2 key to create/decrypt.
+#[cfg(feature = "fido2")]
+pub fn save_domain_key_fido2(path: &Path, key: &DomainKey) -> Result<Vec<u8>, DomainStoreError> {
+    use ctap_hid_fido2::{
+        fidokey::MakeCredentialArgsBuilder, verifier, Cfg, FidoKeyHidFactory,
+    };
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| DomainStoreError::Io(e.to_string()))?;
+    }
+
+    tracing::info!("Creating FIDO2 credential to protect domain key...");
+    tracing::info!(">>> TOUCH YOUR FIDO2 KEY <<<");
+
+    let device = FidoKeyHidFactory::create(&Cfg::init())
+        .map_err(|e| DomainStoreError::Crypto(format!("FIDO2 device: {e}")))?;
+
+    let challenge = verifier::create_challenge();
+    let args = MakeCredentialArgsBuilder::new("dds-domain-key", &challenge).build();
+    let attestation = device
+        .make_credential_with_args(&args)
+        .map_err(|e| DomainStoreError::Crypto(format!("makeCredential: {e}")))?;
+
+    let verify_result = verifier::verify_attestation("dds-domain-key", &challenge, &attestation);
+    if !verify_result.is_success {
+        return Err(DomainStoreError::Crypto(
+            "FIDO2 attestation verification failed".into(),
+        ));
+    }
+    let credential_id = verify_result.credential_id;
+
+    // Generate a random salt for hmac-secret
+    let mut hmac_salt = [0u8; 32];
+    OsRng.fill_bytes(&mut hmac_salt);
+
+    // Get hmac-secret output: do a getAssertion with the just-created credential
+    tracing::info!("Deriving encryption key via hmac-secret...");
+    tracing::info!(">>> TOUCH YOUR FIDO2 KEY AGAIN <<<");
+    let hmac_output = fido2_hmac_secret(&credential_id, &hmac_salt)?;
+
+    // Encrypt the domain key with hmac-secret-derived key
+    let secret = key.signing_key.to_bytes();
+    let name = key.name.clone();
+
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+
+    let mut k = derive_key(&hmac_output, &salt)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&k));
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), secret.as_ref())
+        .map_err(|e| DomainStoreError::Crypto(e.to_string()))?;
+    k.zeroize();
+
+    let map = vec![
+        (
+            CborValue::Text("v".into()),
+            CborValue::Integer(VERSION_FIDO2.into()),
+        ),
+        (CborValue::Text("name".into()), CborValue::Text(name)),
+        (
+            CborValue::Text("credential_id".into()),
+            CborValue::Bytes(credential_id.clone()),
+        ),
+        (
+            CborValue::Text("hmac_salt".into()),
+            CborValue::Bytes(hmac_salt.to_vec()),
+        ),
+        (
+            CborValue::Text("salt".into()),
+            CborValue::Bytes(salt.to_vec()),
+        ),
+        (
+            CborValue::Text("nonce".into()),
+            CborValue::Bytes(nonce.to_vec()),
+        ),
+        (CborValue::Text("key".into()), CborValue::Bytes(ct)),
+    ];
+    let mut buf = Vec::new();
+    ciborium::into_writer(&CborValue::Map(map), &mut buf)
+        .map_err(|e| DomainStoreError::Cbor(e.to_string()))?;
+    std::fs::write(path, &buf).map_err(|e| DomainStoreError::Io(e.to_string()))?;
+
+    tracing::info!(
+        "Domain key saved (FIDO2-protected, credential_id={} bytes)",
+        credential_id.len()
+    );
+    Ok(credential_id)
+}
+
+/// Perform a FIDO2 getAssertion with hmac-secret extension to derive a
+/// deterministic 32-byte key from the authenticator.
+#[cfg(feature = "fido2")]
+fn fido2_hmac_secret(
+    credential_id: &[u8],
+    hmac_salt: &[u8],
+) -> Result<Vec<u8>, DomainStoreError> {
+    use ctap_hid_fido2::{
+        fidokey::{GetAssertionArgsBuilder, get_assertion::Extension},
+        verifier, Cfg, FidoKeyHidFactory,
+    };
+
+    let device = FidoKeyHidFactory::create(&Cfg::init())
+        .map_err(|e| DomainStoreError::Crypto(format!("FIDO2 device: {e}")))?;
+
+    // Convert salt to fixed [u8; 32]
+    let mut salt_arr = [0u8; 32];
+    let copy_len = hmac_salt.len().min(32);
+    salt_arr[..copy_len].copy_from_slice(&hmac_salt[..copy_len]);
+
+    let challenge = verifier::create_challenge();
+    let args = GetAssertionArgsBuilder::new("dds-domain-key", &challenge)
+        .credential_id(credential_id)
+        .extensions(&[Extension::HmacSecret(Some(salt_arr))])
+        .build();
+
+    tracing::info!(">>> TOUCH YOUR FIDO2 KEY TO UNLOCK DOMAIN KEY <<<");
+
+    let assertions = device
+        .get_assertion_with_args(&args)
+        .map_err(|e| DomainStoreError::Crypto(format!("getAssertion: {e}")))?;
+
+    if assertions.is_empty() {
+        return Err(DomainStoreError::Crypto("no assertion returned".into()));
+    }
+
+    // Extract hmac-secret output from extensions
+    for ext in &assertions[0].extensions {
+        if let Extension::HmacSecret(Some(output)) = ext {
+            return Ok(output.to_vec());
+        }
+    }
+
+    Err(DomainStoreError::Crypto(
+        "authenticator did not return hmac-secret output".into(),
+    ))
 }
 
 fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; 32], DomainStoreError> {

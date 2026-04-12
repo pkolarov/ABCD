@@ -47,11 +47,25 @@ read USER_OUT
 [[ -n "${USER_OUT}" ]] && OUT_FILE="${USER_OUT}"
 
 echo ""
-echo "Domain key passphrase:"
-read -s DOMAIN_PASSPHRASE
-echo ""
+# Check if domain key is FIDO2-protected (version 3) by checking file header
+# If FIDO2-protected, no passphrase needed — just touch the key
+DOMAIN_KEY_VERSION="$(python3 -c "
+import sys
+with open('${NODE_DATA}/domain_key.bin', 'rb') as f:
+    data = f.read(20)
+# Look for CBOR map with 'v' key = 3 (FIDO2)
+# Simple heuristic: if file contains 'credential_id' it's FIDO2
+print('fido2' if b'credential_id' in open('${NODE_DATA}/domain_key.bin','rb').read() else 'passphrase')
+" 2>/dev/null || echo "passphrase")"
 
-export DDS_DOMAIN_PASSPHRASE="${DOMAIN_PASSPHRASE}"
+if [[ "${DOMAIN_KEY_VERSION}" == "fido2" ]]; then
+  echo "Domain key is FIDO2-protected — you will need to touch your key."
+else
+  echo "Domain key passphrase:"
+  read -s DOMAIN_PASSPHRASE
+  echo ""
+  export DDS_DOMAIN_PASSPHRASE="${DOMAIN_PASSPHRASE}"
+fi
 
 echo "Issuing admission certificate..."
 "${NODE_BIN}" admit \

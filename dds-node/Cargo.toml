@@ -14,10 +14,15 @@ path = "src/lib.rs"
 name = "dds-node"
 path = "src/main.rs"
 
+[features]
+default = []
+fido2 = ["ctap-hid-fido2"]
+
 [dependencies]
 dds-core = { workspace = true }
 dds-domain = { path = "../dds-domain" }
 dds-store = { workspace = true }
+ctap-hid-fido2 = { version = "3.5", optional = true }
 dds-net = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

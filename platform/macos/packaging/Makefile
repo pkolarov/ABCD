@@ -61,7 +61,7 @@ pkg: product-pkg
 
 rust-binaries:
 	@echo "[1/4] Building Rust binaries ($(BUILD_MODE), $(RUST_TARGET))..."
-	cd "$(REPO_ROOT)" && cargo build $(CARGO_FLAGS) -p dds-node -p dds-cli -p dds-fido2-test
+	cd "$(REPO_ROOT)" && cargo build $(CARGO_FLAGS) -p dds-node --features fido2 -p dds-cli -p dds-fido2-test
 	@echo "  dds-node: $(CARGO_OUT)/dds-node"
 	@echo "  dds:      $(CARGO_OUT)/dds"
 

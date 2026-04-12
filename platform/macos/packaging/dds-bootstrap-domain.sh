@@ -49,16 +49,30 @@ printf "Organization hash (short ID, e.g., acme): "
 read ORG_HASH
 [[ -n "${ORG_HASH}" ]] || { echo "Org hash required" >&2; exit 1; }
 
-printf "Domain key passphrase (protects the domain secret key): "
-read -s DOMAIN_PASSPHRASE
-echo ""
-[[ -n "${DOMAIN_PASSPHRASE}" ]] || { echo "Passphrase required" >&2; exit 1; }
+printf "Protect domain key with FIDO2 hardware key? [Y/n]: "
+read USE_FIDO2
+USE_FIDO2="${USE_FIDO2:-Y}"
+
+DOMAIN_PASSPHRASE=""
+FIDO2_FLAG=""
+if [[ "${USE_FIDO2}" =~ ^[Yy] ]]; then
+  FIDO2_FLAG="--fido2"
+  echo "  Domain key will be protected by your FIDO2 hardware key."
+  echo "  You will need to touch the key twice during creation."
+else
+  printf "Domain key passphrase (protects the domain secret key): "
+  read -s DOMAIN_PASSPHRASE
+  echo ""
+  [[ -n "${DOMAIN_PASSPHRASE}" ]] || { echo "Passphrase required" >&2; exit 1; }
+fi
 
 echo ""
 echo "[1/7] Creating domain '${DOMAIN_NAME}'..."
 mkdir -p "${NODE_DATA}"
-export DDS_DOMAIN_PASSPHRASE="${DOMAIN_PASSPHRASE}"
-"${NODE_BIN}" init-domain --name "${DOMAIN_NAME}" --dir "${NODE_DATA}" | tee "${NODE_DATA}/init-domain.out"
+if [[ -n "${DOMAIN_PASSPHRASE}" ]]; then
+  export DDS_DOMAIN_PASSPHRASE="${DOMAIN_PASSPHRASE}"
+fi
+"${NODE_BIN}" init-domain --name "${DOMAIN_NAME}" --dir "${NODE_DATA}" ${FIDO2_FLAG} | tee "${NODE_DATA}/init-domain.out"
 
 # Parse domain info from domain.toml
 DOMAIN_ID="$(awk -F'= ' '/^id = / { gsub(/"/, "", $2); print $2 }' "${NODE_DATA}/domain.toml")"
