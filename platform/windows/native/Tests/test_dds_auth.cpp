@@ -262,12 +262,19 @@ DDS_TEST(session_assert_json_payload)
 
 DDS_TEST(session_assert_response_success)
 {
-    // Simulate a successful response from dds-node
-    std::string response = "{\"session_token\":\"eyJhbGciOiJSUzI1NiJ9.test\",\"success\":true}";
+    // Simulate a successful response from dds-node /v1/session/assert.
+    // The Rust API returns: session_id, token_cbor_b64, expires_at.
+    std::string response =
+        "{\"session_id\":\"sess-001\","
+        "\"token_cbor_b64\":\"eyJhbGciOiJSUzI1NiJ9.test\","
+        "\"expires_at\":1700000000}";
 
-    std::string token = TestJsonHelpers::JsonGetString(response, "session_token");
-    DDS_ASSERT(token == "eyJhbGciOiJSUzI1NiJ9.test",
-               "session_token must be extracted from success response");
+    std::string sessionId = TestJsonHelpers::JsonGetString(response, "session_id");
+    std::string tokenB64  = TestJsonHelpers::JsonGetString(response, "token_cbor_b64");
+    DDS_ASSERT(sessionId == "sess-001",
+               "session_id must be extracted from success response");
+    DDS_ASSERT(tokenB64  == "eyJhbGciOiJSUzI1NiJ9.test",
+               "token_cbor_b64 must be extracted from success response");
 }
 
 DDS_TEST(session_assert_response_error)
@@ -294,8 +301,10 @@ DDS_TEST(enrolled_users_parse_empty_list)
 
 DDS_TEST(enrolled_users_parse_single_user)
 {
+    // Matches the Rust /v1/enrolled-users response format:
+    // subject_urn (not user_sid), display_name, credential_id
     std::string response =
-        "{\"users\":[{\"user_sid\":\"S-1-5-21-123\","
+        "{\"users\":[{\"subject_urn\":\"urn:vouchsafe:alice.4z2vjf6z\","
         "\"display_name\":\"Alice\","
         "\"credential_id\":\"Y3JlZC0x\"}]}";
 
@@ -304,13 +313,13 @@ DDS_TEST(enrolled_users_parse_single_user)
 
     if (users.size() >= 1)
     {
-        std::string sid  = TestJsonHelpers::JsonGetString(users[0], "user_sid");
+        std::string urn  = TestJsonHelpers::JsonGetString(users[0], "subject_urn");
         std::string name = TestJsonHelpers::JsonGetString(users[0], "display_name");
         std::string cred = TestJsonHelpers::JsonGetString(users[0], "credential_id");
 
-        DDS_ASSERT(sid  == "S-1-5-21-123", "user_sid must be parsed correctly");
-        DDS_ASSERT(name == "Alice",        "display_name must be parsed correctly");
-        DDS_ASSERT(cred == "Y3JlZC0x",    "credential_id must be parsed correctly");
+        DDS_ASSERT(urn  == "urn:vouchsafe:alice.4z2vjf6z", "subject_urn must be parsed correctly");
+        DDS_ASSERT(name == "Alice",                        "display_name must be parsed correctly");
+        DDS_ASSERT(cred == "Y3JlZC0x",                    "credential_id must be parsed correctly");
     }
 }
 
@@ -318,9 +327,9 @@ DDS_TEST(enrolled_users_parse_multiple_users)
 {
     std::string response =
         "{\"users\":["
-        "{\"user_sid\":\"S-1-5-21-100\",\"display_name\":\"Alice\",\"credential_id\":\"c1\"},"
-        "{\"user_sid\":\"S-1-5-21-200\",\"display_name\":\"Bob\",\"credential_id\":\"c2\"},"
-        "{\"user_sid\":\"S-1-5-21-300\",\"display_name\":\"Charlie\",\"credential_id\":\"c3\"}"
+        "{\"subject_urn\":\"urn:vouchsafe:alice.aaa\",\"display_name\":\"Alice\",\"credential_id\":\"c1\"},"
+        "{\"subject_urn\":\"urn:vouchsafe:bob.bbb\",\"display_name\":\"Bob\",\"credential_id\":\"c2\"},"
+        "{\"subject_urn\":\"urn:vouchsafe:charlie.ccc\",\"display_name\":\"Charlie\",\"credential_id\":\"c3\"}"
         "]}";
 
     auto users = TestJsonHelpers::JsonGetObjectArray(response, "users");

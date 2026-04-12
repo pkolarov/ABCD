@@ -551,7 +551,7 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     }
 
     FileLog::Writef("DdsAuth.worker: dds-node assert OK (tokenLen=%zu)\n",
-                    assertResult.sessionToken.size());
+                    assertResult.tokenCborB64.size());
 
     if (pOp->cancelled)
     {
@@ -615,11 +615,11 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
 
     wcsncpy_s(result.password, password.c_str(), _TRUNCATE);
 
-    // Fill session token
-    strncpy_s(result.session_token, assertResult.sessionToken.c_str(), _TRUNCATE);
+    // Fill session token (token_cbor_b64 from Rust /v1/session/assert)
+    strncpy_s(result.session_token, assertResult.tokenCborB64.c_str(), _TRUNCATE);
     // TODO: get subject_urn from the DDS_START_AUTH request; for now use SID
     wcsncpy_s(result.subject_urn, pOp->userSid.c_str(), _TRUNCATE);
-    result.expires_at = (UINT64)time(NULL) + 3600; // 1 hour from now
+    result.expires_at = assertResult.expiresAt; // from dds-node response
 
     m_pipeServer.SendResponse(pOp->pClientCtx, IPC_MSG::DDS_AUTH_COMPLETE, pOp->seqId,
         reinterpret_cast<const BYTE*>(&result), sizeof(result));
@@ -656,29 +656,31 @@ BOOL CDdsAuthBridgeMain::HandleDdsListUsers(
         return HandleListUsers(pClientCtx, seqId);
     }
 
-    // Build IPC response from dds-node data
+    // Build IPC response from dds-node data using the DDS-specific
+    // structs that the credential provider expects.
     BYTE buffer[IPC_PIPE::BUFFER_SIZE];
-    IPC_RESP_USER_LIST* pList = reinterpret_cast<IPC_RESP_USER_LIST*>(buffer);
+    IPC_RESP_DDS_USER_LIST* pList = reinterpret_cast<IPC_RESP_DDS_USER_LIST*>(buffer);
 
-    size_t maxUsers = (sizeof(buffer) - sizeof(IPC_RESP_USER_LIST)) / sizeof(IPC_USER_ENTRY);
+    size_t maxUsers = (sizeof(buffer) - sizeof(IPC_RESP_DDS_USER_LIST)) / sizeof(IPC_DDS_USER_ENTRY);
     UINT32 count = static_cast<UINT32>(min(result.users.size(), maxUsers));
-    pList->userCount = count;
+    pList->count = count;
 
-    IPC_USER_ENTRY* pEntries = reinterpret_cast<IPC_USER_ENTRY*>(buffer + sizeof(IPC_RESP_USER_LIST));
+    IPC_DDS_USER_ENTRY* pEntries = reinterpret_cast<IPC_DDS_USER_ENTRY*>(buffer + sizeof(IPC_RESP_DDS_USER_LIST));
     for (UINT32 i = 0; i < count; i++)
     {
-        ZeroMemory(&pEntries[i], sizeof(IPC_USER_ENTRY));
-        // Convert narrow UTF-8 strings to wide
+        ZeroMemory(&pEntries[i], sizeof(IPC_DDS_USER_ENTRY));
         MultiByteToWideChar(CP_UTF8, 0,
-            result.users[i].userSid.c_str(), -1,
-            pEntries[i].sid, _countof(pEntries[i].sid));
+            result.users[i].subjectUrn.c_str(), -1,
+            pEntries[i].subject_urn, _countof(pEntries[i].subject_urn));
         MultiByteToWideChar(CP_UTF8, 0,
             result.users[i].displayName.c_str(), -1,
-            pEntries[i].displayName, _countof(pEntries[i].displayName));
-        pEntries[i].authMethod = IPC_AUTH_METHOD::FIDO2;
+            pEntries[i].display_name, _countof(pEntries[i].display_name));
+        MultiByteToWideChar(CP_UTF8, 0,
+            result.users[i].credentialId.c_str(), -1,
+            pEntries[i].credential_id, _countof(pEntries[i].credential_id));
     }
 
-    DWORD totalSize = sizeof(IPC_RESP_USER_LIST) + count * sizeof(IPC_USER_ENTRY);
+    DWORD totalSize = sizeof(IPC_RESP_DDS_USER_LIST) + count * sizeof(IPC_DDS_USER_ENTRY);
 
     FileLog::Writef("DdsListUsers: returning %u user(s) from dds-node\n", count);
 

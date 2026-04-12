@@ -240,13 +240,13 @@ static INT_PTR CALLBACK ApprovalDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
         for (size_t i = 0; i < p->users.size(); i++)
         {
             const auto& u = p->users[i];
-            // Format: "DisplayName (SID) — Pending/Approved"
+            // Format: "DisplayName (URN)"
             wchar_t item[512];
             wchar_t nameW[256] = {};
-            wchar_t sidW[160] = {};
+            wchar_t urnW[160] = {};
             MultiByteToWideChar(CP_UTF8, 0, u.displayName.c_str(), -1, nameW, 256);
-            MultiByteToWideChar(CP_UTF8, 0, u.userSid.c_str(), -1, sidW, 160);
-            swprintf_s(item, L"%s (%s)", nameW, sidW);
+            MultiByteToWideChar(CP_UTF8, 0, u.subjectUrn.c_str(), -1, urnW, 160);
+            swprintf_s(item, L"%s (%s)", nameW, urnW);
             SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)item);
         }
 
@@ -372,8 +372,8 @@ bool RunAdminApproveFlow(HWND hwnd)
 
     const DdsEnrolledUser& subject = dlgParam.users[dlgParam.selectedIndex];
 
-    FileLog::Writef("AdminApprove: approving user sid='%s' credId='%s'\n",
-                    subject.userSid.c_str(), subject.credentialId.c_str());
+    FileLog::Writef("AdminApprove: approving user urn='%s' credId='%s'\n",
+                    subject.subjectUrn.c_str(), subject.credentialId.c_str());
 
     // Admin touches authenticator for proof-of-presence
     MessageBoxW(hwnd,
@@ -404,17 +404,11 @@ bool RunAdminApproveFlow(HWND hwnd)
     std::string cdhB64 = Base64UrlEncode(
         assertResult.clientDataHash.data(), assertResult.clientDataHash.size());
 
-    // Build the subject_urn from the enrolled user's credentialId
-    // The dds-node uses the credential_id to look up the subject's URN
-    // We need to provide the subject's URN which is available in the users list
-    // Since the HTTP response doesn't include URN directly, we use the userSid
-    // as a label reference and let dds-node resolve it via the credential_id.
-    //
-    // For now, use "urn:vouchsafe:<userSid>" as the subject_urn —
-    // dds-node's admin_vouch() will look up by credential_id if this doesn't match.
+    // The enrolled user's subject_urn is available directly from the
+    // /v1/enrolled-users response (the "subject_urn" field).
 
     std::string vouchJson = "{";
-    vouchJson += "\"subject_urn\":\"" + subject.userSid + "\",";
+    vouchJson += "\"subject_urn\":\"" + subject.subjectUrn + "\",";
     vouchJson += "\"credential_id\":\"" + credIdB64 + "\",";
     vouchJson += "\"authenticator_data\":\"" + authDataB64 + "\",";
     vouchJson += "\"client_data_hash\":\"" + cdhB64 + "\",";

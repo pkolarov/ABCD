@@ -84,7 +84,24 @@ DdsAssertResult CDdsNodeHttpClient::PostSessionAssert(const std::string& asserti
     if (httpStatus == 200)
     {
         result.success = true;
-        result.sessionToken = JsonGetString(responseBody, "session_token");
+        result.sessionId    = JsonGetString(responseBody, "session_id");
+        result.tokenCborB64 = JsonGetString(responseBody, "token_cbor_b64");
+        // Parse expires_at as a number (the JSON helper only does strings,
+        // so extract the raw digits after the key).
+        result.expiresAt = 0;
+        {
+            std::string needle = "\"expires_at\"";
+            size_t pos = responseBody.find(needle);
+            if (pos != std::string::npos) {
+                pos += needle.size();
+                pos = responseBody.find(':', pos);
+                if (pos != std::string::npos) {
+                    pos++;
+                    while (pos < responseBody.size() && responseBody[pos] == ' ') pos++;
+                    result.expiresAt = strtoull(responseBody.c_str() + pos, nullptr, 10);
+                }
+            }
+        }
     }
     else
     {
@@ -145,7 +162,7 @@ DdsEnrolledUsersResult CDdsNodeHttpClient::GetEnrolledUsers(const std::string& d
         for (const auto& obj : userObjects)
         {
             DdsEnrolledUser user;
-            user.userSid      = JsonGetString(obj, "user_sid");
+            user.subjectUrn   = JsonGetString(obj, "subject_urn");
             user.displayName  = JsonGetString(obj, "display_name");
             user.credentialId = JsonGetString(obj, "credential_id");
             result.users.push_back(std::move(user));

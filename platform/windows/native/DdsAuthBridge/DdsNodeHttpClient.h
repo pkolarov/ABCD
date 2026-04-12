@@ -19,16 +19,18 @@
 struct DdsAssertResult
 {
     bool        success;
-    std::string sessionToken;   // Opaque session token from dds-node
-    std::string errorMessage;   // Non-empty on failure
+    std::string sessionId;         // "sess-..." session identifier
+    std::string tokenCborB64;      // Base64-encoded signed session token (CBOR)
+    uint64_t    expiresAt;         // Unix epoch seconds (UTC)
+    std::string errorMessage;      // Non-empty on failure
 };
 
 // One enrolled user as returned by GET /v1/enrolled-users
 struct DdsEnrolledUser
 {
-    std::string userSid;
+    std::string subjectUrn;        // DDS Vouchsafe URN (was "userSid")
     std::string displayName;
-    std::string credentialId;   // Base64url-encoded
+    std::string credentialId;      // Base64url-encoded FIDO2 credential ID
 };
 
 // Result of a GET /v1/enrolled-users call
