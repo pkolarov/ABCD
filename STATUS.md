@@ -1,7 +1,7 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](DDS-Design-Document.md).
-> Last updated: 2026-04-12 (Windows ARM64 full build + E2E smoke test)
+> Last updated: 2026-04-12 (single-file provisioning + FIDO2 domain key)
 
 ## Build Health
 
@@ -9,7 +9,7 @@
 |---|---|
 | **Rust version** | 1.94.1 (stable) |
 | **Edition** | 2024 |
-| **Workspace crates** | 8 (dds-core, dds-domain, dds-store, dds-net, dds-node, dds-ffi, dds-cli, dds-loadtest) |
+| **Workspace crates** | 9 (dds-core, dds-domain, dds-store, dds-net, dds-node, dds-ffi, dds-cli, dds-loadtest, dds-fido2-test) |
 | **Rust LOC** | 8,400+ |
 | **Rust tests** | 309 |
 | **.NET tests** | 56 (Windows) + 17 (macOS) |
@@ -288,6 +288,14 @@ All 7 crates are functionally complete. The following work is ordered by impact 
 12\. 🟢 **ECDSA-P256 support** — Some FIDO2 authenticators only support P-256. Added as a third `SchemeId` variant with triple-hybrid option `Ed25519+ECDSA-P256+ML-DSA-65`.
 
 13. **macOS managed-device platform** — First working slice landed on 2026-04-10. `dds-domain` now has `MacOsPolicyDocument`; `dds-node` exposes `/v1/macos/policies`, `/v1/macos/software`, and `/v1/macos/applied`; `platform/macos/DdsPolicyAgent` now builds and tests. Remaining work is listed in the macOS status section below.
+
+14\. 🟢 **FIDO2-backed domain key** — Domain secret key can be protected by a FIDO2 hardware authenticator instead of a passphrase (`dds-node init-domain --fido2`). The key is encrypted with the authenticator's hmac-secret output; touch the key to decrypt. Feature-gated behind `--features fido2` (ctap-hid-fido2 crate). Version 3 on-disk format stores credential_id + hmac_salt alongside the encrypted key.
+
+15\. 🟢 **Single-file node provisioning** — `dds-node provision <bundle.dds>`: one file on USB + admin's FIDO2 key + one command + one touch = node admitted, configured, started, and enrolled. The `.dds` bundle contains domain config + encrypted domain key. The provisioning command decrypts the domain key in memory (FIDO2 touch), signs an admission cert, writes config, starts the node, enrolls the device. Domain key is zeroed after use — never written to disk on new machines. `dds-node create-provision-bundle` creates the bundle from an existing domain directory.
+
+16\. 🟢 **macOS installer package** — `platform/macos/packaging/Makefile` produces a `.pkg` installer (Rust binaries + self-contained .NET agent + LaunchDaemons + config templates). Bootstrap scripts: `dds-bootstrap-domain` (creates domain, starts node, enrolls device), `dds-enroll-admin` (enrolls FIDO2 admin user), `dds-admit-node` (issues admission certs). All scripts support FIDO2 domain key protection.
+
+17\. 🟢 **dds-fido2-test** — Interactive FIDO2 enrollment + authentication test tool. Tests the full hardware flow: USB key → makeCredential → dds-node enroll → getAssertion → dds-node session. Works on macOS and Windows with any FIDO2 USB key.
 
 ### Windows Policy Applier Plan (Phase 3 items 9–10)
 
