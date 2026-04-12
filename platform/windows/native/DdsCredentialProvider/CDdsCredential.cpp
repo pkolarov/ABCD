@@ -625,8 +625,8 @@ struct REPORT_RESULT_STATUS_INFO
 
 static const REPORT_RESULT_STATUS_INFO s_rgLogonStatusInfo[] =
 {
-    { STATUS_LOGON_FAILURE, STATUS_SUCCESS, L"Incorrect password or username.", CPSI_ERROR, },
-    { STATUS_ACCOUNT_RESTRICTION, STATUS_ACCOUNT_DISABLED, L"The account is disabled.", CPSI_WARNING },
+    { STATUS_LOGON_FAILURE, STATUS_SUCCESS, const_cast<PWSTR>(L"Incorrect password or username."), CPSI_ERROR, },
+    { STATUS_ACCOUNT_RESTRICTION, STATUS_ACCOUNT_DISABLED, const_cast<PWSTR>(L"The account is disabled."), CPSI_WARNING },
 };
 
 // ReportResult is completely optional.  Its purpose is to allow a credential to customize the string

@@ -805,7 +805,7 @@ BOOL CDdsAuthBridgeMain::HandleGetStatus(
     resp.serviceRunning  = TRUE;
     resp.deviceConnected = FALSE; // No BLE device manager
     resp.batteryLevel    = -1;
-    resp.transport       = TRANSPORT::NONE;
+    resp.transport       = 0; // No hardware transport (DDS is cloud-mediated)
 
     wcscpy_s(resp.deviceName, L"DDS Auth Bridge (no hardware device)");
 
