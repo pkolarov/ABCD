@@ -28,6 +28,11 @@ struct AuthOperation
     std::string         rpId;       // FIDO2 relying party ID
     HANDLE              hThread;    // Worker thread handle
     volatile BOOL       cancelled;  // Set to TRUE to cancel
+
+    // Two-phase challenge/response: set by HandleDdsAuthResponse
+    HANDLE              hResponseEvent; // Signaled when CP sends DDS_AUTH_RESPONSE
+    IPC_REQ_DDS_AUTH_RESPONSE responseData; // Filled by HandleDdsAuthResponse
+    BOOL                responseReceived;   // TRUE once responseData is valid
 };
 
 class CDdsAuthBridgeMain
@@ -75,6 +80,8 @@ private:
 
     // --- DDS-specific handlers ---
     BOOL HandleDdsStartAuth(_In_ IPC_CLIENT_CONTEXT* pClientCtx, _In_ UINT32 seqId,
+        _In_ const BYTE* pPayload, _In_ DWORD payloadLen);
+    BOOL HandleDdsAuthResponse(_In_ IPC_CLIENT_CONTEXT* pClientCtx, _In_ UINT32 seqId,
         _In_ const BYTE* pPayload, _In_ DWORD payloadLen);
     BOOL HandleDdsListUsers(_In_ IPC_CLIENT_CONTEXT* pClientCtx, _In_ UINT32 seqId);
 

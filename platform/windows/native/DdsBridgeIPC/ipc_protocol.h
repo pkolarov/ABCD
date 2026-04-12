@@ -66,11 +66,13 @@ namespace IPC_MSG
     // --- Requests (CP -> Auth Bridge) : DDS cloud auth path (0x0060-0x007F) ---
 
     constexpr UINT16 DDS_START_AUTH     = 0x0060;  // Begin DDS FIDO2 authentication via cloud
+    constexpr UINT16 DDS_AUTH_RESPONSE  = 0x0061;  // CP sends WebAuthn assertion result to Bridge
     constexpr UINT16 DDS_LIST_USERS     = 0x0062;  // List DDS-enrolled users for a device
 
     // --- Responses (Auth Bridge -> CP) : DDS cloud auth path ---
 
     constexpr UINT16 DDS_AUTH_PROGRESS  = 0x8060;  // DDS auth progress update
+    constexpr UINT16 DDS_AUTH_CHALLENGE = 0x8063;  // Bridge sends credential info for CP to call WebAuthn
     constexpr UINT16 DDS_AUTH_COMPLETE  = 0x8061;  // DDS auth result with credentials + session
     constexpr UINT16 DDS_AUTH_ERROR     = 0x806F;  // DDS authentication error
     constexpr UINT16 DDS_USER_LIST      = 0x8062;  // DDS enrolled user list

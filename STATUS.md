@@ -147,7 +147,7 @@ All documents implement `DomainDocument` trait: `embed()` / `extract()` from `To
 
 | Platform | Path | Status | Verified | Notes |
 |---|---|---|---|---|
-| **Windows** | `platform/windows/` | 🟢 Build verified | ✅ 309 Rust + 56 .NET + 34 C++ + 3 E2E | Native CP DLL + Auth Bridge + Policy Agent all build + test on Win11 ARM64; E2E smoke test passes; WebAuthn platform call is still stubbed |
+| **Windows** | `platform/windows/` | 🟢 Build verified | ✅ 309 Rust + 56 .NET + 34 C++ + 3 E2E | Native CP DLL + Auth Bridge + Policy Agent all build + test on Win11 ARM64; E2E smoke test passes; WebAuthn platform API integrated (two-phase challenge/response with hmac-secret) |
 | **macOS** | `platform/macos/` | 🟡 In progress | ✅ .NET build + 17 tests | `DdsPolicyAgent.MacOS` worker, localhost client, state store, launchd plist, host-backed preference/account/launchd/profile/software backends, and Rust `/v1/macos/*` API path landed |
 | **Linux** | `platform/linux/` | ⚪ Planned | n/a | Design-only at this point; no agent code in tree yet |
 
@@ -428,8 +428,8 @@ complete, security-critical hardening (Phase 1) is done, the three
 algorithmic / sync blockers the chaos soak found (B5, B5b, B6) are fixed
 and validated, and the two platform blockers (B1, B2) are now resolved
 with full Windows ARM64 build verification and E2E smoke testing.
-Remaining gaps are *platform WebAuthn integration* (Auth Bridge stub),
-*WiX installer packaging*, and *operational instrumentation*.
+Remaining gaps are *WiX installer packaging*, *Windows service registration*,
+*code signing*, and *operational instrumentation*.
 
 ### Production Blockers
 
@@ -441,7 +441,7 @@ None. All production blockers resolved.
 
 | # | Gap | Resolution |
 | --- | --- | --- |
-| **B1** | **Windows Credential Provider stubbed** | Resolved 2026-04-12: Native C++ COM DLL builds and exports `DllGetClassObject`/`DllCanUnloadNow`. Auth Bridge service builds and connects to dds-node via WinHTTP. IPC library operational. Full CP+FIDO2 E2E smoke test passes (3 tests: Ed25519 lifecycle, P-256 assertion, enrollment flow). Remaining: platform WebAuthn `getAssertion` call is still a stub in `DdsAuthBridgeMain.cpp:393` — needs real Windows Hello integration for production use. |
+| **B1** | **Windows Credential Provider stubbed** | Resolved 2026-04-12: Native C++ COM DLL builds and exports `DllGetClassObject`/`DllCanUnloadNow`. Auth Bridge service builds and connects to dds-node via WinHTTP. IPC library operational. Full CP+FIDO2 E2E smoke test passes (3 tests: Ed25519 lifecycle, P-256 assertion, enrollment flow). WebAuthn platform integration completed: two-phase IPC protocol (`DDS_AUTH_CHALLENGE`/`DDS_AUTH_RESPONSE`) where CP calls `WebAuthNAuthenticatorGetAssertion` with hmac-secret extension on the secure desktop, Bridge verifies assertion via dds-node and decrypts stored password with AES-256-GCM. Remaining for production: WiX installer, Windows service registration, code signing. |
 | **B2** | **Cross-platform builds untested** | Resolved 2026-04-12 for Windows: `cargo build --workspace` + `cargo test --workspace` — 309/309 Rust tests pass on Windows 11 ARM64 (aarch64-pc-windows-msvc). `dotnet build` + `dotnet test` — 56/56 .NET tests pass. Native C++ solution — 4/4 projects build. Android, iOS, embedded remain 🔲 but are not in pilot scope. |
 | B3 | **24h soak result missing** | Resolved by the 2026-04-09 30-min chaos validation soak (`b6-validation-20260409-210025`): 0 errors / 466K ops, all 5 hard §10 KPIs PASS, 14/14 chaos rejoins succeeded. A 24h endurance run is still nice-to-have for long-tail evidence but is no longer load-bearing for §10 sign-off. |
 | B4 | **Ed25519 throughput unverified** | Resolved: 53,975 ops/sec measured in the validation soak (above the 50K target). Heap/bandwidth caveats remain (R5 below) but they are *measurement* gaps, not perf gaps. |
@@ -582,8 +582,8 @@ five hard §10 KPIs PASS, 14/14 chaos rejoins succeeded.
 #### Milestone P1 — Pilot scoping decision
 
 - [ ] Decide pilot platform scope: Linux/macOS daemons only, *or* Windows logon included
-  - If Linux/macOS only → B1 drops out, jump to P2
-  - If Windows included → B1 becomes the critical path (multi-week effort: COM, LSA, MSI, signing)
+  - If Linux/macOS only → jump to P2
+  - If Windows included → remaining work is packaging (WiX/MSI), service registration, and Authenticode signing (COM DLL + Auth Bridge + WebAuthn integration are complete)
 
 #### Milestone P2 — Platform breadth (resolves B2)
 

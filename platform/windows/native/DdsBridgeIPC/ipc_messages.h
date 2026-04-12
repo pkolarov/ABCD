@@ -30,6 +30,12 @@ constexpr DWORD IPC_MAX_URN_LEN          = 256;
 constexpr DWORD IPC_MAX_CREDENTIAL_ID_LEN = 256;
 constexpr DWORD IPC_MAX_SESSION_TOKEN_LEN = 4096;
 
+// WebAuthn assertion field lengths
+constexpr DWORD IPC_MAX_AUTH_DATA_LEN    = 512;   // authenticatorData (typically ~37 bytes, up to ~512 with extensions)
+constexpr DWORD IPC_MAX_SIGNATURE_LEN    = 256;   // ECDSA/EdDSA signature
+constexpr DWORD IPC_MAX_HMAC_SECRET_LEN  = 32;    // hmac-secret output is always 32 bytes
+constexpr DWORD IPC_MAX_SALT_LEN         = 32;    // hmac-secret salt is 32 bytes
+
 #pragma pack(push, 1)
 
 // ============================================================================
@@ -211,6 +217,34 @@ struct IPC_REQ_DDS_LIST_USERS
 // ============================================================================
 // DDS Response Payloads (Auth Bridge -> CP)
 // ============================================================================
+
+// DDS_AUTH_CHALLENGE (0x8063)
+// Sent by Bridge to CP after DDS_START_AUTH. Contains the credential info
+// the CP needs to call WebAuthNAuthenticatorGetAssertion locally.
+struct IPC_RESP_DDS_AUTH_CHALLENGE
+{
+    BYTE   credential_id[IPC_MAX_CREDENTIAL_ID_LEN]; // Raw FIDO2 credential ID bytes
+    DWORD  credential_id_len;                         // Actual length of credential ID
+    char   rp_id[IPC_MAX_RPID_LEN];                  // RP ID (UTF-8, null-terminated)
+    BYTE   salt[IPC_MAX_SALT_LEN];                    // hmac-secret salt from vault
+    DWORD  salt_len;                                  // Actual salt length (32)
+};
+
+// DDS_AUTH_RESPONSE (0x0061)
+// Sent by CP to Bridge after calling WebAuthNAuthenticatorGetAssertion.
+// Contains the assertion proof and the hmac-secret output for password decryption.
+struct IPC_REQ_DDS_AUTH_RESPONSE
+{
+    BYTE   authenticator_data[IPC_MAX_AUTH_DATA_LEN]; // Raw authenticatorData from assertion
+    DWORD  authenticator_data_len;                    // Actual length
+    BYTE   signature[IPC_MAX_SIGNATURE_LEN];          // Assertion signature
+    DWORD  signature_len;                             // Actual length
+    BYTE   credential_id[IPC_MAX_CREDENTIAL_ID_LEN];  // Credential ID from assertion
+    DWORD  credential_id_len;                          // Actual length
+    BYTE   hmac_secret[IPC_MAX_HMAC_SECRET_LEN];      // hmac-secret output (32 bytes)
+    DWORD  hmac_secret_len;                            // Actual length (32 or 0 if not available)
+    BYTE   client_data_hash[32];                       // Echo back the challenge
+};
 
 // DDS_AUTH_PROGRESS (0x8060)
 struct IPC_RESP_DDS_AUTH_PROGRESS

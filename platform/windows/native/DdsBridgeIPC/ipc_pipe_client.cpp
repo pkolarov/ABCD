@@ -231,6 +231,28 @@ BOOL CIpcPipeClient::SendRequestNoReply(
     return WriteRaw(sendBuffer, sendLen);
 }
 
+BOOL CIpcPipeClient::SendMessageWithSeqId(
+    _In_ UINT16 msgType,
+    _In_ UINT32 seqId,
+    _In_reads_bytes_opt_(payloadLen) const BYTE* pPayload,
+    _In_ DWORD payloadLen)
+{
+    BYTE sendBuffer[IPC_PIPE::BUFFER_SIZE];
+
+    DWORD sendLen = IpcSerializeMessage(
+        sendBuffer, sizeof(sendBuffer),
+        msgType, seqId,
+        pPayload, payloadLen
+    );
+
+    if (sendLen == 0)
+    {
+        return FALSE;
+    }
+
+    return WriteRaw(sendBuffer, sendLen);
+}
+
 BOOL CIpcPipeClient::ReadMessage(
     _Out_ IPC_MESSAGE_HEADER* pHeader,
     _Out_writes_bytes_(bufferSize) BYTE* pBuffer,

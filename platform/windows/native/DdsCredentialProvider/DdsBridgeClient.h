@@ -5,6 +5,7 @@
 #pragma once
 
 #include <windows.h>
+#include <webauthn.h>
 #include <string>
 #include <vector>
 #include <functional>
@@ -80,6 +81,13 @@ private:
 
     DdsBridgeAuthResult WaitForAuthComplete(UINT32 seqId, DWORD timeoutMs,
         std::function<void(UINT32, PCWSTR)> progressCallback);
+
+    // Call Windows WebAuthn API to get assertion + hmac-secret, then send response to Bridge.
+    // Returns false and fills result.error* on failure.
+    bool HandleWebAuthnChallenge(
+        UINT32 seqId,
+        const IPC_RESP_DDS_AUTH_CHALLENGE* pChallenge,
+        DdsBridgeAuthResult& result);
 
     CIpcPipeClient m_client;
     BOOL EnsureConnected();

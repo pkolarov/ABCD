@@ -48,6 +48,14 @@ public:
         _In_ DWORD requestPayloadLen
     );
 
+    // Send a message with a specific seqId (for correlated responses like DDS_AUTH_RESPONSE).
+    BOOL SendMessageWithSeqId(
+        _In_ UINT16 msgType,
+        _In_ UINT32 seqId,
+        _In_reads_bytes_opt_(payloadLen) const BYTE* pPayload,
+        _In_ DWORD payloadLen
+    );
+
     // Read the next message from the pipe (for receiving async progress notifications).
     // Returns TRUE if a message was read, FALSE on timeout or error.
     BOOL ReadMessage(

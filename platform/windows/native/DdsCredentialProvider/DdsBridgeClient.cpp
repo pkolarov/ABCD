@@ -5,6 +5,62 @@
 #include "DdsBridgeClient.h"
 #include <cstring>
 #include <functional>
+#include <bcrypt.h>
+
+#pragma comment(lib, "webauthn.lib")
+#pragma comment(lib, "bcrypt.lib")
+
+// Compute SHA-256 of a buffer using BCrypt.
+static bool Sha256(const uint8_t* data, size_t len, uint8_t outHash[32])
+{
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0);
+    if (!BCRYPT_SUCCESS(status)) return false;
+
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    status = BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0);
+    if (!BCRYPT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
+
+    status = BCryptHashData(hHash, const_cast<PUCHAR>(data), static_cast<ULONG>(len), 0);
+    if (!BCRYPT_SUCCESS(status)) { BCryptDestroyHash(hHash); BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
+
+    status = BCryptFinishHash(hHash, outHash, 32, 0);
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return BCRYPT_SUCCESS(status);
+}
+
+// Generate random bytes.
+static bool GenRandom(uint8_t* buf, size_t len)
+{
+    return BCRYPT_SUCCESS(BCryptGenRandom(NULL, buf, static_cast<ULONG>(len),
+                                          BCRYPT_USE_SYSTEM_PREFERRED_RNG));
+}
+
+// Base64url encode (no padding) for clientDataJSON challenge field.
+static std::string Base64UrlEncode(const uint8_t* data, size_t len)
+{
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((len * 4 + 2) / 3);
+    for (size_t i = 0; i < len; i += 3)
+    {
+        uint32_t n = static_cast<uint32_t>(data[i]) << 16;
+        if (i + 1 < len) n |= static_cast<uint32_t>(data[i + 1]) << 8;
+        if (i + 2 < len) n |= static_cast<uint32_t>(data[i + 2]);
+        out.push_back(table[(n >> 18) & 0x3F]);
+        out.push_back(table[(n >> 12) & 0x3F]);
+        if (i + 1 < len) out.push_back(table[(n >> 6) & 0x3F]);
+        if (i + 2 < len) out.push_back(table[n & 0x3F]);
+    }
+    for (auto& c : out)
+    {
+        if (c == '+') c = '-';
+        else if (c == '/') c = '_';
+    }
+    return out;
+}
 
 CDdsBridgeClient::CDdsBridgeClient() = default;
 CDdsBridgeClient::~CDdsBridgeClient() { m_client.Disconnect(); }
@@ -187,6 +243,25 @@ DdsBridgeAuthResult CDdsBridgeClient::WaitForDdsAuthComplete(
             }
             break;
 
+        case IPC_MSG::DDS_AUTH_CHALLENGE:
+            if (payloadLen >= sizeof(IPC_RESP_DDS_AUTH_CHALLENGE))
+            {
+                const IPC_RESP_DDS_AUTH_CHALLENGE* pChallenge =
+                    reinterpret_cast<const IPC_RESP_DDS_AUTH_CHALLENGE*>(payload);
+
+                OutputDebugString(L"DdsBridgeClient: received AUTH_CHALLENGE, calling WebAuthn\n");
+
+                if (!HandleWebAuthnChallenge(seqId, pChallenge, result))
+                {
+                    // HandleWebAuthnChallenge already filled result.error*
+                    return result;
+                }
+                // WebAuthn succeeded and DDS_AUTH_RESPONSE sent — continue waiting for AUTH_COMPLETE
+                if (progressCallback)
+                    progressCallback(IPC_AUTH_STATE::PROCESSING, L"Verifying with DDS node...");
+            }
+            break;
+
         case IPC_MSG::DDS_AUTH_COMPLETE:
             if (payloadLen >= sizeof(IPC_RESP_DDS_AUTH_COMPLETE))
             {
@@ -332,6 +407,201 @@ DdsBridgeAuthResult CDdsBridgeClient::WaitForAuthComplete(
             break; // ignore unrelated messages
         }
     }
+}
+
+// ============================================================================
+// WebAuthn platform API call
+// ============================================================================
+
+bool CDdsBridgeClient::HandleWebAuthnChallenge(
+    UINT32 seqId,
+    const IPC_RESP_DDS_AUTH_CHALLENGE* pChallenge,
+    DdsBridgeAuthResult& result)
+{
+    // Check WebAuthn API availability
+    DWORD apiVersion = WebAuthNGetApiVersionNumber();
+    if (apiVersion < WEBAUTHN_API_VERSION_1)
+    {
+        result.errorCode = IPC_ERROR::SERVICE_ERROR;
+        result.errorMessage = L"WebAuthn API not available on this system";
+        return false;
+    }
+
+    OutputDebugStringA("HandleWebAuthnChallenge: WebAuthn API present\n");
+
+    // Generate a random challenge and construct clientDataJSON.
+    // The WebAuthn API will SHA-256 this JSON to produce the clientDataHash
+    // that the authenticator signs over. We must send the same hash to dds-node.
+    uint8_t challengeBytes[32]{};
+    if (!GenRandom(challengeBytes, sizeof(challengeBytes)))
+    {
+        result.errorCode = IPC_ERROR::SERVICE_ERROR;
+        result.errorMessage = L"Failed to generate random challenge";
+        return false;
+    }
+
+    std::string challengeB64 = Base64UrlEncode(challengeBytes, sizeof(challengeBytes));
+
+    // Construct a minimal WebAuthn clientDataJSON
+    std::string clientDataJson = "{\"type\":\"webauthn.get\",\"challenge\":\"" +
+        challengeB64 + "\",\"origin\":\"https://dds.local\"}";
+
+    // Compute SHA-256 of clientDataJSON — this is what dds-node needs
+    uint8_t clientDataHash[32]{};
+    if (!Sha256(reinterpret_cast<const uint8_t*>(clientDataJson.data()),
+                clientDataJson.size(), clientDataHash))
+    {
+        result.errorCode = IPC_ERROR::SERVICE_ERROR;
+        result.errorMessage = L"Failed to compute clientDataHash";
+        return false;
+    }
+
+    WEBAUTHN_CLIENT_DATA clientData = {};
+    clientData.dwVersion = WEBAUTHN_CLIENT_DATA_CURRENT_VERSION;
+    clientData.cbClientDataJSON = static_cast<DWORD>(clientDataJson.size());
+    clientData.pbClientDataJSON = reinterpret_cast<PBYTE>(
+        const_cast<char*>(clientDataJson.data()));
+    clientData.pwszHashAlgId = WEBAUTHN_HASH_ALGORITHM_SHA_256;
+
+    // Build allow list with the specific credential ID
+    WEBAUTHN_CREDENTIAL_EX credEx = {};
+    credEx.dwVersion = WEBAUTHN_CREDENTIAL_EX_CURRENT_VERSION;
+    credEx.cbId = pChallenge->credential_id_len;
+    credEx.pbId = const_cast<PBYTE>(pChallenge->credential_id);
+    credEx.pwszCredentialType = WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY;
+    credEx.dwTransports = WEBAUTHN_CTAP_TRANSPORT_USB |
+                          WEBAUTHN_CTAP_TRANSPORT_NFC |
+                          WEBAUTHN_CTAP_TRANSPORT_BLE |
+                          WEBAUTHN_CTAP_TRANSPORT_INTERNAL;
+
+    PWEBAUTHN_CREDENTIAL_EX pCredExList = &credEx;
+    WEBAUTHN_CREDENTIAL_LIST credList = {};
+    credList.cCredentials = 1;
+    credList.ppCredentials = &pCredExList;
+
+    // Build hmac-secret salt extension
+    WEBAUTHN_HMAC_SECRET_SALT hmacSalt = {};
+    hmacSalt.cbFirst = pChallenge->salt_len;
+    hmacSalt.pbFirst = const_cast<PBYTE>(pChallenge->salt);
+    hmacSalt.cbSecond = 0;
+    hmacSalt.pbSecond = nullptr;
+
+    WEBAUTHN_HMAC_SECRET_SALT_VALUES hmacSaltValues = {};
+    hmacSaltValues.pGlobalHmacSalt = &hmacSalt;
+    hmacSaltValues.cCredWithHmacSecretSaltList = 0;
+    hmacSaltValues.pCredWithHmacSecretSaltList = nullptr;
+
+    // Convert RP ID to wide string
+    wchar_t rpIdW[IPC_MAX_RPID_LEN]{};
+    MultiByteToWideChar(CP_UTF8, 0, pChallenge->rp_id, -1, rpIdW, IPC_MAX_RPID_LEN);
+
+    // Build GetAssertion options
+    WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS options = {};
+    options.dwVersion = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_6;
+    options.dwTimeoutMilliseconds = 60000;
+    options.dwAuthenticatorAttachment = WEBAUTHN_AUTHENTICATOR_ATTACHMENT_ANY;
+    options.dwUserVerificationRequirement = WEBAUTHN_USER_VERIFICATION_REQUIREMENT_PREFERRED;
+    options.dwFlags = WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG;
+    options.pAllowCredentialList = &credList;
+    options.pHmacSecretSaltValues = &hmacSaltValues;
+
+    // Use a cancellation GUID so the CP can abort if needed
+    GUID cancelId = {};
+    if (SUCCEEDED(WebAuthNGetCancellationId(&cancelId)))
+    {
+        options.pCancellationId = &cancelId;
+    }
+
+    // Call WebAuthNAuthenticatorGetAssertion
+    // The CP runs inside LogonUI.exe on the secure desktop, so GetForegroundWindow()
+    // gives us the correct HWND for the WebAuthn UI prompt.
+    HWND hWnd = GetForegroundWindow();
+    if (hWnd == NULL)
+        hWnd = GetDesktopWindow();
+
+    PWEBAUTHN_ASSERTION pAssertion = nullptr;
+
+    OutputDebugString(L"HandleWebAuthnChallenge: calling WebAuthNAuthenticatorGetAssertion\n");
+
+    HRESULT hr = WebAuthNAuthenticatorGetAssertion(
+        hWnd,
+        rpIdW,
+        &clientData,
+        &options,
+        &pAssertion);
+
+    if (FAILED(hr) || pAssertion == nullptr)
+    {
+        result.errorCode = IPC_ERROR::AUTH_FAILED;
+        wchar_t errMsg[256];
+        swprintf_s(errMsg, L"WebAuthn assertion failed (HRESULT 0x%08lX)", hr);
+        result.errorMessage = errMsg;
+
+        OutputDebugString(errMsg);
+        OutputDebugString(L"\n");
+        return false;
+    }
+
+    OutputDebugStringA("HandleWebAuthnChallenge: assertion succeeded\n");
+
+    // Build DDS_AUTH_RESPONSE from the assertion
+    IPC_REQ_DDS_AUTH_RESPONSE response = {};
+
+    // Copy authenticator data
+    DWORD authDataLen = min(pAssertion->cbAuthenticatorData, (DWORD)sizeof(response.authenticator_data));
+    memcpy(response.authenticator_data, pAssertion->pbAuthenticatorData, authDataLen);
+    response.authenticator_data_len = authDataLen;
+
+    // Copy signature
+    DWORD sigLen = min(pAssertion->cbSignature, (DWORD)sizeof(response.signature));
+    memcpy(response.signature, pAssertion->pbSignature, sigLen);
+    response.signature_len = sigLen;
+
+    // Copy credential ID
+    DWORD credIdLen = min(pAssertion->Credential.cbId, (DWORD)sizeof(response.credential_id));
+    memcpy(response.credential_id, pAssertion->Credential.pbId, credIdLen);
+    response.credential_id_len = credIdLen;
+
+    // Copy hmac-secret output (from assertion version >= 3)
+    if (pAssertion->dwVersion >= WEBAUTHN_ASSERTION_VERSION_3 &&
+        pAssertion->pHmacSecret != nullptr &&
+        pAssertion->pHmacSecret->cbFirst == 32)
+    {
+        memcpy(response.hmac_secret, pAssertion->pHmacSecret->pbFirst, 32);
+        response.hmac_secret_len = 32;
+        OutputDebugStringA("HandleWebAuthnChallenge: hmac-secret output received (32 bytes)\n");
+    }
+    else
+    {
+        response.hmac_secret_len = 0;
+        OutputDebugStringA("HandleWebAuthnChallenge: WARNING - no hmac-secret in assertion response\n");
+    }
+
+    // Send the clientDataHash (SHA-256 of our clientDataJSON) — dds-node needs this
+    // to verify the assertion signature (sig = sign(authenticatorData || clientDataHash))
+    memcpy(response.client_data_hash, clientDataHash, 32);
+
+    // Free the assertion
+    WebAuthNFreeAssertion(pAssertion);
+    pAssertion = nullptr;
+
+    // Send DDS_AUTH_RESPONSE to Bridge with the same seqId
+    BOOL sent = m_client.SendMessageWithSeqId(
+        IPC_MSG::DDS_AUTH_RESPONSE, seqId,
+        reinterpret_cast<const BYTE*>(&response), sizeof(response));
+
+    // Secure cleanup of hmac-secret from local memory
+    SecureZeroMemory(response.hmac_secret, sizeof(response.hmac_secret));
+
+    if (!sent)
+    {
+        result.errorCode = IPC_ERROR::SERVICE_ERROR;
+        result.errorMessage = L"Failed to send WebAuthn response to Auth Bridge";
+        return false;
+    }
+
+    OutputDebugString(L"HandleWebAuthnChallenge: DDS_AUTH_RESPONSE sent to bridge\n");
+    return true; // Continue waiting for DDS_AUTH_COMPLETE
 }
 
 // ============================================================================
