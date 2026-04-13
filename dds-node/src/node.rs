@@ -127,7 +127,11 @@ impl DdsNode {
             peer_id,
             store,
             dag: CausalDag::new(),
-            trust_graph: Arc::new(RwLock::new(TrustGraph::new())),
+            trust_graph: {
+                let mut g = TrustGraph::new();
+                g.set_max_chain_depth(config.domain.max_delegation_depth);
+                Arc::new(RwLock::new(g))
+            },
             trusted_roots,
             topics,
             config,
@@ -204,6 +208,11 @@ impl DdsNode {
                     }
                     if !expired.is_empty() {
                         info!(count = expired.len(), "swept expired tokens");
+                    }
+
+                    // Audit log pruning (only if audit log is enabled)
+                    if self.config.domain.audit_log_enabled {
+                        self.prune_audit_log();
                     }
                 }
                 _ = anti_entropy.tick() => {
@@ -552,6 +561,37 @@ impl DdsNode {
             .unwrap_or(0);
         let mut g = self.trust_graph.write().expect("trust_graph poisoned");
         crate::expiry::sweep_once(&mut g, &mut self.store, now)
+    }
+
+    /// Prune audit log entries based on retention config.
+    fn prune_audit_log(&mut self) {
+        use dds_store::traits::AuditStore;
+
+        // Prune by age
+        if self.config.domain.audit_log_retention_days > 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let cutoff = now.saturating_sub(self.config.domain.audit_log_retention_days * 86400);
+            match self.store.prune_audit_entries_before(cutoff) {
+                Ok(n) if n > 0 => info!(removed = n, "pruned old audit entries"),
+                Err(e) => warn!("audit prune by age failed: {e}"),
+                _ => {}
+            }
+        }
+
+        // Prune by count
+        if self.config.domain.audit_log_max_entries > 0 {
+            match self
+                .store
+                .prune_audit_entries_to_max(self.config.domain.audit_log_max_entries)
+            {
+                Ok(n) if n > 0 => info!(removed = n, "pruned excess audit entries"),
+                Err(e) => warn!("audit prune by count failed: {e}"),
+                _ => {}
+            }
+        }
     }
 
     /// Get the number of connected peers.

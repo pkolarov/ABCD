@@ -35,7 +35,7 @@ use crate::service::{
     ApplicableWindowsPolicy, AppliedReport, AssertionSessionRequest, EnrollDeviceRequest,
     EnrollUserRequest, EnrolledUser, LocalService, NodeStatus, PolicyResult, ServiceError,
 };
-use dds_store::traits::{RevocationStore, TokenStore};
+use dds_store::traits::{AuditStore, RevocationStore, TokenStore};
 
 /// Shared, mutex-guarded service handle. Per-request handlers acquire
 /// the lock for the (very short) duration of the call. The bottleneck
@@ -49,12 +49,12 @@ pub struct NodeInfo {
     pub peer_id: String,
 }
 
-struct AppState<S: TokenStore + RevocationStore + Send + Sync + 'static> {
+struct AppState<S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static> {
     svc: SharedService<S>,
     info: NodeInfo,
 }
 
-impl<S: TokenStore + RevocationStore + Send + Sync + 'static> Clone for AppState<S> {
+impl<S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static> Clone for AppState<S> {
     fn clone(&self) -> Self {
         Self {
             svc: self.svc.clone(),
@@ -66,7 +66,7 @@ impl<S: TokenStore + RevocationStore + Send + Sync + 'static> Clone for AppState
 /// Build the axum router for the local API.
 pub fn router<S>(svc: SharedService<S>, info: NodeInfo) -> Router
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let state = AppState { svc, info };
     Router::new()
@@ -92,6 +92,7 @@ where
         .route("/v1/macos/policies", get(list_macos_policies::<S>))
         .route("/v1/macos/software", get(list_macos_software::<S>))
         .route("/v1/macos/applied", post(record_macos_applied::<S>))
+        .route("/v1/audit/entries", get(list_audit_entries::<S>))
         .with_state(state)
 }
 
@@ -300,7 +301,7 @@ async fn enroll_user<S>(
     Json(req): Json<EnrollUserRequestJson>,
 ) -> Result<Json<EnrollmentResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let attestation_object = b64_decode(&req.attestation_object_b64, "attestation_object_b64")?;
     let client_data_hash = b64_decode(&req.client_data_hash_b64, "client_data_hash_b64")?;
@@ -327,7 +328,7 @@ async fn enroll_device<S>(
     Json(req): Json<EnrollDeviceRequestJson>,
 ) -> Result<Json<EnrollmentResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let internal = EnrollDeviceRequest {
         label: req.label,
@@ -358,7 +359,7 @@ async fn evaluate_policy<S>(
     Json(req): Json<PolicyRequestJson>,
 ) -> Result<Json<PolicyResult>, HttpError>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let svc = state.svc.lock().await;
     let r = svc.evaluate_policy(&req.subject_urn, &req.resource, &req.action)?;
@@ -367,7 +368,7 @@ where
 
 async fn status<S>(State(state): State<AppState<S>>) -> Result<Json<NodeStatus>, HttpError>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let svc = state.svc.lock().await;
     Ok(Json(svc.status(&state.info.peer_id, 0, 0)?))
@@ -380,7 +381,7 @@ async fn issue_session_assert<S>(
     Json(req): Json<AssertionSessionRequestJson>,
 ) -> Result<Json<SessionResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let internal = AssertionSessionRequest {
         subject_urn: req.subject_urn,
@@ -404,7 +405,7 @@ async fn list_enrolled_users<S>(
     Query(q): Query<DeviceUrnQuery>,
 ) -> Result<Json<EnrolledUsersResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let svc = state.svc.lock().await;
     let users = svc.list_enrolled_users(&q.device_urn)?;
@@ -418,7 +419,7 @@ async fn admin_setup<S>(
     Json(req): Json<EnrollUserRequestJson>,
 ) -> Result<Json<EnrollmentResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let attestation_object = b64_decode(&req.attestation_object_b64, "attestation_object_b64")?;
     let client_data_hash = b64_decode(&req.client_data_hash_b64, "client_data_hash_b64")?;
@@ -445,7 +446,7 @@ async fn admin_vouch<S>(
     Json(req): Json<AdminVouchRequestJson>,
 ) -> Result<Json<AdminVouchResponseJson>, HttpError>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let internal = AdminVouchRequest {
         subject_urn: req.subject_urn,
@@ -471,7 +472,7 @@ async fn list_windows_policies<S>(
     Query(q): Query<DeviceUrnQuery>,
 ) -> Result<Json<WindowsPoliciesResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let svc = state.svc.lock().await;
     let policies = svc.list_applicable_windows_policies(&q.device_urn)?;
@@ -483,7 +484,7 @@ async fn list_windows_software<S>(
     Query(q): Query<DeviceUrnQuery>,
 ) -> Result<Json<WindowsSoftwareResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let svc = state.svc.lock().await;
     let software = svc.list_applicable_software(&q.device_urn)?;
@@ -495,7 +496,7 @@ async fn record_windows_applied<S>(
     Json(report): Json<AppliedReport>,
 ) -> Result<StatusCode, HttpError>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let svc = state.svc.lock().await;
     svc.record_applied(&report)?;
@@ -507,7 +508,7 @@ async fn claim_windows_account<S>(
     Json(req): Json<WindowsClaimAccountRequestJson>,
 ) -> Result<Json<WindowsClaimAccountResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let session_token_cbor = b64_decode(&req.session_token_cbor_b64, "session_token_cbor_b64")?;
     let svc = state.svc.lock().await;
@@ -540,7 +541,7 @@ async fn list_macos_policies<S>(
     Query(q): Query<DeviceUrnQuery>,
 ) -> Result<Json<MacOsPoliciesResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let svc = state.svc.lock().await;
     let policies = svc.list_applicable_macos_policies(&q.device_urn)?;
@@ -552,7 +553,7 @@ async fn list_macos_software<S>(
     Query(q): Query<DeviceUrnQuery>,
 ) -> Result<Json<MacOsSoftwareResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let svc = state.svc.lock().await;
     let software = svc.list_applicable_software(&q.device_urn)?;
@@ -564,11 +565,58 @@ async fn record_macos_applied<S>(
     Json(report): Json<AppliedReport>,
 ) -> Result<StatusCode, HttpError>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let svc = state.svc.lock().await;
     svc.record_applied(&report)?;
     Ok(StatusCode::ACCEPTED)
+}
+
+// ---------- Audit log query handler ----------
+
+#[derive(Debug, Deserialize)]
+struct AuditQueryParams {
+    action: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuditEntryJson {
+    action: String,
+    node_urn: String,
+    timestamp: u64,
+    token_cbor_b64: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuditEntriesResponse {
+    entries: Vec<AuditEntryJson>,
+    total: usize,
+}
+
+async fn list_audit_entries<S>(
+    State(state): State<AppState<S>>,
+    Query(params): Query<AuditQueryParams>,
+) -> Result<Json<AuditEntriesResponse>, HttpError>
+where
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+{
+    let svc = state.svc.lock().await;
+    let entries = svc.list_audit_entries(params.action.as_deref(), params.limit)?;
+    let total = entries.len();
+    let json_entries: Vec<AuditEntryJson> = entries
+        .into_iter()
+        .map(|e| AuditEntryJson {
+            action: e.action,
+            node_urn: e.node_urn,
+            timestamp: e.timestamp,
+            token_cbor_b64: base64::engine::general_purpose::STANDARD.encode(&e.token_bytes),
+        })
+        .collect();
+    Ok(Json(AuditEntriesResponse {
+        entries: json_entries,
+        total,
+    }))
 }
 
 /// Bind and serve the HTTP API on `addr` until the future is dropped.
@@ -578,7 +626,7 @@ pub async fn serve<S>(
     info: NodeInfo,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
-    S: TokenStore + RevocationStore + Send + Sync + 'static,
+    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
 {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "HTTP API listening");

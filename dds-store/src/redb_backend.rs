@@ -371,6 +371,86 @@ impl AuditStore for RedbBackend {
         }
         Ok(result)
     }
+
+    fn count_audit_entries(&self) -> StoreResult<usize> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        let table = read_txn
+            .open_table(AUDIT_LOG)
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        Ok(table.len().unwrap_or(0) as usize)
+    }
+
+    fn prune_audit_entries_before(&mut self, before_timestamp: u64) -> StoreResult<usize> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        let mut removed = 0usize;
+        {
+            let mut table = write_txn
+                .open_table(AUDIT_LOG)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            // Collect keys to remove (iterate, then delete)
+            let mut keys_to_remove = Vec::new();
+            for entry in table.iter().map_err(|e| StoreError::Io(e.to_string()))? {
+                let (key, value) = entry.map_err(|e| StoreError::Io(e.to_string()))?;
+                if let Ok(audit_entry) =
+                    ciborium::from_reader::<AuditLogEntry, _>(value.value())
+                {
+                    if audit_entry.timestamp < before_timestamp {
+                        keys_to_remove.push(key.value());
+                    }
+                } else {
+                    keys_to_remove.push(key.value()); // remove corrupt
+                }
+            }
+            for key in &keys_to_remove {
+                let _ = table.remove(key).map_err(|e| StoreError::Io(e.to_string()))?;
+                removed += 1;
+            }
+        }
+        write_txn
+            .commit()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        Ok(removed)
+    }
+
+    fn prune_audit_entries_to_max(&mut self, max_entries: usize) -> StoreResult<usize> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        let mut removed = 0usize;
+        {
+            let mut table = write_txn
+                .open_table(AUDIT_LOG)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            let count = table.len().unwrap_or(0) as usize;
+            if count > max_entries {
+                let to_remove = count - max_entries;
+                // Keys are sequential u64, so remove the smallest ones
+                let mut keys_to_remove = Vec::new();
+                for entry in table.iter().map_err(|e| StoreError::Io(e.to_string()))? {
+                    if keys_to_remove.len() >= to_remove {
+                        break;
+                    }
+                    let (key, _) = entry.map_err(|e| StoreError::Io(e.to_string()))?;
+                    keys_to_remove.push(key.value());
+                }
+                for key in &keys_to_remove {
+                    let _ = table.remove(key).map_err(|e| StoreError::Io(e.to_string()))?;
+                    removed += 1;
+                }
+            }
+        }
+        write_txn
+            .commit()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        Ok(removed)
+    }
 }
 
 impl DirectoryStore for RedbBackend {}

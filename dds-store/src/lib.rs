@@ -165,6 +165,76 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ---- Generic audit store tests ----
+
+    fn make_audit_entry(action: &str, timestamp: u64) -> dds_core::audit::AuditLogEntry {
+        use dds_core::crypto::{PublicKeyBundle, SchemeId, SignatureBundle};
+        dds_core::audit::AuditLogEntry {
+            action: action.to_string(),
+            token_bytes: vec![0xA0],
+            node_urn: "urn:test:node".to_string(),
+            node_public_key: PublicKeyBundle {
+                scheme: SchemeId::Ed25519,
+                bytes: vec![0; 32],
+            },
+            node_signature: SignatureBundle {
+                scheme: SchemeId::Ed25519,
+                bytes: vec![0; 64],
+            },
+            timestamp,
+        }
+    }
+
+    fn test_audit_crud(store: &mut dyn DirectoryStore) {
+        assert_eq!(store.count_audit_entries().unwrap(), 0);
+        store
+            .append_audit_entry(&make_audit_entry("attest", 1000))
+            .unwrap();
+        store
+            .append_audit_entry(&make_audit_entry("vouch", 2000))
+            .unwrap();
+        store
+            .append_audit_entry(&make_audit_entry("revoke", 3000))
+            .unwrap();
+        assert_eq!(store.count_audit_entries().unwrap(), 3);
+        let entries = store.list_audit_entries().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].action, "attest");
+        assert_eq!(entries[2].action, "revoke");
+    }
+
+    fn test_audit_prune_before(store: &mut dyn DirectoryStore) {
+        store
+            .append_audit_entry(&make_audit_entry("a", 1000))
+            .unwrap();
+        store
+            .append_audit_entry(&make_audit_entry("b", 2000))
+            .unwrap();
+        store
+            .append_audit_entry(&make_audit_entry("c", 3000))
+            .unwrap();
+        let removed = store.prune_audit_entries_before(2500).unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(store.count_audit_entries().unwrap(), 1);
+        let entries = store.list_audit_entries().unwrap();
+        assert_eq!(entries[0].action, "c");
+    }
+
+    fn test_audit_prune_to_max(store: &mut dyn DirectoryStore) {
+        for i in 0..5 {
+            store
+                .append_audit_entry(&make_audit_entry(&format!("op{i}"), i * 1000))
+                .unwrap();
+        }
+        assert_eq!(store.count_audit_entries().unwrap(), 5);
+        let removed = store.prune_audit_entries_to_max(2).unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(store.count_audit_entries().unwrap(), 2);
+        // Should keep the 2 newest
+        let entries = store.list_audit_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
     // ---- MemoryBackend tests ----
 
     #[test]
@@ -200,6 +270,21 @@ mod tests {
     #[test]
     fn memory_not_found() {
         test_not_found(&mut MemoryBackend::new());
+    }
+
+    #[test]
+    fn memory_audit_crud() {
+        test_audit_crud(&mut MemoryBackend::new());
+    }
+
+    #[test]
+    fn memory_audit_prune_before() {
+        test_audit_prune_before(&mut MemoryBackend::new());
+    }
+
+    #[test]
+    fn memory_audit_prune_to_max() {
+        test_audit_prune_to_max(&mut MemoryBackend::new());
     }
 
     // ---- RedbBackend tests ----
@@ -251,6 +336,24 @@ mod tests {
     fn redb_not_found() {
         let (mut store, _dir) = make_redb();
         test_not_found(&mut store);
+    }
+
+    #[test]
+    fn redb_audit_crud() {
+        let (mut store, _dir) = make_redb();
+        test_audit_crud(&mut store);
+    }
+
+    #[test]
+    fn redb_audit_prune_before() {
+        let (mut store, _dir) = make_redb();
+        test_audit_prune_before(&mut store);
+    }
+
+    #[test]
+    fn redb_audit_prune_to_max() {
+        let (mut store, _dir) = make_redb();
+        test_audit_prune_to_max(&mut store);
     }
 
     #[test]

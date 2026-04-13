@@ -248,7 +248,7 @@ pub struct AppliedReport {
 /// `DdsNode` so gossip-received tokens are visible to query-time hot
 /// paths without rebuilding from the store on every call. See B5b in
 /// STATUS.md and the doc on `LocalService::new` for the history.
-pub struct LocalService<S: TokenStore + dds_store::traits::RevocationStore> {
+pub struct LocalService<S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::AuditStore> {
     /// Node signing identity (used to issue tokens).
     node_identity: Identity,
     /// Policy engine with loaded rules.
@@ -270,7 +270,7 @@ pub struct LocalService<S: TokenStore + dds_store::traits::RevocationStore> {
     verify_fido2: bool,
 }
 
-impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
+impl<S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::AuditStore> LocalService<S> {
     /// Create a new local service.
     ///
     /// Rehydrates the in-memory `trust_graph` from any tokens already
@@ -1069,6 +1069,26 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             store_burned: self.store.burned_set().map(|s| s.len()).unwrap_or(0),
             uptime_secs: now_epoch() - self.start_time,
         })
+    }
+
+    /// List audit log entries, optionally filtered by action and limited.
+    pub fn list_audit_entries(
+        &self,
+        action: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<dds_core::audit::AuditLogEntry>, ServiceError> {
+        let entries = self
+            .store
+            .list_audit_entries()
+            .map_err(|e| ServiceError::Store(e.to_string()))?;
+        let filtered: Vec<_> = entries
+            .into_iter()
+            .filter(|e| action.map_or(true, |a| e.action == a))
+            .collect();
+        match limit {
+            Some(n) => Ok(filtered.into_iter().rev().take(n).collect()),
+            None => Ok(filtered),
+        }
     }
 
     /// Get a clone of the shared trust graph handle. Callers can take a

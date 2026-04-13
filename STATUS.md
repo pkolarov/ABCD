@@ -1,7 +1,7 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-13 (admin enrollment + user enrollment + FIDO2 passwordless Windows login verified on ARM64 with real HW key; macOS enterprise account/SSO schema modeled)
+> Last updated: 2026-04-13 (P3 complete: delegation depth cap, audit retention, FIDO2 allow-list doc, threat model review)
 
 ## Build Health
 
@@ -48,9 +48,9 @@ Previous verification note (2026-04-13, macOS ARM64):
 |---|---|---|---|---|
 | **dds-core** | §3–§9 | 🟢 Done | 114 | Crypto, identity, tokens (extensible body), CRDTs, trust graph, policy engine |
 | **dds-domain** | §14 | 🟢 Done | 33+20 integ | 9 typed domain documents + Stage 1 domain identity + FIDO2 attestation+assertion (Ed25519 + P-256) + macOS account/SSO bindings |
-| **dds-store** | §6 | 🟢 Done | 15 | Storage traits, MemoryBackend, RedbBackend (ACID) |
+| **dds-store** | §6 | 🟢 Done | 21 | Storage traits, MemoryBackend, RedbBackend (ACID), audit log retention |
 | **dds-net** | §5 | 🟢 Done | 19 | libp2p transport, gossipsub, Kademlia, mDNS, delta-sync |
-| **dds-node** | §12 | 🟢 Done | 49+15 integ | Config, P2P event loop, local authority service, HTTP API, encrypted persistent identity, CP+FIDO2 E2E |
+| **dds-node** | §12 | 🟢 Done | 56+15 integ | Config, P2P event loop, local authority service, HTTP API (incl. audit query), encrypted persistent identity, CP+FIDO2 E2E |
 | **dds-domain** (fido2) | §14 | 🟢 Done | (incl. above) | WebAuthn attestation + assertion parser/verifier (Ed25519 + P-256) |
 | **dds-ffi** | §14.2–14.3 | 🟢 Done | 12 | C ABI (cdylib): identity, token, policy, version |
 | **dds-cli** | §12 | 🟢 Done | 9 | Identity, group, policy, status subcommands |
@@ -92,9 +92,9 @@ All documents implement `DomainDocument` trait: `embed()` / `extract()` from `To
 
 | Module | Tests | Key Types |
 |---|---|---|
-| `traits` | — | `TokenStore`, `RevocationStore`, `OperationStore`, `DirectoryStore` |
-| `memory_backend` | 7 | `MemoryBackend` (in-process, for tests and embedded) |
-| `redb_backend` | 8 | `RedbBackend` (ACID persistent, zero-copy) |
+| `traits` | — | `TokenStore`, `RevocationStore`, `OperationStore`, `AuditStore`, `DirectoryStore` |
+| `memory_backend` | 10 | `MemoryBackend` (in-process, for tests and embedded) |
+| `redb_backend` | 11 | `RedbBackend` (ACID persistent, zero-copy) |
 
 ## Module Detail — dds-net
 
@@ -109,7 +109,7 @@ All documents implement `DomainDocument` trait: `embed()` / `extract()` from `To
 
 | Module | Tests | Key Types |
 |---|---|---|
-| `config` | 5 | `NodeConfig`, `NetworkConfig`, `DomainConfig` (TOML, domain section required) |
+| `config` | 9 | `NodeConfig`, `NetworkConfig`, `DomainConfig` (TOML, domain section required, delegation depth + audit retention) |
 | `node` | 0 | `DdsNode` — swarm event loop, gossip/sync ingestion, admission cert verification at startup |
 | `service` | 6 | `LocalService` — enrollment (with FIDO2 verification), sessions (assertion-based with RP-ID binding), enrolled-user enumeration, admin setup (auto-persists trusted\_roots to TOML config), admin vouch (server-side Ed25519 signing), policy resolution, status |
 | `http` | 9 | `axum` router exposing `LocalService` over `/v1/*` JSON endpoints (incl. `/v1/session/assert`, `/v1/enrolled-users`, `/v1/admin/setup`, `/v1/admin/vouch`); unauthenticated `/v1/session` removed |
@@ -241,7 +241,7 @@ All 7 crates are functionally complete. The following work is ordered by impact 
 
 ### Phase 1 — Production Hardening (high priority)
 
-1. 🟢 **HTTP/JSON-RPC API on dds-node** — `dds-node/src/http.rs` exposes `LocalService` over a localhost axum server. Endpoints: `POST /v1/enroll/user`, `POST /v1/enroll/device`, `POST /v1/session/assert` (assertion-based session; unauthenticated `/v1/session` removed), `GET /v1/enrolled-users` (CP tile enumeration), `POST /v1/admin/setup`, `POST /v1/admin/vouch`, `POST /v1/policy/evaluate`, `GET /v1/status`, `GET /v1/windows/policies`, `GET /v1/windows/software`, `POST /v1/windows/applied`, `POST /v1/windows/claim-account` (resolve first-account claim from a freshly issued local session token), `GET /v1/macos/policies`, `GET /v1/macos/software`, `POST /v1/macos/applied`. JSON request/response types with serde, base64-encoded binary fields. reqwest integration tests cover both Windows and macOS applier endpoints against an in-process server.
+1. 🟢 **HTTP/JSON-RPC API on dds-node** — `dds-node/src/http.rs` exposes `LocalService` over a localhost axum server. Endpoints: `POST /v1/enroll/user`, `POST /v1/enroll/device`, `POST /v1/session/assert` (assertion-based session; unauthenticated `/v1/session` removed), `GET /v1/enrolled-users` (CP tile enumeration), `POST /v1/admin/setup`, `POST /v1/admin/vouch`, `POST /v1/policy/evaluate`, `GET /v1/status`, `GET /v1/windows/policies`, `GET /v1/windows/software`, `POST /v1/windows/applied`, `POST /v1/windows/claim-account` (resolve first-account claim from a freshly issued local session token), `GET /v1/macos/policies`, `GET /v1/macos/software`, `POST /v1/macos/applied`, `GET /v1/audit/entries?action=&limit=` (audit log query). JSON request/response types with serde, base64-encoded binary fields. reqwest integration tests cover both Windows and macOS applier endpoints against an in-process server.
 
 2. 🟢 **FIDO2 attestation + assertion verification** — `dds-domain/src/fido2.rs` parses WebAuthn attestation objects with `ciborium`, supports `none` and `packed` (Ed25519 self-attestation) formats, extracts the COSE_Key credential public key, and verifies the attestation signature. Now also verifies getAssertion responses (Ed25519 + ECDSA P-256) via `verify_assertion()`, with `cose_to_credential_public_key()` for multi-algorithm key parsing. `LocalService::enroll_user` rejects enrollment whose attestation fails to verify; `issue_session_from_assertion()` verifies assertion signatures against enrolled keys. 12 unit tests cover attestation round-trips, assertion verification (both algorithms), bad signatures, COSE key parsing.
 
@@ -298,7 +298,7 @@ All 7 crates are functionally complete. The following work is ordered by impact 
 
 10. **SoftwareAssignment workflow** — Admin publishes a software assignment, devices poll/receive via gossip, local agent downloads package, verifies SHA-256, installs silently. **Enforcement implemented (Phase F, 2026-04-13):** `SoftwareInstaller` + `WindowsSoftwareOperations` with HTTP download, SHA-256 verify, msiexec install/uninstall, registry-based detection. 7 integration tests including real MSI install/uninstall on ARM64.
 
-11\. 🟢 **Audit log** — Append-only signed log of all trust graph mutations (attest, vouch, revoke, burn) for compliance. Each entry signed by the node that performed the action. Syncable via gossip. Opt-in feature enabled via `domain.toml` or `DomainConfig` during domain creation to minimize network overhead.
+11\. 🟢 **Audit log** — Append-only signed log of all trust graph mutations (attest, vouch, revoke, burn) for compliance. Each entry signed by the node that performed the action. Syncable via gossip. Opt-in feature enabled via `domain.toml` or `DomainConfig` during domain creation to minimize network overhead. **Retention**: configurable `audit_log_max_entries` (count cap) and `audit_log_retention_days` (age cap); pruning runs on the expiry sweep timer. Query endpoint: `GET /v1/audit/entries?action=&limit=`.
 
 12\. 🟢 **ECDSA-P256 support** — Some FIDO2 authenticators only support P-256. Added as a third `SchemeId` variant with triple-hybrid option `Ed25519+ECDSA-P256+ML-DSA-65`.
 
@@ -560,8 +560,8 @@ Comparison to the broken soak at the same wall-clock point (15 min in,
 
 | # | Risk | Mitigation |
 | --- | --- | --- |
-| R1 | FIDO2 attestation only supports `none` + `packed/Ed25519`; TPM and full x5c chains deferred | Acceptable for pilot with known authenticator models; document allow-list |
-| R2 | No delegation depth limit on vouch chains | Bound at config layer before opening enrollment to untrusted admins |
+| R1 | FIDO2 attestation only supports `none` + `packed` self-attestation; TPM and full x5c chains deferred | ✅ Documented in [`fido2-attestation-allowlist.md`](docs/fido2-attestation-allowlist.md) with upgrade path |
+| R2 | ~~No delegation depth limit on vouch chains~~ | ✅ **Resolved**: `max_delegation_depth` config (default 5) wired to `TrustGraph` at node init |
 | R3 | No sharded Kademlia | Only matters > 10K nodes; out of scope for pilot |
 | R4 | `DdsNode::node` module has 0 unit tests (event loop covered only by multinode integration test) | Multinode test is the load-bearing coverage; acceptable if soak passes |
 | R5 | Heap and idle-bandwidth KPIs use whole-process RSS proxies, not real allocator / per-direction byte counters. Validation soak measured 17.94 MB / 1K entries vs the §10 ≤ 5 MB target — but the number is dominated by the libp2p / tokio runtime baseline and is *not* a real-allocations regression. | Acceptable for pilot. If a hard verdict is needed pre-GA: wire `dhat` for heap and a custom `Transport` wrapper for byte counters. |
@@ -628,12 +628,12 @@ five hard §10 KPIs PASS, 14/14 chaos rejoins succeeded.
 - [ ] Wire `aarch64-apple-ios` via Xcode toolchain + run Swift XCTest suite on a simulator in CI
 - [ ] Cross-compile `dds-core --no-default-features` for `thumbv7em-none-eabihf` and record binary size vs the 512 KB §10 budget
 
-#### Milestone P3 — Operational readiness
+#### Milestone P3 — Operational readiness ✅
 
-- [ ] Add audit-log retention/rotation policy and document operator runbook
-- [ ] Add delegation depth cap to `PolicyEngine` config (R2)
-- [ ] Document the FIDO2 attestation allow-list and the upgrade path to TPM/x5c (R1)
-- [ ] Threat model review of the domain admission cert flow + the encrypted-at-rest identity store (independent eyes on f225e57)
+- [x] Add delegation depth cap to `DomainConfig` (R2) — `max_delegation_depth` field (default 5), wired to `TrustGraph::set_max_chain_depth()` at node init, 4 config tests
+- [x] Add audit-log retention/rotation — `AuditLogEntry.timestamp` field, `prune_audit_entries_before()` / `prune_audit_entries_to_max()` in both backends, config fields (`audit_log_max_entries`, `audit_log_retention_days`), pruning wired into expiry sweep loop, `GET /v1/audit/entries?action=&limit=` HTTP endpoint, 6 new store tests (21 total)
+- [x] Document FIDO2 attestation allow-list and TPM/x5c upgrade path (R1) — see [`docs/fido2-attestation-allowlist.md`](docs/fido2-attestation-allowlist.md)
+- [x] Threat model review of admission cert flow + encrypted identity store — see [`docs/threat-model-review.md`](docs/threat-model-review.md)
 
 #### Milestone P4 — Pilot deploy
 
@@ -646,7 +646,8 @@ five hard §10 KPIs PASS, 14/14 chaos rejoins succeeded.
 
 Deferred to post-GA:
 
-- Phase 4 items 13–15 (sharded Kad, delegation depth limits as a hard feature, offline enrollment)
+- Phase 4 items 13–15 (sharded Kad, offline enrollment)
+- Open items from threat model review (admission cert revocation list, key rotation — see `docs/threat-model-review.md` §6)
 
 Note: Phase 3 items 9–10 (WindowsPolicyDocument distribution + SoftwareAssignment) are fully implemented through all phases A–I including G+H — all 4 Windows enforcers have production Win32 implementations with full reconciliation/drift-detection, 117 passing .NET tests, WiX MSI installer verified, CI integration complete with MSI compile verification and E2E smoke test.
 

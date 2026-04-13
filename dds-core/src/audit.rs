@@ -19,4 +19,8 @@ pub struct AuditLogEntry {
     pub node_public_key: PublicKeyBundle,
     /// Signature of this entry by the node.
     pub node_signature: SignatureBundle,
+    /// Unix timestamp (seconds since epoch) when this entry was created.
+    /// Older entries without this field deserialize as 0.
+    #[serde(default)]
+    pub timestamp: u64,
 }

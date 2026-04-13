@@ -66,6 +66,23 @@ pub struct DomainConfig {
     /// If false (default), nodes discard historical operations once they are applied to the directory CRDTs.
     #[serde(default = "default_false")]
     pub audit_log_enabled: bool,
+
+    /// Maximum vouch chain depth for trust validation. Bounds the
+    /// delegation depth: root → admin → sub-admin → user = depth 3.
+    /// Prevents unbounded delegation and limits trust graph traversal.
+    /// Default: 5 (from `dds_core::trust::DEFAULT_MAX_CHAIN_DEPTH`).
+    #[serde(default = "default_max_delegation_depth")]
+    pub max_delegation_depth: usize,
+
+    /// Maximum number of audit log entries to retain. When exceeded,
+    /// oldest entries are pruned on the next sweep. 0 = unlimited.
+    #[serde(default)]
+    pub audit_log_max_entries: usize,
+
+    /// Maximum age (in days) for audit log entries. Entries older than
+    /// this are pruned on the next sweep. 0 = no age limit.
+    #[serde(default)]
+    pub audit_log_retention_days: u64,
 }
 
 /// Network settings.
@@ -126,6 +143,10 @@ fn default_api_addr() -> String {
 }
 fn default_false() -> bool {
     false
+}
+
+fn default_max_delegation_depth() -> usize {
+    dds_core::trust::DEFAULT_MAX_CHAIN_DEPTH
 }
 
 fn default_true() -> bool {
@@ -269,5 +290,55 @@ pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
     fn test_invalid_toml() {
         let result = NodeConfig::from_str("not valid toml {{{");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_delegation_depth_defaults_to_5() {
+        let toml = format!(r#"org_hash = "abc123"{DOMAIN_TOML}"#);
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert_eq!(
+            config.domain.max_delegation_depth,
+            dds_core::trust::DEFAULT_MAX_CHAIN_DEPTH
+        );
+    }
+
+    #[test]
+    fn test_delegation_depth_configurable() {
+        let toml = r#"
+            org_hash = "abc123"
+            [domain]
+            name = "test.local"
+            id = "dds-dom:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
+            max_delegation_depth = 3
+        "#;
+        let config = NodeConfig::from_str(toml).unwrap();
+        assert_eq!(config.domain.max_delegation_depth, 3);
+    }
+
+    #[test]
+    fn test_audit_retention_defaults() {
+        let toml = format!(r#"org_hash = "abc123"{DOMAIN_TOML}"#);
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert_eq!(config.domain.audit_log_max_entries, 0);
+        assert_eq!(config.domain.audit_log_retention_days, 0);
+    }
+
+    #[test]
+    fn test_audit_retention_configurable() {
+        let toml = r#"
+            org_hash = "abc123"
+            [domain]
+            name = "test.local"
+            id = "dds-dom:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
+            audit_log_enabled = true
+            audit_log_max_entries = 10000
+            audit_log_retention_days = 90
+        "#;
+        let config = NodeConfig::from_str(toml).unwrap();
+        assert!(config.domain.audit_log_enabled);
+        assert_eq!(config.domain.audit_log_max_entries, 10000);
+        assert_eq!(config.domain.audit_log_retention_days, 90);
     }
 }

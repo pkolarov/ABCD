@@ -188,5 +188,30 @@ impl AuditStore for MemoryBackend {
             })
             .collect()
     }
+
+    fn count_audit_entries(&self) -> StoreResult<usize> {
+        Ok(self.audit_log.len())
+    }
+
+    fn prune_audit_entries_before(&mut self, before_timestamp: u64) -> StoreResult<usize> {
+        let before_len = self.audit_log.len();
+        self.audit_log.retain(|bytes| {
+            if let Ok(entry) = ciborium::from_reader::<AuditLogEntry, _>(bytes.as_slice()) {
+                entry.timestamp >= before_timestamp
+            } else {
+                false
+            }
+        });
+        Ok(before_len - self.audit_log.len())
+    }
+
+    fn prune_audit_entries_to_max(&mut self, max_entries: usize) -> StoreResult<usize> {
+        if self.audit_log.len() <= max_entries {
+            return Ok(0);
+        }
+        let remove_count = self.audit_log.len() - max_entries;
+        self.audit_log.drain(..remove_count);
+        Ok(remove_count)
+    }
 }
 impl DirectoryStore for MemoryBackend {}

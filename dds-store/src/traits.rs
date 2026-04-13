@@ -103,8 +103,19 @@ pub trait AuditStore {
     /// Append an audit log entry.
     fn append_audit_entry(&mut self, entry: &AuditLogEntry) -> StoreResult<()>;
 
-    /// Retrieve all audit log entries, optionally sorted by timestamp.
+    /// Retrieve all audit log entries, ordered by insertion.
     fn list_audit_entries(&self) -> StoreResult<Vec<AuditLogEntry>>;
+
+    /// Count the total number of audit log entries.
+    fn count_audit_entries(&self) -> StoreResult<usize>;
+
+    /// Remove audit entries older than the given Unix timestamp.
+    /// Returns the number of entries removed.
+    fn prune_audit_entries_before(&mut self, before_timestamp: u64) -> StoreResult<usize>;
+
+    /// Remove the oldest entries to keep at most `max_entries`.
+    /// Returns the number of entries removed.
+    fn prune_audit_entries_to_max(&mut self, max_entries: usize) -> StoreResult<usize>;
 }
 
 /// Combined directory store — convenience trait bundling all stores.
