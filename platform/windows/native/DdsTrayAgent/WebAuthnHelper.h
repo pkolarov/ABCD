@@ -72,12 +72,6 @@ public:
     );
 
 private:
-    // Build a synthetic clientDataJSON and return its SHA-256 hash.
-    static std::vector<uint8_t> BuildClientDataHash(
-        const std::string& type,
-        const std::string& rpId
-    );
-
     // Format a HRESULT / WebAuthn error into a readable string.
     static std::string FormatWebAuthnError(HRESULT hr);
 };

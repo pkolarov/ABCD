@@ -237,10 +237,14 @@ bool RunEnrollmentFlow(HWND hwnd)
     }
 
     // Step 2: MakeCredential (Touch 1)
-    // Build userId from the SID string bytes
-    std::vector<uint8_t> userId(
-        reinterpret_cast<const uint8_t*>(userSid.c_str()),
-        reinterpret_cast<const uint8_t*>(userSid.c_str()) + userSid.size() * sizeof(wchar_t));
+    // Build userId from the SID string as UTF-8 bytes.
+    // CTAP2 limits user.id to 64 bytes max — UTF-16LE encoding of a
+    // typical SID exceeds that, so we use the narrow (ASCII) form.
+    char sidUtf8[128] = {};
+    WideCharToMultiByte(CP_UTF8, 0, userSid.c_str(), -1,
+                        sidUtf8, sizeof(sidUtf8), NULL, NULL);
+    std::string sidStr(sidUtf8);
+    std::vector<uint8_t> userId(sidStr.begin(), sidStr.end());
 
     MessageBoxW(hwnd,
         L"Touch your security key to register it.\n\n"
@@ -248,7 +252,7 @@ bool RunEnrollmentFlow(HWND hwnd)
         L"DDS Enrollment", MB_OK | MB_ICONINFORMATION);
 
     auto makeResult = CWebAuthnHelper::MakeCredential(
-        hwnd, rpId, userId, displayName, true /*hmacSecret*/);
+        hwnd, rpId, userId, displayName, true /*hmacSecret - must be enabled at create time*/);
 
     if (!makeResult.success)
     {

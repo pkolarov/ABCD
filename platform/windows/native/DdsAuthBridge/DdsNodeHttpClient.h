@@ -31,6 +31,7 @@ struct DdsEnrolledUser
     std::string subjectUrn;        // DDS Vouchsafe URN (was "userSid")
     std::string displayName;
     std::string credentialId;      // Base64url-encoded FIDO2 credential ID
+    bool        vouched = false;
 };
 
 // Result of a GET /v1/enrolled-users call

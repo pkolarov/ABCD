@@ -16,6 +16,9 @@
 #include <strsafe.h>
 #include <windows.h>
 
+// Diagnostic log (defined in CDdsProvider.cpp)
+extern void CPLog(const char* fmt, ...);
+
 // Global DDS Bridge client shared across credential instances
 static CDdsBridgeClient g_ddsBridgeClient;
 
@@ -135,8 +138,11 @@ HRESULT CDdsCredential::UnAdvise()
 HRESULT CDdsCredential::SetSelected(BOOL* pbAutoLogon)
 {
     OutputDebugString(L"SetSelected()\n");
-    if (auto_tries-- > 0) {
-        *pbAutoLogon = FALSE;
+    // Auto-trigger GetSerialization when we have a valid DDS subject URN.
+    // This starts the FIDO2 auth flow immediately when the user selects the tile.
+    if (_pszSubjectUrn && _pszSubjectUrn[0] != L'\0' && auto_tries-- > 0)
+    {
+        *pbAutoLogon = TRUE;
     }
     else
     {
@@ -398,7 +404,7 @@ HRESULT CDdsCredential::GetSerializationDds(
         _pszSubjectUrn,
         _pszCredentialId ? _pszCredentialId : L"",
         L"dds.local",      // rpId
-        60000,             // 60 second timeout
+        20000,             // 20 second timeout — keep short to avoid freezing LogonUI
         progressCb
     );
 
@@ -407,6 +413,8 @@ HRESULT CDdsCredential::GetSerializationDds(
         OutputDebugString(L"GetSerializationDds: auth failed — ");
         OutputDebugString(authResult.errorMessage.c_str());
         OutputDebugString(L"\n");
+        // Don't auto-trigger again on next tile select — let user click Submit manually
+        auto_tries = 0;
         if (ppwszOptionalStatusText)
         {
             CoTaskMemFree(*ppwszOptionalStatusText);
@@ -420,6 +428,18 @@ HRESULT CDdsCredential::GetSerializationDds(
 
     // Got credentials — serialize as KERB_INTERACTIVE_LOGON (password logon)
     OutputDebugString(L"GetSerializationDds: auth OK, packing KERB credential\n");
+    {
+        char domA[64]{}, userA[64]{};
+        WideCharToMultiByte(CP_UTF8, 0, authResult.domain.c_str(), -1, domA, sizeof(domA), NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, authResult.username.c_str(), -1, userA, sizeof(userA), NULL, NULL);
+        CPLog("GetSerializationDds: domain='%s' user='%s' pwdLen=%zu cpus=%d",
+            domA, userA, authResult.password.size(), (int)_cpus);
+        // Log first/last wchar code points to verify encoding (not the actual password)
+        if (!authResult.password.empty())
+            CPLog("GetSerializationDds: pwd[0]=0x%04X pwd[last]=0x%04X",
+                (unsigned)authResult.password[0],
+                (unsigned)authResult.password[authResult.password.size()-1]);
+    }
 
     PWSTR pwzProtectedPassword = nullptr;
     HRESULT hr = ProtectIfNecessaryAndCopyPassword(
@@ -618,6 +638,7 @@ HRESULT CDdsCredential::GetSerialization(
 )
 {
     OutputDebugString(L"GetSerialization()\n");
+    CPLog("GetSerialization: called, dispatching to GetSerializationDds");
 
     return GetSerializationDds(pcpgsr, pcpcs, ppwszOptionalStatusText, pcpsiOptionalStatusIcon);
 }

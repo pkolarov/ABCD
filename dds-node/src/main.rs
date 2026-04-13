@@ -280,6 +280,7 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let api_trust_graph = std::sync::Arc::clone(&node.trust_graph);
     let mut svc = LocalService::new(node_identity, api_trust_graph, trusted_roots, api_store);
     svc.set_data_dir(config.data_dir.clone());
+    svc.set_config_path(config_path.clone());
     let shared_svc = Arc::new(tokio::sync::Mutex::new(svc));
     let node_info = http::NodeInfo {
         peer_id: node.peer_id.to_string(),

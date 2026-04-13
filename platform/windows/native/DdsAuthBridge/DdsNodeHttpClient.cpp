@@ -165,6 +165,8 @@ DdsEnrolledUsersResult CDdsNodeHttpClient::GetEnrolledUsers(const std::string& d
             user.subjectUrn   = JsonGetString(obj, "subject_urn");
             user.displayName  = JsonGetString(obj, "display_name");
             user.credentialId = JsonGetString(obj, "credential_id");
+            user.subjectUrn   = JsonGetString(obj, "subject_urn");
+            user.vouched      = (obj.find("\"vouched\":true") != std::string::npos);
             result.users.push_back(std::move(user));
         }
     }

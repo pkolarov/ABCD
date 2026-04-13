@@ -464,45 +464,48 @@ bool CDdsBridgeClient::HandleWebAuthnChallenge(
     clientData.pwszHashAlgId = WEBAUTHN_HASH_ALGORITHM_SHA_256;
 
     // Build allow list with the specific credential ID
-    WEBAUTHN_CREDENTIAL_EX credEx = {};
-    credEx.dwVersion = WEBAUTHN_CREDENTIAL_EX_CURRENT_VERSION;
-    credEx.cbId = pChallenge->credential_id_len;
-    credEx.pbId = const_cast<PBYTE>(pChallenge->credential_id);
-    credEx.pwszCredentialType = WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY;
-    credEx.dwTransports = WEBAUTHN_CTAP_TRANSPORT_USB |
-                          WEBAUTHN_CTAP_TRANSPORT_NFC |
-                          WEBAUTHN_CTAP_TRANSPORT_BLE |
-                          WEBAUTHN_CTAP_TRANSPORT_INTERNAL;
+    // Must use CredentialList (inline WEBAUTHN_CREDENTIALS) — not pAllowCredentialList —
+    // to match the enrollment flow exactly. Using pAllowCredentialList + different flags
+    // causes the Windows WebAuthn API to produce different hmac-secret output.
+    WEBAUTHN_CREDENTIAL allowCred = {};
+    allowCred.dwVersion = WEBAUTHN_CREDENTIAL_CURRENT_VERSION;
+    allowCred.cbId = pChallenge->credential_id_len;
+    allowCred.pbId = const_cast<PBYTE>(pChallenge->credential_id);
+    allowCred.pwszCredentialType = WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY;
 
-    PWEBAUTHN_CREDENTIAL_EX pCredExList = &credEx;
-    WEBAUTHN_CREDENTIAL_LIST credList = {};
-    credList.cCredentials = 1;
-    credList.ppCredentials = &pCredExList;
+    WEBAUTHN_CREDENTIALS allowList = {};
+    allowList.cCredentials = 1;
+    allowList.pCredentials = &allowCred;
 
-    // Build hmac-secret salt extension
+    // Build hmac-secret salt — must match enrollment's approach exactly:
+    // both pGlobalHmacSalt AND per-credential salt with cCredWithHmacSecretSaltList=1
     WEBAUTHN_HMAC_SECRET_SALT hmacSalt = {};
     hmacSalt.cbFirst = pChallenge->salt_len;
     hmacSalt.pbFirst = const_cast<PBYTE>(pChallenge->salt);
     hmacSalt.cbSecond = 0;
     hmacSalt.pbSecond = nullptr;
 
+    WEBAUTHN_CRED_WITH_HMAC_SECRET_SALT credSalt = {};
+    credSalt.cbCredID = pChallenge->credential_id_len;
+    credSalt.pbCredID = const_cast<PBYTE>(pChallenge->credential_id);
+    credSalt.pHmacSecretSalt = &hmacSalt;
+
     WEBAUTHN_HMAC_SECRET_SALT_VALUES hmacSaltValues = {};
     hmacSaltValues.pGlobalHmacSalt = &hmacSalt;
-    hmacSaltValues.cCredWithHmacSecretSaltList = 0;
-    hmacSaltValues.pCredWithHmacSecretSaltList = nullptr;
+    hmacSaltValues.cCredWithHmacSecretSaltList = 1;
+    hmacSaltValues.pCredWithHmacSecretSaltList = &credSalt;
 
     // Convert RP ID to wide string
     wchar_t rpIdW[IPC_MAX_RPID_LEN]{};
     MultiByteToWideChar(CP_UTF8, 0, pChallenge->rp_id, -1, rpIdW, IPC_MAX_RPID_LEN);
 
-    // Build GetAssertion options
+    // Build GetAssertion options — must match enrollment exactly:
+    // CURRENT_VERSION, CredentialList (not pAllowCredentialList), DISCOURAGED, no dwFlags
     WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS options = {};
-    options.dwVersion = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_6;
+    options.dwVersion = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_CURRENT_VERSION;
     options.dwTimeoutMilliseconds = 60000;
-    options.dwAuthenticatorAttachment = WEBAUTHN_AUTHENTICATOR_ATTACHMENT_ANY;
-    options.dwUserVerificationRequirement = WEBAUTHN_USER_VERIFICATION_REQUIREMENT_PREFERRED;
-    options.dwFlags = WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG;
-    options.pAllowCredentialList = &credList;
+    options.CredentialList = allowList;
+    options.dwUserVerificationRequirement = WEBAUTHN_USER_VERIFICATION_REQUIREMENT_DISCOURAGED;
     options.pHmacSecretSaltValues = &hmacSaltValues;
 
     // Use a cancellation GUID so the CP can abort if needed

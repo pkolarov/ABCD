@@ -258,8 +258,11 @@ impl IntoResponse for HttpError {
 }
 
 fn b64_decode(s: &str, field: &str) -> Result<Vec<u8>, HttpError> {
+    // Accept both standard base64 and base64url (the Windows WebAuthn API
+    // callers send base64url while the Rust tests use standard base64).
     base64::engine::general_purpose::STANDARD
         .decode(s)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s))
         .map_err(|e| HttpError::bad_request(format!("invalid base64 in {field}: {e}")))
 }
 

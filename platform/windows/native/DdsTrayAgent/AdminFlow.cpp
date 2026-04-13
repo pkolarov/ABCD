@@ -240,13 +240,14 @@ static INT_PTR CALLBACK ApprovalDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
         for (size_t i = 0; i < p->users.size(); i++)
         {
             const auto& u = p->users[i];
-            // Format: "DisplayName (URN)"
+            // Format: "DisplayName (URN) [Status]"
             wchar_t item[512];
             wchar_t nameW[256] = {};
             wchar_t urnW[160] = {};
             MultiByteToWideChar(CP_UTF8, 0, u.displayName.c_str(), -1, nameW, 256);
             MultiByteToWideChar(CP_UTF8, 0, u.subjectUrn.c_str(), -1, urnW, 160);
-            swprintf_s(item, L"%s (%s)", nameW, urnW);
+            const wchar_t* status = u.vouched ? L"Approved" : L"Pending";
+            swprintf_s(item, L"%s (%s) [%s]", nameW, urnW, status);
             SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)item);
         }
 

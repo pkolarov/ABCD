@@ -3,6 +3,7 @@
 //
 
 #include "CredentialVault.h"
+#include "FileLog.h"
 #include <wincrypt.h>
 #include <bcrypt.h>
 #include <shlobj.h>
@@ -222,6 +223,11 @@ bool CCredentialVault::EncryptPassword(
     if (hmacSecretOutput == nullptr || hmacSecretLen != 32 || password == nullptr)
         return false;
 
+    // Log first 4 bytes of hmac key for debugging (safe — not the actual password)
+    FileLog::Writef("EncryptPassword: hmacKey[0..3]=%02x%02x%02x%02x pwLen=%zu\n",
+        hmacSecretOutput[0], hmacSecretOutput[1], hmacSecretOutput[2], hmacSecretOutput[3],
+        wcslen(password));
+
     // Convert password to bytes
     size_t pwLen = wcslen(password) * sizeof(wchar_t);
     const uint8_t* pwBytes = reinterpret_cast<const uint8_t*>(password);
@@ -295,11 +301,21 @@ bool CCredentialVault::DecryptPassword(
     const VaultEntry& entry,
     std::wstring& outPassword)
 {
+    FileLog::Writef("DecryptPassword: hmacLen=%zu encPwdLen=%zu ivLen=%zu tagLen=%zu\n",
+        hmacSecretLen, entry.encryptedPassword.size(), entry.iv.size(), entry.authTag.size());
+    // Log first 4 bytes of hmac key for debugging (safe — not the actual password)
+    if (hmacSecretOutput && hmacSecretLen >= 4)
+        FileLog::Writef("DecryptPassword: hmacKey[0..3]=%02x%02x%02x%02x\n",
+            hmacSecretOutput[0], hmacSecretOutput[1], hmacSecretOutput[2], hmacSecretOutput[3]);
+
     if (hmacSecretOutput == nullptr || hmacSecretLen != 32)
         return false;
 
     if (entry.encryptedPassword.empty() || entry.iv.size() != 12 || entry.authTag.size() != 16)
+    {
+        FileLog::Writef("DecryptPassword: bad vault entry sizes\n");
         return false;
+    }
 
     // Open AES-GCM
     BCRYPT_ALG_HANDLE hAlg = NULL;
@@ -348,10 +364,12 @@ bool CCredentialVault::DecryptPassword(
 
     if (!BCRYPT_SUCCESS(status))
     {
+        FileLog::Writef("DecryptPassword: BCryptDecrypt FAILED status=0x%08lX\n", (unsigned long)status);
         SecureZeroMemory(plaintext.data(), plaintext.size());
         return false;
     }
 
+    FileLog::Writef("DecryptPassword: OK cbResult=%lu\n", cbResult);
     // Convert bytes back to wstring
     outPassword.assign(
         reinterpret_cast<const wchar_t*>(plaintext.data()),

@@ -14,7 +14,7 @@
 #include <stdio.h>
 
 // ---- Diagnostic log to C:\Temp\dds_cp.log ----
-static void CPLog(const char* fmt, ...)
+void CPLog(const char* fmt, ...)
 {
     CreateDirectoryA("C:\\Temp", nullptr); // ensure dir exists
     FILE* f = nullptr;
@@ -465,7 +465,10 @@ HRESULT CDdsProvider::GetFieldDescriptorCount(
     )
 {
     OutputDebugString(L"GetFieldDescriptorCount()\n");
-    *pdwCount = (g_DeviceConnectedLast) ? SFI_NUM_FIELDS : SFI_NUM_FIELDS_NO_USER;
+    // Show all fields (including submit button) when DDS users are loaded,
+    // even if no physical BLE device is connected.
+    *pdwCount = (g_DeviceConnectedLast || g_ddsUsers.count > 0)
+                    ? SFI_NUM_FIELDS : SFI_NUM_FIELDS_NO_USER;
 
     return S_OK;
 }
@@ -667,13 +670,21 @@ HRESULT CDdsProvider::_EnumerateCredentials()
 
     HRESULT hr = 0;
     if (g_ddsUsers.count > 0) {
+        DWORD credIdx = 0;
         for (int i = 0; i < g_ddsUsers.count; i++) {
-            hr = _EnumerateOneCredential(i,
+            // Skip admin accounts — they don't log into Windows
+            std::wstring urn(g_ddsUsers.users[i].subjectUrn);
+            if (urn.find(L"urn:vouchsafe:admin.") == 0)
+                continue;
+            hr = _EnumerateOneCredential(credIdx++,
                 g_ddsUsers.users[i].displayName,
-                g_ddsUsers.users[i].credentialId,
+                L"DDS Passwordless Login",
                 g_ddsUsers.users[i].subjectUrn
             );
         }
+        // If all users were filtered out (only admins), show placeholder
+        if (credIdx == 0)
+            hr = _EnumerateOneCredential(0, L"Connect DDS authenticator", L"No enrolled users", L"");
     }
     else
     {

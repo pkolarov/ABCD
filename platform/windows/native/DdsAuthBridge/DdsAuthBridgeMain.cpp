@@ -358,6 +358,9 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
     std::wstring credentialId(pReq->credential_id);
     std::wstring rpIdW(pReq->rp_id);
 
+    // Reload vault from disk — it may have been updated by the tray agent
+    m_vault.Load();
+
     // Convert RP ID to narrow string for HTTP and vault use.
     char rpIdA[256]{};
     WideCharToMultiByte(CP_UTF8, 0, rpIdW.c_str(), -1, rpIdA, sizeof(rpIdA), nullptr, nullptr);
@@ -552,8 +555,8 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     memcpy(challenge.credential_id, pVaultEntry->credentialId.data(), credIdLen);
     challenge.credential_id_len = credIdLen;
 
-    // Copy RP ID
-    strncpy_s(challenge.rp_id, pOp->rpId.c_str(), _TRUNCATE);
+    // Copy RP ID — use vault entry's rpId (authoritative from enrollment)
+    strncpy_s(challenge.rp_id, pVaultEntry->rpId.c_str(), _TRUNCATE);
 
     // Copy hmac-secret salt from vault
     DWORD saltLen = static_cast<DWORD>(min(pVaultEntry->salt.size(),
@@ -573,6 +576,16 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
 
     // Step 4: Wait for DDS_AUTH_RESPONSE from CP (up to 60 seconds)
     DWORD waitResult = WaitForSingleObject(pOp->hResponseEvent, IPC_PIPE::AUTH_TIMEOUT_MS);
+
+    // After the event fires, copy response data from m_activeAuth (the original)
+    // into our local copy. HandleDdsAuthResponse writes to m_activeAuth, not our
+    // local pOp, so we must read it back under the lock.
+    EnterCriticalSection(&m_csAuth);
+    pOp->cancelled        = m_activeAuth.cancelled;
+    pOp->responseReceived = m_activeAuth.responseReceived;
+    if (m_activeAuth.responseReceived)
+        memcpy(&pOp->responseData, &m_activeAuth.responseData, sizeof(pOp->responseData));
+    LeaveCriticalSection(&m_csAuth);
 
     if (pOp->cancelled)
     {
@@ -694,6 +707,14 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     }
 
     wcsncpy_s(result.password, password.c_str(), _TRUNCATE);
+
+    {
+        char domA[64]{}, userA[64]{};
+        WideCharToMultiByte(CP_UTF8, 0, result.domain, -1, domA, sizeof(domA), NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, result.username, -1, userA, sizeof(userA), NULL, NULL);
+        FileLog::Writef("DdsAuth.worker: domain='%s' username='%s' pwdLen=%zu\n",
+            domA, userA, password.size());
+    }
 
     // Fill session token (token_cbor_b64 from Rust /v1/session/assert)
     strncpy_s(result.session_token, assertResult.tokenCborB64.c_str(), _TRUNCATE);

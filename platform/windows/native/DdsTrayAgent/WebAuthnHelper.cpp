@@ -22,44 +22,64 @@ static std::wstring Utf8ToWide(const std::string& s)
     return w;
 }
 
-std::vector<uint8_t> CWebAuthnHelper::BuildClientDataHash(
+// Build a minimal clientDataJSON string. The Windows WebAuthn API takes
+// the raw JSON and hashes it internally, so we return the JSON bytes, not
+// a hash.  We also compute and return the SHA-256 hash separately because
+// dds-node needs it in its assertion/enrollment request JSON.
+struct ClientData
+{
+    std::vector<uint8_t> json;    // raw clientDataJSON bytes
+    std::vector<uint8_t> hash;    // SHA-256(json)
+};
+
+static ClientData BuildClientData(
     const std::string& type,
     const std::string& rpId)
 {
-    // Build a minimal clientDataJSON matching the WebAuthn spec shape.
-    // The authenticator never sees this directly — only the SHA-256 hash
-    // is sent. dds-node expects base64(hash) in its request JSON.
-    std::string cdj = "{\"type\":\"" + type + "\","
-                      "\"challenge\":\"AAAAAAAAAAAAAAAAAAAAAA\","
-                      "\"origin\":\"https://" + rpId + "\"}";
-
-    // Replace the dummy challenge with random bytes for freshness.
-    // (The actual challenge value doesn't matter for our local flow,
-    // but we make it random so authenticator responses are unique.)
-    uint8_t randomChallenge[32];
-    BCryptGenRandom(NULL, randomChallenge, sizeof(randomChallenge),
+    // Base64url-encode a random challenge
+    uint8_t randomBytes[32];
+    BCryptGenRandom(NULL, randomBytes, sizeof(randomBytes),
                     BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 
-    // SHA-256 the clientDataJSON
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string challenge;
+    challenge.reserve(43);
+    for (int i = 0; i < 32; i += 3)
+    {
+        uint32_t n = static_cast<uint32_t>(randomBytes[i]) << 16;
+        if (i + 1 < 32) n |= static_cast<uint32_t>(randomBytes[i + 1]) << 8;
+        if (i + 2 < 32) n |= static_cast<uint32_t>(randomBytes[i + 2]);
+        challenge.push_back(table[(n >> 18) & 0x3F]);
+        challenge.push_back(table[(n >> 12) & 0x3F]);
+        if (i + 1 < 32) challenge.push_back(table[(n >> 6) & 0x3F]);
+        if (i + 2 < 32) challenge.push_back(table[n & 0x3F]);
+    }
+
+    std::string cdj = "{\"type\":\"" + type + "\","
+                      "\"challenge\":\"" + challenge + "\","
+                      "\"origin\":\"https://" + rpId + "\"}";
+
+    ClientData cd;
+    cd.json.assign(cdj.begin(), cdj.end());
+
+    // SHA-256 the clientDataJSON for dds-node
+    cd.hash.resize(32);
     BCRYPT_ALG_HANDLE hAlg = NULL;
     BCRYPT_HASH_HANDLE hHash = NULL;
-    std::vector<uint8_t> hash(32);
-
     if (BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0)))
     {
         if (BCRYPT_SUCCESS(BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0)))
         {
-            BCryptHashData(hHash, (PUCHAR)cdj.data(), (ULONG)cdj.size(), 0);
-            // Mix in the random challenge so each call produces a unique hash
-            BCryptHashData(hHash, randomChallenge, sizeof(randomChallenge), 0);
-            BCryptFinishHash(hHash, hash.data(), (ULONG)hash.size(), 0);
+            BCryptHashData(hHash, cd.json.data(), (ULONG)cd.json.size(), 0);
+            BCryptFinishHash(hHash, cd.hash.data(), 32, 0);
             BCryptDestroyHash(hHash);
         }
         BCryptCloseAlgorithmProvider(hAlg, 0);
     }
 
-    SecureZeroMemory(randomChallenge, sizeof(randomChallenge));
-    return hash;
+    SecureZeroMemory(randomBytes, sizeof(randomBytes));
+    return cd;
 }
 
 std::string CWebAuthnHelper::FormatWebAuthnError(HRESULT hr)
@@ -85,8 +105,9 @@ MakeCredentialResult CWebAuthnHelper::MakeCredential(
     FileLog::Writef("WebAuthn.MakeCredential: rpId='%s' hmacSecret=%d\n",
                     rpId.c_str(), hmacSecret ? 1 : 0);
 
-    // Build client data hash
-    result.clientDataHash = BuildClientDataHash("webauthn.create", rpId);
+    // Build client data (raw JSON + its SHA-256 hash)
+    auto cd = BuildClientData("webauthn.create", rpId);
+    result.clientDataHash = cd.hash;
 
     // RP entity
     std::wstring rpIdW = Utf8ToWide(rpId);
@@ -116,11 +137,11 @@ MakeCredentialResult CWebAuthnHelper::MakeCredential(
     coseParamsList.cCredentialParameters = 2;
     coseParamsList.pCredentialParameters = coseParams;
 
-    // Client data
+    // Client data — pass the raw JSON, the API hashes it internally
     WEBAUTHN_CLIENT_DATA clientData = {};
     clientData.dwVersion = WEBAUTHN_CLIENT_DATA_CURRENT_VERSION;
-    clientData.cbClientDataJSON = (DWORD)result.clientDataHash.size();
-    clientData.pbClientDataJSON = result.clientDataHash.data();
+    clientData.cbClientDataJSON = (DWORD)cd.json.size();
+    clientData.pbClientDataJSON = cd.json.data();
     clientData.pwszHashAlgId = WEBAUTHN_HASH_ALGORITHM_SHA_256;
 
     // Authenticator make-credential options
@@ -128,7 +149,7 @@ MakeCredentialResult CWebAuthnHelper::MakeCredential(
     options.dwVersion = WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_CURRENT_VERSION;
     options.dwTimeoutMilliseconds = 60000;
     options.dwAttestationConveyancePreference = WEBAUTHN_ATTESTATION_CONVEYANCE_PREFERENCE_DIRECT;
-    options.dwAuthenticatorAttachment = WEBAUTHN_AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM;
+    options.dwAuthenticatorAttachment = WEBAUTHN_AUTHENTICATOR_ATTACHMENT_ANY;
     options.bRequireResidentKey = FALSE;
     options.dwUserVerificationRequirement = WEBAUTHN_USER_VERIFICATION_REQUIREMENT_DISCOURAGED;
 
@@ -206,15 +227,16 @@ GetAssertionResult CWebAuthnHelper::GetAssertionHmacSecret(
         return result;
     }
 
-    result.clientDataHash = BuildClientDataHash("webauthn.get", rpId);
+    auto cd = BuildClientData("webauthn.get", rpId);
+    result.clientDataHash = cd.hash;
 
     std::wstring rpIdW = Utf8ToWide(rpId);
 
-    // Client data
+    // Client data — pass the raw JSON
     WEBAUTHN_CLIENT_DATA clientData = {};
     clientData.dwVersion = WEBAUTHN_CLIENT_DATA_CURRENT_VERSION;
-    clientData.cbClientDataJSON = (DWORD)result.clientDataHash.size();
-    clientData.pbClientDataJSON = result.clientDataHash.data();
+    clientData.cbClientDataJSON = (DWORD)cd.json.size();
+    clientData.pbClientDataJSON = cd.json.data();
     clientData.pwszHashAlgId = WEBAUTHN_HASH_ALGORITHM_SHA_256;
 
     // Allow-list: only this specific credential
@@ -318,15 +340,16 @@ GetAssertionResult CWebAuthnHelper::GetAssertionProof(
     FileLog::Writef("WebAuthn.GetAssertionProof: rpId='%s' credIdLen=%zu\n",
                     rpId.c_str(), credentialId.size());
 
-    result.clientDataHash = BuildClientDataHash("webauthn.get", rpId);
+    auto cd = BuildClientData("webauthn.get", rpId);
+    result.clientDataHash = cd.hash;
 
     std::wstring rpIdW = Utf8ToWide(rpId);
 
-    // Client data
+    // Client data — pass the raw JSON
     WEBAUTHN_CLIENT_DATA clientData = {};
     clientData.dwVersion = WEBAUTHN_CLIENT_DATA_CURRENT_VERSION;
-    clientData.cbClientDataJSON = (DWORD)result.clientDataHash.size();
-    clientData.pbClientDataJSON = result.clientDataHash.data();
+    clientData.cbClientDataJSON = (DWORD)cd.json.size();
+    clientData.pbClientDataJSON = cd.json.data();
     clientData.pwszHashAlgId = WEBAUTHN_HASH_ALGORITHM_SHA_256;
 
     // Allow-list

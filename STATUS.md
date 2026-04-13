@@ -1,7 +1,7 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-12 (single-file provisioning + FIDO2 domain key)
+> Last updated: 2026-04-13 (security hardening merged + clean re-enrollment E2E verified)
 
 ## Build Health
 
@@ -11,21 +11,26 @@
 | **Edition** | 2024 |
 | **Workspace crates** | 9 (dds-core, dds-domain, dds-store, dds-net, dds-node, dds-ffi, dds-cli, dds-loadtest, dds-fido2-test) |
 | **Rust LOC** | 8,400+ |
-| **Rust tests** | 309 |
+| **Rust tests** | 298 |
 | **.NET tests** | 56 (Windows) + 17 (macOS) |
-| **C++ native tests** | 34 (Windows) |
+| **C++ native tests** | 47 (Windows) |
 | **Python tests** | 13 |
-| **Total tests** | 429 ✅ all passing |
+| **Total tests** | 431 ✅ all passing |
 | **Shared library** | libdds\_ffi.dylib (739 KB) |
 
-Verification note (2026-04-12, Windows 11 ARM64):
-- `cargo test --workspace` — **309/309 pass** on Windows 11 ARM64 (aarch64-pc-windows-msvc)
-- `cargo test -p dds-node --test cp_fido_e2e` — **3/3 new CP+FIDO2 E2E tests pass** (Ed25519, P-256, enrollment+assertion)
+Verification note (2026-04-13, Windows 11 ARM64):
+- `cargo test --workspace` — **298/298 pass** on Windows 11 ARM64 (aarch64-pc-windows-msvc)
+- `cargo test -p dds-node --test cp_fido_e2e` — **3/3 CP+FIDO2 E2E tests pass** (Ed25519, P-256, enrollment+assertion)
 - `dotnet build ABCD.sln` — **0 errors** across DdsPolicyAgent (net8.0+net9.0), DdsPolicyAgent.Tests, DdsCredentialProvider (.NET stub)
 - `dotnet test` for `platform/windows/DdsPolicyAgent.Tests` — **56/56 pass** (net8.0+net9.0)
-- Native C++ solution (`DdsNative.sln`) — **4/4 projects build**: Helpers.lib, DdsBridgeIPC.lib, DdsCredentialProvider.dll, DdsAuthBridge.exe
+- Native C++ solution (`DdsNative.sln`) — **6/6 projects build**: Helpers.lib, DdsBridgeIPC.lib, DdsCredentialProvider.dll (ARM64), DdsAuthBridge.exe (x64), DdsTrayAgent.exe (x64), test suites
 - `dds-node/tests/multinode.rs` — **4/4 pass** on Windows ARM64 (dag_converges_after_partition, rejoined_node_catches_up_via_sync_protocol now green)
 - Windows E2E smoke test (`platform/windows/e2e/smoke_test.ps1`) — **8/8 checks pass** including CP DLL COM export verification
+- **Security hardening merged (2026-04-13):** 6 commits: removed unauthenticated session endpoint, enforced RP-ID binding in assertion, credential_id plumbed through Windows CP login path, vault lookup by credential_id (not SID), HTTP API contract alignment, DDS bridge credential selection tests added.
+- **FIDO2 passwordless Windows login re-verified after merge (2026-04-13):** Clean wipe + fresh enrollment: admin setup (auto-persisted trusted_roots) → user enrollment (2 touches) → admin vouch → lock screen → touch key → Windows session. Real YubiKey on Win11 ARM64 QEMU/UTM VM.
+- `test_components.exe` — **11/11 pass**: AES-GCM roundtrip, wrong-key rejection, password encoding, vault serialization, URN-to-SID extraction, IPC struct layout, IPC password transfer, KERB packing, full pipeline, SID resolution, LsaLogonUser with real credentials
+- `test_full_flow.exe` — **PASS**: Full enrollment→login with real FIDO2 authenticator (MakeCredential + 2× GetAssertion + vault save/load + LsaLogonUser)
+- `test_hmac_roundtrip.exe` — **PASS**: hmac-secret determinism + encrypt/decrypt roundtrip with real authenticator
 
 Previous verification note (2026-04-10, macOS):
 - `cargo test -p dds-domain` passed
@@ -40,7 +45,7 @@ Previous verification note (2026-04-10, macOS):
 | **dds-domain** | §14 | 🟢 Done | 29 | 7 typed domain documents + Stage 1 domain identity + FIDO2 attestation+assertion (Ed25519 + P-256) |
 | **dds-store** | §6 | 🟢 Done | 15 | Storage traits, MemoryBackend, RedbBackend (ACID) |
 | **dds-net** | §5 | 🟢 Done | 19 | libp2p transport, gossipsub, Kademlia, mDNS, delta-sync |
-| **dds-node** | §12 | 🟢 Done | 60 | Config, P2P event loop, local authority service, HTTP API, encrypted persistent identity, CP+FIDO2 E2E |
+| **dds-node** | §12 | 🟢 Done | 49+15 integ | Config, P2P event loop, local authority service, HTTP API, encrypted persistent identity, CP+FIDO2 E2E |
 | **dds-domain** (fido2) | §14 | 🟢 Done | (incl. above) | WebAuthn attestation + assertion parser/verifier (Ed25519 + P-256) |
 | **dds-ffi** | §14.2–14.3 | 🟢 Done | 12 | C ABI (cdylib): identity, token, policy, version |
 | **dds-cli** | §12 | 🟢 Done | 9 | Identity, group, policy, status subcommands |
@@ -99,8 +104,8 @@ All documents implement `DomainDocument` trait: `embed()` / `extract()` from `To
 |---|---|---|
 | `config` | 5 | `NodeConfig`, `NetworkConfig`, `DomainConfig` (TOML, domain section required) |
 | `node` | 0 | `DdsNode` — swarm event loop, gossip/sync ingestion, admission cert verification at startup |
-| `service` | 6 | `LocalService` — enrollment (with FIDO2 verification), sessions (incl. assertion-based), enrolled-user enumeration, policy resolution, status |
-| `http` | 9 | `axum` router exposing `LocalService` over `/v1/*` JSON endpoints (incl. `/v1/session/assert`, `/v1/enrolled-users`) |
+| `service` | 6 | `LocalService` — enrollment (with FIDO2 verification), sessions (assertion-based with RP-ID binding), enrolled-user enumeration, admin setup (auto-persists trusted\_roots to TOML config), admin vouch (server-side Ed25519 signing), policy resolution, status |
+| `http` | 9 | `axum` router exposing `LocalService` over `/v1/*` JSON endpoints (incl. `/v1/session/assert`, `/v1/enrolled-users`, `/v1/admin/setup`, `/v1/admin/vouch`); unauthenticated `/v1/session` removed |
 | `identity_store` | 3 | Encrypted-at-rest persistent node identity (Argon2id + ChaCha20Poly1305) |
 | `p2p_identity` | 2 | Persistent libp2p keypair so `PeerId` is stable across restarts |
 | `domain_store` | 5 | TOML public domain file + CBOR domain key + CBOR admission cert load/save |
@@ -147,7 +152,7 @@ All documents implement `DomainDocument` trait: `embed()` / `extract()` from `To
 
 | Platform | Path | Status | Verified | Notes |
 |---|---|---|---|---|
-| **Windows** | `platform/windows/` | 🟢 Build verified | ✅ 309 Rust + 56 .NET + 34 C++ + 3 E2E | Native CP DLL + Auth Bridge + Policy Agent all build + test on Win11 ARM64; E2E smoke test passes; WebAuthn platform API integrated (two-phase challenge/response with hmac-secret) |
+| **Windows** | `platform/windows/` | 🟢 **Login verified** | ✅ 298 Rust + 56 .NET + 47 C++ + 3 E2E | Native CP DLL + Auth Bridge + Tray Agent + Policy Agent all build + test on Win11 ARM64; **FIDO2 passwordless lock screen login re-verified after security hardening merge (2026-04-13)**; security fixes: credential_id-based vault lookup, RP-ID binding, removed unauth session endpoint; WebAuthn hmac-secret two-phase challenge/response verified with real authenticator |
 | **macOS** | `platform/macos/` | 🟡 In progress | ✅ .NET build + 17 tests | `DdsPolicyAgent.MacOS` worker, localhost client, state store, launchd plist, host-backed preference/account/launchd/profile/software backends, and Rust `/v1/macos/*` API path landed |
 | **Linux** | `platform/linux/` | ⚪ Planned | n/a | Design-only at this point; no agent code in tree yet |
 
@@ -179,7 +184,7 @@ Classical-only available for embedded/`no_std` targets.
 |---|---|---|
 | macOS ARM64 (aarch64-apple-darwin) | ✅ Builds + tests | Dev host, 229+ Rust tests + 17 .NET |
 | Linux x86\_64 | ✅ Expected to build | Standard Rust target |
-| **Windows ARM64 (aarch64-pc-windows-msvc)** | ✅ **309 Rust + 56 .NET + 34 C++ tests pass** | **Win11 ARM64, MSVC 14.44 + LLVM 22.1.3, full workspace verified 2026-04-12** |
+| **Windows ARM64 (aarch64-pc-windows-msvc)** | ✅ **298 Rust + 56 .NET + 47 C++ tests pass** | **Win11 ARM64, MSVC 14.44 + LLVM 22.1.3, full workspace verified 2026-04-13 (post security merge)** |
 | Windows x86\_64 | ✅ Expected to build (cross) | CI cross-compile gate |
 | Android ARM64 (aarch64-linux-android) | 🔲 Untested | Needs cargo-ndk |
 | iOS ARM64 (aarch64-apple-ios) | 🔲 Untested | Needs Xcode toolchain |
@@ -252,14 +257,17 @@ All 7 crates are functionally complete. The following work is ordered by impact 
     - `dds-node/src/service.rs`: Added `issue_session_from_assertion()` that looks up credential public key from trust graph, verifies the assertion, and issues a `SessionDocument`. Added `list_enrolled_users()` for CP tile enumeration.
     - `dds-node/src/http.rs`: Added `POST /v1/session/assert` (assertion-based session issuance) and `GET /v1/enrolled-users?device_urn=...` (CP user enumeration) endpoints.
     - All 225+ existing tests pass; 7 new FIDO2 assertion tests added.
+    - `dds-node/src/service.rs`: `admin_setup()` now auto-persists admin URN to `trusted_roots` in the TOML config file via `toml_edit`, eliminating manual config editing. `admin_vouch()` signs vouch tokens with server-side Ed25519 keys.
 
-    **C++ side (build verified on Windows 11 ARM64, 2026-04-12):**
-    - `platform/windows/native/DdsCredentialProvider/` — COM DLL (230 KB), CLSID `{a7f3b2c1-...}`, BLE/PIV stripped, DDS auth path via Auth Bridge IPC
-    - `platform/windows/native/DdsAuthBridge/` — Windows Service (913 KB) with CTAP2 engine, WinHTTP client, credential vault (DPAPI), **platform WebAuthn API** (`webauthn.h`) for getAssertion + hmac-secret, vault password decryption wired
-    - `platform/windows/native/DdsBridgeIPC/` — Named-pipe IPC library (270 KB) with DDS messages (0x0060-0x007F range)
-    - `platform/windows/native/Helpers/` — LSA packaging, COM factory (218 KB)
+    **C++ side (login verified on Windows 11 ARM64, 2026-04-13):**
+    - `platform/windows/native/DdsCredentialProvider/` — COM DLL (ARM64), CLSID `{a7f3b2c1-...}`, BLE/PIV stripped, DDS auth path via Auth Bridge IPC, WebAuthn hmac-secret assertion on secure desktop
+    - `platform/windows/native/DdsAuthBridge/` — Windows Service (x64) with WinHTTP client, credential vault (DPAPI + AES-256-GCM), vault password decryption via hmac-secret, SID resolution via `LookupAccountSid`
+    - `platform/windows/native/DdsTrayAgent/` — System tray enrollment tool (x64): user enrollment (MakeCredential + hmac-secret encrypt), admin setup, admin vouch approval, WebAuthn API wrappers
+    - `platform/windows/native/DdsBridgeIPC/` — Named-pipe IPC library with DDS messages (0x0060-0x007F range), TLV protocol, pack(1) structs
+    - `platform/windows/native/Helpers/` — LSA packaging (KERB_INTERACTIVE_UNLOCK_LOGON), COM factory
+    - `platform/windows/native/Tests/` — 3 test executables: `test_components.exe` (11 non-interactive unit tests), `test_full_flow.exe` (end-to-end with real authenticator + LsaLogonUser), `test_hmac_roundtrip.exe` (hmac-secret determinism)
     - `platform/windows/installer/DdsBundle.wxs` — WiX v4 MSI bundle for all components
-    - Visual Studio 2022 solution: `DdsNative.sln` with 4 projects, all build clean
+    - Visual Studio 2022 solution: `DdsNative.sln` with 6 projects, all build clean
 
     **Build fixes applied (2026-04-12):**
     - Fixed `const wchar_t[]` to `LPWSTR`/`PWSTR` conversion errors in `common.h` and `CDdsCredential.cpp` (MSVC strict C++17)
@@ -431,11 +439,11 @@ Still TODO:
 
 ## Path to Production
 
-Overall: **~95% ready for a scoped pilot.** All 8 crates are functionally
+Overall: **~97% ready for a scoped pilot.** All 8 crates are functionally
 complete, security-critical hardening (Phase 1) is done, the three
 algorithmic / sync blockers the chaos soak found (B5, B5b, B6) are fixed
 and validated, and the two platform blockers (B1, B2) are now resolved
-with full Windows ARM64 build verification and E2E smoke testing.
+with full Windows ARM64 FIDO2 passwordless login verified end-to-end on real hardware (2026-04-13).
 Remaining gaps are *WiX installer packaging*, *Windows service registration*,
 *code signing*, and *operational instrumentation*.
 
@@ -449,7 +457,7 @@ None. All production blockers resolved.
 
 | # | Gap | Resolution |
 | --- | --- | --- |
-| **B1** | **Windows Credential Provider stubbed** | Resolved 2026-04-12: Native C++ COM DLL builds and exports `DllGetClassObject`/`DllCanUnloadNow`. Auth Bridge service builds and connects to dds-node via WinHTTP. IPC library operational. Full CP+FIDO2 E2E smoke test passes (3 tests: Ed25519 lifecycle, P-256 assertion, enrollment flow). WebAuthn platform integration completed: two-phase IPC protocol (`DDS_AUTH_CHALLENGE`/`DDS_AUTH_RESPONSE`) where CP calls `WebAuthNAuthenticatorGetAssertion` with hmac-secret extension on the secure desktop, Bridge verifies assertion via dds-node and decrypts stored password with AES-256-GCM. Remaining for production: WiX installer, Windows service registration, code signing. |
+| **B1** | **Windows Credential Provider stubbed** | Resolved 2026-04-13: **FIDO2 passwordless Windows login verified end-to-end on real hardware.** Full flow: admin setup (FIDO2 key → trusted root, auto-persisted to config) → user enrollment (MakeCredential + hmac-secret encrypt password → DPAPI vault) → admin vouch → lock screen tile → touch key → hmac-secret decrypt → KERB_INTERACTIVE_LOGON → Windows session. Tested on Win11 ARM64 VM with real YubiKey. Re-verified after merging 6 security hardening commits (credential_id-based vault lookup, RP-ID binding enforcement, removed unauthenticated session endpoint, HTTP API contract alignment). Clean wipe + fresh enrollment confirms the merged code works end-to-end. C++ test suite validates AES-GCM, vault serialization, KERB packing, IPC struct layout, LsaLogonUser, and full pipeline with real authenticator (13 tests across 3 executables). Critical fix: WebAuthn `GetAssertion` options must match exactly between enrollment (tray agent, x64) and login (credential provider, ARM64) for hmac-secret determinism. Remaining for production: WiX installer, Windows service registration, code signing. |
 | **B2** | **Cross-platform builds untested** | Resolved 2026-04-12 for Windows: `cargo build --workspace` + `cargo test --workspace` — 309/309 Rust tests pass on Windows 11 ARM64 (aarch64-pc-windows-msvc). `dotnet build` + `dotnet test` — 56/56 .NET tests pass. Native C++ solution — 4/4 projects build. Android, iOS, embedded remain 🔲 but are not in pilot scope. |
 | B3 | **24h soak result missing** | Resolved by the 2026-04-09 30-min chaos validation soak (`b6-validation-20260409-210025`): 0 errors / 466K ops, all 5 hard §10 KPIs PASS, 14/14 chaos rejoins succeeded. A 24h endurance run is still nice-to-have for long-tail evidence but is no longer load-bearing for §10 sign-off. |
 | B4 | **Ed25519 throughput unverified** | Resolved: 53,975 ops/sec measured in the validation soak (above the 50K target). Heap/bandwidth caveats remain (R5 below) but they are *measurement* gaps, not perf gaps. |

@@ -248,6 +248,8 @@ pub struct LocalService<S: TokenStore + dds_store::traits::RevocationStore> {
     store: S,
     /// Data directory for admin key storage (None in test/bench contexts).
     data_dir: Option<PathBuf>,
+    /// Path to the TOML config file (for persisting trusted_roots changes).
+    config_path: Option<PathBuf>,
     /// Node start time.
     start_time: u64,
     /// Whether to verify FIDO2 attestation on enroll_user.
@@ -286,6 +288,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             trusted_roots,
             store,
             data_dir: None,
+            config_path: None,
             start_time: now_epoch(),
             verify_fido2: true,
         };
@@ -364,6 +367,38 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
     /// Set the data directory for admin key storage.
     pub fn set_data_dir(&mut self, path: PathBuf) {
         self.data_dir = Some(path);
+    }
+
+    /// Set the config file path so trusted_roots changes can be persisted.
+    pub fn set_config_path(&mut self, path: PathBuf) {
+        self.config_path = Some(path);
+    }
+
+    /// Persist the current trusted_roots back to the TOML config file.
+    fn persist_trusted_roots(&self) -> Result<(), ServiceError> {
+        let config_path = match &self.config_path {
+            Some(p) => p,
+            None => return Ok(()), // No config path — skip (test context)
+        };
+
+        let content = std::fs::read_to_string(config_path)
+            .map_err(|e| ServiceError::Store(format!("read config: {e}")))?;
+        let mut doc: toml_edit::DocumentMut = content
+            .parse()
+            .map_err(|e| ServiceError::Store(format!("parse config: {e}")))?;
+
+        let roots: Vec<&str> = self.trusted_roots.iter().map(|s| s.as_str()).collect();
+        let mut arr = toml_edit::Array::new();
+        for r in &roots {
+            arr.push(r.to_string());
+        }
+        doc["trusted_roots"] = toml_edit::value(arr);
+
+        std::fs::write(config_path, doc.to_string())
+            .map_err(|e| ServiceError::Store(format!("write config: {e}")))?;
+
+        tracing::info!(count = roots.len(), "persisted trusted_roots to config");
+        Ok(())
     }
 
     /// Add a policy rule.
@@ -1033,8 +1068,11 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
         // Step 2: persist the admin signing key (encrypted).
         self.store_admin_key(&admin_urn, &admin_ident.signing_key)?;
 
-        // Step 3: add to trusted_roots in memory.
+        // Step 3: add to trusted_roots in memory and persist to config.
         self.trusted_roots.insert(admin_urn.clone());
+        if let Err(e) = self.persist_trusted_roots() {
+            tracing::warn!(error = %e, "failed to persist trusted_roots to config file (in-memory update still applies)");
+        }
         tracing::info!(admin_urn = %admin_urn, "admin identity registered and added to trusted roots");
 
         Ok(EnrollmentResult {
