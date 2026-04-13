@@ -1,7 +1,7 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-13 (admin enrollment + user enrollment + FIDO2 passwordless Windows login verified on ARM64 with real HW key)
+> Last updated: 2026-04-13 (admin enrollment + user enrollment + FIDO2 passwordless Windows login verified on ARM64 with real HW key; macOS enterprise account/SSO schema modeled)
 
 ## Build Health
 
@@ -11,11 +11,11 @@
 | **Edition** | 2024 |
 | **Workspace crates** | 9 (dds-core, dds-domain, dds-store, dds-net, dds-node, dds-ffi, dds-cli, dds-loadtest, dds-fido2-test) |
 | **Rust LOC** | 8,400+ |
-| **Rust tests** | 298 |
+| **Rust tests** | 302 |
 | **.NET tests** | 117 (Windows: 78 unit + 39 integration) + 17 (macOS) |
 | **C++ native tests** | 47 (Windows) |
 | **Python tests** | 13 |
-| **Total tests** | 492 ✅ all passing |
+| **Total tests** | 496 ✅ all passing |
 | **Shared library** | libdds\_ffi.dylib (739 KB) |
 
 Verification note (2026-04-13, Windows 11 ARM64):
@@ -40,13 +40,14 @@ Previous verification note (2026-04-13, macOS ARM64):
 - `platform/macos/e2e/smoke-test.sh` — **6/6 pass** (single-machine e2e: domain init → node start → device enroll → gossip publish → agent poll → preference enforcement validated)
 - `make pkg` in `platform/macos/packaging/` — **builds clean**, `DDS-Platform-macOS-0.1.0-arm64.pkg` (Rust + .NET + LaunchDaemons + scripts)
 - Real-host validation: `plutil` plist round-trip, `dscl` user lookup, `id -Gn` admin check, `pwpolicy` auth status, `launchctl` availability, `profiles` command — all confirmed working
+- Focused verification after enterprise account/SSO schema addition: `~/.cargo/bin/cargo test -p dds-domain` — **53/53 pass** (33 unit + 20 integration)
 
 ## Crate Status
 
 | Crate | Design Ref | Status | Tests | Summary |
 |---|---|---|---|---|
 | **dds-core** | §3–§9 | 🟢 Done | 114 | Crypto, identity, tokens (extensible body), CRDTs, trust graph, policy engine |
-| **dds-domain** | §14 | 🟢 Done | 29 | 7 typed domain documents + Stage 1 domain identity + FIDO2 attestation+assertion (Ed25519 + P-256) |
+| **dds-domain** | §14 | 🟢 Done | 33+20 integ | 9 typed domain documents + Stage 1 domain identity + FIDO2 attestation+assertion (Ed25519 + P-256) + macOS account/SSO bindings |
 | **dds-store** | §6 | 🟢 Done | 15 | Storage traits, MemoryBackend, RedbBackend (ACID) |
 | **dds-net** | §5 | 🟢 Done | 19 | libp2p transport, gossipsub, Kademlia, mDNS, delta-sync |
 | **dds-node** | §12 | 🟢 Done | 49+15 integ | Config, P2P event loop, local authority service, HTTP API, encrypted persistent identity, CP+FIDO2 E2E |
@@ -78,6 +79,8 @@ Previous verification note (2026-04-13, macOS ARM64):
 | `DeviceJoinDocument` | `dds:device-join` | 2 | Device enrollment + TPM attestation |
 | `WindowsPolicyDocument` | `dds:windows-policy` | 1 | GPO-equivalent policy (scope, settings, enforcement) |
 | `MacOsPolicyDocument` | `dds:macos-policy` | 2 | macOS managed-device policy (preferences, accounts, launchd, profiles) |
+| `MacAccountBindingDocument` | `dds:macos-account-binding` | 2 | Bind DDS subject + device to the macOS local account that hosts the session |
+| `SsoIdentityLinkDocument` | `dds:sso-identity-link` | 2 | Link enterprise IdP identity to a DDS subject without replacing DDS authorization |
 | `SoftwareAssignment` | `dds:software-assignment` | 1 | App/package deployment manifests |
 | `ServicePrincipalDocument` | `dds:service-principal` | 1 | Machine/service identity registration |
 | `SessionDocument` | `dds:session` | 2 | Short-lived auth session (< 1 ms local check) |
@@ -157,7 +160,7 @@ All documents implement `DomainDocument` trait: `embed()` / `extract()` from `To
 | Platform | Path | Status | Verified | Notes |
 |---|---|---|---|---|
 | **Windows** | `platform/windows/` | 🟢 **Login verified** | ✅ 298 Rust + 56 .NET + 47 C++ + 3 E2E | Native CP DLL + Auth Bridge + Tray Agent + Policy Agent all build + test on Win11 ARM64; **FIDO2 passwordless lock screen login re-verified after security hardening merge (2026-04-13)**; security fixes: credential_id-based vault lookup, RP-ID binding, removed unauth session endpoint; WebAuthn hmac-secret two-phase challenge/response verified with real authenticator |
-| **macOS** | `platform/macos/` | 🟢 **Smoke verified** | ✅ .NET build + 17 tests + smoke e2e | `DdsPolicyAgent.MacOS` worker with 5 host-backed enforcers, `.pkg` installer, single-command smoke test passing (6/6 checks), preference + launchd + account backends validated on real macOS ARM64 hardware |
+| **macOS** | `platform/macos/` | 🟢 **Smoke verified** | ✅ .NET build + 17 tests + smoke e2e | `DdsPolicyAgent.MacOS` worker with 5 host-backed enforcers, `.pkg` installer, single-command smoke test passing (6/6 checks), preference + launchd + account backends validated on real macOS ARM64 hardware; enterprise account/SSO coexistence is now modeled in `dds-domain`, while login-window/FileVault integration remains future `DdsLoginBridge` work |
 | **Linux** | `platform/linux/` | ⚪ Planned | n/a | Design-only at this point; no agent code in tree yet |
 
 ## Cryptography

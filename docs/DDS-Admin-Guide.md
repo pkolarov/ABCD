@@ -745,6 +745,65 @@ launchd (system domain)
               └── reports POST /v1/macos/applied
 ```
 
+### Enterprise Account Models
+
+DDS treats three identities separately on macOS:
+
+- the DDS subject in the trust graph;
+- the local macOS account that owns the home folder and FileVault relationship;
+- the enterprise directory / IdP identity that may own the login window.
+
+The schema now has dedicated document types for the last two relationships:
+`MacAccountBindingDocument` and `SsoIdentityLinkDocument`. Dedicated CLI / HTTP
+admin flows for issuing those documents are still future work, but the model is
+part of the design now and should guide deployments.
+
+#### Standalone Macs (no external directory or IdP)
+
+Use this model for field laptops, disconnected Macs, or small fleets where DDS
+is allowed to own local account lifecycle.
+
+- DDS can manage `local_accounts` policy entries.
+- Users still sign in to macOS with the local account; DDS session bootstrap
+  happens after OS login.
+- DDS owns trust, device policy, software assignment, and local account policy.
+
+Recommended flow:
+
+1. Install the DDS macOS package.
+2. Bootstrap or join the DDS domain.
+3. Enroll the device and the user/admin FIDO2 credentials.
+4. Publish `MacOsPolicyDocument` policy, including `local_accounts` if you want
+   DDS-managed local users.
+5. Keep the macOS login window and FileVault tied to the local macOS account.
+
+#### Directory-bound or Platform SSO-managed Macs
+
+Use this model for enterprise fleets where AD, Open Directory, LDAP, or MDM +
+Platform SSO already owns login and account provisioning.
+
+- Bind or enroll the Mac into that external identity system first.
+- Install DDS after the Mac already has its enterprise login path.
+- Do **not** rely on DDS `local_accounts` policy for these hosts.
+- Use DDS for device enrollment, policy, software, trust graph, and post-login
+  session/bootstrap work.
+
+Recommended flow:
+
+1. Complete directory binding or Automated Device Enrollment + Platform SSO.
+2. Install the DDS macOS package.
+3. Enroll the device into the DDS domain.
+4. Enroll the user's DDS credential.
+5. Let the user keep signing in through the existing directory / IdP path.
+6. Use DDS after login for policy, software, and trust-based authorization.
+
+Current limitation:
+
+- The macOS policy agent refuses `local_accounts` mutation on directory-bound
+  hosts today.
+- Platform SSO coexistence is modeled in the DDS schema, but the login-window /
+  FileVault integration path is still future `DdsLoginBridge` work.
+
 ### Installation
 
 **Option A: Install the .pkg (recommended)**
@@ -903,7 +962,7 @@ Settings can also be overridden via environment variables (prefix `DdsPolicyAgen
 | Capability | Backend | Notes |
 |---|---|---|
 | Managed preferences | `plutil` (binary plist) | Writes to `/Library/Managed Preferences/` |
-| Local accounts | `dscl`, `pwpolicy`, `sysadminctl`, `dseditgroup` | Create/delete/disable users, admin group, hidden flag. Refuses on directory-bound machines. |
+| Local accounts | `dscl`, `pwpolicy`, `sysadminctl`, `dseditgroup` | Create/delete/disable users, admin group, hidden flag. Use only on standalone Macs; refuses on directory-bound machines today. |
 | launchd services | `launchctl` bootstrap/bootout/kickstart | Configure, load, unload managed LaunchDaemons/Agents |
 | Configuration profiles | `profiles -I` / `profiles -R` | SHA-256 idempotency, payload stamp state |
 | Software install | `/usr/sbin/installer` + `pkgutil` | HTTP download, SHA-256 verify, optional signature check. Uninstall intentionally not supported. |

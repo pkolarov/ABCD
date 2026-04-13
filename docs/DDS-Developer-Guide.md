@@ -644,6 +644,20 @@ pub struct SoftwareAssignment {
 }
 ```
 
+**`MacOsPolicyDocument`** — carries managed macOS policy such as preferences,
+local-account directives for standalone Macs, launchd jobs, and configuration
+profiles.
+
+**`MacAccountBindingDocument`** — binds a DDS subject on a specific device to
+the macOS local account that hosts their home folder and session.
+
+**`SsoIdentityLinkDocument`** — links an enterprise IdP identity (AD, Entra,
+Okta, OIDC, and so on) to a DDS subject without making that IdP the DDS
+authorization source.
+
+**`ServicePrincipalDocument`** — registers machine/service identities such as
+`HTTP/api.example.com`.
+
 #### How documents flow through the system
 
 ```

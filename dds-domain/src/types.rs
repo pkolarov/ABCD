@@ -490,7 +490,112 @@ impl DomainDocument for MacOsPolicyDocument {
 }
 
 // ============================================================
-// 5. SoftwareAssignment — app/package deployment manifest
+// 5. MacAccountBindingDocument — subject/device/account binding
+// ============================================================
+
+/// How macOS login and account lifecycle are owned on a device.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MacJoinState {
+    /// No external directory or IdP owns the login window.
+    Standalone,
+    /// Active Directory, Open Directory, LDAP, or similar owns sign-in.
+    DirectoryBound,
+    /// An IdP + MDM Platform SSO flow owns sign-in and local account creation.
+    PlatformSsoManaged,
+    /// DDS couldn't determine ownership safely.
+    Unknown,
+}
+
+/// Which authority owns the macOS account bound to a DDS subject.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MacAccountAuthority {
+    /// DDS creates and mutates the local account lifecycle.
+    DdsLocal,
+    /// The local account exists, but DDS does not own its lifecycle.
+    LocalOnly,
+    /// An external directory owns who may authenticate as the account.
+    ExternalDirectory,
+    /// Platform SSO / IdP owns sign-in and account synchronization.
+    PlatformSso,
+}
+
+/// Binds a DDS subject on a specific device to the macOS local account
+/// that hosts their home folder and login session.
+///
+/// This is intentionally separate from `MacOsPolicyDocument`: policy says
+/// what the host should enforce, while this document records who a login
+/// identity maps to on a given Mac and who owns that account lifecycle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MacAccountBindingDocument {
+    /// Stable binding identifier.
+    pub binding_id: String,
+    /// DDS subject identity URN.
+    pub subject_urn: String,
+    /// DDS device identity URN.
+    pub device_urn: String,
+    /// The macOS short name (`/Users/<short_name>`).
+    pub local_short_name: String,
+    /// Human-readable account name shown in the login window or System Settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_display_name: Option<String>,
+    /// Host join state at the time the binding was recorded.
+    pub join_state: MacJoinState,
+    /// Which authority owns the account lifecycle.
+    pub authority: MacAccountAuthority,
+    /// Local administrative groups/roles this binding expects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admin_groups: Vec<String>,
+    /// Optional link to an enterprise SSO identity record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sso_link_id: Option<String>,
+    /// Unix seconds when the binding was established.
+    pub created_at: u64,
+}
+
+impl DomainDocument for MacAccountBindingDocument {
+    const BODY_TYPE: &'static str = body_types::MACOS_ACCOUNT_BINDING;
+}
+
+// ============================================================
+// 6. SsoIdentityLinkDocument — enterprise identity mapping
+// ============================================================
+
+/// Links an enterprise IdP identity to a DDS subject URN.
+///
+/// This is not an authorization grant. Group membership and privileges
+/// still come from DDS vouches and policy evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SsoIdentityLinkDocument {
+    /// Stable link identifier.
+    pub link_id: String,
+    /// DDS subject identity URN.
+    pub subject_urn: String,
+    /// Provider kind, e.g. `entra`, `okta`, `ad`, `openidc`.
+    pub provider: String,
+    /// Provider-specific immutable subject/object identifier.
+    pub provider_subject: String,
+    /// Optional issuer / tenant / realm identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// Human sign-in name, e.g. UPN or email-like principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_name: Option<String>,
+    /// Optional contact email published by the IdP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Optional display name copied from the IdP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Unix seconds when the mapping was established.
+    pub created_at: u64,
+}
+
+impl DomainDocument for SsoIdentityLinkDocument {
+    const BODY_TYPE: &'static str = body_types::SSO_IDENTITY_LINK;
+}
+
+// ============================================================
+// 7. SoftwareAssignment — app/package deployment manifest
 // ============================================================
 
 /// A software package assignment for managed devices.
@@ -530,7 +635,7 @@ impl DomainDocument for SoftwareAssignment {
 }
 
 // ============================================================
-// 6. ServicePrincipalDocument — machine/service identity
+// 8. ServicePrincipalDocument — machine/service identity
 // ============================================================
 
 /// A service principal (machine identity) registration.
@@ -560,7 +665,7 @@ impl DomainDocument for ServicePrincipalDocument {
 }
 
 // ============================================================
-// 7. SessionDocument — short-lived auth session
+// 9. SessionDocument — short-lived auth session
 // ============================================================
 
 /// A short-lived session token for < 1ms local validation.
@@ -676,5 +781,92 @@ mod tests {
         let mut payload = empty_payload();
         doc.embed(&mut payload).unwrap();
         assert!(MacOsPolicyDocument::extract(&payload).unwrap().is_none());
+    }
+
+    #[test]
+    fn macos_account_binding_embed_extract_round_trip() {
+        let doc = MacAccountBindingDocument {
+            binding_id: "bind-mac-alice".into(),
+            subject_urn: "urn:vouchsafe:alice.abc".into(),
+            device_urn: "urn:vouchsafe:macbook.def".into(),
+            local_short_name: "alice".into(),
+            local_display_name: Some("Alice Example".into()),
+            join_state: MacJoinState::PlatformSsoManaged,
+            authority: MacAccountAuthority::PlatformSso,
+            admin_groups: vec!["admin".into()],
+            sso_link_id: Some("sso-alice".into()),
+            created_at: 1_712_956_800,
+        };
+
+        let mut payload = empty_payload();
+        doc.embed(&mut payload).unwrap();
+
+        let extracted = MacAccountBindingDocument::extract(&payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(extracted, doc);
+    }
+
+    #[test]
+    fn macos_account_binding_extract_returns_none_for_other_body_type() {
+        let doc = SessionDocument {
+            session_id: "sess-1".into(),
+            subject_urn: "urn:vouchsafe:alice.abc".into(),
+            device_urn: Some("urn:vouchsafe:macbook.def".into()),
+            granted_purposes: vec![],
+            authorized_resources: vec![],
+            session_start: 1,
+            duration_secs: 300,
+            mfa_verified: true,
+            tls_binding: None,
+        };
+        let mut payload = empty_payload();
+        doc.embed(&mut payload).unwrap();
+        assert!(
+            MacAccountBindingDocument::extract(&payload)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sso_identity_link_embed_extract_round_trip() {
+        let doc = SsoIdentityLinkDocument {
+            link_id: "sso-alice".into(),
+            subject_urn: "urn:vouchsafe:alice.abc".into(),
+            provider: "entra".into(),
+            provider_subject: "00000000-1111-2222-3333-444444444444".into(),
+            issuer: Some("contoso.onmicrosoft.com".into()),
+            principal_name: Some("alice@contoso.com".into()),
+            email: Some("alice@contoso.com".into()),
+            display_name: Some("Alice Example".into()),
+            created_at: 1_712_956_800,
+        };
+
+        let mut payload = empty_payload();
+        doc.embed(&mut payload).unwrap();
+
+        let extracted = SsoIdentityLinkDocument::extract(&payload).unwrap().unwrap();
+        assert_eq!(extracted, doc);
+    }
+
+    #[test]
+    fn sso_identity_link_extract_returns_none_for_other_body_type() {
+        let doc = DeviceJoinDocument {
+            device_id: "mac-001".into(),
+            hostname: "mbp-001".into(),
+            os: "macOS".into(),
+            os_version: "15.4".into(),
+            tpm_ek_hash: None,
+            org_unit: Some("engineering".into()),
+            tags: vec!["mac".into()],
+        };
+        let mut payload = empty_payload();
+        doc.embed(&mut payload).unwrap();
+        assert!(
+            SsoIdentityLinkDocument::extract(&payload)
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -382,8 +382,9 @@ To prevent resource exhaustion in trust graph evaluation:
 | GPO enforcement (registry, security policy) | `DdsPolicyAgent` Windows Service with pluggable enforcers (§14.5.4) |
 | Software deployment (SCCM/Intune) | `SoftwareAssignment` document + `SoftwareInstaller` enforcer (§14.5.1) |
 | Linux fleet policy / config management | `LinuxPolicyDocument` + `DdsPolicyAgent.Linux` + systemd/PAM bridges (§14.6) |
-| macOS device configuration / profile management | `MacOsPolicyDocument` + `DdsPolicyAgent.MacOS` + launchd/Authorization Services bridges (§14.7) |
-| Local account management | `AccountDirective` via `AccountEnforcer` plus DDS Auth Bridge first-claim flow, both with domain-join guard (§14.5.5) |
+| macOS device configuration / profile management | `MacOsPolicyDocument` + `DdsPolicyAgent.MacOS` (§14.7) |
+| Standalone local account management | `AccountDirective` / `MacAccountDirective` via platform appliers, with external-directory guard (§14.5.5, §14.7.4) |
+| macOS enterprise account / SSO coexistence | `MacAccountBindingDocument` + `SsoIdentityLinkDocument` layered on top of directory or Platform SSO-owned login flows (§14.7.1, §14.7.5) |
 | Password policy (Fine-Grained) | `PasswordPolicyEnforcer` via `PasswordPolicy` directive (§14.5.1) |
 | Organizational Units | Purpose-filtered delegation chains |
 | Group membership | Vouch tokens from authorized admins |
@@ -1482,6 +1483,18 @@ enforcement surface is different:
 
 #### 14.7.1 macOS Domain Document Types
 
+macOS needs DDS to model three separate identities that are often collapsed on
+Windows:
+
+1. the **DDS subject** in the trust graph;
+2. the **local macOS account** that owns the home folder, Secure Token, and
+   FileVault relationship;
+3. the **enterprise SSO identity** (AD, Entra, Okta, OpenID Connect, and so on)
+   that may own the login window experience.
+
+The document model reflects that split instead of pretending the three layers
+are the same object.
+
 **MacOsPolicyDocument** (`body_type: "dds:macos-policy"`):
 
 ```
@@ -1519,6 +1532,49 @@ MacOsPolicyDocument
         └── action: ProfileAction     # Install | Remove
 ```
 
+`MacAccountDirective` is only authoritative on **standalone** Macs where DDS is
+allowed to own local account lifecycle. On directory-bound or Platform SSO
+managed Macs, the account lifecycle remains external and these directives are
+skipped by policy.
+
+**MacAccountBindingDocument** (`body_type: "dds:macos-account-binding"`):
+
+```
+MacAccountBindingDocument
+├── binding_id: String
+├── subject_urn: String
+├── device_urn: String
+├── local_short_name: String
+├── local_display_name: Option<String>
+├── join_state: MacJoinState          # Standalone | DirectoryBound | PlatformSsoManaged | Unknown
+├── authority: MacAccountAuthority    # DdsLocal | LocalOnly | ExternalDirectory | PlatformSso
+├── admin_groups: [String]
+├── sso_link_id: Option<String>
+└── created_at: u64
+```
+
+This records which local macOS account a DDS subject actually uses on a
+specific Mac and who owns that account lifecycle.
+
+**SsoIdentityLinkDocument** (`body_type: "dds:sso-identity-link"`):
+
+```
+SsoIdentityLinkDocument
+├── link_id: String
+├── subject_urn: String
+├── provider: String                  # e.g. "entra", "okta", "ad", "openidc"
+├── provider_subject: String          # immutable IdP object / subject identifier
+├── issuer: Option<String>            # tenant, realm, issuer URL
+├── principal_name: Option<String>    # UPN / login name / email-style principal
+├── email: Option<String>
+├── display_name: Option<String>
+└── created_at: u64
+```
+
+This binds the enterprise IdP identity to the DDS subject without turning the
+IdP into the authorization source. Group membership and privilege still come
+from DDS vouches and policy evaluation.
+
 `SoftwareAssignment` is also reused on macOS.
 Supported install forms:
 
@@ -1550,7 +1606,7 @@ enforcers call macOS-native surfaces:
 | Enforcer | Backend | Notes |
 | --- | --- | --- |
 | `PreferenceEnforcer` | plist / CFPreferences / `defaults` | Writes system or user-template managed preferences |
-| `MacAccountEnforcer` | `sysadminctl`, `dscl`, `dseditgroup` | Local account lifecycle only |
+| `MacAccountEnforcer` | `sysadminctl`, `dscl`, `dseditgroup` | Local account lifecycle only on standalone Macs |
 | `LaunchdEnforcer` | `launchctl` + managed plist files | Service and agent configuration |
 | `ProfileEnforcer` | `profiles` / managed payload install | Only payload classes installable by a local privileged agent |
 | `SoftwareInstaller` | `/usr/sbin/installer`, `softwareupdate` | Requires signature/hash verification |
@@ -1580,8 +1636,12 @@ out of scope for v1.
 
 It does not rewrite arbitrary application bundles or protected system locations.
 
-**Directory-binding guard:** If the host is bound to Active Directory, Open Directory,
-or another external account source, local account mutation is disabled by default.
+**External account-source guard:** If the host is bound to Active Directory,
+Open Directory, LDAP, or another external account source, local account mutation
+is disabled by default. The same architectural rule applies to Platform SSO
+managed Macs: DDS may layer trust, session issuance, and policy on top, but it
+does not become the authority for the login window or FileVault account
+lifecycle.
 
 **Package trust:** `.pkg` installs require:
 
@@ -1608,9 +1668,27 @@ So the design is phased:
 - **Deferred:** replacing FileVault pre-boot authentication or the full loginwindow
   path is explicitly out of scope until a safe, supportable Apple-approved path exists.
 
-This keeps the platform story honest.
-macOS can be managed similarly to Windows in policy/software/device terms, but
-interactive login replacement should not be promised casually.
+This keeps the platform story honest. macOS can be managed similarly to Windows
+in policy/software/device terms, but interactive login replacement should not
+be promised casually.
+
+The host-account model is therefore explicit:
+
+- **Standalone:** DDS may create and mutate local accounts, publish
+  `MacAccountBindingDocument`, and bootstrap DDS sessions after the user logs in
+  with the local macOS account.
+- **DirectoryBound:** AD / Open Directory / LDAP owns the login window and local
+  account lifecycle. DDS records the relationship using
+  `MacAccountBindingDocument` and `SsoIdentityLinkDocument`, but skips
+  local-account mutation.
+- **PlatformSsoManaged:** MDM + Platform SSO owns login, local-account creation,
+  password sync, and FileVault-adjacent policy. DDS treats the IdP identity as
+  an input into trust and session issuance, not as something DDS replaces.
+- **Unknown:** DDS fails closed for account mutation and limits itself to
+  non-destructive policy / session work until ownership is known.
+
+In other words, DDS owns the trust graph and local authorization decision. On
+managed enterprise Macs, it does not claim to own the login window.
 
 #### 14.7.6 Packaging And Deployment
 
@@ -1634,6 +1712,9 @@ Operationally, the macOS rollout model is:
 3. enroll device with DDS;
 4. apply policies in `Audit` mode first;
 5. move selected policies to `Enforce`.
+
+On externally managed Macs, omit `local_accounts` directives and let the
+directory / IdP own login-window account lifecycle.
 
 ---
 
