@@ -262,6 +262,76 @@ public sealed class PreferenceEnforcer : IEnforcer
         return node?.ToJsonString() ?? "null";
     }
 
+    /// <summary>
+    /// Extract the managed-item key for a Set directive.
+    /// Format: <c>scope:domain:key</c>.
+    /// Returns null for non-Set actions.
+    /// </summary>
+    public static string? ExtractManagedKey(JsonElement item)
+    {
+        var action = item.TryGetProperty("action", out var a) ? a.GetString() : null;
+        if (action != "Set") return null;
+        var domain = item.TryGetProperty("domain", out var d) ? d.GetString() : null;
+        var key = item.TryGetProperty("key", out var k) ? k.GetString() : null;
+        if (domain is null || key is null) return null;
+        var scope = ParseScope(item);
+        return $"{scope}:{domain}:{key}";
+    }
+
+    /// <summary>
+    /// Remove preference values that were previously managed by DDS
+    /// but are no longer present in the current policy.
+    /// </summary>
+    public List<string> ReconcileStaleItems(
+        IReadOnlySet<string> staleKeys, EnforcementMode mode)
+    {
+        var changes = new List<string>();
+        foreach (var managedKey in staleKeys)
+        {
+            try
+            {
+                var parts = managedKey.Split(':', 3);
+                if (parts.Length < 3)
+                {
+                    _log.LogWarning("Reconcile: could not parse preference key '{Key}'", managedKey);
+                    continue;
+                }
+
+                var scope = parts[0] == "UserTemplate" ? PreferenceScope.UserTemplate : PreferenceScope.System;
+                var domain = parts[1];
+                var key = parts[2];
+
+                if (!IsValidDomain(domain))
+                {
+                    _log.LogWarning("Reconcile: invalid domain in '{Key}' — skip", managedKey);
+                    continue;
+                }
+
+                var desc = $"Reconcile-Delete {managedKey}";
+
+                if (mode == EnforcementMode.Audit)
+                {
+                    _log.LogInformation("[AUDIT] Preference reconcile: would delete {Key}", managedKey);
+                    changes.Add($"[AUDIT] {desc}");
+                    continue;
+                }
+
+                if (_ops.GetValueJson(domain, key, scope) is not null)
+                {
+                    _ops.DeleteValue(domain, key, scope);
+                    _log.LogInformation("Preference reconcile: deleted stale value {Key}", managedKey);
+                    changes.Add(desc);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Preference reconcile failed for {Key}", managedKey);
+                changes.Add($"FAILED: Reconcile-Delete {managedKey} — {ex.Message}");
+            }
+        }
+        return changes;
+    }
+
     private static string DescribeDirective(JsonElement item)
     {
         var domain = item.TryGetProperty("domain", out var d) ? d.GetString() : "?";

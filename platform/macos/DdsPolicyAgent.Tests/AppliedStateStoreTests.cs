@@ -57,4 +57,41 @@ public class AppliedStateStoreTests : IDisposable
         var store2 = new AppliedStateStore(_tmpDir);
         Assert.False(store2.HasChanged("p:persist", "sha256:xyz"));
     }
+
+    [Fact]
+    public void GetManagedItems_returns_empty_set_when_category_not_tracked()
+    {
+        var items = _store.GetManagedItems("preferences");
+        Assert.Empty(items);
+    }
+
+    [Fact]
+    public void SetManagedItems_and_GetManagedItems_roundtrip()
+    {
+        _store.SetManagedItems("preferences", ["System:com.apple.screensaver:idleTime", "System:com.apple.dock:tilesize"]);
+        var items = _store.GetManagedItems("preferences");
+        Assert.Equal(2, items.Count);
+        Assert.Contains("System:com.apple.screensaver:idleTime", items);
+        Assert.Contains("System:com.apple.dock:tilesize", items);
+    }
+
+    [Fact]
+    public void SetManagedItems_replaces_existing_category()
+    {
+        _store.SetManagedItems("launchd", ["com.dds.old1", "com.dds.old2"]);
+        _store.SetManagedItems("launchd", ["com.dds.new1"]);
+        var items = _store.GetManagedItems("launchd");
+        Assert.Single(items);
+        Assert.Contains("com.dds.new1", items);
+    }
+
+    [Fact]
+    public void ManagedItems_persist_across_instances()
+    {
+        _store.SetManagedItems("profiles", ["com.dds.wifi"]);
+        var store2 = new AppliedStateStore(_tmpDir);
+        var items = store2.GetManagedItems("profiles");
+        Assert.Single(items);
+        Assert.Contains("com.dds.wifi", items);
+    }
 }

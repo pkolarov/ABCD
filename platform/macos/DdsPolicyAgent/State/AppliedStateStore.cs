@@ -27,6 +27,15 @@ public sealed class AppliedState
 
     [JsonPropertyName("software")]
     public Dictionary<string, AppliedEntry> Software { get; set; } = new();
+
+    /// <summary>
+    /// Items currently managed by DDS, keyed by enforcer category
+    /// (e.g. "preferences", "accounts", "launchd", "profiles",
+    /// "software"). Used for reconciliation: items in this set but
+    /// absent from the current policy are cleaned up.
+    /// </summary>
+    [JsonPropertyName("managed_items")]
+    public Dictionary<string, HashSet<string>> ManagedItems { get; set; } = new();
 }
 
 public interface IAppliedStateStore
@@ -35,6 +44,17 @@ public interface IAppliedStateStore
     void Save(AppliedState state);
     bool HasChanged(string targetId, string contentHash);
     void RecordApplied(string targetId, string version, string contentHash, string status, bool isSoftware);
+
+    /// <summary>
+    /// Get the set of items DDS currently manages for a given category.
+    /// Returns an empty set if nothing is tracked yet.
+    /// </summary>
+    IReadOnlySet<string> GetManagedItems(string category);
+
+    /// <summary>
+    /// Replace the managed items for a category with a new set.
+    /// </summary>
+    void SetManagedItems(string category, IEnumerable<string> items);
 }
 
 public sealed class AppliedStateStore : IAppliedStateStore
@@ -100,6 +120,25 @@ public sealed class AppliedStateStore : IAppliedStateStore
                 _state.Software[targetId] = entry;
             else
                 _state.Policies[targetId] = entry;
+            WriteToDisk(_state);
+        }
+    }
+
+    public IReadOnlySet<string> GetManagedItems(string category)
+    {
+        lock (_lock)
+        {
+            if (_state.ManagedItems.TryGetValue(category, out var items))
+                return items;
+            return new HashSet<string>();
+        }
+    }
+
+    public void SetManagedItems(string category, IEnumerable<string> items)
+    {
+        lock (_lock)
+        {
+            _state.ManagedItems[category] = new HashSet<string>(items);
             WriteToDisk(_state);
         }
     }

@@ -21,6 +21,8 @@ public interface IMacAccountOperations
     void SetAdmin(string username, bool isAdmin);
     void SetHidden(string username, bool hidden);
     void SetShell(string username, string? shell);
+    bool IsInGroup(string username, string group);
+    void RemoveFromGroup(string username, string group);
     bool IsDirectoryBound();
 }
 
@@ -34,6 +36,7 @@ public sealed class InMemoryMacAccountOperations : IMacAccountOperations
         public bool Enabled { get; set; } = true;
         public bool Admin { get; set; }
         public bool Hidden { get; set; }
+        public HashSet<string> Groups { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
     private readonly Dictionary<string, AccountState> _accounts = new(StringComparer.OrdinalIgnoreCase);
@@ -65,6 +68,13 @@ public sealed class InMemoryMacAccountOperations : IMacAccountOperations
     public void SetAdmin(string username, bool isAdmin) { if (_accounts.TryGetValue(username, out var a)) a.Admin = isAdmin; }
     public void SetHidden(string username, bool hidden) { if (_accounts.TryGetValue(username, out var a)) a.Hidden = hidden; }
     public void SetShell(string username, string? shell) { if (_accounts.TryGetValue(username, out var a)) a.Shell = shell; }
+    public bool IsInGroup(string username, string group)
+        => _accounts.TryGetValue(username, out var a) && a.Groups.Contains(group);
+    public void RemoveFromGroup(string username, string group)
+    {
+        if (_accounts.TryGetValue(username, out var a))
+            a.Groups.Remove(group);
+    }
     public bool IsDirectoryBound() => SimulateDirectoryBound;
 
     public AccountState? Peek(string username)
@@ -195,6 +205,24 @@ public sealed class HostMacAccountOperations : IMacAccountOperations
 
         PrivilegeGuard.DemandRoot("local macOS shell mutation");
         RunDscl("-create", UserPath(username), "UserShell", shell);
+    }
+
+    public bool IsInGroup(string username, string group)
+    {
+        var result = _runner.Run("/usr/bin/dscl", [".", "-read", $"/Groups/{group}", "GroupMembership"]);
+        if (!result.Succeeded)
+            return false;
+        return result.StandardOutput
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Contains(username, StringComparer.OrdinalIgnoreCase);
+    }
+
+    public void RemoveFromGroup(string username, string group)
+    {
+        PrivilegeGuard.DemandRoot("local macOS group membership mutation");
+        _runner.RunChecked(
+            "/usr/sbin/dseditgroup",
+            ["-o", "edit", "-n", ".", "-d", username, "-t", "user", group]);
     }
 
     public bool IsDirectoryBound()
@@ -427,6 +455,122 @@ public sealed class MacAccountEnforcer : IEnforcer
         => item.TryGetProperty(name, out var value) && value.ValueKind != JsonValueKind.Null
             ? value.GetBoolean()
             : null;
+
+    /// <summary>
+    /// Extract the managed-item key (username) for a Create directive.
+    /// Returns null for non-Create actions.
+    /// </summary>
+    public static string? ExtractManagedKey(JsonElement item)
+    {
+        var action = item.TryGetProperty("action", out var a) ? a.GetString() : null;
+        if (action != "Create") return null;
+        return item.TryGetProperty("username", out var u) ? u.GetString() : null;
+    }
+
+    /// <summary>
+    /// Extract group membership keys (<c>username:group</c>) from a
+    /// Create or Modify directive for reconciliation tracking.
+    /// </summary>
+    public static IEnumerable<string> ExtractManagedGroups(JsonElement item)
+    {
+        var username = item.TryGetProperty("username", out var u) ? u.GetString() : null;
+        if (username is null) yield break;
+
+        if (!item.TryGetProperty("groups", out var groups) || groups.ValueKind != JsonValueKind.Array)
+            yield break;
+
+        foreach (var g in groups.EnumerateArray())
+        {
+            var group = g.GetString();
+            if (!string.IsNullOrWhiteSpace(group))
+                yield return $"{username}:{group}";
+        }
+    }
+
+    /// <summary>
+    /// Disable accounts that were previously managed by DDS but are no
+    /// longer present in the current policy. Disables rather than
+    /// deletes to avoid data loss.
+    /// </summary>
+    public List<string> ReconcileStaleAccounts(IReadOnlySet<string> staleKeys, EnforcementMode mode)
+    {
+        var changes = new List<string>();
+        foreach (var username in staleKeys)
+        {
+            try
+            {
+                var desc = $"Reconcile-Disable '{username}'";
+
+                if (mode == EnforcementMode.Audit)
+                {
+                    _log.LogInformation("[AUDIT] Account reconcile: would disable {User}", username);
+                    changes.Add($"[AUDIT] {desc}");
+                    continue;
+                }
+
+                if (!_ops.UserExists(username))
+                    continue;
+
+                if (!_ops.IsEnabled(username))
+                    continue;
+
+                _ops.DisableUser(username);
+                _log.LogInformation("Account reconcile: disabled stale user '{User}'", username);
+                changes.Add(desc);
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Account reconcile failed for '{User}'", username);
+                changes.Add($"FAILED: Reconcile-Disable '{username}' — {ex.Message}");
+            }
+        }
+        return changes;
+    }
+
+    /// <summary>
+    /// Remove group memberships that were previously managed by DDS
+    /// but are no longer present in the current policy.
+    /// </summary>
+    public List<string> ReconcileStaleGroups(IReadOnlySet<string> staleKeys, EnforcementMode mode)
+    {
+        var changes = new List<string>();
+        foreach (var managedKey in staleKeys)
+        {
+            try
+            {
+                var sep = managedKey.IndexOf(':');
+                if (sep < 0)
+                {
+                    _log.LogWarning("Reconcile: could not parse group key '{Key}'", managedKey);
+                    continue;
+                }
+
+                var username = managedKey[..sep];
+                var group = managedKey[(sep + 1)..];
+                var desc = $"Reconcile-RemoveGroup '{username}' from '{group}'";
+
+                if (mode == EnforcementMode.Audit)
+                {
+                    _log.LogInformation("[AUDIT] Account reconcile: would remove {User} from group {Group}", username, group);
+                    changes.Add($"[AUDIT] {desc}");
+                    continue;
+                }
+
+                if (!_ops.IsInGroup(username, group))
+                    continue;
+
+                _ops.RemoveFromGroup(username, group);
+                _log.LogInformation("Account reconcile: removed '{User}' from group '{Group}'", username, group);
+                changes.Add(desc);
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Account group reconcile failed for '{Key}'", managedKey);
+                changes.Add($"FAILED: Reconcile-RemoveGroup {managedKey} — {ex.Message}");
+            }
+        }
+        return changes;
+    }
 
     private static string DescribeDirective(JsonElement item)
     {

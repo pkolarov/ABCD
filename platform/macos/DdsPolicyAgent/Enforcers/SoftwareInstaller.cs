@@ -248,6 +248,35 @@ public sealed class SoftwareInstaller : IEnforcer
             ? sha["sha256:".Length..].ToLowerInvariant()
             : sha.ToLowerInvariant();
 
+    /// <summary>
+    /// Extract the managed-item key (package_id) for an Install directive.
+    /// Returns null for non-Install actions.
+    /// </summary>
+    public static string? ExtractManagedKey(JsonElement directive)
+    {
+        var action = directive.TryGetProperty("action", out var a) ? a.GetString() : "Install";
+        if (!string.Equals(action, "Install", StringComparison.OrdinalIgnoreCase)) return null;
+        return directive.TryGetProperty("package_id", out var id) ? id.GetString() : null;
+    }
+
+    /// <summary>
+    /// Log stale software packages that are no longer in the policy.
+    /// Generic macOS pkg uninstall is intentionally not supported, so
+    /// this is audit-log only regardless of mode.
+    /// </summary>
+    public List<string> ReconcileStalePackages(IReadOnlySet<string> staleKeys, EnforcementMode mode)
+    {
+        var changes = new List<string>();
+        foreach (var packageId in staleKeys)
+        {
+            _log.LogWarning(
+                "Software reconcile: package '{PackageId}' is no longer in policy but cannot be auto-uninstalled on macOS",
+                packageId);
+            changes.Add($"[MANUAL] Reconcile-Uninstall {packageId} (macOS pkg uninstall not supported — remove manually)");
+        }
+        return changes;
+    }
+
     private static string SanitizeFileName(string value)
     {
         var invalid = Path.GetInvalidFileNameChars();

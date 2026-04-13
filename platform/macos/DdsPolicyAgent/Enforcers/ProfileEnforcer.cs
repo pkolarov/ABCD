@@ -298,6 +298,50 @@ public sealed class ProfileEnforcer : IEnforcer
         }
     }
 
+    /// <summary>
+    /// Extract the managed-item key (identifier) for an Install directive.
+    /// Returns null for non-Install actions.
+    /// </summary>
+    public static string? ExtractManagedKey(JsonElement item)
+    {
+        var action = item.TryGetProperty("action", out var a) ? a.GetString() : null;
+        if (action != "Install") return null;
+        return item.TryGetProperty("identifier", out var i) ? i.GetString() : null;
+    }
+
+    /// <summary>
+    /// Remove configuration profiles that were previously managed by DDS
+    /// but are no longer present in the current policy.
+    /// </summary>
+    public List<string> ReconcileStaleProfiles(IReadOnlySet<string> staleKeys, EnforcementMode mode)
+    {
+        var changes = new List<string>();
+        foreach (var identifier in staleKeys)
+        {
+            try
+            {
+                var desc = $"Reconcile-Remove profile {identifier}";
+
+                if (mode == EnforcementMode.Audit)
+                {
+                    _log.LogInformation("[AUDIT] Profile reconcile: would remove {Identifier}", identifier);
+                    changes.Add($"[AUDIT] {desc}");
+                    continue;
+                }
+
+                _ops.Remove(identifier);
+                _log.LogInformation("Profile reconcile: removed stale profile {Identifier}", identifier);
+                changes.Add(desc);
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Profile reconcile failed for {Identifier}", identifier);
+                changes.Add($"FAILED: Reconcile-Remove profile {identifier} — {ex.Message}");
+            }
+        }
+        return changes;
+    }
+
     private static string DescribeDirective(JsonElement item)
     {
         var identifier = item.TryGetProperty("identifier", out var i) ? i.GetString() : "?";

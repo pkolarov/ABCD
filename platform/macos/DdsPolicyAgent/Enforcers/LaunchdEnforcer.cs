@@ -319,6 +319,50 @@ public sealed class LaunchdEnforcer : IEnforcer
         }
     }
 
+    /// <summary>
+    /// Extract the managed-item key for a Configure directive (label).
+    /// Returns null for non-Configure actions.
+    /// </summary>
+    public static string? ExtractManagedKey(JsonElement item)
+    {
+        var action = item.TryGetProperty("action", out var a) ? a.GetString() : null;
+        if (action != "Configure") return null;
+        return item.TryGetProperty("label", out var l) ? l.GetString() : null;
+    }
+
+    /// <summary>
+    /// Unload launchd jobs that were previously managed by DDS but are
+    /// no longer present in the current policy.
+    /// </summary>
+    public List<string> ReconcileStaleItems(IReadOnlySet<string> staleKeys, EnforcementMode mode)
+    {
+        var changes = new List<string>();
+        foreach (var label in staleKeys)
+        {
+            try
+            {
+                var desc = $"Reconcile-Unload {label}";
+
+                if (mode == EnforcementMode.Audit)
+                {
+                    _log.LogInformation("[AUDIT] launchd reconcile: would unload {Label}", label);
+                    changes.Add($"[AUDIT] {desc}");
+                    continue;
+                }
+
+                _ops.Unload(label);
+                _log.LogInformation("launchd reconcile: unloaded stale job {Label}", label);
+                changes.Add(desc);
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "launchd reconcile failed for {Label}", label);
+                changes.Add($"FAILED: Reconcile-Unload {label} — {ex.Message}");
+            }
+        }
+        return changes;
+    }
+
     private static string DescribeDirective(JsonElement item)
     {
         var label = item.TryGetProperty("label", out var l) ? l.GetString() : "?";
