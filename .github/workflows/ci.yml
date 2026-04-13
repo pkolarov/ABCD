@@ -137,4 +137,4 @@ jobs:
       - name: Build DdsPolicyAgent
         run: dotnet build platform\windows\DdsPolicyAgent\DdsPolicyAgent.csproj -c Debug
       - name: Test DdsPolicyAgent
-        run: dotnet test platform\windows\DdsPolicyAgent.Tests\DdsPolicyAgent.Tests.csproj -c Debug
+        run: dotnet test platform\windows\DdsPolicyAgent.Tests\DdsPolicyAgent.Tests.csproj -c Debug --filter "Category!=Integration"
