@@ -12,6 +12,7 @@
 #include "DdsAuthBridgeMain.h"
 #include "EventLogger.h"
 #include "FileLog.h"
+#include <algorithm>
 #include <ctime>
 #include <string.h>
 #include <lm.h>          // NetGetJoinInformation
@@ -821,7 +822,7 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     IPC_RESP_DDS_AUTH_CHALLENGE challenge = {};
 
     // Copy credential ID
-    DWORD credIdLen = static_cast<DWORD>(min(requestedCredIdBytes.size(),
+    DWORD credIdLen = static_cast<DWORD>((std::min)(requestedCredIdBytes.size(),
                                              sizeof(challenge.credential_id)));
     memcpy(challenge.credential_id, requestedCredIdBytes.data(), credIdLen);
     challenge.credential_id_len = credIdLen;
@@ -837,14 +838,14 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     DWORD saltLen = 0;
     if (pVaultEntry)
     {
-        saltLen = static_cast<DWORD>(min(pVaultEntry->salt.size(),
+        saltLen = static_cast<DWORD>((std::min)(pVaultEntry->salt.size(),
                                          sizeof(challenge.salt)));
         if (saltLen > 0)
             memcpy(challenge.salt, pVaultEntry->salt.data(), saltLen);
     }
     else
     {
-        saltLen = static_cast<DWORD>(min<size_t>(pOp->claimSaltLen, sizeof(challenge.salt)));
+        saltLen = static_cast<DWORD>((std::min<size_t>)(pOp->claimSaltLen, sizeof(challenge.salt)));
         if (saltLen > 0)
             memcpy(challenge.salt, pOp->claimSalt, saltLen);
     }
@@ -1150,7 +1151,7 @@ BOOL CDdsAuthBridgeMain::HandleDdsListUsers(
     IPC_RESP_DDS_USER_LIST* pList = reinterpret_cast<IPC_RESP_DDS_USER_LIST*>(buffer);
 
     size_t maxUsers = (sizeof(buffer) - sizeof(IPC_RESP_DDS_USER_LIST)) / sizeof(IPC_DDS_USER_ENTRY);
-    UINT32 count = static_cast<UINT32>(min(result.users.size(), maxUsers));
+    UINT32 count = static_cast<UINT32>((std::min)(result.users.size(), maxUsers));
     pList->count = count;
 
     IPC_DDS_USER_ENTRY* pEntries = reinterpret_cast<IPC_DDS_USER_ENTRY*>(buffer + sizeof(IPC_RESP_DDS_USER_LIST));
@@ -1207,7 +1208,7 @@ BOOL CDdsAuthBridgeMain::HandleListUsers(
     IPC_RESP_USER_LIST* pList = reinterpret_cast<IPC_RESP_USER_LIST*>(buffer);
 
     size_t maxUsers = (sizeof(buffer) - sizeof(IPC_RESP_USER_LIST)) / sizeof(IPC_USER_ENTRY);
-    UINT32 count = static_cast<UINT32>(min(entries.size(), maxUsers));
+    UINT32 count = static_cast<UINT32>((std::min)(entries.size(), maxUsers));
     pList->userCount = count;
 
     IPC_USER_ENTRY* pEntries = reinterpret_cast<IPC_USER_ENTRY*>(buffer + sizeof(IPC_RESP_USER_LIST));

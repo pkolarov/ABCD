@@ -119,12 +119,12 @@ pub fn save(path: &Path, kp: &Keypair) -> Result<(), P2pIdentityError> {
 }
 
 /// Best-effort: restrict file to owner-only read/write (0o600 on Unix).
-fn set_owner_only_permissions(path: &Path) {
+fn set_owner_only_permissions(_path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(path, perms);
+        let _ = std::fs::set_permissions(_path, perms);
     }
 }
 
