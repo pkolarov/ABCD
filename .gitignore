@@ -3,6 +3,8 @@
 # .NET build artifacts
 **/bin/
 **/obj/
+# Re-include Rust src/bin source directories (excluded by the rule above)
+!**/src/bin/
 
 # Native build output
 **/build/
