@@ -144,6 +144,8 @@ jobs:
         run: dotnet test platform\windows\DdsPolicyAgent.Tests\DdsPolicyAgent.Tests.csproj -c Debug --framework net9.0 --filter "Category!=Integration"
 
       # ---- MSI compile verification ----
+      - name: Build dds-node (release, for MSI staging)
+        run: cargo build -p dds-node --target x86_64-pc-windows-msvc --release
       - name: Install WiX
         run: dotnet tool install --global wix --version 5.0.2
       - name: Publish DdsPolicyAgent for MSI staging
