@@ -2,7 +2,18 @@ name: MSI Installer
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
+    paths:
+      - 'platform/windows/**'
+      - 'dds-node/**'
+      - 'dds-core/**'
+      - 'dds-domain/**'
+      - 'dds-store/**'
+      - 'dds-net/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/msi.yml'
   pull_request:
     paths:
       - 'platform/windows/**'
