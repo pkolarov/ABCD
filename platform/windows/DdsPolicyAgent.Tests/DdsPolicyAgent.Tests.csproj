@@ -25,7 +25,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="Integration/TestData/TestPackage.msi" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Integration/TestData/TestPackage.msi" CopyToOutputDirectory="PreserveNewest" Condition="Exists('Integration/TestData/TestPackage.msi')" />
     <None Include="Integration/TestData/readme.txt" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Integration/TestData/TestPackage.wxs" CopyToOutputDirectory="Never" />
   </ItemGroup>
