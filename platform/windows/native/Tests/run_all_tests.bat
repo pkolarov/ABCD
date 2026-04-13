@@ -24,11 +24,10 @@ echo.
 "%TEST_EXE%"
 set "RESULT=%ERRORLEVEL%"
 
-echo.
 if %RESULT% equ 0 (
     echo All tests passed.
 ) else (
-    echo Some tests FAILED (exit code %RESULT%).
+    echo Some tests FAILED [exit code %RESULT%].
 )
 
 endlocal
