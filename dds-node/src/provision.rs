@@ -465,7 +465,7 @@ audit_log_enabled = false
 fn start_platform_node(config_path: &Path) -> Result<(), ProvisionError> {
     match std::env::consts::OS {
         "macos" => {
-            // Enable and bootstrap the LaunchDaemon
+            // Enable and bootstrap the LaunchDaemon for dds-node
             let _ = std::process::Command::new("launchctl")
                 .args(["enable", "system/com.dds.node"])
                 .status();
@@ -483,6 +483,23 @@ fn start_platform_node(config_path: &Path) -> Result<(), ProvisionError> {
                     .args(["kickstart", "-k", "system/com.dds.node"])
                     .status();
             }
+
+            // Also start the policy agent (mirrors Windows MSI which auto-starts
+            // both DdsNode and DdsPolicyAgent services)
+            let palist_path = "/Library/LaunchDaemons/com.dds.policyagent.plist";
+            if std::path::Path::new(palist_path).exists() {
+                let _ = std::process::Command::new("launchctl")
+                    .args(["enable", "system/com.dds.policyagent"])
+                    .status();
+                let pa_status = std::process::Command::new("launchctl")
+                    .args(["bootstrap", "system", palist_path])
+                    .status();
+                if pa_status.map(|s| !s.success()).unwrap_or(true) {
+                    let _ = std::process::Command::new("launchctl")
+                        .args(["kickstart", "-k", "system/com.dds.policyagent"])
+                        .status();
+                }
+            }
             Ok(())
         }
         "windows" => {
@@ -497,6 +514,10 @@ fn start_platform_node(config_path: &Path) -> Result<(), ProvisionError> {
                     .spawn()
                     .map_err(|e| ProvisionError::NodeStart(e.to_string()))?;
             }
+            // Also start the policy agent if installed
+            let _ = std::process::Command::new("sc")
+                .args(["start", "DdsPolicyAgent"])
+                .status();
             Ok(())
         }
         _ => {

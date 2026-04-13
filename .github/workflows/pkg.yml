@@ -1,0 +1,192 @@
+name: macOS Installer
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'platform/macos/**'
+      - 'dds-node/**'
+      - 'dds-core/**'
+      - 'dds-domain/**'
+      - 'dds-store/**'
+      - 'dds-net/**'
+      - 'dds-cli/**'
+      - 'dds-fido2-test/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/pkg.yml'
+  pull_request:
+    paths:
+      - 'platform/macos/**'
+      - 'dds-node/**'
+      - 'dds-core/**'
+      - 'dds-domain/**'
+      - 'dds-store/**'
+      - 'dds-net/**'
+      - 'dds-cli/**'
+      - 'dds-fido2-test/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/pkg.yml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version (e.g. 0.1.0)'
+        required: false
+        default: '0.1.0'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-pkg:
+    name: macOS .pkg (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: macos-latest     # ARM64 (Apple Silicon)
+            arch: arm64
+            rust_target: aarch64-apple-darwin
+            dotnet_rid: osx-arm64
+          - runner: macos-13         # x86_64 (Intel)
+            arch: x86_64
+            rust_target: x86_64-apple-darwin
+            dotnet_rid: osx-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Compute version ──────────────────────────────────────────
+      - name: Compute version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.version }}" ]]; then
+            v="${{ inputs.version }}"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            v="${{ github.ref_name }}"
+            v="${v#v}"  # strip leading 'v'
+          else
+            v="0.0.0-build.${{ github.run_number }}"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Package version: $v"
+
+      # ── Rust ─────────────────────────────────────────────────────
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pkg-${{ matrix.arch }}
+
+      - name: Build Rust binaries (release)
+        run: |
+          cargo build --release \
+            -p dds-node --features fido2 \
+            -p dds-cli \
+            -p dds-fido2-test
+
+      # ── .NET ─────────────────────────────────────────────────────
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Publish DdsPolicyAgent (self-contained)
+        run: |
+          dotnet publish \
+            platform/macos/DdsPolicyAgent/DdsPolicyAgent.MacOS.csproj \
+            -c Release \
+            -r "${{ matrix.dotnet_rid }}" \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:PublishTrimmed=false \
+            -p:UseAppHost=true \
+            -o platform/macos/packaging/build/agent
+
+      # ── .NET tests ───────────────────────────────────────────────
+      - name: Run macOS policy agent tests
+        run: |
+          dotnet test \
+            platform/macos/DdsPolicyAgent.Tests/DdsPolicyAgent.MacOS.Tests.csproj \
+            --verbosity minimal
+
+      # ── Assemble payload + build .pkg ─────────────────────────────
+      - name: Build .pkg
+        working-directory: platform/macos/packaging
+        run: |
+          make pkg \
+            BUILD_MODE=release \
+            VERSION="${{ steps.version.outputs.version }}" \
+            ARCH="${{ matrix.arch }}"
+
+      - name: Verify .pkg contents
+        run: |
+          PKG="platform/macos/packaging/build/DDS-Platform-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.pkg"
+          echo "=== Package ==="
+          ls -lh "$PKG"
+          echo ""
+          echo "=== Payload files ==="
+          pkgutil --payload-files "$PKG" | grep -v '^\._'
+
+      # ── Upload artifact ──────────────────────────────────────────
+      - name: Upload .pkg
+        uses: actions/upload-artifact@v4
+        with:
+          name: DDS-macOS-${{ matrix.arch }}
+          path: platform/macos/packaging/build/*.pkg
+          if-no-files-found: error
+
+  # ── Smoke test (ARM64 only) ──────────────────────────────────────
+  smoke-test:
+    name: macOS smoke test
+    needs: build-pkg
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke-arm64
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Build binaries (debug, for speed)
+        run: |
+          cargo build -p dds-node --bin dds-node --bin dds-macos-e2e
+          dotnet build platform/macos/DdsPolicyAgent/DdsPolicyAgent.MacOS.csproj -c Debug
+
+      - name: Run smoke test
+        run: platform/macos/e2e/smoke-test.sh
+
+  # ── Release job (only on tags) ─────────────────────────────────
+  release:
+    name: Create Release
+    needs: [build-pkg, smoke-test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all .pkg artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: DDS-macOS-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.pkg
+          generate_release_notes: true
+          draft: true

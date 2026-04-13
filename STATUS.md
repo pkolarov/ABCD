@@ -33,10 +33,12 @@ Verification note (2026-04-13, Windows 11 ARM64):
 - `test_hmac_roundtrip.exe` — **PASS**: hmac-secret determinism + encrypt/decrypt roundtrip with real authenticator
 - **Policy Applier Phases D–F verified (2026-04-13, Windows 11 ARM64):** All 4 enforcers now have production Win32 implementations + real e2e integration tests. `WindowsAccountOperations` (netapi32 P/Invoke: create/delete/disable/enable users, group membership, domain-join check), `WindowsPasswordPolicyOperations` (NetUserModalsGet/Set + secedit for complexity), `WindowsSoftwareOperations` (HTTP download + SHA-256 verify + msiexec install/uninstall + registry-based detection), `WindowsRegistryOperations` (idempotent DWORD/String/QWORD/MultiString/Binary/ExpandString with int↔uint comparison fix). 39 integration tests exercise real Win32 APIs on ARM64. Test MSI (32 KB WiX package) installs/uninstalls cleanly.
 
-Previous verification note (2026-04-10, macOS):
-- `cargo test -p dds-domain` passed
-- `dotnet build` + `dotnet test` for `platform/macos/DdsPolicyAgent*` passed
-- macOS .NET suite is now `17/17` passing after swapping to host-backed backend implementations
+Previous verification note (2026-04-13, macOS ARM64):
+
+- `dotnet test` for `platform/macos/DdsPolicyAgent.Tests` — **17/17 pass** (state store, worker, enforcers, real plutil, launchd, profile, software)
+- `platform/macos/e2e/smoke-test.sh` — **6/6 pass** (single-machine e2e: domain init → node start → device enroll → gossip publish → agent poll → preference enforcement validated)
+- `make pkg` in `platform/macos/packaging/` — **builds clean**, `DDS-Platform-macOS-0.1.0-arm64.pkg` (Rust + .NET + LaunchDaemons + scripts)
+- Real-host validation: `plutil` plist round-trip, `dscl` user lookup, `id -Gn` admin check, `pwpolicy` auth status, `launchctl` availability, `profiles` command — all confirmed working
 
 ## Crate Status
 
@@ -154,7 +156,7 @@ All documents implement `DomainDocument` trait: `embed()` / `extract()` from `To
 | Platform | Path | Status | Verified | Notes |
 |---|---|---|---|---|
 | **Windows** | `platform/windows/` | 🟢 **Login verified** | ✅ 298 Rust + 56 .NET + 47 C++ + 3 E2E | Native CP DLL + Auth Bridge + Tray Agent + Policy Agent all build + test on Win11 ARM64; **FIDO2 passwordless lock screen login re-verified after security hardening merge (2026-04-13)**; security fixes: credential_id-based vault lookup, RP-ID binding, removed unauth session endpoint; WebAuthn hmac-secret two-phase challenge/response verified with real authenticator |
-| **macOS** | `platform/macos/` | 🟡 In progress | ✅ .NET build + 17 tests | `DdsPolicyAgent.MacOS` worker, localhost client, state store, launchd plist, host-backed preference/account/launchd/profile/software backends, and Rust `/v1/macos/*` API path landed |
+| **macOS** | `platform/macos/` | 🟢 **Smoke verified** | ✅ .NET build + 17 tests + smoke e2e | `DdsPolicyAgent.MacOS` worker with 5 host-backed enforcers, `.pkg` installer, single-command smoke test passing (6/6 checks), preference + launchd + account backends validated on real macOS ARM64 hardware |
 | **Linux** | `platform/linux/` | ⚪ Planned | n/a | Design-only at this point; no agent code in tree yet |
 
 ## Cryptography
@@ -414,7 +416,7 @@ agent.
 
 A–F complete (2026-04-13). Phase I (reconciliation) complete (2026-04-13). G+H land as the final shipping PR.
 
-### macOS Managed Device Status (2026-04-10)
+### macOS Managed Device Status (2026-04-13)
 
 Completed:
 
@@ -431,14 +433,22 @@ Completed:
 - `platform/macos/DdsPolicyAgent.Tests/` now has 17 passing .NET tests covering state-store behavior, worker startup guardrails, in-memory enforcers, real plist round-trips, and command-backed launchd/profile/software flows.
 - `ABCD.sln` now includes the macOS policy-agent projects.
 
+Verified on real hardware (2026-04-13, macOS ARM64):
+
+- **Single-machine smoke test added and passing** (`platform/macos/e2e/smoke-test.sh`): one-command harness that inits a domain, starts a `dds-node`, enrolls a device, publishes a macOS policy fixture via gossip, runs the .NET policy agent for one poll cycle, and validates 6 enforcement checks (applied state, preference write, launchd binding, software recording, node health). 6/6 checks pass.
+- **Preference backend validated on real host**: `plutil` round-trip of binary plist values (string, int, bool, array) works correctly. The smoke test confirms `FleetMessage = "smoke-test-pass"` is written to a managed preference plist and read back.
+- **Launchd backend validated on real host**: plist label extraction via `plutil -extract Label raw` works. Launchd state bindings are persisted to JSON. `launchctl` version `7.0.0` confirmed available. Real `bootstrap`/`bootout`/`kickstart` operations require root (tested in unit tests with `RecordingCommandRunner`).
+- **Account backend (read-only) validated on real host**: `dscl . -read /Users/<user>` user lookup works, `id -Gn` admin group membership check works, `pwpolicy -u <user> -authentication-allowed` returns correct status, `dscl localhost -list /` directory-binding detection works (correctly reports not bound). Write operations (`CreateUser`, `DeleteUser`, `DisableUser`) require root and a disposable machine.
+- **Profile backend validated on real host**: `/usr/bin/profiles` command available; system profile listing requires root. Profile install/remove tested via `RecordingCommandRunner` in unit tests.
+- **macOS .pkg installer builds successfully**: `make pkg` in `platform/macos/packaging/` produces `DDS-Platform-macOS-0.1.0-arm64.pkg` (53 MB debug). Payload verified: Rust binaries + self-contained .NET agent + LaunchDaemon plists + bootstrap scripts + config template. Pre/post install scripts handle service stop/start and directory creation.
+
 Still TODO:
 
-- Run the new two-machine macOS harness on two real Macs and capture the first comparison artifact as a baseline.
-- Add a reproducible seeded `dds-node` fixture or smoke harness so the macOS agent e2e path can be run with one command instead of manual state seeding.
-- Validate real host behavior for the account and profile backends on a disposable macOS machine; those code paths are now implemented but still only covered by command-level tests.
+- Run the two-machine macOS harness on two real Macs and capture the first comparison artifact as a baseline.
+- Run the smoke test with `--sudo` on a disposable macOS machine to validate full enforcement (launchd bootstrap/kickstart, real package install/uninstall, account creation).
 - Decide how to model safe package uninstall/remove recipes. Generic `.pkg` uninstall remains intentionally unsupported.
 - Implement `DdsLoginBridge` / Authorization Services integration for post-login privileged workflows. Full loginwindow / FileVault replacement is still explicitly out of scope.
-- Package the macOS agent as a signed/notarized `.pkg` and validate launchd installation, upgrade, and uninstall flows.
+- Sign and notarize the `.pkg` with an Apple Developer ID; validate install/upgrade/uninstall flows on a fresh Mac.
 - Decide whether Linux should share a common policy-agent core library with macOS/Windows or remain as three mostly separate worker implementations.
 - ~~Investigate and stabilize the unrelated `dds-node` multinode failures~~ — **Resolved 2026-04-13**: `dag_converges_after_partition` and `rejoined_node_catches_up_via_sync_protocol` now pass on Windows ARM64 (see verification note above).
 

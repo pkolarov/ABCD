@@ -702,15 +702,143 @@ See [platform/windows/e2e/README.md](../platform/windows/e2e/README.md) for the 
 
 | Component | Type | Purpose |
 |---|---|---|
-| `dds-node` | Rust binary (launchd service) | P2P node + HTTP API |
-| DDS Policy Agent | .NET macOS app (runs as root) | Enforces macOS policy |
+| `dds-node` | Rust binary (LaunchDaemon) | P2P node + HTTP API |
+| DDS Policy Agent | .NET self-contained binary (LaunchDaemon) | Enforces macOS policy (preferences, accounts, launchd, profiles, software) |
+| `dds-bootstrap-domain` | Shell script | Genesis ceremony + first-node setup |
+| `dds-enroll-admin` | Shell script | FIDO2 admin enrollment |
+| `dds-admit-node` | Shell script | Issues admission certs for sibling nodes |
+| `dds-fido2-test` | Rust binary | Interactive FIDO2 enrollment + auth testing |
 
-### Installation via macOS Installer
+### Architecture
 
-The `platform/macos/packaging/` directory contains the macOS installer, which handles:
-- Domain bootstrap (genesis or join)
-- Admin enrollment
-- launchd service installation
+```
+launchd (system domain)
+  ├── com.dds.node (LaunchDaemon)
+  │     └── dds-node run /Library/Application Support/DDS/dds.toml
+  │           └── HTTP 127.0.0.1:5551
+  └── com.dds.policyagent (LaunchDaemon)
+        └── DdsPolicyAgent.MacOS
+              └── polls GET /v1/macos/policies, /v1/macos/software
+              └── enforces via plutil, dscl, launchctl, profiles, installer
+              └── reports POST /v1/macos/applied
+```
+
+### Installation
+
+**Option A: Install the .pkg (recommended)**
+
+Download the latest `DDS-Platform-macOS-<version>-<arch>.pkg` from the GitHub Releases page, or build it locally:
+
+```bash
+cd platform/macos/packaging
+make pkg                              # release build
+# or: make pkg BUILD_MODE=debug       # faster, for testing
+```
+
+Install:
+
+```bash
+sudo installer -pkg build/DDS-Platform-macOS-0.1.0-arm64.pkg -target /
+```
+
+This installs:
+- `/usr/local/bin/dds-node`, `dds`, `dds-fido2-test`
+- `/usr/local/bin/dds-bootstrap-domain`, `dds-enroll-admin`, `dds-admit-node`
+- `/usr/local/lib/dds/DdsPolicyAgent.MacOS` + `appsettings.json`
+- `/Library/LaunchDaemons/com.dds.node.plist` (disabled)
+- `/Library/LaunchDaemons/com.dds.policyagent.plist` (disabled)
+- `/Library/Application Support/DDS/dds.toml.template`
+
+Both LaunchDaemons start **disabled**. The bootstrap script enables them.
+
+**Option B: Build from source**
+
+```bash
+cargo build --release -p dds-node --features fido2 -p dds-cli -p dds-fido2-test
+dotnet publish platform/macos/DdsPolicyAgent/DdsPolicyAgent.MacOS.csproj \
+  -c Release -r osx-arm64 --self-contained true -p:PublishSingleFile=true
+```
+
+### First Node Setup (Genesis)
+
+After installing the .pkg, bootstrap the first node:
+
+```bash
+sudo dds-bootstrap-domain
+```
+
+This interactive script:
+1. Prompts for domain name and org hash
+2. Asks whether to protect the domain key with FIDO2 or a passphrase
+3. Creates the domain (`init-domain`)
+4. Creates a `provision.dds` bundle for sibling nodes
+5. Generates a node key, self-admits, writes `dds.toml`
+6. Starts `dds-node` via launchctl
+7. Enrolls this Mac as a device
+8. Starts the policy agent via launchctl
+9. Saves state to `/Library/Application Support/DDS/bootstrap.env`
+
+### Admin Enrollment (FIDO2)
+
+After the domain is bootstrapped, enroll the first admin:
+
+```bash
+sudo dds-enroll-admin
+```
+
+This script:
+1. Runs FIDO2 enrollment (two touches of your hardware key)
+2. Adds the admin's URN to `trusted_roots` in `dds.toml`
+3. Restarts the node to load the new trusted root
+
+### Adding Sibling Nodes
+
+**Option A: Single-file provisioning (recommended)**
+
+The bootstrap script creates a `provision.dds` bundle. Copy it to the new Mac (USB, SCP, etc.):
+
+```bash
+# On the new Mac (after installing the .pkg):
+sudo dds-node provision /Volumes/USB/provision.dds
+```
+
+This single command:
+1. Decrypts the domain key (FIDO2 touch)
+2. Generates a node key and signs an admission cert
+3. Writes `dds.toml`
+4. Starts both `dds-node` and the policy agent via launchctl
+5. Enrolls the device
+6. The domain key is zeroed in memory — never written to disk on the new machine
+
+**Option B: Manual admission**
+
+On the new Mac:
+
+```bash
+dds-node gen-node-key --data-dir "/Library/Application Support/DDS/node-data"
+# Note the peer_id
+```
+
+On the admin Mac:
+
+```bash
+sudo dds-admit-node
+# Enter the new Mac's peer_id when prompted
+# Copy the resulting admission.cbor to the new Mac
+```
+
+On the new Mac, copy `domain.toml` + `admission.cbor` to `/Library/Application Support/DDS/node-data/`, edit `dds.toml`, and start via launchctl.
+
+**Option C: Windows sibling**
+
+A Windows machine joins the same domain using the same `provision.dds` bundle:
+
+```cmd
+REM After installing the DDS MSI:
+dds-node.exe provision E:\provision.dds
+```
+
+This starts the DdsNode and DdsPolicyAgent Windows Services and enrolls the device. The Windows Credential Provider tile appears on the logon screen once enrolled users sync via gossip (~60 seconds).
 
 ### Data Paths (macOS)
 
@@ -718,33 +846,84 @@ The `platform/macos/packaging/` directory contains the macOS installer, which ha
 |---|---|
 | `/Library/Application Support/DDS/node-data/` | Node database, keys, admission cert |
 | `/Library/Application Support/DDS/dds.toml` | Node configuration |
-| `/Library/LaunchDaemons/com.dds.node.plist` | launchd service definition |
+| `/Library/Application Support/DDS/state/` | Applied policy state, launchd bindings |
+| `/Library/Application Support/DDS/packages/` | Package download cache |
+| `/Library/Application Support/DDS/profiles/` | Profile payload hashes |
+| `/Library/LaunchDaemons/com.dds.node.plist` | dds-node LaunchDaemon |
+| `/Library/LaunchDaemons/com.dds.policyagent.plist` | Policy agent LaunchDaemon |
+| `/Library/Managed Preferences/` | Managed preference plists |
+| `/var/log/dds/` | dds-node logs |
+| `/var/log/dds-policyagent.{out,err}` | Policy agent logs |
 
 ### Policy Agent Configuration
 
-The macOS policy agent reads from `appsettings.json` or environment variables:
+The policy agent reads from `/Library/Application Support/DDS/appsettings.json`:
 
-```bash
-export DdsPolicyAgent__DeviceUrn='urn:dds:device:mac-1'
-export DdsPolicyAgent__NodeBaseUrl='http://127.0.0.1:5551'
-export DdsPolicyAgent__StateDir='/Library/Application Support/DDS/state'
+```json
+{
+  "DdsPolicyAgent": {
+    "DeviceUrn": "urn:vouchsafe:...",
+    "NodeBaseUrl": "http://127.0.0.1:5551",
+    "PollIntervalSeconds": 60,
+    "StateDir": "/Library/Application Support/DDS/state",
+    "ManagedPreferencesDir": "/Library/Managed Preferences",
+    "LaunchDaemonPlistDir": "/Library/LaunchDaemons",
+    "LaunchAgentPlistDir": "/Library/LaunchAgents",
+    "RequirePackageSignature": true
+  }
+}
 ```
 
-The agent must run as `root` for account, profile, software, and launchd operations.
+Settings can also be overridden via environment variables (prefix `DdsPolicyAgent__`).
 
-### Capabilities
+### Policy Enforcement Capabilities
 
 | Capability | Backend | Notes |
 |---|---|---|
-| Managed preferences | `plutil` (plist) | Safe for production |
-| Local accounts | `dscl`, `pwpolicy`, `sysadminctl` | Test on disposable host first |
-| launchd services | `launchctl` | Safe with test plist paths |
-| Configuration profiles | `profiles` CLI | Test on disposable host first |
-| Software install | `/usr/sbin/installer` | SHA-256 verified, signed `.pkg` |
+| Managed preferences | `plutil` (binary plist) | Writes to `/Library/Managed Preferences/` |
+| Local accounts | `dscl`, `pwpolicy`, `sysadminctl`, `dseditgroup` | Create/delete/disable users, admin group, hidden flag. Refuses on directory-bound machines. |
+| launchd services | `launchctl` bootstrap/bootout/kickstart | Configure, load, unload managed LaunchDaemons/Agents |
+| Configuration profiles | `profiles -I` / `profiles -R` | SHA-256 idempotency, payload stamp state |
+| Software install | `/usr/sbin/installer` + `pkgutil` | HTTP download, SHA-256 verify, optional signature check. Uninstall intentionally not supported. |
 
-### Multi-Machine E2E
+### Service Management
 
-For validating a real two-Mac mesh deployment, see [platform/macos/e2e/README.md](../platform/macos/e2e/README.md).
+```bash
+# Check service status
+sudo launchctl list | grep dds
+
+# Restart dds-node
+sudo launchctl kickstart -k system/com.dds.node
+
+# Restart policy agent
+sudo launchctl kickstart -k system/com.dds.policyagent
+
+# Stop services
+sudo launchctl bootout system/com.dds.node
+sudo launchctl bootout system/com.dds.policyagent
+
+# View logs
+tail -f /var/log/dds/dds-node.err
+tail -f /var/log/dds-policyagent.err
+```
+
+### Validating
+
+Run the single-machine smoke test (no sudo required):
+
+```bash
+platform/macos/e2e/smoke-test.sh
+```
+
+This validates the full loop: domain init, node start, device enrollment, policy publish via gossip, agent enforcement (preferences, launchd state), and applied-state tracking.
+
+For a full two-Mac mesh deployment test, see [platform/macos/e2e/README.md](../platform/macos/e2e/README.md).
+
+Run the .NET unit tests:
+
+```bash
+dotnet test platform/macos/DdsPolicyAgent.Tests/DdsPolicyAgent.MacOS.Tests.csproj
+```
 
 ---
 
