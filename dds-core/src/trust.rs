@@ -1024,6 +1024,7 @@ mod tests {
     /// indices the lookup is O(matches-for-subject), independent of the
     /// 10K bystanders. Without the indices, this test fails.
     #[test]
+    #[ignore] // Slow in debug mode on CI (~200s for 10K keygen); run with --release or --include-ignored
     fn test_purposes_for_scales_to_10k_vouches() {
         use std::time::Instant;
 
