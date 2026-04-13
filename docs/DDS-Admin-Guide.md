@@ -325,9 +325,11 @@ curl -X POST http://127.0.0.1:5551/v1/enroll/user \
   -d '{
     "label": "alice",
     "credential_id": "<base64-credential-id>",
-    "public_key_cbor": "<base64-cose-public-key>",
-    "attestation_object": "<base64-attestation-object>",
-    "client_data_hash": "<base64-client-data-hash>"
+    "attestation_object_b64": "<base64-attestation-object>",
+    "client_data_hash_b64": "<base64-client-data-hash>",
+    "rp_id": "acme.com",
+    "display_name": "Alice Smith",
+    "authenticator_type": "cross-platform"
   }'
 ```
 
@@ -335,7 +337,8 @@ Response:
 ```json
 {
   "urn": "urn:vouchsafe:alice.4z2vjf6zjk3j3xkwcu58ftwks61uyd4a",
-  "token_b64": "..."
+  "jti": "...",
+  "token_cbor_b64": "..."
 }
 ```
 
@@ -377,7 +380,8 @@ Response:
 ```json
 {
   "urn": "urn:vouchsafe:win11-pc.7k3mf9...",
-  "token_b64": "..."
+  "jti": "...",
+  "token_cbor_b64": "..."
 }
 ```
 
@@ -389,17 +393,9 @@ The device URN is used to scope policy queries (e.g. "what policies apply to thi
 
 Sessions are short-lived tokens issued after authenticating a user. They are the DDS equivalent of Kerberos tickets.
 
-### Issue a Session (by URN)
-
-```bash
-curl -X POST http://127.0.0.1:5551/v1/session \
-  -H "Content-Type: application/json" \
-  -d '{"subject_urn": "urn:vouchsafe:alice.4z2vjf6zjk3j3xkwcu58ftwks61uyd4a"}'
-```
-
 ### Issue a Session (from FIDO2 Assertion)
 
-This is the primary authentication flow. The client proves possession of a FIDO2 credential, and the node verifies it against a previously enrolled `UserAuthAttestation`.
+Session issuance requires FIDO2 proof-of-possession. The client proves possession of a FIDO2 credential, and the node verifies it against a previously enrolled `UserAuthAttestation`.
 
 ```bash
 curl -X POST http://127.0.0.1:5551/v1/session/assert \
@@ -416,8 +412,7 @@ Response:
 ```json
 {
   "session_id": "sess-...",
-  "subject_urn": "urn:vouchsafe:alice.4z2vjf6...",
-  "token_b64": "...",
+  "token_cbor_b64": "...",
   "expires_at": 1712956800
 }
 ```
