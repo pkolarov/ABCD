@@ -80,11 +80,254 @@ static std::vector<uint8_t> Base64UrlDecode(const std::string& input)
     return out;
 }
 
+static void SecureZeroWString(std::wstring& value)
+{
+    if (!value.empty())
+        SecureZeroMemory(value.data(), value.size() * sizeof(wchar_t));
+    value.clear();
+}
+
+static bool Utf8ToWideString(const std::string& value, std::wstring& outWide)
+{
+    outWide.clear();
+    int needed = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, NULL, 0);
+    if (needed <= 0)
+        return false;
+
+    std::vector<WCHAR> buffer(static_cast<size_t>(needed));
+    if (MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, buffer.data(), needed) <= 0)
+        return false;
+
+    outWide.assign(buffer.data());
+    return true;
+}
+
+static bool GenerateClaimPassword(std::wstring& outPassword)
+{
+    // Guarantee complexity with a fixed prefix and random alnum suffix.
+    static const wchar_t alphabet[] =
+        L"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+
+    uint8_t randomBytes[20]{};
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(NULL, randomBytes, sizeof(randomBytes),
+                                        BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
+    {
+        return false;
+    }
+
+    outPassword = L"Aa1!";
+    for (uint8_t b : randomBytes)
+        outPassword.push_back(alphabet[b % (ARRAYSIZE(alphabet) - 1)]);
+    return true;
+}
+
+static bool LocalUserExists(PCWSTR pszUsername)
+{
+    LPBYTE pBuf = nullptr;
+    NET_API_STATUS status = NetUserGetInfo(NULL, pszUsername, 1, &pBuf);
+    if (pBuf)
+        NetApiBufferFree(pBuf);
+    return status == NERR_Success;
+}
+
+static bool ResolveLocalUserSid(PCWSTR pszUsername, std::wstring& outSid, std::wstring& outError)
+{
+    DWORD sidSize = 0, domainSize = 0;
+    SID_NAME_USE sidUse = SidTypeUnknown;
+    LookupAccountNameW(NULL, pszUsername, NULL, &sidSize, NULL, &domainSize, &sidUse);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || sidSize == 0)
+    {
+        outError = L"Failed to resolve local account SID";
+        return false;
+    }
+
+    std::vector<BYTE> sidBuf(sidSize);
+    std::vector<WCHAR> domainBuf(domainSize ? domainSize : 1);
+    if (!LookupAccountNameW(NULL, pszUsername, sidBuf.data(), &sidSize,
+                            domainBuf.data(), &domainSize, &sidUse))
+    {
+        outError = L"LookupAccountNameW failed for claimed account";
+        return false;
+    }
+
+    LPWSTR pSidText = nullptr;
+    if (!ConvertSidToStringSidW(reinterpret_cast<PSID>(sidBuf.data()), &pSidText))
+    {
+        outError = L"ConvertSidToStringSidW failed for claimed account";
+        return false;
+    }
+
+    outSid = pSidText;
+    LocalFree(pSidText);
+    return true;
+}
+
+static bool ApplyLocalGroups(PCWSTR pszUsername, const std::vector<std::string>& groups, std::wstring& outError)
+{
+    for (const auto& groupUtf8 : groups)
+    {
+        if (groupUtf8.empty())
+            continue;
+
+        std::wstring groupName;
+        if (!Utf8ToWideString(groupUtf8, groupName))
+        {
+            outError = L"Invalid UTF-8 group name in claim response";
+            return false;
+        }
+
+        LOCALGROUP_MEMBERS_INFO_3 member = {};
+        member.lgrmi3_domainandname = const_cast<LPWSTR>(pszUsername);
+        NET_API_STATUS status = NetLocalGroupAddMembers(
+            NULL, groupName.c_str(), 3, reinterpret_cast<LPBYTE>(&member), 1);
+        if (status != NERR_Success && status != ERROR_MEMBER_IN_ALIAS)
+        {
+            wchar_t msg[256]{};
+            swprintf_s(msg, L"Failed to add claimed account to local group '%ls' (status=%lu)",
+                       groupName.c_str(), static_cast<unsigned long>(status));
+            outError = msg;
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool SetPasswordNeverExpiresFlag(PCWSTR pszUsername, bool neverExpires, std::wstring& outError)
+{
+    LPBYTE pBuf = nullptr;
+    NET_API_STATUS status = NetUserGetInfo(NULL, pszUsername, 1, &pBuf);
+    if (status != NERR_Success || pBuf == nullptr)
+    {
+        outError = L"Failed to read local account flags";
+        return false;
+    }
+
+    USER_INFO_1* pInfo = reinterpret_cast<USER_INFO_1*>(pBuf);
+    DWORD flags = pInfo->usri1_flags;
+    NetApiBufferFree(pBuf);
+
+    if (neverExpires)
+        flags |= UF_DONT_EXPIRE_PASSWD;
+    else
+        flags &= ~UF_DONT_EXPIRE_PASSWD;
+
+    USER_INFO_1008 info1008 = {};
+    info1008.usri1008_flags = flags;
+    status = NetUserSetInfo(NULL, pszUsername, 1008, reinterpret_cast<LPBYTE>(&info1008), NULL);
+    if (status != NERR_Success)
+    {
+        outError = L"Failed to update password expiry flags on claimed account";
+        return false;
+    }
+    return true;
+}
+
+static bool UpsertClaimedLocalAccount(
+    const DdsWindowsClaimResult& claim,
+    const std::wstring& password,
+    std::wstring& outSid,
+    std::wstring& outError)
+{
+    std::wstring username;
+    if (!Utf8ToWideString(claim.username, username))
+    {
+        outError = L"Invalid UTF-8 username in claim response";
+        return false;
+    }
+
+    if (username.empty())
+    {
+        outError = L"Claim response did not include a username";
+        return false;
+    }
+
+    if (!LocalUserExists(username.c_str()))
+    {
+        USER_INFO_1 info = {};
+        info.usri1_name = const_cast<LPWSTR>(username.c_str());
+        info.usri1_password = const_cast<LPWSTR>(password.c_str());
+        info.usri1_priv = USER_PRIV_USER;
+        info.usri1_flags = UF_SCRIPT;
+        if (claim.hasPasswordNeverExpires && claim.passwordNeverExpires)
+            info.usri1_flags |= UF_DONT_EXPIRE_PASSWD;
+
+        DWORD parmErr = 0;
+        NET_API_STATUS status = NetUserAdd(NULL, 1, reinterpret_cast<LPBYTE>(&info), &parmErr);
+        if (status != NERR_Success)
+        {
+            wchar_t msg[256]{};
+            swprintf_s(msg, L"NetUserAdd failed while claiming account '%ls' (status=%lu parm=%lu)",
+                       username.c_str(), static_cast<unsigned long>(status),
+                       static_cast<unsigned long>(parmErr));
+            outError = msg;
+            return false;
+        }
+    }
+    else
+    {
+        USER_INFO_1003 pw = {};
+        pw.usri1003_password = const_cast<LPWSTR>(password.c_str());
+        NET_API_STATUS status =
+            NetUserSetInfo(NULL, username.c_str(), 1003, reinterpret_cast<LPBYTE>(&pw), NULL);
+        if (status != NERR_Success)
+        {
+            wchar_t msg[256]{};
+            swprintf_s(msg, L"NetUserSetInfo(1003) failed for claimed account '%ls' (status=%lu)",
+                       username.c_str(), static_cast<unsigned long>(status));
+            outError = msg;
+            return false;
+        }
+    }
+
+    if (!claim.fullName.empty())
+    {
+        std::wstring fullName;
+        if (Utf8ToWideString(claim.fullName, fullName))
+        {
+            USER_INFO_1011 info = {};
+            info.usri1011_full_name = const_cast<LPWSTR>(fullName.c_str());
+            NetUserSetInfo(NULL, username.c_str(), 1011, reinterpret_cast<LPBYTE>(&info), NULL);
+        }
+    }
+
+    if (!claim.description.empty())
+    {
+        std::wstring comment;
+        if (Utf8ToWideString(claim.description, comment))
+        {
+            USER_INFO_1007 info = {};
+            info.usri1007_comment = const_cast<LPWSTR>(comment.c_str());
+            NetUserSetInfo(NULL, username.c_str(), 1007, reinterpret_cast<LPBYTE>(&info), NULL);
+        }
+    }
+
+    if (!ApplyLocalGroups(username.c_str(), claim.groups, outError))
+        return false;
+
+    if (claim.hasPasswordNeverExpires &&
+        !SetPasswordNeverExpiresFlag(username.c_str(), claim.passwordNeverExpires, outError))
+    {
+        return false;
+    }
+
+    if (!ResolveLocalUserSid(username.c_str(), outSid, outError))
+        return false;
+
+    return true;
+}
+
+static void ResetAuthOperation(AuthOperation& op, HANDLE hResponseEvent)
+{
+    SecureZeroMemory(&op.responseData, sizeof(op.responseData));
+    op = AuthOperation{};
+    op.hResponseEvent = hResponseEvent;
+}
+
 CDdsAuthBridgeMain::CDdsAuthBridgeMain()
     : m_hStopEvent(NULL)
     , m_bInitialized(FALSE)
 {
-    ZeroMemory(&m_activeAuth, sizeof(m_activeAuth));
+    m_activeAuth = AuthOperation{};
     m_activeAuth.hResponseEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     InitializeCriticalSection(&m_csAuth);
 }
@@ -186,11 +429,11 @@ void CDdsAuthBridgeMain::SendAuthProgress(
     _In_ IPC_CLIENT_CONTEXT* pClientCtx, _In_ UINT32 seqId,
     _In_ UINT32 state, _In_ PCWSTR message)
 {
-    IPC_RESP_AUTH_PROGRESS progress = {};
+    IPC_RESP_DDS_AUTH_PROGRESS progress = {};
     progress.state = state;
     wcscpy_s(progress.message, message);
 
-    m_pipeServer.SendNotification(pClientCtx, IPC_MSG::AUTH_PROGRESS, seqId,
+    m_pipeServer.SendNotification(pClientCtx, IPC_MSG::DDS_AUTH_PROGRESS, seqId,
         reinterpret_cast<const BYTE*>(&progress), sizeof(progress));
 }
 
@@ -198,11 +441,11 @@ void CDdsAuthBridgeMain::SendAuthError(
     _In_ IPC_CLIENT_CONTEXT* pClientCtx, _In_ UINT32 seqId,
     _In_ UINT32 errorCode, _In_ PCWSTR message)
 {
-    IPC_RESP_AUTH_ERROR errResp = {};
-    errResp.errorCode = errorCode;
+    IPC_RESP_DDS_AUTH_ERROR errResp = {};
+    errResp.error_code = errorCode;
     wcscpy_s(errResp.message, message);
 
-    m_pipeServer.SendResponse(pClientCtx, IPC_MSG::AUTH_ERROR, seqId,
+    m_pipeServer.SendResponse(pClientCtx, IPC_MSG::DDS_AUTH_ERROR, seqId,
         reinterpret_cast<const BYTE*>(&errResp), sizeof(errResp));
 }
 
@@ -354,7 +597,10 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
         return TRUE;
     }
 
-    std::wstring deviceUrn(pReq->device_urn);
+    // Historical note: the IPC field is named `device_urn`, but the
+    // credential provider currently fills it with the DDS subject URN.
+    // The actual endpoint device URN comes from the bridge service config.
+    std::wstring subjectUrn(pReq->device_urn);
     std::wstring credentialId(pReq->credential_id);
     std::wstring rpIdW(pReq->rp_id);
 
@@ -367,9 +613,10 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
 
     {
         char urnA[160]{}, credA[160]{};
-        WideCharToMultiByte(CP_UTF8, 0, deviceUrn.c_str(), -1, urnA, sizeof(urnA), nullptr, nullptr);
+        WideCharToMultiByte(CP_UTF8, 0, subjectUrn.c_str(), -1, urnA, sizeof(urnA), nullptr, nullptr);
         WideCharToMultiByte(CP_UTF8, 0, credentialId.c_str(), -1, credA, sizeof(credA), nullptr, nullptr);
-        FileLog::Writef("DdsStartAuth: device='%s' credId='%s' rp='%s'\n", urnA, credA, rpIdA);
+        FileLog::Writef("DdsStartAuth: subject='%s' device='%s' credId='%s' rp='%s'\n",
+                        urnA, m_config.DeviceUrn().c_str(), credA, rpIdA);
     }
 
     // Look up vault entry by the credential_id from the request.
@@ -385,26 +632,49 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
             pMatchedEntry = m_vault.FindByCredentialId(credIdBytes);
     }
 
-    if (!pMatchedEntry)
+    if (pMatchedEntry)
     {
-        LeaveCriticalSection(&m_csAuth);
-        FileLog::Write("DdsStartAuth: REJECTED -- no vault entry matches credential_id\n");
-        SendAuthError(pClientCtx, seqId, IPC_ERROR::NO_CREDENTIAL,
-            L"No credential enrolled matching the requested credential ID");
-        return TRUE;
+        FileLog::Writef("DdsStartAuth: matched vault entry sid='%ls' credIdLen=%zu\n",
+                        pMatchedEntry->userSid.c_str(), pMatchedEntry->credentialId.size());
     }
-
-    FileLog::Writef("DdsStartAuth: matched vault entry sid='%ls' credIdLen=%zu\n",
-                    pMatchedEntry->userSid.c_str(), pMatchedEntry->credentialId.size());
+    else
+    {
+        FileLog::Write("DdsStartAuth: no vault entry yet -- entering first-claim mode\n");
+        if (m_config.DeviceUrn().empty())
+        {
+            LeaveCriticalSection(&m_csAuth);
+            SendAuthError(pClientCtx, seqId, IPC_ERROR::SERVICE_ERROR,
+                L"Device URN is not configured for first-account claim");
+            return TRUE;
+        }
+    }
 
     // Set up auth operation using the matched vault entry
     m_activeAuth.pClientCtx = pClientCtx;
     m_activeAuth.seqId = seqId;
     m_activeAuth.authMethod = IPC_AUTH_METHOD::FIDO2;
-    m_activeAuth.userSid = pMatchedEntry->userSid;   // Windows SID from vault (for password decryption + SID resolve)
-    m_activeAuth.subjectUrn = deviceUrn;              // DDS subject URN (for auth complete response)
+    m_activeAuth.deviceUrn = m_config.DeviceUrn();
+    m_activeAuth.userSid = pMatchedEntry ? pMatchedEntry->userSid : L"";
+    m_activeAuth.subjectUrn = subjectUrn;
     m_activeAuth.credentialId = credentialId;
     m_activeAuth.rpId = rpIdA[0] ? std::string(rpIdA) : m_config.RpId();
+    m_activeAuth.claimMode = pMatchedEntry ? FALSE : TRUE;
+    m_activeAuth.claimSaltLen = 0;
+    ZeroMemory(m_activeAuth.claimSalt, sizeof(m_activeAuth.claimSalt));
+    if (!pMatchedEntry)
+    {
+        m_activeAuth.claimSaltLen = 32;
+        if (!BCRYPT_SUCCESS(BCryptGenRandom(NULL, m_activeAuth.claimSalt, m_activeAuth.claimSaltLen,
+                                            BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
+        {
+            HANDLE hEvt = m_activeAuth.hResponseEvent;
+            ResetAuthOperation(m_activeAuth, hEvt);
+            LeaveCriticalSection(&m_csAuth);
+            SendAuthError(pClientCtx, seqId, IPC_ERROR::SERVICE_ERROR,
+                L"Failed to generate claim salt");
+            return TRUE;
+        }
+    }
     m_activeAuth.cancelled = FALSE;
     m_activeAuth.responseReceived = FALSE;
     ResetEvent(m_activeAuth.hResponseEvent);
@@ -415,8 +685,7 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
     if (m_activeAuth.hThread == NULL)
     {
         HANDLE hEvt = m_activeAuth.hResponseEvent; // preserve event handle
-        ZeroMemory(&m_activeAuth, sizeof(m_activeAuth));
-        m_activeAuth.hResponseEvent = hEvt;
+        ResetAuthOperation(m_activeAuth, hEvt);
         LeaveCriticalSection(&m_csAuth);
         SendAuthError(pClientCtx, seqId, IPC_ERROR::SERVICE_ERROR,
             L"Failed to start authentication thread");
@@ -485,9 +754,7 @@ DWORD WINAPI CDdsAuthBridgeMain::DdsAuthWorkerThread(_In_ LPVOID pParam)
     {
         CloseHandle(pSelf->m_activeAuth.hThread);
     }
-    SecureZeroMemory(&pSelf->m_activeAuth.responseData, sizeof(pSelf->m_activeAuth.responseData));
-    ZeroMemory(&pSelf->m_activeAuth, sizeof(pSelf->m_activeAuth));
-    pSelf->m_activeAuth.hResponseEvent = hEvt;
+    ResetAuthOperation(pSelf->m_activeAuth, hEvt);
     LeaveCriticalSection(&pSelf->m_csAuth);
 
     return 0;
@@ -513,28 +780,36 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     FileLog::Writef("DdsAuth.worker: seqId=%u begin (rpId='%s')\n",
                     pOp->seqId, pOp->rpId.c_str());
 
-    // Step 1: Find the specific vault entry matching the requested credential.
-    // Use the credential_id from the DDS_START_AUTH request to select the
-    // exact credential, not just the first one for a given SID.
+    // Step 1: Find an existing vault entry for this credential, if any.
     const VaultEntry* pVaultEntry = nullptr;
+    std::vector<uint8_t> requestedCredIdBytes;
     {
         char credIdNarrow[256]{};
         WideCharToMultiByte(CP_UTF8, 0, pOp->credentialId.c_str(), -1,
                             credIdNarrow, sizeof(credIdNarrow), nullptr, nullptr);
-        std::vector<uint8_t> credIdBytes = Base64UrlDecode(std::string(credIdNarrow));
-        if (!credIdBytes.empty())
-            pVaultEntry = m_vault.FindByCredentialId(credIdBytes);
+        requestedCredIdBytes = Base64UrlDecode(std::string(credIdNarrow));
+        if (!requestedCredIdBytes.empty())
+            pVaultEntry = m_vault.FindByCredentialId(requestedCredIdBytes);
     }
 
-    if (!pVaultEntry)
+    if (requestedCredIdBytes.empty())
     {
-        // Fall back to SID-based lookup (shouldn't happen if HandleDdsStartAuth matched)
-        auto userEntries = m_vault.FindByUserSid(pOp->userSid);
-        if (!userEntries.empty())
-            pVaultEntry = userEntries[0];
+        SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::SERVICE_ERROR,
+            L"Credential ID could not be decoded");
+        return;
     }
 
-    if (!pVaultEntry)
+    if (pVaultEntry)
+    {
+        FileLog::Writef("DdsAuth.worker: using vault entry (credIdLen=%zu rp='%s' sid='%ls')\n",
+                        pVaultEntry->credentialId.size(), pVaultEntry->rpId.c_str(),
+                        pVaultEntry->userSid.c_str());
+    }
+    else if (pOp->claimMode)
+    {
+        FileLog::Write("DdsAuth.worker: first-claim path — no vault entry exists yet\n");
+    }
+    else
     {
         FileLog::Write("DdsAuth.worker: vault lookup failed -- no matching credential\n");
         SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::NO_CREDENTIAL,
@@ -542,27 +817,37 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
         return;
     }
 
-    FileLog::Writef("DdsAuth.worker: using vault entry (credIdLen=%zu rp='%s' sid='%ls')\n",
-                    pVaultEntry->credentialId.size(), pVaultEntry->rpId.c_str(),
-                    pVaultEntry->userSid.c_str());
-
     // Step 2: Build and send DDS_AUTH_CHALLENGE to CP
     IPC_RESP_DDS_AUTH_CHALLENGE challenge = {};
 
     // Copy credential ID
-    DWORD credIdLen = static_cast<DWORD>(min(pVaultEntry->credentialId.size(),
-                                              sizeof(challenge.credential_id)));
-    memcpy(challenge.credential_id, pVaultEntry->credentialId.data(), credIdLen);
+    DWORD credIdLen = static_cast<DWORD>(min(requestedCredIdBytes.size(),
+                                             sizeof(challenge.credential_id)));
+    memcpy(challenge.credential_id, requestedCredIdBytes.data(), credIdLen);
     challenge.credential_id_len = credIdLen;
 
-    // Copy RP ID — use vault entry's rpId (authoritative from enrollment)
-    strncpy_s(challenge.rp_id, pVaultEntry->rpId.c_str(), _TRUNCATE);
+    // RP ID comes from the existing vault entry or the configured/requested value.
+    strncpy_s(challenge.rp_id,
+              pVaultEntry ? pVaultEntry->rpId.c_str() : pOp->rpId.c_str(),
+              _TRUNCATE);
 
-    // Copy hmac-secret salt from vault
-    DWORD saltLen = static_cast<DWORD>(min(pVaultEntry->salt.size(),
-                                            sizeof(challenge.salt)));
-    if (saltLen > 0)
-        memcpy(challenge.salt, pVaultEntry->salt.data(), saltLen);
+    // Existing accounts reuse the persisted hmac-secret salt. First claim
+    // uses the temporary salt generated in HandleDdsStartAuth and carried in
+    // the active auth operation.
+    DWORD saltLen = 0;
+    if (pVaultEntry)
+    {
+        saltLen = static_cast<DWORD>(min(pVaultEntry->salt.size(),
+                                         sizeof(challenge.salt)));
+        if (saltLen > 0)
+            memcpy(challenge.salt, pVaultEntry->salt.data(), saltLen);
+    }
+    else
+    {
+        saltLen = static_cast<DWORD>(min<size_t>(pOp->claimSaltLen, sizeof(challenge.salt)));
+        if (saltLen > 0)
+            memcpy(challenge.salt, pOp->claimSalt, saltLen);
+    }
     challenge.salt_len = saltLen;
 
     FileLog::Writef("DdsAuth.worker: sending AUTH_CHALLENGE (credIdLen=%u saltLen=%u)\n",
@@ -652,7 +937,6 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
         return;
     }
 
-    // Step 6: Decrypt password from vault using hmac-secret
     if (pResp->hmac_secret_len != 32)
     {
         FileLog::Writef("DdsAuth.worker: invalid hmac-secret length: %u (expected 32)\n",
@@ -663,16 +947,108 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     }
 
     std::wstring password;
-    if (!CCredentialVault::DecryptPassword(pResp->hmac_secret, pResp->hmac_secret_len,
-                                            *pVaultEntry, password))
+    std::wstring resolvedSid = pOp->userSid;
+    std::string claimedUsernameUtf8;
+    std::string claimedSubjectUrnUtf8;
+    if (!pOp->claimMode)
     {
-        FileLog::Write("DdsAuth.worker: password decryption failed (wrong key or corrupt vault)\n");
-        SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::VAULT_ERROR,
-            L"Failed to decrypt stored password — re-enrollment may be required");
-        return;
-    }
+        if (!CCredentialVault::DecryptPassword(pResp->hmac_secret, pResp->hmac_secret_len,
+                                               *pVaultEntry, password))
+        {
+            FileLog::Write("DdsAuth.worker: password decryption failed (wrong key or corrupt vault)\n");
+            SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::VAULT_ERROR,
+                L"Failed to decrypt stored password — re-enrollment may be required");
+            return;
+        }
 
-    FileLog::Write("DdsAuth.worker: password decrypted successfully\n");
+        FileLog::Write("DdsAuth.worker: password decrypted successfully\n");
+    }
+    else
+    {
+        SendAuthProgress(pOp->pClientCtx, pOp->seqId,
+            IPC_AUTH_STATE::PROCESSING, L"Claiming local Windows account...");
+
+        if (IsDomainJoined())
+        {
+            SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::AUTH_FAILED,
+                L"Account claim is disabled on domain-joined machines");
+            return;
+        }
+
+        std::string claimJson = "{";
+        claimJson += "\"device_urn\":\"" + pOp->deviceUrn + "\",";
+        claimJson += "\"session_token_cbor_b64\":\"" + assertResult.tokenCborB64 + "\"";
+        claimJson += "}";
+
+        DdsWindowsClaimResult claimResult = m_httpClient.PostWindowsClaim(claimJson);
+        if (!claimResult.success)
+        {
+            wchar_t errMsg[384];
+            swprintf_s(errMsg, L"DDS node claim authorization failed: %hs",
+                       claimResult.errorMessage.c_str());
+            SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::AUTH_FAILED, errMsg);
+            return;
+        }
+
+        if (!GenerateClaimPassword(password))
+        {
+            SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::SERVICE_ERROR,
+                L"Failed to generate a local account password");
+            return;
+        }
+
+        std::wstring accountError;
+        if (!UpsertClaimedLocalAccount(claimResult, password, resolvedSid, accountError))
+        {
+            SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::AUTH_FAILED,
+                accountError.empty() ? L"Failed to create or update the claimed local account"
+                                     : accountError.c_str());
+            SecureZeroWString(password);
+            return;
+        }
+        claimedUsernameUtf8 = claimResult.username;
+        claimedSubjectUrnUtf8 = claimResult.subjectUrn;
+
+        VaultEntry entry = {};
+        entry.userSid = resolvedSid;
+        if (!claimResult.fullName.empty())
+        {
+            if (!Utf8ToWideString(claimResult.fullName, entry.displayName))
+                entry.displayName = L"";
+        }
+        if (entry.displayName.empty() && !Utf8ToWideString(claimResult.username, entry.displayName))
+            entry.displayName = L"Claimed User";
+        entry.credentialId = requestedCredIdBytes;
+        entry.rpId = pOp->rpId;
+        entry.salt.assign(pOp->claimSalt, pOp->claimSalt + pOp->claimSaltLen);
+        entry.authMethod = IPC_AUTH_METHOD::FIDO2;
+
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        entry.enrollmentTime =
+            (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+
+        if (!CCredentialVault::EncryptPassword(
+                pResp->hmac_secret, pResp->hmac_secret_len, password.c_str(), entry))
+        {
+            SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::VAULT_ERROR,
+                L"Failed to wrap the claimed account password with hmac-secret");
+            SecureZeroWString(password);
+            return;
+        }
+
+        m_vault.Load();
+        if (!m_vault.EnrollUser(entry) || !m_vault.Save())
+        {
+            SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::VAULT_ERROR,
+                L"Claimed account was created but the local vault could not be updated");
+            SecureZeroWString(password);
+            return;
+        }
+
+        FileLog::Writef("DdsAuth.worker: first-claim completed sid='%ls' username='%s'\n",
+                        resolvedSid.c_str(), claimedUsernameUtf8.c_str());
+    }
 
     // Step 7: Build and send DDS_AUTH_COMPLETE
     IPC_RESP_DDS_AUTH_COMPLETE result = {};
@@ -689,7 +1065,7 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
 
         // Look up account name from SID
         PSID pSid = NULL;
-        if (ConvertStringSidToSidW(pOp->userSid.c_str(), &pSid))
+        if (ConvertStringSidToSidW(resolvedSid.c_str(), &pSid))
         {
             WCHAR userName[256], domainName[256];
             DWORD userLen = ARRAYSIZE(userName), domLen = ARRAYSIZE(domainName);
@@ -706,6 +1082,13 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
         }
     }
 
+    if (pOp->claimMode && !claimedUsernameUtf8.empty())
+    {
+        std::wstring claimedUsernameWide;
+        if (Utf8ToWideString(claimedUsernameUtf8, claimedUsernameWide))
+            wcsncpy_s(result.username, claimedUsernameWide.c_str(), _TRUNCATE);
+    }
+
     wcsncpy_s(result.password, password.c_str(), _TRUNCATE);
 
     {
@@ -718,9 +1101,11 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
 
     // Fill session token (token_cbor_b64 from Rust /v1/session/assert)
     strncpy_s(result.session_token, assertResult.tokenCborB64.c_str(), _TRUNCATE);
-    // Use the DDS subject URN from the DDS_START_AUTH request, not the Windows SID.
+    std::wstring resolvedSubjectUrn = pOp->subjectUrn;
+    if (!claimedSubjectUrnUtf8.empty())
+        Utf8ToWideString(claimedSubjectUrnUtf8, resolvedSubjectUrn);
     wcsncpy_s(result.subject_urn,
-              pOp->subjectUrn.empty() ? pOp->userSid.c_str() : pOp->subjectUrn.c_str(),
+              resolvedSubjectUrn.empty() ? resolvedSid.c_str() : resolvedSubjectUrn.c_str(),
               _TRUNCATE);
     result.expires_at = assertResult.expiresAt; // from dds-node response
 
@@ -728,7 +1113,7 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
         reinterpret_cast<const BYTE*>(&result), sizeof(result));
 
     // Secure cleanup
-    SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
+    SecureZeroWString(password);
     SecureZeroMemory(result.password, sizeof(result.password));
 
     CEventLogger::LogInfo(EVENT_ID::AUTH_SUCCEEDED, L"DDS authentication succeeded");

@@ -4,6 +4,13 @@
 **Source:** `/Users/peter/Dev/Crayonic/CP` branch `feature/bridge-service-integration`
 **Target:** `/Users/peter/ABCD/platform/windows/`
 
+**Status (2026-04-13):** the current tree has the native DDS
+Credential Provider + Auth Bridge login path implemented, including
+`/v1/session/assert`, `/v1/enrolled-users`, and the first-account
+claim path via `/v1/windows/claim-account`. This document remains the
+architecture/rationale record plus the list of packaging work still
+left to do.
+
 ---
 
 ## 1. Executive Summary
@@ -70,7 +77,7 @@ Service) and `DdsPolicyAgent` (.NET, Windows Service). The key decision:
                     │  • Trust graph     │
                     │  • Policy eval     │
                     │  • Gossip + sync   │
-                    │  • /v1/session     │
+                    │  • /v1/session/assert │
                     │  • /v1/windows/*   │
                     └────────────────────┘
 ```
@@ -115,7 +122,7 @@ Service) and `DdsPolicyAgent` (.NET, Windows Service). The key decision:
 | --- | --- |
 | Credential vault (DPAPI vault.dat) | dds-node trust graph (attestation + vouch tokens) |
 | User enumeration from vault | HTTP `GET /v1/enrolled-users?device_urn=...` (new endpoint) |
-| Password derivation from hmac-secret | DDS session token from `/v1/session` (token-based) OR hybrid bridge (§5) |
+| Password bridge / claim seeding | DDS session token from `/v1/session/assert` + hmac-secret-backed vault bridge (§5) |
 | `KERB_INTERACTIVE_UNLOCK_LOGON` packing | Keep for v1 hybrid; Phase 2 moves to custom LSA Authentication Package |
 
 ---
@@ -137,23 +144,26 @@ User clicks tile → CP calls BridgeClient::AuthenticateFido()
 ### 4.2 DDS Target (v1 — Hybrid Bridge)
 
 ```
-User clicks tile → CP calls DdsBridgeClient::Authenticate()
-  → IPC DDS_START_AUTH(device_urn, credential_id)
+User clicks tile → CP calls DdsBridgeClient::AuthenticateDds()
+  → IPC DDS_START_AUTH(selected_subject_urn, credential_id)
   → Auth Bridge Service:
       1. CTAP2 GetAssertion to platform authenticator (USB/platform)
          rpId = "dds.local"
          with hmac-secret extension
-      2. HTTP POST /v1/session to dds-node with:
-           subject_urn = urn:vouchsafe:passkey.<hash(credential_id)>
-           assertion_signature (for verification)
-           mfa_verified = true
-      3. dds-node validates assertion against trust graph
-      4. dds-node returns SessionDocument (session_id, token, purposes)
-      5. Auth Bridge derives Windows password from hmac-secret output
-         (for KERB_INTERACTIVE_UNLOCK_LOGON compatibility)
+      2. HTTP POST /v1/session/assert to dds-node with the assertion proof
+      3. dds-node validates the assertion against the trust graph and
+         returns a local `dds:session` token
+      4a. If a vault entry already exists:
+            Auth Bridge derives the Windows password from hmac-secret
+            and completes logon
+      4b. If no vault entry exists yet:
+            POST /v1/windows/claim-account(device_urn, session_token)
+            → dds-node resolves the one policy-authorized local account
+            → Auth Bridge generates a random Windows password locally
+            → creates/resets the local account and applies groups/flags
+            → wraps the password into the local vault with hmac-secret
   → IPC DDS_AUTH_COMPLETE(domain, username, password, session_token_b64)
   → CP packs KERB_INTERACTIVE_UNLOCK_LOGON (password-based logon)
-  → CP also caches session token for post-logon DDS API calls
   → LSA verifies password → logon
 ```
 
@@ -184,16 +194,22 @@ hmac-secret extension produces a deterministic 32-byte key from a
 per-credential secret + a salt. The Bridge Service uses this to
 decrypt the user's stored Windows password from the vault.
 
-**DDS v1 must do the same thing** — use hmac-secret to decrypt or
-derive a Windows password, because we don't have a custom LSA AP yet.
-This means:
+**DDS v1 still needs the same bridge** because we do not have a custom
+LSA authentication package yet, but DDS now supports two vault-seeding
+modes:
 
-1. During enrollment, the user's Windows password is encrypted with
-   the hmac-secret output and stored in the credential vault (DPAPI).
-2. During logon, hmac-secret regenerates the same key, decrypts the
-   password, and hands it to the CP for `KERB_INTERACTIVE_UNLOCK_LOGON`.
+1. **Existing local account enrollment** — the user's current Windows
+   password is captured once during enrollment, encrypted with
+   hmac-secret, and stored in the local vault.
+2. **Policy-bound first claim** — when no vault entry exists and policy
+   binds `claim_subject_urn` to a local account, the Auth Bridge
+   generates a random password locally on the first successful DDS
+   logon, sets that password on the claimed Windows account, and then
+   encrypts it into the vault with hmac-secret.
 
-This is the Crayonic model exactly. We reuse `CredentialVault` for v1.
+In both cases, later logons regenerate the same hmac-secret output,
+decrypt the vault entry, and hand the password to
+`KERB_INTERACTIVE_UNLOCK_LOGON`.
 
 **DDS-specific addition:** After successful Windows logon, the CP also
 holds a DDS session token. Post-logon processes (DdsPolicyAgent, DDS
@@ -231,15 +247,21 @@ different layers:
 | hmac-secret key agreement | Crayonic `ctap2_protocol` (C++) | C++ | DDS Auth Bridge |
 | Assertion signature verification | **New**: add to DDS `fido2.rs` or `dds-node` service | Rust | dds-node |
 
-**New work needed in DDS Rust side:**
-- Add `verify_assertion(auth_data, client_data_hash, signature, public_key)` to `dds-domain/src/fido2.rs`
-- Support ECDSA P-256 assertions (already have `p256` crate in dds-core)
-- Add `/v1/session` variant that accepts an assertion proof instead of just a subject_urn
+**Implemented in DDS Rust side:**
+- `verify_assertion(auth_data, client_data_hash, signature, public_key)` in
+  `dds-domain/src/fido2.rs`
+- Ed25519 + ECDSA P-256 assertion verification
+- `POST /v1/session/assert`
+- `GET /v1/enrolled-users`
+- `POST /v1/windows/claim-account`
 
-**New work needed in Auth Bridge:**
-- Add HTTP client (libcurl or WinHTTP) to call dds-node `/v1/session`
-- Add DDS-specific IPC messages (§7)
-- Keep the Crayonic CTAP2 engine unchanged
+**Implemented in Auth Bridge:**
+- WinHTTP client for `/v1/session/assert`, `/v1/enrolled-users`, and
+  `/v1/windows/claim-account`
+- DDS-specific IPC messages (§7)
+- First-account claim mode that seeds the vault on the first successful
+  DDS logon when policy authorizes a local account claim
+- Crayonic CTAP2 engine retained for getAssertion + hmac-secret
 
 ---
 
@@ -321,8 +343,9 @@ badge path continues to work alongside the DDS path.
 
 dds-node looks up the credential's public key from the trust graph
 (stored at enrollment in the `UserAuthAttestation` body), verifies
-the assertion signature, then issues a `SessionDocument` exactly
-like the existing `/v1/session` but with cryptographic proof.
+the assertion signature, then issues a `SessionDocument` from
+`/v1/session/assert` using cryptographic proof instead of a
+caller-supplied subject URN.
 
 ---
 
@@ -389,8 +412,11 @@ like the existing `/v1/session` but with cryptographic proof.
    - Admin enrolls user via `dds-cli` (creates `UserAuthAttestation`)
    - On first Windows logon, Auth Bridge calls platform WebAuthn
      makeCredential → dds-node `/v1/enroll/user`
-   - User enters Windows password once → encrypted with hmac-secret
-     → stored in local vault
+   - Existing-account enrollment can still capture the current Windows
+     password once and store it in the local vault
+   - Claim-bound accounts can now skip human password entry entirely:
+     first DDS logon resolves policy via `/v1/windows/claim-account`,
+     creates/resets the local account, and seeds the vault locally
    - Subsequent logons use getAssertion + hmac-secret to decrypt password
 3. **Exit criterion:** new user enrollment works end-to-end on Windows VM
 
@@ -448,7 +474,7 @@ like the existing `/v1/session` but with cryptographic proof.
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
 | Crayonic CP is C++; DDS team may be less fluent | Slower iteration | Fork minimally; keep Crayonic structure intact; change only auth backend |
-| hmac-secret requires user to enter Windows password once (enrollment) | UX friction | Clear enrollment wizard; one-time cost per device |
+| Hybrid password bridge has two onboarding modes (existing-password capture vs first-claim seeding) | UX / implementation complexity | Keep both paths explicit: existing accounts can enroll with one password capture; claim-bound accounts seed a random password on first DDS logon |
 | Custom LSA AP (v2) is complex and must be signed | Multi-week effort, driver signing | Defer to v2; password bridge is adequate for pilot |
 | Platform WebAuthn API (`webauthn.h`) requires Windows 10 1903+ | OS floor | Already within our Win10 1809+ floor (1903 adds webauthn.h; 1809 has basic support) |
 | BLE badge support deferred | Crayonic users may expect it | Document as Phase 2+; platform authenticators cover USB keys + Windows Hello |

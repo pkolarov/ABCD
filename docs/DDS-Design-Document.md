@@ -383,7 +383,7 @@ To prevent resource exhaustion in trust graph evaluation:
 | Software deployment (SCCM/Intune) | `SoftwareAssignment` document + `SoftwareInstaller` enforcer (§14.5.1) |
 | Linux fleet policy / config management | `LinuxPolicyDocument` + `DdsPolicyAgent.Linux` + systemd/PAM bridges (§14.6) |
 | macOS device configuration / profile management | `MacOsPolicyDocument` + `DdsPolicyAgent.MacOS` + launchd/Authorization Services bridges (§14.7) |
-| Local account management | `AccountEnforcer` via `AccountDirective` with domain-join guard (§14.5.5) |
+| Local account management | `AccountDirective` via `AccountEnforcer` plus DDS Auth Bridge first-claim flow, both with domain-join guard (§14.5.5) |
 | Password policy (Fine-Grained) | `PasswordPolicyEnforcer` via `PasswordPolicy` directive (§14.5.1) |
 | Organizational Units | Purpose-filtered delegation chains |
 | Group membership | Vouch tokens from authorized admins |
@@ -393,7 +393,7 @@ To prevent resource exhaustion in trust graph evaluation:
 | FSMO roles | No equivalent needed — no single-master operations; all ops are CRDT-mergeable |
 | DNS integration | Kademlia DHT for name resolution |
 | Schema | Token format defined by `kind` and `purpose` conventions + typed domain documents |
-| Windows logon (Credential Provider) | `DdsCredentialProvider` COM class — passkey → session via dds-node (§14.5) |
+| Windows logon (Credential Provider) | Native `DdsCredentialProvider` + `DdsAuthBridge` — passkey → `/v1/session/assert` → optional first-account claim (§14.5) |
 
 ---
 
@@ -834,22 +834,22 @@ that run on each managed Windows device:
 │  Managed Windows Device                                      │
 │                                                              │
 │  ┌──────────────────────────┐  ┌──────────────────────────┐  │
-│  │      dds-node            │  │  DdsCredentialProvider    │  │
-│  │  (Rust, LocalSystem)     │  │  (.NET 8, COM-visible)   │  │
+│  │      dds-node            │  │  DdsCredentialProvider   │  │
+│  │  (Rust, LocalSystem)     │  │  (C++ COM, LogonUI)      │  │
 │  │                          │  │                          │  │
-│  │  • Trust graph           │  │  Logon → /v1/session     │  │
-│  │  • Policy evaluation     │  │  Passkey → URN → session │  │
+│  │  • Trust graph           │  │  Logon tile              │  │
+│  │  • Policy evaluation     │  │  KERB packing            │  │
 │  │  • Gossip + sync         │  └──────────┬───────────────┘  │
-│  │  • HTTP API on 127.0.0.1 │             │                  │
-│  └──────────┬───────────────┘             │                  │
-│             │ loopback HTTP               │                  │
-│  ┌──────────┴───────────────┐             │                  │
-│  │    DdsPolicyAgent        │             │                  │
-│  │  (.NET 8, LocalSystem)   │             │                  │
-│  │                          ├─────────────┘                  │
-│  │  Poll /v1/windows/*      │                                │
-│  │  every 60s               │                                │
-│  │                          │                                │
+│  │  • HTTP API on 127.0.0.1 │             │ named pipe       │
+│  └──────────┬───────────────┘    ┌────────┴───────────────┐  │
+│             │ loopback HTTP      │    DdsAuthBridge       │  │
+│  ┌──────────┴───────────────┐    │  (C++ Windows Service) │  │
+│  │    DdsPolicyAgent        │    │                        │  │
+│  │  (.NET 8, LocalSystem)   │    │  • WebAuthn getAssertion│ │
+│  │                          │    │  • hmac-secret vault    │ │
+│  │  Poll /v1/windows/*      │    │  • /v1/session/assert   │ │
+│  │  every 60s               │    │  • /v1/windows/claim-account │
+│  │                          │    └─────────────────────────┘  │
 │  │  ┌──────────────────┐    │                                │
 │  │  │ Registry Enforcer│    │                                │
 │  │  │ Account Enforcer │    │                                │
@@ -869,13 +869,14 @@ that run on each managed Windows device:
 | Component | Language | Runs as | Responsibility |
 | --- | --- | --- | --- |
 | `dds-node` | Rust | Windows Service (LocalSystem) | Directory service: trust graph, gossip, sync, policy evaluation, HTTP API |
-| `DdsPolicyAgent` | .NET 8 | Windows Service (LocalSystem) | Enforcement: poll dds-node, dispatch to enforcers, report outcomes |
-| `DdsCredentialProvider` | .NET 8 | COM in-proc (LogonUI) | Windows logon: passkey → session via `/v1/session` |
+| `DdsAuthBridge` | C++ | Windows Service (LocalSystem) | WebAuthn + hmac-secret broker: `/v1/session/assert`, `/v1/windows/claim-account`, local vault |
+| `DdsPolicyAgent` | .NET 8 | Windows Service (LocalSystem) | Post-boot enforcement: poll dds-node, dispatch to enforcers, report outcomes |
+| `DdsCredentialProvider` | C++ | COM in-proc (LogonUI) | Windows logon tile: talk to Auth Bridge and pack `KERB_INTERACTIVE_UNLOCK_LOGON` |
 
-`dds-node` never calls Win32 APIs — it is the same binary on all platforms. Only
-`DdsPolicyAgent` contains Windows-specific enforcement code. This separation means
-the directory layer can be tested, soak-tested, and deployed on Linux/macOS without
-pulling in any Windows dependency.
+`dds-node` never calls Win32 APIs — it is the same binary on all platforms.
+Windows-specific code lives in the native Auth Bridge / Credential Provider
+pair and in `DdsPolicyAgent`. This separation keeps the directory layer
+portable while still allowing pre-logon Windows integration.
 
 #### 14.5.1 Domain Document Types for Enforcement
 
@@ -905,6 +906,7 @@ WindowsPolicyDocument
     ├── local_accounts: [AccountDirective]
     │   ├── username: String
     │   ├── action: AccountAction      # Create | Delete | Disable | Enable
+    │   ├── claim_subject_urn: Option<String>  # subject allowed to first-claim this local account
     │   ├── full_name: Option<String>
     │   ├── description: Option<String>
     │   ├── groups: [String]           # additive membership
@@ -1047,13 +1049,28 @@ Writes to any other path (including non-HKLM hives) are refused with
 **Domain-join guard:** The `AccountEnforcer` refuses all local-account
 operations when `IAccountOperations.IsDomainJoined()` returns true. This
 prevents conflicts with AD-managed accounts on domain-joined machines
-(v1 scope decision — AD-replacement is deferred to Phase 4).
+(v1 scope decision — AD-replacement is deferred to Phase 4). The native
+Windows Auth Bridge applies the same guard before allowing first-account
+claim at the logon screen.
 
 **Password handling:** Passwords are never carried in `WindowsPolicyDocument`
-or `SoftwareAssignment`. When the `AccountEnforcer` creates a local account,
-it generates a random password and stores it DPAPI-protected in the local
-state directory. A future `SecretReleaseDocument` type (encrypted to the
-device URN's public key) is planned for v2.
+or `SoftwareAssignment`. Two Windows flows exist today:
+
+1. For already-known local accounts, enrollment captures the current
+   Windows password once and stores it in the local vault encrypted under
+   a key derived from FIDO2 `hmac-secret`.
+2. For claim-bound accounts (`claim_subject_urn`), the native
+   `DdsAuthBridge` generates a random password locally on the first
+   successful DDS logon, applies it to the local Windows account, then
+   wraps it into the same vault with `hmac-secret`.
+
+The pre-logon claim path is authorized by `dds-node` through
+`POST /v1/windows/claim-account`, which accepts a freshly issued local
+`dds:session` token from `/v1/session/assert` and resolves the one
+policy-authorized local account for that subject and device. A future
+`SecretReleaseDocument` or equivalent encrypted release channel remains a
+v2 extension, but the current design avoids central plaintext password
+distribution for first-account claim.
 
 **Script trust:** Pre/post install scripts in `SoftwareAssignment` are
 trusted based on the document's Vouchsafe signature (the admin who signed
@@ -1146,7 +1163,7 @@ All distro-specific behavior stays in the Linux agent and its enforcers.
 │  │   (Rust, systemd)        │  │   (PAM / sshd hook)     │  │
 │  │                          │  │                         │  │
 │  │  • Trust graph           │  │  login / sudo / ssh     │  │
-│  │  • Policy evaluation     │  │  → /v1/session          │  │
+│  │  • Policy evaluation     │  │  → /v1/session/assert   │  │
 │  │  • Gossip + sync         │  └──────────┬──────────────┘  │
 │  │  • HTTP API on 127.0.0.1 │             │                 │
 │  └──────────┬───────────────┘             │                 │
@@ -1358,7 +1375,7 @@ enforcement surface is different:
 │  │                          │  │                         │  │
 │  │  • Trust graph           │  │  login / unlock /       │  │
 │  │  • Policy evaluation     │  │  privileged action      │  │
-│  │  • Gossip + sync         │  │  → /v1/session          │  │
+│  │  • Gossip + sync         │  │  → /v1/session/assert   │  │
 │  │  • HTTP API on 127.0.0.1 │  └──────────┬──────────────┘  │
 │  └──────────┬───────────────┘             │                 │
 │             │ loopback HTTP               │                 │

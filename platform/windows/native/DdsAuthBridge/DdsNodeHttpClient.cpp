@@ -317,6 +317,61 @@ DdsAdminVouchResult CDdsNodeHttpClient::PostAdminVouch(const std::string& vouchJ
 }
 
 // ============================================================================
+// POST /v1/windows/claim-account
+// ============================================================================
+
+DdsWindowsClaimResult CDdsNodeHttpClient::PostWindowsClaim(const std::string& claimJson)
+{
+    DdsWindowsClaimResult result = {};
+    result.success = false;
+
+    FileLog::Writef("DdsNodeHttpClient: POST /v1/windows/claim-account (bodyLen=%zu)\n",
+                    claimJson.size());
+
+    std::string responseBody;
+    DWORD httpStatus = SendRequest(L"POST", L"/v1/windows/claim-account",
+                                   &claimJson, responseBody);
+
+    if (httpStatus == 0)
+    {
+        result.errorMessage = "Connection to dds-node failed (is it running?)";
+        return result;
+    }
+
+    FileLog::Writef("DdsNodeHttpClient: POST /v1/windows/claim-account -> HTTP %lu\n", httpStatus);
+
+    if (httpStatus == 200)
+    {
+        result.success = true;
+        result.subjectUrn = JsonGetString(responseBody, "subject_urn");
+        result.username = JsonGetString(responseBody, "username");
+        result.fullName = JsonGetString(responseBody, "full_name");
+        result.description = JsonGetString(responseBody, "description");
+        result.groups = JsonGetStringArray(responseBody, "groups");
+
+        std::string pneNeedle = "\"password_never_expires\"";
+        size_t pos = responseBody.find(pneNeedle);
+        if (pos != std::string::npos)
+        {
+            result.hasPasswordNeverExpires = true;
+            result.passwordNeverExpires = JsonGetBool(responseBody, "password_never_expires", false);
+        }
+    }
+    else
+    {
+        result.errorMessage = JsonGetString(responseBody, "error");
+        if (result.errorMessage.empty())
+        {
+            char buf[64];
+            sprintf_s(buf, "dds-node returned HTTP %lu", httpStatus);
+            result.errorMessage = buf;
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
 // WinHTTP transport
 // ============================================================================
 
@@ -588,6 +643,64 @@ std::vector<std::string> CDdsNodeHttpClient::JsonGetObjectArray(const std::strin
         }
 
         results.push_back(json.substr(start, pos - start));
+    }
+
+    return results;
+}
+
+std::vector<std::string> CDdsNodeHttpClient::JsonGetStringArray(const std::string& json, const std::string& key)
+{
+    std::vector<std::string> results;
+
+    std::string needle = "\"" + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos)
+        return results;
+
+    pos += needle.size();
+    pos = json.find('[', pos);
+    if (pos == std::string::npos)
+        return results;
+    pos++;
+
+    while (pos < json.size())
+    {
+        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' ||
+               json[pos] == '\r' || json[pos] == '\n' || json[pos] == ','))
+            pos++;
+
+        if (pos >= json.size() || json[pos] == ']')
+            break;
+        if (json[pos] != '"')
+            break;
+
+        pos++;
+        std::string value;
+        while (pos < json.size() && json[pos] != '"')
+        {
+            if (json[pos] == '\\' && pos + 1 < json.size())
+            {
+                pos++;
+                switch (json[pos])
+                {
+                case '"':  value += '"';  break;
+                case '\\': value += '\\'; break;
+                case '/':  value += '/';  break;
+                case 'n':  value += '\n'; break;
+                case 'r':  value += '\r'; break;
+                case 't':  value += '\t'; break;
+                default:   value += json[pos]; break;
+                }
+            }
+            else
+            {
+                value += json[pos];
+            }
+            pos++;
+        }
+        results.push_back(std::move(value));
+        if (pos < json.size() && json[pos] == '"')
+            pos++;
     }
 
     return results;

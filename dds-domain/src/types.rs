@@ -1,6 +1,6 @@
 //! Typed domain documents — each serializes to CBOR for `TokenPayload::body_cbor`.
 
-use crate::{DomainDocument, body_types};
+use crate::{body_types, DomainDocument};
 use serde::{Deserialize, Serialize};
 
 // ============================================================
@@ -246,6 +246,12 @@ pub struct AccountDirective {
     /// are enforced by the applier, not the document.
     pub username: String,
     pub action: AccountAction,
+    /// Optional DDS subject URN authorized to claim this local account
+    /// on matching Windows endpoints. When absent, the directive is
+    /// still valid for the policy agent but cannot drive the native
+    /// pre-logon claim flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_subject_urn: Option<String>,
     /// Display name shown in `lusrmgr.msc`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_name: Option<String>,

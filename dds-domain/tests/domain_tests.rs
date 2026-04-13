@@ -206,6 +206,7 @@ fn test_account_directive_minimal_and_full() {
     let minimal = AccountDirective {
         username: "alice".into(),
         action: AccountAction::Create,
+        claim_subject_urn: None,
         full_name: None,
         description: None,
         groups: vec![],
@@ -214,6 +215,7 @@ fn test_account_directive_minimal_and_full() {
     let full = AccountDirective {
         username: "bob".into(),
         action: AccountAction::Create,
+        claim_subject_urn: Some("urn:vouchsafe:bob.example".into()),
         full_name: Some("Bob Builder".into()),
         description: Some("Service account for nightly builds".into()),
         groups: vec!["Administrators".into(), "Remote Desktop Users".into()],
@@ -299,6 +301,7 @@ fn test_windows_policy_with_typed_bundle_roundtrip() {
             local_accounts: vec![AccountDirective {
                 username: "ddsadmin".into(),
                 action: AccountAction::Create,
+                claim_subject_urn: Some("urn:vouchsafe:alice.example".into()),
                 full_name: Some("DDS Admin".into()),
                 description: None,
                 groups: vec!["Administrators".into()],
@@ -520,11 +523,9 @@ fn test_extract_wrong_type_returns_none() {
     assert!(DeviceJoinDocument::extract(&payload).unwrap().is_none());
     assert!(WindowsPolicyDocument::extract(&payload).unwrap().is_none());
     assert!(SoftwareAssignment::extract(&payload).unwrap().is_none());
-    assert!(
-        ServicePrincipalDocument::extract(&payload)
-            .unwrap()
-            .is_none()
-    );
+    assert!(ServicePrincipalDocument::extract(&payload)
+        .unwrap()
+        .is_none());
     assert!(SessionDocument::extract(&payload).unwrap().is_some());
 }
 

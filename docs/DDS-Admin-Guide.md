@@ -508,7 +508,39 @@ Query policies for a device:
 curl "http://127.0.0.1:5551/v1/windows/policies?device_urn=urn:vouchsafe:win11-pc.7k3mf9..."
 ```
 
-The Windows DDS Policy Agent service polls this endpoint and enforces the policy locally (registry settings, account management, password policy).
+The Windows DDS Policy Agent service polls this endpoint for post-boot
+enforcement. In the current tree, pre-logon first-account claim for
+`local_accounts` entries bound with `claim_subject_urn` is handled by the
+native DDS Auth Bridge, while the policy agent remains the post-boot
+enforcer for the rest of Windows policy.
+
+### Windows First Account Claim
+
+For passwordless Windows logon, DDS can now bind a local account to a DDS
+subject without ever putting a plaintext password in policy.
+
+1. An admin publishes a `WindowsPolicyDocument` whose
+   `local_accounts[]` entry has `action: Create` and
+   `claim_subject_urn: "<subject URN>"`.
+2. The user selects the DDS tile on the Windows logon screen and
+   completes a FIDO2 assertion.
+3. The native DDS Auth Bridge verifies that assertion through
+   `POST /v1/session/assert`.
+4. If the selected credential has no local vault entry yet, the bridge
+   sends the freshly issued local DDS session token to
+   `POST /v1/windows/claim-account`.
+5. `dds-node` resolves the one claimable local account for that subject
+   and device. The bridge then creates or resets the local Windows
+   account, applies group membership / `password_never_expires`, generates
+   a random password locally, wraps that password with FIDO2
+   `hmac-secret`, and completes the current logon.
+6. Later logons reuse the vault entry and no longer hit the claim path.
+
+Notes:
+- Passwords are never carried in `WindowsPolicyDocument`.
+- Conflicting claim mappings are rejected by `dds-node`.
+- The current implementation refuses first-account claim on
+  domain-joined Windows machines.
 
 ### macOS Policy (MDM Equivalent)
 

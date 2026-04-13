@@ -69,6 +69,20 @@ struct DdsAdminVouchResult
     std::string errorMessage;
 };
 
+// Result of POST /v1/windows/claim-account
+struct DdsWindowsClaimResult
+{
+    bool                     success;
+    std::string              subjectUrn;
+    std::string              username;
+    std::string              fullName;
+    std::string              description;
+    std::vector<std::string> groups;
+    bool                     hasPasswordNeverExpires{ false };
+    bool                     passwordNeverExpires{ false };
+    std::string              errorMessage;
+};
+
 class CDdsNodeHttpClient
 {
 public:
@@ -111,6 +125,12 @@ public:
     // Admin vouches for an enrolled user via FIDO2 assertion proof.
     DdsAdminVouchResult PostAdminVouch(const std::string& vouchJson);
 
+    // POST /v1/windows/claim-account
+    //
+    // Resolves the local Windows account that the holder of a freshly
+    // issued DDS session token is authorized to claim on this endpoint.
+    DdsWindowsClaimResult PostWindowsClaim(const std::string& claimJson);
+
 private:
     std::wstring m_host;
     INTERNET_PORT m_port;
@@ -137,6 +157,9 @@ private:
     // Extract an array of flat JSON objects. Returns the raw strings of
     // each {...} element. Caller parses individual fields with JsonGetString.
     static std::vector<std::string> JsonGetObjectArray(const std::string& json, const std::string& key);
+
+    // Extract an array of strings.
+    static std::vector<std::string> JsonGetStringArray(const std::string& json, const std::string& key);
 
     // URL-encode a narrow string for query parameters.
     static std::wstring Utf8ToWide(const std::string& s);

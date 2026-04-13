@@ -14,26 +14,26 @@
 //! - `POST /v1/policy/evaluate` -> PolicyResponse
 //! - `GET  /v1/status`          -> StatusResponse
 //! - `GET  /v1/windows/policies` / `/software` / `POST /applied`
+//! - `POST /v1/windows/claim-account`
 //! - `GET  /v1/macos/policies` / `/software` / `POST /applied`
 
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
+    Json, Router,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::service::{
-    AdminSetupRequest, AdminVouchRequest,
-    ApplicableMacOsPolicy, ApplicableSoftware, ApplicableWindowsPolicy, AppliedReport,
-    AssertionSessionRequest, EnrollDeviceRequest, EnrollUserRequest, EnrolledUser, LocalService,
-    NodeStatus, PolicyResult, ServiceError,
+    AdminSetupRequest, AdminVouchRequest, ApplicableMacOsPolicy, ApplicableSoftware,
+    ApplicableWindowsPolicy, AppliedReport, AssertionSessionRequest, EnrollDeviceRequest,
+    EnrollUserRequest, EnrolledUser, LocalService, NodeStatus, PolicyResult, ServiceError,
 };
 use dds_store::traits::{RevocationStore, TokenStore};
 
@@ -85,6 +85,10 @@ where
         .route("/v1/windows/policies", get(list_windows_policies::<S>))
         .route("/v1/windows/software", get(list_windows_software::<S>))
         .route("/v1/windows/applied", post(record_windows_applied::<S>))
+        .route(
+            "/v1/windows/claim-account",
+            post(claim_windows_account::<S>),
+        )
         .route("/v1/macos/policies", get(list_macos_policies::<S>))
         .route("/v1/macos/software", get(list_macos_software::<S>))
         .route("/v1/macos/applied", post(record_macos_applied::<S>))
@@ -210,6 +214,25 @@ pub struct MacOsPoliciesResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WindowsSoftwareResponse {
     pub software: Vec<ApplicableSoftware>,
+}
+
+/// Request to resolve a Windows account claim from a freshly issued
+/// local DDS session token.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WindowsClaimAccountRequestJson {
+    pub device_urn: String,
+    pub session_token_cbor_b64: String,
+}
+
+/// Response describing the local account the caller may claim.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WindowsClaimAccountResponse {
+    pub subject_urn: String,
+    pub username: String,
+    pub full_name: Option<String>,
+    pub description: Option<String>,
+    pub groups: Vec<String>,
+    pub password_never_expires: Option<bool>,
 }
 
 /// Response wrapping a list of software assignments for a macOS device.
@@ -479,6 +502,39 @@ where
     Ok(StatusCode::ACCEPTED)
 }
 
+async fn claim_windows_account<S>(
+    State(state): State<AppState<S>>,
+    Json(req): Json<WindowsClaimAccountRequestJson>,
+) -> Result<Json<WindowsClaimAccountResponse>, HttpError>
+where
+    S: TokenStore + RevocationStore + Send + Sync + 'static,
+{
+    let session_token_cbor = b64_decode(&req.session_token_cbor_b64, "session_token_cbor_b64")?;
+    let svc = state.svc.lock().await;
+    let claim = match svc.resolve_windows_account_claim(&req.device_urn, &session_token_cbor) {
+        Ok(claim) => claim,
+        Err(ServiceError::Policy(e) | ServiceError::Trust(e)) => {
+            return Err(HttpError {
+                status: StatusCode::FORBIDDEN,
+                message: e,
+            });
+        }
+        Err(ServiceError::Domain(e) | ServiceError::Token(e)) => {
+            return Err(HttpError::bad_request(e));
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    Ok(Json(WindowsClaimAccountResponse {
+        subject_urn: claim.subject_urn,
+        username: claim.username,
+        full_name: claim.full_name,
+        description: claim.description,
+        groups: claim.groups,
+        password_never_expires: claim.password_never_expires,
+    }))
+}
+
 async fn list_macos_policies<S>(
     State(state): State<AppState<S>>,
     Query(q): Query<DeviceUrnQuery>,
@@ -656,6 +712,10 @@ mod tests {
             .route(
                 "/v1/windows/applied",
                 post(record_windows_applied::<MemoryBackend>),
+            )
+            .route(
+                "/v1/windows/claim-account",
+                post(claim_windows_account::<MemoryBackend>),
             )
             .route(
                 "/v1/macos/policies",
@@ -1004,6 +1064,146 @@ mod tests {
         assert!(names.contains(&"ALICE"));
         assert!(names.contains(&"BOB"));
         assert!(body.users.iter().all(|u| !u.credential_id.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn test_windows_claim_account_endpoint() {
+        use crate::service::SessionRequest;
+        use dds_domain::{
+            AccountAction, AccountDirective, DomainDocument, Enforcement, PolicyScope,
+            WindowsPolicyDocument, WindowsSettings,
+        };
+
+        let TestState { app: state, root } = make_state_with_root();
+        let base = spawn_server(state.clone()).await;
+
+        let device_urn = {
+            let mut svc = state.svc.lock().await;
+            svc.set_verify_fido2(false);
+            svc.enroll_device(EnrollDeviceRequest {
+                label: "claim-device".into(),
+                device_id: "hw-claim-1".into(),
+                hostname: "claim-host".into(),
+                os: "Windows 11".into(),
+                os_version: "24H2".into(),
+                tpm_ek_hash: None,
+                org_unit: None,
+                tags: vec!["claim".into()],
+            })
+            .unwrap()
+            .urn
+        };
+
+        let user_sk = SigningKey::generate(&mut OsRng);
+        let credential_id = "claim-cred-1";
+        let attestation = build_none_attestation(
+            "dds.local",
+            credential_id.as_bytes(),
+            &user_sk.verifying_key(),
+        );
+        let enroll_req = EnrollUserRequestJson {
+            label: "alice".into(),
+            credential_id: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(credential_id.as_bytes()),
+            attestation_object_b64: b64_encode(&attestation),
+            client_data_hash_b64: b64_encode(&[0u8; 32]),
+            rp_id: "dds.local".into(),
+            display_name: "Alice".into(),
+            authenticator_type: "cross-platform".into(),
+        };
+        let enroll_resp = reqwest::Client::new()
+            .post(format!("{base}/v1/enroll/user"))
+            .json(&enroll_req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(enroll_resp.status(), 200);
+        let enroll_body: EnrollmentResponse = enroll_resp.json().await.unwrap();
+
+        vouch_user(&state, &root, &enroll_body.urn).await;
+
+        let admin = Identity::generate("admin-claim", &mut OsRng);
+        let mut payload = TokenPayload {
+            iss: admin.id.to_urn(),
+            iss_key: admin.public_key.clone(),
+            jti: "claim-policy".into(),
+            sub: admin.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1_700_000_000,
+            exp: Some(4_102_444_800),
+            body_type: None,
+            body_cbor: None,
+        };
+        let claim_policy = WindowsPolicyDocument {
+            policy_id: "windows/claim".into(),
+            display_name: "Claim".into(),
+            version: 1,
+            enforcement: Enforcement::Enforce,
+            scope: PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![device_urn.clone()],
+            },
+            settings: vec![],
+            windows: Some(WindowsSettings {
+                local_accounts: vec![AccountDirective {
+                    username: "alice-local".into(),
+                    action: AccountAction::Create,
+                    claim_subject_urn: Some(enroll_body.urn.clone()),
+                    full_name: Some("Alice Local".into()),
+                    description: Some("Claimable account".into()),
+                    groups: vec!["Users".into()],
+                    password_never_expires: Some(true),
+                }],
+                ..Default::default()
+            }),
+        };
+        claim_policy.embed(&mut payload).unwrap();
+        let claim_token = Token::sign(payload, &admin.signing_key).unwrap();
+        {
+            let svc = state.svc.lock().await;
+            svc.trust_graph
+                .write()
+                .unwrap()
+                .add_token(claim_token)
+                .unwrap();
+        }
+
+        let session_token_cbor_b64 = {
+            let mut svc = state.svc.lock().await;
+            let session = svc
+                .issue_session(SessionRequest {
+                    subject_urn: enroll_body.urn.clone(),
+                    device_urn: None,
+                    requested_resources: vec![],
+                    duration_secs: 300,
+                    mfa_verified: true,
+                    tls_binding: None,
+                })
+                .unwrap();
+            b64_encode(&session.token_cbor)
+        };
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/windows/claim-account"))
+            .json(&WindowsClaimAccountRequestJson {
+                device_urn: device_urn.clone(),
+                session_token_cbor_b64,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: WindowsClaimAccountResponse = resp.json().await.unwrap();
+        assert_eq!(body.subject_urn, enroll_body.urn);
+        assert_eq!(body.username, "alice-local");
+        assert_eq!(body.full_name.as_deref(), Some("Alice Local"));
+        assert_eq!(body.groups, vec!["Users".to_string()]);
+        assert_eq!(body.password_never_expires, Some(true));
     }
 
     // ----------------------------------------------------------------

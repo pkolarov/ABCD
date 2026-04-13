@@ -13,8 +13,9 @@ use dds_core::policy::{PolicyEngine, PolicyRule};
 use dds_core::token::{Token, TokenKind, TokenPayload};
 use dds_core::trust::TrustGraph;
 use dds_domain::{
-    DeviceJoinDocument, DomainDocument, Enforcement, MacOsPolicyDocument, PolicyScope,
-    SessionDocument, SoftwareAssignment, UserAuthAttestation, WindowsPolicyDocument,
+    AccountAction, AccountDirective, DeviceJoinDocument, DomainDocument, Enforcement,
+    MacOsPolicyDocument, PolicyScope, SessionDocument, SoftwareAssignment, UserAuthAttestation,
+    WindowsPolicyDocument,
 };
 use dds_store::traits::*;
 use std::collections::BTreeSet;
@@ -189,6 +190,19 @@ pub struct ApplicableSoftware {
     pub issuer: String,
     pub iat: u64,
     pub document: SoftwareAssignment,
+}
+
+/// One local Windows account claim resolved for a DDS subject on a
+/// specific device. The Windows Auth Bridge consumes this after it
+/// proves user possession of the enrolled FIDO2 credential.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct WindowsAccountClaim {
+    pub subject_urn: String,
+    pub username: String,
+    pub full_name: Option<String>,
+    pub description: Option<String>,
+    pub groups: Vec<String>,
+    pub password_never_expires: Option<bool>,
 }
 
 /// Outcome the agent reports back after applying (or attempting to
@@ -781,6 +795,71 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
         Ok(out)
     }
 
+    /// Resolve the local Windows account a subject is allowed to claim on
+    /// this device. Authorization is bound to a freshly issued local DDS
+    /// session token so localhost callers cannot claim accounts by
+    /// presenting an arbitrary `subject_urn`.
+    pub fn resolve_windows_account_claim(
+        &self,
+        device_urn: &str,
+        session_token_cbor: &[u8],
+    ) -> Result<WindowsAccountClaim, ServiceError> {
+        if device_urn.trim().is_empty() {
+            return Err(ServiceError::Domain(
+                "device_urn is required for windows account claim".into(),
+            ));
+        }
+
+        let session = self.validate_local_session_token(session_token_cbor)?;
+        let subject_urn = session.subject_urn;
+
+        let policies = self.list_applicable_windows_policies(device_urn)?;
+        let mut matches: Vec<AccountDirective> = Vec::new();
+        for policy in policies {
+            let Some(bundle) = policy.document.windows else {
+                continue;
+            };
+            for directive in bundle.local_accounts {
+                if directive.action != AccountAction::Create {
+                    continue;
+                }
+                if directive.claim_subject_urn.as_deref() == Some(subject_urn.as_str()) {
+                    matches.push(directive);
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            return Err(ServiceError::Policy(format!(
+                "no claimable windows account for subject '{}' on device '{}'",
+                subject_urn, device_urn
+            )));
+        }
+
+        let claim = matches.remove(0);
+        if matches.iter().any(|other| other != &claim) {
+            return Err(ServiceError::Policy(format!(
+                "multiple conflicting windows account claims for subject '{}' on device '{}'",
+                subject_urn, device_urn
+            )));
+        }
+
+        if claim.username.trim().is_empty() {
+            return Err(ServiceError::Domain(
+                "claimable windows account has an empty username".into(),
+            ));
+        }
+
+        Ok(WindowsAccountClaim {
+            subject_urn,
+            username: claim.username,
+            full_name: claim.full_name,
+            description: claim.description,
+            groups: claim.groups,
+            password_never_expires: claim.password_never_expires,
+        })
+    }
+
     /// Record a `DdsPolicyAgent` apply outcome. v1: this writes a
     /// structured `tracing::info!` line so existing observability
     /// picks it up; a future PR will add a persistent applier-audit
@@ -954,7 +1033,9 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
                 Ok(Some(d)) => d,
                 _ => continue,
             };
-            let vouched = !g.purposes_for(&token.payload.sub, &self.trusted_roots).is_empty();
+            let vouched = !g
+                .purposes_for(&token.payload.sub, &self.trusted_roots)
+                .is_empty();
             users.push(EnrolledUser {
                 subject_urn: token.payload.sub.clone(),
                 display_name: doc.user_display_name.clone(),
@@ -1164,10 +1245,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             let mut found: Option<(String, String)> = None;
             for token in g.attestations_iter() {
                 if token.payload.sub == req.subject_urn {
-                    found = Some((
-                        token.payload.iss.clone(),
-                        token.payload_hash(),
-                    ));
+                    found = Some((token.payload.iss.clone(), token.payload_hash()));
                     break;
                 }
             }
@@ -1260,7 +1338,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             buf
         };
 
-        use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead, Nonce};
+        use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
         let cipher = Aes256Gcm::new_from_slice(&wrap_key)
             .map_err(|e| ServiceError::Store(format!("AES key init: {e}")))?;
         let nonce = Nonce::from_slice(&iv);
@@ -1285,10 +1363,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
     }
 
     /// Load an admin's Ed25519 signing key from encrypted storage.
-    fn load_admin_key(
-        &self,
-        admin_urn: &str,
-    ) -> Result<ed25519_dalek::SigningKey, ServiceError> {
+    fn load_admin_key(&self, admin_urn: &str) -> Result<ed25519_dalek::SigningKey, ServiceError> {
         let data_dir = self.data_dir.as_ref().ok_or_else(|| {
             ServiceError::Store("data_dir not set — cannot load admin keys".to_string())
         })?;
@@ -1307,7 +1382,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
         let ciphertext = &blob[12..];
 
         let wrap_key = self.admin_wrap_key();
-        use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead, Nonce};
+        use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
         let cipher = Aes256Gcm::new_from_slice(&wrap_key)
             .map_err(|e| ServiceError::Store(format!("AES key init: {e}")))?;
         let nonce = Nonce::from_slice(iv);
@@ -1337,6 +1412,46 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
         let mut key = [0u8; 32];
         key.copy_from_slice(&result);
         key
+    }
+
+    /// Validate a session token issued by this node and extract its
+    /// `SessionDocument` body for privileged localhost follow-on flows
+    /// such as Windows account claim.
+    fn validate_local_session_token(
+        &self,
+        session_token_cbor: &[u8],
+    ) -> Result<SessionDocument, ServiceError> {
+        let token = Token::from_cbor(session_token_cbor)
+            .map_err(|e| ServiceError::Token(format!("session token decode: {e}")))?;
+        token
+            .validate()
+            .map_err(|e| ServiceError::Token(format!("session token validate: {e}")))?;
+
+        let expected_issuer = self.node_identity.id.to_urn();
+        if token.payload.iss != expected_issuer {
+            return Err(ServiceError::Trust(format!(
+                "session token issuer '{}' does not match local node '{}'",
+                token.payload.iss, expected_issuer
+            )));
+        }
+
+        if token.payload.purpose.as_deref() != Some("dds:session") {
+            return Err(ServiceError::Token(
+                "token is not a DDS session token".into(),
+            ));
+        }
+
+        let session = SessionDocument::extract(&token.payload)
+            .map_err(|e| ServiceError::Domain(format!("session token body: {e}")))?
+            .ok_or_else(|| ServiceError::Domain("missing SessionDocument body".into()))?;
+
+        if session.subject_urn != token.payload.sub {
+            return Err(ServiceError::Token(
+                "session token subject does not match embedded SessionDocument".into(),
+            ));
+        }
+
+        Ok(session)
     }
 
     // ---- internal ----
@@ -1838,6 +1953,7 @@ mod platform_applier_tests {
                 local_accounts: vec![AccountDirective {
                     username: "ddsadmin".into(),
                     action: AccountAction::Create,
+                    claim_subject_urn: None,
                     full_name: Some("DDS Admin".into()),
                     description: None,
                     groups: vec!["Administrators".into()],
@@ -1865,6 +1981,229 @@ mod platform_applier_tests {
             bundle.password_policy.as_ref().unwrap().min_length,
             Some(14)
         );
+    }
+
+    #[test]
+    fn windows_claim_resolution_uses_local_session_and_policy_mapping() {
+        let (mut svc, admin, roots) = setup();
+        let device_urn = enroll_device(&mut svc, "ws-claim", vec!["workstation".into()], None);
+
+        let user = Identity::generate("alice", &mut OsRng);
+        let user_attest = Token::sign(
+            TokenPayload {
+                iss: user.id.to_urn(),
+                iss_key: user.public_key.clone(),
+                jti: "attest-user-claim".into(),
+                sub: user.id.to_urn(),
+                kind: TokenKind::Attest,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat: 1_700_000_000,
+                exp: Some(4_102_444_800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &user.signing_key,
+        )
+        .unwrap();
+        let user_hash = user_attest.payload_hash();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(user_attest)
+            .unwrap();
+
+        let vouch = Token::sign(
+            TokenPayload {
+                iss: admin.id.to_urn(),
+                iss_key: admin.public_key.clone(),
+                jti: "vouch-user-claim".into(),
+                sub: user.id.to_urn(),
+                kind: TokenKind::Vouch,
+                purpose: Some("dds:group:employees".into()),
+                vch_iss: Some(user.id.to_urn()),
+                vch_sum: Some(user_hash),
+                revokes: None,
+                iat: 1_700_000_000,
+                exp: Some(4_102_444_800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &admin.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph.write().unwrap().add_token(vouch).unwrap();
+
+        let policy = WindowsPolicyDocument {
+            policy_id: "p:claim".into(),
+            display_name: "Claim".into(),
+            version: 1,
+            enforcement: Enforcement::Enforce,
+            scope: PolicyScope {
+                device_tags: vec!["workstation".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            settings: vec![],
+            windows: Some(WindowsSettings {
+                local_accounts: vec![AccountDirective {
+                    username: "alice-local".into(),
+                    action: AccountAction::Create,
+                    claim_subject_urn: Some(user.id.to_urn()),
+                    full_name: Some("Alice Local".into()),
+                    description: Some("Claimable account".into()),
+                    groups: vec!["Users".into(), "Remote Desktop Users".into()],
+                    password_never_expires: Some(true),
+                }],
+                ..Default::default()
+            }),
+        };
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-claim", &policy))
+            .unwrap();
+
+        let session = svc
+            .issue_session(SessionRequest {
+                subject_urn: user.id.to_urn(),
+                device_urn: None,
+                requested_resources: vec![],
+                duration_secs: 300,
+                mfa_verified: true,
+                tls_binding: None,
+            })
+            .unwrap();
+
+        let claim = svc
+            .resolve_windows_account_claim(&device_urn, &session.token_cbor)
+            .unwrap();
+        assert_eq!(claim.subject_urn, user.id.to_urn());
+        assert_eq!(claim.username, "alice-local");
+        assert_eq!(claim.full_name.as_deref(), Some("Alice Local"));
+        assert_eq!(
+            claim.groups,
+            vec!["Users".to_string(), "Remote Desktop Users".to_string()]
+        );
+        assert_eq!(claim.password_never_expires, Some(true));
+
+        assert!(svc
+            .trust_graph
+            .read()
+            .unwrap()
+            .validate_chain(&user.id.to_urn(), &roots)
+            .is_ok());
+    }
+
+    #[test]
+    fn windows_claim_resolution_rejects_conflicting_claims() {
+        let (mut svc, admin, _) = setup();
+        let device_urn = enroll_device(
+            &mut svc,
+            "ws-claim-conflict",
+            vec!["workstation".into()],
+            None,
+        );
+
+        let user = Identity::generate("bob", &mut OsRng);
+        let user_attest = Token::sign(
+            TokenPayload {
+                iss: user.id.to_urn(),
+                iss_key: user.public_key.clone(),
+                jti: "attest-user-conflict".into(),
+                sub: user.id.to_urn(),
+                kind: TokenKind::Attest,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat: 1_700_000_000,
+                exp: Some(4_102_444_800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &user.signing_key,
+        )
+        .unwrap();
+        let user_hash = user_attest.payload_hash();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(user_attest)
+            .unwrap();
+
+        let vouch = Token::sign(
+            TokenPayload {
+                iss: admin.id.to_urn(),
+                iss_key: admin.public_key.clone(),
+                jti: "vouch-user-conflict".into(),
+                sub: user.id.to_urn(),
+                kind: TokenKind::Vouch,
+                purpose: Some("dds:group:employees".into()),
+                vch_iss: Some(user.id.to_urn()),
+                vch_sum: Some(user_hash),
+                revokes: None,
+                iat: 1_700_000_000,
+                exp: Some(4_102_444_800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &admin.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph.write().unwrap().add_token(vouch).unwrap();
+
+        for (jti, username) in [("p-claim-a", "bob-a"), ("p-claim-b", "bob-b")] {
+            let policy = WindowsPolicyDocument {
+                policy_id: jti.into(),
+                display_name: "Claim".into(),
+                version: 1,
+                enforcement: Enforcement::Enforce,
+                scope: PolicyScope {
+                    device_tags: vec!["workstation".into()],
+                    org_units: vec![],
+                    identity_urns: vec![],
+                },
+                settings: vec![],
+                windows: Some(WindowsSettings {
+                    local_accounts: vec![AccountDirective {
+                        username: username.into(),
+                        action: AccountAction::Create,
+                        claim_subject_urn: Some(user.id.to_urn()),
+                        full_name: None,
+                        description: None,
+                        groups: vec![],
+                        password_never_expires: None,
+                    }],
+                    ..Default::default()
+                }),
+            };
+            svc.trust_graph
+                .write()
+                .unwrap()
+                .add_token(attest_with_body(&admin, jti, &policy))
+                .unwrap();
+        }
+
+        let session = svc
+            .issue_session(SessionRequest {
+                subject_urn: user.id.to_urn(),
+                device_urn: None,
+                requested_resources: vec![],
+                duration_secs: 300,
+                mfa_verified: true,
+                tls_binding: None,
+            })
+            .unwrap();
+
+        let err = svc
+            .resolve_windows_account_claim(&device_urn, &session.token_cbor)
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("multiple conflicting windows account claims"));
     }
 
     #[test]
