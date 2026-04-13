@@ -38,18 +38,20 @@ env:
 jobs:
   build-msi:
     name: MSI (${{ matrix.arch }})
-    runs-on: windows-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x64
+            runner: windows-latest
             rust-target: x86_64-pc-windows-msvc
             msbuild-platform: x64
             dotnet-rid: win-x64
             wix-arch: x64
             native-suffix: ''
           - arch: arm64
+            runner: windows-11-arm
             rust-target: aarch64-pc-windows-msvc
             msbuild-platform: ARM64
             dotnet-rid: win-arm64
@@ -78,11 +80,6 @@ jobs:
           echo "version=$v" >> $env:GITHUB_OUTPUT
           Write-Host "MSI Version: $v"
 
-      # ── LLVM (needed for ARM64 cross-compile — ring crate assembly) ─
-      - name: Install LLVM
-        if: matrix.arch == 'arm64'
-        run: choco install llvm --yes --no-progress
-
       # ── Rust ─────────────────────────────────────────────────────
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -93,15 +90,7 @@ jobs:
           key: msi-${{ matrix.arch }}
 
       - name: Build dds-node (${{ matrix.rust-target }})
-        shell: pwsh
-        run: |
-          if ("${{ matrix.arch }}" -eq "arm64") {
-            # ring crate needs clang targeting ARM64 for cross-compilation
-            $env:CC_aarch64_pc_windows_msvc = "clang-cl"
-            $env:AR_aarch64_pc_windows_msvc = "llvm-lib"
-            $env:CFLAGS_aarch64_pc_windows_msvc = "--target=aarch64-pc-windows-msvc"
-          }
-          cargo build --package dds-node --target ${{ matrix.rust-target }} --release
+        run: cargo build --package dds-node --target ${{ matrix.rust-target }} --release
 
       # ── C++ native ─────────────────────────────────────────────���─
       - name: Add MSBuild to PATH
