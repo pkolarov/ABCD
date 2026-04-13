@@ -78,6 +78,11 @@ jobs:
           echo "version=$v" >> $env:GITHUB_OUTPUT
           Write-Host "MSI Version: $v"
 
+      # ── LLVM (needed for ARM64 cross-compile — ring crate assembly) ─
+      - name: Install LLVM
+        if: matrix.arch == 'arm64'
+        run: choco install llvm --yes --no-progress
+
       # ── Rust ─────────────────────────────────────────────────────
       - uses: dtolnay/rust-toolchain@stable
         with:
