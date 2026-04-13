@@ -37,26 +37,12 @@ env:
 
 jobs:
   build-msi:
-    name: MSI (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            runner: windows-latest
-            rust-target: x86_64-pc-windows-msvc
-            msbuild-platform: x64
-            dotnet-rid: win-x64
-            wix-arch: x64
-            native-suffix: ''
-          - arch: arm64
-            runner: windows-11-arm
-            rust-target: aarch64-pc-windows-msvc
-            msbuild-platform: ARM64
-            dotnet-rid: win-arm64
-            wix-arch: arm64
-            native-suffix: '-ARM64'
+    name: MSI (x64)
+    runs-on: windows-latest
+    # NOTE: ARM64 MSI is built locally via Build-Msi.ps1 -Platform arm64
+    # GitHub does not offer hosted Windows ARM64 runners; cross-compiling
+    # the ring crate from x64→ARM64 is unreliable. Add an ARM64 matrix
+    # entry here once a self-hosted ARM64 runner is available.
 
     steps:
       - uses: actions/checkout@v4
@@ -83,24 +69,24 @@ jobs:
       # ── Rust ─────────────────────────────────────────────────────
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.rust-target }}
+          targets: x86_64-pc-windows-msvc
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: msi-${{ matrix.arch }}
+          key: msi-x64
 
-      - name: Build dds-node (${{ matrix.rust-target }})
-        run: cargo build --package dds-node --target ${{ matrix.rust-target }} --release
+      - name: Build dds-node (x86_64-pc-windows-msvc)
+        run: cargo build --package dds-node --target x86_64-pc-windows-msvc --release
 
-      # ── C++ native ─────────────────────────────────────────────���─
+      # ── C++ native ──────────────────────────────────────────────
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
-      - name: Build C++ native (${{ matrix.msbuild-platform }})
+      - name: Build C++ native (x64)
         run: >
           msbuild platform\windows\native\DdsNative.sln
           /p:Configuration=Release
-          /p:Platform=${{ matrix.msbuild-platform }}
+          /p:Platform=x64
           /m
           /verbosity:minimal
 
@@ -109,11 +95,11 @@ jobs:
         with:
           dotnet-version: '9.0.x'
 
-      - name: Publish DdsPolicyAgent (${{ matrix.dotnet-rid }})
+      - name: Publish DdsPolicyAgent (win-x64)
         run: >
           dotnet publish platform\windows\DdsPolicyAgent\DdsPolicyAgent.csproj
           --configuration Release
-          --runtime ${{ matrix.dotnet-rid }}
+          --runtime win-x64
           --self-contained true
           --framework net9.0
           /p:PublishSingleFile=true
@@ -124,14 +110,14 @@ jobs:
       - name: Stage binaries
         shell: pwsh
         run: |
-          $stage = "stage\${{ matrix.arch }}"
+          $stage = "stage\x64"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
           # Rust
-          Copy-Item "target\${{ matrix.rust-target }}\release\dds-node.exe" $stage
+          Copy-Item "target\x86_64-pc-windows-msvc\release\dds-node.exe" $stage
 
           # C++ native
-          $nativeBuild = "platform\windows\native\build\Release${{ matrix.native-suffix }}"
+          $nativeBuild = "platform\windows\native\build\Release"
           @("DdsAuthBridge.exe", "DdsCredentialProvider.dll", "DdsTrayAgent.exe") | ForEach-Object {
             $src = Join-Path $nativeBuild $_
             if (Test-Path $src) { Copy-Item $src $stage }
@@ -148,17 +134,17 @@ jobs:
       - name: Install WiX
         run: dotnet tool install --global wix --version 5.0.2
 
-      - name: Build MSI (${{ matrix.arch }})
+      - name: Build MSI (x64)
         shell: pwsh
         run: |
-          $msiName = "DDS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.msi"
+          $msiName = "DDS-${{ steps.version.outputs.version }}-x64.msi"
           wix build platform\windows\installer\DdsBundle.wxs `
             -o "out\$msiName" `
-            -d BuildDir="stage\${{ matrix.arch }}" `
+            -d BuildDir="stage\x64" `
             -d ConfigDir="platform\windows\installer\config" `
-            -d Platform="${{ matrix.wix-arch }}" `
+            -d Platform="x64" `
             -d Version="${{ steps.version.outputs.version }}" `
-            -arch ${{ matrix.wix-arch }}
+            -arch x64
           Write-Host "Built: out\$msiName"
           Get-ChildItem out\*.msi | Format-Table Name, @{N='Size (MB)';E={[math]::Round($_.Length/1MB,1)}}
 
@@ -166,7 +152,7 @@ jobs:
       - name: Upload MSI
         uses: actions/upload-artifact@v4
         with:
-          name: DDS-MSI-${{ matrix.arch }}
+          name: DDS-MSI-x64
           path: out/*.msi
           if-no-files-found: error
 
