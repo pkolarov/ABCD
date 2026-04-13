@@ -1,0 +1,183 @@
+name: MSI Installer
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'platform/windows/**'
+      - 'dds-node/**'
+      - 'dds-core/**'
+      - 'dds-domain/**'
+      - 'dds-store/**'
+      - 'dds-net/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/msi.yml'
+  pull_request:
+    paths:
+      - 'platform/windows/**'
+      - 'dds-node/**'
+      - 'dds-core/**'
+      - 'dds-domain/**'
+      - 'dds-store/**'
+      - 'dds-net/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/msi.yml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'MSI version (e.g. 1.0.0.0)'
+        required: false
+        default: '1.0.0.0'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-msi:
+    name: MSI (x64)
+    runs-on: windows-latest
+    # NOTE: ARM64 MSI is built locally via Build-Msi.ps1 -Platform arm64
+    # GitHub does not offer hosted Windows ARM64 runners; cross-compiling
+    # the ring crate from x64→ARM64 is unreliable. Add an ARM64 matrix
+    # entry here once a self-hosted ARM64 runner is available.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Compute version ──────────────────────────────────────────
+      - name: Compute version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.version }}" -ne "") {
+            $v = "${{ inputs.version }}"
+          } elseif ("${{ github.ref_type }}" -eq "tag") {
+            # Strip leading 'v' from tag: v1.2.3 -> 1.2.3.0
+            $tag = "${{ github.ref_name }}" -replace '^v', ''
+            $parts = $tag -split '\.'
+            while ($parts.Count -lt 4) { $parts += '0' }
+            $v = $parts[0..3] -join '.'
+          } else {
+            $v = "0.0.0.${{ github.run_number }}"
+          }
+          echo "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "MSI Version: $v"
+
+      # ── Rust ─────────────────────────────────────────────────────
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msi-x64
+
+      - name: Build dds-node (x86_64-pc-windows-msvc)
+        run: cargo build --package dds-node --target x86_64-pc-windows-msvc --release
+
+      # ── C++ native ──────────────────────────────────────────────
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build C++ native (x64)
+        run: >
+          msbuild platform\windows\native\DdsNative.sln
+          /p:Configuration=Release
+          /p:Platform=x64
+          /m
+          /verbosity:minimal
+
+      # ── .NET ─────────────────────────────────────────────────────
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Publish DdsPolicyAgent (win-x64)
+        run: >
+          dotnet publish platform\windows\DdsPolicyAgent\DdsPolicyAgent.csproj
+          --configuration Release
+          --runtime win-x64
+          --self-contained true
+          --framework net9.0
+          /p:PublishSingleFile=true
+          /p:IncludeNativeLibrariesForSelfExtract=true
+          --output stage\dotnet
+
+      # ── Stage binaries ───────────────────────────────────────────
+      - name: Stage binaries
+        shell: pwsh
+        run: |
+          $stage = "stage\x64"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+          # Rust
+          Copy-Item "target\x86_64-pc-windows-msvc\release\dds-node.exe" $stage
+
+          # C++ native
+          $nativeBuild = "platform\windows\native\build\Release"
+          @("DdsAuthBridge.exe", "DdsCredentialProvider.dll", "DdsTrayAgent.exe") | ForEach-Object {
+            $src = Join-Path $nativeBuild $_
+            if (Test-Path $src) { Copy-Item $src $stage }
+            else { Write-Warning "Not found: $src" }
+          }
+
+          # .NET
+          Copy-Item "stage\dotnet\DdsPolicyAgent.exe" $stage
+
+          Write-Host "Staged binaries:"
+          Get-ChildItem $stage | Format-Table Name, Length
+
+      # ── WiX MSI ──────────────────────────────────────────────────
+      - name: Install WiX
+        run: dotnet tool install --global wix --version 5.0.2
+
+      - name: Build MSI (x64)
+        shell: pwsh
+        run: |
+          $msiName = "DDS-${{ steps.version.outputs.version }}-x64.msi"
+          wix build platform\windows\installer\DdsBundle.wxs `
+            -o "out\$msiName" `
+            -d BuildDir="stage\x64" `
+            -d ConfigDir="platform\windows\installer\config" `
+            -d Platform="x64" `
+            -d Version="${{ steps.version.outputs.version }}" `
+            -arch x64
+          Write-Host "Built: out\$msiName"
+          Get-ChildItem out\*.msi | Format-Table Name, @{N='Size (MB)';E={[math]::Round($_.Length/1MB,1)}}
+
+      # ── Upload artifact ──────────────────────────────────────────
+      - name: Upload MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: DDS-MSI-x64
+          path: out/*.msi
+          if-no-files-found: error
+
+  # ── Release job (only on tags) ─────────────────────────────────
+  release:
+    name: Create Release
+    needs: build-msi
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all MSI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: DDS-MSI-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.msi
+          generate_release_notes: true
+          draft: true
