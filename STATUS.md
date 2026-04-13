@@ -1,7 +1,7 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-13 (security hardening merged + clean re-enrollment E2E verified)
+> Last updated: 2026-04-13 (admin enrollment + user enrollment + FIDO2 passwordless Windows login verified on ARM64 with real HW key)
 
 ## Build Health
 
@@ -234,7 +234,7 @@ All 7 crates are functionally complete. The following work is ordered by impact 
 
 ### Phase 1 — Production Hardening (high priority)
 
-1. 🟢 **HTTP/JSON-RPC API on dds-node** — `dds-node/src/http.rs` exposes `LocalService` over a localhost axum server. Endpoints: `POST /v1/enroll/user`, `POST /v1/enroll/device`, `POST /v1/session`, `POST /v1/session/assert` (assertion-based session), `GET /v1/enrolled-users` (CP tile enumeration), `POST /v1/policy/evaluate`, `GET /v1/status`, `GET /v1/windows/policies`, `GET /v1/windows/software`, `POST /v1/windows/applied`, `GET /v1/macos/policies`, `GET /v1/macos/software`, `POST /v1/macos/applied`. JSON request/response types with serde, base64-encoded binary fields. reqwest integration tests cover both Windows and macOS applier endpoints against an in-process server.
+1. 🟢 **HTTP/JSON-RPC API on dds-node** — `dds-node/src/http.rs` exposes `LocalService` over a localhost axum server. Endpoints: `POST /v1/enroll/user`, `POST /v1/enroll/device`, `POST /v1/session/assert` (assertion-based session; unauthenticated `/v1/session` removed), `GET /v1/enrolled-users` (CP tile enumeration), `POST /v1/admin/setup`, `POST /v1/admin/vouch`, `POST /v1/policy/evaluate`, `GET /v1/status`, `GET /v1/windows/policies`, `GET /v1/windows/software`, `POST /v1/windows/applied`, `GET /v1/macos/policies`, `GET /v1/macos/software`, `POST /v1/macos/applied`. JSON request/response types with serde, base64-encoded binary fields. reqwest integration tests cover both Windows and macOS applier endpoints against an in-process server.
 
 2. 🟢 **FIDO2 attestation + assertion verification** — `dds-domain/src/fido2.rs` parses WebAuthn attestation objects with `ciborium`, supports `none` and `packed` (Ed25519 self-attestation) formats, extracts the COSE_Key credential public key, and verifies the attestation signature. Now also verifies getAssertion responses (Ed25519 + ECDSA P-256) via `verify_assertion()`, with `cose_to_credential_public_key()` for multi-algorithm key parsing. `LocalService::enroll_user` rejects enrollment whose attestation fails to verify; `issue_session_from_assertion()` verifies assertion signatures against enrolled keys. 12 unit tests cover attestation round-trips, assertion verification (both algorithms), bad signatures, COSE key parsing.
 
@@ -435,7 +435,7 @@ Still TODO:
 - Implement `DdsLoginBridge` / Authorization Services integration for post-login privileged workflows. Full loginwindow / FileVault replacement is still explicitly out of scope.
 - Package the macOS agent as a signed/notarized `.pkg` and validate launchd installation, upgrade, and uninstall flows.
 - Decide whether Linux should share a common policy-agent core library with macOS/Windows or remain as three mostly separate worker implementations.
-- Investigate and stabilize the unrelated `dds-node` multinode failures (`dag_converges_after_partition`, `rejoined_node_catches_up_via_sync_protocol`) before claiming the whole node test matrix is green on this host.
+- ~~Investigate and stabilize the unrelated `dds-node` multinode failures~~ — **Resolved 2026-04-13**: `dag_converges_after_partition` and `rejoined_node_catches_up_via_sync_protocol` now pass on Windows ARM64 (see verification note above).
 
 ## Path to Production
 
@@ -595,11 +595,9 @@ five hard §10 KPIs PASS, 14/14 chaos rejoins succeeded.
 - [ ] **Optional**: 24-hour endurance run for long-tail evidence. Not load-bearing for §10 sign-off; defer to pilot pre-flight.
 - [ ] **Optional**: Wire `dhat` heap profiling and a custom transport-byte-counter to convert R5's RSS-proxy KPIs to hard verdicts. Defer to pre-GA if pilot sign-off needs them.
 
-#### Milestone P1 — Pilot scoping decision
+#### Milestone P1 — Pilot scoping decision ✅ COMPLETE
 
-- [ ] Decide pilot platform scope: Linux/macOS daemons only, *or* Windows logon included
-  - If Linux/macOS only → jump to P2
-  - If Windows included → remaining work is packaging (WiX/MSI), service registration, and Authenticode signing (COM DLL + Auth Bridge + WebAuthn integration are complete)
+- [x] Decide pilot platform scope: **Windows logon included.** Full FIDO2 passwordless flow verified end-to-end on Windows 11 ARM64 with real YubiKey: admin setup → admin enrollment → user enrollment → admin vouch → lock screen → touch key → Windows session. Remaining work is packaging (WiX/MSI), service registration, and Authenticode signing.
 
 #### Milestone P2 — Platform breadth (resolves B2)
 
@@ -626,8 +624,9 @@ five hard §10 KPIs PASS, 14/14 chaos rejoins succeeded.
 
 Deferred to post-GA:
 
-- Phase 3 items 9–10 (WindowsPolicyDocument distribution, SoftwareAssignment workflow + local agent)
 - Phase 4 items 13–15 (sharded Kad, delegation depth limits as a hard feature, offline enrollment)
+
+Note: Phase 3 items 9–10 (WindowsPolicyDocument distribution + SoftwareAssignment) are now largely implemented — Windows Policy Agent has 56 passing tests and macOS Policy Agent has 17. Remaining work is production packaging and service registration, not core functionality.
 
 ### Phase 4 — Scale
 
