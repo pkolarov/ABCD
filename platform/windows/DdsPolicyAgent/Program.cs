@@ -51,6 +51,17 @@ else
     builder.Services.AddSingleton<IPasswordPolicyOperations, InMemoryPasswordPolicyOperations>();
 }
 
+// Software operations: real Win32 on Windows, in-memory elsewhere.
+if (OperatingSystem.IsWindows())
+{
+    builder.Services.AddSingleton<ISoftwareOperations>(sp =>
+        new WindowsSoftwareOperations(sp.GetRequiredService<IHttpClientFactory>().CreateClient("software")));
+}
+else
+{
+    builder.Services.AddSingleton<ISoftwareOperations, InMemorySoftwareOperations>();
+}
+
 // Register enforcers.
 builder.Services.AddSingleton<RegistryEnforcer>();
 builder.Services.AddSingleton<AccountEnforcer>();

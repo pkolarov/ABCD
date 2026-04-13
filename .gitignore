@@ -45,3 +45,5 @@ platform/windows/installer/out/
 # macOS metadata
 .DS_Store
 ._*
+platform/windows/DdsPolicyAgent.Tests/Integration/TestData/TestPackage.msi
+platform/windows/DdsPolicyAgent.Tests/Integration/TestData/TestPackage.wixpdb

@@ -6,32 +6,180 @@ using Microsoft.Extensions.Logging;
 namespace DDS.PolicyAgent.Enforcers;
 
 /// <summary>
-/// Phase C: log-only stub. Logs what it would install/uninstall.
-/// Phase F replaces the body with real msiexec / Add-AppxPackage /
-/// EXE invocation, SHA-256 verification, and uninstall-string
-/// lookup.
+/// Enforces <c>SoftwareAssignment</c> directives by dispatching
+/// through <see cref="ISoftwareOperations"/>. Supports MSI and EXE
+/// installers with SHA-256 verification.
+///
+/// The directive JSON has the shape:
+/// <code>
+/// {
+///   "package_id": "com.example.editor",
+///   "version": "2.1",
+///   "action": "Install" | "Uninstall",
+///   "installer_type": "msi" | "exe",
+///   "source_url": "https://...",
+///   "sha256": "abcdef...",
+///   "silent_args": "/S"
+/// }
+/// </code>
 /// </summary>
 public sealed class SoftwareInstaller : IEnforcer
 {
+    private readonly ISoftwareOperations _ops;
     private readonly ILogger<SoftwareInstaller> _log;
     public string Name => "Software";
 
-    public SoftwareInstaller(ILogger<SoftwareInstaller> log) => _log = log;
+    public SoftwareInstaller(ISoftwareOperations ops, ILogger<SoftwareInstaller> log)
+    {
+        _ops = ops;
+        _log = log;
+    }
 
-    public Task<EnforcementOutcome> ApplyAsync(
+    public async Task<EnforcementOutcome> ApplyAsync(
         JsonElement directive, EnforcementMode mode, CancellationToken ct = default)
     {
         var pkgId = directive.TryGetProperty("package_id", out var id)
-            ? id.GetString() : "unknown";
+            ? id.GetString() ?? "unknown"
+            : "unknown";
         var version = directive.TryGetProperty("version", out var v)
-            ? v.GetString() : "?";
+            ? v.GetString() ?? "?"
+            : "?";
         var action = directive.TryGetProperty("action", out var a)
-            ? a.GetString() : "Install";
+            ? a.GetString() ?? "Install"
+            : "Install";
+        var installerType = directive.TryGetProperty("installer_type", out var t)
+            ? t.GetString()?.ToLowerInvariant() ?? "msi"
+            : "msi";
 
         var desc = $"{action} {pkgId} v{version}";
-        _log.LogInformation("[DRY-RUN] Software: {Action}", desc);
 
-        return Task.FromResult(new EnforcementOutcome(
-            EnforcementStatus.Skipped, null, new[] { desc }));
+        if (mode == EnforcementMode.Audit)
+        {
+            _log.LogInformation("[AUDIT] Software: would {Action}", desc);
+            return new EnforcementOutcome(
+                EnforcementStatus.Ok, null, [$"[AUDIT] {desc}"]);
+        }
+
+        try
+        {
+            switch (action)
+            {
+                case "Install":
+                    return await ApplyInstallAsync(directive, pkgId, version, installerType, desc, ct);
+
+                case "Uninstall":
+                    return ApplyUninstall(pkgId, desc);
+
+                default:
+                    return new EnforcementOutcome(
+                        EnforcementStatus.Failed,
+                        $"Unknown software action: {action}",
+                        [$"FAILED: {desc} — unknown action"]);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Software enforcer failed: {Desc}", desc);
+            return new EnforcementOutcome(
+                EnforcementStatus.Failed, ex.Message,
+                [$"FAILED: {desc} — {ex.Message}"]);
+        }
+    }
+
+    private async Task<EnforcementOutcome> ApplyInstallAsync(
+        JsonElement directive, string pkgId, string version,
+        string installerType, string desc, CancellationToken ct)
+    {
+        // Already installed?
+        if (_ops.IsInstalled(pkgId))
+        {
+            _log.LogDebug("Software: {Pkg} already installed — skip", pkgId);
+            return new EnforcementOutcome(
+                EnforcementStatus.Ok, null,
+                [$"[NO-OP] {desc} (already installed)"]);
+        }
+
+        var sourceUrl = directive.TryGetProperty("source_url", out var u)
+            ? u.GetString() : null;
+        var sha256 = directive.TryGetProperty("sha256", out var h)
+            ? h.GetString() : null;
+
+        if (string.IsNullOrEmpty(sourceUrl))
+            return new EnforcementOutcome(
+                EnforcementStatus.Failed,
+                "source_url is required for Install",
+                [$"FAILED: {desc} — no source_url"]);
+
+        if (string.IsNullOrEmpty(sha256))
+            return new EnforcementOutcome(
+                EnforcementStatus.Failed,
+                "sha256 is required for Install",
+                [$"FAILED: {desc} — no sha256"]);
+
+        // Download + verify
+        _log.LogInformation("Software: downloading {Url}", sourceUrl);
+        var localPath = await _ops.DownloadAndVerifyAsync(sourceUrl, sha256, ct);
+
+        // Install
+        int exitCode;
+        switch (installerType)
+        {
+            case "msi":
+                var extraArgs = directive.TryGetProperty("silent_args", out var sa)
+                    ? sa.GetString() : null;
+                exitCode = _ops.InstallMsi(localPath, extraArgs);
+                break;
+            case "exe":
+                var silentArgs = directive.TryGetProperty("silent_args", out var ea)
+                    ? ea.GetString() ?? "/S" : "/S";
+                exitCode = _ops.InstallExe(localPath, silentArgs);
+                break;
+            default:
+                return new EnforcementOutcome(
+                    EnforcementStatus.Failed,
+                    $"Unknown installer_type: {installerType}",
+                    [$"FAILED: {desc} — unknown installer_type"]);
+        }
+
+        // Clean up temp file
+        try { File.Delete(localPath); } catch { /* best-effort */ }
+
+        if (exitCode != 0)
+        {
+            var msg = $"Installer exited with code {exitCode}";
+            _log.LogError("Software: {Desc} — {Msg}", desc, msg);
+            return new EnforcementOutcome(
+                EnforcementStatus.Failed, msg,
+                [$"FAILED: {desc} — {msg}"]);
+        }
+
+        _log.LogInformation("Software: {Desc} — success", desc);
+        return new EnforcementOutcome(
+            EnforcementStatus.Ok, null, [desc]);
+    }
+
+    private EnforcementOutcome ApplyUninstall(string pkgId, string desc)
+    {
+        if (!_ops.IsInstalled(pkgId))
+        {
+            _log.LogDebug("Software: {Pkg} not installed — skip uninstall", pkgId);
+            return new EnforcementOutcome(
+                EnforcementStatus.Ok, null,
+                [$"[NO-OP] {desc} (not installed)"]);
+        }
+
+        var exitCode = _ops.UninstallMsi(pkgId);
+        if (exitCode != 0)
+        {
+            var msg = $"Uninstall exited with code {exitCode}";
+            _log.LogError("Software: {Desc} — {Msg}", desc, msg);
+            return new EnforcementOutcome(
+                EnforcementStatus.Failed, msg,
+                [$"FAILED: {desc} — {msg}"]);
+        }
+
+        _log.LogInformation("Software: {Desc} — success", desc);
+        return new EnforcementOutcome(
+            EnforcementStatus.Ok, null, [desc]);
     }
 }

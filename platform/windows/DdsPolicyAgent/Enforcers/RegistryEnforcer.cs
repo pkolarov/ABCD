@@ -99,7 +99,7 @@ public sealed class RegistryEnforcer : IEnforcer
             case "Set":
                 var (value, kind) = ParseValue(item);
                 var existing = _ops.GetValue(hive, key, name);
-                if (existing is not null && existing.Equals(value))
+                if (existing is not null && RegistryValuesEqual(existing, value))
                 {
                     _log.LogDebug("Registry: {Key}\\{Name} already at desired value", key, displayName);
                     return $"[NO-OP] {desc} (already set)";
@@ -172,6 +172,32 @@ public sealed class RegistryEnforcer : IEnforcer
 
         throw new InvalidOperationException(
             $"Cannot parse registry value from JSON kind {val.ValueKind}");
+    }
+
+    /// <summary>
+    /// Compare registry values across type boundaries. The real
+    /// registry returns <c>int</c> for DWORD and <c>long</c> for
+    /// QWORD, while <see cref="ParseValue"/> produces <c>uint</c>
+    /// and <c>ulong</c>. This method normalises both sides before
+    /// comparing.
+    /// </summary>
+    internal static bool RegistryValuesEqual(object existing, object desired)
+    {
+        // Normalise numeric types: registry returns signed, we store unsigned
+        if (existing is int ei && desired is uint du)
+            return (uint)ei == du;
+        if (existing is long el && desired is ulong qu)
+            return (ulong)el == qu;
+
+        // byte[] — SequenceEqual
+        if (existing is byte[] eb && desired is byte[] db)
+            return eb.AsSpan().SequenceEqual(db);
+
+        // string[] — element-wise
+        if (existing is string[] es && desired is string[] ds)
+            return es.Length == ds.Length && es.Zip(ds).All(p => p.First == p.Second);
+
+        return existing.Equals(desired);
     }
 
     private static string DescribeDirective(JsonElement item)

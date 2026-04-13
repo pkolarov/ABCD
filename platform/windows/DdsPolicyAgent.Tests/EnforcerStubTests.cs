@@ -72,17 +72,79 @@ public class EnforcerStubTests
     }
 
     [Fact]
-    public async Task SoftwareInstaller_returns_skipped_with_changes()
+    public async Task SoftwareInstaller_install_requires_source_url()
     {
-        var e = new SoftwareInstaller(NullLogger<SoftwareInstaller>.Instance);
+        var ops = new InMemorySoftwareOperations();
+        var e = new SoftwareInstaller(ops, NullLogger<SoftwareInstaller>.Instance);
         var directive = JsonDocument.Parse("""
         {"package_id":"com.example.editor","version":"1.0","action":"Install"}
         """).RootElement;
 
         var outcome = await e.ApplyAsync(directive, EnforcementMode.Enforce);
-        Assert.Equal(EnforcementStatus.Skipped, outcome.Status);
-        Assert.NotNull(outcome.Changes);
-        Assert.Single(outcome.Changes);
+        Assert.Equal(EnforcementStatus.Failed, outcome.Status);
+        Assert.Contains("source_url", outcome.Error);
+    }
+
+    [Fact]
+    public async Task SoftwareInstaller_audit_mode_does_not_install()
+    {
+        var ops = new InMemorySoftwareOperations();
+        var e = new SoftwareInstaller(ops, NullLogger<SoftwareInstaller>.Instance);
+        var directive = JsonDocument.Parse("""
+        {"package_id":"com.example.editor","version":"1.0","action":"Install",
+         "source_url":"https://example.com/editor.msi","sha256":"abc123"}
+        """).RootElement;
+
+        var outcome = await e.ApplyAsync(directive, EnforcementMode.Audit);
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
+        Assert.Contains("AUDIT", outcome.Changes![0]);
+        Assert.False(ops.IsInstalled("com.example.editor"));
+    }
+
+    [Fact]
+    public async Task SoftwareInstaller_install_via_in_memory_ops()
+    {
+        var ops = new InMemorySoftwareOperations();
+        var e = new SoftwareInstaller(ops, NullLogger<SoftwareInstaller>.Instance);
+        var directive = JsonDocument.Parse("""
+        {"package_id":"com.example.editor","version":"1.0","action":"Install",
+         "installer_type":"msi","source_url":"https://example.com/editor.msi",
+         "sha256":"abc123"}
+        """).RootElement;
+
+        var outcome = await e.ApplyAsync(directive, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
+        Assert.Single(outcome.Changes!);
         Assert.Contains("editor", outcome.Changes[0]);
+    }
+
+    [Fact]
+    public async Task SoftwareInstaller_uninstall_not_installed_is_noop()
+    {
+        var ops = new InMemorySoftwareOperations();
+        var e = new SoftwareInstaller(ops, NullLogger<SoftwareInstaller>.Instance);
+        var directive = JsonDocument.Parse("""
+        {"package_id":"com.example.editor","version":"1.0","action":"Uninstall"}
+        """).RootElement;
+
+        var outcome = await e.ApplyAsync(directive, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
+        Assert.Contains("NO-OP", outcome.Changes![0]);
+    }
+
+    [Fact]
+    public async Task SoftwareInstaller_rejects_bad_sha256()
+    {
+        var ops = new InMemorySoftwareOperations { SimulateHashMismatch = true };
+        var e = new SoftwareInstaller(ops, NullLogger<SoftwareInstaller>.Instance);
+        var directive = JsonDocument.Parse("""
+        {"package_id":"com.example.editor","version":"1.0","action":"Install",
+         "installer_type":"msi","source_url":"https://example.com/editor.msi",
+         "sha256":"abc123"}
+        """).RootElement;
+
+        var outcome = await e.ApplyAsync(directive, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Failed, outcome.Status);
+        Assert.Contains("SHA-256", outcome.Error);
     }
 }

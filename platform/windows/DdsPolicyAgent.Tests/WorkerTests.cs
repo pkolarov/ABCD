@@ -46,7 +46,7 @@ public class WorkerTests
             new RegistryEnforcer(new InMemoryRegistryOperations(), NullLogger<RegistryEnforcer>.Instance),
             new AccountEnforcer(new InMemoryAccountOperations(), NullLogger<AccountEnforcer>.Instance),
             new PasswordPolicyEnforcer(new InMemoryPasswordPolicyOperations(), NullLogger<PasswordPolicyEnforcer>.Instance),
-            new SoftwareInstaller(NullLogger<SoftwareInstaller>.Instance));
+            new SoftwareInstaller(new InMemorySoftwareOperations(), NullLogger<SoftwareInstaller>.Instance));
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
         await worker.StartAsync(cts.Token);
