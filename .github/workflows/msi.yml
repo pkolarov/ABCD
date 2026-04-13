@@ -93,7 +93,15 @@ jobs:
           key: msi-${{ matrix.arch }}
 
       - name: Build dds-node (${{ matrix.rust-target }})
-        run: cargo build --package dds-node --target ${{ matrix.rust-target }} --release
+        shell: pwsh
+        run: |
+          if ("${{ matrix.arch }}" -eq "arm64") {
+            # ring crate needs clang targeting ARM64 for cross-compilation
+            $env:CC_aarch64_pc_windows_msvc = "clang-cl"
+            $env:AR_aarch64_pc_windows_msvc = "llvm-lib"
+            $env:CFLAGS_aarch64_pc_windows_msvc = "--target=aarch64-pc-windows-msvc"
+          }
+          cargo build --package dds-node --target ${{ matrix.rust-target }} --release
 
       # ── C++ native ─────────────────────────────────────────────���─
       - name: Add MSBuild to PATH
