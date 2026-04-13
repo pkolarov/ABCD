@@ -1,0 +1,20 @@
+# DDS Node Configuration
+# Installed to: C:\Program Files\DDS\config\node.toml
+# Edit this file to configure the DDS node service.
+
+# Data directory for vault, certificates, and replication state
+data_dir = 'C:\ProgramData\DDS'
+
+# HTTP API listen address (used by Auth Bridge and Policy Agent)
+api_addr = '127.0.0.1:5551'
+
+# P2P listen addresses (multiaddr format)
+# Uncomment and configure for mesh networking:
+# listen = ['/ip4/0.0.0.0/tcp/4001', '/ip4/0.0.0.0/udp/4001/quic-v1']
+
+# Trusted root identities (URNs of domain founders)
+# These are set during domain initialization (dds-node init-domain)
+# trusted_roots = []
+
+# Bootstrap peers for initial mesh join
+# bootstrap_peers = ['/ip4/192.168.1.10/tcp/4001/p2p/12D3KooW...']

@@ -36,6 +36,12 @@
 *.swo
 *.orig
 
+# MSI installer staging and output
+platform/windows/installer/stage/
+platform/windows/installer/out/
+*.msi
+*.wixpdb
+
 # macOS metadata
 .DS_Store
 ._*

@@ -6,13 +6,41 @@
     2. DDS Auth Bridge        (C++, Windows Service)
     3. DDS Credential Provider (C++, COM DLL)
     4. DdsPolicyAgent         (.NET, Windows Service)
-    5. Configuration files
+    5. DDS Tray Agent          (C++, optional)
+    6. Configuration files
+
+  Build variables (passed via -d on wix command line):
+    BuildDir   — path to staged binaries for the target platform
+    ConfigDir  — path to configuration templates
+    Platform   — "x64" or "arm64"
+    Version    — e.g. "1.0.0.0"
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
 
-  <Package Name="DDS Windows Platform"
+  <!-- ============================================================ -->
+  <!-- Platform detection: set InstallerPlatform to "x64" or "arm64" -->
+  <!-- and pick the correct ProgramFiles folder                      -->
+  <!-- ============================================================ -->
+  <?ifdef Platform ?>
+    <?if $(var.Platform) = "arm64" ?>
+      <?define InstallerPlatform = "arm64" ?>
+      <?define ProductName = "DDS Windows Platform (ARM64)" ?>
+    <?else ?>
+      <?define InstallerPlatform = "x64" ?>
+      <?define ProductName = "DDS Windows Platform (x64)" ?>
+    <?endif ?>
+  <?else ?>
+    <?define InstallerPlatform = "x64" ?>
+    <?define ProductName = "DDS Windows Platform (x64)" ?>
+  <?endif ?>
+
+  <?ifndef Version ?>
+    <?define Version = "1.0.0.0" ?>
+  <?endif ?>
+
+  <Package Name="$(var.ProductName)"
            Manufacturer="DDS"
-           Version="1.0.0.0"
+           Version="$(var.Version)"
            UpgradeCode="F1A2B3C4-D5E6-7890-ABCD-123456789012"
            Compressed="yes"
            InstallerVersion="500">
@@ -40,36 +68,44 @@
     <!-- ============================================================ -->
     <!-- Feature: Core (dds-node)                                     -->
     <!-- ============================================================ -->
-    <Feature Id="F_Core" Title="DDS Node" Level="1">
+    <Feature Id="F_Core" Title="DDS Node" Description="Core P2P directory service daemon" Level="1">
       <ComponentGroupRef Id="CG_DdsNode" />
+      <ComponentGroupRef Id="CG_AppData" />
     </Feature>
 
     <!-- ============================================================ -->
     <!-- Feature: Auth Bridge (C++ service + CTAP2 engine)            -->
     <!-- ============================================================ -->
-    <Feature Id="F_AuthBridge" Title="DDS Auth Bridge" Level="1">
+    <Feature Id="F_AuthBridge" Title="DDS Auth Bridge" Description="FIDO2 authentication bridge for Windows logon" Level="1">
       <ComponentGroupRef Id="CG_AuthBridge" />
     </Feature>
 
     <!-- ============================================================ -->
     <!-- Feature: Credential Provider (COM DLL)                       -->
     <!-- ============================================================ -->
-    <Feature Id="F_CredProv" Title="DDS Credential Provider" Level="1">
+    <Feature Id="F_CredProv" Title="DDS Credential Provider" Description="Windows logon credential provider" Level="1">
       <ComponentGroupRef Id="CG_CredProv" />
     </Feature>
 
     <!-- ============================================================ -->
     <!-- Feature: Policy Agent (.NET service)                         -->
     <!-- ============================================================ -->
-    <Feature Id="F_PolicyAgent" Title="DDS Policy Agent" Level="1">
+    <Feature Id="F_PolicyAgent" Title="DDS Policy Agent" Description="Windows policy enforcement agent" Level="1">
       <ComponentGroupRef Id="CG_PolicyAgent" />
+    </Feature>
+
+    <!-- ============================================================ -->
+    <!-- Feature: Tray Agent (optional, C++)                          -->
+    <!-- ============================================================ -->
+    <Feature Id="F_TrayAgent" Title="DDS Tray Agent" Description="System tray notification agent" Level="2">
+      <ComponentGroupRef Id="CG_TrayAgent" />
     </Feature>
 
     <!-- ============================================================ -->
     <!-- Component: dds-node.exe                                      -->
     <!-- ============================================================ -->
     <ComponentGroup Id="CG_DdsNode" Directory="DIR_BIN">
-      <Component Id="C_DdsNode" Guid="11111111-1111-1111-1111-111111111111" Win64="yes">
+      <Component Id="C_DdsNode" Guid="11111111-1111-1111-1111-111111111111">
         <File Id="dds_node_exe" Source="$(var.BuildDir)\dds-node.exe" KeyPath="yes" />
         <ServiceInstall Id="SI_DdsNode"
                         Name="DdsNode"
@@ -86,7 +122,7 @@
                         Remove="uninstall"
                         Wait="yes" />
       </Component>
-      <Component Id="C_DdsNodeConfig" Guid="22222222-2222-2222-2222-222222222222" Win64="yes" Directory="DIR_CONFIG">
+      <Component Id="C_DdsNodeConfig" Guid="22222222-2222-2222-2222-222222222222" Directory="DIR_CONFIG">
         <File Id="node_config_toml" Source="$(var.ConfigDir)\node.toml" KeyPath="yes" />
       </Component>
     </ComponentGroup>
@@ -95,7 +131,7 @@
     <!-- Component: DDS Auth Bridge service                           -->
     <!-- ============================================================ -->
     <ComponentGroup Id="CG_AuthBridge" Directory="DIR_BIN">
-      <Component Id="C_AuthBridge" Guid="33333333-3333-3333-3333-333333333333" Win64="yes">
+      <Component Id="C_AuthBridge" Guid="33333333-3333-3333-3333-333333333333">
         <File Id="auth_bridge_exe" Source="$(var.BuildDir)\DdsAuthBridge.exe" KeyPath="yes" />
         <ServiceInstall Id="SI_AuthBridge"
                         Name="DdsAuthBridge"
@@ -120,7 +156,7 @@
     <!-- Component: DDS Credential Provider DLL                       -->
     <!-- ============================================================ -->
     <ComponentGroup Id="CG_CredProv" Directory="System64Folder">
-      <Component Id="C_CredProvDll" Guid="44444444-4444-4444-4444-444444444444" Win64="yes">
+      <Component Id="C_CredProvDll" Guid="44444444-4444-4444-4444-444444444444">
         <File Id="credprov_dll" Source="$(var.BuildDir)\DdsCredentialProvider.dll" KeyPath="yes" />
 
         <!-- COM registration: HKCR\CLSID\{...}\InprocServer32 -->
@@ -150,7 +186,7 @@
     <!-- Component: DDS Policy Agent (.NET)                           -->
     <!-- ============================================================ -->
     <ComponentGroup Id="CG_PolicyAgent" Directory="DIR_BIN">
-      <Component Id="C_PolicyAgent" Guid="55555555-5555-5555-5555-555555555555" Win64="yes">
+      <Component Id="C_PolicyAgent" Guid="55555555-5555-5555-5555-555555555555">
         <File Id="policy_agent_exe" Source="$(var.BuildDir)\DdsPolicyAgent.exe" KeyPath="yes" />
         <ServiceInstall Id="SI_PolicyAgent"
                         Name="DdsPolicyAgent"
@@ -172,10 +208,19 @@
     </ComponentGroup>
 
     <!-- ============================================================ -->
+    <!-- Component: DDS Tray Agent (optional)                         -->
+    <!-- ============================================================ -->
+    <ComponentGroup Id="CG_TrayAgent" Directory="DIR_BIN">
+      <Component Id="C_TrayAgent" Guid="77777777-7777-7777-7777-777777777777">
+        <File Id="tray_agent_exe" Source="$(var.BuildDir)\DdsTrayAgent.exe" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- ============================================================ -->
     <!-- Component: ProgramData directory for vault + state           -->
     <!-- ============================================================ -->
     <ComponentGroup Id="CG_AppData" Directory="DIR_APPDATA_DDS">
-      <Component Id="C_AppDataDir" Guid="66666666-6666-6666-6666-666666666666" Win64="yes">
+      <Component Id="C_AppDataDir" Guid="66666666-6666-6666-6666-666666666666">
         <CreateFolder />
       </Component>
     </ComponentGroup>
