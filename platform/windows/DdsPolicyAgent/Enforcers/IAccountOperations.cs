@@ -41,6 +41,11 @@ public interface IAccountOperations
     void SetPasswordNeverExpires(string username, bool neverExpires);
 
     /// <summary>
+    /// Remove the user from a local group. No-op if not a member.
+    /// </summary>
+    void RemoveFromGroup(string username, string group);
+
+    /// <summary>
     /// Returns true if the machine is joined to an AD domain.
     /// The enforcer refuses account operations on domain-joined
     /// machines (v1 scope decision).

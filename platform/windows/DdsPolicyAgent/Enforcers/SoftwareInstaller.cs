@@ -158,6 +158,62 @@ public sealed class SoftwareInstaller : IEnforcer
             EnforcementStatus.Ok, null, [desc]);
     }
 
+    /// <summary>
+    /// Extract the managed-item key for a software directive.
+    /// Returns the package_id for Install actions.
+    /// </summary>
+    public static string? ExtractManagedKey(JsonElement directive)
+    {
+        var action = directive.TryGetProperty("action", out var a) ? a.GetString() : "Install";
+        if (action != "Install") return null;
+        return directive.TryGetProperty("package_id", out var id) ? id.GetString() : null;
+    }
+
+    /// <summary>
+    /// Reconcile stale software — uninstall packages that were
+    /// previously managed by DDS but are no longer assigned.
+    /// </summary>
+    public List<string> ReconcileStalePackages(
+        IReadOnlySet<string> stalePackageIds, EnforcementMode mode)
+    {
+        var changes = new List<string>();
+        foreach (var pkgId in stalePackageIds)
+        {
+            try
+            {
+                if (!_ops.IsInstalled(pkgId))
+                    continue;
+
+                var desc = $"Reconcile-Uninstall {pkgId}";
+
+                if (mode == EnforcementMode.Audit)
+                {
+                    _log.LogInformation("[AUDIT] Software reconcile: would uninstall stale '{Pkg}'", pkgId);
+                    changes.Add($"[AUDIT] {desc}");
+                    continue;
+                }
+
+                var exitCode = _ops.UninstallMsi(pkgId);
+                if (exitCode != 0)
+                {
+                    _log.LogError("Software reconcile: uninstall of '{Pkg}' failed with exit code {Code}", pkgId, exitCode);
+                    changes.Add($"FAILED: {desc} — exit code {exitCode}");
+                }
+                else
+                {
+                    _log.LogInformation("Software reconcile: uninstalled stale '{Pkg}'", pkgId);
+                    changes.Add(desc);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Software reconcile failed for '{Pkg}'", pkgId);
+                changes.Add($"FAILED: Reconcile-Uninstall {pkgId} — {ex.Message}");
+            }
+        }
+        return changes;
+    }
+
     private EnforcementOutcome ApplyUninstall(string pkgId, string desc)
     {
         if (!_ops.IsInstalled(pkgId))

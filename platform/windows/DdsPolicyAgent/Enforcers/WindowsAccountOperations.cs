@@ -129,6 +129,15 @@ public sealed class WindowsAccountOperations : IAccountOperations
                 $"NetLocalGroupAddMembers failed: '{username}' -> '{group}'");
     }
 
+    public void RemoveFromGroup(string username, string group)
+    {
+        var member = new LOCALGROUP_MEMBERS_INFO_3 { lgrmi3_domainandname = username };
+        int result = NetLocalGroupDelMembers(null, group, 3, ref member, 1);
+        if (result != 0 && result != 1377) // 1377 = ERROR_MEMBER_NOT_IN_ALIAS
+            throw new Win32Exception(result,
+                $"NetLocalGroupDelMembers failed: '{username}' from '{group}'");
+    }
+
     public void SetPasswordNeverExpires(string username, bool neverExpires)
     {
         SetUserFlag(username, UserFlags.UF_DONT_EXPIRE_PASSWD, set: neverExpires);
@@ -278,6 +287,11 @@ public sealed class WindowsAccountOperations : IAccountOperations
 
     [DllImport("netapi32.dll", CharSet = CharSet.Unicode)]
     private static extern int NetLocalGroupAddMembers(
+        string? server, string groupName, int level,
+        ref LOCALGROUP_MEMBERS_INFO_3 buf, int totalEntries);
+
+    [DllImport("netapi32.dll", CharSet = CharSet.Unicode)]
+    private static extern int NetLocalGroupDelMembers(
         string? server, string groupName, int level,
         ref LOCALGROUP_MEMBERS_INFO_3 buf, int totalEntries);
 

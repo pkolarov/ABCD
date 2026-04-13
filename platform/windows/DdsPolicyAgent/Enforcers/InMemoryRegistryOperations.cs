@@ -66,6 +66,33 @@ public sealed class InMemoryRegistryOperations : IRegistryOperations
         }
     }
 
+    public IReadOnlyList<string> GetValueNames(string hive, string subKey)
+    {
+        lock (_lock)
+        {
+            var keyPath = MakeKeyPath(hive, subKey);
+            var prefix = keyPath + @"\";
+            return _store.Keys
+                .Where(k => k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                .Select(k => k[prefix.Length..])
+                .ToList();
+        }
+    }
+
+    public IReadOnlyList<string> GetSubKeyNames(string hive, string subKey)
+    {
+        lock (_lock)
+        {
+            var keyPath = MakeKeyPath(hive, subKey);
+            var prefix = keyPath + @"\";
+            return _keys
+                .Where(k => k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                    && !k[prefix.Length..].Contains('\\'))
+                .Select(k => k[prefix.Length..])
+                .ToList();
+        }
+    }
+
     // --- test helpers ---
 
     /// <summary>Read back a value for test assertions.</summary>

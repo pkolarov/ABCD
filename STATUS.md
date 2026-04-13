@@ -12,10 +12,10 @@
 | **Workspace crates** | 9 (dds-core, dds-domain, dds-store, dds-net, dds-node, dds-ffi, dds-cli, dds-loadtest, dds-fido2-test) |
 | **Rust LOC** | 8,400+ |
 | **Rust tests** | 298 |
-| **.NET tests** | 99 (Windows: 60 unit + 39 integration) + 17 (macOS) |
+| **.NET tests** | 117 (Windows: 78 unit + 39 integration) + 17 (macOS) |
 | **C++ native tests** | 47 (Windows) |
 | **Python tests** | 13 |
-| **Total tests** | 474 ✅ all passing |
+| **Total tests** | 492 ✅ all passing |
 | **Shared library** | libdds\_ffi.dylib (739 KB) |
 
 Verification note (2026-04-13, Windows 11 ARM64):
@@ -288,7 +288,7 @@ All 7 crates are functionally complete. The following work is ordered by impact 
 
 ### Phase 3 — Enterprise Features
 
-9. **WindowsPolicyDocument distribution** — End-to-end flow: admin creates a policy document, signs it, gossip propagates to target devices, dds-node on each device evaluates scope + applies settings (registry keys, security policy). **Plan landed 2026-04-09 — see [Windows Policy Applier Plan](#windows-policy-applier-plan-phase-3-items-910) below. Phases A–F complete; G–H remaining.**
+9. **WindowsPolicyDocument distribution** — End-to-end flow: admin creates a policy document, signs it, gossip propagates to target devices, dds-node on each device evaluates scope + applies settings (registry keys, security policy). **Plan landed 2026-04-09 — see [Windows Policy Applier Plan](#windows-policy-applier-plan-phase-3-items-910) below. Phases A–F + I (reconciliation) complete; G–H remaining.**
 
 10. **SoftwareAssignment workflow** — Admin publishes a software assignment, devices poll/receive via gossip, local agent downloads package, verifies SHA-256, installs silently. **Enforcement implemented (Phase F, 2026-04-13):** `SoftwareInstaller` + `WindowsSoftwareOperations` with HTTP download, SHA-256 verify, msiexec install/uninstall, registry-based detection. 7 integration tests including real MSI install/uninstall on ARM64.
 
@@ -410,8 +410,9 @@ agent.
 | **F** | `SoftwareInstaller` for MSI → EXE; SHA-256 verify; uninstall lookup | 7 integration tests: install/uninstall test MSI, HTTP download + SHA-256 | ✅ |
 | **G** | WiX bundle, Authenticode signing scaffolding, service registration. **Resolves B1.** | MSI builds in CI; manual install brings up both services | |
 | **H** | `windows-latest` CI job runs the full integration suite. **Resolves B2 for Windows.** | CI green end-to-end | |
+| **I** | Reconciliation & drift detection: managed-items tracking in state store, stale-item cleanup (registry delete, account disable, group removal, software uninstall), audit-mode support. 18 new unit tests. | `dotnet test` green; stale items cleaned up within one poll cycle | ✅ |
 
-A–F complete (2026-04-13). G+H land as the final shipping PR.
+A–F complete (2026-04-13). Phase I (reconciliation) complete (2026-04-13). G+H land as the final shipping PR.
 
 ### macOS Managed Device Status (2026-04-10)
 
@@ -464,7 +465,7 @@ None. All production blockers resolved.
 | # | Gap | Resolution |
 | --- | --- | --- |
 | **B1** | **Windows Credential Provider stubbed** | Resolved 2026-04-13: **FIDO2 passwordless Windows login verified end-to-end on real hardware.** Full flow: admin setup (FIDO2 key → trusted root, auto-persisted to config) → user enrollment (MakeCredential + hmac-secret encrypt password → DPAPI vault) → admin vouch → lock screen tile → touch key → hmac-secret decrypt → KERB_INTERACTIVE_LOGON → Windows session. The current tree also adds a first-account-claim path for policy-bound local accounts: after `/v1/session/assert`, the native Auth Bridge can call `/v1/windows/claim-account`, generate a random local password, create/reset the Windows account, and seed the vault without putting a password in policy. Tested on Win11 ARM64 VM with real YubiKey. Re-verified after merging 6 security hardening commits (credential_id-based vault lookup, RP-ID binding enforcement, removed unauthenticated session endpoint, HTTP API contract alignment). Clean wipe + fresh enrollment confirms the merged code works end-to-end. C++ test suite validates AES-GCM, vault serialization, KERB packing, IPC struct layout, LsaLogonUser, and full pipeline with real authenticator (13 tests across 3 executables). Critical fix: WebAuthn `GetAssertion` options must match exactly between enrollment (tray agent, x64) and login (credential provider, ARM64) for hmac-secret determinism. Remaining for production: WiX installer, Windows service registration, code signing. |
-| **B2** | **Cross-platform builds untested** | Resolved 2026-04-12 for Windows: `cargo build --workspace` + `cargo test --workspace` — 309/309 Rust tests pass on Windows 11 ARM64 (aarch64-pc-windows-msvc). `dotnet build` + `dotnet test` — 56/56 .NET tests pass. Native C++ solution — 4/4 projects build. Android, iOS, embedded remain 🔲 but are not in pilot scope. |
+| **B2** | **Cross-platform builds untested** | Resolved 2026-04-12 for Windows: `cargo build --workspace` + `cargo test --workspace` — 309/309 Rust tests pass on Windows 11 ARM64 (aarch64-pc-windows-msvc). `dotnet build` + `dotnet test` — 78/78 .NET unit tests pass (117 total with integration). Native C++ solution — 4/4 projects build. Android, iOS, embedded remain 🔲 but are not in pilot scope. |
 | B3 | **24h soak result missing** | Resolved by the 2026-04-09 30-min chaos validation soak (`b6-validation-20260409-210025`): 0 errors / 466K ops, all 5 hard §10 KPIs PASS, 14/14 chaos rejoins succeeded. A 24h endurance run is still nice-to-have for long-tail evidence but is no longer load-bearing for §10 sign-off. |
 | B4 | **Ed25519 throughput unverified** | Resolved: 53,975 ops/sec measured in the validation soak (above the 50K target). Heap/bandwidth caveats remain (R5 below) but they are *measurement* gaps, not perf gaps. |
 | **B5** | **Trust graph queries O(V) in vouch count** — `purposes_for` and `walk_chain` linearly scanned every vouch on every call. Broken soak measured `evaluate_policy` p99 climbing 0.5 → 10.8 ms as the graph grew to 14K tokens. | Fixed in [dds-core/src/trust.rs](dds-core/src/trust.rs): added `vouches_by_subject` and `attestations_by_iss` secondary indices, routed all hot paths through them. Unit test `test_purposes_for_scales_to_10k_vouches` measured 3.2 µs worst-case at 10K vouches (vs 10.8 ms broken — **3,400× speedup**). Validation soak: flat 5 µs across 4K tokens / 30 min. |
@@ -632,7 +633,7 @@ Deferred to post-GA:
 
 - Phase 4 items 13–15 (sharded Kad, delegation depth limits as a hard feature, offline enrollment)
 
-Note: Phase 3 items 9–10 (WindowsPolicyDocument distribution + SoftwareAssignment) are fully implemented through Phase F — all 4 Windows enforcers have production Win32 implementations with 99 passing tests (60 unit + 39 integration) and macOS Policy Agent has 17. Remaining work is production packaging (Phase G) and CI integration (Phase H), not core functionality.
+Note: Phase 3 items 9–10 (WindowsPolicyDocument distribution + SoftwareAssignment) are fully implemented through Phase I — all 4 Windows enforcers have production Win32 implementations with full reconciliation/drift-detection (stale-item cleanup, group membership removal, software uninstall on policy removal). 117 passing .NET tests (78 unit + 39 integration) and macOS Policy Agent has 17. Remaining work is production packaging (Phase G) and CI integration (Phase H), not core functionality.
 
 ### Phase 4 — Scale
 

@@ -57,4 +57,16 @@ public interface IRegistryOperations
     /// Check if a subkey exists.
     /// </summary>
     bool KeyExists(string hive, string subKey);
+
+    /// <summary>
+    /// Enumerate the value names under a subkey. Returns an empty list
+    /// if the key does not exist.
+    /// </summary>
+    IReadOnlyList<string> GetValueNames(string hive, string subKey);
+
+    /// <summary>
+    /// Enumerate the child subkey names under a subkey. Returns an
+    /// empty list if the key does not exist.
+    /// </summary>
+    IReadOnlyList<string> GetSubKeyNames(string hive, string subKey);
 }

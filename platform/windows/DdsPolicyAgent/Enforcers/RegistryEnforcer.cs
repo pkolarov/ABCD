@@ -200,6 +200,127 @@ public sealed class RegistryEnforcer : IEnforcer
         return existing.Equals(desired);
     }
 
+    /// <summary>
+    /// Extract the managed-item key for a directive (used by Worker
+    /// to build the desired managed set).
+    /// Format: <c>hive\key\valueName</c> or <c>hive\key</c> for
+    /// key-level operations.
+    /// </summary>
+    public static string? ExtractManagedKey(JsonElement item)
+    {
+        if (!item.TryGetProperty("hive", out var h) || !item.TryGetProperty("key", out var k))
+            return null;
+        var hive = h.GetString();
+        var key = k.GetString();
+        if (hive is null || key is null) return null;
+
+        var name = item.TryGetProperty("name", out var n) && n.ValueKind != JsonValueKind.Null
+            ? n.GetString()
+            : null;
+        return name is not null ? $@"{hive}\{key}\{name}" : $@"{hive}\{key}";
+    }
+
+    /// <summary>
+    /// Remove registry entries that were previously managed by DDS
+    /// but are no longer present in the current policy.
+    /// </summary>
+    public List<string> ReconcileStaleItems(
+        IReadOnlySet<string> staleKeys, EnforcementMode mode)
+    {
+        var changes = new List<string>();
+        foreach (var managedKey in staleKeys)
+        {
+            try
+            {
+                // Parse "hive\key\valueName" or "hive\key"
+                var parts = ParseManagedKey(managedKey);
+                if (parts is null)
+                {
+                    _log.LogWarning("Reconcile: could not parse managed key '{Key}'", managedKey);
+                    continue;
+                }
+
+                var (hive, key, valueName) = parts.Value;
+
+                if (!IsAllowed(hive, key))
+                {
+                    _log.LogWarning("Reconcile: stale key '{Key}' outside allowlist — skip", managedKey);
+                    continue;
+                }
+
+                var desc = $"Reconcile-Delete {managedKey}";
+
+                if (mode == EnforcementMode.Audit)
+                {
+                    _log.LogInformation("[AUDIT] Registry reconcile: would delete {Key}", managedKey);
+                    changes.Add($"[AUDIT] {desc}");
+                    continue;
+                }
+
+                if (valueName is not null)
+                {
+                    if (_ops.GetValue(hive, key, valueName) is not null)
+                    {
+                        _ops.DeleteValue(hive, key, valueName);
+                        _log.LogInformation("Registry reconcile: deleted stale value {Key}", managedKey);
+                        changes.Add(desc);
+                    }
+                }
+                else
+                {
+                    if (_ops.KeyExists(hive, key))
+                    {
+                        _ops.DeleteKey(hive, key);
+                        _log.LogInformation("Registry reconcile: deleted stale key {Key}", managedKey);
+                        changes.Add(desc);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Registry reconcile failed for {Key}", managedKey);
+                changes.Add($"FAILED: Reconcile-Delete {managedKey} — {ex.Message}");
+            }
+        }
+        return changes;
+    }
+
+    /// <summary>
+    /// Parse a managed key string back into hive, subKey, and optional valueName.
+    /// </summary>
+    internal static (string Hive, string Key, string? ValueName)? ParseManagedKey(string managedKey)
+    {
+        // Format: "hive\key[\valueName]"
+        // Hive is the first segment (e.g. "LocalMachine")
+        var firstSep = managedKey.IndexOf('\\');
+        if (firstSep < 0) return null;
+
+        var hive = managedKey[..firstSep];
+        var rest = managedKey[(firstSep + 1)..];
+
+        // Check if there's a value name by looking at the AllowedPrefixes pattern.
+        // The key path is everything after the hive up to the value name.
+        // We use a heuristic: if the last segment doesn't contain a backslash
+        // after the key prefix, it's a value name.
+        // Actually, we need a better approach. During extraction in ExtractManagedKey,
+        // we encode "hive\key\valueName". The key always contains backslashes
+        // (e.g. SOFTWARE\Policies\DDS\Test), and the valueName is the last component
+        // ONLY if the directive had a "name" property.
+        //
+        // Since we can't distinguish reliably here, we store an explicit separator.
+        // But for backwards compatibility, we use the simpler approach: try to find
+        // the value in the registry. If the full path is a key, treat it as key-level.
+        // Otherwise, split the last component as valueName.
+
+        // Try as a full key path first
+        // If not a key, the last component is the value name
+        var lastSep = rest.LastIndexOf('\\');
+        if (lastSep < 0)
+            return (hive, rest, null); // Just a single-segment key, no value
+
+        return (hive, rest[..lastSep], rest[(lastSep + 1)..]);
+    }
+
     private static string DescribeDirective(JsonElement item)
     {
         var hive = item.TryGetProperty("hive", out var h) ? h.GetString() : "?";

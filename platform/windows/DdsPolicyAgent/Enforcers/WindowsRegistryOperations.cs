@@ -53,6 +53,18 @@ public sealed class WindowsRegistryOperations : IRegistryOperations
         return key is not null;
     }
 
+    public IReadOnlyList<string> GetValueNames(string hive, string subKey)
+    {
+        using var key = OpenBaseKey(hive).OpenSubKey(subKey);
+        return key?.GetValueNames() ?? [];
+    }
+
+    public IReadOnlyList<string> GetSubKeyNames(string hive, string subKey)
+    {
+        using var key = OpenBaseKey(hive).OpenSubKey(subKey);
+        return key?.GetSubKeyNames() ?? [];
+    }
+
     private static RegistryKey OpenBaseKey(string hive) => hive switch
     {
         "LocalMachine" => Registry.LocalMachine,

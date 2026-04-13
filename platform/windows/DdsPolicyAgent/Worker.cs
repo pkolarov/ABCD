@@ -26,14 +26,13 @@ public sealed class Worker : BackgroundService
     private readonly IAppliedStateStore _stateStore;
     private readonly AgentConfig _config;
     private readonly ILogger<Worker> _log;
-    private readonly IEnforcer _registryEnforcer;
-    private readonly IEnforcer _accountEnforcer;
-    private readonly IEnforcer _passwordPolicyEnforcer;
-    private readonly IEnforcer _softwareInstaller;
+    private readonly RegistryEnforcer _registryEnforcer;
+    private readonly AccountEnforcer _accountEnforcer;
+    private readonly PasswordPolicyEnforcer _passwordPolicyEnforcer;
+    private readonly SoftwareInstaller _softwareInstaller;
 
     // Accept concrete enforcer types so the DI container resolves them
-    // directly. The IEnforcer fields allow the dispatch loop to call
-    // them uniformly.
+    // directly and we can call reconciliation methods.
     public Worker(
         IDdsNodeClient client,
         IAppliedStateStore stateStore,
@@ -91,6 +90,13 @@ public sealed class Worker : BackgroundService
 
     private async Task PollAndApplyAsync(CancellationToken ct)
     {
+        // Collect desired managed items across all policies for reconciliation
+        var desiredRegistryKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var desiredAccounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var desiredGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var desiredSoftware = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var globalMode = EnforcementMode.Enforce;
+
         // --- policies ---
         var policies = await _client
             .GetPoliciesAsync(_config.DeviceUrn, ct)
@@ -107,24 +113,32 @@ public sealed class Worker : BackgroundService
                 ? v.ToString()
                 : "0";
 
+            var enforcement = p.Document.TryGetProperty("enforcement", out var e)
+                ? ParseMode(e.GetString())
+                : EnforcementMode.Enforce;
+            if (enforcement == EnforcementMode.Audit)
+                globalMode = EnforcementMode.Audit;
+
+            // Always extract desired items for reconciliation, even if unchanged
+            if (p.Document.TryGetProperty("windows", out var win)
+                && win.ValueKind == JsonValueKind.Object)
+            {
+                ExtractDesiredItems(win, desiredRegistryKeys, desiredAccounts, desiredGroups);
+            }
+
             if (!_stateStore.HasChanged(policyId, hash))
             {
                 _log.LogDebug("Policy {Id} v{V} unchanged — skip", policyId, version);
                 continue;
             }
 
-            var enforcement = p.Document.TryGetProperty("enforcement", out var e)
-                ? ParseMode(e.GetString())
-                : EnforcementMode.Enforce;
-
             var directives = new List<string>();
 
-            // Typed bundle
-            if (p.Document.TryGetProperty("windows", out var win)
-                && win.ValueKind == JsonValueKind.Object)
+            if (p.Document.TryGetProperty("windows", out var winApply)
+                && winApply.ValueKind == JsonValueKind.Object)
             {
                 directives.AddRange(
-                    await DispatchWindowsBundle(win, enforcement, ct).ConfigureAwait(false));
+                    await DispatchWindowsBundle(winApply, enforcement, ct).ConfigureAwait(false));
             }
 
             // Report back
@@ -148,6 +162,11 @@ public sealed class Worker : BackgroundService
                 ? v.GetString() ?? "0"
                 : "0";
 
+            // Track desired software for reconciliation
+            var managedKey = SoftwareInstaller.ExtractManagedKey(s.Document);
+            if (managedKey is not null)
+                desiredSoftware.Add(managedKey);
+
             if (!_stateStore.HasChanged(pkgId, hash))
             {
                 _log.LogDebug("Software {Id} v{V} unchanged — skip", pkgId, version);
@@ -161,6 +180,116 @@ public sealed class Worker : BackgroundService
             var directives = outcome.Changes?.ToList() ?? [];
             await ReportAsync(pkgId, version, directives, ct).ConfigureAwait(false);
             _stateStore.RecordApplied(pkgId, version, hash, "ok", isSoftware: true);
+        }
+
+        // --- reconciliation pass ---
+        await ReconcileAsync(
+            desiredRegistryKeys, desiredAccounts, desiredGroups,
+            desiredSoftware, globalMode, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Extract desired managed-item keys from a Windows policy bundle
+    /// for reconciliation tracking.
+    /// </summary>
+    private static void ExtractDesiredItems(
+        JsonElement win,
+        HashSet<string> registryKeys,
+        HashSet<string> accounts,
+        HashSet<string> groups)
+    {
+        if (win.TryGetProperty("registry", out var reg) && reg.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in reg.EnumerateArray())
+            {
+                var action = item.TryGetProperty("action", out var a) ? a.GetString() : null;
+                if (action == "Set")
+                {
+                    var key = RegistryEnforcer.ExtractManagedKey(item);
+                    if (key is not null) registryKeys.Add(key);
+                }
+            }
+        }
+
+        if (win.TryGetProperty("local_accounts", out var acct) && acct.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in acct.EnumerateArray())
+            {
+                var key = AccountEnforcer.ExtractManagedKey(item);
+                if (key is not null) accounts.Add(key);
+
+                foreach (var g in AccountEnforcer.ExtractManagedGroups(item))
+                    groups.Add(g);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Compare the current desired state with previously managed items.
+    /// Remove stale items that are no longer in the policy.
+    /// </summary>
+    private async Task ReconcileAsync(
+        HashSet<string> desiredRegistry,
+        HashSet<string> desiredAccounts,
+        HashSet<string> desiredGroups,
+        HashSet<string> desiredSoftware,
+        EnforcementMode mode,
+        CancellationToken ct)
+    {
+        var reconcileChanges = new List<string>();
+
+        // Registry reconciliation
+        var prevRegistry = _stateStore.GetManagedItems("registry");
+        var staleRegistry = new HashSet<string>(prevRegistry, StringComparer.OrdinalIgnoreCase);
+        staleRegistry.ExceptWith(desiredRegistry);
+        if (staleRegistry.Count > 0)
+        {
+            _log.LogInformation("Reconciliation: {Count} stale registry entries to clean up", staleRegistry.Count);
+            var changes = _registryEnforcer.ReconcileStaleItems(staleRegistry, mode);
+            reconcileChanges.AddRange(changes);
+        }
+        _stateStore.SetManagedItems("registry", desiredRegistry);
+
+        // Account reconciliation
+        var prevAccounts = _stateStore.GetManagedItems("accounts");
+        var staleAccounts = new HashSet<string>(prevAccounts, StringComparer.OrdinalIgnoreCase);
+        staleAccounts.ExceptWith(desiredAccounts);
+        if (staleAccounts.Count > 0)
+        {
+            _log.LogInformation("Reconciliation: {Count} stale accounts to disable", staleAccounts.Count);
+            var changes = _accountEnforcer.ReconcileStaleAccounts(staleAccounts, mode);
+            reconcileChanges.AddRange(changes);
+        }
+        _stateStore.SetManagedItems("accounts", desiredAccounts);
+
+        // Group membership reconciliation
+        var prevGroups = _stateStore.GetManagedItems("account_groups");
+        var staleGroups = new HashSet<string>(prevGroups, StringComparer.OrdinalIgnoreCase);
+        staleGroups.ExceptWith(desiredGroups);
+        if (staleGroups.Count > 0)
+        {
+            _log.LogInformation("Reconciliation: {Count} stale group memberships to remove", staleGroups.Count);
+            var changes = _accountEnforcer.ReconcileStaleGroups(staleGroups, mode);
+            reconcileChanges.AddRange(changes);
+        }
+        _stateStore.SetManagedItems("account_groups", desiredGroups);
+
+        // Software reconciliation
+        var prevSoftware = _stateStore.GetManagedItems("software_managed");
+        var staleSoftware = new HashSet<string>(prevSoftware, StringComparer.OrdinalIgnoreCase);
+        staleSoftware.ExceptWith(desiredSoftware);
+        if (staleSoftware.Count > 0)
+        {
+            _log.LogInformation("Reconciliation: {Count} stale software packages to uninstall", staleSoftware.Count);
+            var changes = _softwareInstaller.ReconcileStalePackages(staleSoftware, mode);
+            reconcileChanges.AddRange(changes);
+        }
+        _stateStore.SetManagedItems("software_managed", desiredSoftware);
+
+        if (reconcileChanges.Count > 0)
+        {
+            _log.LogInformation("Reconciliation complete: {Count} actions taken", reconcileChanges.Count);
+            await ReportAsync("_reconciliation", "1", reconcileChanges, ct).ConfigureAwait(false);
         }
     }
 

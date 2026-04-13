@@ -97,6 +97,15 @@ public sealed class InMemoryAccountOperations : IAccountOperations
         }
     }
 
+    public void RemoveFromGroup(string username, string group)
+    {
+        lock (_lock)
+        {
+            if (_accounts.TryGetValue(username, out var a))
+                a.Groups.Remove(group);
+        }
+    }
+
     public void SetPasswordNeverExpires(string username, bool neverExpires)
     {
         lock (_lock)

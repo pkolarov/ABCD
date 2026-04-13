@@ -573,6 +573,55 @@ curl -X POST http://127.0.0.1:5551/v1/macos/applied \
   -d '{"device_urn": "...", "applied_policies": [...]}'
 ```
 
+### Reconciliation & Drift Detection
+
+The Windows policy agent automatically reconciles endpoint state with the
+current policy on every poll cycle (every 60 seconds). This means:
+
+**Stale-item cleanup.** When you remove a directive from a policy (e.g., delete
+a registry entry from the `registry` array, remove a user from `local_accounts`,
+or unassign a software package), the agent detects that the item was previously
+managed by DDS but is no longer desired. It then cleans up:
+
+| Category | Cleanup action |
+|---|---|
+| Registry values | Deleted (within allowlist only) |
+| Local accounts | Disabled (not deleted, to preserve profiles) |
+| Group memberships | User removed from the group |
+| Software packages | Silently uninstalled via `msiexec /x` |
+
+**Drift correction.** If someone manually changes a DDS-managed registry value
+or re-enables a disabled account, the agent corrects the drift on the next poll
+cycle. Each enforcer reads current system state and re-applies the desired
+value if it differs.
+
+**Audit mode.** If any policy in the current cycle uses `enforcement: Audit`,
+the reconciliation pass logs what *would* be cleaned up but does not actually
+remove anything. Use this for dry-run validation before switching to `Enforce`.
+
+**Safety guarantees:**
+- Only items that DDS previously created/set are touched — pre-existing
+  system state is never modified by reconciliation.
+- Registry cleanup respects the same allowlist as forward enforcement.
+- The agent tracks managed items in `%ProgramData%\DDS\applied-state.json`
+  under the `managed_items` key.
+
+**Example: removing a registry entry from policy.**
+
+Before (policy has the entry):
+```json
+{
+  "windows": {
+    "registry": [
+      {"hive":"LocalMachine","key":"SOFTWARE\\Policies\\DDS\\Feature","name":"Enabled","value":{"Dword":1},"action":"Set"}
+    ]
+  }
+}
+```
+
+After (entry removed from policy): the agent detects `Enabled` is no longer
+desired, deletes it from the registry, and updates its managed-items tracking.
+
 ---
 
 ## Windows Deployment

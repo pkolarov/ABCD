@@ -1098,9 +1098,18 @@ The agent persists `%ProgramData%\DDS\applied-state.json`:
       "applied_at": 1712640123,
       "status": "ok"
     }
+  },
+  "managed_items": {
+    "registry": ["LocalMachine\\SOFTWARE\\Policies\\DDS\\Feature\\Enabled"],
+    "accounts": ["dds-kiosk"],
+    "account_groups": ["dds-kiosk:Users"],
+    "software_managed": ["com.example.editor"]
   }
 }
 ```
+
+The `managed_items` section tracks which items DDS currently owns on the
+endpoint, enabling reconciliation of stale items (see §14.5.9).
 
 On each poll cycle, the agent computes `SHA-256(document_json)` and compares
 to the stored `content_hash`. If unchanged, the policy is skipped entirely.
@@ -1141,6 +1150,77 @@ together.
 Audit mode is the recommended rollout strategy: publish policies in `Audit`
 first, review the agent logs, then flip to `Enforce` by publishing a new
 version of the same `policy_id` with `enforcement: Enforce`.
+
+#### 14.5.9 Reconciliation & Drift Detection
+
+Idempotent per-directive enforcement (§14.5.6) ensures the *desired* state is
+applied, but it does not address two critical scenarios:
+
+1. **Stale items** — an item was in a previous policy but has been removed from
+   the current policy. Without reconciliation, the old setting/account/package
+   persists on the endpoint indefinitely.
+2. **Drift** — an admin or script manually changes a DDS-managed value. Without
+   reconciliation, the drift is not corrected until the policy document itself
+   changes (triggering a hash difference).
+
+**Managed-items tracking.** The applied-state file is extended with a
+`managed_items` map, keyed by enforcer category:
+
+```json
+{
+  "policies": { ... },
+  "software": { ... },
+  "managed_items": {
+    "registry": ["LocalMachine\\SOFTWARE\\Policies\\DDS\\Feature\\Enabled", ...],
+    "accounts": ["dds-kiosk", "dds-audit"],
+    "account_groups": ["dds-kiosk:Users", "dds-audit:EventLogReaders"],
+    "software_managed": ["com.example.editor", "com.example.vpn"]
+  }
+}
+```
+
+**Reconciliation algorithm.** On every poll cycle, after all policies and
+software assignments have been applied, the Worker executes a reconciliation
+pass:
+
+1. **Extract desired set** — scan all current policy documents and build the
+   full set of managed-item keys per category (registry paths, usernames,
+   group memberships, package IDs).
+2. **Compute stale set** — `stale = previously_managed − desired`. Items in
+   this set were managed by DDS in a prior cycle but are absent from the
+   current policy.
+3. **Clean up stale items** — dispatch to the appropriate enforcer:
+   - **Registry:** delete the stale value or key (within allowlist).
+   - **Accounts:** disable (not delete) stale users to avoid data loss.
+   - **Group memberships:** remove the user from the stale group.
+   - **Software:** silently uninstall stale packages via `msiexec /x`.
+4. **Update managed set** — replace the stored managed-items with the
+   current desired set.
+
+**Drift correction** is handled by the existing idempotent enforcers: on every
+poll cycle, each Set/Create directive re-reads actual state and overwrites if it
+differs from desired. Because this happens every 60 seconds, manual drift is
+corrected within one poll interval — even when the policy document hash has not
+changed.
+
+**Audit mode** applies to reconciliation: when any policy in the cycle specifies
+`enforcement: Audit`, the reconciliation pass logs what *would* be removed but
+does not actually delete/disable anything.
+
+**Safety guarantees:**
+
+- The reconciliation pass only touches items DDS previously created or set
+  (tracked in `managed_items`). Pre-existing system state is never modified.
+- Registry cleanup respects the same allowlist as forward enforcement
+  (§14.5.5).
+- Account cleanup disables rather than deletes, preserving user profiles and
+  data for forensic or recovery purposes.
+- Software uninstall uses the same `msiexec /x` path as explicit Uninstall
+  directives, so it honours MSI rollback on failure.
+
+**Platform scope:** Reconciliation is implemented for Windows in v1. macOS and
+Linux reconciliation follow the same algorithm with platform-appropriate
+backends.
 
 ### 14.6 Linux Platform — Managed Device Architecture
 

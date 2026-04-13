@@ -166,6 +166,128 @@ public sealed class AccountEnforcer : IEnforcer
         return $"Enable '{username}'";
     }
 
+    /// <summary>
+    /// Extract the managed-item key for a Create directive.
+    /// Returns the username, or null for non-Create actions.
+    /// </summary>
+    public static string? ExtractManagedKey(JsonElement item)
+    {
+        var action = item.TryGetProperty("action", out var a) ? a.GetString() : null;
+        if (action != "Create") return null;
+        return item.TryGetProperty("username", out var u) ? u.GetString() : null;
+    }
+
+    /// <summary>
+    /// Extract the desired group memberships for an account directive.
+    /// Returns a set of "username:group" keys.
+    /// </summary>
+    public static IEnumerable<string> ExtractManagedGroups(JsonElement item)
+    {
+        var username = item.TryGetProperty("username", out var u) ? u.GetString() : null;
+        if (username is null) yield break;
+
+        if (item.TryGetProperty("groups", out var groups) && groups.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var g in groups.EnumerateArray())
+            {
+                var groupName = g.GetString();
+                if (groupName is not null)
+                    yield return $"{username}:{groupName}";
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reconcile stale accounts — disable users that were previously
+    /// managed by DDS but are no longer in the current policy.
+    /// Stale accounts are disabled rather than deleted to avoid data loss.
+    /// </summary>
+    public List<string> ReconcileStaleAccounts(
+        IReadOnlySet<string> staleUsernames, EnforcementMode mode)
+    {
+        if (_ops.IsDomainJoined()) return [];
+
+        var changes = new List<string>();
+        foreach (var username in staleUsernames)
+        {
+            try
+            {
+                if (!_ops.UserExists(username))
+                    continue;
+
+                var desc = $"Reconcile-Disable '{username}'";
+
+                if (mode == EnforcementMode.Audit)
+                {
+                    _log.LogInformation("[AUDIT] Account reconcile: would disable stale user '{User}'", username);
+                    changes.Add($"[AUDIT] {desc}");
+                    continue;
+                }
+
+                if (_ops.IsEnabled(username))
+                {
+                    _ops.DisableUser(username);
+                    _log.LogInformation("Account reconcile: disabled stale user '{User}'", username);
+                    changes.Add(desc);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Account reconcile failed for '{User}'", username);
+                changes.Add($"FAILED: Reconcile-Disable '{username}' — {ex.Message}");
+            }
+        }
+        return changes;
+    }
+
+    /// <summary>
+    /// Reconcile stale group memberships — remove user from groups
+    /// that DDS previously added but are no longer in the policy.
+    /// </summary>
+    public List<string> ReconcileStaleGroups(
+        IReadOnlySet<string> staleGroupKeys, EnforcementMode mode)
+    {
+        if (_ops.IsDomainJoined()) return [];
+
+        var changes = new List<string>();
+        foreach (var key in staleGroupKeys)
+        {
+            var sep = key.IndexOf(':');
+            if (sep < 0) continue;
+            var username = key[..sep];
+            var group = key[(sep + 1)..];
+
+            try
+            {
+                if (!_ops.UserExists(username))
+                    continue;
+
+                var desc = $"Reconcile-RemoveFromGroup '{username}' from '{group}'";
+
+                if (mode == EnforcementMode.Audit)
+                {
+                    _log.LogInformation("[AUDIT] Account reconcile: would remove '{User}' from '{Group}'", username, group);
+                    changes.Add($"[AUDIT] {desc}");
+                    continue;
+                }
+
+                var currentGroups = _ops.GetGroups(username);
+                if (currentGroups.Contains(group))
+                {
+                    _ops.RemoveFromGroup(username, group);
+                    _log.LogInformation("Account reconcile: removed '{User}' from '{Group}'", username, group);
+                    changes.Add(desc);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Account reconcile: failed to remove '{User}' from '{Group}'", username, group);
+                changes.Add($"FAILED: {key} — {ex.Message}");
+            }
+        }
+        return changes;
+    }
+
     private static string DescribeDirective(JsonElement item)
     {
         var user = item.TryGetProperty("username", out var u) ? u.GetString() : "?";
