@@ -41,17 +41,15 @@ env:
 
 jobs:
   build-pkg:
-    name: macOS .pkg (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
+    name: macOS .pkg (${{ matrix.arch }})
+    runs-on: macos-latest   # ARM64 runner; cross-compiles x86_64 target
     strategy:
       matrix:
         include:
-          - runner: macos-latest     # ARM64 (Apple Silicon)
-            arch: arm64
+          - arch: arm64
             rust_target: aarch64-apple-darwin
             dotnet_rid: osx-arm64
-          - runner: macos-13         # x86_64 (Intel)
-            arch: x86_64
+          - arch: x86_64
             rust_target: x86_64-apple-darwin
             dotnet_rid: osx-x64
 
@@ -80,7 +78,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: pkg-${{ matrix.arch }}
+          key: macos-pkg-${{ matrix.arch }}
 
       - name: Build Rust binaries (release)
         run: |
