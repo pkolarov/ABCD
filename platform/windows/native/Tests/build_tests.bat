@@ -48,6 +48,7 @@ cl.exe /nologo ^
     /W3 ^
     /Zi ^
     /Od ^
+    /MDd ^
     /D_DEBUG ^
     /DWIN32 ^
     /D_WINDOWS ^

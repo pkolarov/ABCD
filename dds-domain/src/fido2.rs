@@ -766,7 +766,7 @@ mod tests {
         signed.extend_from_slice(&cdh);
         let sig: P256Signature = sk.sign(&signed);
 
-        let parsed = verify_assertion(&auth_data, &cdh, &sig.to_der().as_bytes(), &pk).unwrap();
+        let parsed = verify_assertion(&auth_data, &cdh, sig.to_der().as_bytes(), &pk).unwrap();
         assert_eq!(parsed.sign_count, 42);
         assert!(parsed.user_present);
     }

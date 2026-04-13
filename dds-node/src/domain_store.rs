@@ -197,7 +197,7 @@ pub fn load_domain_key(path: &Path) -> Result<DomainKey, DomainStoreError> {
 /// in a provision bundle without writing it to disk first.
 pub fn load_domain_key_from_bytes(bytes: &[u8]) -> Result<DomainKey, DomainStoreError> {
     let value: CborValue =
-        ciborium::from_reader(&bytes[..]).map_err(|e| DomainStoreError::Cbor(e.to_string()))?;
+        ciborium::from_reader(bytes).map_err(|e| DomainStoreError::Cbor(e.to_string()))?;
     let map = value
         .as_map()
         .ok_or_else(|| DomainStoreError::Format("not a map".into()))?;
