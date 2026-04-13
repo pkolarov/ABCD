@@ -216,18 +216,17 @@ fn cmd_provision(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = flag(args, "--data-dir").map(PathBuf::from);
     let no_start = args.iter().any(|a| a == "--no-start");
 
-    let summary = provision::run_provision(
-        &bundle_path,
-        data_dir.as_deref(),
-        !no_start,
-    )?;
+    let summary = provision::run_provision(&bundle_path, data_dir.as_deref(), !no_start)?;
 
     println!();
     println!("============================================================");
     println!("  Node Provisioned");
     println!("============================================================");
     println!();
-    println!("  Domain:     {} ({})", summary.domain_name, summary.domain_id);
+    println!(
+        "  Domain:     {} ({})",
+        summary.domain_name, summary.domain_id
+    );
     println!("  Peer ID:    {}", summary.peer_id);
     if let Some(urn) = &summary.device_urn {
         println!("  Device URN: {urn}");

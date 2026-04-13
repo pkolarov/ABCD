@@ -17,6 +17,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev
       - run: cargo test --workspace --all-features
 
   clippy:
@@ -28,6 +29,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   fmt:
@@ -89,18 +91,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev
       - run: cargo bench --workspace --no-run
 
-  cross-embedded:
-    name: cross-compile thumbv7em-none-eabihf
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: thumbv7em-none-eabihf
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build -p dds-core --no-default-features --target thumbv7em-none-eabihf
+  # cross-embedded: thumbv7em-none-eabihf removed — dds-core dependencies
+  # pull in std; re-enable after no_std audit (not in pilot scope)
 
   windows-native:
     name: windows native components

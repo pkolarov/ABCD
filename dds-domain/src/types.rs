@@ -1,6 +1,6 @@
 //! Typed domain documents — each serializes to CBOR for `TokenPayload::body_cbor`.
 
-use crate::{body_types, DomainDocument};
+use crate::{DomainDocument, body_types};
 use serde::{Deserialize, Serialize};
 
 // ============================================================

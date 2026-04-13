@@ -240,7 +240,8 @@ fn make_fido2_user_attest(
     jti: &str,
 ) -> Token {
     let client_data_hash = [0xAB; 32];
-    let attestation = build_packed_self_attestation(rp_id, credential_id, cred_sk, &client_data_hash);
+    let attestation =
+        build_packed_self_attestation(rp_id, credential_id, cred_sk, &client_data_hash);
     let doc = UserAuthAttestation {
         credential_id: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(credential_id),
         attestation_object: attestation,
@@ -289,8 +290,7 @@ async fn cp_fido2_ed25519_full_lifecycle() {
     let cred_sk = SigningKey::generate(&mut OsRng);
     let rp_id = "dds.local";
     let credential_id = b"cp-e2e-cred-ed25519";
-    let stored_cred_id =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(credential_id);
+    let stored_cred_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(credential_id);
 
     // Build the trust chain: root attest → alice UserAuthAttestation → root vouches alice
     let root_attest = make_attest(&root, "att-root-cp-e2e");
@@ -483,7 +483,7 @@ async fn cp_fido2_ed25519_full_lifecycle() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cp_fido2_p256_assertion() {
     use dds_domain::fido2::build_packed_self_attestation_p256;
-    use p256::ecdsa::{signature::Signer as _, DerSignature, SigningKey as P256SigningKey};
+    use p256::ecdsa::{DerSignature, SigningKey as P256SigningKey, signature::Signer as _};
 
     let client = Client::new();
     let domain_key = dds_domain::DomainKey::from_secret_bytes("cp-p256.local", [43u8; 32]);
@@ -495,10 +495,8 @@ async fn cp_fido2_p256_assertion() {
     let rp_id = "dds.local";
     let credential_id = b"cp-e2e-cred-p256";
     let cdh = [0xEF; 32];
-    let attestation =
-        build_packed_self_attestation_p256(rp_id, credential_id, &p256_sk, &cdh);
-    let stored_cred_id =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(credential_id);
+    let attestation = build_packed_self_attestation_p256(rp_id, credential_id, &p256_sk, &cdh);
+    let stored_cred_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(credential_id);
 
     // Build trust chain with P-256 attestation embedded
     let root_attest = make_attest(&root, "att-root-p256");
@@ -652,8 +650,7 @@ async fn cp_fido2_enroll_then_assert() {
     msg.extend_from_slice(&acdh);
     let sig = cred_sk.sign(&msg);
 
-    let stored_cred_id =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(credential_id);
+    let stored_cred_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(credential_id);
     let no_vouch_resp = client
         .post(format!("{api}/v1/session/assert"))
         .json(&AssertionSessionRequestJson {

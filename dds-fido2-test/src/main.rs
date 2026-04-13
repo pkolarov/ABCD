@@ -18,8 +18,9 @@
 
 use base64::Engine;
 use ctap_hid_fido2::{
+    Cfg, FidoKeyHidFactory,
     fidokey::{GetAssertionArgsBuilder, MakeCredentialArgsBuilder},
-    verifier, Cfg, FidoKeyHidFactory,
+    verifier,
 };
 use serde::{Deserialize, Serialize};
 
@@ -68,31 +69,55 @@ fn rebuild_attestation_cbor(
 
 fn cbor_text(out: &mut Vec<u8>, s: &str) {
     let len = s.len();
-    if len < 24 { out.push(0x60 | len as u8); }
-    else if len < 256 { out.push(0x78); out.push(len as u8); }
-    else { out.push(0x79); out.extend_from_slice(&(len as u16).to_be_bytes()); }
+    if len < 24 {
+        out.push(0x60 | len as u8);
+    } else if len < 256 {
+        out.push(0x78);
+        out.push(len as u8);
+    } else {
+        out.push(0x79);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+    }
     out.extend_from_slice(s.as_bytes());
 }
 
 fn cbor_bytes(out: &mut Vec<u8>, b: &[u8]) {
     let len = b.len();
-    if len < 24 { out.push(0x40 | len as u8); }
-    else if len < 256 { out.push(0x58); out.push(len as u8); }
-    else { out.push(0x59); out.extend_from_slice(&(len as u16).to_be_bytes()); }
+    if len < 24 {
+        out.push(0x40 | len as u8);
+    } else if len < 256 {
+        out.push(0x58);
+        out.push(len as u8);
+    } else {
+        out.push(0x59);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+    }
     out.extend_from_slice(b);
 }
 
 fn cbor_int(out: &mut Vec<u8>, val: i64) {
     if val >= 0 {
         let v = val as u64;
-        if v < 24 { out.push(v as u8); }
-        else if v < 256 { out.push(0x18); out.push(v as u8); }
-        else { out.push(0x19); out.extend_from_slice(&(v as u16).to_be_bytes()); }
+        if v < 24 {
+            out.push(v as u8);
+        } else if v < 256 {
+            out.push(0x18);
+            out.push(v as u8);
+        } else {
+            out.push(0x19);
+            out.extend_from_slice(&(v as u16).to_be_bytes());
+        }
     } else {
         let v = (-1 - val) as u64;
-        if v < 24 { out.push(0x20 | v as u8); }
-        else if v < 256 { out.push(0x38); out.push(v as u8); }
-        else { out.push(0x39); out.extend_from_slice(&(v as u16).to_be_bytes()); }
+        if v < 24 {
+            out.push(0x20 | v as u8);
+        } else if v < 256 {
+            out.push(0x38);
+            out.push(v as u8);
+        } else {
+            out.push(0x39);
+            out.extend_from_slice(&(v as u16).to_be_bytes());
+        }
     }
 }
 
@@ -109,6 +134,7 @@ struct EnrollUserRequest {
     authenticator_type: String,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct EnrollmentResponse {
     urn: String,
@@ -126,6 +152,7 @@ struct SessionAssertRequest {
     duration_secs: Option<u64>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct SessionResponse {
     session_id: String,
@@ -173,10 +200,12 @@ async fn main() {
 
     let make_args = MakeCredentialArgsBuilder::new(RP_ID, &challenge_create).build();
 
-    let attestation = device.make_credential_with_args(&make_args).unwrap_or_else(|e| {
-        eprintln!("  makeCredential failed: {e}");
-        std::process::exit(1);
-    });
+    let attestation = device
+        .make_credential_with_args(&make_args)
+        .unwrap_or_else(|e| {
+            eprintln!("  makeCredential failed: {e}");
+            std::process::exit(1);
+        });
 
     // Verify the attestation locally first
     let verify_result = verifier::verify_attestation(RP_ID, &challenge_create, &attestation);
@@ -188,9 +217,11 @@ async fn main() {
     let credential_id = &verify_result.credential_id;
     let credential_id_b64url = b64url(credential_id);
     println!("  Credential created and verified!");
-    println!("  ID: {}... ({} bytes)",
-             &credential_id_b64url[..20.min(credential_id_b64url.len())],
-             credential_id.len());
+    println!(
+        "  ID: {}... ({} bytes)",
+        &credential_id_b64url[..20.min(credential_id_b64url.len())],
+        credential_id.len()
+    );
 
     // Rebuild CBOR attestation object for dds-node enrollment
     let attestation_object = rebuild_attestation_cbor(
@@ -260,10 +291,12 @@ async fn main() {
         .credential_id(credential_id)
         .build();
 
-    let assertions = device.get_assertion_with_args(&assert_args).unwrap_or_else(|e| {
-        eprintln!("  getAssertion failed: {e}");
-        std::process::exit(1);
-    });
+    let assertions = device
+        .get_assertion_with_args(&assert_args)
+        .unwrap_or_else(|e| {
+            eprintln!("  getAssertion failed: {e}");
+            std::process::exit(1);
+        });
 
     if assertions.is_empty() {
         eprintln!("  getAssertion returned no assertions");
@@ -278,9 +311,15 @@ async fn main() {
         &challenge_assert,
         assertion,
     );
-    println!("  Assertion received! (local verify: {})", if ok { "PASS" } else { "FAIL" });
-    println!("  authData: {} bytes, signature: {} bytes",
-             assertion.auth_data.len(), assertion.signature.len());
+    println!(
+        "  Assertion received! (local verify: {})",
+        if ok { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  authData: {} bytes, signature: {} bytes",
+        assertion.auth_data.len(),
+        assertion.signature.len()
+    );
 
     // Step 5: POST assertion to dds-node /v1/session/assert
     println!();

@@ -523,9 +523,11 @@ fn test_extract_wrong_type_returns_none() {
     assert!(DeviceJoinDocument::extract(&payload).unwrap().is_none());
     assert!(WindowsPolicyDocument::extract(&payload).unwrap().is_none());
     assert!(SoftwareAssignment::extract(&payload).unwrap().is_none());
-    assert!(ServicePrincipalDocument::extract(&payload)
-        .unwrap()
-        .is_none());
+    assert!(
+        ServicePrincipalDocument::extract(&payload)
+            .unwrap()
+            .is_none()
+    );
     assert!(SessionDocument::extract(&payload).unwrap().is_some());
 }
 

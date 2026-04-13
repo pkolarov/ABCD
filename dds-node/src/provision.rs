@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ciborium::value::Value as CborValue;
-use dds_domain::domain::{from_hex, to_hex, DomainId};
 use dds_domain::Domain;
+use dds_domain::domain::{DomainId, from_hex, to_hex};
 use zeroize::Zeroize;
 
 use crate::{domain_store, identity_store, p2p_identity};
@@ -213,8 +213,7 @@ pub fn create_bundle(
     let domain_key_bin = domain_dir.join("domain_key.bin");
 
     let domain = domain_store::load_domain_file(&domain_toml)?;
-    let key_blob =
-        std::fs::read(&domain_key_bin).map_err(|e| ProvisionError::Io(e.to_string()))?;
+    let key_blob = std::fs::read(&domain_key_bin).map_err(|e| ProvisionError::Io(e.to_string()))?;
 
     let bundle = ProvisionBundle {
         domain_name: domain.name,
@@ -300,9 +299,7 @@ pub fn run_provision(
     println!("  Domain: {} ({})", bundle.domain_name, bundle.domain_id);
 
     // 2. Determine directories
-    let data_dir = data_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(default_data_dir);
+    let data_dir = data_dir.map(PathBuf::from).unwrap_or_else(default_data_dir);
     let config_dir = data_dir
         .parent()
         .map(PathBuf::from)
@@ -368,11 +365,8 @@ pub fn run_provision(
     domain_store::save_domain_file(&data_dir.join("domain.toml"), &domain)?;
 
     // node_key.bin
-    let _node_ident = identity_store::load_or_create(
-        &data_dir.join("node_key.bin"),
-        "dds-node",
-    )
-    .map_err(|e| ProvisionError::Io(format!("node key: {e}")))?;
+    let _node_ident = identity_store::load_or_create(&data_dir.join("node_key.bin"), "dds-node")
+        .map_err(|e| ProvisionError::Io(format!("node key: {e}")))?;
 
     // dds.toml
     let config_path = config_dir.join("dds.toml");
@@ -407,8 +401,7 @@ audit_log_enabled = false
         domain_pubkey = bundle.domain_pubkey,
         admission = admission_path.display(),
     );
-    std::fs::write(&config_path, &config_content)
-        .map_err(|e| ProvisionError::Io(e.to_string()))?;
+    std::fs::write(&config_path, &config_content).map_err(|e| ProvisionError::Io(e.to_string()))?;
     println!("  Config: {}", config_path.display());
 
     // Verify no domain_key.bin leaked to data_dir
@@ -539,7 +532,12 @@ fn enroll_this_device(api_url: &str, org_hash: &str) -> Result<String, Provision
 
     let body = format!(
         r#"{{"label":"{}","device_id":"{}","hostname":"{}","os":"{}","os_version":"{}","tpm_ek_hash":null,"org_unit":"{}","tags":["auto-provisioned"]}}"#,
-        hostname, device_id, hostname, os_name, std::env::consts::ARCH, org_hash
+        hostname,
+        device_id,
+        hostname,
+        os_name,
+        std::env::consts::ARCH,
+        org_hash
     );
 
     let output = std::process::Command::new("curl")

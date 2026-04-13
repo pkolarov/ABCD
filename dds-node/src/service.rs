@@ -1338,7 +1338,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
             buf
         };
 
-        use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
         let cipher = Aes256Gcm::new_from_slice(&wrap_key)
             .map_err(|e| ServiceError::Store(format!("AES key init: {e}")))?;
         let nonce = Nonce::from_slice(&iv);
@@ -1382,7 +1382,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore> LocalService<S> {
         let ciphertext = &blob[12..];
 
         let wrap_key = self.admin_wrap_key();
-        use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
         let cipher = Aes256Gcm::new_from_slice(&wrap_key)
             .map_err(|e| ServiceError::Store(format!("AES key init: {e}")))?;
         let nonce = Nonce::from_slice(iv);
@@ -2089,12 +2089,13 @@ mod platform_applier_tests {
         );
         assert_eq!(claim.password_never_expires, Some(true));
 
-        assert!(svc
-            .trust_graph
-            .read()
-            .unwrap()
-            .validate_chain(&user.id.to_urn(), &roots)
-            .is_ok());
+        assert!(
+            svc.trust_graph
+                .read()
+                .unwrap()
+                .validate_chain(&user.id.to_urn(), &roots)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2201,9 +2202,10 @@ mod platform_applier_tests {
         let err = svc
             .resolve_windows_account_claim(&device_urn, &session.token_cbor)
             .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("multiple conflicting windows account claims"));
+        assert!(
+            err.to_string()
+                .contains("multiple conflicting windows account claims")
+        );
     }
 
     #[test]

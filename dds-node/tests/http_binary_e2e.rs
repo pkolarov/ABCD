@@ -543,9 +543,14 @@ async fn binary_http_api_end_to_end() {
 
     // The FIDO2-enrolled alice doesn't have a vouch from root, so
     // session assertion should fail (no granted purposes).
-    let session_resp =
-        post_session_assert(&client, &node.fixture.api_url, &alice_cred_b64, &alice_sk, rp_id)
-            .await;
+    let session_resp = post_session_assert(
+        &client,
+        &node.fixture.api_url,
+        &alice_cred_b64,
+        &alice_sk,
+        rp_id,
+    )
+    .await;
     // Without a vouch, expect failure (subject has no granted purposes).
     assert!(
         !session_resp.status().is_success(),

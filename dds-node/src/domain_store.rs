@@ -288,7 +288,9 @@ pub fn load_domain_key_from_bytes(bytes: &[u8]) -> Result<DomainKey, DomainStore
                 .map_err(|e| DomainStoreError::Crypto(format!("decrypt: {e}")))?;
             k.zeroize();
             if pt.len() != 32 {
-                return Err(DomainStoreError::Format("decrypted key wrong length".into()));
+                return Err(DomainStoreError::Format(
+                    "decrypted key wrong length".into(),
+                ));
             }
             let mut k = [0u8; 32];
             k.copy_from_slice(&pt);
@@ -335,9 +337,7 @@ pub fn load_admission_cert(path: &Path) -> Result<AdmissionCert, DomainStoreErro
 /// No passphrase needed — touch the FIDO2 key to create/decrypt.
 #[cfg(feature = "fido2")]
 pub fn save_domain_key_fido2(path: &Path, key: &DomainKey) -> Result<Vec<u8>, DomainStoreError> {
-    use ctap_hid_fido2::{
-        fidokey::MakeCredentialArgsBuilder, verifier, Cfg, FidoKeyHidFactory,
-    };
+    use ctap_hid_fido2::{Cfg, FidoKeyHidFactory, fidokey::MakeCredentialArgsBuilder, verifier};
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| DomainStoreError::Io(e.to_string()))?;
@@ -428,13 +428,11 @@ pub fn save_domain_key_fido2(path: &Path, key: &DomainKey) -> Result<Vec<u8>, Do
 /// Perform a FIDO2 getAssertion with hmac-secret extension to derive a
 /// deterministic 32-byte key from the authenticator.
 #[cfg(feature = "fido2")]
-fn fido2_hmac_secret(
-    credential_id: &[u8],
-    hmac_salt: &[u8],
-) -> Result<Vec<u8>, DomainStoreError> {
+fn fido2_hmac_secret(credential_id: &[u8], hmac_salt: &[u8]) -> Result<Vec<u8>, DomainStoreError> {
     use ctap_hid_fido2::{
+        Cfg, FidoKeyHidFactory,
         fidokey::{GetAssertionArgsBuilder, get_assertion::Extension},
-        verifier, Cfg, FidoKeyHidFactory,
+        verifier,
     };
 
     let device = FidoKeyHidFactory::create(&Cfg::init())
