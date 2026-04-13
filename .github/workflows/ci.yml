@@ -129,12 +129,84 @@ jobs:
         working-directory: platform\windows\native\Tests
         run: .\run_all_tests.bat
 
-      # ---- .NET DdsPolicyAgent ----
+      # ---- .NET DdsPolicyAgent (both net8.0 and net9.0) ----
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
-      - name: Build DdsPolicyAgent
+          dotnet-version: |
+            8.0.x
+            9.0.x
+      - name: Build DdsPolicyAgent (net8.0 + net9.0)
         run: dotnet build platform\windows\DdsPolicyAgent\DdsPolicyAgent.csproj -c Debug
-      - name: Test DdsPolicyAgent
-        run: dotnet test platform\windows\DdsPolicyAgent.Tests\DdsPolicyAgent.Tests.csproj -c Debug --filter "Category!=Integration"
+      - name: Test DdsPolicyAgent (net8.0)
+        run: dotnet test platform\windows\DdsPolicyAgent.Tests\DdsPolicyAgent.Tests.csproj -c Debug --framework net8.0 --filter "Category!=Integration"
+      - name: Test DdsPolicyAgent (net9.0)
+        run: dotnet test platform\windows\DdsPolicyAgent.Tests\DdsPolicyAgent.Tests.csproj -c Debug --framework net9.0 --filter "Category!=Integration"
+
+      # ---- MSI compile verification ----
+      - name: Install WiX
+        run: dotnet tool install --global wix --version 5.0.2
+      - name: Publish DdsPolicyAgent for MSI staging
+        run: >
+          dotnet publish platform\windows\DdsPolicyAgent\DdsPolicyAgent.csproj
+          --configuration Release
+          --runtime win-x64
+          --self-contained true
+          --framework net9.0
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          --output stage\dotnet
+      - name: Build C++ native (x64 Release)
+        run: >
+          msbuild platform\windows\native\DdsNative.sln
+          /p:Configuration=Release
+          /p:Platform=x64
+          /m
+          /verbosity:minimal
+      - name: Stage binaries for MSI
+        shell: pwsh
+        run: |
+          $stage = "stage\x64"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item "target\x86_64-pc-windows-msvc\release\dds-node.exe" $stage -ErrorAction Stop
+          $nativeBuild = "platform\windows\native\build\Release"
+          @("DdsAuthBridge.exe", "DdsCredentialProvider.dll", "DdsTrayAgent.exe") | ForEach-Object {
+            $src = Join-Path $nativeBuild $_
+            if (Test-Path $src) { Copy-Item $src $stage }
+            else { Write-Warning "Not found: $src" }
+          }
+          Copy-Item "stage\dotnet\DdsPolicyAgent.exe" $stage
+          Write-Host "Staged binaries:"
+          Get-ChildItem $stage | Format-Table Name, Length
+      - name: Verify MSI compiles
+        shell: pwsh
+        run: |
+          wix build platform\windows\installer\DdsBundle.wxs `
+            -o "out\DDS-ci-verify-x64.msi" `
+            -d BuildDir="stage\x64" `
+            -d ConfigDir="platform\windows\installer\config" `
+            -d Platform="x64" `
+            -d Version="0.0.0.0" `
+            -arch x64
+          $msi = Get-Item "out\DDS-ci-verify-x64.msi"
+          Write-Host "MSI compiled: $($msi.Name), size: $([math]::Round($msi.Length/1MB,1)) MB"
+          if ($msi.Length -lt 1MB) { throw "MSI too small — likely missing binaries" }
+
+      # ---- E2E smoke test ----
+      - name: Run Windows E2E smoke test
+        shell: pwsh
+        run: |
+          # The smoke test auto-finds binaries in target\debug or target\release
+          # Build was done with --target so binaries are under target\x86_64-pc-windows-msvc\
+          # Create a symlink so the smoke test finds them
+          $debugDir = "target\debug"
+          $srcDir = "target\x86_64-pc-windows-msvc\debug"
+          if ((-not (Test-Path "$debugDir\dds-node.exe")) -and (Test-Path "$srcDir\dds-node.exe")) {
+            New-Item -ItemType Directory -Path $debugDir -Force | Out-Null
+            Copy-Item "$srcDir\dds-node.exe" "$debugDir\dds-node.exe"
+            if (Test-Path "$srcDir\dds.exe") {
+              Copy-Item "$srcDir\dds.exe" "$debugDir\dds.exe"
+            }
+          }
+          & platform\windows\e2e\smoke_test.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Smoke test failed with exit code $LASTEXITCODE" }

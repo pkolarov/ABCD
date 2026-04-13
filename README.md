@@ -22,6 +22,16 @@ cargo build -p dds-ffi --release
 python3 -m pytest bindings/python/test_dds.py -v
 ```
 
+### Windows MSI Installer
+
+```powershell
+# Build the all-in-one MSI (installs node, credential provider, auth bridge, policy agent)
+cd platform\windows\installer
+.\Build-Msi.ps1 -Platform x64   # or arm64
+```
+
+See [DDS Admin Guide — Windows Deployment](docs/DDS-Admin-Guide.md#windows-deployment) for details.
+
 ## Documentation
 
 | Document | Audience | Description |

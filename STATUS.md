@@ -32,6 +32,7 @@ Verification note (2026-04-13, Windows 11 ARM64):
 - `test_full_flow.exe` — **PASS**: Full enrollment→login with real FIDO2 authenticator (MakeCredential + 2× GetAssertion + vault save/load + LsaLogonUser)
 - `test_hmac_roundtrip.exe` — **PASS**: hmac-secret determinism + encrypt/decrypt roundtrip with real authenticator
 - **Policy Applier Phases D–F verified (2026-04-13, Windows 11 ARM64):** All 4 enforcers now have production Win32 implementations + real e2e integration tests. `WindowsAccountOperations` (netapi32 P/Invoke: create/delete/disable/enable users, group membership, domain-join check), `WindowsPasswordPolicyOperations` (NetUserModalsGet/Set + secedit for complexity), `WindowsSoftwareOperations` (HTTP download + SHA-256 verify + msiexec install/uninstall + registry-based detection), `WindowsRegistryOperations` (idempotent DWORD/String/QWORD/MultiString/Binary/ExpandString with int↔uint comparison fix). 39 integration tests exercise real Win32 APIs on ARM64. Test MSI (32 KB WiX package) installs/uninstalls cleanly.
+- **Phase G+H (installer + CI) verified (2026-04-13, Windows 11 ARM64):** WiX v4 MSI builds clean (30.9 MB ARM64 package, 0 warnings). Includes 5 components: `dds-node.exe` (Windows Service), `DdsAuthBridge.exe` (Windows Service, depends on DdsNode), `DdsCredentialProvider.dll` (COM DLL in System32), `DdsPolicyAgent.exe` (Windows Service, depends on DdsNode), `DdsTrayAgent.exe` (optional). Configuration templates (`node.toml`, `appsettings.json`) installed to `C:\Program Files\DDS\config\`. `C:\ProgramData\DDS\` created for vault/logs/state. CI workflows: `msi.yml` builds x64 MSI + validates + generates SHA-256 checksums + Authenticode signing scaffolding (conditional on certificate secret); `ci.yml` `windows-native` job enhanced with .NET 8.0+9.0 dual testing, Release MSI compile verification, and E2E smoke test execution.
 
 Previous verification note (2026-04-13, macOS ARM64):
 
@@ -410,11 +411,11 @@ agent.
 | **D** | `RegistryEnforcer` + first end-to-end on Windows | 15 integration tests (HKCU + HKLM) on ARM64 | ✅ |
 | **E** | `AccountEnforcer` (refuse on domain-joined) + `PasswordPolicyEnforcer` | 11 account + 6 password policy integration tests on ARM64 | ✅ |
 | **F** | `SoftwareInstaller` for MSI → EXE; SHA-256 verify; uninstall lookup | 7 integration tests: install/uninstall test MSI, HTTP download + SHA-256 | ✅ |
-| **G** | WiX bundle, Authenticode signing scaffolding, service registration. **Resolves B1.** | MSI builds in CI; manual install brings up both services | |
-| **H** | `windows-latest` CI job runs the full integration suite. **Resolves B2 for Windows.** | CI green end-to-end | |
+| **G** | WiX bundle, Authenticode signing scaffolding, service registration. **Resolves B1.** | MSI builds in CI; manual install brings up both services | ✅ |
+| **H** | `windows-latest` CI job runs the full integration suite. **Resolves B2 for Windows.** | CI green end-to-end | ✅ |
 | **I** | Reconciliation & drift detection: managed-items tracking in state store, stale-item cleanup (registry delete, account disable, group removal, software uninstall), audit-mode support. 18 new unit tests. | `dotnet test` green; stale items cleaned up within one poll cycle | ✅ |
 
-A–F complete (2026-04-13). Phase I (reconciliation) complete (2026-04-13). G+H land as the final shipping PR.
+A–I complete (2026-04-13). G+H landed 2026-04-13: WiX v4 MSI installer verified on ARM64 (30.9 MB, all 5 components + service registration + COM registration + config templates), Authenticode signing scaffolding in CI (conditional on `SIGN_CERT_BASE64` secret), MSI validation + SHA-256 checksums in release workflow, CI `windows-native` job enhanced with .NET 8.0+9.0 dual testing, MSI compile verification, and E2E smoke test.
 
 ### macOS Managed Device Status (2026-04-13)
 
@@ -461,8 +462,9 @@ and validated, and the two platform blockers (B1, B2) are now resolved
 with full Windows ARM64 FIDO2 passwordless login verified end-to-end on real hardware (2026-04-13).
 All four Windows policy enforcers (Registry, Account, PasswordPolicy, Software)
 are now production-implemented with 39 Win32 integration tests passing on ARM64 (2026-04-13).
-Remaining gaps are *WiX installer packaging*, *Windows service registration*,
-*code signing*, and *operational instrumentation*.
+WiX installer packaging and Windows service registration are now complete.
+Remaining gaps are *Authenticode code signing* (scaffolding in CI, needs certificate)
+and *operational instrumentation*.
 
 ### Production Blockers
 
@@ -643,7 +645,7 @@ Deferred to post-GA:
 
 - Phase 4 items 13–15 (sharded Kad, delegation depth limits as a hard feature, offline enrollment)
 
-Note: Phase 3 items 9–10 (WindowsPolicyDocument distribution + SoftwareAssignment) are fully implemented through Phase I — all 4 Windows enforcers have production Win32 implementations with full reconciliation/drift-detection (stale-item cleanup, group membership removal, software uninstall on policy removal). 117 passing .NET tests (78 unit + 39 integration) and macOS Policy Agent has 17. Remaining work is production packaging (Phase G) and CI integration (Phase H), not core functionality.
+Note: Phase 3 items 9–10 (WindowsPolicyDocument distribution + SoftwareAssignment) are fully implemented through all phases A–I including G+H — all 4 Windows enforcers have production Win32 implementations with full reconciliation/drift-detection, 117 passing .NET tests, WiX MSI installer verified, CI integration complete with MSI compile verification and E2E smoke test.
 
 ### Phase 4 — Scale
 

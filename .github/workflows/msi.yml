@@ -102,8 +102,8 @@ jobs:
           --runtime win-x64
           --self-contained true
           --framework net9.0
-          /p:PublishSingleFile=true
-          /p:IncludeNativeLibrariesForSelfExtract=true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
           --output stage\dotnet
 
       # ── Stage binaries ───────────────────────────────────────────
@@ -137,6 +137,7 @@ jobs:
       - name: Build MSI (x64)
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Path out -Force | Out-Null
           $msiName = "DDS-${{ steps.version.outputs.version }}-x64.msi"
           wix build platform\windows\installer\DdsBundle.wxs `
             -o "out\$msiName" `
@@ -148,12 +149,76 @@ jobs:
           Write-Host "Built: out\$msiName"
           Get-ChildItem out\*.msi | Format-Table Name, @{N='Size (MB)';E={[math]::Round($_.Length/1MB,1)}}
 
+      # ── Authenticode signing (when certificate is available) ──────
+      - name: Sign binaries (Authenticode)
+        if: env.SIGN_CERT != ''
+        shell: pwsh
+        env:
+          SIGN_CERT: ${{ secrets.SIGN_CERT_BASE64 }}
+          SIGN_CERT_PASSWORD: ${{ secrets.SIGN_CERT_PASSWORD }}
+          SIGN_TIMESTAMP_URL: http://timestamp.digicert.com
+        run: |
+          # Decode the PFX certificate from base64
+          $certPath = [System.IO.Path]::GetTempFileName() + ".pfx"
+          [System.Convert]::FromBase64String($env:SIGN_CERT) | Set-Content $certPath -AsByteStream
+
+          # Sign each binary and the MSI
+          $filesToSign = @(
+            "stage\x64\dds-node.exe",
+            "stage\x64\DdsAuthBridge.exe",
+            "stage\x64\DdsCredentialProvider.dll",
+            "stage\x64\DdsPolicyAgent.exe",
+            "stage\x64\DdsTrayAgent.exe"
+          ) + @(Get-ChildItem "out\*.msi" | ForEach-Object { $_.FullName })
+
+          foreach ($file in $filesToSign) {
+            if (Test-Path $file) {
+              & signtool sign /f $certPath /p $env:SIGN_CERT_PASSWORD `
+                /tr $env:SIGN_TIMESTAMP_URL /td sha256 /fd sha256 `
+                /d "DDS Windows Platform" $file
+              Write-Host "Signed: $file"
+            }
+          }
+
+          # Clean up
+          Remove-Item $certPath -Force
+
+      # ── Validate MSI ─────────────────────────────────────────────
+      - name: Validate MSI
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem "out\*.msi" | Select-Object -First 1
+          if (-not $msi) { throw "No MSI found in out\" }
+
+          # Basic size sanity check (MSI should be > 1 MB with all binaries)
+          $sizeMB = [math]::Round($msi.Length / 1MB, 1)
+          Write-Host "MSI size: $sizeMB MB"
+          if ($msi.Length -lt 1MB) { throw "MSI suspiciously small: $sizeMB MB" }
+
+          # Validate with wix
+          wix msi validate $msi.FullName
+          Write-Host "MSI validation passed"
+
+      # ── SHA-256 checksums ────────────────────────────────────────
+      - name: Generate SHA-256 checksums
+        shell: pwsh
+        run: |
+          $checksumFile = "out\SHA256SUMS.txt"
+          Get-ChildItem "out\*.msi" | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)" | Tee-Object -Append -FilePath $checksumFile
+          }
+          Write-Host "Checksums:"
+          Get-Content $checksumFile
+
       # ── Upload artifact ──────────────────────────────────────────
       - name: Upload MSI
         uses: actions/upload-artifact@v4
         with:
           name: DDS-MSI-x64
-          path: out/*.msi
+          path: |
+            out/*.msi
+            out/SHA256SUMS.txt
           if-no-files-found: error
 
   # ── Release job (only on tags) ─────────────────────────────────
@@ -178,6 +243,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.msi
+          files: |
+            artifacts/*.msi
+            artifacts/SHA256SUMS.txt
           generate_release_notes: true
           draft: true

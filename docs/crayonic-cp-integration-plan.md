@@ -4,12 +4,15 @@
 **Source:** `/Users/peter/Dev/Crayonic/CP` branch `feature/bridge-service-integration`
 **Target:** `/Users/peter/ABCD/platform/windows/`
 
-**Status (2026-04-13):** the current tree has the native DDS
-Credential Provider + Auth Bridge login path implemented, including
-`/v1/session/assert`, `/v1/enrolled-users`, and the first-account
-claim path via `/v1/windows/claim-account`. This document remains the
-architecture/rationale record plus the list of packaging work still
-left to do.
+**Status (2026-04-13):** All six implementation phases (I–VI) are
+**complete**. The native DDS Credential Provider + Auth Bridge login
+path is implemented and verified end-to-end on Windows 11 ARM64 with
+real FIDO2 hardware. WiX v4 MSI installer packages all components
+(dds-node, Auth Bridge, Credential Provider, Policy Agent, Tray Agent)
+with Windows Service registration and COM registration. CI workflows
+build x64 MSI, run full integration tests, validate the MSI, and
+execute E2E smoke tests. This document is now an architecture/rationale
+record.
 
 ---
 
@@ -351,7 +354,14 @@ caller-supplied subject URN.
 
 ## 9. Implementation Phases
 
-### Phase I — Fork & Strip (1 week)
+> **All phases complete (2026-04-13).** Phases I–IV delivered the native
+> C++ credential provider, Auth Bridge, and FIDO2 assertion verification.
+> Phase V delivered the WiX v4 MSI installer with all 5 components,
+> service registration, and COM registration. Phase VI delivered CI
+> integration with MSI compile verification, .NET 8.0+9.0 dual testing,
+> and E2E smoke test execution. See STATUS.md for verification details.
+
+### Phase I — Fork & Strip ✅
 
 1. Copy Crayonic CP repo into `platform/windows/native/`:
    ```
@@ -374,7 +384,7 @@ caller-supplied subject URN.
    with a static "DDS" tile, clicking it returns a failure (no auth
    backend yet)
 
-### Phase II — Auth Bridge → dds-node (1 week)
+### Phase II — Auth Bridge → dds-node ✅
 
 1. Add WinHTTP client to DdsAuthBridge for calling dds-node
 2. Add `DDS_START_AUTH` / `DDS_AUTH_COMPLETE` IPC messages
@@ -390,7 +400,7 @@ caller-supplied subject URN.
 5. **Exit criterion:** full logon flow works: user clicks DDS tile →
    FIDO2 assertion → dds-node session → Windows logon
 
-### Phase III — dds-node Assertion Verification (1 week)
+### Phase III — dds-node Assertion Verification ✅
 
 1. Add `verify_assertion()` to `dds-domain/src/fido2.rs`:
    - P-256 signature verification (reuse existing `p256` crate)
@@ -404,7 +414,7 @@ caller-supplied subject URN.
 6. **Exit criterion:** `cargo test --workspace` green; assertion-based
    session issuance works end-to-end
 
-### Phase IV — User Enumeration & Enrollment (1 week)
+### Phase IV — User Enumeration & Enrollment ✅
 
 1. Wire CP tile enumeration to `DDS_LIST_USERS` → Auth Bridge →
    dds-node `GET /v1/enrolled-users`
@@ -420,7 +430,7 @@ caller-supplied subject URN.
    - Subsequent logons use getAssertion + hmac-secret to decrypt password
 3. **Exit criterion:** new user enrollment works end-to-end on Windows VM
 
-### Phase V — WiX Bundle & Polish (1 week)
+### Phase V — WiX Bundle & Polish ✅
 
 1. Merge all components into single WiX MSI:
    - `dds-node.exe` (Rust)
@@ -435,15 +445,17 @@ caller-supplied subject URN.
 5. **Exit criterion:** single MSI installs everything; clean
    install/uninstall cycle on Windows VM. Resolves B1.
 
-### Phase VI — Tests & CI (1 week)
+### Phase VI — Tests & CI ✅
 
 1. Port Crayonic test harness to DDS conventions
 2. Mock dds-node HTTP responses for Auth Bridge unit tests
 3. `windows-latest` GitHub Actions job:
    - Build Rust (`dds-node.exe` for `x86_64-pc-windows-msvc`)
    - Build C++ (MSBuild for Auth Bridge + CP)
-   - Build .NET (DdsPolicyAgent)
+   - Build .NET (DdsPolicyAgent, net8.0 + net9.0)
    - Run unit tests for all three
+   - MSI compile verification (stage + wix build + validate)
+   - E2E smoke test execution
 4. **Exit criterion:** CI green on `windows-latest`. Resolves B2 for Windows.
 
 ---

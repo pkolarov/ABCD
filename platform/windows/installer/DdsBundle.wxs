@@ -114,7 +114,8 @@
                         Type="ownProcess"
                         Start="auto"
                         Account="LocalSystem"
-                        ErrorControl="normal" />
+                        ErrorControl="normal"
+                        Arguments="run --config &quot;[DIR_CONFIG]node.toml&quot;" />
         <ServiceControl Id="SC_DdsNode"
                         Name="DdsNode"
                         Start="install"
@@ -155,8 +156,10 @@
     <!-- ============================================================ -->
     <!-- Component: DDS Credential Provider DLL                       -->
     <!-- ============================================================ -->
+    <!-- ICE09 warns about non-permanent System32 component; this is intentional
+         for credential providers — they must live in System32 for logonui.exe -->
     <ComponentGroup Id="CG_CredProv" Directory="System64Folder">
-      <Component Id="C_CredProvDll" Guid="44444444-4444-4444-4444-444444444444">
+      <Component Id="C_CredProvDll" Guid="44444444-4444-4444-4444-444444444444" Permanent="yes">
         <File Id="credprov_dll" Source="$(var.BuildDir)\DdsCredentialProvider.dll" KeyPath="yes" />
 
         <!-- COM registration: HKCR\CLSID\{...}\InprocServer32 -->
@@ -195,7 +198,8 @@
                         Type="ownProcess"
                         Start="auto"
                         Account="LocalSystem"
-                        ErrorControl="normal">
+                        ErrorControl="normal"
+                        Arguments="--contentRoot &quot;[INSTALLFOLDER]&quot;">
           <ServiceDependency Id="DdsNode" />
         </ServiceInstall>
         <ServiceControl Id="SC_PolicyAgent"
@@ -204,6 +208,9 @@
                         Stop="both"
                         Remove="uninstall"
                         Wait="yes" />
+      </Component>
+      <Component Id="C_PolicyAgentConfig" Guid="88888888-8888-8888-8888-888888888888" Directory="DIR_CONFIG">
+        <File Id="policy_agent_appsettings" Source="$(var.ConfigDir)\appsettings.json" KeyPath="yes" />
       </Component>
     </ComponentGroup>
 

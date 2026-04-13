@@ -57,3 +57,10 @@ The Rust tests use the same `build_packed_self_attestation()` and
 `build_assertion_auth_data()` helpers from `dds-domain::fido2` that
 the unit tests use, but exercise them through the full HTTP API stack
 against a real dds-node binary.
+
+## CI
+
+The smoke test runs automatically in the `windows-native` job of
+`.github/workflows/ci.yml` on every push to `main` and every PR.
+The CI job also verifies that the WiX MSI compiles successfully
+with all staged binaries.

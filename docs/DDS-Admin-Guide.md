@@ -633,7 +633,8 @@ desired, deletes it from the registry, and updates its managed-items tracking.
 | `dds-node.exe` | Rust binary (Windows Service) | P2P node + HTTP API |
 | DDS Credential Provider | C++ COM DLL | Logon screen FIDO2 tile |
 | DDS Auth Bridge | C++ Windows Service | Mediates between CP and dds-node |
-| DDS Policy Agent | .NET 8.0 Windows Service | Enforces GPO-equivalent policy |
+| DDS Policy Agent | .NET Windows Service | Enforces GPO-equivalent policy |
+| DDS Tray Agent | C++ desktop app (optional) | Enrollment and notification UI |
 
 ### Architecture
 
@@ -648,31 +649,52 @@ Windows Logon Screen
 
 ### Installation
 
-1. **Build all components:**
-   ```cmd
-   cargo build --workspace
-   msbuild platform\windows\native\DdsNative.sln /p:Configuration=Release /p:Platform=x64
-   dotnet build ABCD.sln -c Release
-   ```
+**Option A — MSI installer (recommended):**
 
-2. **Install dds-node as a Windows Service**
+Download or build the MSI package, then run:
 
-3. **Register the Credential Provider:**
-   ```
-   HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\
-       Credential Providers\{8C0DBE9A-5E27-4DDA-9A4B-3B5C8A6E2A11}
-   ```
+```powershell
+msiexec /i DDS-<version>-x64.msi /qn
+```
 
-4. **Install and start the Auth Bridge and Policy Agent services**
+The MSI installs all components to `C:\Program Files\DDS\`, registers three
+Windows Services (`DdsNode`, `DdsAuthBridge`, `DdsPolicyAgent`), registers
+the Credential Provider COM DLL in System32, and creates
+`C:\ProgramData\DDS\` for vault/logs/state. Configuration templates are
+installed to `C:\Program Files\DDS\config\` (`node.toml` and
+`appsettings.json`).
+
+To build the MSI locally:
+
+```powershell
+cd platform\windows\installer
+.\Build-Msi.ps1 -Platform x64   # or arm64
+```
+
+**Option B — Manual build:**
+
+```cmd
+cargo build --workspace --release
+msbuild platform\windows\native\DdsNative.sln /p:Configuration=Release /p:Platform=x64
+dotnet publish platform\windows\DdsPolicyAgent\DdsPolicyAgent.csproj -c Release --runtime win-x64 --self-contained -p:PublishSingleFile=true
+```
+
+Then register services and the Credential Provider COM DLL manually.
+The MSI source (`platform/windows/installer/DdsBundle.wxs`) documents the
+exact registry keys, service definitions, and COM registration needed.
 
 ### Data Paths (Windows)
 
 | Path | Purpose |
 |---|---|
+| `C:\Program Files\DDS\bin\` | Binaries (dds-node, Auth Bridge, Policy Agent, Tray Agent) |
+| `C:\Program Files\DDS\config\node.toml` | Node configuration |
+| `C:\Program Files\DDS\config\appsettings.json` | Policy Agent configuration |
+| `C:\ProgramData\DDS\` | Runtime data directory (vault, logs, applied-state) |
 | `C:\ProgramData\DDS\node-data\` | Node database, keys, admission cert |
-| `C:\ProgramData\DDS\dds.toml` | Node configuration |
 | `C:\ProgramData\DDS\node-data\domain.toml` | Domain public identity |
 | `C:\ProgramData\DDS\node-data\admission.cbor` | Admission certificate |
+| `C:\Windows\System32\DdsCredentialProvider.dll` | Credential Provider COM DLL |
 
 ### Validating
 
