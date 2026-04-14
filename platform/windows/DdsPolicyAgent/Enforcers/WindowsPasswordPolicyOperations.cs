@@ -154,7 +154,16 @@ public sealed class WindowsPasswordPolicyOperations : IPasswordPolicyOperations
             };
 
             using var proc = System.Diagnostics.Process.Start(psi);
-            proc!.WaitForExit(10_000);
+            var stdoutTask = proc!.StandardOutput.ReadToEndAsync();
+            var stderrTask = proc.StandardError.ReadToEndAsync();
+            bool exited = proc.WaitForExit(10_000);
+            if (!exited)
+            {
+                try { proc.Kill(); } catch { /* best-effort */ }
+                Task.WhenAll(stdoutTask, stderrTask).GetAwaiter().GetResult();
+                return null;
+            }
+            Task.WhenAll(stdoutTask, stderrTask).GetAwaiter().GetResult();
             if (proc.ExitCode != 0) return null;
 
             foreach (var line in File.ReadAllLines(cfgPath))
@@ -210,13 +219,19 @@ public sealed class WindowsPasswordPolicyOperations : IPasswordPolicyOperations
             };
 
             using var proc = System.Diagnostics.Process.Start(psi);
-            proc!.WaitForExit(30_000);
-            if (proc.ExitCode != 0)
+            var stdoutTask = proc!.StandardOutput.ReadToEndAsync();
+            var stderrTask = proc.StandardError.ReadToEndAsync();
+            bool exited = proc.WaitForExit(30_000);
+            if (!exited)
             {
-                var stderr = proc.StandardError.ReadToEnd();
-                throw new InvalidOperationException(
-                    $"secedit /configure failed (exit {proc.ExitCode}): {stderr}");
+                try { proc.Kill(); } catch { /* best-effort */ }
+                Task.WhenAll(stdoutTask, stderrTask).GetAwaiter().GetResult();
+                throw new InvalidOperationException("secedit /configure timed out after 30 s");
             }
+            Task.WhenAll(stdoutTask, stderrTask).GetAwaiter().GetResult();
+            if (proc.ExitCode != 0)
+                throw new InvalidOperationException(
+                    $"secedit /configure failed (exit {proc.ExitCode}): {stderrTask.Result}");
         }
         finally
         {

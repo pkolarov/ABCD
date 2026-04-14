@@ -32,28 +32,44 @@ struct ClientData
     std::vector<uint8_t> hash;    // SHA-256(json)
 };
 
+// Build clientDataJSON and compute SHA-256(clientDataJSON).
+//
+// When `challengeB64url` is non-empty it is used directly as the challenge
+// field (server-issued path). When empty, a 32-byte random nonce is
+// generated locally (enrollment / legacy path).
 static ClientData BuildClientData(
     const std::string& type,
-    const std::string& rpId)
+    const std::string& rpId,
+    const std::string& challengeB64url = "")
 {
-    // Base64url-encode a random challenge
-    uint8_t randomBytes[32];
-    BCryptGenRandom(NULL, randomBytes, sizeof(randomBytes),
-                    BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-
-    static const char table[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     std::string challenge;
-    challenge.reserve(43);
-    for (int i = 0; i < 32; i += 3)
+
+    if (!challengeB64url.empty())
     {
-        uint32_t n = static_cast<uint32_t>(randomBytes[i]) << 16;
-        if (i + 1 < 32) n |= static_cast<uint32_t>(randomBytes[i + 1]) << 8;
-        if (i + 2 < 32) n |= static_cast<uint32_t>(randomBytes[i + 2]);
-        challenge.push_back(table[(n >> 18) & 0x3F]);
-        challenge.push_back(table[(n >> 12) & 0x3F]);
-        if (i + 1 < 32) challenge.push_back(table[(n >> 6) & 0x3F]);
-        if (i + 2 < 32) challenge.push_back(table[n & 0x3F]);
+        // Use the server-issued challenge verbatim (already base64url-encoded).
+        challenge = challengeB64url;
+    }
+    else
+    {
+        // Generate a local random challenge (used during enrollment/registration).
+        uint8_t randomBytes[32];
+        BCryptGenRandom(NULL, randomBytes, sizeof(randomBytes),
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+
+        static const char table[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        challenge.reserve(43);
+        for (int i = 0; i < 32; i += 3)
+        {
+            uint32_t n = static_cast<uint32_t>(randomBytes[i]) << 16;
+            if (i + 1 < 32) n |= static_cast<uint32_t>(randomBytes[i + 1]) << 8;
+            if (i + 2 < 32) n |= static_cast<uint32_t>(randomBytes[i + 2]);
+            challenge.push_back(table[(n >> 18) & 0x3F]);
+            challenge.push_back(table[(n >> 12) & 0x3F]);
+            if (i + 1 < 32) challenge.push_back(table[(n >> 6) & 0x3F]);
+            if (i + 2 < 32) challenge.push_back(table[n & 0x3F]);
+        }
+        SecureZeroMemory(randomBytes, sizeof(randomBytes));
     }
 
     std::string cdj = "{\"type\":\"" + type + "\","
@@ -78,7 +94,6 @@ static ClientData BuildClientData(
         BCryptCloseAlgorithmProvider(hAlg, 0);
     }
 
-    SecureZeroMemory(randomBytes, sizeof(randomBytes));
     return cd;
 }
 
@@ -213,12 +228,14 @@ GetAssertionResult CWebAuthnHelper::GetAssertionHmacSecret(
     HWND hwnd,
     const std::string& rpId,
     const std::vector<uint8_t>& credentialId,
-    const std::vector<uint8_t>& salt)
+    const std::vector<uint8_t>& salt,
+    const std::string& challengeB64url)
 {
     GetAssertionResult result = {};
 
-    FileLog::Writef("WebAuthn.GetAssertionHmac: rpId='%s' credIdLen=%zu saltLen=%zu\n",
-                    rpId.c_str(), credentialId.size(), salt.size());
+    FileLog::Writef("WebAuthn.GetAssertionHmac: rpId='%s' credIdLen=%zu saltLen=%zu serverChallenge=%s\n",
+                    rpId.c_str(), credentialId.size(), salt.size(),
+                    challengeB64url.empty() ? "local" : "server");
 
     if (salt.size() != 32)
     {
@@ -227,7 +244,7 @@ GetAssertionResult CWebAuthnHelper::GetAssertionHmacSecret(
         return result;
     }
 
-    auto cd = BuildClientData("webauthn.get", rpId);
+    auto cd = BuildClientData("webauthn.get", rpId, challengeB64url);
     result.clientDataHash = cd.hash;
 
     std::wstring rpIdW = Utf8ToWide(rpId);
@@ -333,14 +350,16 @@ GetAssertionResult CWebAuthnHelper::GetAssertionHmacSecret(
 GetAssertionResult CWebAuthnHelper::GetAssertionProof(
     HWND hwnd,
     const std::string& rpId,
-    const std::vector<uint8_t>& credentialId)
+    const std::vector<uint8_t>& credentialId,
+    const std::string& challengeB64url)
 {
     GetAssertionResult result = {};
 
-    FileLog::Writef("WebAuthn.GetAssertionProof: rpId='%s' credIdLen=%zu\n",
-                    rpId.c_str(), credentialId.size());
+    FileLog::Writef("WebAuthn.GetAssertionProof: rpId='%s' credIdLen=%zu serverChallenge=%s\n",
+                    rpId.c_str(), credentialId.size(),
+                    challengeB64url.empty() ? "local" : "server");
 
-    auto cd = BuildClientData("webauthn.get", rpId);
+    auto cd = BuildClientData("webauthn.get", rpId, challengeB64url);
     result.clientDataHash = cd.hash;
 
     std::wstring rpIdW = Utf8ToWide(rpId);

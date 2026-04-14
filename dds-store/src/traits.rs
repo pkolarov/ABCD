@@ -118,5 +118,42 @@ pub trait AuditStore {
     fn prune_audit_entries_to_max(&mut self, max_entries: usize) -> StoreResult<usize>;
 }
 
+/// Short-lived challenge storage for FIDO2 assertion freshness.
+///
+/// Challenges are server-issued 32-byte nonces with a TTL. Each challenge
+/// is single-use: `consume_challenge` atomically validates, removes, and
+/// returns the nonce bytes so the caller can reconstruct `clientDataJSON`
+/// and verify `client_data_hash`.
+pub trait ChallengeStore {
+    /// Record a new server-issued challenge.
+    /// `bytes` is 32 raw nonce bytes; `expires_at` is a Unix timestamp.
+    fn put_challenge(&mut self, id: &str, bytes: &[u8; 32], expires_at: u64) -> StoreResult<()>;
+
+    /// Atomically verify the challenge exists and is not expired, delete it,
+    /// and return its bytes. Returns `StoreError::NotFound` if the id is
+    /// unknown or already consumed; returns a descriptive `StoreError::Io`
+    /// if the challenge has expired.
+    fn consume_challenge(&mut self, id: &str, now: u64) -> StoreResult<[u8; 32]>;
+
+    /// Delete all challenges whose `expires_at <= now`. Returns the count.
+    fn sweep_expired_challenges(&mut self, now: u64) -> StoreResult<usize>;
+}
+
+/// Per-credential sign-count storage for FIDO2 replay detection.
+///
+/// Persists the highest observed `sign_count` per credential so that
+/// non-monotonic counters (clone/replay attacks) can be detected.
+pub trait CredentialStateStore {
+    /// Return the stored sign count for a credential, or `None` if never seen.
+    fn get_sign_count(&self, credential_id: &str) -> StoreResult<Option<u32>>;
+
+    /// Persist a new sign count. Must be called only after verifying the
+    /// new count exceeds the stored count.
+    fn set_sign_count(&mut self, credential_id: &str, count: u32) -> StoreResult<()>;
+}
+
 /// Combined directory store — convenience trait bundling all stores.
-pub trait DirectoryStore: TokenStore + RevocationStore + OperationStore + AuditStore {}
+pub trait DirectoryStore:
+    TokenStore + RevocationStore + OperationStore + AuditStore + ChallengeStore + CredentialStateStore
+{
+}

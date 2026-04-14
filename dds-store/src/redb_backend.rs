@@ -21,6 +21,10 @@ const REVOKED: TableDefinition<&str, &[u8]> = TableDefinition::new("revoked");
 const BURNED: TableDefinition<&str, &[u8]> = TableDefinition::new("burned");
 const OPERATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("operations");
 const AUDIT_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("audit_log");
+// Value: 8-byte expires_at (u64 big-endian) || 32-byte nonce
+const CHALLENGES: TableDefinition<&str, &[u8]> = TableDefinition::new("challenges");
+// Value: 4-byte sign_count (u32 big-endian)
+const CREDENTIAL_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("credential_state");
 
 /// redb-backed persistent storage.
 #[derive(Clone)]
@@ -52,6 +56,12 @@ impl RedbBackend {
                 .map_err(|e| StoreError::Io(e.to_string()))?;
             let _ = write_txn
                 .open_table(AUDIT_LOG)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            let _ = write_txn
+                .open_table(CHALLENGES)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            let _ = write_txn
+                .open_table(CREDENTIAL_STATE)
                 .map_err(|e| StoreError::Io(e.to_string()))?;
         }
         write_txn
@@ -452,6 +462,159 @@ impl AuditStore for RedbBackend {
             .commit()
             .map_err(|e| StoreError::Io(e.to_string()))?;
         Ok(removed)
+    }
+}
+
+impl ChallengeStore for RedbBackend {
+    fn put_challenge(&mut self, id: &str, bytes: &[u8; 32], expires_at: u64) -> StoreResult<()> {
+        // Value: 8-byte expires_at (big-endian) || 32-byte nonce
+        let mut value = [0u8; 40];
+        value[..8].copy_from_slice(&expires_at.to_be_bytes());
+        value[8..].copy_from_slice(bytes);
+
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        {
+            let mut table = write_txn
+                .open_table(CHALLENGES)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            table
+                .insert(id, value.as_slice())
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    fn consume_challenge(&mut self, id: &str, now: u64) -> StoreResult<[u8; 32]> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        let result = {
+            let mut table = write_txn
+                .open_table(CHALLENGES)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            // Copy raw bytes out before any mutable operation on the table.
+            let encoded: Vec<u8> = {
+                let guard = table
+                    .get(id)
+                    .map_err(|e| StoreError::Io(e.to_string()))?
+                    .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+                guard.value().to_vec()
+            };
+            if encoded.len() < 40 {
+                return Err(StoreError::Serde("challenge record too short".into()));
+            }
+            let expires_at = u64::from_be_bytes(encoded[..8].try_into().unwrap());
+            if now >= expires_at {
+                return Err(StoreError::Io(format!(
+                    "challenge '{}' has expired (expired at {expires_at}, now {now})",
+                    id
+                )));
+            }
+            let mut nonce = [0u8; 32];
+            nonce.copy_from_slice(&encoded[8..40]);
+            table
+                .remove(id)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            nonce
+        };
+        write_txn
+            .commit()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        Ok(result)
+    }
+
+    fn sweep_expired_challenges(&mut self, now: u64) -> StoreResult<usize> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        let count = {
+            let mut table = write_txn
+                .open_table(CHALLENGES)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            let expired: Vec<String> = table
+                .iter()
+                .map_err(|e| StoreError::Io(e.to_string()))?
+                .filter_map(|entry| {
+                    let (key, value) = entry.ok()?;
+                    let raw = value.value();
+                    if raw.len() < 8 {
+                        return Some(key.value().to_string());
+                    }
+                    let expires_at = u64::from_be_bytes(raw[..8].try_into().ok()?);
+                    if now >= expires_at {
+                        Some(key.value().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let n = expired.len();
+            for id in &expired {
+                table
+                    .remove(id.as_str())
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+            }
+            n
+        };
+        write_txn
+            .commit()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        Ok(count)
+    }
+}
+
+impl CredentialStateStore for RedbBackend {
+    fn get_sign_count(&self, credential_id: &str) -> StoreResult<Option<u32>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        let table = read_txn
+            .open_table(CREDENTIAL_STATE)
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        match table
+            .get(credential_id)
+            .map_err(|e| StoreError::Io(e.to_string()))?
+        {
+            None => Ok(None),
+            Some(guard) => {
+                let raw = guard.value();
+                if raw.len() < 4 {
+                    return Err(StoreError::Serde(
+                        "credential_state record too short".into(),
+                    ));
+                }
+                Ok(Some(u32::from_be_bytes(raw[..4].try_into().unwrap())))
+            }
+        }
+    }
+
+    fn set_sign_count(&mut self, credential_id: &str, count: u32) -> StoreResult<()> {
+        let value = count.to_be_bytes();
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        {
+            let mut table = write_txn
+                .open_table(CREDENTIAL_STATE)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            table
+                .insert(credential_id, value.as_slice())
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        Ok(())
     }
 }
 

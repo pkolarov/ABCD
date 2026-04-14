@@ -33,6 +33,11 @@ public sealed class WindowsAccountOperations : IAccountOperations
 
     public void CreateUser(string username, string? fullName, string? description)
     {
+        if (!IsValidSamUsername(username))
+            throw new ArgumentException(
+                $"'{username}' is not a valid SAM account name " +
+                "(1\u201320 chars, letters/digits/._-).", nameof(username));
+
         // Generate a 32-char random password meeting complexity requirements
         var password = GenerateRandomPassword();
 
@@ -186,6 +191,12 @@ public sealed class WindowsAccountOperations : IAccountOperations
         var bytes = RandomNumberGenerator.GetBytes(24);
         return "Aa1!" + Convert.ToBase64String(bytes);
     }
+
+    // SAM account names: 1–20 chars, letters, digits, dot, underscore, hyphen.
+    private static bool IsValidSamUsername(string name) =>
+        !string.IsNullOrEmpty(name)
+        && name.Length <= 20
+        && System.Text.RegularExpressions.Regex.IsMatch(name, @"^[A-Za-z0-9._\-]+$");
 
     // ----------------------------------------------------------------
     // P/Invoke declarations — netapi32.dll

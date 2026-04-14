@@ -228,6 +228,12 @@ struct IPC_RESP_DDS_AUTH_CHALLENGE
     char   rp_id[IPC_MAX_RPID_LEN];                  // RP ID (UTF-8, null-terminated)
     BYTE   salt[IPC_MAX_SALT_LEN];                    // hmac-secret salt from vault
     DWORD  salt_len;                                  // Actual salt length (32)
+    // Server-issued challenge fields (added for replay protection).
+    // The Bridge fetches these from GET /v1/session/challenge before forwarding
+    // the challenge to the CP. The CP passes challenge_b64url directly to
+    // BuildClientData and echoes challenge_id back in IPC_REQ_DDS_AUTH_RESPONSE.
+    char   challenge_id[64];      // Server challenge ID (null-terminated, max 63 chars)
+    char   challenge_b64url[48];  // Base64url challenge nonce (44 chars + NUL) for clientDataJSON
 };
 
 // DDS_AUTH_RESPONSE (0x0061)
@@ -243,7 +249,8 @@ struct IPC_REQ_DDS_AUTH_RESPONSE
     DWORD  credential_id_len;                          // Actual length
     BYTE   hmac_secret[IPC_MAX_HMAC_SECRET_LEN];      // hmac-secret output (32 bytes)
     DWORD  hmac_secret_len;                            // Actual length (32 or 0 if not available)
-    BYTE   client_data_hash[32];                       // Echo back the challenge
+    BYTE   client_data_hash[32];                       // SHA-256(clientDataJSON)
+    char   challenge_id[64];                           // Echo of IPC_RESP_DDS_AUTH_CHALLENGE.challenge_id
 };
 
 // DDS_AUTH_PROGRESS (0x8060)

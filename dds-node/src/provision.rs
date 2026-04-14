@@ -611,11 +611,9 @@ mod tests {
     use super::*;
     use dds_domain::DomainKey;
     use rand::rngs::OsRng;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    // Shared with domain_store tests to prevent env var races
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     #[test]
     fn bundle_roundtrip() {

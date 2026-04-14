@@ -163,10 +163,12 @@ impl Token {
 
         #[cfg(feature = "std")]
         if let Some(exp) = self.payload.exp {
-            if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-                if now.as_secs() > exp {
-                    return Err(TokenError::Expired(self.payload.jti.clone()));
-                }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| TokenError::ClockError)?
+                .as_secs();
+            if now > exp {
+                return Err(TokenError::Expired(self.payload.jti.clone()));
             }
         }
 
@@ -248,6 +250,7 @@ pub enum TokenError {
     SerializationError,
     DeserializationError,
     Expired(alloc::string::String),
+    ClockError,
 }
 
 impl fmt::Display for TokenError {
@@ -269,6 +272,7 @@ impl fmt::Display for TokenError {
             TokenError::SerializationError => write!(f, "CBOR serialization failed"),
             TokenError::DeserializationError => write!(f, "CBOR deserialization failed"),
             TokenError::Expired(jti) => write!(f, "token {} is expired", jti),
+            TokenError::ClockError => write!(f, "system clock unavailable"),
         }
     }
 }
@@ -524,6 +528,16 @@ mod tests {
         let token = Token::sign(payload, &user.signing_key).unwrap();
         let err = token.validate().unwrap_err();
         assert!(matches!(err, TokenError::Expired(_)));
+    }
+
+    #[test]
+    fn test_clock_error_variant() {
+        // Verify ClockError is a distinct variant with the expected display string.
+        let err = TokenError::ClockError;
+        assert_eq!(err.to_string(), "system clock unavailable");
+        // Ensure it does not match other variants.
+        assert!(!matches!(err, TokenError::Expired(_)));
+        assert!(!matches!(err, TokenError::InvalidSignature));
     }
 
     #[test]

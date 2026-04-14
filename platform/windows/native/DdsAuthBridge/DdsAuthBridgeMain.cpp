@@ -818,7 +818,22 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
         return;
     }
 
-    // Step 2: Build and send DDS_AUTH_CHALLENGE to CP
+    // Step 2a: Fetch a server-issued FIDO2 challenge from dds-node.
+    //          This ensures the assertion binds to a server-issued nonce that
+    //          can only be used once, preventing replay attacks.
+    DdsChallengeResult serverChallenge = m_httpClient.GetSessionChallenge();
+    if (!serverChallenge.success)
+    {
+        FileLog::Writef("DdsAuth.worker: failed to fetch server challenge: %s\n",
+                        serverChallenge.errorMessage.c_str());
+        SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::SERVICE_ERROR,
+            L"Could not obtain authentication challenge from DDS node");
+        return;
+    }
+    FileLog::Writef("DdsAuth.worker: obtained challenge '%s'\n",
+                    serverChallenge.challengeId.c_str());
+
+    // Step 2b: Build and send DDS_AUTH_CHALLENGE to CP (includes server challenge).
     IPC_RESP_DDS_AUTH_CHALLENGE challenge = {};
 
     // Copy credential ID
@@ -851,8 +866,12 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     }
     challenge.salt_len = saltLen;
 
-    FileLog::Writef("DdsAuth.worker: sending AUTH_CHALLENGE (credIdLen=%u saltLen=%u)\n",
-                    credIdLen, saltLen);
+    // Populate server challenge fields so the CP uses the server nonce in WebAuthn.
+    strncpy_s(challenge.challenge_id, serverChallenge.challengeId.c_str(), _TRUNCATE);
+    strncpy_s(challenge.challenge_b64url, serverChallenge.challengeB64url.c_str(), _TRUNCATE);
+
+    FileLog::Writef("DdsAuth.worker: sending AUTH_CHALLENGE (credIdLen=%u saltLen=%u challengeId='%s')\n",
+                    credIdLen, saltLen, challenge.challenge_id);
 
     m_pipeServer.SendNotification(pOp->pClientCtx, IPC_MSG::DDS_AUTH_CHALLENGE, pOp->seqId,
         reinterpret_cast<const BYTE*>(&challenge), sizeof(challenge));
@@ -908,9 +927,19 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     std::string sigB64 = Base64UrlEncode(pResp->signature, pResp->signature_len);
     std::string cdhB64 = Base64UrlEncode(pResp->client_data_hash, 32);
 
+    // CP echoes back the challenge_id from the IPC challenge; use it in the POST.
+    std::string challengeIdStr(pResp->challenge_id, strnlen(pResp->challenge_id, sizeof(pResp->challenge_id)));
+    if (challengeIdStr.empty())
+    {
+        // Fallback: use the server challenge we fetched (should not normally happen).
+        challengeIdStr = serverChallenge.challengeId;
+        FileLog::Write("DdsAuth.worker: CP did not echo challenge_id — using server copy\n");
+    }
+
     // Build the JSON expected by dds-node's AssertionSessionRequestJson
     std::string assertionJson = "{";
     assertionJson += "\"credential_id\":\"" + credIdB64 + "\",";
+    assertionJson += "\"challenge_id\":\"" + challengeIdStr + "\",";
     assertionJson += "\"client_data_hash\":\"" + cdhB64 + "\",";
     assertionJson += "\"authenticator_data\":\"" + authDataB64 + "\",";
     assertionJson += "\"signature\":\"" + sigB64 + "\"";

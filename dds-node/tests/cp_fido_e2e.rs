@@ -29,7 +29,7 @@ use dds_domain::{DeviceJoinDocument, DomainDocument, SessionDocument, UserAuthAt
 use dds_node::config::{DomainConfig, NetworkConfig, NodeConfig};
 use dds_node::domain_store;
 use dds_node::http::{
-    AssertionSessionRequestJson, EnrollDeviceRequestJson, EnrollUserRequestJson,
+    AssertionSessionRequestJson, ChallengeResponse, EnrollDeviceRequestJson, EnrollUserRequestJson,
     EnrolledUsersResponse, EnrollmentResponse, PolicyRequestJson, SessionResponse,
 };
 use dds_node::p2p_identity;
@@ -63,6 +63,29 @@ fn encode_b64(bytes: &[u8]) -> String {
 
 fn decode_b64(s: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+}
+
+/// Fetch a server-issued challenge from the node. Returns `(challenge_id, challenge_b64url)`.
+async fn fetch_challenge(client: &Client, api: &str) -> (String, String) {
+    let resp = client
+        .get(format!("{api}/v1/session/challenge"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "challenge endpoint failed");
+    let body: ChallengeResponse = resp.json().await.unwrap();
+    (body.challenge_id, body.challenge_b64url)
+}
+
+/// Build the clientDataHash for a server-issued challenge.
+/// Constructs the exact JSON the C++ bridge produces:
+/// `{"type":"webauthn.get","challenge":"<b64url>","origin":"https://<rp_id>"}`.
+fn make_cdh_from_challenge(rp_id: &str, challenge_b64url: &str) -> [u8; 32] {
+    use sha2::Digest;
+    let cdj = format!(
+        r#"{{"type":"webauthn.get","challenge":"{challenge_b64url}","origin":"https://{rp_id}"}}"#
+    );
+    sha2::Sha256::digest(cdj.as_bytes()).into()
 }
 
 fn make_attest(identity: &Identity, jti: &str) -> Token {
@@ -374,11 +397,13 @@ async fn cp_fido2_ed25519_full_lifecycle() {
     // ── 4. Authenticate via FIDO2 assertion ─────────────────────────
     //
     // This simulates exactly what the Auth Bridge does after calling
-    // the platform WebAuthn API: builds authenticatorData + signs it
-    // with the credential key, then POSTs to /v1/session/assert.
+    // the platform WebAuthn API: fetches a server challenge, builds
+    // clientDataJSON from it, hashes it, signs auth_data || cdh,
+    // then POSTs to /v1/session/assert.
 
+    let (challenge_id, challenge_b64url) = fetch_challenge(&client, api).await;
     let auth_data = build_assertion_auth_data(rp_id, 1);
-    let assertion_cdh = [0xCD; 32]; // client data hash for assertion
+    let assertion_cdh = make_cdh_from_challenge(rp_id, &challenge_b64url);
     let mut signed_msg = Vec::new();
     signed_msg.extend_from_slice(&auth_data);
     signed_msg.extend_from_slice(&assertion_cdh);
@@ -389,6 +414,7 @@ async fn cp_fido2_ed25519_full_lifecycle() {
         .json(&AssertionSessionRequestJson {
             subject_urn: Some(alice.id.to_urn()),
             credential_id: stored_cred_id.clone(),
+            challenge_id,
             client_data_hash: encode_b64(&assertion_cdh),
             authenticator_data: encode_b64(&auth_data),
             signature: encode_b64(&signature.to_bytes()),
@@ -417,6 +443,7 @@ async fn cp_fido2_ed25519_full_lifecycle() {
     assert!(session.expires_at > 0);
 
     // ── 5. Verify wrong key is rejected ─────────────────────────────
+    // Fails at crypto step (before challenge check); dummy challenge_id suffices.
     let wrong_sk = SigningKey::generate(&mut OsRng);
     let wrong_sig = wrong_sk.sign(&signed_msg);
 
@@ -425,6 +452,7 @@ async fn cp_fido2_ed25519_full_lifecycle() {
         .json(&AssertionSessionRequestJson {
             subject_urn: Some(alice.id.to_urn()),
             credential_id: stored_cred_id.clone(),
+            challenge_id: "dummy-bad-key".into(),
             client_data_hash: encode_b64(&assertion_cdh),
             authenticator_data: encode_b64(&auth_data),
             signature: encode_b64(&wrong_sig.to_bytes()),
@@ -440,11 +468,13 @@ async fn cp_fido2_ed25519_full_lifecycle() {
     );
 
     // ── 6. Verify unknown credential is rejected ────────────────────
+    // Fails at credential-lookup step; dummy challenge_id suffices.
     let unknown_resp = client
         .post(format!("{api}/v1/session/assert"))
         .json(&AssertionSessionRequestJson {
             subject_urn: None,
             credential_id: "nonexistent-credential-id".to_string(),
+            challenge_id: "dummy-unknown-cred".into(),
             client_data_hash: encode_b64(&assertion_cdh),
             authenticator_data: encode_b64(&auth_data),
             signature: encode_b64(&signature.to_bytes()),
@@ -548,9 +578,10 @@ async fn cp_fido2_p256_assertion() {
     let api = &node.fixture.api_url;
     wait_for_status(&client, api).await;
 
-    // FIDO2 assertion with P-256
+    // FIDO2 assertion with P-256 — fetch a real challenge so the node accepts it.
+    let (challenge_id, challenge_b64url) = fetch_challenge(&client, api).await;
     let auth_data = build_assertion_auth_data(rp_id, 1);
-    let assertion_cdh = [0xBB; 32];
+    let assertion_cdh = make_cdh_from_challenge(rp_id, &challenge_b64url);
     let mut signed_msg = Vec::new();
     signed_msg.extend_from_slice(&auth_data);
     signed_msg.extend_from_slice(&assertion_cdh);
@@ -561,6 +592,7 @@ async fn cp_fido2_p256_assertion() {
         .json(&AssertionSessionRequestJson {
             subject_urn: Some(bob.id.to_urn()),
             credential_id: stored_cred_id,
+            challenge_id,
             client_data_hash: encode_b64(&assertion_cdh),
             authenticator_data: encode_b64(&auth_data),
             signature: encode_b64(sig.as_bytes()),
@@ -647,21 +679,23 @@ async fn cp_fido2_enroll_then_assert() {
     // Without a vouch from root, assertion should fail with 500
     // (subject has no granted purposes)
     let auth_data = build_assertion_auth_data(rp_id, 1);
-    let acdh = [0x22; 32];
-    let mut msg = Vec::new();
-    msg.extend_from_slice(&auth_data);
-    msg.extend_from_slice(&acdh);
-    let sig = cred_sk.sign(&msg);
-
     let stored_cred_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(credential_id);
+    // Use a real challenge so verification proceeds through UP, RP-ID, and challenge
+    // checks — only failing at session issuance because the user has no vouch.
+    let (no_vouch_ch_id, no_vouch_ch_b64) = fetch_challenge(&client, api).await;
+    let no_vouch_cdh = make_cdh_from_challenge(rp_id, &no_vouch_ch_b64);
+    let mut no_vouch_msg = auth_data.clone();
+    no_vouch_msg.extend_from_slice(&no_vouch_cdh);
+    let no_vouch_sig = cred_sk.sign(&no_vouch_msg);
     let no_vouch_resp = client
         .post(format!("{api}/v1/session/assert"))
         .json(&AssertionSessionRequestJson {
             subject_urn: Some(enrolled.urn.clone()),
             credential_id: stored_cred_id,
-            client_data_hash: encode_b64(&acdh),
+            challenge_id: no_vouch_ch_id,
+            client_data_hash: encode_b64(&no_vouch_cdh),
             authenticator_data: encode_b64(&auth_data),
-            signature: encode_b64(&sig.to_bytes()),
+            signature: encode_b64(&no_vouch_sig.to_bytes()),
             duration_secs: None,
         })
         .send()

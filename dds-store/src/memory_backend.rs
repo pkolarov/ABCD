@@ -3,7 +3,7 @@
 //! Used for unit tests and embedded/RTOS deployments where
 //! persistent storage is not available or not needed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use dds_core::audit::AuditLogEntry;
 use dds_core::crdt::causal_dag::Operation;
@@ -19,6 +19,9 @@ pub struct MemoryBackend {
     burned: BTreeSet<String>,
     operations: BTreeMap<String, Vec<u8>>,
     audit_log: Vec<Vec<u8>>,
+    /// (nonce_bytes, expires_at)
+    challenges: HashMap<String, ([u8; 32], u64)>,
+    credential_sign_counts: HashMap<String, u32>,
 }
 
 impl MemoryBackend {
@@ -29,6 +32,8 @@ impl MemoryBackend {
             burned: BTreeSet::new(),
             operations: BTreeMap::new(),
             audit_log: Vec::new(),
+            challenges: HashMap::new(),
+            credential_sign_counts: HashMap::new(),
         }
     }
 
@@ -214,4 +219,45 @@ impl AuditStore for MemoryBackend {
         Ok(remove_count)
     }
 }
+impl ChallengeStore for MemoryBackend {
+    fn put_challenge(&mut self, id: &str, bytes: &[u8; 32], expires_at: u64) -> StoreResult<()> {
+        self.challenges.insert(id.to_string(), (*bytes, expires_at));
+        Ok(())
+    }
+
+    fn consume_challenge(&mut self, id: &str, now: u64) -> StoreResult<[u8; 32]> {
+        let (nonce, expires_at) = self
+            .challenges
+            .get(id)
+            .copied()
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        if now >= expires_at {
+            return Err(StoreError::Io(format!(
+                "challenge '{}' has expired (expired at {expires_at}, now {now})",
+                id
+            )));
+        }
+        self.challenges.remove(id);
+        Ok(nonce)
+    }
+
+    fn sweep_expired_challenges(&mut self, now: u64) -> StoreResult<usize> {
+        let before = self.challenges.len();
+        self.challenges.retain(|_, (_, exp)| now < *exp);
+        Ok(before - self.challenges.len())
+    }
+}
+
+impl CredentialStateStore for MemoryBackend {
+    fn get_sign_count(&self, credential_id: &str) -> StoreResult<Option<u32>> {
+        Ok(self.credential_sign_counts.get(credential_id).copied())
+    }
+
+    fn set_sign_count(&mut self, credential_id: &str, count: u32) -> StoreResult<()> {
+        self.credential_sign_counts
+            .insert(credential_id.to_string(), count);
+        Ok(())
+    }
+}
+
 impl DirectoryStore for MemoryBackend {}

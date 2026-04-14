@@ -11,7 +11,7 @@ use dds_domain::{DeviceJoinDocument, DomainDocument, UserAuthAttestation};
 use dds_node::config::{DomainConfig, NetworkConfig, NodeConfig};
 use dds_node::domain_store;
 use dds_node::http::{
-    AssertionSessionRequestJson, EnrollDeviceRequestJson, EnrollUserRequestJson,
+    AssertionSessionRequestJson, ChallengeResponse, EnrollDeviceRequestJson, EnrollUserRequestJson,
     EnrollmentResponse, PolicyRequestJson, SessionResponse,
 };
 use dds_node::node::DdsNode;
@@ -419,6 +419,7 @@ async fn enroll_user_fido2(
 }
 
 /// Issue a session via FIDO2 assertion (POST /v1/session/assert).
+/// Fetches a fresh server challenge, builds the correct clientDataJSON, and signs.
 async fn post_session_assert(
     client: &Client,
     api_url: &str,
@@ -427,17 +428,36 @@ async fn post_session_assert(
     rp_id: &str,
 ) -> reqwest::Response {
     use ed25519_dalek::Signer as _;
+    use sha2::Digest;
+
+    // Fetch a server-issued challenge.
+    let ch_resp = client
+        .get(format!("{api_url}/v1/session/challenge"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ch_resp.status(), 200, "challenge fetch failed");
+    let ch: ChallengeResponse = ch_resp.json().await.unwrap();
+
+    // Build clientDataJSON exactly as the C++ bridge does.
+    let cdj = format!(
+        r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://{}"}}"#,
+        ch.challenge_b64url, rp_id
+    );
+    let cdh: [u8; 32] = sha2::Sha256::digest(cdj.as_bytes()).into();
+
     let auth_data = build_assertion_auth_data(rp_id, 1);
-    let cdh = [0xE2; 32];
     let mut signed_msg = Vec::new();
     signed_msg.extend_from_slice(&auth_data);
     signed_msg.extend_from_slice(&cdh);
     let sig = signing_key.sign(&signed_msg);
+
     client
         .post(format!("{api_url}/v1/session/assert"))
         .json(&AssertionSessionRequestJson {
             subject_urn: None,
             credential_id: credential_id_b64.to_string(),
+            challenge_id: ch.challenge_id,
             client_data_hash: encode_b64(&cdh),
             authenticator_data: encode_b64(&auth_data),
             signature: encode_b64(&sig.to_bytes()),

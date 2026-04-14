@@ -33,6 +33,8 @@ public sealed class CommandExecutionException : InvalidOperationException
 
 public sealed class ProcessCommandRunner : ICommandRunner
 {
+    private const int DefaultTimeoutMs = 5 * 60 * 1000; // 5 minutes
+
     private readonly ILogger<ProcessCommandRunner> _log;
 
     public ProcessCommandRunner(ILogger<ProcessCommandRunner> log) => _log = log;
@@ -61,7 +63,15 @@ public sealed class ProcessCommandRunner : ICommandRunner
 
         var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
         var stderrTask = process.StandardError.ReadToEndAsync(ct);
-        process.WaitForExit();
+
+        bool exited = process.WaitForExit(DefaultTimeoutMs);
+        if (!exited)
+        {
+            try { process.Kill(entireProcessTree: true); } catch { /* best-effort */ }
+            Task.WhenAll(stdoutTask, stderrTask).GetAwaiter().GetResult();
+            throw new CommandExecutionException(
+                $"{fileName} did not exit within {DefaultTimeoutMs / 1000} s and was killed");
+        }
 
         var stdout = stdoutTask.GetAwaiter().GetResult();
         var stderr = stderrTask.GetAwaiter().GetResult();

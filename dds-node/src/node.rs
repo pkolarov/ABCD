@@ -108,8 +108,8 @@ impl DdsNode {
         })?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_err(|e| format!("system clock error, cannot verify admission cert: {e}"))?
+            .as_secs();
         cert.verify(&domain_pubkey, &domain_id, &peer_id.to_string(), now)
             .map_err(|e| format!("admission cert verification failed: {e}"))?;
         info!(domain = %config.domain.name, %peer_id, "admission cert verified");
@@ -555,10 +555,13 @@ impl DdsNode {
     /// Run a single token-expiry sweep using the current system time.
     /// Public so the binary or tests can drive it on demand.
     pub fn sweep_expired(&mut self) -> crate::expiry::SweepStats {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(e) => {
+                warn!("system clock error, skipping expiry sweep: {e}");
+                return crate::expiry::SweepStats::default();
+            }
+        };
         let mut g = self.trust_graph.write().expect("trust_graph poisoned");
         crate::expiry::sweep_once(&mut g, &mut self.store, now)
     }

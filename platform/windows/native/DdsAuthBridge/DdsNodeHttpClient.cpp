@@ -317,6 +317,75 @@ DdsAdminVouchResult CDdsNodeHttpClient::PostAdminVouch(const std::string& vouchJ
 }
 
 // ============================================================================
+// GET /v1/session/challenge and GET /v1/admin/challenge
+// ============================================================================
+
+DdsChallengeResult CDdsNodeHttpClient::GetSessionChallenge()
+{
+    FileLog::Write("DdsNodeHttpClient: GET /v1/session/challenge\n");
+    std::string responseBody;
+    DWORD httpStatus = SendRequest(L"GET", L"/v1/session/challenge", nullptr, responseBody);
+    if (httpStatus == 0)
+    {
+        DdsChallengeResult r = {};
+        r.errorMessage = "Connection to dds-node failed";
+        return r;
+    }
+    FileLog::Writef("DdsNodeHttpClient: GET /v1/session/challenge -> HTTP %lu\n", httpStatus);
+    return ParseChallengeResponse(httpStatus, responseBody);
+}
+
+DdsChallengeResult CDdsNodeHttpClient::GetAdminChallenge()
+{
+    FileLog::Write("DdsNodeHttpClient: GET /v1/admin/challenge\n");
+    std::string responseBody;
+    DWORD httpStatus = SendRequest(L"GET", L"/v1/admin/challenge", nullptr, responseBody);
+    if (httpStatus == 0)
+    {
+        DdsChallengeResult r = {};
+        r.errorMessage = "Connection to dds-node failed";
+        return r;
+    }
+    FileLog::Writef("DdsNodeHttpClient: GET /v1/admin/challenge -> HTTP %lu\n", httpStatus);
+    return ParseChallengeResponse(httpStatus, responseBody);
+}
+
+DdsChallengeResult CDdsNodeHttpClient::ParseChallengeResponse(DWORD httpStatus, const std::string& responseBody)
+{
+    DdsChallengeResult result = {};
+    result.success = false;
+
+    if (httpStatus == 200)
+    {
+        result.challengeId     = JsonGetString(responseBody, "challenge_id");
+        result.challengeB64url = JsonGetString(responseBody, "challenge_b64url");
+
+        // Parse expires_at (uint64 — use strtoull to avoid truncation).
+        std::string expiresStr = JsonGetString(responseBody, "expires_at");
+        if (!expiresStr.empty())
+            result.expiresAt = std::strtoull(expiresStr.c_str(), nullptr, 10);
+
+        if (result.challengeId.empty() || result.challengeB64url.empty())
+        {
+            result.errorMessage = "challenge response missing required fields";
+            return result;
+        }
+        result.success = true;
+    }
+    else
+    {
+        result.errorMessage = JsonGetString(responseBody, "error");
+        if (result.errorMessage.empty())
+        {
+            char buf[64];
+            sprintf_s(buf, "dds-node returned HTTP %lu for challenge", httpStatus);
+            result.errorMessage = buf;
+        }
+    }
+    return result;
+}
+
+// ============================================================================
 // POST /v1/windows/claim-account
 // ============================================================================
 

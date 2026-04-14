@@ -54,21 +54,29 @@ public:
 
     // Get an assertion with hmac-secret output for password decryption.
     //
-    // credentialId: The credential to use (from MakeCredential).
-    // salt:         32-byte salt for the hmac-secret extension.
+    // credentialId:    The credential to use (from MakeCredential).
+    // salt:            32-byte salt for the hmac-secret extension.
+    // challengeB64url: Server-issued base64url challenge nonce. When non-empty
+    //                  this is used as the clientDataJSON challenge instead of
+    //                  a locally generated random value. Pass "" for the legacy
+    //                  (no server challenge) path.
     static GetAssertionResult GetAssertionHmacSecret(
         HWND hwnd,
         const std::string& rpId,
         const std::vector<uint8_t>& credentialId,
-        const std::vector<uint8_t>& salt
+        const std::vector<uint8_t>& salt,
+        const std::string& challengeB64url = ""
     );
 
     // Get an assertion as a proof-of-presence (no hmac-secret).
     // Used for admin vouch operations.
+    //
+    // challengeB64url: Server-issued base64url challenge nonce (see above).
     static GetAssertionResult GetAssertionProof(
         HWND hwnd,
         const std::string& rpId,
-        const std::vector<uint8_t>& credentialId
+        const std::vector<uint8_t>& credentialId,
+        const std::string& challengeB64url = ""
     );
 
 private:

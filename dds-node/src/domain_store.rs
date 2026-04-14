@@ -486,10 +486,9 @@ fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; 32], DomainStoreErr
 mod tests {
     use super::*;
     use rand::rngs::OsRng;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     #[test]
     fn domain_file_roundtrip() {

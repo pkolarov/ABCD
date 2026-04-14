@@ -53,6 +53,8 @@ pub struct EnrollDeviceRequest {
 pub struct AssertionSessionRequest {
     pub subject_urn: Option<String>,
     pub credential_id: String,
+    /// Server-issued challenge ID from `GET /v1/session/challenge`.
+    pub challenge_id: String,
     pub client_data_hash: Vec<u8>,
     pub authenticator_data: Vec<u8>,
     pub signature: Vec<u8>,
@@ -69,6 +71,8 @@ pub type AdminSetupRequest = EnrollUserRequest;
 pub struct AdminVouchRequest {
     pub subject_urn: String,
     pub credential_id: String,
+    /// Server-issued challenge ID from `GET /v1/admin/challenge`.
+    pub challenge_id: String,
     pub client_data_hash: Vec<u8>,
     pub authenticator_data: Vec<u8>,
     pub signature: Vec<u8>,
@@ -81,6 +85,12 @@ pub struct AdminVouchResult {
     pub vouch_jti: String,
     pub subject_urn: String,
     pub admin_urn: String,
+}
+
+/// Internal output of the shared FIDO2 assertion verifier.
+struct CommonAssertionOutput {
+    subject_urn: String,
+    user_verified: bool,
 }
 
 /// Enrolled user info for CP tile enumeration.
@@ -249,7 +259,11 @@ pub struct AppliedReport {
 /// paths without rebuilding from the store on every call. See B5b in
 /// STATUS.md and the doc on `LocalService::new` for the history.
 pub struct LocalService<
-    S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::AuditStore,
+    S: TokenStore
+        + dds_store::traits::RevocationStore
+        + dds_store::traits::AuditStore
+        + ChallengeStore
+        + CredentialStateStore,
 > {
     /// Node signing identity (used to issue tokens).
     node_identity: Identity,
@@ -272,8 +286,13 @@ pub struct LocalService<
     verify_fido2: bool,
 }
 
-impl<S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::AuditStore>
-    LocalService<S>
+impl<
+    S: TokenStore
+        + dds_store::traits::RevocationStore
+        + dds_store::traits::AuditStore
+        + ChallengeStore
+        + CredentialStateStore,
+> LocalService<S>
 {
     /// Create a new local service.
     ///
@@ -889,21 +908,22 @@ impl<S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::Aud
     // Credential Provider integration (Phase III)
     // ================================================================
 
-    /// Issue a session from a FIDO2 assertion proof.
-    ///
-    /// The caller (Auth Bridge) sends the raw getAssertion output; we
-    /// look up the credential's public key from the trust graph, verify
-    /// the assertion signature, then issue a `SessionDocument` exactly
-    /// like `issue_session` but with cryptographic proof of possession.
-    pub fn issue_session_from_assertion(
+    /// Shared FIDO2 assertion verifier used by both session issuance and
+    /// admin vouch. Enforces: credential lookup, crypto, UP flag, RP-ID
+    /// binding, server-challenge freshness, and sign-count monotonicity.
+    fn verify_assertion_common(
         &mut self,
-        req: AssertionSessionRequest,
-    ) -> Result<SessionResult, ServiceError> {
+        credential_id: &str,
+        challenge_id: &str,
+        client_data_hash: &[u8],
+        authenticator_data: &[u8],
+        signature: &[u8],
+    ) -> Result<CommonAssertionOutput, ServiceError> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use dds_domain::fido2::{cose_to_credential_public_key, verify_assertion};
+        use sha2::{Digest, Sha256};
 
-        // 1. Look up the credential's public key from the trust graph.
-        //    We scan attestation tokens for a UserAuthAttestation whose
-        //    credential_id matches.
+        // 1. Look up the credential's public key and enrolled RP-ID from the trust graph.
         let (subject_urn, public_key, enrolled_rp_id) = {
             let g = self
                 .trust_graph
@@ -919,20 +939,15 @@ impl<S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::Aud
                     Ok(Some(d)) => d,
                     _ => continue,
                 };
-                if doc.credential_id == req.credential_id {
-                    // Extract the COSE public key from the attestation object.
+                if doc.credential_id == credential_id {
                     let parsed = dds_domain::fido2::verify_attestation(
                         &doc.attestation_object,
                         &doc.client_data_hash,
                     )
                     .map_err(|e| ServiceError::Fido2(format!("re-parse attestation: {e}")))?;
-
-                    // Build COSE_Key bytes from the parsed attestation's
-                    // auth_data (credential public key starts after AAGUID + credId).
                     let auth_data = &parsed.auth_data;
                     let p = 37 + 16 + 2 + parsed.credential_id.len();
                     let cose_bytes = &auth_data[p..];
-
                     found = Some((
                         token.payload.sub.clone(),
                         cose_bytes.to_vec(),
@@ -944,38 +959,27 @@ impl<S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::Aud
 
             let (sub, cose_bytes, rp_id) = found.ok_or_else(|| {
                 ServiceError::Fido2(format!(
-                    "credential_id '{}' not found in trust graph",
-                    req.credential_id
+                    "credential_id '{credential_id}' not found in trust graph"
                 ))
             })?;
-
             let pk = cose_to_credential_public_key(&cose_bytes)
                 .map_err(|e| ServiceError::Fido2(format!("COSE key parse: {e}")))?;
             (sub, pk, rp_id)
         };
 
-        // 2. Verify the assertion signature and enforce WebAuthn flags.
-        let parsed = verify_assertion(
-            &req.authenticator_data,
-            &req.client_data_hash,
-            &req.signature,
-            &public_key,
-        )
-        .map_err(|e| ServiceError::Fido2(e.to_string()))?;
+        // 2. Cryptographic signature verification.
+        let parsed = verify_assertion(authenticator_data, client_data_hash, signature, &public_key)
+            .map_err(|e| ServiceError::Fido2(e.to_string()))?;
 
-        // Enforce user-presence (UP) flag — authenticator must confirm
-        // the user is physically present (touch / biometric).
+        // 3. User-presence (UP) flag — physical touch/biometric required.
         if !parsed.user_present {
             return Err(ServiceError::Fido2(
                 "assertion failed: user_present (UP) flag not set".into(),
             ));
         }
 
-        // Enforce RP ID binding — the rp_id_hash in the assertion's
-        // authenticatorData must match SHA-256(enrolled_rp_id). This
-        // prevents cross-site assertion replay.
+        // 4. RP-ID binding — prevents cross-site assertion replay.
         {
-            use sha2::{Digest, Sha256};
             let expected_hash = Sha256::digest(enrolled_rp_id.as_bytes());
             if parsed.rp_id_hash != expected_hash.as_slice() {
                 return Err(ServiceError::Fido2(
@@ -984,27 +988,82 @@ impl<S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::Aud
             }
         }
 
-        // Log sign_count for future replay detection. Full enforcement
-        // requires per-credential counter persistence (not yet implemented).
+        // 5. Challenge freshness — consume server-issued challenge and verify
+        //    that client_data_hash matches SHA-256 of the expected clientDataJSON.
+        {
+            let now = now_epoch();
+            let challenge_bytes = self
+                .store
+                .consume_challenge(challenge_id, now)
+                .map_err(|e| ServiceError::Fido2(format!("challenge invalid: {e}")))?;
+            let ch_b64url = URL_SAFE_NO_PAD.encode(challenge_bytes);
+            // Reconstruct the exact clientDataJSON the C++ client produced.
+            let expected_cdj = format!(
+                r#"{{"type":"webauthn.get","challenge":"{ch_b64url}","origin":"https://{enrolled_rp_id}"}}"#
+            );
+            let expected_hash = Sha256::digest(expected_cdj.as_bytes());
+            if expected_hash.as_slice() != client_data_hash {
+                return Err(ServiceError::Fido2(
+                    "client_data_hash does not match server-issued challenge".into(),
+                ));
+            }
+        }
+
+        // 6. Sign-count monotonicity — detect cloned authenticators / replay.
+        //    Authenticators that do not support counters report 0; skip the check.
         if parsed.sign_count > 0 {
-            tracing::debug!(
-                credential_id = %req.credential_id,
-                sign_count = parsed.sign_count,
-                "assertion sign_count (replay detection requires persistent counter)"
+            let stored = self
+                .store
+                .get_sign_count(credential_id)
+                .map_err(|e| ServiceError::Store(e.to_string()))?
+                .unwrap_or(0);
+            if parsed.sign_count <= stored {
+                return Err(ServiceError::Fido2(format!(
+                    "sign_count replay detected: received {} <= stored {} for credential '{credential_id}'",
+                    parsed.sign_count, stored
+                )));
+            }
+            self.store
+                .set_sign_count(credential_id, parsed.sign_count)
+                .map_err(|e| ServiceError::Store(e.to_string()))?;
+        } else {
+            tracing::warn!(
+                credential_id = %credential_id,
+                "authenticator reported sign_count=0; counter-based replay detection skipped"
             );
         }
 
-        // 3. Issue a session bound to the enrolled subject URN.
-        //    The caller's subject_urn is IGNORED — the session is always
-        //    issued for the identity that owns the verified credential.
-        //    mfa_verified reflects the actual user_verified (UV) flag
-        //    from the authenticator, not a caller-supplied claim.
-        let session_req = SessionRequest {
+        Ok(CommonAssertionOutput {
             subject_urn,
+            user_verified: parsed.user_verified,
+        })
+    }
+
+    /// Issue a session from a FIDO2 assertion proof.
+    ///
+    /// The caller (Auth Bridge) sends the raw getAssertion output; we verify
+    /// the assertion via `verify_assertion_common`, then issue a SessionDocument.
+    pub fn issue_session_from_assertion(
+        &mut self,
+        req: AssertionSessionRequest,
+    ) -> Result<SessionResult, ServiceError> {
+        let out = self.verify_assertion_common(
+            &req.credential_id,
+            &req.challenge_id,
+            &req.client_data_hash,
+            &req.authenticator_data,
+            &req.signature,
+        )?;
+
+        // Issue a session bound to the enrolled subject URN. The caller's
+        // subject_urn is IGNORED — the session is always bound to the credential
+        // owner. mfa_verified reflects the actual UV flag from the authenticator.
+        let session_req = SessionRequest {
+            subject_urn: out.subject_urn,
             device_urn: None,
             requested_resources: vec![],
             duration_secs: req.duration_secs.unwrap_or(3600).min(86400),
-            mfa_verified: parsed.user_verified,
+            mfa_verified: out.user_verified,
             tls_binding: None,
         };
         self.issue_session(session_req)
@@ -1188,67 +1247,26 @@ impl<S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::Aud
     }
 
     /// Admin vouches for an enrolled user. The admin proves presence via
-    /// FIDO2 assertion. The node verifies the assertion, checks admin is a
-    /// trusted root, loads the admin's persisted signing key, and signs a
+    /// FIDO2 assertion. The node verifies the assertion (UP, RP-ID, challenge
+    /// freshness, and sign-count via `verify_assertion_common`), checks admin
+    /// is a trusted root, loads the admin's persisted signing key, and signs a
     /// Vouch token granting the subject the requested purpose.
     pub fn admin_vouch(
         &mut self,
         req: AdminVouchRequest,
     ) -> Result<AdminVouchResult, ServiceError> {
-        use dds_domain::fido2::{cose_to_credential_public_key, verify_assertion};
-
-        // 1. Look up admin credential in trust graph (same as session assertion).
-        let (admin_urn, public_key) = {
-            let g = self
-                .trust_graph
-                .read()
-                .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
-
-            let mut found: Option<(String, Vec<u8>)> = None;
-            for token in g.attestations_iter() {
-                if g.is_revoked(&token.payload.jti) || g.is_burned(&token.payload.iss) {
-                    continue;
-                }
-                let doc = match UserAuthAttestation::extract(&token.payload) {
-                    Ok(Some(d)) => d,
-                    _ => continue,
-                };
-                if doc.credential_id == req.credential_id {
-                    let parsed = dds_domain::fido2::verify_attestation(
-                        &doc.attestation_object,
-                        &doc.client_data_hash,
-                    )
-                    .map_err(|e| ServiceError::Fido2(format!("re-parse attestation: {e}")))?;
-                    let auth_data = &parsed.auth_data;
-                    let p = 37 + 16 + 2 + parsed.credential_id.len();
-                    let cose_bytes = &auth_data[p..];
-                    found = Some((token.payload.sub.clone(), cose_bytes.to_vec()));
-                    break;
-                }
-            }
-
-            let (sub, cose_bytes) = found.ok_or_else(|| {
-                ServiceError::Fido2(format!(
-                    "admin credential_id '{}' not found in trust graph",
-                    req.credential_id
-                ))
-            })?;
-
-            let pk = cose_to_credential_public_key(&cose_bytes)
-                .map_err(|e| ServiceError::Fido2(format!("COSE key parse: {e}")))?;
-            (sub, pk)
-        };
-
-        // 2. Verify FIDO2 assertion (proves admin touched authenticator).
-        let _parsed = verify_assertion(
-            &req.authenticator_data,
+        // 1–6. Shared assertion verifier: credential lookup, crypto, UP flag,
+        //      RP-ID binding, challenge freshness, sign-count monotonicity.
+        let out = self.verify_assertion_common(
+            &req.credential_id,
+            &req.challenge_id,
             &req.client_data_hash,
+            &req.authenticator_data,
             &req.signature,
-            &public_key,
-        )
-        .map_err(|e| ServiceError::Fido2(e.to_string()))?;
+        )?;
+        let admin_urn = out.subject_urn;
 
-        // 3. Check admin is a trusted root.
+        // 7. Check admin is a trusted root.
         if !self.trusted_roots.contains(&admin_urn) {
             return Err(ServiceError::Trust(format!(
                 "identity '{}' is not a trusted root",
@@ -1256,10 +1274,10 @@ impl<S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::Aud
             )));
         }
 
-        // 4. Load admin's persisted signing key.
+        // 8. Load admin's persisted signing key.
         let admin_signing_key = self.load_admin_key(&admin_urn)?;
 
-        // 5. Find the subject's attestation token to compute vch_sum.
+        // 9. Find the subject's attestation token to compute vch_sum.
         let (subject_attest_iss, subject_attest_hash) = {
             let g = self
                 .trust_graph
@@ -1281,7 +1299,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::Aud
             })?
         };
 
-        // 6. Build and sign the vouch token.
+        // 10. Build and sign the vouch token.
         let purpose = req.purpose.unwrap_or_else(|| "dds:session".to_string());
         let vouch_jti = format!("vouch-{}", rand_u64());
         let admin_public_key = dds_core::crypto::PublicKeyBundle {

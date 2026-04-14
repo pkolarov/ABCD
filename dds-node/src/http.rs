@@ -35,7 +35,9 @@ use crate::service::{
     ApplicableWindowsPolicy, AppliedReport, AssertionSessionRequest, EnrollDeviceRequest,
     EnrollUserRequest, EnrolledUser, LocalService, NodeStatus, PolicyResult, ServiceError,
 };
-use dds_store::traits::{AuditStore, RevocationStore, TokenStore};
+use dds_store::traits::{
+    AuditStore, ChallengeStore, CredentialStateStore, RevocationStore, TokenStore,
+};
 
 /// Shared, mutex-guarded service handle. Per-request handlers acquire
 /// the lock for the (very short) duration of the call. The bottleneck
@@ -49,12 +51,31 @@ pub struct NodeInfo {
     pub peer_id: String,
 }
 
-struct AppState<S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static> {
+struct AppState<
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+> {
     svc: SharedService<S>,
     info: NodeInfo,
 }
 
-impl<S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static> Clone for AppState<S> {
+impl<
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+> Clone for AppState<S>
+{
     fn clone(&self) -> Self {
         Self {
             svc: self.svc.clone(),
@@ -63,10 +84,20 @@ impl<S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static> Clone
     }
 }
 
+/// TTL for server-issued FIDO2 challenges (5 minutes).
+const CHALLENGE_TTL_SECS: u64 = 300;
+
 /// Build the axum router for the local API.
 pub fn router<S>(svc: SharedService<S>, info: NodeInfo) -> Router
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let state = AppState { svc, info };
     Router::new()
@@ -76,8 +107,10 @@ where
         // removed. Session issuance now requires FIDO2 proof-of-possession
         // via /v1/session/assert. The internal `issue_session` method is
         // still available for use by `issue_session_from_assertion`.
+        .route("/v1/session/challenge", get(issue_session_challenge::<S>))
         .route("/v1/session/assert", post(issue_session_assert::<S>))
         .route("/v1/enrolled-users", get(list_enrolled_users::<S>))
+        .route("/v1/admin/challenge", get(issue_admin_challenge::<S>))
         .route("/v1/admin/setup", post(admin_setup::<S>))
         .route("/v1/admin/vouch", post(admin_vouch::<S>))
         .route("/v1/policy/evaluate", post(evaluate_policy::<S>))
@@ -159,10 +192,20 @@ pub struct PolicyRequestJson {
 
 // ---------- Credential Provider types (Phase III) ----------
 
+/// Response from `GET /v1/session/challenge` and `GET /v1/admin/challenge`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChallengeResponse {
+    pub challenge_id: String,
+    pub challenge_b64url: String,
+    pub expires_at: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AssertionSessionRequestJson {
     pub subject_urn: Option<String>,
     pub credential_id: String,
+    /// Server-issued challenge ID from `GET /v1/session/challenge`.
+    pub challenge_id: String,
     pub client_data_hash: String,
     pub authenticator_data: String,
     pub signature: String,
@@ -173,6 +216,8 @@ pub struct AssertionSessionRequestJson {
 pub struct AdminVouchRequestJson {
     pub subject_urn: String,
     pub credential_id: String,
+    /// Server-issued challenge ID from `GET /v1/admin/challenge`.
+    pub challenge_id: String,
     pub authenticator_data: String,
     pub client_data_hash: String,
     pub signature: String,
@@ -301,7 +346,14 @@ async fn enroll_user<S>(
     Json(req): Json<EnrollUserRequestJson>,
 ) -> Result<Json<EnrollmentResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let attestation_object = b64_decode(&req.attestation_object_b64, "attestation_object_b64")?;
     let client_data_hash = b64_decode(&req.client_data_hash_b64, "client_data_hash_b64")?;
@@ -328,7 +380,14 @@ async fn enroll_device<S>(
     Json(req): Json<EnrollDeviceRequestJson>,
 ) -> Result<Json<EnrollmentResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let internal = EnrollDeviceRequest {
         label: req.label,
@@ -359,7 +418,14 @@ async fn evaluate_policy<S>(
     Json(req): Json<PolicyRequestJson>,
 ) -> Result<Json<PolicyResult>, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let svc = state.svc.lock().await;
     let r = svc.evaluate_policy(&req.subject_urn, &req.resource, &req.action)?;
@@ -368,7 +434,14 @@ where
 
 async fn status<S>(State(state): State<AppState<S>>) -> Result<Json<NodeStatus>, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let svc = state.svc.lock().await;
     Ok(Json(svc.status(&state.info.peer_id, 0, 0)?))
@@ -376,16 +449,108 @@ where
 
 // ---------- Credential Provider handlers (Phase III) ----------
 
+async fn issue_session_challenge<S>(
+    State(state): State<AppState<S>>,
+) -> Result<Json<ChallengeResponse>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    issue_challenge(state, "session").await
+}
+
+async fn issue_admin_challenge<S>(
+    State(state): State<AppState<S>>,
+) -> Result<Json<ChallengeResponse>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    issue_challenge(state, "admin").await
+}
+
+async fn issue_challenge<S>(
+    state: AppState<S>,
+    kind: &str,
+) -> Result<Json<ChallengeResponse>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use rand::RngCore;
+
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| HttpError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("system clock error: {e}"),
+        })?
+        .as_secs();
+    let expires_at = now + CHALLENGE_TTL_SECS;
+
+    let id = format!(
+        "chall-{kind}-{}",
+        now ^ u64::from_ne_bytes(bytes[..8].try_into().unwrap())
+    );
+    let challenge_b64url = URL_SAFE_NO_PAD.encode(bytes);
+
+    {
+        let mut svc = state.svc.lock().await;
+        svc.store_mut()
+            .put_challenge(&id, &bytes, expires_at)
+            .map_err(|e| HttpError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("store error: {e}"),
+            })?;
+    }
+
+    Ok(Json(ChallengeResponse {
+        challenge_id: id,
+        challenge_b64url,
+        expires_at,
+    }))
+}
+
 async fn issue_session_assert<S>(
     State(state): State<AppState<S>>,
     Json(req): Json<AssertionSessionRequestJson>,
 ) -> Result<Json<SessionResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let internal = AssertionSessionRequest {
         subject_urn: req.subject_urn,
         credential_id: req.credential_id,
+        challenge_id: req.challenge_id,
         client_data_hash: b64_decode(&req.client_data_hash, "client_data_hash")?,
         authenticator_data: b64_decode(&req.authenticator_data, "authenticator_data")?,
         signature: b64_decode(&req.signature, "signature")?,
@@ -405,7 +570,14 @@ async fn list_enrolled_users<S>(
     Query(q): Query<DeviceUrnQuery>,
 ) -> Result<Json<EnrolledUsersResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let svc = state.svc.lock().await;
     let users = svc.list_enrolled_users(&q.device_urn)?;
@@ -419,7 +591,14 @@ async fn admin_setup<S>(
     Json(req): Json<EnrollUserRequestJson>,
 ) -> Result<Json<EnrollmentResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let attestation_object = b64_decode(&req.attestation_object_b64, "attestation_object_b64")?;
     let client_data_hash = b64_decode(&req.client_data_hash_b64, "client_data_hash_b64")?;
@@ -446,11 +625,19 @@ async fn admin_vouch<S>(
     Json(req): Json<AdminVouchRequestJson>,
 ) -> Result<Json<AdminVouchResponseJson>, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let internal = AdminVouchRequest {
         subject_urn: req.subject_urn,
         credential_id: req.credential_id,
+        challenge_id: req.challenge_id,
         client_data_hash: b64_decode(&req.client_data_hash, "client_data_hash")?,
         authenticator_data: b64_decode(&req.authenticator_data, "authenticator_data")?,
         signature: b64_decode(&req.signature, "signature")?,
@@ -472,7 +659,14 @@ async fn list_windows_policies<S>(
     Query(q): Query<DeviceUrnQuery>,
 ) -> Result<Json<WindowsPoliciesResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let svc = state.svc.lock().await;
     let policies = svc.list_applicable_windows_policies(&q.device_urn)?;
@@ -484,7 +678,14 @@ async fn list_windows_software<S>(
     Query(q): Query<DeviceUrnQuery>,
 ) -> Result<Json<WindowsSoftwareResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let svc = state.svc.lock().await;
     let software = svc.list_applicable_software(&q.device_urn)?;
@@ -496,7 +697,14 @@ async fn record_windows_applied<S>(
     Json(report): Json<AppliedReport>,
 ) -> Result<StatusCode, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let svc = state.svc.lock().await;
     svc.record_applied(&report)?;
@@ -508,7 +716,14 @@ async fn claim_windows_account<S>(
     Json(req): Json<WindowsClaimAccountRequestJson>,
 ) -> Result<Json<WindowsClaimAccountResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let session_token_cbor = b64_decode(&req.session_token_cbor_b64, "session_token_cbor_b64")?;
     let svc = state.svc.lock().await;
@@ -541,7 +756,14 @@ async fn list_macos_policies<S>(
     Query(q): Query<DeviceUrnQuery>,
 ) -> Result<Json<MacOsPoliciesResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let svc = state.svc.lock().await;
     let policies = svc.list_applicable_macos_policies(&q.device_urn)?;
@@ -553,7 +775,14 @@ async fn list_macos_software<S>(
     Query(q): Query<DeviceUrnQuery>,
 ) -> Result<Json<MacOsSoftwareResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let svc = state.svc.lock().await;
     let software = svc.list_applicable_software(&q.device_urn)?;
@@ -565,7 +794,14 @@ async fn record_macos_applied<S>(
     Json(report): Json<AppliedReport>,
 ) -> Result<StatusCode, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let svc = state.svc.lock().await;
     svc.record_applied(&report)?;
@@ -599,7 +835,14 @@ async fn list_audit_entries<S>(
     Query(params): Query<AuditQueryParams>,
 ) -> Result<Json<AuditEntriesResponse>, HttpError>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let svc = state.svc.lock().await;
     let entries = svc.list_audit_entries(params.action.as_deref(), params.limit)?;
@@ -626,7 +869,14 @@ pub async fn serve<S>(
     info: NodeInfo,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
-    S: TokenStore + RevocationStore + AuditStore + Send + Sync + 'static,
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
 {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "HTTP API listening");
@@ -737,6 +987,10 @@ mod tests {
             .route("/v1/enroll/user", post(enroll_user::<MemoryBackend>))
             .route("/v1/enroll/device", post(enroll_device::<MemoryBackend>))
             .route(
+                "/v1/session/challenge",
+                get(issue_session_challenge::<MemoryBackend>),
+            )
+            .route(
                 "/v1/session/assert",
                 post(issue_session_assert::<MemoryBackend>),
             )
@@ -744,6 +998,12 @@ mod tests {
                 "/v1/enrolled-users",
                 get(list_enrolled_users::<MemoryBackend>),
             )
+            .route(
+                "/v1/admin/challenge",
+                get(issue_admin_challenge::<MemoryBackend>),
+            )
+            .route("/v1/admin/setup", post(admin_setup::<MemoryBackend>))
+            .route("/v1/admin/vouch", post(admin_vouch::<MemoryBackend>))
             .route(
                 "/v1/policy/evaluate",
                 post(evaluate_policy::<MemoryBackend>),
@@ -785,6 +1045,48 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{}", addr)
+    }
+
+    /// Fetch a server-issued challenge from `path` (e.g. `/v1/session/challenge`).
+    /// Returns `(challenge_id, challenge_b64url)`.
+    async fn fetch_challenge(base: &str, path: &str) -> (String, String) {
+        let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+        assert_eq!(resp.status(), 200, "challenge endpoint failed");
+        let body: ChallengeResponse = resp.json().await.unwrap();
+        (body.challenge_id, body.challenge_b64url)
+    }
+
+    /// Build a FIDO2 assertion using a server-supplied challenge.
+    ///
+    /// Constructs `clientDataJSON` exactly as the C++ bridge does:
+    /// `{"type":"webauthn.get","challenge":"<b64url>","origin":"https://<rp_id>"}`.
+    /// Returns `(auth_data_b64, client_data_hash_b64, sig_b64)`.
+    fn build_assertion_with_challenge(
+        rp_id: &str,
+        sk: &SigningKey,
+        sign_count: u32,
+        challenge_b64url: &str,
+    ) -> (String, String, String) {
+        use dds_domain::fido2::build_assertion_auth_data;
+        use ed25519_dalek::Signer;
+
+        let auth_data = build_assertion_auth_data(rp_id, sign_count);
+
+        let cdj = format!(
+            r#"{{"type":"webauthn.get","challenge":"{challenge_b64url}","origin":"https://{rp_id}"}}"#
+        );
+        let cdh = sha2::Sha256::digest(cdj.as_bytes());
+
+        let mut signed_msg = Vec::new();
+        signed_msg.extend_from_slice(&auth_data);
+        signed_msg.extend_from_slice(&cdh);
+        let sig = sk.sign(&signed_msg);
+
+        (
+            b64_encode(&auth_data),
+            b64_encode(&cdh),
+            b64_encode(&sig.to_bytes()),
+        )
     }
 
     #[tokio::test]
@@ -898,8 +1200,7 @@ mod tests {
     /// and verify a session is issued. End-to-end CP flow.
     #[tokio::test]
     async fn test_session_assert_ed25519_roundtrip() {
-        use dds_domain::fido2::{build_assertion_auth_data, build_none_attestation};
-        use ed25519_dalek::Signer;
+        use dds_domain::fido2::build_none_attestation;
 
         let ts = make_state_with_root();
         let state = ts.app;
@@ -934,22 +1235,21 @@ mod tests {
         // 1b. Root vouches for the enrolled user so they have purposes.
         vouch_user(&state, &ts.root, &enrolled.urn).await;
 
-        // 2. Build a FIDO2 assertion signed by the same key.
-        let auth_data = build_assertion_auth_data("dds.local", 1);
-        let cdh = sha2::Sha256::digest(b"test-client-data-json");
-        let mut signed_msg = Vec::new();
-        signed_msg.extend_from_slice(&auth_data);
-        signed_msg.extend_from_slice(&cdh);
-        let sig = sk.sign(&signed_msg);
+        // 2. Fetch a server challenge and build the FIDO2 assertion from it.
+        let (challenge_id, challenge_b64url) =
+            fetch_challenge(&base, "/v1/session/challenge").await;
+        let (auth_data_b64, cdh_b64, sig_b64) =
+            build_assertion_with_challenge("dds.local", &sk, 1, &challenge_b64url);
 
         // 3. POST /v1/session/assert — use the base64url credential_id
         //    that matches what enroll_user stored in the trust graph.
         let assert_req = AssertionSessionRequestJson {
             subject_urn: Some(enrolled.urn.clone()),
             credential_id: cred_id_b64,
-            client_data_hash: b64_encode(&cdh),
-            authenticator_data: b64_encode(&auth_data),
-            signature: b64_encode(&sig.to_bytes()),
+            challenge_id,
+            client_data_hash: cdh_b64,
+            authenticator_data: auth_data_b64,
+            signature: sig_b64,
             duration_secs: Some(1800),
         };
         let resp = reqwest::Client::new()
@@ -995,7 +1295,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
 
-        // Sign assertion with key B (wrong key).
+        // Sign assertion with key B (wrong key). Rejected at crypto step (before challenge).
         let sk_b = SigningKey::generate(&mut OsRng);
         let auth_data = build_assertion_auth_data("dds.local", 1);
         let cdh = [0xABu8; 32];
@@ -1007,6 +1307,7 @@ mod tests {
         let assert_req = AssertionSessionRequestJson {
             subject_urn: None,
             credential_id: cred_id_b64,
+            challenge_id: "dummy-id".into(),
             client_data_hash: b64_encode(&cdh),
             authenticator_data: b64_encode(&auth_data),
             signature: b64_encode(&sig.to_bytes()),
@@ -1038,9 +1339,11 @@ mod tests {
         signed_msg.extend_from_slice(&cdh);
         let sig = sk.sign(&signed_msg);
 
+        // Rejected at credential-lookup step (before challenge).
         let assert_req = AssertionSessionRequestJson {
             subject_urn: None,
             credential_id: "nonexistent-cred".into(),
+            challenge_id: "dummy-id".into(),
             client_data_hash: b64_encode(&cdh),
             authenticator_data: b64_encode(&auth_data),
             signature: b64_encode(&sig.to_bytes()),
@@ -1631,5 +1934,493 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 202);
+    }
+
+    // ----------------------------------------------------------------
+    // FIDO2 replay / freshness regression tests (Phase 5)
+    // ----------------------------------------------------------------
+
+    /// Helper: enroll a user and return (cred_id_b64, sk, enrolled_urn).
+    async fn enroll_user_helper(
+        base: &str,
+        label: &str,
+        cred_bytes: &[u8],
+        rp_id: &str,
+    ) -> (String, SigningKey, String) {
+        use dds_domain::fido2::build_none_attestation;
+        let sk = SigningKey::generate(&mut OsRng);
+        let attestation = build_none_attestation(rp_id, cred_bytes, &sk.verifying_key());
+        let cred_id_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred_bytes);
+        let enroll_req = EnrollUserRequestJson {
+            label: label.into(),
+            credential_id: cred_id_b64.clone(),
+            attestation_object_b64: b64_encode(&attestation),
+            client_data_hash_b64: b64_encode(&[0u8; 32]),
+            rp_id: rp_id.into(),
+            display_name: label.to_uppercase(),
+            authenticator_type: "platform".into(),
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/enroll/user"))
+            .json(&enroll_req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: EnrollmentResponse = resp.json().await.unwrap();
+        (cred_id_b64, sk, body.urn)
+    }
+
+    /// POST /v1/session/assert using a fresh challenge.
+    #[allow(clippy::too_many_arguments)]
+    async fn assert_session(
+        base: &str,
+        cred_id: &str,
+        sk: &SigningKey,
+        rp_id: &str,
+        sign_count: u32,
+        challenge_id: String,
+        challenge_b64url: &str,
+        duration_secs: Option<u64>,
+    ) -> reqwest::StatusCode {
+        let (auth_data_b64, cdh_b64, sig_b64) =
+            build_assertion_with_challenge(rp_id, sk, sign_count, challenge_b64url);
+        let req = AssertionSessionRequestJson {
+            subject_urn: None,
+            credential_id: cred_id.into(),
+            challenge_id,
+            client_data_hash: cdh_b64,
+            authenticator_data: auth_data_b64,
+            signature: sig_b64,
+            duration_secs,
+        };
+        reqwest::Client::new()
+            .post(format!("{base}/v1/session/assert"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Omitting `challenge_id` causes JSON deserialization failure → 422.
+    #[tokio::test]
+    async fn test_assert_requires_challenge() {
+        let state = make_state();
+        let base = spawn_server(state).await;
+
+        // Send request without `challenge_id` field.
+        let body = serde_json::json!({
+            "credential_id": "cred-x",
+            "client_data_hash": b64_encode(&[0u8; 32]),
+            "authenticator_data": b64_encode(&[0u8; 37]),
+            "signature": b64_encode(&[0u8; 64]),
+        });
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/session/assert"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        // axum returns 422 Unprocessable Entity for missing required fields.
+        assert_eq!(resp.status(), 422);
+    }
+
+    /// A challenge is single-use: replaying the same challenge_id is rejected.
+    #[tokio::test]
+    async fn test_assert_challenge_single_use() {
+        let ts = make_state_with_root();
+        let state = ts.app;
+        let base = spawn_server(state.clone()).await;
+
+        let (cred_id, sk, urn) =
+            enroll_user_helper(&base, "alice", b"cred-single-use", "dds.local").await;
+        vouch_user(&state, &ts.root, &urn).await;
+
+        let (challenge_id, challenge_b64url) =
+            fetch_challenge(&base, "/v1/session/challenge").await;
+
+        // First use succeeds.
+        let status = assert_session(
+            &base,
+            &cred_id,
+            &sk,
+            "dds.local",
+            1,
+            challenge_id.clone(),
+            &challenge_b64url,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "first assertion should succeed");
+
+        // Second use with same challenge_id is rejected.
+        let (auth_data_b64, cdh_b64, sig_b64) =
+            build_assertion_with_challenge("dds.local", &sk, 2, &challenge_b64url);
+        let req = AssertionSessionRequestJson {
+            subject_urn: None,
+            credential_id: cred_id,
+            challenge_id,
+            client_data_hash: cdh_b64,
+            authenticator_data: auth_data_b64,
+            signature: sig_b64,
+            duration_secs: None,
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/session/assert"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "replayed challenge should be rejected");
+    }
+
+    /// A challenge with an already-expired TTL is rejected.
+    #[tokio::test]
+    async fn test_assert_stale_challenge() {
+        let ts = make_state_with_root();
+        let state = ts.app;
+        let base = spawn_server(state.clone()).await;
+
+        let (cred_id, sk, urn) =
+            enroll_user_helper(&base, "dave", b"cred-stale", "dds.local").await;
+        vouch_user(&state, &ts.root, &urn).await;
+
+        // Inject an already-expired challenge directly into the store.
+        let stale_bytes = [0xDEu8; 32];
+        let stale_id = "chall-expired-test";
+        {
+            let mut svc = state.svc.lock().await;
+            // expires_at = 1 (Unix epoch + 1 s) — already expired.
+            svc.store_mut()
+                .put_challenge(stale_id, &stale_bytes, 1)
+                .unwrap();
+        }
+
+        let challenge_b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(stale_bytes);
+        let (auth_data_b64, cdh_b64, sig_b64) =
+            build_assertion_with_challenge("dds.local", &sk, 1, &challenge_b64url);
+        let req = AssertionSessionRequestJson {
+            subject_urn: None,
+            credential_id: cred_id,
+            challenge_id: stale_id.into(),
+            client_data_hash: cdh_b64,
+            authenticator_data: auth_data_b64,
+            signature: sig_b64,
+            duration_secs: None,
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/session/assert"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "stale challenge should be rejected");
+    }
+
+    /// Non-monotonic sign_count is rejected as a replay attack.
+    #[tokio::test]
+    async fn test_assert_nonmonotonic_sign_count() {
+        let ts = make_state_with_root();
+        let state = ts.app;
+        let base = spawn_server(state.clone()).await;
+
+        let (cred_id, sk, urn) =
+            enroll_user_helper(&base, "eve", b"cred-counter", "dds.local").await;
+        vouch_user(&state, &ts.root, &urn).await;
+
+        // First assertion with count=5 — accepted.
+        let (ch_id, ch_b64) = fetch_challenge(&base, "/v1/session/challenge").await;
+        let status =
+            assert_session(&base, &cred_id, &sk, "dds.local", 5, ch_id, &ch_b64, None).await;
+        assert_eq!(status, 200, "first assertion (count=5) should succeed");
+
+        // Second assertion with count=3 (not monotonic) — rejected.
+        let (ch_id2, ch_b64_2) = fetch_challenge(&base, "/v1/session/challenge").await;
+        let status2 = assert_session(
+            &base,
+            &cred_id,
+            &sk,
+            "dds.local",
+            3,
+            ch_id2,
+            &ch_b64_2,
+            None,
+        )
+        .await;
+        assert_eq!(status2, 401, "non-monotonic sign_count should be rejected");
+    }
+
+    /// sign_count=0 (authenticator without counter support) skips replay detection.
+    #[tokio::test]
+    async fn test_assert_sign_count_zero_skips_check() {
+        let ts = make_state_with_root();
+        let state = ts.app;
+        let base = spawn_server(state.clone()).await;
+
+        let (cred_id, sk, urn) =
+            enroll_user_helper(&base, "frank", b"cred-no-counter", "dds.local").await;
+        vouch_user(&state, &ts.root, &urn).await;
+
+        // Two consecutive assertions both with count=0 should both succeed.
+        let (ch_id, ch_b64) = fetch_challenge(&base, "/v1/session/challenge").await;
+        let status =
+            assert_session(&base, &cred_id, &sk, "dds.local", 0, ch_id, &ch_b64, None).await;
+        assert_eq!(status, 200, "first count=0 assertion should succeed");
+
+        let (ch_id2, ch_b64_2) = fetch_challenge(&base, "/v1/session/challenge").await;
+        let status2 = assert_session(
+            &base,
+            &cred_id,
+            &sk,
+            "dds.local",
+            0,
+            ch_id2,
+            &ch_b64_2,
+            None,
+        )
+        .await;
+        assert_eq!(status2, 200, "second count=0 assertion should also succeed");
+    }
+
+    /// admin_vouch missing challenge_id → 422.
+    #[tokio::test]
+    async fn test_admin_vouch_requires_challenge() {
+        let state = make_state();
+        let base = spawn_server(state).await;
+
+        let body = serde_json::json!({
+            "subject_urn": "urn:vouchsafe:nobody.aaa",
+            "credential_id": "cred-x",
+            "authenticator_data": b64_encode(&[0u8; 37]),
+            "client_data_hash": b64_encode(&[0u8; 32]),
+            "signature": b64_encode(&[0u8; 64]),
+        });
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/admin/vouch"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422);
+    }
+
+    /// admin_vouch enforces UP flag (user_present must be set).
+    ///
+    /// `build_assertion_auth_data` sets flags=0x01 (UP). We craft
+    /// authenticatorData with flags=0x00 to simulate a missing UP flag.
+    #[tokio::test]
+    async fn test_admin_vouch_requires_up() {
+        use sha2::Digest;
+
+        let ts = make_state_with_root();
+        let state = ts.app;
+        let base = spawn_server(state.clone()).await;
+
+        let (cred_id, sk, _urn) =
+            enroll_user_helper(&base, "grace", b"cred-no-up", "dds.local").await;
+
+        // Build authenticatorData with flags=0x00 (UP not set).
+        let rp_id_hash = sha2::Sha256::digest(b"dds.local");
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&rp_id_hash);
+        auth_data.push(0x00); // flags: UP=0, UV=0
+        auth_data.extend_from_slice(&[0u8; 4]); // sign_count = 0
+
+        let (ch_id, ch_b64) = fetch_challenge(&base, "/v1/admin/challenge").await;
+        let cdj = format!(
+            r#"{{"type":"webauthn.get","challenge":"{ch_b64}","origin":"https://dds.local"}}"#
+        );
+        let cdh = sha2::Sha256::digest(cdj.as_bytes());
+        let mut msg = auth_data.clone();
+        msg.extend_from_slice(&cdh);
+        let sig = {
+            use ed25519_dalek::Signer;
+            sk.sign(&msg)
+        };
+
+        let req = AdminVouchRequestJson {
+            subject_urn: "urn:vouchsafe:nobody.bbb".into(),
+            credential_id: cred_id,
+            challenge_id: ch_id,
+            authenticator_data: b64_encode(&auth_data),
+            client_data_hash: b64_encode(&cdh),
+            signature: b64_encode(&sig.to_bytes()),
+            purpose: None,
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/admin/vouch"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "UP=0 should be rejected");
+    }
+
+    /// admin_vouch enforces RP-ID binding.
+    #[tokio::test]
+    async fn test_admin_vouch_rp_id_enforced() {
+        use sha2::Digest;
+
+        let ts = make_state_with_root();
+        let state = ts.app;
+        let base = spawn_server(state.clone()).await;
+
+        // Enroll at "dds.local" but present auth_data for "evil.com".
+        let (cred_id, sk, _urn) =
+            enroll_user_helper(&base, "heidi", b"cred-rp-test", "dds.local").await;
+
+        // Build authenticatorData with rp_id_hash for wrong origin.
+        let wrong_rp_hash = sha2::Sha256::digest(b"evil.com");
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&wrong_rp_hash);
+        auth_data.push(0x01); // UP flag set
+        auth_data.extend_from_slice(&[0u8; 4]); // sign_count = 0
+
+        let (ch_id, ch_b64) = fetch_challenge(&base, "/v1/admin/challenge").await;
+        // Use correct origin in clientDataJSON, wrong rp_id in auth_data hash.
+        let cdj = format!(
+            r#"{{"type":"webauthn.get","challenge":"{ch_b64}","origin":"https://dds.local"}}"#
+        );
+        let cdh = sha2::Sha256::digest(cdj.as_bytes());
+        let mut msg = auth_data.clone();
+        msg.extend_from_slice(&cdh);
+        let sig = {
+            use ed25519_dalek::Signer;
+            sk.sign(&msg)
+        };
+
+        let req = AdminVouchRequestJson {
+            subject_urn: "urn:vouchsafe:nobody.ccc".into(),
+            credential_id: cred_id,
+            challenge_id: ch_id,
+            authenticator_data: b64_encode(&auth_data),
+            client_data_hash: b64_encode(&cdh),
+            signature: b64_encode(&sig.to_bytes()),
+            purpose: None,
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/admin/vouch"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "wrong RP-ID hash should be rejected");
+    }
+
+    /// admin_vouch challenge is single-use — replaying the same challenge_id fails.
+    ///
+    /// The first vouch attempt consumes the challenge but fails at the "not a
+    /// trusted root" check. The second attempt with the same challenge_id must
+    /// fail at the challenge step itself (401), proving the challenge was consumed.
+    #[tokio::test]
+    async fn test_admin_vouch_challenge_single_use() {
+        let ts = make_state_with_root();
+        let state = ts.app;
+        let base = spawn_server(state.clone()).await;
+
+        let (cred_id, sk, _urn) =
+            enroll_user_helper(&base, "ivan", b"cred-vouch-single", "dds.local").await;
+
+        let (ch_id, ch_b64) = fetch_challenge(&base, "/v1/admin/challenge").await;
+        let (auth_data_b64, cdh_b64, sig_b64) =
+            build_assertion_with_challenge("dds.local", &sk, 1, &ch_b64);
+
+        // First attempt: challenge is valid but credential is not a trusted root,
+        // so we get a non-422 error (challenge is consumed regardless of outcome).
+        let resp1 = reqwest::Client::new()
+            .post(format!("{base}/v1/admin/vouch"))
+            .json(&AdminVouchRequestJson {
+                subject_urn: "urn:vouchsafe:nobody.ddd".into(),
+                credential_id: cred_id.clone(),
+                challenge_id: ch_id.clone(),
+                authenticator_data: auth_data_b64.clone(),
+                client_data_hash: cdh_b64.clone(),
+                signature: sig_b64.clone(),
+                purpose: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            resp1.status(),
+            422,
+            "first attempt must not be a parse error"
+        );
+
+        // Second attempt with same challenge_id — must be rejected at challenge step.
+        let (auth_data2, cdh2, sig2) = build_assertion_with_challenge("dds.local", &sk, 2, &ch_b64);
+        let resp2 = reqwest::Client::new()
+            .post(format!("{base}/v1/admin/vouch"))
+            .json(&AdminVouchRequestJson {
+                subject_urn: "urn:vouchsafe:nobody.ddd".into(),
+                credential_id: cred_id,
+                challenge_id: ch_id,
+                authenticator_data: auth_data2,
+                client_data_hash: cdh2,
+                signature: sig2,
+                purpose: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp2.status(),
+            401,
+            "replayed admin challenge should be rejected"
+        );
+    }
+
+    /// A session challenge cannot be used for admin/vouch (they're independent stores,
+    /// both using the same ChallengeStore, but a valid challenge_id issued by
+    /// /v1/session/challenge is consumed here — the test verifies it's rejected on
+    /// the second use regardless of which endpoint issued it).
+    #[tokio::test]
+    async fn test_session_and_vouch_challenges_independent() {
+        let ts = make_state_with_root();
+        let state = ts.app;
+        let base = spawn_server(state.clone()).await;
+
+        let (cred_id, sk, urn) =
+            enroll_user_helper(&base, "judy", b"cred-cross", "dds.local").await;
+        vouch_user(&state, &ts.root, &urn).await;
+
+        // Obtain a session challenge, consume it successfully via /v1/session/assert.
+        let (ch_id, ch_b64) = fetch_challenge(&base, "/v1/session/challenge").await;
+        let status = assert_session(
+            &base,
+            &cred_id,
+            &sk,
+            "dds.local",
+            1,
+            ch_id.clone(),
+            &ch_b64,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "first session assert should succeed");
+
+        // Now try to reuse the same challenge_id for a second session assert.
+        let (auth2, cdh2, sig2) = build_assertion_with_challenge("dds.local", &sk, 2, &ch_b64);
+        let req2 = AssertionSessionRequestJson {
+            subject_urn: None,
+            credential_id: cred_id,
+            challenge_id: ch_id,
+            client_data_hash: cdh2,
+            authenticator_data: auth2,
+            signature: sig2,
+            duration_secs: None,
+        };
+        let resp2 = reqwest::Client::new()
+            .post(format!("{base}/v1/session/assert"))
+            .json(&req2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp2.status(),
+            401,
+            "consumed session challenge must not be reusable"
+        );
     }
 }

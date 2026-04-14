@@ -1,7 +1,7 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-14 (CLI parity: full wrapper for every HTTP endpoint + `debug ping|stats|config`)
+> Last updated: 2026-04-14 (CLI parity + FIDO2 replay hardening: server-issued single-use challenges, sign-count monotonicity, admin vouch UP/RP-ID parity)
 
 ## Build Health
 
@@ -324,6 +324,8 @@ All 7 crates are functionally complete. The following work is ordered by impact 
 
 17\. 🟢 **dds-fido2-test** — Interactive FIDO2 enrollment + authentication test tool. Tests the full hardware flow: USB key → makeCredential → dds-node enroll → getAssertion → dds-node session. Works on macOS and Windows with any FIDO2 USB key.
 
+18. **macOS enterprise login / Platform SSO roadmap** — DDS should not try to replace `loginwindow` directly. The supported path is to evolve from the current post-login coexistence model into an Apple-approved Platform SSO integration: first coexist with directory / IdP-owned login, then implement Platform SSO password mode, then add Secure Enclave backed passwordless flows where Apple allows them. Detailed tasks are tracked in the macOS roadmap section below.
+
 ### Windows Policy Applier Plan (Phase 3 items 9–10)
 
 Items 9 and 10 above split into *distribution* (already solved by gossip + the
@@ -467,6 +469,127 @@ Still TODO:
 - Sign and notarize the `.pkg` with an Apple Developer ID; validate install/upgrade/uninstall flows on a fresh Mac.
 - Decide whether Linux should share a common policy-agent core library with macOS/Windows or remain as three mostly separate worker implementations.
 - ~~Investigate and stabilize the unrelated `dds-node` multinode failures~~ — **Resolved 2026-04-13**: `dag_converges_after_partition` and `rejoined_node_catches_up_via_sync_protocol` now pass on Windows ARM64 (see verification note above).
+
+### macOS Enterprise Login Roadmap (Phase 3 item 18)
+
+Goal: make DDS work on macOS the way Entra works today, but through the
+Apple-supported identity path rather than by trying to replace the macOS login
+stack directly.
+
+Guardrails:
+
+- DDS remains the trust graph and local authorization source.
+- macOS still has a real local account underneath login, home folder ownership,
+  Secure Token, and FileVault.
+- The implementation path is `coexistence -> Platform SSO password mode ->
+  Secure Enclave / passwordless mode`, not "raw FIDO2 key unlocks the desktop".
+- Full custom replacement of `loginwindow` or FileVault pre-boot auth remains
+  out of scope unless Apple exposes a safe, supported API surface for it.
+
+#### Milestone M18.1 — v1.5 Coexistence On Enterprise Macs
+
+Target outcome: DDS works cleanly on Macs where AD / Open Directory / LDAP /
+Entra Platform SSO / Okta already owns login.
+
+- [ ] Add macOS host classification in the platform agent / future login bridge:
+  `Standalone`, `DirectoryBound`, `PlatformSsoManaged`, `Unknown`
+- [ ] Use that classification consistently to refuse DDS-owned `local_accounts`
+  mutation on non-standalone Macs
+- [ ] Add node/API support to publish and query `MacAccountBindingDocument`
+  and `SsoIdentityLinkDocument`
+- [ ] Define the admin issuance flow for those documents: subject mapping,
+  device scoping, conflict detection, revocation/update semantics
+- [ ] Add local reporting so a managed Mac can tell `dds-node` which macOS
+  account signed in and which external identity source owns it
+- [ ] Document operator guidance for:
+  - standalone DDS-managed Macs
+  - directory-bound Macs
+  - Platform SSO-managed Macs
+- [ ] Add tests covering:
+  - directory-bound host classification
+  - Platform SSO-managed host classification
+  - skipped account mutation on externally managed Macs
+  - binding/link document round-trip through HTTP
+
+Exit criteria:
+
+- DDS-managed local account mutation is impossible on externally managed Macs.
+- Operators can bind DDS subjects to enterprise-managed macOS accounts without
+  promising DDS desktop login yet.
+
+#### Milestone M18.2 — v2 DDS Platform SSO Password Mode
+
+Target outcome: DDS can participate in macOS desktop sign-in through an
+Apple-approved Platform SSO extension using password-based login semantics.
+
+- [ ] Create `platform/macos/DdsPlatformSsoExtension/` as the new identity
+  integration component
+- [ ] Stand up the required macOS app / extension packaging structure so the
+  Platform SSO extension can be deployed by MDM
+- [ ] Implement DDS-backed identity lookup:
+  - external principal -> `SsoIdentityLinkDocument`
+  - linked DDS subject -> policy / group / purpose resolution
+  - device -> `MacAccountBindingDocument`
+- [ ] Implement account binding behavior for first login:
+  - create local account if policy allows
+  - or attach to an existing local account
+  - persist the resulting binding document
+- [ ] Implement session bootstrap after successful Platform SSO sign-in:
+  - extension obtains DDS proof
+  - `dds-node` issues `SessionDocument`
+  - local apps / follow-on authorization can use DDS session state
+- [ ] Add MDM deployment artifacts and configuration profile templates for the
+  Platform SSO extension
+- [ ] Add a test harness for:
+  - principal mapping
+  - first-login account creation/binding logic
+  - password sync / password change event handling
+  - session issuance after sign-in
+- [ ] Validate on a real MDM-managed macOS host
+
+Exit criteria:
+
+- A user can sign in to macOS through DDS-backed Platform SSO password mode.
+- The Mac still has a normal local account underneath, but DDS now participates
+  in the supported desktop login path.
+
+#### Milestone M18.3 — v3 Secure Enclave / Passwordless Mode
+
+Target outcome: DDS offers the best macOS sign-in UX Apple allows, using Secure
+Enclave / platform credential style flows instead of direct password entry.
+
+- [ ] Extend the Platform SSO implementation to support Secure Enclave-backed
+  credential mode where the platform permits it
+- [ ] Define how DDS proof material binds to:
+  - local Secure Enclave state
+  - DDS subject identity
+  - device identity
+- [ ] Decide whether DDS FIDO2 enrollment and macOS platform credentials should
+  share one identity link or remain separate linked authenticators
+- [ ] Implement recovery / rebind flows for:
+  - motherboard replacement / Secure Enclave reset
+  - lost hardware key
+  - account re-association on reprovisioned Macs
+- [ ] Test reboot, unlock, password change, account recovery, and FileVault
+  interaction behavior on real hardware
+- [ ] Document the exact limits clearly: what is true desktop passwordless,
+  what still falls back to local password, and what remains Apple-controlled
+
+Exit criteria:
+
+- DDS supports the strongest Apple-supported passwordless macOS login path
+  available.
+- Recovery and operational failure modes are understood well enough for pilot
+  deployment.
+
+#### Milestone M18.4 — Deferred / Explicit Non-Goals
+
+- [ ] Do not attempt unsupported replacement of `loginwindow`
+- [ ] Do not attempt custom FileVault pre-boot authentication replacement
+- [ ] Do not promise plain FIDO2 security-key desktop login unless Apple exposes
+  a supportable path for it
+- [ ] Do not couple DDS authorization semantics to any one IdP vendor; DDS
+  remains the authorization system even when Entra/Okta/etc. provides login UX
 
 ## Path to Production
 

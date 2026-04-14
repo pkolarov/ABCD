@@ -69,6 +69,16 @@ struct DdsAdminVouchResult
     std::string errorMessage;
 };
 
+// Result of GET /v1/session/challenge or /v1/admin/challenge
+struct DdsChallengeResult
+{
+    bool        success;
+    std::string challengeId;      // Opaque server ID to echo back in the assertion POST
+    std::string challengeB64url;  // Base64url-encoded 32-byte nonce for clientDataJSON
+    uint64_t    expiresAt;        // Unix epoch seconds when the challenge expires
+    std::string errorMessage;
+};
+
 // Result of POST /v1/windows/claim-account
 struct DdsWindowsClaimResult
 {
@@ -125,6 +135,18 @@ public:
     // Admin vouches for an enrolled user via FIDO2 assertion proof.
     DdsAdminVouchResult PostAdminVouch(const std::string& vouchJson);
 
+    // GET /v1/session/challenge
+    //
+    // Fetches a short-lived (300 s) single-use challenge nonce for
+    // /v1/session/assert. The challenge_id must be echoed back in the assertion.
+    DdsChallengeResult GetSessionChallenge();
+
+    // GET /v1/admin/challenge
+    //
+    // Fetches a short-lived (300 s) single-use challenge nonce for
+    // /v1/admin/vouch. The challenge_id must be echoed back in the vouch POST.
+    DdsChallengeResult GetAdminChallenge();
+
     // POST /v1/windows/claim-account
     //
     // Resolves the local Windows account that the holder of a freshly
@@ -146,6 +168,9 @@ private:
     );
 
     // ---- Minimal JSON helpers (no external dependencies) ----
+
+    // Shared helper: parse the JSON body returned by challenge endpoints.
+    DdsChallengeResult ParseChallengeResponse(DWORD httpStatus, const std::string& responseBody);
 
     // Extract a string value for a given key from a flat JSON object.
     // Only handles simple cases (no nested objects for the extracted key).
