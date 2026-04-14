@@ -9,12 +9,14 @@
 //! `http://127.0.0.1:5551`).
 
 mod client;
+mod dump;
 
 use clap::{Parser, Subcommand};
 use client::{DEFAULT_NODE_URL, get_json, post_json, post_no_body};
 use dds_core::identity::Identity;
 use dds_store::RedbBackend;
 use dds_store::traits::*;
+use dump::{DUMP_VERSION, DdsDump};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -89,6 +91,21 @@ enum Commands {
     Debug {
         #[command(subcommand)]
         action: DebugAction,
+    },
+    /// Export the local store to a single `.ddsdump` file for air-gapped sync.
+    Export {
+        /// Destination path for the dump file.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Import a `.ddsdump` file into the local store (idempotent).
+    Import {
+        /// Source path of the dump file.
+        #[arg(long = "in")]
+        input: PathBuf,
+        /// Parse and validate the file but make no store writes.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -381,6 +398,8 @@ async fn main() {
             handle_cp(action, &url).await;
         }
         Commands::Debug { action } => handle_debug(action, &cli.node_url).await,
+        Commands::Export { out } => handle_export(&cli.data_dir, &out),
+        Commands::Import { input, dry_run } => handle_import(&cli.data_dir, &input, dry_run),
     }
 }
 
@@ -956,6 +975,259 @@ async fn handle_debug(action: DebugAction, node_url: &str) {
             println!("  (journalctl, Event Viewer, `Console.app`) to view tracing output.");
         }
     }
+}
+
+// ================================================================
+// export / import (air-gapped sync)
+// ================================================================
+
+/// Read the `domain.toml` next to the store and return its `id` field.
+/// Returns `None` if the file doesn't exist; errors out on parse failure.
+fn read_domain_id(data_dir: &Path) -> Option<String> {
+    let path = data_dir.join("domain.toml");
+    if !path.exists() {
+        return None;
+    }
+    let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        eprintln!("Failed to read {}: {e}", path.display());
+        std::process::exit(1);
+    });
+    #[derive(Deserialize)]
+    struct DomainToml {
+        id: String,
+    }
+    let d: DomainToml = toml::from_str(&body).unwrap_or_else(|e| {
+        eprintln!("Failed to parse {}: {e}", path.display());
+        std::process::exit(1);
+    });
+    Some(d.id)
+}
+
+fn open_store_or_exit(data_dir: &Path, create: bool) -> RedbBackend {
+    if create {
+        std::fs::create_dir_all(data_dir).unwrap_or_else(|e| {
+            eprintln!("Failed to create data dir {}: {e}", data_dir.display());
+            std::process::exit(1);
+        });
+    }
+    let db_path = data_dir.join("directory.redb");
+    if !create && !db_path.exists() {
+        eprintln!("No store found at {}", db_path.display());
+        std::process::exit(1);
+    }
+    RedbBackend::open(&db_path).unwrap_or_else(|e| {
+        eprintln!("Failed to open store at {}: {e}", db_path.display());
+        std::process::exit(1);
+    })
+}
+
+fn handle_export(data_dir: &Path, out: &Path) {
+    let store = open_store_or_exit(data_dir, false);
+
+    let domain_id = read_domain_id(data_dir).unwrap_or_else(|| {
+        eprintln!(
+            "Error: no domain.toml in {} — export requires a provisioned node.",
+            data_dir.display()
+        );
+        std::process::exit(1);
+    });
+
+    // Collect tokens.
+    let jtis = store.list_tokens(None).unwrap_or_else(|e| {
+        eprintln!("Failed to list tokens: {e}");
+        std::process::exit(1);
+    });
+    let mut tokens: Vec<Vec<u8>> = Vec::with_capacity(jtis.len());
+    for jti in &jtis {
+        let token = store.get_token(jti).unwrap_or_else(|e| {
+            eprintln!("Failed to read token {jti}: {e}");
+            std::process::exit(1);
+        });
+        let bytes = token.to_cbor().unwrap_or_else(|e| {
+            eprintln!("Failed to encode token {jti}: {e}");
+            std::process::exit(1);
+        });
+        tokens.push(bytes);
+    }
+
+    // Collect operations.
+    let op_ids = store.operation_ids().unwrap_or_else(|e| {
+        eprintln!("Failed to list operations: {e}");
+        std::process::exit(1);
+    });
+    let mut operations: Vec<Vec<u8>> = Vec::with_capacity(op_ids.len());
+    for id in &op_ids {
+        let op = store.get_operation(id).unwrap_or_else(|e| {
+            eprintln!("Failed to read operation {id}: {e}");
+            std::process::exit(1);
+        });
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&op, &mut bytes).unwrap_or_else(|e| {
+            eprintln!("Failed to encode operation {id}: {e}");
+            std::process::exit(1);
+        });
+        operations.push(bytes);
+    }
+
+    // Revoked + burned sets.
+    let revoked: Vec<String> = store
+        .revoked_set()
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to read revoked set: {e}");
+            std::process::exit(1);
+        })
+        .into_iter()
+        .collect();
+    let burned: Vec<String> = store
+        .burned_set()
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to read burned set: {e}");
+            std::process::exit(1);
+        })
+        .into_iter()
+        .collect();
+
+    let dump = DdsDump {
+        version: DUMP_VERSION,
+        domain_id: domain_id.clone(),
+        exported_at: now_epoch(),
+        tokens,
+        operations,
+        revoked,
+        burned,
+    };
+
+    let bytes = dump.to_cbor().unwrap_or_else(|e| {
+        eprintln!("Failed to encode dump: {e}");
+        std::process::exit(1);
+    });
+
+    if let Some(parent) = out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+            eprintln!("Failed to create {}: {e}", parent.display());
+            std::process::exit(1);
+        });
+    }
+    std::fs::write(out, &bytes).unwrap_or_else(|e| {
+        eprintln!("Failed to write {}: {e}", out.display());
+        std::process::exit(1);
+    });
+
+    println!("Exported dump to {}", out.display());
+    println!("  Domain:     {domain_id}");
+    println!("  Tokens:     {}", dump.tokens.len());
+    println!("  Operations: {}", dump.operations.len());
+    println!("  Revoked:    {}", dump.revoked.len());
+    println!("  Burned:     {}", dump.burned.len());
+    println!("  Size:       {} bytes", bytes.len());
+}
+
+fn handle_import(data_dir: &Path, input: &Path, dry_run: bool) {
+    // Parse dump first — validating the file before opening the store means
+    // a bad file never perturbs on-disk state.
+    let bytes = std::fs::read(input).unwrap_or_else(|e| {
+        eprintln!("Failed to read {}: {e}", input.display());
+        std::process::exit(1);
+    });
+    let dump = DdsDump::from_cbor(&bytes).unwrap_or_else(|e| {
+        eprintln!("Failed to parse dump: {e}");
+        std::process::exit(1);
+    });
+
+    if dump.version != DUMP_VERSION {
+        eprintln!(
+            "Error: unsupported dump version {} (this CLI understands v{DUMP_VERSION})",
+            dump.version
+        );
+        std::process::exit(1);
+    }
+
+    // Domain-id check — refuse to cross-pollinate stores from different
+    // domains. If the local node hasn't been provisioned yet, accept the
+    // dump (the caller is bootstrapping from the dump itself).
+    if let Some(local_id) = read_domain_id(data_dir)
+        && local_id != dump.domain_id
+    {
+        eprintln!(
+            "Error: domain mismatch — dump is for {}, local store is for {}",
+            dump.domain_id, local_id
+        );
+        std::process::exit(1);
+    }
+
+    println!("Dump:");
+    println!("  Domain:      {}", dump.domain_id);
+    println!("  Exported at: {}", dump.exported_at);
+    println!("  Tokens:      {}", dump.tokens.len());
+    println!("  Operations:  {}", dump.operations.len());
+    println!("  Revoked:     {}", dump.revoked.len());
+    println!("  Burned:      {}", dump.burned.len());
+
+    if dry_run {
+        println!("(dry run — no writes performed)");
+        return;
+    }
+
+    let mut store = open_store_or_exit(data_dir, true);
+
+    let mut new_tokens = 0usize;
+    let mut dup_tokens = 0usize;
+    for (i, raw) in dump.tokens.iter().enumerate() {
+        let token = dds_core::token::Token::from_cbor(raw).unwrap_or_else(|e| {
+            eprintln!("Failed to decode token #{i}: {e}");
+            std::process::exit(1);
+        });
+        let jti = token.payload.jti.clone();
+        if store.has_token(&jti) {
+            dup_tokens += 1;
+        } else {
+            new_tokens += 1;
+        }
+        store.put_token(&token).unwrap_or_else(|e| {
+            eprintln!("Failed to write token {jti}: {e}");
+            std::process::exit(1);
+        });
+    }
+
+    let mut new_ops = 0usize;
+    let mut dup_ops = 0usize;
+    for (i, raw) in dump.operations.iter().enumerate() {
+        let op: dds_core::crdt::causal_dag::Operation = ciborium::de::from_reader(raw.as_slice())
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to decode operation #{i}: {e}");
+                std::process::exit(1);
+            });
+        let inserted = store.put_operation(&op).unwrap_or_else(|e| {
+            eprintln!("Failed to write operation {}: {e}", op.id);
+            std::process::exit(1);
+        });
+        if inserted {
+            new_ops += 1;
+        } else {
+            dup_ops += 1;
+        }
+    }
+
+    for jti in &dump.revoked {
+        store.revoke(jti).unwrap_or_else(|e| {
+            eprintln!("Failed to revoke {jti}: {e}");
+            std::process::exit(1);
+        });
+    }
+    for urn in &dump.burned {
+        store.burn(urn).unwrap_or_else(|e| {
+            eprintln!("Failed to burn {urn}: {e}");
+            std::process::exit(1);
+        });
+    }
+
+    println!("Imported:");
+    println!("  Tokens:     {new_tokens} new, {dup_tokens} already present");
+    println!("  Operations: {new_ops} new, {dup_ops} already present");
+    println!("  Revoked:    {} applied", dump.revoked.len());
+    println!("  Burned:     {} applied", dump.burned.len());
 }
 
 // ================================================================

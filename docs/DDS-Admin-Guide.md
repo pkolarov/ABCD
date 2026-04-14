@@ -24,8 +24,9 @@ For background on how DDS works internally, see the [Developer Guide](DDS-Develo
 14. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
 15. [Audit Log](#audit-log)
 16. [Debugging](#debugging)
-17. [Security Reference](#security-reference)
-18. [Troubleshooting](#troubleshooting)
+17. [Air-Gapped Sync (USB Stick / Courier)](#air-gapped-sync-usb-stick--courier)
+18. [Security Reference](#security-reference)
+19. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -1292,6 +1293,75 @@ test generated configs before rolling them out.
 `tracing` framework (see the [Logs](#logs) section above) — tail them
 with standard OS tooling (`journalctl -u dds-node`, Windows Event
 Viewer / Service log, `Console.app` on macOS).
+
+---
+
+## Air-Gapped Sync (USB Stick / Courier)
+
+Some deployments run DDS nodes on networks that can never route packets
+to each other: classified enclaves, shipboard networks, off-grid sites.
+The `dds export` / `dds import` commands package a node's state into a
+single file so two peers can stay in sync through a courier or USB
+stick.
+
+### How it works
+
+- **Export** reads the local `directory.redb` and `domain.toml`, and
+  writes a single CBOR file (`.ddsdump`) containing:
+  - every signed token (attestations, vouches, revocations)
+  - every CRDT causal-DAG operation
+  - the revoked-JTI and burned-URN sets
+  - the source domain ID (to prevent cross-domain pollution)
+- **Import** decodes the file, checks the domain ID against the
+  destination's `domain.toml`, and replays the records. All writes are
+  *idempotent*: re-importing the same dump changes nothing because the
+  CRDT merge is deterministic and `put_token` / `put_operation` are
+  keyed by JTI / operation ID.
+
+Because the format is a plain CBOR document, a `.ddsdump` is exactly the
+same size as the on-disk store contents — no extra framing overhead.
+
+### Commands
+
+```bash
+# On node A: package the current state.
+dds --data-dir /var/lib/dds export --out /mnt/usb/acme-2026-04.ddsdump
+# Exported dump to /mnt/usb/acme-2026-04.ddsdump
+#   Domain:     dds-dom:acme-7x4q…
+#   Tokens:     142
+#   Operations: 318
+#   Revoked:    3
+#   Burned:     0
+#   Size:       412803 bytes
+
+# On node B (different site, no network path): replay it.
+dds --data-dir /var/lib/dds import --in /mnt/usb/acme-2026-04.ddsdump
+# Imported:
+#   Tokens:     140 new, 2 already present
+#   Operations: 316 new, 2 already present
+#   Revoked:    3 applied
+#   Burned:     0 applied
+
+# Preview-only (no writes). Useful when verifying a dump before applying.
+dds --data-dir /var/lib/dds import --in /mnt/usb/acme-2026-04.ddsdump --dry-run
+```
+
+### Domain-id enforcement
+
+If the dump's `domain_id` does not match the destination's
+`domain.toml`, import aborts with a clear error before touching the
+store. This is a safety check, not an access-control boundary: the
+records themselves are cryptographically signed, so even forcing a
+cross-domain merge would produce tokens that fail signature
+verification at the destination.
+
+### When to use this vs. network sync
+
+Prefer live libp2p sync (mDNS / bootstrap peers / DHT) whenever the
+nodes can reach each other. Anti-entropy catches up in under a minute
+even after long disconnections. Air-gapped sync is a fallback for
+deployments where that is impossible — it is not a performance
+optimisation.
 
 ---
 

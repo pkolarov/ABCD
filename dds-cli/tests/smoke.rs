@@ -15,7 +15,7 @@ fn test_help() {
     // All top-level subcommands should be advertised in --help.
     for cmd in [
         "identity", "group", "policy", "status", "enroll", "admin", "audit", "platform", "cp",
-        "debug",
+        "debug", "export", "import",
     ] {
         assert!(stdout.contains(cmd), "help missing {cmd}: {stdout}");
     }
@@ -43,6 +43,8 @@ fn test_subcommand_help() {
         vec!["debug", "ping", "--help"],
         vec!["debug", "stats", "--help"],
         vec!["debug", "config", "--help"],
+        vec!["export", "--help"],
+        vec!["import", "--help"],
     ] {
         let out = dds_cli().args(&tree).output().unwrap();
         assert!(
@@ -238,6 +240,222 @@ fn test_group_vouch_and_status() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Tokens:       1"));
+}
+
+// ================================================================
+// export / import (air-gapped sync)
+// ================================================================
+
+/// Write a minimal `domain.toml` next to the store so the export/import
+/// domain-id check has something to read.
+fn seed_domain(dir: &std::path::Path, id: &str) {
+    use std::io::Write;
+    let mut f = std::fs::File::create(dir.join("domain.toml")).unwrap();
+    writeln!(
+        f,
+        "name = \"test.example\"\nid = \"{id}\"\npubkey = \"{}\"",
+        "0".repeat(64)
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_export_import_round_trip() {
+    // Node A: create a vouch + revocation + burn, export.
+    let src = tempfile::tempdir().unwrap();
+    let src_dir = src.path().to_str().unwrap();
+    let domain_id = "dds-dom:test-round-trip";
+    seed_domain(src.path(), domain_id);
+
+    // Populate with a vouch.
+    let out = dds_cli()
+        .args([
+            "--data-dir",
+            src_dir,
+            "group",
+            "vouch",
+            "--as-label",
+            "admin",
+            "--user",
+            "urn:vouchsafe:bob.fakehash",
+            "--purpose",
+            "group:backend",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Export.
+    let dump_path = src.path().join("sync.ddsdump");
+    let out = dds_cli()
+        .args([
+            "--data-dir",
+            src_dir,
+            "export",
+            "--out",
+            dump_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "export failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Tokens:     1"));
+    assert!(dump_path.exists());
+
+    // Node B: empty, same domain. Import.
+    let dst = tempfile::tempdir().unwrap();
+    let dst_dir = dst.path().to_str().unwrap();
+    seed_domain(dst.path(), domain_id);
+
+    let out = dds_cli()
+        .args([
+            "--data-dir",
+            dst_dir,
+            "import",
+            "--in",
+            dump_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "import failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Tokens:     1 new"));
+
+    // Node B's status should now show 1 token.
+    let out = dds_cli()
+        .args(["--data-dir", dst_dir, "status"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Tokens:       1"));
+
+    // Second import is idempotent — everything duplicated.
+    let out = dds_cli()
+        .args([
+            "--data-dir",
+            dst_dir,
+            "import",
+            "--in",
+            dump_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("0 new, 1 already present"));
+}
+
+#[test]
+fn test_import_rejects_domain_mismatch() {
+    let src = tempfile::tempdir().unwrap();
+    seed_domain(src.path(), "dds-dom:alpha");
+    // Populate something exportable.
+    let out = dds_cli()
+        .args([
+            "--data-dir",
+            src.path().to_str().unwrap(),
+            "group",
+            "vouch",
+            "--as-label",
+            "a",
+            "--user",
+            "urn:vouchsafe:x.h",
+            "--purpose",
+            "group:x",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let dump_path = src.path().join("alpha.ddsdump");
+    let out = dds_cli()
+        .args([
+            "--data-dir",
+            src.path().to_str().unwrap(),
+            "export",
+            "--out",
+            dump_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Destination node on a different domain.
+    let dst = tempfile::tempdir().unwrap();
+    seed_domain(dst.path(), "dds-dom:beta");
+    let out = dds_cli()
+        .args([
+            "--data-dir",
+            dst.path().to_str().unwrap(),
+            "import",
+            "--in",
+            dump_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "import should have been rejected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("domain mismatch"));
+}
+
+#[test]
+fn test_import_dry_run_makes_no_writes() {
+    let src = tempfile::tempdir().unwrap();
+    seed_domain(src.path(), "dds-dom:dry");
+    let out = dds_cli()
+        .args([
+            "--data-dir",
+            src.path().to_str().unwrap(),
+            "group",
+            "vouch",
+            "--as-label",
+            "a",
+            "--user",
+            "urn:vouchsafe:x.h",
+            "--purpose",
+            "group:x",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let dump_path = src.path().join("dry.ddsdump");
+    let out = dds_cli()
+        .args([
+            "--data-dir",
+            src.path().to_str().unwrap(),
+            "export",
+            "--out",
+            dump_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Empty dest — dry-run should print summary but not create a store.
+    let dst = tempfile::tempdir().unwrap();
+    seed_domain(dst.path(), "dds-dom:dry");
+    let out = dds_cli()
+        .args([
+            "--data-dir",
+            dst.path().to_str().unwrap(),
+            "import",
+            "--in",
+            dump_path.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("(dry run"));
+    assert!(!dst.path().join("directory.redb").exists());
 }
 
 #[test]

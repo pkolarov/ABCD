@@ -870,6 +870,7 @@ name = "dds-cli"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "ciborium",
  "clap",
  "dds-core",
  "dds-store",

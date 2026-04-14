@@ -82,7 +82,7 @@ See [DDS Admin Guide — Windows Deployment](docs/DDS-Admin-Guide.md#windows-dep
 | `dds-net` | lib | libp2p transport, gossipsub, Kademlia, mDNS, delta-sync |
 | `dds-node` | lib + bin | P2P daemon + local authority HTTP API |
 | `dds-ffi` | cdylib | C ABI for Python/C#/Swift/Kotlin bindings |
-| `dds-cli` | bin | CLI: identity, group, policy, status |
+| `dds-cli` | bin | CLI: identity, group, policy, status, enroll, admin, audit, platform, cp, debug, export/import |
 | `dds-loadtest` | bin | Multi-node load/soak test harness |
 | `dds-fido2-test` | bin | WebAuthn testing utility |
 
@@ -170,6 +170,11 @@ dds cp session-assert --credential-id ... --authenticator-data ... \
 dds debug ping                           # reachability check
 dds debug stats                          # pretty-printed NodeStatus
 dds debug config ./config.toml           # offline TOML validation
+
+# Air-gapped sync (USB stick / courier)
+dds --data-dir ./node-a export --out sync.ddsdump   # package tokens + CRDT ops + revocations
+dds --data-dir ./node-b import --in  sync.ddsdump   # idempotent merge into sibling node
+dds --data-dir ./node-b import --in  sync.ddsdump --dry-run   # preview only
 ```
 
 ### HTTP API (`dds-node`, localhost:5551)

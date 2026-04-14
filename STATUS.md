@@ -11,11 +11,11 @@
 | **Edition** | 2024 |
 | **Workspace crates** | 9 (dds-core, dds-domain, dds-store, dds-net, dds-node, dds-ffi, dds-cli, dds-loadtest, dds-fido2-test) |
 | **Rust LOC** | 8,400+ |
-| **Rust tests** | 302 |
+| **Rust tests** | 305 |
 | **.NET tests** | 117 (Windows: 78 unit + 39 integration) + 17 (macOS) |
 | **C++ native tests** | 47 (Windows) |
 | **Python tests** | 13 |
-| **Total tests** | 496 ✅ all passing |
+| **Total tests** | 499 ✅ all passing |
 | **Shared library** | libdds\_ffi.dylib (739 KB) |
 
 Verification note (2026-04-13, Windows 11 ARM64):
@@ -53,7 +53,7 @@ Previous verification note (2026-04-13, macOS ARM64):
 | **dds-node** | §12 | 🟢 Done | 56+15 integ | Config, P2P event loop, local authority service, HTTP API (incl. audit query), encrypted persistent identity, CP+FIDO2 E2E |
 | **dds-domain** (fido2) | §14 | 🟢 Done | (incl. above) | WebAuthn attestation + assertion parser/verifier (Ed25519 + P-256) |
 | **dds-ffi** | §14.2–14.3 | 🟢 Done | 12 | C ABI (cdylib): identity, token, policy, version |
-| **dds-cli** | §12 | 🟢 Done | 13 | Full HTTP-surface coverage: identity, group, policy, status, enroll, admin, audit, platform, cp, debug |
+| **dds-cli** | §12 | 🟢 Done | 16 | Full HTTP-surface coverage + air-gapped `export`/`import` (one-file CBOR .ddsdump) |
 
 ## Module Detail — dds-core
 
@@ -154,6 +154,8 @@ Global flags: `--data-dir <dir>` (local store), `--node-url <url>` (dds-node HTT
 | `cp enrolled-users` / `cp session-assert` | — | `GET /v1/enrolled-users`, `POST /v1/session/assert` |
 | `debug ping` / `debug stats` | help+fail | Reachability check / full `NodeStatus` dump |
 | `debug config <file>` | 2 | Parse/validate a dds-node `config.toml` offline |
+| `export --out <file>` | 1 | Package local store (tokens + CRDT ops + revocations) as one CBOR `.ddsdump` file for air-gapped sync |
+| `import --in <file> [--dry-run]` | 2 | Idempotent merge of a `.ddsdump` into the local store; domain-id guarded |
 
 ## Platform Integrations
 
