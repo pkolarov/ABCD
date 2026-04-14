@@ -519,7 +519,10 @@ async fn handle_policy(action: PolicyAction, node_url: &str) {
                     action,
                 };
                 let r: PolicyResult = post_json(node_url, "/v1/policy/evaluate", &req).await;
-                println!("Policy decision: {}", if r.allowed { "ALLOW" } else { "DENY" });
+                println!(
+                    "Policy decision: {}",
+                    if r.allowed { "ALLOW" } else { "DENY" }
+                );
                 println!("  Reason: {}", r.reason);
             } else {
                 let trust_graph = dds_core::trust::TrustGraph::new();
@@ -717,8 +720,7 @@ async fn handle_audit(action: AuditAction, node_url: &str) {
             if let Some(l) = limit {
                 q.push(("limit", l.to_string()));
             }
-            let query_refs: Vec<(&str, &str)> =
-                q.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let query_refs: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
             let r: AuditEntriesResponse =
                 get_json(node_url, "/v1/audit/entries", &query_refs).await;
             println!("Audit log ({} entries):", r.total);
@@ -746,18 +748,28 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
     match action {
         PlatformAction::Windows { action } => match action {
             WindowsAction::Policies { device_urn } => {
-                let r: WindowsPoliciesResponse =
-                    get_json(node_url, "/v1/windows/policies", &[("device_urn", &device_urn)])
-                        .await;
-                println!("Windows policies for {} ({}):", device_urn, r.policies.len());
+                let r: WindowsPoliciesResponse = get_json(
+                    node_url,
+                    "/v1/windows/policies",
+                    &[("device_urn", &device_urn)],
+                )
+                .await;
+                println!(
+                    "Windows policies for {} ({}):",
+                    device_urn,
+                    r.policies.len()
+                );
                 for p in &r.policies {
                     println!("  - jti={} issuer={} iat={}", p.jti, p.issuer, p.iat);
                 }
             }
             WindowsAction::Software { device_urn } => {
-                let r: WindowsSoftwareResponse =
-                    get_json(node_url, "/v1/windows/software", &[("device_urn", &device_urn)])
-                        .await;
+                let r: WindowsSoftwareResponse = get_json(
+                    node_url,
+                    "/v1/windows/software",
+                    &[("device_urn", &device_urn)],
+                )
+                .await;
                 println!(
                     "Windows software for {} ({}):",
                     device_urn,
@@ -795,16 +807,24 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
         },
         PlatformAction::Macos { action } => match action {
             MacosAction::Policies { device_urn } => {
-                let r: MacosPoliciesResponse =
-                    get_json(node_url, "/v1/macos/policies", &[("device_urn", &device_urn)]).await;
+                let r: MacosPoliciesResponse = get_json(
+                    node_url,
+                    "/v1/macos/policies",
+                    &[("device_urn", &device_urn)],
+                )
+                .await;
                 println!("macOS policies for {} ({}):", device_urn, r.policies.len());
                 for p in &r.policies {
                     println!("  - jti={} issuer={} iat={}", p.jti, p.issuer, p.iat);
                 }
             }
             MacosAction::Software { device_urn } => {
-                let r: MacosSoftwareResponse =
-                    get_json(node_url, "/v1/macos/software", &[("device_urn", &device_urn)]).await;
+                let r: MacosSoftwareResponse = get_json(
+                    node_url,
+                    "/v1/macos/software",
+                    &[("device_urn", &device_urn)],
+                )
+                .await;
                 println!("macOS software for {} ({}):", device_urn, r.software.len());
                 for s in &r.software {
                     println!("  - jti={} issuer={} iat={}", s.jti, s.issuer, s.iat);
@@ -909,7 +929,10 @@ async fn handle_debug(action: DebugAction, node_url: &str) {
                 std::process::exit(1);
             });
             println!("Config file: {}", file.display());
-            println!("  Top-level keys: {:?}", doc.as_table().map(|t| t.keys().collect::<Vec<_>>()));
+            println!(
+                "  Top-level keys: {:?}",
+                doc.as_table().map(|t| t.keys().collect::<Vec<_>>())
+            );
             // Highlight a few well-known fields if present.
             if let Some(domain) = doc.get("domain") {
                 println!("\n[domain]");

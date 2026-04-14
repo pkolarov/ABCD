@@ -98,7 +98,9 @@ struct ErrorEnvelope {
 }
 
 fn parse_error_message(body: &str) -> Option<String> {
-    serde_json::from_str::<ErrorEnvelope>(body).ok().map(|e| e.error)
+    serde_json::from_str::<ErrorEnvelope>(body)
+        .ok()
+        .map(|e| e.error)
 }
 
 fn fail_reach(url: &str, detail: &str) -> ! {

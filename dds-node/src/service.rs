@@ -248,7 +248,9 @@ pub struct AppliedReport {
 /// `DdsNode` so gossip-received tokens are visible to query-time hot
 /// paths without rebuilding from the store on every call. See B5b in
 /// STATUS.md and the doc on `LocalService::new` for the history.
-pub struct LocalService<S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::AuditStore> {
+pub struct LocalService<
+    S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::AuditStore,
+> {
     /// Node signing identity (used to issue tokens).
     node_identity: Identity,
     /// Policy engine with loaded rules.
@@ -270,7 +272,9 @@ pub struct LocalService<S: TokenStore + dds_store::traits::RevocationStore + dds
     verify_fido2: bool,
 }
 
-impl<S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::AuditStore> LocalService<S> {
+impl<S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::AuditStore>
+    LocalService<S>
+{
     /// Create a new local service.
     ///
     /// Rehydrates the in-memory `trust_graph` from any tokens already
@@ -1083,7 +1087,7 @@ impl<S: TokenStore + dds_store::traits::RevocationStore + dds_store::traits::Aud
             .map_err(|e| ServiceError::Store(e.to_string()))?;
         let filtered: Vec<_> = entries
             .into_iter()
-            .filter(|e| action.map_or(true, |a| e.action == a))
+            .filter(|e| action.is_none_or(|a| e.action == a))
             .collect();
         match limit {
             Some(n) => Ok(filtered.into_iter().rev().take(n).collect()),

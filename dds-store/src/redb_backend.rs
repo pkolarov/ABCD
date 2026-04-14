@@ -397,9 +397,7 @@ impl AuditStore for RedbBackend {
             let mut keys_to_remove = Vec::new();
             for entry in table.iter().map_err(|e| StoreError::Io(e.to_string()))? {
                 let (key, value) = entry.map_err(|e| StoreError::Io(e.to_string()))?;
-                if let Ok(audit_entry) =
-                    ciborium::from_reader::<AuditLogEntry, _>(value.value())
-                {
+                if let Ok(audit_entry) = ciborium::from_reader::<AuditLogEntry, _>(value.value()) {
                     if audit_entry.timestamp < before_timestamp {
                         keys_to_remove.push(key.value());
                     }
@@ -408,7 +406,9 @@ impl AuditStore for RedbBackend {
                 }
             }
             for key in &keys_to_remove {
-                let _ = table.remove(key).map_err(|e| StoreError::Io(e.to_string()))?;
+                let _ = table
+                    .remove(key)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
                 removed += 1;
             }
         }
@@ -441,7 +441,9 @@ impl AuditStore for RedbBackend {
                     keys_to_remove.push(key.value());
                 }
                 for key in &keys_to_remove {
-                    let _ = table.remove(key).map_err(|e| StoreError::Io(e.to_string()))?;
+                    let _ = table
+                        .remove(key)
+                        .map_err(|e| StoreError::Io(e.to_string()))?;
                     removed += 1;
                 }
             }

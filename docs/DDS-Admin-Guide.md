@@ -15,14 +15,17 @@ For background on how DDS works internally, see the [Developer Guide](DDS-Develo
 5. [Node Configuration Reference](#node-configuration-reference)
 6. [Enrolling Users](#enrolling-users)
 7. [Enrolling Devices](#enrolling-devices)
-8. [Sessions and Authentication](#sessions-and-authentication)
-9. [Groups and Trust](#groups-and-trust)
-10. [Policy Management](#policy-management)
-11. [Windows Deployment](#windows-deployment)
-12. [macOS Deployment](#macos-deployment)
-13. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
-14. [Security Reference](#security-reference)
-15. [Troubleshooting](#troubleshooting)
+8. [Admin Bootstrap](#admin-bootstrap)
+9. [Sessions and Authentication](#sessions-and-authentication)
+10. [Groups and Trust](#groups-and-trust)
+11. [Policy Management](#policy-management)
+12. [Windows Deployment](#windows-deployment)
+13. [macOS Deployment](#macos-deployment)
+14. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
+15. [Audit Log](#audit-log)
+16. [Debugging](#debugging)
+17. [Security Reference](#security-reference)
+18. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -342,6 +345,24 @@ Response:
 }
 ```
 
+### Via CLI
+
+`dds enroll user` wraps the same endpoint. The b64 arguments come from a
+WebAuthn registration ceremony — in practice the Windows Auth Bridge or
+a browser-based enrollment page gathers them and the CLI is used for
+scripting / testing.
+
+```bash
+dds enroll user \
+    --label alice \
+    --credential-id <base64-credential-id> \
+    --attestation-object <base64> \
+    --client-data-hash <base64> \
+    --rp-id acme.com \
+    --display-name "Alice Smith" \
+    --authenticator-type cross-platform
+```
+
 ### Enrollment Flow (Windows Credential Provider)
 
 On Windows with the DDS Credential Provider installed:
@@ -385,7 +406,78 @@ Response:
 }
 ```
 
+### Via CLI
+
+```bash
+dds enroll device \
+    --label win11-pc \
+    --device-id DDS-WIN-PC-001 \
+    --hostname WIN11-PC \
+    --os "Windows 11" \
+    --os-version 24H2 \
+    --tag windows --tag engineering
+```
+
+Use `--tag` multiple times to attach several tags. Optional fields
+`--tpm-ek-hash` and `--org-unit` are accepted for devices that report
+TPM EK attestation or belong to an organizational unit.
+
 The device URN is used to scope policy queries (e.g. "what policies apply to this device?").
+
+---
+
+## Admin Bootstrap
+
+The first admin on a freshly-provisioned domain must be created by a
+special bootstrap path that does not require an existing vouching admin.
+After that, every further admin or user vouch is a normal signed
+`vch:vouch` token.
+
+### First admin (`dds admin setup`)
+
+Run this **once per domain**, on the first node, with a FIDO2 authenticator
+attached. The request shape is identical to `enroll user`; the only
+difference is that the resulting identity is registered as a trusted
+root.
+
+```bash
+dds admin setup \
+    --label root-admin \
+    --credential-id <base64> \
+    --attestation-object <base64> \
+    --client-data-hash <base64> \
+    --rp-id acme.com \
+    --display-name "Root Admin" \
+    --authenticator-type cross-platform
+```
+
+Response includes the admin URN, the attestation JTI, and the
+CBOR-encoded token. Save the URN in the `[trust_graph]` of
+`dds.toml` under `trusted_roots = [...]` so surviving nodes keep the
+anchor after the first node goes offline.
+
+### Subsequent vouches (`dds admin vouch`)
+
+Once the first admin exists, further admins and users are added with a
+FIDO2 *assertion* (proof-of-possession): the admin signs a challenge
+with their already-enrolled credential, and `dds-node` issues the vouch
+on their behalf.
+
+```bash
+dds admin vouch \
+    --subject-urn urn:vouchsafe:bob.7k3mf9... \
+    --credential-id <b64> \
+    --authenticator-data <b64> \
+    --client-data-hash <b64> \
+    --signature <b64> \
+    --purpose group:admins
+```
+
+The response includes the vouch JTI, the subject URN, and the admin URN
+that signed it. `admin vouch` is the right CLI for any “admin adds this
+person to a group” workflow; `dds group vouch` (below) bypasses FIDO2
+entirely and is intended for offline / scripted flows against a local
+store.
 
 ---
 
@@ -480,11 +572,18 @@ Policy evaluation walks from a user's node upward through the vouch chain, colle
 ### Evaluate Policy Locally
 
 ```bash
-# Via CLI
+# Via CLI (offline — uses an empty trust graph, good for testing rules)
 dds policy check \
     --user urn:vouchsafe:bob.7k3mf9... \
     --resource repo:main \
     --action read
+
+# Via CLI against a running node (uses the node's real trust graph)
+dds policy check \
+    --user urn:vouchsafe:bob.7k3mf9... \
+    --resource repo:main \
+    --action read \
+    --remote
 
 # Via HTTP API
 curl -X POST http://127.0.0.1:5551/v1/policy/evaluate \
@@ -505,7 +604,12 @@ DDS distributes Windows policy as `WindowsPolicyDocument` tokens, which are the 
 Query policies for a device:
 
 ```bash
+# HTTP
 curl "http://127.0.0.1:5551/v1/windows/policies?device_urn=urn:vouchsafe:win11-pc.7k3mf9..."
+
+# CLI
+dds platform windows policies --device-urn urn:vouchsafe:win11-pc.7k3mf9...
+dds platform windows software --device-urn urn:vouchsafe:win11-pc.7k3mf9...
 ```
 
 The Windows DDS Policy Agent service polls this endpoint for post-boot
@@ -547,7 +651,12 @@ Notes:
 Query macOS policies for a device:
 
 ```bash
+# HTTP
 curl "http://127.0.0.1:5551/v1/macos/policies?device_urn=urn:vouchsafe:mac-1.7k3mf9..."
+
+# CLI
+dds platform macos policies --device-urn urn:vouchsafe:mac-1.7k3mf9...
+dds platform macos software --device-urn urn:vouchsafe:mac-1.7k3mf9...
 ```
 
 The macOS DDS Policy Agent enforces:
@@ -562,15 +671,29 @@ The macOS DDS Policy Agent enforces:
 After applying policy, agents report what they applied:
 
 ```bash
-# Windows
+# Windows (HTTP)
 curl -X POST http://127.0.0.1:5551/v1/windows/applied \
   -H "Content-Type: application/json" \
   -d '{"device_urn": "...", "applied_policies": [...]}'
 
-# macOS
+# macOS (HTTP)
 curl -X POST http://127.0.0.1:5551/v1/macos/applied \
   -H "Content-Type: application/json" \
   -d '{"device_urn": "...", "applied_policies": [...]}'
+
+# Either platform — submit a report from a JSON file via CLI
+dds platform windows applied --from-file ./applied-report.json
+dds platform macos   applied --from-file ./applied-report.json
+```
+
+For Windows first-account claim (described in the previous section), the
+Auth Bridge calls `/v1/windows/claim-account` directly, but the same
+endpoint is reachable for testing via:
+
+```bash
+dds platform windows claim-account \
+    --device-urn urn:vouchsafe:win11-pc.7k3mf9... \
+    --session-token-b64 <base64 CBOR session token>
 ```
 
 ### Reconciliation & Drift Detection
@@ -1016,8 +1139,11 @@ dotnet test platform/macos/DdsPolicyAgent.Tests/DdsPolicyAgent.MacOS.Tests.cspro
 # Via HTTP API
 curl http://127.0.0.1:5551/v1/status | jq
 
-# Via CLI
+# Via CLI — local store counters only (no node contact)
 dds status
+
+# Via CLI — live node status
+dds status --remote
 ```
 
 Returns:
@@ -1035,7 +1161,7 @@ curl "http://127.0.0.1:5551/v1/enrolled-users?device_urn=urn:vouchsafe:..."
 Or via CLI:
 
 ```bash
-dds cp --node-url http://127.0.0.1:5551 enrolled-users [--device-urn ...]
+dds cp enrolled-users [--device-urn ...]
 ```
 
 ### Logs
@@ -1074,6 +1200,98 @@ Exits with status 2 if any KPI fails. See [dds-loadtest/README.md](../dds-loadte
 | Ed25519 verify throughput | ≥ 50,000 ops/s |
 | CRDT merge | ≤ 0.05 ms (p99) |
 | Peak heap per 1K entries | ≤ 5 MB |
+
+---
+
+## Audit Log
+
+Every token accepted by the node — attestations, vouches, revocations,
+burns — is appended to a local audit log (when `audit_log_enabled` is
+set in `[domain]`). Each entry is the full CBOR of the original token
+plus a `timestamp` and a signature from the node that recorded it, so
+the log is tamper-evident even if the redb file is tampered with later.
+
+### Query the log
+
+```bash
+# Newest entries, all actions
+dds audit list
+
+# Filter by action
+dds audit list --action vouch
+dds audit list --action revoke
+
+# Cap the page size
+dds audit list --limit 100
+
+# HTTP equivalent
+curl "http://127.0.0.1:5551/v1/audit/entries?action=vouch&limit=100" | jq
+```
+
+Output lists the timestamp (Unix seconds), the `action`, the node URN
+that recorded it, and a truncated base64 prefix of the CBOR token. To
+decode the token fully, pipe the full `token_cbor_b64` field to a CBOR
+decoder (e.g. `cbor2diag`).
+
+### Retention
+
+Audit entries are pruned on the same tick as expired sessions. Control
+retention in `dds.toml`:
+
+```toml
+[domain]
+audit_log_enabled            = true
+audit_log_max_entries        = 100_000   # 0 = unlimited
+audit_log_retention_days     = 90        # 0 = no age limit
+```
+
+Both caps are applied every sweep; the older one wins when both are set.
+
+---
+
+## Debugging
+
+### Reachability check
+
+Confirm the CLI can talk to the node:
+
+```bash
+dds debug ping
+# OK — node http://127.0.0.1:5551 reachable (peer_id=12D3Koo..., uptime=1234s)
+```
+
+### Full node statistics
+
+`dds debug stats` is equivalent to `dds status --remote` but prints
+every `NodeStatus` field (peer id, uptime, connected peers, DAG ops,
+trust graph token counts, store counts, and burned/revoked totals).
+
+```bash
+dds debug stats
+```
+
+### Validate a config file
+
+Parses a `dds-node` `config.toml` without starting the node, and surfaces
+the operational-readiness fields that are easy to misspell:
+
+```bash
+dds debug config ./dds.toml
+```
+
+Prints the top-level keys plus any of:
+`max_chain_depth`, `max_delegation_depth`, `audit_log_enabled`,
+`audit_log_max_entries`, `audit_log_retention_days`.
+
+Bad TOML exits non-zero with a clear message — use this in CI to smoke-
+test generated configs before rolling them out.
+
+### Node-side logs
+
+`dds-node` does not expose logs over HTTP. Logs go to stdout via the
+`tracing` framework (see the [Logs](#logs) section above) — tail them
+with standard OS tooling (`journalctl -u dds-node`, Windows Event
+Viewer / Service log, `Console.app` on macOS).
 
 ---
 

@@ -113,23 +113,63 @@ dds-node run [config.toml]
 
 ### CLI (`dds-cli`)
 
+The `dds` CLI wraps every `dds-node` HTTP endpoint and also exposes
+offline local-store operations. Remote subcommands share the global
+`--node-url` flag (default `http://127.0.0.1:5551`). Offline subcommands
+share `--data-dir` (default `.dds`).
+
 ```bash
-# Generate identities
+# ---- Offline / local store ----
 dds identity create alice                # Ed25519
 dds identity create quantum-bob --hybrid # Ed25519 + ML-DSA-65
-
-# Inspect a URN
 dds identity show urn:vouchsafe:alice.<hash>
 
-# Vouch and revoke group membership
-dds group vouch --as-label admin --user urn:vouchsafe:bob.<hash> --purpose group:backend
+dds group vouch  --as-label admin --user urn:vouchsafe:bob.<hash> --purpose group:backend
 dds group revoke --as-label admin --jti vouch-admin-bob-<uuid>
 
-# Offline policy check
 dds policy check --user urn:vouchsafe:bob.<hash> --resource repo:main --action read
+dds status                               # local store counters
 
-# Store diagnostics
-dds status
+# ---- Remote (requires a running dds-node) ----
+dds status --remote                      # GET  /v1/status
+dds policy check --user ... --resource ... --action ... --remote
+                                         # POST /v1/policy/evaluate
+
+# Enrollment
+dds enroll user   --label alice --credential-id <b64url> \
+    --attestation-object <b64> --client-data-hash <b64> \
+    --rp-id example.com --display-name "Alice"
+dds enroll device --label laptop --device-id <uuid> --hostname lap01 \
+    --os windows --os-version 11
+
+# Admin bootstrap (first admin / subsequent vouches)
+dds admin setup --label root-admin --credential-id <b64url> \
+    --attestation-object <b64> --client-data-hash <b64> \
+    --rp-id example.com --display-name "Root"
+dds admin vouch --subject-urn urn:vouchsafe:bob.<hash> \
+    --credential-id <b64url> --authenticator-data <b64> \
+    --client-data-hash <b64> --signature <b64> --purpose group:admins
+
+# Audit log
+dds audit list                           # newest first
+dds audit list --action vouch --limit 50
+
+# Platform applier queries (agent-facing, but useful for debugging)
+dds platform windows policies  --device-urn urn:vouchsafe:laptop.<hash>
+dds platform windows software  --device-urn urn:vouchsafe:laptop.<hash>
+dds platform windows applied   --from-file report.json
+dds platform windows claim-account --device-urn ... --session-token-b64 <b64>
+dds platform macos   policies  --device-urn ...
+
+# Credential Provider helpers
+dds cp enrolled-users [--device-urn ...]
+dds cp session-assert --credential-id ... --authenticator-data ... \
+    --client-data-hash ... --signature ...
+
+# Debugging
+dds debug ping                           # reachability check
+dds debug stats                          # pretty-printed NodeStatus
+dds debug config ./config.toml           # offline TOML validation
 ```
 
 ### HTTP API (`dds-node`, localhost:5551)
