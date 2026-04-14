@@ -359,11 +359,7 @@ DdsChallengeResult CDdsNodeHttpClient::ParseChallengeResponse(DWORD httpStatus, 
     {
         result.challengeId     = JsonGetString(responseBody, "challenge_id");
         result.challengeB64url = JsonGetString(responseBody, "challenge_b64url");
-
-        // Parse expires_at (uint64 — use strtoull to avoid truncation).
-        std::string expiresStr = JsonGetString(responseBody, "expires_at");
-        if (!expiresStr.empty())
-            result.expiresAt = std::strtoull(expiresStr.c_str(), nullptr, 10);
+        result.expiresAt       = JsonGetUint64(responseBody, "expires_at");
 
         if (result.challengeId.empty() || result.challengeB64url.empty())
         {
@@ -634,6 +630,33 @@ std::string CDdsNodeHttpClient::JsonGetString(const std::string& json, const std
     }
 
     return result;
+}
+
+uint64_t CDdsNodeHttpClient::JsonGetUint64(const std::string& json, const std::string& key)
+{
+    // Extract an unquoted numeric value for a given key, e.g. "expires_at":1712957100
+    std::string needle = "\"" + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos)
+        return 0;
+
+    pos += needle.size();
+    pos = json.find(':', pos);
+    if (pos == std::string::npos)
+        return 0;
+    pos++; // skip ':'
+
+    // Skip whitespace
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' ||
+           json[pos] == '\r' || json[pos] == '\n'))
+        pos++;
+
+    // Numeric value: read digits (no leading quote expected)
+    if (pos >= json.size() || json[pos] == '"')
+        return 0;
+
+    char* end = nullptr;
+    return std::strtoull(json.c_str() + pos, &end, 10);
 }
 
 bool CDdsNodeHttpClient::JsonGetBool(const std::string& json, const std::string& key, bool defaultVal)

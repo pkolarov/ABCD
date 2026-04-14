@@ -192,12 +192,11 @@ bool RunAdminSetupFlow(HWND hwnd)
 
     FileLog::Writef("AdminSetup: OK adminUrn='%s'\n", setupResult.adminUrn.c_str());
 
-    wchar_t successMsg[768];
+    wchar_t successMsg[512];
     swprintf_s(successMsg,
         L"Admin key registered!\n\n"
         L"Admin URN: %hs\n\n"
-        L"Add this URN to the trusted_roots list in dds.toml,\n"
-        L"then restart dds-node for admin approval to work.",
+        L"This device is now authorized to approve user enrollments.",
         setupResult.adminUrn.c_str());
     MessageBoxW(hwnd, successMsg, L"Admin Setup Complete", MB_OK | MB_ICONINFORMATION);
 

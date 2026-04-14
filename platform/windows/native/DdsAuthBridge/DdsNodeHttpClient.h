@@ -179,6 +179,9 @@ private:
     // Extract a boolean value for a given key.
     static bool JsonGetBool(const std::string& json, const std::string& key, bool defaultVal);
 
+    // Extract an unquoted uint64 value for a given key (e.g. "expires_at":1712957100).
+    static uint64_t JsonGetUint64(const std::string& json, const std::string& key);
+
     // Extract an array of flat JSON objects. Returns the raw strings of
     // each {...} element. Caller parses individual fields with JsonGetString.
     static std::vector<std::string> JsonGetObjectArray(const std::string& json, const std::string& key);
