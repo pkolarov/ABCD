@@ -376,13 +376,28 @@ bool RunAdminApproveFlow(HWND hwnd)
     FileLog::Writef("AdminApprove: approving user urn='%s' credId='%s'\n",
                     subject.subjectUrn.c_str(), subject.credentialId.c_str());
 
+    // Fetch a server-issued admin challenge before touching the authenticator.
+    // The server stores the nonce and will consume it in /v1/admin/vouch to
+    // enforce freshness and single-use; the assertion's clientDataJSON must
+    // bind to this nonce for the hash check to pass.
+    DdsChallengeResult adminChallenge = httpClient.GetAdminChallenge();
+    if (!adminChallenge.success)
+    {
+        FileLog::Writef("AdminApprove: GetAdminChallenge failed: %s\n",
+                        adminChallenge.errorMessage.c_str());
+        MessageBoxW(hwnd,
+            L"Failed to fetch admin challenge from DDS node.",
+            L"Admin Approval Error", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
     // Admin touches authenticator for proof-of-presence
     MessageBoxW(hwnd,
         L"Touch your admin security key to approve this enrollment.",
         L"DDS Admin Approval", MB_OK | MB_ICONINFORMATION);
 
     auto assertResult = CWebAuthnHelper::GetAssertionProof(
-        hwnd, rpId, adminCredId);
+        hwnd, rpId, adminCredId, adminChallenge.challengeB64url);
 
     if (!assertResult.success)
     {
@@ -411,6 +426,7 @@ bool RunAdminApproveFlow(HWND hwnd)
     std::string vouchJson = "{";
     vouchJson += "\"subject_urn\":\"" + subject.subjectUrn + "\",";
     vouchJson += "\"credential_id\":\"" + credIdB64 + "\",";
+    vouchJson += "\"challenge_id\":\"" + adminChallenge.challengeId + "\",";
     vouchJson += "\"authenticator_data\":\"" + authDataB64 + "\",";
     vouchJson += "\"client_data_hash\":\"" + cdhB64 + "\",";
     vouchJson += "\"signature\":\"" + sigB64 + "\"";

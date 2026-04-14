@@ -490,13 +490,41 @@ Sessions are short-lived tokens issued after authenticating a user. They are the
 
 Session issuance requires FIDO2 proof-of-possession. The client proves possession of a FIDO2 credential, and the node verifies it against a previously enrolled `UserAuthAttestation`.
 
+**Step 1 — fetch a server challenge (single-use, 300 s TTL):**
+
+```bash
+curl http://127.0.0.1:5551/v1/session/challenge
+```
+
+```json
+{
+  "challenge_id": "chall-session-17...",
+  "challenge_b64url": "<43-char base64url nonce>",
+  "expires_at": 1712957100
+}
+```
+
+**Step 2 — build `clientDataJSON` and compute `client_data_hash`:**
+
+```text
+clientDataJSON = {"type":"webauthn.get","challenge":"<challenge_b64url>","origin":"https://<rp_id>"}
+client_data_hash = SHA-256(clientDataJSON)   # base64-encode for the request
+```
+
+No spaces. Field order must be exactly: `type`, `challenge`, `origin`.
+
+**Step 3 — call your FIDO2 authenticator** with `client_data_hash` as the clientDataHash, collect `authenticator_data` and `signature`.
+
+**Step 4 — submit the assertion:**
+
 ```bash
 curl -X POST http://127.0.0.1:5551/v1/session/assert \
   -H "Content-Type: application/json" \
   -d '{
-    "credential_id": "<base64>",
+    "credential_id": "<base64url>",
+    "challenge_id": "<challenge_id from step 1>",
+    "client_data_hash": "<base64(SHA-256(clientDataJSON))>",
     "authenticator_data": "<base64>",
-    "client_data_hash": "<base64>",
     "signature": "<base64>"
   }'
 ```
@@ -510,11 +538,14 @@ Response:
 }
 ```
 
+The `challenge_id` is single-use: a second POST with the same ID is rejected with 401.
+
 ### Via CLI
 
 ```bash
 dds cp --node-url http://127.0.0.1:5551 session-assert \
     --credential-id <b64> \
+    --challenge-id <challenge_id> \
     --authenticator-data <b64> \
     --client-data-hash <b64> \
     --signature <b64>

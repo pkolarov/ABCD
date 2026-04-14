@@ -429,22 +429,28 @@ bool CDdsBridgeClient::HandleWebAuthnChallenge(
 
     OutputDebugStringA("HandleWebAuthnChallenge: WebAuthn API present\n");
 
-    // Generate a random challenge and construct clientDataJSON.
-    // The WebAuthn API will SHA-256 this JSON to produce the clientDataHash
-    // that the authenticator signs over. We must send the same hash to dds-node.
-    uint8_t challengeBytes[32]{};
-    if (!GenRandom(challengeBytes, sizeof(challengeBytes)))
+    // Use the server-issued challenge forwarded by the Bridge over IPC.
+    // Do NOT generate a local random challenge — the server has already stored
+    // this nonce and will consume it during /v1/session/assert verification.
+    std::string challengeB64(pChallenge->challenge_b64url,
+        strnlen(pChallenge->challenge_b64url, sizeof(pChallenge->challenge_b64url)));
+    if (challengeB64.empty())
     {
         result.errorCode = IPC_ERROR::SERVICE_ERROR;
-        result.errorMessage = L"Failed to generate random challenge";
+        result.errorMessage = L"Bridge did not supply a server challenge";
         return false;
     }
 
-    std::string challengeB64 = Base64UrlEncode(challengeBytes, sizeof(challengeBytes));
+    // Use the enrolled RP ID for the origin — must exactly match what the server
+    // enrolled and what verify_assertion_common reconstructs for hash comparison.
+    std::string rpIdStr(pChallenge->rp_id,
+        strnlen(pChallenge->rp_id, sizeof(pChallenge->rp_id)));
 
-    // Construct a minimal WebAuthn clientDataJSON
+    // Construct clientDataJSON.  Field order and whitespace must be identical to
+    // what the server reconstructs in service.rs::verify_assertion_common:
+    //   {"type":"webauthn.get","challenge":"<43-char-b64url>","origin":"https://<rpId>"}
     std::string clientDataJson = "{\"type\":\"webauthn.get\",\"challenge\":\"" +
-        challengeB64 + "\",\"origin\":\"https://dds.local\"}";
+        challengeB64 + "\",\"origin\":\"https://" + rpIdStr + "\"}";
 
     // Compute SHA-256 of clientDataJSON — this is what dds-node needs
     uint8_t clientDataHash[32]{};
@@ -583,6 +589,12 @@ bool CDdsBridgeClient::HandleWebAuthnChallenge(
     // Send the clientDataHash (SHA-256 of our clientDataJSON) — dds-node needs this
     // to verify the assertion signature (sig = sign(authenticatorData || clientDataHash))
     memcpy(response.client_data_hash, clientDataHash, 32);
+
+    // Echo the server challenge ID back so the Bridge can include it in the
+    // POST /v1/session/assert body.  The server matches it against the stored
+    // nonce to enforce single-use and freshness.
+    strncpy_s(response.challenge_id, sizeof(response.challenge_id),
+        pChallenge->challenge_id, _TRUNCATE);
 
     // Free the assertion
     WebAuthNFreeAssertion(pAssertion);

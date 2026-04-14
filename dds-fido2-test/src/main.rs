@@ -23,6 +23,7 @@ use ctap_hid_fido2::{
     verifier,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const RP_ID: &str = "dds.local";
 const NODE_URL: &str = "http://127.0.0.1:5551";
@@ -142,10 +143,19 @@ struct EnrollmentResponse {
     token_cbor_b64: String,
 }
 
+#[allow(dead_code)]
+#[derive(Deserialize, Debug)]
+struct ChallengeResponse {
+    challenge_id: String,
+    challenge_b64url: String,
+    expires_at: u64,
+}
+
 #[derive(Serialize)]
 struct SessionAssertRequest {
     subject_urn: Option<String>,
     credential_id: String,
+    challenge_id: String,
     client_data_hash: String,
     authenticator_data: String,
     signature: String,
@@ -278,16 +288,47 @@ async fn main() {
         }
     };
 
-    // Step 4: Get assertion (getAssertion)
+    // Step 4: Fetch server challenge then get FIDO2 assertion
     println!();
     println!("[4/5] Getting FIDO2 assertion...");
+
+    // Fetch a single-use server challenge.  The server stores the nonce and
+    // will consume it when verifying /v1/session/assert, so we must use it
+    // rather than a locally generated random value.
+    let challenge_resp: ChallengeResponse = client
+        .get(format!("{NODE_URL}/v1/session/challenge"))
+        .send()
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("  GET /v1/session/challenge failed: {e}");
+            std::process::exit(1);
+        })
+        .json()
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("  Failed to parse challenge response: {e}");
+            std::process::exit(1);
+        });
+
+    // Build clientDataJSON exactly as the server reconstructs it in
+    // verify_assertion_common (service.rs):
+    //   {"type":"webauthn.get","challenge":"<b64url>","origin":"https://<rpId>"}
+    // No spaces, fixed field order.
+    let client_data_json = format!(
+        r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://{}"}}"#,
+        challenge_resp.challenge_b64url, RP_ID
+    );
+
+    // SHA-256(clientDataJSON) is the clientDataHash the authenticator signs
+    // alongside authenticatorData.  Pass it as the challenge bytes so that
+    // ctap-hid-fido2 feeds it directly to the CTAP2 getAssertion command.
+    let cdh: [u8; 32] = Sha256::digest(client_data_json.as_bytes()).into();
+
     println!();
     println!("  >>> TOUCH YOUR FIDO2 KEY AGAIN <<<");
     println!();
 
-    let challenge_assert = verifier::create_challenge();
-
-    let assert_args = GetAssertionArgsBuilder::new(RP_ID, &challenge_assert)
+    let assert_args = GetAssertionArgsBuilder::new(RP_ID, &cdh)
         .credential_id(credential_id)
         .build();
 
@@ -304,13 +345,9 @@ async fn main() {
     }
     let assertion = &assertions[0];
 
-    // Verify locally
-    let ok = verifier::verify_assertion(
-        RP_ID,
-        &verify_result.credential_public_key,
-        &challenge_assert,
-        assertion,
-    );
+    // Verify locally — cdh is the clientDataHash the authenticator signed.
+    let ok =
+        verifier::verify_assertion(RP_ID, &verify_result.credential_public_key, &cdh, assertion);
     println!(
         "  Assertion received! (local verify: {})",
         if ok { "PASS" } else { "FAIL" }
@@ -328,7 +365,8 @@ async fn main() {
     let assert_req = SessionAssertRequest {
         subject_urn: Some(enrolled.urn.clone()),
         credential_id: credential_id_b64url,
-        client_data_hash: b64(&challenge_assert),
+        challenge_id: challenge_resp.challenge_id,
+        client_data_hash: b64(&cdh),
         authenticator_data: b64(&assertion.auth_data),
         signature: b64(&assertion.signature),
         duration_secs: Some(3600),

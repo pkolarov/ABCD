@@ -234,30 +234,37 @@ DDS_TEST(dds_node_url_parsing_custom_port)
 
 DDS_TEST(session_assert_json_payload)
 {
-    // Construct the JSON payload that PostSessionAssert sends
-    std::string authenticatorData = "AQIDBA==";
-    std::string clientDataJSON    = "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0In0=";
+    // Construct the JSON payload that PostSessionAssert sends to
+    // POST /v1/session/assert (AssertionSessionRequestJson in http.rs).
+    // Fields: credential_id, challenge_id, client_data_hash,
+    //         authenticator_data, signature.
+    std::string credentialId     = "Y3JlZC0xMjM=";
+    std::string challengeId      = "chall-session-1234567890abcdef";
+    std::string clientDataHash   = "AQIDBA==";  // base64(SHA-256(clientDataJSON))
+    std::string authenticatorData = "BQYHCA==";
     std::string signature         = "MEUCIQC+";
-    std::string userHandle        = "dXNlcjEyMw==";
 
-    // Build the assertion JSON as the caller would
+    // Build the assertion JSON as DdsAuthBridgeMain does
     std::string json = "{";
-    json += "\"authenticatorData\":\"" + authenticatorData + "\",";
-    json += "\"clientDataJSON\":\"" + clientDataJSON + "\",";
-    json += "\"signature\":\"" + signature + "\",";
-    json += "\"userHandle\":\"" + userHandle + "\"";
+    json += "\"credential_id\":\"" + credentialId + "\",";
+    json += "\"challenge_id\":\"" + challengeId + "\",";
+    json += "\"client_data_hash\":\"" + clientDataHash + "\",";
+    json += "\"authenticator_data\":\"" + authenticatorData + "\",";
+    json += "\"signature\":\"" + signature + "\"";
     json += "}";
 
     // Verify all fields are present and extractable
-    std::string gotAuth = TestJsonHelpers::JsonGetString(json, "authenticatorData");
-    std::string gotCdj  = TestJsonHelpers::JsonGetString(json, "clientDataJSON");
-    std::string gotSig  = TestJsonHelpers::JsonGetString(json, "signature");
-    std::string gotUh   = TestJsonHelpers::JsonGetString(json, "userHandle");
+    std::string gotCred  = TestJsonHelpers::JsonGetString(json, "credential_id");
+    std::string gotChall = TestJsonHelpers::JsonGetString(json, "challenge_id");
+    std::string gotCdh   = TestJsonHelpers::JsonGetString(json, "client_data_hash");
+    std::string gotAuth  = TestJsonHelpers::JsonGetString(json, "authenticator_data");
+    std::string gotSig   = TestJsonHelpers::JsonGetString(json, "signature");
 
-    DDS_ASSERT(gotAuth == authenticatorData, "authenticatorData must round-trip in JSON");
-    DDS_ASSERT(gotCdj  == clientDataJSON,    "clientDataJSON must round-trip in JSON");
-    DDS_ASSERT(gotSig  == signature,         "signature must round-trip in JSON");
-    DDS_ASSERT(gotUh   == userHandle,        "userHandle must round-trip in JSON");
+    DDS_ASSERT(gotCred  == credentialId,      "credential_id must round-trip in JSON");
+    DDS_ASSERT(gotChall == challengeId,       "challenge_id must round-trip in JSON");
+    DDS_ASSERT(gotCdh   == clientDataHash,    "client_data_hash must round-trip in JSON");
+    DDS_ASSERT(gotAuth  == authenticatorData, "authenticator_data must round-trip in JSON");
+    DDS_ASSERT(gotSig   == signature,         "signature must round-trip in JSON");
 }
 
 DDS_TEST(session_assert_response_success)
