@@ -12,10 +12,108 @@ fn test_help() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Decentralized Directory Service CLI"));
-    assert!(stdout.contains("identity"));
-    assert!(stdout.contains("group"));
-    assert!(stdout.contains("policy"));
-    assert!(stdout.contains("status"));
+    // All top-level subcommands should be advertised in --help.
+    for cmd in [
+        "identity", "group", "policy", "status", "enroll", "admin", "audit", "platform", "cp",
+        "debug",
+    ] {
+        assert!(stdout.contains(cmd), "help missing {cmd}: {stdout}");
+    }
+}
+
+#[test]
+fn test_subcommand_help() {
+    // Every new subcommand tree must have its own --help without crashing.
+    for tree in [
+        vec!["audit", "--help"],
+        vec!["audit", "list", "--help"],
+        vec!["admin", "--help"],
+        vec!["admin", "setup", "--help"],
+        vec!["admin", "vouch", "--help"],
+        vec!["enroll", "--help"],
+        vec!["enroll", "user", "--help"],
+        vec!["enroll", "device", "--help"],
+        vec!["platform", "--help"],
+        vec!["platform", "windows", "--help"],
+        vec!["platform", "windows", "policies", "--help"],
+        vec!["platform", "windows", "applied", "--help"],
+        vec!["platform", "windows", "claim-account", "--help"],
+        vec!["platform", "macos", "--help"],
+        vec!["debug", "--help"],
+        vec!["debug", "ping", "--help"],
+        vec!["debug", "stats", "--help"],
+        vec!["debug", "config", "--help"],
+    ] {
+        let out = dds_cli().args(&tree).output().unwrap();
+        assert!(
+            out.status.success(),
+            "help failed for {tree:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn test_remote_commands_fail_when_node_absent() {
+    // Use an unreachable node URL (an unassigned loopback port on a reserved
+    // 127.x range) so the CLI is forced to report the reach error cleanly.
+    let bad_url = "http://127.0.0.1:1"; // port 1 won't accept connections
+    for tree in [
+        vec!["--node-url", bad_url, "status", "--remote"],
+        vec!["--node-url", bad_url, "audit", "list"],
+        vec!["--node-url", bad_url, "debug", "ping"],
+        vec!["--node-url", bad_url, "debug", "stats"],
+    ] {
+        let out = dds_cli().args(&tree).output().unwrap();
+        assert!(!out.status.success(), "expected failure for {tree:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cannot reach dds-node"),
+            "unexpected stderr for {tree:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_debug_config_parses_toml() {
+    use std::io::Write;
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_path = tmp.path().join("test-config.toml");
+    let mut f = std::fs::File::create(&cfg_path).unwrap();
+    writeln!(
+        f,
+        "[domain]\nmax_delegation_depth = 7\naudit_log_enabled = true\naudit_log_max_entries = 500\n"
+    )
+    .unwrap();
+    let out = dds_cli()
+        .args(["debug", "config", cfg_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "debug config failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("max_delegation_depth: 7"));
+    assert!(stdout.contains("audit_log_enabled: true"));
+    assert!(stdout.contains("audit_log_max_entries: 500"));
+}
+
+#[test]
+fn test_debug_config_rejects_invalid_toml() {
+    use std::io::Write;
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_path = tmp.path().join("broken.toml");
+    let mut f = std::fs::File::create(&cfg_path).unwrap();
+    writeln!(f, "[domain\nthis is = not = valid").unwrap();
+    let out = dds_cli()
+        .args(["debug", "config", cfg_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Invalid TOML"));
 }
 
 #[test]

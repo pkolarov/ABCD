@@ -1,7 +1,7 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-13 (P3 complete: delegation depth cap, audit retention, FIDO2 allow-list doc, threat model review)
+> Last updated: 2026-04-14 (CLI parity: full wrapper for every HTTP endpoint + `debug ping|stats|config`)
 
 ## Build Health
 
@@ -53,7 +53,7 @@ Previous verification note (2026-04-13, macOS ARM64):
 | **dds-node** | §12 | 🟢 Done | 56+15 integ | Config, P2P event loop, local authority service, HTTP API (incl. audit query), encrypted persistent identity, CP+FIDO2 E2E |
 | **dds-domain** (fido2) | §14 | 🟢 Done | (incl. above) | WebAuthn attestation + assertion parser/verifier (Ed25519 + P-256) |
 | **dds-ffi** | §14.2–14.3 | 🟢 Done | 12 | C ABI (cdylib): identity, token, policy, version |
-| **dds-cli** | §12 | 🟢 Done | 9 | Identity, group, policy, status subcommands |
+| **dds-cli** | §12 | 🟢 Done | 13 | Full HTTP-surface coverage: identity, group, policy, status, enroll, admin, audit, platform, cp, debug |
 
 ## Module Detail — dds-core
 
@@ -136,14 +136,24 @@ All documents implement `DomainDocument` trait: `embed()` / `extract()` from `To
 
 ## Module Detail — dds-cli
 
+Global flags: `--data-dir <dir>` (local store), `--node-url <url>` (dds-node HTTP API, default `http://127.0.0.1:5551`).
+
 | Subcommand | Tests | What It Does |
 |---|---|---|
 | `identity create [--hybrid]` | 2 | Generate classical or hybrid PQ identity |
 | `identity show <urn>` | 2 | Parse and display URN components |
 | `group vouch` | 2 | Create vouch token, persist to store |
 | `group revoke` | 1 | Revoke a vouch by JTI |
-| `policy check` | 1 | Offline policy evaluation |
-| `status` | 1 | Store diagnostics (tokens, revocations, burns) |
+| `policy check [--remote]` | 1 | Offline policy evaluation (or `/v1/policy/evaluate`) |
+| `status [--remote]` | 1 | Local store stats (or `/v1/status`) |
+| `enroll user` / `enroll device` | help | `POST /v1/enroll/user`, `POST /v1/enroll/device` |
+| `admin setup` / `admin vouch` | help | `POST /v1/admin/setup`, `POST /v1/admin/vouch` |
+| `audit list [--action] [--limit]` | help+fail | `GET /v1/audit/entries` |
+| `platform windows policies\|software\|applied\|claim-account` | help | Wraps all four `/v1/windows/*` endpoints |
+| `platform macos policies\|software\|applied` | help | Wraps `/v1/macos/*` endpoints |
+| `cp enrolled-users` / `cp session-assert` | — | `GET /v1/enrolled-users`, `POST /v1/session/assert` |
+| `debug ping` / `debug stats` | help+fail | Reachability check / full `NodeStatus` dump |
+| `debug config <file>` | 2 | Parse/validate a dds-node `config.toml` offline |
 
 ## Platform Integrations
 
