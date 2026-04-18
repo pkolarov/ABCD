@@ -195,6 +195,7 @@ fn write_node_fixture(
             idle_timeout_secs: 60,
             api_addr: api_addr.clone(),
             api_auth: Default::default(),
+            allow_legacy_v1_tokens: false,
         },
         org_hash: "e2e-org".to_string(),
         domain: DomainConfig {
@@ -288,6 +289,7 @@ impl Publisher {
                 idle_timeout_secs: 60,
                 api_addr: format!("127.0.0.1:{}", reserve_port()),
                 api_auth: Default::default(),
+            allow_legacy_v1_tokens: false,
             },
             org_hash: "e2e-org".to_string(),
             domain: DomainConfig {

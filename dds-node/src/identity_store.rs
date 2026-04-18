@@ -10,16 +10,23 @@
 //! File format (CBOR map):
 //! ```text
 //! {
-//!   "v":     u8,            // 1 = plain, 2 = argon2id+chacha20poly1305
-//!   "label": text,
-//!   "salt":  bytes(16)?,    // (v=2 only)
-//!   "nonce": bytes(12)?,    // (v=2 only)
-//!   "key":   bytes,         // 32 raw bytes (v=1) or ciphertext (v=2)
+//!   "v":      u8,          // 1=plain, 2=argon2id(legacy), 3=argon2id+params-in-blob
+//!   "label":  text,
+//!   "salt":   bytes(16)?,  // v>=2
+//!   "nonce":  bytes(12)?,  // v>=2
+//!   "m_cost": u32?,        // v=3 (Argon2id memory, KiB)
+//!   "t_cost": u32?,        // v=3 (Argon2id iterations)
+//!   "p_cost": u32?,        // v=3 (Argon2id lanes)
+//!   "key":    bytes,       // 32 raw bytes (v=1) or ciphertext (v>=2)
 //! }
 //! ```
 //!
 //! Versioning is explicit so future migrations (e.g. PQ wrap, OS keyring)
-//! can land without breaking existing on-disk material.
+//! can land without breaking existing on-disk material. **M-10 (security
+//! review)**: v=3 stores Argon2id parameters inside the blob (rather than
+//! hardcoding them) so a future parameter bump does not need yet another
+//! schema version. Loads of v=2 blobs transparently re-encrypt as v=3
+//! (lazy rewrap) so the migration is invisible to operators.
 
 use std::path::Path;
 
@@ -47,6 +54,44 @@ pub(crate) static PASSPHRASE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::
 
 const VERSION_PLAIN: u8 = 1;
 const VERSION_ENCRYPTED: u8 = 2;
+/// **M-10 (security review)**: v=3 carries Argon2id parameters in the
+/// blob and uses OWASP second-tier defaults (m=64 MiB, t=3, p=4).
+const VERSION_ENCRYPTED_V3: u8 = 3;
+
+/// Legacy v=2 Argon2id parameters, retained for backward-compatible
+/// decryption of existing blobs during the lazy-rewrap window.
+const V2_M_COST_KIB: u32 = 19 * 1024;
+const V2_T_COST: u32 = 2;
+const V2_P_COST: u32 = 1;
+
+/// **M-10** — v=3 Argon2id parameters. OWASP's second tier for
+/// interactive unlock; target unlock time ~200–500 ms on modern
+/// hardware. Parameters live in the blob so a future bump is just
+/// another value here + a migration step (no new `v`).
+const V3_M_COST_KIB: u32 = 64 * 1024;
+const V3_T_COST: u32 = 3;
+const V3_P_COST: u32 = 4;
+
+/// Argon2id parameters read from / written to the v=3 blob.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KdfParams {
+    m_cost_kib: u32,
+    t_cost: u32,
+    p_cost: u32,
+}
+
+impl KdfParams {
+    const V2: Self = Self {
+        m_cost_kib: V2_M_COST_KIB,
+        t_cost: V2_T_COST,
+        p_cost: V2_P_COST,
+    };
+    const V3: Self = Self {
+        m_cost_kib: V3_M_COST_KIB,
+        t_cost: V3_T_COST,
+        p_cost: V3_P_COST,
+    };
+}
 
 /// **M-14 (security review)**: path of the sticky "this node was
 /// once encrypted" marker file. When present, `save()` refuses to
@@ -144,11 +189,16 @@ pub fn save(path: &Path, ident: &Identity) -> Result<(), IdentityStoreError> {
     // is wiped on drop even on the early-error paths that follow.
     let map = match passphrase {
         Ok(pass) if !pass.is_empty() => {
+            // M-10: write v=3 with parameters embedded in the blob so
+            // future parameter bumps do not need yet another schema
+            // version. Loads of legacy v=2 blobs are rewrapped to v=3
+            // transparently (see `load`).
+            let params = KdfParams::V3;
             let mut salt = [0u8; 16];
             OsRng.fill_bytes(&mut salt);
             let mut nonce_bytes = [0u8; 12];
             OsRng.fill_bytes(&mut nonce_bytes);
-            let mut key = derive_key(pass.as_bytes(), &salt)?;
+            let mut key = derive_key(pass.as_bytes(), &salt, params)?;
             let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
             let ct = cipher
                 .encrypt(Nonce::from_slice(&nonce_bytes), key_bytes.as_ref())
@@ -158,7 +208,7 @@ pub fn save(path: &Path, ident: &Identity) -> Result<(), IdentityStoreError> {
             vec![
                 (
                     CborValue::Text("v".into()),
-                    CborValue::Integer(VERSION_ENCRYPTED.into()),
+                    CborValue::Integer(VERSION_ENCRYPTED_V3.into()),
                 ),
                 (CborValue::Text("label".into()), CborValue::Text(label)),
                 (
@@ -168,6 +218,18 @@ pub fn save(path: &Path, ident: &Identity) -> Result<(), IdentityStoreError> {
                 (
                     CborValue::Text("nonce".into()),
                     CborValue::Bytes(nonce_bytes.to_vec()),
+                ),
+                (
+                    CborValue::Text("m_cost".into()),
+                    CborValue::Integer(params.m_cost_kib.into()),
+                ),
+                (
+                    CborValue::Text("t_cost".into()),
+                    CborValue::Integer(params.t_cost.into()),
+                ),
+                (
+                    CborValue::Text("p_cost".into()),
+                    CborValue::Integer(params.p_cost.into()),
                 ),
                 (CborValue::Text("key".into()), CborValue::Bytes(ct)),
             ]
@@ -273,6 +335,9 @@ pub fn load(path: &Path) -> Result<Identity, IdentityStoreError> {
     let mut salt: Option<Vec<u8>> = None;
     let mut nonce: Option<Vec<u8>> = None;
     let mut key_field: Option<Vec<u8>> = None;
+    let mut m_cost: Option<u32> = None;
+    let mut t_cost: Option<u32> = None;
+    let mut p_cost: Option<u32> = None;
     for (k, v) in map.iter() {
         if let Some(name) = k.as_text() {
             match name {
@@ -281,6 +346,15 @@ pub fn load(path: &Path) -> Result<Identity, IdentityStoreError> {
                 "salt" => salt = v.as_bytes().cloned(),
                 "nonce" => nonce = v.as_bytes().cloned(),
                 "key" => key_field = v.as_bytes().cloned(),
+                "m_cost" => {
+                    m_cost = v.as_integer().and_then(|i| u32::try_from(i).ok());
+                }
+                "t_cost" => {
+                    t_cost = v.as_integer().and_then(|i| u32::try_from(i).ok());
+                }
+                "p_cost" => {
+                    p_cost = v.as_integer().and_then(|i| u32::try_from(i).ok());
+                }
                 _ => {}
             }
         }
@@ -288,6 +362,7 @@ pub fn load(path: &Path) -> Result<Identity, IdentityStoreError> {
     let label = label.ok_or_else(|| IdentityStoreError::Format("missing label".into()))?;
     let key_field = key_field.ok_or_else(|| IdentityStoreError::Format("missing key".into()))?;
 
+    let mut rewrap_v2_to_v3 = false;
     let mut raw = match version {
         Some(v) if v == VERSION_PLAIN as i64 => {
             if key_field.len() != 32 {
@@ -297,7 +372,7 @@ pub fn load(path: &Path) -> Result<Identity, IdentityStoreError> {
             k.copy_from_slice(&key_field);
             k
         }
-        Some(v) if v == VERSION_ENCRYPTED as i64 => {
+        Some(v) if v == VERSION_ENCRYPTED as i64 || v == VERSION_ENCRYPTED_V3 as i64 => {
             // H-9: passphrase wiped on drop.
             let pass = Zeroizing::new(std::env::var(PASSPHRASE_ENV).map_err(|_| {
                 IdentityStoreError::Crypto(format!(
@@ -306,7 +381,29 @@ pub fn load(path: &Path) -> Result<Identity, IdentityStoreError> {
             })?);
             let salt = salt.ok_or_else(|| IdentityStoreError::Format("missing salt".into()))?;
             let nonce = nonce.ok_or_else(|| IdentityStoreError::Format("missing nonce".into()))?;
-            let mut key = derive_key(pass.as_bytes(), &salt)?;
+            // v=2 uses legacy params; v=3 uses the params baked into
+            // the blob. If v=3 lacks any of m/t/p, reject as malformed
+            // rather than silently falling back.
+            let params = if v == VERSION_ENCRYPTED as i64 {
+                rewrap_v2_to_v3 = true;
+                KdfParams::V2
+            } else {
+                let m = m_cost.ok_or_else(|| {
+                    IdentityStoreError::Format("v=3 missing m_cost".into())
+                })?;
+                let t = t_cost.ok_or_else(|| {
+                    IdentityStoreError::Format("v=3 missing t_cost".into())
+                })?;
+                let p = p_cost.ok_or_else(|| {
+                    IdentityStoreError::Format("v=3 missing p_cost".into())
+                })?;
+                KdfParams {
+                    m_cost_kib: m,
+                    t_cost: t,
+                    p_cost: p,
+                }
+            };
+            let mut key = derive_key(pass.as_bytes(), &salt, params)?;
             let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
             let mut pt = cipher
                 .decrypt(Nonce::from_slice(&nonce), key_field.as_ref())
@@ -332,12 +429,42 @@ pub fn load(path: &Path) -> Result<Identity, IdentityStoreError> {
 
     let signing_key = SigningKey::from_bytes(&raw);
     raw.zeroize();
-    Ok(Identity::from_signing_key(&label, signing_key))
+    let ident = Identity::from_signing_key(&label, signing_key);
+
+    // **M-10**: lazy rewrap. When the blob on disk is v=2 and the
+    // passphrase is available, re-encrypt as v=3 with the new
+    // Argon2id parameters. On failure log and return the identity
+    // anyway — we've successfully decrypted, so the caller should
+    // proceed; a subsequent save on a writable volume will migrate
+    // on its own.
+    if rewrap_v2_to_v3 {
+        match save(path, &ident) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %path.display(),
+                    "M-10: identity rewrapped v=2 -> v=3 Argon2id (m=64MiB, t=3, p=4)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "M-10: v=2 decrypt succeeded but lazy rewrap failed; \
+                     identity will be used but remains on v=2 on disk"
+                );
+            }
+        }
+    }
+
+    Ok(ident)
 }
 
-fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; 32], IdentityStoreError> {
-    // Modest Argon2id params: 19 MiB, 2 iterations, 1 lane.
-    let params = Params::new(19 * 1024, 2, 1, Some(32))
+fn derive_key(
+    passphrase: &[u8],
+    salt: &[u8],
+    p: KdfParams,
+) -> Result<[u8; 32], IdentityStoreError> {
+    let params = Params::new(p.m_cost_kib, p.t_cost, p.p_cost, Some(32))
         .map_err(|e| IdentityStoreError::Crypto(e.to_string()))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = [0u8; 32];
@@ -401,6 +528,119 @@ mod tests {
         let a = load_or_create(&path, "node").unwrap();
         let b = load_or_create(&path, "node").unwrap();
         assert_eq!(a.id.to_urn(), b.id.to_urn());
+    }
+
+    /// **M-10 (security review)**: new saves use the v=3 schema
+    /// with Argon2id parameters embedded in the blob.
+    #[test]
+    fn test_m10_save_writes_v3_with_embedded_params() {
+        let _g = PASSPHRASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::set_var(PASSPHRASE_ENV, "unit-test-m10") };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("node_key.bin");
+        let _ = load_or_create(&path, "node-m10").unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let value: CborValue = ciborium::from_reader(&bytes[..]).unwrap();
+        let map = value.as_map().unwrap();
+        let mut v: Option<i64> = None;
+        let mut m: Option<u32> = None;
+        let mut t: Option<u32> = None;
+        let mut p: Option<u32> = None;
+        for (k, val) in map {
+            match k.as_text().unwrap_or("") {
+                "v" => v = val.as_integer().and_then(|i| i64::try_from(i).ok()),
+                "m_cost" => m = val.as_integer().and_then(|i| u32::try_from(i).ok()),
+                "t_cost" => t = val.as_integer().and_then(|i| u32::try_from(i).ok()),
+                "p_cost" => p = val.as_integer().and_then(|i| u32::try_from(i).ok()),
+                _ => {}
+            }
+        }
+        assert_eq!(v, Some(VERSION_ENCRYPTED_V3 as i64));
+        assert_eq!(m, Some(V3_M_COST_KIB));
+        assert_eq!(t, Some(V3_T_COST));
+        assert_eq!(p, Some(V3_P_COST));
+        unsafe { std::env::remove_var(PASSPHRASE_ENV) };
+    }
+
+    /// **M-10**: a blob saved under v=2 legacy params is
+    /// transparently rewrapped to v=3 on the next successful load.
+    /// The identity is preserved; only the on-disk KDF parameters
+    /// change.
+    #[test]
+    fn test_m10_lazy_rewrap_v2_to_v3() {
+        let _g = PASSPHRASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let pass = "unit-test-m10-rewrap";
+        unsafe { std::env::set_var(PASSPHRASE_ENV, pass) };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("node_key.bin");
+
+        // Hand-craft a v=2 blob for a freshly-generated identity.
+        let ident = Identity::generate("legacy", &mut OsRng);
+        let urn = ident.id.to_urn();
+        let mut key_bytes = ident.signing_key.to_bytes();
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let mut k = derive_key(pass.as_bytes(), &salt, KdfParams::V2).unwrap();
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&k));
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), key_bytes.as_ref())
+            .unwrap();
+        k.zeroize();
+        key_bytes.zeroize();
+        let map = vec![
+            (
+                CborValue::Text("v".into()),
+                CborValue::Integer((VERSION_ENCRYPTED as i64).into()),
+            ),
+            (
+                CborValue::Text("label".into()),
+                CborValue::Text("legacy".into()),
+            ),
+            (
+                CborValue::Text("salt".into()),
+                CborValue::Bytes(salt.to_vec()),
+            ),
+            (
+                CborValue::Text("nonce".into()),
+                CborValue::Bytes(nonce_bytes.to_vec()),
+            ),
+            (CborValue::Text("key".into()), CborValue::Bytes(ct)),
+        ];
+        let mut buf = Vec::new();
+        ciborium::into_writer(&CborValue::Map(map), &mut buf).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+        // M-14's marker must exist so `save` doesn't refuse (encrypted
+        // save will also create it, but simulate the pre-existing
+        // state to be safe).
+        std::fs::write(encrypted_marker_path(&path), []).unwrap();
+
+        // Load — must succeed AND trigger lazy rewrap.
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.id.to_urn(), urn);
+
+        // On-disk version is now v=3.
+        let bytes = std::fs::read(&path).unwrap();
+        let value: CborValue = ciborium::from_reader(&bytes[..]).unwrap();
+        let map = value.as_map().unwrap();
+        let v = map
+            .iter()
+            .find_map(|(k, val)| (k.as_text()? == "v").then(|| val.as_integer()))
+            .flatten()
+            .and_then(|i| i64::try_from(i).ok());
+        assert_eq!(v, Some(VERSION_ENCRYPTED_V3 as i64));
+
+        // And a fresh load still returns the same identity.
+        let again = load(&path).unwrap();
+        assert_eq!(again.id.to_urn(), urn);
+
+        unsafe { std::env::remove_var(PASSPHRASE_ENV) };
     }
 
     /// **M-14 (security review)**: once the identity has been saved

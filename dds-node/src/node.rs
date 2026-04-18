@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use dds_core::crdt::causal_dag::{CausalDag, Operation};
-use dds_core::token::{Token, TokenKind};
+use dds_core::token::{TOKEN_WIRE_V1, Token, TokenKind};
 use dds_core::trust::TrustGraph;
 use dds_net::gossip::{DdsTopic, DdsTopicSet, GossipMessage};
 use dds_net::sync::{SyncPayload, SyncRequest, SyncResponse, apply_sync_payloads_with_graph};
@@ -486,6 +486,27 @@ impl DdsNode {
         }
     }
 
+    /// **M-1 / M-2 downgrade guard (security review)**. When
+    /// `NetworkConfig::allow_legacy_v1_tokens` is false, drop any
+    /// inbound token in the legacy v=1 envelope. Persisted v1 state
+    /// already in the local store keeps verifying — only fresh ingest
+    /// from peers is gated.
+    fn legacy_token_refused(&self, token: &Token, source: &str) -> bool {
+        if token.wire_version() == TOKEN_WIRE_V1
+            && !self.config.network.allow_legacy_v1_tokens
+        {
+            warn!(
+                jti = %token.payload.jti,
+                issuer = %token.payload.iss,
+                source,
+                "dropping legacy v1 token (allow_legacy_v1_tokens=false)"
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     fn ingest_operation(&mut self, op_bytes: &[u8], token_bytes: &[u8]) {
         let op: dds_core::crdt::causal_dag::Operation = match ciborium::from_reader(op_bytes) {
             Ok(op) => op,
@@ -501,6 +522,9 @@ impl DdsNode {
                 return;
             }
         };
+        if self.legacy_token_refused(&token, "gossip-op") {
+            return;
+        }
         if let Err(e) = token.validate() {
             warn!("token validation failed: {e}");
             return;
@@ -579,6 +603,9 @@ impl DdsNode {
                 return;
             }
         };
+        if self.legacy_token_refused(&token, "gossip-revocation") {
+            return;
+        }
         if let Err(e) = token.validate() {
             warn!("revocation validation failed: {e}");
             return;
@@ -624,6 +651,9 @@ impl DdsNode {
                 return;
             }
         };
+        if self.legacy_token_refused(&token, "gossip-burn") {
+            return;
+        }
         if let Err(e) = token.validate() {
             warn!("burn validation failed: {e}");
             return;
@@ -824,6 +854,21 @@ impl DdsNode {
                     Ok(t) => t,
                     Err(_) => return true, // let apply_sync_payloads surface the error
                 };
+                // **M-1 / M-2 downgrade guard**: same cutoff as the
+                // gossip path. Persisted v1 on this node's disk is
+                // fine; fresh ingest from a peer is not, unless the
+                // operator has opted in.
+                if token.wire_version() == TOKEN_WIRE_V1
+                    && !self.config.network.allow_legacy_v1_tokens
+                {
+                    warn!(
+                        %peer,
+                        jti = %token.payload.jti,
+                        issuer = %token.payload.iss,
+                        "sync: dropping legacy v1 token (allow_legacy_v1_tokens=false)"
+                    );
+                    return false;
+                }
                 if !publisher_capability_ok(&token, &self.trust_graph, &self.trusted_roots) {
                     warn!(
                         %peer,

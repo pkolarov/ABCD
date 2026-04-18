@@ -135,6 +135,17 @@ pub struct NetworkConfig {
     /// [`ApiAuthConfig`].
     #[serde(default)]
     pub api_auth: ApiAuthConfig,
+
+    /// **M-1 / M-2 downgrade guard (security review)** — when `false`
+    /// (the default), inbound tokens in the legacy v=1 envelope
+    /// (pre-canonical-CBOR, pre-domain-separated hybrid) are dropped
+    /// at the gossip/sync ingest layer. Persisted v1 tokens already
+    /// in the local store still verify and serve normally — this flag
+    /// controls only fresh ingest from peers. Operators set it to
+    /// `true` during a domain-wide v1→v2 cutover if legacy publishers
+    /// are still live, then flip back to `false`.
+    #[serde(default = "default_false")]
+    pub allow_legacy_v1_tokens: bool,
 }
 
 impl Default for NetworkConfig {
@@ -147,6 +158,7 @@ impl Default for NetworkConfig {
             idle_timeout_secs: default_idle_timeout(),
             api_addr: default_api_addr(),
             api_auth: ApiAuthConfig::default(),
+            allow_legacy_v1_tokens: false,
         }
     }
 }
@@ -454,6 +466,29 @@ pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
         assert!(config.network.api_auth.trust_loopback_tcp_admin);
         assert!(config.network.api_auth.unix_admin_uids.is_empty());
         assert!(config.network.api_auth.windows_admin_sids.is_empty());
+    }
+
+    /// **M-1 / M-2 downgrade guard (security review)** — legacy v1
+    /// ingest is refused by default. Flag round-trips through TOML.
+    #[test]
+    fn test_allow_legacy_v1_tokens_defaults_false() {
+        let toml = format!(r#"org_hash = "abc123"{DOMAIN_TOML}"#);
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert!(!config.network.allow_legacy_v1_tokens);
+    }
+
+    #[test]
+    fn test_allow_legacy_v1_tokens_roundtrip() {
+        let toml = format!(
+            r#"
+            org_hash = "abc123"
+            {DOMAIN_TOML}
+            [network]
+            allow_legacy_v1_tokens = true
+        "#
+        );
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert!(config.network.allow_legacy_v1_tokens);
     }
 
     #[test]
