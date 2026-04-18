@@ -22,6 +22,9 @@
          native libsodium dependency which would complicate the
          MSI footprint. -->
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.4.0" />
+    <!-- L-16 (security review): explicit ACL on applied-state.json.
+         Windows-only; no-op on other platforms. -->
+    <PackageReference Include="System.IO.FileSystem.AccessControl" Version="5.0.0" Condition="'$(TargetFramework)' == 'net8.0' OR '$(TargetFramework)' == 'net9.0'" />
   </ItemGroup>
 
 </Project>

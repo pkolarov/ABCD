@@ -382,6 +382,20 @@ HRESULT RetrieveNegotiateAuthPackage(ULONG * pulAuthPackage)
 //
 // pwzToProtect must not be NULL or the empty string.
 //
+// L-14 (security review): zero and free a plaintext password buffer.
+// Using CoTaskMemFree alone leaves the plaintext in freed heap memory
+// until the allocator reuses it, which forensic / live-memory tools
+// can recover. Pass the nominal wchar length (without NUL) — a NULL
+// pointer is a no-op.
+static void SecureFreePassword(PWSTR pwz)
+{
+    if (pwz)
+    {
+        SecureZeroMemory(pwz, wcslen(pwz) * sizeof(WCHAR));
+        CoTaskMemFree(pwz);
+    }
+}
+
 static HRESULT ProtectAndCopyString(
     PCWSTR pwzToProtect,
     PWSTR* ppwzProtected
@@ -436,7 +450,7 @@ static HRESULT ProtectAndCopyString(
             }
         }
 
-        CoTaskMemFree(pwzToProtectCopy);
+        SecureFreePassword(pwzToProtectCopy);
     }
 
     return hr;
@@ -492,7 +506,7 @@ HRESULT ProtectIfNecessaryAndCopyPassword(
                 hr = ProtectAndCopyString(pwzPasswordCopy, ppwzProtectedPassword);
             }
 
-            CoTaskMemFree(pwzPasswordCopy);
+            SecureFreePassword(pwzPasswordCopy);
         }
     }
     else

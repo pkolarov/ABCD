@@ -50,11 +50,11 @@ backward-compat fallback); M-14 (encrypted-marker refuses silent
 plaintext downgrade); L-18 (atomic `bump_sign_count` primitive —
 defense-in-depth if L-17 lands).
 
-**Still deferred** (3 High, 6 Medium, 3 Low): H-6, H-7, H-12
-(all require cross-language redesigns — mTLS/HMAC between C++ and
-Rust, UDS transport, libp2p admission protocol); M-1, M-2, M-8
-(partial), M-10, M-13, M-15, M-17, M-18; L-14, L-16, L-17.
-Rationale for each is in the row-level status table.
+**Still deferred** (3 High, 6 Medium + 1 partial, 1 Low): H-6, H-7,
+H-12 (all require cross-language redesigns — mTLS/HMAC between C++
+and Rust, UDS transport, libp2p admission protocol); M-1, M-2,
+M-10, M-13, M-15, M-18, plus M-8 (partial); L-17. Rationale for
+each is in the row-level status table.
 
 **Reviewer follow-ups already closed this round** (previously flagged
 as partial):
@@ -69,6 +69,27 @@ as partial):
 - **H-8**: bootstrap admin rehydrated from config at startup;
   `admin_vouch` with `purpose::ADMIN` promotes the subject to
   `trusted_roots` and persists.
+
+**2026-04-18 second follow-up pass — new fixes:**
+
+- **L-14**: `ProtectAndCopyString` and `ProtectIfNecessaryAndCopyPassword`
+  now `SecureZeroMemory` their plaintext-password `SHStrDupW` copies
+  before `CoTaskMemFree`. Both `CDdsCredential::GetSerializationDds`
+  and `GetSerializationBridge` zero `pwzProtectedPassword` before
+  freeing it (the CredUI / already-encrypted paths hand back plaintext
+  through that pointer, so zeroing is not merely defense-in-depth).
+- **L-16**: `AppliedStateStore.WriteToDisk` sets an explicit,
+  non-inherited DACL on `applied-state.json` granting only
+  `LocalSystem` and `BUILTIN\Administrators`. No-op on non-Windows
+  builds so existing xUnit tests keep passing cross-platform.
+- **M-17**: `CborDecoder` adds `kMaxCborDepth = 16` and bounded-alloc
+  guards. Array/map element counts rejected when they exceed the
+  remaining wire bytes (each element ≥ 1 byte; map entries ≥ 2
+  bytes). `ReadBytes` compares against `Remaining()` rather than
+  computing `m_pos + count`, which closes a size_t-wrap on
+  attacker-chosen lengths. Depth carried as a parameter through
+  `DecodeValue` instead of a member to avoid state bleed between
+  `Decode` calls.
 
 **2026-04-18 follow-up pass — new fixes:**
 
@@ -133,9 +154,9 @@ as partial):
 | M-12 | ✅ Fixed (pending verify) | `AssertionSessionRequest` / `AdminVouchRequest` gained an optional `client_data_json` field. When present, `verify_assertion_common` (i) hashes the supplied JSON and binds it to the authenticator-signed `client_data_hash`, then (ii) parses the JSON and validates `type`, `challenge`, `origin` individually per WebAuthn §7.2 steps 7–9 (plus a `crossOrigin == false` guard). `decode_b64url_any` accepts both base64url-no-pad (spec) and base64url-with-pad (some stacks). When the field is absent the legacy reconstruct-and-hash path still runs so existing clients aren't broken; clients SHOULD start sending the raw bytes. |
 | M-13 | ⏸ Deferred | Requires FIDO MDS integration / policy |
 | M-14 | ✅ Fixed (pending verify) | `identity_store::save` writes a sticky `<path>.encrypted-marker` after any successful encrypted save. On subsequent saves, if the marker exists and the caller is about to produce a plaintext blob (empty `DDS_NODE_PASSPHRASE`), `save` returns a `Crypto` error and refuses to overwrite. `DDS_NODE_ALLOW_PLAINTEXT_DOWNGRADE=1` is an explicit escape hatch (logged at warn) for dev/testing. Defeats the attack described in the review: an attacker with FS write who clears the passphrase env var and waits for a restart can no longer roll back the key to plaintext silently. Test `test_m14_refuses_plaintext_downgrade` covers both the refusal and the override. |
-| M-15 | ⏸ Deferred | FIDO2 code path is feature-gated off by default |
+| M-15 | ⏸ Deferred | Investigated 2026-04-18 and re-deferred. Binding `hmac_salt` to `SHA-256(node_urn)` breaks the provisioning path: `create_bundle` embeds the admin's v3 CBOR blob verbatim into `ProvisionBundle.domain_key_blob`, and the target node's `run_provision` unwraps it with only the authenticator — it has no knowledge of the admin's node URN. A sound fix needs either a bundle-specific re-wrap step in `create_bundle` (strip binding on export) or a separate export format, both larger than the review's one-line suggestion. Impact is also thinner than the review states: `provision` asserts `domain_key.bin` is never persisted on non-admin nodes (`provision.rs:646`), so the "any provisioned node's key file" attack surface is narrower than claimed. |
 | M-16 | ✅ Fixed (pending verify) | `.ddsdump` v2 mandatory Ed25519 signature over `DdsDump::signing_bytes`. `dds export` requires unwrapped `DomainKey`. `dds import` verifies against the local `domain.toml` pubkey. **Downgrade-defense**: v1 (unsigned) dumps now REFUSE by default — the importer errors out unless `--allow-unsigned` is passed, because a tampered v2 dump could otherwise be relabelled as v1 and bypass signature verification. Plus L-5 0o600 on the written file. |
-| M-17 | ⏸ Deferred | C++ only; Windows-specific audit |
+| M-17 | ✅ Fixed (pending verify) | `ctap2/cbor.cpp` decoder now enforces a 16-level nesting cap, rejects array/map element counts that exceed remaining wire bytes (closes `resize(2^63)` allocation DoS from a hostile USB-HID device), and rewrites the `m_pos + count` overflow check in `ReadBytes` as `count > Remaining()`. `DecodeValue` threads depth through the recursion rather than storing it on the decoder so repeated `Decode` calls don't accumulate state. |
 | M-18 | ⏸ Deferred | WiX / installer change |
 | M-19 | ✅ Fixed (pending verify) | Boot-time wall clock captured; `verify_assertion_common` refuses when `now() < boot_wall_time` |
 | M-20 | ✅ Fixed (pending verify) | `directory.redb` set to `0o600` on Unix after `Database::create` |
@@ -159,9 +180,9 @@ as partial):
 | L-11 | ✅ Audited | Production-callsite audit: `LwwRegister` is only referenced by `dds-loadtest` fixtures and `dds-core/benches/crdt_merge.rs` — no directory CRDT path uses wall-clock LWW semantics. Limitation documented in-module so future callers re-audit before relying on convergence. |
 | L-12 | ✅ Fixed (pending verify) | `AuditLogEntry::prev_hash` + `chain_hash()` + `sign_ed25519_chained` constructor. **Append-time enforcement**: both `MemoryBackend` and `RedbBackend` `append_audit_entry` now verify the new entry's `prev_hash` equals the previously-stored entry's `chain_hash` (or is empty for the genesis entry); mismatches return `StoreError::Serde` so the caller can log the forensic event. `DdsNode::emit_local_audit` is the production hook — reads the chain head, stamps, signs, appends. `AuditStore::audit_chain_head` is exposed for callers that need to construct chained entries themselves. |
 | L-13 | ✅ Fixed (pending verify) | `credential_ids_eq` in `service.rs` decodes both sides via base64url-no-pad / standard / url-safe / standard-no-pad and compares raw bytes. Falls back to string equality if neither side is base64. |
-| L-14 | ⏸ Deferred | C++ Credential Provider stack hygiene |
+| L-14 | ✅ Fixed (pending verify) | `helpers.cpp` gains a static `SecureFreePassword(PWSTR)` helper that `SecureZeroMemory`s then `CoTaskMemFree`s. `ProtectAndCopyString` and `ProtectIfNecessaryAndCopyPassword` use it on their internal `SHStrDupW` copies (which previously leaked plaintext into freed heap). Both `CDdsCredential::GetSerializationDds` and `GetSerializationBridge` inline the same zero-before-free on `pwzProtectedPassword` — important because the `CPUS_CREDUI` and already-encrypted branches hand back plaintext through that pointer, not ciphertext. Windows build required to verify. |
 | L-15 | ✅ Fixed (pending verify) | `subtle::ConstantTimeEq` on `vch_sum` comparisons via `payload_hash_eq` |
-| L-16 | ⏸ Deferred | C# applied-state file ACL; Windows-only |
+| L-16 | ✅ Fixed (pending verify) | `AppliedStateStore.WriteToDisk` applies the restricted DACL to the `.tmp` file BEFORE `File.Move`. Same-volume `File.Move` is a metadata rename that preserves the source DACL, so the final `applied-state.json` never observably exists with the inherited parent ACL — closes the write-time race. Fail-closed on Windows: if `SetWindowsDacl` throws, the tmp file is deleted and the exception propagates, so the caller (holding `_lock`) sees the write fail. On Windows the DACL grants `FullControl` only to `LocalSystem` and `BUILTIN\Administrators` with inheritance disabled; `OperatingSystem.IsWindows()` short-circuits the helper on non-Windows (the agent never ships there in production). Added `System.IO.FileSystem.AccessControl` to the csproj, guarded by `TargetFramework`. |
 | L-17 | ⏸ Deferred | Service mutex refactor; couple with L-18 |
 | L-18 | ✅ Fixed (pending verify) | `CredentialStateStore::bump_sign_count(credential, new)` is an atomic check-and-set primitive: the redb backend performs the compare and the write inside a single write transaction, and `StoreError::SignCountReplay { stored, attempted }` distinguishes the replay case from a generic I/O failure. Service layer at `verify_assertion_common` now calls `bump_sign_count` instead of the race-prone `get` + compare + `set` sequence. Today the service-wide mutex (L-17) already serializes these calls, but the backend-level atomicity is correct on its own — if L-17 is ever split out, the sign-count replay invariant stays intact. Tests on both MemoryBackend and RedbBackend assert the accept / equal-reject / less-than-reject behaviour. |
 
@@ -814,12 +835,23 @@ that span a transport or protocol boundary:
 
 Medium/Low items still open are either narrower (M-10 Argon2id
 parameter bump requires a disk-format migration; M-13 FIDO MDS;
-M-17 C++ CTAP2 CBOR audit; M-18 service-account split in WiX;
-L-14 CP stack hygiene; L-16 AppliedState ACL; L-17 service mutex
+M-18 service-account split in WiX; L-17 service mutex
 refactor — pair with L-18 completion if needed) or have no cheap
 independent fix (M-1 canonical CBOR, M-2 hybrid-sig domain
 separation: both rolled into a future versioned breaking change).
-M-15 waits on the FIDO2 code path going on by default.
+M-15 (node-bound FIDO2 hmac_salt) was investigated and deferred
+again this pass: binding the admin-machine `domain_key.bin` to its
+own node identity breaks the provisioning path, where
+`create_bundle` embeds the admin's CBOR v3 blob verbatim into
+`domain_key_blob` and the target node's `provision` unwraps it
+from bytes using only the authenticator. A proper fix requires
+either a bundle-specific re-wrap step (strip binding on export) or
+a separate "export" format; both are larger than the review's
+one-line fix suggests. M-15's real-world impact is also thinner
+than stated: `provision` explicitly does not persist
+`domain_key.bin` on non-admin nodes (asserted at
+`provision.rs:646`), so the "any provisioned node's key file"
+attack surface is narrower than the review claimed.
 
 ## Cross-references to prior review
 

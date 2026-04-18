@@ -5,6 +5,18 @@
 #include "cbor.h"
 #include <string.h>
 
+// M-17 (security review): bound-checks on the decoder.
+//
+// CTAP2 messages come off USB-HID from hardware that is *usually*
+// benign, but a malicious USB device can pass any bytes. Without caps,
+// attacker-chosen length prefixes trivially turn into unbounded
+// allocations (e.g., `major 4 / argument 2^63` → `vector::resize`).
+//
+// CTAP2 shapes are small — GetInfo responses and attestation objects
+// sit well under 16 levels deep with order-of-dozens elements. These
+// limits are generous relative to that.
+static constexpr size_t kMaxCborDepth = 16;
+
 // ============================================================================
 // CborValue constructors
 // ============================================================================
@@ -288,7 +300,7 @@ bool CborDecoder::Decode(const uint8_t* data, size_t len, CborValue& outValue)
     m_pos = 0;
     m_error = nullptr;
 
-    if (!DecodeValue(outValue))
+    if (!DecodeValue(outValue, 0))
     {
         if (!m_error) m_error = "Unknown decode error";
         return false;
@@ -310,7 +322,9 @@ bool CborDecoder::ReadByte(uint8_t& b)
 
 bool CborDecoder::ReadBytes(uint8_t* buf, size_t count)
 {
-    if (m_pos + count > m_size)
+    // Compare against Remaining() rather than computing m_pos + count,
+    // which can wrap for attacker-chosen count.
+    if (count > Remaining())
     {
         m_error = "Unexpected end of input reading bytes";
         return false;
@@ -376,8 +390,14 @@ bool CborDecoder::DecodeHead(uint8_t& majorType, uint64_t& argument)
     return true;
 }
 
-bool CborDecoder::DecodeValue(CborValue& outVal)
+bool CborDecoder::DecodeValue(CborValue& outVal, size_t depth)
 {
+    if (depth >= kMaxCborDepth)
+    {
+        m_error = "CBOR nesting depth exceeded";
+        return false;
+    }
+
     uint8_t majorType;
     uint64_t argument;
 
@@ -424,11 +444,18 @@ bool CborDecoder::DecodeValue(CborValue& outVal)
 
     case 4: // Array
     {
+        // Each element consumes at least one byte, so reject element
+        // counts that cannot possibly fit in what's left on the wire.
+        if (argument > Remaining())
+        {
+            m_error = "Array element count exceeds remaining data";
+            return false;
+        }
         outVal.type = CborType::Array;
         outVal.arrayVal.resize(static_cast<size_t>(argument));
         for (size_t i = 0; i < static_cast<size_t>(argument); i++)
         {
-            if (!DecodeValue(outVal.arrayVal[i]))
+            if (!DecodeValue(outVal.arrayVal[i], depth + 1))
                 return false;
         }
         return true;
@@ -436,13 +463,20 @@ bool CborDecoder::DecodeValue(CborValue& outVal)
 
     case 5: // Map
     {
+        // Each entry is key + value, so a map of `argument` pairs needs
+        // >= 2*argument bytes. Reject anything that obviously can't fit.
+        if (argument > Remaining() / 2)
+        {
+            m_error = "Map entry count exceeds remaining data";
+            return false;
+        }
         outVal.type = CborType::Map;
         outVal.mapVal.resize(static_cast<size_t>(argument));
         for (size_t i = 0; i < static_cast<size_t>(argument); i++)
         {
-            if (!DecodeValue(outVal.mapVal[i].first))
+            if (!DecodeValue(outVal.mapVal[i].first, depth + 1))
                 return false;
-            if (!DecodeValue(outVal.mapVal[i].second))
+            if (!DecodeValue(outVal.mapVal[i].second, depth + 1))
                 return false;
         }
         return true;

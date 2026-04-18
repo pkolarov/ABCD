@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+using System.Runtime.Versioning;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -181,6 +184,59 @@ public sealed class AppliedStateStore : IAppliedStateStore
         // Atomic-ish write: write to a temp file, then rename.
         var tmp = _path + ".tmp";
         File.WriteAllText(tmp, json);
+        // L-16 (security review): apply the restricted DACL to the temp
+        // file BEFORE the rename. File.Move on the same volume is a
+        // metadata rename that preserves the source's DACL, so the
+        // final file never observably exists with an inherited ACL.
+        // Fail closed: if ACL application fails on Windows, the write
+        // is aborted before the rename so applied-state.json is never
+        // left in an under-protected state.
+        try
+        {
+            RestrictAccessToSystem(tmp);
+        }
+        catch
+        {
+            try { File.Delete(tmp); } catch { /* best-effort */ }
+            throw;
+        }
         File.Move(tmp, _path, overwrite: true);
+    }
+
+    // L-16 (security review): applied-state.json previously inherited the
+    // parent directory's ACL. A local admin-equivalent user with write
+    // access to the state dir could tamper with it and mislead the agent's
+    // reconciliation (e.g., mark a policy as already-applied so the real
+    // policy never runs). Set an explicit, non-inherited DACL that grants
+    // only SYSTEM and the local Administrators group.
+    //
+    // Throws on Windows if ACL application fails so the write is aborted
+    // before the file becomes visible at its final path. No-op on other
+    // platforms (non-Windows has no meaningful NTFS DACL model to enforce
+    // here and never ships the policy agent in production).
+    private static void RestrictAccessToSystem(string path)
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+        SetWindowsDacl(path);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void SetWindowsDacl(string path)
+    {
+        var info = new FileInfo(path);
+        var security = new FileSecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+
+        var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+        var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+        security.SetOwner(system);
+        security.SetGroup(system);
+        security.AddAccessRule(new FileSystemAccessRule(
+            system, FileSystemRights.FullControl, AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(
+            admins, FileSystemRights.FullControl, AccessControlType.Allow));
+
+        info.SetAccessControl(security);
     }
 }

@@ -490,7 +490,16 @@ HRESULT CDdsCredential::GetSerializationDds(
                 }
             }
         }
-        CoTaskMemFree(pwzProtectedPassword);
+        // L-14 (security review): zero before free. In CPUS_CREDUI and
+        // already-encrypted paths pwzProtectedPassword holds plaintext;
+        // in the CredProtect path it holds ciphertext, but zeroing is
+        // cheap defense-in-depth.
+        if (pwzProtectedPassword)
+        {
+            SecureZeroMemory(pwzProtectedPassword,
+                             wcslen(pwzProtectedPassword) * sizeof(wchar_t));
+            CoTaskMemFree(pwzProtectedPassword);
+        }
     }
 
     return hr;
@@ -620,7 +629,13 @@ HRESULT CDdsCredential::GetSerializationBridge(
                 }
             }
         }
-        CoTaskMemFree(pwzProtectedPassword);
+        // L-14 (security review): zero before free — see GetSerializationDds.
+        if (pwzProtectedPassword)
+        {
+            SecureZeroMemory(pwzProtectedPassword,
+                             wcslen(pwzProtectedPassword) * sizeof(wchar_t));
+            CoTaskMemFree(pwzProtectedPassword);
+        }
     }
 
     return hr;

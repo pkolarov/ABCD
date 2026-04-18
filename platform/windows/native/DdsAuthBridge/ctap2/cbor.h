@@ -141,7 +141,7 @@ private:
     size_t          m_pos;
     const char*     m_error;
 
-    bool DecodeValue(CborValue& outVal);
+    bool DecodeValue(CborValue& outVal, size_t depth);
     bool DecodeHead(uint8_t& majorType, uint64_t& argument);
     bool ReadByte(uint8_t& b);
     bool ReadBytes(uint8_t* buf, size_t count);
