@@ -19,15 +19,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ciborium::value::Value as CborValue;
 use dds_domain::Domain;
+use dds_domain::DomainKey;
 use dds_domain::domain::{DomainId, from_hex, to_hex};
+use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use crate::{domain_store, identity_store, p2p_identity};
 
-const BUNDLE_VERSION: u64 = 2;
+/// Current wire version: v3 bundles carry a mandatory Ed25519
+/// signature over the canonical signing bytes, verified on load
+/// against the embedded `domain_pubkey`.
+const BUNDLE_VERSION: u64 = 3;
 /// Minimum supported bundle version for read. v1 had no integrity
-/// metadata; we still read it but emit a warning.
+/// metadata; v2 carried a SHA-256 fingerprint but no signature; we
+/// still read both but emit a warning because neither prevents a
+/// bundle-signing-key swap on its own.
 const MIN_READ_VERSION: u64 = 1;
 
 // ---- Error type ----
@@ -70,7 +77,7 @@ impl From<domain_store::DomainStoreError> for ProvisionError {
 // ---- Bundle ----
 
 /// A provision bundle containing everything needed to join a domain.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProvisionBundle {
     pub domain_name: String,
     pub domain_id: String,
@@ -81,28 +88,78 @@ pub struct ProvisionBundle {
     pub api_port: u16,
     pub mdns_enabled: bool,
     /// SHA-256 fingerprint of the integrity-bound metadata fields
-    /// (domain_id + domain_pubkey + org_hash + ports). Set on load
-    /// for v2 bundles, or computed on the fly otherwise. Operators
-    /// must confirm this fingerprint OUT-OF-BAND before importing
-    /// — see H-10 in the security review.
+    /// (domain_id + domain_pubkey + org_hash + ports + domain_key_blob).
+    /// Populated on load for v2+ bundles. Operators MUST confirm this
+    /// fingerprint OUT-OF-BAND before importing; the in-bundle
+    /// signature (v3+) catches the common tamper case where the
+    /// metadata is altered without re-deriving a new domain key.
     pub fingerprint: String,
 }
 
-/// Save a provision bundle to a `.dds` file.
+/// Canonical bytes covered by the bundle's signature and fingerprint.
+/// Order is fixed; any field added in a future version must go AFTER
+/// the existing fields so v3 consumers continue to verify against the
+/// same prefix. Includes `domain_key_blob` so a MITM swapping the
+/// encrypted key for one they control invalidates the signature.
+fn signing_bytes(bundle: &ProvisionBundle) -> Vec<u8> {
+    let mut h = Sha256::new();
+    h.update(b"dds-bundle-v3|");
+    h.update(bundle.domain_id.as_bytes());
+    h.update(b"|");
+    h.update(bundle.domain_pubkey.as_bytes());
+    h.update(b"|");
+    h.update(bundle.org_hash.as_bytes());
+    h.update(b"|");
+    h.update(bundle.listen_port.to_be_bytes());
+    h.update(b"|");
+    h.update(bundle.api_port.to_be_bytes());
+    h.update(b"|");
+    h.update([u8::from(bundle.mdns_enabled)]);
+    h.update(b"|");
+    h.update((bundle.domain_key_blob.len() as u64).to_be_bytes());
+    h.update(&bundle.domain_key_blob);
+    h.finalize().to_vec()
+}
+
+/// Save a v3 provision bundle to a `.dds` file, signed by `signer`
+/// (the domain Ed25519 signing key).
 ///
-/// **H-10 (security review)**: bundle metadata is hashed and the
-/// fingerprint is embedded so the loader can detect any in-flight
-/// tamper of `domain_pubkey`, `domain_id`, `org_hash`, or ports.
-/// Note this is TOFU: a sophisticated attacker who replaces the
-/// pubkey AND recomputes the fingerprint can still pass verification.
-/// Operators MUST confirm the printed fingerprint out-of-band before
-/// importing on the destination. See `bundle.fingerprint` and the
-/// CLI output of `dds-node create-provision-bundle`.
-pub fn save_bundle(path: &Path, bundle: &ProvisionBundle) -> Result<(), ProvisionError> {
+/// **H-10 (security review)**: the bundle body is hashed via
+/// `signing_bytes` and signed with the domain key. The verifying
+/// pubkey embedded in `bundle.domain_pubkey` is what `load_bundle`
+/// will verify against. Combined with the fingerprint printed on
+/// both create and load paths, this defends against two distinct
+/// attacks:
+///
+///   - Metadata tamper *without* key swap: signature verification
+///     fails (because the same key signs a different message hash).
+///   - Full swap including pubkey and signing key: signature verifies
+///     against the attacker's key; the fingerprint changes; the
+///     operator MUST detect the mismatch out-of-band via the
+///     fingerprint that was printed at bundle-creation time.
+pub fn save_bundle(
+    path: &Path,
+    bundle: &ProvisionBundle,
+    signer: &DomainKey,
+) -> Result<(), ProvisionError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ProvisionError::Io(e.to_string()))?;
     }
+    // Sanity-check: the signer's pubkey must match the embedded
+    // domain_pubkey, otherwise `load_bundle` would reject the bundle.
+    let signer_pubkey_hex = to_hex(&signer.pubkey());
+    if signer_pubkey_hex != bundle.domain_pubkey {
+        return Err(ProvisionError::Format(format!(
+            "signer pubkey ({signer_pubkey_hex}) does not match \
+             bundle.domain_pubkey ({}) — refusing to write a bundle \
+             that would fail verification on load",
+            bundle.domain_pubkey
+        )));
+    }
     let fingerprint = compute_fingerprint(bundle);
+    let msg = signing_bytes(bundle);
+    let signature = signer.signing_key.sign(&msg).to_bytes().to_vec();
+
     let map = vec![
         (
             CborValue::Text("version".into()),
@@ -144,6 +201,10 @@ pub fn save_bundle(path: &Path, bundle: &ProvisionBundle) -> Result<(), Provisio
             CborValue::Text("fingerprint".into()),
             CborValue::Text(fingerprint),
         ),
+        (
+            CborValue::Text("signature".into()),
+            CborValue::Bytes(signature),
+        ),
     ];
     let mut buf = Vec::new();
     ciborium::into_writer(&CborValue::Map(map), &mut buf)
@@ -152,27 +213,15 @@ pub fn save_bundle(path: &Path, bundle: &ProvisionBundle) -> Result<(), Provisio
     Ok(())
 }
 
-/// SHA-256 fingerprint over the metadata fields covered by H-10:
-/// `domain_id`, `domain_pubkey`, `org_hash`, listen_port, api_port,
-/// mdns_enabled. Concatenation uses unambiguous separators; this is
-/// the operator-visible hash, not a CBOR-canonical fingerprint.
+/// SHA-256 fingerprint over the same canonical signing bytes used
+/// for the bundle signature. Operators confirm this value
+/// out-of-band — it covers `domain_id`, `domain_pubkey`, `org_hash`,
+/// ports, `mdns_enabled`, and `domain_key_blob` so that any
+/// attacker-controlled substitution changes the fingerprint too.
 fn compute_fingerprint(bundle: &ProvisionBundle) -> String {
-    let mut h = Sha256::new();
-    h.update(b"dds-bundle-v2|");
-    h.update(bundle.domain_id.as_bytes());
-    h.update(b"|");
-    h.update(bundle.domain_pubkey.as_bytes());
-    h.update(b"|");
-    h.update(bundle.org_hash.as_bytes());
-    h.update(b"|");
-    h.update(bundle.listen_port.to_be_bytes());
-    h.update(b"|");
-    h.update(bundle.api_port.to_be_bytes());
-    h.update(b"|");
-    h.update([u8::from(bundle.mdns_enabled)]);
-    let digest = h.finalize();
+    let digest = signing_bytes(bundle);
     let mut s = String::with_capacity(64);
-    for b in digest {
+    for b in &digest {
         s.push_str(&format!("{:02x}", b));
     }
     s
@@ -245,6 +294,13 @@ pub fn load_bundle(path: &Path) -> Result<ProvisionBundle, ProvisionError> {
             None
         }
     });
+    let stored_signature: Option<Vec<u8>> = map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some("signature") {
+            v.as_bytes().cloned()
+        } else {
+            None
+        }
+    });
 
     let bundle = ProvisionBundle {
         domain_name: get_text("domain_name")?,
@@ -257,43 +313,112 @@ pub fn load_bundle(path: &Path) -> Result<ProvisionBundle, ProvisionError> {
         mdns_enabled: get_bool("mdns_enabled", true),
         fingerprint: String::new(),
     };
-    let computed = compute_fingerprint(&bundle);
-    if version >= 2 {
-        // **H-10 (security review)**: integrity check. Stored fingerprint
-        // must match the recomputed one. If absent or mismatched the
-        // bundle was tampered or corrupted in transit.
-        let stored = stored_fingerprint.ok_or_else(|| {
-            ProvisionError::Format(
-                "v2 bundle is missing the fingerprint field — refuse to import".into(),
-            )
-        })?;
-        if stored != computed {
-            return Err(ProvisionError::Format(format!(
-                "bundle fingerprint mismatch: file claims {stored}, computed {computed}; \
-                 the bundle has been tampered with"
-            )));
+    let computed_fingerprint = compute_fingerprint(&bundle);
+
+    match version {
+        3 => {
+            // **H-10 (security review)**: v3 MUST carry a signature and
+            // MUST carry the fingerprint. Both are verified here; the
+            // caller then prints the fingerprint for operator OOB
+            // confirmation.
+            let sig_bytes = stored_signature.ok_or_else(|| {
+                ProvisionError::Format(
+                    "v3 bundle missing signature field — refuse to import".into(),
+                )
+            })?;
+            let stored = stored_fingerprint.ok_or_else(|| {
+                ProvisionError::Format(
+                    "v3 bundle missing fingerprint field — refuse to import".into(),
+                )
+            })?;
+            if stored != computed_fingerprint {
+                return Err(ProvisionError::Format(format!(
+                    "bundle fingerprint mismatch: file claims {stored}, computed \
+                     {computed_fingerprint}; the bundle has been tampered with"
+                )));
+            }
+            // Verify the Ed25519 signature against the embedded pubkey.
+            // This catches metadata tampering that re-computes the
+            // fingerprint but does not have the domain signing key.
+            let pk_bytes = from_hex(&bundle.domain_pubkey).map_err(|e| {
+                ProvisionError::Format(format!("bundle domain_pubkey is not hex: {e}"))
+            })?;
+            if pk_bytes.len() != 32 {
+                return Err(ProvisionError::Format(
+                    "bundle domain_pubkey is not 32 bytes".into(),
+                ));
+            }
+            let mut pk_arr = [0u8; 32];
+            pk_arr.copy_from_slice(&pk_bytes);
+            let vk = VerifyingKey::from_bytes(&pk_arr).map_err(|e| {
+                ProvisionError::Format(format!("bundle domain_pubkey invalid: {e}"))
+            })?;
+            if sig_bytes.len() != 64 {
+                return Err(ProvisionError::Format(
+                    "bundle signature is not 64 bytes".into(),
+                ));
+            }
+            let mut sig_arr = [0u8; 64];
+            sig_arr.copy_from_slice(&sig_bytes);
+            let sig = Signature::from_bytes(&sig_arr);
+            let msg = signing_bytes(&bundle);
+            vk.verify(&msg, &sig).map_err(|_| {
+                ProvisionError::Format(
+                    "bundle signature does not verify against embedded domain_pubkey \
+                     — the bundle has been tampered with or the pubkey was substituted"
+                        .into(),
+                )
+            })?;
+            Ok(ProvisionBundle {
+                fingerprint: computed_fingerprint,
+                ..bundle
+            })
         }
-        Ok(ProvisionBundle {
-            fingerprint: computed,
-            ..bundle
-        })
-    } else {
-        // v1 (legacy): no fingerprint on disk. Compute one for display
-        // but warn that this bundle has no integrity protection.
-        tracing::warn!(
-            "loading legacy v1 provision bundle (no integrity fingerprint stored); \
-             confirm the displayed fingerprint out-of-band before trusting"
-        );
-        Ok(ProvisionBundle {
-            fingerprint: computed,
-            ..bundle
-        })
+        2 => {
+            // v2 legacy: fingerprint but no signature.
+            let stored = stored_fingerprint.ok_or_else(|| {
+                ProvisionError::Format(
+                    "v2 bundle is missing the fingerprint field — refuse to import".into(),
+                )
+            })?;
+            if stored != computed_fingerprint {
+                return Err(ProvisionError::Format(format!(
+                    "bundle fingerprint mismatch: file claims {stored}, computed \
+                     {computed_fingerprint}; the bundle has been tampered with"
+                )));
+            }
+            tracing::warn!(
+                "loading legacy v2 provision bundle (unsigned, fingerprint only); \
+                 re-create with the current toolchain to get an Ed25519-signed v3 bundle"
+            );
+            Ok(ProvisionBundle {
+                fingerprint: computed_fingerprint,
+                ..bundle
+            })
+        }
+        _ => {
+            // v1: no integrity metadata at all.
+            tracing::warn!(
+                "loading legacy v1 provision bundle (no integrity metadata); \
+                 confirm the displayed fingerprint out-of-band before trusting"
+            );
+            Ok(ProvisionBundle {
+                fingerprint: computed_fingerprint,
+                ..bundle
+            })
+        }
     }
 }
 
 // ---- Bundle creation ----
 
 /// Create a provision bundle from the domain directory (after init-domain).
+///
+/// Unwraps the domain key from `<domain_dir>/domain_key.bin` (this
+/// triggers the FIDO2 touch / passphrase prompt) so it can sign the
+/// bundle body per H-10. If the operator cannot unwrap the key here,
+/// the fallback is out of scope — they cannot create a v3 bundle
+/// without access to the signing key.
 pub fn create_bundle(
     domain_dir: &Path,
     org_hash: &str,
@@ -304,6 +429,8 @@ pub fn create_bundle(
 
     let domain = domain_store::load_domain_file(&domain_toml)?;
     let key_blob = std::fs::read(&domain_key_bin).map_err(|e| ProvisionError::Io(e.to_string()))?;
+    // Unwrap the signing key (may prompt for passphrase / FIDO2 touch).
+    let signer = domain_store::load_domain_key_from_bytes(&key_blob)?;
 
     let bundle = ProvisionBundle {
         domain_name: domain.name,
@@ -317,7 +444,12 @@ pub fn create_bundle(
         fingerprint: String::new(),
     };
 
-    save_bundle(out_path, &bundle)?;
+    save_bundle(out_path, &bundle, &signer)?;
+    // Zeroize the unwrapped signing key.
+    let mut secret = signer.signing_key.to_bytes();
+    secret.zeroize();
+    drop(signer);
+
     // H-10 (security review): print the fingerprint so the operator
     // can confirm it out-of-band on the importing side.
     let fp = compute_fingerprint(&bundle);
@@ -393,6 +525,16 @@ pub fn run_provision(
     println!("[1/6] Loading provision bundle...");
     let bundle = load_bundle(bundle_path)?;
     println!("  Domain: {} ({})", bundle.domain_name, bundle.domain_id);
+    // H-10 (security review): show the operator the integrity
+    // fingerprint that was printed at bundle-creation time. They
+    // MUST confirm it matches out-of-band before the provision
+    // proceeds — the in-bundle signature alone cannot defend
+    // against a full key-swap attack.
+    println!("  Bundle fingerprint: {}", bundle.fingerprint);
+    println!(
+        "  >>> Confirm this fingerprint matches the one printed at \
+         `dds-node create-provision-bundle` time BEFORE proceeding <<<"
+    );
 
     // 2. Determine directories
     let data_dir = data_dir.map(PathBuf::from).unwrap_or_else(default_data_dir);
@@ -715,11 +857,13 @@ mod tests {
     fn bundle_roundtrip() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.dds");
+        let key = DomainKey::generate("test.local", &mut OsRng);
+        let domain = key.domain();
 
         let bundle = ProvisionBundle {
-            domain_name: "test.local".into(),
-            domain_id: "dds-dom:aaaa".into(),
-            domain_pubkey: "ff".repeat(32),
+            domain_name: domain.name.clone(),
+            domain_id: domain.id.to_string(),
+            domain_pubkey: to_hex(&domain.pubkey),
             domain_key_blob: vec![1, 2, 3, 4],
             org_hash: "test-org".into(),
             listen_port: 4001,
@@ -728,7 +872,7 @@ mod tests {
             fingerprint: String::new(),
         };
 
-        save_bundle(&path, &bundle).unwrap();
+        save_bundle(&path, &bundle, &key).unwrap();
         let loaded = load_bundle(&path).unwrap();
         assert!(
             !loaded.fingerprint.is_empty(),
@@ -736,13 +880,95 @@ mod tests {
         );
         assert_eq!(loaded.fingerprint, compute_fingerprint(&bundle));
 
-        assert_eq!(loaded.domain_name, "test.local");
-        assert_eq!(loaded.domain_id, "dds-dom:aaaa");
+        assert_eq!(loaded.domain_name, domain.name);
+        assert_eq!(loaded.domain_id, domain.id.to_string());
         assert_eq!(loaded.domain_key_blob, vec![1, 2, 3, 4]);
         assert_eq!(loaded.org_hash, "test-org");
         assert_eq!(loaded.listen_port, 4001);
         assert_eq!(loaded.api_port, 5551);
         assert!(loaded.mdns_enabled);
+    }
+
+    /// H-10 regression: a bundle whose signature doesn't match the
+    /// embedded pubkey must be rejected.
+    #[test]
+    fn bundle_rejects_tampered_signature() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tampered.dds");
+        let key = DomainKey::generate("test.local", &mut OsRng);
+        let domain = key.domain();
+
+        let bundle = ProvisionBundle {
+            domain_name: domain.name.clone(),
+            domain_id: domain.id.to_string(),
+            domain_pubkey: to_hex(&domain.pubkey),
+            domain_key_blob: vec![1, 2, 3, 4],
+            org_hash: "test-org".into(),
+            listen_port: 4001,
+            api_port: 5551,
+            mdns_enabled: true,
+            fingerprint: String::new(),
+        };
+        save_bundle(&path, &bundle, &key).unwrap();
+
+        // Flip a byte in the signature.
+        let bytes = std::fs::read(&path).unwrap();
+        let value: CborValue = ciborium::from_reader(&bytes[..]).unwrap();
+        let mut map = value.into_map().unwrap();
+        for (k, v) in map.iter_mut() {
+            if k.as_text() == Some("signature") {
+                if let CborValue::Bytes(b) = v {
+                    b[0] ^= 0xFF;
+                }
+            }
+        }
+        let mut buf = Vec::new();
+        ciborium::into_writer(&CborValue::Map(map), &mut buf).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+
+        let err = load_bundle(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("signature does not verify"),
+            "expected signature verification error, got: {err}"
+        );
+    }
+
+    /// H-10 regression: if the attacker substitutes a whole new key
+    /// (both pubkey and signature re-derived with it) the signature
+    /// verifies, but the fingerprint changes — operator OOB check
+    /// is the last line of defense. We verify the fingerprint
+    /// genuinely differs between the two signers.
+    #[test]
+    fn bundle_fingerprint_diverges_under_key_swap() {
+        let dir = TempDir::new().unwrap();
+        let legit = DomainKey::generate("legit", &mut OsRng);
+        let attacker = DomainKey::generate("attacker", &mut OsRng);
+
+        let b1 = ProvisionBundle {
+            domain_name: "x".into(),
+            domain_id: legit.id().to_string(),
+            domain_pubkey: to_hex(&legit.pubkey()),
+            domain_key_blob: vec![1, 2, 3],
+            org_hash: "org".into(),
+            listen_port: 4001,
+            api_port: 5551,
+            mdns_enabled: true,
+            fingerprint: String::new(),
+        };
+        let b2 = ProvisionBundle {
+            domain_pubkey: to_hex(&attacker.pubkey()),
+            domain_id: attacker.id().to_string(),
+            ..b1.clone()
+        };
+        // Each bundle signs cleanly with ITS key but the fingerprints
+        // differ — operator OOB would catch the swap.
+        let p1 = dir.path().join("legit.dds");
+        let p2 = dir.path().join("attacker.dds");
+        save_bundle(&p1, &b1, &legit).unwrap();
+        save_bundle(&p2, &b2, &attacker).unwrap();
+        let l1 = load_bundle(&p1).unwrap();
+        let l2 = load_bundle(&p2).unwrap();
+        assert_ne!(l1.fingerprint, l2.fingerprint);
     }
 
     #[test]

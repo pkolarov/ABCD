@@ -25,6 +25,15 @@ pub struct NodeConfig {
     #[serde(default)]
     pub trusted_roots: Vec<String>,
 
+    /// URN of the domain's bootstrap admin — the principal that
+    /// completed `admin_setup`. H-8 in the security review: the
+    /// bootstrap admin may vouch for any purpose, while non-bootstrap
+    /// admins must hold a `dds:admin-vouch:<purpose>` capability vouch
+    /// signed by the bootstrap admin. Persisted so that the constraint
+    /// survives node restart; rehydrated by `LocalService::new`.
+    #[serde(default)]
+    pub bootstrap_admin_urn: Option<String>,
+
     /// Optional explicit path to the persistent node identity file.
     /// Defaults to `<data_dir>/node_key.bin`. The file is encrypted with
     /// `DDS_NODE_PASSPHRASE` if that environment variable is set.
@@ -242,6 +251,34 @@ pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
     fn test_missing_domain_section_fails() {
         let result = NodeConfig::from_str(r#"org_hash = "abc123""#);
         assert!(result.is_err(), "config without [domain] must fail");
+    }
+
+    /// H-8 regression: `bootstrap_admin_urn` must round-trip through
+    /// config serialization so the bootstrap admin's "vouch-anything"
+    /// privilege survives restart.
+    #[test]
+    fn test_bootstrap_admin_urn_roundtrip() {
+        let toml = format!(
+            r#"
+            org_hash = "abc"
+            bootstrap_admin_urn = "urn:vouchsafe:bootstrap.hash"
+            {DOMAIN_TOML}
+        "#
+        );
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert_eq!(
+            config.bootstrap_admin_urn.as_deref(),
+            Some("urn:vouchsafe:bootstrap.hash")
+        );
+    }
+
+    /// Defaults: no bootstrap admin recorded means a fresh node that
+    /// has not yet completed `admin_setup`.
+    #[test]
+    fn test_bootstrap_admin_urn_default_none() {
+        let toml = format!(r#"org_hash = "abc"{DOMAIN_TOML}"#);
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert_eq!(config.bootstrap_admin_urn, None);
     }
 
     #[test]

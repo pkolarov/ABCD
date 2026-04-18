@@ -436,7 +436,11 @@ impl<
         self.trusted_roots.insert(urn);
     }
 
-    /// Persist the current trusted_roots back to the TOML config file.
+    /// Persist the current trusted_roots AND `bootstrap_admin_urn`
+    /// back to the TOML config file. **H-8 (security review)**:
+    /// `bootstrap_admin_urn` must round-trip across restarts so that
+    /// the bootstrap admin's "vouch-anything" privilege does not
+    /// silently disappear on node restart.
     fn persist_trusted_roots(&self) -> Result<(), ServiceError> {
         let config_path = match &self.config_path {
             Some(p) => p,
@@ -456,11 +460,35 @@ impl<
         }
         doc["trusted_roots"] = toml_edit::value(arr);
 
+        match &self.bootstrap_admin_urn {
+            Some(urn) => {
+                doc["bootstrap_admin_urn"] = toml_edit::value(urn.as_str());
+            }
+            None => {
+                doc.remove("bootstrap_admin_urn");
+            }
+        }
+
         std::fs::write(config_path, doc.to_string())
             .map_err(|e| ServiceError::Store(format!("write config: {e}")))?;
 
-        tracing::info!(count = roots.len(), "persisted trusted_roots to config");
+        tracing::info!(
+            count = roots.len(),
+            bootstrap = ?self.bootstrap_admin_urn,
+            "persisted trusted_roots + bootstrap_admin_urn to config"
+        );
         Ok(())
+    }
+
+    /// Set the `bootstrap_admin_urn` from durable config at startup.
+    /// Called by the node initialization path right after
+    /// `LocalService::new` so the in-memory state matches what was
+    /// previously persisted — without this, the original bootstrap
+    /// admin was treated as a non-bootstrap admin after a restart and
+    /// would fail `admin_vouch` for purposes it hadn't been vouched
+    /// for. H-8 regression.
+    pub fn set_bootstrap_admin_urn(&mut self, urn: Option<String>) {
+        self.bootstrap_admin_urn = urn;
     }
 
     /// Add a policy rule.
@@ -1514,6 +1542,34 @@ impl<
                 .write()
                 .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
             let _ = g.add_token(vouch_token);
+        }
+
+        // **H-8 (security review)**: if the purpose is `dds:admin`,
+        // promote the subject into `trusted_roots` and persist so the
+        // new admin survives restart. This is the production path for
+        // "adding a second admin via admin_vouch" that was called out
+        // as missing. The capability gate earlier in this function
+        // (bootstrap admin OR holder of `dds:admin-vouch:dds:admin`)
+        // is what authorizes the promotion.
+        if requested_purpose == dds_core::token::purpose::ADMIN {
+            let promoted = self.trusted_roots.insert(req.subject_urn.clone());
+            if promoted {
+                if let Err(e) = self.persist_trusted_roots() {
+                    tracing::warn!(
+                        admin = %admin_urn,
+                        subject = %req.subject_urn,
+                        error = %e,
+                        "promoted subject to trusted_roots but persisting config failed; \
+                         promotion is effective in memory and will be lost on restart"
+                    );
+                } else {
+                    tracing::info!(
+                        admin = %admin_urn,
+                        subject = %req.subject_urn,
+                        "admin_vouch promoted subject to trusted_roots"
+                    );
+                }
+            }
         }
 
         // Zeroize the admin signing key bytes.

@@ -42,7 +42,7 @@ left for a follow-up PR — usually because the fix spans languages
 |---|---|---|
 | C-1 | ✅ Fixed (pending verify) | `read_cstr`/`write_json`/`write_str` null-check; test `null_input_returns_invalid_input` |
 | C-2 | ✅ Fixed (pending verify) | Bootstrap sentinel `<data_dir>/.bootstrap` + refuse-if-roots-non-empty; sentinel consumed atomically |
-| C-3 | ✅ Fixed (pending verify) | Publisher-capability filter on `list_applicable_*`; purposes defined in `dds_core::token::purpose` |
+| C-3 | ✅ Fixed (pending verify) | Publisher-capability filter on `list_applicable_*` (serve time) AND on gossip/sync ingest (`publisher_capability_ok` in `dds-node/src/node.rs`). Unauthorized policy/software attestations are now dropped before they enter the trust graph. Purposes defined in `dds_core::token::purpose`. |
 
 ### High
 
@@ -55,9 +55,9 @@ left for a follow-up PR — usually because the fix spans languages
 | H-5 | ✅ Fixed (pending verify) | Named-pipe SDDL tightened to `SY`-only (dropped `IU`); C++ change, compile-test requires Windows CI |
 | H-6 | ⏸ Deferred | Challenge HMAC + mTLS between Auth Bridge and dds-node; C++/Rust cross-cut |
 | H-7 | ⏸ Deferred | UDS/named-pipe peer-creds gating on HTTP; larger transport rewrite |
-| H-8 | ✅ Fixed (pending verify) | `admin_vouch` requires `dds:admin-vouch:<purpose>` for non-bootstrap admins; bootstrap admin tracked on service |
+| H-8 | ✅ Fixed (pending verify) | `admin_vouch` requires `dds:admin-vouch:<purpose>` for non-bootstrap admins; `bootstrap_admin_urn` persisted to config and rehydrated on startup (survives restart); vouch with `purpose == dds:admin` now promotes the subject into `trusted_roots` and persists. (Generating the second admin's signing key is still a separate operational step — `admin_setup` is the only auto-generation path today.) |
 | H-9 | ✅ Fixed (pending verify) | `Zeroizing` wraps passphrase + admin plaintext; buffers wiped on early-return paths |
-| H-10 | ✅ Fixed (pending verify) | Bundle v2 embeds SHA-256 integrity fingerprint; load verifies; CLI prints for OOB confirmation; test `bundle_rejects_tampered_fingerprint` |
+| H-10 | ✅ Fixed (pending verify) | Bundle v3 carries a mandatory Ed25519 signature over canonical `signing_bytes` (domain_id + domain_pubkey + org_hash + ports + mdns + domain_key_blob), verified on load against the embedded `domain_pubkey`. Fingerprint is now ALSO printed on load so operators can confirm OOB. `save_bundle` requires an unwrapped `DomainKey` and refuses to write if the signer pubkey doesn't match the embedded one. Tests: `bundle_rejects_tampered_signature`, `bundle_fingerprint_diverges_under_key_swap`. |
 | H-11 | ✅ Fixed (pending verify) | `SyncResponse` capped at 1000 entries / 5 MB; `complete: false` signals pagination |
 | H-12 | ⏸ Deferred | Per-peer admission gating in gossip ingest; requires libp2p behaviour protocol design |
 
@@ -69,7 +69,7 @@ left for a follow-up PR — usually because the fix spans languages
 | M-2 | ⏸ Deferred | Versioned breaking change; roll in a future release |
 | M-3 | ✅ Fixed (pending verify) | Global token-bucket middleware (60 req/s) returns 429 |
 | M-4 | ⏸ Deferred | Low-priority hardening; connection caps tracked separately |
-| M-5 | ✅ Fixed (pending verify) | `sync_payloads` capped at 10k entries with FIFO eviction |
+| M-5 | ✅ Fixed (pending verify) | `sync_payloads` capped at 10k entries with FIFO eviction in `cache_sync_payload`; `handle_sync_response` now also routes inserts through `cache_sync_payload` so the cap applies on both the gossip and sync paths (previously the raw `insert` in the sync path bypassed the cap). |
 | M-6 | ⏸ Deferred | Paired with H-12; land together |
 | M-7 | ⏸ Deferred | `scope_vouched` flag needs schema/config change and admin UX; follow-up |
 | M-8 | ⚠ Partial | Added structured log of every `device_urn` query; session-token check deferred until device-session issuance lands |

@@ -287,6 +287,7 @@ async fn publish_fixture(
             audit_log_retention_days: 0,
         },
         trusted_roots: Vec::new(),
+        bootstrap_admin_urn: None,
         identity_path: None,
         expiry_scan_interval_secs: 60,
     };

@@ -29,6 +29,15 @@ pub mod purpose {
     pub const POLICY_PUBLISHER_MACOS: &str = "dds:policy-publisher-macos";
     /// Authorized to publish `SoftwareAssignment` attestations.
     pub const SOFTWARE_PUBLISHER: &str = "dds:software-publisher";
+
+    /// Special purpose: the subject of a vouch with this purpose is
+    /// being promoted to a trusted-root admin. `admin_vouch` enforces
+    /// that only the bootstrap admin (or an admin holding
+    /// `dds:admin-vouch:dds:admin`) may issue such a vouch, and on
+    /// success the subject is added to `trusted_roots` and persisted
+    /// to config so the promotion survives restart. H-8 in the
+    /// security review.
+    pub const ADMIN: &str = "dds:admin";
 }
 
 /// The type of a Vouchsafe token.

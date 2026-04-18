@@ -356,6 +356,23 @@ impl DdsNode {
             warn!("token validation failed: {e}");
             return;
         }
+        // **C-3 (security review)**: before admitting the token to the
+        // trust graph, reject attestations that embed a policy or
+        // software document whose issuer lacks the matching publisher
+        // capability. Filtering only at serve time (see
+        // `LocalService::list_applicable_*`) still admitted the rogue
+        // token into the graph, letting it propagate to peers whose
+        // filters or agents might be older/patched differently.
+        // Ingest-side reject is the authoritative gate.
+        if !publisher_capability_ok(&token, &self.trust_graph, &self.trusted_roots) {
+            warn!(
+                jti = %token.payload.jti,
+                issuer = %token.payload.iss,
+                body_type = ?token.payload.body_type,
+                "rejecting inbound token: issuer lacks the required publisher capability"
+            );
+            return;
+        }
         {
             let mut g = self.trust_graph.write().expect("trust_graph poisoned");
             if let Err(e) = g.add_token(token.clone()) {
@@ -565,17 +582,52 @@ impl DdsNode {
             debug!(%peer, "sync: peer reported no diff");
             return;
         }
-        let payloads = resp.payloads;
+        // **C-3 (security review)**: filter out any inbound payload whose
+        // token is a publisher-kind attestation from an issuer that
+        // lacks the matching capability. The sync path receives the same
+        // trust-graph additions as the gossip ingest path, so it must
+        // run the same gate — otherwise an attacker who hits a peer's
+        // sync protocol (bypassing the gossip mesh) can still seed
+        // rogue policy/software tokens into every node they sync with.
+        let payloads: Vec<SyncPayload> = resp
+            .payloads
+            .into_iter()
+            .filter(|payload| {
+                let token = match Token::from_cbor(&payload.token_bytes) {
+                    Ok(t) => t,
+                    Err(_) => return true, // let apply_sync_payloads surface the error
+                };
+                if publisher_capability_ok(&token, &self.trust_graph, &self.trusted_roots) {
+                    true
+                } else {
+                    warn!(
+                        %peer,
+                        jti = %token.payload.jti,
+                        issuer = %token.payload.iss,
+                        body_type = ?token.payload.body_type,
+                        "sync: dropping payload whose issuer lacks publisher capability"
+                    );
+                    false
+                }
+            })
+            .collect();
+        if payloads.is_empty() {
+            debug!(%peer, "sync: all payloads rejected by publisher capability filter");
+            return;
+        }
         let result = {
             let mut g = self.trust_graph.write().expect("trust_graph poisoned");
             apply_sync_payloads_with_graph(&payloads, &mut self.dag, &mut self.store, &mut g)
         };
         // Repopulate the sync cache so the next inbound request from
-        // some other peer can serve these payloads onward.
+        // some other peer can serve these payloads onward. **M-5
+        // (security review)**: route through `cache_sync_payload` so
+        // the FIFO cap applies — the previous raw `insert` here
+        // bypassed the bound.
         for payload in &payloads {
             if let Ok(op) = ciborium::from_reader::<Operation, _>(payload.op_bytes.as_slice()) {
                 let id = op.id.clone();
-                self.sync_payloads.insert(id, payload.clone());
+                self.cache_sync_payload(&id, &op, &payload.token_bytes);
             }
         }
         info!(
@@ -690,4 +742,45 @@ impl DdsNode {
         let g = self.trust_graph.read().expect("trust_graph poisoned");
         policy_engine.evaluate(subject_urn, resource, action, &g, &self.trusted_roots)
     }
+}
+
+/// **C-3 (security review)**: return `true` unless the token is an
+/// attestation embedding one of the publisher-gated document types
+/// (Windows policy, macOS policy, software assignment) whose issuer
+/// does NOT hold the matching `dds:policy-publisher-*` /
+/// `dds:software-publisher` capability chained to a trusted root.
+///
+/// Non-publisher tokens (user-auth attestations, device joins,
+/// vouches, revocations, burns) are always accepted here — this
+/// gate is specifically for the unauthenticated-remote-state
+/// injection path the security review called out as C-3.
+fn publisher_capability_ok(
+    token: &Token,
+    trust_graph: &Arc<RwLock<TrustGraph>>,
+    trusted_roots: &BTreeSet<String>,
+) -> bool {
+    use dds_core::token::{TokenKind, purpose};
+    use dds_domain::body_types;
+
+    if token.payload.kind != TokenKind::Attest {
+        return true;
+    }
+    let body_type = match token.payload.body_type.as_deref() {
+        Some(bt) => bt,
+        None => return true,
+    };
+    let required = match body_type {
+        body_types::WINDOWS_POLICY => purpose::POLICY_PUBLISHER_WINDOWS,
+        body_types::MACOS_POLICY => purpose::POLICY_PUBLISHER_MACOS,
+        body_types::SOFTWARE_ASSIGNMENT => purpose::SOFTWARE_PUBLISHER,
+        _ => return true,
+    };
+    let g = match trust_graph.read() {
+        Ok(g) => g,
+        // Defensive: if the lock is poisoned, prefer to err on the
+        // side of rejecting the token rather than panicking the event
+        // loop or silently admitting a potentially rogue token.
+        Err(_) => return false,
+    };
+    g.has_purpose(&token.payload.iss, required, trusted_roots)
 }
