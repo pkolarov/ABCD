@@ -285,6 +285,7 @@ async fn publish_fixture(
             max_delegation_depth: 5,
             audit_log_max_entries: 0,
             audit_log_retention_days: 0,
+            enforce_device_scope_vouch: false,
         },
         trusted_roots: Vec::new(),
         bootstrap_admin_urn: None,

@@ -25,6 +25,16 @@ pub struct AuditLogEntry {
     /// Older entries without this field deserialize as 0.
     #[serde(default)]
     pub timestamp: u64,
+    /// **L-12 (security review)**: SHA-256 of the previous entry's
+    /// [`AuditLogEntry::chain_hash`], or empty bytes for the first
+    /// entry in the log ("genesis"). The hash chain makes the log
+    /// tamper-evident: removing or editing any entry breaks the
+    /// chain at every later entry. `prev_hash` is covered by
+    /// `node_signature` via [`AuditLogEntry::signing_bytes`], so it
+    /// cannot be rewritten without a fresh signature from the
+    /// (correctly-bound) node key.
+    #[serde(default, with = "serde_bytes")]
+    pub prev_hash: Vec<u8>,
 }
 
 /// The fields of an `AuditLogEntry` that are covered by the
@@ -40,6 +50,10 @@ struct AuditLogSignedFields<'a> {
     node_urn: &'a str,
     node_public_key: &'a PublicKeyBundle,
     timestamp: u64,
+    /// L-12: include the chain predecessor in the signed bytes so
+    /// rewriting history requires forging every subsequent signature.
+    #[serde(with = "serde_bytes")]
+    prev_hash: &'a [u8],
 }
 
 /// Errors from constructing or verifying an `AuditLogEntry`.
@@ -73,10 +87,27 @@ impl AuditLogEntry {
             node_urn: &self.node_urn,
             node_public_key: &self.node_public_key,
             timestamp: self.timestamp,
+            prev_hash: &self.prev_hash,
         };
         let mut buf = Vec::new();
         ciborium::into_writer(&signed, &mut buf).map_err(|_| AuditError::Serialization)?;
         Ok(buf)
+    }
+
+    /// **L-12 (security review)**: the hash that the *next* entry in
+    /// the log should carry as `prev_hash`. Computed over the full
+    /// signed bytes plus the signature so any tamper to the entry
+    /// (including the signature field itself) rotates the chain
+    /// head and breaks all following entries.
+    pub fn chain_hash(&self) -> Result<Vec<u8>, AuditError> {
+        use sha2::{Digest, Sha256};
+        let bytes = self.signing_bytes()?;
+        let mut h = Sha256::new();
+        h.update(b"dds-audit-chain-v1|");
+        h.update(&bytes);
+        h.update(b"|");
+        h.update(&self.node_signature.bytes);
+        Ok(h.finalize().to_vec())
     }
 
     /// Construct and sign an entry with an Ed25519 signing key derived
@@ -88,6 +119,28 @@ impl AuditLogEntry {
         node_urn: impl Into<String>,
         signing_key: &ed25519_dalek::SigningKey,
         timestamp: u64,
+    ) -> Result<Self, AuditError> {
+        Self::sign_ed25519_chained(
+            action,
+            token_bytes,
+            node_urn,
+            signing_key,
+            timestamp,
+            Vec::new(),
+        )
+    }
+
+    /// Construct and sign an entry, stamping `prev_hash` from the
+    /// previous log entry's [`AuditLogEntry::chain_hash`]. Pass an
+    /// empty `prev_hash` for the genesis entry. **L-12**.
+    #[cfg(feature = "std")]
+    pub fn sign_ed25519_chained(
+        action: impl Into<String>,
+        token_bytes: Vec<u8>,
+        node_urn: impl Into<String>,
+        signing_key: &ed25519_dalek::SigningKey,
+        timestamp: u64,
+        prev_hash: Vec<u8>,
     ) -> Result<Self, AuditError> {
         use ed25519_dalek::Signer;
 
@@ -106,6 +159,7 @@ impl AuditLogEntry {
                 bytes: Vec::new(),
             },
             timestamp,
+            prev_hash,
         };
         let bytes = entry.signing_bytes()?;
         let sig = signing_key.sign(&bytes);
@@ -182,6 +236,57 @@ mod tests {
         .unwrap();
         entry.action = "burn".into();
         assert_eq!(entry.verify(), Err(AuditError::InvalidSignature));
+    }
+
+    /// L-12: chaining together three entries and verifying each
+    /// `prev_hash` matches the previous entry's `chain_hash`.
+    #[test]
+    fn audit_entry_chain_hash_links_next_entry() {
+        let id = Identity::generate("audit", &mut OsRng);
+        let e1 = AuditLogEntry::sign_ed25519_chained(
+            "attest",
+            alloc::vec![0xA1],
+            id.id.to_urn(),
+            &id.signing_key,
+            1,
+            Vec::new(),
+        )
+        .unwrap();
+        let h1 = e1.chain_hash().unwrap();
+        let e2 = AuditLogEntry::sign_ed25519_chained(
+            "vouch",
+            alloc::vec![0xA2],
+            id.id.to_urn(),
+            &id.signing_key,
+            2,
+            h1.clone(),
+        )
+        .unwrap();
+        assert_eq!(e2.prev_hash, h1);
+        assert!(e1.verify().is_ok());
+        assert!(e2.verify().is_ok());
+    }
+
+    /// L-12: flipping a bit in entry 1 changes its `chain_hash`, so
+    /// entry 2's `prev_hash` no longer matches — chain break is
+    /// detectable by a verifier walking the log.
+    #[test]
+    fn audit_entry_chain_break_detectable() {
+        let id = Identity::generate("audit", &mut OsRng);
+        let mut e1 = AuditLogEntry::sign_ed25519(
+            "attest",
+            alloc::vec![0xA1],
+            id.id.to_urn(),
+            &id.signing_key,
+            1,
+        )
+        .unwrap();
+        let h1_before = e1.chain_hash().unwrap();
+        // Tamper with entry 1 — this also invalidates its signature.
+        e1.action = "burn".into();
+        assert!(e1.verify().is_err());
+        let h1_after = e1.chain_hash().unwrap();
+        assert_ne!(h1_before, h1_after);
     }
 
     #[test]

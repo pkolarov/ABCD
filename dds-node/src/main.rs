@@ -283,6 +283,8 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // H-8 (security review): restore bootstrap admin identity from
     // durable config so the constraint survives restart.
     svc.set_bootstrap_admin_urn(config.bootstrap_admin_urn.clone());
+    // M-7 (security review): apply device-scope vouch enforcement.
+    svc.set_enforce_device_scope_vouch(config.domain.enforce_device_scope_vouch);
     let shared_svc = Arc::new(tokio::sync::Mutex::new(svc));
     let node_info = http::NodeInfo {
         peer_id: node.peer_id.to_string(),

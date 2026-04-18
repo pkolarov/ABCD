@@ -182,6 +182,7 @@ mod tests {
                 bytes: vec![0; 64],
             },
             timestamp,
+            prev_hash: Vec::new(),
         }
     }
 

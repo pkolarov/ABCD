@@ -137,9 +137,12 @@ impl Identity {
         let classical = crate::crypto::Ed25519Only::generate(rng);
         let public_key = classical.public_key_bundle();
         let id = VouchsafeId::from_public_key(label, &public_key);
+        // L-1 (security review): move the signing key out of the
+        // wrapper rather than clone it, so there's only one copy on
+        // the heap.
         Self {
             id,
-            signing_key: classical.ed25519_signing_key().clone(),
+            signing_key: classical.into_signing_key(),
             public_key,
         }
     }

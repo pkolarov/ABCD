@@ -99,6 +99,13 @@ fn make_vouch(
 }
 
 fn make_revoke(revoker: &Identity, target_jti: &str, jti: &str) -> Token {
+    // Use a fresh `iat` so the revocation falls inside the M-9
+    // replay window (the production `ingest_revocation` gate
+    // refuses revocations whose iat is older than the window).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     Token::sign(
         TokenPayload {
             iss: revoker.id.to_urn(),
@@ -110,7 +117,7 @@ fn make_revoke(revoker: &Identity, target_jti: &str, jti: &str) -> Token {
             vch_iss: None,
             vch_sum: None,
             revokes: Some(target_jti.to_string()),
-            iat: 1_002,
+            iat: now,
             exp: None,
             body_type: None,
             body_cbor: None,
@@ -198,6 +205,7 @@ fn write_node_fixture(
             max_delegation_depth: 5,
             audit_log_max_entries: 0,
             audit_log_retention_days: 0,
+            enforce_device_scope_vouch: false,
         },
         trusted_roots,
         bootstrap_admin_urn: None,
@@ -289,6 +297,7 @@ impl Publisher {
                 max_delegation_depth: 5,
                 audit_log_max_entries: 0,
                 audit_log_retention_days: 0,
+                enforce_device_scope_vouch: false,
             },
             trusted_roots: Vec::new(),
             bootstrap_admin_urn: None,

@@ -2,6 +2,24 @@
 //!
 //! Used for mutable directory entry attributes (display name, email, etc.).
 //! Conflicts resolved by timestamp ordering. Ties broken by value ordering.
+//!
+//! **L-11 (security review)**: `timestamp` is a plain `u64`
+//! (typically seconds-since-epoch supplied by the caller) — the merge
+//! rule is strictly "larger timestamp wins, ties broken by value
+//! ordering". This means convergence is driven by wall-clock
+//! ordering, NOT causal (happens-before) ordering. Call sites that
+//! need causal-correct convergence under clock skew must either
+//!
+//!   (a) supply a monotonic or hybrid-logical-clock timestamp, or
+//!   (b) use a different CRDT (e.g. a CausalDag backed by
+//!       `dds_core::crdt::causal_dag`).
+//!
+//! Current in-repo audit: LwwRegister is only referenced by
+//! `dds-loadtest/src/harness.rs` (chaos/soak fixtures) and
+//! `dds-core/benches/crdt_merge.rs`. No production directory
+//! operation depends on it, so the wall-clock semantics are safe
+//! today. If you add a new production caller, re-audit this
+//! limitation before relying on convergence.
 
 use core::cmp::Ordering;
 use core::fmt;

@@ -46,6 +46,14 @@ impl Ed25519Only {
         &self.signing_key
     }
 
+    /// Consume the wrapper and return the owned Ed25519 signing key.
+    /// L-1 (security review): preferred over `.clone()` of the borrowed
+    /// reference, which leaves an extra unzeroed copy of the secret
+    /// on the heap until both drop.
+    pub fn into_signing_key(self) -> SigningKey {
+        self.signing_key
+    }
+
     /// Get the raw Ed25519 verifying key.
     pub fn ed25519_verifying_key(&self) -> VerifyingKey {
         self.signing_key.verifying_key()

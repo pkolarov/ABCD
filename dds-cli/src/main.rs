@@ -1003,6 +1003,36 @@ fn read_domain_id(data_dir: &Path) -> Option<String> {
     Some(d.id)
 }
 
+/// Read the `pubkey` field from the local `domain.toml`, hex-decoded.
+/// Returns `None` when the file is absent. Exits on parse failure.
+fn read_domain_pubkey(data_dir: &Path) -> Option<Vec<u8>> {
+    let path = data_dir.join("domain.toml");
+    if !path.exists() {
+        return None;
+    }
+    let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        eprintln!("Failed to read {}: {e}", path.display());
+        std::process::exit(1);
+    });
+    #[derive(Deserialize)]
+    struct DomainToml {
+        pubkey: String,
+    }
+    let d: DomainToml = toml::from_str(&body).unwrap_or_else(|e| {
+        eprintln!("Failed to parse {}: {e}", path.display());
+        std::process::exit(1);
+    });
+    let bytes = dds_domain::domain::from_hex(&d.pubkey).unwrap_or_else(|e| {
+        eprintln!("Failed to decode domain_pubkey hex: {e}");
+        std::process::exit(1);
+    });
+    if bytes.len() != 32 {
+        eprintln!("Domain pubkey must be 32 bytes");
+        std::process::exit(1);
+    }
+    Some(bytes)
+}
+
 fn open_store_or_exit(data_dir: &Path, create: bool) -> RedbBackend {
     if create {
         std::fs::create_dir_all(data_dir).unwrap_or_else(|e| {
@@ -1087,7 +1117,7 @@ fn handle_export(data_dir: &Path, out: &Path) {
         .into_iter()
         .collect();
 
-    let dump = DdsDump {
+    let mut dump = DdsDump {
         version: DUMP_VERSION,
         domain_id: domain_id.clone(),
         exported_at: now_epoch(),
@@ -1095,7 +1125,31 @@ fn handle_export(data_dir: &Path, out: &Path) {
         operations,
         revoked,
         burned,
+        signature: Vec::new(),
     };
+
+    // **M-16 (security review)**: sign the canonical digest of the
+    // dump with the domain signing key so the importer can reject
+    // a tampered file. Requires the operator to unwrap the domain
+    // key (triggers the passphrase/FIDO2 prompt).
+    let domain_key_path = data_dir.join("domain_key.bin");
+    let signer = match dds_node::domain_store::load_domain_key(&domain_key_path) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!(
+                "Failed to load/unwrap domain key at {}: {e} — \
+                 `dds export` must run on a host that holds the domain signing key",
+                domain_key_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    use ed25519_dalek::Signer;
+    dump.signature = signer
+        .signing_key
+        .sign(&dump.signing_bytes())
+        .to_bytes()
+        .to_vec();
 
     let bytes = dump.to_cbor().unwrap_or_else(|e| {
         eprintln!("Failed to encode dump: {e}");
@@ -1144,9 +1198,11 @@ fn handle_import(data_dir: &Path, input: &Path, dry_run: bool) {
         std::process::exit(1);
     });
 
-    if dump.version != DUMP_VERSION {
+    use dump::DUMP_MIN_READ_VERSION;
+    if dump.version < DUMP_MIN_READ_VERSION || dump.version > DUMP_VERSION {
         eprintln!(
-            "Error: unsupported dump version {} (this CLI understands v{DUMP_VERSION})",
+            "Error: unsupported dump version {} (this CLI understands \
+             v{DUMP_MIN_READ_VERSION}..=v{DUMP_VERSION})",
             dump.version
         );
         std::process::exit(1);
@@ -1155,14 +1211,73 @@ fn handle_import(data_dir: &Path, input: &Path, dry_run: bool) {
     // Domain-id check — refuse to cross-pollinate stores from different
     // domains. If the local node hasn't been provisioned yet, accept the
     // dump (the caller is bootstrapping from the dump itself).
-    if let Some(local_id) = read_domain_id(data_dir)
-        && local_id != dump.domain_id
+    let local_domain_id = read_domain_id(data_dir);
+    if let Some(ref local_id) = local_domain_id
+        && local_id != &dump.domain_id
     {
         eprintln!(
             "Error: domain mismatch — dump is for {}, local store is for {}",
             dump.domain_id, local_id
         );
         std::process::exit(1);
+    }
+
+    // **M-16 (security review)**: verify the dump signature before
+    // applying anything. v2+ dumps MUST be signed; v1 dumps are
+    // accepted with a loud warning because they pre-date signing.
+    //
+    // The verifying key is the local domain pubkey when we have one
+    // (the common "import into a provisioned node" case). If we're
+    // bootstrapping a fresh node from the dump, there is no local
+    // pubkey yet — we refuse to proceed without a sibling `domain.toml`
+    // so the importer cannot be tricked by an unsigned dump from an
+    // unknown domain. Operators who really want to bootstrap from an
+    // unsigned dump must first write a legitimate `domain.toml` by
+    // another means (provisioning bundle, manual copy, etc.).
+    if dump.version >= 2 {
+        let pubkey_bytes = match read_domain_pubkey(data_dir) {
+            Some(pk) => pk,
+            None => {
+                eprintln!(
+                    "Error: cannot verify dump signature — local node has no \
+                     domain.toml (provision first, then import)"
+                );
+                std::process::exit(1);
+            }
+        };
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        if dump.signature.len() != 64 {
+            eprintln!(
+                "Error: dump signature is {} bytes, expected 64",
+                dump.signature.len()
+            );
+            std::process::exit(1);
+        }
+        let mut pk_arr = [0u8; 32];
+        pk_arr.copy_from_slice(&pubkey_bytes);
+        let vk = VerifyingKey::from_bytes(&pk_arr).unwrap_or_else(|e| {
+            eprintln!("Error: local domain pubkey invalid: {e}");
+            std::process::exit(1);
+        });
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&dump.signature);
+        let sig = Signature::from_bytes(&sig_arr);
+        let msg = dump.signing_bytes();
+        if vk.verify(&msg, &sig).is_err() {
+            eprintln!(
+                "Error: dump signature does not verify against local domain \
+                 pubkey — the dump was tampered with or was exported by a \
+                 different domain"
+            );
+            std::process::exit(1);
+        }
+    } else {
+        eprintln!(
+            "WARNING: loading legacy v{} dump without a signature — cannot \
+             verify integrity. Upgrade the exporting host and re-export \
+             for a signed v{DUMP_VERSION} dump.",
+            dump.version
+        );
     }
 
     println!("Dump:");

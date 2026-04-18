@@ -48,6 +48,25 @@ const SYNC_MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 /// embed UUIDv7-ish prefixes and are roughly time-ordered.
 const SYNC_PAYLOAD_CACHE_CAP: usize = 10_000;
 
+/// **M-6 (security review)**: how often to re-verify the admission
+/// cert after startup. An expired cert will trigger a clean shutdown
+/// — the node stops publishing and returns from `run()`. Set to
+/// 10 minutes to balance "catch expiry quickly" against log/CPU
+/// overhead.
+const ADMISSION_RECHECK_INTERVAL_SECS: u64 = 600;
+
+/// **M-9 (security review)**: maximum age (in seconds) of an inbound
+/// revocation or burn `iat` relative to the local wall clock. Older
+/// tokens are rejected on the theory that a legitimate revocation
+/// will be issued within minutes of its creation. Blocks an attacker
+/// from recording an old revocation and replaying it forever with a
+/// fresh gossip envelope — the content-hash dedupe in gossipsub is
+/// not enough because an attacker can inject a different op_id and
+/// force a re-apply + audit-log spam.
+/// 7 days accommodates slow human review/approval paths while still
+/// bounding the replay window tightly.
+const REVOCATION_REPLAY_WINDOW_SECS: u64 = 7 * 86400;
+
 /// The running DDS node state.
 ///
 /// `trust_graph` is shared (`Arc<RwLock<TrustGraph>>`) so the swarm event
@@ -66,6 +85,13 @@ pub struct DdsNode {
     pub trusted_roots: BTreeSet<String>,
     pub topics: DdsTopicSet,
     pub config: NodeConfig,
+    /// **M-6 (security review)**: retained admission cert + domain
+    /// pubkey + domain id so we can re-verify the cert on every
+    /// `ADMISSION_RECHECK_INTERVAL` tick. Without a periodic re-verify
+    /// a node whose cert has expired keeps operating until restart.
+    admission_cert: dds_domain::AdmissionCert,
+    domain_pubkey: [u8; 32],
+    domain_id: DomainId,
     /// In-memory cache of live `SyncPayload`s, keyed by operation id.
     /// Built up at gossip-ingest time so the anti-entropy responder can
     /// reply without re-deriving op→token mapping at lookup time.
@@ -155,6 +181,9 @@ impl DdsNode {
             config,
             sync_payloads: BTreeMap::new(),
             sync_last_outbound: BTreeMap::new(),
+            admission_cert: cert,
+            domain_pubkey,
+            domain_id,
         })
     }
 
@@ -211,6 +240,15 @@ impl DdsNode {
         let mut anti_entropy = tokio::time::interval(ANTI_ENTROPY_INTERVAL);
         anti_entropy.tick().await;
 
+        // **M-6 (security review)**: re-verify the admission cert on
+        // a schedule. An expired cert means the node should stop
+        // participating — we return cleanly from `run()` rather than
+        // continuing to gossip/serve under an invalid admission.
+        let mut admission_recheck = tokio::time::interval(std::time::Duration::from_secs(
+            ADMISSION_RECHECK_INTERVAL_SECS,
+        ));
+        admission_recheck.tick().await;
+
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => {
@@ -239,8 +277,40 @@ impl DdsNode {
                         self.try_sync_with(peer);
                     }
                 }
+                _ = admission_recheck.tick() => {
+                    if let Err(e) = self.verify_admission_still_valid() {
+                        tracing::error!(
+                            peer_id = %self.peer_id,
+                            error = %e,
+                            "admission cert no longer valid — shutting down"
+                        );
+                        return Err(
+                            format!("admission cert re-verification failed: {e}").into()
+                        );
+                    }
+                }
             }
         }
+    }
+
+    /// **M-6 (security review)**: re-run the same admission-cert
+    /// verification that happens at startup. Returns `Err` if the
+    /// cert is expired, if its signature no longer checks out, or
+    /// if it is bound to a different peer. Exposed publicly for
+    /// tests that want to observe expiry handling.
+    pub fn verify_admission_still_valid(&self) -> Result<(), String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("system clock error: {e}"))?
+            .as_secs();
+        self.admission_cert
+            .verify(
+                &self.domain_pubkey,
+                &self.domain_id,
+                &self.peer_id.to_string(),
+                now,
+            )
+            .map_err(|e| format!("{e}"))
     }
 
     /// Apply one swarm event using the production ingest path (gossip,
@@ -434,6 +504,21 @@ impl DdsNode {
             warn!("revocation validation failed: {e}");
             return;
         }
+        // **M-9 (security review)**: reject replays of old revocations.
+        // A revocation's `iat` must be within REVOCATION_REPLAY_WINDOW_SECS
+        // of the local wall clock. Without this gate an attacker could
+        // record any old revocation and replay it indefinitely, which
+        // pollutes the audit log and can cause a revoked-but-not-yet-
+        // expired token to re-enter the revoked set at an inconvenient
+        // time.
+        if !revocation_within_replay_window(token.payload.iat) {
+            warn!(
+                jti = %token.payload.jti,
+                iat = token.payload.iat,
+                "rejecting revocation: iat is outside the replay-tolerance window"
+            );
+            return;
+        }
         {
             let mut g = self.trust_graph.write().expect("trust_graph poisoned");
             if let Err(e) = g.add_token(token.clone()) {
@@ -462,6 +547,15 @@ impl DdsNode {
         };
         if let Err(e) = token.validate() {
             warn!("burn validation failed: {e}");
+            return;
+        }
+        // M-9: same replay window applies to burn tokens.
+        if !revocation_within_replay_window(token.payload.iat) {
+            warn!(
+                jti = %token.payload.jti,
+                iat = token.payload.iat,
+                "rejecting burn: iat is outside the replay-tolerance window"
+            );
             return;
         }
         {
@@ -742,6 +836,29 @@ impl DdsNode {
         let g = self.trust_graph.read().expect("trust_graph poisoned");
         policy_engine.evaluate(subject_urn, resource, action, &g, &self.trusted_roots)
     }
+}
+
+/// **M-9 (security review)**: return `true` if a revocation or burn
+/// token's `iat` is within `REVOCATION_REPLAY_WINDOW_SECS` of the
+/// local wall clock — i.e. neither far in the future (clock skew or
+/// malicious) nor far in the past (replay). `iat == 0` is accepted
+/// (legacy unstamped tokens from very old exports) to avoid a
+/// wholesale rejection of pre-stamp revocations.
+fn revocation_within_replay_window(iat: u64) -> bool {
+    if iat == 0 {
+        return true;
+    }
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => return true, // clock pre-1970: don't gate
+    };
+    // Permit small forward clock skew (up to 1 hour) but reject
+    // anything beyond the replay window backwards.
+    const FORWARD_SKEW_SECS: u64 = 3600;
+    if iat > now.saturating_add(FORWARD_SKEW_SECS) {
+        return false;
+    }
+    now.saturating_sub(iat) <= REVOCATION_REPLAY_WINDOW_SECS
 }
 
 /// **C-3 (security review)**: return `true` unless the token is an

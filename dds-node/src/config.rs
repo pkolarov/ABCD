@@ -92,6 +92,15 @@ pub struct DomainConfig {
     /// this are pruned on the next sweep. 0 = no age limit.
     #[serde(default)]
     pub audit_log_retention_days: u64,
+
+    /// **M-7 (security review)**: when true, only honor a device's
+    /// self-attested `tags` / `org_unit` for policy/software scoping
+    /// if there is also a vouch from a trusted root with purpose
+    /// `dds:device-scope` over the device URN. Default `false` to
+    /// preserve behavior on existing deployments — operators can
+    /// turn it on once they've vouched all enrolled devices.
+    #[serde(default)]
+    pub enforce_device_scope_vouch: bool,
 }
 
 /// Network settings.

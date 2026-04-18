@@ -26,6 +26,11 @@ tokio = { version = "1", features = ["rt", "macros"] }
 base64 = "0.22"
 toml = "0.8"
 ciborium = { workspace = true }
+serde_bytes = { workspace = true }
+sha2 = { workspace = true }
+dds-domain = { path = "../dds-domain" }
+dds-node = { path = "../dds-node" }
+ed25519-dalek = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

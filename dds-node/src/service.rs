@@ -297,6 +297,11 @@ pub struct LocalService<
     boot_wall_time: SystemTime,
     /// Whether to verify FIDO2 attestation on enroll_user.
     verify_fido2: bool,
+    /// **M-7 (security review)**: when true, only honor self-attested
+    /// device tags/org_unit if the device has a vouch from a trusted
+    /// root with purpose `dds:device-scope`. Set from
+    /// `NodeConfig.domain.enforce_device_scope_vouch` at startup.
+    enforce_device_scope_vouch: bool,
 }
 
 impl<
@@ -343,6 +348,7 @@ impl<
             start_time: now_epoch(),
             boot_wall_time: SystemTime::now(),
             verify_fido2: true,
+            enforce_device_scope_vouch: false,
         };
         // Best-effort rehydration: pull any pre-existing tokens from the
         // store into the in-memory graph. Only relevant when the store
@@ -489,6 +495,51 @@ impl<
     /// for. H-8 regression.
     pub fn set_bootstrap_admin_urn(&mut self, urn: Option<String>) {
         self.bootstrap_admin_urn = urn;
+    }
+
+    /// **M-7 (security review)**: toggle enforcement of the
+    /// `dds:device-scope` vouch requirement for honoring self-attested
+    /// device tags / org_unit. Wired from
+    /// `NodeConfig.domain.enforce_device_scope_vouch` at startup.
+    pub fn set_enforce_device_scope_vouch(&mut self, enforce: bool) {
+        self.enforce_device_scope_vouch = enforce;
+    }
+
+    /// **M-7 (security review)**: thin wrapper that reads the
+    /// device's self-attested `tags` + `org_unit` via
+    /// `device_targeting_facts`, then drops them on the floor when
+    /// `enforce_device_scope_vouch` is enabled and the device lacks
+    /// a `dds:device-scope` vouch from a trusted root. When
+    /// enforcement is off (the default) the function is a no-op
+    /// passthrough, preserving behavior on existing deployments.
+    fn device_targeting_facts_gated(
+        &self,
+        g: &TrustGraph,
+        device_urn: &str,
+    ) -> (Vec<String>, Option<String>) {
+        let (tags, ou) = device_targeting_facts(g, device_urn);
+        if !self.enforce_device_scope_vouch {
+            return (tags, ou);
+        }
+        let scope_vouched = g.has_purpose(
+            device_urn,
+            dds_core::token::purpose::DEVICE_SCOPE,
+            &self.trusted_roots,
+        );
+        if scope_vouched {
+            (tags, ou)
+        } else {
+            if !tags.is_empty() || ou.is_some() {
+                tracing::warn!(
+                    %device_urn,
+                    tags_count = tags.len(),
+                    org_unit = ?ou,
+                    "device has self-attested scope facts but no dds:device-scope \
+                     vouch; dropping to avoid honoring unverified claims"
+                );
+            }
+            (Vec::new(), None)
+        }
     }
 
     /// Add a policy rule.
@@ -756,7 +807,7 @@ impl<
             .read()
             .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
 
-        let (device_tags, device_ou) = device_targeting_facts(&g, device_urn);
+        let (device_tags, device_ou) = self.device_targeting_facts_gated(&g, device_urn);
 
         let mut out = Vec::new();
         for token in g.attestations_iter() {
@@ -820,7 +871,7 @@ impl<
             .read()
             .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
 
-        let (device_tags, device_ou) = device_targeting_facts(&g, device_urn);
+        let (device_tags, device_ou) = self.device_targeting_facts_gated(&g, device_urn);
 
         let mut out = Vec::new();
         for token in g.attestations_iter() {
@@ -876,7 +927,7 @@ impl<
             .read()
             .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
 
-        let (device_tags, device_ou) = device_targeting_facts(&g, device_urn);
+        let (device_tags, device_ou) = self.device_targeting_facts_gated(&g, device_urn);
 
         let mut out = Vec::new();
         for token in g.attestations_iter() {
@@ -1052,7 +1103,12 @@ impl<
                     Ok(Some(d)) => d,
                     _ => continue,
                 };
-                if doc.credential_id == credential_id {
+                // **L-13 (security review)**: compare credential IDs
+                // by the raw bytes they decode to, not by base64
+                // string equality. Different clients may emit
+                // standard vs base64url, with or without padding;
+                // decoding normalizes any of those representations.
+                if credential_ids_eq(&doc.credential_id, credential_id) {
                     let parsed = dds_domain::fido2::verify_attestation(
                         &doc.attestation_object,
                         &doc.client_data_hash,
@@ -1877,6 +1933,26 @@ fn rand_u64() -> u64 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     RandomState::new().build_hasher().finish()
+}
+
+/// **L-13 (security review)**: compare two credential-id strings by
+/// decoding both to raw bytes first (accepting standard base64 OR
+/// base64url, with or without padding) and comparing the bytes.
+/// Falls back to string equality if neither decode succeeds, which
+/// matches the prior behaviour for opaque/raw inputs.
+fn credential_ids_eq(a: &str, b: &str) -> bool {
+    let decode = |s: &str| -> Option<Vec<u8>> {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(s)
+            .or_else(|_| base64::engine::general_purpose::STANDARD.decode(s))
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s))
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(s))
+            .ok()
+    };
+    match (decode(a), decode(b)) {
+        (Some(da), Some(db)) => da == db,
+        _ => a == b,
+    }
 }
 
 /// Find the device's `tags` + `org_unit` by walking the trust graph

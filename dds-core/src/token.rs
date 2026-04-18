@@ -38,6 +38,14 @@ pub mod purpose {
     /// to config so the promotion survives restart. H-8 in the
     /// security review.
     pub const ADMIN: &str = "dds:admin";
+
+    /// Special purpose: the subject of a vouch with this purpose has
+    /// had its self-attested device scope (tags / org_unit) confirmed
+    /// by the voucher. With `NodeConfig::enforce_device_scope_vouch`
+    /// enabled, only scope facts from devices carrying such a vouch
+    /// are honored when evaluating `PolicyScope.device_tags` /
+    /// `PolicyScope.org_units`. Closes M-7 in the security review.
+    pub const DEVICE_SCOPE: &str = "dds:device-scope";
 }
 
 /// The type of a Vouchsafe token.

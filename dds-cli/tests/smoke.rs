@@ -246,17 +246,42 @@ fn test_group_vouch_and_status() {
 // export / import (air-gapped sync)
 // ================================================================
 
-/// Write a minimal `domain.toml` next to the store so the export/import
-/// domain-id check has something to read.
-fn seed_domain(dir: &std::path::Path, id: &str) {
-    use std::io::Write;
-    let mut f = std::fs::File::create(dir.join("domain.toml")).unwrap();
-    writeln!(
-        f,
-        "name = \"test.example\"\nid = \"{id}\"\npubkey = \"{}\"",
-        "0".repeat(64)
-    )
-    .unwrap();
+/// Write a minimal `domain.toml` + `domain_key.bin` next to the
+/// store so the export path (which now signs the dump with the
+/// domain key per M-16) has a real key to unwrap. The `id` arg is
+/// ignored for v2 signed dumps — the id is derived from the
+/// generated key so the fixture must use whatever that yields. Kept
+/// as `_id` for source-compat with the legacy callers.
+#[allow(dead_code)]
+fn seed_domain(dir: &std::path::Path, _id: &str) {
+    use dds_domain::DomainKey;
+    use rand::rngs::OsRng;
+    // Plain-mode domain key (no passphrase) so tests don't need to
+    // juggle env state. Matches the existing `provision_with_plain_domain_key`
+    // convention.
+    // SAFETY: set_var is required because the signing path reads
+    // DDS_DOMAIN_PASSPHRASE from the environment; an empty value
+    // keeps tests deterministic under parallel execution.
+    unsafe { std::env::set_var("DDS_DOMAIN_PASSPHRASE", "") };
+    let key = DomainKey::generate("test.example", &mut OsRng);
+    let domain = key.domain();
+    dds_node::domain_store::save_domain_file(&dir.join("domain.toml"), &domain).unwrap();
+    dds_node::domain_store::save_domain_key(&dir.join("domain_key.bin"), &key).unwrap();
+}
+
+/// Helper: the real domain id the test fixture will have, derived
+/// from the key generated in `seed_domain`. Tests that compare
+/// domain ids should call `seed_domain_returning_id` instead.
+#[allow(dead_code)]
+fn seed_domain_returning_id(dir: &std::path::Path) -> String {
+    use dds_domain::DomainKey;
+    use rand::rngs::OsRng;
+    unsafe { std::env::set_var("DDS_DOMAIN_PASSPHRASE", "") };
+    let key = DomainKey::generate("test.example", &mut OsRng);
+    let domain = key.domain();
+    dds_node::domain_store::save_domain_file(&dir.join("domain.toml"), &domain).unwrap();
+    dds_node::domain_store::save_domain_key(&dir.join("domain_key.bin"), &key).unwrap();
+    domain.id.to_string()
 }
 
 #[test]
@@ -264,8 +289,7 @@ fn test_export_import_round_trip() {
     // Node A: create a vouch + revocation + burn, export.
     let src = tempfile::tempdir().unwrap();
     let src_dir = src.path().to_str().unwrap();
-    let domain_id = "dds-dom:test-round-trip";
-    seed_domain(src.path(), domain_id);
+    let domain_id = seed_domain_returning_id(src.path());
 
     // Populate with a vouch.
     let out = dds_cli()
@@ -306,10 +330,18 @@ fn test_export_import_round_trip() {
     assert!(stdout.contains("Tokens:     1"));
     assert!(dump_path.exists());
 
-    // Node B: empty, same domain. Import.
+    // Node B: empty, same domain. Clone the src's domain files so
+    // the signed dump verifies against dst's copy of the pubkey.
     let dst = tempfile::tempdir().unwrap();
     let dst_dir = dst.path().to_str().unwrap();
-    seed_domain(dst.path(), domain_id);
+    std::fs::copy(
+        src.path().join("domain.toml"),
+        dst.path().join("domain.toml"),
+    )
+    .unwrap();
+    // dst intentionally does NOT have domain_key.bin — it's an
+    // importer, not a signer.
+    let _ = domain_id; // same domain by construction
 
     let out = dds_cli()
         .args([
@@ -356,7 +388,7 @@ fn test_export_import_round_trip() {
 #[test]
 fn test_import_rejects_domain_mismatch() {
     let src = tempfile::tempdir().unwrap();
-    seed_domain(src.path(), "dds-dom:alpha");
+    let _src_id = seed_domain_returning_id(src.path());
     // Populate something exportable.
     let out = dds_cli()
         .args([
@@ -389,7 +421,7 @@ fn test_import_rejects_domain_mismatch() {
 
     // Destination node on a different domain.
     let dst = tempfile::tempdir().unwrap();
-    seed_domain(dst.path(), "dds-dom:beta");
+    let _ = seed_domain_returning_id(dst.path());
     let out = dds_cli()
         .args([
             "--data-dir",
@@ -408,7 +440,7 @@ fn test_import_rejects_domain_mismatch() {
 #[test]
 fn test_import_dry_run_makes_no_writes() {
     let src = tempfile::tempdir().unwrap();
-    seed_domain(src.path(), "dds-dom:dry");
+    let _ = seed_domain_returning_id(src.path());
     let out = dds_cli()
         .args([
             "--data-dir",
@@ -439,8 +471,13 @@ fn test_import_dry_run_makes_no_writes() {
     assert!(out.status.success());
 
     // Empty dest — dry-run should print summary but not create a store.
+    // Clone src's domain so signature verification passes.
     let dst = tempfile::tempdir().unwrap();
-    seed_domain(dst.path(), "dds-dom:dry");
+    std::fs::copy(
+        src.path().join("domain.toml"),
+        dst.path().join("domain.toml"),
+    )
+    .unwrap();
     let out = dds_cli()
         .args([
             "--data-dir",
