@@ -186,6 +186,7 @@ fn write_node_fixture(
             heartbeat_secs: 1,
             idle_timeout_secs: 60,
             api_addr: api_addr.clone(),
+            api_auth: Default::default(),
         },
         org_hash: "cp-e2e-org".to_string(),
         domain: DomainConfig {

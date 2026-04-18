@@ -7,6 +7,7 @@
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub mod config;
+pub mod device_binding;
 pub mod domain_store;
 pub mod expiry;
 pub mod http;

@@ -129,6 +129,12 @@ pub struct NetworkConfig {
     /// Local API listen address.
     #[serde(default = "default_api_addr")]
     pub api_addr: String,
+
+    /// **H-7 (security review)** — transport-auth policy for the local
+    /// API. Governs which callers may reach admin-gated endpoints. See
+    /// [`ApiAuthConfig`].
+    #[serde(default)]
+    pub api_auth: ApiAuthConfig,
 }
 
 impl Default for NetworkConfig {
@@ -140,6 +146,74 @@ impl Default for NetworkConfig {
             heartbeat_secs: default_heartbeat(),
             idle_timeout_secs: default_idle_timeout(),
             api_addr: default_api_addr(),
+            api_auth: ApiAuthConfig::default(),
+        }
+    }
+}
+
+/// **H-7 (security review)** — transport-authentication policy for
+/// the local HTTP API.
+///
+/// The local API currently binds loopback TCP and has no per-caller
+/// identity. G1-S2/S3 of the transport-authn remediation move the
+/// listener to a UDS (Unix) or named pipe (Windows) and populate a
+/// `CallerIdentity` extension from peer credentials (`SO_PEERCRED` /
+/// `GetNamedPipeClientProcessId`). The admin-gate middleware then
+/// admits only callers whose `uid` is in `unix_admin_uids` (or `0`)
+/// or whose `sid` is in `windows_admin_sids`.
+///
+/// `trust_loopback_tcp_admin` is the migration escape hatch. While
+/// it's `true` (current default), callers whose identity is
+/// `Anonymous` — i.e. loopback TCP — are still admitted to admin
+/// endpoints so existing deployments keep working. G1-S5 flips this
+/// to `false`; G1-S6 removes the TCP listener entirely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiAuthConfig {
+    /// When `true`, callers whose `CallerIdentity` is `Anonymous`
+    /// (loopback TCP with no peer creds) are admitted to admin
+    /// endpoints. Default `true` for backward compatibility during
+    /// the transport migration.
+    #[serde(default = "default_true")]
+    pub trust_loopback_tcp_admin: bool,
+
+    /// Additional UIDs permitted on admin endpoints over UDS. `0`
+    /// (root) and the service UID (the effective UID of the dds-node
+    /// process) are always admitted. Extras listed here let an
+    /// operator whitelist specific admin accounts.
+    #[serde(default)]
+    pub unix_admin_uids: Vec<u32>,
+
+    /// SIDs permitted on admin endpoints over the Windows named pipe.
+    /// SYSTEM (`S-1-5-18`) and `BUILTIN\Administrators`
+    /// (`S-1-5-32-544`) are always admitted; extras listed here let
+    /// an operator whitelist per-service SIDs (Auth Bridge, Policy
+    /// Agent).
+    #[serde(default)]
+    pub windows_admin_sids: Vec<String>,
+
+    /// **H-6 (security review)** — path to the per-install HMAC
+    /// secret used to authenticate the node's HTTP response bodies.
+    /// When set, every response carries an `X-DDS-Body-MAC` header
+    /// whose value is
+    /// `base64(HMAC-SHA256(key, method || \0 || path || \0 || body))`.
+    /// Windows Auth Bridge clients verify the MAC on the
+    /// `/v1/session/challenge` response to block the challenge-
+    /// substitution attack from H-6. The file must be at least 16
+    /// bytes; the MSI / packaging layer generates 32 random bytes
+    /// at install time. `None` = feature disabled (signer is a
+    /// no-op — existing clients that ignore the header are not
+    /// affected).
+    #[serde(default)]
+    pub node_hmac_secret_path: Option<PathBuf>,
+}
+
+impl Default for ApiAuthConfig {
+    fn default() -> Self {
+        Self {
+            trust_loopback_tcp_admin: true,
+            unix_admin_uids: Vec::new(),
+            windows_admin_sids: Vec::new(),
+            node_hmac_secret_path: None,
         }
     }
 }
@@ -368,6 +442,40 @@ pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
         let config = NodeConfig::from_str(&toml).unwrap();
         assert_eq!(config.domain.audit_log_max_entries, 0);
         assert_eq!(config.domain.audit_log_retention_days, 0);
+    }
+
+    /// H-7: the default `ApiAuthConfig` preserves existing TCP
+    /// deployments (trust loopback) while the transport migration
+    /// is in flight.
+    #[test]
+    fn test_api_auth_defaults() {
+        let toml = format!(r#"org_hash = "abc123"{DOMAIN_TOML}"#);
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert!(config.network.api_auth.trust_loopback_tcp_admin);
+        assert!(config.network.api_auth.unix_admin_uids.is_empty());
+        assert!(config.network.api_auth.windows_admin_sids.is_empty());
+    }
+
+    #[test]
+    fn test_api_auth_strict_roundtrip() {
+        let toml = format!(
+            r#"
+            org_hash = "abc123"
+            {DOMAIN_TOML}
+            [network]
+            [network.api_auth]
+            trust_loopback_tcp_admin = false
+            unix_admin_uids = [1000, 1001]
+            windows_admin_sids = ["S-1-5-21-1-2-3-1000"]
+        "#
+        );
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert!(!config.network.api_auth.trust_loopback_tcp_admin);
+        assert_eq!(config.network.api_auth.unix_admin_uids, vec![1000, 1001]);
+        assert_eq!(
+            config.network.api_auth.windows_admin_sids,
+            vec!["S-1-5-21-1-2-3-1000".to_string()]
+        );
     }
 
     #[test]

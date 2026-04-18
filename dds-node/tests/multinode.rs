@@ -60,6 +60,7 @@ async fn spawn_node(org: &str) -> (DdsNode, TempDir) {
             heartbeat_secs: 1,
             idle_timeout_secs: 60,
             api_addr: "127.0.0.1:0".to_string(),
+            api_auth: Default::default(),
         },
         org_hash: org.to_string(),
         domain: dds_node::config::DomainConfig {

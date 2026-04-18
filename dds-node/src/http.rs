@@ -27,11 +27,17 @@ use axum::{
     routing::{get, post},
 };
 use base64::Engine;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use std::path::Path;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
+use crate::config::ApiAuthConfig;
+use crate::device_binding::{BindingOutcome, CallerPrincipal, DeviceBindingStore};
 use crate::service::{
     AdminSetupRequest, AdminVouchRequest, ApplicableMacOsPolicy, ApplicableSoftware,
     ApplicableWindowsPolicy, AppliedReport, AssertionSessionRequest, EnrollDeviceRequest,
@@ -40,6 +46,352 @@ use crate::service::{
 use dds_store::traits::{
     AuditStore, ChallengeStore, CredentialStateStore, RevocationStore, TokenStore,
 };
+
+/// **H-7 (security review)** — caller identity derived from the
+/// transport layer. Populated per-connection by the listener; absent
+/// on loopback TCP (the current production transport), in which case
+/// the middleware treats the caller as [`CallerIdentity::Anonymous`].
+///
+/// Once the node listens on a Unix domain socket (G1-S2) or Windows
+/// named pipe (G1-S3) the transport extracts peer credentials via
+/// `SO_PEERCRED` / `getpeereid` or `GetNamedPipeClientProcessId` and
+/// inserts the resulting `CallerIdentity` as a request extension.
+/// Handlers and middleware then read it through
+/// `req.extensions().get::<CallerIdentity>()`.
+#[derive(Clone, Debug)]
+pub enum CallerIdentity {
+    /// No peer-credential info was available (loopback TCP).
+    /// Admitted to admin endpoints only while
+    /// [`AdminPolicy::trust_loopback_tcp_admin`] is `true`.
+    Anonymous,
+    /// UDS caller on Unix. `uid`/`gid` come from `SO_PEERCRED` (Linux)
+    /// or `getpeereid` (macOS); `pid` is informational.
+    #[cfg(unix)]
+    Uds { uid: u32, gid: u32, pid: i32 },
+    /// Named-pipe caller on Windows. `sid` is the caller's primary
+    /// user SID in string form (`S-1-5-…`); `pid` is informational.
+    #[cfg(windows)]
+    Pipe { sid: String, pid: u32 },
+}
+
+#[async_trait::async_trait]
+impl<S> axum::extract::FromRequestParts<S> for CallerIdentity
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<CallerIdentity>()
+            .cloned()
+            .unwrap_or(CallerIdentity::Anonymous))
+    }
+}
+
+impl CallerIdentity {
+    /// Returns true if the caller is authorized to reach admin-gated
+    /// endpoints under the given policy.
+    pub fn is_admin(&self, policy: &AdminPolicy) -> bool {
+        match self {
+            CallerIdentity::Anonymous => policy.trust_loopback_tcp_admin,
+            #[cfg(unix)]
+            CallerIdentity::Uds { uid, .. } => {
+                *uid == 0 || policy.service_uid == Some(*uid) || policy.admin_uids.contains(uid)
+            }
+            #[cfg(windows)]
+            CallerIdentity::Pipe { sid, .. } => {
+                const SYSTEM_SID: &str = "S-1-5-18";
+                const BUILTIN_ADMINS_SID: &str = "S-1-5-32-544";
+                sid == SYSTEM_SID
+                    || sid == BUILTIN_ADMINS_SID
+                    || policy.admin_sids.iter().any(|s| s == sid)
+            }
+        }
+    }
+}
+
+/// Runtime policy derived from [`ApiAuthConfig`] plus ambient info
+/// (service UID on Unix). Cloned into the admin middleware's state.
+#[derive(Clone, Debug)]
+pub struct AdminPolicy {
+    pub trust_loopback_tcp_admin: bool,
+    pub admin_uids: Vec<u32>,
+    pub admin_sids: Vec<String>,
+    /// Effective UID of the dds-node process on Unix. Populated by
+    /// [`AdminPolicy::from_config`]; always admitted. `None` on
+    /// Windows or if the current UID cannot be determined.
+    pub service_uid: Option<u32>,
+}
+
+impl AdminPolicy {
+    /// Construct from config. On Unix the current process's effective
+    /// UID is captured so that admin endpoints remain reachable to
+    /// the dds-node service account without requiring an explicit
+    /// entry in `unix_admin_uids`.
+    pub fn from_config(cfg: &ApiAuthConfig) -> Self {
+        #[cfg(unix)]
+        let service_uid = {
+            // Safety: `geteuid` has no preconditions and is always
+            // safe to call.
+            let uid = unsafe { libc::geteuid() };
+            Some(uid)
+        };
+        #[cfg(not(unix))]
+        let service_uid = None;
+
+        Self {
+            trust_loopback_tcp_admin: cfg.trust_loopback_tcp_admin,
+            admin_uids: cfg.unix_admin_uids.clone(),
+            admin_sids: cfg.windows_admin_sids.clone(),
+            service_uid,
+        }
+    }
+}
+
+// ---------- M-8: device-caller binding helpers ----------
+
+/// Read-side check for M-8. Admits a request against `device_urn`
+/// when:
+/// - the caller is an admin under the policy (operator inspecting a
+///   peer), or
+/// - the caller is [`CallerIdentity::Anonymous`] (loopback TCP; the
+///   transport cannot supply peer credentials yet — existing
+///   deployments keep working), or
+/// - the stored binding equals the caller's principal.
+///
+/// Otherwise returns 403.
+fn check_device_binding_read(
+    caller: &CallerIdentity,
+    admin_policy: &AdminPolicy,
+    binding: Option<&DeviceBindingStore>,
+    device_urn: &str,
+) -> Result<(), HttpError> {
+    if caller.is_admin(admin_policy) {
+        return Ok(());
+    }
+    // M-8 is blocked on H-7 for loopback TCP; preserve behaviour.
+    if matches!(caller, CallerIdentity::Anonymous) {
+        return Ok(());
+    }
+    let Some(store) = binding else {
+        // No store configured — fall through to allow (only happens in
+        // unit tests constructed without a binding store).
+        return Ok(());
+    };
+    let Some(principal) = CallerPrincipal::from_caller(caller) else {
+        return Ok(());
+    };
+    match store.get(device_urn) {
+        Some(stored) if stored == principal => Ok(()),
+        Some(stored) => {
+            tracing::warn!(
+                device_urn,
+                ?caller,
+                ?stored,
+                "M-8: device-caller binding mismatch"
+            );
+            Err(HttpError {
+                status: StatusCode::FORBIDDEN,
+                message: "not_authorized".to_owned(),
+            })
+        }
+        None => {
+            tracing::warn!(
+                device_urn,
+                ?caller,
+                "M-8: read against unbound device_urn — the device's agent must POST /applied first"
+            );
+            Err(HttpError {
+                status: StatusCode::FORBIDDEN,
+                message: "not_authorized".to_owned(),
+            })
+        }
+    }
+}
+
+/// Write-side helper for M-8. Called from
+/// `POST /v1/{windows,macos}/applied` handlers: admits admin callers,
+/// passes through for `Anonymous` (TCP back-compat), TOFU-binds
+/// the first concrete caller for a given `device_urn`, and returns
+/// 403 on a principal mismatch.
+fn tofu_device_binding(
+    caller: &CallerIdentity,
+    admin_policy: &AdminPolicy,
+    binding: Option<&DeviceBindingStore>,
+    device_urn: &str,
+) -> Result<(), HttpError> {
+    if caller.is_admin(admin_policy) {
+        return Ok(());
+    }
+    if matches!(caller, CallerIdentity::Anonymous) {
+        return Ok(());
+    }
+    let Some(store) = binding else {
+        return Ok(());
+    };
+    let Some(principal) = CallerPrincipal::from_caller(caller) else {
+        return Ok(());
+    };
+    let outcome = store
+        .tofu_bind(device_urn, principal.clone())
+        .map_err(|e| {
+            tracing::error!(error = %e, device_urn, "failed to persist device binding");
+            HttpError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: "internal_error".to_owned(),
+            }
+        })?;
+    match outcome {
+        BindingOutcome::Established => {
+            tracing::info!(device_urn, ?principal, "M-8: device binding established (TOFU)");
+            Ok(())
+        }
+        BindingOutcome::Matched => Ok(()),
+        BindingOutcome::Mismatch { stored } => {
+            tracing::warn!(
+                device_urn,
+                ?principal,
+                ?stored,
+                "M-8: TOFU-bound device_urn rejected a different caller"
+            );
+            Err(HttpError {
+                status: StatusCode::FORBIDDEN,
+                message: "not_authorized".to_owned(),
+            })
+        }
+    }
+}
+
+// ---------- H-6: per-install HMAC signer for response bodies ----------
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// **H-6 (security review)** — per-install HMAC-SHA256 key used to
+/// authenticate the node's HTTP responses to the Windows Auth
+/// Bridge and the Policy Agents. Loaded at startup from the path in
+/// [`ApiAuthConfig::node_hmac_secret_path`]; `None` disables signing.
+///
+/// The key is wrapped in [`Zeroizing`] so the in-memory copy is
+/// wiped on drop, and in an [`Arc`] so the middleware can clone it
+/// cheaply per request.
+#[derive(Clone)]
+pub struct ResponseMacKey(Arc<Zeroizing<Vec<u8>>>);
+
+impl ResponseMacKey {
+    /// Load a per-install HMAC key from disk. The file must contain
+    /// at least 16 bytes of key material; the MSI generates 32 random
+    /// bytes.
+    pub fn from_file(path: &Path) -> std::io::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        if bytes.len() < 16 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HMAC key at {} is {} bytes; at least 16 required",
+                    path.display(),
+                    bytes.len()
+                ),
+            ));
+        }
+        Ok(Self(Arc::new(Zeroizing::new(bytes))))
+    }
+
+    /// Compute `HMAC-SHA256(key, method || 0x00 || path || 0x00 || body)`.
+    /// The null separators prevent ambiguity between e.g.
+    /// `("GET", "/a/b")` and `("GE", "T/a/b")`.
+    fn sign(&self, method: &str, path: &str, body: &[u8]) -> [u8; 32] {
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.0)
+            .expect("HMAC-SHA256 accepts any key length");
+        mac.update(method.as_bytes());
+        mac.update(&[0]);
+        mac.update(path.as_bytes());
+        mac.update(&[0]);
+        mac.update(body);
+        mac.finalize().into_bytes().into()
+    }
+}
+
+/// Cap on the response body size we're willing to buffer for MAC
+/// computation. 8 MiB is well above any legitimate response (audit
+/// log pages are paginated, sync responses are capped at 5 MiB per
+/// H-11, individual JSON objects are tiny).
+const RESPONSE_MAC_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// HTTP header name carrying the MAC.
+const RESPONSE_MAC_HEADER: &str = "x-dds-body-mac";
+
+/// Middleware that buffers each response body, computes
+/// `HMAC-SHA256(key, method || 0 || path || 0 || body)`, and writes
+/// the base64-standard-encoded value into the `X-DDS-Body-MAC`
+/// response header. Closes H-6 — the Windows Auth Bridge verifies
+/// the MAC on `/v1/session/challenge` so an attacker who manages to
+/// bind the server address first cannot substitute challenges.
+///
+/// Clients that do not verify the header simply ignore it, so the
+/// change is transparent during the rollout.
+async fn sign_response_body_middleware(
+    State(key): State<ResponseMacKey>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let method = req.method().as_str().to_owned();
+    let path = req.uri().path().to_owned();
+    let resp = next.run(req).await;
+    let (mut parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, RESPONSE_MAC_MAX_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to buffer response body for HMAC signing");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal_error"})),
+            )
+                .into_response();
+        }
+    };
+    let mac = key.sign(&method, &path, &bytes);
+    let mac_b64 = base64::engine::general_purpose::STANDARD.encode(mac);
+    // HeaderValue::from_str only fails on invalid-ASCII; base64 is
+    // ASCII by construction, so unwrap is sound.
+    parts.headers.insert(
+        axum::http::HeaderName::from_static(RESPONSE_MAC_HEADER),
+        axum::http::HeaderValue::from_str(&mac_b64).expect("base64 output is ascii"),
+    );
+    Response::from_parts(parts, axum::body::Body::from(bytes))
+}
+
+/// Middleware that rejects the request with 403 if the caller is not
+/// authorized for admin endpoints under [`AdminPolicy`]. Applied as a
+/// `route_layer` on the admin sub-router in [`router`].
+async fn require_admin_middleware(
+    State(policy): State<Arc<AdminPolicy>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let caller = req
+        .extensions()
+        .get::<CallerIdentity>()
+        .cloned()
+        .unwrap_or(CallerIdentity::Anonymous);
+    if !caller.is_admin(&policy) {
+        tracing::warn!(
+            caller = ?caller,
+            path = %req.uri().path(),
+            "admin endpoint denied: caller not authorized"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "not_authorized"})),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
 
 /// Shared, mutex-guarded service handle. Per-request handlers acquire
 /// the lock for the (very short) duration of the call. The bottleneck
@@ -65,6 +417,14 @@ struct AppState<
 > {
     svc: SharedService<S>,
     info: NodeInfo,
+    /// **M-8 (security review)**. Shared device-caller binding store.
+    /// `None` disables binding checks (useful in tests that construct
+    /// a bare router). In production `main.rs` always supplies one.
+    device_binding: Option<Arc<DeviceBindingStore>>,
+    /// Cached admin policy. Needed by M-8's device-binding helper so
+    /// the check can bypass the binding for admin callers (the CLI
+    /// operator inspecting a peer's policy set).
+    admin_policy: Arc<AdminPolicy>,
 }
 
 impl<
@@ -82,6 +442,8 @@ impl<
         Self {
             svc: self.svc.clone(),
             info: self.info.clone(),
+            device_binding: self.device_binding.clone(),
+            admin_policy: self.admin_policy.clone(),
         }
     }
 }
@@ -151,7 +513,27 @@ async fn rate_limit_middleware(
 }
 
 /// Build the axum router for the local API.
-pub fn router<S>(svc: SharedService<S>, info: NodeInfo) -> Router
+///
+/// `admin_policy` governs which callers may reach admin-gated
+/// endpoints (H-7). On loopback TCP — where the transport cannot
+/// supply peer credentials — admission falls back to
+/// [`AdminPolicy::trust_loopback_tcp_admin`], which is `true` by
+/// default so existing deployments keep working during the migration
+/// to UDS / named pipe.
+///
+/// `response_mac_key` — when `Some`, every response carries an
+/// `X-DDS-Body-MAC` header (H-6). `None` disables the signer.
+///
+/// `device_binding` — shared device-caller binding store (M-8).
+/// When `None` the binding check is a no-op — intended for unit
+/// tests; `main.rs` always supplies a real store.
+pub fn router<S>(
+    svc: SharedService<S>,
+    info: NodeInfo,
+    admin_policy: AdminPolicy,
+    response_mac_key: Option<ResponseMacKey>,
+    device_binding: Option<Arc<DeviceBindingStore>>,
+) -> Router
 where
     S: TokenStore
         + RevocationStore
@@ -162,21 +544,43 @@ where
         + Sync
         + 'static,
 {
-    let state = AppState { svc, info };
     let rate_limiter = Arc::new(GlobalRateLimiter::new());
-    Router::new()
+    let admin_policy = Arc::new(admin_policy);
+    let state = AppState {
+        svc,
+        info,
+        device_binding,
+        admin_policy: admin_policy.clone(),
+    };
+
+    // **H-7 (security review)** — admin-gated sub-router. Every route
+    // here goes through `require_admin_middleware`, which denies
+    // callers whose `CallerIdentity` fails the policy check.
+    let admin_routes = Router::new()
         .route("/v1/enroll/user", post(enroll_user::<S>))
         .route("/v1/enroll/device", post(enroll_device::<S>))
+        .route("/v1/enrolled-users", get(list_enrolled_users::<S>))
+        .route("/v1/admin/challenge", get(issue_admin_challenge::<S>))
+        .route("/v1/admin/setup", post(admin_setup::<S>))
+        .route("/v1/admin/vouch", post(admin_vouch::<S>))
+        .route("/v1/audit/entries", get(list_audit_entries::<S>))
+        .route_layer(axum::middleware::from_fn_with_state(
+            admin_policy.clone(),
+            require_admin_middleware,
+        ));
+
+    // Public / per-session-auth routes. `session/assert` and
+    // `session/challenge` carry their own FIDO2 proof-of-possession
+    // semantics and are not gated by the transport admin check.
+    // Policy / software enumeration remains public for now; G1-S1c
+    // adds device-caller binding as a separate layer.
+    let public_routes = Router::new()
         // NOTE: The unauthenticated POST /v1/session endpoint has been
         // removed. Session issuance now requires FIDO2 proof-of-possession
         // via /v1/session/assert. The internal `issue_session` method is
         // still available for use by `issue_session_from_assertion`.
         .route("/v1/session/challenge", get(issue_session_challenge::<S>))
         .route("/v1/session/assert", post(issue_session_assert::<S>))
-        .route("/v1/enrolled-users", get(list_enrolled_users::<S>))
-        .route("/v1/admin/challenge", get(issue_admin_challenge::<S>))
-        .route("/v1/admin/setup", post(admin_setup::<S>))
-        .route("/v1/admin/vouch", post(admin_vouch::<S>))
         .route("/v1/policy/evaluate", post(evaluate_policy::<S>))
         .route("/v1/status", get(status::<S>))
         .route("/v1/node/info", get(node_info::<S>))
@@ -189,8 +593,10 @@ where
         )
         .route("/v1/macos/policies", get(list_macos_policies::<S>))
         .route("/v1/macos/software", get(list_macos_software::<S>))
-        .route("/v1/macos/applied", post(record_macos_applied::<S>))
-        .route("/v1/audit/entries", get(list_audit_entries::<S>))
+        .route("/v1/macos/applied", post(record_macos_applied::<S>));
+
+    let mut app = admin_routes
+        .merge(public_routes)
         .with_state(state)
         // M-3: rate limit before any handler runs.
         .layer(axum::middleware::from_fn_with_state(
@@ -198,7 +604,19 @@ where
             rate_limit_middleware,
         ))
         // M-11: bound deserialization input size.
-        .layer(DefaultBodyLimit::max(HTTP_MAX_BODY_BYTES))
+        .layer(DefaultBodyLimit::max(HTTP_MAX_BODY_BYTES));
+
+    // H-6: append the response-body signer as the outermost layer
+    // so its MAC covers the bytes the client actually receives
+    // (after every other handler and middleware has run).
+    if let Some(key) = response_mac_key {
+        app = app.layer(axum::middleware::from_fn_with_state(
+            key,
+            sign_response_body_middleware,
+        ));
+    }
+
+    app
 }
 
 // ---------- request/response types ----------
@@ -811,6 +1229,7 @@ where
 
 async fn list_windows_policies<S>(
     State(state): State<AppState<S>>,
+    caller: CallerIdentity,
     Query(q): Query<DeviceUrnQuery>,
 ) -> Result<Json<dds_core::envelope::SignedPolicyEnvelope>, HttpError>
 where
@@ -823,9 +1242,14 @@ where
         + Sync
         + 'static,
 {
-    // M-8 (security review): until per-device session tokens land,
-    // log every policy enumeration so any cross-device probing is
-    // visible in the audit trail.
+    // M-8 (security review): bind every policy read to the caller's
+    // device URN (once H-7's transport supplies caller credentials).
+    check_device_binding_read(
+        &caller,
+        &state.admin_policy,
+        state.device_binding.as_deref(),
+        &q.device_urn,
+    )?;
     tracing::info!(device_urn = %q.device_urn, "list_windows_policies");
     let svc = state.svc.lock().await;
     let policies = svc.list_applicable_windows_policies(&q.device_urn)?;
@@ -847,6 +1271,7 @@ where
 
 async fn list_windows_software<S>(
     State(state): State<AppState<S>>,
+    caller: CallerIdentity,
     Query(q): Query<DeviceUrnQuery>,
 ) -> Result<Json<dds_core::envelope::SignedPolicyEnvelope>, HttpError>
 where
@@ -859,6 +1284,12 @@ where
         + Sync
         + 'static,
 {
+    check_device_binding_read(
+        &caller,
+        &state.admin_policy,
+        state.device_binding.as_deref(),
+        &q.device_urn,
+    )?;
     tracing::info!(device_urn = %q.device_urn, "list_windows_software");
     let svc = state.svc.lock().await;
     let software = svc.list_applicable_software(&q.device_urn)?;
@@ -877,6 +1308,7 @@ where
 
 async fn record_windows_applied<S>(
     State(state): State<AppState<S>>,
+    caller: CallerIdentity,
     Json(report): Json<AppliedReport>,
 ) -> Result<StatusCode, HttpError>
 where
@@ -889,6 +1321,13 @@ where
         + Sync
         + 'static,
 {
+    // M-8: TOFU-bind `(caller, device_urn)` on first applied-report.
+    tofu_device_binding(
+        &caller,
+        &state.admin_policy,
+        state.device_binding.as_deref(),
+        &report.device_urn,
+    )?;
     let svc = state.svc.lock().await;
     svc.record_applied(&report)?;
     Ok(StatusCode::ACCEPTED)
@@ -896,6 +1335,7 @@ where
 
 async fn claim_windows_account<S>(
     State(state): State<AppState<S>>,
+    caller: CallerIdentity,
     Json(req): Json<WindowsClaimAccountRequestJson>,
 ) -> Result<Json<WindowsClaimAccountResponse>, HttpError>
 where
@@ -908,6 +1348,12 @@ where
         + Sync
         + 'static,
 {
+    check_device_binding_read(
+        &caller,
+        &state.admin_policy,
+        state.device_binding.as_deref(),
+        &req.device_urn,
+    )?;
     let session_token_cbor = b64_decode(&req.session_token_cbor_b64, "session_token_cbor_b64")?;
     let svc = state.svc.lock().await;
     let claim = match svc.resolve_windows_account_claim(&req.device_urn, &session_token_cbor) {
@@ -936,6 +1382,7 @@ where
 
 async fn list_macos_policies<S>(
     State(state): State<AppState<S>>,
+    caller: CallerIdentity,
     Query(q): Query<DeviceUrnQuery>,
 ) -> Result<Json<dds_core::envelope::SignedPolicyEnvelope>, HttpError>
 where
@@ -948,6 +1395,12 @@ where
         + Sync
         + 'static,
 {
+    check_device_binding_read(
+        &caller,
+        &state.admin_policy,
+        state.device_binding.as_deref(),
+        &q.device_urn,
+    )?;
     tracing::info!(device_urn = %q.device_urn, "list_macos_policies");
     let svc = state.svc.lock().await;
     let policies = svc.list_applicable_macos_policies(&q.device_urn)?;
@@ -969,6 +1422,7 @@ where
 
 async fn list_macos_software<S>(
     State(state): State<AppState<S>>,
+    caller: CallerIdentity,
     Query(q): Query<DeviceUrnQuery>,
 ) -> Result<Json<dds_core::envelope::SignedPolicyEnvelope>, HttpError>
 where
@@ -981,6 +1435,12 @@ where
         + Sync
         + 'static,
 {
+    check_device_binding_read(
+        &caller,
+        &state.admin_policy,
+        state.device_binding.as_deref(),
+        &q.device_urn,
+    )?;
     tracing::info!(device_urn = %q.device_urn, "list_macos_software");
     let svc = state.svc.lock().await;
     let software = svc.list_applicable_software(&q.device_urn)?;
@@ -999,6 +1459,7 @@ where
 
 async fn record_macos_applied<S>(
     State(state): State<AppState<S>>,
+    caller: CallerIdentity,
     Json(report): Json<AppliedReport>,
 ) -> Result<StatusCode, HttpError>
 where
@@ -1011,6 +1472,12 @@ where
         + Sync
         + 'static,
 {
+    tofu_device_binding(
+        &caller,
+        &state.admin_policy,
+        state.device_binding.as_deref(),
+        &report.device_urn,
+    )?;
     let svc = state.svc.lock().await;
     svc.record_applied(&report)?;
     Ok(StatusCode::ACCEPTED)
@@ -1075,6 +1542,9 @@ pub async fn serve<S>(
     addr: &str,
     svc: SharedService<S>,
     info: NodeInfo,
+    admin_policy: AdminPolicy,
+    response_mac_key: Option<ResponseMacKey>,
+    device_binding: Option<Arc<DeviceBindingStore>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: TokenStore
@@ -1088,7 +1558,15 @@ where
 {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "HTTP API listening");
-    axum::serve(listener, router(svc, info)).await?;
+    // Loopback TCP cannot supply peer credentials, so no `CallerIdentity`
+    // extension is inserted here. `require_admin_middleware` will treat
+    // callers as `CallerIdentity::Anonymous` and fall back to
+    // `trust_loopback_tcp_admin`.
+    axum::serve(
+        listener,
+        router(svc, info, admin_policy, response_mac_key, device_binding),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1178,6 +1656,8 @@ mod tests {
                 info: NodeInfo {
                     peer_id: "12D3KooWUnit".into(),
                 },
+                device_binding: None,
+                admin_policy: Arc::new(tcp_trust_policy()),
             },
             root,
         }
@@ -2805,5 +3285,426 @@ mod tests {
             401,
             "consumed session challenge must not be reusable"
         );
+    }
+
+    // ---------- H-7: admin-gate middleware tests ----------
+
+    fn tcp_trust_policy() -> AdminPolicy {
+        AdminPolicy {
+            trust_loopback_tcp_admin: true,
+            admin_uids: Vec::new(),
+            admin_sids: Vec::new(),
+            service_uid: None,
+        }
+    }
+
+    fn strict_policy() -> AdminPolicy {
+        AdminPolicy {
+            trust_loopback_tcp_admin: false,
+            admin_uids: vec![4242],
+            admin_sids: vec!["S-1-5-21-1-2-3-4242".to_string()],
+            service_uid: None,
+        }
+    }
+
+    #[test]
+    fn anonymous_caller_admitted_when_trust_loopback_tcp() {
+        let caller = CallerIdentity::Anonymous;
+        assert!(caller.is_admin(&tcp_trust_policy()));
+    }
+
+    #[test]
+    fn anonymous_caller_denied_under_strict_policy() {
+        let caller = CallerIdentity::Anonymous;
+        assert!(!caller.is_admin(&strict_policy()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uds_root_is_always_admin() {
+        let caller = CallerIdentity::Uds {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        // Root wins even under the strict policy that doesn't list 0.
+        assert!(caller.is_admin(&strict_policy()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uds_service_uid_is_admin() {
+        let policy = AdminPolicy {
+            trust_loopback_tcp_admin: false,
+            admin_uids: Vec::new(),
+            admin_sids: Vec::new(),
+            service_uid: Some(1000),
+        };
+        let caller = CallerIdentity::Uds {
+            uid: 1000,
+            gid: 1000,
+            pid: 42,
+        };
+        assert!(caller.is_admin(&policy));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uds_non_admin_uid_denied() {
+        let caller = CallerIdentity::Uds {
+            uid: 9999,
+            gid: 9999,
+            pid: 42,
+        };
+        assert!(!caller.is_admin(&strict_policy()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uds_allowlisted_uid_admitted() {
+        let caller = CallerIdentity::Uds {
+            uid: 4242,
+            gid: 4242,
+            pid: 42,
+        };
+        assert!(caller.is_admin(&strict_policy()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_system_always_admin() {
+        let caller = CallerIdentity::Pipe {
+            sid: "S-1-5-18".to_string(),
+            pid: 4,
+        };
+        assert!(caller.is_admin(&strict_policy()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_builtin_admins_always_admin() {
+        let caller = CallerIdentity::Pipe {
+            sid: "S-1-5-32-544".to_string(),
+            pid: 7,
+        };
+        assert!(caller.is_admin(&strict_policy()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_allowlisted_sid_admitted() {
+        let caller = CallerIdentity::Pipe {
+            sid: "S-1-5-21-1-2-3-4242".to_string(),
+            pid: 7,
+        };
+        assert!(caller.is_admin(&strict_policy()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_non_admin_sid_denied() {
+        let caller = CallerIdentity::Pipe {
+            sid: "S-1-5-21-9-9-9-1001".to_string(),
+            pid: 7,
+        };
+        assert!(!caller.is_admin(&strict_policy()));
+    }
+
+    /// When the router is built with a strict policy and the caller
+    /// has no `CallerIdentity` extension (loopback TCP during the
+    /// migration), admin endpoints return 403 and public endpoints
+    /// keep working.
+    #[tokio::test]
+    async fn production_router_enforces_admin_gate_under_strict_policy() {
+        let state = make_state();
+        let svc = state.svc.clone();
+        let info = state.info.clone();
+        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{}", addr);
+
+        // Public endpoint still works.
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200, "status endpoint must remain public");
+
+        // Admin endpoint denied.
+        let resp = reqwest::get(format!("{base}/v1/enrolled-users"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            403,
+            "admin endpoint must return 403 under strict policy"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "not_authorized");
+
+        // Admin challenge is admin-gated too.
+        let resp = reqwest::get(format!("{base}/v1/admin/challenge"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+
+        // Audit entries (admin-gated) denied.
+        let resp = reqwest::get(format!("{base}/v1/audit/entries"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+    }
+
+    /// Regression: when `trust_loopback_tcp_admin = true` (the current
+    /// default), the admin gate is a no-op on TCP and existing
+    /// behavior is preserved.
+    #[tokio::test]
+    async fn production_router_admits_anonymous_under_trust_loopback() {
+        let state = make_state();
+        let svc = state.svc.clone();
+        let info = state.info.clone();
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{}", addr);
+
+        // enrolled-users needs a device_urn query param; any response
+        // *other than* 403 proves the admin gate admitted.
+        let resp = reqwest::get(format!(
+            "{base}/v1/enrolled-users?device_urn=urn:vouchsafe:device.x"
+        ))
+        .await
+        .unwrap();
+        assert_ne!(
+            resp.status(),
+            403,
+            "admin gate must admit Anonymous when trust_loopback_tcp_admin=true"
+        );
+
+        // Admin challenge should also be reachable (no body required).
+        let resp = reqwest::get(format!("{base}/v1/admin/challenge"))
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            403,
+            "admin/challenge must admit Anonymous when trust_loopback_tcp_admin=true"
+        );
+    }
+
+    // ---------- H-6: response MAC signer tests ----------
+
+    fn test_mac_key() -> ResponseMacKey {
+        // 32 bytes of deterministic material so tests can recompute.
+        let bytes: Vec<u8> = (0u8..32).collect();
+        ResponseMacKey(Arc::new(Zeroizing::new(bytes)))
+    }
+
+    fn expected_mac(key: &[u8], method: &str, path: &str, body: &[u8]) -> String {
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(key).unwrap();
+        mac.update(method.as_bytes());
+        mac.update(&[0]);
+        mac.update(path.as_bytes());
+        mac.update(&[0]);
+        mac.update(body);
+        let bytes = mac.finalize().into_bytes();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn mac_key_rejects_short_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("tiny.key");
+        std::fs::write(&p, b"short").unwrap();
+        assert!(ResponseMacKey::from_file(&p).is_err());
+    }
+
+    #[test]
+    fn mac_key_loads_from_sufficient_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ok.key");
+        std::fs::write(&p, vec![0u8; 32]).unwrap();
+        assert!(ResponseMacKey::from_file(&p).is_ok());
+    }
+
+    #[test]
+    fn mac_separator_prevents_method_path_splice() {
+        // ("GET", "/a/b") and ("GE", "T/a/b") must yield different
+        // MACs — the null separator is what prevents the splice.
+        let key = test_mac_key();
+        let a = key.sign("GET", "/a/b", b"");
+        let b = key.sign("GE", "T/a/b", b"");
+        assert_ne!(a, b);
+    }
+
+    /// Response MAC header is present and correct when a key is
+    /// configured. Also asserts the signer runs as the outermost
+    /// layer — rate-limit / body-limit errors would otherwise produce
+    /// a response without the header.
+    #[tokio::test]
+    async fn response_mac_header_is_signed_and_verifiable() {
+        let state = make_state();
+        let svc = state.svc.clone();
+        let info = state.info.clone();
+        let key = test_mac_key();
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), Some(key.clone()), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{}", addr);
+
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        let header = resp
+            .headers()
+            .get(RESPONSE_MAC_HEADER)
+            .expect("X-DDS-Body-MAC header present")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = resp.bytes().await.unwrap();
+        let expected = expected_mac(&key.0, "GET", "/v1/status", &body);
+        assert_eq!(header, expected, "MAC header matches expected HMAC");
+    }
+
+    #[tokio::test]
+    async fn response_mac_absent_when_key_not_configured() {
+        let state = make_state();
+        let svc = state.svc.clone();
+        let info = state.info.clone();
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{}", addr);
+
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert!(
+            resp.headers().get(RESPONSE_MAC_HEADER).is_none(),
+            "no MAC header when key not configured"
+        );
+    }
+
+    // ---------- M-8: device-caller binding tests ----------
+
+    fn anon_caller() -> CallerIdentity {
+        CallerIdentity::Anonymous
+    }
+
+    #[cfg(unix)]
+    fn uds_caller(uid: u32) -> CallerIdentity {
+        CallerIdentity::Uds {
+            uid,
+            gid: uid,
+            pid: 1,
+        }
+    }
+
+    #[test]
+    fn anonymous_caller_bypasses_binding_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let res = check_device_binding_read(
+            &anon_caller(),
+            &tcp_trust_policy(),
+            Some(&store),
+            "urn:device:x",
+        );
+        assert!(res.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uds_caller_read_denied_on_unbound_urn_under_strict_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let caller = uds_caller(1000);
+        let res = check_device_binding_read(&caller, &strict_policy(), Some(&store), "urn:device:x");
+        assert!(res.is_err());
+        assert_eq!(res.err().unwrap().status, StatusCode::FORBIDDEN);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uds_caller_tofu_binds_then_reads_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let caller = uds_caller(1000);
+        let res = tofu_device_binding(&caller, &strict_policy(), Some(&store), "urn:device:x");
+        assert!(res.is_ok());
+        let res = check_device_binding_read(&caller, &strict_policy(), Some(&store), "urn:device:x");
+        assert!(res.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uds_caller_mismatch_rejected_after_tofu() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let good = uds_caller(1000);
+        let bad = uds_caller(9999);
+        assert!(tofu_device_binding(&good, &strict_policy(), Some(&store), "urn:device:x").is_ok());
+        let res = check_device_binding_read(&bad, &strict_policy(), Some(&store), "urn:device:x");
+        assert!(res.is_err());
+        let res = tofu_device_binding(&bad, &strict_policy(), Some(&store), "urn:device:x");
+        assert!(res.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_caller_bypasses_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let other = uds_caller(1000);
+        assert!(tofu_device_binding(&other, &strict_policy(), Some(&store), "urn:device:x").is_ok());
+        // uid=0 passes the admin check even under strict_policy().
+        let admin = uds_caller(0);
+        let res = check_device_binding_read(&admin, &strict_policy(), Some(&store), "urn:device:x");
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn response_mac_header_covers_error_responses() {
+        // An admin-gated endpoint returning 403 must still carry a
+        // signed MAC header — otherwise a MITM could manufacture
+        // error responses.
+        let state = make_state();
+        let svc = state.svc.clone();
+        let info = state.info.clone();
+        let key = test_mac_key();
+        let app = router::<MemoryBackend>(svc, info, strict_policy(), Some(key.clone()), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{}", addr);
+
+        let resp = reqwest::get(format!("{base}/v1/admin/challenge"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let header = resp
+            .headers()
+            .get(RESPONSE_MAC_HEADER)
+            .expect("MAC header present even on 403")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = resp.bytes().await.unwrap();
+        let expected = expected_mac(&key.0, "GET", "/v1/admin/challenge", &body);
+        assert_eq!(header, expected);
     }
 }

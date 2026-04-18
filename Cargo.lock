@@ -1002,6 +1002,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "argon2",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chacha20poly1305",
@@ -1015,6 +1016,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "hex",
+ "hmac",
  "home",
  "hyper",
  "libc",

@@ -289,8 +289,38 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let node_info = http::NodeInfo {
         peer_id: node.peer_id.to_string(),
     };
+    let admin_policy = http::AdminPolicy::from_config(&config.network.api_auth);
+    let response_mac_key = match &config.network.api_auth.node_hmac_secret_path {
+        Some(path) => {
+            let key = http::ResponseMacKey::from_file(path).map_err(|e| {
+                format!(
+                    "failed to load node HMAC secret from {}: {e}",
+                    path.display()
+                )
+            })?;
+            info!(path = %path.display(), "loaded node HMAC secret (H-6)");
+            Some(key)
+        }
+        None => None,
+    };
+    // M-8: node-local device-caller binding store.
+    let binding_path = dds_node::device_binding::DeviceBindingStore::default_path(&config.data_dir);
+    let device_binding = Some(Arc::new(
+        dds_node::device_binding::DeviceBindingStore::load_or_empty(binding_path.clone()).map_err(
+            |e| format!("failed to load device-binding store at {}: {e}", binding_path.display()),
+        )?,
+    ));
     tokio::spawn(async move {
-        if let Err(e) = http::serve(&api_addr, shared_svc, node_info).await {
+        if let Err(e) = http::serve(
+            &api_addr,
+            shared_svc,
+            node_info,
+            admin_policy,
+            response_mac_key,
+            device_binding,
+        )
+        .await
+        {
             tracing::error!("HTTP API server error: {e}");
         }
     });

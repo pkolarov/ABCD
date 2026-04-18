@@ -274,6 +274,7 @@ async fn publish_fixture(
             heartbeat_secs: 1,
             idle_timeout_secs: 60,
             api_addr: "127.0.0.1:0".to_string(),
+            api_auth: Default::default(),
         },
         org_hash: spec.org_hash.clone(),
         domain: DomainConfig {
