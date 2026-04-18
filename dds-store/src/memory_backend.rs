@@ -178,6 +178,31 @@ impl OperationStore for MemoryBackend {
 
 impl AuditStore for MemoryBackend {
     fn append_audit_entry(&mut self, entry: &AuditLogEntry) -> StoreResult<()> {
+        // **L-12 (security review)**: enforce the hash chain on
+        // append. The first entry must have an empty `prev_hash`;
+        // every subsequent entry's `prev_hash` must equal the
+        // previous entry's `chain_hash`. Breaking the chain here
+        // surfaces as a `StoreError::Serde` so the caller can log
+        // the forensic event and refuse to persist corrupted state.
+        if let Some(last_bytes) = self.audit_log.last() {
+            let last: AuditLogEntry = ciborium::from_reader(last_bytes.as_slice())
+                .map_err(|e| StoreError::Serde(format!("prev audit decode: {e}")))?;
+            let expected = last
+                .chain_hash()
+                .map_err(|e| StoreError::Serde(format!("prev chain_hash: {e}")))?;
+            if entry.prev_hash != expected {
+                return Err(StoreError::Serde(format!(
+                    "audit chain break: entry prev_hash does not match last entry's chain_hash \
+                     (expected {} bytes, got {} bytes)",
+                    expected.len(),
+                    entry.prev_hash.len()
+                )));
+            }
+        } else if !entry.prev_hash.is_empty() {
+            return Err(StoreError::Serde(
+                "audit chain break: first entry must have empty prev_hash".into(),
+            ));
+        }
         let mut buf = Vec::new();
         ciborium::into_writer(entry, &mut buf).map_err(|e| StoreError::Serde(e.to_string()))?;
         self.audit_log.push(buf);

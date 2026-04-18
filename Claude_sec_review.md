@@ -73,14 +73,14 @@ left for a follow-up PR — usually because the fix spans languages
 | M-6 | ✅ Fixed (pending verify) | `DdsNode::run` re-verifies the admission cert every 600 s against `(domain_pubkey, domain_id, peer_id, now)`. Expiry → clean shutdown. Helper exposed as `verify_admission_still_valid` for tests. |
 | M-7 | ✅ Fixed (pending verify) | Config flag `NodeConfig.domain.enforce_device_scope_vouch` (default off). When on, `list_applicable_*` only honors a device's self-attested `tags`/`org_unit` if the device has a `dds:device-scope` vouch from a trusted root (new `purpose::DEVICE_SCOPE` constant). Off by default to preserve behavior on existing deployments. |
 | M-8 | ⚠ Partial | Added structured log of every `device_urn` query; session-token check deferred until device-session issuance lands |
-| M-9 | ✅ Fixed (pending verify) | `ingest_revocation` and `ingest_burn` reject tokens whose `iat` is older than `REVOCATION_REPLAY_WINDOW_SECS` (7 days) or more than 1 hour in the future. `iat == 0` (legacy unstamped) is passthrough. |
+| M-9 | ✅ Fixed (pending verify) | Replay window (7 days forward 1h) enforced on BOTH gossip (`ingest_revocation`/`ingest_burn`) and sync (`handle_sync_response` filter) paths via `revocation_within_replay_window`. Revoke/burn tokens with stale `iat` are dropped before reaching `apply_sync_payloads_with_graph`. |
 | M-10 | ⏸ Deferred | Parameter bump requires disk-format migration of existing encrypted node keys |
 | M-11 | ✅ Fixed (pending verify) | `DefaultBodyLimit::max(256 KiB)` on Axum; gossipsub cap tracked separately |
 | M-12 | ⏸ Deferred | Current hash-compare path is cryptographically equivalent when clients serialize identically |
 | M-13 | ⏸ Deferred | Requires FIDO MDS integration / policy |
 | M-14 | ⏸ Deferred | Interacts with M-10 disk format; land together |
 | M-15 | ⏸ Deferred | FIDO2 code path is feature-gated off by default |
-| M-16 | ✅ Fixed (pending verify) | `.ddsdump` format bumped to v2; mandatory Ed25519 signature over `DdsDump::signing_bytes` (SHA-256 over version + domain_id + exported_at + each tokens/ops/revoked/burned entry in order). `dds export` requires an unwrapped `DomainKey`, refusing if absent. `dds import` verifies the signature against the local `domain.toml` pubkey; legacy v1 dumps warn. Plus L-5 0o600 on the written file. |
+| M-16 | ✅ Fixed (pending verify) | `.ddsdump` v2 mandatory Ed25519 signature over `DdsDump::signing_bytes`. `dds export` requires unwrapped `DomainKey`. `dds import` verifies against the local `domain.toml` pubkey. **Downgrade-defense**: v1 (unsigned) dumps now REFUSE by default — the importer errors out unless `--allow-unsigned` is passed, because a tampered v2 dump could otherwise be relabelled as v1 and bypass signature verification. Plus L-5 0o600 on the written file. |
 | M-17 | ⏸ Deferred | C++ only; Windows-specific audit |
 | M-18 | ⏸ Deferred | WiX / installer change |
 | M-19 | ✅ Fixed (pending verify) | Boot-time wall clock captured; `verify_assertion_common` refuses when `now() < boot_wall_time` |
@@ -103,7 +103,7 @@ left for a follow-up PR — usually because the fix spans languages
 | L-9 | ✅ Fixed (pending verify) | `ServiceError` mapped to opaque codes (`auth_failed`, `permission_denied`, `invalid_input`, `internal_error`); full detail logged server-side |
 | L-10 | ✅ Fixed (pending verify) | Admin blob now prefixed with version byte (rolled into M-22) |
 | L-11 | ✅ Audited | Production-callsite audit: `LwwRegister` is only referenced by `dds-loadtest` fixtures and `dds-core/benches/crdt_merge.rs` — no directory CRDT path uses wall-clock LWW semantics. Limitation documented in-module so future callers re-audit before relying on convergence. |
-| L-12 | ✅ Fixed (pending verify) | `AuditLogEntry` gains `prev_hash` (covered by `node_signature`) and a `chain_hash()` helper. New `sign_ed25519_chained` constructor stamps `prev_hash` from the previous entry's `chain_hash`. Tests: `audit_entry_chain_hash_links_next_entry`, `audit_entry_chain_break_detectable`. Store-side full-chain verification is the follow-up. |
+| L-12 | ✅ Fixed (pending verify) | `AuditLogEntry::prev_hash` + `chain_hash()` + `sign_ed25519_chained` constructor. **Append-time enforcement**: both `MemoryBackend` and `RedbBackend` `append_audit_entry` now verify the new entry's `prev_hash` equals the previously-stored entry's `chain_hash` (or is empty for the genesis entry); mismatches return `StoreError::Serde` so the caller can log the forensic event. `DdsNode::emit_local_audit` is the production hook — reads the chain head, stamps, signs, appends. `AuditStore::audit_chain_head` is exposed for callers that need to construct chained entries themselves. |
 | L-13 | ✅ Fixed (pending verify) | `credential_ids_eq` in `service.rs` decodes both sides via base64url-no-pad / standard / url-safe / standard-no-pad and compares raw bytes. Falls back to string equality if neither side is base64. |
 | L-14 | ⏸ Deferred | C++ Credential Provider stack hygiene |
 | L-15 | ✅ Fixed (pending verify) | `subtle::ConstantTimeEq` on `vch_sum` comparisons via `payload_hash_eq` |

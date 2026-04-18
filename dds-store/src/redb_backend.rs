@@ -364,7 +364,34 @@ impl AuditStore for RedbBackend {
             let mut table = write_txn
                 .open_table(AUDIT_LOG)
                 .map_err(|e| StoreError::Io(e.to_string()))?;
+            // **L-12 (security review)**: enforce the hash chain
+            // inside the same write transaction so a chain-break is
+            // either atomically rejected or the append is atomic.
             let next_id = table.len().unwrap_or(0);
+            if next_id > 0 {
+                // Fetch the last entry (highest id).
+                let last_bytes = table
+                    .get(next_id - 1)
+                    .map_err(|e| StoreError::Io(e.to_string()))?
+                    .ok_or_else(|| StoreError::Io("missing last audit entry".into()))?;
+                let last: AuditLogEntry = ciborium::from_reader(last_bytes.value())
+                    .map_err(|e| StoreError::Serde(format!("prev audit decode: {e}")))?;
+                let expected = last
+                    .chain_hash()
+                    .map_err(|e| StoreError::Serde(format!("prev chain_hash: {e}")))?;
+                if entry.prev_hash != expected {
+                    return Err(StoreError::Serde(format!(
+                        "audit chain break: entry prev_hash does not match last entry's \
+                         chain_hash (expected {} bytes, got {} bytes)",
+                        expected.len(),
+                        entry.prev_hash.len()
+                    )));
+                }
+            } else if !entry.prev_hash.is_empty() {
+                return Err(StoreError::Serde(
+                    "audit chain break: first entry must have empty prev_hash".into(),
+                ));
+            }
             table
                 .insert(next_id, buf.as_slice())
                 .map_err(|e| StoreError::Io(e.to_string()))?;

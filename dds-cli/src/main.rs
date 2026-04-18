@@ -106,6 +106,13 @@ enum Commands {
         /// Parse and validate the file but make no store writes.
         #[arg(long)]
         dry_run: bool,
+        /// **M-16 (security review)**: opt in to importing an unsigned
+        /// legacy v1 dump. Default is to refuse — an attacker who can
+        /// tamper with the dump can also strip a v2 signature, so v1
+        /// must never be silently downgraded. Operators who really
+        /// need to migrate from v1 must pass this flag explicitly.
+        #[arg(long)]
+        allow_unsigned: bool,
     },
 }
 
@@ -399,7 +406,11 @@ async fn main() {
         }
         Commands::Debug { action } => handle_debug(action, &cli.node_url).await,
         Commands::Export { out } => handle_export(&cli.data_dir, &out),
-        Commands::Import { input, dry_run } => handle_import(&cli.data_dir, &input, dry_run),
+        Commands::Import {
+            input,
+            dry_run,
+            allow_unsigned,
+        } => handle_import(&cli.data_dir, &input, dry_run, allow_unsigned),
     }
 }
 
@@ -1186,7 +1197,7 @@ fn handle_export(data_dir: &Path, out: &Path) {
     println!("  Size:       {} bytes", bytes.len());
 }
 
-fn handle_import(data_dir: &Path, input: &Path, dry_run: bool) {
+fn handle_import(data_dir: &Path, input: &Path, dry_run: bool, allow_unsigned: bool) {
     // Parse dump first — validating the file before opening the store means
     // a bad file never perturbs on-disk state.
     let bytes = std::fs::read(input).unwrap_or_else(|e| {
@@ -1271,13 +1282,34 @@ fn handle_import(data_dir: &Path, input: &Path, dry_run: bool) {
             );
             std::process::exit(1);
         }
-    } else {
+    } else if allow_unsigned {
+        // Operator has explicitly opted in to loading a legacy unsigned
+        // dump (e.g. one-time migration from a pre-M-16 export). The
+        // integrity of the payload depends entirely on the operator's
+        // out-of-band chain of custody — there is no cryptographic
+        // check after this point.
         eprintln!(
-            "WARNING: loading legacy v{} dump without a signature — cannot \
-             verify integrity. Upgrade the exporting host and re-export \
-             for a signed v{DUMP_VERSION} dump.",
+            "WARNING: loading legacy v{} dump with --allow-unsigned — \
+             no cryptographic integrity check is possible. Verify the \
+             dump was transferred through a trusted channel.",
             dump.version
         );
+    } else {
+        // **M-16 downgrade defense**: a v2 dump carries the signature
+        // INSIDE the file, so a tamper that strips the signature and
+        // rewrites `version` to 1 would bypass verification. Refuse
+        // v1 by default; require an explicit `--allow-unsigned` flag
+        // to proceed.
+        eprintln!(
+            "Error: refusing to import legacy v{} dump — pre-v{DUMP_VERSION} \
+             dumps carry no signature and are indistinguishable from a \
+             tampered signed dump where the signature was stripped. \
+             Re-export from an up-to-date host for a signed v{DUMP_VERSION} \
+             dump, or pass --allow-unsigned if the dump's integrity is \
+             established through other means.",
+            dump.version
+        );
+        std::process::exit(1);
     }
 
     println!("Dump:");

@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use dds_core::crdt::causal_dag::{CausalDag, Operation};
-use dds_core::token::Token;
+use dds_core::token::{Token, TokenKind};
 use dds_core::trust::TrustGraph;
 use dds_net::gossip::{DdsTopic, DdsTopicSet, GossipMessage};
 use dds_net::sync::{SyncPayload, SyncRequest, SyncResponse, apply_sync_payloads_with_graph};
@@ -599,8 +599,62 @@ impl DdsNode {
             );
             return;
         }
-        let _ = self.store.append_audit_entry(&entry);
+        // **L-12 (security review)**: the store now enforces
+        // `entry.prev_hash == local_chain_head()`. Inbound gossip
+        // entries carry the SOURCE node's chain linkage which will
+        // not match our local chain — log the rejection as an
+        // integrity event rather than silently accepting it. When
+        // audit-log gossip becomes a live feature it will need a
+        // wrapper entry: we stamp a LOCAL `AuditLogEntry` whose
+        // `action` encodes "observed inbound" and whose `token_bytes`
+        // carry the original — future work.
+        if let Err(e) = self.store.append_audit_entry(&entry) {
+            warn!(
+                node = %entry.node_urn,
+                action = %entry.action,
+                error = %e,
+                "audit entry refused by store (likely chain mismatch from gossip)"
+            );
+            return;
+        }
         info!(action = %entry.action, node = %entry.node_urn, "audit log entry appended");
+    }
+
+    /// **L-12 (security review)**: emit a locally-chained audit
+    /// entry for an action this node just performed. Reads the
+    /// current chain head from the store, stamps `prev_hash`, signs
+    /// with `signing_key`, and appends. Returns the appended entry
+    /// so the caller can gossip it if they choose.
+    ///
+    /// This is the ONE public path production code should use when
+    /// generating audit entries — it guarantees the chain property
+    /// holds at append time.
+    pub fn emit_local_audit(
+        &mut self,
+        action: impl Into<String>,
+        token_bytes: Vec<u8>,
+        node_urn: impl Into<String>,
+        signing_key: &ed25519_dalek::SigningKey,
+        timestamp: u64,
+    ) -> Result<dds_core::audit::AuditLogEntry, String> {
+        let prev_hash = self
+            .store
+            .audit_chain_head()
+            .map_err(|e| format!("chain head: {e}"))?
+            .unwrap_or_default();
+        let entry = dds_core::audit::AuditLogEntry::sign_ed25519_chained(
+            action,
+            token_bytes,
+            node_urn,
+            signing_key,
+            timestamp,
+            prev_hash,
+        )
+        .map_err(|e| format!("sign: {e}"))?;
+        self.store
+            .append_audit_entry(&entry)
+            .map_err(|e| format!("append: {e}"))?;
+        Ok(entry)
     }
 
     // ---------- anti-entropy sync (B6) ----------
@@ -691,9 +745,7 @@ impl DdsNode {
                     Ok(t) => t,
                     Err(_) => return true, // let apply_sync_payloads surface the error
                 };
-                if publisher_capability_ok(&token, &self.trust_graph, &self.trusted_roots) {
-                    true
-                } else {
+                if !publisher_capability_ok(&token, &self.trust_graph, &self.trusted_roots) {
                     warn!(
                         %peer,
                         jti = %token.payload.jti,
@@ -701,8 +753,27 @@ impl DdsNode {
                         body_type = ?token.payload.body_type,
                         "sync: dropping payload whose issuer lacks publisher capability"
                     );
-                    false
+                    return false;
                 }
+                // **M-9 (security review)**: the live gossip ingest path
+                // runs `revocation_within_replay_window` on
+                // revoke/burn tokens. The sync path has to run the
+                // same check — otherwise an attacker who can push to
+                // a peer's sync protocol can replay old revocations
+                // that gossip would reject.
+                if matches!(token.payload.kind, TokenKind::Revoke | TokenKind::Burn)
+                    && !revocation_within_replay_window(token.payload.iat)
+                {
+                    warn!(
+                        %peer,
+                        jti = %token.payload.jti,
+                        iat = token.payload.iat,
+                        kind = ?token.payload.kind,
+                        "sync: dropping revoke/burn payload: iat outside replay window"
+                    );
+                    return false;
+                }
+                true
             })
             .collect();
         if payloads.is_empty() {
@@ -876,7 +947,7 @@ fn publisher_capability_ok(
     trust_graph: &Arc<RwLock<TrustGraph>>,
     trusted_roots: &BTreeSet<String>,
 ) -> bool {
-    use dds_core::token::{TokenKind, purpose};
+    use dds_core::token::purpose;
     use dds_domain::body_types;
 
     if token.payload.kind != TokenKind::Attest {

@@ -101,7 +101,27 @@ pub trait OperationStore {
 /// Audit log storage — stores append-only cryptographic audit log entries.
 pub trait AuditStore {
     /// Append an audit log entry.
+    ///
+    /// **L-12 (security review)**: implementations MUST verify the
+    /// hash chain on append. Specifically: if the store already has
+    /// at least one entry, the incoming `entry.prev_hash` must equal
+    /// the last stored entry's `chain_hash()`. For an empty store the
+    /// incoming `prev_hash` must be empty ("genesis"). Violations
+    /// return `StoreError::Serde(...)` with a message describing the
+    /// break so callers can surface it. Implementations that want to
+    /// opt out of chain enforcement for legacy reasons should do so
+    /// behind a clearly-labelled `*_unchecked` helper.
     fn append_audit_entry(&mut self, entry: &AuditLogEntry) -> StoreResult<()>;
+
+    /// Return the `chain_hash` of the last stored entry, or `None` if
+    /// the store is empty. Used by callers that need to construct
+    /// chained entries with the correct `prev_hash`.
+    fn audit_chain_head(&self) -> StoreResult<Option<Vec<u8>>> {
+        Ok(self
+            .list_audit_entries()?
+            .last()
+            .and_then(|e| e.chain_hash().ok()))
+    }
 
     /// Retrieve all audit log entries, ordered by insertion.
     fn list_audit_entries(&self) -> StoreResult<Vec<AuditLogEntry>>;

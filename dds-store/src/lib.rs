@@ -186,17 +186,22 @@ mod tests {
         }
     }
 
+    /// Append an audit entry to `store`, stamping `prev_hash` from
+    /// the current chain head so the L-12 chain-enforcement check
+    /// passes. Use this from audit-crud tests in place of a raw
+    /// `append_audit_entry(make_audit_entry(...))`.
+    fn append_audit_chained(store: &mut dyn DirectoryStore, action: &str, timestamp: u64) {
+        let prev_hash = store.audit_chain_head().unwrap().unwrap_or_default();
+        let mut entry = make_audit_entry(action, timestamp);
+        entry.prev_hash = prev_hash;
+        store.append_audit_entry(&entry).unwrap();
+    }
+
     fn test_audit_crud(store: &mut dyn DirectoryStore) {
         assert_eq!(store.count_audit_entries().unwrap(), 0);
-        store
-            .append_audit_entry(&make_audit_entry("attest", 1000))
-            .unwrap();
-        store
-            .append_audit_entry(&make_audit_entry("vouch", 2000))
-            .unwrap();
-        store
-            .append_audit_entry(&make_audit_entry("revoke", 3000))
-            .unwrap();
+        append_audit_chained(store, "attest", 1000);
+        append_audit_chained(store, "vouch", 2000);
+        append_audit_chained(store, "revoke", 3000);
         assert_eq!(store.count_audit_entries().unwrap(), 3);
         let entries = store.list_audit_entries().unwrap();
         assert_eq!(entries.len(), 3);
@@ -205,15 +210,9 @@ mod tests {
     }
 
     fn test_audit_prune_before(store: &mut dyn DirectoryStore) {
-        store
-            .append_audit_entry(&make_audit_entry("a", 1000))
-            .unwrap();
-        store
-            .append_audit_entry(&make_audit_entry("b", 2000))
-            .unwrap();
-        store
-            .append_audit_entry(&make_audit_entry("c", 3000))
-            .unwrap();
+        append_audit_chained(store, "a", 1000);
+        append_audit_chained(store, "b", 2000);
+        append_audit_chained(store, "c", 3000);
         let removed = store.prune_audit_entries_before(2500).unwrap();
         assert_eq!(removed, 2);
         assert_eq!(store.count_audit_entries().unwrap(), 1);
@@ -223,9 +222,7 @@ mod tests {
 
     fn test_audit_prune_to_max(store: &mut dyn DirectoryStore) {
         for i in 0..5 {
-            store
-                .append_audit_entry(&make_audit_entry(&format!("op{i}"), i * 1000))
-                .unwrap();
+            append_audit_chained(store, &format!("op{i}"), i * 1000);
         }
         assert_eq!(store.count_audit_entries().unwrap(), 5);
         let removed = store.prune_audit_entries_to_max(2).unwrap();
