@@ -113,7 +113,7 @@ left for a follow-up PR — usually because the fix spans languages
 
 ### Known caveats after this pass
 
-- `dds-node/tests/multinode.rs::rejoined_node_catches_up_via_sync_protocol` remains flaky under parallel test execution (~1 in 8 runs). Pre-existing libp2p request_response + initial-dial timing issue; improved but not eliminated by migrating to `Swarm::add_peer_address` and a continuously-pumping harness. Tracked for follow-up.
+- None open. The earlier multinode test flake (`rejoined_node_catches_up_via_sync_protocol` et al.) was fixed separately by switching the test harness to one-sided dials via a new `connect_one_sided` helper. Root cause was the libp2p-tcp simultaneous-dial race on Noise negotiation — `gossipsub.add_explicit_peer` auto-dialed on both sides, producing "Handshake failed: input error" ~10% of runs. Verified at 50/50 on the full multinode suite and 5/5 on the full workspace suite.
 
 ---
 

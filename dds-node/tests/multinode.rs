@@ -201,7 +201,11 @@ async fn wait_for_listen(node: &mut DdsNode) -> Multiaddr {
 }
 
 /// Dial peer's address from `from` and remember it as an explicit
-/// gossipsub peer so the mesh forms quickly.
+/// gossipsub peer so the mesh forms quickly. Prefer
+/// `connect_one_sided` for new tests — it avoids the
+/// simultaneous-dial race. Retained for any future test that
+/// specifically wants two-sided dial semantics.
+#[allow(dead_code)]
 fn connect(from: &mut DdsNode, peer: libp2p::PeerId, addr: Multiaddr) {
     from.swarm
         .behaviour_mut()
@@ -222,6 +226,36 @@ fn connect(from: &mut DdsNode, peer: libp2p::PeerId, addr: Multiaddr) {
     // negotiation window under parallel-test CPU contention.
     from.swarm.add_peer_address(peer, addr_with_peer.clone());
     from.swarm.dial(addr_with_peer).unwrap();
+}
+
+/// Establish A<->B connectivity with a SINGLE outgoing dial from A
+/// to B. Both ends also register the other's address in the swarm
+/// address book so request_response can consult it on send_request.
+/// Neither side calls `gossipsub.add_explicit_peer` (which triggers
+/// its own unconditional dial via `ToSwarm::Dial` and was the root
+/// cause of the `rejoined_node_catches_up_via_sync_protocol`
+/// flake — simultaneous-dial race in libp2p-tcp produced
+/// "Handshake failed: input error" on Noise negotiation ~10% of
+/// the time). Gossipsub mesh still forms within 1-2 heartbeats
+/// from the established connection, which is plenty for the 20 s
+/// propagation window the test allots.
+fn connect_one_sided(
+    initiator: &mut DdsNode,
+    initiator_pid: libp2p::PeerId,
+    initiator_addr: Multiaddr,
+    responder: &mut DdsNode,
+    responder_pid: libp2p::PeerId,
+    responder_addr: Multiaddr,
+) {
+    let init_addr = initiator_addr.with(libp2p::multiaddr::Protocol::P2p(initiator_pid));
+    let resp_addr = responder_addr.with(libp2p::multiaddr::Protocol::P2p(responder_pid));
+    // Address-book registration — no dialing triggered by either call.
+    initiator
+        .swarm
+        .add_peer_address(responder_pid, resp_addr.clone());
+    responder.swarm.add_peer_address(initiator_pid, init_addr);
+    // Single outgoing dial, from the initiator only.
+    initiator.swarm.dial(resp_addr).unwrap();
 }
 
 fn make_attest_token(label: &str, jti: &str) -> (Identity, Token) {
@@ -325,13 +359,22 @@ async fn three_node_cluster(org: &str) -> (Vec<DdsNode>, Vec<TempDir>) {
     let b_pid = b.peer_id;
     let c_pid = c.peer_id;
 
-    // Star topology: a <-> b, a <-> c, b <-> c
-    connect(&mut a, b_pid, b_addr.clone());
-    connect(&mut a, c_pid, c_addr.clone());
-    connect(&mut b, a_pid, a_addr.clone());
-    connect(&mut b, c_pid, c_addr.clone());
-    connect(&mut c, a_pid, a_addr.clone());
-    connect(&mut c, b_pid, b_addr.clone());
+    // Star topology with single-direction dials (A→B, A→C, B→C).
+    // Two-sided dials used to trigger the simultaneous-dial race in
+    // libp2p-tcp (Noise "input error"); one-sided dials produce the
+    // same bidirectional TCP connection without the race.
+    connect_one_sided(&mut a, a_pid, a_addr.clone(), &mut b, b_pid, b_addr.clone());
+    connect_one_sided(&mut a, a_pid, a_addr.clone(), &mut c, c_pid, c_addr.clone());
+    connect_one_sided(&mut b, b_pid, b_addr, &mut c, c_pid, c_addr);
+    // All three nodes still need gossipsub explicit_peer on at least
+    // one side so the mesh forms quickly in the 10 s
+    // MESH_FORMATION_TIMEOUT window the tests allot. Adding it only
+    // on the initiator keeps the race out — the `add_explicit_peer`
+    // auto-dial is a no-op when the peer is already connected via the
+    // explicit `dial` above.
+    a.swarm.behaviour_mut().gossipsub.add_explicit_peer(&b_pid);
+    a.swarm.behaviour_mut().gossipsub.add_explicit_peer(&c_pid);
+    b.swarm.behaviour_mut().gossipsub.add_explicit_peer(&c_pid);
 
     // Pump until mesh forms — gossipsub heartbeat is 1s, mesh formation
     // typically requires 2-3 heartbeats after the TCP handshake.
@@ -448,10 +491,52 @@ async fn dag_converges_after_partition() {
     let a_addr: Multiaddr = nodes[0].config.network.listen_addr.parse().unwrap();
     let b_addr: Multiaddr = nodes[1].config.network.listen_addr.parse().unwrap();
 
-    connect(&mut rejoiner, a_pid, a_addr);
-    connect(&mut rejoiner, b_pid, b_addr);
-    connect(&mut nodes[0], r_pid, r_addr.clone());
-    connect(&mut nodes[1], r_pid, r_addr);
+    // Rejoiner dials both existing nodes (one-sided); existing nodes
+    // just register the rejoiner's address. Gossipsub explicit_peer
+    // is set on BOTH sides so the mesh forms fresh for the rejoiner
+    // — it was never previously connected, so the existing nodes have
+    // no mesh membership for it yet. Setting explicit_peer on the
+    // existing-nodes side does NOT re-trigger a simultaneous dial
+    // here because the dial below completes first (explicit_peer
+    // DialOpts use `PeerCondition::DisconnectedAndNotDialing` — the
+    // already-connecting peer is a no-op).
+    let (a_slice, bc_slice) = nodes.split_at_mut(1);
+    connect_one_sided(
+        &mut rejoiner,
+        r_pid,
+        r_addr.clone(),
+        &mut a_slice[0],
+        a_pid,
+        a_addr,
+    );
+    connect_one_sided(
+        &mut rejoiner,
+        r_pid,
+        r_addr,
+        &mut bc_slice[0],
+        b_pid,
+        b_addr,
+    );
+    rejoiner
+        .swarm
+        .behaviour_mut()
+        .gossipsub
+        .add_explicit_peer(&a_pid);
+    rejoiner
+        .swarm
+        .behaviour_mut()
+        .gossipsub
+        .add_explicit_peer(&b_pid);
+    a_slice[0]
+        .swarm
+        .behaviour_mut()
+        .gossipsub
+        .add_explicit_peer(&r_pid);
+    bc_slice[0]
+        .swarm
+        .behaviour_mut()
+        .gossipsub
+        .add_explicit_peer(&r_pid);
 
     // Let mesh form between rejoiner and existing nodes.
     {
@@ -539,8 +624,9 @@ async fn rejoined_node_catches_up_via_sync_protocol() {
     let b_addr = wait_for_listen(&mut b).await;
     let a_pid = a.peer_id;
     let b_pid = b.peer_id;
-    connect(&mut a, b_pid, b_addr.clone());
-    connect(&mut b, a_pid, a_addr.clone());
+    // One-sided connect to avoid the simultaneous-dial race that was
+    // the documented flake source (libp2p-tcp Noise "input error").
+    connect_one_sided(&mut a, a_pid, a_addr.clone(), &mut b, b_pid, b_addr.clone());
     {
         let mut refs: Vec<&mut DdsNode> = vec![&mut a, &mut b];
         pump_many_production(&mut refs, MESH_FORMATION_TIMEOUT).await;
@@ -553,21 +639,12 @@ async fn rejoined_node_catches_up_via_sync_protocol() {
     let op2 = op_for(&t2);
     publish_attest(&mut b, &op2, &t2);
 
-    // Pump A/B for the propagation window. Two paths can converge them:
-    //   (1) gossipsub deliveries between explicit peers
-    //   (2) the sync protocol triggered by ConnectionEstablished
-    // Re-issue force_sync periodically as a hedge: under parallel-test
-    // CPU contention the very first request_response send_request can
-    // race the protocol negotiation and the dial, surfacing as a
-    // `DialFailure`. The call is cheap and idempotent.
-    let sync_deadline = Instant::now() + PROPAGATION_TIMEOUT * 2;
-    let mut last_resync = Instant::now();
+    // Pump A/B for the propagation window. The production handler
+    // on ConnectionEstablished calls try_sync_with, which pulls
+    // whatever the peer has that we don't. Gossipsub also carries
+    // ops over the same connection. Either path is sufficient.
+    let sync_deadline = Instant::now() + PROPAGATION_TIMEOUT;
     while Instant::now() < sync_deadline {
-        if last_resync.elapsed() > Duration::from_millis(500) {
-            a.force_sync_with(b_pid);
-            b.force_sync_with(a_pid);
-            last_resync = Instant::now();
-        }
         {
             let mut refs: Vec<&mut DdsNode> = vec![&mut a, &mut b];
             pump_many_production(&mut refs, Duration::from_millis(100)).await;
@@ -596,26 +673,20 @@ async fn rejoined_node_catches_up_via_sync_protocol() {
     let (mut c, _cd) = spawn_node("multinode-sync").await;
     let c_addr = wait_for_listen(&mut c).await;
     let c_pid = c.peer_id;
-    connect(&mut c, a_pid, a_addr);
-    connect(&mut c, b_pid, b_addr);
-    connect(&mut a, c_pid, c_addr.clone());
-    connect(&mut b, c_pid, c_addr);
+    // Rejoining node C is the initiator toward A and B — one-sided
+    // dials avoid the race. A and B only register C's address.
+    connect_one_sided(&mut c, c_pid, c_addr.clone(), &mut a, a_pid, a_addr);
+    connect_one_sided(&mut c, c_pid, c_addr, &mut b, b_pid, b_addr);
 
     // Drive all three nodes. NO additional publish happens after this
-    // — convergence is purely the sync protocol's job. Re-issue C's sync
-    // requests periodically as a defense against the request landing
-    // before request_response negotiation completes.
-    let c_deadline = Instant::now() + PROPAGATION_TIMEOUT * 2;
-    let mut last_resync = Instant::now() - Duration::from_secs(60);
+    // — convergence is purely the sync protocol's job. The production
+    // ConnectionEstablished handler issues try_sync_with when C's
+    // dials land, which pulls both ops in one round-trip each.
+    let c_deadline = Instant::now() + PROPAGATION_TIMEOUT;
     while Instant::now() < c_deadline {
-        if last_resync.elapsed() > Duration::from_millis(150) {
-            c.force_sync_with(a_pid);
-            c.force_sync_with(b_pid);
-            last_resync = Instant::now();
-        }
         {
             let mut refs: Vec<&mut DdsNode> = vec![&mut a, &mut b, &mut c];
-            pump_many_production(&mut refs, Duration::from_millis(50)).await;
+            pump_many_production(&mut refs, Duration::from_millis(100)).await;
         }
         if c.dag.contains(&op1.id) && c.dag.contains(&op2.id) {
             return;
