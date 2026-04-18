@@ -34,6 +34,10 @@ heapless = { version = "0.8", features = ["serde"] }
 serde_bytes = { version = "0.11", default-features = false, features = ["alloc"] }
 rand_core = { version = "0.6", default-features = false }
 
+# Crypto helpers
+subtle = { version = "2", default-features = false }
+zeroize = { version = "1", features = ["derive"] }
+
 # Storage
 redb = "2"
 

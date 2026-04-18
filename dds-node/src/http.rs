@@ -21,13 +21,15 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::service::{
@@ -87,6 +89,67 @@ impl<
 /// TTL for server-issued FIDO2 challenges (5 minutes).
 const CHALLENGE_TTL_SECS: u64 = 300;
 
+/// **M-11 (security review)**: cap inbound JSON bodies. The Axum
+/// default is 2 MB; 256 KB is generous for the largest legitimate
+/// payload here (FIDO2 attestation objects with large authenticator
+/// extensions) and prevents an attacker from forcing the deserializer
+/// to allocate huge buffers before any app-layer filter fires.
+const HTTP_MAX_BODY_BYTES: usize = 256 * 1024;
+
+/// **M-3 (security review)**: lightweight global token-bucket rate limit
+/// applied to every HTTP request. Loopback-only API, so a single counter
+/// is adequate defense-in-depth against pathological floods of
+/// CPU-heavy paths (FIDO2 verification, policy evaluation) by a local
+/// process. 60 req/s sustained, 60 burst. Returns HTTP 429.
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
+const RATE_LIMIT_BURST: u32 = 60;
+
+#[derive(Debug)]
+struct GlobalRateLimiter {
+    inner: StdMutex<(Instant, u32)>,
+}
+
+impl GlobalRateLimiter {
+    fn new() -> Self {
+        Self {
+            inner: StdMutex::new((Instant::now(), 0)),
+        }
+    }
+
+    /// Returns true if a request is permitted right now.
+    fn check(&self) -> bool {
+        let now = Instant::now();
+        let mut g = match self.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if now.duration_since(g.0) >= RATE_LIMIT_WINDOW {
+            *g = (now, 1);
+            true
+        } else if g.1 < RATE_LIMIT_BURST {
+            g.1 += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+async fn rate_limit_middleware(
+    State(rl): State<Arc<GlobalRateLimiter>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !rl.check() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "rate_limited"})),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
 /// Build the axum router for the local API.
 pub fn router<S>(svc: SharedService<S>, info: NodeInfo) -> Router
 where
@@ -100,6 +163,7 @@ where
         + 'static,
 {
     let state = AppState { svc, info };
+    let rate_limiter = Arc::new(GlobalRateLimiter::new());
     Router::new()
         .route("/v1/enroll/user", post(enroll_user::<S>))
         .route("/v1/enroll/device", post(enroll_device::<S>))
@@ -127,6 +191,13 @@ where
         .route("/v1/macos/applied", post(record_macos_applied::<S>))
         .route("/v1/audit/entries", get(list_audit_entries::<S>))
         .with_state(state)
+        // M-3: rate limit before any handler runs.
+        .layer(axum::middleware::from_fn_with_state(
+            rate_limiter,
+            rate_limit_middleware,
+        ))
+        // M-11: bound deserialization input size.
+        .layer(DefaultBodyLimit::max(HTTP_MAX_BODY_BYTES))
 }
 
 // ---------- request/response types ----------
@@ -305,13 +376,23 @@ impl HttpError {
 
 impl From<ServiceError> for HttpError {
     fn from(e: ServiceError) -> Self {
-        let status = match e {
-            ServiceError::Fido2(_) => StatusCode::UNAUTHORIZED,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        // **L-9 (security review)**: classify the error coarsely for
+        // the response — never expose the inner message, which can
+        // contain trust-graph contents ("credential X not found",
+        // "challenge expired") that aid an attacker. Full detail is
+        // logged server-side at error level.
+        let (status, code) = match &e {
+            ServiceError::Fido2(_) => (StatusCode::UNAUTHORIZED, "auth_failed"),
+            ServiceError::Trust(_) => (StatusCode::FORBIDDEN, "permission_denied"),
+            ServiceError::Policy(_) => (StatusCode::FORBIDDEN, "permission_denied"),
+            ServiceError::Token(_) => (StatusCode::BAD_REQUEST, "invalid_input"),
+            ServiceError::Domain(_) => (StatusCode::BAD_REQUEST, "invalid_input"),
+            ServiceError::Store(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };
+        tracing::warn!(error = %e, code, "service error returned to client");
         Self {
             status,
-            message: e.to_string(),
+            message: code.to_string(),
         }
     }
 }
@@ -668,6 +749,10 @@ where
         + Sync
         + 'static,
 {
+    // M-8 (security review): until per-device session tokens land,
+    // log every policy enumeration so any cross-device probing is
+    // visible in the audit trail.
+    tracing::info!(device_urn = %q.device_urn, "list_windows_policies");
     let svc = state.svc.lock().await;
     let policies = svc.list_applicable_windows_policies(&q.device_urn)?;
     Ok(Json(WindowsPoliciesResponse { policies }))
@@ -687,6 +772,7 @@ where
         + Sync
         + 'static,
 {
+    tracing::info!(device_urn = %q.device_urn, "list_windows_software");
     let svc = state.svc.lock().await;
     let software = svc.list_applicable_software(&q.device_urn)?;
     Ok(Json(WindowsSoftwareResponse { software }))
@@ -765,6 +851,7 @@ where
         + Sync
         + 'static,
 {
+    tracing::info!(device_urn = %q.device_urn, "list_macos_policies");
     let svc = state.svc.lock().await;
     let policies = svc.list_applicable_macos_policies(&q.device_urn)?;
     Ok(Json(MacOsPoliciesResponse { policies }))
@@ -784,6 +871,7 @@ where
         + Sync
         + 'static,
 {
+    tracing::info!(device_urn = %q.device_urn, "list_macos_software");
     let svc = state.svc.lock().await;
     let software = svc.list_applicable_software(&q.device_urn)?;
     Ok(Json(MacOsSoftwareResponse { software }))
@@ -932,7 +1020,36 @@ mod tests {
             &root.signing_key,
         )
         .unwrap();
+        let attest_hash = attest.payload_hash();
         graph.add_token(attest).unwrap();
+        // C-3: seed publisher capabilities so the policy/software list
+        // endpoints accept root-issued documents in tests.
+        for purpose in [
+            dds_core::token::purpose::POLICY_PUBLISHER_WINDOWS,
+            dds_core::token::purpose::POLICY_PUBLISHER_MACOS,
+            dds_core::token::purpose::SOFTWARE_PUBLISHER,
+        ] {
+            let v = Token::sign(
+                TokenPayload {
+                    iss: root.id.to_urn(),
+                    iss_key: root.public_key.clone(),
+                    jti: format!("vouch-self-root-{}", purpose.replace(':', "-")),
+                    sub: root.id.to_urn(),
+                    kind: TokenKind::Vouch,
+                    purpose: Some(purpose.to_string()),
+                    vch_iss: Some(root.id.to_urn()),
+                    vch_sum: Some(attest_hash.clone()),
+                    revokes: None,
+                    iat: 1000,
+                    exp: Some(4102444800),
+                    body_type: None,
+                    body_cbor: None,
+                },
+                &root.signing_key,
+            )
+            .unwrap();
+            graph.add_token(v).unwrap();
+        }
         let shared_graph = std::sync::Arc::new(std::sync::RwLock::new(graph));
         let svc = LocalService::new(node_ident, shared_graph, roots, MemoryBackend::new());
         TestState {
@@ -1515,6 +1632,13 @@ mod tests {
         };
         claim_policy.embed(&mut payload).unwrap();
         let claim_token = Token::sign(payload, &admin.signing_key).unwrap();
+        // C-3: grant the claim-policy admin a publisher capability.
+        seed_publisher_capabilities(
+            &state,
+            &admin,
+            &[dds_core::token::purpose::POLICY_PUBLISHER_WINDOWS],
+        )
+        .await;
         {
             let svc = state.svc.lock().await;
             svc.trust_graph
@@ -1669,11 +1793,87 @@ mod tests {
         pkg.embed(&mut sw_payload).unwrap();
         let sw_token = Token::sign(sw_payload, &admin.signing_key).unwrap();
 
+        // C-3: register admin as trusted root + grant publisher capabilities
+        // via self-vouches so the list endpoints accept these issuers.
+        seed_publisher_capabilities(
+            state,
+            &admin,
+            &[
+                dds_core::token::purpose::POLICY_PUBLISHER_WINDOWS,
+                dds_core::token::purpose::SOFTWARE_PUBLISHER,
+            ],
+        )
+        .await;
+
         let svc = state.svc.lock().await;
         let mut g = svc.trust_graph.write().unwrap();
         g.add_token(policy_token).unwrap();
         g.add_token(sw_token).unwrap();
         device_urn
+    }
+
+    /// Test helper: register `admin` as a trusted root and self-vouch
+    /// the requested publisher capabilities (C-3 in the security review).
+    async fn seed_publisher_capabilities(
+        state: &AppState<MemoryBackend>,
+        admin: &Identity,
+        purposes: &[&str],
+    ) {
+        use dds_core::token::{Token, TokenKind, TokenPayload};
+
+        {
+            let mut svc = state.svc.lock().await;
+            svc.insert_trusted_root_for_test(admin.id.to_urn());
+        }
+        let admin_attest = Token::sign(
+            TokenPayload {
+                iss: admin.id.to_urn(),
+                iss_key: admin.public_key.clone(),
+                jti: format!("attest-publisher-{}", admin.id.label()),
+                sub: admin.id.to_urn(),
+                kind: TokenKind::Attest,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat: 1_700_000_000,
+                exp: Some(4_102_444_800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &admin.signing_key,
+        )
+        .unwrap();
+        let admin_attest_hash = admin_attest.payload_hash();
+        let svc = state.svc.lock().await;
+        let mut g = svc.trust_graph.write().unwrap();
+        g.add_token(admin_attest).unwrap();
+        for purpose in purposes {
+            let v = Token::sign(
+                TokenPayload {
+                    iss: admin.id.to_urn(),
+                    iss_key: admin.public_key.clone(),
+                    jti: format!(
+                        "vouch-self-{}-{}",
+                        admin.id.label(),
+                        purpose.replace(':', "-")
+                    ),
+                    sub: admin.id.to_urn(),
+                    kind: TokenKind::Vouch,
+                    purpose: Some(purpose.to_string()),
+                    vch_iss: Some(admin.id.to_urn()),
+                    vch_sum: Some(admin_attest_hash.clone()),
+                    revokes: None,
+                    iat: 1_700_000_000,
+                    exp: Some(4_102_444_800),
+                    body_type: None,
+                    body_cbor: None,
+                },
+                &admin.signing_key,
+            )
+            .unwrap();
+            g.add_token(v).unwrap();
+        }
     }
 
     /// Seed the test state with a macOS device join + a macOS policy and
@@ -1779,6 +1979,17 @@ mod tests {
         };
         pkg.embed(&mut sw_payload).unwrap();
         let sw_token = Token::sign(sw_payload, &admin.signing_key).unwrap();
+
+        // C-3: same publisher-capability seeding as the Windows path.
+        seed_publisher_capabilities(
+            state,
+            &admin,
+            &[
+                dds_core::token::purpose::POLICY_PUBLISHER_MACOS,
+                dds_core::token::purpose::SOFTWARE_PUBLISHER,
+            ],
+        )
+        .await;
 
         let svc = state.svc.lock().await;
         let mut g = svc.trust_graph.write().unwrap();

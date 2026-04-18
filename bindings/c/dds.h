@@ -5,6 +5,15 @@
  * All functions use JSON strings for complex data exchange.
  * Caller must free returned strings with dds_free_string().
  * Return values: 0 = success, negative = error code.
+ *
+ * Pointer-safety contract (security review C-1):
+ *   - Every `const char*` input MUST be a valid NUL-terminated C string.
+ *     Passing NULL yields DDS_ERR_INVALID_INPUT without dereferencing.
+ *   - Every `char** out` output MUST be a valid writable pointer to a
+ *     `char*` location. Passing NULL yields DDS_ERR_INVALID_INPUT.
+ *   - dds_free_string is null-safe: passing NULL is a no-op.
+ *   - These checks make buggy bindings (NULL-passing) return an error
+ *     code rather than crashing the host process.
  */
 
 #ifndef DDS_H

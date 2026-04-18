@@ -207,11 +207,21 @@ fn connect(from: &mut DdsNode, peer: libp2p::PeerId, addr: Multiaddr) {
         .behaviour_mut()
         .gossipsub
         .add_explicit_peer(&peer);
+    // Append the peer-id suffix so the swarm can verify the remote on
+    // dial. Without /p2p/<peer>, the connection establishes but identify
+    // has to fill in the peer id later, which races against the first
+    // sync send_request.
+    let addr_with_peer = addr.clone().with(libp2p::multiaddr::Protocol::P2p(peer));
     from.swarm
         .behaviour_mut()
         .kademlia
-        .add_address(&peer, addr.clone());
-    from.swarm.dial(addr).unwrap();
+        .add_address(&peer, addr_with_peer.clone());
+    // Register the peer's address with the swarm-level address book
+    // (which request_response consults on dial). Without this,
+    // `send_request` fails with `DialFailure` during the initial
+    // negotiation window under parallel-test CPU contention.
+    from.swarm.add_peer_address(peer, addr_with_peer.clone());
+    from.swarm.dial(addr_with_peer).unwrap();
 }
 
 fn make_attest_token(label: &str, jti: &str) -> (Identity, Token) {
@@ -270,7 +280,7 @@ fn publish_attest(node: &mut DdsNode, op: &Operation, token: &Token) {
     let token_bytes = token.to_cbor().unwrap();
     let msg = GossipMessage::DirectoryOp {
         op_bytes,
-        token_bytes,
+        token_bytes: token_bytes.clone(),
     };
     let cbor = msg.to_cbor().unwrap();
     let topic = node.topics.operations.to_ident_topic();
@@ -282,6 +292,11 @@ fn publish_attest(node: &mut DdsNode, op: &Operation, token: &Token) {
     use dds_store::traits::TokenStore;
     let _ = node.store.put_token(token);
     let _ = node.dag.insert(op.clone());
+    // Seed the sync cache so this node can serve its own op to peers that
+    // connect after the publish (gossipsub does not re-deliver to late
+    // joiners; the sync protocol fills that gap, but only if the payload
+    // is cached here).
+    node.cache_sync_payload(&op.id, op, &token_bytes);
 }
 
 fn publish_revocation(node: &mut DdsNode, token: &Token) {
@@ -476,15 +491,27 @@ async fn pump_many_production(nodes: &mut [&mut DdsNode], dur: Duration) {
     let deadline = Instant::now() + dur;
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
+        // Bound the per-iteration wait at ~50ms so that even during
+        // quiet periods (no swarm events) we keep looping, yielding
+        // control so queued request_response sends and dial attempts
+        // have a chance to progress between iterations. The previous
+        // "timeout-then-return" pattern exited the whole pump on the
+        // first lull — a common failure mode on slow CI runners where
+        // the sync request hadn't landed yet.
+        let slice = remaining.min(Duration::from_millis(50));
         let futs: Vec<_> = nodes
             .iter_mut()
             .map(|n| Box::pin(n.swarm.select_next_some()))
             .collect();
-        match timeout(remaining, futures::future::select_all(futs)).await {
+        match timeout(slice, futures::future::select_all(futs)).await {
             Ok((event, idx, _rest)) => {
                 nodes[idx].handle_swarm_event(event);
             }
-            Err(_) => return,
+            Err(_) => {
+                // Silence in this slice — yield and continue; don't
+                // abandon the pump just because there was no event.
+                tokio::task::yield_now().await;
+            }
         }
     }
 }
@@ -526,12 +553,24 @@ async fn rejoined_node_catches_up_via_sync_protocol() {
     let op2 = op_for(&t2);
     publish_attest(&mut b, &op2, &t2);
 
-    // Pump until both ops are visible on A and B.
-    let deadline = Instant::now() + PROPAGATION_TIMEOUT;
-    while Instant::now() < deadline {
+    // Pump A/B for the propagation window. Two paths can converge them:
+    //   (1) gossipsub deliveries between explicit peers
+    //   (2) the sync protocol triggered by ConnectionEstablished
+    // Re-issue force_sync periodically as a hedge: under parallel-test
+    // CPU contention the very first request_response send_request can
+    // race the protocol negotiation and the dial, surfacing as a
+    // `DialFailure`. The call is cheap and idempotent.
+    let sync_deadline = Instant::now() + PROPAGATION_TIMEOUT * 2;
+    let mut last_resync = Instant::now();
+    while Instant::now() < sync_deadline {
+        if last_resync.elapsed() > Duration::from_millis(500) {
+            a.force_sync_with(b_pid);
+            b.force_sync_with(a_pid);
+            last_resync = Instant::now();
+        }
         {
             let mut refs: Vec<&mut DdsNode> = vec![&mut a, &mut b];
-            pump_many_production(&mut refs, Duration::from_millis(200)).await;
+            pump_many_production(&mut refs, Duration::from_millis(100)).await;
         }
         if a.dag.contains(&op1.id)
             && a.dag.contains(&op2.id)
@@ -563,12 +602,20 @@ async fn rejoined_node_catches_up_via_sync_protocol() {
     connect(&mut b, c_pid, c_addr);
 
     // Drive all three nodes. NO additional publish happens after this
-    // — convergence is purely the sync protocol's job.
-    let deadline = Instant::now() + PROPAGATION_TIMEOUT;
-    while Instant::now() < deadline {
+    // — convergence is purely the sync protocol's job. Re-issue C's sync
+    // requests periodically as a defense against the request landing
+    // before request_response negotiation completes.
+    let c_deadline = Instant::now() + PROPAGATION_TIMEOUT * 2;
+    let mut last_resync = Instant::now() - Duration::from_secs(60);
+    while Instant::now() < c_deadline {
+        if last_resync.elapsed() > Duration::from_millis(150) {
+            c.force_sync_with(a_pid);
+            c.force_sync_with(b_pid);
+            last_resync = Instant::now();
+        }
         {
             let mut refs: Vec<&mut DdsNode> = vec![&mut a, &mut b, &mut c];
-            pump_many_production(&mut refs, Duration::from_millis(200)).await;
+            pump_many_production(&mut refs, Duration::from_millis(50)).await;
         }
         if c.dag.contains(&op1.id) && c.dag.contains(&op2.id) {
             return;

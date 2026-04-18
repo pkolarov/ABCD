@@ -22,6 +22,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
+use zeroize::Zeroize;
 
 /// Request to enroll a user via FIDO2 attestation.
 #[derive(Debug, Clone)]
@@ -274,6 +276,12 @@ pub struct LocalService<
     pub trust_graph: Arc<RwLock<TrustGraph>>,
     /// Trusted root URNs.
     trusted_roots: BTreeSet<String>,
+    /// **H-8 (security review)**: the URN of the bootstrap admin (the
+    /// first principal added to `trusted_roots` via `admin_setup`).
+    /// Bootstrap admin can vouch for any purpose; non-bootstrap admins
+    /// must possess a `dds:admin-vouch:<purpose>` capability before
+    /// they can vouch for `<purpose>`.
+    bootstrap_admin_urn: Option<String>,
     /// Storage backend.
     store: S,
     /// Data directory for admin key storage (None in test/bench contexts).
@@ -282,6 +290,11 @@ pub struct LocalService<
     config_path: Option<PathBuf>,
     /// Node start time.
     start_time: u64,
+    /// **M-19 (security review)**: monotonic snapshot of `SystemTime::now()`
+    /// at service construction. If a later `now()` is *less* than this,
+    /// the system clock has regressed (NTP backstep, VM snapshot rewind)
+    /// and we refuse session/challenge validations to avoid replays.
+    boot_wall_time: SystemTime,
     /// Whether to verify FIDO2 attestation on enroll_user.
     verify_fido2: bool,
 }
@@ -323,10 +336,12 @@ impl<
             policy_engine: PolicyEngine::new(),
             trust_graph,
             trusted_roots,
+            bootstrap_admin_urn: None,
             store,
             data_dir: None,
             config_path: None,
             start_time: now_epoch(),
+            boot_wall_time: SystemTime::now(),
             verify_fido2: true,
         };
         // Best-effort rehydration: pull any pre-existing tokens from the
@@ -409,6 +424,16 @@ impl<
     /// Set the config file path so trusted_roots changes can be persisted.
     pub fn set_config_path(&mut self, path: PathBuf) {
         self.config_path = Some(path);
+    }
+
+    /// Test/internal accessor: insert a URN into the trusted_roots set.
+    /// Used by integration tests that need to seed multiple admins
+    /// without going through the bootstrap-gated `admin_setup`.
+    /// **Not** intended for production callers — production code adds
+    /// admins via `admin_setup` (initial) or `admin_vouch` (subsequent).
+    #[doc(hidden)]
+    pub fn insert_trusted_root_for_test(&mut self, urn: String) {
+        self.trusted_roots.insert(urn);
     }
 
     /// Persist the current trusted_roots back to the TOML config file.
@@ -721,6 +746,26 @@ impl<
             if matches!(doc.enforcement, Enforcement::Disabled) {
                 continue;
             }
+            // C-3 (security review): the issuer of an attestation that
+            // embeds a WindowsPolicyDocument must hold the
+            // `dds:policy-publisher-windows` capability via a vouch
+            // chain back to a trusted root. Without this filter, any
+            // libp2p peer that completed the Noise handshake could
+            // gossip a self-signed token containing arbitrary policy
+            // (registry edits, account creation) and have it served to
+            // every Policy Agent in the domain.
+            if !g.has_purpose(
+                &token.payload.iss,
+                dds_core::token::purpose::POLICY_PUBLISHER_WINDOWS,
+                &self.trusted_roots,
+            ) {
+                tracing::warn!(
+                    jti = %token.payload.jti,
+                    issuer = %token.payload.iss,
+                    "rejecting Windows policy: issuer lacks dds:policy-publisher-windows capability"
+                );
+                continue;
+            }
             if !scope_matches(&doc.scope, device_urn, &device_tags, device_ou.as_deref()) {
                 continue;
             }
@@ -765,6 +810,19 @@ impl<
             if matches!(doc.enforcement, Enforcement::Disabled) {
                 continue;
             }
+            // C-3: same publisher capability gate as Windows policies.
+            if !g.has_purpose(
+                &token.payload.iss,
+                dds_core::token::purpose::POLICY_PUBLISHER_MACOS,
+                &self.trusted_roots,
+            ) {
+                tracing::warn!(
+                    jti = %token.payload.jti,
+                    issuer = %token.payload.iss,
+                    "rejecting macOS policy: issuer lacks dds:policy-publisher-macos capability"
+                );
+                continue;
+            }
             if !scope_matches(&doc.scope, device_urn, &device_tags, device_ou.as_deref()) {
                 continue;
             }
@@ -805,6 +863,19 @@ impl<
                     continue;
                 }
             };
+            // C-3: same publisher capability gate.
+            if !g.has_purpose(
+                &token.payload.iss,
+                dds_core::token::purpose::SOFTWARE_PUBLISHER,
+                &self.trusted_roots,
+            ) {
+                tracing::warn!(
+                    jti = %token.payload.jti,
+                    issuer = %token.payload.iss,
+                    "rejecting software assignment: issuer lacks dds:software-publisher capability"
+                );
+                continue;
+            }
             if !scope_matches(&doc.scope, device_urn, &device_tags, device_ou.as_deref()) {
                 continue;
             }
@@ -922,6 +993,20 @@ impl<
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use dds_domain::fido2::{cose_to_credential_public_key, verify_assertion};
         use sha2::{Digest, Sha256};
+
+        // M-19 (security review): refuse if the wall clock has regressed
+        // since startup. NTP backstep or VM snapshot-restore could
+        // un-expire a previously-consumed challenge or session. Compare
+        // against the boot snapshot — `consume_challenge` itself uses
+        // wall time below, so a regression there would silently re-validate
+        // an already-spent challenge.
+        if let Err(_e) = SystemTime::now().duration_since(self.boot_wall_time) {
+            return Err(ServiceError::Fido2(
+                "system clock regressed since service startup; \
+                 refusing FIDO2 assertion to avoid challenge / session replay"
+                    .to_string(),
+            ));
+        }
 
         // 1. Look up the credential's public key and enrolled RP-ID from the trust graph.
         let (subject_urn, public_key, enrolled_rp_id) = {
@@ -1172,10 +1257,40 @@ impl<
     /// `<data_dir>/admin_keys/` encrypted with AES-256-GCM keyed from
     /// the node's own signing key. The admin's URN is added to the
     /// in-memory `trusted_roots` set.
+    ///
+    /// **C-2 (security review)**: bootstrap is gated by an out-of-band
+    /// sentinel file at `<data_dir>/.bootstrap`. The endpoint refuses
+    /// every call unless the sentinel exists, AND refuses to add a
+    /// second bootstrap admin once `trusted_roots` is non-empty.
+    /// On success the sentinel is removed atomically. Operators must
+    /// `touch <data_dir>/.bootstrap` (or use the MSI/launchd installer
+    /// hook) before the first call. This blocks the LPE attack where
+    /// a local unprivileged process self-enrolled as admin and then
+    /// vouched themselves arbitrary purposes.
+    ///
+    /// Subsequent admins MUST be added via `admin_vouch` from an
+    /// existing admin (which itself is capability-gated; see H-8).
     pub fn admin_setup(
         &mut self,
         req: AdminSetupRequest,
     ) -> Result<EnrollmentResult, ServiceError> {
+        // C-2: gate.
+        if !self.trusted_roots.is_empty() {
+            return Err(ServiceError::Trust(
+                "admin_setup: a bootstrap admin already exists; \
+                 use admin_vouch to add additional admins"
+                    .to_string(),
+            ));
+        }
+        let sentinel = self.bootstrap_sentinel_path()?;
+        if !sentinel.exists() {
+            return Err(ServiceError::Trust(format!(
+                "admin_setup: bootstrap sentinel '{}' is absent — \
+                 the operator must `touch` it before the first admin_setup call",
+                sentinel.display()
+            )));
+        }
+
         // Step 1: enroll the admin exactly like a normal user.
         // We need the generated identity to persist the signing key,
         // so we inline the enrollment logic here.
@@ -1234,8 +1349,23 @@ impl<
 
         // Step 3: add to trusted_roots in memory and persist to config.
         self.trusted_roots.insert(admin_urn.clone());
+        // C-2 + H-8: this is THE bootstrap admin (we already refused if any
+        // admin existed). Record it so admin_vouch can let the bootstrap
+        // admin act unconstrained while constraining sub-admins.
+        self.bootstrap_admin_urn = Some(admin_urn.clone());
         if let Err(e) = self.persist_trusted_roots() {
             tracing::warn!(error = %e, "failed to persist trusted_roots to config file (in-memory update still applies)");
+        }
+        // C-2: consume the sentinel atomically. If removal fails (read-only fs?)
+        // we still proceed — the trusted_roots non-empty check is a sufficient
+        // gate against a second admin_setup, and the operator can clean up
+        // the file out-of-band.
+        if let Err(e) = std::fs::remove_file(&sentinel) {
+            tracing::warn!(
+                path = %sentinel.display(),
+                error = %e,
+                "admin_setup succeeded but bootstrap sentinel removal failed; please remove manually"
+            );
         }
         tracing::info!(admin_urn = %admin_urn, "admin identity registered and added to trusted roots");
 
@@ -1244,6 +1374,20 @@ impl<
             jti: token.payload.jti.clone(),
             token_cbor: cbor,
         })
+    }
+
+    /// Resolve the path to the bootstrap sentinel file. Used by C-2:
+    /// the file must exist before `admin_setup` can succeed and is
+    /// consumed on success.
+    fn bootstrap_sentinel_path(&self) -> Result<PathBuf, ServiceError> {
+        let dir = self.data_dir.as_ref().ok_or_else(|| {
+            ServiceError::Store(
+                "admin_setup requires data_dir to be configured \
+                 (so the bootstrap sentinel can be located)"
+                    .to_string(),
+            )
+        })?;
+        Ok(dir.join(".bootstrap"))
     }
 
     /// Admin vouches for an enrolled user. The admin proves presence via
@@ -1274,6 +1418,42 @@ impl<
             )));
         }
 
+        // H-8 (security review): capability-gate the vouch.
+        //
+        // The bootstrap admin (the principal that completed `admin_setup`)
+        // can vouch for any purpose. Any other admin in `trusted_roots`
+        // must hold a vouch from the bootstrap admin with purpose
+        // `dds:admin-vouch:<requested-purpose>`. This blocks the
+        // composed attack from C-2 + previous behaviour where the first
+        // local process to self-enroll as admin obtained unlimited
+        // vouching power over the entire domain.
+        let requested_purpose = req
+            .purpose
+            .clone()
+            .unwrap_or_else(|| "dds:session".to_string());
+        let is_bootstrap_admin = self
+            .bootstrap_admin_urn
+            .as_deref()
+            .map(|b| b == admin_urn)
+            .unwrap_or(false);
+        if !is_bootstrap_admin {
+            let cap = format!("dds:admin-vouch:{requested_purpose}");
+            let allowed = {
+                let g = self
+                    .trust_graph
+                    .read()
+                    .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+                g.has_purpose(&admin_urn, &cap, &self.trusted_roots)
+            };
+            if !allowed {
+                return Err(ServiceError::Trust(format!(
+                    "admin '{admin_urn}' lacks capability '{cap}' to vouch for purpose \
+                     '{requested_purpose}' — only the bootstrap admin or an admin holding \
+                     this capability vouch may vouch for this purpose"
+                )));
+            }
+        }
+
         // 8. Load admin's persisted signing key.
         let admin_signing_key = self.load_admin_key(&admin_urn)?;
 
@@ -1300,8 +1480,8 @@ impl<
         };
 
         // 10. Build and sign the vouch token.
-        let purpose = req.purpose.unwrap_or_else(|| "dds:session".to_string());
-        let vouch_jti = format!("vouch-{}", rand_u64());
+        let purpose = requested_purpose.clone();
+        let vouch_jti = format!("vouch-{}", Uuid::new_v4().simple());
         let admin_public_key = dds_core::crypto::PublicKeyBundle {
             scheme: dds_core::crypto::SchemeId::Ed25519,
             bytes: admin_signing_key.verifying_key().to_bytes().to_vec(),
@@ -1356,55 +1536,108 @@ impl<
     // ---- admin key persistence ----
 
     /// Persist an admin's Ed25519 signing key encrypted with AES-256-GCM.
-    /// The encryption key is derived from SHA-256(node_signing_key || "admin-key-wrap").
+    ///
+    /// **Wire format (security review M-22, L-10):**
+    ///   - Version byte (`0x02`) | 12-byte IV | AES-256-GCM ciphertext+tag
+    ///   - The wrap key is `SHA-256(node_signing_key || "admin-key-wrap")`
+    ///   - **AAD = `admin_urn` bytes** so that swapping one admin's key blob
+    ///     for another's fails the AEAD check (M-22 attack #2). Version 1
+    ///     blobs (no AAD) are still readable on load for backward compat.
+    ///
+    /// File mode is set to `0o600` (Unix). The containing directory is set
+    /// to `0o700`. Atomic write via tempfile + rename so a crash mid-write
+    /// can't leave a torn blob.
+    ///
+    /// Plaintext key material is zeroized after use.
+    ///
+    /// **TODO(security)**: bind the wrap key to OS-bound storage (DPAPI
+    /// on Windows, Keychain on macOS, TPM on Linux). Currently if the
+    /// node key file is compromised on disk, all admin keys fall too —
+    /// see M-22 in the security review for the deferred follow-up.
     fn store_admin_key(
         &self,
         admin_urn: &str,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(), ServiceError> {
+        const ADMIN_BLOB_VERSION: u8 = 0x02;
+
         let data_dir = self.data_dir.as_ref().ok_or_else(|| {
             ServiceError::Store("data_dir not set — cannot persist admin keys".to_string())
         })?;
         let dir = data_dir.join("admin_keys");
         std::fs::create_dir_all(&dir)
             .map_err(|e| ServiceError::Store(format!("create admin_keys dir: {e}")))?;
+        // M-22 / L-4: tighten directory perms (Unix only — Windows uses
+        // explicit ACLs on the parent ProgramData tree).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
 
-        let wrap_key = self.admin_wrap_key();
-        let plaintext = signing_key.to_bytes();
+        let mut wrap_key = self.admin_wrap_key();
+        // H-9: wrap plaintext in zeroize-on-drop wrapper before encrypt
+        // so an early return can't leave secret bytes on the heap.
+        let mut plaintext = signing_key.to_bytes();
 
-        // Generate random IV (12 bytes) and encrypt with AES-256-GCM.
-        let iv: [u8; 12] = {
-            let mut buf = [0u8; 12];
+        let mut iv = [0u8; 12];
+        {
             use rand::RngCore;
-            rand::rngs::OsRng.fill_bytes(&mut buf);
-            buf
-        };
+            rand::rngs::OsRng.fill_bytes(&mut iv);
+        }
 
-        use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead, aead::Payload};
         let cipher = Aes256Gcm::new_from_slice(&wrap_key)
             .map_err(|e| ServiceError::Store(format!("AES key init: {e}")))?;
         let nonce = Nonce::from_slice(&iv);
+        // M-22: bind ciphertext to admin_urn via AEAD AAD.
         let ciphertext = cipher
-            .encrypt(nonce, plaintext.as_ref())
-            .map_err(|e| ServiceError::Store(format!("AES encrypt: {e}")))?;
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext.as_ref(),
+                    aad: admin_urn.as_bytes(),
+                },
+            )
+            .map_err(|e| {
+                // Zeroize before returning the error.
+                plaintext.zeroize();
+                wrap_key.zeroize();
+                ServiceError::Store(format!("AES encrypt: {e}"))
+            })?;
+        plaintext.zeroize();
+        wrap_key.zeroize();
 
-        // Write: iv (12) || ciphertext+tag (32+16=48)
         let urn_hash = {
             use sha2::{Digest, Sha256};
             hex::encode(Sha256::digest(admin_urn.as_bytes()))
         };
         let path = dir.join(format!("{urn_hash}.key"));
-        let mut blob = Vec::with_capacity(12 + ciphertext.len());
+        let mut blob = Vec::with_capacity(1 + 12 + ciphertext.len());
+        blob.push(ADMIN_BLOB_VERSION);
         blob.extend_from_slice(&iv);
         blob.extend_from_slice(&ciphertext);
-        std::fs::write(&path, &blob)
-            .map_err(|e| ServiceError::Store(format!("write admin key: {e}")))?;
+
+        // L-3: atomic write — tempfile in same directory, then rename.
+        let tmp = tempfile::NamedTempFile::new_in(&dir)
+            .map_err(|e| ServiceError::Store(format!("admin key tempfile: {e}")))?;
+        std::fs::write(tmp.path(), &blob)
+            .map_err(|e| ServiceError::Store(format!("admin key tempfile write: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600));
+        }
+        tmp.persist(&path)
+            .map_err(|e| ServiceError::Store(format!("admin key persist: {e}")))?;
 
         tracing::debug!(path = %path.display(), "persisted admin signing key");
         Ok(())
     }
 
     /// Load an admin's Ed25519 signing key from encrypted storage.
+    /// Supports legacy v1 blobs (no version byte, no AAD) and current
+    /// v2 blobs (1-byte version `0x02`, AAD = admin_urn).
     fn load_admin_key(&self, admin_urn: &str) -> Result<ed25519_dalek::SigningKey, ServiceError> {
         let data_dir = self.data_dir.as_ref().ok_or_else(|| {
             ServiceError::Store("data_dir not set — cannot load admin keys".to_string())
@@ -1416,23 +1649,46 @@ impl<
         let path = data_dir.join("admin_keys").join(format!("{urn_hash}.key"));
         let blob = std::fs::read(&path)
             .map_err(|e| ServiceError::Store(format!("read admin key {}: {e}", path.display())))?;
-        if blob.len() < 12 + 32 {
-            return Err(ServiceError::Store("admin key file too short".to_string()));
-        }
 
-        let iv = &blob[..12];
-        let ciphertext = &blob[12..];
-
-        let wrap_key = self.admin_wrap_key();
-        use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead, aead::Payload};
+        let mut wrap_key = self.admin_wrap_key();
         let cipher = Aes256Gcm::new_from_slice(&wrap_key)
             .map_err(|e| ServiceError::Store(format!("AES key init: {e}")))?;
-        let nonce = Nonce::from_slice(iv);
-        let plaintext = cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| ServiceError::Store(format!("AES decrypt admin key: {e}")))?;
+
+        // Try v2 (versioned, AEAD bound to admin_urn) first.
+        let mut plaintext = if blob.first() == Some(&0x02) && blob.len() >= 1 + 12 + 16 {
+            let iv = &blob[1..13];
+            let ciphertext = &blob[13..];
+            let nonce = Nonce::from_slice(iv);
+            cipher
+                .decrypt(
+                    nonce,
+                    Payload {
+                        msg: ciphertext,
+                        aad: admin_urn.as_bytes(),
+                    },
+                )
+                .map_err(|e| ServiceError::Store(format!("AES decrypt admin key v2: {e}")))?
+        } else if blob.len() >= 12 + 32 + 16 {
+            // v1 legacy: no version byte, no AAD.
+            tracing::warn!(
+                path = %path.display(),
+                "loading legacy v1 admin key blob (no AAD); will be re-wrapped on next admin_setup"
+            );
+            let iv = &blob[..12];
+            let ciphertext = &blob[12..];
+            let nonce = Nonce::from_slice(iv);
+            cipher
+                .decrypt(nonce, ciphertext)
+                .map_err(|e| ServiceError::Store(format!("AES decrypt admin key v1: {e}")))?
+        } else {
+            wrap_key.zeroize();
+            return Err(ServiceError::Store("admin key file too short".to_string()));
+        };
+        wrap_key.zeroize();
 
         if plaintext.len() != 32 {
+            plaintext.zeroize();
             return Err(ServiceError::Store(format!(
                 "decrypted admin key is {} bytes, expected 32",
                 plaintext.len()
@@ -1440,7 +1696,10 @@ impl<
         }
         let mut key_bytes = [0u8; 32];
         key_bytes.copy_from_slice(&plaintext);
-        Ok(ed25519_dalek::SigningKey::from_bytes(&key_bytes))
+        plaintext.zeroize();
+        let key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+        key_bytes.zeroize();
+        Ok(key)
     }
 
     /// Derive the AES-256 wrapping key for admin key storage from the
@@ -1502,7 +1761,15 @@ impl<
         TokenPayload {
             iss: ident.id.to_urn(),
             iss_key: ident.public_key.clone(),
-            jti: format!("attest-{}", ident.id.label()),
+            // H-4 (security review): JTIs were `attest-<label>` —
+            // deterministic. Two enrollments with the same label
+            // collided, letting an attacker overwrite a legitimate
+            // attestation in the trust graph and corrupt issuer-keyed
+            // lookups. Suffix with a random UUID so JTIs are globally
+            // unique. Prior to this, `dds-core::trust::add_token` also
+            // silently overwrote duplicate JTIs; that has been
+            // tightened to reject duplicates outright (`DuplicateJti`).
+            jti: format!("attest-{}-{}", ident.id.label(), Uuid::new_v4().simple()),
             sub: ident.id.to_urn(),
             kind: TokenKind::Attest,
             purpose: None,
@@ -1637,7 +1904,73 @@ mod platform_applier_tests {
             roots.clone(),
             MemoryBackend::new(),
         );
+        // C-3: seed the trust graph with self-issued publisher
+        // capability vouches. The admin IS the trusted root in these
+        // tests, so a self-vouch is sufficient — production deployments
+        // would have a domain admin vouch for a separate publisher
+        // identity, but the chain validation logic treats both as
+        // equivalent (the chain terminates as soon as it hits a root).
+        let admin_attest = make_attest_for_publisher_setup(&admin);
+        let admin_attest_hash = admin_attest.payload_hash();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(admin_attest)
+            .unwrap();
+        for purpose in [
+            dds_core::token::purpose::POLICY_PUBLISHER_WINDOWS,
+            dds_core::token::purpose::POLICY_PUBLISHER_MACOS,
+            dds_core::token::purpose::SOFTWARE_PUBLISHER,
+        ] {
+            let v = make_self_vouch(&admin, &admin_attest_hash, purpose);
+            svc.trust_graph.write().unwrap().add_token(v).unwrap();
+        }
         (svc, admin, roots)
+    }
+
+    /// Test helper: create the attestation for the admin so vouches
+    /// targeting them have a `vch_sum` to verify against. Mirrors the
+    /// production `make_attest_payload` with a deterministic JTI.
+    fn make_attest_for_publisher_setup(admin: &Identity) -> Token {
+        let payload = TokenPayload {
+            iss: admin.id.to_urn(),
+            iss_key: admin.public_key.clone(),
+            jti: format!("attest-publisher-{}", admin.id.label()),
+            sub: admin.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1_700_000_000,
+            exp: Some(4_102_444_800),
+            body_type: None,
+            body_cbor: None,
+        };
+        Token::sign(payload, &admin.signing_key).unwrap()
+    }
+
+    fn make_self_vouch(admin: &Identity, target_hash: &str, purpose: &str) -> Token {
+        let payload = TokenPayload {
+            iss: admin.id.to_urn(),
+            iss_key: admin.public_key.clone(),
+            jti: format!(
+                "vouch-self-{}-{}",
+                admin.id.label(),
+                purpose.replace(':', "-")
+            ),
+            sub: admin.id.to_urn(),
+            kind: TokenKind::Vouch,
+            purpose: Some(purpose.to_string()),
+            vch_iss: Some(admin.id.to_urn()),
+            vch_sum: Some(target_hash.to_string()),
+            revokes: None,
+            iat: 1_700_000_000,
+            exp: Some(4_102_444_800),
+            body_type: None,
+            body_cbor: None,
+        };
+        Token::sign(payload, &admin.signing_key).unwrap()
     }
 
     /// Mint a self-signed attestation `Token` carrying a domain

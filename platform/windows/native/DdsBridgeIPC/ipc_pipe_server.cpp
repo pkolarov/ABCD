@@ -145,11 +145,25 @@ BOOL CIpcPipeServer::CreatePipeSecurity(
     _Out_ PSECURITY_DESCRIPTOR* ppSD,
     _Out_ PSECURITY_ATTRIBUTES* ppSA)
 {
-    // SDDL: Allow SYSTEM (SY) and INTERACTIVE (IU) full access, deny all others
-    // D: DACL
-    // (A;;GA;;;SY) - Allow Generic All to SYSTEM
-    // (A;;GA;;;IU) - Allow Generic All to INTERACTIVE (LogonUI sessions)
-    PCWSTR pszSDDL = L"D:(A;;GA;;;SY)(A;;GA;;;IU)";
+    // **H-5 (security review)**: SDDL tightened to SYSTEM-only.
+    //
+    // Rationale: the DDS Credential Provider runs in winlogon.exe, which
+    // executes as NT AUTHORITY\SYSTEM on the Windows secure desktop.
+    // The prior SDDL included `(A;;GA;;;IU)` which granted GENERIC_ALL
+    // to every INTERACTIVE user. On multi-user hosts (Terminal Server,
+    // Citrix, RDS) that let User B open the same pipe and race/read
+    // User A's FIDO2 assertion + plaintext password material in flight.
+    //
+    // Legitimate callers:
+    //   - The Credential Provider DLL, hosted in winlogon.exe / LogonUI →
+    //     SYSTEM. Covered by `SY`.
+    //   - The DdsAuthBridge service, registered as LocalSystem by the MSI
+    //     (see platform/windows/installer/DdsBundle.wxs). Covered by `SY`.
+    //
+    // If a future platform change runs the bridge under a dedicated
+    // service SID, add a narrowly-scoped ACE for that SID here rather
+    // than widening back to IU.
+    PCWSTR pszSDDL = L"D:(A;;GA;;;SY)";
 
     PSECURITY_DESCRIPTOR pSD = nullptr;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(

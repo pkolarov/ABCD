@@ -25,14 +25,33 @@ pub const DDS_ERR_POLICY_DENIED: i32 = -5;
 pub const DDS_ERR_INTERNAL: i32 = -99;
 
 // ---- Helpers ----
+//
+// **C-1 (security review): every helper checks for null pointers before
+// dereferencing.** All `*mut *mut c_char` outputs and `*const c_char`
+// inputs are caller-supplied. A buggy or adversarial language binding
+// (Python, C#, Swift, Kotlin) could pass NULL — without these checks
+// `read_cstr` would dereference 0x0 (segfault) and `write_*` would
+// perform a raw store through the attacker-controlled pointer.
+
+/// Maximum array length accepted from JSON input by FFI helpers
+/// (rules / tokens). L-8 — caps deserialized array sizes so a
+/// malicious JSON blob cannot consume unbounded memory.
+const FFI_MAX_RULES: usize = 10_000;
+const FFI_MAX_TOKENS: usize = 100_000;
 
 fn read_cstr(ptr: *const c_char) -> Result<&'static str, i32> {
+    if ptr.is_null() {
+        return Err(DDS_ERR_INVALID_INPUT);
+    }
     unsafe { CStr::from_ptr(ptr) }
         .to_str()
         .map_err(|_| DDS_ERR_INVALID_INPUT)
 }
 
 fn write_json(out: *mut *mut c_char, json: serde_json::Value) -> i32 {
+    if out.is_null() {
+        return DDS_ERR_INVALID_INPUT;
+    }
     match CString::new(json.to_string()) {
         Ok(cs) => {
             unsafe { *out = cs.into_raw() };
@@ -43,6 +62,9 @@ fn write_json(out: *mut *mut c_char, json: serde_json::Value) -> i32 {
 }
 
 fn write_str(out: *mut *mut c_char, s: &str) -> i32 {
+    if out.is_null() {
+        return DDS_ERR_INVALID_INPUT;
+    }
     match CString::new(s) {
         Ok(cs) => {
             unsafe { *out = cs.into_raw() };
@@ -275,6 +297,13 @@ pub unsafe extern "C" fn dds_policy_evaluate(
 
     let mut graph = TrustGraph::new();
     if let Some(tokens) = config["tokens_cbor_hex"].as_array() {
+        if tokens.len() > FFI_MAX_TOKENS {
+            return write_err(
+                out,
+                DDS_ERR_INVALID_INPUT,
+                "tokens_cbor_hex exceeds maximum length",
+            );
+        }
         for tok_hex in tokens {
             if let Some(s) = tok_hex.as_str() {
                 if let Ok(bytes) = hex::decode(s) {
@@ -288,6 +317,9 @@ pub unsafe extern "C" fn dds_policy_evaluate(
 
     let mut engine = PolicyEngine::new();
     if let Some(rules) = config["rules"].as_array() {
+        if rules.len() > FFI_MAX_RULES {
+            return write_err(out, DDS_ERR_INVALID_INPUT, "rules exceeds maximum length");
+        }
         for r in rules {
             let effect = match r["effect"].as_str() {
                 Some("Allow") => Effect::Allow,
@@ -361,13 +393,50 @@ pub unsafe extern "C" fn dds_version(out: *mut *mut c_char) -> i32 {
 }
 
 fn now_epoch() -> u64 {
+    // L-7: never panic across the FFI boundary on a pre-1970 clock
+    // (SystemTime::duration_since(UNIX_EPOCH) errors when the system
+    // clock is set before 1970). Treat it as 0; downstream callers
+    // already tolerate `iat == 0` for legacy/unstamped tokens.
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn write_err(out: *mut *mut c_char, code: i32, msg: &str) -> i32 {
     let _ = write_json(out, serde_json::json!({ "error": msg }));
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::ptr;
+
+    /// C-1 regression: every FFI helper rejects null inputs/outputs
+    /// without dereferencing.
+    #[test]
+    fn null_input_returns_invalid_input() {
+        // dds_identity_create with null label
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe { dds_identity_create(ptr::null(), &mut out as *mut _) };
+        assert_eq!(rc, DDS_ERR_INVALID_INPUT);
+        assert!(
+            out.is_null(),
+            "out must not be written when input is invalid"
+        );
+
+        // dds_identity_create with null out
+        let label = CString::new("alice").unwrap();
+        let rc = unsafe { dds_identity_create(label.as_ptr(), ptr::null_mut()) };
+        assert_eq!(rc, DDS_ERR_INVALID_INPUT);
+
+        // dds_version with null out
+        let rc = unsafe { dds_version(ptr::null_mut()) };
+        assert_eq!(rc, DDS_ERR_INVALID_INPUT);
+
+        // dds_free_string is null-safe (no panic)
+        unsafe { dds_free_string(ptr::null_mut()) };
+    }
 }

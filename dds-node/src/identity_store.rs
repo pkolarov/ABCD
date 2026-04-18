@@ -31,7 +31,7 @@ use dds_core::identity::Identity;
 use ed25519_dalek::SigningKey;
 use rand::RngCore;
 use rand::rngs::OsRng;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Environment variable name for the optional disk-encryption passphrase.
 pub const PASSPHRASE_ENV: &str = "DDS_NODE_PASSPHRASE";
@@ -79,11 +79,21 @@ pub fn load_or_create(path: &Path, label: &str) -> Result<Identity, IdentityStor
 pub fn save(path: &Path, ident: &Identity) -> Result<(), IdentityStoreError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| IdentityStoreError::Io(e.to_string()))?;
+        // L-4 (security review): tighten parent directory perms.
+        // `create_dir_all` uses the process umask (typically 0o755)
+        // and leaves key files in a world-readable parent.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
     let mut key_bytes = ident.signing_key.to_bytes();
     let label = ident.id.label().to_string();
 
-    let map = match std::env::var(PASSPHRASE_ENV) {
+    // H-9 (security review): wrap the passphrase in `Zeroizing` so it
+    // is wiped on drop even on the early-error paths that follow.
+    let map = match std::env::var(PASSPHRASE_ENV).map(Zeroizing::new) {
         Ok(pass) if !pass.is_empty() => {
             let mut salt = [0u8; 16];
             OsRng.fill_bytes(&mut salt);
@@ -136,7 +146,19 @@ pub fn save(path: &Path, ident: &Identity) -> Result<(), IdentityStoreError> {
     let mut buf = Vec::new();
     ciborium::into_writer(&CborValue::Map(map), &mut buf)
         .map_err(|e| IdentityStoreError::Cbor(e.to_string()))?;
-    std::fs::write(path, &buf).map_err(|e| IdentityStoreError::Io(e.to_string()))?;
+    // L-3 (security review): atomic write — tempfile + rename so a
+    // crash mid-write can't leave a torn key blob on disk. Set perms
+    // before the rename so the final file is never world-readable.
+    let parent = path
+        .parent()
+        .ok_or_else(|| IdentityStoreError::Io("identity path has no parent".into()))?;
+    let tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| IdentityStoreError::Io(format!("tempfile: {e}")))?;
+    std::fs::write(tmp.path(), &buf)
+        .map_err(|e| IdentityStoreError::Io(format!("tempfile write: {e}")))?;
+    set_owner_only_permissions(tmp.path());
+    tmp.persist(path)
+        .map_err(|e| IdentityStoreError::Io(format!("rename: {e}")))?;
     set_owner_only_permissions(path);
     Ok(())
 }
@@ -151,9 +173,35 @@ fn set_owner_only_permissions(_path: &Path) {
     }
 }
 
+/// Read a file without following symlinks (L-2). On Unix uses
+/// `O_NOFOLLOW`; on Windows we just call `std::fs::read` because NTFS
+/// semantics differ and parent-directory ACLs are the standard
+/// hardening mechanism.
+fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::read(path)
+    }
+}
+
 /// Load an identity from disk.
 pub fn load(path: &Path) -> Result<Identity, IdentityStoreError> {
-    let bytes = std::fs::read(path).map_err(|e| IdentityStoreError::Io(e.to_string()))?;
+    // L-2 (security review): refuse to follow symlinks on Unix so a
+    // local attacker who controls a sibling path can't redirect the
+    // read to an attacker-chosen blob. Windows: rely on parent ACL.
+    let bytes = read_no_follow(path).map_err(|e| IdentityStoreError::Io(e.to_string()))?;
     let value: CborValue =
         ciborium::from_reader(&bytes[..]).map_err(|e| IdentityStoreError::Cbor(e.to_string()))?;
     let map = value
@@ -190,11 +238,12 @@ pub fn load(path: &Path) -> Result<Identity, IdentityStoreError> {
             k
         }
         Some(v) if v == VERSION_ENCRYPTED as i64 => {
-            let pass = std::env::var(PASSPHRASE_ENV).map_err(|_| {
+            // H-9: passphrase wiped on drop.
+            let pass = Zeroizing::new(std::env::var(PASSPHRASE_ENV).map_err(|_| {
                 IdentityStoreError::Crypto(format!(
                     "identity is encrypted but {PASSPHRASE_ENV} is not set"
                 ))
-            })?;
+            })?);
             let salt = salt.ok_or_else(|| IdentityStoreError::Format("missing salt".into()))?;
             let nonce = nonce.ok_or_else(|| IdentityStoreError::Format("missing nonce".into()))?;
             let mut key = derive_key(pass.as_bytes(), &salt)?;

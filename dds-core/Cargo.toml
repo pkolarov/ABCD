@@ -24,6 +24,7 @@ serde_bytes = { workspace = true }
 pqcrypto-mldsa = { workspace = true, optional = true }
 pqcrypto-traits = { workspace = true, optional = true }
 p256 = { workspace = true }
+subtle = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

@@ -9,6 +9,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
+use subtle::ConstantTimeEq;
+
 use crate::token::{Token, TokenKind};
 
 /// Default maximum trust chain depth.
@@ -83,11 +85,21 @@ impl TrustGraph {
             TokenKind::Attest => {
                 let jti = token.payload.jti.clone();
                 let iss = token.payload.iss.clone();
+                // H-4: refuse duplicate JTIs outright. The previous behaviour
+                // silently overwrote the prior token under the same JTI,
+                // letting a second enrollment with the same label substitute
+                // its own attestation in issuer-keyed lookups.
+                if self.attestations.contains_key(&jti) || self.vouches.contains_key(&jti) {
+                    return Err(TrustError::DuplicateJti(jti));
+                }
                 self.attestations.insert(jti.clone(), token);
                 self.attestations_by_iss.entry(iss).or_default().insert(jti);
             }
             TokenKind::Vouch => {
                 let jti = token.payload.jti.clone();
+                if self.vouches.contains_key(&jti) || self.attestations.contains_key(&jti) {
+                    return Err(TrustError::DuplicateJti(jti));
+                }
                 // Vouch::create enforces vch_iss is Some, so this clone
                 // is safe — but we tolerate None defensively.
                 if let Some(subject) = token.payload.vch_iss.clone() {
@@ -100,32 +112,33 @@ impl TrustGraph {
             }
             TokenKind::Revoke => {
                 if let Some(ref target_jti) = token.payload.revokes {
-                    // Only accept revocation if revoker issued the target token,
-                    // or if target is not yet known (store for deferred check).
+                    // H-1: only accept revocation if revoker issued the target
+                    // token. Refuse revocations of targets we don't know about —
+                    // the prior "deferred" path let an attacker pre-publish a
+                    // revocation for a predictable JTI and have it activate when
+                    // the legitimate token arrived.
                     let revoker_iss = token.payload.iss.clone();
-                    let authorized = self
+                    let target = self
                         .attestations
                         .get(target_jti)
-                        .map(|t| t.payload.iss == revoker_iss)
-                        .unwrap_or(false)
-                        || self
-                            .vouches
-                            .get(target_jti)
-                            .map(|t| t.payload.iss == revoker_iss)
-                            .unwrap_or(false);
-
-                    if !authorized {
-                        // Check if the target is unknown yet — reject outright
-                        let target_known = self.attestations.contains_key(target_jti)
-                            || self.vouches.contains_key(target_jti);
-                        if target_known {
+                        .or_else(|| self.vouches.get(target_jti));
+                    match target {
+                        Some(t) if t.payload.iss == revoker_iss => {
+                            self.revocations.insert(target_jti.clone(), revoker_iss);
+                        }
+                        Some(_) => {
                             return Err(TrustError::Unauthorized(
                                 "revoker is not the issuer of the target token".into(),
                             ));
                         }
+                        None => {
+                            return Err(TrustError::Unauthorized(
+                                "revocation target unknown — refuse to defer (would let \
+                                 unauthorized peers seed revocations against future tokens)"
+                                    .into(),
+                            ));
+                        }
                     }
-
-                    self.revocations.insert(target_jti.clone(), revoker_iss);
                 }
             }
             TokenKind::Burn => {
@@ -280,7 +293,7 @@ impl TrustGraph {
             if let Some(ref expected_hash) = vouch.payload.vch_sum {
                 if let Some(target) = target_token {
                     let actual_hash = target.payload_hash();
-                    if *expected_hash != actual_hash {
+                    if !payload_hash_eq(expected_hash, &actual_hash) {
                         last_err = TrustError::VouchHashMismatch {
                             expected: expected_hash.clone(),
                             got: actual_hash,
@@ -355,7 +368,7 @@ impl TrustGraph {
             if let Some(ref expected_hash) = t.payload.vch_sum {
                 match target_token {
                     Some(target) => {
-                        if target.payload_hash() != *expected_hash {
+                        if !payload_hash_eq(&target.payload_hash(), expected_hash) {
                             return false;
                         }
                     }
@@ -383,7 +396,7 @@ impl TrustGraph {
                 if let Some(ref expected_hash) = t.payload.vch_sum {
                     match target_token {
                         Some(target) => {
-                            if target.payload_hash() != *expected_hash {
+                            if !payload_hash_eq(&target.payload_hash(), expected_hash) {
                                 return false;
                             }
                         }
@@ -508,6 +521,8 @@ pub enum TrustError {
     Unauthorized(String),
     /// The vouch hash does not match the target token.
     VouchHashMismatch { expected: String, got: String },
+    /// A token with the same JTI is already in the graph.
+    DuplicateJti(String),
 }
 
 impl fmt::Display for TrustError {
@@ -523,8 +538,20 @@ impl fmt::Display for TrustError {
             TrustError::VouchHashMismatch { expected, got } => {
                 write!(f, "vouch hash mismatch: expected {}, got {}", expected, got)
             }
+            TrustError::DuplicateJti(jti) => {
+                write!(f, "duplicate JTI rejected: {}", jti)
+            }
         }
     }
+}
+
+/// Constant-time equality on hex-encoded payload-hash strings. The hashes
+/// themselves are public, but L-15 prefers ct_eq for discipline so future
+/// per-comparison timing channels (e.g. early-exit byte loops introduced
+/// by an unrelated change) cannot leak even when callers use
+/// constant-time-naive comparisons elsewhere.
+fn payload_hash_eq(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 #[cfg(test)]
@@ -908,6 +935,76 @@ mod tests {
         let revoke = make_revoke(&user, &jti);
         assert!(graph.add_token(revoke).is_ok());
         assert!(graph.is_revoked(&jti));
+    }
+
+    /// H-1 regression: a revocation whose target JTI is unknown to the
+    /// graph must be rejected, NOT deferred. Prior behaviour silently
+    /// stored the revocation; when the legitimate token arrived later
+    /// it was dead-on-arrival.
+    #[test]
+    fn revocation_for_unknown_target_is_rejected() {
+        let mut graph = TrustGraph::new();
+        let attacker = Identity::generate("attacker", &mut OsRng);
+
+        // Attacker gossips a revocation for a JTI nobody has issued yet.
+        let revoke = make_revoke(&attacker, "attest-victim");
+        let err = graph.add_token(revoke).unwrap_err();
+        assert!(
+            matches!(err, TrustError::Unauthorized(_)),
+            "expected Unauthorized, got {err:?}"
+        );
+
+        // The legitimate target arriving later must be ingested cleanly
+        // and must NOT be marked revoked by the attacker's earlier attempt.
+        let victim = Identity::generate("victim", &mut OsRng);
+        let attest = make_attest(&victim);
+        let jti = attest.payload.jti.clone();
+        graph.add_token(attest).unwrap();
+        assert!(
+            !graph.is_revoked(&jti),
+            "victim's token must not be revoked by attacker's pre-emptive revocation"
+        );
+    }
+
+    /// H-4 regression: two attestations sharing a JTI (e.g. label
+    /// collision) must not silently overwrite. The second insertion
+    /// must be rejected as a duplicate.
+    #[test]
+    fn duplicate_attestation_jti_is_rejected() {
+        let mut graph = TrustGraph::new();
+        // Two distinct identities, but build a manual second token
+        // sharing the first's JTI.
+        let alice = Identity::generate("alice", &mut OsRng);
+        let bob = Identity::generate("bob", &mut OsRng);
+
+        let alice_token = make_attest(&alice);
+        let shared_jti = alice_token.payload.jti.clone();
+        graph.add_token(alice_token).unwrap();
+
+        let mut bob_payload = TokenPayload {
+            iss: bob.id.to_urn(),
+            iss_key: bob.public_key.clone(),
+            jti: shared_jti.clone(),
+            sub: bob.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: Some(String::from("dds:directory-entry")),
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1000,
+            exp: Some(4102444800),
+            body_type: None,
+            body_cbor: None,
+        };
+        // Override the synthetic "attest-bob" jti with alice's:
+        bob_payload.jti = shared_jti.clone();
+        let bob_token = Token::sign(bob_payload, &bob.signing_key).unwrap();
+
+        let err = graph.add_token(bob_token).unwrap_err();
+        assert!(
+            matches!(&err, TrustError::DuplicateJti(j) if j == &shared_jti),
+            "expected DuplicateJti, got {err:?}"
+        );
     }
 
     #[test]

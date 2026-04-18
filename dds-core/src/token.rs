@@ -16,6 +16,21 @@ use sha2::{Digest, Sha256};
 use crate::crypto::{PublicKeyBundle, SignatureBundle};
 use crate::identity::VouchsafeId;
 
+/// Canonical purpose strings for vouches that grant a publishing
+/// capability. C-3 from the security review: only attestations whose
+/// issuer chains to a trusted root via a vouch carrying one of these
+/// purposes may publish the corresponding document type. The constants
+/// live here so that producers (admin tooling) and consumers
+/// (`list_applicable_*` filters in `dds-node`) cannot drift.
+pub mod purpose {
+    /// Authorized to publish `WindowsPolicyDocument` attestations.
+    pub const POLICY_PUBLISHER_WINDOWS: &str = "dds:policy-publisher-windows";
+    /// Authorized to publish `MacOsPolicyDocument` attestations.
+    pub const POLICY_PUBLISHER_MACOS: &str = "dds:policy-publisher-macos";
+    /// Authorized to publish `SoftwareAssignment` attestations.
+    pub const SOFTWARE_PUBLISHER: &str = "dds:software-publisher";
+}
+
 /// The type of a Vouchsafe token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TokenKind {

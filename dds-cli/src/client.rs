@@ -16,6 +16,35 @@ pub fn new_client() -> Client {
         .expect("reqwest client build")
 }
 
+/// **L-6 (security review)**: refuse non-loopback HTTP URLs. The CLI
+/// is designed for local admin use; a plaintext `http://` call to a
+/// non-loopback host would leak bearer-like tokens and requests over
+/// the wire. Loopback (127.0.0.1, ::1, localhost) stays allowed
+/// because the API is loopback-only by design. HTTPS is always
+/// allowed regardless of host.
+fn enforce_tls_for_non_loopback(url: &str) {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return;
+    }
+    if !lower.starts_with("http://") {
+        fail(&format!(
+            "unsupported URL scheme (only http and https are allowed): {url}"
+        ));
+    }
+    // Extract the host between "http://" and the next '/' or ':'.
+    let rest = &lower[7..];
+    let host_end = rest.find(['/', ':']).unwrap_or(rest.len());
+    let host = &rest[..host_end];
+    let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]");
+    if !is_loopback {
+        fail(&format!(
+            "refusing plaintext http:// to non-loopback host {host} — \
+             use https:// or target 127.0.0.1/localhost (see L-6 in the security review)"
+        ));
+    }
+}
+
 /// Run `GET {base}{path}` with the given query params, deserializing the
 /// JSON body on success. On HTTP error, print the node's error body to
 /// stderr and exit with code 1.
@@ -25,6 +54,7 @@ where
 {
     let client = new_client();
     let url = format!("{base}{path}");
+    enforce_tls_for_non_loopback(&url);
     let resp = client
         .get(&url)
         .query(query)
@@ -43,6 +73,7 @@ where
 {
     let client = new_client();
     let url = format!("{base}{path}");
+    enforce_tls_for_non_loopback(&url);
     let resp = client
         .post(&url)
         .json(body)
@@ -60,6 +91,7 @@ where
 {
     let client = new_client();
     let url = format!("{base}{path}");
+    enforce_tls_for_non_loopback(&url);
     let resp = client
         .post(&url)
         .json(body)

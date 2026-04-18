@@ -1114,6 +1114,14 @@ fn handle_export(data_dir: &Path, out: &Path) {
         eprintln!("Failed to write {}: {e}", out.display());
         std::process::exit(1);
     });
+    // L-5 (security review): restrict dump file to owner-only read.
+    // The dump contains revocation/burn lists that can reveal trust
+    // graph internals; prior default permissions left it world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(out, std::fs::Permissions::from_mode(0o600));
+    }
 
     println!("Exported dump to {}", out.display());
     println!("  Domain:     {domain_id}");

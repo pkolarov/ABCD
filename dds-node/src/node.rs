@@ -30,6 +30,24 @@ const ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(60);
 /// Throttles the on-connect storm when libp2p reconnects flap.
 const SYNC_PER_PEER_COOLDOWN: Duration = Duration::from_secs(15);
 
+/// **H-11 (security review)**: hard cap on the number of payloads
+/// returned in a single `SyncResponse`. Prevents an attacker (or any
+/// admitted peer with an empty `known_op_ids`) from forcing the
+/// responder to clone the entire `sync_payloads` cache into one
+/// message. Pagination across requests handles the legitimate case.
+const SYNC_MAX_RESPONSE_ENTRIES: usize = 1_000;
+/// **H-11 (security review)**: hard cap on the serialized op + token
+/// bytes returned in a single `SyncResponse`. ~5 MB is large enough for
+/// healthy domains but small enough to bound the worst-case allocation
+/// in `build_sync_response` and the per-request CBOR work in the codec.
+const SYNC_MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
+/// **M-5 (security review)**: cap on `sync_payloads` cache size. The
+/// previous unbounded `BTreeMap` accumulated forever; combined with H-11
+/// it gave a hostile peer an unbounded amplification factor. Eviction
+/// policy is FIFO via `BTreeMap::pop_first` — sufficient since op_ids
+/// embed UUIDv7-ish prefixes and are roughly time-ordered.
+const SYNC_PAYLOAD_CACHE_CAP: usize = 10_000;
+
 /// The running DDS node state.
 ///
 /// `trust_graph` is shared (`Arc<RwLock<TrustGraph>>`) so the swarm event
@@ -363,11 +381,20 @@ impl DdsNode {
     /// Insert an op + its backing token bytes into the sync payload cache
     /// so the anti-entropy responder can serve it back to peers without
     /// reconstructing the (op, token) pair from scratch. Called from both
-    /// the gossip ingest path and the sync-applied path.
-    fn cache_sync_payload(&mut self, op_id: &str, op: &Operation, token_bytes: &[u8]) {
+    /// the gossip ingest path and the sync-applied path. Pub so that the
+    /// local publish path (HTTP handler, tests) can seed the cache for
+    /// ops that originate here and never travel inbound via gossip.
+    pub fn cache_sync_payload(&mut self, op_id: &str, op: &Operation, token_bytes: &[u8]) {
         let mut op_bytes = Vec::new();
         if ciborium::into_writer(op, &mut op_bytes).is_err() {
             return;
+        }
+        // M-5: enforce a hard cap with FIFO eviction so the cache can't
+        // grow unbounded under steady-state op traffic.
+        while self.sync_payloads.len() >= SYNC_PAYLOAD_CACHE_CAP
+            && !self.sync_payloads.contains_key(op_id)
+        {
+            self.sync_payloads.pop_first();
         }
         self.sync_payloads.insert(
             op_id.to_string(),
@@ -440,27 +467,64 @@ impl DdsNode {
         if !self.config.domain.audit_log_enabled {
             return;
         }
-        if let Ok(entry) = ciborium::from_reader::<dds_core::audit::AuditLogEntry, _>(entry_bytes) {
-            let _ = self.store.append_audit_entry(&entry);
-            info!(action = %entry.action, node = %entry.node_urn, "audit log entry appended");
+        let entry = match ciborium::from_reader::<dds_core::audit::AuditLogEntry, _>(entry_bytes) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("audit entry deserialize failed: {e}");
+                return;
+            }
+        };
+        // **M-21 (security review)**: verify the entry's `node_signature`
+        // and that `node_urn` cryptographically binds to `node_public_key`
+        // before appending. The previous path appended any deserializable
+        // entry from any peer, letting a malicious peer poison the
+        // compliance trail with forged actions.
+        if let Err(e) = entry.verify() {
+            warn!(
+                node = %entry.node_urn,
+                action = %entry.action,
+                error = %e,
+                "rejecting forged or malformed audit entry"
+            );
+            return;
         }
+        let _ = self.store.append_audit_entry(&entry);
+        info!(action = %entry.action, node = %entry.node_urn, "audit log entry appended");
     }
 
     // ---------- anti-entropy sync (B6) ----------
 
     /// Build the response to an inbound sync request: every cached
     /// payload whose op_id is *not* in the requester's `known_op_ids`.
+    ///
+    /// **H-11 (security review)**: capped at `SYNC_MAX_RESPONSE_ENTRIES`
+    /// payloads or `SYNC_MAX_RESPONSE_BYTES` of serialized op + token
+    /// bytes, whichever is reached first. The previous unbounded form
+    /// let a peer with `known_op_ids: {}` force the responder to clone
+    /// the entire `sync_payloads` cache into one message — combined
+    /// with no LRU on the cache (M-5) this was an unbounded amplification
+    /// attack. Now any peer must page through repeated requests; the
+    /// `complete` flag tells them whether more remains.
     fn build_sync_response(&self, req: &SyncRequest) -> SyncResponse {
-        let payloads: Vec<SyncPayload> = self
-            .sync_payloads
-            .iter()
-            .filter(|(id, _)| !req.known_op_ids.contains(id.as_str()))
-            .map(|(_, payload)| payload.clone())
-            .collect();
-        SyncResponse {
-            payloads,
-            complete: true,
+        let mut payloads: Vec<SyncPayload> =
+            Vec::with_capacity(SYNC_MAX_RESPONSE_ENTRIES.min(self.sync_payloads.len()));
+        let mut bytes_acc: usize = 0;
+        let mut complete = true;
+        for (id, payload) in &self.sync_payloads {
+            if req.known_op_ids.contains(id.as_str()) {
+                continue;
+            }
+            let payload_bytes = payload.op_bytes.len() + payload.token_bytes.len();
+            if payloads.len() >= SYNC_MAX_RESPONSE_ENTRIES
+                || bytes_acc.saturating_add(payload_bytes) > SYNC_MAX_RESPONSE_BYTES
+            {
+                complete = false;
+                break;
+            }
+            bytes_acc += payload_bytes;
+            payloads.push(payload.clone());
         }
+        SyncResponse { payloads, complete }
     }
 
     /// Build a sync request from local DAG state.
@@ -484,6 +548,14 @@ impl DdsNode {
         let req_id = self.swarm.behaviour_mut().sync.send_request(&peer, req);
         self.sync_last_outbound.insert(peer, now);
         debug!(%peer, ?req_id, "sync: sent request");
+    }
+
+    /// Send a sync request to a peer unconditionally, bypassing the
+    /// per-peer cooldown. Intended for tests and for the HTTP layer when
+    /// a fresh enrollment makes an immediate re-sync desirable.
+    pub fn force_sync_with(&mut self, peer: PeerId) {
+        self.sync_last_outbound.remove(&peer);
+        self.try_sync_with(peer);
     }
 
     /// Apply an inbound sync response: merge into trust graph + DAG +

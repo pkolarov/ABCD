@@ -35,7 +35,18 @@ pub struct RedbBackend {
 impl RedbBackend {
     /// Open or create a redb database at the given path.
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let path = path.as_ref();
         let db = Database::create(path).map_err(|e| StoreError::Io(e.to_string()))?;
+        // M-20 (security review): restrict the database file to owner
+        // read/write. redb creates it with process umask (typically
+        // 0o644), leaving tokens, audit entries, and credential
+        // metadata readable by any local user. Windows inherits parent
+        // ACL; we document that operators must restrict the data dir.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
 
         // Ensure all tables exist
         let write_txn = db

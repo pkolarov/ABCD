@@ -20,11 +20,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ciborium::value::Value as CborValue;
 use dds_domain::Domain;
 use dds_domain::domain::{DomainId, from_hex, to_hex};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use crate::{domain_store, identity_store, p2p_identity};
 
-const BUNDLE_VERSION: u64 = 1;
+const BUNDLE_VERSION: u64 = 2;
+/// Minimum supported bundle version for read. v1 had no integrity
+/// metadata; we still read it but emit a warning.
+const MIN_READ_VERSION: u64 = 1;
 
 // ---- Error type ----
 
@@ -76,13 +80,29 @@ pub struct ProvisionBundle {
     pub listen_port: u16,
     pub api_port: u16,
     pub mdns_enabled: bool,
+    /// SHA-256 fingerprint of the integrity-bound metadata fields
+    /// (domain_id + domain_pubkey + org_hash + ports). Set on load
+    /// for v2 bundles, or computed on the fly otherwise. Operators
+    /// must confirm this fingerprint OUT-OF-BAND before importing
+    /// — see H-10 in the security review.
+    pub fingerprint: String,
 }
 
 /// Save a provision bundle to a `.dds` file.
+///
+/// **H-10 (security review)**: bundle metadata is hashed and the
+/// fingerprint is embedded so the loader can detect any in-flight
+/// tamper of `domain_pubkey`, `domain_id`, `org_hash`, or ports.
+/// Note this is TOFU: a sophisticated attacker who replaces the
+/// pubkey AND recomputes the fingerprint can still pass verification.
+/// Operators MUST confirm the printed fingerprint out-of-band before
+/// importing on the destination. See `bundle.fingerprint` and the
+/// CLI output of `dds-node create-provision-bundle`.
 pub fn save_bundle(path: &Path, bundle: &ProvisionBundle) -> Result<(), ProvisionError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ProvisionError::Io(e.to_string()))?;
     }
+    let fingerprint = compute_fingerprint(bundle);
     let map = vec![
         (
             CborValue::Text("version".into()),
@@ -120,12 +140,42 @@ pub fn save_bundle(path: &Path, bundle: &ProvisionBundle) -> Result<(), Provisio
             CborValue::Text("mdns_enabled".into()),
             CborValue::Bool(bundle.mdns_enabled),
         ),
+        (
+            CborValue::Text("fingerprint".into()),
+            CborValue::Text(fingerprint),
+        ),
     ];
     let mut buf = Vec::new();
     ciborium::into_writer(&CborValue::Map(map), &mut buf)
         .map_err(|e| ProvisionError::Cbor(e.to_string()))?;
     std::fs::write(path, &buf).map_err(|e| ProvisionError::Io(e.to_string()))?;
     Ok(())
+}
+
+/// SHA-256 fingerprint over the metadata fields covered by H-10:
+/// `domain_id`, `domain_pubkey`, `org_hash`, listen_port, api_port,
+/// mdns_enabled. Concatenation uses unambiguous separators; this is
+/// the operator-visible hash, not a CBOR-canonical fingerprint.
+fn compute_fingerprint(bundle: &ProvisionBundle) -> String {
+    let mut h = Sha256::new();
+    h.update(b"dds-bundle-v2|");
+    h.update(bundle.domain_id.as_bytes());
+    h.update(b"|");
+    h.update(bundle.domain_pubkey.as_bytes());
+    h.update(b"|");
+    h.update(bundle.org_hash.as_bytes());
+    h.update(b"|");
+    h.update(bundle.listen_port.to_be_bytes());
+    h.update(b"|");
+    h.update(bundle.api_port.to_be_bytes());
+    h.update(b"|");
+    h.update([u8::from(bundle.mdns_enabled)]);
+    let digest = h.finalize();
+    let mut s = String::with_capacity(64);
+    for b in digest {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }
 
 /// Load a provision bundle from a `.dds` file.
@@ -183,13 +233,20 @@ pub fn load_bundle(path: &Path) -> Result<ProvisionBundle, ProvisionError> {
     };
 
     let version = get_u64("version", 0);
-    if version != BUNDLE_VERSION {
+    if !(MIN_READ_VERSION..=BUNDLE_VERSION).contains(&version) {
         return Err(ProvisionError::Format(format!(
-            "unsupported bundle version {version} (expected {BUNDLE_VERSION})"
+            "unsupported bundle version {version} (supported {MIN_READ_VERSION}..={BUNDLE_VERSION})"
         )));
     }
+    let stored_fingerprint: Option<String> = map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some("fingerprint") {
+            v.as_text().map(|s| s.to_string())
+        } else {
+            None
+        }
+    });
 
-    Ok(ProvisionBundle {
+    let bundle = ProvisionBundle {
         domain_name: get_text("domain_name")?,
         domain_id: get_text("domain_id")?,
         domain_pubkey: get_text("domain_pubkey")?,
@@ -198,7 +255,40 @@ pub fn load_bundle(path: &Path) -> Result<ProvisionBundle, ProvisionError> {
         listen_port: get_u64("listen_port", 4001) as u16,
         api_port: get_u64("api_port", 5551) as u16,
         mdns_enabled: get_bool("mdns_enabled", true),
-    })
+        fingerprint: String::new(),
+    };
+    let computed = compute_fingerprint(&bundle);
+    if version >= 2 {
+        // **H-10 (security review)**: integrity check. Stored fingerprint
+        // must match the recomputed one. If absent or mismatched the
+        // bundle was tampered or corrupted in transit.
+        let stored = stored_fingerprint.ok_or_else(|| {
+            ProvisionError::Format(
+                "v2 bundle is missing the fingerprint field — refuse to import".into(),
+            )
+        })?;
+        if stored != computed {
+            return Err(ProvisionError::Format(format!(
+                "bundle fingerprint mismatch: file claims {stored}, computed {computed}; \
+                 the bundle has been tampered with"
+            )));
+        }
+        Ok(ProvisionBundle {
+            fingerprint: computed,
+            ..bundle
+        })
+    } else {
+        // v1 (legacy): no fingerprint on disk. Compute one for display
+        // but warn that this bundle has no integrity protection.
+        tracing::warn!(
+            "loading legacy v1 provision bundle (no integrity fingerprint stored); \
+             confirm the displayed fingerprint out-of-band before trusting"
+        );
+        Ok(ProvisionBundle {
+            fingerprint: computed,
+            ..bundle
+        })
+    }
 }
 
 // ---- Bundle creation ----
@@ -224,9 +314,15 @@ pub fn create_bundle(
         listen_port: 4001,
         api_port: 5551,
         mdns_enabled: true,
+        fingerprint: String::new(),
     };
 
     save_bundle(out_path, &bundle)?;
+    // H-10 (security review): print the fingerprint so the operator
+    // can confirm it out-of-band on the importing side.
+    let fp = compute_fingerprint(&bundle);
+    println!("Bundle integrity fingerprint: {fp}");
+    println!("  Confirm this fingerprint on the importing host BEFORE provisioning.");
     Ok(())
 }
 
@@ -629,10 +725,16 @@ mod tests {
             listen_port: 4001,
             api_port: 5551,
             mdns_enabled: true,
+            fingerprint: String::new(),
         };
 
         save_bundle(&path, &bundle).unwrap();
         let loaded = load_bundle(&path).unwrap();
+        assert!(
+            !loaded.fingerprint.is_empty(),
+            "fingerprint populated on load"
+        );
+        assert_eq!(loaded.fingerprint, compute_fingerprint(&bundle));
 
         assert_eq!(loaded.domain_name, "test.local");
         assert_eq!(loaded.domain_id, "dds-dom:aaaa");
@@ -658,6 +760,68 @@ mod tests {
 
         let err = load_bundle(&path).unwrap_err();
         assert!(err.to_string().contains("unsupported bundle version"));
+    }
+
+    /// H-10 regression: if a v2 bundle has a fingerprint that does not
+    /// match the other metadata, loading must fail.
+    #[test]
+    fn bundle_rejects_tampered_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tampered.dds");
+
+        // Build a legitimate bundle, then corrupt the stored fingerprint.
+        let map = vec![
+            (
+                CborValue::Text("version".into()),
+                CborValue::Integer(2i64.into()),
+            ),
+            (
+                CborValue::Text("domain_name".into()),
+                CborValue::Text("test.local".into()),
+            ),
+            (
+                CborValue::Text("domain_id".into()),
+                CborValue::Text("dds-dom:aaaa".into()),
+            ),
+            (
+                CborValue::Text("domain_pubkey".into()),
+                CborValue::Text("ff".repeat(32)),
+            ),
+            (
+                CborValue::Text("domain_key".into()),
+                CborValue::Bytes(vec![1, 2, 3]),
+            ),
+            (
+                CborValue::Text("org_hash".into()),
+                CborValue::Text("org".into()),
+            ),
+            (
+                CborValue::Text("listen_port".into()),
+                CborValue::Integer(4001u64.into()),
+            ),
+            (
+                CborValue::Text("api_port".into()),
+                CborValue::Integer(5551u64.into()),
+            ),
+            (
+                CborValue::Text("mdns_enabled".into()),
+                CborValue::Bool(true),
+            ),
+            (
+                CborValue::Text("fingerprint".into()),
+                // Deliberately wrong.
+                CborValue::Text("00".repeat(32)),
+            ),
+        ];
+        let mut buf = Vec::new();
+        ciborium::into_writer(&CborValue::Map(map), &mut buf).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+
+        let err = load_bundle(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("fingerprint mismatch"),
+            "expected fingerprint mismatch error, got: {err}"
+        );
     }
 
     #[test]
