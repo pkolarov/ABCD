@@ -27,7 +27,7 @@ The codebase documents most endpoints as "localhost-only with OS process isolati
 
 ---
 
-## Remediation status (2026-04-18)
+## Remediation status (2026-04-18, updated after reviewer follow-up)
 
 This section records the state of each finding after the remediation pass.
 `✅ Fixed (pending verify)` means code landed in this branch and local
@@ -35,6 +35,33 @@ test + clippy are green; still needs CI, code review, and any production
 exercise before being considered closed. `⏸ Deferred` means intentionally
 left for a follow-up PR — usually because the fix spans languages
 (Rust + C# agents, C++ bridge) or requires a disk/wire format migration.
+
+**Shipped this pass (commits `2442953`, `ae9d33e`, `a8035ff`, `1c19206`, `e66d696`):**
+all 3 Critical (C-1, C-2, C-3), 7 High (H-1, H-4, H-5, H-8, H-9, H-10, H-11),
+10 Medium (M-3, M-5, M-6, M-7, M-9, M-11, M-16, M-19, M-20, M-21, M-22),
+and 12 Low (L-1, L-2, L-3, L-4, L-5, L-6, L-7, L-8, L-9, L-10, L-11 audit,
+L-12, L-13, L-15).
+
+**Still deferred** (5 High, 10 Medium, 4 Low): H-2, H-3, H-6, H-7, H-12
+(all require cross-language redesigns — signed policy bodies in C#,
+mTLS/HMAC between C++ and Rust, UDS transport, libp2p admission
+protocol); M-1, M-2, M-4, M-8 (partial), M-10, M-12, M-13, M-14, M-15,
+M-17, M-18; L-14, L-16, L-17, L-18. Rationale for each is in the
+row-level status table.
+
+**Reviewer follow-ups already closed this round** (previously flagged
+as partial):
+
+- **M-9**: replay window now enforced on BOTH gossip AND sync paths.
+- **M-16**: v1 dumps refused by default; `--allow-unsigned` required
+  for legacy migration (closes the v2 → v1 downgrade attack).
+- **L-12**: store-side append-time chain verification landed in both
+  `MemoryBackend` and `RedbBackend`; `DdsNode::emit_local_audit` is
+  the production chained-emit hook.
+- **C-3**: ingest-side reject added to complement the serve-side filter.
+- **H-8**: bootstrap admin rehydrated from config at startup;
+  `admin_vouch` with `purpose::ADMIN` promotes the subject to
+  `trusted_roots` and persists.
 
 ### Critical
 
