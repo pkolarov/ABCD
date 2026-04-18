@@ -16,6 +16,9 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
     <PackageReference Include="Microsoft.Extensions.Http" Version="8.0.1" />
+    <!-- H-3 (security review): pure-managed Ed25519 verifier for
+         signed policy/software envelopes. -->
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.4.0" />
   </ItemGroup>
 
   <ItemGroup>

@@ -58,6 +58,16 @@ pub struct AssertionSessionRequest {
     /// Server-issued challenge ID from `GET /v1/session/challenge`.
     pub challenge_id: String,
     pub client_data_hash: Vec<u8>,
+    /// **M-12 (security review)**: raw UTF-8 bytes of the
+    /// authenticator's `clientDataJSON`. Optional for backward
+    /// compatibility — when present, the server parses the JSON and
+    /// validates `type`, `origin`, `challenge` per WebAuthn §7.2
+    /// steps 7–9 instead of reconstructing the expected JSON and
+    /// comparing hashes (which is fragile: any difference in key
+    /// ordering or escaping from the client's serializer produces a
+    /// spurious mismatch). When absent, the legacy reconstruct-and-
+    /// compare path runs.
+    pub client_data_json: Option<Vec<u8>>,
     pub authenticator_data: Vec<u8>,
     pub signature: Vec<u8>,
     pub duration_secs: Option<u64>,
@@ -76,6 +86,8 @@ pub struct AdminVouchRequest {
     /// Server-issued challenge ID from `GET /v1/admin/challenge`.
     pub challenge_id: String,
     pub client_data_hash: Vec<u8>,
+    /// M-12 (see `AssertionSessionRequest::client_data_json`).
+    pub client_data_json: Option<Vec<u8>>,
     pub authenticator_data: Vec<u8>,
     pub signature: Vec<u8>,
     pub purpose: Option<String>,
@@ -782,6 +794,58 @@ impl<
         })
     }
 
+    /// The node's Vouchsafe URN (used as the `node_urn` field on
+    /// signed policy/software envelopes so the agent can record
+    /// provenance alongside its signature check).
+    pub fn node_urn(&self) -> String {
+        self.node_identity.id.to_urn()
+    }
+
+    /// The node's raw Ed25519 public-key bytes. The Windows and macOS
+    /// Policy Agents pin this value at install time (via the
+    /// provisioning bundle) and use it to verify
+    /// `SignedPolicyEnvelope` returned by the policy/software
+    /// endpoints (H-2 / H-3 in the security review).
+    pub fn node_pubkey_bytes(&self) -> [u8; 32] {
+        self.node_identity.verifying_key().to_bytes()
+    }
+
+    /// Sign a policy/software response payload with the node's
+    /// Ed25519 signing key, producing an envelope the agent can
+    /// verify against its pinned node pubkey. `payload_json` is the
+    /// exact UTF-8 JSON bytes the agent will later deserialize; we
+    /// sign the raw bytes so the agent does not have to re-encode
+    /// (re-encoding with a different JSON serializer would make the
+    /// signed bytes divergent, see M-12 for the same class of
+    /// fragility on `clientDataJSON`).
+    pub fn sign_policy_envelope(
+        &self,
+        device_urn: &str,
+        envelope_kind: &str,
+        payload_json: &[u8],
+    ) -> dds_core::envelope::SignedPolicyEnvelope {
+        use base64::Engine as _;
+        let issued_at = now_epoch();
+        let sig = dds_core::envelope::sign_envelope(
+            &self.node_identity.signing_key,
+            device_urn,
+            envelope_kind,
+            issued_at,
+            payload_json,
+        );
+        let b64 = base64::engine::general_purpose::STANDARD;
+        dds_core::envelope::SignedPolicyEnvelope {
+            version: 1,
+            kind: envelope_kind.to_string(),
+            device_urn: device_urn.to_string(),
+            issued_at,
+            payload_b64: b64.encode(payload_json),
+            signature_b64: b64.encode(sig),
+            node_urn: self.node_identity.id.to_urn(),
+            node_pubkey_b64: b64.encode(self.node_pubkey_bytes()),
+        }
+    }
+
     /// List every `WindowsPolicyDocument` whose scope matches the
     /// given device URN. Skips revoked, burned, and `Disabled`
     /// documents. The result is in attestation-iteration order
@@ -1061,11 +1125,21 @@ impl<
     /// Shared FIDO2 assertion verifier used by both session issuance and
     /// admin vouch. Enforces: credential lookup, crypto, UP flag, RP-ID
     /// binding, server-challenge freshness, and sign-count monotonicity.
+    ///
+    /// **M-12 (security review)**: `client_data_json`, when `Some`,
+    /// is the raw authenticator-signed `clientDataJSON` bytes. The
+    /// verifier then parses them and checks `type == "webauthn.get"`,
+    /// `challenge == base64url(server_challenge)`, and
+    /// `origin == "https://" || enrolled_rp_id` individually per
+    /// WebAuthn §7.2 steps 7–9. When `None`, falls back to the
+    /// reconstruct-and-hash-compare path (cryptographically
+    /// equivalent only if the client emits byte-identical JSON).
     fn verify_assertion_common(
         &mut self,
         credential_id: &str,
         challenge_id: &str,
         client_data_hash: &[u8],
+        client_data_json: Option<&[u8]>,
         authenticator_data: &[u8],
         signature: &[u8],
     ) -> Result<CommonAssertionOutput, ServiceError> {
@@ -1158,43 +1232,116 @@ impl<
         }
 
         // 5. Challenge freshness — consume server-issued challenge and verify
-        //    that client_data_hash matches SHA-256 of the expected clientDataJSON.
+        //    the clientDataJSON. Two validation paths:
+        //    - **M-12 preferred**: if the client supplied raw
+        //      `clientDataJSON` bytes, parse them and check `type`,
+        //      `challenge`, `origin` individually per WebAuthn §7.2
+        //      steps 7–9. Then confirm the hash still matches what
+        //      the authenticator actually signed.
+        //    - **Legacy fallback**: reconstruct the expected JSON
+        //      string and hash-compare. Works only if the client
+        //      emits byte-identical JSON (fragile).
         {
             let now = now_epoch();
             let challenge_bytes = self
                 .store
                 .consume_challenge(challenge_id, now)
                 .map_err(|e| ServiceError::Fido2(format!("challenge invalid: {e}")))?;
-            let ch_b64url = URL_SAFE_NO_PAD.encode(challenge_bytes);
-            // Reconstruct the exact clientDataJSON the C++ client produced.
-            let expected_cdj = format!(
-                r#"{{"type":"webauthn.get","challenge":"{ch_b64url}","origin":"https://{enrolled_rp_id}"}}"#
-            );
-            let expected_hash = Sha256::digest(expected_cdj.as_bytes());
-            if expected_hash.as_slice() != client_data_hash {
-                return Err(ServiceError::Fido2(
-                    "client_data_hash does not match server-issued challenge".into(),
-                ));
+            let expected_challenge_b64url = URL_SAFE_NO_PAD.encode(challenge_bytes.as_slice());
+            let expected_origin = format!("https://{enrolled_rp_id}");
+
+            if let Some(cdj_bytes) = client_data_json {
+                // The authenticator signed SHA-256(clientDataJSON). Before
+                // parsing, bind the supplied JSON to the signed hash — else
+                // an attacker could present unrelated bytes that happen to
+                // parse with valid fields.
+                let cdj_hash = Sha256::digest(cdj_bytes);
+                if cdj_hash.as_slice() != client_data_hash {
+                    return Err(ServiceError::Fido2(
+                        "client_data_hash does not match SHA-256 of supplied clientDataJSON"
+                            .into(),
+                    ));
+                }
+                let cdj: serde_json::Value = serde_json::from_slice(cdj_bytes).map_err(|e| {
+                    ServiceError::Fido2(format!("clientDataJSON is not valid JSON: {e}"))
+                })?;
+                // §7.2 step 7: type must be "webauthn.get".
+                let ty = cdj.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ServiceError::Fido2("clientDataJSON missing type field".into())
+                })?;
+                if ty != "webauthn.get" {
+                    return Err(ServiceError::Fido2(format!(
+                        "clientDataJSON type is {ty:?}, expected \"webauthn.get\""
+                    )));
+                }
+                // §7.2 step 8: challenge must equal server-issued value.
+                let ch = cdj.get("challenge").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ServiceError::Fido2("clientDataJSON missing challenge field".into())
+                })?;
+                // Clients may send base64url-without-padding (spec) or
+                // base64url-with-padding (some stacks). Decode both
+                // sides to raw bytes and compare.
+                let ch_raw = decode_b64url_any(ch).ok_or_else(|| {
+                    ServiceError::Fido2(
+                        "clientDataJSON challenge field is not valid base64url".into(),
+                    )
+                })?;
+                if ch_raw != challenge_bytes {
+                    return Err(ServiceError::Fido2(
+                        "clientDataJSON challenge does not match server-issued challenge".into(),
+                    ));
+                }
+                // §7.2 step 9: origin must be https://<enrolled_rp_id>.
+                let origin = cdj.get("origin").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ServiceError::Fido2("clientDataJSON missing origin field".into())
+                })?;
+                if origin != expected_origin {
+                    return Err(ServiceError::Fido2(format!(
+                        "clientDataJSON origin is {origin:?}, expected {expected_origin:?}"
+                    )));
+                }
+                // Reject mixed-origin / cross-origin flows we do not support.
+                if cdj
+                    .get("crossOrigin")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    return Err(ServiceError::Fido2(
+                        "clientDataJSON.crossOrigin is true; cross-origin assertions are refused"
+                            .into(),
+                    ));
+                }
+            } else {
+                let ch_b64url = expected_challenge_b64url;
+                let expected_cdj = format!(
+                    r#"{{"type":"webauthn.get","challenge":"{ch_b64url}","origin":"{expected_origin}"}}"#
+                );
+                let expected_hash = Sha256::digest(expected_cdj.as_bytes());
+                if expected_hash.as_slice() != client_data_hash {
+                    return Err(ServiceError::Fido2(
+                        "client_data_hash does not match server-issued challenge".into(),
+                    ));
+                }
             }
         }
 
         // 6. Sign-count monotonicity — detect cloned authenticators / replay.
         //    Authenticators that do not support counters report 0; skip the check.
+        //    **L-18 (security review)**: use the atomic `bump_sign_count`
+        //    primitive so the compare and the write happen under the same
+        //    backend transaction. Today the service-wide mutex (see L-17)
+        //    serializes these calls, but if L-17 is ever fixed the check
+        //    here must remain race-free on its own.
         if parsed.sign_count > 0 {
-            let stored = self
-                .store
-                .get_sign_count(credential_id)
-                .map_err(|e| ServiceError::Store(e.to_string()))?
-                .unwrap_or(0);
-            if parsed.sign_count <= stored {
-                return Err(ServiceError::Fido2(format!(
-                    "sign_count replay detected: received {} <= stored {} for credential '{credential_id}'",
-                    parsed.sign_count, stored
-                )));
+            match self.store.bump_sign_count(credential_id, parsed.sign_count) {
+                Ok(()) => {}
+                Err(dds_store::traits::StoreError::SignCountReplay { stored, attempted }) => {
+                    return Err(ServiceError::Fido2(format!(
+                        "sign_count replay detected: received {attempted} <= stored {stored} for credential '{credential_id}'"
+                    )));
+                }
+                Err(e) => return Err(ServiceError::Store(e.to_string())),
             }
-            self.store
-                .set_sign_count(credential_id, parsed.sign_count)
-                .map_err(|e| ServiceError::Store(e.to_string()))?;
         } else {
             tracing::warn!(
                 credential_id = %credential_id,
@@ -1220,6 +1367,7 @@ impl<
             &req.credential_id,
             &req.challenge_id,
             &req.client_data_hash,
+            req.client_data_json.as_deref(),
             &req.authenticator_data,
             &req.signature,
         )?;
@@ -1489,6 +1637,7 @@ impl<
             &req.credential_id,
             &req.challenge_id,
             &req.client_data_hash,
+            req.client_data_json.as_deref(),
             &req.authenticator_data,
             &req.signature,
         )?;
@@ -1933,6 +2082,18 @@ fn rand_u64() -> u64 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     RandomState::new().build_hasher().finish()
+}
+
+/// **M-12 (security review)**: decode a WebAuthn `challenge` field
+/// into raw bytes, accepting both base64url-no-pad (per spec) and
+/// base64url-with-pad (some JS stacks), but rejecting standard
+/// base64 — a WebAuthn client MUST emit base64url here, and
+/// accepting `+/` alphabet would hide a client bug.
+fn decode_b64url_any(s: &str) -> Option<Vec<u8>> {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s))
+        .ok()
 }
 
 /// **L-13 (security review)**: compare two credential-id strings by

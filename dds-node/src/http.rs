@@ -179,6 +179,7 @@ where
         .route("/v1/admin/vouch", post(admin_vouch::<S>))
         .route("/v1/policy/evaluate", post(evaluate_policy::<S>))
         .route("/v1/status", get(status::<S>))
+        .route("/v1/node/info", get(node_info::<S>))
         .route("/v1/windows/policies", get(list_windows_policies::<S>))
         .route("/v1/windows/software", get(list_windows_software::<S>))
         .route("/v1/windows/applied", post(record_windows_applied::<S>))
@@ -271,19 +272,28 @@ pub struct ChallengeResponse {
     pub expires_at: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AssertionSessionRequestJson {
     pub subject_urn: Option<String>,
     pub credential_id: String,
     /// Server-issued challenge ID from `GET /v1/session/challenge`.
     pub challenge_id: String,
     pub client_data_hash: String,
+    /// **M-12 (security review)**: optional base64-standard
+    /// encoding of the raw authenticator-signed `clientDataJSON`.
+    /// When present, the node parses the JSON and validates
+    /// `type`/`origin`/`challenge` individually per WebAuthn §7.2.
+    /// When absent, the legacy reconstruct-and-hash path is used.
+    /// Clients SHOULD always include this — the legacy path is
+    /// fragile under JSON-serializer differences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_data_json_b64: Option<String>,
     pub authenticator_data: String,
     pub signature: String,
     pub duration_secs: Option<u64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AdminVouchRequestJson {
     pub subject_urn: String,
     pub credential_id: String,
@@ -291,6 +301,9 @@ pub struct AdminVouchRequestJson {
     pub challenge_id: String,
     pub authenticator_data: String,
     pub client_data_hash: String,
+    /// M-12 (see `AssertionSessionRequestJson::client_data_json_b64`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_data_json_b64: Option<String>,
     pub signature: String,
     pub purpose: Option<String>,
 }
@@ -356,6 +369,35 @@ pub struct WindowsClaimAccountResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MacOsSoftwareResponse {
     pub software: Vec<ApplicableSoftware>,
+}
+
+/// Response for `GET /v1/node/info` — used by Policy Agents to
+/// discover the node's URN and Ed25519 signing public key so they
+/// can pin the key at first contact (H-2 / H-3).
+///
+/// **Trust model.** The response itself is served over unauthenticated
+/// loopback HTTP, so it must not be trusted on its own for pinning.
+/// Agents consume it in one of two ways:
+///
+/// 1. **Install-time pinning** (preferred): the MSI / provisioning
+///    step writes the expected `node_pubkey_b64` into the agent's
+///    config. The agent compares the live value to the pinned one
+///    and refuses on mismatch.
+/// 2. **TOFU** (fallback for dev): agents with no pinned value on
+///    first run cache the served pubkey and refuse any subsequent
+///    change. Operators are warned.
+///
+/// A future pass will add a `domain_binding_sig_b64` field — a
+/// signature by the domain signing key over
+/// `(domain_id || node_urn || node_pubkey)` generated once at
+/// provisioning. That closes the TOFU gap because the agent only
+/// needs to pin the domain pubkey (which already ships via the
+/// provisioning bundle, H-10).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NodeInfoResponse {
+    pub node_urn: String,
+    pub node_pubkey_b64: String,
+    pub peer_id: String,
 }
 
 // ---------- error type ----------
@@ -528,6 +570,28 @@ where
     Ok(Json(svc.status(&state.info.peer_id, 0, 0)?))
 }
 
+/// `GET /v1/node/info` — discovery endpoint for Policy Agents. See
+/// `NodeInfoResponse` for the trust-model caveats.
+async fn node_info<S>(State(state): State<AppState<S>>) -> Result<Json<NodeInfoResponse>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    use base64::Engine as _;
+    let svc = state.svc.lock().await;
+    Ok(Json(NodeInfoResponse {
+        node_urn: svc.node_urn(),
+        node_pubkey_b64: base64::engine::general_purpose::STANDARD.encode(svc.node_pubkey_bytes()),
+        peer_id: state.info.peer_id.clone(),
+    }))
+}
+
 // ---------- Credential Provider handlers (Phase III) ----------
 
 async fn issue_session_challenge<S>(
@@ -628,11 +692,16 @@ where
         + Sync
         + 'static,
 {
+    let client_data_json = match req.client_data_json_b64.as_deref() {
+        Some(s) => Some(b64_decode(s, "client_data_json_b64")?),
+        None => None,
+    };
     let internal = AssertionSessionRequest {
         subject_urn: req.subject_urn,
         credential_id: req.credential_id,
         challenge_id: req.challenge_id,
         client_data_hash: b64_decode(&req.client_data_hash, "client_data_hash")?,
+        client_data_json,
         authenticator_data: b64_decode(&req.authenticator_data, "authenticator_data")?,
         signature: b64_decode(&req.signature, "signature")?,
         duration_secs: req.duration_secs,
@@ -715,11 +784,16 @@ where
         + Sync
         + 'static,
 {
+    let client_data_json = match req.client_data_json_b64.as_deref() {
+        Some(s) => Some(b64_decode(s, "client_data_json_b64")?),
+        None => None,
+    };
     let internal = AdminVouchRequest {
         subject_urn: req.subject_urn,
         credential_id: req.credential_id,
         challenge_id: req.challenge_id,
         client_data_hash: b64_decode(&req.client_data_hash, "client_data_hash")?,
+        client_data_json,
         authenticator_data: b64_decode(&req.authenticator_data, "authenticator_data")?,
         signature: b64_decode(&req.signature, "signature")?,
         purpose: req.purpose,
@@ -738,7 +812,7 @@ where
 async fn list_windows_policies<S>(
     State(state): State<AppState<S>>,
     Query(q): Query<DeviceUrnQuery>,
-) -> Result<Json<WindowsPoliciesResponse>, HttpError>
+) -> Result<Json<dds_core::envelope::SignedPolicyEnvelope>, HttpError>
 where
     S: TokenStore
         + RevocationStore
@@ -755,13 +829,26 @@ where
     tracing::info!(device_urn = %q.device_urn, "list_windows_policies");
     let svc = state.svc.lock().await;
     let policies = svc.list_applicable_windows_policies(&q.device_urn)?;
-    Ok(Json(WindowsPoliciesResponse { policies }))
+    let payload = WindowsPoliciesResponse { policies };
+    // H-2 (security review): serialize once, sign the bytes, hand the
+    // bytes back base64-encoded. Policy Agent verifies the sig under
+    // its pinned node pubkey before dispatching any enforcer.
+    let payload_json = serde_json::to_vec(&payload).map_err(|e| HttpError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("serialize: {e}"),
+    })?;
+    let env = svc.sign_policy_envelope(
+        &q.device_urn,
+        dds_core::envelope::kind::WINDOWS_POLICIES,
+        &payload_json,
+    );
+    Ok(Json(env))
 }
 
 async fn list_windows_software<S>(
     State(state): State<AppState<S>>,
     Query(q): Query<DeviceUrnQuery>,
-) -> Result<Json<WindowsSoftwareResponse>, HttpError>
+) -> Result<Json<dds_core::envelope::SignedPolicyEnvelope>, HttpError>
 where
     S: TokenStore
         + RevocationStore
@@ -775,7 +862,17 @@ where
     tracing::info!(device_urn = %q.device_urn, "list_windows_software");
     let svc = state.svc.lock().await;
     let software = svc.list_applicable_software(&q.device_urn)?;
-    Ok(Json(WindowsSoftwareResponse { software }))
+    let payload = WindowsSoftwareResponse { software };
+    let payload_json = serde_json::to_vec(&payload).map_err(|e| HttpError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("serialize: {e}"),
+    })?;
+    let env = svc.sign_policy_envelope(
+        &q.device_urn,
+        dds_core::envelope::kind::WINDOWS_SOFTWARE,
+        &payload_json,
+    );
+    Ok(Json(env))
 }
 
 async fn record_windows_applied<S>(
@@ -840,7 +937,7 @@ where
 async fn list_macos_policies<S>(
     State(state): State<AppState<S>>,
     Query(q): Query<DeviceUrnQuery>,
-) -> Result<Json<MacOsPoliciesResponse>, HttpError>
+) -> Result<Json<dds_core::envelope::SignedPolicyEnvelope>, HttpError>
 where
     S: TokenStore
         + RevocationStore
@@ -854,13 +951,26 @@ where
     tracing::info!(device_urn = %q.device_urn, "list_macos_policies");
     let svc = state.svc.lock().await;
     let policies = svc.list_applicable_macos_policies(&q.device_urn)?;
-    Ok(Json(MacOsPoliciesResponse { policies }))
+    let payload = MacOsPoliciesResponse { policies };
+    // H-3 (security review): sign the payload so the macOS Policy
+    // Agent can verify against its pinned node pubkey before
+    // dispatching launchd/accounts/profiles enforcers as root.
+    let payload_json = serde_json::to_vec(&payload).map_err(|e| HttpError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("serialize: {e}"),
+    })?;
+    let env = svc.sign_policy_envelope(
+        &q.device_urn,
+        dds_core::envelope::kind::MACOS_POLICIES,
+        &payload_json,
+    );
+    Ok(Json(env))
 }
 
 async fn list_macos_software<S>(
     State(state): State<AppState<S>>,
     Query(q): Query<DeviceUrnQuery>,
-) -> Result<Json<MacOsSoftwareResponse>, HttpError>
+) -> Result<Json<dds_core::envelope::SignedPolicyEnvelope>, HttpError>
 where
     S: TokenStore
         + RevocationStore
@@ -874,7 +984,17 @@ where
     tracing::info!(device_urn = %q.device_urn, "list_macos_software");
     let svc = state.svc.lock().await;
     let software = svc.list_applicable_software(&q.device_urn)?;
-    Ok(Json(MacOsSoftwareResponse { software }))
+    let payload = MacOsSoftwareResponse { software };
+    let payload_json = serde_json::to_vec(&payload).map_err(|e| HttpError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("serialize: {e}"),
+    })?;
+    let env = svc.sign_policy_envelope(
+        &q.device_urn,
+        dds_core::envelope::kind::MACOS_SOFTWARE,
+        &payload_json,
+    );
+    Ok(Json(env))
 }
 
 async fn record_macos_applied<S>(
@@ -1368,7 +1488,9 @@ mod tests {
             authenticator_data: auth_data_b64,
             signature: sig_b64,
             duration_secs: Some(1800),
-        };
+        
+            ..Default::default()
+};
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/session/assert"))
             .json(&assert_req)
@@ -1429,7 +1551,9 @@ mod tests {
             authenticator_data: b64_encode(&auth_data),
             signature: b64_encode(&sig.to_bytes()),
             duration_secs: None,
-        };
+        
+            ..Default::default()
+};
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/session/assert"))
             .json(&assert_req)
@@ -1465,7 +1589,9 @@ mod tests {
             authenticator_data: b64_encode(&auth_data),
             signature: b64_encode(&sig.to_bytes()),
             duration_secs: None,
-        };
+        
+            ..Default::default()
+};
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/session/assert"))
             .json(&assert_req)
@@ -1998,6 +2124,19 @@ mod tests {
         device_urn
     }
 
+    /// H-2 / H-3 (security review): policy/software endpoints now
+    /// return a `SignedPolicyEnvelope`; the tests unwrap the envelope
+    /// (payload is the same JSON they used to receive directly).
+    /// Tests don't re-verify the signature — that's exercised in
+    /// `dds_core::envelope::tests::interop_vector_is_stable` and the
+    /// C# agent-side suites.
+    fn unwrap_envelope_payload(env: dds_core::envelope::SignedPolicyEnvelope) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(&env.payload_b64)
+            .expect("envelope payload_b64 must decode")
+    }
+
     #[tokio::test]
     async fn test_windows_policies_endpoint_returns_typed_bundle() {
         let state = make_state();
@@ -2011,7 +2150,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let body: WindowsPoliciesResponse = resp.json().await.unwrap();
+        let env: dds_core::envelope::SignedPolicyEnvelope = resp.json().await.unwrap();
+        assert_eq!(env.kind, dds_core::envelope::kind::WINDOWS_POLICIES);
+        assert_eq!(env.device_urn, device_urn);
+        let bytes = unwrap_envelope_payload(env);
+        let body: WindowsPoliciesResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body.policies.len(), 1);
         assert_eq!(body.policies[0].document.policy_id, "security/baseline");
         let bundle = body.policies[0].document.windows.as_ref().unwrap();
@@ -2033,7 +2176,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let body: WindowsSoftwareResponse = resp.json().await.unwrap();
+        let env: dds_core::envelope::SignedPolicyEnvelope = resp.json().await.unwrap();
+        assert_eq!(env.kind, dds_core::envelope::kind::WINDOWS_SOFTWARE);
+        let bytes = unwrap_envelope_payload(env);
+        let body: WindowsSoftwareResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body.software.len(), 1);
         assert_eq!(body.software[0].document.package_id, "com.example.editor");
 
@@ -2045,7 +2191,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let body: WindowsSoftwareResponse = resp.json().await.unwrap();
+        let env: dds_core::envelope::SignedPolicyEnvelope = resp.json().await.unwrap();
+        let bytes = unwrap_envelope_payload(env);
+        let body: WindowsSoftwareResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body.software.len(), 0);
     }
 
@@ -2086,7 +2234,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let body: MacOsPoliciesResponse = resp.json().await.unwrap();
+        let env: dds_core::envelope::SignedPolicyEnvelope = resp.json().await.unwrap();
+        assert_eq!(env.kind, dds_core::envelope::kind::MACOS_POLICIES);
+        let bytes = unwrap_envelope_payload(env);
+        let body: MacOsPoliciesResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body.policies.len(), 1);
         assert_eq!(body.policies[0].document.policy_id, "security/screensaver");
         let bundle = body.policies[0].document.macos.as_ref().unwrap();
@@ -2107,7 +2258,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let body: MacOsSoftwareResponse = resp.json().await.unwrap();
+        let env: dds_core::envelope::SignedPolicyEnvelope = resp.json().await.unwrap();
+        assert_eq!(env.kind, dds_core::envelope::kind::MACOS_SOFTWARE);
+        let bytes = unwrap_envelope_payload(env);
+        let body: MacOsSoftwareResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body.software.len(), 1);
         assert_eq!(
             body.software[0].document.package_id,
@@ -2121,7 +2275,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let body: MacOsSoftwareResponse = resp.json().await.unwrap();
+        let env: dds_core::envelope::SignedPolicyEnvelope = resp.json().await.unwrap();
+        let bytes = unwrap_envelope_payload(env);
+        let body: MacOsSoftwareResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body.software.len(), 0);
     }
 
@@ -2204,7 +2360,9 @@ mod tests {
             authenticator_data: auth_data_b64,
             signature: sig_b64,
             duration_secs,
-        };
+        
+            ..Default::default()
+};
         reqwest::Client::new()
             .post(format!("{base}/v1/session/assert"))
             .json(&req)
@@ -2276,7 +2434,9 @@ mod tests {
             authenticator_data: auth_data_b64,
             signature: sig_b64,
             duration_secs: None,
-        };
+        
+            ..Default::default()
+};
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/session/assert"))
             .json(&req)
@@ -2319,7 +2479,9 @@ mod tests {
             authenticator_data: auth_data_b64,
             signature: sig_b64,
             duration_secs: None,
-        };
+        
+            ..Default::default()
+};
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/session/assert"))
             .json(&req)
@@ -2458,7 +2620,9 @@ mod tests {
             client_data_hash: b64_encode(&cdh),
             signature: b64_encode(&sig.to_bytes()),
             purpose: None,
-        };
+        
+            ..Default::default()
+};
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/admin/vouch"))
             .json(&req)
@@ -2509,7 +2673,9 @@ mod tests {
             client_data_hash: b64_encode(&cdh),
             signature: b64_encode(&sig.to_bytes()),
             purpose: None,
-        };
+        
+            ..Default::default()
+};
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/admin/vouch"))
             .json(&req)
@@ -2549,7 +2715,9 @@ mod tests {
                 client_data_hash: cdh_b64.clone(),
                 signature: sig_b64.clone(),
                 purpose: None,
-            })
+            
+                ..Default::default()
+})
             .send()
             .await
             .unwrap();
@@ -2571,7 +2739,9 @@ mod tests {
                 client_data_hash: cdh2,
                 signature: sig2,
                 purpose: None,
-            })
+            
+                ..Default::default()
+})
             .send()
             .await
             .unwrap();
@@ -2621,7 +2791,9 @@ mod tests {
             authenticator_data: auth2,
             signature: sig2,
             duration_secs: None,
-        };
+        
+            ..Default::default()
+};
         let resp2 = reqwest::Client::new()
             .post(format!("{base}/v1/session/assert"))
             .json(&req2)

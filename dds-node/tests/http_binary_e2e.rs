@@ -473,7 +473,9 @@ async fn post_session_assert(
             authenticator_data: encode_b64(&auth_data),
             signature: encode_b64(&sig.to_bytes()),
             duration_secs: Some(300),
-        })
+        
+            ..Default::default()
+})
         .send()
         .await
         .unwrap()

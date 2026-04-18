@@ -286,3 +286,45 @@ impl CredentialStateStore for MemoryBackend {
 }
 
 impl DirectoryStore for MemoryBackend {}
+
+#[cfg(test)]
+mod l18_sign_count_tests {
+    use super::*;
+
+    /// L-18: `bump_sign_count` must accept a strictly-greater value
+    /// and reject anything else, atomically from the caller's point
+    /// of view.
+    #[test]
+    fn bump_sign_count_memory_behaviour() {
+        let mut be = MemoryBackend::new();
+
+        // First bump from 0 → 5 succeeds; state visible.
+        be.bump_sign_count("cred-a", 5).unwrap();
+        assert_eq!(be.get_sign_count("cred-a").unwrap(), Some(5));
+
+        // Strictly greater → accepted.
+        be.bump_sign_count("cred-a", 6).unwrap();
+        assert_eq!(be.get_sign_count("cred-a").unwrap(), Some(6));
+
+        // Equal → rejected, state unchanged.
+        let err = be.bump_sign_count("cred-a", 6).unwrap_err();
+        match err {
+            StoreError::SignCountReplay { stored, attempted } => {
+                assert_eq!(stored, 6);
+                assert_eq!(attempted, 6);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(be.get_sign_count("cred-a").unwrap(), Some(6));
+
+        // Less-than → rejected.
+        assert!(matches!(
+            be.bump_sign_count("cred-a", 2),
+            Err(StoreError::SignCountReplay { stored: 6, attempted: 2 })
+        ));
+
+        // Separate credentials don't interfere.
+        be.bump_sign_count("cred-b", 1).unwrap();
+        assert_eq!(be.get_sign_count("cred-b").unwrap(), Some(1));
+    }
+}

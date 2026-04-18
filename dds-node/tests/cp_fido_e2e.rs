@@ -421,7 +421,9 @@ async fn cp_fido2_ed25519_full_lifecycle() {
             authenticator_data: encode_b64(&auth_data),
             signature: encode_b64(&signature.to_bytes()),
             duration_secs: Some(3600),
-        })
+        
+            ..Default::default()
+})
         .send()
         .await
         .unwrap();
@@ -459,7 +461,9 @@ async fn cp_fido2_ed25519_full_lifecycle() {
             authenticator_data: encode_b64(&auth_data),
             signature: encode_b64(&wrong_sig.to_bytes()),
             duration_secs: None,
-        })
+        
+            ..Default::default()
+})
         .send()
         .await
         .unwrap();
@@ -481,7 +485,9 @@ async fn cp_fido2_ed25519_full_lifecycle() {
             authenticator_data: encode_b64(&auth_data),
             signature: encode_b64(&signature.to_bytes()),
             duration_secs: None,
-        })
+        
+            ..Default::default()
+})
         .send()
         .await
         .unwrap();
@@ -599,7 +605,9 @@ async fn cp_fido2_p256_assertion() {
             authenticator_data: encode_b64(&auth_data),
             signature: encode_b64(sig.as_bytes()),
             duration_secs: Some(1800),
-        })
+        
+            ..Default::default()
+})
         .send()
         .await
         .unwrap();
@@ -699,7 +707,9 @@ async fn cp_fido2_enroll_then_assert() {
             authenticator_data: encode_b64(&auth_data),
             signature: encode_b64(&no_vouch_sig.to_bytes()),
             duration_secs: None,
-        })
+        
+            ..Default::default()
+})
         .send()
         .await
         .unwrap();

@@ -17,6 +17,11 @@
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.1" />
     <PackageReference Include="Microsoft.Extensions.Http" Version="8.0.1" />
+    <!-- H-2 (security review): pure-managed Ed25519 verifier for
+         signed policy/software envelopes. BouncyCastle avoids a
+         native libsodium dependency which would complicate the
+         MSI footprint. -->
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.4.0" />
   </ItemGroup>
 
 </Project>

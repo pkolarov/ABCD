@@ -778,12 +778,15 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
     match action {
         PlatformAction::Windows { action } => match action {
             WindowsAction::Policies { device_urn } => {
-                let r: WindowsPoliciesResponse = get_json(
+                let env: dds_core::envelope::SignedPolicyEnvelope = get_json(
                     node_url,
                     "/v1/windows/policies",
                     &[("device_urn", &device_urn)],
                 )
                 .await;
+                let bytes =
+                    unwrap_envelope(env, dds_core::envelope::kind::WINDOWS_POLICIES);
+                let r: WindowsPoliciesPayload = serde_json::from_slice(&bytes).unwrap();
                 println!(
                     "Windows policies for {} ({}):",
                     device_urn,
@@ -794,12 +797,15 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
                 }
             }
             WindowsAction::Software { device_urn } => {
-                let r: WindowsSoftwareResponse = get_json(
+                let env: dds_core::envelope::SignedPolicyEnvelope = get_json(
                     node_url,
                     "/v1/windows/software",
                     &[("device_urn", &device_urn)],
                 )
                 .await;
+                let bytes =
+                    unwrap_envelope(env, dds_core::envelope::kind::WINDOWS_SOFTWARE);
+                let r: WindowsSoftwarePayload = serde_json::from_slice(&bytes).unwrap();
                 println!(
                     "Windows software for {} ({}):",
                     device_urn,
@@ -837,24 +843,28 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
         },
         PlatformAction::Macos { action } => match action {
             MacosAction::Policies { device_urn } => {
-                let r: MacosPoliciesResponse = get_json(
+                let env: dds_core::envelope::SignedPolicyEnvelope = get_json(
                     node_url,
                     "/v1/macos/policies",
                     &[("device_urn", &device_urn)],
                 )
                 .await;
+                let bytes = unwrap_envelope(env, dds_core::envelope::kind::MACOS_POLICIES);
+                let r: MacosPoliciesPayload = serde_json::from_slice(&bytes).unwrap();
                 println!("macOS policies for {} ({}):", device_urn, r.policies.len());
                 for p in &r.policies {
                     println!("  - jti={} issuer={} iat={}", p.jti, p.issuer, p.iat);
                 }
             }
             MacosAction::Software { device_urn } => {
-                let r: MacosSoftwareResponse = get_json(
+                let env: dds_core::envelope::SignedPolicyEnvelope = get_json(
                     node_url,
                     "/v1/macos/software",
                     &[("device_urn", &device_urn)],
                 )
                 .await;
+                let bytes = unwrap_envelope(env, dds_core::envelope::kind::MACOS_SOFTWARE);
+                let r: MacosSoftwarePayload = serde_json::from_slice(&bytes).unwrap();
                 println!("macOS software for {} ({}):", device_urn, r.software.len());
                 for s in &r.software {
                     println!("  - jti={} issuer={} iat={}", s.jti, s.issuer, s.iat);
@@ -1534,23 +1544,80 @@ struct ApplicablePolicyJson {
 }
 
 #[derive(Deserialize)]
-struct WindowsPoliciesResponse {
+struct WindowsPoliciesPayload {
     policies: Vec<ApplicablePolicyJson>,
 }
 
 #[derive(Deserialize)]
-struct WindowsSoftwareResponse {
+struct WindowsSoftwarePayload {
     software: Vec<ApplicablePolicyJson>,
 }
 
 #[derive(Deserialize)]
-struct MacosPoliciesResponse {
+struct MacosPoliciesPayload {
     policies: Vec<ApplicablePolicyJson>,
 }
 
 #[derive(Deserialize)]
-struct MacosSoftwareResponse {
+struct MacosSoftwarePayload {
     software: Vec<ApplicablePolicyJson>,
+}
+
+/// **H-2 / H-3 (security review)**: policy/software endpoints now
+/// return a `SignedPolicyEnvelope`. The CLI is a diagnostic tool so
+/// it only parses — real enforcement happens in the Policy Agents,
+/// which pin the node pubkey and verify the signature before
+/// dispatch. If `DDS_NODE_PUBKEY` is set, the CLI verifies too.
+fn unwrap_envelope(env: dds_core::envelope::SignedPolicyEnvelope, expected_kind: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    if env.kind != expected_kind {
+        eprintln!(
+            "warning: envelope kind {:?} does not match expected {:?} — refusing to parse",
+            env.kind, expected_kind
+        );
+        std::process::exit(1);
+    }
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let payload = b64.decode(&env.payload_b64).unwrap_or_else(|e| {
+        eprintln!("envelope payload_b64 decode failed: {e}");
+        std::process::exit(1);
+    });
+    if let Ok(pinned_b64) = std::env::var("DDS_NODE_PUBKEY") {
+        let pinned = b64.decode(pinned_b64.trim()).unwrap_or_else(|e| {
+            eprintln!("DDS_NODE_PUBKEY is not valid base64: {e}");
+            std::process::exit(1);
+        });
+        let pinned: [u8; 32] = pinned.as_slice().try_into().unwrap_or_else(|_| {
+            eprintln!("DDS_NODE_PUBKEY must decode to 32 bytes");
+            std::process::exit(1);
+        });
+        let sig = b64.decode(&env.signature_b64).unwrap_or_else(|e| {
+            eprintln!("envelope signature_b64 decode failed: {e}");
+            std::process::exit(1);
+        });
+        let sig: [u8; 64] = sig.as_slice().try_into().unwrap_or_else(|_| {
+            eprintln!("envelope signature must be 64 bytes");
+            std::process::exit(1);
+        });
+        if dds_core::envelope::verify_envelope(
+            &pinned,
+            &env.device_urn,
+            &env.kind,
+            env.issued_at,
+            &payload,
+            &sig,
+        )
+        .is_err()
+        {
+            eprintln!("envelope signature did not verify against DDS_NODE_PUBKEY");
+            std::process::exit(1);
+        }
+    } else {
+        eprintln!(
+            "note: DDS_NODE_PUBKEY unset — skipping signature verification (dev mode)"
+        );
+    }
+    payload
 }
 
 #[derive(Serialize)]

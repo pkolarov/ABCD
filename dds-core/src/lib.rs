@@ -14,6 +14,7 @@ extern crate alloc;
 
 pub mod crdt;
 pub mod crypto;
+pub mod envelope;
 pub mod identity;
 pub mod policy;
 pub mod token;

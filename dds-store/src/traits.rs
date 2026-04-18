@@ -19,6 +19,12 @@ pub enum StoreError {
     Io(String),
     /// Item not found.
     NotFound(String),
+    /// **L-18 (security review)**: atomic sign-count bump refused
+    /// because the new count is not strictly greater than the
+    /// stored one. Returned by `CredentialStateStore::bump_sign_count`
+    /// — either a clone/replay attempt or a racing caller that
+    /// already consumed this counter value.
+    SignCountReplay { stored: u32, attempted: u32 },
 }
 
 impl fmt::Display for StoreError {
@@ -27,6 +33,10 @@ impl fmt::Display for StoreError {
             StoreError::Serde(e) => write!(f, "serialization error: {e}"),
             StoreError::Io(e) => write!(f, "I/O error: {e}"),
             StoreError::NotFound(key) => write!(f, "not found: {key}"),
+            StoreError::SignCountReplay { stored, attempted } => write!(
+                f,
+                "sign-count replay: attempted {attempted} <= stored {stored}"
+            ),
         }
     }
 }
@@ -170,6 +180,35 @@ pub trait CredentialStateStore {
     /// Persist a new sign count. Must be called only after verifying the
     /// new count exceeds the stored count.
     fn set_sign_count(&mut self, credential_id: &str, count: u32) -> StoreResult<()>;
+
+    /// **L-18 (security review)**: atomic check-and-set. Returns
+    /// `Ok(())` if `new_count > stored`; else
+    /// `Err(StoreError::SignCountReplay { .. })`. The backend MUST
+    /// perform the compare and the write under the same lock /
+    /// transaction so two concurrent callers cannot both read the
+    /// same stored value, see their `new_count > stored`, and each
+    /// commit — which would allow the second caller to reuse an
+    /// assertion that was already consumed by the first.
+    ///
+    /// Default implementation is intentionally non-atomic and only
+    /// suitable for backends whose `get_sign_count` +
+    /// `set_sign_count` are serialized by an outer mutex. Backends
+    /// must override this when they hold their own concurrency
+    /// domain (e.g. a redb write transaction).
+    fn bump_sign_count(
+        &mut self,
+        credential_id: &str,
+        new_count: u32,
+    ) -> StoreResult<()> {
+        let stored = self.get_sign_count(credential_id)?.unwrap_or(0);
+        if new_count <= stored {
+            return Err(StoreError::SignCountReplay {
+                stored,
+                attempted: new_count,
+            });
+        }
+        self.set_sign_count(credential_id, new_count)
+    }
 }
 
 /// Combined directory store — convenience trait bundling all stores.

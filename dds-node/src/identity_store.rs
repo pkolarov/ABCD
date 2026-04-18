@@ -36,11 +36,31 @@ use zeroize::{Zeroize, Zeroizing};
 /// Environment variable name for the optional disk-encryption passphrase.
 pub const PASSPHRASE_ENV: &str = "DDS_NODE_PASSPHRASE";
 
+/// **M-14 (security review)**: escape hatch for explicit,
+/// operator-acknowledged plaintext downgrade (dev/testing only).
+/// Set to a non-empty value to allow `save()` to write an
+/// unencrypted blob even when an encrypted marker exists.
+pub const ALLOW_PLAINTEXT_DOWNGRADE_ENV: &str = "DDS_NODE_ALLOW_PLAINTEXT_DOWNGRADE";
+
 #[cfg(test)]
 pub(crate) static PASSPHRASE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const VERSION_PLAIN: u8 = 1;
 const VERSION_ENCRYPTED: u8 = 2;
+
+/// **M-14 (security review)**: path of the sticky "this node was
+/// once encrypted" marker file. When present, `save()` refuses to
+/// write a plaintext blob so an attacker with filesystem write
+/// cannot force a silent downgrade by clearing the passphrase env
+/// var. The marker is intentionally a side file (same name + suffix)
+/// rather than a field inside the key blob: we must be able to
+/// detect the invariant without first parsing (and thus trusting) an
+/// arbitrary file an attacker may have swapped in.
+fn encrypted_marker_path(key_path: &Path) -> std::path::PathBuf {
+    let mut p = key_path.as_os_str().to_os_string();
+    p.push(".encrypted-marker");
+    std::path::PathBuf::from(p)
+}
 
 /// Errors loading or saving the persistent identity.
 #[derive(Debug)]
@@ -91,9 +111,38 @@ pub fn save(path: &Path, ident: &Identity) -> Result<(), IdentityStoreError> {
     let mut key_bytes = ident.signing_key.to_bytes();
     let label = ident.id.label().to_string();
 
+    // M-14 (security review): compute whether the caller is about to
+    // produce a plaintext blob, and refuse if a previous save wrote
+    // an encrypted blob. The attacker's scenario is: unset the
+    // passphrase env var (or remove/corrupt the passphrase source)
+    // and wait for the next save — without this gate, the key on
+    // disk would silently roll back to plaintext.
+    let passphrase = std::env::var(PASSPHRASE_ENV).map(Zeroizing::new);
+    let will_be_plaintext =
+        !matches!(&passphrase, Ok(p) if !p.is_empty());
+    if will_be_plaintext && encrypted_marker_path(path).exists() {
+        let allow_downgrade = std::env::var(ALLOW_PLAINTEXT_DOWNGRADE_ENV)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !allow_downgrade {
+            return Err(IdentityStoreError::Crypto(format!(
+                "refusing to overwrite encrypted identity at {} with plaintext \
+                 ({PASSPHRASE_ENV} is empty but an encrypted-marker is present). \
+                 If this is intentional (e.g., rotating to a new passphrase), \
+                 set {ALLOW_PLAINTEXT_DOWNGRADE_ENV}=1 to override.",
+                path.display()
+            )));
+        }
+        tracing::warn!(
+            "plaintext downgrade of encrypted identity at {} permitted by \
+             {ALLOW_PLAINTEXT_DOWNGRADE_ENV}",
+            path.display()
+        );
+    }
+
     // H-9 (security review): wrap the passphrase in `Zeroizing` so it
     // is wiped on drop even on the early-error paths that follow.
-    let map = match std::env::var(PASSPHRASE_ENV).map(Zeroizing::new) {
+    let map = match passphrase {
         Ok(pass) if !pass.is_empty() => {
             let mut salt = [0u8; 16];
             OsRng.fill_bytes(&mut salt);
@@ -160,6 +209,17 @@ pub fn save(path: &Path, ident: &Identity) -> Result<(), IdentityStoreError> {
     tmp.persist(path)
         .map_err(|e| IdentityStoreError::Io(format!("rename: {e}")))?;
     set_owner_only_permissions(path);
+
+    // M-14: drop the sticky marker once we've written an encrypted
+    // blob. We intentionally only create the marker on success, and
+    // never remove it once present (downgrade is then always explicit).
+    if !will_be_plaintext {
+        let marker = encrypted_marker_path(path);
+        if !marker.exists() {
+            let _ = std::fs::write(&marker, []);
+            set_owner_only_permissions(&marker);
+        }
+    }
     Ok(())
 }
 
@@ -341,5 +401,43 @@ mod tests {
         let a = load_or_create(&path, "node").unwrap();
         let b = load_or_create(&path, "node").unwrap();
         assert_eq!(a.id.to_urn(), b.id.to_urn());
+    }
+
+    /// **M-14 (security review)**: once the identity has been saved
+    /// encrypted, a subsequent save with `DDS_NODE_PASSPHRASE` unset
+    /// must fail — the sticky marker prevents a silent downgrade
+    /// that a local attacker could force by clearing the env var.
+    #[test]
+    fn test_m14_refuses_plaintext_downgrade() {
+        let _g = PASSPHRASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::set_var(PASSPHRASE_ENV, "correct horse battery staple") };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("node_key.bin");
+        let ident = load_or_create(&path, "node-m14").unwrap();
+        assert!(encrypted_marker_path(&path).exists());
+
+        // Now clear the passphrase and try to overwrite with plaintext.
+        unsafe { std::env::remove_var(PASSPHRASE_ENV) };
+        let err = save(&path, &ident).expect_err("save must refuse downgrade");
+        match err {
+            IdentityStoreError::Crypto(msg) => {
+                assert!(
+                    msg.contains("refusing to overwrite encrypted identity"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected Crypto error, got {other:?}"),
+        }
+
+        // Explicit override allows downgrade (dev/testing).
+        unsafe {
+            std::env::set_var(ALLOW_PLAINTEXT_DOWNGRADE_ENV, "1");
+        }
+        save(&path, &ident).expect("explicit override must succeed");
+        unsafe {
+            std::env::remove_var(ALLOW_PLAINTEXT_DOWNGRADE_ENV);
+        }
     }
 }

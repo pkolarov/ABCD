@@ -80,6 +80,15 @@ public sealed class AppliedReport
 /// HTTP client for the dds-node Windows applier endpoints.
 /// Uses <see cref="IHttpClientFactory"/> for testability and
 /// connection pooling.
+///
+/// <para>
+/// <b>H-2 (security review)</b>: the policy/software endpoints now
+/// return a <see cref="SignedPolicyEnvelope"/>. The client unwraps
+/// and verifies the envelope against a pinned node pubkey before
+/// handing the payload back. If no pubkey is pinned
+/// (<c>pinnedNodePubkey == null</c>) the client refuses to fetch
+/// — failing closed is the correct default for a SYSTEM agent.
+/// </para>
 /// </summary>
 public interface IDdsNodeClient
 {
@@ -96,15 +105,29 @@ public interface IDdsNodeClient
 public sealed class DdsNodeClient : IDdsNodeClient
 {
     private readonly HttpClient _http;
+    private readonly EnvelopeVerifier _verifier;
 
-    public DdsNodeClient(HttpClient http) => _http = http;
+    private static readonly System.Text.Json.JsonSerializerOptions PayloadJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+    };
+
+    public DdsNodeClient(HttpClient http, EnvelopeVerifier verifier)
+    {
+        _http = http;
+        _verifier = verifier;
+    }
 
     public async Task<List<ApplicableWindowsPolicy>> GetPoliciesAsync(
         string deviceUrn, CancellationToken ct = default)
     {
         var url = $"v1/windows/policies?device_urn={Uri.EscapeDataString(deviceUrn)}";
-        var resp = await _http.GetFromJsonAsync<WindowsPoliciesResponse>(url, ct)
-            .ConfigureAwait(false);
+        var env = await _http.GetFromJsonAsync<SignedPolicyEnvelope>(url, ct)
+            .ConfigureAwait(false)
+            ?? throw new InvalidOperationException("dds-node returned empty envelope");
+        var payload = _verifier.VerifyAndUnwrap(env, EnvelopeKind.WindowsPolicies);
+        var resp = System.Text.Json.JsonSerializer
+            .Deserialize<WindowsPoliciesResponse>(payload, PayloadJsonOptions);
         return resp?.Policies ?? [];
     }
 
@@ -112,8 +135,12 @@ public sealed class DdsNodeClient : IDdsNodeClient
         string deviceUrn, CancellationToken ct = default)
     {
         var url = $"v1/windows/software?device_urn={Uri.EscapeDataString(deviceUrn)}";
-        var resp = await _http.GetFromJsonAsync<WindowsSoftwareResponse>(url, ct)
-            .ConfigureAwait(false);
+        var env = await _http.GetFromJsonAsync<SignedPolicyEnvelope>(url, ct)
+            .ConfigureAwait(false)
+            ?? throw new InvalidOperationException("dds-node returned empty envelope");
+        var payload = _verifier.VerifyAndUnwrap(env, EnvelopeKind.WindowsSoftware);
+        var resp = System.Text.Json.JsonSerializer
+            .Deserialize<WindowsSoftwareResponse>(payload, PayloadJsonOptions);
         return resp?.Software ?? [];
     }
 

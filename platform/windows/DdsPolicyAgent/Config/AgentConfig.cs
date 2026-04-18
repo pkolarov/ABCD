@@ -38,4 +38,25 @@ public sealed class AgentConfig
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
             "DDS")
         : "./dds-agent-state";
+
+    /// <summary>
+    /// <b>H-2 (security review)</b>: base64-standard-with-padding
+    /// encoding of the 32-byte Ed25519 public key of the dds-node
+    /// that this agent is bound to. Every signed policy / software
+    /// envelope must verify under this pubkey before any enforcer
+    /// runs. Pin at MSI install time by reading the pubkey from a
+    /// provisioning bundle (or <c>dds-node status --node-pubkey</c>).
+    ///
+    /// Required in production. A null/empty value causes the agent
+    /// to fail closed — it will log an error and not apply any
+    /// policy.
+    /// </summary>
+    public string PinnedNodePubkeyB64 { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Maximum tolerated clock skew between the node and the agent
+    /// when validating the envelope's <c>issued_at</c> timestamp.
+    /// Default: 300 seconds.
+    /// </summary>
+    public int EnvelopeMaxClockSkewSeconds { get; set; } = 300;
 }

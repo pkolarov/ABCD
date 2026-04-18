@@ -654,6 +654,106 @@ impl CredentialStateStore for RedbBackend {
             .map_err(|e| StoreError::Io(e.to_string()))?;
         Ok(())
     }
+
+    /// **L-18 (security review)**: perform the compare and the write
+    /// inside a single write transaction. redb serializes write
+    /// transactions, so two concurrent callers cannot both observe
+    /// the pre-bump stored value and each commit their own update.
+    fn bump_sign_count(
+        &mut self,
+        credential_id: &str,
+        new_count: u32,
+    ) -> StoreResult<()> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        let (stored, should_write) = {
+            let table = write_txn
+                .open_table(CREDENTIAL_STATE)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            let stored = match table
+                .get(credential_id)
+                .map_err(|e| StoreError::Io(e.to_string()))?
+            {
+                None => 0u32,
+                Some(guard) => {
+                    let raw = guard.value();
+                    if raw.len() < 4 {
+                        return Err(StoreError::Serde(
+                            "credential_state record too short".into(),
+                        ));
+                    }
+                    u32::from_be_bytes(raw[..4].try_into().unwrap())
+                }
+            };
+            (stored, new_count > stored)
+        };
+        if !should_write {
+            // Abort the write transaction without touching the table.
+            // redb does not require an explicit abort — dropping the
+            // txn is sufficient — but we do it explicitly for clarity.
+            drop(write_txn);
+            return Err(StoreError::SignCountReplay {
+                stored,
+                attempted: new_count,
+            });
+        }
+        {
+            let mut table = write_txn
+                .open_table(CREDENTIAL_STATE)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            let value = new_count.to_be_bytes();
+            table
+                .insert(credential_id, value.as_slice())
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        Ok(())
+    }
 }
 
 impl DirectoryStore for RedbBackend {}
+
+#[cfg(test)]
+mod l18_sign_count_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn open_temp() -> (TempDir, RedbBackend) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.redb");
+        let be = RedbBackend::open(&path).unwrap();
+        (dir, be)
+    }
+
+    /// L-18: the redb backend performs the compare-and-write inside
+    /// a single write transaction — this is what makes the primitive
+    /// safe against the race the finding warns about. The test only
+    /// exercises behaviour (true concurrency is in the mutex layer).
+    #[test]
+    fn bump_sign_count_redb_behaviour() {
+        let (_dir, mut be) = open_temp();
+
+        be.bump_sign_count("cred-x", 10).unwrap();
+        assert_eq!(be.get_sign_count("cred-x").unwrap(), Some(10));
+
+        be.bump_sign_count("cred-x", 11).unwrap();
+        assert_eq!(be.get_sign_count("cred-x").unwrap(), Some(11));
+
+        let err = be.bump_sign_count("cred-x", 11).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::SignCountReplay { stored: 11, attempted: 11 }
+        ));
+        assert_eq!(be.get_sign_count("cred-x").unwrap(), Some(11));
+
+        assert!(matches!(
+            be.bump_sign_count("cred-x", 5),
+            Err(StoreError::SignCountReplay { stored: 11, attempted: 5 })
+        ));
+        assert_eq!(be.get_sign_count("cred-x").unwrap(), Some(11));
+    }
+}

@@ -67,6 +67,26 @@ const ADMISSION_RECHECK_INTERVAL_SECS: u64 = 600;
 /// bounding the replay window tightly.
 const REVOCATION_REPLAY_WINDOW_SECS: u64 = 7 * 86400;
 
+/// **M-4 (security review)**: upper bound on the number of mDNS-
+/// discovered peers we accept per minute. Each new peer triggers a
+/// Noise handshake (CPU-heavy) and a sync request (allocates
+/// response state). Without a cap, a LAN attacker that can
+/// fabricate mDNS responses with attacker-controlled peer IDs can
+/// burn the node's CPU on handshakes against ghosts and crowd real
+/// peers out of the peer table. 60 accept/minute is generous for
+/// real deployments (office floors rarely churn that fast) while
+/// shutting down Sybil floods.
+const MDNS_NEW_PEER_ACCEPT_PER_MINUTE: u32 = 60;
+
+/// **M-4 (security review)**: hard ceiling on the number of
+/// actively-tracked mDNS peers the node keeps addresses for in the
+/// Kademlia routing table. Once we reach this, new mDNS
+/// announcements are ignored (not evicted; we prefer stable
+/// known-good peers under attack). Legitimate discovery re-runs on
+/// expiry, so a lost real peer will reappear once a fake one is
+/// evicted via the mDNS TTL.
+const MDNS_PEER_TABLE_MAX: usize = 256;
+
 /// The running DDS node state.
 ///
 /// `trust_graph` is shared (`Arc<RwLock<TrustGraph>>`) so the swarm event
@@ -99,6 +119,16 @@ pub struct DdsNode {
     sync_payloads: BTreeMap<String, SyncPayload>,
     /// Per-peer "last outbound sync" timestamp for the cooldown throttle.
     sync_last_outbound: BTreeMap<PeerId, Instant>,
+    /// **M-4 (security review)**: sliding-window counter for newly
+    /// accepted mDNS peers. `(window_start, count)`: if `now -
+    /// window_start >= 60s`, reset and start a fresh window; else
+    /// increment and reject once `count >= MDNS_NEW_PEER_ACCEPT_PER_MINUTE`.
+    mdns_rate: (Instant, u32),
+    /// **M-4 (security review)**: set of peer-IDs we've added via
+    /// mDNS since startup (and not yet expired). Used to enforce the
+    /// hard ceiling and to de-duplicate Discovered events for the
+    /// same peer within a short window.
+    mdns_known_peers: BTreeSet<PeerId>,
 }
 
 impl DdsNode {
@@ -184,6 +214,8 @@ impl DdsNode {
             admission_cert: cert,
             domain_pubkey,
             domain_id,
+            mdns_rate: (Instant::now(), 0),
+            mdns_known_peers: BTreeSet::new(),
         })
     }
 
@@ -329,6 +361,14 @@ impl DdsNode {
                 peers,
             ))) => {
                 for (peer_id, addr) in peers {
+                    // M-4: gate mDNS-discovered peers on per-minute rate
+                    // and a hard table ceiling. Already-known peers
+                    // bypass both (a re-announcement from a peer we
+                    // already track is not a new resource commitment).
+                    if !self.mdns_accept_peer(&peer_id) {
+                        debug!(%peer_id, %addr, "mDNS: peer rejected by M-4 caps");
+                        continue;
+                    }
                     info!(%peer_id, %addr, "mDNS: discovered peer");
                     self.swarm
                         .behaviour_mut()
@@ -340,6 +380,7 @@ impl DdsNode {
             SwarmEvent::Behaviour(DdsBehaviourEvent::Mdns(libp2p::mdns::Event::Expired(peers))) => {
                 for (peer_id, _addr) in peers {
                     info!(%peer_id, "mDNS: peer expired");
+                    self.mdns_known_peers.remove(&peer_id);
                     dds_net::discovery::remove_mdns_peer(&mut self.swarm, peer_id);
                 }
             }
@@ -363,6 +404,44 @@ impl DdsNode {
             }
             _ => {}
         }
+    }
+
+    /// **M-4 (security review)**: decide whether to accept an
+    /// mDNS-discovered peer. Returns `true` if the peer should be
+    /// added to the Kademlia routing table and the gossipsub
+    /// explicit-peer list; `false` if the per-minute rate or table
+    /// ceiling is exceeded (or the peer is already tracked).
+    ///
+    /// Already-tracked peers return `false` — there is no additional
+    /// resource cost to re-announce, and returning `true` would
+    /// let an attacker inflate the per-minute counter with re-runs.
+    fn mdns_accept_peer(&mut self, peer_id: &PeerId) -> bool {
+        if self.mdns_known_peers.contains(peer_id) {
+            return false;
+        }
+        if self.mdns_known_peers.len() >= MDNS_PEER_TABLE_MAX {
+            warn!(
+                known = self.mdns_known_peers.len(),
+                cap = MDNS_PEER_TABLE_MAX,
+                "mDNS peer-table ceiling hit; dropping new peer"
+            );
+            return false;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.mdns_rate.0) >= Duration::from_secs(60) {
+            self.mdns_rate = (now, 0);
+        }
+        if self.mdns_rate.1 >= MDNS_NEW_PEER_ACCEPT_PER_MINUTE {
+            warn!(
+                accepted_this_window = self.mdns_rate.1,
+                cap = MDNS_NEW_PEER_ACCEPT_PER_MINUTE,
+                "mDNS new-peer rate cap hit; dropping discovery"
+            );
+            return false;
+        }
+        self.mdns_rate.1 += 1;
+        self.mdns_known_peers.insert(*peer_id);
+        true
     }
 
     fn handle_gossip_message(&mut self, topic_hash: &libp2p::gossipsub::TopicHash, data: &[u8]) {

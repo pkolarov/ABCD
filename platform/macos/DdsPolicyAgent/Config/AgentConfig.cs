@@ -101,6 +101,24 @@ public sealed class AgentConfig
     /// </summary>
     public bool AllowInlinePackageScripts { get; set; }
 
+    /// <summary>
+    /// <b>H-3 (security review)</b>: base64-standard-with-padding
+    /// encoding of the 32-byte Ed25519 public key of the dds-node
+    /// this agent is bound to. Every signed policy / software
+    /// envelope must verify under this pubkey before any enforcer
+    /// runs. Pin at install time via the provisioning bundle.
+    /// Required in production — empty string means the agent will
+    /// fail closed.
+    /// </summary>
+    public string PinnedNodePubkeyB64 { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Maximum tolerated clock skew between the node and the agent
+    /// when validating the envelope's <c>issued_at</c> timestamp.
+    /// Default: 300 seconds.
+    /// </summary>
+    public int EnvelopeMaxClockSkewSeconds { get; set; } = 300;
+
     public string ResolveStateDir()
         => string.IsNullOrWhiteSpace(StateDir)
             ? (OperatingSystem.IsMacOS()

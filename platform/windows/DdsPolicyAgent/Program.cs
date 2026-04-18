@@ -19,6 +19,37 @@ builder.Services.AddSingleton<IAppliedStateStore>(sp =>
     return new AppliedStateStore(cfg.StateDir);
 });
 
+// **H-2 (security review)**: build the envelope verifier from the
+// pinned node pubkey. Fail fast at startup if the pubkey is missing
+// or malformed — a SYSTEM agent must not run with an unauthenticated
+// localhost channel.
+builder.Services.AddSingleton<EnvelopeVerifier>(sp =>
+{
+    var cfg = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<AgentConfig>>().Value;
+    if (string.IsNullOrWhiteSpace(cfg.PinnedNodePubkeyB64))
+    {
+        throw new InvalidOperationException(
+            "DdsPolicyAgent:PinnedNodePubkeyB64 is not configured. "
+            + "Pin the dds-node public key at install time (see H-2 in the security review).");
+    }
+    byte[] pubkey;
+    try { pubkey = Convert.FromBase64String(cfg.PinnedNodePubkeyB64); }
+    catch (FormatException e)
+    {
+        throw new InvalidOperationException(
+            "DdsPolicyAgent:PinnedNodePubkeyB64 is not valid base64", e);
+    }
+    if (pubkey.Length != 32)
+        throw new InvalidOperationException(
+            "DdsPolicyAgent:PinnedNodePubkeyB64 must decode to 32 bytes");
+    if (string.IsNullOrWhiteSpace(cfg.DeviceUrn))
+        throw new InvalidOperationException(
+            "DdsPolicyAgent:DeviceUrn is required for envelope verification");
+    return new EnvelopeVerifier(
+        pubkey, cfg.DeviceUrn,
+        TimeSpan.FromSeconds(cfg.EnvelopeMaxClockSkewSeconds));
+});
+
 // Register the HTTP client for dds-node.
 builder.Services.AddHttpClient<IDdsNodeClient, DdsNodeClient>((sp, http) =>
 {

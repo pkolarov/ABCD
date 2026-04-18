@@ -522,7 +522,14 @@ async fn cmd_collect(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         .json()
         .await?;
 
-    let policies: MacOsPoliciesResponse = client
+    // H-3 (security review): endpoints now return a signed envelope
+    // around the original JSON. This diagnostic binary unwraps
+    // without verifying (the real Policy Agent pins the node pubkey
+    // and verifies). The envelope-kind check still catches an
+    // attacker splicing a software envelope into a policies response.
+    use base64::Engine as _;
+    let envelope_b64 = base64::engine::general_purpose::STANDARD;
+    let policies_env: dds_core::envelope::SignedPolicyEnvelope = client
         .get(format!("{node_url}/v1/macos/policies"))
         .query(&[("device_urn", &device_urn)])
         .send()
@@ -530,8 +537,13 @@ async fn cmd_collect(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         .error_for_status()?
         .json()
         .await?;
+    if policies_env.kind != dds_core::envelope::kind::MACOS_POLICIES {
+        return Err(format!("unexpected envelope kind: {}", policies_env.kind).into());
+    }
+    let policies_bytes = envelope_b64.decode(&policies_env.payload_b64)?;
+    let policies: MacOsPoliciesResponse = serde_json::from_slice(&policies_bytes)?;
 
-    let software: MacOsSoftwareResponse = client
+    let software_env: dds_core::envelope::SignedPolicyEnvelope = client
         .get(format!("{node_url}/v1/macos/software"))
         .query(&[("device_urn", &device_urn)])
         .send()
@@ -539,6 +551,11 @@ async fn cmd_collect(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         .error_for_status()?
         .json()
         .await?;
+    if software_env.kind != dds_core::envelope::kind::MACOS_SOFTWARE {
+        return Err(format!("unexpected envelope kind: {}", software_env.kind).into());
+    }
+    let software_bytes = envelope_b64.decode(&software_env.payload_b64)?;
+    let software: MacOsSoftwareResponse = serde_json::from_slice(&software_bytes)?;
 
     let applied_state = load_applied_state(&state_dir.join("applied-state.json"))?;
     let observed_preference_value_json = read_plist_json_value(

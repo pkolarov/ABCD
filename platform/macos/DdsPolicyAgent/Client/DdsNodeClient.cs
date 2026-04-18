@@ -87,15 +87,28 @@ public interface IDdsNodeClient
 public sealed class DdsNodeClient : IDdsNodeClient
 {
     private readonly HttpClient _http;
+    private readonly EnvelopeVerifier _verifier;
 
-    public DdsNodeClient(HttpClient http) => _http = http;
+    private static readonly JsonSerializerOptions PayloadJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+    };
+
+    public DdsNodeClient(HttpClient http, EnvelopeVerifier verifier)
+    {
+        _http = http;
+        _verifier = verifier;
+    }
 
     public async Task<List<ApplicableMacOsPolicy>> GetPoliciesAsync(
         string deviceUrn, CancellationToken ct = default)
     {
         var url = $"v1/macos/policies?device_urn={Uri.EscapeDataString(deviceUrn)}";
-        var resp = await _http.GetFromJsonAsync<MacOsPoliciesResponse>(url, ct)
-            .ConfigureAwait(false);
+        var env = await _http.GetFromJsonAsync<SignedPolicyEnvelope>(url, ct)
+            .ConfigureAwait(false)
+            ?? throw new InvalidOperationException("dds-node returned empty envelope");
+        var payload = _verifier.VerifyAndUnwrap(env, EnvelopeKind.MacOsPolicies);
+        var resp = JsonSerializer.Deserialize<MacOsPoliciesResponse>(payload, PayloadJsonOptions);
         return resp?.Policies ?? [];
     }
 
@@ -103,8 +116,11 @@ public sealed class DdsNodeClient : IDdsNodeClient
         string deviceUrn, CancellationToken ct = default)
     {
         var url = $"v1/macos/software?device_urn={Uri.EscapeDataString(deviceUrn)}";
-        var resp = await _http.GetFromJsonAsync<MacOsSoftwareResponse>(url, ct)
-            .ConfigureAwait(false);
+        var env = await _http.GetFromJsonAsync<SignedPolicyEnvelope>(url, ct)
+            .ConfigureAwait(false)
+            ?? throw new InvalidOperationException("dds-node returned empty envelope");
+        var payload = _verifier.VerifyAndUnwrap(env, EnvelopeKind.MacOsSoftware);
+        var resp = JsonSerializer.Deserialize<MacOsSoftwareResponse>(payload, PayloadJsonOptions);
         return resp?.Software ?? [];
     }
 

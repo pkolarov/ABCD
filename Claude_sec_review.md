@@ -42,12 +42,19 @@ all 3 Critical (C-1, C-2, C-3), 7 High (H-1, H-4, H-5, H-8, H-9, H-10, H-11),
 and 12 Low (L-1, L-2, L-3, L-4, L-5, L-6, L-7, L-8, L-9, L-10, L-11 audit,
 L-12, L-13, L-15).
 
-**Still deferred** (5 High, 10 Medium, 4 Low): H-2, H-3, H-6, H-7, H-12
-(all require cross-language redesigns — signed policy bodies in C#,
-mTLS/HMAC between C++ and Rust, UDS transport, libp2p admission
-protocol); M-1, M-2, M-4, M-8 (partial), M-10, M-12, M-13, M-14, M-15,
-M-17, M-18; L-14, L-16, L-17, L-18. Rationale for each is in the
-row-level status table.
+**Shipped this pass (2026-04-18 follow-up):** H-2 and H-3 (Rust signer +
+C# BouncyCastle verifier across Windows + macOS agents, with a
+cross-language test vector pinned on both sides); M-4 (mDNS Sybil
+caps); M-12 (WebAuthn §7.2 field-level clientDataJSON parser, with
+backward-compat fallback); M-14 (encrypted-marker refuses silent
+plaintext downgrade); L-18 (atomic `bump_sign_count` primitive —
+defense-in-depth if L-17 lands).
+
+**Still deferred** (3 High, 6 Medium, 3 Low): H-6, H-7, H-12
+(all require cross-language redesigns — mTLS/HMAC between C++ and
+Rust, UDS transport, libp2p admission protocol); M-1, M-2, M-8
+(partial), M-10, M-13, M-15, M-17, M-18; L-14, L-16, L-17.
+Rationale for each is in the row-level status table.
 
 **Reviewer follow-ups already closed this round** (previously flagged
 as partial):
@@ -63,6 +70,26 @@ as partial):
   `admin_vouch` with `purpose::ADMIN` promotes the subject to
   `trusted_roots` and persists.
 
+**2026-04-18 follow-up pass — new fixes:**
+
+- **H-2 / H-3**: Signed policy/software envelopes. Rust signs each
+  `/v1/{windows,macos}/{policies,software}` response with the node's
+  Ed25519 signing key; Windows and macOS C# agents (BouncyCastle
+  pure-managed Ed25519) verify against a pinned pubkey before any
+  enforcer runs. Fails closed when the pubkey isn't configured.
+  Cross-language interop vector pinned bilaterally (Rust emits → C#
+  verifies). 19 new unit tests across `dds-core`, `dds-node`,
+  `DdsPolicyAgent.Tests`, `DdsPolicyAgent.MacOS.Tests`.
+- **M-4**: mDNS Sybil caps on the node swarm (per-minute new-peer
+  rate + hard peer-table ceiling).
+- **M-12**: Client-supplied `clientDataJSON` is now parsed per
+  WebAuthn §7.2 field-by-field instead of reconstruct-and-hash.
+  Legacy fallback preserves backward compat.
+- **M-14**: Sticky encrypted marker refuses silent plaintext
+  downgrade of the node identity file.
+- **L-18**: Atomic `bump_sign_count` primitive (redb write-txn
+  enclosed); service switched over. Race-free even without L-17.
+
 ### Critical
 
 | ID | Status | Notes |
@@ -76,8 +103,8 @@ as partial):
 | ID | Status | Notes |
 |---|---|---|
 | H-1 | ✅ Fixed (pending verify) | Revocations for unknown targets now rejected outright; test `revocation_for_unknown_target_is_rejected` |
-| H-2 | ⏸ Deferred | Signed policy token bodies + C# Ed25519 verifier; cross-language, out of scope this pass |
-| H-3 | ⏸ Deferred | Same design as H-2 on macOS agent |
+| H-2 | ✅ Fixed (pending verify) | `dds-core::envelope::SignedPolicyEnvelope` binds each `/v1/windows/{policies,software}` response to the node's Ed25519 key. Windows agent (BouncyCastle) pins the node pubkey via `AgentConfig.PinnedNodePubkeyB64`, enforces version/kind/device_urn/clock-skew gates, then verifies the signature before dispatching any enforcer. `DdsNodeClient` now fails closed if the pubkey is unconfigured. Cross-language fixture pinned bilaterally: Rust emits, C# verifies the exact same bytes (`envelope::tests::interop_vector_is_stable` ↔ `EnvelopeVerifierTests.InteropVectorAcceptsRustSignature`). **Caveat**: agent pins the node pubkey, not the domain pubkey — a proper domain-signed node-binding chain (closing the TOFU gap at first install) is tracked in the `NodeInfoResponse` doc as follow-up. |
+| H-3 | ✅ Fixed (pending verify) | Same envelope design as H-2, applied to `/v1/macos/{policies,software}` and the macOS agent. Mirrored tests cross-verify the Rust-emitted interop vector. |
 | H-4 | ✅ Fixed (pending verify) | JTIs suffixed with UUIDv4; `TrustError::DuplicateJti` rejects overlaps |
 | H-5 | ✅ Fixed (pending verify) | Named-pipe SDDL tightened to `SY`-only (dropped `IU`); C++ change, compile-test requires Windows CI |
 | H-6 | ⏸ Deferred | Challenge HMAC + mTLS between Auth Bridge and dds-node; C++/Rust cross-cut |
@@ -95,7 +122,7 @@ as partial):
 | M-1 | ⏸ Deferred | Verified no in-pipeline normalizer exists today; signed bytes are round-tripped verbatim |
 | M-2 | ⏸ Deferred | Versioned breaking change; roll in a future release |
 | M-3 | ✅ Fixed (pending verify) | Global token-bucket middleware (60 req/s) returns 429 |
-| M-4 | ⏸ Deferred | Low-priority hardening; connection caps tracked separately |
+| M-4 | ✅ Fixed (pending verify) | `DdsNode::mdns_accept_peer` gates every mDNS-discovered peer on (a) a sliding-window rate cap of `MDNS_NEW_PEER_ACCEPT_PER_MINUTE = 60` new-peer acceptances per minute and (b) a hard ceiling of `MDNS_PEER_TABLE_MAX = 256` actively-tracked peers. Already-known peers bypass the cap so legitimate re-announcements don't consume budget; expired peers are removed on the mDNS Expired event so the table self-heals. Under a LAN Sybil flood the caps prevent the node from burning CPU on Noise handshakes against ghosts or crowding real peers out of Kademlia. |
 | M-5 | ✅ Fixed (pending verify) | `sync_payloads` capped at 10k entries with FIFO eviction in `cache_sync_payload`; `handle_sync_response` now also routes inserts through `cache_sync_payload` so the cap applies on both the gossip and sync paths (previously the raw `insert` in the sync path bypassed the cap). |
 | M-6 | ✅ Fixed (pending verify) | `DdsNode::run` re-verifies the admission cert every 600 s against `(domain_pubkey, domain_id, peer_id, now)`. Expiry → clean shutdown. Helper exposed as `verify_admission_still_valid` for tests. |
 | M-7 | ✅ Fixed (pending verify) | Config flag `NodeConfig.domain.enforce_device_scope_vouch` (default off). When on, `list_applicable_*` only honors a device's self-attested `tags`/`org_unit` if the device has a `dds:device-scope` vouch from a trusted root (new `purpose::DEVICE_SCOPE` constant). Off by default to preserve behavior on existing deployments. |
@@ -103,9 +130,9 @@ as partial):
 | M-9 | ✅ Fixed (pending verify) | Replay window (7 days forward 1h) enforced on BOTH gossip (`ingest_revocation`/`ingest_burn`) and sync (`handle_sync_response` filter) paths via `revocation_within_replay_window`. Revoke/burn tokens with stale `iat` are dropped before reaching `apply_sync_payloads_with_graph`. |
 | M-10 | ⏸ Deferred | Parameter bump requires disk-format migration of existing encrypted node keys |
 | M-11 | ✅ Fixed (pending verify) | `DefaultBodyLimit::max(256 KiB)` on Axum; gossipsub cap tracked separately |
-| M-12 | ⏸ Deferred | Current hash-compare path is cryptographically equivalent when clients serialize identically |
+| M-12 | ✅ Fixed (pending verify) | `AssertionSessionRequest` / `AdminVouchRequest` gained an optional `client_data_json` field. When present, `verify_assertion_common` (i) hashes the supplied JSON and binds it to the authenticator-signed `client_data_hash`, then (ii) parses the JSON and validates `type`, `challenge`, `origin` individually per WebAuthn §7.2 steps 7–9 (plus a `crossOrigin == false` guard). `decode_b64url_any` accepts both base64url-no-pad (spec) and base64url-with-pad (some stacks). When the field is absent the legacy reconstruct-and-hash path still runs so existing clients aren't broken; clients SHOULD start sending the raw bytes. |
 | M-13 | ⏸ Deferred | Requires FIDO MDS integration / policy |
-| M-14 | ⏸ Deferred | Interacts with M-10 disk format; land together |
+| M-14 | ✅ Fixed (pending verify) | `identity_store::save` writes a sticky `<path>.encrypted-marker` after any successful encrypted save. On subsequent saves, if the marker exists and the caller is about to produce a plaintext blob (empty `DDS_NODE_PASSPHRASE`), `save` returns a `Crypto` error and refuses to overwrite. `DDS_NODE_ALLOW_PLAINTEXT_DOWNGRADE=1` is an explicit escape hatch (logged at warn) for dev/testing. Defeats the attack described in the review: an attacker with FS write who clears the passphrase env var and waits for a restart can no longer roll back the key to plaintext silently. Test `test_m14_refuses_plaintext_downgrade` covers both the refusal and the override. |
 | M-15 | ⏸ Deferred | FIDO2 code path is feature-gated off by default |
 | M-16 | ✅ Fixed (pending verify) | `.ddsdump` v2 mandatory Ed25519 signature over `DdsDump::signing_bytes`. `dds export` requires unwrapped `DomainKey`. `dds import` verifies against the local `domain.toml` pubkey. **Downgrade-defense**: v1 (unsigned) dumps now REFUSE by default — the importer errors out unless `--allow-unsigned` is passed, because a tampered v2 dump could otherwise be relabelled as v1 and bypass signature verification. Plus L-5 0o600 on the written file. |
 | M-17 | ⏸ Deferred | C++ only; Windows-specific audit |
@@ -136,7 +163,7 @@ as partial):
 | L-15 | ✅ Fixed (pending verify) | `subtle::ConstantTimeEq` on `vch_sum` comparisons via `payload_hash_eq` |
 | L-16 | ⏸ Deferred | C# applied-state file ACL; Windows-only |
 | L-17 | ⏸ Deferred | Service mutex refactor; couple with L-18 |
-| L-18 | ⏸ Deferred | Requires L-17 to land first |
+| L-18 | ✅ Fixed (pending verify) | `CredentialStateStore::bump_sign_count(credential, new)` is an atomic check-and-set primitive: the redb backend performs the compare and the write inside a single write transaction, and `StoreError::SignCountReplay { stored, attempted }` distinguishes the replay case from a generic I/O failure. Service layer at `verify_assertion_common` now calls `bump_sign_count` instead of the race-prone `get` + compare + `set` sequence. Today the service-wide mutex (L-17) already serializes these calls, but the backend-level atomicity is correct on its own — if L-17 is ever split out, the sign-count replay invariant stays intact. Tests on both MemoryBackend and RedbBackend assert the accept / equal-reject / less-than-reject behaviour. |
 
 ### Known caveats after this pass
 
@@ -758,6 +785,41 @@ If triaging by effort × blast radius:
 2. **This sprint (architectural, ~1–3 days each):** **H-2**, **H-3**, **H-6**, **H-7**, **H-8**, **H-10**, **H-11**, **H-12**. H-2 and H-3 share a design (signed document bodies + agent-side verification) — build once, apply to both agents.
 3. **Next:** Medium cluster, starting **M-5** (pending diff, cheap fix), **M-3** (rate limits), **M-8** (policy enumeration authorization), **M-21** (audit signature verification), **M-22** (OS-bound admin key wrap).
 4. **Backlog:** Low / Informational items; bundle into a general hardening pass.
+
+### Remaining deferred work after the 2026-04-18 pass
+
+The three deferred High findings all require architectural changes
+that span a transport or protocol boundary:
+
+- **H-7** — Transport authn on `127.0.0.1:5551`. Requires swapping
+  the Axum TCP bind for a Unix domain socket with `SO_PEERCRED` on
+  Linux/macOS and a named-pipe + `GetNamedPipeClientProcessId` on
+  Windows, plus client-side refactors in the CLI, both agents, the
+  Auth Bridge, and the FFI. Also unlocks M-8's completion
+  (per-device session binding on `/v1/*/policies` and
+  `/v1/*/software`) since a UDS can attach a per-device session
+  identifier to the caller.
+- **H-12** — Per-peer admission gating in gossip/sync. Requires a
+  new libp2p request-response behaviour that the node runs
+  immediately after Noise: peers exchange admission certs and the
+  swarm drops gossip/sync from unadmitted peers at the behaviour
+  layer. C-3's publisher-capability filter remains the last line of
+  defence even after H-12 lands.
+- **H-6** — HMAC-authenticated challenge between the Windows Auth
+  Bridge and `dds-node`. Cleanest design is a per-install secret
+  provisioned by the MSI; this requires coordinated changes in the
+  WiX installer, the C++ Auth Bridge / Credential Provider, and a
+  new Rust middleware that validates the HMAC before answering
+  `/v1/session/challenge`. Pairs conceptually with H-7.
+
+Medium/Low items still open are either narrower (M-10 Argon2id
+parameter bump requires a disk-format migration; M-13 FIDO MDS;
+M-17 C++ CTAP2 CBOR audit; M-18 service-account split in WiX;
+L-14 CP stack hygiene; L-16 AppliedState ACL; L-17 service mutex
+refactor — pair with L-18 completion if needed) or have no cheap
+independent fix (M-1 canonical CBOR, M-2 hybrid-sig domain
+separation: both rolled into a future versioned breaking change).
+M-15 waits on the FIDO2 code path going on by default.
 
 ## Cross-references to prior review
 
