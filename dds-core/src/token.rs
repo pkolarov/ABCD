@@ -268,9 +268,25 @@ impl Token {
     /// payload — a non-canonical wire is rejected as
     /// [`TokenError::NonCanonicalPayload`], closing M-1's signature
     /// malleability.
+    ///
+    /// Dispatch picks the right hybrid / triple-hybrid verifier
+    /// based on the envelope version: v=1 tokens use the legacy
+    /// pre-M-2 verifiers (no scheme-specific domain prefixes) so
+    /// persisted v=1 hybrid tokens keep verifying; v=2 tokens go
+    /// through the domain-separated M-2 verifiers. For single-
+    /// scheme signatures the distinction is immaterial — classical
+    /// verify is identical under both versions.
     pub fn verify_signature(&self) -> Result<(), TokenError> {
-        let signed_input: alloc::borrow::Cow<'_, [u8]> = match self.wire_version {
-            TOKEN_WIRE_V1 => alloc::borrow::Cow::Borrowed(&self.payload_bytes),
+        let (signed_input, result): (alloc::borrow::Cow<'_, [u8]>, _) = match self.wire_version {
+            TOKEN_WIRE_V1 => {
+                let input = alloc::borrow::Cow::Borrowed(self.payload_bytes.as_slice());
+                let r = crate::crypto::verify_v1(
+                    &self.payload.iss_key,
+                    &input,
+                    &self.signature,
+                );
+                (input, r)
+            }
             TOKEN_WIRE_V2 => {
                 // Re-canonicalise and compare. An attacker submitting
                 // non-canonical bytes paired with a signature valid
@@ -283,12 +299,16 @@ impl Token {
                     Vec::with_capacity(TOKEN_V2_DOMAIN_TAG.len() + self.payload_bytes.len());
                 signed.extend_from_slice(TOKEN_V2_DOMAIN_TAG);
                 signed.extend_from_slice(&self.payload_bytes);
-                alloc::borrow::Cow::Owned(signed)
+                let input = alloc::borrow::Cow::Owned(signed);
+                let r = crate::crypto::verify(&self.payload.iss_key, &input, &self.signature);
+                (input, r)
             }
             other => return Err(TokenError::UnsupportedWireVersion(other)),
         };
-        crate::crypto::verify(&self.payload.iss_key, &signed_input, &self.signature)
-            .map_err(|_| TokenError::InvalidSignature)
+        // `signed_input` is kept alive in-scope so the Cow stays valid
+        // across the verify call above.
+        let _ = signed_input;
+        result.map_err(|_| TokenError::InvalidSignature)
     }
 
     /// Verify that the issuer URN is cryptographically bound to the issuer key.
@@ -940,6 +960,63 @@ mod tests {
         let restored = Token::from_cbor(&envelope).unwrap();
         assert_eq!(restored.wire_version(), TOKEN_WIRE_V1);
         assert!(restored.verify_signature().is_ok());
+    }
+
+    /// **Review regression** — legacy v=1 hybrid tokens must still
+    /// verify after M-2 lands. The dispatch in `Token::verify_signature`
+    /// routes v=1 envelopes through `crypto::verify_v1` which in turn
+    /// calls `hybrid::verify_hybrid_v1` (no scheme prefixes). Without
+    /// this path, `allow_legacy_v1_tokens = true` would only get
+    /// legacy hybrid tokens past the ingest filter; validation would
+    /// still reject them because the v2 verifier expects
+    /// scheme-prefixed signed bytes that a pre-M-2 signer never
+    /// produced.
+    #[cfg(feature = "pq")]
+    #[test]
+    fn v1_hybrid_token_still_verifies_after_m2() {
+        let root = Identity::generate_hybrid("pq-root", &mut OsRng);
+        let payload = TokenPayload {
+            iss: root.id.to_urn(),
+            iss_key: root.public_key.clone(),
+            jti: "legacy-hybrid".into(),
+            sub: root.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1_000,
+            exp: Some(4_102_444_800),
+            body_type: None,
+            body_cbor: None,
+        };
+        // Build a v=1 hybrid token using the legacy (pre-M-2) sign
+        // path. This mirrors what's already on disk on any node that
+        // ran a pre-v2 release.
+        let token = Token::create_with_version(payload, TOKEN_WIRE_V1, |msg| {
+            root.hybrid_key.sign_v1(msg)
+        })
+        .unwrap();
+        assert_eq!(token.wire_version(), TOKEN_WIRE_V1);
+        assert!(
+            token.verify_signature().is_ok(),
+            "legacy v=1 hybrid token must verify via verify_hybrid_v1"
+        );
+
+        // And crucially: a v=1 envelope carrying a v=2 (prefixed)
+        // hybrid signature must STILL fail, since v=1 dispatch goes
+        // through the unprefixed verifier.
+        let v2_sig = root.hybrid_key.sign_v2(&token.payload_bytes);
+        let forged = Token {
+            payload: token.payload.clone(),
+            payload_bytes: token.payload_bytes.clone(),
+            signature: v2_sig,
+            wire_version: TOKEN_WIRE_V1,
+        };
+        assert_eq!(
+            forged.verify_signature(),
+            Err(TokenError::InvalidSignature)
+        );
     }
 
     #[test]

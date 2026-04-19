@@ -195,11 +195,20 @@ pub struct ApiAuthConfig {
     #[serde(default)]
     pub unix_admin_uids: Vec<u32>,
 
-    /// SIDs permitted on admin endpoints over the Windows named pipe.
-    /// SYSTEM (`S-1-5-18`) and `BUILTIN\Administrators`
-    /// (`S-1-5-32-544`) are always admitted; extras listed here let
-    /// an operator whitelist per-service SIDs (Auth Bridge, Policy
-    /// Agent).
+    /// Primary **user** SIDs permitted on admin endpoints over the
+    /// Windows named pipe. Only `LocalSystem` (`S-1-5-18`) is
+    /// admitted by default — that covers the dds-node service
+    /// account and the C++ Auth Bridge / C# Policy Agent when they
+    /// run as `LocalSystem` (which they do today per the MSI).
+    ///
+    /// **Caveat**: this is a primary-SID allowlist, not a group
+    /// allowlist. `BUILTIN\Administrators` (`S-1-5-32-544`) is a
+    /// group SID that never appears as a caller's primary SID, so
+    /// listing it here has no effect. To admit elevated admin
+    /// operators running the CLI, enumerate their per-user SIDs
+    /// (`S-1-5-21-…`). Once the pipe listener (G1-S3) surfaces
+    /// `TokenGroups`, a separate `windows_admin_groups` field will
+    /// let operators admit by group membership.
     #[serde(default)]
     pub windows_admin_sids: Vec<String>,
 

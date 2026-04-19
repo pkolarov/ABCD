@@ -69,7 +69,16 @@ pub enum CallerIdentity {
     #[cfg(unix)]
     Uds { uid: u32, gid: u32, pid: i32 },
     /// Named-pipe caller on Windows. `sid` is the caller's primary
-    /// user SID in string form (`S-1-5-…`); `pid` is informational.
+    /// **user** SID in string form (`S-1-5-21-...` for domain /
+    /// local-account users, or a service SID like `S-1-5-18` for
+    /// `SYSTEM`). This is NOT a group SID — `BUILTIN\Administrators`
+    /// (`S-1-5-32-544`) never appears here even for elevated admin
+    /// users, because their primary SID is their individual user
+    /// account, not the group. Group-membership-based admission
+    /// (e.g., "any member of `Administrators`") will require the
+    /// pipe listener (G1-S3) to surface `TokenGroups` separately;
+    /// until then, admins must be listed explicitly in
+    /// [`AdminPolicy::admin_sids`].
     #[cfg(windows)]
     Pipe { sid: String, pid: u32 },
 }
@@ -105,11 +114,20 @@ impl CallerIdentity {
             }
             #[cfg(windows)]
             CallerIdentity::Pipe { sid, .. } => {
+                // `S-1-5-18` (`LocalSystem`) is a valid **primary**
+                // SID for a service process, and the dds-node service
+                // typically runs under it, so it's the one built-in
+                // value we admit. We deliberately do NOT fast-path
+                // `S-1-5-32-544` (`BUILTIN\Administrators`) here:
+                // that's a group SID, never a caller's primary SID,
+                // so the match would be dead code and the promise
+                // that "elevated admin users are admitted" would be
+                // a lie. Group-membership checks need the pipe
+                // listener (G1-S3) to expose `TokenGroups`; until
+                // then admins must be allowlisted by their primary
+                // user SID in `admin_sids`.
                 const SYSTEM_SID: &str = "S-1-5-18";
-                const BUILTIN_ADMINS_SID: &str = "S-1-5-32-544";
-                sid == SYSTEM_SID
-                    || sid == BUILTIN_ADMINS_SID
-                    || policy.admin_sids.iter().any(|s| s == sid)
+                sid == SYSTEM_SID || policy.admin_sids.iter().any(|s| s == sid)
             }
         }
     }
@@ -3380,14 +3398,22 @@ mod tests {
         assert!(caller.is_admin(&strict_policy()));
     }
 
+    /// Regression: `BUILTIN\Administrators` (`S-1-5-32-544`) is a
+    /// group SID and never appears as a caller's primary SID, so
+    /// `is_admin` must NOT fast-path it. Group-membership-based
+    /// admission requires the pipe listener (G1-S3) to surface
+    /// `TokenGroups` separately; until then, admins go through
+    /// `admin_sids` by primary SID.
     #[cfg(windows)]
     #[test]
-    fn pipe_builtin_admins_always_admin() {
+    fn pipe_builtin_admins_group_sid_is_not_an_auto_admin() {
         let caller = CallerIdentity::Pipe {
             sid: "S-1-5-32-544".to_string(),
             pid: 7,
         };
-        assert!(caller.is_admin(&strict_policy()));
+        // Under strict_policy the list does not contain the group
+        // SID, so admission must be refused.
+        assert!(!caller.is_admin(&strict_policy()));
     }
 
     #[cfg(windows)]
