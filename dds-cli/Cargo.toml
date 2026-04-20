@@ -22,7 +22,11 @@ serde_json = { workspace = true }
 serde = { workspace = true, features = ["std", "derive"] }
 rand = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt", "macros"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "macros", "net"] }
 base64 = "0.22"
 toml = "0.8"
 ciborium = { workspace = true }

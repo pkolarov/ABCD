@@ -27,7 +27,7 @@ The codebase documents most endpoints as "localhost-only with OS process isolati
 
 ---
 
-## Remediation status (2026-04-18, updated after reviewer follow-up)
+## Remediation status (latest pass 2026-04-19)
 
 This section records the state of each finding after the remediation pass.
 `✅ Fixed (pending verify)` means code landed in this branch and local
@@ -50,11 +50,19 @@ backward-compat fallback); M-14 (encrypted-marker refuses silent
 plaintext downgrade); L-18 (atomic `bump_sign_count` primitive —
 defense-in-depth if L-17 lands).
 
-**Still deferred** (3 High, 6 Medium + 1 partial, 1 Low): H-6, H-7,
-H-12 (all require cross-language redesigns — mTLS/HMAC between C++
-and Rust, UDS transport, libp2p admission protocol); M-1, M-2,
-M-10, M-13, M-15, M-18, plus M-8 (partial); L-17. Rationale for
-each is in the row-level status table.
+**Still deferred (after the 2026-04-19 pass)** — 1 High, 2 High
+(step-2 of previously-partial items), 3 Medium + 1 partial, 1 Low:
+**H-12** (per-peer admission in gossip — libp2p behaviour protocol);
+**H-6 step-2** (MSI-provisioned HMAC secret + Auth Bridge consumes
+and enforces the response MAC + challenge-HMAC binding); **H-7
+step-2** (UDS listener on Linux/macOS + named-pipe listener on
+Windows + CLI / C# agent / C++ Auth Bridge client refactors); **M-8
+step-2** (write-side TOFU + session-token binding, blocked on H-7
+step-2 listeners); **M-13** (FIDO MDS attestation policy); **M-15**
+(node-bound FIDO2 `hmac_salt` via bundle re-wrap — re-deferred
+2026-04-18); **M-18** (WiX service-account split); **L-17** (service
+mutex refactor, pairs with already-landed L-18). Rationale for each
+is in the row-level status table.
 
 **Reviewer follow-ups already closed this round** (previously flagged
 as partial):
@@ -111,6 +119,130 @@ as partial):
 - **L-18**: Atomic `bump_sign_count` primitive (redb write-txn
   enclosed); service switched over. Race-free even without L-17.
 
+**2026-04-19 follow-up pass — new fixes:**
+
+- **M-1**: Canonical-CBOR encoder landed as `dds-core::cbor_canonical`
+  (RFC 8949 §4.2.1 deterministic encoding: shortest-form integer args,
+  definite-length items, text-string map keys sorted by encoded bytes).
+  Token wire bumped to `v=2`; signed bytes are
+  `"dds-token-v2\x00" || canonical_cbor(payload)`. The v=2 verify path
+  recanonicalises and rejects any wire whose payload bytes aren't
+  byte-identical, which closes the key-reorder / length-encoding
+  signature malleability. Legacy `Token::sign_v1` / `verify_signature`
+  v=1 path stays so pinned vectors and on-disk pre-v2 blobs keep
+  decoding. New errors: `TokenError::NonCanonicalPayload`,
+  `UnsupportedWireVersion(u8)`. Commit `60050ce`. See also the M-1/M-2
+  downgrade guard below.
+- **M-2**: Hybrid and triple-hybrid signatures are now domain-separated
+  per component. Ed25519 signs
+  `"dds-hybrid-v2/ed25519\x00" || msg`; ML-DSA-65 signs
+  `"dds-hybrid-v2/mldsa65\x00" || msg`; triple-hybrid uses the matching
+  `"dds-triple-v2/{ed25519,p256,mldsa65}\x00"` prefixes. Regression
+  test asserts the Ed25519 (and P-256) component of a v2 hybrid
+  signature cannot be lifted out and verified standalone. `sign` /
+  `verify_hybrid` are v2 aliases; `sign_v1` / `verify_*_v1` kept for
+  pinning legacy vectors. Commit `60050ce`.
+- **M-10**: Keyfile schema `v=3` now carries Argon2id
+  `(m_cost, t_cost, p_cost)` in the blob. Defaults raised to m=64 MiB,
+  t=3, p=4 (OWASP tier-2; target unlock ~200–500 ms on modern
+  hardware). `load()` accepts v=2 (legacy 19 MiB / t=2 / p=1) and v=3;
+  a v=2 success triggers a transparent rewrap to v=3 so operators see
+  no disruption. `derive_key` takes `KdfParams`; `save()` always emits
+  v=3. Tests pin on-disk bytes at v=3 and the lazy v2→v3 rewrap
+  preserves identity URN. M-14 plaintext-downgrade guard unchanged.
+  Commit `1b5f51d`.
+- **M-1 / M-2 downgrade guard**: `NetworkConfig.allow_legacy_v1_tokens`
+  (default `false`) gates every inbound token path:
+  `DdsNode::legacy_token_refused` drops v=1 envelopes at gossip
+  (`ingest_operation`, `ingest_revocation`, `ingest_burn`) and at the
+  sync-response filter. Persisted v=1 tokens already on the local
+  store continue to verify and serve — only fresh ingest is gated.
+  Operators flip the flag on for a domain-wide cutover and back off
+  once legacy publishers are retired. Commit `1b5f51d`. Pairs with M-1
+  and M-2 above.
+- **H-6 / H-7 / M-8 step-1 (Rust plumbing)**: Transport-neutral
+  scaffolding ready for the UDS/named-pipe follow-up. TCP listener
+  stays the default so existing deployments are unchanged.
+  - `ApiAuthConfig` on `NetworkConfig` carries
+    `trust_loopback_tcp_admin` (default `true` for backward compat),
+    `unix_admin_uids`, `windows_admin_sids`, `node_hmac_secret_path`.
+  - `CallerIdentity {Anonymous, Uds{uid,gid,pid}, Pipe{sid,pid}}` +
+    `FromRequestParts` extractor. Note: the `Uds` / `Pipe` variants
+    are defined but never constructed in production — step 2 will
+    instantiate them from the listener.
+  - `AdminPolicy` + `require_admin_middleware` gate
+    `/v1/enroll/*`, `/v1/admin/*`, `/v1/enrolled-users`,
+    `/v1/audit/entries`.
+  - `ResponseMacKey::from_file` + `sign_response_body_middleware`
+    emit
+    `X-DDS-Body-MAC = base64(HMAC-SHA256(key, method||0||path||0||body))`
+    on every response when a key is configured (H-6 defense-in-depth;
+    MSI-provisioned secret lands in step 2).
+  - `device_binding` module: JSON-backed TOFU store at
+    `<data_dir>/device_bindings.json` (`0o600` on Unix, atomic
+    persist via tempfile). `check_device_binding_read` +
+    `tofu_device_binding` wired on all 7 Windows/macOS
+    `/v1/*/{policies,software,applied,claim-account}` endpoints.
+    Admin callers bypass; Anonymous (TCP) still bypasses until the
+    listeners in step 2 land so existing deployments stay green.
+  - 16 new unit tests (2 config, 5 device_binding, 9 admin/MAC/
+    binding plumbing). Commit `730dc6c`.
+- **v1 hybrid verify dispatch**: `Token::verify_signature` was
+  switching the signed input on `wire_version` but then unconditionally
+  calling `crypto::verify`, which after M-2 only routed hybrid /
+  triple-hybrid to the v2 domain-separated verifiers. Under the default
+  pq build this meant persisted v=1 hybrid tokens (and v=1 hybrid
+  tokens admitted via `allow_legacy_v1_tokens`) still failed
+  validation. Fixed by adding `crypto::verify_v1` as a sibling
+  dispatcher that routes hybrid / triple-hybrid to the pre-M-2 v1
+  verifiers; classical schemes share the same backend under both entry
+  points. Regression test: a v=1 hybrid signed by `sign_v1` verifies
+  end-to-end, and a v=2 hybrid signature placed in a v=1 envelope is
+  correctly rejected. Commit `14dbc8f`.
+- **Windows admin-SID semantics**: `is_admin` fast-pathed
+  `BUILTIN\Administrators` (`S-1-5-32-544`) as always admitted. That's
+  a group SID and never appears as a caller's primary SID — the match
+  was dead code and the docs misrepresented the policy. Removed;
+  only `S-1-5-18` (LocalSystem) is admitted implicitly, and all other
+  callers must match `AdminPolicy.admin_sids` as a primary-SID
+  allowlist. Doc comments on `CallerIdentity::Pipe`, `AdminPolicy`,
+  and `ApiAuthConfig.windows_admin_sids` now describe the actual
+  semantics and flag a future `windows_admin_groups` field that the
+  pipe listener can populate from `TokenGroups`. Commit `14dbc8f`.
+
+**2026-04-20 follow-up pass — H-7 step-2a (Rust + CLI):**
+
+- **H-7 step-2a**: `serve` in `dds-node::http` now dispatches on the
+  `api_addr` scheme. `unix:/path` routes to a new `serve_unix` that
+  hand-rolls a hyper-1 serve loop (axum 0.7's `axum::serve` is
+  `TcpListener`-only): accept a `UnixStream`, call `peer_cred()` to
+  materialise the caller's `uid`/`gid`/`pid`, inject
+  `CallerIdentity::Uds` as a request extension, then delegate to the
+  shared axum `Router` via `hyper::service::service_fn`. The admin
+  gate and the M-8 device-binding middleware see a concrete
+  `CallerIdentity` instead of falling back to `Anonymous`. Socket
+  permissions set to `0o660` right after bind; stale socket files
+  from a prior crashed run are removed first so `EADDRINUSE` can't
+  brick the service.
+  - `dds-cli::client` grew a minimal hyper + `UnixStream` client that
+    kicks in when the base URL starts with `unix:`. Reqwest stays
+    the transport for TCP/HTTPS. `L-6` loopback-only check
+    explicitly exempts `unix:` URLs since they are local by
+    definition.
+  - Four end-to-end integration tests pin the full pipeline:
+    service-uid caller admitted, non-matching uid rejected with 403
+    even when `trust_loopback_tcp_admin = false`, `0o660` mode
+    observed on bind, stale non-socket file replaced cleanly on
+    restart.
+  - **Still outstanding** (step 2b): Windows named-pipe listener
+    (mirror design of `serve_unix` using
+    `GetNamedPipeClientProcessId` + `OpenProcessToken`), C# Policy
+    Agent `DdsNodeClient` swap of `HttpMessageHandler` to a
+    `SocketsHttpHandler` with `ConnectCallback` on Linux/macOS, C++
+    Auth Bridge named-pipe HTTP client. `trust_loopback_tcp_admin`
+    stays `true` by default until all clients are on the new
+    transport.
+
 ### Critical
 
 | ID | Status | Notes |
@@ -128,8 +260,8 @@ as partial):
 | H-3 | ✅ Fixed (pending verify) | Same envelope design as H-2, applied to `/v1/macos/{policies,software}` and the macOS agent. Mirrored tests cross-verify the Rust-emitted interop vector. |
 | H-4 | ✅ Fixed (pending verify) | JTIs suffixed with UUIDv4; `TrustError::DuplicateJti` rejects overlaps |
 | H-5 | ✅ Fixed (pending verify) | Named-pipe SDDL tightened to `SY`-only (dropped `IU`); C++ change, compile-test requires Windows CI |
-| H-6 | ⏸ Deferred | Challenge HMAC + mTLS between Auth Bridge and dds-node; C++/Rust cross-cut |
-| H-7 | ⏸ Deferred | UDS/named-pipe peer-creds gating on HTTP; larger transport rewrite |
+| H-6 | ⚠ Partial | Step-1 plumbing in tree (commit `730dc6c`): `ResponseMacKey::from_file` + `sign_response_body_middleware` emit `X-DDS-Body-MAC` on every response when a key is configured. **Still outstanding (step 2)**: MSI-provisioned per-install HMAC secret, C++ Auth Bridge consumes the secret and verifies/enforces the MAC on every response, challenge-HMAC binding on `/v1/session/challenge`. See the 2026-04-19 follow-up pass block above. |
+| H-7 | ⚠ Partial | Step-1 plumbing in tree (commit `730dc6c`): `ApiAuthConfig` + `CallerIdentity {Anonymous, Uds, Pipe}` extractor + `AdminPolicy` + `require_admin_middleware` gate `/v1/enroll/*`, `/v1/admin/*`, `/v1/enrolled-users`, `/v1/audit/entries`. **Step 2a landed 2026-04-20**: `serve` dispatches on `unix:` scheme; new `serve_unix` accepts UDS connections, extracts peer creds via `stream.peer_cred()`, and injects `CallerIdentity::Uds { uid, gid, pid }` on every request before the admin gate. Socket perms `0o660`; stale-file cleanup on bind. `dds-cli` understands `unix:/path` URLs via a minimal hyper+UnixStream client. Four end-to-end tests pin the full pipeline (service-uid admitted, unknown uid rejected, 0o660 mode, stale replacement). **Still outstanding (step 2b)**: Windows named-pipe listener (`GetNamedPipeClientProcessId` + `OpenProcessToken`), C# Policy Agent `DdsNodeClient` transport swap on Windows + macOS, C++ Auth Bridge named-pipe HTTP client. TCP listener still bound by default (`trust_loopback_tcp_admin = true`) so existing deployments keep working; flip to `false` once all clients are on UDS/pipe. |
 | H-8 | ✅ Fixed (pending verify) | `admin_vouch` requires `dds:admin-vouch:<purpose>` for non-bootstrap admins; `bootstrap_admin_urn` persisted to config and rehydrated on startup (survives restart); vouch with `purpose == dds:admin` now promotes the subject into `trusted_roots` and persists. (Generating the second admin's signing key is still a separate operational step — `admin_setup` is the only auto-generation path today.) |
 | H-9 | ✅ Fixed (pending verify) | `Zeroizing` wraps passphrase + admin plaintext; buffers wiped on early-return paths |
 | H-10 | ✅ Fixed (pending verify) | Bundle v3 carries a mandatory Ed25519 signature over canonical `signing_bytes` (domain_id + domain_pubkey + org_hash + ports + mdns + domain_key_blob), verified on load against the embedded `domain_pubkey`. Fingerprint is now ALSO printed on load so operators can confirm OOB. `save_bundle` requires an unwrapped `DomainKey` and refuses to write if the signer pubkey doesn't match the embedded one. Tests: `bundle_rejects_tampered_signature`, `bundle_fingerprint_diverges_under_key_swap`. |
@@ -140,16 +272,16 @@ as partial):
 
 | ID | Status | Notes |
 |---|---|---|
-| M-1 | ⏸ Deferred | Verified no in-pipeline normalizer exists today; signed bytes are round-tripped verbatim |
-| M-2 | ⏸ Deferred | Versioned breaking change; roll in a future release |
+| M-1 | ✅ Fixed (pending verify) | Canonical-CBOR encoder at `dds-core::cbor_canonical` implements RFC 8949 §4.2.1 (shortest-form ints, definite-length items, sorted text-string keys). Token wire bumped to `v=2`; signed bytes are `"dds-token-v2\x00" \|\| canonical_cbor(payload)`. The v=2 verify path recanonicalises and rejects any wire whose payload bytes aren't byte-identical, closing the key-reorder / length-encoding malleability. Legacy `sign_v1` / v=1 verify kept for pinned vectors + on-disk blobs. New errors: `TokenError::NonCanonicalPayload`, `UnsupportedWireVersion(u8)`. Commit `60050ce`. **See also** the M-1/M-2 downgrade guard in the 2026-04-19 follow-up pass block above — `NetworkConfig.allow_legacy_v1_tokens` (default `false`) refuses fresh v=1 ingest so attackers can't force a downgrade. |
+| M-2 | ✅ Fixed (pending verify) | Hybrid and triple-hybrid signatures are now domain-separated per component: Ed25519 signs `"dds-hybrid-v2/ed25519\x00" \|\| msg`, ML-DSA-65 signs `"dds-hybrid-v2/mldsa65\x00" \|\| msg`, triple-hybrid uses the matching `"dds-triple-v2/{ed25519,p256,mldsa65}\x00"` prefixes. Regression test asserts the Ed25519 (and P-256) component of a v2 hybrid signature cannot be lifted out and verified standalone under the base scheme. `sign` / `verify_hybrid` are v2 aliases; `sign_v1` / `verify_*_v1` stay so legacy vectors keep verifying. Commit `60050ce`. Pairs with the M-1/M-2 downgrade guard (see 2026-04-19 block). |
 | M-3 | ✅ Fixed (pending verify) | Global token-bucket middleware (60 req/s) returns 429 |
 | M-4 | ✅ Fixed (pending verify) | `DdsNode::mdns_accept_peer` gates every mDNS-discovered peer on (a) a sliding-window rate cap of `MDNS_NEW_PEER_ACCEPT_PER_MINUTE = 60` new-peer acceptances per minute and (b) a hard ceiling of `MDNS_PEER_TABLE_MAX = 256` actively-tracked peers. Already-known peers bypass the cap so legitimate re-announcements don't consume budget; expired peers are removed on the mDNS Expired event so the table self-heals. Under a LAN Sybil flood the caps prevent the node from burning CPU on Noise handshakes against ghosts or crowding real peers out of Kademlia. |
 | M-5 | ✅ Fixed (pending verify) | `sync_payloads` capped at 10k entries with FIFO eviction in `cache_sync_payload`; `handle_sync_response` now also routes inserts through `cache_sync_payload` so the cap applies on both the gossip and sync paths (previously the raw `insert` in the sync path bypassed the cap). |
 | M-6 | ✅ Fixed (pending verify) | `DdsNode::run` re-verifies the admission cert every 600 s against `(domain_pubkey, domain_id, peer_id, now)`. Expiry → clean shutdown. Helper exposed as `verify_admission_still_valid` for tests. |
 | M-7 | ✅ Fixed (pending verify) | Config flag `NodeConfig.domain.enforce_device_scope_vouch` (default off). When on, `list_applicable_*` only honors a device's self-attested `tags`/`org_unit` if the device has a `dds:device-scope` vouch from a trusted root (new `purpose::DEVICE_SCOPE` constant). Off by default to preserve behavior on existing deployments. |
-| M-8 | ⚠ Partial | Added structured log of every `device_urn` query; session-token check deferred until device-session issuance lands |
+| M-8 | ⚠ Partial | Step-1 (commit `730dc6c`): new `device_binding` module — JSON-backed TOFU store at `<data_dir>/device_bindings.json` (`0o600` on Unix, atomic persist). `check_device_binding_read` + `tofu_device_binding` wired on all 7 Windows/macOS `/v1/*/{policies,software,applied,claim-account}` endpoints. Admin callers bypass. Structured `device_urn` query log remains. **Still outstanding (step 2)**: write-side session-token check binding the caller's authenticated identity to `device_urn`; at present `Anonymous` (TCP) callers bypass TOFU until the listeners in H-7 step-2 land. |
 | M-9 | ✅ Fixed (pending verify) | Replay window (7 days forward 1h) enforced on BOTH gossip (`ingest_revocation`/`ingest_burn`) and sync (`handle_sync_response` filter) paths via `revocation_within_replay_window`. Revoke/burn tokens with stale `iat` are dropped before reaching `apply_sync_payloads_with_graph`. |
-| M-10 | ⏸ Deferred | Parameter bump requires disk-format migration of existing encrypted node keys |
+| M-10 | ✅ Fixed (pending verify) | Keyfile schema `v=3` carries Argon2id `(m_cost, t_cost, p_cost)` in the blob so future parameter bumps don't need yet another version. Defaults raised to m=64 MiB, t=3, p=4 (OWASP tier-2; target unlock ~200–500 ms on modern hardware). `load()` accepts v=2 (legacy 19 MiB / t=2 / p=1) and v=3; a v=2 success triggers a transparent rewrap to v=3 on next save, so operators see no disruption post-upgrade. `derive_key` takes `KdfParams`; `save()` always emits v=3. Tests: v=3 schema + params observable in on-disk bytes, v=2 → v=3 lazy rewrap preserves identity URN, M-14 plaintext-downgrade guard unchanged. Commit `1b5f51d`. |
 | M-11 | ✅ Fixed (pending verify) | `DefaultBodyLimit::max(256 KiB)` on Axum; gossipsub cap tracked separately |
 | M-12 | ✅ Fixed (pending verify) | `AssertionSessionRequest` / `AdminVouchRequest` gained an optional `client_data_json` field. When present, `verify_assertion_common` (i) hashes the supplied JSON and binds it to the authenticator-signed `client_data_hash`, then (ii) parses the JSON and validates `type`, `challenge`, `origin` individually per WebAuthn §7.2 steps 7–9 (plus a `crossOrigin == false` guard). `decode_b64url_any` accepts both base64url-no-pad (spec) and base64url-with-pad (some stacks). When the field is absent the legacy reconstruct-and-hash path still runs so existing clients aren't broken; clients SHOULD start sending the raw bytes. |
 | M-13 | ⏸ Deferred | Requires FIDO MDS integration / policy |
@@ -807,51 +939,76 @@ If triaging by effort × blast radius:
 3. **Next:** Medium cluster, starting **M-5** (pending diff, cheap fix), **M-3** (rate limits), **M-8** (policy enumeration authorization), **M-21** (audit signature verification), **M-22** (OS-bound admin key wrap).
 4. **Backlog:** Low / Informational items; bundle into a general hardening pass.
 
-### Remaining deferred work after the 2026-04-18 pass
+### Remaining deferred work after the 2026-04-19 pass
 
-The three deferred High findings all require architectural changes
-that span a transport or protocol boundary:
+The 2026-04-19 pass landed the Rust-side step-1 plumbing for H-6,
+H-7, and M-8 (see the 2026-04-19 follow-up pass block above) and
+closed M-1, M-2, and M-10. What's left splits into "step-2 of
+previously-partial items," "H-12 architectural," and a small
+cleanup cluster.
 
-- **H-7** — Transport authn on `127.0.0.1:5551`. Requires swapping
-  the Axum TCP bind for a Unix domain socket with `SO_PEERCRED` on
-  Linux/macOS and a named-pipe + `GetNamedPipeClientProcessId` on
-  Windows, plus client-side refactors in the CLI, both agents, the
-  Auth Bridge, and the FFI. Also unlocks M-8's completion
-  (per-device session binding on `/v1/*/policies` and
-  `/v1/*/software`) since a UDS can attach a per-device session
-  identifier to the caller.
-- **H-12** — Per-peer admission gating in gossip/sync. Requires a
-  new libp2p request-response behaviour that the node runs
-  immediately after Noise: peers exchange admission certs and the
-  swarm drops gossip/sync from unadmitted peers at the behaviour
-  layer. C-3's publisher-capability filter remains the last line of
-  defence even after H-12 lands.
-- **H-6** — HMAC-authenticated challenge between the Windows Auth
-  Bridge and `dds-node`. Cleanest design is a per-install secret
-  provisioned by the MSI; this requires coordinated changes in the
-  WiX installer, the C++ Auth Bridge / Credential Provider, and a
-  new Rust middleware that validates the HMAC before answering
-  `/v1/session/challenge`. Pairs conceptually with H-7.
+**Step-2 of previously-partial items** (all cross-language):
 
-Medium/Low items still open are either narrower (M-10 Argon2id
-parameter bump requires a disk-format migration; M-13 FIDO MDS;
-M-18 service-account split in WiX; L-17 service mutex
-refactor — pair with L-18 completion if needed) or have no cheap
-independent fix (M-1 canonical CBOR, M-2 hybrid-sig domain
-separation: both rolled into a future versioned breaking change).
-M-15 (node-bound FIDO2 hmac_salt) was investigated and deferred
-again this pass: binding the admin-machine `domain_key.bin` to its
-own node identity breaks the provisioning path, where
-`create_bundle` embeds the admin's CBOR v3 blob verbatim into
-`domain_key_blob` and the target node's `provision` unwraps it
-from bytes using only the authenticator. A proper fix requires
-either a bundle-specific re-wrap step (strip binding on export) or
-a separate "export" format; both are larger than the review's
-one-line fix suggests. M-15's real-world impact is also thinner
-than stated: `provision` explicitly does not persist
-`domain_key.bin` on non-admin nodes (asserted at
-`provision.rs:646`), so the "any provisioned node's key file"
-attack surface is narrower than the review claimed.
+- **H-7 step-2a landed 2026-04-20** (Rust server + CLI client);
+  **step-2b still outstanding** — Windows named-pipe listener
+  (`GetNamedPipeClientProcessId` + `OpenProcessToken` to populate
+  `CallerIdentity::Pipe`), C# Policy Agent `DdsNodeClient` transport
+  swap for both Windows and macOS (inject a `SocketsHttpHandler` with
+  a `ConnectCallback` that opens a `UnixDomainSocketEndPoint` on
+  Linux/macOS or calls `CreateFileW` on a pipe name on Windows), and
+  C++ Auth Bridge named-pipe HTTP/1 client in
+  `DdsNodeHttpClient.cpp`. Once step-2b lands across both agents and
+  the Auth Bridge, `trust_loopback_tcp_admin` flips to `false` by
+  default — right now TCP callers are still Anonymous-but-admin for
+  backward compat. H-7 step-2 also unblocks M-8 step-2.
+- **H-6 step-2** — The response-MAC middleware is already emitting
+  `X-DDS-Body-MAC` when a key is configured; the remaining work is
+  (a) MSI installer provisions a per-install 32-byte random secret
+  at `node_hmac_secret_path` (WiX custom action), (b) C++ Auth
+  Bridge loads the same secret and verifies the MAC on every
+  response, failing closed on mismatch, (c) challenge-HMAC binding
+  on `/v1/session/challenge` so an attacker who binds the port
+  before `dds-node` can't return an arbitrary challenge. Pairs
+  with H-7 step-2.
+- **M-8 step-2** — With H-7 step-2 in tree, replace the Anonymous
+  bypass on read-side endpoints with a session-token check that
+  binds the caller's authenticated identity to `device_urn` before
+  any TOFU record is consulted. Tighten `check_device_binding_read`
+  to reject unknown `device_urn` instead of logging-and-allowing.
+
+**H-12** (Rust-only, independent):
+
+- Per-peer admission gating in gossip/sync. Requires a new libp2p
+  request-response behaviour that the node runs immediately after
+  Noise: peers exchange admission certs and the swarm drops
+  gossip/sync from unadmitted peers at the behaviour layer. C-3's
+  publisher-capability filter remains the last line of defence
+  even after H-12 lands. Can run in parallel with H-7/H-6 step-2
+  in a separate worktree — no shared files.
+
+**Cleanup cluster** (smaller, independent):
+
+- **M-13** — FIDO MDS integration (attestation-statement verify
+  against a policy-configured trust anchor list or offline MDS
+  mirror).
+- **M-15** — Re-deferred 2026-04-18. Binding the admin-machine
+  `domain_key.bin` to its own node identity breaks the provisioning
+  path, where `create_bundle` embeds the admin's CBOR v3 blob
+  verbatim into `domain_key_blob` and the target node's `provision`
+  unwraps it from bytes using only the authenticator. A proper fix
+  requires either a bundle-specific re-wrap step (strip binding on
+  export) or a separate "export" format; both are larger than the
+  review's one-line suggestion. Impact is thinner than the review
+  states: `provision` asserts `domain_key.bin` is never persisted
+  on non-admin nodes (`provision.rs:646`), so the "any provisioned
+  node's key file" attack surface is narrower than claimed.
+- **M-18** — Split WiX service accounts: run the HTTP-polling part
+  of DdsPolicyAgent and the Auth Bridge under narrower service SIDs;
+  have enforcers impersonate up only when they need elevation.
+- **L-17** — Service-mutex refactor. Concurrency ceiling of one
+  HTTP request at a time on the shared service mutex. L-18's atomic
+  `bump_sign_count` already landed, so the sign-count replay
+  invariant is safe once the mutex comes off.
 
 ## Cross-references to prior review
 

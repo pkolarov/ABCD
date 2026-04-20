@@ -1556,6 +1556,18 @@ where
 }
 
 /// Bind and serve the HTTP API on `addr` until the future is dropped.
+///
+/// Scheme dispatch (H-7 step-2):
+/// - `unix:/path/to/sock` — Unix domain socket. Every accepted
+///   connection's peer credentials (`uid`, `gid`, `pid`) are extracted
+///   via `getpeereid` / `SO_PEERCRED` and injected as a
+///   [`CallerIdentity::Uds`] extension on every request, so
+///   [`require_admin_middleware`] sees a concrete identity rather than
+///   falling back to `Anonymous`. The socket file is created with
+///   `0o660` so only the owner and service group can connect.
+/// - anything else — legacy loopback TCP (e.g. `127.0.0.1:5551`).
+///   Callers are treated as [`CallerIdentity::Anonymous`] and fall
+///   back to [`AdminPolicy::trust_loopback_tcp_admin`].
 pub async fn serve<S>(
     addr: &str,
     svc: SharedService<S>,
@@ -1574,8 +1586,28 @@ where
         + Sync
         + 'static,
 {
+    if let Some(path) = addr.strip_prefix("unix:") {
+        #[cfg(unix)]
+        {
+            return serve_unix(
+                Path::new(path),
+                svc,
+                info,
+                admin_policy,
+                response_mac_key,
+                device_binding,
+            )
+            .await;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            return Err("UDS transport is only supported on Unix platforms".into());
+        }
+    }
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "HTTP API listening");
+    tracing::info!(%addr, "HTTP API listening on TCP");
     // Loopback TCP cannot supply peer credentials, so no `CallerIdentity`
     // extension is inserted here. `require_admin_middleware` will treat
     // callers as `CallerIdentity::Anonymous` and fall back to
@@ -1586,6 +1618,114 @@ where
     )
     .await?;
     Ok(())
+}
+
+/// UDS serve loop for H-7 step-2.
+///
+/// axum 0.7's `axum::serve` only accepts a `TcpListener`, so this
+/// mirrors what it does internally — accept a stream, wrap it with
+/// `hyper_util::rt::TokioIo`, and hand it to
+/// `hyper::server::conn::http1::Builder::serve_connection` with a
+/// per-connection service that (a) injects the caller's UDS peer
+/// credentials as a request extension and (b) delegates to the axum
+/// router. One task per connection; router is cheaply `Clone`.
+#[cfg(unix)]
+async fn serve_unix<S>(
+    path: &Path,
+    svc: SharedService<S>,
+    info: NodeInfo,
+    admin_policy: AdminPolicy,
+    response_mac_key: Option<ResponseMacKey>,
+    device_binding: Option<Arc<DeviceBindingStore>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    use hyper::server::conn::http1;
+    use hyper_util::rt::TokioIo;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::net::UnixListener;
+    use tower::ServiceExt as _;
+
+    // A stale socket file from a prior run of the same node would make
+    // `bind` fail with `EADDRINUSE`. Remove it first; the subsequent
+    // `bind` + `chmod` race window is negligible on a private data dir
+    // that is already `0o700` (L-4 in the review).
+    if path.exists() {
+        std::fs::remove_file(path)
+            .map_err(|e| format!("failed to remove stale socket {}: {e}", path.display()))?;
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "failed to create socket parent dir {}: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+    let listener = UnixListener::bind(path)
+        .map_err(|e| format!("failed to bind UDS {}: {e}", path.display()))?;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o660);
+    std::fs::set_permissions(path, perms)?;
+    tracing::info!(path = %path.display(), "HTTP API listening on UDS");
+
+    let app = router(svc, info, admin_policy, response_mac_key, device_binding);
+
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "UDS accept failed");
+                // Avoid a spin-loop on a persistent accept error.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+        };
+        let peer = match stream.peer_cred() {
+            Ok(cred) => CallerIdentity::Uds {
+                uid: cred.uid(),
+                gid: cred.gid(),
+                pid: cred.pid().unwrap_or(0),
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "peer_cred failed; dropping connection");
+                continue;
+            }
+        };
+        let app = app.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let svc_fn = hyper::service::service_fn({
+                let app = app.clone();
+                move |req: hyper::Request<hyper::body::Incoming>| {
+                    let app = app.clone();
+                    let peer = peer.clone();
+                    async move {
+                        let (mut parts, body) = req.into_parts();
+                        parts.extensions.insert(peer);
+                        let body = axum::body::Body::new(body);
+                        let req = axum::http::Request::from_parts(parts, body);
+                        let resp: axum::response::Response =
+                            app.oneshot(req).await.unwrap_or_else(|never| match never {});
+                        Ok::<_, std::convert::Infallible>(resp)
+                    }
+                }
+            });
+            if let Err(e) = http1::Builder::new().serve_connection(io, svc_fn).await {
+                tracing::debug!(error = %e, "UDS connection closed");
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -3732,5 +3872,218 @@ mod tests {
         let body = resp.bytes().await.unwrap();
         let expected = expected_mac(&key.0, "GET", "/v1/admin/challenge", &body);
         assert_eq!(header, expected);
+    }
+
+    // ---------- H-7 step-2: UDS listener end-to-end ----------
+
+    #[cfg(unix)]
+    mod uds_listener {
+        use super::*;
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Full};
+        use hyper::client::conn::http1;
+        use hyper_util::rt::TokioIo;
+        use tokio::net::UnixStream;
+        use tokio::time::{Duration, sleep};
+
+        async fn wait_for_socket(path: &std::path::Path) {
+            use std::os::unix::fs::FileTypeExt;
+            for _ in 0..100 {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if meta.file_type().is_socket() {
+                        return;
+                    }
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+            panic!("UDS socket {} never appeared", path.display());
+        }
+
+        async fn send(
+            sock: &std::path::Path,
+            method: &str,
+            uri: &str,
+        ) -> (hyper::StatusCode, Bytes) {
+            let stream = UnixStream::connect(sock).await.unwrap();
+            let io = TokioIo::new(stream);
+            let (mut sender, conn) = http1::handshake::<_, Full<Bytes>>(io).await.unwrap();
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let req = hyper::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("host", "localhost")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let resp = sender.send_request(req).await.unwrap();
+            let status = resp.status();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, body)
+        }
+
+        /// Under a strict policy whose `service_uid` is the test
+        /// process's effective UID, UDS callers should be admitted to
+        /// admin endpoints. This pins the full pipeline: UDS accept →
+        /// peer_cred → `CallerIdentity::Uds` injection → admin gate.
+        #[tokio::test]
+        async fn admin_endpoint_admits_service_uid_caller() {
+            let state = make_state();
+            let svc = state.svc.clone();
+            let info = state.info.clone();
+
+            let tmp = tempfile::tempdir().unwrap();
+            let sock = tmp.path().join("dds.sock");
+            let addr = format!("unix:{}", sock.display());
+            let current_uid = unsafe { libc::geteuid() };
+            let policy = AdminPolicy {
+                trust_loopback_tcp_admin: false,
+                admin_uids: vec![],
+                admin_sids: vec![],
+                service_uid: Some(current_uid),
+            };
+
+            let server = tokio::spawn(async move {
+                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None)
+                    .await;
+            });
+            wait_for_socket(&sock).await;
+
+            // Public endpoint must work.
+            let (status, _) = send(&sock, "GET", "/v1/status").await;
+            assert!(
+                status.is_success(),
+                "expected /v1/status to succeed over UDS, got {status}"
+            );
+
+            // Admin endpoint — the caller's uid equals the configured
+            // `service_uid`, so the gate admits and the handler runs.
+            // We only care that it is NOT 403; the underlying request
+            // may 200 or 400 depending on handler state.
+            let (status, _) = send(&sock, "GET", "/v1/admin/challenge").await;
+            assert_ne!(
+                status,
+                hyper::StatusCode::FORBIDDEN,
+                "admin gate denied UDS caller whose uid matches service_uid"
+            );
+
+            server.abort();
+        }
+
+        /// When `service_uid` is set to a sentinel that cannot match the
+        /// test process, the admin gate must return 403 — the UDS peer
+        /// creds are being extracted and the policy is being enforced.
+        #[tokio::test]
+        async fn admin_endpoint_rejects_unknown_uid_caller() {
+            let state = make_state();
+            let svc = state.svc.clone();
+            let info = state.info.clone();
+
+            let tmp = tempfile::tempdir().unwrap();
+            let sock = tmp.path().join("dds.sock");
+            let addr = format!("unix:{}", sock.display());
+            // service_uid = u32::MAX is guaranteed not to match any
+            // real process, so the test's own uid must fail the gate.
+            let policy = AdminPolicy {
+                trust_loopback_tcp_admin: false,
+                admin_uids: vec![],
+                admin_sids: vec![],
+                service_uid: Some(u32::MAX),
+            };
+
+            let server = tokio::spawn(async move {
+                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None)
+                    .await;
+            });
+            wait_for_socket(&sock).await;
+
+            let (status, body) = send(&sock, "GET", "/v1/admin/challenge").await;
+            assert_eq!(
+                status,
+                hyper::StatusCode::FORBIDDEN,
+                "admin gate must reject non-service uid over UDS; body={:?}",
+                String::from_utf8_lossy(&body),
+            );
+
+            // Public endpoint remains reachable — the gate is
+            // per-route, not per-connection.
+            let (status, _) = send(&sock, "GET", "/v1/status").await;
+            assert!(status.is_success());
+
+            server.abort();
+        }
+
+        /// Socket file permissions must be `0o660` after bind so
+        /// other local users can't connect. L-16 / H-5 analogue for
+        /// the Unix side of H-7.
+        #[tokio::test]
+        async fn socket_mode_is_group_only_on_bind() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let state = make_state();
+            let svc = state.svc.clone();
+            let info = state.info.clone();
+
+            let tmp = tempfile::tempdir().unwrap();
+            let sock = tmp.path().join("dds.sock");
+            let addr = format!("unix:{}", sock.display());
+            let policy = AdminPolicy {
+                trust_loopback_tcp_admin: false,
+                admin_uids: vec![],
+                admin_sids: vec![],
+                service_uid: Some(unsafe { libc::geteuid() }),
+            };
+
+            let server = tokio::spawn(async move {
+                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None)
+                    .await;
+            });
+            wait_for_socket(&sock).await;
+
+            let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o660,
+                "expected socket mode 0o660 after bind, got 0o{mode:o}"
+            );
+
+            server.abort();
+        }
+
+        /// Re-binding over a stale socket (previous run's leftover) must
+        /// succeed — the listener removes the file first. Prevents
+        /// `EADDRINUSE` on a non-clean shutdown.
+        #[tokio::test]
+        async fn stale_socket_is_replaced_on_bind() {
+            let state = make_state();
+            let svc = state.svc.clone();
+            let info = state.info.clone();
+
+            let tmp = tempfile::tempdir().unwrap();
+            let sock = tmp.path().join("dds.sock");
+            // Plant a stale file so `bind` would otherwise fail.
+            std::fs::write(&sock, b"stale").unwrap();
+            assert!(sock.exists());
+
+            let addr = format!("unix:{}", sock.display());
+            let policy = AdminPolicy {
+                trust_loopback_tcp_admin: false,
+                admin_uids: vec![],
+                admin_sids: vec![],
+                service_uid: Some(unsafe { libc::geteuid() }),
+            };
+
+            let server = tokio::spawn(async move {
+                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None)
+                    .await;
+            });
+            wait_for_socket(&sock).await;
+
+            // Sanity: connect succeeds, so we're hitting the fresh
+            // listener, not the stale file.
+            let (status, _) = send(&sock, "GET", "/v1/status").await;
+            assert!(status.is_success());
+
+            server.abort();
+        }
     }
 }

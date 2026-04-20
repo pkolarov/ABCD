@@ -1,9 +1,22 @@
 //! Shared HTTP client helpers for CLI subcommands that call `dds-node`.
+//!
+//! Two transports are supported:
+//! - `http://host:port` / `https://host:port` — normal TCP, via reqwest.
+//! - `unix:/path/to/dds.sock` — Unix domain socket (H-7 step-2), served
+//!   by `dds-node` when `network.api_addr = "unix:/..."` in the node's
+//!   TOML config. The CLI runs an HTTP/1 client directly over the
+//!   socket using hyper + hyper-util so reqwest's TCP-only connector
+//!   doesn't get in the way.
 
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::client::conn::http1;
+use hyper_util::rt::TokioIo;
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use tokio::net::UnixStream;
 
 /// Default dds-node loopback API base URL.
 pub const DEFAULT_NODE_URL: &str = "http://127.0.0.1:5551";
@@ -21,15 +34,16 @@ pub fn new_client() -> Client {
 /// non-loopback host would leak bearer-like tokens and requests over
 /// the wire. Loopback (127.0.0.1, ::1, localhost) stays allowed
 /// because the API is loopback-only by design. HTTPS is always
-/// allowed regardless of host.
+/// allowed regardless of host. `unix:` URLs are local by definition
+/// and bypass the check.
 fn enforce_tls_for_non_loopback(url: &str) {
     let lower = url.to_ascii_lowercase();
-    if lower.starts_with("https://") {
+    if lower.starts_with("https://") || lower.starts_with("unix:") {
         return;
     }
     if !lower.starts_with("http://") {
         fail(&format!(
-            "unsupported URL scheme (only http and https are allowed): {url}"
+            "unsupported URL scheme (only http, https, and unix: are allowed): {url}"
         ));
     }
     // Extract the host between "http://" and the next '/' or ':'.
@@ -52,9 +66,16 @@ pub async fn get_json<T>(base: &str, path: &str, query: &[(&str, &str)]) -> T
 where
     T: DeserializeOwned,
 {
+    enforce_tls_for_non_loopback(base);
+
+    if let Some(sock) = base.strip_prefix("unix:") {
+        let full_path = build_path_with_query(path, query);
+        let (status, body) = uds_request(sock, "GET", &full_path, Bytes::new(), None).await;
+        return handle_uds_response(status, body);
+    }
+
     let client = new_client();
     let url = format!("{base}{path}");
-    enforce_tls_for_non_loopback(&url);
     let resp = client
         .get(&url)
         .query(query)
@@ -71,9 +92,23 @@ where
     Req: Serialize,
     Resp: DeserializeOwned,
 {
+    enforce_tls_for_non_loopback(base);
+
+    if let Some(sock) = base.strip_prefix("unix:") {
+        let json = serde_json::to_vec(body).unwrap_or_else(|e| fail(&format!("serialize: {e}")));
+        let (status, body) = uds_request(
+            sock,
+            "POST",
+            path,
+            Bytes::from(json),
+            Some("application/json"),
+        )
+        .await;
+        return handle_uds_response(status, body);
+    }
+
     let client = new_client();
     let url = format!("{base}{path}");
-    enforce_tls_for_non_loopback(&url);
     let resp = client
         .post(&url)
         .json(body)
@@ -89,9 +124,29 @@ pub async fn post_no_body<Req>(base: &str, path: &str, body: &Req) -> StatusCode
 where
     Req: Serialize,
 {
+    enforce_tls_for_non_loopback(base);
+
+    if let Some(sock) = base.strip_prefix("unix:") {
+        let json = serde_json::to_vec(body).unwrap_or_else(|e| fail(&format!("serialize: {e}")));
+        let (status, bytes) = uds_request(
+            sock,
+            "POST",
+            path,
+            Bytes::from(json),
+            Some("application/json"),
+        )
+        .await;
+        return if status.is_success() {
+            status
+        } else {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            eprintln!("Error: HTTP {status} — {text}");
+            std::process::exit(1);
+        };
+    }
+
     let client = new_client();
     let url = format!("{base}{path}");
-    enforce_tls_for_non_loopback(&url);
     let resp = client
         .post(&url)
         .json(body)
@@ -124,6 +179,113 @@ async fn handle_response<T: DeserializeOwned>(resp: reqwest::Response) -> T {
     }
 }
 
+fn handle_uds_response<T: DeserializeOwned>(status: StatusCode, body: Bytes) -> T {
+    if status.is_success() {
+        serde_json::from_slice::<T>(&body)
+            .unwrap_or_else(|e| fail(&format!("invalid JSON response: {e}")))
+    } else {
+        let text = String::from_utf8_lossy(&body).into_owned();
+        let msg = parse_error_message(&text).unwrap_or(text);
+        eprintln!("Error: HTTP {status} — {msg}");
+        std::process::exit(1);
+    }
+}
+
+/// Minimal HTTP/1 client over a Unix domain socket. Opens a fresh
+/// connection per call — the CLI is short-lived and the overhead is
+/// one syscall plus HTTP/1 line-parsing, so pooling is not worth the
+/// complexity here.
+async fn uds_request(
+    sock_path: &str,
+    method: &str,
+    path_and_query: &str,
+    body: Bytes,
+    content_type: Option<&str>,
+) -> (StatusCode, Bytes) {
+    #[cfg(unix)]
+    {
+        let stream = UnixStream::connect(sock_path).await.unwrap_or_else(|e| {
+            fail_reach(&format!("unix:{sock_path}"), &e.to_string());
+        });
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = http1::handshake::<_, Full<Bytes>>(io)
+            .await
+            .unwrap_or_else(|e| fail(&format!("HTTP handshake over UDS failed: {e}")));
+        tokio::spawn(async move {
+            // The connection future drives the I/O for this one request;
+            // errors are routed back through `send_request` so we can
+            // drop them here.
+            let _ = conn.await;
+        });
+
+        let mut req = hyper::Request::builder()
+            .method(method)
+            .uri(path_and_query)
+            .header("host", "localhost");
+        if let Some(ct) = content_type {
+            req = req.header("content-type", ct);
+        }
+        req = req.header("content-length", body.len().to_string());
+        let req = req
+            .body(Full::new(body))
+            .unwrap_or_else(|e| fail(&format!("build request: {e}")));
+
+        let resp = sender
+            .send_request(req)
+            .await
+            .unwrap_or_else(|e| fail_reach(&format!("unix:{sock_path}"), &e.to_string()));
+        let status = StatusCode::from_u16(resp.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let collected = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|e| fail(&format!("read response body: {e}")));
+        let body = collected.to_bytes();
+        (status, body)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (sock_path, method, path_and_query, body, content_type);
+        fail("UDS transport is only supported on Unix platforms");
+    }
+}
+
+fn build_path_with_query(path: &str, query: &[(&str, &str)]) -> String {
+    if query.is_empty() {
+        return path.to_string();
+    }
+    let mut out = String::with_capacity(path.len() + 32);
+    out.push_str(path);
+    out.push('?');
+    for (i, (k, v)) in query.iter().enumerate() {
+        if i > 0 {
+            out.push('&');
+        }
+        push_form_encoded(&mut out, k);
+        out.push('=');
+        push_form_encoded(&mut out, v);
+    }
+    out
+}
+
+/// Minimal application/x-www-form-urlencoded encoder for path-query
+/// keys and values. Keeps unreserved chars as-is, percent-encodes
+/// everything else. Matches the subset reqwest emits for our callers
+/// (only ASCII keys/values in practice).
+fn push_form_encoded(out: &mut String, s: &str) {
+    for b in s.as_bytes() {
+        let c = *b;
+        let unreserved = c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'~');
+        if unreserved {
+            out.push(c as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{c:02X}"));
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct ErrorEnvelope {
     error: String,
@@ -143,4 +305,26 @@ fn fail_reach(url: &str, detail: &str) -> ! {
 fn fail(msg: &str) -> ! {
     eprintln!("Error: {msg}");
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_path_with_query_empty() {
+        assert_eq!(build_path_with_query("/v1/x", &[]), "/v1/x");
+    }
+
+    #[test]
+    fn build_path_with_query_encodes_reserved() {
+        let got = build_path_with_query("/v1/x", &[("device_urn", "urn:vch:ab cd")]);
+        assert_eq!(got, "/v1/x?device_urn=urn%3Avch%3Aab%20cd");
+    }
+
+    #[test]
+    fn build_path_with_query_multi() {
+        let got = build_path_with_query("/v1/audit/entries", &[("action", "vouch"), ("limit", "10")]);
+        assert_eq!(got, "/v1/audit/entries?action=vouch&limit=10");
+    }
 }
