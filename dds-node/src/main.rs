@@ -53,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match sub {
         "init-domain" => cmd_init_domain(&args[1..]),
         "gen-node-key" => cmd_gen_node_key(&args[1..]),
+        "gen-hmac-secret" => cmd_gen_hmac_secret(&args[1..]),
         "admit" => cmd_admit(&args[1..]),
         "create-provision-bundle" => cmd_create_bundle(&args[1..]),
         "provision" => cmd_provision(&args[1..]),
@@ -78,6 +79,7 @@ fn print_usage() {
         "Usage:
   dds-node init-domain --name <NAME> --dir <DIR> [--fido2]
   dds-node gen-node-key --data-dir <DIR>
+  dds-node gen-hmac-secret --out <FILE> [--force]
   dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--out <FILE>] [--ttl-days <N>]
   dds-node create-provision-bundle --dir <DIR> --org <ORG> [--out <FILE>]
   dds-node provision <BUNDLE.dds> [--data-dir <DIR>] [--no-start]
@@ -158,6 +160,61 @@ fn cmd_gen_node_key(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("  peer_id:  {}", peer_id);
     println!();
     println!("Send this peer id to the domain admin to obtain an admission cert.");
+    Ok(())
+}
+
+/// **H-6 step-2 (security review)**: generate a 32-byte random HMAC
+/// secret suitable for use as `NetworkConfig.api_auth.node_hmac_secret_path`
+/// on the node side and as the matching verification key on the C++
+/// Auth Bridge side. The MSI installs this at first run so the
+/// per-install secret is unique to each deployment and fresh on every
+/// clean install.
+///
+/// By default refuses to overwrite an existing file — pass `--force`
+/// to replace. On Unix the file is written via atomic rename with
+/// `0o600`. On Windows the default ACL applied by `std::fs::write` is
+/// inherited from `ProgramData\DDS`, which the MSI already restricts
+/// to `LocalSystem` + `BUILTIN\Administrators`; we don't add an
+/// explicit DACL here to avoid drifting from the MSI-installed
+/// permissions.
+fn cmd_gen_hmac_secret(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use rand::RngCore;
+    let out = PathBuf::from(require_flag(args, "--out")?);
+    let force = args.iter().any(|a| a == "--force");
+    if out.exists() && !force {
+        eprintln!(
+            "refusing to overwrite existing HMAC secret at {} (pass --force to replace)",
+            out.display()
+        );
+        std::process::exit(1);
+    }
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut secret = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+
+    // Atomic write via tempfile in the target directory so a crash
+    // mid-write can't leave a torn file.
+    let parent = out.parent().unwrap_or_else(|| std::path::Path::new("."));
+    use std::io::Write as _;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(&secret)?;
+    tmp.flush()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600))?;
+    }
+    tmp.persist(&out)?;
+
+    println!("Wrote 32-byte HMAC secret to {}", out.display());
+    println!("Configure dds-node's network.api_auth.node_hmac_secret_path");
+    println!("to this path, and distribute the same file to the Windows");
+    println!("Auth Bridge service (it reads it from its HmacSecretPath");
+    println!("registry value).");
     Ok(())
 }
 

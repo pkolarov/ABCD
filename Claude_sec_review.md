@@ -50,17 +50,16 @@ backward-compat fallback); M-14 (encrypted-marker refuses silent
 plaintext downgrade); L-18 (atomic `bump_sign_count` primitive —
 defense-in-depth if L-17 lands).
 
-**Still deferred (after the 2026-04-20 passes)** — 0 High, 1 High
-step-2, 3 Medium + 1 partial, 1 Low: **H-6 step-2**
-(MSI-provisioned HMAC secret + Auth Bridge consumes and enforces
-the response MAC + challenge-HMAC binding); **M-8 step-2**
-(write-side session-token binding; H-7 step-2 listeners are in
-tree, operational cutover gates the flip); **M-13** (FIDO MDS
-attestation policy); **M-15** (node-bound FIDO2 `hmac_salt` via
-bundle re-wrap — re-deferred 2026-04-18); **M-18** (WiX
-service-account split); **L-17** (service mutex refactor, pairs
-with already-landed L-18). H-7 step-2a/step-2b and H-12 are all
-Fixed-pending-verify as of 2026-04-20.
+**Still deferred (after the 2026-04-20 passes)** — 0 High, 3 Medium
++ 1 partial, 1 Low: **M-8 step-2** (write-side session-token
+binding; H-7 step-2 listeners are in tree, operational cutover
+gates the flip); **M-13** (FIDO MDS attestation policy); **M-15**
+(node-bound FIDO2 `hmac_salt` via bundle re-wrap — re-deferred
+2026-04-18); **M-18** (WiX service-account split); **L-17**
+(service mutex refactor, pairs with already-landed L-18). All
+High findings (H-6, H-7 step-2a/2b, H-12) are Fixed-pending-verify
+as of 2026-04-20 — Windows CI runs are required for the C++ /
+MSI portions of H-6 and H-7.
 
 **Reviewer follow-ups already closed this round** (previously flagged
 as partial):
@@ -207,6 +206,53 @@ as partial):
   and `ApiAuthConfig.windows_admin_sids` now describe the actual
   semantics and flag a future `windows_admin_groups` field that the
   pipe listener can populate from `TokenGroups`. Commit `14dbc8f`.
+
+**2026-04-20 follow-up pass — H-6 step-2 (response MAC + MSI secret provisioning):**
+
+- **H-6 step-2**: Closes the challenge-substitution attack vector
+  that made the Auth Bridge trust whatever `/v1/session/challenge`
+  returned — even from a squatter who bound `127.0.0.1:5551` before
+  `dds-node`.
+  - **Rust CLI**: new `dds-node gen-hmac-secret --out <FILE>`
+    subcommand. Writes 32 random bytes via atomic tempfile rename;
+    sets `0o600` on Unix; refuses to overwrite without `--force` so
+    reinstalls / repairs cannot rotate the secret and desync the
+    Auth Bridge from the node. Exercised by four integration tests
+    in `tests/h6_gen_hmac_secret.rs` (size, mode, refuse-overwrite,
+    force-rotate, missing-parent-dir).
+  - **WiX MSI**: new deferred `CA_GenHmacSecret` custom action
+    invokes `dds-node.exe gen-hmac-secret --out
+    [CommonAppDataFolder]DDS\node-hmac.key` after `InstallFiles`
+    and before the services start; runs as LocalSystem so the
+    service accounts that read the file later share the owner.
+    Paired registry value `HKLM\SOFTWARE\DDS\AuthBridge\
+    HmacSecretPath` under `C_AuthBridge` tells the Auth Bridge
+    where to find the file. `config/node.toml` template adds
+    `[network.api_auth].node_hmac_secret_path` pointing at the
+    same file so `dds-node` and the Auth Bridge always load the
+    same 32 bytes.
+  - **C++ Auth Bridge**: `CDdsConfiguration` gains
+    `HmacSecretPath()` (registry value `HmacSecretPath`).
+    `CDdsNodeHttpClient::LoadHmacSecret(path)` reads the file (16-1024
+    bytes accepted). `VerifyResponseMac` computes
+    `HMAC-SHA256(key, method || 0 || path_without_query || 0 || body)`
+    via BCrypt, base64-decodes the `X-DDS-Body-MAC` header via
+    `CryptStringToBinary`, and constant-time-compares 32 bytes.
+    Wired into both `SendRequestWinHttp` (`WinHttpQueryHeaders`
+    with `WINHTTP_QUERY_CUSTOM`) and `SendRequestPipe` (header
+    parsed out of the raw response buffer, case-insensitive).
+    Mismatched / missing MAC → body cleared + status 0 → caller
+    fails closed. On startup, `DdsAuthBridgeMain::Initialize`
+    calls `LoadHmacSecret`; configured-but-unreadable aborts
+    startup via `SERVICE_START_FAILED`; unconfigured logs a
+    warning and runs without verification (transition-only so
+    pre-MSI-custom-action installs don't brick). Verification
+    in `SendRequestWinHttp` happens before `WinHttpCloseHandle`,
+    so the header can still be read when we look for it.
+  - **Caveat**: C++ and WiX code is authored on macOS; Windows
+    CI must compile and run the end-to-end challenge path
+    (real dds-node + Auth Bridge + Credential Provider) before
+    this can be considered verified.
 
 **2026-04-20 follow-up pass — H-12 (per-peer admission gating):**
 
@@ -357,7 +403,7 @@ as partial):
 | H-3 | ✅ Fixed (pending verify) | Same envelope design as H-2, applied to `/v1/macos/{policies,software}` and the macOS agent. Mirrored tests cross-verify the Rust-emitted interop vector. |
 | H-4 | ✅ Fixed (pending verify) | JTIs suffixed with UUIDv4; `TrustError::DuplicateJti` rejects overlaps |
 | H-5 | ✅ Fixed (pending verify) | Named-pipe SDDL tightened to `SY`-only (dropped `IU`); C++ change, compile-test requires Windows CI |
-| H-6 | ⚠ Partial | Step-1 plumbing in tree (commit `730dc6c`): `ResponseMacKey::from_file` + `sign_response_body_middleware` emit `X-DDS-Body-MAC` on every response when a key is configured. **Still outstanding (step 2)**: MSI-provisioned per-install HMAC secret, C++ Auth Bridge consumes the secret and verifies/enforces the MAC on every response, challenge-HMAC binding on `/v1/session/challenge`. See the 2026-04-19 follow-up pass block above. |
+| H-6 | ✅ Fixed (pending verify) | Step-1 plumbing in tree (commit `730dc6c`): `ResponseMacKey::from_file` + `sign_response_body_middleware` emit `X-DDS-Body-MAC` on every response when a key is configured. **Step-2 landed 2026-04-20**: `dds-node gen-hmac-secret` CLI subcommand writes a 32-byte atomic `0o600` secret file (4 integration tests: size, mode, refuse-overwrite, force-rotate). WiX MSI `CA_GenHmacSecret` custom action provisions the file at install time; `HKLM\SOFTWARE\DDS\AuthBridge\HmacSecretPath` points the Auth Bridge at the same file; node.toml template references `[network.api_auth].node_hmac_secret_path` so both sides load the identical bytes. C++ Auth Bridge `CDdsNodeHttpClient::VerifyResponseMac` computes HMAC-SHA256 via BCrypt, base64-decodes the header via CryptStringToBinary, constant-time-compares 32 bytes, and fails closed (body cleared + status 0) on mismatch or missing header — verified on both WinHTTP and pipe transports. `DdsAuthBridgeMain::Initialize` aborts startup when the configured path is unreadable, and logs a warning + runs without verification when the path is empty (transition-only). **Caveat**: C++ + WiX are authored on macOS; Windows CI must compile and run the end-to-end challenge flow. |
 | H-7 | ⚠ Partial | Step-1 plumbing in tree (commit `730dc6c`): `ApiAuthConfig` + `CallerIdentity {Anonymous, Uds, Pipe}` extractor + `AdminPolicy` + `require_admin_middleware` gate `/v1/enroll/*`, `/v1/admin/*`, `/v1/enrolled-users`, `/v1/audit/entries`. **Step 2a landed 2026-04-20**: `serve` dispatches on `unix:` scheme; new `serve_unix` accepts UDS connections, extracts peer creds via `stream.peer_cred()`, and injects `CallerIdentity::Uds { uid, gid, pid }` on every request before the admin gate. Socket perms `0o660`; stale-file cleanup on bind. `dds-cli` understands `unix:/path` URLs via a minimal hyper+UnixStream client. **Step 2b landed 2026-04-20**: `serve` now also dispatches on `pipe:<name>`; new `serve_pipe` wraps tokio's `NamedPipeServer` and extracts caller primary-user SID via `GetNamedPipeClientProcessId` + `OpenProcessToken` + `GetTokenInformation(TokenUser)` + `ConvertSidToStringSidW` into `CallerIdentity::Pipe`. Both C# Policy Agents (macOS + Windows) gain a `DdsNodeHttpFactory` that swaps the primary `HttpMessageHandler` to a `SocketsHttpHandler` with a `ConnectCallback` for UDS or `NamedPipeClientStream`. C++ Auth Bridge's `CDdsNodeHttpClient` now dispatches on `pipe:` URLs to `SendRequestPipe` (minimal HTTP/1 over `CreateFileW` + `WriteFile`/`ReadFile` with `Connection: close`). Cross-language tests: Rust 4 UDS e2e on unit tests; C# macOS 15 (incl. live UDS echo-responder); C# Windows 21 (incl. live named-pipe echo-responder, skip-on-non-Windows). C++ Auth Bridge pipe path is authored but requires Windows CI for compile + integration verification. **Still outstanding**: flip `trust_loopback_tcp_admin = false` once operators cut all clients over to the new transports; revisit H-12 after this rolls out. |
 | H-8 | ✅ Fixed (pending verify) | `admin_vouch` requires `dds:admin-vouch:<purpose>` for non-bootstrap admins; `bootstrap_admin_urn` persisted to config and rehydrated on startup (survives restart); vouch with `purpose == dds:admin` now promotes the subject into `trusted_roots` and persists. (Generating the second admin's signing key is still a separate operational step — `admin_setup` is the only auto-generation path today.) |
 | H-9 | ✅ Fixed (pending verify) | `Zeroizing` wraps passphrase + admin plaintext; buffers wiped on early-return paths |

@@ -20,6 +20,12 @@ public:
     DWORD DdsNodePort() const { return m_dwDdsNodePort; }
     const std::string& DeviceUrn() const { return m_deviceUrn; }
     const std::string& RpId() const { return m_rpId; }
+    // **H-6 step-2 (security review)**: per-install shared secret for
+    // response-body MAC verification. Provisioned by the MSI at install
+    // time, read by both dds-node (via `node_hmac_secret_path` in
+    // network.api_auth) and this service. Empty string = MAC
+    // verification disabled (transitional; deployments SHOULD set it).
+    const std::wstring& HmacSecretPath() const { return m_hmacSecretPath; }
 
     // --- Credential Provider Filter Settings ---
     BOOL  FilterBuiltInProviders() const { return m_bFilterBuiltInProviders; }
@@ -35,6 +41,7 @@ private:
 
     DWORD ReadDword(_In_ HKEY hKey, _In_ PCWSTR pszValueName, _In_ DWORD dwDefault) const;
     std::string ReadStringNarrow(_In_ HKEY hKey, _In_ PCWSTR pszValueName, _In_ const char* pszDefault) const;
+    std::wstring ReadStringWide(_In_ HKEY hKey, _In_ PCWSTR pszValueName, _In_ const wchar_t* pszDefault) const;
 
     // DDS Node connection
     DWORD       m_dwDdsNodePort;    // default 5551
@@ -46,4 +53,7 @@ private:
 
     // Auth methods
     BOOL  m_bAllowPasswordFallback;
+
+    // H-6 step-2: response-MAC secret file path.
+    std::wstring m_hmacSecretPath;
 };

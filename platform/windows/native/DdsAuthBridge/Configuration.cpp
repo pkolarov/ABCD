@@ -29,6 +29,8 @@ void CDdsConfiguration::Load()
 
     m_deviceUrn = ReadStringNarrow(hKey, L"DeviceUrn", "");
     m_rpId      = ReadStringNarrow(hKey, L"RpId", "dds.local");
+    // H-6 step-2: path to the per-install HMAC secret file.
+    m_hmacSecretPath = ReadStringWide(hKey, L"HmacSecretPath", L"");
 
     RegCloseKey(hKey);
 }
@@ -75,4 +77,18 @@ std::string CDdsConfiguration::ReadStringNarrow(_In_ HKEY hKey, _In_ PCWSTR pszV
             return std::string(narrow);
     }
     return std::string(pszDefault);
+}
+
+std::wstring CDdsConfiguration::ReadStringWide(_In_ HKEY hKey, _In_ PCWSTR pszValueName, _In_ const wchar_t* pszDefault) const
+{
+    wchar_t buf[1024] = {0};
+    DWORD type = 0, cbData = sizeof(buf) - sizeof(wchar_t);
+    if (RegQueryValueExW(hKey, pszValueName, NULL, &type,
+                         (LPBYTE)buf, &cbData) == ERROR_SUCCESS &&
+        (type == REG_SZ || type == REG_EXPAND_SZ))
+    {
+        if (buf[0] != L'\0')
+            return std::wstring(buf);
+    }
+    return std::wstring(pszDefault);
 }

@@ -361,6 +361,40 @@ BOOL CDdsAuthBridgeMain::Initialize(_In_ HANDLE hStopEvent)
     // Configure dds-node HTTP client
     m_httpClient.SetPort(m_config.DdsNodePort());
 
+    // **H-6 step-2 (security review)**: load the per-install HMAC
+    // secret. If configured, every response from dds-node is
+    // verified against HMAC-SHA256(key, method||0||path||0||body);
+    // mismatched / missing MAC = refused response. Fail-closed on
+    // configured-but-unreadable so an attacker can't strip the
+    // secret by deleting the file.
+    {
+        const std::wstring& hmacPath = m_config.HmacSecretPath();
+        if (hmacPath.empty())
+        {
+            FileLog::Write(
+                "DdsAuthBridge: HmacSecretPath not configured — H-6 MAC "
+                "verification disabled (transition-only)\n");
+            CEventLogger::LogWarning(
+                EVENT_ID::SERVICE_START_FAILED,
+                L"HmacSecretPath not configured — response-body MAC "
+                L"verification is disabled. Run `dds-node gen-hmac-secret` "
+                L"and set HKLM\\SOFTWARE\\DDS\\AuthBridge\\HmacSecretPath.");
+        }
+        else if (!m_httpClient.LoadHmacSecret(hmacPath))
+        {
+            CEventLogger::LogError(
+                EVENT_ID::SERVICE_START_FAILED,
+                L"Failed to load HMAC secret — refusing to start the Auth Bridge");
+            return FALSE;
+        }
+        else
+        {
+            FileLog::Write(
+                "DdsAuthBridge: HMAC secret loaded — response-body MAC "
+                "verification enabled\n");
+        }
+    }
+
     // Load credential vault
     if (!m_vault.Load())
     {

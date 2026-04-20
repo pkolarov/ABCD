@@ -14,6 +14,8 @@
 #include <cstdint>
 
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "crypt32.lib")
 
 // Result of a POST /v1/session/assert call
 struct DdsAssertResult
@@ -113,6 +115,17 @@ public:
     void SetBaseUrl(const std::string& baseUrl);
     void SetPort(DWORD port);
 
+    // **H-6 step-2 (security review)**: load the per-install HMAC
+    // secret that dds-node uses to sign response bodies. Once set,
+    // every response from dds-node MUST carry a valid
+    // `X-DDS-Body-MAC` header or the request fails closed. Call with
+    // an empty path to disable verification (transition-only).
+    //
+    // Returns false on I/O error (file missing / short read). Caller
+    // logs + fails service startup on false.
+    bool LoadHmacSecret(const std::wstring& path);
+    bool HmacSecretLoaded() const { return !m_hmacKey.empty(); }
+
     // POST /v1/session/assert
     //
     // Sends the FIDO2 assertion proof to dds-node for server-side
@@ -181,6 +194,9 @@ private:
     Transport    m_transport;       // Selected transport mode
     std::wstring m_pipeName;         // Bare pipe name, e.g. "dds-api"
                                      // (without the "\\.\pipe\" prefix)
+    std::vector<uint8_t> m_hmacKey;  // H-6 step-2: per-install HMAC
+                                     // secret; empty = MAC
+                                     // verification disabled.
 
     // Dispatch entry point: routes to SendRequestWinHttp or
     // SendRequestPipe based on m_transport. Returns the HTTP status
@@ -212,6 +228,24 @@ private:
         const std::string* requestBody,
         std::string& responseBody
     );
+
+    // H-6 step-2: verify `X-DDS-Body-MAC` against a freshly-computed
+    // HMAC-SHA256(key, method || 0 || path || 0 || body) where the
+    // path is stripped of its query string (the Rust middleware
+    // signs `uri.path()`). `receivedMacB64` is the raw header value.
+    // Returns true iff:
+    //   - MAC verification is disabled (m_hmacKey empty), OR
+    //   - the decoded MAC matches byte-for-byte under constant-time
+    //     comparison.
+    // Callers MUST clear the response body and return an error on
+    // false — we fail closed to defeat the H-6 challenge-substitution
+    // attack.
+    bool VerifyResponseMac(
+        const wchar_t* verb,
+        const wchar_t* path,
+        const std::string& receivedMacB64,
+        const std::string& body
+    ) const;
 
     // ---- Minimal JSON helpers (no external dependencies) ----
 

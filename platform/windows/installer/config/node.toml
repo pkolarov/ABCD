@@ -5,12 +5,22 @@
 # Data directory for vault, certificates, and replication state
 data_dir = 'C:\ProgramData\DDS'
 
-# HTTP API listen address (used by Auth Bridge and Policy Agent)
+[network]
+# HTTP API listen address (used by Auth Bridge and Policy Agent).
+# Switch to `pipe:dds-api` once all clients run on the Windows named-pipe
+# transport (H-7 step-2b in the security review).
 api_addr = '127.0.0.1:5551'
 
-# P2P listen addresses (multiaddr format)
-# Uncomment and configure for mesh networking:
-# listen = ['/ip4/0.0.0.0/tcp/4001', '/ip4/0.0.0.0/udp/4001/quic-v1']
+# P2P listen addresses (multiaddr format).
+# listen_addr = '/ip4/0.0.0.0/tcp/4001'
+
+[network.api_auth]
+# **H-6 step-2 (security review)** — per-install HMAC secret used to
+# sign every HTTP response body. The MSI provisions this file via the
+# `gen-hmac-secret` custom action; the Auth Bridge reads the same
+# file via HKLM\SOFTWARE\DDS\AuthBridge\HmacSecretPath. Delete the
+# line to disable response-MAC signing (transition-only).
+node_hmac_secret_path = 'C:\ProgramData\DDS\node-hmac.key'
 
 # Trusted root identities (URNs of domain founders)
 # These are set during domain initialization (dds-node init-domain)

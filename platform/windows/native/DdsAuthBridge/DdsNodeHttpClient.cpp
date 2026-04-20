@@ -6,6 +6,8 @@
 #include "FileLog.h"
 #include <sstream>
 #include <algorithm>
+#include <bcrypt.h>
+#include <wincrypt.h>
 
 // ============================================================================
 // Construction / Configuration
@@ -76,6 +78,214 @@ void CDdsNodeHttpClient::SetBaseUrl(const std::string& baseUrl)
 void CDdsNodeHttpClient::SetPort(DWORD port)
 {
     m_port = static_cast<INTERNET_PORT>(port);
+}
+
+bool CDdsNodeHttpClient::LoadHmacSecret(const std::wstring& path)
+{
+    // Empty path = disabled. Clear any previously-loaded key so
+    // reconfiguration at runtime (not currently used, but free) does
+    // not leave stale material in place.
+    if (path.empty())
+    {
+        m_hmacKey.clear();
+        return true;
+    }
+
+    HANDLE hFile = CreateFileW(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (hFile == INVALID_HANDLE_VALUE)
+    {
+        FileLog::Writef(
+            "DdsNodeHttpClient: LoadHmacSecret: CreateFile failed: %lu\n",
+            GetLastError());
+        return false;
+    }
+
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(hFile, &size) || size.QuadPart < 16 || size.QuadPart > 1024)
+    {
+        FileLog::Writef(
+            "DdsNodeHttpClient: LoadHmacSecret: refusing file of size %lld "
+            "(expected 16..1024 bytes)\n",
+            static_cast<long long>(size.QuadPart));
+        CloseHandle(hFile);
+        return false;
+    }
+
+    std::vector<uint8_t> buf(static_cast<size_t>(size.QuadPart));
+    DWORD read = 0;
+    if (!ReadFile(hFile, buf.data(), static_cast<DWORD>(buf.size()), &read, nullptr) ||
+        read != buf.size())
+    {
+        FileLog::Writef(
+            "DdsNodeHttpClient: LoadHmacSecret: ReadFile failed: %lu (read %lu of %zu)\n",
+            GetLastError(), read, buf.size());
+        CloseHandle(hFile);
+        return false;
+    }
+    CloseHandle(hFile);
+
+    m_hmacKey = std::move(buf);
+    return true;
+}
+
+namespace
+{
+    // Strip any "?..." query string from a wide ASCII path so the MAC
+    // input matches the Rust middleware's `req.uri().path()` which is
+    // query-less.
+    std::string PathNoQueryNarrow(const wchar_t* wpath)
+    {
+        std::string out;
+        for (const wchar_t* p = wpath; *p; ++p)
+        {
+            if (*p == L'?')
+                break;
+            out.push_back(static_cast<char>(*p & 0x7F));
+        }
+        return out;
+    }
+
+    // Compute HMAC-SHA256(key, msg) into a 32-byte buffer. Returns
+    // true on success. Uses BCrypt — modern Windows CNG, not the
+    // legacy CryptoAPI.
+    bool ComputeHmacSha256(
+        const uint8_t* key, size_t keyLen,
+        const std::vector<uint8_t>& msg,
+        uint8_t out[32])
+    {
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        NTSTATUS st = BCryptOpenAlgorithmProvider(
+            &hAlg,
+            BCRYPT_SHA256_ALGORITHM,
+            nullptr,
+            BCRYPT_ALG_HANDLE_HMAC_FLAG);
+        if (st != 0)
+            return false;
+
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        st = BCryptCreateHash(
+            hAlg, &hHash,
+            nullptr, 0,
+            const_cast<PUCHAR>(key),
+            static_cast<ULONG>(keyLen),
+            0);
+        if (st != 0)
+        {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return false;
+        }
+
+        st = BCryptHashData(
+            hHash,
+            msg.empty() ? nullptr : const_cast<PUCHAR>(msg.data()),
+            static_cast<ULONG>(msg.size()),
+            0);
+        if (st != 0)
+        {
+            BCryptDestroyHash(hHash);
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return false;
+        }
+
+        st = BCryptFinishHash(hHash, out, 32, 0);
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return st == 0;
+    }
+
+    // Base64-decode (RFC 4648 standard alphabet, with padding) via
+    // CryptStringToBinary. Returns the decoded bytes, or an empty
+    // vector on malformed input.
+    std::vector<uint8_t> Base64Decode(const std::string& s)
+    {
+        DWORD outLen = 0;
+        if (!CryptStringToBinaryA(
+                s.c_str(), static_cast<DWORD>(s.size()),
+                CRYPT_STRING_BASE64, nullptr, &outLen, nullptr, nullptr))
+        {
+            return {};
+        }
+        std::vector<uint8_t> out(outLen);
+        if (!CryptStringToBinaryA(
+                s.c_str(), static_cast<DWORD>(s.size()),
+                CRYPT_STRING_BASE64, out.data(), &outLen, nullptr, nullptr))
+        {
+            return {};
+        }
+        out.resize(outLen);
+        return out;
+    }
+
+    // Constant-time equality: returns 0 iff a == b (32 bytes each).
+    int CtEq32(const uint8_t a[32], const uint8_t b[32])
+    {
+        uint8_t diff = 0;
+        for (size_t i = 0; i < 32; ++i)
+            diff |= static_cast<uint8_t>(a[i] ^ b[i]);
+        return diff; // 0 => equal
+    }
+}
+
+bool CDdsNodeHttpClient::VerifyResponseMac(
+    const wchar_t* verb,
+    const wchar_t* path,
+    const std::string& receivedMacB64,
+    const std::string& body) const
+{
+    // Feature disabled until the per-install secret is provisioned.
+    // In that state the service still runs (so first-boot before MSI
+    // runs the custom action doesn't brick the machine), but the
+    // caller SHOULD refuse to start if HmacSecretLoaded() is false
+    // on a production install.
+    if (m_hmacKey.empty())
+        return true;
+
+    if (receivedMacB64.empty())
+    {
+        FileLog::Write("DdsNodeHttpClient: response missing X-DDS-Body-MAC header\n");
+        return false;
+    }
+
+    // Build the signed input: method || 0 || path(no-query) || 0 || body.
+    std::vector<uint8_t> msg;
+    for (const wchar_t* p = verb; *p; ++p)
+        msg.push_back(static_cast<uint8_t>(*p & 0x7F));
+    msg.push_back(0);
+    std::string pathOnly = PathNoQueryNarrow(path);
+    for (char c : pathOnly)
+        msg.push_back(static_cast<uint8_t>(c));
+    msg.push_back(0);
+    msg.insert(msg.end(), body.begin(), body.end());
+
+    uint8_t expected[32];
+    if (!ComputeHmacSha256(m_hmacKey.data(), m_hmacKey.size(), msg, expected))
+    {
+        FileLog::Write("DdsNodeHttpClient: BCrypt HMAC-SHA256 failed\n");
+        return false;
+    }
+
+    std::vector<uint8_t> received = Base64Decode(receivedMacB64);
+    if (received.size() != 32)
+    {
+        FileLog::Writef(
+            "DdsNodeHttpClient: malformed X-DDS-Body-MAC (decoded %zu bytes)\n",
+            received.size());
+        return false;
+    }
+
+    if (CtEq32(expected, received.data()) != 0)
+    {
+        FileLog::Write("DdsNodeHttpClient: X-DDS-Body-MAC verification FAILED\n");
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================
@@ -600,9 +810,53 @@ DWORD CDdsNodeHttpClient::SendRequestWinHttp(
 
     } while (bytesAvailable > 0);
 
+    // H-6 step-2: verify the response-body MAC. We read the header
+    // BEFORE closing the request handle.
+    std::string macHeader;
+    {
+        DWORD sz = 0;
+        WinHttpQueryHeaders(
+            hRequest,
+            WINHTTP_QUERY_CUSTOM,
+            L"X-DDS-Body-MAC",
+            WINHTTP_NO_OUTPUT_BUFFER,
+            &sz,
+            WINHTTP_NO_HEADER_INDEX);
+        if (sz > 0)
+        {
+            std::vector<wchar_t> wbuf(sz / sizeof(wchar_t) + 1, 0);
+            DWORD sz2 = sz;
+            if (WinHttpQueryHeaders(
+                    hRequest,
+                    WINHTTP_QUERY_CUSTOM,
+                    L"X-DDS-Body-MAC",
+                    wbuf.data(),
+                    &sz2,
+                    WINHTTP_NO_HEADER_INDEX))
+            {
+                // The value is base64 (ASCII) — narrow it.
+                for (wchar_t c : wbuf)
+                {
+                    if (c == 0) break;
+                    macHeader.push_back(static_cast<char>(c & 0x7F));
+                }
+            }
+        }
+    }
+
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
+
+    if (!VerifyResponseMac(verb, path, macHeader, responseBody))
+    {
+        FileLog::Writef(
+            "DdsNodeHttpClient: MAC verification failed for %ls %ls — "
+            "dropping response\n",
+            verb, path);
+        responseBody.clear();
+        return 0;
+    }
 
     return httpStatus;
 }
@@ -816,6 +1070,65 @@ DWORD CDdsNodeHttpClient::SendRequestPipe(
         return 0;
     }
     responseBody.assign(responseBuf, bodyOffset, responseBuf.size() - bodyOffset);
+
+    // H-6 step-2: parse `X-DDS-Body-MAC` out of the header block and
+    // verify. Header search is case-insensitive (HTTP/1.1 §3.2);
+    // the Rust middleware emits the lowercased form but other
+    // implementations may not. Search the header region only.
+    std::string macHeader;
+    {
+        const std::string& b = responseBuf;
+        const std::string needle = "\nx-dds-body-mac:";
+        const size_t headerRegionEnd = bodyOffset;
+        size_t pos = 0;
+        while (pos < headerRegionEnd)
+        {
+            // Case-insensitive find.
+            size_t found = std::string::npos;
+            for (size_t i = pos; i + needle.size() < headerRegionEnd; ++i)
+            {
+                bool match = true;
+                for (size_t j = 0; j < needle.size(); ++j)
+                {
+                    char c = b[i + j];
+                    char n = needle[j];
+                    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+                    if (c != n)
+                    {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match)
+                {
+                    found = i;
+                    break;
+                }
+            }
+            if (found == std::string::npos)
+                break;
+            // Skip past "\nX-DDS-Body-MAC:"
+            size_t vs = found + needle.size();
+            // Optional whitespace.
+            while (vs < headerRegionEnd && (b[vs] == ' ' || b[vs] == '\t'))
+                vs++;
+            // Read until CR or LF.
+            size_t ve = vs;
+            while (ve < headerRegionEnd && b[ve] != '\r' && b[ve] != '\n')
+                ve++;
+            macHeader.assign(b, vs, ve - vs);
+            break;
+        }
+    }
+    if (!VerifyResponseMac(verb, path, macHeader, responseBody))
+    {
+        FileLog::Writef(
+            "DdsNodeHttpClient: MAC verification failed over pipe for %ls %ls — "
+            "dropping response\n",
+            verb, path);
+        responseBody.clear();
+        return 0;
+    }
     return status;
 }
 
