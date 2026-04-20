@@ -8,6 +8,7 @@
 //! - [`discovery`] — Kademlia DHT + mDNS peer discovery
 //! - [`sync`] — Delta-sync protocol for efficient state convergence
 
+pub mod admission;
 pub mod discovery;
 pub mod gossip;
 pub mod sync;

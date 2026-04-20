@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use dds_core::crdt::causal_dag::{CausalDag, Operation};
 use dds_core::token::{TOKEN_WIRE_V1, Token, TokenKind};
 use dds_core::trust::TrustGraph;
+use dds_net::admission::{AdmissionRequest, AdmissionResponse};
 use dds_net::gossip::{DdsTopic, DdsTopicSet, GossipMessage};
 use dds_net::sync::{SyncPayload, SyncRequest, SyncResponse, apply_sync_payloads_with_graph};
 use dds_net::transport::{DdsBehaviour, DdsBehaviourEvent, SwarmConfig};
@@ -129,6 +130,15 @@ pub struct DdsNode {
     /// hard ceiling and to de-duplicate Discovered events for the
     /// same peer within a short window.
     mdns_known_peers: BTreeSet<PeerId>,
+    /// **H-12 (security review)**: peers that have presented a valid
+    /// admission cert via the `/dds/admission/1.0.0/<domain>` handshake
+    /// since the connection was established. Membership is the
+    /// authoritative gate for `handle_gossip_message` and
+    /// `handle_sync_event` — messages from unadmitted peers are
+    /// dropped at the behaviour layer before `dds-node` ingests them.
+    /// Cleared on `ConnectionClosed` so a reconnected peer must
+    /// present its cert afresh.
+    admitted_peers: BTreeSet<PeerId>,
 }
 
 impl DdsNode {
@@ -216,6 +226,7 @@ impl DdsNode {
             domain_id,
             mdns_rate: (Instant::now(), 0),
             mdns_known_peers: BTreeSet::new(),
+            admitted_peers: BTreeSet::new(),
         })
     }
 
@@ -353,8 +364,26 @@ impl DdsNode {
 
         match event {
             SwarmEvent::Behaviour(DdsBehaviourEvent::Gossipsub(
-                libp2p::gossipsub::Event::Message { message, .. },
+                libp2p::gossipsub::Event::Message {
+                    propagation_source,
+                    message,
+                    ..
+                },
             )) => {
+                // H-12: gate gossip ingest on the relayer being
+                // admitted. The gossipsub signer (`message.source`) is
+                // whoever originally published; `propagation_source`
+                // is the peer that actually handed us this envelope.
+                // An unadmitted peer should not be able to inject into
+                // our ingest pipeline regardless of whom it claims to
+                // be relaying for.
+                if !self.admitted_peers.contains(&propagation_source) {
+                    debug!(
+                        peer = %propagation_source,
+                        "H-12: dropping gossip from unadmitted peer"
+                    );
+                    return;
+                }
                 self.handle_gossip_message(&message.topic, &message.data);
             }
             SwarmEvent::Behaviour(DdsBehaviourEvent::Mdns(libp2p::mdns::Event::Discovered(
@@ -387,22 +416,140 @@ impl DdsNode {
             SwarmEvent::Behaviour(DdsBehaviourEvent::Sync(sync_event)) => {
                 self.handle_sync_event(sync_event);
             }
+            SwarmEvent::Behaviour(DdsBehaviourEvent::Admission(admission_event)) => {
+                self.handle_admission_event(admission_event);
+            }
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!(%address, "listening on");
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 info!(%peer_id, "connection established");
-                // Pull anything we might have missed while we were
-                // disconnected from this peer (or never knew about).
-                self.try_sync_with(peer_id);
+                // H-12: initiate the admission handshake immediately
+                // so the peer is either admitted (and can contribute
+                // gossip / sync) or silently unadmitted (messages
+                // dropped). The peer reciprocates by sending its own
+                // AdmissionRequest — we'll answer by returning our
+                // own cert in the Message::Request handler.
+                self.request_peer_admission(peer_id);
+                // NOTE: sync is *not* kicked off here any more. We
+                // want peers to be admitted before we burn sync-state
+                // transfer on them. The admission-success path fires
+                // `try_sync_with` once the peer is verified.
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 info!(%peer_id, "connection closed");
                 // Drop the cooldown so a fresh reconnect immediately
                 // re-syncs without waiting out the throttle.
                 self.sync_last_outbound.remove(&peer_id);
+                // H-12: a reconnected peer must present its cert
+                // afresh — we don't trust a stale admission across
+                // connection lifecycles.
+                self.admitted_peers.remove(&peer_id);
             }
             _ => {}
+        }
+    }
+
+    /// Send an `AdmissionRequest` to a peer we just connected to
+    /// (H-12). The peer answers with its admission cert in an
+    /// `AdmissionResponse`, which we verify in
+    /// `handle_admission_event`. Between `ConnectionEstablished` and
+    /// receipt of a valid cert, the peer stays out of
+    /// `admitted_peers` and therefore its gossip / sync is dropped.
+    fn request_peer_admission(&mut self, peer_id: PeerId) {
+        let _id = self
+            .swarm
+            .behaviour_mut()
+            .admission
+            .send_request(&peer_id, AdmissionRequest);
+        debug!(%peer_id, "H-12: sent admission request");
+    }
+
+    /// Handle admission-protocol events (H-12). Serves our own cert
+    /// in response to inbound requests, and verifies peer-supplied
+    /// certs from inbound responses.
+    fn handle_admission_event(
+        &mut self,
+        event: RrEvent<AdmissionRequest, AdmissionResponse>,
+    ) {
+        match event {
+            RrEvent::Message { peer, message, .. } => match message {
+                RrMessage::Request { channel, .. } => {
+                    // Serve our own admission cert. Serialising on
+                    // every request is cheap (one CBOR encode of a
+                    // ~100-byte struct) and keeps us from caching a
+                    // potentially-stale blob if the cert is rotated
+                    // at runtime in the future.
+                    let cert_cbor = match self.admission_cert.to_cbor() {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            warn!(%peer, error = %e, "H-12: failed to serialize our cert");
+                            None
+                        }
+                    };
+                    if self
+                        .swarm
+                        .behaviour_mut()
+                        .admission
+                        .send_response(channel, AdmissionResponse { cert_cbor })
+                        .is_err()
+                    {
+                        warn!(%peer, "H-12: failed to send admission response (channel closed)");
+                    }
+                }
+                RrMessage::Response { response, .. } => {
+                    self.verify_peer_admission(peer, response);
+                }
+            },
+            RrEvent::OutboundFailure { peer, error, .. } => {
+                debug!(%peer, %error, "H-12: admission outbound failure");
+            }
+            RrEvent::InboundFailure { peer, error, .. } => {
+                debug!(%peer, %error, "H-12: admission inbound failure");
+            }
+            RrEvent::ResponseSent { .. } => {}
+        }
+    }
+
+    /// Verify a peer-supplied admission cert (H-12). On success the
+    /// peer is added to `admitted_peers` and an opportunistic sync is
+    /// kicked off — at this point we've proven the peer belongs to
+    /// the same domain and is worth catching up with.
+    fn verify_peer_admission(&mut self, peer_id: PeerId, response: AdmissionResponse) {
+        let Some(cert_cbor) = response.cert_cbor else {
+            warn!(%peer_id, "H-12: peer returned no cert — staying unadmitted");
+            return;
+        };
+        let cert = match dds_domain::AdmissionCert::from_cbor(&cert_cbor) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(%peer_id, error = ?e, "H-12: peer cert failed to decode");
+                return;
+            }
+        };
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(e) => {
+                warn!(%peer_id, error = %e, "H-12: system clock error verifying peer cert");
+                return;
+            }
+        };
+        match cert.verify(
+            &self.domain_pubkey,
+            &self.domain_id,
+            &peer_id.to_string(),
+            now,
+        ) {
+            Ok(()) => {
+                info!(%peer_id, "H-12: peer admitted to domain");
+                self.admitted_peers.insert(peer_id);
+                // Now that we've verified the peer belongs to our
+                // domain, kick off an opportunistic sync.
+                self.try_sync_with(peer_id);
+            }
+            Err(e) => {
+                warn!(%peer_id, error = ?e, "H-12: peer cert rejected — staying unadmitted");
+            }
         }
     }
 
@@ -937,6 +1084,15 @@ impl DdsNode {
                 RrMessage::Request {
                     request, channel, ..
                 } => {
+                    // H-12: refuse to serve sync data to unadmitted
+                    // peers. Dropping the channel closes the stream
+                    // without a response; the requester sees an
+                    // `OutboundFailure::ConnectionClosed`.
+                    if !self.admitted_peers.contains(&peer) {
+                        debug!(%peer, "H-12: dropping sync request from unadmitted peer");
+                        drop(channel);
+                        return;
+                    }
                     let response = self.build_sync_response(&request);
                     let payload_count = response.payloads.len();
                     if self
@@ -952,6 +1108,14 @@ impl DdsNode {
                     }
                 }
                 RrMessage::Response { response, .. } => {
+                    // H-12: ignore sync responses from unadmitted
+                    // peers — their payloads could carry unauthorised
+                    // state. Without admission we can't trust the
+                    // peer belongs to our domain.
+                    if !self.admitted_peers.contains(&peer) {
+                        debug!(%peer, "H-12: dropping sync response from unadmitted peer");
+                        return;
+                    }
                     self.handle_sync_response(peer, response);
                 }
             },
@@ -963,6 +1127,26 @@ impl DdsNode {
             }
             RrEvent::ResponseSent { .. } => {}
         }
+    }
+
+    /// H-12: read-only view of peers admitted to this node's domain
+    /// during the current connection lifecycle. Primarily for tests
+    /// that want to assert the admission handshake completed.
+    pub fn admitted_peers(&self) -> &BTreeSet<PeerId> {
+        &self.admitted_peers
+    }
+
+    /// H-12 test hook: overwrite the cert this node hands out to
+    /// peers during the admission handshake. Used by the H-12
+    /// regression suite to simulate a peer presenting a cert that
+    /// will fail verification at the remote end (e.g., issued for
+    /// the wrong peer id). Not intended for production use — the
+    /// real cert is verified against this node's own peer id at
+    /// `init()` time, and we don't want a running node to
+    /// accidentally re-key itself.
+    #[doc(hidden)]
+    pub fn set_admission_cert_for_tests(&mut self, cert: dds_domain::AdmissionCert) {
+        self.admission_cert = cert;
     }
 
     /// Run a single token-expiry sweep using the current system time.

@@ -17,6 +17,7 @@ use libp2p::{
     tcp, yamux,
 };
 
+use crate::admission::{AdmissionRequest, AdmissionResponse};
 use crate::sync::{SyncRequest, SyncResponse};
 
 /// Combined network behaviour for DDS nodes.
@@ -38,6 +39,16 @@ pub struct DdsBehaviour {
     /// Resolves B6 (the gossipsub-only delivery gap surfaced by the
     /// 2026-04-09 chaos soak).
     pub sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
+    /// **H-12 (security review)**: per-peer admission handshake.
+    /// Immediately after Noise completes, each side asks the other
+    /// for its admission cert over `/dds/admission/1.0.0/<domain>`
+    /// and verifies it against the domain pubkey + its own `PeerId`
+    /// expectation. Only admitted peers are allowed to publish into
+    /// gossip or request sync; `dds-node` enforces the check against
+    /// the result of this exchange. Kept as a separate behaviour
+    /// (not piggybacked on `sync`) so the protocol version can evolve
+    /// independently.
+    pub admission: request_response::cbor::Behaviour<AdmissionRequest, AdmissionResponse>,
 }
 
 /// Configuration for building a DDS swarm.
@@ -71,6 +82,12 @@ impl SwarmConfig {
     pub fn sync_protocol(&self) -> String {
         format!("/dds/sync/1.0.0/{}", self.domain_tag)
     }
+    /// Admission-exchange protocol name for this domain (H-12).
+    /// Domain-tagged so a peer in a different domain never even
+    /// enters the admission handshake.
+    pub fn admission_protocol(&self) -> String {
+        format!("/dds/admission/1.0.0/{}", self.domain_tag)
+    }
 }
 
 impl Default for SwarmConfig {
@@ -95,6 +112,7 @@ pub fn build_swarm(
     let kad_protocol = config.kad_protocol();
     let identify_protocol = config.identify_protocol();
     let sync_protocol = config.sync_protocol();
+    let admission_protocol = config.admission_protocol();
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -162,12 +180,27 @@ pub fn build_swarm(
                 request_response::Config::default(),
             );
 
+            // H-12: admission handshake (request_response over CBOR).
+            // Both sides advertise the protocol so either party can
+            // initiate; `dds-node` drives the exchange on
+            // `ConnectionEstablished`.
+            let admission =
+                request_response::cbor::Behaviour::<AdmissionRequest, AdmissionResponse>::new(
+                    [(
+                        StreamProtocol::try_from_owned(admission_protocol.clone())
+                            .map_err(|e| std::io::Error::other(format!("invalid protocol: {e}")))?,
+                        request_response::ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default(),
+                );
+
             Ok(DdsBehaviour {
                 gossipsub,
                 kademlia,
                 mdns,
                 identify,
                 sync,
+                admission,
             })
         })?
         .with_swarm_config(|c: libp2p::swarm::Config| {

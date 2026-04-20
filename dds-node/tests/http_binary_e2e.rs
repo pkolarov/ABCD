@@ -323,7 +323,14 @@ impl Publisher {
                             PublishCommand::Revocation(token) => publish_revocation(&mut node, &token),
                         }
                     }
-                    _event = node.swarm.select_next_some() => {}
+                    // H-12: route every swarm event through the
+                    // production handler so the admission
+                    // request/response exchange actually runs on the
+                    // publisher side. Otherwise node_a never sees us
+                    // admitted and drops our gossip.
+                    event = node.swarm.select_next_some() => {
+                        node.handle_swarm_event(event);
+                    }
                 }
             }
         });

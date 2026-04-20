@@ -50,19 +50,17 @@ backward-compat fallback); M-14 (encrypted-marker refuses silent
 plaintext downgrade); L-18 (atomic `bump_sign_count` primitive —
 defense-in-depth if L-17 lands).
 
-**Still deferred (after the 2026-04-19 pass)** — 1 High, 2 High
-(step-2 of previously-partial items), 3 Medium + 1 partial, 1 Low:
-**H-12** (per-peer admission in gossip — libp2p behaviour protocol);
-**H-6 step-2** (MSI-provisioned HMAC secret + Auth Bridge consumes
-and enforces the response MAC + challenge-HMAC binding); **H-7
-step-2** (UDS listener on Linux/macOS + named-pipe listener on
-Windows + CLI / C# agent / C++ Auth Bridge client refactors); **M-8
-step-2** (write-side TOFU + session-token binding, blocked on H-7
-step-2 listeners); **M-13** (FIDO MDS attestation policy); **M-15**
-(node-bound FIDO2 `hmac_salt` via bundle re-wrap — re-deferred
-2026-04-18); **M-18** (WiX service-account split); **L-17** (service
-mutex refactor, pairs with already-landed L-18). Rationale for each
-is in the row-level status table.
+**Still deferred (after the 2026-04-20 passes)** — 0 High, 1 High
+step-2, 3 Medium + 1 partial, 1 Low: **H-6 step-2**
+(MSI-provisioned HMAC secret + Auth Bridge consumes and enforces
+the response MAC + challenge-HMAC binding); **M-8 step-2**
+(write-side session-token binding; H-7 step-2 listeners are in
+tree, operational cutover gates the flip); **M-13** (FIDO MDS
+attestation policy); **M-15** (node-bound FIDO2 `hmac_salt` via
+bundle re-wrap — re-deferred 2026-04-18); **M-18** (WiX
+service-account split); **L-17** (service mutex refactor, pairs
+with already-landed L-18). H-7 step-2a/step-2b and H-12 are all
+Fixed-pending-verify as of 2026-04-20.
 
 **Reviewer follow-ups already closed this round** (previously flagged
 as partial):
@@ -210,6 +208,54 @@ as partial):
   semantics and flag a future `windows_admin_groups` field that the
   pipe listener can populate from `TokenGroups`. Commit `14dbc8f`.
 
+**2026-04-20 follow-up pass — H-12 (per-peer admission gating):**
+
+- **H-12**: new `request_response` behaviour
+  `/dds/admission/1.0.0/<domain_tag>` exchanged immediately after
+  Noise completes. `dds_net::admission::AdmissionRequest` /
+  `AdmissionResponse { cert_cbor: Option<Vec<u8>> }` — the
+  network layer ships the cert as opaque CBOR bytes so
+  `dds-net` stays independent of `dds-domain`. `DdsNode` tracks
+  a per-connection `admitted_peers: BTreeSet<PeerId>` and:
+  - On `SwarmEvent::ConnectionEstablished`, fires an
+    `AdmissionRequest` at the peer. No sync is scheduled until
+    admission completes — unadmitted peers no longer burn our
+    `try_sync_with` budget.
+  - On inbound `AdmissionRequest`, responds with our own cert
+    (cheap `to_cbor()` per request).
+  - On inbound `AdmissionResponse`, runs
+    `AdmissionCert::verify(&domain_pubkey, &domain_id, peer_id,
+    now)`. Only peers whose cert verifies are inserted into
+    `admitted_peers`; verification failure is silently logged and
+    the peer stays unadmitted.
+  - On `ConnectionClosed`, removes the peer from
+    `admitted_peers` so a reconnecting peer must present its
+    cert fresh.
+  - Gossip ingest in `handle_swarm_event` now checks
+    `propagation_source` against `admitted_peers` — messages
+    from unadmitted peers are dropped before
+    `handle_gossip_message` runs. Sync request/response events
+    are gated the same way: unadmitted requesters are refused
+    (channel dropped), unadmitted responders' payloads are
+    ignored.
+  - C-3's publisher-capability filter remains the last line of
+    defence even after H-12 lands.
+- Two new integration tests in `dds-node/tests/h12_admission.rs`
+  pin the behaviour via the production `handle_swarm_event`
+  path:
+  - `admitted_peers_populated_and_gossip_flows` — two nodes
+    with valid certs admit each other and gossip propagates.
+  - `unadmitted_peer_gossip_dropped` — a node whose cert was
+    issued for the wrong `peer_id` is never admitted and its
+    gossip never lands in the receiver's trust graph.
+- One test-harness fix in `dds-node/tests/http_binary_e2e.rs`:
+  the `Publisher` helper now routes its swarm events through
+  `handle_swarm_event` instead of a passthrough
+  `select_next_some()`, so the admission handshake actually
+  runs on the publisher side. Existing
+  `binary_nodes_converge_on_gossip_and_revocation` test
+  restored to green.
+
 **2026-04-20 follow-up pass — H-7 step-2b (client transports + Windows pipe listener):**
 
 - **H-7 step-2b (Rust side — Windows named-pipe listener)**:
@@ -317,7 +363,7 @@ as partial):
 | H-9 | ✅ Fixed (pending verify) | `Zeroizing` wraps passphrase + admin plaintext; buffers wiped on early-return paths |
 | H-10 | ✅ Fixed (pending verify) | Bundle v3 carries a mandatory Ed25519 signature over canonical `signing_bytes` (domain_id + domain_pubkey + org_hash + ports + mdns + domain_key_blob), verified on load against the embedded `domain_pubkey`. Fingerprint is now ALSO printed on load so operators can confirm OOB. `save_bundle` requires an unwrapped `DomainKey` and refuses to write if the signer pubkey doesn't match the embedded one. Tests: `bundle_rejects_tampered_signature`, `bundle_fingerprint_diverges_under_key_swap`. |
 | H-11 | ✅ Fixed (pending verify) | `SyncResponse` capped at 1000 entries / 5 MB; `complete: false` signals pagination |
-| H-12 | ⏸ Deferred | Per-peer admission gating in gossip ingest; requires libp2p behaviour protocol design |
+| H-12 | ✅ Fixed (pending verify) | New `request_response` behaviour on `/dds/admission/1.0.0/<domain>` runs after Noise; peers exchange admission certs via `AdmissionRequest`/`AdmissionResponse` (opaque CBOR-wrapped cert so `dds-net` stays independent of `dds-domain`). `DdsNode::admitted_peers: BTreeSet<PeerId>` is populated only after `AdmissionCert::verify` succeeds against the domain pubkey + the remote libp2p `peer_id`. Gossip and sync from unadmitted peers are dropped at the behaviour layer: `handle_gossip_message` rejects on `propagation_source`; sync refuses to serve or consume responses from non-admitted peers. Reconnection clears the entry so peers re-verify. C-3's publisher-capability filter remains the last line of defence. Tests: `dds-node/tests/h12_admission.rs` pins positive (valid cert → admitted → gossip flows) and negative (cert for wrong `peer_id` → never admitted → gossip dropped) via `handle_swarm_event`. |
 
 ### Medium
 
