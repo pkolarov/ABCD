@@ -14,6 +14,8 @@
 CDdsNodeHttpClient::CDdsNodeHttpClient()
     : m_host(L"127.0.0.1")
     , m_port(5551)
+    , m_transport(Transport::Tcp)
+    , m_pipeName()
 {
 }
 
@@ -23,6 +25,27 @@ CDdsNodeHttpClient::~CDdsNodeHttpClient()
 
 void CDdsNodeHttpClient::SetBaseUrl(const std::string& baseUrl)
 {
+    // **H-7 step-2b (security review)**: recognise the `pipe:` scheme
+    // used by the Rust server's named-pipe listener. The Rust config
+    // accepts either a bare name (pipe:dds-api) or a fully-qualified
+    // pipe path (pipe:\\.\pipe\dds-api); we normalise both to a bare
+    // pipe name in m_pipeName because CreateFile below always
+    // prefixes \\.\pipe\ itself.
+    if (baseUrl.rfind("pipe:", 0) == 0)
+    {
+        std::string spec = baseUrl.substr(5);
+        // Strip leading `\\.\pipe\` if present.
+        const std::string kLocalPipePrefix = "\\\\.\\pipe\\";
+        if (spec.rfind(kLocalPipePrefix, 0) == 0)
+            spec = spec.substr(kLocalPipePrefix.size());
+        m_pipeName = Utf8ToWide(spec);
+        m_transport = Transport::Pipe;
+        return;
+    }
+
+    m_transport = Transport::Tcp;
+    m_pipeName.clear();
+
     // Parse "http://host:port" -- minimal parsing for localhost use.
     // Expected forms: "http://127.0.0.1:5551", "http://localhost:5551"
     std::string url = baseUrl;
@@ -440,7 +463,19 @@ DdsWindowsClaimResult CDdsNodeHttpClient::PostWindowsClaim(const std::string& cl
 // WinHTTP transport
 // ============================================================================
 
+// Dispatcher: route based on configured transport.
 DWORD CDdsNodeHttpClient::SendRequest(
+    const wchar_t* verb,
+    const wchar_t* path,
+    const std::string* requestBody,
+    std::string& responseBody)
+{
+    if (m_transport == Transport::Pipe)
+        return SendRequestPipe(verb, path, requestBody, responseBody);
+    return SendRequestWinHttp(verb, path, requestBody, responseBody);
+}
+
+DWORD CDdsNodeHttpClient::SendRequestWinHttp(
     const wchar_t* verb,
     const wchar_t* path,
     const std::string* requestBody,
@@ -570,6 +605,218 @@ DWORD CDdsNodeHttpClient::SendRequest(
     WinHttpCloseHandle(hSession);
 
     return httpStatus;
+}
+
+// ============================================================================
+// Named-pipe HTTP/1 client (H-7 step-2b)
+//
+// Why roll our own instead of using WinHTTP?
+//   WinHTTP speaks HTTP over sockets. The named-pipe transport
+//   carries the exact same HTTP/1 wire format over a
+//   FILE_TYPE_PIPE handle — no TCP under it. We could wrap the pipe
+//   behind a custom WinHTTP protocol hook, but the transport
+//   primitives are trivial enough (single request, blocking read
+//   until EOF) that an inline WriteFile / ReadFile loop is smaller
+//   and clearer.
+//
+// Protocol shape:
+//   Request line + minimal headers (Host, Connection: close,
+//   Content-Type + Content-Length for POST) + CRLFCRLF + body.
+//   We set `Connection: close` so the Rust serve_pipe loop drops
+//   the pipe when the response finishes; that lets us use ReadFile
+//   in a loop until the handle reports ERROR_BROKEN_PIPE instead of
+//   parsing Content-Length on the response.
+//
+// Peer-cred authentication:
+//   We don't need to do anything client-side. The Rust listener
+//   calls GetNamedPipeClientProcessId on the server-side handle of
+//   this connection, then OpenProcessToken + GetTokenInformation to
+//   pull our primary user SID. As long as we're running as the
+//   intended service account, we get admitted by the AdminPolicy
+//   allowlist.
+// ============================================================================
+
+namespace
+{
+    // Does the buffer contain the CRLFCRLF end-of-headers marker?
+    // Returns the offset just past the marker, or std::string::npos.
+    size_t FindHeaderEnd(const std::string& buf)
+    {
+        size_t p = buf.find("\r\n\r\n");
+        if (p == std::string::npos)
+            return std::string::npos;
+        return p + 4;
+    }
+
+    // Parse the numeric status code from a "HTTP/1.1 200 OK" line.
+    // Returns 0 on malformed input.
+    DWORD ParseStatusLine(const std::string& buf)
+    {
+        // Find end of status line.
+        size_t eol = buf.find("\r\n");
+        if (eol == std::string::npos)
+            return 0;
+        // Skip "HTTP/x.y " prefix.
+        size_t sp = buf.find(' ');
+        if (sp == std::string::npos || sp >= eol)
+            return 0;
+        size_t sp2 = buf.find(' ', sp + 1);
+        size_t end = (sp2 == std::string::npos) ? eol : sp2;
+        std::string codeStr = buf.substr(sp + 1, end - sp - 1);
+        int code = atoi(codeStr.c_str());
+        return (code > 0 && code < 1000) ? static_cast<DWORD>(code) : 0;
+    }
+}
+
+DWORD CDdsNodeHttpClient::SendRequestPipe(
+    const wchar_t* verb,
+    const wchar_t* path,
+    const std::string* requestBody,
+    std::string& responseBody)
+{
+    responseBody.clear();
+
+    if (m_pipeName.empty())
+    {
+        FileLog::Writef("DdsNodeHttpClient: pipe transport selected but m_pipeName is empty\n");
+        return 0;
+    }
+
+    // Build the full pipe path: \\.\pipe\<name>
+    std::wstring fullPipePath = L"\\\\.\\pipe\\";
+    fullPipePath += m_pipeName;
+
+    // Open the pipe. Retry once on ERROR_PIPE_BUSY via WaitNamedPipe.
+    HANDLE hPipe = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        hPipe = CreateFileW(
+            fullPipePath.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,                      // no sharing
+            nullptr,                // default security
+            OPEN_EXISTING,
+            0,                      // default attributes
+            nullptr);
+        if (hPipe != INVALID_HANDLE_VALUE)
+            break;
+
+        DWORD err = GetLastError();
+        if (err != ERROR_PIPE_BUSY)
+        {
+            FileLog::Writef(
+                "DdsNodeHttpClient: CreateFile(pipe) failed: %lu\n", err);
+            return 0;
+        }
+        if (!WaitNamedPipeW(fullPipePath.c_str(), 5000 /* ms */))
+        {
+            FileLog::Writef(
+                "DdsNodeHttpClient: WaitNamedPipe timed out: %lu\n", GetLastError());
+            return 0;
+        }
+    }
+
+    if (hPipe == INVALID_HANDLE_VALUE)
+        return 0;
+
+    // The Rust server defaults to byte-stream mode; set matching
+    // mode explicitly so we don't rely on the server's default.
+    DWORD pipeMode = PIPE_READMODE_BYTE;
+    if (!SetNamedPipeHandleState(hPipe, &pipeMode, nullptr, nullptr))
+    {
+        // Non-fatal: the default mode on the server side is already byte,
+        // so log and continue.
+        FileLog::Writef(
+            "DdsNodeHttpClient: SetNamedPipeHandleState failed (non-fatal): %lu\n",
+            GetLastError());
+    }
+
+    // Build the HTTP/1.1 request. Wide verb/path come in as ASCII —
+    // we widen to narrow here because the wire is bytes.
+    std::string req;
+    // Request line: "VERB <path> HTTP/1.1\r\n"
+    for (const wchar_t* p = verb; *p; ++p)
+        req.push_back(static_cast<char>(*p & 0x7F));
+    req.push_back(' ');
+    for (const wchar_t* p = path; *p; ++p)
+        req.push_back(static_cast<char>(*p & 0x7F));
+    req.append(" HTTP/1.1\r\n");
+    // Host header (authority is cosmetic on a pipe transport).
+    req.append("Host: localhost\r\n");
+    req.append("Connection: close\r\n");
+    if (requestBody != nullptr)
+    {
+        req.append("Content-Type: application/json\r\n");
+        char clbuf[64];
+        _snprintf_s(clbuf, _TRUNCATE, "Content-Length: %zu\r\n", requestBody->size());
+        req.append(clbuf);
+    }
+    else
+    {
+        req.append("Content-Length: 0\r\n");
+    }
+    req.append("\r\n");
+    if (requestBody != nullptr)
+        req.append(*requestBody);
+
+    // Write the whole request. WriteFile on a pipe writes the full
+    // buffer in one call on success (or returns an error).
+    DWORD written = 0;
+    if (!WriteFile(hPipe, req.data(), static_cast<DWORD>(req.size()), &written, nullptr) ||
+        written != req.size())
+    {
+        FileLog::Writef(
+            "DdsNodeHttpClient: WriteFile(pipe) failed: %lu (wrote %lu of %zu)\n",
+            GetLastError(), written, req.size());
+        CloseHandle(hPipe);
+        return 0;
+    }
+
+    // Read until the server closes the pipe (Connection: close).
+    std::string responseBuf;
+    responseBuf.reserve(8192);
+    char chunk[8192];
+    constexpr size_t kMaxResponse = 1 * 1024 * 1024; // 1 MiB
+    for (;;)
+    {
+        DWORD read = 0;
+        BOOL ok = ReadFile(hPipe, chunk, sizeof(chunk), &read, nullptr);
+        if (!ok)
+        {
+            DWORD err = GetLastError();
+            if (err == ERROR_BROKEN_PIPE || err == ERROR_HANDLE_EOF)
+                break; // normal end of response
+            FileLog::Writef("DdsNodeHttpClient: ReadFile(pipe) failed: %lu\n", err);
+            CloseHandle(hPipe);
+            return 0;
+        }
+        if (read == 0)
+            break; // EOF
+        responseBuf.append(chunk, read);
+        if (responseBuf.size() > kMaxResponse)
+            break; // bounded — cap parity with the WinHTTP path
+    }
+    CloseHandle(hPipe);
+
+    // Parse status code and split out the body.
+    DWORD status = ParseStatusLine(responseBuf);
+    if (status == 0)
+    {
+        FileLog::Writef(
+            "DdsNodeHttpClient: malformed HTTP response over pipe (len=%zu)\n",
+            responseBuf.size());
+        return 0;
+    }
+    size_t bodyOffset = FindHeaderEnd(responseBuf);
+    if (bodyOffset == std::string::npos)
+    {
+        FileLog::Writef(
+            "DdsNodeHttpClient: no CRLFCRLF in pipe response (len=%zu)\n",
+            responseBuf.size());
+        return 0;
+    }
+    responseBody.assign(responseBuf, bodyOffset, responseBuf.size() - bodyOffset);
+    return status;
 }
 
 // ============================================================================

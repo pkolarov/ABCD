@@ -99,8 +99,17 @@ public:
     CDdsNodeHttpClient();
     ~CDdsNodeHttpClient();
 
-    // Set the base URL. Default is http://127.0.0.1:5551.
-    // Call before any request methods. Port-only overload also available.
+    // Set the base URL. Call before any request methods.
+    //
+    // Supported schemes:
+    //   http://host:port       — loopback TCP (legacy, default)
+    //   pipe:<name>            — Windows named pipe (H-7 step-2b).
+    //                            Accepts either a bare name
+    //                            (pipe:dds-api → \\.\pipe\dds-api) or
+    //                            a full pipe path
+    //                            (pipe:\\.\pipe\dds-api).
+    //
+    // Port-only overload affects the TCP path only.
     void SetBaseUrl(const std::string& baseUrl);
     void SetPort(DWORD port);
 
@@ -154,16 +163,53 @@ public:
     DdsWindowsClaimResult PostWindowsClaim(const std::string& claimJson);
 
 private:
-    std::wstring m_host;
-    INTERNET_PORT m_port;
+    // **H-7 step-2b (security review)**: transport dispatch. The
+    // dds-node HTTP API can bind either TCP loopback (legacy) or a
+    // Windows named pipe (current target). Named pipe is the
+    // preferred transport because the node's pipe listener extracts
+    // the caller's primary user SID via GetNamedPipeClientProcessId
+    // + OpenProcessToken + GetTokenInformation and gates admin
+    // endpoints on it. On TCP callers are anonymous.
+    enum class Transport
+    {
+        Tcp,
+        Pipe,
+    };
 
-    // Open a WinHTTP session, connect, send request, and read response.
-    // Returns the HTTP status code, or 0 on connection/transport error.
-    // responseBody receives the UTF-8 response body.
+    std::wstring m_host;            // TCP host (e.g. "127.0.0.1")
+    INTERNET_PORT m_port;            // TCP port (e.g. 5551)
+    Transport    m_transport;       // Selected transport mode
+    std::wstring m_pipeName;         // Bare pipe name, e.g. "dds-api"
+                                     // (without the "\\.\pipe\" prefix)
+
+    // Dispatch entry point: routes to SendRequestWinHttp or
+    // SendRequestPipe based on m_transport. Returns the HTTP status
+    // code, or 0 on connection/transport error. responseBody receives
+    // the UTF-8 response body.
     DWORD SendRequest(
         const wchar_t* verb,
         const wchar_t* path,
         const std::string* requestBody,     // nullptr for GET
+        std::string& responseBody
+    );
+
+    // WinHTTP implementation (TCP loopback).
+    DWORD SendRequestWinHttp(
+        const wchar_t* verb,
+        const wchar_t* path,
+        const std::string* requestBody,
+        std::string& responseBody
+    );
+
+    // Named-pipe implementation. Opens \\.\pipe\<m_pipeName>, writes a
+    // minimal HTTP/1.1 request, reads the response until EOF
+    // (server sets Connection: close), parses the status line and
+    // body. No keep-alive, no streaming — each call is one request
+    // per pipe connection.
+    DWORD SendRequestPipe(
+        const wchar_t* verb,
+        const wchar_t* path,
+        const std::string* requestBody,
         std::string& responseBody
     );
 

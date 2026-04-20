@@ -210,6 +210,57 @@ as partial):
   semantics and flag a future `windows_admin_groups` field that the
   pipe listener can populate from `TokenGroups`. Commit `14dbc8f`.
 
+**2026-04-20 follow-up pass — H-7 step-2b (client transports + Windows pipe listener):**
+
+- **H-7 step-2b (Rust side — Windows named-pipe listener)**:
+  `dds-node::http::serve` now recognises `pipe:<name>` alongside the
+  existing `unix:<path>`. `serve_pipe` mirrors `serve_unix`: tokio's
+  `NamedPipeServer` accepts clients with `first_pipe_instance(true)`
+  (fail-fast if another process already owns the pipe), each accept
+  spins up a fresh instance so subsequent clients aren't refused,
+  and the caller's primary user SID is read via
+  `GetNamedPipeClientProcessId` → `OpenProcess` →
+  `OpenProcessToken` → `GetTokenInformation(TokenUser)` →
+  `ConvertSidToStringSidW`. The SID + PID land in
+  `CallerIdentity::Pipe`, which the existing admin gate evaluates.
+  Cross-compiled clean under `cargo clippy --target
+  x86_64-pc-windows-gnu --all-targets -- -D warnings`; runtime
+  verification requires a Windows host.
+- **H-7 step-2b (macOS Policy Agent)**: new
+  `DdsNodeHttpFactory` dispatches on the `NodeBaseUrl` scheme
+  (`unix:/...` / TCP). For UDS it installs a
+  `SocketsHttpHandler.ConnectCallback` that opens a
+  `UnixDomainSocketEndPoint` per HTTP connection; TCP still uses
+  the platform default handler. `HttpClient.BaseAddress` is
+  `http://localhost/` under UDS because `HttpClient` requires an
+  `http://`-shaped URI. Program.cs pipes the factory through
+  `AddHttpClient(...).ConfigurePrimaryHttpMessageHandler(...)`.
+  15 xUnit tests including a real UDS echo-responder end-to-end
+  confirms the `ConnectCallback` is wired correctly.
+- **H-7 step-2b (Windows Policy Agent)**: parallel
+  `DdsNodeHttpFactory` with three schemes — `pipe:<name>`
+  (primary, opens `NamedPipeClientStream` via
+  `ConnectCallback`), `unix:/path` (kept for cross-platform dev
+  builds on macOS/Linux), and TCP. 21 xUnit tests including a
+  Windows-only named-pipe echo-responder end-to-end path (skipped
+  cleanly on non-Windows CI hosts).
+- **H-7 step-2b (C++ Auth Bridge)**:
+  `CDdsNodeHttpClient::SetBaseUrl` recognises `pipe:<name>`; a new
+  `SendRequestPipe` implements HTTP/1.1 over `CreateFileW` +
+  `WriteFile` / `ReadFile` with `Connection: close` semantics so
+  the server drives end-of-response via `ERROR_BROKEN_PIPE`.
+  `WaitNamedPipeW` handles `ERROR_PIPE_BUSY` with a 5 s retry.
+  **Authored on macOS; Windows CI must compile + integration-test.**
+  The existing WinHTTP path is retained and still kicks in for
+  TCP URLs.
+- **Still outstanding** after step-2b: TCP listener is still the
+  default — flipping `trust_loopback_tcp_admin = false` is safe
+  once operators roll the node config + both agents + the Auth
+  Bridge to `pipe:` / `unix:` and confirm no legacy clients
+  remain. H-6 step-2 (MSI HMAC secret provisioning + Auth Bridge
+  response-MAC enforcement + challenge-HMAC binding) is still
+  pending and now unblocked by this transport slice.
+
 **2026-04-20 follow-up pass — H-7 step-2a (Rust + CLI):**
 
 - **H-7 step-2a**: `serve` in `dds-node::http` now dispatches on the
@@ -261,7 +312,7 @@ as partial):
 | H-4 | ✅ Fixed (pending verify) | JTIs suffixed with UUIDv4; `TrustError::DuplicateJti` rejects overlaps |
 | H-5 | ✅ Fixed (pending verify) | Named-pipe SDDL tightened to `SY`-only (dropped `IU`); C++ change, compile-test requires Windows CI |
 | H-6 | ⚠ Partial | Step-1 plumbing in tree (commit `730dc6c`): `ResponseMacKey::from_file` + `sign_response_body_middleware` emit `X-DDS-Body-MAC` on every response when a key is configured. **Still outstanding (step 2)**: MSI-provisioned per-install HMAC secret, C++ Auth Bridge consumes the secret and verifies/enforces the MAC on every response, challenge-HMAC binding on `/v1/session/challenge`. See the 2026-04-19 follow-up pass block above. |
-| H-7 | ⚠ Partial | Step-1 plumbing in tree (commit `730dc6c`): `ApiAuthConfig` + `CallerIdentity {Anonymous, Uds, Pipe}` extractor + `AdminPolicy` + `require_admin_middleware` gate `/v1/enroll/*`, `/v1/admin/*`, `/v1/enrolled-users`, `/v1/audit/entries`. **Step 2a landed 2026-04-20**: `serve` dispatches on `unix:` scheme; new `serve_unix` accepts UDS connections, extracts peer creds via `stream.peer_cred()`, and injects `CallerIdentity::Uds { uid, gid, pid }` on every request before the admin gate. Socket perms `0o660`; stale-file cleanup on bind. `dds-cli` understands `unix:/path` URLs via a minimal hyper+UnixStream client. Four end-to-end tests pin the full pipeline (service-uid admitted, unknown uid rejected, 0o660 mode, stale replacement). **Still outstanding (step 2b)**: Windows named-pipe listener (`GetNamedPipeClientProcessId` + `OpenProcessToken`), C# Policy Agent `DdsNodeClient` transport swap on Windows + macOS, C++ Auth Bridge named-pipe HTTP client. TCP listener still bound by default (`trust_loopback_tcp_admin = true`) so existing deployments keep working; flip to `false` once all clients are on UDS/pipe. |
+| H-7 | ⚠ Partial | Step-1 plumbing in tree (commit `730dc6c`): `ApiAuthConfig` + `CallerIdentity {Anonymous, Uds, Pipe}` extractor + `AdminPolicy` + `require_admin_middleware` gate `/v1/enroll/*`, `/v1/admin/*`, `/v1/enrolled-users`, `/v1/audit/entries`. **Step 2a landed 2026-04-20**: `serve` dispatches on `unix:` scheme; new `serve_unix` accepts UDS connections, extracts peer creds via `stream.peer_cred()`, and injects `CallerIdentity::Uds { uid, gid, pid }` on every request before the admin gate. Socket perms `0o660`; stale-file cleanup on bind. `dds-cli` understands `unix:/path` URLs via a minimal hyper+UnixStream client. **Step 2b landed 2026-04-20**: `serve` now also dispatches on `pipe:<name>`; new `serve_pipe` wraps tokio's `NamedPipeServer` and extracts caller primary-user SID via `GetNamedPipeClientProcessId` + `OpenProcessToken` + `GetTokenInformation(TokenUser)` + `ConvertSidToStringSidW` into `CallerIdentity::Pipe`. Both C# Policy Agents (macOS + Windows) gain a `DdsNodeHttpFactory` that swaps the primary `HttpMessageHandler` to a `SocketsHttpHandler` with a `ConnectCallback` for UDS or `NamedPipeClientStream`. C++ Auth Bridge's `CDdsNodeHttpClient` now dispatches on `pipe:` URLs to `SendRequestPipe` (minimal HTTP/1 over `CreateFileW` + `WriteFile`/`ReadFile` with `Connection: close`). Cross-language tests: Rust 4 UDS e2e on unit tests; C# macOS 15 (incl. live UDS echo-responder); C# Windows 21 (incl. live named-pipe echo-responder, skip-on-non-Windows). C++ Auth Bridge pipe path is authored but requires Windows CI for compile + integration verification. **Still outstanding**: flip `trust_loopback_tcp_admin = false` once operators cut all clients over to the new transports; revisit H-12 after this rolls out. |
 | H-8 | ✅ Fixed (pending verify) | `admin_vouch` requires `dds:admin-vouch:<purpose>` for non-bootstrap admins; `bootstrap_admin_urn` persisted to config and rehydrated on startup (survives restart); vouch with `purpose == dds:admin` now promotes the subject into `trusted_roots` and persists. (Generating the second admin's signing key is still a separate operational step — `admin_setup` is the only auto-generation path today.) |
 | H-9 | ✅ Fixed (pending verify) | `Zeroizing` wraps passphrase + admin plaintext; buffers wiped on early-return paths |
 | H-10 | ✅ Fixed (pending verify) | Bundle v3 carries a mandatory Ed25519 signature over canonical `signing_bytes` (domain_id + domain_pubkey + org_hash + ports + mdns + domain_key_blob), verified on load against the embedded `domain_pubkey`. Fingerprint is now ALSO printed on load so operators can confirm OOB. `save_bundle` requires an unwrapped `DomainKey` and refuses to write if the signer pubkey doesn't match the embedded one. Tests: `bundle_rejects_tampered_signature`, `bundle_fingerprint_diverges_under_key_swap`. |
@@ -949,18 +1000,19 @@ cleanup cluster.
 
 **Step-2 of previously-partial items** (all cross-language):
 
-- **H-7 step-2a landed 2026-04-20** (Rust server + CLI client);
-  **step-2b still outstanding** — Windows named-pipe listener
-  (`GetNamedPipeClientProcessId` + `OpenProcessToken` to populate
-  `CallerIdentity::Pipe`), C# Policy Agent `DdsNodeClient` transport
-  swap for both Windows and macOS (inject a `SocketsHttpHandler` with
-  a `ConnectCallback` that opens a `UnixDomainSocketEndPoint` on
-  Linux/macOS or calls `CreateFileW` on a pipe name on Windows), and
-  C++ Auth Bridge named-pipe HTTP/1 client in
-  `DdsNodeHttpClient.cpp`. Once step-2b lands across both agents and
-  the Auth Bridge, `trust_loopback_tcp_admin` flips to `false` by
-  default — right now TCP callers are still Anonymous-but-admin for
-  backward compat. H-7 step-2 also unblocks M-8 step-2.
+- **H-7 step-2 landed 2026-04-20** across both sub-slices.
+  Step-2a: Rust UDS listener in `dds-node::http::serve_unix` + CLI
+  hyper-over-`UnixStream` client. Step-2b: Rust Windows named-pipe
+  listener in `serve_pipe` (extracts caller SID via Win32 token APIs),
+  macOS + Windows C# `DdsNodeHttpFactory` for `HttpClient`
+  transport-swap, and C++ Auth Bridge pipe HTTP/1 client
+  (`SendRequestPipe`). What remains is the operational cutover:
+  roll `trust_loopback_tcp_admin = false` in the node config once
+  all clients are on UDS/pipe, then remove the TCP bind. M-8 step-2
+  (write-side session-token binding) becomes addressable.
+  **Verification caveat**: the C++ Auth Bridge changes were
+  authored on macOS — Windows CI must confirm the MSVC compile +
+  exercise the pipe path end-to-end against the Rust `serve_pipe`.
 - **H-6 step-2** — The response-MAC middleware is already emitting
   `X-DDS-Body-MAC` when a key is configured; the remaining work is
   (a) MSI installer provisions a per-install 32-byte random secret

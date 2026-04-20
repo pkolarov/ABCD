@@ -1042,6 +1042,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.60.2",
  "zeroize",
 ]
 

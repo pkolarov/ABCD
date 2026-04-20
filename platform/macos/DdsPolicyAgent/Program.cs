@@ -49,11 +49,21 @@ builder.Services.AddSingleton<EnvelopeVerifier>(sp =>
         TimeSpan.FromSeconds(cfg.EnvelopeMaxClockSkewSeconds));
 });
 
+// **H-7 step-2b (security review)**: primary handler routes `unix:`
+// URLs through a `SocketsHttpHandler` with a `ConnectCallback` that
+// opens the named Unix domain socket, so the Rust node's UDS listener
+// sees a concrete peer-cred-authenticated caller. TCP URLs keep the
+// default handler. See `DdsNodeHttpFactory` for the dispatch rules.
 builder.Services.AddHttpClient<IDdsNodeClient, DdsNodeClient>((sp, http) =>
 {
     var cfg = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<AgentConfig>>().Value;
-    http.BaseAddress = new Uri(cfg.NodeBaseUrl.TrimEnd('/') + "/");
+    http.BaseAddress = DdsNodeHttpFactory.ResolveBaseAddress(cfg.NodeBaseUrl);
     http.Timeout = TimeSpan.FromSeconds(10);
+})
+.ConfigurePrimaryHttpMessageHandler(sp =>
+{
+    var cfg = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<AgentConfig>>().Value;
+    return DdsNodeHttpFactory.BuildHandler(cfg.NodeBaseUrl);
 });
 builder.Services.AddHttpClient();
 

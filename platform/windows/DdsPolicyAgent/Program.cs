@@ -51,11 +51,22 @@ builder.Services.AddSingleton<EnvelopeVerifier>(sp =>
 });
 
 // Register the HTTP client for dds-node.
+// **H-7 step-2b (security review)**: primary handler routes `pipe:` URLs
+// through a `SocketsHttpHandler` with a `ConnectCallback` that opens a
+// `NamedPipeClientStream`, so the Rust node's pipe listener sees a
+// concrete caller SID via `GetNamedPipeClientProcessId`. `unix:` is
+// also supported for cross-platform dev builds. TCP URLs keep the
+// default handler. See `DdsNodeHttpFactory` for the dispatch rules.
 builder.Services.AddHttpClient<IDdsNodeClient, DdsNodeClient>((sp, http) =>
 {
     var cfg = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<AgentConfig>>().Value;
-    http.BaseAddress = new Uri(cfg.NodeBaseUrl.TrimEnd('/') + "/");
+    http.BaseAddress = DdsNodeHttpFactory.ResolveBaseAddress(cfg.NodeBaseUrl);
     http.Timeout = TimeSpan.FromSeconds(10);
+})
+.ConfigurePrimaryHttpMessageHandler(sp =>
+{
+    var cfg = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<AgentConfig>>().Value;
+    return DdsNodeHttpFactory.BuildHandler(cfg.NodeBaseUrl);
 });
 
 // Registry operations: real Win32 on Windows, no-op elsewhere.

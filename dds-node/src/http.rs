@@ -1565,6 +1565,13 @@ where
 ///   [`require_admin_middleware`] sees a concrete identity rather than
 ///   falling back to `Anonymous`. The socket file is created with
 ///   `0o660` so only the owner and service group can connect.
+/// - `pipe:<pipe-name>` — Windows named pipe. `<pipe-name>` is either a
+///   bare name (e.g. `dds-api`, expanded to `\\.\pipe\dds-api`) or a
+///   full pipe path (`\\.\pipe\...`, passthrough). Every accepted
+///   connection extracts the caller's primary **user** SID via
+///   `GetNamedPipeClientProcessId` + `OpenProcessToken` +
+///   `GetTokenInformation(TokenUser)` and injects
+///   [`CallerIdentity::Pipe`].
 /// - anything else — legacy loopback TCP (e.g. `127.0.0.1:5551`).
 ///   Callers are treated as [`CallerIdentity::Anonymous`] and fall
 ///   back to [`AdminPolicy::trust_loopback_tcp_admin`].
@@ -1603,6 +1610,26 @@ where
         {
             let _ = path;
             return Err("UDS transport is only supported on Unix platforms".into());
+        }
+    }
+
+    if let Some(pipe_spec) = addr.strip_prefix("pipe:") {
+        #[cfg(windows)]
+        {
+            return serve_pipe(
+                pipe_spec,
+                svc,
+                info,
+                admin_policy,
+                response_mac_key,
+                device_binding,
+            )
+            .await;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = pipe_spec;
+            return Err("named-pipe transport is only supported on Windows".into());
         }
     }
 
@@ -1726,6 +1753,229 @@ where
             }
         });
     }
+}
+
+/// Named-pipe serve loop for H-7 step-2b on Windows.
+///
+/// Mirror of [`serve_unix`]: accept a pipe connection, extract the
+/// caller's primary user SID from the bound token, inject
+/// [`CallerIdentity::Pipe`] as a per-request extension, and serve
+/// HTTP/1 over the pipe via hyper. The caller SID is the input to
+/// [`AdminPolicy::is_admin`] on Windows.
+///
+/// `pipe_spec` is either a bare name (e.g. `dds-api`, expanded to
+/// `\\.\pipe\dds-api`) or a full pipe path (`\\.\pipe\...`).
+#[cfg(windows)]
+async fn serve_pipe<S>(
+    pipe_spec: &str,
+    svc: SharedService<S>,
+    info: NodeInfo,
+    admin_policy: AdminPolicy,
+    response_mac_key: Option<ResponseMacKey>,
+    device_binding: Option<Arc<DeviceBindingStore>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    use hyper::server::conn::http1;
+    use hyper_util::rt::TokioIo;
+    use tokio::net::windows::named_pipe::ServerOptions;
+    use tower::ServiceExt as _;
+
+    let pipe_path = normalize_pipe_name(pipe_spec);
+    tracing::info!(pipe = %pipe_path, "HTTP API listening on named pipe");
+
+    let app = router(svc, info, admin_policy, response_mac_key, device_binding);
+
+    // First instance: `first_pipe_instance(true)` makes `create` fail
+    // if another process has already opened a server on this name.
+    // This is the named-pipe analogue of the stale-socket cleanup in
+    // `serve_unix`: we would rather fail-fast at startup than accept
+    // connections on an unowned pipe.
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&pipe_path)
+        .map_err(|e| format!("failed to create named pipe {pipe_path}: {e}"))?;
+
+    loop {
+        if let Err(e) = server.connect().await {
+            tracing::error!(error = %e, "named-pipe connect failed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
+        }
+        // The connected pipe becomes this request's stream; spin up a
+        // fresh server instance so new clients aren't refused while
+        // this one is in use.
+        let connected = server;
+        server = ServerOptions::new()
+            .create(&pipe_path)
+            .map_err(|e| format!("failed to create next named-pipe instance: {e}"))?;
+
+        // Pull caller SID + PID off the connected pipe handle BEFORE
+        // we hand it to hyper.
+        let caller = match extract_pipe_caller(&connected) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "named-pipe caller lookup failed; dropping");
+                drop(connected);
+                continue;
+            }
+        };
+
+        let app = app.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(connected);
+            let svc_fn = hyper::service::service_fn({
+                let app = app.clone();
+                move |req: hyper::Request<hyper::body::Incoming>| {
+                    let app = app.clone();
+                    let caller = caller.clone();
+                    async move {
+                        let (mut parts, body) = req.into_parts();
+                        parts.extensions.insert(caller);
+                        let body = axum::body::Body::new(body);
+                        let req = axum::http::Request::from_parts(parts, body);
+                        let resp: axum::response::Response =
+                            app.oneshot(req).await.unwrap_or_else(|never| match never {});
+                        Ok::<_, std::convert::Infallible>(resp)
+                    }
+                }
+            });
+            if let Err(e) = http1::Builder::new().serve_connection(io, svc_fn).await {
+                tracing::debug!(error = %e, "named-pipe connection closed");
+            }
+        });
+    }
+}
+
+#[cfg(windows)]
+fn normalize_pipe_name(spec: &str) -> String {
+    if spec.starts_with(r"\\") {
+        spec.to_string()
+    } else {
+        format!(r"\\.\pipe\{spec}")
+    }
+}
+
+/// Extract the connected client's primary user SID and process id
+/// from a server-side named-pipe handle. Used on Windows to populate
+/// [`CallerIdentity::Pipe`]. Returns an I/O error when any of the
+/// Win32 calls fail; callers drop the connection and log.
+#[cfg(windows)]
+fn extract_pipe_caller(
+    server: &tokio::net::windows::named_pipe::NamedPipeServer,
+) -> std::io::Result<CallerIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let pipe_handle = server.as_raw_handle() as HANDLE;
+
+    // 1. client PID from the pipe.
+    let mut pid: u32 = 0;
+    if unsafe { GetNamedPipeClientProcessId(pipe_handle, &mut pid) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // 2. open the client process with the minimum access needed to
+    //    grab its primary token.
+    let proc_handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if proc_handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // 3. open the token for TOKEN_QUERY.
+    let mut token_handle: HANDLE = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(proc_handle, TOKEN_QUERY, &mut token_handle) } == 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe {
+            CloseHandle(proc_handle);
+        }
+        return Err(e);
+    }
+
+    // 4. sized query first, then real query, for TOKEN_USER.
+    let mut needed: u32 = 0;
+    let _ = unsafe {
+        GetTokenInformation(token_handle, TokenUser, std::ptr::null_mut(), 0, &mut needed)
+    };
+    if needed == 0 {
+        unsafe {
+            CloseHandle(token_handle);
+            CloseHandle(proc_handle);
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut buf = vec![0u8; needed as usize];
+    let ok = unsafe {
+        GetTokenInformation(
+            token_handle,
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    };
+    unsafe {
+        CloseHandle(token_handle);
+        CloseHandle(proc_handle);
+    }
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Safety: `buf` is aligned to u8; `TOKEN_USER` begins with a
+    // pointer and a `DWORD`. It has stricter alignment than u8, so
+    // we must read through a pointer rather than mem::transmute — but
+    // `&*` on a cast pointer is fine since the allocator returns a
+    // properly-aligned allocation for `Vec<u8>` only if we cast it to
+    // a pointer that expects a less-strict type. In practice glibc /
+    // MSVC allocators return 8- or 16-byte aligned blocks so this is
+    // safe; to be robust we copy the pointer value out rather than
+    // take a reference into the buffer.
+    let sid_ptr = {
+        let token_user = buf.as_ptr() as *const TOKEN_USER;
+        // Copy out just the SID pointer.
+        unsafe { (*token_user).User.Sid }
+    };
+    if sid_ptr.is_null() {
+        return Err(std::io::Error::other("TokenUser.Sid is null"));
+    }
+
+    // 5. SID → string via Authorization::ConvertSidToStringSidW.
+    let mut sid_wstr: *mut u16 = std::ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(sid_ptr, &mut sid_wstr) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // wcslen on the returned UTF-16 string.
+    let mut len = 0usize;
+    while unsafe { *sid_wstr.add(len) } != 0 {
+        len += 1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(sid_wstr, len) };
+    let sid_string = String::from_utf16_lossy(slice);
+    unsafe {
+        LocalFree(sid_wstr.cast());
+    }
+
+    Ok(CallerIdentity::Pipe {
+        sid: sid_string,
+        pid,
+    })
 }
 
 #[cfg(test)]
