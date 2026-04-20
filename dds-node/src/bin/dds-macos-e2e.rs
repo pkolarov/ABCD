@@ -42,11 +42,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "publish" => cmd_publish(&args[1..]).await,
         "collect" => cmd_collect(&args[1..]).await,
         "compare" => cmd_compare(&args[1..]),
+        "gen-publisher-seed" => cmd_gen_publisher_seed(&args[1..]),
         _ => {
             eprintln!("{}", main_usage());
             std::process::exit(2);
         }
     }
+}
+
+/// Generate a fresh 32-byte Ed25519 seed for the e2e publisher,
+/// write it as 64 hex chars to `--out`, and print the derived URN on
+/// stdout so the smoke harness can slot it into node.toml's
+/// `trusted_roots` before launching the node. C-3's
+/// `publisher_capability_ok` only admits policy/software tokens
+/// whose issuer chains back to a trusted root — so the e2e publisher
+/// self-vouches for the `dds:policy-publisher-macos` and
+/// `dds:software-publisher` purposes, which is only accepted if the
+/// publisher IS a trusted root.
+fn cmd_gen_publisher_seed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use rand::RngCore;
+    let out = PathBuf::from(require_flag(args, "--out")?);
+    let label = flag(args, "--label").unwrap_or("macos-e2e-publisher");
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    let hex = seed.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(&out, &hex)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let identity = Identity::from_signing_key(label, sk);
+    println!("seed_file: {}", out.display());
+    println!("urn:       {}", identity.id.to_urn());
+    Ok(())
+}
+
+/// Parse a 32-byte seed from a file containing 64 hex chars.
+fn load_publisher_seed(path: &std::path::Path) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let raw = std::fs::read_to_string(path)?;
+    let trimmed = raw.trim();
+    if trimmed.len() != 64 {
+        return Err(format!(
+            "publisher seed file {} must contain 64 hex chars, got {}",
+            path.display(),
+            trimmed.len()
+        )
+        .into());
+    }
+    let mut seed = [0u8; 32];
+    for i in 0..32 {
+        seed[i] = u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16)
+            .map_err(|e| format!("invalid hex in {}: {e}", path.display()))?;
+    }
+    Ok(seed)
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -188,6 +243,7 @@ async fn cmd_publish(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     let connect_timeout_secs: u64 = flag(args, "--connect-timeout-secs")
         .unwrap_or("20")
         .parse()?;
+    let publisher_seed_path = flag(args, "--publisher-seed-file").map(PathBuf::from);
 
     let domain_key = domain_store::load_domain_key(&domain_key_path)?;
     let domain = domain_store::load_domain_file(&domain_path)?;
@@ -215,6 +271,7 @@ async fn cmd_publish(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             publish_count,
             publish_interval_ms,
             connect_timeout_secs,
+            publisher_seed_path,
         },
     )
     .await?;
@@ -243,6 +300,16 @@ struct PublishSpec {
     publish_count: usize,
     publish_interval_ms: u64,
     connect_timeout_secs: u64,
+    /// Optional path to a 32-byte seed (64 hex chars) that
+    /// deterministically derives the publisher identity. When set,
+    /// the smoke harness has already inserted the resulting URN
+    /// into node.toml's `trusted_roots`, so the publisher's
+    /// self-vouch for `dds:policy-publisher-macos` chains back to a
+    /// trusted root and C-3's `publisher_capability_ok` admits the
+    /// policy / software tokens. When `None` (legacy behaviour), a
+    /// fresh random identity is used and the ingest side will
+    /// reject the tokens.
+    publisher_seed_path: Option<PathBuf>,
 }
 
 async fn publish_fixture(
@@ -299,7 +366,53 @@ async fn publish_fixture(
     node.start()?;
     wait_for_mesh(&mut node, Duration::from_secs(spec.connect_timeout_secs)).await?;
 
-    let publisher = Identity::generate("macos-e2e-publisher", &mut OsRng);
+    // Publisher identity: deterministic from a seed file when the
+    // harness provides one, else fresh random. The smoke's
+    // `gen-publisher-seed` subcommand writes the seed and prints the
+    // URN so the test setup can slot it into `trusted_roots` on the
+    // target node before we start publishing.
+    let publisher = match &spec.publisher_seed_path {
+        Some(p) => {
+            let seed = load_publisher_seed(p)?;
+            let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+            Identity::from_signing_key("macos-e2e-publisher", sk)
+        }
+        None => Identity::generate("macos-e2e-publisher", &mut OsRng),
+    };
+
+    // C-3: publish self-attestation + self-vouches for the
+    // publisher-capability purposes the policy/software tokens
+    // require. Node-side `publisher_capability_ok` only admits
+    // those tokens once these vouches have been ingested — so we
+    // publish them first, pump a heartbeat for gossip to settle,
+    // and THEN fire the policy/software tokens.
+    {
+        let self_attest_token = self_attest_identity(&publisher)?;
+        let attest_hash = self_attest_token.payload_hash();
+        publish_operation(&mut node, &self_attest_token)?;
+
+        let policy_vouch = self_vouch_purpose(
+            &publisher,
+            &attest_hash,
+            dds_core::token::purpose::POLICY_PUBLISHER_MACOS,
+            "macos-e2e-vouch-policy-publisher-macos",
+        )?;
+        publish_operation(&mut node, &policy_vouch)?;
+
+        let software_vouch = self_vouch_purpose(
+            &publisher,
+            &attest_hash,
+            dds_core::token::purpose::SOFTWARE_PUBLISHER,
+            "macos-e2e-vouch-software-publisher",
+        )?;
+        publish_operation(&mut node, &software_vouch)?;
+
+        // Give node_a time to ingest the attest + vouches before we
+        // send policy/software tokens that reference them. Without
+        // this, the policy token can arrive before the vouch and
+        // `publisher_capability_ok` rejects it.
+        pump_for(&mut node, Duration::from_millis(spec.publish_interval_ms)).await;
+    }
 
     let value_json: serde_json::Value = serde_json::from_str(&spec.preference_value_json)?;
     let policy = MacOsPolicyDocument {
@@ -402,6 +515,55 @@ async fn publish_fixture(
     })
 }
 
+/// Self-attestation for the e2e publisher. The resulting token's
+/// `payload_hash()` is the `vch_sum` the capability vouches must
+/// reference for `has_purpose` to accept them.
+fn self_attest_identity(identity: &Identity) -> Result<Token, Box<dyn std::error::Error>> {
+    let payload = TokenPayload {
+        iss: identity.id.to_urn(),
+        iss_key: identity.public_key.clone(),
+        jti: format!("attest-{}", identity.id.label()),
+        sub: identity.id.to_urn(),
+        kind: TokenKind::Attest,
+        purpose: None,
+        vch_iss: None,
+        vch_sum: None,
+        revokes: None,
+        iat: now_epoch(),
+        exp: Some(now_epoch() + 86_400),
+        body_type: None,
+        body_cbor: None,
+    };
+    Token::sign(payload, &identity.signing_key).map_err(|e| format!("sign attest: {e}").into())
+}
+
+/// Self-vouch issuing `purpose` over the publisher's own identity
+/// (`vch_sum` pins the attestation's payload hash). Accepted only
+/// when the publisher's URN is in the target node's `trusted_roots`.
+fn self_vouch_purpose(
+    identity: &Identity,
+    attest_hash: &str,
+    purpose: &str,
+    jti: &str,
+) -> Result<Token, Box<dyn std::error::Error>> {
+    let payload = TokenPayload {
+        iss: identity.id.to_urn(),
+        iss_key: identity.public_key.clone(),
+        jti: jti.to_string(),
+        sub: identity.id.to_urn(),
+        kind: TokenKind::Vouch,
+        purpose: Some(purpose.to_string()),
+        vch_iss: Some(identity.id.to_urn()),
+        vch_sum: Some(attest_hash.to_string()),
+        revokes: None,
+        iat: now_epoch(),
+        exp: Some(now_epoch() + 86_400),
+        body_type: None,
+        body_cbor: None,
+    };
+    Token::sign(payload, &identity.signing_key).map_err(|e| format!("sign vouch: {e}").into())
+}
+
 fn attest_with_body<T: DomainDocument>(
     identity: &Identity,
     jti: &str,
@@ -454,14 +616,24 @@ async fn wait_for_mesh(
     node: &mut DdsNode,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // H-12: it's not enough to have a TCP connection; the remote peer
+    // must also be in `admitted_peers` (i.e. its admission cert has
+    // verified) before any gossip we emit will be accepted. Return
+    // only after both conditions hold.
     let deadline = Instant::now() + timeout;
     loop {
-        if node.swarm.connected_peers().count() > 0 {
+        if node.swarm.connected_peers().count() > 0 && !node.admitted_peers().is_empty() {
             return Ok(());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err("timed out waiting for publisher to connect to bootstrap peer".into());
+            return Err(format!(
+                "timed out waiting for publisher to be admitted \
+                 (connected={}, admitted={})",
+                node.swarm.connected_peers().count(),
+                node.admitted_peers().len(),
+            )
+            .into());
         }
         if let Ok(event) = tokio::time::timeout(
             remaining.min(Duration::from_millis(500)),

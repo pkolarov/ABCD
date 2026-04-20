@@ -64,7 +64,9 @@ cleanup() {
   rm -rf "${RUN_ROOT}"
   echo "  cleaned ${RUN_ROOT}"
 }
-trap cleanup EXIT
+if [[ -z "${DDS_SMOKE_KEEP:-}" ]]; then
+  trap cleanup EXIT
+fi
 
 pass() { echo "  PASS: $1"; }
 fail() { echo "  FAIL: $1" >&2; FAILED=true; }
@@ -126,10 +128,20 @@ DOMAIN_NAME="$(awk -F'= ' '/^name = / { gsub(/"/, "", $2); print $2 }' "${DOMAIN
 DOMAIN_ID="$(awk -F'= ' '/^id = / { gsub(/"/, "", $2); print $2 }' "${DOMAIN_FILE}")"
 DOMAIN_PUBKEY="$(awk -F'= ' '/^pubkey = / { gsub(/"/, "", $2); print $2 }' "${DOMAIN_FILE}")"
 
+# C-3: generate a deterministic e2e publisher identity and seed node_a's
+# `trusted_roots` with its URN. The publisher then self-vouches for
+# `dds:policy-publisher-macos` + `dds:software-publisher` (see
+# `publish_fixture` in dds-macos-e2e), and `publisher_capability_ok`
+# admits the tokens because the vouch's issuer is a trusted root.
+PUBLISHER_SEED="${RUN_ROOT}/publisher-seed.hex"
+"${E2E_BIN}" gen-publisher-seed --out "${PUBLISHER_SEED}" > "${RUN_ROOT}/publisher-seed.out"
+PUBLISHER_URN="$(awk '/^urn:/ { print $2 }' "${RUN_ROOT}/publisher-seed.out")"
+[[ -n "${PUBLISHER_URN}" ]] || { echo "FAIL: could not derive publisher URN" >&2; exit 1; }
+
 cat > "${RUN_ROOT}/dds.toml" <<EOF
 data_dir = "${RUN_ROOT}/node-data"
 org_hash = "smoke-test"
-trusted_roots = []
+trusted_roots = ["${PUBLISHER_URN}"]
 
 [network]
 listen_addr = "/ip4/127.0.0.1/tcp/${P2P_PORT}"
@@ -232,15 +244,25 @@ BOOTSTRAP_PEER="/ip4/127.0.0.1/tcp/${P2P_PORT}/p2p/${PEER_ID}"
   --launchd-marker-path "${RUN_ROOT}/launchd-fired.txt" \
   --package-marker-path "${RUN_ROOT}/install-root/software-installed.txt" \
   --out "${RUN_ROOT}/manifest.json" \
+  --publisher-seed-file "${PUBLISHER_SEED}" \
   --connect-timeout-secs 30 2>&1 | tail -5
 echo "  fixture published"
 
 # Wait for gossip convergence
 sleep 3
 
-# Verify node received the policy
+# Verify node received the policy. Since H-2/H-3 the response is a
+# `SignedPolicyEnvelope { version, kind, device_urn, issued_at,
+# payload_b64, signature_b64, ... }` with the actual
+# `{"policies": [...]}` body base64-encoded inside `payload_b64` — we
+# decode that here so the check matches the on-the-wire format.
 POLICY_COUNT=$(curl -sf "${NODE_URL}/v1/macos/policies?device_urn=${DEVICE_URN}" \
-  | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('policies',[])))" 2>/dev/null || echo 0)
+  | python3 -c "
+import json, sys, base64
+env = json.load(sys.stdin)
+inner = json.loads(base64.b64decode(env['payload_b64'])) if 'payload_b64' in env else env
+print(len(inner.get('policies', [])))
+" 2>/dev/null || echo 0)
 echo "  policies visible: ${POLICY_COUNT}"
 [[ "${POLICY_COUNT}" -ge 1 ]] || { echo "FAIL: no policies visible after publish" >&2; exit 1; }
 
@@ -250,6 +272,14 @@ echo "=== Step 8: Run policy agent ==="
 export DDS_POLICYAGENT_ASSUME_ROOT=1
 export DdsPolicyAgent__DeviceUrn="${DEVICE_URN}"
 export DdsPolicyAgent__NodeBaseUrl="${NODE_URL}"
+
+# H-3: the macOS agent pins the running node's Ed25519 pubkey and
+# fails startup without it. Pull it from `/v1/node/info` now — in a
+# production install this is baked in by the provisioning bundle.
+NODE_PUBKEY_B64=$(curl -sf "${NODE_URL}/v1/node/info" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['node_pubkey_b64'])")
+[[ -n "${NODE_PUBKEY_B64}" ]] || { echo "FAIL: could not fetch node pubkey" >&2; exit 1; }
+export DdsPolicyAgent__PinnedNodePubkeyB64="${NODE_PUBKEY_B64}"
 export DdsPolicyAgent__PollIntervalSeconds=5
 export DdsPolicyAgent__StateDir="${RUN_ROOT}/state"
 export DdsPolicyAgent__ManagedPreferencesDir="${RUN_ROOT}/ManagedPreferences"
