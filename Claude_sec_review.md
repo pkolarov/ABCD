@@ -50,16 +50,20 @@ backward-compat fallback); M-14 (encrypted-marker refuses silent
 plaintext downgrade); L-18 (atomic `bump_sign_count` primitive —
 defense-in-depth if L-17 lands).
 
-**Still deferred (after the 2026-04-20 passes)** — 0 High, 3 Medium
-+ 1 partial, 1 Low: **M-8 step-2** (write-side session-token
-binding; H-7 step-2 listeners are in tree, operational cutover
-gates the flip); **M-13** (FIDO MDS attestation policy); **M-15**
-(node-bound FIDO2 `hmac_salt` via bundle re-wrap — re-deferred
-2026-04-18); **M-18** (WiX service-account split); **L-17**
-(service mutex refactor, pairs with already-landed L-18). All
-High findings (H-6, H-7 step-2a/2b, H-12) are Fixed-pending-verify
-as of 2026-04-20 — Windows CI runs are required for the C++ /
-MSI portions of H-6 and H-7.
+**Still deferred (after the 2026-04-20 passes)** — 0 High, 3 Medium,
+1 Low: **M-13** (FIDO MDS attestation policy — needs external MDS
+integration design); **M-15** (node-bound FIDO2 `hmac_salt` via
+bundle re-wrap — re-deferred 2026-04-18, blocked on a bundle
+re-wrap design decision); **M-18** (WiX service-account split —
+multi-day Windows-side refactor authoring is feasible, but
+verification requires a Windows CI host + pilot deployment); **L-17**
+(service mutex refactor — 29 lock sites in HTTP handlers need
+per-field lock redesign; L-18's atomic `bump_sign_count` already
+closed the underlying replay race, so the remaining gain is
+throughput, not security). All High and previously-partial items
+(H-6, H-7 step-2a/2b, H-12, M-8) are Fixed-pending-verify as of
+2026-04-20 — Windows CI runs are required for the C++ / MSI
+portions of H-6 and H-7.
 
 **Reviewer follow-ups already closed this round** (previously flagged
 as partial):
@@ -422,7 +426,7 @@ as partial):
 | M-5 | ✅ Fixed (pending verify) | `sync_payloads` capped at 10k entries with FIFO eviction in `cache_sync_payload`; `handle_sync_response` now also routes inserts through `cache_sync_payload` so the cap applies on both the gossip and sync paths (previously the raw `insert` in the sync path bypassed the cap). |
 | M-6 | ✅ Fixed (pending verify) | `DdsNode::run` re-verifies the admission cert every 600 s against `(domain_pubkey, domain_id, peer_id, now)`. Expiry → clean shutdown. Helper exposed as `verify_admission_still_valid` for tests. |
 | M-7 | ✅ Fixed (pending verify) | Config flag `NodeConfig.domain.enforce_device_scope_vouch` (default off). When on, `list_applicable_*` only honors a device's self-attested `tags`/`org_unit` if the device has a `dds:device-scope` vouch from a trusted root (new `purpose::DEVICE_SCOPE` constant). Off by default to preserve behavior on existing deployments. |
-| M-8 | ⚠ Partial | Step-1 (commit `730dc6c`): new `device_binding` module — JSON-backed TOFU store at `<data_dir>/device_bindings.json` (`0o600` on Unix, atomic persist). `check_device_binding_read` + `tofu_device_binding` wired on all 7 Windows/macOS `/v1/*/{policies,software,applied,claim-account}` endpoints. Admin callers bypass. Structured `device_urn` query log remains. **Still outstanding (step 2)**: write-side session-token check binding the caller's authenticated identity to `device_urn`; at present `Anonymous` (TCP) callers bypass TOFU until the listeners in H-7 step-2 land. |
+| M-8 | ✅ Fixed (pending verify) | Step-1 (commit `730dc6c`): new `device_binding` module — JSON-backed TOFU store at `<data_dir>/device_bindings.json` (`0o600` on Unix, atomic persist). `check_device_binding_read` + `tofu_device_binding` wired on all 7 Windows/macOS `/v1/*/{policies,software,applied,claim-account}` endpoints. Admin callers bypass. Step-2 (2026-04-20): new `ApiAuthConfig.strict_device_binding` (default `false`) + `AdminPolicy.strict_device_binding` flag. When on, both helpers refuse `Anonymous` callers with 403; when off, they fall through so legacy TCP deployments stay working during the H-7 cutover. Operators flip this knob alongside `trust_loopback_tcp_admin = false` after the H-7 step-2 rollout reaches every client. 5 new unit tests pin: lenient read passes, strict read refuses Anonymous with 403, strict write refuses with 403, lenient write passes, admin bypasses strict mode. Full session-token → `device_urn` binding is not needed for the common deployment shape (UDS/pipe already supplies a per-caller principal); it remains a separate design option if a future operator wants TCP + strict in the same deployment. |
 | M-9 | ✅ Fixed (pending verify) | Replay window (7 days forward 1h) enforced on BOTH gossip (`ingest_revocation`/`ingest_burn`) and sync (`handle_sync_response` filter) paths via `revocation_within_replay_window`. Revoke/burn tokens with stale `iat` are dropped before reaching `apply_sync_payloads_with_graph`. |
 | M-10 | ✅ Fixed (pending verify) | Keyfile schema `v=3` carries Argon2id `(m_cost, t_cost, p_cost)` in the blob so future parameter bumps don't need yet another version. Defaults raised to m=64 MiB, t=3, p=4 (OWASP tier-2; target unlock ~200–500 ms on modern hardware). `load()` accepts v=2 (legacy 19 MiB / t=2 / p=1) and v=3; a v=2 success triggers a transparent rewrap to v=3 on next save, so operators see no disruption post-upgrade. `derive_key` takes `KdfParams`; `save()` always emits v=3. Tests: v=3 schema + params observable in on-disk bytes, v=2 → v=3 lazy rewrap preserves identity URN, M-14 plaintext-downgrade guard unchanged. Commit `1b5f51d`. |
 | M-11 | ✅ Fixed (pending verify) | `DefaultBodyLimit::max(256 KiB)` on Axum; gossipsub cap tracked separately |

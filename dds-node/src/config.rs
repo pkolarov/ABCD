@@ -226,6 +226,20 @@ pub struct ApiAuthConfig {
     /// affected).
     #[serde(default)]
     pub node_hmac_secret_path: Option<PathBuf>,
+
+    /// **M-8 step-2 (security review)** — when `true`, `Anonymous`
+    /// callers (loopback TCP with no peer credentials) are refused
+    /// on device-scoped read endpoints (`/v1/windows/*`,
+    /// `/v1/macos/*`). M-8 step-1 wired a TOFU device-binding store
+    /// that gates `Uds` / `Pipe` callers; step-2's remaining work
+    /// is to drop the `Anonymous` bypass once operators have cut
+    /// over to UDS / named-pipe transport (see `api_addr = unix:/…`
+    /// or `pipe:…`). Defaults to `false` so existing TCP deployments
+    /// keep working during the H-7 transport cutover; flip to
+    /// `true` after the cutover and simultaneously drop
+    /// `trust_loopback_tcp_admin`.
+    #[serde(default)]
+    pub strict_device_binding: bool,
 }
 
 impl Default for ApiAuthConfig {
@@ -235,6 +249,7 @@ impl Default for ApiAuthConfig {
             unix_admin_uids: Vec::new(),
             windows_admin_sids: Vec::new(),
             node_hmac_secret_path: None,
+            strict_device_binding: false,
         }
     }
 }

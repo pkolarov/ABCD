@@ -144,6 +144,13 @@ pub struct AdminPolicy {
     /// [`AdminPolicy::from_config`]; always admitted. `None` on
     /// Windows or if the current UID cannot be determined.
     pub service_uid: Option<u32>,
+    /// **M-8 step-2 (security review)**. When `true`, `Anonymous`
+    /// callers (loopback TCP) are refused on device-scoped read
+    /// endpoints. Operators set this via
+    /// [`ApiAuthConfig::strict_device_binding`] once the H-7
+    /// transport cutover is complete and TCP is no longer a
+    /// default.
+    pub strict_device_binding: bool,
 }
 
 impl AdminPolicy {
@@ -167,6 +174,7 @@ impl AdminPolicy {
             admin_uids: cfg.unix_admin_uids.clone(),
             admin_sids: cfg.windows_admin_sids.clone(),
             service_uid,
+            strict_device_binding: cfg.strict_device_binding,
         }
     }
 }
@@ -192,8 +200,25 @@ fn check_device_binding_read(
     if caller.is_admin(admin_policy) {
         return Ok(());
     }
-    // M-8 is blocked on H-7 for loopback TCP; preserve behaviour.
+    // **M-8 step-2 (security review)**. On TCP the caller has no
+    // peer credentials, so we cannot bind them to a concrete
+    // principal. Legacy deployments keep the old bypass (the
+    // operator still has to tighten things — see
+    // `strict_device_binding`). Strict deployments refuse the
+    // request outright: if you want device-scoped reads, switch to
+    // UDS / named-pipe and expose a real `CallerIdentity` to this
+    // helper.
     if matches!(caller, CallerIdentity::Anonymous) {
+        if admin_policy.strict_device_binding {
+            tracing::warn!(
+                device_urn,
+                "M-8 step-2: refusing Anonymous (TCP) caller on device-scoped read under strict_device_binding"
+            );
+            return Err(HttpError {
+                status: StatusCode::FORBIDDEN,
+                message: "not_authorized".to_owned(),
+            });
+        }
         return Ok(());
     }
     let Some(store) = binding else {
@@ -247,6 +272,19 @@ fn tofu_device_binding(
         return Ok(());
     }
     if matches!(caller, CallerIdentity::Anonymous) {
+        // **M-8 step-2**: same rationale as `check_device_binding_read`.
+        // On strict deployments, TCP callers cannot TOFU-bind a device
+        // URN because we have no principal to bind them to.
+        if admin_policy.strict_device_binding {
+            tracing::warn!(
+                device_urn,
+                "M-8 step-2: refusing Anonymous (TCP) caller on device-scoped write under strict_device_binding"
+            );
+            return Err(HttpError {
+                status: StatusCode::FORBIDDEN,
+                message: "not_authorized".to_owned(),
+            });
+        }
         return Ok(());
     }
     let Some(store) = binding else {
@@ -3703,6 +3741,7 @@ mod tests {
             admin_uids: Vec::new(),
             admin_sids: Vec::new(),
             service_uid: None,
+            strict_device_binding: false,
         }
     }
 
@@ -3712,6 +3751,16 @@ mod tests {
             admin_uids: vec![4242],
             admin_sids: vec!["S-1-5-21-1-2-3-4242".to_string()],
             service_uid: None,
+            strict_device_binding: false,
+        }
+    }
+
+    /// **M-8 step-2**: strict policy with `strict_device_binding` on.
+    /// Used by the two M-8 step-2 regression tests below.
+    fn strict_device_binding_policy() -> AdminPolicy {
+        AdminPolicy {
+            strict_device_binding: true,
+            ..strict_policy()
         }
     }
 
@@ -3747,6 +3796,7 @@ mod tests {
             admin_uids: Vec::new(),
             admin_sids: Vec::new(),
             service_uid: Some(1000),
+            strict_device_binding: false,
         };
         let caller = CallerIdentity::Uds {
             uid: 1000,
@@ -4091,6 +4141,85 @@ mod tests {
         assert!(res.is_ok());
     }
 
+    // ---------- M-8 step-2: strict_device_binding Anonymous gate ----------
+
+    #[test]
+    fn anonymous_read_allowed_when_strict_device_binding_off() {
+        // Default (lenient) behaviour: Anonymous callers pass through
+        // device-scoped read endpoints so legacy TCP deployments keep
+        // working during the H-7 transport cutover.
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let caller = CallerIdentity::Anonymous;
+        let res =
+            check_device_binding_read(&caller, &strict_policy(), Some(&store), "urn:device:any");
+        assert!(res.is_ok(), "Anonymous must pass when strict_device_binding=false");
+    }
+
+    #[test]
+    fn anonymous_read_refused_under_strict_device_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let caller = CallerIdentity::Anonymous;
+        let res = check_device_binding_read(
+            &caller,
+            &strict_device_binding_policy(),
+            Some(&store),
+            "urn:device:any",
+        );
+        let err = res.expect_err("strict mode must refuse Anonymous read");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn anonymous_write_refused_under_strict_device_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let caller = CallerIdentity::Anonymous;
+        let res = tofu_device_binding(
+            &caller,
+            &strict_device_binding_policy(),
+            Some(&store),
+            "urn:device:any",
+        );
+        let err = res.expect_err("strict mode must refuse Anonymous write");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn anonymous_write_allowed_when_strict_device_binding_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let caller = CallerIdentity::Anonymous;
+        let res =
+            tofu_device_binding(&caller, &strict_policy(), Some(&store), "urn:device:any");
+        assert!(res.is_ok());
+    }
+
+    /// Admin callers keep bypassing regardless of `strict_device_binding`
+    /// — operators inspecting a peer's policy set should always have
+    /// unfettered access.
+    #[cfg(unix)]
+    #[test]
+    fn admin_caller_bypasses_strict_device_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        // uid=0 → admin under strict_policy and strict_device_binding_policy.
+        let caller = uds_caller(0);
+        let res = check_device_binding_read(
+            &caller,
+            &strict_device_binding_policy(),
+            Some(&store),
+            "urn:device:any",
+        );
+        assert!(res.is_ok());
+    }
+
     #[tokio::test]
     async fn response_mac_header_covers_error_responses() {
         // An admin-gated endpoint returning 403 must still carry a
@@ -4191,6 +4320,7 @@ mod tests {
                 admin_uids: vec![],
                 admin_sids: vec![],
                 service_uid: Some(current_uid),
+                strict_device_binding: false,
             };
 
             let server = tokio::spawn(async move {
@@ -4239,6 +4369,7 @@ mod tests {
                 admin_uids: vec![],
                 admin_sids: vec![],
                 service_uid: Some(u32::MAX),
+                strict_device_binding: false,
             };
 
             let server = tokio::spawn(async move {
@@ -4282,6 +4413,7 @@ mod tests {
                 admin_uids: vec![],
                 admin_sids: vec![],
                 service_uid: Some(unsafe { libc::geteuid() }),
+                strict_device_binding: false,
             };
 
             let server = tokio::spawn(async move {
@@ -4320,6 +4452,7 @@ mod tests {
                 admin_uids: vec![],
                 admin_sids: vec![],
                 service_uid: Some(unsafe { libc::geteuid() }),
+                strict_device_binding: false,
             };
 
             let server = tokio::spawn(async move {
