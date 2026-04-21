@@ -879,24 +879,39 @@ If a node regenerated its libp2p key every time it started, its `PeerId` would c
 So the persistent transport identity is not optional decoration.
 It is part of the security model.
 
-### 12.5 Important Limitation In The Current Code
+### 12.5 Per-Peer Admission Handshake (H-12, 2026-04-20)
 
-The node verifies **its own** admission certificate at startup.
+Updated since earlier drafts of this whitepaper. The node now
+performs a full mutual admission-verification exchange in addition
+to verifying its own cert at startup:
 
-What the current node does **not** yet do is:
+- a dedicated `request_response::cbor::Behaviour` on
+  `/dds/admission/1.0.0/<domain_tag>` runs immediately after Noise;
+- each side asks the other for its admission cert; the response
+  carries the cert as opaque CBOR bytes so `dds-net` stays
+  layer-independent of `dds-domain`;
+- `DdsNode::admitted_peers: BTreeSet<PeerId>` is populated only
+  after `AdmissionCert::verify(&domain_pubkey, &domain_id,
+  &peer_id.to_string(), now)` succeeds — a peer whose cert was
+  issued for a different `peer_id`, a different domain, or has
+  expired stays unadmitted;
+- gossip (`Event::Message { propagation_source, .. }`) and the
+  sync request/response stream are both gated on the peer being
+  in `admitted_peers`; unadmitted messages are dropped at the
+  behaviour layer before they reach the ingest helpers;
+- `ConnectionClosed` clears the peer from the set, so reconnects
+  re-verify.
 
-- exchange admission certs with remote peers during connection setup;
-- verify remote peers' membership during the live libp2p handshake.
+Domain enforcement today is therefore:
 
-So domain enforcement today is strongest at:
-
-- local startup validation;
-- namespaced protocol strings for some libp2p behaviors;
-- namespaced gossip topics.
-
-It is **not yet** a full mutual admission-verification handshake between peers.
-
-That distinction matters.
+- **local startup validation** (unchanged);
+- **per-peer admission exchange post-Noise** (H-12);
+- **namespaced protocol strings** on every behaviour (domain tag
+  baked into the protocol IDs for kad, identify, sync, admission);
+- **namespaced gossip topics**;
+- **publisher-capability filter (C-3)** on gossip ingest, as the
+  last line of defence against an admitted but unauthorised
+  policy/software publisher.
 
 ## 13. Storage Layer
 
@@ -1542,9 +1557,16 @@ These are more "shaped" than "finished":
 
 ### 19.4 Design Gaps That Matter For Security Discussions
 
-These are the biggest architectural caveats in the current code:
+These are the biggest architectural caveats in the current code. The
+2026-04-17 → 2026-04-21 security-remediation sweep closed several of
+them; the remainder are genuine open work.
 
-1. Remote peer admission is not mutually verified during live connection setup.
+1. ~~Remote peer admission is not mutually verified during live
+   connection setup.~~ **Closed by H-12 (2026-04-20)**: a
+   `request_response` behaviour on `/dds/admission/1.0.0/<domain>`
+   runs immediately after Noise, each side verifies the other's
+   admission cert, and gossip / sync from unadmitted peers is
+   dropped at the behaviour layer.
 2. Kademlia is used for discovery, not as the directory state store.
 3. The node-side in-memory graph is not rebuilt from disk at startup.
 4. The HTTP status endpoint does not expose live peer and DAG counters.
@@ -1552,6 +1574,47 @@ These are the biggest architectural caveats in the current code:
 
 These are not fatal flaws for a prototype or research system.
 They are just important truths.
+
+### 19.5 Security Remediation Status (as of 2026-04-21)
+
+The full per-finding ledger lives in
+[`Claude_sec_review.md`](../Claude_sec_review.md). Summary:
+
+- **All Critical (3/3) and High (12/12) findings** are Fixed
+  (pending verify — the Windows CI run still needs to confirm the
+  C++ Auth Bridge / WiX-MSI pieces of H-6 and H-7 step-2b).
+- **19 of 22 Medium** and **17 of 18 Low** findings are closed.
+- Remaining deferred items and the rationale for each: M-13 (FIDO
+  MDS integration — external design), M-15 (node-bound FIDO2
+  `hmac_salt` via bundle re-wrap — blocked on export-format
+  design), M-18 (WiX service-account split — multi-day Windows
+  refactor, unverifiable without Windows CI), L-17 (29 HTTP
+  handler lock sites — L-18's atomic `bump_sign_count` already
+  closed the underlying replay race, so the remaining gain is
+  throughput not security).
+
+Notable things a reader / builder should be aware of:
+
+- **Transport auth**: HTTP API `api_addr` dispatches on scheme —
+  `127.0.0.1:…` (legacy TCP) vs `unix:/…` (UDS) vs `pipe:<name>`
+  (Windows named pipe). Only the UDS / pipe paths carry peer
+  credentials that the admin-gate and the TOFU device-binding
+  helper can pin a caller to.
+- **Response MAC**: every HTTP response is signed with
+  `X-DDS-Body-MAC = base64(HMAC-SHA256(key, method || 0 || path
+  || 0 || body))` when `network.api_auth.node_hmac_secret_path`
+  is set; the Windows Auth Bridge verifies the MAC to defeat
+  port-squatting attacks.
+- **Publisher capabilities (C-3)**: policy / software
+  attestations require the issuer to chain back to a trusted
+  root with the matching `dds:policy-publisher-*` or
+  `dds:software-publisher` vouch. Enforced at both gossip ingest
+  and at serve time.
+- **Token envelope**: default is `v=2` canonical CBOR with
+  domain-prefixed signing input; hybrid + triple-hybrid
+  signatures now domain-separated per component. Legacy `v=1` is
+  readable but only ingested when
+  `network.allow_legacy_v1_tokens = true`.
 
 ## 20. Why DDS Is Educationally Interesting
 

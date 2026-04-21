@@ -41,6 +41,8 @@ See [DDS Admin Guide — Windows Deployment](docs/DDS-Admin-Guide.md#windows-dep
 | **[Design Document](docs/DDS-Design-Document.md)** | Architects | Formal specification (§1–§14): identity, CRDTs, P2P, tokens, policy, trust |
 | **[Implementation Whitepaper](docs/DDS-Implementation-Whitepaper.md)** | Engineers | Technical deep-dive on implementation choices and performance budgets |
 | **[STATUS.md](STATUS.md)** | Contributors | Module-by-module implementation tracker with test counts |
+| **[Claude_sec_review.md](Claude_sec_review.md)** | Security reviewers | Source-validated security review with per-finding remediation status (latest pass 2026-04-21 — all Critical + High findings closed) |
+| **[Threat Model Review](docs/threat-model-review.md)** | Architects | Narrative threat model with resolved / open items per subsystem |
 
 ### Platform-Specific
 
@@ -177,19 +179,38 @@ dds --data-dir ./node-b import --in  sync.ddsdump   # idempotent merge into sibl
 dds --data-dir ./node-b import --in  sync.ddsdump --dry-run   # preview only
 ```
 
-### HTTP API (`dds-node`, localhost:5551)
+### HTTP API (`dds-node`)
+
+`api_addr` is scheme-dispatched — production deployments should pick
+**UDS or named pipe** so peer credentials gate the admin endpoints
+and the device-binding helper pins callers to `device_urn` on
+reads:
+
+| `api_addr` | Transport | Peer auth |
+|---|---|---|
+| `127.0.0.1:5551` | loopback TCP (legacy default) | none |
+| `unix:/var/run/dds/api.sock` | Unix domain socket | `SO_PEERCRED` / `getpeereid` |
+| `pipe:dds-api` | Windows named pipe (`\\.\pipe\dds-api`) | primary user SID |
+
+When `network.api_auth.node_hmac_secret_path` is set, every response
+body also carries `X-DDS-Body-MAC` (HMAC-SHA256) so Windows Auth
+Bridge clients can verify response integrity. The MSI provisions
+this secret; locally, run
+`dds-node gen-hmac-secret --out <FILE>`.
 
 | Method | Endpoint | Purpose |
 |---|---|---|
 | `POST` | `/v1/enroll/user` | FIDO2/passkey user enrollment |
 | `POST` | `/v1/enroll/device` | Device enrollment + hardware attestation |
-| `POST` | `/v1/session` | Issue short-lived session token |
+| `GET` | `/v1/session/challenge` | Fresh single-use session challenge |
 | `POST` | `/v1/session/assert` | Issue session from FIDO2 assertion |
 | `GET` | `/v1/enrolled-users` | List enrolled users |
 | `POST` | `/v1/policy/evaluate` | Offline policy evaluation |
 | `GET` | `/v1/status` | Node diagnostics (peers, DAG, trust) |
+| `GET` | `/v1/node/info` | Node pubkey + peer id (for agent pinning) |
 | `GET` | `/v1/windows/policies` | Windows policy for this device |
 | `GET` | `/v1/macos/policies` | macOS policy for this device |
+| `GET` | `/v1/audit/entries` | Signed audit-log slice |
 
 ### Rust API (`dds-core` + `dds-domain`)
 

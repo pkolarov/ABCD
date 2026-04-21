@@ -1,7 +1,66 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-14 (CLI parity + FIDO2 replay hardening: server-issued single-use challenges, sign-count monotonicity, admin vouch UP/RP-ID parity)
+> Last updated: 2026-04-21 (Security remediation sweep complete — all Critical + High findings closed pending Windows CI; see the dedicated [Security Remediation Status](#security-remediation-status) section below)
+
+## Security Remediation Status
+
+Full, source-validated independent review: [Claude_sec_review.md](Claude_sec_review.md)
+(latest pass 2026-04-21). Prior pre-review gaps file:
+[security-gaps.md](security-gaps.md) — now marked superseded.
+
+| Severity | Fixed (pending verify) | Deferred | Rationale for deferral |
+|---|---|---|---|
+| **Critical** | 3/3 | — | — |
+| **High** | 12/12 | — | Windows CI still needs to verify the C++ Auth Bridge + MSI custom action pieces of H-6 and H-7 step-2b. |
+| **Medium** | 19/22 | 3 | M-13 (FIDO MDS integration — external design), M-15 (node-bound FIDO2 `hmac_salt`; blocked on bundle re-wrap design), M-18 (WiX service-account split — multi-day Windows refactor, unverifiable without Windows CI). |
+| **Low** | 17/18 | 1 | L-17 (service-mutex refactor — 29 HTTP handler lock sites; L-18's atomic `bump_sign_count` already closed the replay race so the remaining gain is throughput not security). |
+
+**Highlights shipped in the 2026-04-17 → 2026-04-21 sweep:**
+
+- **Transport auth (H-6, H-7)**: `dds-node::http::serve` now dispatches
+  on `api_addr` scheme. `unix:/path` binds a Unix domain socket and
+  extracts peer credentials on every connection via `peer_cred()`;
+  `pipe:<name>` binds a Windows named pipe and pulls the caller's
+  primary SID via `GetNamedPipeClientProcessId` →
+  `OpenProcessToken` → `GetTokenInformation(TokenUser)`. The
+  `CallerIdentity { Anonymous, Uds, Pipe }` extractor injects the
+  result into every request, and the admin-gate middleware admits
+  based on uid/sid allowlists. Three clients gained matching
+  transport-swap factories: `dds-cli` (hyper + `UnixStream`), the
+  macOS Policy Agent (`DdsNodeHttpFactory` + `ConnectCallback` to
+  `UnixDomainSocketEndPoint`), the Windows Policy Agent (same,
+  plus `NamedPipeClientStream`), and the C++ Auth Bridge
+  (`SendRequestPipe` with `CreateFileW` +
+  `WriteFile`/`ReadFile`). The MSI provisions a per-install 32-byte
+  HMAC secret via a new `CA_GenHmacSecret` custom action; the C++
+  Auth Bridge verifies `X-DDS-Body-MAC` on every response via
+  BCrypt (H-6 step-2 defense-in-depth).
+- **Per-peer admission (H-12)**: new libp2p request-response
+  behaviour on `/dds/admission/1.0.0/<domain>` runs after Noise;
+  `DdsNode::admitted_peers` is populated only after the peer's
+  admission cert verifies against the domain pubkey. Gossip and
+  sync from unadmitted peers are dropped at the behaviour layer.
+- **Crypto hygiene (M-1, M-2, M-10)**: canonical-CBOR token
+  envelope (`v=2`, `dds-token-v2\0 || canonical_cbor(payload)`);
+  hybrid + triple-hybrid signatures now domain-separated per
+  component; Argon2id keyfile schema `v=3` carries
+  `(m_cost, t_cost, p_cost)` with defaults bumped to m=64 MiB,
+  t=3, p=4 (OWASP tier-2, lazy v=2 → v=3 rewrap on load).
+- **Publisher capabilities (C-3)**: `publisher_capability_ok`
+  filter on gossip/sync ingest drops unauthorised
+  policy/software attestations before they enter the trust graph;
+  a symmetric filter on the serve side is kept as defense in
+  depth.
+- **CLI**: new `dds-node gen-hmac-secret --out <FILE>` subcommand
+  writes the per-install HMAC secret (used by the MSI custom
+  action). New `dds-macos-e2e gen-publisher-seed --out <FILE>`
+  subcommand produces a deterministic publisher identity for the
+  e2e harness (needed after C-3's ingest filter).
+- **Doc-refresh pass 2026-04-21**: STATUS, Admin Guide,
+  threat-model review, Design Document, Developer Guide,
+  Implementation Whitepaper, README, and security-gaps.md all
+  updated to reflect the current posture.
 
 ## Build Health
 
@@ -26,7 +85,19 @@ Verification note (2026-04-13, Windows 11 ARM64):
 - Native C++ solution (`DdsNative.sln`) — **6/6 projects build**: Helpers.lib, DdsBridgeIPC.lib, DdsCredentialProvider.dll (ARM64), DdsAuthBridge.exe (x64), DdsTrayAgent.exe (x64), test suites
 - `dds-node/tests/multinode.rs` — **4/4 pass** on Windows ARM64 (dag_converges_after_partition, rejoined_node_catches_up_via_sync_protocol now green)
 - Windows E2E smoke test (`platform/windows/e2e/smoke_test.ps1`) — **8/8 checks pass** including CP DLL COM export verification
-- **Security hardening merged (2026-04-13):** 6 commits: removed unauthenticated session endpoint, enforced RP-ID binding in assertion, credential_id plumbed through Windows CP login path, vault lookup by credential_id (not SID), HTTP API contract alignment, DDS bridge credential selection tests added.
+- **Security hardening merged (2026-04-13 → 2026-04-21):** initial
+  6-commit pre-review batch (removed unauthenticated session
+  endpoint, RP-ID binding in assertion, credential_id plumbing,
+  vault lookup fix, HTTP contract alignment, CP test coverage);
+  then the full Claude-sec-review remediation sweep covering all
+  3 Critical, all 12 High, 19 of 22 Medium, 17 of 18 Low findings
+  — see the [Security Remediation Status](#security-remediation-status)
+  section above and [Claude_sec_review.md](Claude_sec_review.md)
+  for the per-finding ledger. On the Rust workspace every
+  security test added in the sweep is now in-tree and green on
+  the native host + cross-compiled clean for
+  `x86_64-pc-windows-gnu`. The C++ Auth Bridge / MSI pieces of
+  H-6 and H-7 step-2b still need Windows CI to run.
 - **FIDO2 passwordless Windows login re-verified after merge (2026-04-13):** Clean wipe + fresh enrollment: admin setup (auto-persisted trusted_roots) → user enrollment (2 touches) → admin vouch → lock screen → touch key → Windows session. Real YubiKey on Win11 ARM64 QEMU/UTM VM.
 - `test_components.exe` — **11/11 pass**: AES-GCM roundtrip, wrong-key rejection, password encoding, vault serialization, URN-to-SID extraction, IPC struct layout, IPC password transfer, KERB packing, full pipeline, SID resolution, LsaLogonUser with real credentials
 - `test_full_flow.exe` — **PASS**: Full enrollment→login with real FIDO2 authenticator (MakeCredential + 2× GetAssertion + vault save/load + LsaLogonUser)

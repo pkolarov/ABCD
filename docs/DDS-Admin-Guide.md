@@ -257,7 +257,52 @@ The `dds.toml` file controls all node behavior.
 | `mdns_enabled` | bool | `true` | Enable mDNS for LAN auto-discovery |
 | `heartbeat_secs` | int | `5` | Gossipsub heartbeat interval |
 | `idle_timeout_secs` | int | `60` | Close idle peer connections after this duration |
-| `api_addr` | string | `127.0.0.1:5551` | Local HTTP API bind address |
+| `api_addr` | string | `127.0.0.1:5551` | Local HTTP API bind. See **HTTP API transport** below. |
+| `allow_legacy_v1_tokens` | bool | `false` | Accept legacy pre-canonical-CBOR token envelopes on ingest. Turn on briefly during a domain-wide v1 → v2 cutover. |
+
+#### HTTP API transport (H-7)
+
+`api_addr` dispatches on scheme:
+
+| Scheme | Transport | Peer auth |
+|---|---|---|
+| `127.0.0.1:<port>` | loopback TCP (legacy, current default) | none — caller is `Anonymous`; admission falls back to `trust_loopback_tcp_admin` |
+| `unix:/path/to/dds.sock` | Unix domain socket | `getpeereid` / `SO_PEERCRED` → uid/gid/pid |
+| `pipe:<name>` | Windows named pipe (resolves to `\\.\pipe\<name>`) | `GetNamedPipeClientProcessId` + token-user SID |
+
+The UDS / named-pipe paths expose a concrete `CallerIdentity` to the
+admin middleware and the device-binding helper, so admin endpoints can
+be gated on uid / SID and `/v1/*/policies` + `/v1/*/software` bind
+TOFU to the caller's principal. Switch production deployments to one
+of them and then drop `trust_loopback_tcp_admin`.
+
+### `[network.api_auth]` Section (H-6 / H-7 / M-8)
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `trust_loopback_tcp_admin` | bool | `true` | Admit `Anonymous` (TCP) callers to admin endpoints. Transition-only; flip to `false` once every client is on UDS / pipe. |
+| `unix_admin_uids` | uint[] | `[]` | Additional UIDs admitted on admin endpoints over UDS (`0` and the service UID are always admitted). |
+| `windows_admin_sids` | string[] | `[]` | Primary user SIDs admitted on admin endpoints over the named pipe. `S-1-5-18` (LocalSystem) is always admitted. |
+| `node_hmac_secret_path` | path | _unset_ | Per-install HMAC secret used to sign every HTTP response body with `X-DDS-Body-MAC`. The Windows Auth Bridge verifies this to defeat the H-6 challenge-substitution attack. See **Provisioning the response-MAC secret** below. |
+| `strict_device_binding` | bool | `false` | Refuse `Anonymous` (TCP) callers on device-scoped reads. Flip on alongside `trust_loopback_tcp_admin = false`. |
+
+##### Provisioning the response-MAC secret
+
+The MSI installer runs a `CA_GenHmacSecret` custom action that generates
+the file at install time. To provision manually (e.g. on Linux/macOS
+or in a dev loop):
+
+```bash
+dds-node gen-hmac-secret --out /var/lib/dds/node-hmac.key
+# then set:
+#   network.api_auth.node_hmac_secret_path = "/var/lib/dds/node-hmac.key"
+# and distribute the same file to the Windows Auth Bridge
+# (HKLM\SOFTWARE\DDS\AuthBridge\HmacSecretPath).
+```
+
+The file is a fresh 32-byte random key with `0o600` permissions on
+Unix. Pass `--force` to rotate; reinstalls skip overwriting so the
+node and Auth Bridge stay in sync.
 
 ### `[domain]` Section
 
@@ -628,6 +673,35 @@ curl -X POST http://127.0.0.1:5551/v1/policy/evaluate \
 ```
 
 Policy evaluation is offline and targets sub-millisecond latency. It uses only the local trust graph and policy rules — no network calls.
+
+### Publishing policy — publisher capabilities (C-3)
+
+Policy and software documents are **only** admitted into the trust
+graph when the issuer chains back to a trusted root with the matching
+publisher-capability vouch. The supported purposes are:
+
+| Purpose | Covers |
+|---|---|
+| `dds:policy-publisher-windows` | `WindowsPolicyDocument` attestations |
+| `dds:policy-publisher-macos` | `MacOsPolicyDocument` attestations |
+| `dds:software-publisher` | `SoftwareAssignment` attestations |
+
+Before an operator identity can publish policy or software, an admin
+must vouch for that identity with the right purpose. Example:
+
+```bash
+# Assume `alice-ops` is already enrolled as a DDS user.
+# Give her permission to publish Windows policy:
+dds admin vouch \
+    --as-label admin \
+    --subject urn:vouchsafe:alice-ops.7k3mf9... \
+    --purpose dds:policy-publisher-windows
+```
+
+Attestations from any other issuer are rejected at gossip ingest and
+also filtered at serve time as defense in depth. Operators migrating
+from a pre-C-3 deployment should vouch their existing publishers
+before the first ingest restart.
 
 ### Windows Policy (GPO Equivalent)
 

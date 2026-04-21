@@ -11,6 +11,31 @@ Let's dive in.
 
 ---
 
+> **Security-sensitive? (2026-04-21)** This guide is an educational
+> narrative. For the source-of-truth on the production security
+> posture — threat models, remediation status per finding, and the
+> current defaults — see [`Claude_sec_review.md`](../Claude_sec_review.md).
+> Key things a developer should know up-front:
+>
+> - HTTP API transport: `api_addr` is scheme-dispatched —
+>   `127.0.0.1:…` = legacy loopback TCP (Anonymous caller),
+>   `unix:/…` = Unix domain socket (peer-cred-authenticated), and
+>   `pipe:<name>` = Windows named pipe (SID-authenticated).
+>   Admin endpoints go through a `require_admin_middleware` that
+>   evaluates peer creds against `AdmissionPolicy`.
+> - P2P ingest: per-peer admission cert is exchanged on
+>   `/dds/admission/1.0.0/<domain>` immediately after Noise; gossip
+>   and sync from unadmitted peers are dropped at the behaviour
+>   layer (see §8.4 of the Design Document).
+> - Token envelope: the default is `v=2` canonical CBOR with
+>   domain-prefixed signing input (`"dds-token-v2\0" || canonical`);
+>   legacy `v=1` is readable but only ingested when
+>   `allow_legacy_v1_tokens = true`.
+> - Keyfile format: `v=3` carries the Argon2id params in the blob
+>   (defaults m=64 MiB, t=3, p=4). Legacy `v=2` auto-upgrades on
+>   first load; plaintext downgrade refuses once the encrypted
+>   marker is present.
+
 ## 📑 Table of Contents
 
 1. [Chapter 1: The End of the Server](#chapter-1-the-end-of-the-server) — Why are we building this?

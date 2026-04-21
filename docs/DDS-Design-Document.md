@@ -1,7 +1,7 @@
 # Decentralized Directory Service (DDS) — Design Document
 
 **Version:** 0.2 (Draft)
-**Date:** 2026-04-10
+**Date:** 2026-04-10  (security sections §8.4–§8.7 revised 2026-04-21)
 
 ---
 
@@ -368,6 +368,98 @@ To prevent resource exhaustion in trust graph evaluation:
 - Maximum delegation chain depth: **configurable, default 5**
 - Cycle detection: Impossible by design (Vouchsafe's `vch_sum` content-addressing means vouch chains are strictly acyclic)
 - Verification is bounded deterministic computation
+
+### 8.4 Per-Peer Admission (H-12)
+
+A DDS node binds to its domain by holding an `AdmissionCert` — an
+Ed25519 signature from the domain key over `(domain_id, peer_id,
+issued_at, expires_at)`. Self-verification at startup is necessary
+but not sufficient: without a peer-facing exchange, any libp2p peer
+that completes Noise can publish into gossip/sync without being
+admitted.
+
+Design:
+
+- A dedicated `request_response::cbor::Behaviour` on
+  `/dds/admission/1.0.0/<domain_tag>` runs immediately after Noise.
+  Each side sends an `AdmissionRequest` and the peer answers with
+  its admission cert (carried as opaque CBOR bytes so the network
+  layer stays independent of the domain layer).
+- `DdsNode::admitted_peers: BTreeSet<PeerId>` is populated only
+  after `AdmissionCert::verify(&domain_pubkey, &domain_id,
+  &peer_id.to_string(), now)` succeeds. Failure is silently logged;
+  the peer stays unadmitted.
+- Gossipsub `Event::Message { propagation_source, .. }` is gated on
+  `propagation_source ∈ admitted_peers` before the message reaches
+  `handle_gossip_message`. Sync request/response events are gated
+  the same way — unadmitted requesters have their channel dropped;
+  unadmitted responders' payloads are ignored.
+- `ConnectionClosed` removes the peer from the set, so a
+  reconnecting peer must re-verify.
+- C-3's publisher-capability filter (§8.5) remains as the last line
+  of defence even after H-12.
+
+### 8.5 Publisher Capabilities (C-3)
+
+Policy and software attestations are only admitted into the trust
+graph when the issuer chains back to a trusted root with the
+matching publisher-capability vouch: `dds:policy-publisher-windows`,
+`dds:policy-publisher-macos`, or `dds:software-publisher`. The
+filter (`publisher_capability_ok` in `dds-node/src/node.rs`) runs
+both on gossip ingest and again on the serve side of
+`list_applicable_*`. Unauthorised attestations never land in the
+graph and never reach the Policy Agents.
+
+### 8.6 HTTP API Transport Auth (H-6 / H-7)
+
+The local HTTP API's `api_addr` dispatches on scheme:
+
+| Scheme | Transport | Peer cred |
+|---|---|---|
+| `127.0.0.1:<port>` | loopback TCP (legacy) | none — `CallerIdentity::Anonymous` |
+| `unix:/path` | Unix domain socket | `SO_PEERCRED` / `getpeereid` → `CallerIdentity::Uds { uid, gid, pid }` |
+| `pipe:<name>` | Windows named pipe | `GetNamedPipeClientProcessId` + `OpenProcessToken` + `GetTokenInformation(TokenUser)` → `CallerIdentity::Pipe { sid, pid }` |
+
+Admin endpoints (`/v1/enroll/*`, `/v1/admin/*`, `/v1/enrolled-users`,
+`/v1/audit/entries`) run through `require_admin_middleware`, which
+evaluates the caller against `AdmissionPolicy.{admin_uids,
+admin_sids, service_uid}`. Device-scoped endpoints
+(`/v1/{windows,macos}/{policies,software,applied}`) run through
+`check_device_binding_read` / `tofu_device_binding`, which TOFU-bind
+the first caller to a device URN and refuse mismatched follow-ups.
+
+Response-body MAC (H-6): when configured, every response carries
+`X-DDS-Body-MAC: base64(HMAC-SHA256(key, method || 0 || path || 0
+|| body))`. The Windows Auth Bridge verifies the MAC before
+processing the response, defeating the
+challenge-substitution-via-port-squat attack. The MSI provisions
+the 32-byte per-install secret; `dds-node gen-hmac-secret --out
+<FILE>` is the operator tool.
+
+### 8.7 Keyfile Format v=3 (M-10)
+
+Encrypted identity keyfiles now carry the Argon2id parameters in
+the blob so future parameter bumps don't require yet another
+schema version:
+
+```
+{ v: 3,
+  salt: bytes(16),
+  nonce: bytes(12),
+  key: encrypted_bytes,
+  m_cost: uint,   // KiB
+  t_cost: uint,   // iterations
+  p_cost: uint }  // parallelism
+```
+
+v=3 defaults are **m=64 MiB, t=3, p=4** (OWASP tier-2 — target
+unlock 200–500 ms on modern hardware). Legacy v=2 blobs (19 MiB,
+t=2, p=1) load successfully and are transparently rewrapped to
+v=3 on first save. Plaintext downgrade is refused when an
+`<path>.encrypted-marker` is present (M-14); operators can opt
+into a plaintext rewrite with
+`DDS_NODE_ALLOW_PLAINTEXT_DOWNGRADE=1` for disposable dev
+environments.
 
 ---
 

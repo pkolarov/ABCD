@@ -2,6 +2,29 @@
 
 Date: 2026-04-12
 
+> **SUPERSEDED (2026-04-21).** This document captures the state of the
+> security review as of 2026-04-12. A fuller independent review — with
+> per-finding severity, source-validated attack vectors, and
+> remediation status — lives in [Claude_sec_review.md](Claude_sec_review.md)
+> and is current as of 2026-04-21. Every finding flagged in this file
+> has been subsumed by the newer review:
+>
+> | Here | New review |
+> |---|---|
+> | Unauthenticated session mint | ✅ still fixed (`/v1/session` endpoint removed) |
+> | Assertion not bound to subject | ✅ still fixed (I-3 in new review) |
+> | Self-attested device scope | M-7 + M-8 step-1/2 + H-8 addressed it end-to-end |
+> | Enrolled-user enumeration | C-2, H-8 tightened admin bootstrap + vouch capability |
+> | Plaintext key fallback | M-14 (encrypted-marker refuses silent plaintext downgrade) |
+> | Windows ACL hardening | H-5 (named-pipe SDDL), L-16 (AppliedStateStore DACL) |
+> | `0.0.0.0:4001` default | M-4 (mDNS rate caps); H-12 now gates peers post-Noise |
+> | mDNS default-on | M-4 caps + hard peer-table ceiling |
+> | Sign count enforcement | L-18 (atomic `bump_sign_count`) + I-4 |
+> | Dependency audit | Out-of-scope for review; still tracked operationally |
+>
+> Prefer the newer review for all day-to-day operator / dev decisions.
+> This file is retained only for historical context.
+
 ## Findings
 
 ### ~~Critical: Local HTTP API can mint signed session tokens without proof-of-possession~~
