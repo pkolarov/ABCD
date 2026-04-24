@@ -117,12 +117,18 @@ requests, and gossip ingest decisions.
   required to emit normalized signatures. The MAC-replay window is
   closed at the protocol layer by the single-use server challenge
   upstream.
-- **`dds-node::ingest_revocation` doesn't call `cache_sync_payload`.**
-  Means a node that learned a revoke via gossip cannot relay it via
-  the request_response sync protocol to a future reconnecting peer
-  — only the originating publisher can. Doesn't affect this
-  particular test (A originates and caches), but worth fixing
-  separately. **Tracked as a follow-up.**
+- **`dds-node::ingest_revocation` (and `ingest_burn`) didn't call
+  `cache_sync_payload`.** Production gap: a node that learned a
+  revoke via gossip couldn't relay it via the request_response sync
+  protocol to a future reconnecting peer — only the originating
+  publisher could. Didn't affect this particular test (A originates
+  and caches), but a real risk in production deployments. Fixed:
+  both ingests now seed the cache with a deterministic synthetic op
+  (`op-<jti>`). Pinned by
+  `relay_revocation_propagates_via_sync_after_originator_drops` in
+  [`dds-node/tests/multinode.rs`](../dds-node/tests/multinode.rs)
+  — A publishes, B ingests, A drops, C joins fresh and reaches
+  only B → C must learn the revoke via sync.
 
 ## `dds-fido2-test` — single-node HW
 

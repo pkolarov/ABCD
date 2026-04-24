@@ -339,7 +339,9 @@ fn publish_attest(node: &mut DdsNode, op: &Operation, token: &Token) {
 
 fn publish_revocation(node: &mut DdsNode, token: &Token) {
     let token_bytes = token.to_cbor().unwrap();
-    let msg = GossipMessage::Revocation { token_bytes };
+    let msg = GossipMessage::Revocation {
+        token_bytes: token_bytes.clone(),
+    };
     let cbor = msg.to_cbor().unwrap();
     let topic = node.topics.revocations.to_ident_topic();
     let _ = node.swarm.behaviour_mut().gossipsub.publish(topic, cbor);
@@ -348,6 +350,19 @@ fn publish_revocation(node: &mut DdsNode, token: &Token) {
         use dds_store::traits::RevocationStore;
         let _ = node.store.revoke(&target);
     }
+    // Seed the sync cache on the publisher with the same op-id format
+    // that `ingest_revocation` uses on relayers (`op-<jti>`), so peers
+    // catching up via the request_response sync protocol get a single
+    // dedup'd payload regardless of whether they pull from the
+    // originator or a relay.
+    let op = Operation {
+        id: format!("op-{}", token.payload.jti),
+        author: token.payload.iss.clone(),
+        deps: Vec::new(),
+        data: Vec::new(),
+        timestamp: 0,
+    };
+    node.cache_sync_payload(&op.id, &op, &token_bytes);
 }
 
 /// Set up three connected nodes; returns them and their temp dirs.
@@ -702,5 +717,117 @@ async fn rejoined_node_catches_up_via_sync_protocol() {
         c.dag.len(),
         c.dag.contains(&op1.id),
         c.dag.contains(&op2.id),
+    );
+}
+
+/// Regression: a revoke that arrived on a relay node (B) via gossip
+/// must be relayable to a third node (C) via the request_response
+/// sync protocol — not just by the originating publisher (A).
+///
+/// Before the fix, `ingest_revocation` populated the trust graph and
+/// the store but did NOT call `cache_sync_payload`, so the responder
+/// had nothing to send. A peer that joined the mesh after the
+/// originator had disconnected would silently miss every revoke that
+/// landed during its absence.
+///
+/// This test pins the contract: A publishes a revoke and immediately
+/// drops out of the mesh; B receives the revoke via gossip; C joins
+/// fresh and connects only to B; C must learn the revoke via sync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_revocation_propagates_via_sync_after_originator_drops() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Pre-seed an attestation that the revocation will target. Insert
+    // it into B and C directly so the revoke has something to revoke
+    // on each node — we want to test relay of the revoke specifically,
+    // not gossip propagation of the underlying attestation.
+    let (carol, target) = make_attest_token("carol", "att-relay-revoke");
+
+    // A and B form the initial mesh.
+    let (mut a, _ad) = spawn_node("multinode-relay-revoke").await;
+    let (mut b, _bd) = spawn_node("multinode-relay-revoke").await;
+    let a_addr = wait_for_listen(&mut a).await;
+    let b_addr = wait_for_listen(&mut b).await;
+    let a_pid = a.peer_id;
+    let b_pid = b.peer_id;
+    connect_one_sided(&mut a, a_pid, a_addr.clone(), &mut b, b_pid, b_addr.clone());
+
+    // Pre-seed the target attestation on both A and B so the revoke
+    // has something to revoke when it lands.
+    use dds_store::traits::TokenStore;
+    for n in [&mut a, &mut b] {
+        n.trust_graph
+            .write()
+            .unwrap()
+            .add_token(target.clone())
+            .unwrap();
+        n.store.put_token(&target).unwrap();
+    }
+
+    {
+        let mut refs: Vec<&mut DdsNode> = vec![&mut a, &mut b];
+        pump_many_production(&mut refs, MESH_FORMATION_TIMEOUT).await;
+    }
+
+    // A publishes the revoke. B should ingest it via gossip and now
+    // (post-fix) cache it for sync relay.
+    let revoke = make_revoke("att-relay-revoke", &carol);
+    let revoke_jti = revoke.payload.jti.clone();
+    publish_revocation(&mut a, &revoke);
+
+    // Pump until B sees the revoke.
+    let revoke_deadline = Instant::now() + PROPAGATION_TIMEOUT;
+    while Instant::now() < revoke_deadline {
+        {
+            let mut refs: Vec<&mut DdsNode> = vec![&mut a, &mut b];
+            pump_many_production(&mut refs, Duration::from_millis(100)).await;
+        }
+        if b.trust_graph.read().unwrap().is_revoked("att-relay-revoke") {
+            break;
+        }
+    }
+    assert!(
+        b.trust_graph.read().unwrap().is_revoked("att-relay-revoke"),
+        "B failed to ingest revoke via gossip"
+    );
+
+    // Now drop A entirely. C will join after this and can only reach B.
+    drop(a);
+
+    let (mut c, _cd) = spawn_node("multinode-relay-revoke").await;
+    // Pre-seed the target attestation on C too — same justification as
+    // above; we're pinning revoke relay, not attestation propagation.
+    c.trust_graph
+        .write()
+        .unwrap()
+        .add_token(target.clone())
+        .unwrap();
+    c.store.put_token(&target).unwrap();
+
+    let c_addr = wait_for_listen(&mut c).await;
+    let c_pid = c.peer_id;
+    connect_one_sided(&mut c, c_pid, c_addr, &mut b, b_pid, b_addr);
+
+    // C must learn the revoke from B via sync — A is gone, gossip on
+    // the revocations topic is one-shot and was published before C
+    // joined, so the only path left is the request_response sync
+    // protocol firing on ConnectionEstablished + admission completion.
+    let sync_deadline = Instant::now() + PROPAGATION_TIMEOUT;
+    while Instant::now() < sync_deadline {
+        {
+            let mut refs: Vec<&mut DdsNode> = vec![&mut b, &mut c];
+            pump_many_production(&mut refs, Duration::from_millis(100)).await;
+        }
+        if c.trust_graph.read().unwrap().is_revoked("att-relay-revoke") {
+            return;
+        }
+    }
+    panic!(
+        "C never learned the revoke ({revoke_jti}) from B via sync — \
+         this is the relay-revocation regression. \
+         B has revoke = {}, C has revoke = {}, C dag size = {}",
+        b.trust_graph.read().unwrap().is_revoked("att-relay-revoke"),
+        c.trust_graph.read().unwrap().is_revoked("att-relay-revoke"),
+        c.dag.len(),
     );
 }

@@ -156,13 +156,17 @@ Multinode FIDO2 E2E with real hardware (2026-04-24, Windows 11 x64 + Crayonic Ke
     enforces low-S to defend against malleability, and authenticators
     aren't required to emit normalized sigs. Replay is already gated
     upstream by the single-use server challenge.
-- **Follow-up** (not blocking): `dds-node::ingest_revocation` does
-  not call `cache_sync_payload`, so a node that learned a revoke via
-  gossip cannot relay it to a future reconnecting peer via the
-  request_response sync protocol — only the originating publisher
-  can. The multinode test only exercises the originator path so it
-  passes today; production deployments should land the cache call
-  in `ingest_revocation` to match `ingest_operation`.
+- **Follow-up landed**: `dds-node::ingest_revocation` and
+  `ingest_burn` now seed the sync-payload cache with a deterministic
+  synthetic op (`op-<jti>`) so a node that learned a revoke / burn
+  via gossip can relay it to a future reconnecting peer via the
+  request_response sync protocol — not just the originating
+  publisher. New regression test
+  `relay_revocation_propagates_via_sync_after_originator_drops` in
+  `dds-node/tests/multinode.rs` pins the contract: A publishes
+  revoke → B ingests via gossip → A drops → C joins fresh and
+  connects only to B → C must learn the revoke via sync.
+  All 5 multinode tests (including the 4 pre-existing) pass.
 
 Previous verification note (2026-04-13, macOS ARM64):
 

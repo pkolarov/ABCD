@@ -788,6 +788,17 @@ impl DdsNode {
             }
             info!(target_jti = %target, "revocation applied");
         }
+        // Seed the sync-payload cache so a peer that reconnects (or
+        // joins fresh) AFTER this revoke landed via gossip can still
+        // pull it from us via the request_response sync protocol.
+        // Without this, only the originating publisher could relay the
+        // revoke — every other node that learned about it via gossip
+        // would silently fail to forward it on sync, so a partitioned
+        // peer's catch-up depended on the original publisher being
+        // reachable. Mirrors the `cache_sync_payload` call in
+        // `ingest_operation`.
+        let op = synthetic_op_for_token(&token);
+        self.cache_sync_payload(&op.id, &op, token_bytes);
     }
 
     fn ingest_burn(&mut self, token_bytes: &[u8]) {
@@ -828,6 +839,11 @@ impl DdsNode {
             error!("store burn error: {e}");
         }
         info!(urn = %token.payload.iss, "identity burned");
+        // See comment in `ingest_revocation`: cache the burn so a
+        // reconnecting peer can sync it from us, not just from the
+        // original publisher.
+        let op = synthetic_op_for_token(&token);
+        self.cache_sync_payload(&op.id, &op, token_bytes);
     }
 
     fn ingest_audit(&mut self, entry_bytes: &[u8]) {
@@ -1246,6 +1262,22 @@ fn revocation_within_replay_window(iat: u64) -> bool {
 /// does NOT hold the matching `dds:policy-publisher-*` /
 /// `dds:software-publisher` capability chained to a trusted root.
 ///
+/// Build a deterministic synthetic `Operation` for a token that
+/// arrived on a side-channel topic (Revocation / Burn). The sync
+/// protocol carries (op, token) pairs — using a stable id keyed on
+/// the token's JTI ensures the publisher and any relay node compute
+/// the same cache key, so the responder's `known_op_ids` filter
+/// correctly dedupes when the requester already has the token.
+fn synthetic_op_for_token(token: &Token) -> Operation {
+    Operation {
+        id: format!("op-{}", token.payload.jti),
+        author: token.payload.iss.clone(),
+        deps: Vec::new(),
+        data: Vec::new(),
+        timestamp: 0,
+    }
+}
+
 /// Non-publisher tokens (user-auth attestations, device joins,
 /// vouches, revocations, burns) are always accepted here — this
 /// gate is specifically for the unauthenticated-remote-state
