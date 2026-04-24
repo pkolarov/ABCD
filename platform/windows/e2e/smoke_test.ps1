@@ -28,15 +28,23 @@
 .PARAMETER Port
     HTTP API port for the test node. Default: 15551.
 
+.PARAMETER Target
+    Cargo target triple to pass to `cargo test` in step 2 (so CI runs
+    that already built the workspace under e.g. `x86_64-pc-windows-msvc`
+    don't re-link the world from scratch under the host triple — which
+    can blow the runner's disk). Empty means "host default".
+
 .EXAMPLE
     .\smoke_test.ps1
     .\smoke_test.ps1 -Port 15552
+    .\smoke_test.ps1 -Target x86_64-pc-windows-msvc
 #>
 
 param(
     [string]$NodeBinary = "",
     [string]$CliBinary = "",
-    [int]$Port = 15551
+    [int]$Port = 15551,
+    [string]$Target = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -172,8 +180,11 @@ audit_log_enabled = false
     Write-Step 2 "Running Rust CP+FIDO2 E2E tests (cargo test)"
 
     $env:RUST_LOG = "warn"
+    $cargoArgs = @("test", "-p", "dds-node", "--test", "cp_fido_e2e")
+    if ($Target -ne "") { $cargoArgs += @("--target", $Target) }
+    $cargoArgs += @("--", "--nocapture")
     $ErrorActionPreference = "Continue"
-    $testResult = & cargo test -p dds-node --test cp_fido_e2e -- --nocapture 2>&1 | Out-String
+    $testResult = & cargo @cargoArgs 2>&1 | Out-String
     $testExitCode = $LASTEXITCODE
     $ErrorActionPreference = "Stop"
 
@@ -243,12 +254,30 @@ audit_log_enabled = false
 
     $cpDll = Join-Path $nativeBuildDir "Debug\DdsCredentialProvider.dll"
     if (Test-Path $cpDll) {
-        # Try to find dumpbin from MSVC tools
-        $msvcBin = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostarm64\arm64"
-        if (Test-Path "$msvcBin\dumpbin.exe") {
-            $env:PATH = "$msvcBin;$env:PATH"
-        }
+        # Try to locate dumpbin via vswhere — works for any host arch
+        # (x64 or ARM64) and any VS edition (BuildTools / Community / etc.).
         $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+        if (-not $dumpbin) {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            if (Test-Path $vswhere) {
+                $vsRoot = & $vswhere -latest -products * `
+                    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                    -property installationPath 2>$null
+                if ($vsRoot) {
+                    $msvcRoot = Join-Path $vsRoot "VC\Tools\MSVC"
+                    $msvcVer = Get-ChildItem $msvcRoot -ErrorAction SilentlyContinue |
+                        Sort-Object Name -Descending | Select-Object -First 1
+                    if ($msvcVer) {
+                        $hostArch = if ([Environment]::Is64BitOperatingSystem -and $env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "Hostarm64" } else { "Hostx64" }
+                        $candidate = Join-Path $msvcVer.FullName "bin\$hostArch\x64\dumpbin.exe"
+                        if (Test-Path $candidate) {
+                            $env:PATH = "$(Split-Path $candidate);$env:PATH"
+                            $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+                        }
+                    }
+                }
+            }
+        }
         if ($dumpbin) {
             $exports = & dumpbin.exe /exports $cpDll 2>&1
             $hasGetClassObject = $exports | Select-String "DllGetClassObject"

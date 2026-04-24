@@ -27,7 +27,7 @@ The codebase documents most endpoints as "localhost-only with OS process isolati
 
 ---
 
-## Remediation status (latest pass 2026-04-19)
+## Remediation status (latest pass 2026-04-21; Windows host verification 2026-04-24)
 
 This section records the state of each finding after the remediation pass.
 `✅ Fixed (pending verify)` means code landed in this branch and local
@@ -257,6 +257,52 @@ as partial):
     CI must compile and run the end-to-end challenge path
     (real dds-node + Auth Bridge + Credential Provider) before
     this can be considered verified.
+
+**2026-04-24 follow-up pass — Windows host verification + idempotency fix:**
+
+- **H-6 step-2 verified on Windows x64**: Full sweep on a Windows
+  11 + BuildTools 14.44 + WiX 5.0.2 host. `cargo test --workspace`
+  421/421 green, native `DdsNative.sln` Debug + Release build clean,
+  41/41 native unit tests pass, .NET `DdsPolicyAgent.Tests` 149/149
+  pass (110 unit + 39 integration on real Win32 APIs), MSI compiles
+  and `wix msi validate` passes (33.6 MB), `CA_GenHmacSecret` is
+  present in the MSI tables and idempotent end-to-end. Windows E2E
+  smoke test 8/8 checks pass, including the `cp_fido_e2e` Rust E2E
+  through the assertion + session-issuance path that this
+  finding gates.
+- **H-6 step-2 idempotency bug fixed**: the original
+  `gen-hmac-secret` exited with code 1 if the target file already
+  existed, and the WiX `CustomAction Return="check"` would have
+  failed every MSI **repair / upgrade**. Added an explicit
+  `--keep-existing` flag (exits 0 with a "kept existing secret"
+  message when the file is present); the WiX `ExeCommand` now
+  passes `--keep-existing`. Direct human callers still get the
+  refuse-to-overwrite safety net. Pinned by two new tests in
+  `dds-node/tests/h6_gen_hmac_secret.rs`
+  (`gen_hmac_secret_keep_existing_is_idempotent`,
+  `gen_hmac_secret_keep_existing_writes_when_missing`).
+- **H-7 step-2b verified on Windows x64**: `serve_pipe` and the
+  C++ Auth Bridge `SendRequestPipe` compile clean under MSVC; the
+  C# `DdsNodeHttpFactory` for both Windows and macOS Policy Agents
+  compiles and tests pass. The named-pipe transport itself is
+  exercised by `cp_fido_e2e` via the Auth Bridge → dds-node round
+  trip in the smoke test.
+- **Pre-existing Windows-build bugs surfaced and fixed during
+  verification** (none of these are security findings, but
+  several would have masked CI failures):
+  - `dds-cli/src/client.rs` imported `tokio::net::UnixStream` and
+    `hyper-util` symbols at module scope without `#[cfg(unix)]`
+    guards → broke any Windows build that ran `cargo test
+    -p dds-cli`. Now properly gated.
+  - `platform/windows/native/Tests/build_tests.bat` invoked
+    `vswhere -latest -requires VC.Tools.x86.x64` without
+    `-products *`, which excludes the BuildTools SKU. Fixed.
+  - `platform/windows/e2e/smoke_test.ps1` hardcoded an ARM64
+    dumpbin path and force-rebuilt `cp_fido_e2e` for the host
+    triple (which OOM'd a CI runner already holding the
+    `x86_64-pc-windows-msvc` workspace cache). Now discovers
+    dumpbin via `vswhere` and accepts a `-Target` parameter so
+    the existing artifacts get reused.
 
 **2026-04-20 follow-up pass — H-12 (per-peer admission gating):**
 

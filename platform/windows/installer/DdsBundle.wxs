@@ -173,7 +173,7 @@
     <!-- ============================================================ -->
     <CustomAction Id="CA_GenHmacSecret"
                   FileRef="dds_node_exe"
-                  ExeCommand='gen-hmac-secret --out "[CommonAppDataFolder]DDS\node-hmac.key"'
+                  ExeCommand='gen-hmac-secret --keep-existing --out "[CommonAppDataFolder]DDS\node-hmac.key"'
                   Execute="deferred"
                   Impersonate="no"
                   Return="check" />

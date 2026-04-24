@@ -197,18 +197,14 @@ jobs:
       # ---- E2E smoke test ----
       - name: Run Windows E2E smoke test
         shell: pwsh
+        env:
+          # Reuse the workspace test artifacts under target\x86_64-pc-windows-msvc.
+          # CARGO_INCREMENTAL=0 keeps cp_fido_e2e from blowing the runner's
+          # disk by writing fresh per-crate incremental caches.
+          CARGO_INCREMENTAL: "0"
         run: |
-          # The smoke test auto-finds binaries in target\debug or target\release
-          # Build was done with --target so binaries are under target\x86_64-pc-windows-msvc\
-          # Create a symlink so the smoke test finds them
-          $debugDir = "target\debug"
-          $srcDir = "target\x86_64-pc-windows-msvc\debug"
-          if ((-not (Test-Path "$debugDir\dds-node.exe")) -and (Test-Path "$srcDir\dds-node.exe")) {
-            New-Item -ItemType Directory -Path $debugDir -Force | Out-Null
-            Copy-Item "$srcDir\dds-node.exe" "$debugDir\dds-node.exe"
-            if (Test-Path "$srcDir\dds.exe") {
-              Copy-Item "$srcDir\dds.exe" "$debugDir\dds.exe"
-            }
-          }
-          & platform\windows\e2e\smoke_test.ps1
+          & platform\windows\e2e\smoke_test.ps1 `
+            -NodeBinary "target\x86_64-pc-windows-msvc\debug\dds-node.exe" `
+            -CliBinary  "target\x86_64-pc-windows-msvc\debug\dds.exe" `
+            -Target     "x86_64-pc-windows-msvc"
           if ($LASTEXITCODE -ne 0) { throw "Smoke test failed with exit code $LASTEXITCODE" }

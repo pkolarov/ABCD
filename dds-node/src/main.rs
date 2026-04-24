@@ -79,7 +79,7 @@ fn print_usage() {
         "Usage:
   dds-node init-domain --name <NAME> --dir <DIR> [--fido2]
   dds-node gen-node-key --data-dir <DIR>
-  dds-node gen-hmac-secret --out <FILE> [--force]
+  dds-node gen-hmac-secret --out <FILE> [--force] [--keep-existing]
   dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--out <FILE>] [--ttl-days <N>]
   dds-node create-provision-bundle --dir <DIR> --org <ORG> [--out <FILE>]
   dds-node provision <BUNDLE.dds> [--data-dir <DIR>] [--no-start]
@@ -181,12 +181,26 @@ fn cmd_gen_hmac_secret(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     use rand::RngCore;
     let out = PathBuf::from(require_flag(args, "--out")?);
     let force = args.iter().any(|a| a == "--force");
-    if out.exists() && !force {
-        eprintln!(
-            "refusing to overwrite existing HMAC secret at {} (pass --force to replace)",
-            out.display()
-        );
-        std::process::exit(1);
+    // The MSI custom action passes --keep-existing so reinstalls/repairs/upgrades
+    // do not rotate the secret (which would desynchronise dds-node from the
+    // Windows Auth Bridge — see DdsBundle.wxs CA_GenHmacSecret). Humans running
+    // the command directly still get the refuse-to-overwrite safety net.
+    let keep_existing = args.iter().any(|a| a == "--keep-existing");
+    if out.exists() {
+        if keep_existing {
+            println!(
+                "HMAC secret already exists at {} — keeping it (--keep-existing)",
+                out.display()
+            );
+            return Ok(());
+        }
+        if !force {
+            eprintln!(
+                "refusing to overwrite existing HMAC secret at {} (pass --force to replace)",
+                out.display()
+            );
+            std::process::exit(1);
+        }
     }
     if let Some(parent) = out.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {

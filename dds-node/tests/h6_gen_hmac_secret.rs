@@ -109,6 +109,67 @@ fn gen_hmac_secret_force_replaces_file() {
 }
 
 #[test]
+fn gen_hmac_secret_keep_existing_is_idempotent() {
+    // The MSI CA_GenHmacSecret invokes us with `--keep-existing` so a
+    // repair / upgrade does not rotate the secret (which would
+    // desynchronise dds-node from the Windows Auth Bridge). Verify
+    // that flag exits 0 and leaves the file byte-for-byte unchanged.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("node-hmac.key");
+
+    assert!(
+        dds_node_bin()
+            .args(["gen-hmac-secret", "--out", out.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let first = file_bytes(&out);
+
+    let status = dds_node_bin()
+        .args([
+            "gen-hmac-secret",
+            "--keep-existing",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "--keep-existing must exit 0 when the file already exists"
+    );
+    assert_eq!(
+        first,
+        file_bytes(&out),
+        "--keep-existing must NOT rotate an existing secret"
+    );
+}
+
+#[test]
+fn gen_hmac_secret_keep_existing_writes_when_missing() {
+    // First-install path: the file does not exist yet, so --keep-existing
+    // must still write a fresh 32-byte secret.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("node-hmac.key");
+
+    let status = dds_node_bin()
+        .args([
+            "gen-hmac-secret",
+            "--keep-existing",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(file_bytes(&out).len(), 32);
+}
+
+#[test]
 fn gen_hmac_secret_creates_missing_parent_dir() {
     let tmp = tempfile::tempdir().unwrap();
     // Path with a parent directory that does not yet exist. The MSI

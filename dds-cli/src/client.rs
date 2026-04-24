@@ -9,13 +9,19 @@
 //!   doesn't get in the way.
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::client::conn::http1;
-use hyper_util::rt::TokioIo;
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+// UDS transport pulls in hyper + tokio's UnixStream — Unix-only.
+#[cfg(unix)]
+use http_body_util::{BodyExt, Full};
+#[cfg(unix)]
+use hyper::client::conn::http1;
+#[cfg(unix)]
+use hyper_util::rt::TokioIo;
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 /// Default dds-node loopback API base URL.

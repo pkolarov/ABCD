@@ -17,7 +17,8 @@ if not exist "%VSWHERE%" (
     exit /b 1
 )
 
-for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
+REM `-products *` matches Build Tools as well as the Community/Pro/Enterprise IDEs.
+for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
     set "VS_INSTALL=%%i"
 )
 

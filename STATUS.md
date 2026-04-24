@@ -1,7 +1,7 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-21 (Security remediation sweep complete — all Critical + High findings closed pending Windows CI; see the dedicated [Security Remediation Status](#security-remediation-status) section below)
+> Last updated: 2026-04-24 (Windows host verification pass — H-6 step-2 + H-7 step-2b now verified end-to-end on Windows x64; several pre-existing build/CI bugs surfaced and fixed: dds-cli unix-only imports, build_tests.bat BuildTools support, gen-hmac-secret idempotency for MSI repair/upgrade, smoke_test.ps1 -Target plumbing.)
 
 ## Security Remediation Status
 
@@ -9,11 +9,11 @@ Full, source-validated independent review: [Claude_sec_review.md](Claude_sec_rev
 (latest pass 2026-04-21). Prior pre-review gaps file:
 [security-gaps.md](security-gaps.md) — now marked superseded.
 
-| Severity | Fixed (pending verify) | Deferred | Rationale for deferral |
+| Severity | Fixed | Deferred | Rationale for deferral |
 |---|---|---|---|
 | **Critical** | 3/3 | — | — |
-| **High** | 12/12 | — | Windows CI still needs to verify the C++ Auth Bridge + MSI custom action pieces of H-6 and H-7 step-2b. |
-| **Medium** | 19/22 | 3 | M-13 (FIDO MDS integration — external design), M-15 (node-bound FIDO2 `hmac_salt`; blocked on bundle re-wrap design), M-18 (WiX service-account split — multi-day Windows refactor, unverifiable without Windows CI). |
+| **High** | 12/12 | — | H-6 + H-7 step-2b verified on Windows x64 host 2026-04-24 — see "Windows host verification (2026-04-24)" below. |
+| **Medium** | 19/22 | 3 | M-13 (FIDO MDS integration — external design), M-15 (node-bound FIDO2 `hmac_salt`; blocked on bundle re-wrap design), M-18 (WiX service-account split — multi-day Windows refactor). |
 | **Low** | 17/18 | 1 | L-17 (service-mutex refactor — 29 HTTP handler lock sites; L-18's atomic `bump_sign_count` already closed the replay race so the remaining gain is throughput not security). |
 
 **Highlights shipped in the 2026-04-17 → 2026-04-21 sweep:**
@@ -104,6 +104,21 @@ Verification note (2026-04-13, Windows 11 ARM64):
 - `test_hmac_roundtrip.exe` — **PASS**: hmac-secret determinism + encrypt/decrypt roundtrip with real authenticator
 - **Policy Applier Phases D–F verified (2026-04-13, Windows 11 ARM64):** All 4 enforcers now have production Win32 implementations + real e2e integration tests. `WindowsAccountOperations` (netapi32 P/Invoke: create/delete/disable/enable users, group membership, domain-join check), `WindowsPasswordPolicyOperations` (NetUserModalsGet/Set + secedit for complexity), `WindowsSoftwareOperations` (HTTP download + SHA-256 verify + msiexec install/uninstall + registry-based detection), `WindowsRegistryOperations` (idempotent DWORD/String/QWORD/MultiString/Binary/ExpandString with int↔uint comparison fix). 39 integration tests exercise real Win32 APIs on ARM64. Test MSI (32 KB WiX package) installs/uninstalls cleanly.
 - **Phase G+H (installer + CI) verified (2026-04-13, Windows 11 ARM64):** WiX v4 MSI builds clean (30.9 MB ARM64 package, 0 warnings). Includes 5 components: `dds-node.exe` (Windows Service), `DdsAuthBridge.exe` (Windows Service, depends on DdsNode), `DdsCredentialProvider.dll` (COM DLL in System32), `DdsPolicyAgent.exe` (Windows Service, depends on DdsNode), `DdsTrayAgent.exe` (optional). Configuration templates (`node.toml`, `appsettings.json`) installed to `C:\Program Files\DDS\config\`. `C:\ProgramData\DDS\` created for vault/logs/state. CI workflows: `msi.yml` builds x64 MSI + validates + generates SHA-256 checksums + Authenticode signing scaffolding (conditional on certificate secret); `ci.yml` `windows-native` job enhanced with .NET 8.0+9.0 dual testing, Release MSI compile verification, and E2E smoke test execution.
+
+Windows host verification (2026-04-24, Windows 11 x64 + BuildTools 14.44 + WiX 5.0.2):
+
+- `cargo test --workspace --target x86_64-pc-windows-msvc` — **421/421 pass across 25 binaries** (`CARGO_PROFILE_TEST_DEBUG=line-tables-only` to keep PDBs from blowing the runner's disk).
+- C++ native solution (`platform\windows\native\DdsNative.sln`, x64 Debug + Release) — **6/6 projects build clean**: Helpers, DdsBridgeIPC, DdsCommon, DdsCredentialProvider, DdsAuthBridge, DdsTrayAgent.
+- Native test suite (`Tests\build_tests.bat` + `run_all_tests.bat`) — **41/41 tests pass**: IPC layout, message types, struct field offsets, IPC serialization, dds-node URL parsing, JSON helpers, base64url decoding, vault-by-credential-id matching, subject-URN extraction.
+- `dotnet test platform\windows\DdsPolicyAgent.Tests --framework net8.0` — **149/149 pass** (110 unit + 39 integration on real Win32 APIs). net9.0 framework runtime not installed locally on this host; CI continues to cover both via `setup-dotnet`.
+- WiX MSI compiles clean: `wix build DdsBundle.wxs` → **33.64 MB MSI**, `wix msi validate` passes. `CA_GenHmacSecret` custom action present in MSI tables, idempotent end-to-end (verified by re-invoking the staged `dds-node.exe gen-hmac-secret --keep-existing --out X` and hash-comparing the file).
+- Windows E2E smoke test (`platform\windows\e2e\smoke_test.ps1 -Target x86_64-pc-windows-msvc`) — **8/8 checks pass** including `cp_fido_e2e` Rust E2E (3/3) and CP DLL COM-export verification.
+- **Pre-existing build/CI bugs surfaced and fixed during this pass:**
+  - `dds-cli/src/client.rs` imported `tokio::net::UnixStream` and `hyper-util` symbols at module scope without `#[cfg(unix)]` guards → broke any Windows build that ran `cargo test -p dds-cli`. Now properly gated; on Windows the UDS branch compiles to a `fail()` stub.
+  - `dds-node gen-hmac-secret`: refused to overwrite an existing key file with exit 1 → combined with the WiX `CustomAction Return="check"`, this would have failed every MSI **repair / upgrade** install (the secret already exists from the original install). Added `--keep-existing` flag (exits 0 with message when the file is present); the WiX `ExeCommand` now passes `--keep-existing`. Two new tests in `h6_gen_hmac_secret.rs` pin the behavior.
+  - `platform\windows\native\Tests\build_tests.bat` invoked `vswhere -latest -requires VC.Tools.x86.x64` without `-products *` → matched only Community/Pro/Enterprise IDEs, not the BuildTools SKU. Now passes `-products *` so a clean BuildTools-only host (and the GitHub Actions runner) can build the native test binary.
+  - `platform\windows\e2e\smoke_test.ps1`: hardcoded the ARM64 dumpbin path under `bin\Hostarm64\arm64`; on x64 runners this silently skipped the COM-export check. Now discovers dumpbin via `vswhere` for any host arch. The script also unconditionally ran `cargo test -p dds-node --test cp_fido_e2e` against the host triple — on a CI runner that already built the workspace under `--target x86_64-pc-windows-msvc` this kicked off a second full link cycle and OOM'd the runner's disk. Added `-Target` parameter so callers can reuse the existing artifacts.
+  - `.github/workflows/ci.yml`: dropped the brittle "copy binaries into target/debug" pre-step in favor of passing the new `-NodeBinary`/`-CliBinary`/`-Target` parameters directly, with `CARGO_INCREMENTAL=0` set on the smoke-test step to keep its incremental cache from doubling target size on the runner.
 
 Previous verification note (2026-04-13, macOS ARM64):
 
