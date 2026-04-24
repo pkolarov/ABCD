@@ -319,16 +319,21 @@ async fn main() {
         challenge_resp.challenge_b64url, RP_ID
     );
 
-    // SHA-256(clientDataJSON) is the clientDataHash the authenticator signs
-    // alongside authenticatorData.  Pass it as the challenge bytes so that
-    // ctap-hid-fido2 feeds it directly to the CTAP2 getAssertion command.
-    let cdh: [u8; 32] = Sha256::digest(client_data_json.as_bytes()).into();
+    // The cdh the server expects (and the device must sign) is
+    // SHA-256(clientDataJSON). `ctap-hid-fido2`'s GetAssertion API
+    // takes the *raw* challenge and hashes it internally before
+    // wiring it to the CTAP2 command — so we MUST pass clientDataJSON
+    // itself (NOT the pre-hashed cdh) here, otherwise the device
+    // signs over SHA-256(cdh) and the server's verify disagrees by
+    // one hash round.
+    let cdj_bytes = client_data_json.as_bytes();
+    let cdh: [u8; 32] = Sha256::digest(cdj_bytes).into();
 
     println!();
     println!("  >>> TOUCH YOUR FIDO2 KEY AGAIN <<<");
     println!();
 
-    let assert_args = GetAssertionArgsBuilder::new(RP_ID, &cdh)
+    let assert_args = GetAssertionArgsBuilder::new(RP_ID, cdj_bytes)
         .credential_id(credential_id)
         .build();
 
@@ -345,9 +350,12 @@ async fn main() {
     }
     let assertion = &assertions[0];
 
-    // Verify locally — cdh is the clientDataHash the authenticator signed.
+    // Local verify — `verifier::verify_assertion`'s `challenge` parameter
+    // is hashed internally before being concatenated with auth_data, so
+    // we pass `cdj_bytes` (matching what we passed to GetAssertion) so
+    // both sides hash the same input once.
     let ok =
-        verifier::verify_assertion(RP_ID, &verify_result.credential_public_key, &cdh, assertion);
+        verifier::verify_assertion(RP_ID, &verify_result.credential_public_key, cdj_bytes, assertion);
     println!(
         "  Assertion received! (local verify: {})",
         if ok { "PASS" } else { "FAIL" }

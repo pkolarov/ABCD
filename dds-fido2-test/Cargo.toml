@@ -9,12 +9,40 @@ license.workspace = true
 name = "dds-fido2-test"
 path = "src/main.rs"
 
+[[bin]]
+name = "dds-multinode-fido2-test"
+path = "src/bin/multinode.rs"
+
+[[bin]]
+name = "dds-fido2-probe"
+path = "src/bin/probe.rs"
+
 [dependencies]
 ctap-hid-fido2 = "3.5"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "time", "sync"] }
 serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true }
 base64 = "0.22"
 sha2 = { workspace = true }
 rand = { workspace = true }
+
+# Used only by the multinode binary — pull in the in-process node stack
+# so we can spin up three DdsNode instances and inject pre-signed vouch /
+# revoke tokens directly into the gossip layer.
+dds-core = { path = "../dds-core" }
+dds-domain = { path = "../dds-domain" }
+dds-net = { path = "../dds-net" }
+dds-node = { path = "../dds-node" }
+dds-store = { path = "../dds-store" }
+ciborium = "0.2"
+ed25519-dalek = { workspace = true, features = ["std"] }
+futures = "0.3"
+libp2p = { workspace = true }
+tempfile = "3"
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Probe-only — direct p256 verify cross-check
+p256 = { version = "0.13", features = ["ecdsa"] }
+signature = "2"

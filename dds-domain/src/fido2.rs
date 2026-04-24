@@ -224,6 +224,10 @@ fn verify_packed(
             let signature = P256Signature::from_der(&sig)
                 .or_else(|_| P256Signature::from_slice(&sig))
                 .map_err(|e| Fido2Error::KeyError(format!("P-256 sig: {e}")))?;
+            // Normalize high-S signatures — the RustCrypto p256 verifier
+            // enforces low-S; some authenticators emit high-S. See the
+            // matching note in `verify_assertion` for why this is safe.
+            let signature = signature.normalize_s().unwrap_or(signature);
             vk.verify(&signed, &signature)
                 .map_err(|_| Fido2Error::BadSignature)
         }
@@ -306,6 +310,15 @@ pub fn verify_assertion(
             let sig = P256Signature::from_der(signature)
                 .or_else(|_| P256Signature::from_slice(signature))
                 .map_err(|e| Fido2Error::KeyError(format!("P-256 sig: {e}")))?;
+            // WebAuthn-spec authenticators (e.g. Crayonic KeyVault, some
+            // YubiKey firmware) emit ECDSA signatures with high-S
+            // values. The RustCrypto `p256` crate enforces low-S in
+            // `verify` to defend against malleability, which would
+            // reject otherwise-valid assertions. Normalize before
+            // verifying — assertion replay is already gated by the
+            // single-use server challenge upstream, so the malleability
+            // window is closed at the protocol layer regardless.
+            let sig = sig.normalize_s().unwrap_or(sig);
             vk.verify(&signed, &sig)
                 .map_err(|_| Fido2Error::BadSignature)?;
         }

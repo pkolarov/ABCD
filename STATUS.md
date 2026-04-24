@@ -120,6 +120,50 @@ Windows host verification (2026-04-24, Windows 11 x64 + BuildTools 14.44 + WiX 5
   - `platform\windows\e2e\smoke_test.ps1`: hardcoded the ARM64 dumpbin path under `bin\Hostarm64\arm64`; on x64 runners this silently skipped the COM-export check. Now discovers dumpbin via `vswhere` for any host arch. The script also unconditionally ran `cargo test -p dds-node --test cp_fido_e2e` against the host triple — on a CI runner that already built the workspace under `--target x86_64-pc-windows-msvc` this kicked off a second full link cycle and OOM'd the runner's disk. Added `-Target` parameter so callers can reuse the existing artifacts.
   - `.github/workflows/ci.yml`: dropped the brittle "copy binaries into target/debug" pre-step in favor of passing the new `-NodeBinary`/`-CliBinary`/`-Target` parameters directly, with `CARGO_INCREMENTAL=0` set on the smoke-test step to keep its incremental cache from doubling target size on the runner.
 
+Multinode FIDO2 E2E with real hardware (2026-04-24, Windows 11 x64 + Crayonic KeyVault):
+
+- New interactive binary [`dds-multinode-fido2-test`](dds-fido2-test/README.md)
+  spawns three in-process `DdsNode` instances in a star mesh on
+  loopback, each with its own HTTP API. Walks a real authenticator
+  through enrollment on node A, cross-node session issuance on node B,
+  partition-while-revoke + sync catch-up on C, and a final assertion
+  on C that must fail because the vouch was revoked.
+- Verified end-to-end on the Crayonic KeyVault: 3 touches, all checks
+  passed:
+  ```
+  ✓ user visible on B and C
+  ✓ vouch propagated — purposes_for(user) contains dds:user on all 3 nodes
+  ✓ session issued by node B
+  ✓ node C also grants dds:user → cross-node consistency confirmed
+  ✓ revoke visible on A and B (C is partitioned)
+  ✓ revoke arrived on C via sync protocol
+  ✓ node C correctly refused session issuance after revoke
+  === ALL CHECKS PASSED ===
+  ```
+- Bugs surfaced and fixed during the bring-up (full detail in
+  [`dds-fido2-test/README.md`](dds-fido2-test/README.md)):
+  - `dds-fido2-test`'s assertion path passed the pre-hashed cdh to
+    `ctap-hid-fido2`'s `GetAssertionArgsBuilder`, which hashes its
+    `challenge` arg internally before wiring it to the CTAP2
+    command — so the device signed over `SHA-256(cdh)` while the
+    server verified over `cdh`. ctap-hid-fido2's local verifier
+    hashes the same way and agreed with itself, masking the
+    mismatch. Fix: pass `clientDataJSON` bytes; the lib hashes
+    once. Same bug also fixed in the single-node `src/main.rs`.
+  - `dds_domain::fido2::verify_assertion` didn't `normalize_s()` the
+    P-256 signature before verify. Defensive — the actual root cause
+    was the double-hash above — but the RustCrypto p256 verifier
+    enforces low-S to defend against malleability, and authenticators
+    aren't required to emit normalized sigs. Replay is already gated
+    upstream by the single-use server challenge.
+- **Follow-up** (not blocking): `dds-node::ingest_revocation` does
+  not call `cache_sync_payload`, so a node that learned a revoke via
+  gossip cannot relay it to a future reconnecting peer via the
+  request_response sync protocol — only the originating publisher
+  can. The multinode test only exercises the originator path so it
+  passes today; production deployments should land the cache call
+  in `ingest_revocation` to match `ingest_operation`.
+
 Previous verification note (2026-04-13, macOS ARM64):
 
 - `dotnet test` for `platform/macos/DdsPolicyAgent.Tests` — **17/17 pass** (state store, worker, enforcers, real plutil, launchd, profile, software)
