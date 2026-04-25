@@ -40,6 +40,7 @@ See [DDS Admin Guide — Windows Deployment](docs/DDS-Admin-Guide.md#windows-dep
 | **[DDS Developer Guide](docs/DDS-Developer-Guide.md)** | Developers | End-to-end walkthrough of how DDS works under the hood |
 | **[Design Document](docs/DDS-Design-Document.md)** | Architects | Formal specification (§1–§14): identity, CRDTs, P2P, tokens, policy, trust |
 | **[Implementation Whitepaper](docs/DDS-Implementation-Whitepaper.md)** | Engineers | Technical deep-dive on implementation choices and performance budgets |
+| **[AD Drop-in Replacement Roadmap](docs/AD-drop-in-replacement-roadmap.md)** | Architects / Product | Gap map and claim-gated roadmap for DDS to become a credible AD DS replacement |
 | **[STATUS.md](STATUS.md)** | Contributors | Module-by-module implementation tracker with test counts |
 | **[Claude_sec_review.md](Claude_sec_review.md)** | Security reviewers | Source-validated security review with per-finding remediation status (latest pass 2026-04-21 — all Critical + High findings closed) |
 | **[Threat Model Review](docs/threat-model-review.md)** | Architects | Narrative threat model with resolved / open items per subsystem |
