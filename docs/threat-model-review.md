@@ -206,9 +206,9 @@ The local HTTP API now dispatches on `api_addr` scheme:
 
 | Scheme | Transport | Peer-cred source | Use |
 |---|---|---|---|
-| `127.0.0.1:<port>` | loopback TCP (legacy) | none — caller is `CallerIdentity::Anonymous` | backward compat; flip off with `strict_device_binding = true` once clients move |
+| `127.0.0.1:<port>` | loopback TCP (legacy; Linux/macOS dev default) | none — caller is `CallerIdentity::Anonymous` | backward compat; flip off with `strict_device_binding = true` once clients move |
 | `unix:/path/to/sock` | UDS (Linux/macOS) | `stream.peer_cred()` → `CallerIdentity::Uds { uid, gid, pid }` | Recommended on Linux/macOS |
-| `pipe:<name>` | Windows named pipe | `GetNamedPipeClientProcessId` + `OpenProcessToken` + `GetTokenInformation(TokenUser)` → `CallerIdentity::Pipe { sid, pid }` | Recommended on Windows |
+| `pipe:<name>` | Windows named pipe (Windows MSI default since A-2) | `GetNamedPipeClientProcessId` + `OpenProcessToken` + `GetTokenInformation(TokenUser)` → `CallerIdentity::Pipe { sid, pid }` | Default on Windows |
 
 Clients that have been updated:
 - `dds-cli` (hyper + `UnixStream` for `unix:` URLs).
@@ -216,7 +216,15 @@ Clients that have been updated:
   `UnixDomainSocketEndPoint`).
 - Windows Policy Agent (same, plus `NamedPipeClientStream`).
 - C++ Auth Bridge (`SendRequestPipe` over `CreateFileW` +
-  `WriteFile`/`ReadFile`; unverified on Windows pending CI).
+  `WriteFile`/`ReadFile`; verified on Windows x64 host 2026-04-24).
+- **A-2 (2026-04-25)**: Windows Auth Bridge `CDdsConfiguration` now
+  reads an `ApiAddr` REG_SZ alongside `DdsNodePort` and routes through
+  `SetBaseUrl`, and the MSI provisions
+  `HKLM\SOFTWARE\DDS\AuthBridge\ApiAddr = pipe:dds-api`. The shipped
+  `node.toml` template defaults `api_addr = 'pipe:dds-api'` and
+  `[network.api_auth] trust_loopback_tcp_admin = false`. Stock MSI
+  installs reach the H-7 step-2b pipe transport without operator
+  changes.
 
 Response-body MAC (H-6): when
 `network.api_auth.node_hmac_secret_path` is set, every response carries
@@ -229,12 +237,16 @@ caller fails closed.
 
 ### Recommendations
 
-1. Finish the operational cutover on every deployment: switch
-   `api_addr` to `unix:…` / `pipe:…`, then flip both
+1. Finish the operational cutover on every Linux/macOS deployment:
+   switch `api_addr` to `unix:…`, then flip both
    `trust_loopback_tcp_admin = false` and `strict_device_binding = true`.
-2. Run Windows CI on the C++ Auth Bridge pipe path (`SendRequestPipe`)
-   and the MSI custom action (`CA_GenHmacSecret`). Macro-verified on
-   macOS; Windows runtime still needed.
+   Windows MSI installs already ship pipe-by-default with
+   `trust_loopback_tcp_admin = false` since A-2 (2026-04-25); flip
+   `strict_device_binding = true` next.
+2. Verified on Windows x64 host 2026-04-24: C++ Auth Bridge pipe path
+   (`SendRequestPipe`) and the MSI custom action (`CA_GenHmacSecret`).
+   A-2 closes the runtime-config gap so the pipe transport is reachable
+   from a stock MSI install — real-hardware login reverify pending.
 3. For the Windows software installer TOCTOU gap (B-6), move package
    staging out of `%TEMP%` into a SYSTEM/Admin-only cache and rehash
    immediately before launch.

@@ -129,11 +129,19 @@ if (-not (Test-Path $NodeToml)) {
 # Data directory for vault, certificates, and replication state
 data_dir = 'C:\ProgramData\DDS'
 
-# HTTP API listen address (used by Auth Bridge and Policy Agent)
-api_addr = '127.0.0.1:5551'
+[network]
+# HTTP API listen address (used by Auth Bridge and Policy Agent).
+# A-2 (security review): default to the named-pipe transport so the
+# admin gate sees a verified caller SID.
+api_addr = 'pipe:dds-api'
 
 # P2P listen addresses (multiaddr format)
 # listen = ['/ip4/0.0.0.0/tcp/4001', '/ip4/0.0.0.0/udp/4001/quic-v1']
+
+[network.api_auth]
+# A-2: refuse loopback-TCP admin callers; safe because api_addr ships as a
+# named pipe and the LocalSystem services match the built-in S-1-5-18 allowlist.
+trust_loopback_tcp_admin = false
 
 # Trusted root identities (URNs of domain founders)
 # trusted_roots = []

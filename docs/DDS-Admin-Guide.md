@@ -257,7 +257,7 @@ The `dds.toml` file controls all node behavior.
 | `mdns_enabled` | bool | `true` | Enable mDNS for LAN auto-discovery |
 | `heartbeat_secs` | int | `5` | Gossipsub heartbeat interval |
 | `idle_timeout_secs` | int | `60` | Close idle peer connections after this duration |
-| `api_addr` | string | `127.0.0.1:5551` | Local HTTP API bind. See **HTTP API transport** below. |
+| `api_addr` | string | `127.0.0.1:5551` (Linux/macOS dev), `pipe:dds-api` (Windows MSI) | Local HTTP API bind. See **HTTP API transport** below. |
 | `allow_legacy_v1_tokens` | bool | `false` | Accept legacy pre-canonical-CBOR token envelopes on ingest. Turn on briefly during a domain-wide v1 → v2 cutover. |
 
 #### HTTP API transport (H-7)
@@ -266,21 +266,33 @@ The `dds.toml` file controls all node behavior.
 
 | Scheme | Transport | Peer auth |
 |---|---|---|
-| `127.0.0.1:<port>` | loopback TCP (legacy, current default) | none — caller is `Anonymous`; admission falls back to `trust_loopback_tcp_admin` |
+| `127.0.0.1:<port>` | loopback TCP (legacy; still the Linux/macOS dev default) | none — caller is `Anonymous`; admission falls back to `trust_loopback_tcp_admin` |
 | `unix:/path/to/dds.sock` | Unix domain socket | `getpeereid` / `SO_PEERCRED` → uid/gid/pid |
-| `pipe:<name>` | Windows named pipe (resolves to `\\.\pipe\<name>`) | `GetNamedPipeClientProcessId` + token-user SID |
+| `pipe:<name>` | Windows named pipe (resolves to `\\.\pipe\<name>`); **Windows MSI default since A-2 (2026-04-25)** | `GetNamedPipeClientProcessId` + token-user SID |
 
 The UDS / named-pipe paths expose a concrete `CallerIdentity` to the
 admin middleware and the device-binding helper, so admin endpoints can
 be gated on uid / SID and `/v1/*/policies` + `/v1/*/software` bind
-TOFU to the caller's principal. Switch production deployments to one
-of them and then drop `trust_loopback_tcp_admin`.
+TOFU to the caller's principal.
+
+**Windows MSI deployments** ship pipe-first by default since **A-2
+(2026-04-25)**: `node.toml` is generated with `api_addr = 'pipe:dds-api'`
+and `[network.api_auth] trust_loopback_tcp_admin = false`, the Auth
+Bridge reads `HKLM\SOFTWARE\DDS\AuthBridge\ApiAddr = pipe:dds-api`, and
+the Policy Agent's `appsettings.json` has `NodeBaseUrl = "pipe:dds-api"`.
+A hand-installed dev/test deployment that does not provision the
+registry value still falls back to TCP loopback via `DdsNodePort`
+(legacy behaviour preserved).
+
+**Linux / macOS deployments** stay on TCP by default for backward
+compat — switch `api_addr` to `unix:…` and then drop
+`trust_loopback_tcp_admin` once every client is on the new transport.
 
 ### `[network.api_auth]` Section (H-6 / H-7 / M-8)
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `trust_loopback_tcp_admin` | bool | `true` | Admit `Anonymous` (TCP) callers to admin endpoints. Transition-only; flip to `false` once every client is on UDS / pipe. |
+| `trust_loopback_tcp_admin` | bool | `true` (Rust default), `false` in the Windows MSI's shipped `node.toml` since A-2 | Admit `Anonymous` (TCP) callers to admin endpoints. Transition-only; flip to `false` once every client is on UDS / pipe. |
 | `unix_admin_uids` | uint[] | `[]` | Additional UIDs admitted on admin endpoints over UDS (`0` and the service UID are always admitted). |
 | `windows_admin_sids` | string[] | `[]` | Primary user SIDs admitted on admin endpoints over the named pipe. `S-1-5-18` (LocalSystem) is always admitted. |
 | `node_hmac_secret_path` | path | _unset_ | Per-install HMAC secret used to sign every HTTP response body with `X-DDS-Body-MAC`. The Windows Auth Bridge verifies this to defeat the H-6 challenge-substitution attack. See **Provisioning the response-MAC secret** below. |
@@ -303,6 +315,25 @@ dds-node gen-hmac-secret --out /var/lib/dds/node-hmac.key
 The file is a fresh 32-byte random key with `0o600` permissions on
 Unix. Pass `--force` to rotate; reinstalls skip overwriting so the
 node and Auth Bridge stay in sync.
+
+##### Windows Auth Bridge registry knobs (`HKLM\SOFTWARE\DDS\AuthBridge`)
+
+The Auth Bridge service reads its config from the registry. The MSI
+provisions all keys at install time; operators can override per-host:
+
+| Value | Type | MSI default | Purpose |
+|---|---|---|---|
+| `ApiAddr` | REG_SZ | `pipe:dds-api` | Full URL forwarded to the bridge's HTTP client. Recognised schemes mirror `api_addr`: `pipe:<name>` (preferred), `http://host:port`. **A-2 (2026-04-25)**: when set, this wins over `DdsNodePort`; empty falls back to `http://127.0.0.1:<DdsNodePort>` for legacy compatibility. Must point at the same target as the node's `api_addr`. |
+| `DdsNodePort` | REG_DWORD | `5551` | Legacy TCP-only fallback port; only consulted when `ApiAddr` is empty. |
+| `HmacSecretPath` | REG_EXPAND_SZ | `%ProgramData%\DDS\node-hmac.key` | Path to the H-6 response-MAC secret. Empty = MAC verification disabled (transition-only); unreadable = service refuses to start. |
+| `DeviceUrn` | REG_SZ | _unset_ | Optional pin for the device URN used in enrolled-user lookups. |
+| `RpId` | REG_SZ | `dds.local` | FIDO2 relying-party ID. |
+| `FilterBuiltInProviders` | REG_DWORD | `0` | Hide other Credential Providers when DDS is configured. |
+| `AllowPasswordFallback` | REG_DWORD | `1` | Allow the password-tile fallback when the FIDO2 path fails. |
+
+A matching client knob lives in the Policy Agent's
+`appsettings.json`: `DdsPolicyAgent.NodeBaseUrl`. The MSI ships
+`pipe:dds-api`; flip to TCP only when reverting the cutover.
 
 ### `[domain]` Section
 

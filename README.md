@@ -189,9 +189,9 @@ reads:
 
 | `api_addr` | Transport | Peer auth |
 |---|---|---|
-| `127.0.0.1:5551` | loopback TCP (legacy default) | none |
+| `127.0.0.1:5551` | loopback TCP (Linux/macOS dev default) | none |
 | `unix:/var/run/dds/api.sock` | Unix domain socket | `SO_PEERCRED` / `getpeereid` |
-| `pipe:dds-api` | Windows named pipe (`\\.\pipe\dds-api`) | primary user SID |
+| `pipe:dds-api` | Windows named pipe (`\\.\pipe\dds-api`); **Windows MSI default since A-2 (2026-04-25)** | primary user SID |
 
 When `network.api_auth.node_hmac_secret_path` is set, every response
 body also carries `X-DDS-Body-MAC` (HMAC-SHA256) so Windows Auth

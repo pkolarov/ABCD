@@ -416,9 +416,9 @@ The local HTTP API's `api_addr` dispatches on scheme:
 
 | Scheme | Transport | Peer cred |
 |---|---|---|
-| `127.0.0.1:<port>` | loopback TCP (legacy) | none — `CallerIdentity::Anonymous` |
+| `127.0.0.1:<port>` | loopback TCP (legacy; Linux/macOS dev default) | none — `CallerIdentity::Anonymous` |
 | `unix:/path` | Unix domain socket | `SO_PEERCRED` / `getpeereid` → `CallerIdentity::Uds { uid, gid, pid }` |
-| `pipe:<name>` | Windows named pipe | `GetNamedPipeClientProcessId` + `OpenProcessToken` + `GetTokenInformation(TokenUser)` → `CallerIdentity::Pipe { sid, pid }` |
+| `pipe:<name>` | Windows named pipe (Windows MSI default since A-2) | `GetNamedPipeClientProcessId` + `OpenProcessToken` + `GetTokenInformation(TokenUser)` → `CallerIdentity::Pipe { sid, pid }` |
 
 Admin endpoints (`/v1/enroll/*`, `/v1/admin/*`, `/v1/enrolled-users`,
 `/v1/audit/entries`) run through `require_admin_middleware`, which
@@ -427,6 +427,17 @@ admin_sids, service_uid}`. Device-scoped endpoints
 (`/v1/{windows,macos}/{policies,software,applied}`) run through
 `check_device_binding_read` / `tofu_device_binding`, which TOFU-bind
 the first caller to a device URN and refuse mismatched follow-ups.
+
+The Windows Auth Bridge picks its transport via
+`HKLM\SOFTWARE\DDS\AuthBridge\ApiAddr` (REG_SZ) — added in **A-2
+(2026-04-25)** — which is forwarded verbatim to
+`CDdsNodeHttpClient::SetBaseUrl`. Empty falls back to the legacy
+`DdsNodePort` DWORD (TCP loopback). The MSI provisions
+`ApiAddr = pipe:dds-api`, matching the shipped `node.toml` template
+(`api_addr = 'pipe:dds-api'` + `trust_loopback_tcp_admin = false`)
+and the Policy Agent's `appsettings.json`
+(`NodeBaseUrl = "pipe:dds-api"`). Stock MSI installs reach the
+named-pipe transport without operator changes.
 
 Response-body MAC (H-6): when configured, every response carries
 `X-DDS-Body-MAC: base64(HMAC-SHA256(key, method || 0 || path || 0

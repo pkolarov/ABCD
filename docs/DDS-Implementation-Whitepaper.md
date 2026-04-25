@@ -1599,7 +1599,14 @@ Notable things a reader / builder should be aware of:
   `127.0.0.1:…` (legacy TCP) vs `unix:/…` (UDS) vs `pipe:<name>`
   (Windows named pipe). Only the UDS / pipe paths carry peer
   credentials that the admin-gate and the TOFU device-binding
-  helper can pin a caller to.
+  helper can pin a caller to. **Windows MSI installs default to
+  `pipe:dds-api` since A-2 (2026-04-25)**: `node.toml` ships with
+  `api_addr = 'pipe:dds-api'` and
+  `trust_loopback_tcp_admin = false`, the Auth Bridge reads
+  `HKLM\SOFTWARE\DDS\AuthBridge\ApiAddr = pipe:dds-api`, and the
+  Policy Agent's `appsettings.json` `NodeBaseUrl` matches.
+  Linux/macOS dev deployments still default to TCP — operators
+  flip them manually.
 - **Response MAC**: every HTTP response is signed with
   `X-DDS-Body-MAC = base64(HMAC-SHA256(key, method || 0 || path
   || 0 || body))` when `network.api_auth.node_hmac_secret_path`

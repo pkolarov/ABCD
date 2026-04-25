@@ -22,7 +22,11 @@ Let's dive in.
 >   `unix:/…` = Unix domain socket (peer-cred-authenticated), and
 >   `pipe:<name>` = Windows named pipe (SID-authenticated).
 >   Admin endpoints go through a `require_admin_middleware` that
->   evaluates peer creds against `AdmissionPolicy`.
+>   evaluates peer creds against `AdmissionPolicy`. **Windows MSI
+>   installs default to `pipe:dds-api` since A-2 (2026-04-25)**;
+>   the Auth Bridge picks the URL from
+>   `HKLM\SOFTWARE\DDS\AuthBridge\ApiAddr` (REG_SZ) and the Policy
+>   Agent reads it from `appsettings.json` `NodeBaseUrl`.
 > - P2P ingest: per-peer admission cert is exchanged on
 >   `/dds/admission/1.0.0/<domain>` immediately after Noise; gossip
 >   and sync from unadmitted peers are dropped at the behaviour

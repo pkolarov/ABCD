@@ -81,6 +81,7 @@ struct DdsTestRegistrar
 #include "test_dds_auth.cpp"
 #include "test_dds_bridge_selection.cpp"
 #include "test_join_state.cpp"
+#include "test_api_addr_resolve.cpp"
 
 // ============================================================================
 // main -- run all tests, print summary
