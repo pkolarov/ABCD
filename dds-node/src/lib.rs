@@ -6,6 +6,7 @@
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+pub mod admission_revocation_store;
 pub mod config;
 pub mod device_binding;
 pub mod domain_store;

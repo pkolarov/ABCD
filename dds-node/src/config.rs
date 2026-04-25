@@ -337,6 +337,15 @@ impl NodeConfig {
             .clone()
             .unwrap_or_else(|| self.data_dir.join("admission.cbor"))
     }
+
+    /// Path to the admission revocation list file (CBOR-encoded
+    /// `RevocationListV1`). Defaults to `<data_dir>/admission_revocations.cbor`.
+    /// The list is loaded once at startup; revocations dropped here
+    /// take effect on the next node restart and from then on apply to
+    /// every peer admission handshake.
+    pub fn admission_revocations_path(&self) -> PathBuf {
+        self.data_dir.join("admission_revocations.cbor")
+    }
 }
 
 /// Configuration errors.

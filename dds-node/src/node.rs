@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 
 use dds_domain::{DomainId, domain::from_hex};
 
+use crate::admission_revocation_store::{self, AdmissionRevocationStore};
 use crate::config::NodeConfig;
 
 /// How often we proactively sync against every connected peer as a
@@ -139,6 +140,13 @@ pub struct DdsNode {
     /// Cleared on `ConnectionClosed` so a reconnected peer must
     /// present its cert afresh.
     admitted_peers: BTreeSet<PeerId>,
+    /// **Threat-model §1 — admission cert revocation list (open
+    /// item #4)**: domain-signed list of peer ids that are no longer
+    /// welcome. Loaded once at startup from
+    /// `<data_dir>/admission_revocations.cbor`. Consulted before
+    /// admitting a peer in [`Self::verify_peer_admission`] and at
+    /// startup in [`Self::init`] so a revoked node refuses to start.
+    admission_revocations: AdmissionRevocationStore,
 }
 
 impl DdsNode {
@@ -198,6 +206,36 @@ impl DdsNode {
             .map_err(|e| format!("admission cert verification failed: {e}"))?;
         info!(domain = %config.domain.name, %peer_id, "admission cert verified");
 
+        // Threat-model §1 — admission cert revocation list (open item #4):
+        // Load the domain-signed revocation list and refuse to start if
+        // *this* node's PeerId appears in it. Without the self-check a
+        // compromised node could keep restarting after the admin issued
+        // a revocation — only peer-side enforcement would stop it from
+        // talking to the network.
+        let revocations_path = config.admission_revocations_path();
+        let admission_revocations =
+            admission_revocation_store::load_or_empty(&revocations_path, domain_id, domain_pubkey)
+                .map_err(|e| {
+                    format!(
+                        "failed to load admission revocation list from {}: {e}",
+                        revocations_path.display()
+                    )
+                })?;
+        if admission_revocations.is_revoked(&peer_id.to_string()) {
+            return Err(format!(
+                "this node's admission has been revoked (peer_id {peer_id}); refusing to start. \
+                 Re-provision with a new libp2p keypair and a fresh admission cert to rejoin."
+            )
+            .into());
+        }
+        if !admission_revocations.is_empty() {
+            info!(
+                count = admission_revocations.len(),
+                path = %revocations_path.display(),
+                "loaded admission revocation list"
+            );
+        }
+
         // Build trusted roots set
         let trusted_roots: BTreeSet<String> = config.trusted_roots.iter().cloned().collect();
 
@@ -227,6 +265,7 @@ impl DdsNode {
             mdns_rate: (Instant::now(), 0),
             mdns_known_peers: BTreeSet::new(),
             admitted_peers: BTreeSet::new(),
+            admission_revocations,
         })
     }
 
@@ -512,7 +551,20 @@ impl DdsNode {
     /// peer is added to `admitted_peers` and an opportunistic sync is
     /// kicked off — at this point we've proven the peer belongs to
     /// the same domain and is worth catching up with.
+    ///
+    /// Threat-model §1 — admission cert revocation list (open item #4):
+    /// before accepting the cert we consult `admission_revocations`.
+    /// A peer whose id appears there is rejected even with a valid
+    /// cert, since the cert was issued before the admin revoked them.
     fn verify_peer_admission(&mut self, peer_id: PeerId, response: AdmissionResponse) {
+        let peer_str = peer_id.to_string();
+        if self.admission_revocations.is_revoked(&peer_str) {
+            warn!(
+                %peer_id,
+                "H-12: peer is on the domain admission revocation list — refusing to admit"
+            );
+            return;
+        }
         let Some(cert_cbor) = response.cert_cbor else {
             warn!(%peer_id, "H-12: peer returned no cert — staying unadmitted");
             return;
@@ -531,12 +583,7 @@ impl DdsNode {
                 return;
             }
         };
-        match cert.verify(
-            &self.domain_pubkey,
-            &self.domain_id,
-            &peer_id.to_string(),
-            now,
-        ) {
+        match cert.verify(&self.domain_pubkey, &self.domain_id, &peer_str, now) {
             Ok(()) => {
                 info!(%peer_id, "H-12: peer admitted to domain");
                 self.admitted_peers.insert(peer_id);
@@ -548,6 +595,15 @@ impl DdsNode {
                 warn!(%peer_id, error = ?e, "H-12: peer cert rejected — staying unadmitted");
             }
         }
+    }
+
+    /// Threat-model §1 — open item #4 (admission cert revocation list):
+    /// expose the in-memory revocation store for tests. The store is
+    /// loaded once at startup; callers that want to force a reload
+    /// (e.g. after `dds-node import-revocation`) should restart the
+    /// node, since the H-12 handshake only fires on connect/reconnect.
+    pub fn admission_revocations(&self) -> &AdmissionRevocationStore {
+        &self.admission_revocations
     }
 
     /// **M-4 (security review)**: decide whether to accept an

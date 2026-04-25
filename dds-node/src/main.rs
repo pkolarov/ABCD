@@ -19,6 +19,19 @@
 //!   Ship the resulting cert to the sibling and place it at
 //!   `<data_dir>/admission.cbor`.
 //!
+//! - `dds-node revoke-admission --domain-key <FILE> --domain <FILE> --peer-id <ID> [--reason <STR>] [--out FILE]`
+//!   Threat-model §1 / open item #4. The admin issues a domain-signed
+//!   admission revocation for `peer_id`. Ship the resulting CBOR file
+//!   to every node and import it with `import-revocation`. Each node
+//!   then refuses to admit (or, on its own peer id, refuses to start)
+//!   the revoked peer.
+//!
+//! - `dds-node import-revocation --data-dir <DIR> --in <FILE>`
+//!   Append a revocation file to the local
+//!   `<data_dir>/admission_revocations.cbor`. Idempotent. Restart the
+//!   node so the new entry takes effect on the next admission
+//!   handshake.
+//!
 //! - `dds-node run [config.toml]`
 //!   Default action. Loads config, verifies admission cert, runs the
 //!   P2P node.
@@ -55,6 +68,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "gen-node-key" => cmd_gen_node_key(&args[1..]),
         "gen-hmac-secret" => cmd_gen_hmac_secret(&args[1..]),
         "admit" => cmd_admit(&args[1..]),
+        "revoke-admission" => cmd_revoke_admission(&args[1..]),
+        "import-revocation" => cmd_import_revocation(&args[1..]),
         "create-provision-bundle" => cmd_create_bundle(&args[1..]),
         "provision" => cmd_provision(&args[1..]),
         "run" => cmd_run(&args[1..]).await,
@@ -81,6 +96,8 @@ fn print_usage() {
   dds-node gen-node-key --data-dir <DIR>
   dds-node gen-hmac-secret --out <FILE> [--force] [--keep-existing]
   dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--out <FILE>] [--ttl-days <N>]
+  dds-node revoke-admission --domain-key <FILE> --domain <FILE> --peer-id <ID> [--reason <STR>] [--out <FILE>]
+  dds-node import-revocation --data-dir <DIR> --in <FILE>
   dds-node create-provision-bundle --dir <DIR> --org <ORG> [--out <FILE>]
   dds-node provision <BUNDLE.dds> [--data-dir <DIR>] [--no-start]
   dds-node run [config.toml]"
@@ -262,6 +279,104 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         println!("  expires:   never");
     }
     println!("  out:       {}", out.display());
+    Ok(())
+}
+
+/// Threat-model §1 / open item #4: issue a domain-signed admission
+/// revocation. Ship the resulting CBOR file to every node and import
+/// it with `import-revocation`. Revocations are permanent — to
+/// re-admit the peer, generate a new libp2p keypair on the target
+/// machine and issue a fresh admission cert for the new PeerId.
+fn cmd_revoke_admission(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use dds_node::admission_revocation_store;
+
+    let domain_key_path = PathBuf::from(require_flag(args, "--domain-key")?);
+    let domain_path = PathBuf::from(require_flag(args, "--domain")?);
+    let peer_id = require_flag(args, "--peer-id")?;
+    let reason = flag(args, "--reason").map(|s| s.to_string());
+    let out = PathBuf::from(flag(args, "--out").unwrap_or("admission_revocation.cbor"));
+
+    let key = domain_store::load_domain_key(&domain_key_path)?;
+    let domain = domain_store::load_domain_file(&domain_path)?;
+    if key.id() != domain.id {
+        return Err("domain key does not match domain.toml id".into());
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let rev = key.revoke_admission(peer_id.to_string(), now, reason.clone());
+    admission_revocation_store::save_revocation_file(&out, &rev)?;
+
+    println!("Admission revocation issued:");
+    println!("  domain:     {} ({})", domain.name, domain.id);
+    println!("  peer_id:    {peer_id}");
+    println!("  revoked_at: {now}");
+    if let Some(r) = reason {
+        println!("  reason:     {r}");
+    }
+    println!("  out:        {}", out.display());
+    println!();
+    println!("Distribute this file to every node in the domain and run:");
+    println!(
+        "  dds-node import-revocation --data-dir <DIR> --in {}",
+        out.display()
+    );
+    Ok(())
+}
+
+/// Append a revocation file produced by `revoke-admission` into the
+/// node's local revocation list at
+/// `<data_dir>/admission_revocations.cbor`. Idempotent. The new entry
+/// only takes effect at the next node restart, since the H-12
+/// admission handshake is a per-connection event and the loaded list
+/// is cached for the lifetime of the running process.
+fn cmd_import_revocation(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use dds_node::admission_revocation_store;
+
+    let data_dir = PathBuf::from(require_flag(args, "--data-dir")?);
+    let in_path = PathBuf::from(require_flag(args, "--in")?);
+
+    // We need the domain pubkey + id to verify the revocation on
+    // import. Read them from the node's config — this guarantees the
+    // operator has explicitly placed a config under data_dir, and
+    // mirrors how the node itself loads them.
+    let cfg_path = data_dir.join("dds.toml");
+    let cfg = if cfg_path.exists() {
+        NodeConfig::from_file(&cfg_path)?
+    } else {
+        return Err(format!(
+            "no dds.toml at {} — import-revocation needs the node's config to know which \
+             domain to verify the revocation against",
+            cfg_path.display()
+        )
+        .into());
+    };
+    let domain_id = dds_domain::DomainId::parse(&cfg.domain.id)?;
+    let pk_vec = dds_domain::domain::from_hex(&cfg.domain.pubkey)?;
+    if pk_vec.len() != 32 {
+        return Err("domain pubkey is not 32 bytes".into());
+    }
+    let mut domain_pubkey = [0u8; 32];
+    domain_pubkey.copy_from_slice(&pk_vec);
+
+    let list_path = cfg.admission_revocations_path();
+    let (added, _) =
+        admission_revocation_store::import_into(&list_path, &in_path, domain_id, domain_pubkey)?;
+
+    let store = admission_revocation_store::load_or_empty(&list_path, domain_id, domain_pubkey)?;
+    if added {
+        println!("Imported revocation into {}", list_path.display());
+    } else {
+        println!(
+            "Revocation already present in {} (idempotent no-op)",
+            list_path.display()
+        );
+    }
+    println!("  total entries: {}", store.len());
+    println!();
+    println!("Restart the node for the new entry to take effect on the next");
+    println!("admission handshake.");
     Ok(())
 }
 

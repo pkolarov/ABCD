@@ -207,6 +207,32 @@ impl DomainKey {
             signature: sig.to_bytes().to_vec(),
         }
     }
+
+    /// Issue an admission revocation for a peer id. Once a node loads
+    /// this revocation, it will refuse to admit `peer_id` during the
+    /// H-12 handshake regardless of what cert that peer presents.
+    /// Revocations are permanent — there is no un-revoke. To re-admit
+    /// the peer, generate a new libp2p keypair on the target machine
+    /// and issue a fresh admission cert for the new PeerId.
+    pub fn revoke_admission(
+        &self,
+        peer_id: String,
+        revoked_at: u64,
+        reason: Option<String>,
+    ) -> AdmissionRevocation {
+        let body = RevocationBody {
+            domain_id: self.id(),
+            peer_id,
+            revoked_at,
+            reason,
+        };
+        let payload = body.to_signing_bytes();
+        let sig = self.signing_key.sign(&payload);
+        AdmissionRevocation {
+            body,
+            signature: sig.to_bytes().to_vec(),
+        }
+    }
 }
 
 impl DomainSigner for DomainKey {
@@ -276,6 +302,85 @@ impl AdmissionCert {
             && now > exp
         {
             return Err(DomainError::Expired);
+        }
+        if self.signature.len() != 64 {
+            return Err(DomainError::Signature(format!(
+                "expected 64-byte signature, got {}",
+                self.signature.len()
+            )));
+        }
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&self.signature);
+        let vk = VerifyingKey::from_bytes(domain_pubkey)
+            .map_err(|e| DomainError::Crypto(e.to_string()))?;
+        let sig = Signature::from_bytes(&sig_arr);
+        let payload = self.body.to_signing_bytes();
+        vk.verify(&payload, &sig)
+            .map_err(|e| DomainError::Signature(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Signed body of an admission revocation. Mirrors [`AdmissionBody`] in
+/// shape so peers can verify revocations against the same domain pubkey
+/// they already trust for admissions. Field order is fixed; the CBOR
+/// encoding of this struct is what gets signed.
+///
+/// `peer_id` is the libp2p PeerId string of the node whose admission is
+/// being revoked. `revoked_at` is UNIX-seconds at issuance (used by
+/// recipients to detect rebroadcast staleness, not to expire the
+/// revocation itself — once revoked, a peer stays revoked).
+///
+/// **Threat-model §1 — admission cert revocation list (open item #4).**
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevocationBody {
+    pub domain_id: DomainId,
+    pub peer_id: String,
+    pub revoked_at: u64,
+    pub reason: Option<String>,
+}
+
+impl RevocationBody {
+    fn to_signing_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf).expect("cbor encode revocation body");
+        buf
+    }
+}
+
+/// Domain-signed statement that a previously-admitted peer id is no
+/// longer welcome in the domain. Verified against the domain pubkey;
+/// peers check the local revocation list during the H-12 admission
+/// handshake and refuse to admit a peer whose id appears here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdmissionRevocation {
+    pub body: RevocationBody,
+    pub signature: Vec<u8>, // 64 bytes
+}
+
+impl AdmissionRevocation {
+    pub fn to_cbor(&self) -> Result<Vec<u8>, DomainError> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf).map_err(|e| DomainError::Serialize(e.to_string()))?;
+        Ok(buf)
+    }
+
+    pub fn from_cbor(bytes: &[u8]) -> Result<Self, DomainError> {
+        ciborium::from_reader(bytes).map_err(|e| DomainError::Deserialize(e.to_string()))
+    }
+
+    /// Verify the signature against `domain_pubkey` and confirm the
+    /// revocation applies to `expected_domain_id`. Unlike
+    /// [`AdmissionCert::verify`], there is no `expected_peer_id` argument
+    /// — callers iterate the revocation list and match on
+    /// `body.peer_id` themselves.
+    pub fn verify(
+        &self,
+        domain_pubkey: &[u8; 32],
+        expected_domain_id: &DomainId,
+    ) -> Result<(), DomainError> {
+        if &self.body.domain_id != expected_domain_id {
+            return Err(DomainError::Mismatch("domain_id mismatch".into()));
         }
         if self.signature.len() != 64 {
             return Err(DomainError::Signature(format!(
@@ -440,5 +545,72 @@ mod tests {
         let s = to_hex(&bytes);
         assert_eq!(s, "deadbeef00ff");
         assert_eq!(from_hex(&s).unwrap(), bytes);
+    }
+
+    #[test]
+    fn admission_revocation_sign_and_verify() {
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let d = key.domain();
+        let rev = key.revoke_admission(
+            "12D3KooWPeerIdExample".into(),
+            1_700_000_000,
+            Some("key compromise".into()),
+        );
+        rev.verify(&d.pubkey, &d.id).unwrap();
+        assert_eq!(rev.body.peer_id, "12D3KooWPeerIdExample");
+        assert_eq!(rev.body.reason.as_deref(), Some("key compromise"));
+    }
+
+    #[test]
+    fn admission_revocation_rejects_wrong_domain() {
+        let a = DomainKey::generate("acme.com", &mut OsRng);
+        let b = DomainKey::generate("globex.com", &mut OsRng);
+        let rev = a.revoke_admission("peer".into(), 0, None);
+        let other = b.domain();
+        assert!(rev.verify(&other.pubkey, &other.id).is_err());
+    }
+
+    #[test]
+    fn admission_revocation_rejects_tampered_signature() {
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let d = key.domain();
+        let mut rev = key.revoke_admission("peer".into(), 0, None);
+        rev.signature[0] ^= 0xff;
+        assert!(matches!(
+            rev.verify(&d.pubkey, &d.id),
+            Err(DomainError::Signature(_))
+        ));
+    }
+
+    #[test]
+    fn admission_revocation_rejects_tampered_body() {
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let d = key.domain();
+        let mut rev = key.revoke_admission("peer-A".into(), 0, None);
+        // Forge a different peer id while keeping the original signature.
+        rev.body.peer_id = "peer-B".into();
+        assert!(matches!(
+            rev.verify(&d.pubkey, &d.id),
+            Err(DomainError::Signature(_))
+        ));
+    }
+
+    #[test]
+    fn admission_revocation_cbor_roundtrip() {
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let rev = key.revoke_admission("peer".into(), 1234, Some("decommissioned".into()));
+        let bytes = rev.to_cbor().unwrap();
+        let decoded = AdmissionRevocation::from_cbor(&bytes).unwrap();
+        let d = key.domain();
+        decoded.verify(&d.pubkey, &d.id).unwrap();
+        assert_eq!(decoded, rev);
+    }
+
+    #[test]
+    fn admission_revocation_signature_is_unique_per_peer() {
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let r1 = key.revoke_admission("peer-A".into(), 100, None);
+        let r2 = key.revoke_admission("peer-B".into(), 100, None);
+        assert_ne!(r1.signature, r2.signature);
     }
 }

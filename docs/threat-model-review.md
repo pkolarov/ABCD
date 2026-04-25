@@ -48,7 +48,7 @@ unadmitted peers are dropped at the behaviour layer.
 | Risk | Severity | Mitigation |
 |------|----------|------------|
 | **Bearer token** — admission cert is a static file with no channel binding. Anyone who obtains a copy can impersonate the admitted peer on another machine. | High | The cert binds to a `PeerId` derived from a libp2p Ed25519 keypair stored in `p2p_key.bin`. An attacker needs both the cert AND the private key. However, if both files are copied, the node is fully cloned. |
-| **No revocation** — there is no mechanism to revoke an admission cert. A compromised node stays admitted until the domain key is rotated. | High | **Gap**: Add a domain-level revocation list (signed by the domain key) that nodes exchange via gossip. Peers check the list before accepting connections. |
+| ~~**No revocation** — there is no mechanism to revoke an admission cert. A compromised node stays admitted until the domain key is rotated.~~ | ~~High~~ | **FIXED (2026-04-26)**: domain-signed `AdmissionRevocation` tokens (`dds-domain::AdmissionRevocation`), persisted at `<data_dir>/admission_revocations.cbor` (`dds-node::admission_revocation_store`). The H-12 handshake refuses to admit a peer whose id appears in the list, and `DdsNode::init` refuses to start if the local node's own peer id is revoked. CLI: `dds-node revoke-admission` issues a revocation, `dds-node import-revocation` adds it to a node. v1 distribution is manual file copy; gossip-piggyback is a future increment. |
 | ~~**No expiry enforcement** — `AdmissionBody::expires_at` is optional and not checked at connection time by peers.~~ | ~~Medium~~ | **FIXED (M-6)**. `DdsNode::run` re-verifies the admission cert every 600 s against `(domain_pubkey, domain_id, peer_id, now)`; expiry triggers a clean shutdown. |
 | **Replay** — a captured admission cert can be replayed indefinitely since there is no nonce or timestamp-based freshness check beyond the optional `expires_at`. | Medium | Addressed by binding to `PeerId` (which requires the corresponding private key). True replay requires key theft. |
 
@@ -56,7 +56,12 @@ unadmitted peers are dropped at the behaviour layer.
 
 1. ~~Add `admission_cert_ttl_days` config field; nodes reject peers whose cert
    `expires_at` is in the past.~~ → **closed by M-6**.
-2. Implement a domain-signed revocation list gossipped on the `dds-revoke` topic.
+2. ~~Implement a domain-signed revocation list gossipped on the `dds-revoke` topic.~~
+   → **partially closed (2026-04-26)**: domain-signed revocation type
+   landed (`AdmissionRevocation`), with on-disk store and H-12 enforcement
+   (open item #4 in §8). v1 distribution is manual file copy; gossip-based
+   piggyback on the H-12 admission response (so revocations propagate
+   automatically as peers reconnect) remains as a follow-up increment.
 3. ~~Consider mutual admission cert exchange during libp2p Noise handshake so
    both peers verify domain membership before any application traffic.~~ →
    **closed by H-12** (via request-response behaviour that runs immediately
@@ -285,7 +290,7 @@ application from failed application.
 | 1 | ~~Sync persistence before trust-graph acceptance (B-1)~~ ✅ closed 2026-04-25 | High | §5 |
 | 2 | ~~Live-attestation requirement for purpose grants (B-2)~~ ✅ closed 2026-04-25 | High | §5 |
 | 3 | ~~Failed enforcement retry semantics (B-3)~~ ✅ closed 2026-04-25 | High | §7 |
-| 4 | Admission cert revocation list | High | §1 |
+| 4 | ~~Admission cert revocation list~~ ✅ closed 2026-04-26 (manual distribution; gossip-piggyback follow-up tracked in §1 recommendations) | High | §1 |
 | 5 | ~~Active-version selection for policies/software (B-4)~~ ✅ closed 2026-04-25 | Medium | §5 |
 | 6 | ~~Challenge-store cleanup and caps (B-5)~~ ✅ closed 2026-04-25 | Medium | §5 |
 | 7 | ~~Windows software staging TOCTOU hardening (B-6)~~ ✅ closed 2026-04-25 (Windows-CI verification of DACL helper still pending) | Medium | §6 |
@@ -300,5 +305,7 @@ All Critical findings from the source-validated review are now Fixed
 (pending verify). All six findings (B-1 through B-6) from the
 2026-04-25 follow-up have landed in this branch as of 2026-04-25
 follow-up #5; only the Windows-side DACL helper for B-6 still needs
-Windows CI to exercise. The single remaining High item is the
-admission cert revocation list (§1) — orthogonal to B-1…B-6.
+Windows CI to exercise. The previously-open admission cert revocation
+list (§1) closed on 2026-04-26 — local enforcement (the load-bearing
+half) is in tree; gossip-based auto-distribution is a follow-up
+increment. **No High items remain open.**

@@ -21,7 +21,10 @@ pub mod domain;
 pub mod fido2;
 pub mod types;
 
-pub use domain::{AdmissionBody, AdmissionCert, Domain, DomainId, DomainKey, DomainSigner};
+pub use domain::{
+    AdmissionBody, AdmissionCert, AdmissionRevocation, Domain, DomainId, DomainKey, DomainSigner,
+    RevocationBody,
+};
 pub use types::*;
 
 use dds_core::token::TokenPayload;
