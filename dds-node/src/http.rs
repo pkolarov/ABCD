@@ -688,6 +688,15 @@ pub struct EnrollUserRequestJson {
     pub rp_id: String,
     pub display_name: String,
     pub authenticator_type: String,
+    /// **A-1 step-3 (security review)**: base64-standard-encoded raw
+    /// UTF-8 bytes of the authenticator's `clientDataJSON`. Optional
+    /// for backward compatibility — when present, the server
+    /// validates `type == "webauthn.create"`, `origin ==
+    /// "https://<rp_id>"`, and `crossOrigin != true` per WebAuthn
+    /// §7.1 steps 8–11. The supplied JSON is bound to
+    /// `client_data_hash_b64` via SHA-256 first.
+    #[serde(default)]
+    pub client_data_json_b64: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -954,6 +963,10 @@ where
 {
     let attestation_object = b64_decode(&req.attestation_object_b64, "attestation_object_b64")?;
     let client_data_hash = b64_decode(&req.client_data_hash_b64, "client_data_hash_b64")?;
+    let client_data_json = match &req.client_data_json_b64 {
+        Some(s) => Some(b64_decode(s, "client_data_json_b64")?),
+        None => None,
+    };
     let internal = EnrollUserRequest {
         label: req.label,
         credential_id: req.credential_id,
@@ -962,6 +975,7 @@ where
         rp_id: req.rp_id,
         display_name: req.display_name,
         authenticator_type: req.authenticator_type,
+        client_data_json,
     };
     let mut svc = state.svc.lock().await;
     let r = svc.enroll_user(internal)?;
@@ -1226,6 +1240,10 @@ where
 {
     let attestation_object = b64_decode(&req.attestation_object_b64, "attestation_object_b64")?;
     let client_data_hash = b64_decode(&req.client_data_hash_b64, "client_data_hash_b64")?;
+    let client_data_json = match &req.client_data_json_b64 {
+        Some(s) => Some(b64_decode(s, "client_data_json_b64")?),
+        None => None,
+    };
     let internal = AdminSetupRequest {
         label: req.label,
         credential_id: req.credential_id,
@@ -1234,6 +1252,7 @@ where
         rp_id: req.rp_id,
         display_name: req.display_name,
         authenticator_type: req.authenticator_type,
+        client_data_json,
     };
     let mut svc = state.svc.lock().await;
     let r = svc.admin_setup(internal)?;
@@ -2281,6 +2300,7 @@ mod tests {
             rp_id: "example.com".into(),
             display_name: "Alice".into(),
             authenticator_type: "platform".into(),
+            client_data_json_b64: None,
         };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/enroll/user"))
@@ -2305,6 +2325,7 @@ mod tests {
             rp_id: "example.com".into(),
             display_name: "Alice".into(),
             authenticator_type: "platform".into(),
+            client_data_json_b64: None,
         };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/enroll/user"))
@@ -2392,6 +2413,7 @@ mod tests {
             rp_id: "dds.local".into(),
             display_name: "Bob".into(),
             authenticator_type: "platform".into(),
+            client_data_json_b64: None,
         };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/enroll/user"))
@@ -2461,6 +2483,7 @@ mod tests {
             rp_id: "dds.local".into(),
             display_name: "Carol".into(),
             authenticator_type: "platform".into(),
+            client_data_json_b64: None,
         };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/enroll/user"))
@@ -2570,6 +2593,7 @@ mod tests {
                 rp_id: "dds.local".into(),
                 display_name: name.to_uppercase(),
                 authenticator_type: "platform".into(),
+                client_data_json_b64: None,
             };
             let resp = reqwest::Client::new()
                 .post(format!("{base}/v1/enroll/user"))
@@ -2641,6 +2665,7 @@ mod tests {
             rp_id: "dds.local".into(),
             display_name: "Alice".into(),
             authenticator_type: "cross-platform".into(),
+            client_data_json_b64: None,
         };
         let enroll_resp = reqwest::Client::new()
             .post(format!("{base}/v1/enroll/user"))
@@ -3263,6 +3288,7 @@ mod tests {
             rp_id: rp_id.into(),
             display_name: label.to_uppercase(),
             authenticator_type: "platform".into(),
+            client_data_json_b64: None,
         };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/enroll/user"))

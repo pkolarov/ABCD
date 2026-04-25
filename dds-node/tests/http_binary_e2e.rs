@@ -432,6 +432,7 @@ async fn enroll_user_fido2(
             rp_id: rp_id.to_string(),
             display_name: label.to_string(),
             authenticator_type: "platform".to_string(),
+            client_data_json_b64: None,
         })
         .send()
         .await
@@ -664,6 +665,7 @@ async fn binary_http_api_end_to_end() {
             rp_id: "example.com".to_string(),
             display_name: "Carol".to_string(),
             authenticator_type: "platform".to_string(),
+            client_data_json_b64: None,
         })
         .send()
         .await

@@ -14,7 +14,7 @@ marked superseded.
 | Severity | Fixed | Deferred | Addendum (open) | Rationale for deferral |
 |---|---|---|---|---|
 | **Critical** | 3/3 | — | — | — |
-| **High** | 12/12 | — | 2 (A-1 ⚠ step-1 landed, A-2) | H-6 + H-7 step-2b verified on Windows x64 host 2026-04-24 — see "Windows host verification (2026-04-24)" below. |
+| **High** | 12/12 | — | 1 (A-2); A-1 landed pending HW verify | H-6 + H-7 step-2b verified on Windows x64 host 2026-04-24 — see "Windows host verification (2026-04-24)" below. |
 | **Medium** | 20/22 | 3 | 3 (A-3, A-4, A-6) | M-13 (FIDO MDS integration — external design), M-15 (node-bound FIDO2 `hmac_salt`; blocked on bundle re-wrap design), M-18 (WiX service-account split — multi-day Windows refactor). |
 | **Low** | 17/18 | 1 | — | L-17 (service-mutex refactor — 29 HTTP handler lock sites; L-18's atomic `bump_sign_count` already closed the replay race so the remaining gain is throughput not security). |
 
@@ -23,7 +23,7 @@ M-1…M-22 ledger; the addendum table below is the per-finding view.
 
 **Addendum pass 2026-04-24** (5 open + 1 landed):
 
-- **A-1 (High) ⚠ steps 1+2 landed 2026-04-25, step-3 still open**:
+- **A-1 (High) ✅ steps 1+2+3 landed 2026-04-25, pending HW reverify**:
   Step-1 — `fmt = "none"` is rejected by default; opt-in via
   `DomainConfig.allow_unattested_credentials` (default `false`),
   with WARN logging on accepted unattested paths.
@@ -34,11 +34,19 @@ M-1…M-22 ledger; the addendum table below is the per-finding view.
   that pubkey. Chain validation against trust anchors stays in
   M-13 (FIDO MDS integration). Four new unit tests cover the
   positive path (synthetic rcgen leaf), garbage cert, sig under
-  wrong key, and alg/SPKI mismatch. **Real-HW
-  (`dds-multinode-fido2-test`) verification pending** — re-run
-  next time a Crayonic / YubiKey is connected.
-  **Step-3 still open** — clientDataJSON parsing at enrollment to
-  mirror M-12.
+  wrong key, and alg/SPKI mismatch.
+  Step-3 — `EnrollUserRequest` / `AdminSetupRequest` gain optional
+  `client_data_json` (mirroring M-12 at the assertion side); new
+  `verify_enrollment_client_data` helper enforces
+  `type == "webauthn.create"`, `origin == "https://<rp_id>"`, and
+  `crossOrigin != true` after binding the JSON to the signed CDH
+  via SHA-256. Backward-compatible — when the field is absent the
+  legacy rp-id-hash-only path runs. 8 new unit tests cover the
+  helper.
+  **Real-HW (`dds-multinode-fido2-test`) verification pending** —
+  re-run next time a Crayonic / YubiKey is connected.
+  Server-issued enrollment challenge (closes the cdj.challenge
+  gap) is tracked separately as a follow-up.
 - **A-2 (High)**: Windows Auth Bridge `CDdsConfiguration` only reads
   `DdsNodePort`; there is no `ApiAddr` field. `DdsAuthBridgeMain` wires
   the HTTP client via `SetPort`, not `SetBaseUrl`, so the pipe transport

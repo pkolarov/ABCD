@@ -35,6 +35,18 @@ pub struct EnrollUserRequest {
     pub rp_id: String,
     pub display_name: String,
     pub authenticator_type: String,
+    /// **A-1 step-3 (security review)**: raw UTF-8 bytes of the
+    /// authenticator's `clientDataJSON` from MakeCredential. Optional
+    /// for backward compatibility — when present, the server parses
+    /// the JSON and validates `type == "webauthn.create"`,
+    /// `origin == "https://<rp_id>"`, and `crossOrigin != true` per
+    /// WebAuthn §7.1 steps 8–11. The supplied JSON is bound to the
+    /// signed `client_data_hash` first, so an attacker cannot present
+    /// unrelated bytes that happen to parse with the right fields.
+    /// When absent, only the `client_data_hash` -> `authData`
+    /// rp-id-hash check runs (legacy behaviour). Mirrors the M-12
+    /// pattern at the assertion side.
+    pub client_data_json: Option<Vec<u8>>,
 }
 
 /// Request to enroll a device.
@@ -585,6 +597,15 @@ impl<
     ) -> Result<EnrollmentResult, ServiceError> {
         let mut credential_id = req.credential_id.clone();
         if self.verify_fido2 {
+            // A-1 step-3: when the caller supplies raw clientDataJSON,
+            // bind it to the signed hash and validate `type` /
+            // `origin` / `crossOrigin` per WebAuthn §7.1.
+            verify_enrollment_client_data(
+                req.client_data_json.as_deref(),
+                &req.client_data_hash,
+                &req.rp_id,
+            )?;
+
             let parsed = dds_domain::fido2::verify_attestation(
                 &req.attestation_object,
                 &req.client_data_hash,
@@ -1565,6 +1586,13 @@ impl<
         // so we inline the enrollment logic here.
         let mut credential_id = req.credential_id.clone();
         if self.verify_fido2 {
+            // A-1 step-3: same clientDataJSON checks as `enroll_user`.
+            verify_enrollment_client_data(
+                req.client_data_json.as_deref(),
+                &req.client_data_hash,
+                &req.rp_id,
+            )?;
+
             let parsed = dds_domain::fido2::verify_attestation(
                 &req.attestation_object,
                 &req.client_data_hash,
@@ -2131,6 +2159,89 @@ fn rand_u64() -> u64 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     RandomState::new().build_hasher().finish()
+}
+
+/// **A-1 step-3 (security review)**: validate the raw
+/// `clientDataJSON` from a MakeCredential response, mirroring M-12's
+/// assertion-side check. When `cdj_bytes` is `None`, the legacy
+/// "no clientDataJSON" path runs (caller still validates the
+/// rp-id-hash via `verify_attestation`). When `Some`:
+///
+/// 1. Bind the supplied JSON to the signed `client_data_hash` via
+///    SHA-256 — otherwise an attacker could present unrelated bytes
+///    that happen to parse with valid fields.
+/// 2. Parse the JSON and enforce per WebAuthn §7.1 steps 8–11:
+///    - `type == "webauthn.create"` (assertion path enforces
+///      `"webauthn.get"` instead).
+///    - `origin == "https://<rp_id>"`.
+///    - `crossOrigin != true`.
+///
+/// **Note** on the missing challenge check: the assertion path
+/// validates the cdj `challenge` against a server-issued value
+/// consumed via `consume_challenge`. Today's enrollment flow has no
+/// matching server-issued challenge endpoint — the client supplies
+/// whatever challenge it computed `client_data_hash` over. Closing
+/// that gap is a separate refactor (introduce
+/// `/v1/enroll/challenge`); the `type` and `origin` checks land here
+/// in step-3 because they are independent of that work.
+fn verify_enrollment_client_data(
+    cdj_bytes: Option<&[u8]>,
+    client_data_hash: &[u8],
+    rp_id: &str,
+) -> Result<(), ServiceError> {
+    use sha2::{Digest, Sha256};
+
+    let Some(cdj_bytes) = cdj_bytes else {
+        return Ok(());
+    };
+
+    // 1. Bind clientDataJSON to the signed hash.
+    let cdj_hash = Sha256::digest(cdj_bytes);
+    if cdj_hash.as_slice() != client_data_hash {
+        return Err(ServiceError::Fido2(
+            "client_data_hash does not match SHA-256 of supplied clientDataJSON".into(),
+        ));
+    }
+
+    // 2. Parse and validate fields.
+    let cdj: serde_json::Value = serde_json::from_slice(cdj_bytes)
+        .map_err(|e| ServiceError::Fido2(format!("clientDataJSON is not valid JSON: {e}")))?;
+
+    // §7.1 step 8: type must be "webauthn.create".
+    let ty = cdj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServiceError::Fido2("clientDataJSON missing type field".into()))?;
+    if ty != "webauthn.create" {
+        return Err(ServiceError::Fido2(format!(
+            "clientDataJSON type is {ty:?}, expected \"webauthn.create\""
+        )));
+    }
+
+    // §7.1 step 10: origin must be https://<rp_id>.
+    let expected_origin = format!("https://{rp_id}");
+    let origin = cdj
+        .get("origin")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServiceError::Fido2("clientDataJSON missing origin field".into()))?;
+    if origin != expected_origin {
+        return Err(ServiceError::Fido2(format!(
+            "clientDataJSON origin is {origin:?}, expected {expected_origin:?}"
+        )));
+    }
+
+    // Reject mixed-origin / cross-origin enrollment we do not support.
+    if cdj
+        .get("crossOrigin")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(ServiceError::Fido2(
+            "clientDataJSON.crossOrigin is true; cross-origin enrollment is refused".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// **M-12 (security review)**: decode a WebAuthn `challenge` field
@@ -3017,4 +3128,128 @@ mod platform_applier_tests {
     // exercised in this module.
     #[allow(dead_code)]
     fn _used(_: DeviceJoinDocument) {}
+}
+
+#[cfg(test)]
+mod a1_step3_client_data_tests {
+    //! **A-1 step-3**: unit tests for `verify_enrollment_client_data`.
+    //! Mirror the M-12 assertion-side coverage; the only differences
+    //! are `type == "webauthn.create"` (vs `"webauthn.get"`) and the
+    //! absence of a server-issued challenge check (no enrollment
+    //! challenge endpoint exists yet — see helper docstring).
+
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn cdj(ty: &str, origin: &str, cross_origin: Option<bool>) -> Vec<u8> {
+        let mut obj = serde_json::json!({
+            "type": ty,
+            "origin": origin,
+            "challenge": "AAAA",
+        });
+        if let Some(co) = cross_origin {
+            obj["crossOrigin"] = serde_json::Value::Bool(co);
+        }
+        serde_json::to_vec(&obj).unwrap()
+    }
+
+    fn cdh_of(bytes: &[u8]) -> Vec<u8> {
+        Sha256::digest(bytes).to_vec()
+    }
+
+    #[test]
+    fn legacy_no_cdj_path_passes_through() {
+        // None means "old client" — helper must succeed without
+        // touching anything else. Caller still validates rp-id-hash
+        // via verify_attestation.
+        verify_enrollment_client_data(None, &[0u8; 32], "example.com").unwrap();
+    }
+
+    #[test]
+    fn well_formed_cdj_accepted() {
+        let bytes = cdj("webauthn.create", "https://example.com", None);
+        let cdh = cdh_of(&bytes);
+        verify_enrollment_client_data(Some(&bytes), &cdh, "example.com").unwrap();
+    }
+
+    #[test]
+    fn cdh_mismatch_rejected() {
+        let bytes = cdj("webauthn.create", "https://example.com", None);
+        // Pass a CDH that doesn't match the JSON.
+        let res = verify_enrollment_client_data(Some(&bytes), &[0u8; 32], "example.com");
+        match res {
+            Err(ServiceError::Fido2(msg)) => {
+                assert!(msg.contains("client_data_hash does not match"), "msg: {msg}");
+            }
+            other => panic!("expected Fido2(cdh mismatch), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrong_type_rejected() {
+        // `webauthn.get` is the assertion type; enrollment must be
+        // `webauthn.create`. An attacker who replays an assertion-time
+        // clientDataJSON to the enrollment endpoint must be rejected.
+        let bytes = cdj("webauthn.get", "https://example.com", None);
+        let cdh = cdh_of(&bytes);
+        let res = verify_enrollment_client_data(Some(&bytes), &cdh, "example.com");
+        match res {
+            Err(ServiceError::Fido2(msg)) => {
+                assert!(msg.contains("webauthn.create"), "msg: {msg}");
+            }
+            other => panic!("expected Fido2(type), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrong_origin_rejected() {
+        let bytes = cdj("webauthn.create", "https://attacker.com", None);
+        let cdh = cdh_of(&bytes);
+        let res = verify_enrollment_client_data(Some(&bytes), &cdh, "example.com");
+        match res {
+            Err(ServiceError::Fido2(msg)) => {
+                assert!(msg.contains("origin"), "msg: {msg}");
+                assert!(msg.contains("example.com"), "msg: {msg}");
+            }
+            other => panic!("expected Fido2(origin), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_origin_rejected() {
+        let bytes = cdj("webauthn.create", "https://example.com", Some(true));
+        let cdh = cdh_of(&bytes);
+        let res = verify_enrollment_client_data(Some(&bytes), &cdh, "example.com");
+        match res {
+            Err(ServiceError::Fido2(msg)) => {
+                assert!(msg.contains("crossOrigin"), "msg: {msg}");
+            }
+            other => panic!("expected Fido2(crossOrigin), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_origin_false_or_missing_accepted() {
+        // Explicit `false` is fine.
+        let bytes = cdj("webauthn.create", "https://example.com", Some(false));
+        let cdh = cdh_of(&bytes);
+        verify_enrollment_client_data(Some(&bytes), &cdh, "example.com").unwrap();
+        // Missing field defaults to `false`.
+        let bytes = cdj("webauthn.create", "https://example.com", None);
+        let cdh = cdh_of(&bytes);
+        verify_enrollment_client_data(Some(&bytes), &cdh, "example.com").unwrap();
+    }
+
+    #[test]
+    fn malformed_json_rejected() {
+        let bytes = b"this is not json".to_vec();
+        let cdh = cdh_of(&bytes);
+        let res = verify_enrollment_client_data(Some(&bytes), &cdh, "example.com");
+        match res {
+            Err(ServiceError::Fido2(msg)) => {
+                assert!(msg.contains("not valid JSON"), "msg: {msg}");
+            }
+            other => panic!("expected Fido2(json), got {other:?}"),
+        }
+    }
 }

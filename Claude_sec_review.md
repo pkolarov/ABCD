@@ -1231,7 +1231,7 @@ same pass — "loopback TCP is admin by default" and "device APIs allow
 anonymous TCP" — are already tracked as H-7 (⚠ Partial) and M-8 step-2
 respectively, and are not re-listed.
 
-### A-1 (High). ⚠ Partial — FIDO2 packed attestation with `x5c` is accepted without verifying the statement signature or chain
+### A-1 (High). ✅ Fixed (pending HW verify) — FIDO2 packed attestation with `x5c` is accepted without verifying the statement signature or chain
 **Location:** [dds-domain/src/fido2.rs](dds-domain/src/fido2.rs)
 
 **What's wrong:** `verify_attestation` accepts `fmt == "none"`
@@ -1318,10 +1318,44 @@ and to gate `fmt == "none"` behind an explicit
   key in the leaf cert vs credential pubkey in `authData`, sig
   over `authData || cdh`) so spec-conforming authenticators
   should pass without changes.
-- **Step 3 (open)** — Mirror M-12's clientDataJSON parsing at
-  enrollment so `type`/`challenge`/`origin` are validated
-  individually (today the enroll path only compares the
-  `client_data_hash` against `authData`'s embedded value).
+- **Step 3 ✅ landed 2026-04-25** — `EnrollUserRequest` (and
+  `AdminSetupRequest`, which is a type alias) gain an optional
+  `client_data_json: Option<Vec<u8>>` field. New
+  `verify_enrollment_client_data` helper mirrors M-12's
+  assertion-side logic: bind the supplied JSON to the signed
+  `client_data_hash` via SHA-256, parse, then enforce
+  `type == "webauthn.create"`,
+  `origin == "https://<rp_id>"`, and `crossOrigin != true` per
+  WebAuthn §7.1 steps 8–11. Both `enroll_user` and `admin_setup`
+  call the helper before `verify_attestation`. The helper returns
+  `Ok(())` when `cdj_bytes` is `None`, so existing clients that
+  don't populate the field stay on the legacy
+  `client_data_hash` ↔ `authData.rp_id_hash` check (pure backward
+  compat). HTTP wire layer gains
+  `EnrollUserRequestJson::client_data_json_b64: Option<String>`
+  (`#[serde(default)]`) on the same backward-compat policy.
+  **Known gap**: today's enrollment flow has no server-issued
+  challenge endpoint, so `cdj.challenge` is *not* validated
+  against a server value (assertion-side does, via
+  `consume_challenge`). Closing that requires introducing
+  `/v1/enroll/challenge` and is tracked separately. The `type`
+  and `origin` checks land here in step-3 because they're
+  independent of the challenge plumbing and the type check alone
+  blocks the practical attack of replaying an assertion-time
+  clientDataJSON to the enrollment endpoint. New unit tests in
+  `service::a1_step3_client_data_tests` (8 tests): legacy
+  no-cdj passthrough, well-formed accepted, cdh mismatch rejected,
+  wrong type rejected, wrong origin rejected, crossOrigin true
+  rejected, crossOrigin false/missing accepted, malformed JSON
+  rejected. `cargo test --workspace` ⇒ 451/451 ok (up from 443);
+  clippy clean.
+
+**A-1 overall**: Step-1 closed the `fmt=none` gap, Step-2 closed
+the `x5c` skipped-signature gap, Step-3 added field-level
+clientDataJSON validation at enrollment. The original A-1
+finding is fully addressed pending real-HW reverification of the
+multinode FIDO2 test (`dds-multinode-fido2-test` against a
+Crayonic / YubiKey).
 
 ---
 

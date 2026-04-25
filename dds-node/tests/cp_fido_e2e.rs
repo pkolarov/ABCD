@@ -669,6 +669,7 @@ async fn cp_fido2_enroll_then_assert() {
             rp_id: rp_id.to_string(),
             display_name: "Carol".to_string(),
             authenticator_type: "platform".to_string(),
+            client_data_json_b64: None,
         })
         .send()
         .await

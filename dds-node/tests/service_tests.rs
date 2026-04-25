@@ -70,6 +70,7 @@ fn test_enroll_user() {
             rp_id: "example.com".into(),
             display_name: "Alice".into(),
             authenticator_type: "platform".into(),
+            client_data_json: None,
         })
         .unwrap();
 
@@ -99,6 +100,7 @@ fn test_enroll_user_rejects_invalid_attestation() {
         rp_id: "example.com".into(),
         display_name: "Alice".into(),
         authenticator_type: "platform".into(),
+        client_data_json: None,
     });
     assert!(result.is_err());
 }

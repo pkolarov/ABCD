@@ -80,6 +80,7 @@ impl Synth {
             rp_id: "dds.local".into(),
             display_name: format!("User {s}"),
             authenticator_type: "platform".into(),
+            client_data_json: None,
         }
     }
 
