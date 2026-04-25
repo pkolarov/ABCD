@@ -65,24 +65,37 @@ throughput, not security). All High and previously-partial items
 2026-04-20 — Windows CI runs are required for the C++ / MSI
 portions of H-6 and H-7.
 
-**2026-04-25 independent follow-up — new open findings:** 3 High,
-3 Medium. These were found after reviewing the source first and only
-then comparing against `security-gaps.md`, this review, and
+**2026-04-25 independent follow-up — new findings:** 3 High,
+3 Medium (1 High and 2 Medium landed this pass; 2 High and 1 Medium
+remain open). These were found after reviewing the source first and
+only then comparing against `security-gaps.md`, this review, and
 `docs/threat-model-review.md`. They are not duplicates of H-6/H-7/M-8,
 L-9, A-1, A-3, A-4, or A-6.
 
-- **B-1 (High)**: sync response application writes tokens and
-  revocation/burn side effects to persistent storage before the trust
-  graph accepts them. `apply_sync_payloads_with_graph` stores each token
-  at `dds-net/src/sync.rs:316` before `trust_graph.add_token`, while
-  `TokenStore::put_token` explicitly overwrites existing JTIs. An
-  admitted peer can send a validly signed duplicate-JTI token that the
-  in-memory graph rejects, but the store retains for the next restart;
-  malformed or unauthorized revoke/burn side effects can likewise be
-  persisted even after graph rejection. **Fix:** validate with the trust
-  graph first, make store insertion put-if-absent or exact-byte
-  idempotent, and apply `store.revoke` / `store.burn` only when graph
-  insertion succeeds.
+- **B-1 (High) ✅ landed 2026-04-25**: sync response application wrote
+  tokens and revocation/burn side effects to persistent storage before
+  the trust graph accepted them. `apply_sync_payloads_with_graph` stored
+  each token at `dds-net/src/sync.rs:316` before `trust_graph.add_token`,
+  while `TokenStore::put_token` explicitly overwrites existing JTIs. An
+  admitted peer could send a validly signed duplicate-JTI token that the
+  in-memory graph rejects, but the store would retain for the next
+  restart; malformed or unauthorized revoke/burn side effects could
+  likewise be persisted even after graph rejection. **Fix shipped:**
+  `apply_sync_payloads_with_graph` now feeds the trust graph FIRST and
+  gates `store.put_token` + `store.revoke` + `store.burn` on
+  `add_token` success. Store writes additionally use put-if-absent
+  semantics (`store.has_token` check before `put_token`), so a graph
+  race or future regression cannot overwrite a stored JTI. The graphless
+  `apply_sync_payloads` (used in tests + airgap doc) gained the same
+  put-if-absent guard for defense in depth. Three new regression tests
+  in `dds-net/src/sync.rs::tests`:
+  `b1_with_graph_duplicate_jti_does_not_overwrite_store`,
+  `b1_with_graph_unauthorized_revoke_skips_store_revocation`,
+  `b1_graphless_duplicate_jti_does_not_overwrite_store`. The DAG insert
+  is intentionally still attempted — operations are keyed by `op.id`
+  (not `jti`) and a duplicate-JTI attack carries no privilege into the
+  CRDT operation graph. Gossip ingest in `dds-node::node` was already
+  graph-first and required no change.
 - **B-2 (High)**: purpose checks are not tied to a live target
   attestation, and inbound token validation does not enforce the shape
   invariants enforced by `Token::create`. `has_purpose` /

@@ -135,12 +135,19 @@ pub struct SyncResult {
 ///
 /// For each payload:
 /// 1. Deserialize and validate the token
-/// 2. Store the token
+/// 2. Store the token (put-if-absent — never overwrite an existing JTI)
 /// 3. Handle revocations/burns
 /// 4. Insert the operation into the DAG
 ///
 /// Operations are sorted topologically before insertion so that
 /// dependencies are satisfied.
+///
+/// Production callers should prefer [`apply_sync_payloads_with_graph`],
+/// which additionally validates each token through the in-memory trust
+/// graph before persisting it. This graphless variant only enforces the
+/// store-side half of the **B-1** mitigation (put-if-absent on token
+/// JTIs); the revoke/burn store side effects are still applied because
+/// without a trust graph we have no second authority to gate them on.
 pub fn apply_sync_payloads(
     payloads: &[SyncPayload],
     dag: &mut CausalDag,
@@ -185,12 +192,17 @@ pub fn apply_sync_payloads(
     });
 
     for (op, token) in &items {
-        // Store the token
-        match store.put_token(token) {
-            Ok(()) => result.tokens_stored += 1,
-            Err(e) => {
-                result.errors.push(format!("token store: {e}"));
-                continue;
+        // **B-1**: store the token put-if-absent. Without a trust graph
+        // to consult, the store cannot tell whether a same-JTI token
+        // is a benign re-delivery or a malicious overwrite, so the
+        // safest default is "first writer wins".
+        if !store.has_token(&token.payload.jti) {
+            match store.put_token(token) {
+                Ok(()) => result.tokens_stored += 1,
+                Err(e) => {
+                    result.errors.push(format!("token store: {e}"));
+                    continue;
+                }
             }
         }
 
@@ -268,10 +280,17 @@ pub fn apply_sync_payloads(
 /// Same as `apply_sync_payloads`, but also feeds successfully-applied
 /// tokens into the supplied `TrustGraph`. This is the variant the
 /// production node uses now that the in-memory trust graph is the
-/// source of truth for query-time hot paths (post-B5b). Errors from
-/// `TrustGraph::add_token` are recorded but non-fatal — the gossip
-/// pipeline already revalidates everything from the store on restart,
-/// and a single rejected token shouldn't drop the rest of the batch.
+/// source of truth for query-time hot paths (post-B5b).
+///
+/// **B-1**: the trust graph is consulted *before* the store is
+/// touched. Tokens the graph rejects (bad signature, duplicate JTI,
+/// unauthorized revocation, burned issuer, …) never reach
+/// `store.put_token`, and their `store.revoke` / `store.burn`
+/// side effects are not applied. The op-level DAG insert is still
+/// attempted because the operation graph is keyed by `op.id` (not
+/// `jti`) and represents an independent CRDT layer; if the token was
+/// rejected, the in-memory graph state already had the prior copy and
+/// will continue to validate downstream queries.
 pub fn apply_sync_payloads_with_graph(
     payloads: &[SyncPayload],
     dag: &mut CausalDag,
@@ -314,49 +333,67 @@ pub fn apply_sync_payloads_with_graph(
     });
 
     for (op, token) in &items {
-        // Persist to the store.
-        match store.put_token(token) {
-            Ok(()) => result.tokens_stored += 1,
+        // **B-1**: feed the trust graph FIRST. If it rejects (duplicate
+        // JTI, unauthorized revocation, bad signature, …), skip the
+        // store write and any revoke/burn side effects so a malicious
+        // admitted peer can't poison persistent state with tokens the
+        // in-memory graph already refused.
+        let graph_accepted = match trust_graph.add_token(token.clone()) {
+            Ok(()) => true,
             Err(e) => {
-                result.errors.push(format!("token store: {e}"));
-                continue;
+                result.errors.push(format!("trust graph add: {e}"));
+                false
             }
-        }
+        };
 
-        // Feed the trust graph.
-        if let Err(e) = trust_graph.add_token(token.clone()) {
-            // Duplicate or replay — log but don't bail; we still want
-            // to apply revocations/burns and the DAG insert.
-            result.errors.push(format!("trust graph add: {e}"));
-        }
+        if graph_accepted {
+            // Persist to the store with put-if-absent semantics. Even
+            // after the graph accepts, never overwrite an existing JTI
+            // — defense in depth against any race where the graph
+            // state lags the store.
+            if !store.has_token(&token.payload.jti) {
+                match store.put_token(token) {
+                    Ok(()) => result.tokens_stored += 1,
+                    Err(e) => {
+                        result.errors.push(format!("token store: {e}"));
+                        // fall through to DAG insert; storage failure is
+                        // non-fatal for the operation graph.
+                    }
+                }
+            }
 
-        // Apply revocation / burn side effects on the store.
-        match token.payload.kind {
-            TokenKind::Revoke => {
-                if let Some(ref target_jti) = token.payload.revokes {
-                    if !store.is_revoked(target_jti) {
-                        if let Err(e) = store.revoke(target_jti) {
-                            result.errors.push(format!("revoke: {e}"));
-                        } else {
-                            result.revocations_applied += 1;
+            // Apply revocation / burn side effects on the store. Only
+            // reachable if the trust graph accepted the token, so the
+            // revoke/burn target is authorized.
+            match token.payload.kind {
+                TokenKind::Revoke => {
+                    if let Some(ref target_jti) = token.payload.revokes {
+                        if !store.is_revoked(target_jti) {
+                            if let Err(e) = store.revoke(target_jti) {
+                                result.errors.push(format!("revoke: {e}"));
+                            } else {
+                                result.revocations_applied += 1;
+                            }
                         }
                     }
                 }
-            }
-            TokenKind::Burn => {
-                let urn = &token.payload.iss;
-                if !store.is_burned(urn) {
-                    if let Err(e) = store.burn(urn) {
-                        result.errors.push(format!("burn: {e}"));
-                    } else {
-                        result.burns_applied += 1;
+                TokenKind::Burn => {
+                    let urn = &token.payload.iss;
+                    if !store.is_burned(urn) {
+                        if let Err(e) = store.burn(urn) {
+                            result.errors.push(format!("burn: {e}"));
+                        } else {
+                            result.burns_applied += 1;
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
 
-        // Insert into the DAG.
+        // Insert into the DAG. Independent of the token-graph decision
+        // — the DAG is keyed by op.id, not jti, and a duplicate-JTI
+        // attack carries no privileges into the operation graph.
         match dag.insert(op.clone()) {
             Ok(true) => result.ops_merged += 1,
             Ok(false) => {} // duplicate
@@ -638,5 +675,216 @@ mod tests {
         assert!(dag.contains("a"));
         assert!(dag.contains("b"));
         assert!(result.errors.is_empty());
+    }
+
+    // ---------- B-1 regression tests ----------
+
+    /// **B-1**: a duplicate-JTI sync payload from an admitted peer must
+    /// not overwrite the existing token in the store. The trust graph
+    /// rejects on `DuplicateJti`; before the fix the store was written
+    /// first and retained the attacker's bytes for the next restart.
+    #[test]
+    fn b1_with_graph_duplicate_jti_does_not_overwrite_store() {
+        let alice = make_identity("alice");
+        let mallory = make_identity("mallory");
+
+        let original = make_attest_token(&alice);
+        let original_jti = original.payload.jti.clone();
+        let original_bytes = original.to_cbor().unwrap();
+
+        // Same JTI as `original`, but issued + signed by mallory and
+        // pointing at a different subject. Token::validate() accepts
+        // this (signature is good under mallory's key); the trust graph
+        // must reject it as DuplicateJti.
+        let attacker = Token::sign(
+            TokenPayload {
+                iss: mallory.id.to_urn(),
+                iss_key: mallory.public_key.clone(),
+                jti: original_jti.clone(),
+                sub: "victim".to_string(),
+                kind: TokenKind::Attest,
+                purpose: Some("admin".to_string()),
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat: 1000,
+                exp: Some(4102444800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &mallory.signing_key,
+        )
+        .unwrap();
+        let attacker_bytes = attacker.to_cbor().unwrap();
+        assert_ne!(original_bytes, attacker_bytes, "test setup");
+
+        let mut dag = CausalDag::new();
+        let mut store = MemoryBackend::new();
+        let mut graph = TrustGraph::new();
+
+        // Land the original via sync.
+        let first = apply_sync_payloads_with_graph(
+            &[SyncPayload {
+                op_bytes: serialize_op(&make_op("op-1", vec![])),
+                token_bytes: original_bytes.clone(),
+            }],
+            &mut dag,
+            &mut store,
+            &mut graph,
+        );
+        assert_eq!(first.tokens_stored, 1, "{:?}", first.errors);
+        assert!(first.errors.is_empty());
+
+        // Attacker tries the duplicate-JTI replacement.
+        let second = apply_sync_payloads_with_graph(
+            &[SyncPayload {
+                op_bytes: serialize_op(&make_op("op-2", vec![])),
+                token_bytes: attacker_bytes,
+            }],
+            &mut dag,
+            &mut store,
+            &mut graph,
+        );
+        assert_eq!(
+            second.tokens_stored, 0,
+            "store must refuse to overwrite the original JTI"
+        );
+        assert!(
+            second.errors.iter().any(|e| e.contains("trust graph add")),
+            "expected graph rejection error, got {:?}",
+            second.errors
+        );
+
+        // Store still holds the *original* bytes.
+        let on_disk = store.get_token(&original_jti).unwrap();
+        assert_eq!(on_disk.payload.iss, alice.id.to_urn());
+        assert_eq!(on_disk.payload.sub, alice.id.to_urn());
+    }
+
+    /// **B-1**: an unauthorized revoke (signed by someone other than
+    /// the target's issuer) must not produce a persisted revocation,
+    /// even if the rest of the sync batch processes normally.
+    #[test]
+    fn b1_with_graph_unauthorized_revoke_skips_store_revocation() {
+        let alice = make_identity("alice");
+        let mallory = make_identity("mallory");
+
+        // Alice's attestation lands first.
+        let attest = make_attest_token(&alice);
+        let attest_jti = attest.payload.jti.clone();
+
+        let mut dag = CausalDag::new();
+        let mut store = MemoryBackend::new();
+        let mut graph = TrustGraph::new();
+
+        let warmup = apply_sync_payloads_with_graph(
+            &[SyncPayload {
+                op_bytes: serialize_op(&make_op("op-attest", vec![])),
+                token_bytes: attest.to_cbor().unwrap(),
+            }],
+            &mut dag,
+            &mut store,
+            &mut graph,
+        );
+        assert_eq!(warmup.tokens_stored, 1);
+
+        // Mallory tries to revoke Alice's attestation.
+        let unauthorized_revoke = Token::sign(
+            TokenPayload {
+                iss: mallory.id.to_urn(),
+                iss_key: mallory.public_key.clone(),
+                jti: "evil-revoke".to_string(),
+                sub: alice.id.to_urn(),
+                kind: TokenKind::Revoke,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: Some(attest_jti.clone()),
+                iat: 2000,
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &mallory.signing_key,
+        )
+        .unwrap();
+
+        let result = apply_sync_payloads_with_graph(
+            &[SyncPayload {
+                op_bytes: serialize_op(&make_op("op-revoke", vec![])),
+                token_bytes: unauthorized_revoke.to_cbor().unwrap(),
+            }],
+            &mut dag,
+            &mut store,
+            &mut graph,
+        );
+        assert_eq!(result.revocations_applied, 0);
+        assert_eq!(result.tokens_stored, 0);
+        assert!(
+            !store.is_revoked(&attest_jti),
+            "unauthorized revoke must not be persisted"
+        );
+        assert!(
+            result.errors.iter().any(|e| e.contains("trust graph add")),
+            "expected graph rejection error, got {:?}",
+            result.errors
+        );
+    }
+
+    /// **B-1** (graphless variant): even without a trust graph,
+    /// `apply_sync_payloads` must use put-if-absent so a duplicate-JTI
+    /// payload cannot overwrite the stored token bytes.
+    #[test]
+    fn b1_graphless_duplicate_jti_does_not_overwrite_store() {
+        let alice = make_identity("alice");
+        let mallory = make_identity("mallory");
+
+        let original = make_attest_token(&alice);
+        let original_jti = original.payload.jti.clone();
+
+        let attacker = Token::sign(
+            TokenPayload {
+                iss: mallory.id.to_urn(),
+                iss_key: mallory.public_key.clone(),
+                jti: original_jti.clone(),
+                sub: "victim".to_string(),
+                kind: TokenKind::Attest,
+                purpose: Some("admin".to_string()),
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat: 1000,
+                exp: Some(4102444800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &mallory.signing_key,
+        )
+        .unwrap();
+
+        let mut dag = CausalDag::new();
+        let mut store = MemoryBackend::new();
+
+        let first = apply_sync_payloads(
+            &[SyncPayload {
+                op_bytes: serialize_op(&make_op("op-1", vec![])),
+                token_bytes: original.to_cbor().unwrap(),
+            }],
+            &mut dag,
+            &mut store,
+        );
+        assert_eq!(first.tokens_stored, 1);
+
+        let second = apply_sync_payloads(
+            &[SyncPayload {
+                op_bytes: serialize_op(&make_op("op-2", vec![])),
+                token_bytes: attacker.to_cbor().unwrap(),
+            }],
+            &mut dag,
+            &mut store,
+        );
+        assert_eq!(second.tokens_stored, 0);
+        let on_disk = store.get_token(&original_jti).unwrap();
+        assert_eq!(on_disk.payload.iss, alice.id.to_urn());
     }
 }
