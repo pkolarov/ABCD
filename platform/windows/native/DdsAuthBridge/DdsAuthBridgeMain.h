@@ -15,6 +15,7 @@
 #include "Configuration.h"
 #include "CredentialVault.h"
 #include "DdsNodeHttpClient.h"
+#include "JoinState.h"
 #include "ctap2/ctap2_protocol.h"
 #include "ctap2/ctap2_pin_protocol.h"
 
@@ -111,6 +112,7 @@ private:
     void SendAuthError(_In_ IPC_CLIENT_CONTEXT* pClientCtx, _In_ UINT32 seqId,
         _In_ UINT32 errorCode, _In_ PCWSTR message);
 
-    // Determine if this machine is domain-joined
-    static BOOL IsDomainJoined();
+    // Determine the host's directory join classification.
+    // See docs/windows-ad-coexistence-spec.md §2 for the contract.
+    static dds::JoinState GetJoinState();
 };

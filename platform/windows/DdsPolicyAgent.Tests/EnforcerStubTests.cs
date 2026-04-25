@@ -2,6 +2,7 @@
 
 using System.Text.Json;
 using DDS.PolicyAgent.Enforcers;
+using DDS.PolicyAgent.HostState;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DDS.PolicyAgent.Tests;
@@ -37,7 +38,7 @@ public class EnforcerStubTests
     public async Task AccountEnforcer_creates_user_in_enforce_mode()
     {
         var ops = new InMemoryAccountOperations();
-        var e = new AccountEnforcer(ops, NullLogger<AccountEnforcer>.Instance);
+        var e = new AccountEnforcer(ops, new InMemoryJoinStateProbe(), NullLogger<AccountEnforcer>.Instance);
         var directive = JsonDocument.Parse("""
         [
             {"username":"alice","action":"Create"}
@@ -248,7 +249,7 @@ public class EnforcerStubTests
     {
         var ops = new InMemoryAccountOperations();
         ops.CreateUser("stale-user", null, null);
-        var e = new AccountEnforcer(ops, NullLogger<AccountEnforcer>.Instance);
+        var e = new AccountEnforcer(ops, new InMemoryJoinStateProbe(), NullLogger<AccountEnforcer>.Instance);
 
         var stale = new HashSet<string> { "stale-user" };
         var changes = e.ReconcileStaleAccounts(stale, EnforcementMode.Enforce);
@@ -263,7 +264,7 @@ public class EnforcerStubTests
     {
         var ops = new InMemoryAccountOperations();
         ops.CreateUser("stale-user", null, null);
-        var e = new AccountEnforcer(ops, NullLogger<AccountEnforcer>.Instance);
+        var e = new AccountEnforcer(ops, new InMemoryJoinStateProbe(), NullLogger<AccountEnforcer>.Instance);
 
         var stale = new HashSet<string> { "stale-user" };
         var changes = e.ReconcileStaleAccounts(stale, EnforcementMode.Audit);
@@ -280,7 +281,7 @@ public class EnforcerStubTests
         ops.CreateUser("bob", null, null);
         ops.AddToGroup("bob", "Administrators");
         ops.AddToGroup("bob", "Users");
-        var e = new AccountEnforcer(ops, NullLogger<AccountEnforcer>.Instance);
+        var e = new AccountEnforcer(ops, new InMemoryJoinStateProbe(), NullLogger<AccountEnforcer>.Instance);
 
         var stale = new HashSet<string> { "bob:Administrators" };
         var changes = e.ReconcileStaleGroups(stale, EnforcementMode.Enforce);

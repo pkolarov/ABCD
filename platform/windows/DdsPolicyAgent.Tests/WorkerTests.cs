@@ -4,6 +4,7 @@ using System.Text.Json;
 using DDS.PolicyAgent.Client;
 using DDS.PolicyAgent.Config;
 using DDS.PolicyAgent.Enforcers;
+using DDS.PolicyAgent.HostState;
 using DDS.PolicyAgent.State;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -44,7 +45,7 @@ public class WorkerTests
             client, stateStore, config,
             NullLogger<Worker>.Instance,
             new RegistryEnforcer(new InMemoryRegistryOperations(), NullLogger<RegistryEnforcer>.Instance),
-            new AccountEnforcer(new InMemoryAccountOperations(), NullLogger<AccountEnforcer>.Instance),
+            new AccountEnforcer(new InMemoryAccountOperations(), new InMemoryJoinStateProbe(), NullLogger<AccountEnforcer>.Instance),
             new PasswordPolicyEnforcer(new InMemoryPasswordPolicyOperations(), NullLogger<PasswordPolicyEnforcer>.Instance),
             new SoftwareInstaller(new InMemorySoftwareOperations(), NullLogger<SoftwareInstaller>.Instance));
 

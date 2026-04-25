@@ -2,6 +2,7 @@
 
 using System.Text.Json;
 using DDS.PolicyAgent.Enforcers;
+using DDS.PolicyAgent.HostState;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DDS.PolicyAgent.Tests;
@@ -9,11 +10,12 @@ namespace DDS.PolicyAgent.Tests;
 public class AccountEnforcerTests
 {
     private readonly InMemoryAccountOperations _ops = new();
+    private readonly InMemoryJoinStateProbe _joinState = new(JoinState.Workgroup);
     private readonly AccountEnforcer _enforcer;
 
     public AccountEnforcerTests()
     {
-        _enforcer = new AccountEnforcer(_ops, NullLogger<AccountEnforcer>.Instance);
+        _enforcer = new AccountEnforcer(_ops, _joinState, NullLogger<AccountEnforcer>.Instance);
     }
 
     // --- Create ---
@@ -134,12 +136,32 @@ public class AccountEnforcerTests
     [Fact]
     public async Task Refuses_on_domain_joined_machine()
     {
-        _ops.SimulateDomainJoined = true;
+        _joinState.Current = JoinState.AdJoined;
         var dir = Parse("""[{"username":"alice","action":"Create"}]""");
         var r = await _enforcer.ApplyAsync(dir, EnforcementMode.Enforce);
         Assert.Equal(EnforcementStatus.Skipped, r.Status);
         Assert.Contains("domain-joined", r.Error);
         Assert.False(_ops.UserExists("alice"));
+    }
+
+    [Fact]
+    public async Task Refuses_on_hybrid_joined_machine()
+    {
+        _joinState.Current = JoinState.HybridJoined;
+        var dir = Parse("""[{"username":"alice","action":"Create"}]""");
+        var r = await _enforcer.ApplyAsync(dir, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Skipped, r.Status);
+        Assert.False(_ops.UserExists("alice"));
+    }
+
+    [Fact]
+    public async Task Allows_on_workgroup_machine()
+    {
+        _joinState.Current = JoinState.Workgroup;
+        var dir = Parse("""[{"username":"wg","action":"Create"}]""");
+        var r = await _enforcer.ApplyAsync(dir, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Ok, r.Status);
+        Assert.True(_ops.UserExists("wg"));
     }
 
     // --- Multiple directives ---

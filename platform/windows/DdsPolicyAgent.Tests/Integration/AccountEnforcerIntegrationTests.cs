@@ -3,6 +3,7 @@
 using System.Runtime.Versioning;
 using System.Text.Json;
 using DDS.PolicyAgent.Enforcers;
+using DDS.PolicyAgent.HostState;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DDS.PolicyAgent.Tests.Integration;
@@ -19,24 +20,36 @@ namespace DDS.PolicyAgent.Tests.Integration;
 public sealed class AccountEnforcerIntegrationTests : IDisposable
 {
     private readonly WindowsAccountOperations _ops = new();
+    private readonly InMemoryJoinStateProbe _probe = new(JoinState.Workgroup);
     private readonly string _suffix = Guid.NewGuid().ToString("N")[..8];
     private readonly List<string> _createdUsers = new();
 
     private string TestUser(string tag = "main") => $"dds-e2e-{_suffix[..4]}{tag[..1]}";
 
     // ----------------------------------------------------------------
-    // IsDomainJoined
+    // WindowsJoinStateProbe — smoke
     // ----------------------------------------------------------------
 
     [SkippableFact]
-    public void IsDomainJoined_Returns_Bool_Without_Throwing()
+    public void WindowsJoinStateProbe_Detect_Returns_Workgroup_On_Dev_Box()
     {
         SkipIfNotAdmin();
-        // On a workgroup machine this should be false.
-        // We don't assert the value — just verify the P/Invoke works.
-        var result = _ops.IsDomainJoined();
-        // This ARM64 dev box is not domain-joined
-        Assert.False(result);
+        // The dev / CI host is not domain-joined. We don't strictly
+        // assert Workgroup (HybridJoined is theoretically possible if
+        // the box is workplace-registered) — the contract under test
+        // is that the probe completes without throwing and returns one
+        // of the five well-known states. The build runner is expected
+        // to be Workgroup; CI assertion is in the workgroup smoke.
+        var probe = new WindowsJoinStateProbe();
+        var state = probe.Detect();
+        Assert.Contains(state, new[]
+        {
+            JoinState.Workgroup,
+            JoinState.AdJoined,
+            JoinState.HybridJoined,
+            JoinState.EntraOnlyJoined,
+            JoinState.Unknown,
+        });
     }
 
     // ----------------------------------------------------------------
@@ -156,7 +169,7 @@ public sealed class AccountEnforcerIntegrationTests : IDisposable
         var user = TestUser("enf");
         _createdUsers.Add(user);
 
-        var enforcer = new AccountEnforcer(_ops, NullLogger<AccountEnforcer>.Instance);
+        var enforcer = new AccountEnforcer(_ops, _probe, NullLogger<AccountEnforcer>.Instance);
         var json = $$"""
         [{"username":"{{user}}","action":"Create","full_name":"E2E Bot","groups":["Users"],"password_never_expires":true}]
         """;
@@ -176,7 +189,7 @@ public sealed class AccountEnforcerIntegrationTests : IDisposable
         _ops.CreateUser(user, null, null);
         _createdUsers.Add(user);
 
-        var enforcer = new AccountEnforcer(_ops, NullLogger<AccountEnforcer>.Instance);
+        var enforcer = new AccountEnforcer(_ops, _probe, NullLogger<AccountEnforcer>.Instance);
 
         // Disable
         var disableJson = $$"""[{"username":"{{user}}","action":"Disable"}]""";

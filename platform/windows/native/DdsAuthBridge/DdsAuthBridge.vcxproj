@@ -158,12 +158,14 @@
     <ClCompile Include="CredentialVault.cpp" />
     <ClCompile Include="EventLogger.cpp" />
     <ClCompile Include="FileLog.cpp" />
+    <ClCompile Include="JoinState.cpp" />
     <ClCompile Include="ctap2\cbor.cpp" />
     <ClCompile Include="ctap2\ctap2_protocol.cpp" />
     <ClCompile Include="ctap2\ctap2_pin_protocol.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EventLogger.h" />
+    <ClInclude Include="JoinState.h" />
     <ClInclude Include="ctap2\cbor.h" />
     <ClInclude Include="ctap2\ctap2_protocol.h" />
     <ClInclude Include="ctap2\ctap2_pin_protocol.h" />

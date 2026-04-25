@@ -21,12 +21,6 @@ public sealed class InMemoryAccountOperations : IAccountOperations
     private readonly Dictionary<string, AccountState> _accounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _lock = new();
 
-    /// <summary>
-    /// Simulate domain-joined state. Default: false (workgroup).
-    /// Tests can set this to true to exercise the domain-join guard.
-    /// </summary>
-    public bool SimulateDomainJoined { get; set; }
-
     public bool UserExists(string username)
     {
         lock (_lock) { return _accounts.ContainsKey(username); }
@@ -114,8 +108,6 @@ public sealed class InMemoryAccountOperations : IAccountOperations
                 a.PasswordNeverExpires = neverExpires;
         }
     }
-
-    public bool IsDomainJoined() => SimulateDomainJoined;
 
     // --- test helpers ---
 

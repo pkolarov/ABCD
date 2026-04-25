@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 using System.Text.Json;
+using DDS.PolicyAgent.HostState;
 using Microsoft.Extensions.Logging;
 
 namespace DDS.PolicyAgent.Enforcers;
@@ -10,19 +11,31 @@ namespace DDS.PolicyAgent.Enforcers;
 /// dispatching through <see cref="IAccountOperations"/>.
 ///
 /// <b>v1 scope decision:</b> refuses all operations on domain-joined
-/// machines. The AD-replacement story is Phase 4.
+/// machines (classic AD or hybrid AD+Entra). The AD-coexistence
+/// audit-only override for the other surfaces is Phase 2; account
+/// mutation stays refused on AD/Hybrid even after that.
 /// </summary>
 public sealed class AccountEnforcer : IEnforcer
 {
     private readonly IAccountOperations _ops;
+    private readonly IJoinStateProbe _joinState;
     private readonly ILogger<AccountEnforcer> _log;
     public string Name => "Account";
 
-    public AccountEnforcer(IAccountOperations ops, ILogger<AccountEnforcer> log)
+    public AccountEnforcer(
+        IAccountOperations ops,
+        IJoinStateProbe joinState,
+        ILogger<AccountEnforcer> log)
     {
         _ops = ops;
+        _joinState = joinState;
         _log = log;
     }
+
+    private bool RefuseOnHostState() =>
+        _joinState.Detect() is JoinState.AdJoined
+                            or JoinState.HybridJoined
+                            or JoinState.Unknown;
 
     public Task<EnforcementOutcome> ApplyAsync(
         JsonElement directive, EnforcementMode mode, CancellationToken ct = default)
@@ -31,7 +44,7 @@ public sealed class AccountEnforcer : IEnforcer
             return Task.FromResult(new EnforcementOutcome(EnforcementStatus.Skipped));
 
         // Domain-join guard (v1 scope decision)
-        if (_ops.IsDomainJoined())
+        if (RefuseOnHostState())
         {
             _log.LogWarning("Account enforcer refused: machine is domain-joined (v1 out of scope)");
             return Task.FromResult(new EnforcementOutcome(
@@ -205,7 +218,7 @@ public sealed class AccountEnforcer : IEnforcer
     public List<string> ReconcileStaleAccounts(
         IReadOnlySet<string> staleUsernames, EnforcementMode mode)
     {
-        if (_ops.IsDomainJoined()) return [];
+        if (RefuseOnHostState()) return [];
 
         var changes = new List<string>();
         foreach (var username in staleUsernames)
@@ -247,7 +260,7 @@ public sealed class AccountEnforcer : IEnforcer
     public List<string> ReconcileStaleGroups(
         IReadOnlySet<string> staleGroupKeys, EnforcementMode mode)
     {
-        if (_ops.IsDomainJoined()) return [];
+        if (RefuseOnHostState()) return [];
 
         var changes = new List<string>();
         foreach (var key in staleGroupKeys)

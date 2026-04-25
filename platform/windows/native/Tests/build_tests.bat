@@ -62,7 +62,9 @@ cl.exe /nologo ^
     /Fd:"%OUT_DIR%\dds_native_tests.pdb" ^
     /Fo:"%OUT_DIR%\\" ^
     "%~dp0test_main.cpp" ^
-    "%~dp0..\DdsBridgeIPC\ipc_protocol.cpp"
+    "%~dp0..\DdsBridgeIPC\ipc_protocol.cpp" ^
+    "%~dp0..\DdsAuthBridge\JoinState.cpp" ^
+    /link netapi32.lib
 
 if errorlevel 1 (
     echo.

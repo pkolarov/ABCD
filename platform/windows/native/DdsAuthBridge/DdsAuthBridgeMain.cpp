@@ -484,19 +484,9 @@ void CDdsAuthBridgeMain::SendAuthError(
         reinterpret_cast<const BYTE*>(&errResp), sizeof(errResp));
 }
 
-BOOL CDdsAuthBridgeMain::IsDomainJoined()
+dds::JoinState CDdsAuthBridgeMain::GetJoinState()
 {
-    LPWSTR pDomain = nullptr;
-    NETSETUP_JOIN_STATUS joinStatus = NetSetupUnknownStatus;
-
-    NET_API_STATUS status = NetGetJoinInformation(nullptr, &pDomain, &joinStatus);
-    if (status == NERR_Success)
-    {
-        if (pDomain) NetApiBufferFree(pDomain);
-        return (joinStatus == NetSetupDomainName);
-    }
-
-    return FALSE;
+    return dds::GetCachedJoinState();
 }
 
 // ============================================================================
@@ -1032,8 +1022,13 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
         SendAuthProgress(pOp->pClientCtx, pOp->seqId,
             IPC_AUTH_STATE::PROCESSING, L"Claiming local Windows account...");
 
-        if (IsDomainJoined())
+        if (GetJoinState() != dds::JoinState::Workgroup)
         {
+            // Phase 1 preserves the previous "block claim on domain-joined"
+            // behavior. AD-08 (Phase 3) will split this into more specific
+            // PRE_ENROLLMENT_REQUIRED / UNSUPPORTED_HOST IPC errors per
+            // JoinState. For now we keep the broader-than-AD-only gate so
+            // Hybrid / EntraOnly / Unknown hosts also fail safe.
             SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::AUTH_FAILED,
                 L"Account claim is disabled on domain-joined machines");
             return;

@@ -4,7 +4,9 @@ using DDS.PolicyAgent;
 using DDS.PolicyAgent.Client;
 using DDS.PolicyAgent.Config;
 using DDS.PolicyAgent.Enforcers;
+using DDS.PolicyAgent.HostState;
 using DDS.PolicyAgent.State;
+using Microsoft.Extensions.Logging;
 
 var builder = Host.CreateApplicationBuilder(args);
 
@@ -91,6 +93,22 @@ else
 {
     builder.Services.AddSingleton<IAccountOperations, InMemoryAccountOperations>();
     builder.Services.AddSingleton<IPasswordPolicyOperations, InMemoryPasswordPolicyOperations>();
+}
+
+// Host JoinState probe: real probe on Windows, in-memory Workgroup
+// elsewhere so the host build links cleanly on macOS/Linux dev boxes.
+// Phase 1 wires the seam; the periodic-refresh timer + worker-side
+// EffectiveMode override land in AD-04 (Phase 2).
+if (OperatingSystem.IsWindows())
+{
+    builder.Services.AddSingleton<IJoinStateProbe>(sp =>
+        new WindowsJoinStateProbe(
+            sp.GetRequiredService<ILoggerFactory>().CreateLogger<WindowsJoinStateProbe>()));
+}
+else
+{
+    builder.Services.AddSingleton<IJoinStateProbe>(_ =>
+        new InMemoryJoinStateProbe(JoinState.Workgroup));
 }
 
 // Software operations: real Win32 on Windows, in-memory elsewhere.

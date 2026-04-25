@@ -15,15 +15,6 @@ namespace DDS.PolicyAgent.Enforcers;
 [SupportedOSPlatform("windows")]
 public sealed class WindowsAccountOperations : IAccountOperations
 {
-    public bool IsDomainJoined()
-    {
-        int result = NetGetJoinInformation(null, out var buffer, out var joinStatus);
-        if (buffer != IntPtr.Zero) NetApiBufferFree(buffer);
-        if (result != 0)
-            throw new Win32Exception(result, "NetGetJoinInformation failed");
-        return joinStatus == NetJoinStatus.NetSetupDomainName;
-    }
-
     public bool UserExists(string username)
     {
         int result = NetUserGetInfo(null, username, 0, out var buffer);
@@ -205,14 +196,6 @@ public sealed class WindowsAccountOperations : IAccountOperations
     private const int MAX_PREFERRED_LENGTH = -1;
     private const int LG_INCLUDE_INDIRECT = 0x0001;
 
-    private enum NetJoinStatus
-    {
-        NetSetupUnknownStatus = 0,
-        NetSetupUnjoined,
-        NetSetupWorkgroupName,
-        NetSetupDomainName,
-    }
-
     [Flags]
     private enum UserPrivilege : uint
     {
@@ -266,10 +249,6 @@ public sealed class WindowsAccountOperations : IAccountOperations
     {
         public string? lgrmi3_domainandname;
     }
-
-    [DllImport("netapi32.dll", CharSet = CharSet.Unicode)]
-    private static extern int NetGetJoinInformation(
-        string? server, out IntPtr nameBuffer, out NetJoinStatus status);
 
     [DllImport("netapi32.dll", CharSet = CharSet.Unicode)]
     private static extern int NetUserAdd(
