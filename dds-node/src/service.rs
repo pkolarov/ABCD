@@ -900,9 +900,17 @@ impl<
 
     /// List every `WindowsPolicyDocument` whose scope matches the
     /// given device URN. Skips revoked, burned, and `Disabled`
-    /// documents. The result is in attestation-iteration order
-    /// (implementation-defined); the agent should sort by
-    /// `(policy_id, version)` if it cares about determinism.
+    /// documents.
+    ///
+    /// **B-4 (security review):** if multiple in-scope attestations
+    /// share the same logical `policy_id`, only one is returned —
+    /// the document with the highest `version`, with ties broken by
+    /// the latest `iat`, and final ties broken lexicographically by
+    /// `jti`. Agents key applied state by `policy_id`, so without
+    /// this filter two attestations carrying conflicting versions
+    /// could flap across restarts depending on attestation iteration
+    /// order. The result vector is sorted by `policy_id` so callers
+    /// observe a stable order on every poll.
     ///
     /// This is the read side of Phase 3 item 9 — the
     /// `DdsPolicyAgent` calls this once a minute via
@@ -971,6 +979,9 @@ impl<
                 document: doc,
             });
         }
+        // B-4: collapse duplicates by `policy_id`, keep the winner,
+        // emit in stable (policy_id-sorted) order.
+        let out = supersede_windows_policies(out);
         Ok(out)
     }
 
@@ -978,6 +989,10 @@ impl<
     /// device URN. Skips revoked, burned, and `Disabled` documents.
     /// Scope semantics are identical to
     /// `list_applicable_windows_policies`.
+    ///
+    /// **B-4 (security review):** see `list_applicable_windows_policies`
+    /// — duplicates by `policy_id` are collapsed to the winner
+    /// (highest `version`, then latest `iat`, then lex-smallest `jti`).
     pub fn list_applicable_macos_policies(
         &self,
         device_urn: &str,
@@ -1028,12 +1043,24 @@ impl<
                 document: doc,
             });
         }
+        let out = supersede_macos_policies(out);
         Ok(out)
     }
 
     /// List every `SoftwareAssignment` whose scope matches the given
     /// device URN. Skips revoked / burned tokens. Same scope rules as
     /// `list_applicable_windows_policies`. Phase 3 item 10.
+    ///
+    /// **B-4 (security review):** if multiple in-scope assignments
+    /// share the same logical `package_id`, only one is returned —
+    /// the assignment with the latest `iat`, with ties broken
+    /// lexicographically by `jti`. Agents key applied state by
+    /// `package_id`; without this filter two attestations carrying
+    /// conflicting versions could flap across restarts. (Software
+    /// `version` is a free-form string — semver is not assumed —
+    /// so we order by signing timestamp rather than the version
+    /// field.) The result vector is sorted by `package_id` so
+    /// callers observe a stable order.
     pub fn list_applicable_software(
         &self,
         device_urn: &str,
@@ -1081,6 +1108,7 @@ impl<
                 document: doc,
             });
         }
+        let out = supersede_software(out);
         Ok(out)
     }
 
@@ -2148,6 +2176,129 @@ impl std::fmt::Display for ServiceError {
 
 impl std::error::Error for ServiceError {}
 
+/// **B-4 (security review).** Collapse multiple `WindowsPolicyDocument`
+/// attestations sharing the same `policy_id` to a single winner.
+/// Winner: highest `version`; tiebreak latest `iat`; final tiebreak
+/// lex-smallest `jti`. Output is sorted by `policy_id` for stable
+/// agent ordering across polls.
+fn supersede_windows_policies(items: Vec<ApplicableWindowsPolicy>) -> Vec<ApplicableWindowsPolicy> {
+    use std::collections::BTreeMap;
+    let mut by_id: BTreeMap<String, ApplicableWindowsPolicy> = BTreeMap::new();
+    for item in items {
+        let key = item.document.policy_id.clone();
+        match by_id.get(&key) {
+            None => {
+                by_id.insert(key, item);
+            }
+            Some(prev) => {
+                let prev_v = prev.document.version;
+                let cur_v = item.document.version;
+                let take = match cur_v.cmp(&prev_v) {
+                    core::cmp::Ordering::Greater => true,
+                    core::cmp::Ordering::Less => false,
+                    core::cmp::Ordering::Equal => match item.iat.cmp(&prev.iat) {
+                        core::cmp::Ordering::Greater => true,
+                        core::cmp::Ordering::Less => false,
+                        core::cmp::Ordering::Equal => item.jti < prev.jti,
+                    },
+                };
+                if take {
+                    tracing::warn!(
+                        policy_id = %key,
+                        winning_jti = %item.jti,
+                        winning_version = item.document.version,
+                        loser_jti = %prev.jti,
+                        loser_version = prev.document.version,
+                        "B-4: superseding duplicate windows policy"
+                    );
+                    by_id.insert(key, item);
+                } else {
+                    tracing::warn!(
+                        policy_id = %key,
+                        winning_jti = %prev.jti,
+                        winning_version = prev.document.version,
+                        loser_jti = %item.jti,
+                        loser_version = item.document.version,
+                        "B-4: dropping duplicate windows policy"
+                    );
+                }
+            }
+        }
+    }
+    by_id.into_values().collect()
+}
+
+/// **B-4** macOS policy supersession — same rules as
+/// [`supersede_windows_policies`].
+fn supersede_macos_policies(items: Vec<ApplicableMacOsPolicy>) -> Vec<ApplicableMacOsPolicy> {
+    use std::collections::BTreeMap;
+    let mut by_id: BTreeMap<String, ApplicableMacOsPolicy> = BTreeMap::new();
+    for item in items {
+        let key = item.document.policy_id.clone();
+        match by_id.get(&key) {
+            None => {
+                by_id.insert(key, item);
+            }
+            Some(prev) => {
+                let prev_v = prev.document.version;
+                let cur_v = item.document.version;
+                let take = match cur_v.cmp(&prev_v) {
+                    core::cmp::Ordering::Greater => true,
+                    core::cmp::Ordering::Less => false,
+                    core::cmp::Ordering::Equal => match item.iat.cmp(&prev.iat) {
+                        core::cmp::Ordering::Greater => true,
+                        core::cmp::Ordering::Less => false,
+                        core::cmp::Ordering::Equal => item.jti < prev.jti,
+                    },
+                };
+                if take {
+                    tracing::warn!(
+                        policy_id = %key,
+                        winning_jti = %item.jti,
+                        loser_jti = %prev.jti,
+                        "B-4: superseding duplicate macos policy"
+                    );
+                    by_id.insert(key, item);
+                }
+            }
+        }
+    }
+    by_id.into_values().collect()
+}
+
+/// **B-4** software supersession. Software `version` is a free-form
+/// string, so we order by signing timestamp `iat` (latest wins) with a
+/// final lex-smallest-`jti` tiebreaker.
+fn supersede_software(items: Vec<ApplicableSoftware>) -> Vec<ApplicableSoftware> {
+    use std::collections::BTreeMap;
+    let mut by_id: BTreeMap<String, ApplicableSoftware> = BTreeMap::new();
+    for item in items {
+        let key = item.document.package_id.clone();
+        match by_id.get(&key) {
+            None => {
+                by_id.insert(key, item);
+            }
+            Some(prev) => {
+                let take = match item.iat.cmp(&prev.iat) {
+                    core::cmp::Ordering::Greater => true,
+                    core::cmp::Ordering::Less => false,
+                    core::cmp::Ordering::Equal => item.jti < prev.jti,
+                };
+                if take {
+                    tracing::warn!(
+                        package_id = %key,
+                        winning_jti = %item.jti,
+                        loser_jti = %prev.jti,
+                        "B-4: superseding duplicate software assignment"
+                    );
+                    by_id.insert(key, item);
+                }
+            }
+        }
+    }
+    by_id.into_values().collect()
+}
+
 fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3122,6 +3273,157 @@ mod platform_applier_tests {
         assert_eq!(bundle.local_accounts[0].username, "alice");
         assert_eq!(bundle.launchd[0].label, "com.dds.agent");
         assert_eq!(bundle.profiles[0].identifier, "com.dds.test");
+    }
+
+    // ============================================================
+    // B-4 (security review): deterministic supersession
+    // ============================================================
+
+    /// **B-4 regression.** Two `WindowsPolicyDocument` attestations with
+    /// the same `policy_id` but different `version`s must collapse to
+    /// the highest version.
+    #[test]
+    fn b4_windows_policies_supersede_by_version() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "ws-b4", vec!["workstation".into()], None);
+
+        let mut p_old = baseline_policy("p:supersede", PolicyScope { device_tags: vec![], org_units: vec![], identity_urns: vec![] });
+        p_old.version = 3;
+        let mut p_new = baseline_policy("p:supersede", PolicyScope { device_tags: vec![], org_units: vec![], identity_urns: vec![] });
+        p_new.version = 7;
+
+        // Insert in "wrong" order: the higher version arrives first,
+        // then the older one — supersession must still pick v=7.
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-new", &p_new))
+            .unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-old", &p_old))
+            .unwrap();
+
+        let hits = svc.list_applicable_windows_policies(&dev).unwrap();
+        assert_eq!(hits.len(), 1, "duplicate policy_id must collapse to one");
+        assert_eq!(hits[0].document.version, 7);
+        assert_eq!(hits[0].jti, "p-new");
+    }
+
+    /// **B-4 regression.** When two attestations share both `policy_id`
+    /// and `version`, the one with the latest `iat` wins.
+    #[test]
+    fn b4_windows_policies_supersede_by_iat_on_version_tie() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "ws-b4-iat", vec!["workstation".into()], None);
+
+        let p = baseline_policy("p:tie", PolicyScope { device_tags: vec![], org_units: vec![], identity_urns: vec![] });
+        let mut t_early = attest_with_body(&admin, "p-early", &p);
+        let mut t_late = attest_with_body(&admin, "p-late", &p);
+        // attest_with_body fixes iat at 1_700_000_000; tweak the late
+        // one to be later by re-signing a copy of the payload with a
+        // later iat. We rebuild from scratch to avoid mutating the
+        // signed bytes.
+        let _ = (&mut t_early, &mut t_late);
+        let p_late_payload = TokenPayload {
+            iat: 1_700_001_000,
+            ..t_late.payload.clone()
+        };
+        t_late = Token::sign(p_late_payload, &admin.signing_key).unwrap();
+
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(t_early)
+            .unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(t_late)
+            .unwrap();
+
+        let hits = svc.list_applicable_windows_policies(&dev).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].iat, 1_700_001_000,
+            "B-4: latest iat must win on version tie"
+        );
+    }
+
+    /// **B-4 regression.** Two `SoftwareAssignment` attestations with
+    /// the same `package_id` collapse to the latest `iat`.
+    #[test]
+    fn b4_software_supersedes_by_iat() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "ws-b4-sw", vec!["developer".into()], None);
+
+        let pkg_v1 = SoftwareAssignment {
+            package_id: "com.example.editor".into(),
+            display_name: "Editor".into(),
+            version: "1.0.0".into(),
+            source: "https://cdn.example.com/editor-1.0.0.msi".into(),
+            sha256: "deadbeef".into(),
+            action: dds_domain::InstallAction::Install,
+            scope: PolicyScope {
+                device_tags: vec!["developer".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            silent: true,
+            pre_install_script: None,
+            post_install_script: None,
+        };
+        let pkg_v2 = SoftwareAssignment {
+            version: "2.0.0".into(),
+            source: "https://cdn.example.com/editor-2.0.0.msi".into(),
+            sha256: "feedface".into(),
+            ..pkg_v1.clone()
+        };
+
+        let mut t_v1 = attest_with_body(&admin, "sw-v1", &pkg_v1);
+        let _ = &mut t_v1;
+        let pkg_v2_payload = TokenPayload {
+            iat: 1_700_002_000,
+            ..attest_with_body(&admin, "sw-v2", &pkg_v2).payload
+        };
+        let t_v2 = Token::sign(pkg_v2_payload, &admin.signing_key).unwrap();
+
+        svc.trust_graph.write().unwrap().add_token(t_v1).unwrap();
+        svc.trust_graph.write().unwrap().add_token(t_v2).unwrap();
+
+        let hits = svc.list_applicable_software(&dev).unwrap();
+        assert_eq!(hits.len(), 1, "duplicate package_id must collapse to one");
+        assert_eq!(hits[0].document.version, "2.0.0");
+        assert_eq!(hits[0].iat, 1_700_002_000);
+    }
+
+    /// **B-4 regression.** Documents with *different* logical IDs are
+    /// preserved — supersession only collapses duplicates within the
+    /// same `policy_id` / `package_id`.
+    #[test]
+    fn b4_distinct_ids_are_not_collapsed() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "ws-b4-distinct", vec![], None);
+
+        let a = baseline_policy("p:a", PolicyScope { device_tags: vec![], org_units: vec![], identity_urns: vec![] });
+        let b = baseline_policy("p:b", PolicyScope { device_tags: vec![], org_units: vec![], identity_urns: vec![] });
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-a", &a))
+            .unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-b", &b))
+            .unwrap();
+
+        let hits = svc.list_applicable_windows_policies(&dev).unwrap();
+        assert_eq!(hits.len(), 2);
+        // Stable order: alphabetic by policy_id.
+        assert_eq!(hits[0].document.policy_id, "p:a");
+        assert_eq!(hits[1].document.policy_id, "p:b");
     }
 
     // Silence the unused-import warning when only some helpers are

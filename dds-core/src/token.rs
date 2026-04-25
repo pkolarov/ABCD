@@ -197,18 +197,12 @@ impl Token {
     where
         F: FnOnce(&[u8]) -> SignatureBundle,
     {
-        // Shape validation identical to the pre-v2 path.
-        if matches!(payload.kind, TokenKind::Revoke | TokenKind::Burn) && payload.exp.is_some() {
-            return Err(TokenError::RevocationMustNotExpire);
-        }
-        if payload.kind == TokenKind::Vouch
-            && (payload.vch_iss.is_none() || payload.vch_sum.is_none())
-        {
-            return Err(TokenError::VouchMissingFields);
-        }
-        if payload.kind == TokenKind::Revoke && payload.revokes.is_none() {
-            return Err(TokenError::RevokeMissingTarget);
-        }
+        // Shape validation: the same invariants are also enforced on
+        // ingest (`Token::validate_shape`) so that an inbound token
+        // missing kind-specific fields cannot bypass these checks
+        // when it was signed by a foreign producer that didn't run
+        // through `create_with_version`. **B-2 (security review).**
+        validate_shape(&payload)?;
 
         let (payload_bytes, signed_input) = match wire_version {
             TOKEN_WIRE_V1 => {
@@ -321,8 +315,19 @@ impl Token {
         Ok(())
     }
 
-    /// Full validation: signature + issuer binding + expiry check.
+    /// Full validation: shape + signature + issuer binding + expiry.
+    ///
+    /// **B-2 (security review):** the shape check matches the
+    /// invariants enforced by [`Token::create_with_version`] so an
+    /// inbound, signed token whose kind-specific fields are missing
+    /// (e.g. a `Vouch` without `vch_iss` / `vch_sum`, a `Revoke`
+    /// without `revokes`, or a `Revoke` / `Burn` carrying `exp`) is
+    /// rejected the same way it would be at construction time. The
+    /// trust graph also calls [`Token::validate_shape`] on ingest;
+    /// this method exists for callers that already hold a `Token`
+    /// and want a single full-validation entry point.
     pub fn validate(&self) -> Result<(), TokenError> {
+        self.validate_shape()?;
         self.verify_signature()?;
         self.verify_issuer_binding()?;
 
@@ -338,6 +343,13 @@ impl Token {
         }
 
         Ok(())
+    }
+
+    /// Enforce the shape invariants in [`validate_shape`] against
+    /// `self.payload`. Returns the same errors as the construction
+    /// path so callers can surface them uniformly.
+    pub fn validate_shape(&self) -> Result<(), TokenError> {
+        validate_shape(&self.payload)
     }
 
     /// Compute the SHA-256 hash of this token's payload bytes (for use as `vch_sum`).
@@ -398,6 +410,29 @@ struct TokenWire {
 }
 
 /// Helper: CBOR encode.
+/// **B-2 (security review).** Shared structural validator: enforced
+/// on construction (`Token::create_with_version`) and on ingest
+/// (`Token::validate` / `Token::validate_shape`, called by
+/// `TrustGraph::add_token`). Without this, a foreign signer that
+/// emits a CBOR-correct, signature-valid token without
+/// `vch_iss` / `vch_sum` (for a vouch) or without `revokes` (for a
+/// revoke) was accepted by the verifier path even though local
+/// construction always rejected it.
+fn validate_shape(payload: &TokenPayload) -> Result<(), TokenError> {
+    if matches!(payload.kind, TokenKind::Revoke | TokenKind::Burn) && payload.exp.is_some() {
+        return Err(TokenError::RevocationMustNotExpire);
+    }
+    if payload.kind == TokenKind::Vouch
+        && (payload.vch_iss.is_none() || payload.vch_sum.is_none())
+    {
+        return Err(TokenError::VouchMissingFields);
+    }
+    if payload.kind == TokenKind::Revoke && payload.revokes.is_none() {
+        return Err(TokenError::RevokeMissingTarget);
+    }
+    Ok(())
+}
+
 fn cbor_encode<T: Serialize>(value: &T) -> Result<Vec<u8>, TokenError> {
     let mut buf = Vec::new();
     ciborium::into_writer(value, &mut buf).map_err(|_| TokenError::SerializationError)?;

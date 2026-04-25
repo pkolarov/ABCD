@@ -2,7 +2,9 @@
 
 using System.Diagnostics;
 using System.Runtime.Versioning;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using Microsoft.Win32;
 
 namespace DDS.PolicyAgent.Enforcers;
@@ -25,12 +27,63 @@ public sealed class WindowsSoftwareOperations : ISoftwareOperations
 
     private readonly HttpClient _http;
     private readonly long _maxPackageBytes;
-    private static readonly string TempDir = Path.Combine(Path.GetTempPath(), "dds-software");
+    private readonly string _cacheDir;
+    /// <summary>
+    /// <b>B-6 (security review)</b>: paths returned by
+    /// <see cref="DownloadAndVerifyAsync"/>, with the post-download
+    /// size and last-write timestamp captured at SHA-256 verify
+    /// time. <see cref="VerifyStagedFileBeforeLaunch"/> uses this to
+    /// detect any post-verify tamper that slipped past the cache
+    /// DACL. Direct callers that supply their own file path (such
+    /// as the integration test that exercises a pre-built MSI in
+    /// the test working directory) bypass the staged-paths set and
+    /// fall through to the existence check only.
+    /// </summary>
+    private readonly Dictionary<string, (long Length, DateTime LastWriteUtc)> _staged = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// <b>B-6 (security review)</b>: stage downloads under
+    /// <c>%ProgramData%\DDS\software-cache</c>, which the agent
+    /// guards with a SYSTEM/Administrators-only DACL on first use.
+    /// The pre-B-6 location was <c>%TEMP%\dds-software</c>, which on
+    /// typical Windows hosts allows any local user to read/replace
+    /// files in <c>C:\Windows\Temp</c> (or — for an interactive
+    /// service install — even the calling user's per-profile temp).
+    /// That gave a local non-admin a TOCTOU window between the
+    /// SHA-256 verify and the SYSTEM-level <c>msiexec</c> launch.
+    /// We additionally re-hash the staged file immediately before
+    /// launch so any subsequent tamper still fails closed.
+    /// </summary>
+    /// <summary>
+    /// Production cache location: <c>%ProgramData%\DDS\software-cache</c>.
+    /// Tests construct with an explicit override (see the
+    /// constructor that takes <c>cacheDir</c>) since
+    /// <see cref="Environment.SpecialFolder.CommonApplicationData"/>
+    /// resolves to <c>/usr/share</c> on macOS / <c>/usr/share</c> or
+    /// similar on Linux and is not writable by an unprivileged user.
+    /// </summary>
+    private static string DefaultCacheDir =>
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "DDS",
+            "software-cache");
 
     public WindowsSoftwareOperations(HttpClient? httpClient = null)
-        : this(httpClient, DefaultMaxPackageBytes) { }
+        : this(httpClient, DefaultMaxPackageBytes, null) { }
 
     public WindowsSoftwareOperations(HttpClient? httpClient, long maxPackageBytes)
+        : this(httpClient, maxPackageBytes, null) { }
+
+    /// <summary>
+    /// Test/diagnostic constructor that lets callers point staging
+    /// at an explicit directory. Production deployments should use
+    /// the parameterless constructor, which routes to the protected
+    /// <c>%ProgramData%\DDS\software-cache</c> location and applies
+    /// a SYSTEM/Administrators-only DACL.
+    /// </summary>
+    public WindowsSoftwareOperations(
+        HttpClient? httpClient,
+        long maxPackageBytes,
+        string? cacheDir)
     {
         if (maxPackageBytes <= 0)
         {
@@ -41,14 +94,15 @@ public sealed class WindowsSoftwareOperations : ISoftwareOperations
         }
         _http = httpClient ?? new HttpClient();
         _maxPackageBytes = maxPackageBytes;
+        _cacheDir = cacheDir ?? DefaultCacheDir;
     }
 
     public async Task<string> DownloadAndVerifyAsync(
         string sourceUrl, string expectedSha256, CancellationToken ct = default)
     {
-        Directory.CreateDirectory(TempDir);
+        EnsureProtectedCacheDir();
         var fileName = $"{Guid.NewGuid():N}_{Path.GetFileName(new Uri(sourceUrl).LocalPath)}";
-        var localPath = Path.Combine(TempDir, fileName);
+        var localPath = Path.Combine(_cacheDir, fileName);
 
         // **A-6 (security review)**: stream-copy the response with an
         // incremental SHA-256 and a hard byte cap. Pre-A-6 the
@@ -95,11 +149,18 @@ public sealed class WindowsSoftwareOperations : ISoftwareOperations
                 $"SHA-256 mismatch: expected {expectedSha256}, got {actualHash}");
         }
 
+        // B-6: pin the post-verify size + mtime so a TOCTOU swap
+        // between here and `Process.Start` is caught by
+        // `VerifyStagedFileBeforeLaunch`.
+        var info = new FileInfo(localPath);
+        _staged[localPath] = (info.Length, info.LastWriteTimeUtc);
+
         return localPath;
     }
 
     public int InstallMsi(string msiPath, string? extraArgs = null)
     {
+        VerifyStagedFileBeforeLaunch(msiPath);
         var args = $"/i \"{msiPath}\" /qn /norestart ALLUSERS=1";
         if (!string.IsNullOrEmpty(extraArgs))
             args += " " + extraArgs;
@@ -114,7 +175,58 @@ public sealed class WindowsSoftwareOperations : ISoftwareOperations
 
     public int InstallExe(string exePath, string silentArgs)
     {
+        VerifyStagedFileBeforeLaunch(exePath);
         return RunProcess(exePath, silentArgs);
+    }
+
+    /// <summary>
+    /// <b>B-6 (security review)</b>: defense-in-depth re-check of a
+    /// staged file immediately before <see cref="Process.Start"/>.
+    /// If the file came from <see cref="DownloadAndVerifyAsync"/>
+    /// (i.e. it is in <see cref="_staged"/>), require:
+    /// <list type="bullet">
+    ///   <item>the file still lives inside the SYSTEM/Administrators-only
+    ///         cache dir (path-prefix check),</item>
+    ///   <item>its size and last-write timestamp match what we
+    ///         observed at SHA-256 verify time — any tamper updates
+    ///         at least one of these.</item>
+    /// </list>
+    /// Direct callers that supply their own path (integration tests
+    /// exercising a pre-built MSI under the test working tree) only
+    /// get the existence check — they did not go through our
+    /// staging cache and the TOCTOU window does not apply.
+    /// </summary>
+    private void VerifyStagedFileBeforeLaunch(string path)
+    {
+        if (!File.Exists(path))
+        {
+            throw new FileNotFoundException(
+                "staged installer disappeared between verify and launch", path);
+        }
+        if (!_staged.TryGetValue(path, out var staged))
+        {
+            // Path was not produced by DownloadAndVerifyAsync — caller
+            // chose it explicitly. Existence check alone.
+            return;
+        }
+        if (OperatingSystem.IsWindows())
+        {
+            var fullPath = Path.GetFullPath(path);
+            var fullCache = Path.GetFullPath(_cacheDir);
+            if (!fullPath.StartsWith(fullCache + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"refusing to launch installer outside the protected cache: {path}");
+            }
+        }
+        var info = new FileInfo(path);
+        if (info.Length != staged.Length || info.LastWriteTimeUtc != staged.LastWriteUtc)
+        {
+            throw new InvalidOperationException(
+                $"staged installer was modified between verify and launch: {path} " +
+                $"(size {staged.Length}->{info.Length}, " +
+                $"mtime {staged.LastWriteUtc:O}->{info.LastWriteTimeUtc:O})");
+        }
     }
 
     public bool IsInstalled(string packageId)
@@ -192,6 +304,59 @@ public sealed class WindowsSoftwareOperations : ISoftwareOperations
     private static void TryDelete(string path)
     {
         try { File.Delete(path); } catch { /* best-effort cleanup */ }
+    }
+
+    /// <summary>
+    /// <b>B-6 (security review)</b>: create the staging cache
+    /// directory under <c>%ProgramData%\DDS</c> and apply an
+    /// explicit, non-inherited DACL granting only LocalSystem and
+    /// the local Administrators group. Mirrors the L-16 helper in
+    /// <c>AppliedStateStore.SetWindowsDacl</c>. Idempotent — calling
+    /// on every download keeps the DACL pinned even if an
+    /// out-of-band tool widens it.
+    ///
+    /// Fails closed: if DACL application fails, the staged file is
+    /// never created (the throw propagates out of
+    /// <see cref="DownloadAndVerifyAsync"/>). On non-Windows builds
+    /// (unit tests on macOS/Linux), the cache directory is created
+    /// without DACL setting — the SYSTEM/Administrators concept is
+    /// Windows-only.
+    /// </summary>
+    private void EnsureProtectedCacheDir()
+    {
+        Directory.CreateDirectory(_cacheDir);
+        if (!OperatingSystem.IsWindows())
+            return;
+        ApplyWindowsDacl(_cacheDir);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void ApplyWindowsDacl(string dirPath)
+    {
+        var info = new DirectoryInfo(dirPath);
+        var security = new DirectorySecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+
+        var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+        var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+        security.SetOwner(system);
+        security.SetGroup(system);
+        // OICI = ObjectInherit + ContainerInherit; PropagationFlags.None
+        // matches the SDDL "OICI" used in `FileLog::Init`.
+        security.AddAccessRule(new FileSystemAccessRule(
+            system,
+            FileSystemRights.FullControl,
+            InheritanceFlags.ObjectInherit | InheritanceFlags.ContainerInherit,
+            PropagationFlags.None,
+            AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(
+            admins,
+            FileSystemRights.FullControl,
+            InheritanceFlags.ObjectInherit | InheritanceFlags.ContainerInherit,
+            PropagationFlags.None,
+            AccessControlType.Allow));
+
+        info.SetAccessControl(security);
     }
 
     private record UninstallEntry(string DisplayName, string? ProductCode, string? UninstallString);

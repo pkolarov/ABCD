@@ -13,11 +13,13 @@ key management, and platform-specific concerns.
 > ~~with strikethrough~~ and a link to the fix.
 >
 > **2026-04-25 update.** A later independent source pass added six
-> open findings to the review ledger: B-1 through B-6. The highest-risk
-> architectural additions are sync persistence before trust-graph
-> acceptance, purpose grants that are not tied to a live target
-> attestation, and endpoint agents marking failed enforcement as
-> complete. They are summarized in the relevant sections below.
+> open findings to the review ledger: B-1 through B-6. **All six
+> have since landed in this branch** (latest follow-up 2026-04-25
+> #5 — see Claude_sec_review.md and STATUS.md for the per-finding
+> ledger). The Windows-side DACL helper for B-6 is the only piece
+> still requiring Windows CI exercise; the cross-platform tamper
+> defense is green on the dev host. Sections below have been
+> updated to reflect closure.
 
 ---
 
@@ -188,9 +190,9 @@ Administrators). However:
 
 | Gap | Risk | Recommendation |
 |-----|------|----------------|
-| **Sync persistence before validation (B-1)** — sync response application can write duplicate-JTI tokens and revoke/burn side effects to persistent storage even when the trust graph rejects the token. | High | Make trust-graph acceptance the first durable gate; make token storage put-if-absent or exact-byte idempotent; apply revoke/burn side effects only after graph acceptance. |
-| **Purpose grants not bound to live target attestations (B-2)** — `has_purpose` / `purposes_for` can rely on revoked/expired target attestations, and inbound token validation does not enforce the vouch shape invariants used by local token creation. | High | Share one token structural validator across creation, decode/validate, and graph ingest. Require a matching unrevoked, unexpired target attestation for every vouched purpose. |
-| **No deterministic active-version selection (B-4)** — multiple active policy/software attestations with the same logical ID can all be served, leaving final state to iteration order. | Medium | Add supersession semantics, require old-version revocation, or select one latest valid document per logical ID at serve time. |
+| **Sync persistence before validation (B-1)** ✅ closed 2026-04-25 — `apply_sync_payloads_with_graph` now feeds the trust graph before any persistent write, and `store.put_token` / `store.revoke` / `store.burn` only fire on graph acceptance; `put_token` additionally uses put-if-absent semantics so duplicate JTIs cannot overwrite. | High | (closed — see Claude_sec_review.md) |
+| **Purpose grants not bound to live target attestations (B-2)** ✅ closed 2026-04-25 — `Token::create_with_version` and `Token::validate` share `Token::validate_shape` (called by `TrustGraph::add_token`), and `has_purpose` / `purposes_for` / `walk_chain` route through `active_attestation_for_iss` which skips revoked, expired, and burned-issuer attestations. | High | (closed — see Claude_sec_review.md) |
+| **No deterministic active-version selection (B-4)** ✅ closed 2026-04-25 — `LocalService::list_applicable_*` now collapses duplicate `policy_id` / `package_id` at serve time (highest version → latest iat → lex-smallest jti) and emits in stable id-sorted order. | Medium | (closed — see Claude_sec_review.md) |
 | **No trust graph partitioning** — all tokens are visible to all nodes. | Low | By design for the single-domain model. Multi-domain deployments would need topic-level isolation. |
 | **Challenge store cleanup is passive (B-5)** ✅ closed 2026-04-25 — expired session/admin challenges were not deleted on failed consume and no production sweeper called `sweep_expired_challenges`. | Medium | The issue path (`http::issue_challenge`) now sweeps expired rows on every put, enforces a `MAX_OUTSTANDING_CHALLENGES = 4096` global cap (returning 503 when the backlog is full), and `consume_challenge` deletes expired/malformed rows in the same write transaction. A new `count_challenges` method on `ChallengeStore` backs the cap check; tests added in `dds-store` (4) and `dds-node::http` (2). |
 | **Expiry sweep race** — the expiry sweeper runs on a timer; a token that just expired may be evaluated as valid until the next sweep. | Low | The window is bounded by `expiry_scan_interval_secs` (default 60s). For real-time expiry checking, add an inline expiry check in `evaluate_policy`. |
@@ -247,9 +249,15 @@ caller fails closed.
    (`SendRequestPipe`) and the MSI custom action (`CA_GenHmacSecret`).
    A-2 closes the runtime-config gap so the pipe transport is reachable
    from a stock MSI install — real-hardware login reverify pending.
-3. For the Windows software installer TOCTOU gap (B-6), move package
+3. ~~For the Windows software installer TOCTOU gap (B-6), move package
    staging out of `%TEMP%` into a SYSTEM/Admin-only cache and rehash
-   immediately before launch.
+   immediately before launch.~~ ✅ closed 2026-04-25: staging now
+   defaults to `%ProgramData%\DDS\software-cache` with a
+   SYSTEM/Administrators-only DACL, and `InstallMsi` / `InstallExe`
+   re-verify post-download `(size, mtime)` immediately before
+   `Process.Start` (cross-platform tests in
+   `DdsPolicyAgent.Tests/B6SoftwareStagingTests.cs`; Windows DACL
+   helper requires Windows CI to exercise).
 
 ---
 
@@ -266,7 +274,7 @@ application from failed application.
 
 | Gap | Risk | Recommendation |
 |-----|------|----------------|
-| **Failed enforcement can be marked complete (B-3)** — Windows records `"ok"` even when enforcers fail; macOS records failure but `HasChanged` ignores status, so unchanged failed documents are skipped on later polls. | High | Record success only after successful outcomes. Include status in `HasChanged`, retry failed entries, and keep reporting failure until the document succeeds or is superseded. |
+| **Failed enforcement can be marked complete (B-3)** ✅ closed 2026-04-25 — `AppliedStateStore.HasChanged` now requires a successful prior status (`"ok"` / `"skipped"`) to short-circuit; the Windows worker threads the real `EnforcementStatus` through `ApplyBundleResult` into `RecordApplied` / `ReportAsync` instead of hardcoding `"ok"` (matches macOS pattern). | High | (closed — see Claude_sec_review.md) |
 
 ---
 
@@ -274,13 +282,13 @@ application from failed application.
 
 | # | Item | Priority | Section |
 |---|------|----------|---------|
-| 1 | Sync persistence before trust-graph acceptance (B-1) | High | §5 |
-| 2 | Live-attestation requirement for purpose grants (B-2) | High | §5 |
-| 3 | Failed enforcement retry semantics (B-3) | High | §7 |
+| 1 | ~~Sync persistence before trust-graph acceptance (B-1)~~ ✅ closed 2026-04-25 | High | §5 |
+| 2 | ~~Live-attestation requirement for purpose grants (B-2)~~ ✅ closed 2026-04-25 | High | §5 |
+| 3 | ~~Failed enforcement retry semantics (B-3)~~ ✅ closed 2026-04-25 | High | §7 |
 | 4 | Admission cert revocation list | High | §1 |
-| 5 | Active-version selection for policies/software (B-4) | Medium | §5 |
+| 5 | ~~Active-version selection for policies/software (B-4)~~ ✅ closed 2026-04-25 | Medium | §5 |
 | 6 | ~~Challenge-store cleanup and caps (B-5)~~ ✅ closed 2026-04-25 | Medium | §5 |
-| 7 | Windows software staging TOCTOU hardening (B-6) | Medium | §6 |
+| 7 | ~~Windows software staging TOCTOU hardening (B-6)~~ ✅ closed 2026-04-25 (Windows-CI verification of DACL helper still pending) | Medium | §6 |
 | 8 | Windows data directory ACL (dir-level) | Medium | §3 |
 | 9 | Key rotation mechanism | Medium | §2 |
 | 10 | WiX virtual service account split (M-18) | Medium | §3 |
@@ -289,5 +297,8 @@ application from failed application.
 | 13 | Real-time expiry in `evaluate_policy` | Low | §5 |
 
 All Critical findings from the source-validated review are now Fixed
-(pending verify). Three new High findings from the 2026-04-25 follow-up
-remain open: B-1, B-2, and B-3.
+(pending verify). All six findings (B-1 through B-6) from the
+2026-04-25 follow-up have landed in this branch as of 2026-04-25
+follow-up #5; only the Windows-side DACL helper for B-6 still needs
+Windows CI to exercise. The single remaining High item is the
+admission cert revocation list (§1) — orthogonal to B-1…B-6.

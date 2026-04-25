@@ -66,11 +66,13 @@ throughput, not security). All High and previously-partial items
 portions of H-6 and H-7.
 
 **2026-04-25 independent follow-up — new findings:** 3 High,
-3 Medium (1 High and 2 Medium landed this pass; 2 High and 1 Medium
-remain open). These were found after reviewing the source first and
-only then comparing against `security-gaps.md`, this review, and
-`docs/threat-model-review.md`. They are not duplicates of H-6/H-7/M-8,
-L-9, A-1, A-3, A-4, or A-6.
+3 Medium — **all 6 landed in this branch as of 2026-04-25
+follow-up #5** (B-6's Windows DACL helper still needs Windows CI
+to exercise; the cross-platform tamper-detection logic is green
+on the dev host). These were found after reviewing the source
+first and only then comparing against `security-gaps.md`, this
+review, and `docs/threat-model-review.md`. They are not
+duplicates of H-6/H-7/M-8, L-9, A-1, A-3, A-4, or A-6.
 
 - **B-1 (High) ✅ landed 2026-04-25**: sync response application wrote
   tokens and revocation/burn side effects to persistent storage before
@@ -96,17 +98,31 @@ L-9, A-1, A-3, A-4, or A-6.
   (not `jti`) and a duplicate-JTI attack carries no privilege into the
   CRDT operation graph. Gossip ingest in `dds-node::node` was already
   graph-first and required no change.
-- **B-2 (High)**: purpose checks are not tied to a live target
-  attestation, and inbound token validation does not enforce the shape
-  invariants enforced by `Token::create`. `has_purpose` /
-  `purposes_for` use `attestation_for_iss` only for `vch_sum` hash
-  comparison and do not reject revoked or expired target attestations.
-  Separately, `Token::validate` accepts signed vouches missing
-  `vch_sum` / `vch_iss`, even though local construction rejects them.
-  **Fix:** share one structural validator between `Token::create`,
-  `Token::validate`, and graph ingest; require a matching active
-  attestation for every purpose grant; and prefer exact target-token
-  references over "first attestation for issuer" lookup.
+- **B-2 (High) ✅ landed 2026-04-25**: purpose checks were not tied
+  to a live target attestation, and inbound token validation did
+  not enforce the shape invariants enforced by `Token::create`.
+  `has_purpose` / `purposes_for` used `attestation_for_iss` only
+  for `vch_sum` hash comparison and did not reject revoked or
+  expired target attestations. Separately, `Token::validate`
+  accepted signed vouches missing `vch_sum` / `vch_iss`, even
+  though local construction rejected them. **Fix shipped:**
+  `Token::create_with_version` and `Token::validate` now share
+  one structural validator (`Token::validate_shape`), called by
+  `TrustGraph::add_token` on ingest — a foreign signer that emits
+  a CBOR-correct, signature-valid `Vouch` without `vch_iss` /
+  `vch_sum` (or a `Revoke` without `revokes`, or a `Revoke` /
+  `Burn` carrying `exp`) is rejected the same way it would be at
+  construction. `TrustGraph::has_purpose` / `purposes_for` /
+  `walk_chain` route through a new `active_attestation_for_iss`
+  helper that skips revoked, expired, and burned-issuer
+  attestations; when the vouch carries `vch_sum`, the active
+  attestation must hash to that value exactly (no fallback to
+  "first attestation for issuer"). Four new regression tests in
+  `dds-core::trust::tests`:
+  `b2_purpose_grant_drops_when_target_attestation_revoked`,
+  `b2_purpose_grant_drops_when_subject_burned`,
+  `b2_validate_rejects_vouch_missing_vch_fields`, and
+  `b2_purpose_grant_requires_target_attestation_even_without_vch_sum`.
 - **B-3 (High) ✅ landed 2026-04-25**: failed policy/software enforcement
   could be recorded as applied and skipped forever. The Windows worker
   recorded `"ok"` after dispatch even when an enforcer returned
@@ -125,14 +141,30 @@ L-9, A-1, A-3, A-4, or A-6.
   `_failed_software`, `_returns_false_when_last_status_is_skipped_unchanged_content`)
   and the matching three tests in
   `platform/windows/DdsPolicyAgent.Tests/AppliedStateStoreTests.cs`.
-- **B-4 (Medium)**: active policy/software versions are not resolved
-  deterministically. The node returns every matching policy/software
-  attestation in implementation-defined order; agents key applied state
-  by logical `policy_id` / `package_id`. Multiple active documents for
-  the same logical ID can therefore apply in the wrong final order or
-  flap across restarts. **Fix:** add explicit supersession semantics,
-  require revocation of old versions, or select one latest valid
-  document per logical ID at serve time.
+- **B-4 (Medium) ✅ landed 2026-04-25**: active policy/software
+  versions were not resolved deterministically. The node returned
+  every matching policy/software attestation in
+  implementation-defined order; agents key applied state by logical
+  `policy_id` / `package_id`. Multiple active documents for the
+  same logical ID could therefore apply in the wrong final order
+  or flap across restarts. **Fix shipped:**
+  `LocalService::list_applicable_windows_policies` /
+  `list_applicable_macos_policies` /
+  `list_applicable_software` now collapse duplicates by logical
+  ID at serve time. Winner: highest `version`, then latest `iat`,
+  then lex-smallest `jti` (software falls back to `iat` ordering
+  because its `version` is a free-form string). The result vector
+  is sorted by logical ID so callers observe a stable order on
+  every poll. Three new helpers (`supersede_windows_policies` /
+  `supersede_macos_policies` / `supersede_software`) keep the
+  selection logic shared and out of the hot loop. Losing
+  duplicates are warn-logged with both JTIs so duplicate
+  publication is still operationally visible. Four new regression
+  tests in `dds-node::service::platform_applier_tests`:
+  `b4_windows_policies_supersede_by_version`,
+  `b4_windows_policies_supersede_by_iat_on_version_tie`,
+  `b4_software_supersedes_by_iat`, and
+  `b4_distinct_ids_are_not_collapsed`.
 - **B-5 (Medium) ✅ landed 2026-04-25**: challenge records can accumulate
   without production cleanup. `/v1/session/challenge` and
   `/v1/admin/challenge` persisted challenge rows, expired rows were not
@@ -150,13 +182,36 @@ L-9, A-1, A-3, A-4, or A-6.
   `dds-store/src/redb_backend.rs::b5_challenge_cleanup_tests` (2), and
   `dds-node/src/http.rs::tests::test_issue_challenge_caps_outstanding`
   / `::test_consume_expired_drops_row`.
-- **B-6 (Medium)**: the Windows software installer has a post-hash
-  TOCTOU window. Packages are staged under `%TEMP%\dds-software`,
-  hashed, closed, then later executed as SYSTEM. On typical Windows temp
-  ACLs, a local user may be able to swap or delete the staged file
-  between verification and `Process.Start`. **Fix:** stage under a
-  SYSTEM/Admin-only cache, preserve a protected verified handle where
-  practical, or rehash immediately before launch.
+- **B-6 (Medium) ✅ landed 2026-04-25 (Windows-CI verification
+  pending)**: the Windows software installer had a post-hash TOCTOU
+  window. Packages were staged under `%TEMP%\dds-software`, hashed,
+  closed, then later executed as SYSTEM. On typical Windows temp
+  ACLs, a local user could swap or delete the staged file between
+  verification and `Process.Start`. **Fix shipped:** staging now
+  defaults to `%ProgramData%\DDS\software-cache`. The first download
+  applies an explicit, non-inherited DACL granting only LocalSystem
+  and `BUILTIN\Administrators` (`OICI` for inherited child files) —
+  same pattern as L-16's `AppliedStateStore.SetWindowsDacl` and
+  A-4's `FileLog::Init`. Defense-in-depth at launch:
+  `DownloadAndVerifyAsync` pins the post-verify `(size, last-write
+  UTC)` of every staged file in `_staged`; `InstallMsi` /
+  `InstallExe` re-check both immediately before `Process.Start`
+  via a new `VerifyStagedFileBeforeLaunch` and refuse with
+  `InvalidOperationException` if either drifted. The path-prefix
+  check fails closed if the staged file moves outside the cache.
+  Direct callers that supply their own path (integration tests
+  pointing at a pre-built MSI) get the existence check only — they
+  did not go through staging and the TOCTOU window does not apply.
+  A new `cacheDir` constructor parameter lets cross-platform unit
+  tests use a per-test sandbox; production paths route to the
+  protected default. Four new tests in
+  `DdsPolicyAgent.Tests/B6SoftwareStagingTests.cs`:
+  `B6_install_rejects_tamper_after_download`,
+  `B6_install_rejects_mtime_only_tamper`,
+  `B6_install_accepts_external_path_with_existence_check`, and
+  `B6_staging_uses_configured_cache_dir`. The Windows DACL
+  application path (`ApplyWindowsDacl`) requires Windows CI to
+  exercise.
 
 **Reviewer follow-ups already closed this round** (previously flagged
 as partial):
