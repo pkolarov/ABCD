@@ -533,11 +533,12 @@ impl ChallengeStore for RedbBackend {
             .db
             .begin_write()
             .map_err(|e| StoreError::Io(e.to_string()))?;
-        let result = {
+        // Outer Result lets us delete an expired row in the same write-txn
+        // before returning the expiry error (B-5).
+        let outcome: Result<[u8; 32], StoreError> = {
             let mut table = write_txn
                 .open_table(CHALLENGES)
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            // Copy raw bytes out before any mutable operation on the table.
             let encoded: Vec<u8> = {
                 let guard = table
                     .get(id)
@@ -546,26 +547,35 @@ impl ChallengeStore for RedbBackend {
                 guard.value().to_vec()
             };
             if encoded.len() < 40 {
-                return Err(StoreError::Serde("challenge record too short".into()));
+                // Treat malformed rows like expired ones — drop them so a
+                // probe contributes to cleanup.
+                let _ = table.remove(id);
+                Err(StoreError::Serde("challenge record too short".into()))
+            } else {
+                let expires_at = u64::from_be_bytes(encoded[..8].try_into().unwrap());
+                if now >= expires_at {
+                    // B-5: delete the expired row inside the same transaction.
+                    table
+                        .remove(id)
+                        .map_err(|e| StoreError::Io(e.to_string()))?;
+                    Err(StoreError::Io(format!(
+                        "challenge '{}' has expired (expired at {expires_at}, now {now})",
+                        id
+                    )))
+                } else {
+                    let mut nonce = [0u8; 32];
+                    nonce.copy_from_slice(&encoded[8..40]);
+                    table
+                        .remove(id)
+                        .map_err(|e| StoreError::Io(e.to_string()))?;
+                    Ok(nonce)
+                }
             }
-            let expires_at = u64::from_be_bytes(encoded[..8].try_into().unwrap());
-            if now >= expires_at {
-                return Err(StoreError::Io(format!(
-                    "challenge '{}' has expired (expired at {expires_at}, now {now})",
-                    id
-                )));
-            }
-            let mut nonce = [0u8; 32];
-            nonce.copy_from_slice(&encoded[8..40]);
-            table
-                .remove(id)
-                .map_err(|e| StoreError::Io(e.to_string()))?;
-            nonce
         };
         write_txn
             .commit()
             .map_err(|e| StoreError::Io(e.to_string()))?;
-        Ok(result)
+        outcome
     }
 
     fn sweep_expired_challenges(&mut self, now: u64) -> StoreResult<usize> {
@@ -606,6 +616,19 @@ impl ChallengeStore for RedbBackend {
             .commit()
             .map_err(|e| StoreError::Io(e.to_string()))?;
         Ok(count)
+    }
+
+    fn count_challenges(&self) -> StoreResult<usize> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        let table = match read_txn.open_table(CHALLENGES) {
+            Ok(t) => t,
+            // No challenges have ever been written; treat as empty.
+            Err(_) => return Ok(0),
+        };
+        Ok(table.len().unwrap_or(0) as usize)
     }
 }
 
@@ -755,5 +778,57 @@ mod l18_sign_count_tests {
             Err(StoreError::SignCountReplay { stored: 11, attempted: 5 })
         ));
         assert_eq!(be.get_sign_count("cred-x").unwrap(), Some(11));
+    }
+}
+
+#[cfg(test)]
+mod b5_challenge_cleanup_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn open_temp() -> (TempDir, RedbBackend) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.redb");
+        let be = RedbBackend::open(&path).unwrap();
+        (dir, be)
+    }
+
+    /// B-5: `consume_challenge` on an expired row removes it so the
+    /// table cannot accumulate rows when callers probe stale ids.
+    #[test]
+    fn consume_expired_drops_row() {
+        let (_dir, mut be) = open_temp();
+        be.put_challenge("c1", &[7u8; 32], 100).unwrap();
+        assert_eq!(be.count_challenges().unwrap(), 1);
+
+        let err = be.consume_challenge("c1", 200).unwrap_err();
+        assert!(matches!(err, StoreError::Io(_)));
+        assert_eq!(be.count_challenges().unwrap(), 0);
+
+        // A second probe of the same id is now a plain NotFound.
+        let err2 = be.consume_challenge("c1", 200).unwrap_err();
+        assert!(matches!(err2, StoreError::NotFound(_)));
+    }
+
+    /// B-5: `count_challenges` reflects live rows on a fresh DB and
+    /// after sweep / consume.
+    #[test]
+    fn count_and_sweep_track_outstanding() {
+        let (_dir, mut be) = open_temp();
+        // Empty table → CHALLENGES has never been written; count is 0.
+        assert_eq!(be.count_challenges().unwrap(), 0);
+
+        be.put_challenge("a", &[1u8; 32], 100).unwrap();
+        be.put_challenge("b", &[2u8; 32], 200).unwrap();
+        be.put_challenge("c", &[3u8; 32], 300).unwrap();
+        assert_eq!(be.count_challenges().unwrap(), 3);
+
+        let removed = be.sweep_expired_challenges(150).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(be.count_challenges().unwrap(), 2);
+
+        let nonce = be.consume_challenge("b", 150).unwrap();
+        assert_eq!(nonce, [2u8; 32]);
+        assert_eq!(be.count_challenges().unwrap(), 1);
     }
 }

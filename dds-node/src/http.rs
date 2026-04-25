@@ -507,6 +507,17 @@ impl<
 /// TTL for server-issued FIDO2 challenges (5 minutes).
 const CHALLENGE_TTL_SECS: u64 = 300;
 
+/// **B-5 (security review)**: cap on outstanding challenge rows. The
+/// production sweeper deletes expired rows on every issue and on every
+/// failed consume, but a flood of un-consumed challenges can still
+/// accumulate within a single TTL window. Once this many rows are
+/// outstanding (after sweeping expired ones), `/v1/session/challenge`
+/// and `/v1/admin/challenge` return 503 instead of issuing a new
+/// challenge. 4096 is comfortably above any single-host workload —
+/// the credential provider issues one challenge per logon — and tight
+/// enough to bound the redb table.
+const MAX_OUTSTANDING_CHALLENGES: usize = 4096;
+
 /// **M-11 (security review)**: cap inbound JSON bodies. The Axum
 /// default is 2 MB; 256 KB is generous for the largest legitimate
 /// payload here (FIDO2 attestation objects with large authenticator
@@ -1151,7 +1162,27 @@ where
 
     {
         let mut svc = state.svc.lock().await;
-        svc.store_mut()
+        // B-5: amortized cleanup on every issue. Drop expired rows first,
+        // then enforce a global cap. The cap is checked AFTER the sweep so
+        // a long-idle node never trips it unnecessarily.
+        let store = svc.store_mut();
+        if let Err(e) = store.sweep_expired_challenges(now) {
+            // Sweep failures are not fatal to issuance — log and continue.
+            tracing::warn!("sweep_expired_challenges failed: {e}");
+        }
+        let outstanding = store.count_challenges().map_err(|e| HttpError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("store error: {e}"),
+        })?;
+        if outstanding >= MAX_OUTSTANDING_CHALLENGES {
+            return Err(HttpError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: format!(
+                    "challenge backlog full ({outstanding} outstanding); retry after consume/expiry"
+                ),
+            });
+        }
+        store
             .put_challenge(&id, &bytes, expires_at)
             .map_err(|e| HttpError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -3452,6 +3483,88 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 401, "stale challenge should be rejected");
+    }
+
+    /// **B-5**: when more than `MAX_OUTSTANDING_CHALLENGES` live rows
+    /// are already in the store, `/v1/session/challenge` returns 503
+    /// instead of issuing a new one — the issue path sweeps expired
+    /// rows first, so a long-idle table never trips the cap.
+    #[tokio::test]
+    async fn test_issue_challenge_caps_outstanding() {
+        let state = make_state();
+        let base = spawn_server(state.clone()).await;
+
+        // Pre-populate the store with the cap's worth of live challenges.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let live_until = now + CHALLENGE_TTL_SECS;
+        {
+            let mut svc = state.svc.lock().await;
+            let store = svc.store_mut();
+            for i in 0..MAX_OUTSTANDING_CHALLENGES {
+                let id = format!("chall-cap-{i}");
+                store.put_challenge(&id, &[0u8; 32], live_until).unwrap();
+            }
+            assert_eq!(store.count_challenges().unwrap(), MAX_OUTSTANDING_CHALLENGES);
+        }
+
+        // The next issue request must be rejected with 503.
+        let resp = reqwest::get(format!("{base}/v1/session/challenge"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            503,
+            "challenge issuance must fail closed once the cap is reached"
+        );
+
+        // Drop one live row and re-issue — the cap should now allow it.
+        {
+            let mut svc = state.svc.lock().await;
+            let _ = svc.store_mut().consume_challenge("chall-cap-0", now).unwrap();
+        }
+        let resp2 = reqwest::get(format!("{base}/v1/session/challenge"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp2.status(),
+            200,
+            "challenge issuance must succeed after the backlog drops below the cap"
+        );
+    }
+
+    /// **B-5**: a probe of an expired `challenge_id` must drop the row
+    /// from the store rather than letting it accumulate.
+    #[tokio::test]
+    async fn test_consume_expired_drops_row() {
+        let state = make_state();
+        let _base = spawn_server(state.clone()).await;
+
+        let stale_bytes = [0xABu8; 32];
+        let stale_id = "chall-b5-expired";
+        {
+            let mut svc = state.svc.lock().await;
+            // expires_at = 1 → already expired for any realistic `now`.
+            svc.store_mut()
+                .put_challenge(stale_id, &stale_bytes, 1)
+                .unwrap();
+            assert_eq!(svc.store_mut().count_challenges().unwrap(), 1);
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        {
+            let mut svc = state.svc.lock().await;
+            let err = svc.store_mut().consume_challenge(stale_id, now).unwrap_err();
+            // Expiry path returns Io with a descriptive message.
+            assert!(format!("{err}").contains("expired"));
+            // Row is gone.
+            assert_eq!(svc.store_mut().count_challenges().unwrap(), 0);
+        }
     }
 
     /// Non-monotonic sign_count is rejected as a replay attack.

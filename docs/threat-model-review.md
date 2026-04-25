@@ -192,7 +192,7 @@ Administrators). However:
 | **Purpose grants not bound to live target attestations (B-2)** — `has_purpose` / `purposes_for` can rely on revoked/expired target attestations, and inbound token validation does not enforce the vouch shape invariants used by local token creation. | High | Share one token structural validator across creation, decode/validate, and graph ingest. Require a matching unrevoked, unexpired target attestation for every vouched purpose. |
 | **No deterministic active-version selection (B-4)** — multiple active policy/software attestations with the same logical ID can all be served, leaving final state to iteration order. | Medium | Add supersession semantics, require old-version revocation, or select one latest valid document per logical ID at serve time. |
 | **No trust graph partitioning** — all tokens are visible to all nodes. | Low | By design for the single-domain model. Multi-domain deployments would need topic-level isolation. |
-| **Challenge store cleanup is passive (B-5)** — expired session/admin challenges are not deleted on failed consume and no production sweeper calls `sweep_expired_challenges`. | Medium | Sweep on issue/consume, delete expired rows when encountered, and cap outstanding challenges per caller/kind. |
+| **Challenge store cleanup is passive (B-5)** ✅ closed 2026-04-25 — expired session/admin challenges were not deleted on failed consume and no production sweeper called `sweep_expired_challenges`. | Medium | The issue path (`http::issue_challenge`) now sweeps expired rows on every put, enforces a `MAX_OUTSTANDING_CHALLENGES = 4096` global cap (returning 503 when the backlog is full), and `consume_challenge` deletes expired/malformed rows in the same write transaction. A new `count_challenges` method on `ChallengeStore` backs the cap check; tests added in `dds-store` (4) and `dds-node::http` (2). |
 | **Expiry sweep race** — the expiry sweeper runs on a timer; a token that just expired may be evaluated as valid until the next sweep. | Low | The window is bounded by `expiry_scan_interval_secs` (default 60s). For real-time expiry checking, add an inline expiry check in `evaluate_policy`. |
 | **Admin set is per-node local** — `trusted_roots` is read from local TOML; peers can disagree about who is an admin (I-11). | Medium | A future redesign should chain admins back to a domain-key-signed genesis attestation so the admin set is derived from gossip. |
 
@@ -267,7 +267,7 @@ application from failed application.
 | 3 | Failed enforcement retry semantics (B-3) | High | §7 |
 | 4 | Admission cert revocation list | High | §1 |
 | 5 | Active-version selection for policies/software (B-4) | Medium | §5 |
-| 6 | Challenge-store cleanup and caps (B-5) | Medium | §5 |
+| 6 | ~~Challenge-store cleanup and caps (B-5)~~ ✅ closed 2026-04-25 | Medium | §5 |
 | 7 | Windows software staging TOCTOU hardening (B-6) | Medium | §6 |
 | 8 | Windows data directory ACL (dir-level) | Medium | §3 |
 | 9 | Key rotation mechanism | Medium | §2 |

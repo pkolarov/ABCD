@@ -109,12 +109,23 @@ L-9, A-1, A-3, A-4, or A-6.
   flap across restarts. **Fix:** add explicit supersession semantics,
   require revocation of old versions, or select one latest valid
   document per logical ID at serve time.
-- **B-5 (Medium)**: challenge records can accumulate without production
-  cleanup. `/v1/session/challenge` and `/v1/admin/challenge` persist
-  challenge rows, expired rows are not deleted on failed consume, and
-  `sweep_expired_challenges` has no production caller. **Fix:** sweep
-  on issue/consume, delete expired rows when encountered, and cap
-  outstanding challenges per kind / caller.
+- **B-5 (Medium) ✅ landed 2026-04-25**: challenge records can accumulate
+  without production cleanup. `/v1/session/challenge` and
+  `/v1/admin/challenge` persisted challenge rows, expired rows were not
+  deleted on failed consume, and `sweep_expired_challenges` had no
+  production caller. **Fix shipped:** the issue path
+  (`http::issue_challenge`) now calls `sweep_expired_challenges` before
+  every `put_challenge`, then enforces a global
+  `MAX_OUTSTANDING_CHALLENGES = 4096` cap (returning `503 Service
+  Unavailable` if the backlog is full). `consume_challenge` deletes
+  expired and malformed rows in the same write transaction so a probe
+  of a stale id contributes to cleanup rather than leaking the row. A
+  new `count_challenges` method on `ChallengeStore` backs the cap
+  check. New tests:
+  `dds-store/src/memory_backend.rs::b5_challenge_cleanup_tests` (2),
+  `dds-store/src/redb_backend.rs::b5_challenge_cleanup_tests` (2), and
+  `dds-node/src/http.rs::tests::test_issue_challenge_caps_outstanding`
+  / `::test_consume_expired_drops_row`.
 - **B-6 (Medium)**: the Windows software installer has a post-hash
   TOCTOU window. Packages are staged under `%TEMP%\dds-software`,
   hashed, closed, then later executed as SYSTEM. On typical Windows temp

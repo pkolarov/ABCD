@@ -163,10 +163,19 @@ pub trait ChallengeStore {
     /// and return its bytes. Returns `StoreError::NotFound` if the id is
     /// unknown or already consumed; returns a descriptive `StoreError::Io`
     /// if the challenge has expired.
+    ///
+    /// **B-5 (security review):** when the row is found expired the
+    /// backend MUST delete it before returning the expiry error so a
+    /// caller that probes a stale id contributes to cleanup rather
+    /// than letting the row accumulate.
     fn consume_challenge(&mut self, id: &str, now: u64) -> StoreResult<[u8; 32]>;
 
     /// Delete all challenges whose `expires_at <= now`. Returns the count.
     fn sweep_expired_challenges(&mut self, now: u64) -> StoreResult<usize>;
+
+    /// Total number of challenge rows currently outstanding (expired or not).
+    /// Used by issue paths to enforce a global cap after sweeping expired rows.
+    fn count_challenges(&self) -> StoreResult<usize>;
 }
 
 /// Per-credential sign-count storage for FIDO2 replay detection.

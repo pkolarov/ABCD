@@ -257,6 +257,9 @@ impl ChallengeStore for MemoryBackend {
             .copied()
             .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
         if now >= expires_at {
+            // B-5: delete the expired row so a probe of a stale id helps clean
+            // up rather than leaving the entry to accumulate.
+            self.challenges.remove(id);
             return Err(StoreError::Io(format!(
                 "challenge '{}' has expired (expired at {expires_at}, now {now})",
                 id
@@ -270,6 +273,10 @@ impl ChallengeStore for MemoryBackend {
         let before = self.challenges.len();
         self.challenges.retain(|_, (_, exp)| now < *exp);
         Ok(before - self.challenges.len())
+    }
+
+    fn count_challenges(&self) -> StoreResult<usize> {
+        Ok(self.challenges.len())
     }
 }
 
@@ -326,5 +333,45 @@ mod l18_sign_count_tests {
         // Separate credentials don't interfere.
         be.bump_sign_count("cred-b", 1).unwrap();
         assert_eq!(be.get_sign_count("cred-b").unwrap(), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod b5_challenge_cleanup_tests {
+    use super::*;
+
+    /// B-5: `consume_challenge` on an expired row removes it so the
+    /// table doesn't leak rows when callers probe stale ids.
+    #[test]
+    fn consume_expired_drops_row() {
+        let mut be = MemoryBackend::new();
+        be.put_challenge("c1", &[7u8; 32], 100).unwrap();
+        assert_eq!(be.count_challenges().unwrap(), 1);
+
+        // now > expires_at — consume returns Err but row is dropped.
+        let err = be.consume_challenge("c1", 200).unwrap_err();
+        assert!(matches!(err, StoreError::Io(_)));
+        assert_eq!(be.count_challenges().unwrap(), 0);
+    }
+
+    /// B-5: `count_challenges` reflects live rows; `sweep_expired_challenges`
+    /// drops expired ones and leaves valid ones intact.
+    #[test]
+    fn sweep_and_count_track_outstanding() {
+        let mut be = MemoryBackend::new();
+        be.put_challenge("a", &[1u8; 32], 100).unwrap();
+        be.put_challenge("b", &[2u8; 32], 200).unwrap();
+        be.put_challenge("c", &[3u8; 32], 300).unwrap();
+        assert_eq!(be.count_challenges().unwrap(), 3);
+
+        // now=150 expires only "a".
+        let removed = be.sweep_expired_challenges(150).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(be.count_challenges().unwrap(), 2);
+
+        // Successful consume of a live row also drops it.
+        let nonce = be.consume_challenge("b", 150).unwrap();
+        assert_eq!(nonce, [2u8; 32]);
+        assert_eq!(be.count_challenges().unwrap(), 1);
     }
 }
