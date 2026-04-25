@@ -1219,3 +1219,224 @@ cleanup cluster.
 - **Critical:** C-1 (FFI null deref), C-2 (admin_setup bootstrap), C-3 (policy-publisher authorization).
 - **High:** H-1 (revocation auth bypass), H-2 (Windows Policy Agent unsigned HTTP), H-3 (macOS Policy Agent unsigned HTTP), H-4 (attestation JTI collision), H-5 (named-pipe SDDL), H-6 (challenge injection), H-7 (HTTP authZ missing), H-8 (admin_vouch capability), H-10 (bundle integrity), H-11 (sync response size), H-12 (per-peer admission).
 - **Medium:** M-21 (audit signature not verified on ingest), M-22 (admin keys wrapped only by node key).
+
+---
+
+## Addendum — 2026-04-24 code-path pass
+
+An independent re-read of the code on 2026-04-24 (without reopening the
+security docs first) surfaced six items not already covered by the
+`C-1…H-12 / M-1…M-22 / L-1…L-18` ledger above. Two other items from the
+same pass — "loopback TCP is admin by default" and "device APIs allow
+anonymous TCP" — are already tracked as H-7 (⚠ Partial) and M-8 step-2
+respectively, and are not re-listed.
+
+### A-1 (High). FIDO2 packed attestation with `x5c` is accepted without verifying the statement signature or chain
+**Location:** [dds-domain/src/fido2.rs:96-98](dds-domain/src/fido2.rs#L96-L98), [dds-domain/src/fido2.rs:190-198](dds-domain/src/fido2.rs#L190-L198)
+
+**What's wrong:** `verify_attestation` accepts `fmt == "none"`
+unconditionally ("Nothing to verify cryptographically"), and in the
+`packed` path, the moment `x5c` is present the function returns
+`Ok(())` without verifying the attestation signature over
+`authData || clientDataHash` or walking the certificate chain. The
+credential public key parsed from attacker-supplied `authData` is then
+stored and used to authenticate future assertions.
+
+**Attack vector:** A local process hitting `POST /v1/enroll/user` can
+construct an `attestationObject` with `fmt = "none"` (or `fmt = "packed"`
+with any `x5c` value), embed a `COSE_Key` under its own control in
+`authData`, and have the node persist that key as an enrolled
+credential. Subsequent `POST /v1/session/assert` calls signed by the
+matching private key then mint a valid session — no authenticator was
+ever involved.
+
+**Relation to M-13:** M-13 (deferred) flags this at the "MDS
+integration" level. A-1 records the exploitable delta: the packed
+path does not even verify the `sig` field of its own attestation
+statement when `x5c` is present, independent of any MDS trust-anchor
+decision. A full MDS integration is one fix; a much smaller fix
+is to verify the packed `sig` unconditionally (it's self-contained)
+and to gate `fmt == "none"` behind an explicit
+`allow_self_attestation` config knob.
+
+**Fix:**
+- Validate `clientDataJSON` `type`/`challenge`/`origin` at enrollment
+  (M-12 already does this for assertion — mirror it for enroll).
+- In `verify_packed`: when `x5c` is present, verify the signature over
+  `authData || clientDataHash` under the leaf cert's public key, then
+  validate the chain against a configured trust anchor list (defer to
+  M-13 for the anchor source).
+- Gate `fmt == "none"` behind `ApiAuthConfig.allow_self_attestation`
+  (default `false`) and log the enrollment at WARN when it's used.
+
+---
+
+### A-2 (High). Windows Auth Bridge config path cannot select the pipe transport
+**Location:** [platform/windows/native/DdsAuthBridge/Configuration.cpp:26-28](platform/windows/native/DdsAuthBridge/Configuration.cpp#L26-L28), [platform/windows/native/DdsAuthBridge/Configuration.h:20](platform/windows/native/DdsAuthBridge/Configuration.h#L20), [platform/windows/native/DdsAuthBridge/DdsAuthBridgeMain.cpp:362](platform/windows/native/DdsAuthBridge/DdsAuthBridgeMain.cpp#L362)
+
+**What's wrong:** H-7 step-2b added `SetBaseUrl` to
+`CDdsNodeHttpClient` and taught it to parse `pipe:<name>` URLs.
+However, the Windows service's Configuration class only reads a
+`DdsNodePort` DWORD from the registry; there is no `ApiAddr` / URL
+field. `DdsAuthBridgeMain::Initialize` wires the HTTP client via
+`m_httpClient.SetPort(m_config.DdsNodePort())`, not `SetBaseUrl`.
+Net effect: even on a Windows machine where the Rust `dds-node` is
+configured for `pipe:<name>`, the Auth Bridge will still dial
+`http://127.0.0.1:<port>`, and — because the Rust side no longer
+serves on TCP in that configuration — the bridge simply fails to
+connect. Operators who keep the TCP listener enabled to work around
+this stay on the unauthenticated loopback transport.
+
+**Attack vector:** Any operator who follows the H-7 step-2 cutover
+path for Windows ends up with a bridge that can't reach the node and
+has to keep `api_addr = tcp` + `trust_loopback_tcp_admin = true`.
+The H-7 defense-in-depth benefit is therefore unreachable on Windows
+until the config wiring closes.
+
+**Fix:**
+- Add `ApiAddr` (REG_SZ) alongside `DdsNodePort` in
+  `CDdsConfiguration`; when set, pass it to `SetBaseUrl`, else fall
+  back to port.
+- Update the WiX MSI to write `ApiAddr = pipe:<install-specific name>`
+  by default, matching the Rust `node.toml` template generated by
+  the same install.
+- Flip `trust_loopback_tcp_admin = false` in the shipped config once
+  this lands.
+
+---
+
+### A-3 (Medium). Response MAC verification is fail-open when no secret is configured
+**Location:** [platform/windows/native/DdsAuthBridge/DdsNodeHttpClient.cpp:242-248](platform/windows/native/DdsAuthBridge/DdsNodeHttpClient.cpp#L242-L248), [dds-node/src/config.rs:215-228](dds-node/src/config.rs#L215-L228)
+
+**What's wrong:** `CDdsNodeHttpClient::VerifyResponseMac` returns
+`true` when `m_hmacKey.empty()`. The Rust node default for
+`api_auth.node_hmac_secret_path` is `None`. `DdsAuthBridgeMain` does
+log a warning and (good) fails closed on a configured-but-unreadable
+path, but a bridge that boots without an `HmacSecretPath` registry
+value accepts unsigned responses with no further indication.
+
+The H-6 remediation acknowledges this as "transition-only" (see the
+2026-04-21 highlights block), but it still means the default
+posture of a hand-installed dev/test deployment has the MAC check
+disabled on both sides, despite the middleware being present in the
+Rust binary.
+
+**Attack vector:** An attacker who binds `127.0.0.1:<port>` before
+`dds-node` starts (the H-6 threat model) can still return arbitrary
+challenges on any deployment that did not run the MSI's
+`CA_GenHmacSecret` custom action or did not set the
+`node_hmac_secret_path` in `node.toml`.
+
+**Fix:**
+- Treat the MAC as a mandatory protocol feature on the Auth Bridge
+  ↔ node channel: if `m_hmacKey.empty()`, refuse to start the bridge
+  on production builds (or refuse to make HTTP calls). Keep the
+  current behaviour behind a build-time `DDS_DEV_ALLOW_NO_MAC` flag.
+- On the Rust side, emit the MAC unconditionally in the transport
+  envelope so clients that ignore the header today remain
+  unaffected but clients that check it cannot be tricked into
+  missing-header = accept.
+
+---
+
+### A-4 (Medium). Auth Bridge logs emit first 4 bytes of HMAC-derived material and password length; log directory has no explicit DACL
+**Location:** [platform/windows/native/DdsAuthBridge/CredentialVault.cpp:226-229](platform/windows/native/DdsAuthBridge/CredentialVault.cpp#L226-L229), [platform/windows/native/DdsAuthBridge/CredentialVault.cpp:304-309](platform/windows/native/DdsAuthBridge/CredentialVault.cpp#L304-L309), [platform/windows/native/DdsAuthBridge/FileLog.cpp:27-37](platform/windows/native/DdsAuthBridge/FileLog.cpp#L27-L37)
+
+**What's wrong:** `EncryptPassword` and `DecryptPassword` write the
+first four bytes of the HMAC-derived encryption key plus the caller
+password length into the file log, via `FileLog::Writef`. The log
+file is created under `%ProgramData%\DDS\authbridge.log` by
+`FileLog::Init`, which calls `CreateDirectoryW` but sets no explicit
+DACL — the directory and file inherit the default `%ProgramData%`
+ACL, which grants Read to `BUILTIN\Users` on most Windows SKUs.
+
+The comment in `EncryptPassword` asserts "safe — not the actual
+password", which is true, but the four bytes are derived from
+(`hmac_salt_output`) output of a FIDO2 `hmac-secret` extension call.
+That output is both the AES-GCM key *and* (via its derivation) a
+long-lived proof-of-possession for the authenticator + credential on
+that host. Leaking any prefix of it into a user-readable log is a
+weaker-by-degrees disclosure that's worth removing outright given
+the trivial fix.
+
+**Attack vector:** Any user account on the box can read
+`%ProgramData%\DDS\authbridge.log` and correlate username +
+password-length per logon to a four-byte HMAC-key prefix, degrading
+the offline-attack posture of the vault.
+
+**Fix:**
+- Strip the `hmacKey[0..3]` debug printf from both paths — they were
+  for development diagnostics and are no longer needed.
+- Optionally replace with a SHA-256 prefix of the ciphertext as a
+  stable non-secret identifier if debugging still needs per-entry
+  correlation.
+- Set an explicit DACL on `%ProgramData%\DDS` at `FileLog::Init`:
+  `LocalSystem` + `BUILTIN\Administrators` = `FullControl`,
+  everyone else denied. Mirror the `AppliedStateStore` DACL helper
+  used for L-16.
+
+---
+
+### A-5 (Medium). P2P identity store lacks the hardening applied to the main identity store
+**Location:** [dds-node/src/p2p_identity.rs:62-118](dds-node/src/p2p_identity.rs#L62-L118), [dds-node/src/p2p_identity.rs:131-185](dds-node/src/p2p_identity.rs#L131-L185), [dds-node/src/p2p_identity.rs:187-196](dds-node/src/p2p_identity.rs#L187-L196)
+
+**What's wrong:** `p2p_identity::save` writes the keypair with a
+plain `std::fs::write` and only calls `set_owner_only_permissions`
+*after* the write completes. There is no `O_NOFOLLOW` protection on
+load. Argon2 parameters are fixed at `Params::new(19 * 1024, 2, 1,
+…)` (m=19 MiB, t=2, p=1 — the old OWASP tier-1 values).
+
+The main identity store got L-2 (`O_NOFOLLOW` on read), L-3
+(`NamedTempFile::persist` for atomic writes), and M-10 (Argon2id
+bumped to m=64 MiB, t=3, p=4 with a `v=3` schema and lazy rewrap).
+None of those changes were ported to `p2p_identity.rs`, even though
+the P2P key determines the node's libp2p `PeerId` (and therefore its
+admission-cert identity under H-12).
+
+**Attack vector:**
+- Pre-seeding a symlink at the write path redirects the fresh
+  keypair into an attacker-writable location.
+- The non-atomic write leaves a window in which a crash produces a
+  truncated/partially-permissioned file.
+- The lower Argon2 parameters reduce the cost of an offline attack
+  on the passphrase-wrapped form by ~3× relative to the main
+  identity file.
+
+**Fix:**
+- Port the `NamedTempFile::persist` + permission-before-rename
+  pattern used in `identity_store::save` to `p2p_identity::save`.
+- Port the `O_NOFOLLOW` read guard from `identity_store::load` to
+  `p2p_identity::load`.
+- Raise `derive_key` to the OWASP tier-2 params used by M-10 and
+  version the blob so existing deployments auto-upgrade on next
+  save.
+
+---
+
+### A-6 (Medium). Agent software downloaders stream untrusted content to disk before hash validation, with no byte cap
+**Location:** [platform/windows/DdsPolicyAgent/Enforcers/WindowsSoftwareOperations.cs:27-51](platform/windows/DdsPolicyAgent/Enforcers/WindowsSoftwareOperations.cs#L27-L51), [platform/macos/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs:180-210](platform/macos/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs#L180-L210)
+
+**What's wrong:** Both the Windows and macOS Policy Agent software
+enforcers download a package with `response.Content.CopyToAsync(fs,
+ct)` and only compute SHA-256 after the full file is on disk. There
+is no `Content-Length` check, no byte cap, and no streaming hash.
+
+**Attack vector:** A compromised or MITM'd publisher URL can return
+an attacker-chosen body of arbitrary size. Even though the SHA-256
+check later rejects it, the agent has already written the full
+response to `%TEMP%\dds-software\…` (Windows) or the package cache
+(macOS). On a resource-constrained host this is a cheap DoS
+(disk-fill, or triggering a low-space cascade in other services).
+
+**Impact:** Local availability on managed endpoints; no change in
+integrity posture (the hash check still runs).
+
+**Fix:**
+- Read `response.Content.Headers.ContentLength` and reject any
+  download larger than a policy-configured cap (default ~1 GiB is
+  a reasonable starting point — MSI/PKG files are typically <200 MiB).
+- Hash while streaming via `IncrementalHash.CreateHash(HashAlgorithmName.SHA256)`
+  and abort the copy loop the moment the running total exceeds the
+  cap.
+- Treat a missing `Content-Length` as "unknown size" and apply the
+  same streaming cap by tracking bytes written.

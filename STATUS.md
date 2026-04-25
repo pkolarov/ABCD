@@ -1,20 +1,53 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-24 (Windows host verification pass — H-6 step-2 + H-7 step-2b now verified end-to-end on Windows x64; several pre-existing build/CI bugs surfaced and fixed: dds-cli unix-only imports, build_tests.bat BuildTools support, gen-hmac-secret idempotency for MSI repair/upgrade, smoke_test.ps1 -Target plumbing.)
+> Last updated: 2026-04-25 (Windows host verification pass — H-6 step-2 + H-7 step-2b now verified end-to-end on Windows x64; several pre-existing build/CI bugs surfaced and fixed: dds-cli unix-only imports, build_tests.bat BuildTools support, gen-hmac-secret idempotency for MSI repair/upgrade, smoke_test.ps1 -Target plumbing. A 2026-04-24 addendum code-path pass added 6 new findings — 2 High, 4 Medium — tracked as A-1…A-6 in [Claude_sec_review.md](Claude_sec_review.md).)
 
 ## Security Remediation Status
 
 Full, source-validated independent review: [Claude_sec_review.md](Claude_sec_review.md)
-(latest pass 2026-04-21). Prior pre-review gaps file:
-[security-gaps.md](security-gaps.md) — now marked superseded.
+(latest full pass 2026-04-21; addendum pass 2026-04-24 adds A-1…A-6 —
+see the "Addendum — 2026-04-24 code-path pass" section of that file).
+Prior pre-review gaps file: [security-gaps.md](security-gaps.md) — now
+marked superseded.
 
-| Severity | Fixed | Deferred | Rationale for deferral |
-|---|---|---|---|
-| **Critical** | 3/3 | — | — |
-| **High** | 12/12 | — | H-6 + H-7 step-2b verified on Windows x64 host 2026-04-24 — see "Windows host verification (2026-04-24)" below. |
-| **Medium** | 19/22 | 3 | M-13 (FIDO MDS integration — external design), M-15 (node-bound FIDO2 `hmac_salt`; blocked on bundle re-wrap design), M-18 (WiX service-account split — multi-day Windows refactor). |
-| **Low** | 17/18 | 1 | L-17 (service-mutex refactor — 29 HTTP handler lock sites; L-18's atomic `bump_sign_count` already closed the replay race so the remaining gain is throughput not security). |
+| Severity | Fixed | Deferred | Addendum (new, open) | Rationale for deferral |
+|---|---|---|---|---|
+| **Critical** | 3/3 | — | — | — |
+| **High** | 12/12 | — | 2 (A-1, A-2) | H-6 + H-7 step-2b verified on Windows x64 host 2026-04-24 — see "Windows host verification (2026-04-24)" below. |
+| **Medium** | 19/22 | 3 | 4 (A-3…A-6) | M-13 (FIDO MDS integration — external design), M-15 (node-bound FIDO2 `hmac_salt`; blocked on bundle re-wrap design), M-18 (WiX service-account split — multi-day Windows refactor). |
+| **Low** | 17/18 | 1 | — | L-17 (service-mutex refactor — 29 HTTP handler lock sites; L-18's atomic `bump_sign_count` already closed the replay race so the remaining gain is throughput not security). |
+
+**Addendum pass 2026-04-24** (open — code fixes not yet landed):
+
+- **A-1 (High)**: FIDO2 packed attestation with `x5c` returns `Ok(())` without
+  verifying the statement signature; `fmt == "none"` unconditionally accepted.
+  Sharper than M-13's deferred MDS note — the `sig` field of packed
+  attestations is self-contained and should be verified regardless of
+  the anchor-list decision.
+- **A-2 (High)**: Windows Auth Bridge `CDdsConfiguration` only reads
+  `DdsNodePort`; there is no `ApiAddr` field. `DdsAuthBridgeMain` wires
+  the HTTP client via `SetPort`, not `SetBaseUrl`, so the pipe transport
+  in `DdsNodeHttpClient` is unreachable from registry config. Closes the
+  loop on H-7 step-2b on the runtime config side (note: H-7 step-2b code
+  paths were verified on Windows on 2026-04-24, but the registry config
+  still wires TCP — the pipe transport is not reachable end-to-end until
+  A-2 lands).
+- **A-3 (Medium)**: Response-MAC verification is fail-open when no secret is
+  configured (`m_hmacKey.empty() → return true`). H-6 acknowledges this
+  as transition-only; formalised here because it's still the default of
+  non-MSI deployments.
+- **A-4 (Medium)**: Auth Bridge logs emit the first 4 bytes of
+  HMAC-derived key material plus password length; `%ProgramData%\DDS`
+  has no explicit DACL (inherits default `BUILTIN\Users`:Read).
+- **A-5 (Medium)**: `dds-node/src/p2p_identity.rs` missed the L-2
+  (`O_NOFOLLOW`), L-3 (atomic persist), and M-10 (Argon2 tier-2) hardening
+  that landed in `identity_store.rs`. The P2P key controls the
+  node's `PeerId` / admission identity, so the same invariants apply.
+- **A-6 (Medium)**: Both Policy Agent software enforcers (Windows + macOS)
+  stream downloads to disk with no byte cap / `Content-Length` check,
+  then compute SHA-256 afterwards. Local availability DoS (disk-fill)
+  on a compromised publisher URL.
 
 **Highlights shipped in the 2026-04-17 → 2026-04-21 sweep:**
 
