@@ -1,7 +1,11 @@
 # DDS Windows AD Coexistence Gap Plan
 
-**Status:** Proposed  
-**Date:** 2026-04-13  
+> **⚠️ Superseded by [windows-ad-coexistence-spec.md](windows-ad-coexistence-spec.md) on 2026-04-25.**
+> Kept for historical reference as the originating gap analysis. The locked v1
+> behavior, decisions, and per-task implementation plan now live in the spec.
+
+**Status:** Superseded
+**Date:** 2026-04-13
 **Owner:** Windows platform / auth / policy-agent workstream
 
 ---
