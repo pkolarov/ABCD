@@ -784,8 +784,7 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
                     &[("device_urn", &device_urn)],
                 )
                 .await;
-                let bytes =
-                    unwrap_envelope(env, dds_core::envelope::kind::WINDOWS_POLICIES);
+                let bytes = unwrap_envelope(env, dds_core::envelope::kind::WINDOWS_POLICIES);
                 let r: WindowsPoliciesPayload = serde_json::from_slice(&bytes).unwrap();
                 println!(
                     "Windows policies for {} ({}):",
@@ -803,8 +802,7 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
                     &[("device_urn", &device_urn)],
                 )
                 .await;
-                let bytes =
-                    unwrap_envelope(env, dds_core::envelope::kind::WINDOWS_SOFTWARE);
+                let bytes = unwrap_envelope(env, dds_core::envelope::kind::WINDOWS_SOFTWARE);
                 let r: WindowsSoftwarePayload = serde_json::from_slice(&bytes).unwrap();
                 println!(
                     "Windows software for {} ({}):",
@@ -1613,9 +1611,7 @@ fn unwrap_envelope(env: dds_core::envelope::SignedPolicyEnvelope, expected_kind:
             std::process::exit(1);
         }
     } else {
-        eprintln!(
-            "note: DDS_NODE_PUBKEY unset — skipping signature verification (dev mode)"
-        );
+        eprintln!("note: DDS_NODE_PUBKEY unset — skipping signature verification (dev mode)");
     }
     payload
 }

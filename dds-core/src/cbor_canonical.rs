@@ -166,7 +166,6 @@ pub fn encode_token_payload(p: &TokenPayload) -> Vec<u8> {
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

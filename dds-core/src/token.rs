@@ -274,11 +274,7 @@ impl Token {
         let (signed_input, result): (alloc::borrow::Cow<'_, [u8]>, _) = match self.wire_version {
             TOKEN_WIRE_V1 => {
                 let input = alloc::borrow::Cow::Borrowed(self.payload_bytes.as_slice());
-                let r = crate::crypto::verify_v1(
-                    &self.payload.iss_key,
-                    &input,
-                    &self.signature,
-                );
+                let r = crate::crypto::verify_v1(&self.payload.iss_key, &input, &self.signature);
                 (input, r)
             }
             TOKEN_WIRE_V2 => {
@@ -422,8 +418,7 @@ fn validate_shape(payload: &TokenPayload) -> Result<(), TokenError> {
     if matches!(payload.kind, TokenKind::Revoke | TokenKind::Burn) && payload.exp.is_some() {
         return Err(TokenError::RevocationMustNotExpire);
     }
-    if payload.kind == TokenKind::Vouch
-        && (payload.vch_iss.is_none() || payload.vch_sum.is_none())
+    if payload.kind == TokenKind::Vouch && (payload.vch_iss.is_none() || payload.vch_sum.is_none())
     {
         return Err(TokenError::VouchMissingFields);
     }
@@ -920,10 +915,7 @@ mod tests {
             signature: v2.signature().clone(),
             wire_version: TOKEN_WIRE_V1,
         };
-        assert_eq!(
-            forged.verify_signature(),
-            Err(TokenError::InvalidSignature)
-        );
+        assert_eq!(forged.verify_signature(), Err(TokenError::InvalidSignature));
 
         // Same story the other way: v1 signature in a v2 envelope
         // flags non-canonical payload (or signature invalid) once
@@ -1028,10 +1020,9 @@ mod tests {
         // Build a v=1 hybrid token using the legacy (pre-M-2) sign
         // path. This mirrors what's already on disk on any node that
         // ran a pre-v2 release.
-        let token = Token::create_with_version(payload, TOKEN_WIRE_V1, |msg| {
-            root.hybrid_key.sign_v1(msg)
-        })
-        .unwrap();
+        let token =
+            Token::create_with_version(payload, TOKEN_WIRE_V1, |msg| root.hybrid_key.sign_v1(msg))
+                .unwrap();
         assert_eq!(token.wire_version(), TOKEN_WIRE_V1);
         assert!(
             token.verify_signature().is_ok(),
@@ -1048,10 +1039,7 @@ mod tests {
             signature: v2_sig,
             wire_version: TOKEN_WIRE_V1,
         };
-        assert_eq!(
-            forged.verify_signature(),
-            Err(TokenError::InvalidSignature)
-        );
+        assert_eq!(forged.verify_signature(), Err(TokenError::InvalidSignature));
     }
 
     #[test]

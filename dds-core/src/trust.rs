@@ -378,11 +378,7 @@ impl TrustGraph {
     /// multiple active attestations exist, returns the first whose
     /// payload-hash matches `expected_hash`, falling back to the
     /// first active one when `expected_hash` is `None`.
-    fn active_attestation_for_iss(
-        &self,
-        iss: &str,
-        expected_hash: Option<&str>,
-    ) -> Option<&Token> {
+    fn active_attestation_for_iss(&self, iss: &str, expected_hash: Option<&str>) -> Option<&Token> {
         if self.burned.contains(iss) {
             return None;
         }
@@ -1212,9 +1208,11 @@ mod tests {
 
         // Pre-revoke: the grant exists.
         assert!(graph.has_purpose(&user.id.to_urn(), "group:dev", &roots));
-        assert!(graph
-            .purposes_for(&user.id.to_urn(), &roots)
-            .contains("group:dev"));
+        assert!(
+            graph
+                .purposes_for(&user.id.to_urn(), &roots)
+                .contains("group:dev")
+        );
 
         // Revoke the target attestation (the user's self-issued
         // attestation). The vouch is still present and not directly

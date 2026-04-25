@@ -163,8 +163,7 @@ pub fn save(path: &Path, ident: &Identity) -> Result<(), IdentityStoreError> {
     // and wait for the next save — without this gate, the key on
     // disk would silently roll back to plaintext.
     let passphrase = std::env::var(PASSPHRASE_ENV).map(Zeroizing::new);
-    let will_be_plaintext =
-        !matches!(&passphrase, Ok(p) if !p.is_empty());
+    let will_be_plaintext = !matches!(&passphrase, Ok(p) if !p.is_empty());
     if will_be_plaintext && encrypted_marker_path(path).exists() {
         let allow_downgrade = std::env::var(ALLOW_PLAINTEXT_DOWNGRADE_ENV)
             .map(|s| !s.is_empty())
@@ -388,15 +387,12 @@ pub fn load(path: &Path) -> Result<Identity, IdentityStoreError> {
                 rewrap_v2_to_v3 = true;
                 KdfParams::V2
             } else {
-                let m = m_cost.ok_or_else(|| {
-                    IdentityStoreError::Format("v=3 missing m_cost".into())
-                })?;
-                let t = t_cost.ok_or_else(|| {
-                    IdentityStoreError::Format("v=3 missing t_cost".into())
-                })?;
-                let p = p_cost.ok_or_else(|| {
-                    IdentityStoreError::Format("v=3 missing p_cost".into())
-                })?;
+                let m = m_cost
+                    .ok_or_else(|| IdentityStoreError::Format("v=3 missing m_cost".into()))?;
+                let t = t_cost
+                    .ok_or_else(|| IdentityStoreError::Format("v=3 missing t_cost".into()))?;
+                let p = p_cost
+                    .ok_or_else(|| IdentityStoreError::Format("v=3 missing p_cost".into()))?;
                 KdfParams {
                     m_cost_kib: m,
                     t_cost: t,

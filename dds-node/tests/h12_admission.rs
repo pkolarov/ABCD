@@ -145,8 +145,9 @@ where
             let futs: Vec<
                 std::pin::Pin<
                     Box<
-                        dyn std::future::Future<Output = SwarmEvent<dds_net::transport::DdsBehaviourEvent>>
-                            + Send,
+                        dyn std::future::Future<
+                                Output = SwarmEvent<dds_net::transport::DdsBehaviourEvent>,
+                            > + Send,
                     >,
                 >,
             > = vec![
@@ -271,12 +272,7 @@ async fn admitted_peers_populated_and_gossip_flows() {
         b.trust_graph.read().unwrap().attestations_iter().count() > 0
     })
     .await;
-    let b_attests = b
-        .trust_graph
-        .read()
-        .unwrap()
-        .attestations_iter()
-        .count();
+    let b_attests = b.trust_graph.read().unwrap().attestations_iter().count();
     assert!(
         b_attests > 0,
         "attestation did not propagate to B under valid admission"
@@ -331,12 +327,7 @@ async fn unadmitted_peer_gossip_dropped() {
     sleep(Duration::from_secs(2)).await;
     pump_until(&mut a, &mut b, Duration::from_secs(1), |_, _| false).await;
 
-    let a_attests = a
-        .trust_graph
-        .read()
-        .unwrap()
-        .attestations_iter()
-        .count();
+    let a_attests = a.trust_graph.read().unwrap().attestations_iter().count();
     assert_eq!(
         a_attests, 0,
         "A ingested a token from unadmitted peer B (H-12 gate failed)"

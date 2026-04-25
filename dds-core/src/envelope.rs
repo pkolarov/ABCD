@@ -87,11 +87,7 @@ pub fn signing_bytes(
     payload: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(
-        DOMAIN_TAG.len()
-            + 4 + device_urn.len()
-            + 4 + envelope_kind.len()
-            + 8
-            + 4 + payload.len(),
+        DOMAIN_TAG.len() + 4 + device_urn.len() + 4 + envelope_kind.len() + 8 + 4 + payload.len(),
     );
     out.extend_from_slice(DOMAIN_TAG);
     put_u32_le(&mut out, device_urn.len() as u32);
@@ -218,15 +214,17 @@ mod tests {
         let payload = br#"{"policies":[]}"#;
         let sig = sign_envelope(&k, "urn:vch:dev.abc", kind::WINDOWS_POLICIES, 100, payload);
         let pk = k.verifying_key().to_bytes();
-        assert!(verify_envelope(
-            &pk,
-            "urn:vch:dev.abc",
-            kind::WINDOWS_POLICIES,
-            100,
-            payload,
-            &sig
-        )
-        .is_ok());
+        assert!(
+            verify_envelope(
+                &pk,
+                "urn:vch:dev.abc",
+                kind::WINDOWS_POLICIES,
+                100,
+                payload,
+                &sig
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -235,15 +233,17 @@ mod tests {
         let payload = br#"{"policies":[]}"#;
         let sig = sign_envelope(&k, "urn:vch:dev.abc", kind::WINDOWS_POLICIES, 100, payload);
         let pk = k.verifying_key().to_bytes();
-        assert!(verify_envelope(
-            &pk,
-            "urn:vch:dev.xyz",
-            kind::WINDOWS_POLICIES,
-            100,
-            payload,
-            &sig
-        )
-        .is_err());
+        assert!(
+            verify_envelope(
+                &pk,
+                "urn:vch:dev.xyz",
+                kind::WINDOWS_POLICIES,
+                100,
+                payload,
+                &sig
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -253,15 +253,17 @@ mod tests {
         let sig = sign_envelope(&k, "urn:vch:dev.abc", kind::WINDOWS_POLICIES, 100, payload);
         let pk = k.verifying_key().to_bytes();
         // Splicing a policies envelope into a software verifier must fail.
-        assert!(verify_envelope(
-            &pk,
-            "urn:vch:dev.abc",
-            kind::WINDOWS_SOFTWARE,
-            100,
-            payload,
-            &sig
-        )
-        .is_err());
+        assert!(
+            verify_envelope(
+                &pk,
+                "urn:vch:dev.abc",
+                kind::WINDOWS_SOFTWARE,
+                100,
+                payload,
+                &sig
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -270,15 +272,17 @@ mod tests {
         let payload = br#"{"policies":[]}"#;
         let sig = sign_envelope(&k, "urn:vch:dev.abc", kind::WINDOWS_POLICIES, 100, payload);
         let pk = k.verifying_key().to_bytes();
-        assert!(verify_envelope(
-            &pk,
-            "urn:vch:dev.abc",
-            kind::WINDOWS_POLICIES,
-            101,
-            payload,
-            &sig
-        )
-        .is_err());
+        assert!(
+            verify_envelope(
+                &pk,
+                "urn:vch:dev.abc",
+                kind::WINDOWS_POLICIES,
+                101,
+                payload,
+                &sig
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -288,15 +292,17 @@ mod tests {
         let sig = sign_envelope(&k, "urn:vch:dev.abc", kind::WINDOWS_POLICIES, 100, payload);
         let pk = k.verifying_key().to_bytes();
         let tampered = br#"{"policies":[{"p":"evil"}]}"#;
-        assert!(verify_envelope(
-            &pk,
-            "urn:vch:dev.abc",
-            kind::WINDOWS_POLICIES,
-            100,
-            tampered,
-            &sig
-        )
-        .is_err());
+        assert!(
+            verify_envelope(
+                &pk,
+                "urn:vch:dev.abc",
+                kind::WINDOWS_POLICIES,
+                100,
+                tampered,
+                &sig
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -306,15 +312,17 @@ mod tests {
         let payload = br#"{"policies":[]}"#;
         let sig = sign_envelope(&k, "urn:vch:dev.abc", kind::WINDOWS_POLICIES, 100, payload);
         let pk = attacker.verifying_key().to_bytes();
-        assert!(verify_envelope(
-            &pk,
-            "urn:vch:dev.abc",
-            kind::WINDOWS_POLICIES,
-            100,
-            payload,
-            &sig
-        )
-        .is_err());
+        assert!(
+            verify_envelope(
+                &pk,
+                "urn:vch:dev.abc",
+                kind::WINDOWS_POLICIES,
+                100,
+                payload,
+                &sig
+            )
+            .is_err()
+        );
     }
 
     /// Cross-language determinism: the signing-bytes layout must be
@@ -371,8 +379,7 @@ mod tests {
     // signature, stable across runs and platforms. Computed once.
     const PINNED_PUBKEY_HEX: &str =
         "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664";
-    const PINNED_SIG_HEX: &str =
-        "ec6c05fcf6ab6744ff8cba07ac93f6ac6fb69d1d214fdcc3b6f709a2fc63deaf37956c367c60185fc9e5dd91ff1c01bf4a4edfa7e5d7d25e595c861a98015c05";
+    const PINNED_SIG_HEX: &str = "ec6c05fcf6ab6744ff8cba07ac93f6ac6fb69d1d214fdcc3b6f709a2fc63deaf37956c367c60185fc9e5dd91ff1c01bf4a4edfa7e5d7d25e595c861a98015c05";
 
     fn hex_lower(bytes: &[u8]) -> String {
         let mut s = String::with_capacity(bytes.len() * 2);

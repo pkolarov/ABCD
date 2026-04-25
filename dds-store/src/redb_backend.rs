@@ -682,11 +682,7 @@ impl CredentialStateStore for RedbBackend {
     /// inside a single write transaction. redb serializes write
     /// transactions, so two concurrent callers cannot both observe
     /// the pre-bump stored value and each commit their own update.
-    fn bump_sign_count(
-        &mut self,
-        credential_id: &str,
-        new_count: u32,
-    ) -> StoreResult<()> {
+    fn bump_sign_count(&mut self, credential_id: &str, new_count: u32) -> StoreResult<()> {
         let write_txn = self
             .db
             .begin_write()
@@ -769,13 +765,19 @@ mod l18_sign_count_tests {
         let err = be.bump_sign_count("cred-x", 11).unwrap_err();
         assert!(matches!(
             err,
-            StoreError::SignCountReplay { stored: 11, attempted: 11 }
+            StoreError::SignCountReplay {
+                stored: 11,
+                attempted: 11
+            }
         ));
         assert_eq!(be.get_sign_count("cred-x").unwrap(), Some(11));
 
         assert!(matches!(
             be.bump_sign_count("cred-x", 5),
-            Err(StoreError::SignCountReplay { stored: 11, attempted: 5 })
+            Err(StoreError::SignCountReplay {
+                stored: 11,
+                attempted: 5
+            })
         ));
         assert_eq!(be.get_sign_count("cred-x").unwrap(), Some(11));
     }

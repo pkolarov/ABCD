@@ -327,7 +327,10 @@ mod l18_sign_count_tests {
         // Less-than → rejected.
         assert!(matches!(
             be.bump_sign_count("cred-a", 2),
-            Err(StoreError::SignCountReplay { stored: 6, attempted: 2 })
+            Err(StoreError::SignCountReplay {
+                stored: 6,
+                attempted: 2
+            })
         ));
 
         // Separate credentials don't interfere.

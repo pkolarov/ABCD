@@ -192,7 +192,10 @@ pub fn save(path: &Path, kp: &Keypair) -> Result<(), P2pIdentityError> {
                     CborValue::Text("v".into()),
                     CborValue::Integer(VERSION_PLAIN.into()),
                 ),
-                (CborValue::Text("key".into()), CborValue::Bytes(proto.clone())),
+                (
+                    CborValue::Text("key".into()),
+                    CborValue::Bytes(proto.clone()),
+                ),
             ];
             proto.zeroize();
             v
@@ -299,12 +302,12 @@ pub fn load(path: &Path) -> Result<Keypair, P2pIdentityError> {
                 rewrap_v2_to_v3 = true;
                 KdfParams::V2
             } else {
-                let m = m_cost
-                    .ok_or_else(|| P2pIdentityError::Format("v=3 missing m_cost".into()))?;
-                let t = t_cost
-                    .ok_or_else(|| P2pIdentityError::Format("v=3 missing t_cost".into()))?;
-                let p = p_cost
-                    .ok_or_else(|| P2pIdentityError::Format("v=3 missing p_cost".into()))?;
+                let m =
+                    m_cost.ok_or_else(|| P2pIdentityError::Format("v=3 missing m_cost".into()))?;
+                let t =
+                    t_cost.ok_or_else(|| P2pIdentityError::Format("v=3 missing t_cost".into()))?;
+                let p =
+                    p_cost.ok_or_else(|| P2pIdentityError::Format("v=3 missing p_cost".into()))?;
                 KdfParams {
                     m_cost_kib: m,
                     t_cost: t,
@@ -357,11 +360,7 @@ pub fn load(path: &Path) -> Result<Keypair, P2pIdentityError> {
     Ok(kp)
 }
 
-fn derive_key(
-    passphrase: &[u8],
-    salt: &[u8],
-    p: KdfParams,
-) -> Result<[u8; 32], P2pIdentityError> {
+fn derive_key(passphrase: &[u8], salt: &[u8], p: KdfParams) -> Result<[u8; 32], P2pIdentityError> {
     let params = Params::new(p.m_cost_kib, p.t_cost, p.p_cost, Some(32))
         .map_err(|e| P2pIdentityError::Crypto(e.to_string()))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);

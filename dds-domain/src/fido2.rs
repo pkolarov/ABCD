@@ -216,9 +216,9 @@ fn verify_packed(
                         .ok_or_else(|| Fido2Error::Format("x5c not array".into()))?;
                     let mut certs = Vec::with_capacity(arr.len());
                     for cert in arr {
-                        let bytes = cert.as_bytes().ok_or_else(|| {
-                            Fido2Error::Format("x5c element not bytes".into())
-                        })?;
+                        let bytes = cert
+                            .as_bytes()
+                            .ok_or_else(|| Fido2Error::Format("x5c element not bytes".into()))?;
                         certs.push(bytes.clone());
                     }
                     x5c = Some(certs);
@@ -775,8 +775,7 @@ mod tests {
     ) -> (Vec<u8>, p256::ecdsa::SigningKey) {
         use p256::ecdsa::signature::Signer;
         // 1. Self-signed leaf attestation cert (rcgen).
-        let key_pair =
-            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut params = rcgen::CertificateParams::new(vec!["dds-test".to_string()]).unwrap();
         params.distinguished_name = rcgen::DistinguishedName::new();
         let cert = params.self_signed(&key_pair).unwrap();
@@ -919,10 +918,8 @@ mod tests {
         // Synthesize a leaf cert under attestation_sk_a, but sign the
         // attestation with attestation_sk_b. The cert says A; the sig
         // matches B. Must reject.
-        let key_pair_a =
-            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let params =
-            rcgen::CertificateParams::new(vec!["dds-test".to_string()]).unwrap();
+        let key_pair_a = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["dds-test".to_string()]).unwrap();
         let cert_a = params.self_signed(&key_pair_a).unwrap();
 
         let attestation_sk_b = P256SigningKey::random(&mut OsRng);
@@ -975,10 +972,8 @@ mod tests {
     #[test]
     fn test_packed_x5c_alg_mismatch_rejected() {
         use p256::ecdsa::SigningKey as P256SigningKey;
-        let key_pair =
-            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let params =
-            rcgen::CertificateParams::new(vec!["dds-test".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["dds-test".to_string()]).unwrap();
         let cert = params.self_signed(&key_pair).unwrap();
 
         let cred_sk = P256SigningKey::random(&mut OsRng);

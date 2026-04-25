@@ -336,8 +336,7 @@ async fn spawn_node(
     node.store.put_token(admin_attest)?;
 
     // Listen + subscribe (matches multinode.rs).
-    node.swarm
-        .listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
+    node.swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
     node.topics
         .subscribe_all(&mut node.swarm.behaviour_mut().gossipsub, false)?;
 
@@ -378,9 +377,18 @@ fn wire_mesh(handles: &mut [NodeHandle]) {
     let b = &mut b_slice[0];
     let c = &mut c_slice[0];
 
-    let a_addr_p = a.listen_addr.clone().with(libp2p::multiaddr::Protocol::P2p(a.peer_id));
-    let b_addr_p = b.listen_addr.clone().with(libp2p::multiaddr::Protocol::P2p(b.peer_id));
-    let c_addr_p = c.listen_addr.clone().with(libp2p::multiaddr::Protocol::P2p(c.peer_id));
+    let a_addr_p = a
+        .listen_addr
+        .clone()
+        .with(libp2p::multiaddr::Protocol::P2p(a.peer_id));
+    let b_addr_p = b
+        .listen_addr
+        .clone()
+        .with(libp2p::multiaddr::Protocol::P2p(b.peer_id));
+    let c_addr_p = c
+        .listen_addr
+        .clone()
+        .with(libp2p::multiaddr::Protocol::P2p(c.peer_id));
 
     // A→B
     a.node.swarm.add_peer_address(b.peer_id, b_addr_p.clone());
@@ -399,19 +407,28 @@ fn wire_mesh(handles: &mut [NodeHandle]) {
 
     // Gossipsub explicit_peer on initiator side only — see multinode.rs
     // for why this avoids the dial race.
-    a.node.swarm.behaviour_mut().gossipsub.add_explicit_peer(&b.peer_id);
-    a.node.swarm.behaviour_mut().gossipsub.add_explicit_peer(&c.peer_id);
-    b.node.swarm.behaviour_mut().gossipsub.add_explicit_peer(&c.peer_id);
+    a.node
+        .swarm
+        .behaviour_mut()
+        .gossipsub
+        .add_explicit_peer(&b.peer_id);
+    a.node
+        .swarm
+        .behaviour_mut()
+        .gossipsub
+        .add_explicit_peer(&c.peer_id);
+    b.node
+        .swarm
+        .behaviour_mut()
+        .gossipsub
+        .add_explicit_peer(&c.peer_id);
 }
 
 // ── HTTP serve binding ────────────────────────────────────────────
 
 /// Build the LocalService for one node sharing its trust_graph + store
 /// with the in-process DdsNode, then spawn the HTTP serve loop.
-fn spawn_http(
-    h: &NodeHandle,
-    admin_attest: &Token,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn spawn_http(h: &NodeHandle, admin_attest: &Token) -> Result<(), Box<dyn std::error::Error>> {
     // Use a synthetic node Identity — we never persist it; it's only used
     // to sign internally-issued tokens (e.g. session docs).
     let node_identity = Identity::generate("multinode-test-node", &mut OsRng);
@@ -438,9 +455,7 @@ fn spawn_http(
     let api_addr = h.node.config.network.api_addr.clone();
 
     tokio::spawn(async move {
-        if let Err(e) =
-            http::serve(&api_addr, shared_svc, info, admin_policy, None, None).await
-        {
+        if let Err(e) = http::serve(&api_addr, shared_svc, info, admin_policy, None, None).await {
             eprintln!("HTTP serve error on {api_addr}: {e}");
         }
     });
@@ -572,13 +587,8 @@ struct SnapshotResult {
 }
 
 async fn swarm_pump(mut nodes: Vec<NodeHandle>, mut rx: mpsc::Receiver<PumpCmd>) {
-    let trusted_roots: BTreeSet<String> = nodes[0]
-        .node
-        .config
-        .trusted_roots
-        .iter()
-        .cloned()
-        .collect();
+    let trusted_roots: BTreeSet<String> =
+        nodes[0].node.config.trusted_roots.iter().cloned().collect();
 
     loop {
         // Race: command arrival vs swarm event from any node.
@@ -627,10 +637,11 @@ async fn swarm_pump(mut nodes: Vec<NodeHandle>, mut rx: mpsc::Receiver<PumpCmd>)
                 }
                 Some(PumpCmd::Snapshot { node_idx, purposes, revokes, reply }) => {
                     drop(event_futs);
-                    let mut out = SnapshotResult::default();
-                    out.connected_peers =
-                        nodes[node_idx].node.swarm.connected_peers().count();
-                    out.admitted_peers = nodes[node_idx].node.admitted_peers().len();
+                    let mut out = SnapshotResult {
+                        connected_peers: nodes[node_idx].node.swarm.connected_peers().count(),
+                        admitted_peers: nodes[node_idx].node.admitted_peers().len(),
+                        ..SnapshotResult::default()
+                    };
                     let ops_topic = nodes[node_idx].node.topics.operations.to_ident_topic();
                     let topic_hash = ops_topic.hash();
                     // Count peers we know are subscribed to the
@@ -746,10 +757,10 @@ async fn wait_status_ready(urls: &[String]) -> Result<(), Box<dyn std::error::Er
             if Instant::now() > deadline {
                 return Err(format!("status endpoint never came up: {url}").into());
             }
-            if let Ok(r) = client.get(format!("{url}/v1/status")).send().await {
-                if r.status().is_success() {
-                    break;
-                }
+            if let Ok(r) = client.get(format!("{url}/v1/status")).send().await
+                && r.status().is_success()
+            {
+                break;
             }
             sleep(Duration::from_millis(150)).await;
         }
@@ -981,10 +992,9 @@ async fn wait_revoke(
         }
         if Instant::now() > deadline {
             diag_snapshot(cmd_tx, "wait_revoke FINAL").await?;
-            return Err(format!(
-                "revoke for vouch {jti} did not propagate to nodes {node_idxs:?}"
-            )
-            .into());
+            return Err(
+                format!("revoke for vouch {jti} did not propagate to nodes {node_idxs:?}").into(),
+            );
         }
         sleep(Duration::from_millis(250)).await;
     }
@@ -1017,11 +1027,7 @@ const TOUCH_LEAD_SECS: u64 = 5;
 /// Retry a FIDO call that can return `CTAP2_ERR_USER_ACTION_TIMEOUT`
 /// (Crayonic KeyVault is occasionally flaky on `makeCredential`).
 /// Re-prompts the operator and retries up to `max_attempts` total.
-async fn retry_fido<T, E, F>(
-    label: &str,
-    max_attempts: usize,
-    mut op: F,
-) -> Result<T, String>
+async fn retry_fido<T, E, F>(label: &str, max_attempts: usize, mut op: F) -> Result<T, String>
 where
     F: FnMut() -> Result<T, E>,
     E: std::fmt::Display,
@@ -1047,7 +1053,6 @@ where
     }
     Err(format!("{label} exhausted retries"))
 }
-
 
 struct EnrolledHw {
     cred_id: Vec<u8>,
@@ -1092,7 +1097,7 @@ async fn touch_1_enroll(
         &attestation.attstmt_sig,
         &attestation.attstmt_x5c,
     );
-    let cdh = challenge.clone();
+    let cdh = challenge;
 
     let user_label = format!("multinode-user-{:08x}", rand::random::<u32>());
     let req = EnrollUserRequest {
@@ -1157,11 +1162,9 @@ async fn fido_assert(
     let args = GetAssertionArgsBuilder::new(RP_ID, cdj_bytes)
         .credential_id(cred_id)
         .build();
-    let assertions = retry_fido("getAssertion", 3, || {
-        device.get_assertion_with_args(&args)
-    })
-    .await
-    .map_err(|e| format!("getAssertion failed after retries: {e}"))?;
+    let assertions = retry_fido("getAssertion", 3, || device.get_assertion_with_args(&args))
+        .await
+        .map_err(|e| format!("getAssertion failed after retries: {e}"))?;
     let a = assertions
         .into_iter()
         .next()
@@ -1252,12 +1255,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pre-create admin Identity and self-attest. Trusted by all 3 nodes.
     let admin = Identity::generate(ADMIN_LABEL, &mut OsRng);
     let admin_attest = build_admin_self_attest(&admin);
-    println!("Admin URN (trusted root on all 3 nodes): {}", admin.id.to_urn());
+    println!(
+        "Admin URN (trusted root on all 3 nodes): {}",
+        admin.id.to_urn()
+    );
 
     // Shared domain (deterministic per run — 32 zero bytes XOR'd with run id).
-    let domain_key =
-        dds_domain::DomainKey::from_secret_bytes("multinode-hw", [42u8; 32]);
-    println!("Domain: {} ({})", domain_key.domain().name, domain_key.domain().id);
+    let domain_key = dds_domain::DomainKey::from_secret_bytes("multinode-hw", [42u8; 32]);
+    println!(
+        "Domain: {} ({})",
+        domain_key.domain().name,
+        domain_key.domain().id
+    );
 
     // Spawn 3 nodes.
     let trusted_roots = vec![admin.id.to_urn()];
@@ -1356,7 +1365,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             token: vouch,
         })
         .await?;
-    wait_purpose(&cmd_tx, &[0, 1, 2], &enrolled.user_urn, "dds:user", PROPAGATION_TIMEOUT).await?;
+    wait_purpose(
+        &cmd_tx,
+        &[0, 1, 2],
+        &enrolled.user_urn,
+        "dds:user",
+        PROPAGATION_TIMEOUT,
+    )
+    .await?;
     println!("  ✓ vouch propagated — purposes_for(user) contains dds:user on all 3 nodes");
 
     // ── TOUCH 2 ─────────────────────────────────────────────────────
@@ -1458,8 +1474,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // admission auto-sync raced with disconnect cleanup, this kicks
     // it again. force_sync_with bypasses the 15 s per-peer cooldown.
     sleep(Duration::from_secs(3)).await;
-    let other_peer_ids: Vec<libp2p::PeerId> =
-        reconnect_peers.iter().map(|(p, _)| *p).collect();
+    let other_peer_ids: Vec<libp2p::PeerId> = reconnect_peers.iter().map(|(p, _)| *p).collect();
     cmd_tx
         .send(PumpCmd::ForceSync {
             node_idx: 2,

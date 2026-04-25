@@ -382,7 +382,12 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let binding_path = dds_node::device_binding::DeviceBindingStore::default_path(&config.data_dir);
     let device_binding = Some(Arc::new(
         dds_node::device_binding::DeviceBindingStore::load_or_empty(binding_path.clone()).map_err(
-            |e| format!("failed to load device-binding store at {}: {e}", binding_path.display()),
+            |e| {
+                format!(
+                    "failed to load device-binding store at {}: {e}",
+                    binding_path.display()
+                )
+            },
         )?,
     ));
     tokio::spawn(async move {

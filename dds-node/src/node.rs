@@ -468,10 +468,7 @@ impl DdsNode {
     /// Handle admission-protocol events (H-12). Serves our own cert
     /// in response to inbound requests, and verifies peer-supplied
     /// certs from inbound responses.
-    fn handle_admission_event(
-        &mut self,
-        event: RrEvent<AdmissionRequest, AdmissionResponse>,
-    ) {
+    fn handle_admission_event(&mut self, event: RrEvent<AdmissionRequest, AdmissionResponse>) {
         match event {
             RrEvent::Message { peer, message, .. } => match message {
                 RrMessage::Request { channel, .. } => {
@@ -639,9 +636,7 @@ impl DdsNode {
     /// already in the local store keeps verifying — only fresh ingest
     /// from peers is gated.
     fn legacy_token_refused(&self, token: &Token, source: &str) -> bool {
-        if token.wire_version() == TOKEN_WIRE_V1
-            && !self.config.network.allow_legacy_v1_tokens
-        {
+        if token.wire_version() == TOKEN_WIRE_V1 && !self.config.network.allow_legacy_v1_tokens {
             warn!(
                 jti = %token.payload.jti,
                 issuer = %token.payload.iss,

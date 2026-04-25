@@ -28,7 +28,10 @@ fn gen_hmac_secret_writes_32_bytes() {
         .stdout(Stdio::null())
         .status()
         .unwrap();
-    assert!(status.success(), "gen-hmac-secret should succeed on fresh out");
+    assert!(
+        status.success(),
+        "gen-hmac-secret should succeed on fresh out"
+    );
     let bytes = file_bytes(&out);
     assert_eq!(bytes.len(), 32, "HMAC secret must be exactly 32 bytes");
 
@@ -89,12 +92,7 @@ fn gen_hmac_secret_force_replaces_file() {
 
     assert!(
         dds_node_bin()
-            .args([
-                "gen-hmac-secret",
-                "--out",
-                out.to_str().unwrap(),
-                "--force",
-            ])
+            .args(["gen-hmac-secret", "--out", out.to_str().unwrap(), "--force",])
             .stdout(Stdio::null())
             .status()
             .unwrap()

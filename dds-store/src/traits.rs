@@ -204,11 +204,7 @@ pub trait CredentialStateStore {
     /// `set_sign_count` are serialized by an outer mutex. Backends
     /// must override this when they hold their own concurrency
     /// domain (e.g. a redb write transaction).
-    fn bump_sign_count(
-        &mut self,
-        credential_id: &str,
-        new_count: u32,
-    ) -> StoreResult<()> {
+    fn bump_sign_count(&mut self, credential_id: &str, new_count: u32) -> StoreResult<()> {
         let stored = self.get_sign_count(credential_id)?.unwrap_or(0);
         if new_count <= stored {
             return Err(StoreError::SignCountReplay {

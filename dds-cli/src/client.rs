@@ -330,7 +330,8 @@ mod tests {
 
     #[test]
     fn build_path_with_query_multi() {
-        let got = build_path_with_query("/v1/audit/entries", &[("action", "vouch"), ("limit", "10")]);
+        let got =
+            build_path_with_query("/v1/audit/entries", &[("action", "vouch"), ("limit", "10")]);
         assert_eq!(got, "/v1/audit/entries?action=vouch&limit=10");
     }
 }

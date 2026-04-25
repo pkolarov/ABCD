@@ -82,13 +82,7 @@ fn cbor_array_header(out: &mut Vec<u8>, len: usize) {
     }
 }
 
-fn rebuild(
-    fmt: &str,
-    auth_data: &[u8],
-    alg: i32,
-    sig: &[u8],
-    x5c: &[Vec<u8>],
-) -> Vec<u8> {
+fn rebuild(fmt: &str, auth_data: &[u8], alg: i32, sig: &[u8], x5c: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(0xa3);
     cbor_text(&mut out, "fmt");
@@ -150,7 +144,13 @@ fn main() {
     println!("local ctap-hid-fido2 verify: OK");
 
     // ── Step 3: rebuild attobj like multinode test does ──────────
-    let attobj = rebuild(&att.fmt, &att.auth_data, att.attstmt_alg, &att.attstmt_sig, &att.attstmt_x5c);
+    let attobj = rebuild(
+        &att.fmt,
+        &att.auth_data,
+        att.attstmt_alg,
+        &att.attstmt_sig,
+        &att.attstmt_x5c,
+    );
     println!("rebuilt attobj len={}", attobj.len());
 
     // ── Step 4: parse via dds_domain::fido2 (the server's path) ──
@@ -204,13 +204,11 @@ fn main() {
     );
 
     // ── Step 6: cross-check — verify via ctap-hid-fido2 too ──────
-    let local_ok = verifier::verify_assertion(
-        RP_ID,
-        &verify.credential_public_key,
-        &cdh,
-        &a,
+    let local_ok = verifier::verify_assertion(RP_ID, &verify.credential_public_key, &cdh, &a);
+    println!(
+        "ctap-hid-fido2 verify_assertion: {}",
+        if local_ok { "PASS" } else { "FAIL" }
     );
-    println!("ctap-hid-fido2 verify_assertion: {}", if local_ok { "PASS" } else { "FAIL" });
 
     // ── Step 7: verify assertion via dds_domain::fido2 ───────────
     let dds_result = dds_domain::fido2::verify_assertion(&a.auth_data, &cdh, &a.signature, &pk);
@@ -222,7 +220,8 @@ fn main() {
     // ── Step 7b: low-level p256 cross-check ─────────────────────
     {
         use ::signature::Verifier;
-        let cose_pk_v = match dds_domain::fido2::cose_to_credential_public_key(cose_bytes).unwrap() {
+        let cose_pk_v = match dds_domain::fido2::cose_to_credential_public_key(cose_bytes).unwrap()
+        {
             dds_domain::fido2::CredentialPublicKey::P256(vk) => vk,
             _ => panic!("not P256"),
         };
@@ -249,20 +248,44 @@ fn main() {
     signed.extend_from_slice(&a.auth_data);
     signed.extend_from_slice(&cdh);
     println!("\n── diagnostic dump ──");
-    println!("assertion.auth_data ({} bytes): {}", a.auth_data.len(), hex(&a.auth_data));
+    println!(
+        "assertion.auth_data ({} bytes): {}",
+        a.auth_data.len(),
+        hex(&a.auth_data)
+    );
     println!("client_data_hash    ({} bytes): {}", cdh.len(), hex(&cdh));
-    println!("signed blob         ({} bytes): {}", signed.len(), hex(&signed[..40.min(signed.len())]));
-    println!("  (showing first 40 bytes only; full sig verification uses all {} bytes)", signed.len());
-    println!("assertion.signature ({} bytes): {}", a.signature.len(), hex(&a.signature));
+    println!(
+        "signed blob         ({} bytes): {}",
+        signed.len(),
+        hex(&signed[..40.min(signed.len())])
+    );
+    println!(
+        "  (showing first 40 bytes only; full sig verification uses all {} bytes)",
+        signed.len()
+    );
+    println!(
+        "assertion.signature ({} bytes): {}",
+        a.signature.len(),
+        hex(&a.signature)
+    );
     // Compare: ctap-hid-fido2's public key PEM vs dds_domain extracted bytes
-    println!("\nctap-hid-fido2 cred PK PEM:\n{}", verify.credential_public_key.pem);
-    println!("cose_bytes ({} bytes): {}", cose_bytes.len(), hex(cose_bytes));
+    println!(
+        "\nctap-hid-fido2 cred PK PEM:\n{}",
+        verify.credential_public_key.pem
+    );
+    println!(
+        "cose_bytes ({} bytes): {}",
+        cose_bytes.len(),
+        hex(cose_bytes)
+    );
 
     if !local_ok && dds_result.is_err() {
         std::process::exit(1);
     }
     if local_ok && dds_result.is_err() {
-        eprintln!("\n!! local ctap-hid-fido2 PASSES but dds_domain FAILS — bug in dds_domain::fido2::verify_assertion");
+        eprintln!(
+            "\n!! local ctap-hid-fido2 PASSES but dds_domain FAILS — bug in dds_domain::fido2::verify_assertion"
+        );
         std::process::exit(2);
     }
     println!("\nALL CHECKS PASSED");
@@ -271,6 +294,8 @@ fn main() {
 fn hex(b: &[u8]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(b.len() * 2);
-    for c in b { let _ = write!(s, "{c:02x}"); }
+    for c in b {
+        let _ = write!(s, "{c:02x}");
+    }
     s
 }

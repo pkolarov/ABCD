@@ -50,9 +50,9 @@ impl CallerPrincipal {
                 Some(CallerPrincipal::UnixUid { uid: *uid })
             }
             #[cfg(windows)]
-            crate::http::CallerIdentity::Pipe { sid, .. } => Some(CallerPrincipal::WindowsSid {
-                sid: sid.clone(),
-            }),
+            crate::http::CallerIdentity::Pipe { sid, .. } => {
+                Some(CallerPrincipal::WindowsSid { sid: sid.clone() })
+            }
         }
     }
 }
@@ -179,8 +179,7 @@ mod tests {
     #[test]
     fn tofu_establish_then_match() {
         let dir = TempDir::new().unwrap();
-        let store =
-            DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap();
+        let store = DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap();
         let p = uid_principal(1000);
         assert_eq!(
             store.tofu_bind("urn:device:x", p.clone()).unwrap(),
@@ -195,8 +194,7 @@ mod tests {
     #[test]
     fn tofu_mismatch_returns_stored_principal() {
         let dir = TempDir::new().unwrap();
-        let store =
-            DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap();
+        let store = DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap();
         assert_eq!(
             store
                 .tofu_bind("urn:device:x", uid_principal(1000))
@@ -220,9 +218,7 @@ mod tests {
         let path = dir.path().join("b.json");
         {
             let store = DeviceBindingStore::load_or_empty(path.clone()).unwrap();
-            store
-                .tofu_bind("urn:device:x", uid_principal(42))
-                .unwrap();
+            store.tofu_bind("urn:device:x", uid_principal(42)).unwrap();
         }
         let reopened = DeviceBindingStore::load_or_empty(path).unwrap();
         assert_eq!(reopened.get("urn:device:x"), Some(uid_principal(42)));
@@ -233,9 +229,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("b.json");
         let store = DeviceBindingStore::load_or_empty(path.clone()).unwrap();
-        store
-            .tofu_bind("urn:device:x", uid_principal(1))
-            .unwrap();
+        store.tofu_bind("urn:device:x", uid_principal(1)).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -250,8 +244,7 @@ mod tests {
     #[test]
     fn get_returns_none_for_unbound_urn() {
         let dir = TempDir::new().unwrap();
-        let store =
-            DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap();
+        let store = DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap();
         assert!(store.get("urn:device:missing").is_none());
     }
 }

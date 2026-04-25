@@ -354,8 +354,12 @@ async fn main() {
     // is hashed internally before being concatenated with auth_data, so
     // we pass `cdj_bytes` (matching what we passed to GetAssertion) so
     // both sides hash the same input once.
-    let ok =
-        verifier::verify_assertion(RP_ID, &verify_result.credential_public_key, cdj_bytes, assertion);
+    let ok = verifier::verify_assertion(
+        RP_ID,
+        &verify_result.credential_public_key,
+        cdj_bytes,
+        assertion,
+    );
     println!(
         "  Assertion received! (local verify: {})",
         if ok { "PASS" } else { "FAIL" }
