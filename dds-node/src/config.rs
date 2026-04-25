@@ -101,6 +101,17 @@ pub struct DomainConfig {
     /// turn it on once they've vouched all enrolled devices.
     #[serde(default)]
     pub enforce_device_scope_vouch: bool,
+
+    /// **A-1 step-1 (security review)**: opt into accepting FIDO2
+    /// enrollment attestations with `fmt = "none"`. Default `false`
+    /// — packed self-attestation (or full with `x5c`, after A-1
+    /// step-2 lands) is required. Flip to `true` only on
+    /// dev/test deployments where a real authenticator is not
+    /// available and the operator explicitly accepts that any
+    /// local process can mint credentials. Each enrollment that
+    /// uses the unattested path is logged at WARN.
+    #[serde(default)]
+    pub allow_unattested_credentials: bool,
 }
 
 /// Network settings.

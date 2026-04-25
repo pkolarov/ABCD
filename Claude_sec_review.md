@@ -1231,8 +1231,8 @@ same pass — "loopback TCP is admin by default" and "device APIs allow
 anonymous TCP" — are already tracked as H-7 (⚠ Partial) and M-8 step-2
 respectively, and are not re-listed.
 
-### A-1 (High). FIDO2 packed attestation with `x5c` is accepted without verifying the statement signature or chain
-**Location:** [dds-domain/src/fido2.rs:96-98](dds-domain/src/fido2.rs#L96-L98), [dds-domain/src/fido2.rs:190-198](dds-domain/src/fido2.rs#L190-L198)
+### A-1 (High). ⚠ Partial — FIDO2 packed attestation with `x5c` is accepted without verifying the statement signature or chain
+**Location:** [dds-domain/src/fido2.rs](dds-domain/src/fido2.rs)
 
 **What's wrong:** `verify_attestation` accepts `fmt == "none"`
 unconditionally ("Nothing to verify cryptographically"), and in the
@@ -1257,17 +1257,44 @@ statement when `x5c` is present, independent of any MDS trust-anchor
 decision. A full MDS integration is one fix; a much smaller fix
 is to verify the packed `sig` unconditionally (it's self-contained)
 and to gate `fmt == "none"` behind an explicit
-`allow_self_attestation` config knob.
+`allow_unattested_credentials` config knob.
 
-**Fix:**
-- Validate `clientDataJSON` `type`/`challenge`/`origin` at enrollment
-  (M-12 already does this for assertion — mirror it for enroll).
-- In `verify_packed`: when `x5c` is present, verify the signature over
-  `authData || clientDataHash` under the leaf cert's public key, then
-  validate the chain against a configured trust anchor list (defer to
-  M-13 for the anchor source).
-- Gate `fmt == "none"` behind `ApiAuthConfig.allow_self_attestation`
-  (default `false`) and log the enrollment at WARN when it's used.
+**Resolution status:**
+
+- **Step 1 ✅ landed 2026-04-25** — `verify_attestation` now takes
+  an `allow_unattested_credentials: bool`; `fmt = "none"` returns
+  `Fido2Error::Unsupported` unless the caller opts in. Wired
+  through three enrollment call sites
+  (`enroll_user` / `admin_setup` / re-parse on session assert) from
+  a new `DomainConfig.allow_unattested_credentials` field that
+  defaults to `false`. The re-parse callsite passes `true` so
+  already-stored unattested credentials don't regress on the next
+  session-assert. Each accepted unattested enrollment is logged
+  at WARN so operators can audit usage. Test fixtures across
+  `dds-node` (5 in-process tests, 5 HTTP tests, the binary HTTP
+  e2e harness, `service_tests.rs`) now use
+  `build_packed_self_attestation` over the matching CDH; the
+  `dds-fido2-test` HW probe / multinode binaries and the
+  `dds-loadtest` harness keep `allow_unattested_credentials =
+  true` because they exercise synthetic or HW-driven flows where
+  `fmt = "none"` may legitimately appear. New `fido2.rs` tests
+  pin: `none` rejected by default (Ed25519 + P-256), `none`
+  accepted under `allow = true`, packed unaffected by the flag.
+  `cargo test --workspace` ⇒ 439/439 ok;
+  `cargo clippy -p dds-domain -p dds-node -p dds-loadtest
+  --all-targets -- -D warnings` ⇒ clean.
+- **Step 2 (open)** — `verify_packed` still returns `Ok(())` when
+  `x5c` is present without verifying the leaf cert's signature
+  over `authData || clientDataHash`. Will land in a follow-up
+  commit that adds an X.509 parser dep (`x509-parser`) so we can
+  extract the leaf SPKI and verify the `sig` field; chain
+  validation against a trust-anchor list stays deferred to M-13.
+  Test scaffolding will use `rcgen` (already a transitive in the
+  lock file) to synthesize a self-signed leaf cert.
+- **Step 3 (open)** — Mirror M-12's clientDataJSON parsing at
+  enrollment so `type`/`challenge`/`origin` are validated
+  individually (today the enroll path only compares the
+  `client_data_hash` against `authData`'s embedded value).
 
 ---
 

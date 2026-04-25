@@ -154,7 +154,11 @@ fn main() {
     println!("rebuilt attobj len={}", attobj.len());
 
     // ── Step 4: parse via dds_domain::fido2 (the server's path) ──
-    let parsed = match dds_domain::fido2::verify_attestation(&attobj, &chal) {
+    // A-1 step-1: probe is a HW debugging tool; tolerate fmt=none in
+    // case the authenticator emits it (real authenticators usually
+    // emit `packed` with `x5c`, but we don't want the probe to fail
+    // before reaching the diagnostic prints below).
+    let parsed = match dds_domain::fido2::verify_attestation(&attobj, &chal, true) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("dds_domain verify_attestation FAILED: {e}");

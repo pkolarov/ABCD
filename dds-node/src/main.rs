@@ -356,6 +356,10 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     svc.set_bootstrap_admin_urn(config.bootstrap_admin_urn.clone());
     // M-7 (security review): apply device-scope vouch enforcement.
     svc.set_enforce_device_scope_vouch(config.domain.enforce_device_scope_vouch);
+    // A-1 step-1: opt into unattested-credential enrollment iff the
+    // operator set the flag explicitly in node.toml. Default is
+    // `false` so production deployments require real attestation.
+    svc.set_allow_unattested_credentials(config.domain.allow_unattested_credentials);
     let shared_svc = Arc::new(tokio::sync::Mutex::new(svc));
     let node_info = http::NodeInfo {
         peer_id: node.peer_id.to_string(),

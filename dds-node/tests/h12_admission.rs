@@ -86,6 +86,7 @@ async fn spawn_with_domain(
             audit_log_max_entries: 0,
             audit_log_retention_days: 0,
             enforce_device_scope_vouch: false,
+            allow_unattested_credentials: false,
         },
         trusted_roots: Vec::new(),
         bootstrap_admin_urn: None,

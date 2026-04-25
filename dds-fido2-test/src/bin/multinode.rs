@@ -315,6 +315,11 @@ async fn spawn_node(
             audit_log_max_entries: 0,
             audit_log_retention_days: 0,
             enforce_device_scope_vouch: false,
+            // A-1 step-1: HW test harness — tolerate fmt=none in case
+            // the connected authenticator emits it. Real Crayonic /
+            // YubiKey hardware produces packed-with-x5c; this flag is
+            // belt-and-braces.
+            allow_unattested_credentials: true,
         },
         trusted_roots: trusted_roots.to_vec(),
         bootstrap_admin_urn: None,

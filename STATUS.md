@@ -14,7 +14,7 @@ marked superseded.
 | Severity | Fixed | Deferred | Addendum (open) | Rationale for deferral |
 |---|---|---|---|---|
 | **Critical** | 3/3 | — | — | — |
-| **High** | 12/12 | — | 2 (A-1, A-2) | H-6 + H-7 step-2b verified on Windows x64 host 2026-04-24 — see "Windows host verification (2026-04-24)" below. |
+| **High** | 12/12 | — | 2 (A-1 ⚠ step-1 landed, A-2) | H-6 + H-7 step-2b verified on Windows x64 host 2026-04-24 — see "Windows host verification (2026-04-24)" below. |
 | **Medium** | 20/22 | 3 | 3 (A-3, A-4, A-6) | M-13 (FIDO MDS integration — external design), M-15 (node-bound FIDO2 `hmac_salt`; blocked on bundle re-wrap design), M-18 (WiX service-account split — multi-day Windows refactor). |
 | **Low** | 17/18 | 1 | — | L-17 (service-mutex refactor — 29 HTTP handler lock sites; L-18's atomic `bump_sign_count` already closed the replay race so the remaining gain is throughput not security). |
 
@@ -23,11 +23,17 @@ M-1…M-22 ledger; the addendum table below is the per-finding view.
 
 **Addendum pass 2026-04-24** (5 open + 1 landed):
 
-- **A-1 (High)**: FIDO2 packed attestation with `x5c` returns `Ok(())` without
-  verifying the statement signature; `fmt == "none"` unconditionally accepted.
-  Sharper than M-13's deferred MDS note — the `sig` field of packed
-  attestations is self-contained and should be verified regardless of
-  the anchor-list decision.
+- **A-1 (High) ⚠ step-1 landed 2026-04-25**: `fmt = "none"` is now
+  rejected by default. `verify_attestation` takes an
+  `allow_unattested_credentials: bool` (wired from
+  `DomainConfig.allow_unattested_credentials`, default `false`);
+  unattested enrollments are refused with `Fido2Error::Unsupported`
+  unless an operator explicitly opts in, and accepted unattested
+  paths log at WARN. Test fixtures across `dds-node` switched to
+  `build_packed_self_attestation`. **Step-2 still open** — `x5c`
+  packed attestations still accept any `sig` (X.509 parser dep
+  needed). **Step-3 still open** — clientDataJSON parsing at
+  enrollment to mirror M-12.
 - **A-2 (High)**: Windows Auth Bridge `CDdsConfiguration` only reads
   `DdsNodePort`; there is no `ApiAddr` field. `DdsAuthBridgeMain` wires
   the HTTP client via `SetPort`, not `SetBaseUrl`, so the pipe transport

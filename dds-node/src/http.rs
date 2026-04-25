@@ -2023,7 +2023,7 @@ mod tests {
     use dds_core::identity::Identity;
     use dds_core::token::{Token, TokenKind, TokenPayload};
     use dds_core::trust::TrustGraph;
-    use dds_domain::fido2::build_none_attestation;
+    use dds_domain::fido2::build_packed_self_attestation;
     use dds_store::MemoryBackend;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
@@ -2268,7 +2268,11 @@ mod tests {
         let state = make_state();
         let base = spawn_server(state).await;
         let sk = SigningKey::generate(&mut OsRng);
-        let attestation = build_none_attestation("example.com", b"cred-x", &sk.verifying_key());
+        // A-1 step-1: packed self-attestation over the all-zero CDH
+        // that the request below pins (`client_data_hash_b64:
+        // b64_encode(&[0u8; 32])`).
+        let attestation =
+            build_packed_self_attestation("example.com", b"cred-x", &sk, &[0u8; 32]);
         let req = EnrollUserRequestJson {
             label: "alice".into(),
             credential_id: "cred-x".into(),
@@ -2363,7 +2367,7 @@ mod tests {
     /// and verify a session is issued. End-to-end CP flow.
     #[tokio::test]
     async fn test_session_assert_ed25519_roundtrip() {
-        use dds_domain::fido2::build_none_attestation;
+        use dds_domain::fido2::build_packed_self_attestation;
 
         let ts = make_state_with_root();
         let state = ts.app;
@@ -2372,7 +2376,10 @@ mod tests {
         // 1. Enroll a user with an Ed25519 credential.
         let sk = SigningKey::generate(&mut OsRng);
         let cred_id = b"cred-assert-test";
-        let attestation = build_none_attestation("dds.local", cred_id, &sk.verifying_key());
+        // A-1 step-1: packed self-attestation over the same all-zero
+        // CDH the request below pins.
+        let attestation =
+            build_packed_self_attestation("dds.local", cred_id, &sk, &[0u8; 32]);
         // enroll_user base64url-encodes the raw credential_id from the
         // attestation object, so the stored credential_id in the trust
         // graph is base64url(b"cred-assert-test"), not the raw string.
@@ -2432,7 +2439,7 @@ mod tests {
     /// Assertion with wrong key should be rejected.
     #[tokio::test]
     async fn test_session_assert_rejects_wrong_key() {
-        use dds_domain::fido2::{build_assertion_auth_data, build_none_attestation};
+        use dds_domain::fido2::{build_assertion_auth_data, build_packed_self_attestation};
         use ed25519_dalek::Signer;
 
         let state = make_state();
@@ -2441,7 +2448,10 @@ mod tests {
         // Enroll with key A.
         let sk_a = SigningKey::generate(&mut OsRng);
         let cred_bytes = b"cred-wrong";
-        let attestation = build_none_attestation("dds.local", cred_bytes, &sk_a.verifying_key());
+        // A-1 step-1: enroll with a packed self-attestation; the
+        // assertion path below uses a different signing key (sk_b) to
+        // exercise the wrong-key rejection.
+        let attestation = build_packed_self_attestation("dds.local", cred_bytes, &sk_a, &[0u8; 32]);
         let cred_id_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred_bytes);
         let enroll_req = EnrollUserRequestJson {
             label: "carol".into(),
@@ -2530,7 +2540,7 @@ mod tests {
     /// GET /v1/enrolled-users returns enrolled user attestations.
     #[tokio::test]
     async fn test_enrolled_users_endpoint() {
-        use dds_domain::fido2::build_none_attestation;
+        use dds_domain::fido2::build_packed_self_attestation;
 
         let state = make_state();
         let base = spawn_server(state).await;
@@ -2550,7 +2560,7 @@ mod tests {
         for (name, cred) in [("alice", "cred-a"), ("bob", "cred-b")] {
             let sk = SigningKey::generate(&mut OsRng);
             let attestation =
-                build_none_attestation("dds.local", cred.as_bytes(), &sk.verifying_key());
+                build_packed_self_attestation("dds.local", cred.as_bytes(), &sk, &[0u8; 32]);
             let cred_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred.as_bytes());
             let enroll_req = EnrollUserRequestJson {
                 label: name.into(),
@@ -2616,10 +2626,11 @@ mod tests {
 
         let user_sk = SigningKey::generate(&mut OsRng);
         let credential_id = "claim-cred-1";
-        let attestation = build_none_attestation(
+        let attestation = build_packed_self_attestation(
             "dds.local",
             credential_id.as_bytes(),
-            &user_sk.verifying_key(),
+            &user_sk,
+            &[0u8; 32],
         );
         let enroll_req = EnrollUserRequestJson {
             label: "alice".into(),
@@ -3240,9 +3251,9 @@ mod tests {
         cred_bytes: &[u8],
         rp_id: &str,
     ) -> (String, SigningKey, String) {
-        use dds_domain::fido2::build_none_attestation;
+        use dds_domain::fido2::build_packed_self_attestation;
         let sk = SigningKey::generate(&mut OsRng);
-        let attestation = build_none_attestation(rp_id, cred_bytes, &sk.verifying_key());
+        let attestation = build_packed_self_attestation(rp_id, cred_bytes, &sk, &[0u8; 32]);
         let cred_id_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred_bytes);
         let enroll_req = EnrollUserRequestJson {
             label: label.into(),

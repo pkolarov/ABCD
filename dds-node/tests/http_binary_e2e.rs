@@ -6,7 +6,7 @@ use base64::Engine;
 use dds_core::crdt::causal_dag::Operation;
 use dds_core::identity::Identity;
 use dds_core::token::{Token, TokenKind, TokenPayload};
-use dds_domain::fido2::{build_assertion_auth_data, build_none_attestation};
+use dds_domain::fido2::{build_assertion_auth_data, build_packed_self_attestation};
 use dds_domain::{DeviceJoinDocument, DomainDocument, UserAuthAttestation};
 use dds_node::config::{DomainConfig, NetworkConfig, NodeConfig};
 use dds_node::domain_store;
@@ -208,6 +208,7 @@ fn write_node_fixture(
             audit_log_max_entries: 0,
             audit_log_retention_days: 0,
             enforce_device_scope_vouch: false,
+            allow_unattested_credentials: false,
         },
         trusted_roots,
         bootstrap_admin_urn: None,
@@ -302,6 +303,7 @@ impl Publisher {
                 audit_log_max_entries: 0,
                 audit_log_retention_days: 0,
                 enforce_device_scope_vouch: false,
+                allow_unattested_credentials: false,
             },
             trusted_roots: Vec::new(),
             bootstrap_admin_urn: None,
@@ -415,7 +417,9 @@ async fn enroll_user_fido2(
 ) -> (String, SigningKey) {
     let sk = SigningKey::generate(&mut OsRng);
     let cred_bytes = format!("cred-{label}");
-    let attestation = build_none_attestation(rp_id, cred_bytes.as_bytes(), &sk.verifying_key());
+    // A-1 step-1: packed self-attestation over the all-zero CDH that
+    // the request below pins.
+    let attestation = build_packed_self_attestation(rp_id, cred_bytes.as_bytes(), &sk, &[0u8; 32]);
     let cred_id_b64 =
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred_bytes.as_bytes());
     let resp = client
@@ -646,8 +650,10 @@ async fn binary_http_api_end_to_end() {
     assert_eq!(device_doc.hostname, "workstation-01");
 
     let cred_sk = SigningKey::generate(&mut OsRng);
+    // A-1 step-1: packed self-attestation over the 0xAB CDH the
+    // request below pins.
     let attestation =
-        build_none_attestation("example.com", b"cred-http-e2e", &cred_sk.verifying_key());
+        build_packed_self_attestation("example.com", b"cred-http-e2e", &cred_sk, &[0xAB; 32]);
     let user_resp = client
         .post(format!("{}/v1/enroll/user", node.fixture.api_url))
         .json(&EnrollUserRequestJson {

@@ -64,9 +64,26 @@ impl std::error::Error for Fido2Error {}
 /// `attestation_object` is the raw CBOR-encoded value returned by
 /// `navigator.credentials.create()`'s `response.attestationObject`.
 /// `client_data_hash` is SHA-256(clientDataJSON).
+///
+/// **A-1 step-1 (security review, 2026-04-25)**: `fmt = "none"`
+/// (no attestation at all) is gated behind
+/// `allow_unattested_credentials`. The default deployment posture
+/// (set by [`crate::Service`] / [`DomainConfig`]) is `false`, so a
+/// caller that hands in an attestation object with `fmt = "none"`
+/// is rejected with [`Fido2Error::Unsupported`]. Set the parameter
+/// to `true` only on dev/test paths or when the operator has
+/// explicitly opted in via configuration. Packed attestation
+/// (whether self-attested with no `x5c` or full with an `x5c`
+/// chain) is verified regardless of the flag.
+///
+/// Re-parse callers (e.g. assertion-time sanity checks where the
+/// attestation was already trusted at original enrollment) should
+/// pass `allow_unattested_credentials = true` so the re-parse does
+/// not regress on previously-stored credentials.
 pub fn verify_attestation(
     attestation_object: &[u8],
     client_data_hash: &[u8],
+    allow_unattested_credentials: bool,
 ) -> Result<ParsedAttestation, Fido2Error> {
     let value: CborValue =
         ciborium::from_reader(attestation_object).map_err(|e| Fido2Error::Cbor(e.to_string()))?;
@@ -95,7 +112,18 @@ pub fn verify_attestation(
 
     match fmt.as_str() {
         "none" => {
-            // Nothing to verify cryptographically.
+            // **A-1 step-1**: refuse `fmt = "none"` unless the caller
+            // has explicitly opted in. Callers that accept it should
+            // log the decision at WARN — `dds-domain` stays
+            // `tracing`-free, so the WARN happens on the caller side
+            // (see `Service::enroll_user` etc.).
+            if !allow_unattested_credentials {
+                return Err(Fido2Error::Unsupported(
+                    "fmt=none rejected: no attestation provided and \
+                     allow_unattested_credentials is false (A-1)"
+                        .into(),
+                ));
+            }
         }
         "packed" => {
             let stmt =
@@ -611,11 +639,12 @@ mod tests {
     use rand::rngs::OsRng;
 
     #[test]
-    fn test_none_attestation_roundtrip() {
+    fn test_none_attestation_roundtrip_when_allowed() {
         let sk = SigningKey::generate(&mut OsRng);
         let cred_id = b"test-credential";
         let attestation = build_none_attestation("example.com", cred_id, &sk.verifying_key());
-        let parsed = verify_attestation(&attestation, &[0u8; 32]).unwrap();
+        // A-1 step-1: caller must opt in to fmt=none.
+        let parsed = verify_attestation(&attestation, &[0u8; 32], true).unwrap();
         assert_eq!(parsed.fmt, "none");
         assert_eq!(parsed.credential_id, cred_id);
         match &parsed.credential_public_key {
@@ -629,14 +658,14 @@ mod tests {
     }
 
     #[test]
-    fn test_p256_none_attestation_roundtrip() {
+    fn test_p256_none_attestation_roundtrip_when_allowed() {
         use p256::ecdsa::SigningKey as P256SigningKey;
 
         let sk = P256SigningKey::random(&mut OsRng);
         let vk = P256VerifyingKey::from(&sk);
         let cred_id = b"p256-credential";
         let attestation = build_none_attestation_p256("example.com", cred_id, &vk);
-        let parsed = verify_attestation(&attestation, &[0u8; 32]).unwrap();
+        let parsed = verify_attestation(&attestation, &[0u8; 32], true).unwrap();
         assert_eq!(parsed.fmt, "none");
         assert_eq!(parsed.credential_id, cred_id);
         match &parsed.credential_public_key {
@@ -652,6 +681,49 @@ mod tests {
         assert_eq!(parsed.rp_id_hash, expected_hash);
     }
 
+    /// **A-1 step-1**: `fmt = "none"` is rejected when the caller has not
+    /// opted into unattested credentials.
+    #[test]
+    fn test_none_attestation_rejected_by_default() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let attestation = build_none_attestation("example.com", b"cred", &sk.verifying_key());
+        let res = verify_attestation(&attestation, &[0u8; 32], false);
+        match res {
+            Err(Fido2Error::Unsupported(msg)) => {
+                assert!(msg.contains("fmt=none"), "unexpected message: {msg}");
+                assert!(msg.contains("A-1"), "missing remediation tag: {msg}");
+            }
+            other => panic!("expected Unsupported(fmt=none), got {other:?}"),
+        }
+    }
+
+    /// **A-1 step-1**: P-256 variant of the gate.
+    #[test]
+    fn test_p256_none_attestation_rejected_by_default() {
+        use p256::ecdsa::SigningKey as P256SigningKey;
+        let sk = P256SigningKey::random(&mut OsRng);
+        let vk = P256VerifyingKey::from(&sk);
+        let attestation = build_none_attestation_p256("example.com", b"p", &vk);
+        let res = verify_attestation(&attestation, &[0u8; 32], false);
+        assert!(matches!(res, Err(Fido2Error::Unsupported(_))));
+    }
+
+    /// **A-1 step-1**: packed self-attestation is unaffected by the
+    /// `allow_unattested_credentials` flag — it still verifies the
+    /// signature regardless.
+    #[test]
+    fn test_packed_unaffected_by_unattested_flag() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let cdh = [0xAB; 32];
+        let attestation = build_packed_self_attestation("login.example.com", b"cred1", &sk, &cdh);
+        // Both flag values must accept a valid packed attestation.
+        for allow in [false, true] {
+            let parsed = verify_attestation(&attestation, &cdh, allow).unwrap();
+            assert_eq!(parsed.fmt, "packed");
+            assert_eq!(parsed.credential_id, b"cred1");
+        }
+    }
+
     #[test]
     fn test_p256_packed_self_attestation() {
         use p256::ecdsa::SigningKey as P256SigningKey;
@@ -660,7 +732,9 @@ mod tests {
         let cdh = [0xCD; 32];
         let attestation =
             build_packed_self_attestation_p256("login.example.com", b"p256-cred", &sk, &cdh);
-        let parsed = verify_attestation(&attestation, &cdh).unwrap();
+        // packed verification is unaffected by the unattested flag —
+        // pass `false` (the default) to confirm.
+        let parsed = verify_attestation(&attestation, &cdh, false).unwrap();
         assert_eq!(parsed.fmt, "packed");
         assert_eq!(parsed.credential_id, b"p256-cred");
         assert!(matches!(
@@ -674,7 +748,7 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let cdh = [0xAB; 32];
         let attestation = build_packed_self_attestation("login.example.com", b"cred1", &sk, &cdh);
-        let parsed = verify_attestation(&attestation, &cdh).unwrap();
+        let parsed = verify_attestation(&attestation, &cdh, false).unwrap();
         assert_eq!(parsed.fmt, "packed");
         assert_eq!(parsed.credential_id, b"cred1");
     }
@@ -687,20 +761,20 @@ mod tests {
             build_packed_self_attestation("login.example.com", b"cred1", &sk, &cdh);
         // Verifying with the wrong client_data_hash must fail.
         let wrong = [0u8; 32];
-        let res = verify_attestation(&attestation, &wrong);
+        let res = verify_attestation(&attestation, &wrong, false);
         assert!(matches!(res, Err(Fido2Error::BadSignature)));
 
         // Tamper a byte in the attestation and confirm it fails too.
         let len = attestation.len();
         attestation[len - 1] ^= 0xFF;
-        let res2 = verify_attestation(&attestation, &cdh);
+        let res2 = verify_attestation(&attestation, &cdh, false);
         assert!(res2.is_err());
     }
 
     #[test]
     fn test_garbage_input_rejected() {
-        assert!(verify_attestation(&[0u8; 4], &[0u8; 32]).is_err());
-        assert!(verify_attestation(b"not cbor", &[0u8; 32]).is_err());
+        assert!(verify_attestation(&[0u8; 4], &[0u8; 32], true).is_err());
+        assert!(verify_attestation(b"not cbor", &[0u8; 32], true).is_err());
     }
 
     #[test]
@@ -715,7 +789,7 @@ mod tests {
         ];
         let mut bytes = Vec::new();
         ciborium::into_writer(&CborValue::Map(map), &mut bytes).unwrap();
-        let res = verify_attestation(&bytes, &[0u8; 32]);
+        let res = verify_attestation(&bytes, &[0u8; 32], true);
         assert!(matches!(
             res,
             Err(Fido2Error::Unsupported(_)) | Err(Fido2Error::Format(_))

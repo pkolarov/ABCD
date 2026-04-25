@@ -4,7 +4,7 @@ use dds_core::identity::Identity;
 use dds_core::policy::{Effect, PolicyRule};
 use dds_core::token::{Token, TokenKind, TokenPayload};
 use dds_core::trust::TrustGraph;
-use dds_domain::fido2::build_none_attestation;
+use dds_domain::fido2::build_packed_self_attestation;
 use dds_domain::{DeviceJoinDocument, DomainDocument, SessionDocument, UserAuthAttestation};
 use dds_node::service::*;
 use dds_store::MemoryBackend;
@@ -55,13 +55,18 @@ fn make_service() -> (Identity, LocalService<MemoryBackend>) {
 fn test_enroll_user() {
     let (_root, mut svc) = make_service();
     let cred_sk = SigningKey::generate(&mut OsRng);
-    let attestation = build_none_attestation("example.com", b"cred-123", &cred_sk.verifying_key());
+    // A-1 step-1: packed self-attestation over the 0xBB CDH passed
+    // below. Default `allow_unattested_credentials = false` no longer
+    // accepts fmt=none, so this test exercises the packed path.
+    let cdh = [0xBB; 32];
+    let attestation =
+        build_packed_self_attestation("example.com", b"cred-123", &cred_sk, &cdh);
     let result = svc
         .enroll_user(EnrollUserRequest {
             label: "alice".into(),
             credential_id: "cred-123".into(),
             attestation_object: attestation,
-            client_data_hash: vec![0xBB; 32],
+            client_data_hash: cdh.to_vec(),
             rp_id: "example.com".into(),
             display_name: "Alice".into(),
             authenticator_type: "platform".into(),

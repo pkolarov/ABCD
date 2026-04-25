@@ -309,6 +309,13 @@ pub struct LocalService<
     boot_wall_time: SystemTime,
     /// Whether to verify FIDO2 attestation on enroll_user.
     verify_fido2: bool,
+    /// **A-1 step-1 (security review)**: when true, accept enrollment
+    /// attestations with `fmt = "none"` (no cryptographic
+    /// attestation at all). Default `false`; flip to `true` only on
+    /// dev/test paths or when an operator has explicitly opted in
+    /// via `DomainConfig.allow_unattested_credentials`. Packed
+    /// attestation (with or without `x5c`) is verified regardless.
+    allow_unattested_credentials: bool,
     /// **M-7 (security review)**: when true, only honor self-attested
     /// device tags/org_unit if the device has a vouch from a trusted
     /// root with purpose `dds:device-scope`. Set from
@@ -360,6 +367,7 @@ impl<
             start_time: now_epoch(),
             boot_wall_time: SystemTime::now(),
             verify_fido2: true,
+            allow_unattested_credentials: false,
             enforce_device_scope_vouch: false,
         };
         // Best-effort rehydration: pull any pre-existing tokens from the
@@ -432,6 +440,17 @@ impl<
     /// leave this enabled.
     pub fn set_verify_fido2(&mut self, verify: bool) {
         self.verify_fido2 = verify;
+    }
+
+    /// **A-1 step-1**: opt into unattested-credential enrollment.
+    /// When `true`, attestations with `fmt = "none"` are accepted.
+    /// Default `false`; production deployments should leave this
+    /// off so attackers cannot enroll credentials they fully
+    /// control without any cryptographic proof at MakeCredential
+    /// time. Wired from
+    /// `NodeConfig.domain.allow_unattested_credentials`.
+    pub fn set_allow_unattested_credentials(&mut self, allow: bool) {
+        self.allow_unattested_credentials = allow;
     }
 
     /// Set the data directory for admin key storage.
@@ -569,8 +588,20 @@ impl<
             let parsed = dds_domain::fido2::verify_attestation(
                 &req.attestation_object,
                 &req.client_data_hash,
+                self.allow_unattested_credentials,
             )
             .map_err(|e| ServiceError::Fido2(e.to_string()))?;
+
+            // A-1 step-1: surface the policy decision when an operator
+            // opted into fmt=none. Helps audit trails distinguish
+            // "real attestation" from "explicitly unattested".
+            if parsed.fmt == "none" {
+                tracing::warn!(
+                    label = %req.label,
+                    "A-1: enrolling user with fmt=none (unattested) — \
+                     allow_unattested_credentials is true"
+                );
+            }
 
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
@@ -1183,9 +1214,15 @@ impl<
                 // standard vs base64url, with or without padding;
                 // decoding normalizes any of those representations.
                 if credential_ids_eq(&doc.credential_id, credential_id) {
+                    // A-1 step-1: re-parse for credential lookup ONLY.
+                    // Trust was already established at original
+                    // enrollment time; pass `true` so the re-parse
+                    // doesn't reject already-stored unattested
+                    // credentials retroactively.
                     let parsed = dds_domain::fido2::verify_attestation(
                         &doc.attestation_object,
                         &doc.client_data_hash,
+                        true,
                     )
                     .map_err(|e| ServiceError::Fido2(format!("re-parse attestation: {e}")))?;
                     let auth_data = &parsed.auth_data;
@@ -1531,8 +1568,20 @@ impl<
             let parsed = dds_domain::fido2::verify_attestation(
                 &req.attestation_object,
                 &req.client_data_hash,
+                self.allow_unattested_credentials,
             )
             .map_err(|e| ServiceError::Fido2(e.to_string()))?;
+
+            // A-1 step-1: same WARN as the user-enroll path so the
+            // bootstrap admin's enrollment is auditable when
+            // attestation is `none`.
+            if parsed.fmt == "none" {
+                tracing::warn!(
+                    label = %req.label,
+                    "A-1: bootstrapping admin with fmt=none (unattested) — \
+                     allow_unattested_credentials is true"
+                );
+            }
 
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
