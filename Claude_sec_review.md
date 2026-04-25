@@ -1377,13 +1377,13 @@ the offline-attack posture of the vault.
 
 ---
 
-### A-5 (Medium). P2P identity store lacks the hardening applied to the main identity store
-**Location:** [dds-node/src/p2p_identity.rs:62-118](dds-node/src/p2p_identity.rs#L62-L118), [dds-node/src/p2p_identity.rs:131-185](dds-node/src/p2p_identity.rs#L131-L185), [dds-node/src/p2p_identity.rs:187-196](dds-node/src/p2p_identity.rs#L187-L196)
+### A-5 (Medium). ✅ Fixed (pending verify) — P2P identity store lacks the hardening applied to the main identity store
+**Location:** [dds-node/src/p2p_identity.rs](dds-node/src/p2p_identity.rs)
 
-**What's wrong:** `p2p_identity::save` writes the keypair with a
-plain `std::fs::write` and only calls `set_owner_only_permissions`
-*after* the write completes. There is no `O_NOFOLLOW` protection on
-load. Argon2 parameters are fixed at `Params::new(19 * 1024, 2, 1,
+**What's wrong:** `p2p_identity::save` wrote the keypair with a
+plain `std::fs::write` and only called `set_owner_only_permissions`
+*after* the write completed. There was no `O_NOFOLLOW` protection on
+load. Argon2 parameters were fixed at `Params::new(19 * 1024, 2, 1,
 …)` (m=19 MiB, t=2, p=1 — the old OWASP tier-1 values).
 
 The main identity store got L-2 (`O_NOFOLLOW` on read), L-3
@@ -1402,14 +1402,35 @@ admission-cert identity under H-12).
   on the passphrase-wrapped form by ~3× relative to the main
   identity file.
 
-**Fix:**
-- Port the `NamedTempFile::persist` + permission-before-rename
-  pattern used in `identity_store::save` to `p2p_identity::save`.
-- Port the `O_NOFOLLOW` read guard from `identity_store::load` to
-  `p2p_identity::load`.
-- Raise `derive_key` to the OWASP tier-2 params used by M-10 and
-  version the blob so existing deployments auto-upgrade on next
-  save.
+**Resolution (2026-04-25):** ported all three patterns from
+`identity_store.rs` verbatim:
+- L-3 — `tempfile::NamedTempFile::new_in(parent)` +
+  `set_owner_only_permissions(tmp.path())` *before*
+  `tmp.persist(path)`, plus L-4 (parent dir `0o700`) on Unix.
+- L-2 — new `read_no_follow` helper using
+  `OpenOptions::custom_flags(libc::O_NOFOLLOW)` on Unix.
+- M-10 — new `VERSION_ENCRYPTED_V3` blob with `(m_cost, t_cost,
+  p_cost)` fields embedded in CBOR; defaults bumped to m=64 MiB,
+  t=3, p=4. Loads of pre-existing v=2 blobs decrypt under the
+  legacy tier-1 params and trigger a transparent rewrap to v=3 on
+  the same path so the upgrade is invisible to operators. PeerId is
+  preserved across the rewrap.
+
+Tests added (in `dds-node/src/p2p_identity.rs`):
+- `save_writes_v3_with_embedded_params` — pins the on-disk schema:
+  v=3 plus the three KDF fields with the expected values.
+- `lazy_rewrap_v2_to_v3_preserves_peer_id` — hand-builds a v=2 blob,
+  loads it (PeerId stable), and asserts the on-disk version flipped
+  to v=3 afterwards.
+- `load_refuses_symlink_unix` — symlinks the key path at a real
+  blob and asserts the load fails with `Io` (O_NOFOLLOW).
+
+The two pre-existing tests (`plain_roundtrip_stable_peer_id`,
+`encrypted_roundtrip`) still pass against the new code, which means
+the format is forward-compatible for callers that only see the
+public `load_or_create` entry point. `cargo test -p dds-node` ⇒
+138/138 ok; `cargo clippy -p dds-node --all-targets -- -D warnings`
+⇒ clean.
 
 ---
 
