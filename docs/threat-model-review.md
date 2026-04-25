@@ -11,6 +11,13 @@ key management, and platform-specific concerns.
 > retained for architectural context. Findings that have since been
 > closed by the 2026-04-17 → 2026-04-21 remediation sweep are marked
 > ~~with strikethrough~~ and a link to the fix.
+>
+> **2026-04-25 update.** A later independent source pass added six
+> open findings to the review ledger: B-1 through B-6. The highest-risk
+> architectural additions are sync persistence before trust-graph
+> acceptance, purpose grants that are not tied to a live target
+> attestation, and endpoint agents marking failed enforcement as
+> complete. They are summarized in the relevant sections below.
 
 ---
 
@@ -181,7 +188,11 @@ Administrators). However:
 
 | Gap | Risk | Recommendation |
 |-----|------|----------------|
+| **Sync persistence before validation (B-1)** — sync response application can write duplicate-JTI tokens and revoke/burn side effects to persistent storage even when the trust graph rejects the token. | High | Make trust-graph acceptance the first durable gate; make token storage put-if-absent or exact-byte idempotent; apply revoke/burn side effects only after graph acceptance. |
+| **Purpose grants not bound to live target attestations (B-2)** — `has_purpose` / `purposes_for` can rely on revoked/expired target attestations, and inbound token validation does not enforce the vouch shape invariants used by local token creation. | High | Share one token structural validator across creation, decode/validate, and graph ingest. Require a matching unrevoked, unexpired target attestation for every vouched purpose. |
+| **No deterministic active-version selection (B-4)** — multiple active policy/software attestations with the same logical ID can all be served, leaving final state to iteration order. | Medium | Add supersession semantics, require old-version revocation, or select one latest valid document per logical ID at serve time. |
 | **No trust graph partitioning** — all tokens are visible to all nodes. | Low | By design for the single-domain model. Multi-domain deployments would need topic-level isolation. |
+| **Challenge store cleanup is passive (B-5)** — expired session/admin challenges are not deleted on failed consume and no production sweeper calls `sweep_expired_challenges`. | Medium | Sweep on issue/consume, delete expired rows when encountered, and cap outstanding challenges per caller/kind. |
 | **Expiry sweep race** — the expiry sweeper runs on a timer; a token that just expired may be evaluated as valid until the next sweep. | Low | The window is bounded by `expiry_scan_interval_secs` (default 60s). For real-time expiry checking, add an inline expiry check in `evaluate_policy`. |
 | **Admin set is per-node local** — `trusted_roots` is read from local TOML; peers can disagree about who is an admin (I-11). | Medium | A future redesign should chain admins back to a domain-key-signed genesis attestation so the admin set is derived from gossip. |
 
@@ -224,22 +235,47 @@ caller fails closed.
 2. Run Windows CI on the C++ Auth Bridge pipe path (`SendRequestPipe`)
    and the MSI custom action (`CA_GenHmacSecret`). Macro-verified on
    macOS; Windows runtime still needed.
+3. For the Windows software installer TOCTOU gap (B-6), move package
+   staging out of `%TEMP%` into a SYSTEM/Admin-only cache and rehash
+   immediately before launch.
 
 ---
 
-## 7. Summary of Open Items
+## 7. Endpoint Agent Convergence
+
+### Current State
+
+Windows and macOS policy agents persist `applied-state.json` so they can
+skip unchanged policy and software documents. This keeps steady-state
+polls cheap, but the state machine needs to distinguish successful
+application from failed application.
+
+### Remaining Gaps
+
+| Gap | Risk | Recommendation |
+|-----|------|----------------|
+| **Failed enforcement can be marked complete (B-3)** — Windows records `"ok"` even when enforcers fail; macOS records failure but `HasChanged` ignores status, so unchanged failed documents are skipped on later polls. | High | Record success only after successful outcomes. Include status in `HasChanged`, retry failed entries, and keep reporting failure until the document succeeds or is superseded. |
+
+---
+
+## 8. Summary of Open Items
 
 | # | Item | Priority | Section |
 |---|------|----------|---------|
-| 1 | Admission cert revocation list | High | §1 |
-| 2 | Windows data directory ACL (dir-level) | Medium | §3 |
-| 3 | Key rotation mechanism | Medium | §2 |
-| 4 | WiX virtual service account split (M-18) | Medium | §3 |
-| 5 | Admin-set coherence via gossip (I-11) | Medium | §5 |
-| 6 | Message-level encryption (opt-in) | Low | §4 |
-| 7 | Real-time expiry in `evaluate_policy` | Low | §5 |
+| 1 | Sync persistence before trust-graph acceptance (B-1) | High | §5 |
+| 2 | Live-attestation requirement for purpose grants (B-2) | High | §5 |
+| 3 | Failed enforcement retry semantics (B-3) | High | §7 |
+| 4 | Admission cert revocation list | High | §1 |
+| 5 | Active-version selection for policies/software (B-4) | Medium | §5 |
+| 6 | Challenge-store cleanup and caps (B-5) | Medium | §5 |
+| 7 | Windows software staging TOCTOU hardening (B-6) | Medium | §6 |
+| 8 | Windows data directory ACL (dir-level) | Medium | §3 |
+| 9 | Key rotation mechanism | Medium | §2 |
+| 10 | WiX virtual service account split (M-18) | Medium | §3 |
+| 11 | Admin-set coherence via gossip (I-11) | Medium | §5 |
+| 12 | Message-level encryption (opt-in) | Low | §4 |
+| 13 | Real-time expiry in `evaluate_policy` | Low | §5 |
 
-All High / Critical findings from the source-validated review are now
-Fixed (pending verify) — the one remaining "High" entry above is a
-forward-looking gap that wasn't in scope for the 2026-04-17 → 2026-04-21
-remediation sweep.
+All Critical findings from the source-validated review are now Fixed
+(pending verify). Three new High findings from the 2026-04-25 follow-up
+remain open: B-1, B-2, and B-3.

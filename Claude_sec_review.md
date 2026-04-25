@@ -65,6 +65,64 @@ throughput, not security). All High and previously-partial items
 2026-04-20 — Windows CI runs are required for the C++ / MSI
 portions of H-6 and H-7.
 
+**2026-04-25 independent follow-up — new open findings:** 3 High,
+3 Medium. These were found after reviewing the source first and only
+then comparing against `security-gaps.md`, this review, and
+`docs/threat-model-review.md`. They are not duplicates of H-6/H-7/M-8,
+L-9, A-1, A-3, A-4, or A-6.
+
+- **B-1 (High)**: sync response application writes tokens and
+  revocation/burn side effects to persistent storage before the trust
+  graph accepts them. `apply_sync_payloads_with_graph` stores each token
+  at `dds-net/src/sync.rs:316` before `trust_graph.add_token`, while
+  `TokenStore::put_token` explicitly overwrites existing JTIs. An
+  admitted peer can send a validly signed duplicate-JTI token that the
+  in-memory graph rejects, but the store retains for the next restart;
+  malformed or unauthorized revoke/burn side effects can likewise be
+  persisted even after graph rejection. **Fix:** validate with the trust
+  graph first, make store insertion put-if-absent or exact-byte
+  idempotent, and apply `store.revoke` / `store.burn` only when graph
+  insertion succeeds.
+- **B-2 (High)**: purpose checks are not tied to a live target
+  attestation, and inbound token validation does not enforce the shape
+  invariants enforced by `Token::create`. `has_purpose` /
+  `purposes_for` use `attestation_for_iss` only for `vch_sum` hash
+  comparison and do not reject revoked or expired target attestations.
+  Separately, `Token::validate` accepts signed vouches missing
+  `vch_sum` / `vch_iss`, even though local construction rejects them.
+  **Fix:** share one structural validator between `Token::create`,
+  `Token::validate`, and graph ingest; require a matching active
+  attestation for every purpose grant; and prefer exact target-token
+  references over "first attestation for issuer" lookup.
+- **B-3 (High)**: failed policy/software enforcement can be recorded as
+  applied and skipped forever. The Windows worker records `"ok"` after
+  dispatch even when an enforcer returned `Failed`; the macOS worker
+  records failure status, but `HasChanged` ignores status and therefore
+  skips unchanged failed documents on later polls. **Fix:** record
+  success only for successful outcomes, include status in `HasChanged`,
+  and retry failed entries until they succeed or are superseded.
+- **B-4 (Medium)**: active policy/software versions are not resolved
+  deterministically. The node returns every matching policy/software
+  attestation in implementation-defined order; agents key applied state
+  by logical `policy_id` / `package_id`. Multiple active documents for
+  the same logical ID can therefore apply in the wrong final order or
+  flap across restarts. **Fix:** add explicit supersession semantics,
+  require revocation of old versions, or select one latest valid
+  document per logical ID at serve time.
+- **B-5 (Medium)**: challenge records can accumulate without production
+  cleanup. `/v1/session/challenge` and `/v1/admin/challenge` persist
+  challenge rows, expired rows are not deleted on failed consume, and
+  `sweep_expired_challenges` has no production caller. **Fix:** sweep
+  on issue/consume, delete expired rows when encountered, and cap
+  outstanding challenges per kind / caller.
+- **B-6 (Medium)**: the Windows software installer has a post-hash
+  TOCTOU window. Packages are staged under `%TEMP%\dds-software`,
+  hashed, closed, then later executed as SYSTEM. On typical Windows temp
+  ACLs, a local user may be able to swap or delete the staged file
+  between verification and `Process.Start`. **Fix:** stage under a
+  SYSTEM/Admin-only cache, preserve a protected verified handle where
+  practical, or rehash immediately before launch.
+
 **Reviewer follow-ups already closed this round** (previously flagged
 as partial):
 
