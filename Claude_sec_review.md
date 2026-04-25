@@ -1283,14 +1283,41 @@ and to gate `fmt == "none"` behind an explicit
   `cargo test --workspace` ⇒ 439/439 ok;
   `cargo clippy -p dds-domain -p dds-node -p dds-loadtest
   --all-targets -- -D warnings` ⇒ clean.
-- **Step 2 (open)** — `verify_packed` still returns `Ok(())` when
-  `x5c` is present without verifying the leaf cert's signature
-  over `authData || clientDataHash`. Will land in a follow-up
-  commit that adds an X.509 parser dep (`x509-parser`) so we can
-  extract the leaf SPKI and verify the `sig` field; chain
-  validation against a trust-anchor list stays deferred to M-13.
-  Test scaffolding will use `rcgen` (already a transitive in the
-  lock file) to synthesize a self-signed leaf cert.
+- **Step 2 ✅ landed 2026-04-25** — `verify_packed` no longer
+  returns `Ok(())` when `x5c` is present. New
+  `leaf_public_key_from_der` helper parses `x5c[0]` via
+  `x509-parser`, extracts the SubjectPublicKey from its SPKI,
+  enforces that the SPKI's algorithm OID matches the `attStmt.alg`
+  field (defending against an alg-downgrade where the attacker
+  ships an EC cert under EdDSA framing), and returns the pubkey as
+  an internal `AttestationPublicKey` enum. New
+  `verify_attestation_sig` then verifies the `sig` field over
+  `authData || clientDataHash` under that pubkey using the same
+  Ed25519 / P-256 paths the self-attestation branch already used
+  (with low-S normalisation on P-256). Both packed sub-modes
+  (self-attestation and full-attestation-with-x5c) now go through
+  the same signature check. Chain validation against a
+  trust-anchor list stays deferred to M-13 — A-1 step-2 is
+  strictly stronger than the pre-A-1 "trust on sight" posture
+  because the attacker now has to forge a sig matching the leaf
+  pubkey on a CDH the server controls. New `fido2.rs` tests:
+  positive (synthetic packed-with-x5c using a `rcgen`-generated
+  self-signed leaf, sig verified end-to-end), negative — garbage
+  cert rejected with `Format`, negative — sig under the wrong
+  attestation key rejected with `BadSignature`, negative —
+  alg/SPKI mismatch rejected with `Unsupported`. New direct dep
+  `x509-parser = "0.18"` on `dds-domain` (already a transitive in
+  the workspace lock); `rcgen = "0.13"` and
+  `p256` `pkcs8` feature added as dev-deps for the synthetic
+  cert. `cargo test --workspace` ⇒ 443/443 ok; clippy clean on
+  the touched crates. **Verification caveat**: real-HW path
+  (Crayonic KeyVault via `dds-multinode-fido2-test`) was not
+  re-run as part of this commit — the user should re-run the
+  multinode HW E2E next time a key is connected. The synthetic
+  test mirrors the WebAuthn shape closely (separate attestation
+  key in the leaf cert vs credential pubkey in `authData`, sig
+  over `authData || cdh`) so spec-conforming authenticators
+  should pass without changes.
 - **Step 3 (open)** — Mirror M-12's clientDataJSON parsing at
   enrollment so `type`/`challenge`/`origin` are validated
   individually (today the enroll path only compares the

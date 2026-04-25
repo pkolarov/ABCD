@@ -23,17 +23,22 @@ M-1…M-22 ledger; the addendum table below is the per-finding view.
 
 **Addendum pass 2026-04-24** (5 open + 1 landed):
 
-- **A-1 (High) ⚠ step-1 landed 2026-04-25**: `fmt = "none"` is now
-  rejected by default. `verify_attestation` takes an
-  `allow_unattested_credentials: bool` (wired from
-  `DomainConfig.allow_unattested_credentials`, default `false`);
-  unattested enrollments are refused with `Fido2Error::Unsupported`
-  unless an operator explicitly opts in, and accepted unattested
-  paths log at WARN. Test fixtures across `dds-node` switched to
-  `build_packed_self_attestation`. **Step-2 still open** — `x5c`
-  packed attestations still accept any `sig` (X.509 parser dep
-  needed). **Step-3 still open** — clientDataJSON parsing at
-  enrollment to mirror M-12.
+- **A-1 (High) ⚠ steps 1+2 landed 2026-04-25, step-3 still open**:
+  Step-1 — `fmt = "none"` is rejected by default; opt-in via
+  `DomainConfig.allow_unattested_credentials` (default `false`),
+  with WARN logging on accepted unattested paths.
+  Step-2 — `verify_packed` now verifies `attStmt.sig` even when
+  `x5c` is present: `x509-parser` extracts the leaf cert's SPKI,
+  the alg OID is double-checked against `attStmt.alg`, and the
+  signature is verified over `authData || clientDataHash` under
+  that pubkey. Chain validation against trust anchors stays in
+  M-13 (FIDO MDS integration). Four new unit tests cover the
+  positive path (synthetic rcgen leaf), garbage cert, sig under
+  wrong key, and alg/SPKI mismatch. **Real-HW
+  (`dds-multinode-fido2-test`) verification pending** — re-run
+  next time a Crayonic / YubiKey is connected.
+  **Step-3 still open** — clientDataJSON parsing at enrollment to
+  mirror M-12.
 - **A-2 (High)**: Windows Auth Bridge `CDdsConfiguration` only reads
   `DdsNodePort`; there is no `ApiAddr` field. `DdsAuthBridgeMain` wires
   the HTTP client via `SetPort`, not `SetBaseUrl`, so the pipe transport

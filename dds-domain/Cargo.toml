@@ -21,6 +21,20 @@ base32 = { workspace = true }
 rand_core = { workspace = true }
 base64 = "0.22"
 serde_json = { workspace = true }
+# **A-1 step-2 (security review)** — used in `verify_packed` to extract
+# the leaf cert's SubjectPublicKeyInfo from `attStmt.x5c[0]` so the
+# attestation `sig` can be verified under the attestation key (rather
+# than blindly accepted). Already a transitive in the workspace.
+x509-parser = "0.18"
 
 [dev-dependencies]
 rand = { workspace = true }
+# **A-1 step-2** — synthesize a self-signed leaf cert at test time so
+# the positive-path unit test for `verify_packed`'s x5c branch does not
+# need a real authenticator. Already a transitive in the workspace.
+rcgen = "0.13"
+# **A-1 step-2** — pkcs8 feature on `p256` lets the test harness load
+# rcgen-generated PKCS8 PEM into `p256::ecdsa::SigningKey` so the
+# attestation `sig` matches the leaf cert's SPKI. Production code paths
+# do not need PKCS8.
+p256 = { workspace = true, features = ["pkcs8"] }

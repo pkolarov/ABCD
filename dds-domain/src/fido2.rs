@@ -204,62 +204,184 @@ fn verify_packed(
         .ok_or_else(|| Fido2Error::Format("attStmt not map".into()))?;
     let mut alg: Option<i64> = None;
     let mut sig: Option<Vec<u8>> = None;
-    let mut x5c_present = false;
+    let mut x5c: Option<Vec<Vec<u8>>> = None;
     for (k, v) in map.iter() {
         if let Some(key) = k.as_text() {
             match key {
                 "alg" => alg = v.as_integer().and_then(|i| i64::try_from(i).ok()),
                 "sig" => sig = v.as_bytes().cloned(),
-                "x5c" => x5c_present = true,
+                "x5c" => {
+                    let arr = v
+                        .as_array()
+                        .ok_or_else(|| Fido2Error::Format("x5c not array".into()))?;
+                    let mut certs = Vec::with_capacity(arr.len());
+                    for cert in arr {
+                        let bytes = cert.as_bytes().ok_or_else(|| {
+                            Fido2Error::Format("x5c element not bytes".into())
+                        })?;
+                        certs.push(bytes.clone());
+                    }
+                    x5c = Some(certs);
+                }
                 _ => {}
             }
         }
     }
-    if x5c_present {
-        // Full attestation with an x5c certificate chain (sent by hardware
-        // authenticators like YubiKey, SoloKey, Keyvault, etc.).  We skip
-        // certificate-chain signature verification — the credential public
-        // key extracted from authData is what we store and use for future
-        // assertions.  Physical presence of the authenticator during
-        // MakeCredential is sufficient trust for our use case.
-        return Ok(());
-    }
     let sig = sig.ok_or_else(|| Fido2Error::Format("missing sig".into()))?;
 
-    // Signed data = authData || clientDataHash
+    // Signed data = authData || clientDataHash. Same input regardless
+    // of the packed sub-mode (self-attestation vs full attestation
+    // with x5c).
     let mut signed = Vec::with_capacity(auth_data.len() + client_data_hash.len());
     signed.extend_from_slice(auth_data);
     signed.extend_from_slice(client_data_hash);
 
-    match credential_pk {
-        CredentialPublicKey::Ed25519(vk) => {
+    // **A-1 step-2 (security review, 2026-04-25)**: verify the
+    // attestation signature regardless of whether the statement
+    // carries an `x5c` chain. Pre-A-1 this branch returned `Ok(())`
+    // unconditionally when `x5c` was present, which let any local
+    // process forge a packed attestation by attaching arbitrary cert
+    // bytes. We now extract the leaf cert's SubjectPublicKeyInfo and
+    // verify the `sig` field under that pubkey. Chain validation
+    // against a trust-anchor list remains deferred to M-13 (FIDO MDS
+    // integration); presence-without-validation of a plausible cert
+    // is still strictly stronger than the previous "trust on sight"
+    // posture, because the attacker now has to produce a signature
+    // matching the leaf pubkey on a CDH the server controls.
+    if let Some(x5c) = x5c {
+        let leaf = x5c
+            .first()
+            .ok_or_else(|| Fido2Error::Format("x5c empty".into()))?;
+        let leaf_pk = leaf_public_key_from_der(leaf, alg)?;
+        return verify_attestation_sig(&leaf_pk, alg, &sig, &signed);
+    }
+
+    // Self-attestation (no x5c): the signature is verified under the
+    // **credential** pubkey from authData. WebAuthn §8.2.1 requires
+    // `attStmt.alg` to match the credential pubkey's algorithm.
+    let credential_attest_pk = match credential_pk {
+        CredentialPublicKey::Ed25519(vk) => AttestationPublicKey::Ed25519(*vk),
+        CredentialPublicKey::P256(vk) => AttestationPublicKey::P256(*vk),
+    };
+    verify_attestation_sig(&credential_attest_pk, alg, &sig, &signed)
+}
+
+/// Public key recovered from an attestation source (the credential
+/// pubkey for self-attestation, or the leaf cert pubkey for `x5c`).
+/// Distinct from [`CredentialPublicKey`] only so the call site cannot
+/// confuse "key signing the attestation" with "key signing future
+/// assertions."
+enum AttestationPublicKey {
+    Ed25519(VerifyingKey),
+    P256(P256VerifyingKey),
+}
+
+/// Verify `attStmt.sig` over the WebAuthn signed-input
+/// (`authData || clientDataHash`) under the attestation pubkey,
+/// enforcing the WebAuthn requirement that `alg` matches the key
+/// type.
+fn verify_attestation_sig(
+    pk: &AttestationPublicKey,
+    alg: Option<i64>,
+    sig: &[u8],
+    signed: &[u8],
+) -> Result<(), Fido2Error> {
+    match pk {
+        AttestationPublicKey::Ed25519(vk) => {
             if alg != Some(COSE_ALG_EDDSA) {
                 return Err(Fido2Error::Unsupported(format!(
                     "packed alg={alg:?} for Ed25519 key"
                 )));
             }
-            let signature = Ed25519Signature::from_slice(&sig)
+            let signature = Ed25519Signature::from_slice(sig)
                 .map_err(|e| Fido2Error::KeyError(e.to_string()))?;
-            vk.verify(&signed, &signature)
+            vk.verify(signed, &signature)
                 .map_err(|_| Fido2Error::BadSignature)
         }
-        CredentialPublicKey::P256(vk) => {
+        AttestationPublicKey::P256(vk) => {
             if alg != Some(COSE_ALG_ES256) {
                 return Err(Fido2Error::Unsupported(format!(
                     "packed alg={alg:?} for P-256 key"
                 )));
             }
-            let signature = P256Signature::from_der(&sig)
-                .or_else(|_| P256Signature::from_slice(&sig))
+            let signature = P256Signature::from_der(sig)
+                .or_else(|_| P256Signature::from_slice(sig))
                 .map_err(|e| Fido2Error::KeyError(format!("P-256 sig: {e}")))?;
-            // Normalize high-S signatures — the RustCrypto p256 verifier
-            // enforces low-S; some authenticators emit high-S. See the
-            // matching note in `verify_assertion` for why this is safe.
+            // Normalize high-S signatures — see the matching note in
+            // `verify_assertion`.
             let signature = signature.normalize_s().unwrap_or(signature);
-            vk.verify(&signed, &signature)
+            vk.verify(signed, &signature)
                 .map_err(|_| Fido2Error::BadSignature)
         }
     }
+}
+
+/// Extract the SubjectPublicKey from a DER-encoded X.509 certificate
+/// and return it as an [`AttestationPublicKey`]. Used to verify the
+/// `attStmt.sig` field of a packed-with-`x5c` attestation under the
+/// leaf attestation cert's public key (A-1 step-2).
+///
+/// `expected_alg` is the COSE alg from `attStmt.alg`. We use it to
+/// pick which key shape to extract; the SPKI's algorithm OID is
+/// double-checked against it so an attacker cannot ship a cert under
+/// one algorithm and a `sig` under another.
+fn leaf_public_key_from_der(
+    cert_der: &[u8],
+    expected_alg: Option<i64>,
+) -> Result<AttestationPublicKey, Fido2Error> {
+    use x509_parser::oid_registry;
+    use x509_parser::prelude::FromDer;
+
+    let (rest, cert) = x509_parser::certificate::X509Certificate::from_der(cert_der)
+        .map_err(|e| Fido2Error::Format(format!("x5c[0] not a valid X.509 cert: {e}")))?;
+    if !rest.is_empty() {
+        return Err(Fido2Error::Format(
+            "x5c[0] has trailing bytes after cert".into(),
+        ));
+    }
+
+    let spki = &cert.tbs_certificate.subject_pki;
+    let raw = spki.subject_public_key.data.as_ref();
+    let oid = &spki.algorithm.algorithm;
+
+    // P-256 leaf: OID is id-ecPublicKey (1.2.840.10045.2.1) and the
+    // curve parameter is prime256v1 (1.2.840.10045.3.1.7). The raw
+    // bytes are an uncompressed SEC1 point (0x04 || x || y, 65 bytes).
+    if *oid == oid_registry::OID_KEY_TYPE_EC_PUBLIC_KEY {
+        if expected_alg != Some(COSE_ALG_ES256) {
+            return Err(Fido2Error::Unsupported(format!(
+                "x5c leaf is EC but attStmt.alg={expected_alg:?} (expected -7 / ES256)"
+            )));
+        }
+        let vk = P256VerifyingKey::from_sec1_bytes(raw)
+            .map_err(|e| Fido2Error::KeyError(format!("x5c P-256: {e}")))?;
+        return Ok(AttestationPublicKey::P256(vk));
+    }
+
+    // Ed25519 leaf: OID is id-Ed25519 (1.3.101.112). The raw bytes
+    // are the 32-byte public key.
+    if *oid == oid_registry::OID_SIG_ED25519 {
+        if expected_alg != Some(COSE_ALG_EDDSA) {
+            return Err(Fido2Error::Unsupported(format!(
+                "x5c leaf is Ed25519 but attStmt.alg={expected_alg:?} (expected -8 / EdDSA)"
+            )));
+        }
+        if raw.len() != 32 {
+            return Err(Fido2Error::Format(format!(
+                "x5c leaf Ed25519 SPKI len={} expected 32",
+                raw.len()
+            )));
+        }
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(raw);
+        let vk = VerifyingKey::from_bytes(&bytes)
+            .map_err(|e| Fido2Error::KeyError(format!("x5c Ed25519: {e}")))?;
+        return Ok(AttestationPublicKey::Ed25519(vk));
+    }
+
+    Err(Fido2Error::Unsupported(format!(
+        "x5c leaf algorithm OID {oid} not supported (only ES256 / EdDSA)"
+    )))
 }
 
 // =========================================================================
@@ -637,6 +759,263 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+
+    /// **A-1 step-2** test helper: build a synthetic packed-with-x5c
+    /// attestation. The credential pubkey lives in `authData`; the
+    /// **attestation** key (separate, owned by `attestation_sk`) signs
+    /// `authData || cdh`. The leaf cert is a self-signed P-256 cert
+    /// generated by `rcgen` carrying the attestation pubkey in its
+    /// SubjectPublicKeyInfo. Mirrors the shape that real authenticators
+    /// (YubiKey / SoloKey / Crayonic) emit.
+    fn build_packed_x5c_attestation_p256(
+        rp_id: &str,
+        credential_id: &[u8],
+        credential_signing_key: &p256::ecdsa::SigningKey,
+        client_data_hash: &[u8],
+    ) -> (Vec<u8>, p256::ecdsa::SigningKey) {
+        use p256::ecdsa::signature::Signer;
+        // 1. Self-signed leaf attestation cert (rcgen).
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["dds-test".to_string()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der().to_vec();
+
+        // 2. The attestation private key (matching the leaf cert's
+        // SPKI). rcgen lets us export PKCS8 DER, which we re-import
+        // through `p256` so we can sign with it. (PEM would need both
+        // `pkcs8` AND `pem` features on `p256`; DER needs only the
+        // first, which we already enable in dev-deps.)
+        let key_der = key_pair.serialize_der();
+        let attestation_sk = {
+            use p256::pkcs8::DecodePrivateKey;
+            p256::ecdsa::SigningKey::from_pkcs8_der(&key_der).unwrap()
+        };
+
+        // 3. Build authData carrying the *credential* pubkey (separate
+        //    from the attestation key — this models the WebAuthn
+        //    distinction).
+        let credential_vk = P256VerifyingKey::from(credential_signing_key);
+        let auth_data = build_auth_data_p256(rp_id, credential_id, &credential_vk);
+
+        // 4. Sign authData || cdh under the attestation key. This is
+        //    what real packed-with-x5c emits.
+        let mut signed = Vec::new();
+        signed.extend_from_slice(&auth_data);
+        signed.extend_from_slice(client_data_hash);
+        let sig: P256Signature = attestation_sk.sign(&signed);
+
+        let stmt: Vec<(CborValue, CborValue)> = vec![
+            (
+                CborValue::Text("alg".into()),
+                CborValue::Integer(COSE_ALG_ES256.into()),
+            ),
+            (
+                CborValue::Text("sig".into()),
+                CborValue::Bytes(sig.to_der().as_bytes().to_vec()),
+            ),
+            (
+                CborValue::Text("x5c".into()),
+                CborValue::Array(vec![CborValue::Bytes(cert_der)]),
+            ),
+        ];
+        let map: Vec<(CborValue, CborValue)> = vec![
+            (
+                CborValue::Text("fmt".into()),
+                CborValue::Text("packed".into()),
+            ),
+            (CborValue::Text("attStmt".into()), CborValue::Map(stmt)),
+            (
+                CborValue::Text("authData".into()),
+                CborValue::Bytes(auth_data),
+            ),
+        ];
+        let mut out = Vec::new();
+        ciborium::into_writer(&CborValue::Map(map), &mut out).unwrap();
+        (out, attestation_sk)
+    }
+
+    /// **A-1 step-2**: positive — packed attestation with a valid
+    /// `x5c` leaf signature is accepted. The leaf cert is synthesized
+    /// at test time; the attestation pubkey is distinct from the
+    /// credential pubkey, mirroring the WebAuthn shape.
+    #[test]
+    fn test_packed_x5c_p256_valid() {
+        use p256::ecdsa::SigningKey as P256SigningKey;
+        let cred_sk = P256SigningKey::random(&mut OsRng);
+        let cdh = [0xCD; 32];
+        let (attestation, _att_sk) =
+            build_packed_x5c_attestation_p256("login.example.com", b"hw-cred", &cred_sk, &cdh);
+        let parsed = verify_attestation(&attestation, &cdh, false).unwrap();
+        assert_eq!(parsed.fmt, "packed");
+        assert_eq!(parsed.credential_id, b"hw-cred");
+        // The persisted credential pubkey is the credential's, not the
+        // attestation cert's.
+        match &parsed.credential_public_key {
+            CredentialPublicKey::P256(vk) => {
+                let expected = P256VerifyingKey::from(&cred_sk);
+                assert_eq!(vk.to_encoded_point(false), expected.to_encoded_point(false));
+            }
+            other => panic!("expected P-256 credential, got {other:?}"),
+        }
+    }
+
+    /// **A-1 step-2**: negative — packed attestation whose `x5c[0]`
+    /// is not a valid X.509 cert is rejected with `Format`. (Pre-A-1
+    /// step-2 this would have returned `Ok(())`.)
+    #[test]
+    fn test_packed_x5c_garbage_cert_rejected() {
+        let stmt: Vec<(CborValue, CborValue)> = vec![
+            (
+                CborValue::Text("alg".into()),
+                CborValue::Integer(COSE_ALG_ES256.into()),
+            ),
+            (
+                CborValue::Text("sig".into()),
+                CborValue::Bytes(vec![0u8; 64]),
+            ),
+            (
+                CborValue::Text("x5c".into()),
+                CborValue::Array(vec![CborValue::Bytes(b"definitely not DER".to_vec())]),
+            ),
+        ];
+        // Build minimal authData with a P-256 credential pubkey so the
+        // parser gets past parse_auth_data and into verify_packed.
+        use p256::ecdsa::SigningKey as P256SigningKey;
+        let cred_vk = P256VerifyingKey::from(&P256SigningKey::random(&mut OsRng));
+        let auth_data = build_auth_data_p256("login.example.com", b"hw-cred", &cred_vk);
+        let map: Vec<(CborValue, CborValue)> = vec![
+            (
+                CborValue::Text("fmt".into()),
+                CborValue::Text("packed".into()),
+            ),
+            (CborValue::Text("attStmt".into()), CborValue::Map(stmt)),
+            (
+                CborValue::Text("authData".into()),
+                CborValue::Bytes(auth_data),
+            ),
+        ];
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&CborValue::Map(map), &mut bytes).unwrap();
+        let res = verify_attestation(&bytes, &[0u8; 32], false);
+        match res {
+            Err(Fido2Error::Format(msg)) => {
+                assert!(msg.contains("x5c"), "unexpected message: {msg}");
+            }
+            other => panic!("expected Format(x5c…), got {other:?}"),
+        }
+    }
+
+    /// **A-1 step-2**: negative — packed attestation with a valid leaf
+    /// cert but a `sig` signed under a *different* key is rejected
+    /// with `BadSignature`. This is the attack the pre-A-1 code
+    /// allowed: drop in any cert, sign with anything, get accepted.
+    #[test]
+    fn test_packed_x5c_sig_under_wrong_key_rejected() {
+        use p256::ecdsa::SigningKey as P256SigningKey;
+        use p256::ecdsa::signature::Signer;
+
+        // Synthesize a leaf cert under attestation_sk_a, but sign the
+        // attestation with attestation_sk_b. The cert says A; the sig
+        // matches B. Must reject.
+        let key_pair_a =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let params =
+            rcgen::CertificateParams::new(vec!["dds-test".to_string()]).unwrap();
+        let cert_a = params.self_signed(&key_pair_a).unwrap();
+
+        let attestation_sk_b = P256SigningKey::random(&mut OsRng);
+
+        let cred_sk = P256SigningKey::random(&mut OsRng);
+        let cred_vk = P256VerifyingKey::from(&cred_sk);
+        let auth_data = build_auth_data_p256("login.example.com", b"hw-cred", &cred_vk);
+        let cdh = [0xAA; 32];
+
+        let mut signed = Vec::new();
+        signed.extend_from_slice(&auth_data);
+        signed.extend_from_slice(&cdh);
+        let sig: P256Signature = attestation_sk_b.sign(&signed);
+
+        let stmt: Vec<(CborValue, CborValue)> = vec![
+            (
+                CborValue::Text("alg".into()),
+                CborValue::Integer(COSE_ALG_ES256.into()),
+            ),
+            (
+                CborValue::Text("sig".into()),
+                CborValue::Bytes(sig.to_der().as_bytes().to_vec()),
+            ),
+            (
+                CborValue::Text("x5c".into()),
+                CborValue::Array(vec![CborValue::Bytes(cert_a.der().to_vec())]),
+            ),
+        ];
+        let map: Vec<(CborValue, CborValue)> = vec![
+            (
+                CborValue::Text("fmt".into()),
+                CborValue::Text("packed".into()),
+            ),
+            (CborValue::Text("attStmt".into()), CborValue::Map(stmt)),
+            (
+                CborValue::Text("authData".into()),
+                CborValue::Bytes(auth_data),
+            ),
+        ];
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&CborValue::Map(map), &mut bytes).unwrap();
+        let res = verify_attestation(&bytes, &cdh, false);
+        assert!(matches!(res, Err(Fido2Error::BadSignature)));
+    }
+
+    /// **A-1 step-2**: defense-in-depth — `attStmt.alg` claiming Ed25519
+    /// while the `x5c` leaf carries a P-256 SPKI is rejected. Prevents
+    /// a downgrade where an attacker presents a real EC cert but
+    /// claims a different algorithm to skip `from_sec1_bytes` parsing.
+    #[test]
+    fn test_packed_x5c_alg_mismatch_rejected() {
+        use p256::ecdsa::SigningKey as P256SigningKey;
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let params =
+            rcgen::CertificateParams::new(vec!["dds-test".to_string()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+
+        let cred_sk = P256SigningKey::random(&mut OsRng);
+        let cred_vk = P256VerifyingKey::from(&cred_sk);
+        let auth_data = build_auth_data_p256("login.example.com", b"hw-cred", &cred_vk);
+        let cdh = [0xAA; 32];
+
+        let stmt: Vec<(CborValue, CborValue)> = vec![
+            (
+                CborValue::Text("alg".into()),
+                CborValue::Integer(COSE_ALG_EDDSA.into()), // wrong on purpose
+            ),
+            (
+                CborValue::Text("sig".into()),
+                CborValue::Bytes(vec![0u8; 64]),
+            ),
+            (
+                CborValue::Text("x5c".into()),
+                CborValue::Array(vec![CborValue::Bytes(cert.der().to_vec())]),
+            ),
+        ];
+        let map: Vec<(CborValue, CborValue)> = vec![
+            (
+                CborValue::Text("fmt".into()),
+                CborValue::Text("packed".into()),
+            ),
+            (CborValue::Text("attStmt".into()), CborValue::Map(stmt)),
+            (
+                CborValue::Text("authData".into()),
+                CborValue::Bytes(auth_data),
+            ),
+        ];
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&CborValue::Map(map), &mut bytes).unwrap();
+        let res = verify_attestation(&bytes, &cdh, false);
+        assert!(matches!(res, Err(Fido2Error::Unsupported(_))));
+    }
 
     #[test]
     fn test_none_attestation_roundtrip_when_allowed() {

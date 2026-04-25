@@ -927,10 +927,12 @@ dependencies = [
  "p256",
  "rand 0.8.5",
  "rand_core 0.6.4",
+ "rcgen",
  "serde",
  "serde_bytes",
  "serde_json",
  "sha2",
+ "x509-parser 0.18.1",
 ]
 
 [[package]]
