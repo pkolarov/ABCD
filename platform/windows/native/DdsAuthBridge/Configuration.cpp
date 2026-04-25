@@ -29,6 +29,10 @@ void CDdsConfiguration::Load()
 
     m_deviceUrn = ReadStringNarrow(hKey, L"DeviceUrn", "");
     m_rpId      = ReadStringNarrow(hKey, L"RpId", "dds.local");
+    // A-2 (security review): optional full URL for the dds-node API,
+    // including the `pipe:<name>` form added in H-7 step-2b. Empty =
+    // legacy port-only behaviour.
+    m_apiAddr   = ReadStringNarrow(hKey, L"ApiAddr", "");
     // H-6 step-2: path to the per-install HMAC secret file.
     m_hmacSecretPath = ReadStringWide(hKey, L"HmacSecretPath", L"");
 

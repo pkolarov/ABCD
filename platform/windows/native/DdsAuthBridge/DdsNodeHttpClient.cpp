@@ -239,13 +239,25 @@ bool CDdsNodeHttpClient::VerifyResponseMac(
     const std::string& receivedMacB64,
     const std::string& body) const
 {
-    // Feature disabled until the per-install secret is provisioned.
-    // In that state the service still runs (so first-boot before MSI
-    // runs the custom action doesn't brick the machine), but the
-    // caller SHOULD refuse to start if HmacSecretLoaded() is false
-    // on a production install.
+    // **A-3 (security review)**: production builds reject empty-key
+    // verification — the bridge's Initialize() already refused to
+    // start without HMAC material, so reaching this branch with an
+    // empty key implies a code path that bypassed config loading and
+    // is not safe to trust. Dev/test builds keep the legacy
+    // accept-unsigned behaviour behind DDS_DEV_ALLOW_NO_MAC so
+    // first-boot test rigs and unit tests still work without a
+    // provisioned secret.
     if (m_hmacKey.empty())
+    {
+#ifdef DDS_DEV_ALLOW_NO_MAC
         return true;
+#else
+        FileLog::Write(
+            "DdsNodeHttpClient: response MAC check refused — no HMAC key "
+            "loaded (A-3 fail-closed)\n");
+        return false;
+#endif
+    }
 
     if (receivedMacB64.empty())
     {

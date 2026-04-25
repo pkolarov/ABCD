@@ -223,10 +223,11 @@ bool CCredentialVault::EncryptPassword(
     if (hmacSecretOutput == nullptr || hmacSecretLen != 32 || password == nullptr)
         return false;
 
-    // Log first 4 bytes of hmac key for debugging (safe — not the actual password)
-    FileLog::Writef("EncryptPassword: hmacKey[0..3]=%02x%02x%02x%02x pwLen=%zu\n",
-        hmacSecretOutput[0], hmacSecretOutput[1], hmacSecretOutput[2], hmacSecretOutput[3],
-        wcslen(password));
+    // A-4 (security review): the previous build logged the first four bytes of the
+    // FIDO2 hmac-secret-derived AES-GCM key plus the cleartext password length to
+    // %ProgramData%\DDS\authbridge.log. The directory inherits BUILTIN\Users:Read on
+    // most SKUs, so any local user could correlate per-logon prefixes of long-lived
+    // authenticator-binding key material. The diagnostic is removed outright.
 
     // Convert password to bytes
     size_t pwLen = wcslen(password) * sizeof(wchar_t);
@@ -301,12 +302,11 @@ bool CCredentialVault::DecryptPassword(
     const VaultEntry& entry,
     std::wstring& outPassword)
 {
-    FileLog::Writef("DecryptPassword: hmacLen=%zu encPwdLen=%zu ivLen=%zu tagLen=%zu\n",
-        hmacSecretLen, entry.encryptedPassword.size(), entry.iv.size(), entry.authTag.size());
-    // Log first 4 bytes of hmac key for debugging (safe — not the actual password)
-    if (hmacSecretOutput && hmacSecretLen >= 4)
-        FileLog::Writef("DecryptPassword: hmacKey[0..3]=%02x%02x%02x%02x\n",
-            hmacSecretOutput[0], hmacSecretOutput[1], hmacSecretOutput[2], hmacSecretOutput[3]);
+    FileLog::Writef("DecryptPassword: encPwdLen=%zu ivLen=%zu tagLen=%zu\n",
+        entry.encryptedPassword.size(), entry.iv.size(), entry.authTag.size());
+    // A-4 (security review): the previous build also logged the first four bytes of
+    // the hmac-secret-derived key here. Removed — the size triple above is enough to
+    // diagnose vault-entry shape issues without disclosing key material.
 
     if (hmacSecretOutput == nullptr || hmacSecretLen != 32)
         return false;

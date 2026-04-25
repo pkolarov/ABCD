@@ -9,6 +9,10 @@ using Microsoft.Extensions.Options;
 
 namespace DDS.PolicyAgent.MacOS.Tests;
 
+// Joined to the same non-parallel collection as BackendOperationTests:
+// the A-6 tests below mutate `DDS_POLICYAGENT_ASSUME_ROOT` and would
+// otherwise race with that class's ctor/Dispose.
+[Collection("PolicyAgentEnvSerial")]
 public class EnforcerTests
 {
     [Fact]

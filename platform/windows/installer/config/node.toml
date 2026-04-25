@@ -7,9 +7,13 @@ data_dir = 'C:\ProgramData\DDS'
 
 [network]
 # HTTP API listen address (used by Auth Bridge and Policy Agent).
-# Switch to `pipe:dds-api` once all clients run on the Windows named-pipe
-# transport (H-7 step-2b in the security review).
-api_addr = '127.0.0.1:5551'
+# **A-2 (security review)**: the MSI now writes
+# HKLM\SOFTWARE\DDS\AuthBridge\ApiAddr = "pipe:dds-api" by default and
+# matching values into the Policy Agent's appsettings.json, so the Rust
+# node ships the named-pipe listener as the supported transport. Change
+# this to `127.0.0.1:5551` only if you need the legacy loopback-TCP path
+# (and re-enable trust_loopback_tcp_admin in [network.api_auth]).
+api_addr = 'pipe:dds-api'
 
 # P2P listen addresses (multiaddr format).
 # listen_addr = '/ip4/0.0.0.0/tcp/4001'

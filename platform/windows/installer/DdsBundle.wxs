@@ -159,6 +159,20 @@
                        Name="HmacSecretPath"
                        Value="[CommonAppDataFolder]DDS\node-hmac.key"
                        Type="expandable" />
+
+        <!-- **A-2 (security review)**: select the named-pipe transport
+             added in H-7 step-2b by default. The Rust dds-node.toml
+             template installed alongside this MSI declares
+             `api_addr = "pipe:dds-api"`, so the Auth Bridge has to
+             dial the same pipe rather than the loopback TCP listener
+             (which the hardened config disables). Operators who want
+             to keep the legacy TCP path can remove this value or set
+             it to "http://127.0.0.1:5551" via group policy. -->
+        <RegistryValue Root="HKLM"
+                       Key="SOFTWARE\DDS\AuthBridge"
+                       Name="ApiAddr"
+                       Value="pipe:dds-api"
+                       Type="string" />
       </Component>
     </ComponentGroup>
 

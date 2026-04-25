@@ -1,7 +1,7 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-25 (Windows host verification pass — H-6 step-2 + H-7 step-2b now verified end-to-end on Windows x64; several pre-existing build/CI bugs surfaced and fixed: dds-cli unix-only imports, build_tests.bat BuildTools support, gen-hmac-secret idempotency for MSI repair/upgrade, smoke_test.ps1 -Target plumbing. A 2026-04-24 addendum code-path pass added 6 new findings — 2 High, 4 Medium — tracked as A-1…A-6 in [Claude_sec_review.md](Claude_sec_review.md). 2026-04-25 follow-up: B-5 closed — `http::issue_challenge` now sweeps expired rows on every put, enforces a `MAX_OUTSTANDING_CHALLENGES = 4096` global cap (503 when full), and `consume_challenge` deletes expired/malformed rows in the same write txn; `count_challenges` added to `ChallengeStore`. 2026-04-25 follow-up #2: B-3 closed — Policy Agent `AppliedStateStore.HasChanged` now requires a successful prior status (`"ok"`/`"skipped"`) to short-circuit, and the Windows worker threads the real `EnforcementStatus` through a new `ApplyBundleResult` aggregate into `RecordApplied` / `ReportAsync` instead of hardcoding `"ok"` (matches macOS pattern); 6 regression tests added across both AppliedStateStore test suites. Also published [docs/AD-drop-in-replacement-roadmap.md](docs/AD-drop-in-replacement-roadmap.md) — claim-ladder gap map for any future "AD DS replacement" framing.)
+> Last updated: 2026-04-25 (Windows host verification pass — H-6 step-2 + H-7 step-2b now verified end-to-end on Windows x64; several pre-existing build/CI bugs surfaced and fixed: dds-cli unix-only imports, build_tests.bat BuildTools support, gen-hmac-secret idempotency for MSI repair/upgrade, smoke_test.ps1 -Target plumbing. A 2026-04-24 addendum code-path pass added 6 new findings — 2 High, 4 Medium — tracked as A-1…A-6 in [Claude_sec_review.md](Claude_sec_review.md). 2026-04-25 follow-up: B-5 closed — `http::issue_challenge` now sweeps expired rows on every put, enforces a `MAX_OUTSTANDING_CHALLENGES = 4096` global cap (503 when full), and `consume_challenge` deletes expired/malformed rows in the same write txn; `count_challenges` added to `ChallengeStore`. 2026-04-25 follow-up #2: B-3 closed — Policy Agent `AppliedStateStore.HasChanged` now requires a successful prior status (`"ok"`/`"skipped"`) to short-circuit, and the Windows worker threads the real `EnforcementStatus` through a new `ApplyBundleResult` aggregate into `RecordApplied` / `ReportAsync` instead of hardcoding `"ok"` (matches macOS pattern); 6 regression tests added across both AppliedStateStore test suites. Also published [docs/AD-drop-in-replacement-roadmap.md](docs/AD-drop-in-replacement-roadmap.md) — claim-ladder gap map for any future "AD DS replacement" framing. 2026-04-25 follow-up #3: A-2 / A-3 / A-4 source-side fixes landed (Windows-CI verification still pending) — see the per-finding entries below. Also fixed a pre-existing flaky-test bug in the macOS .NET suite: `BackendOperationTests` and `EnforcerTests` both mutate the process-wide `DDS_POLICYAGENT_ASSUME_ROOT` env var, and xUnit's parallel runner was interleaving one class's `Dispose` with another class's still-running tests. Both classes now share an `[Collection("PolicyAgentEnvSerial")]` non-parallel collection; macOS suite is 72/72 deterministic across 5 reruns.)
 
 ## Security Remediation Status
 
@@ -14,8 +14,8 @@ marked superseded.
 | Severity | Fixed | Deferred | Addendum (open) | Rationale for deferral |
 |---|---|---|---|---|
 | **Critical** | 3/3 | — | — | — |
-| **High** | 12/12 | — | 1 (A-2); A-1 landed pending HW verify | H-6 + H-7 step-2b verified on Windows x64 host 2026-04-24 — see "Windows host verification (2026-04-24)" below. |
-| **Medium** | 21/22 | 3 | 2 (A-3, A-4); A-6 macOS landed, Windows pending CI | M-13 (FIDO MDS integration — external design), M-15 (node-bound FIDO2 `hmac_salt`; blocked on bundle re-wrap design), M-18 (WiX service-account split — multi-day Windows refactor). |
+| **High** | 12/12 | — | A-1 + A-2 landed pending Windows-host reverify | H-6 + H-7 step-2b verified on Windows x64 host 2026-04-24 — see "Windows host verification (2026-04-24)" below. A-2 source side landed 2026-04-25 (`ApiAddr` registry field + `SetBaseUrl` wiring + WiX/MSI defaults); Windows CI rerun pending. |
+| **Medium** | 21/22 | 3 | A-3 / A-4 / A-5 / A-6 source side landed; Windows CI half pending for A-3/A-4/A-6 | M-13 (FIDO MDS integration — external design), M-15 (node-bound FIDO2 `hmac_salt`; blocked on bundle re-wrap design), M-18 (WiX service-account split — multi-day Windows refactor). |
 | **Low** | 17/18 | 1 | — | L-17 (service-mutex refactor — 29 HTTP handler lock sites; L-18's atomic `bump_sign_count` already closed the replay race so the remaining gain is throughput not security). |
 
 The "Fixed" column count for Medium tracks A-5 alongside the
@@ -47,21 +47,39 @@ M-1…M-22 ledger; the addendum table below is the per-finding view.
   re-run next time a Crayonic / YubiKey is connected.
   Server-issued enrollment challenge (closes the cdj.challenge
   gap) is tracked separately as a follow-up.
-- **A-2 (High)**: Windows Auth Bridge `CDdsConfiguration` only reads
-  `DdsNodePort`; there is no `ApiAddr` field. `DdsAuthBridgeMain` wires
-  the HTTP client via `SetPort`, not `SetBaseUrl`, so the pipe transport
-  in `DdsNodeHttpClient` is unreachable from registry config. Closes the
-  loop on H-7 step-2b on the runtime config side (note: H-7 step-2b code
-  paths were verified on Windows on 2026-04-24, but the registry config
-  still wires TCP — the pipe transport is not reachable end-to-end until
-  A-2 lands).
-- **A-3 (Medium)**: Response-MAC verification is fail-open when no secret is
-  configured (`m_hmacKey.empty() → return true`). H-6 acknowledges this
-  as transition-only; formalised here because it's still the default of
-  non-MSI deployments.
-- **A-4 (Medium)**: Auth Bridge logs emit the first 4 bytes of
-  HMAC-derived key material plus password length; `%ProgramData%\DDS`
-  has no explicit DACL (inherits default `BUILTIN\Users`:Read).
+- **A-2 (High) ✅ source-side landed 2026-04-25, pending Windows CI**:
+  `CDdsConfiguration` now reads an `ApiAddr` (REG_SZ) value next to
+  `DdsNodePort`; when non-empty, `DdsAuthBridgeMain::Initialize`
+  threads it through `m_httpClient.SetBaseUrl(...)` (the H-7 step-2b
+  path that recognises the `pipe:<name>` scheme). The shipped
+  `installer/DdsBundle.wxs` writes `ApiAddr = "pipe:dds-api"` to
+  `HKLM\SOFTWARE\DDS\AuthBridge` by default, the Rust template
+  `installer/config/node.toml` defaults `api_addr = 'pipe:dds-api'`,
+  and `installer/config/appsettings.json` defaults
+  `DdsPolicyAgent.NodeBaseUrl = "pipe:dds-api"` — all three sides of
+  the H-7 step-2b transport now agree out of the box. C++ compile +
+  test of the bridge is pending Windows CI.
+- **A-3 (Medium) ✅ source-side landed 2026-04-25, pending Windows CI**:
+  `CDdsAuthBridgeMain::Initialize` is now fail-closed when
+  `HmacSecretPath` is empty (logs an EventLog error + returns FALSE
+  rather than continuing with MAC disabled). The legacy permissive
+  behaviour is gated behind a build-time `DDS_DEV_ALLOW_NO_MAC` macro
+  the production MSI does not define. Defense-in-depth: the same
+  flag also gates the `m_hmacKey.empty() → accept` short-circuit in
+  `CDdsNodeHttpClient::VerifyResponseMac`. Dev/test rigs (and the
+  C++ test binaries, which run without the MSI) still work.
+- **A-4 (Medium) ✅ source-side landed 2026-04-25, pending Windows CI**:
+  `CCredentialVault::EncryptPassword` / `DecryptPassword` no longer
+  log the four-byte hmac-secret key prefix or the cleartext password
+  length. `FileLog::Init` now applies an explicit, non-inherited
+  DACL to `%ProgramData%\DDS` via
+  `ConvertStringSecurityDescriptorToSecurityDescriptorW` +
+  `SetNamedSecurityInfoW` with SDDL
+  `D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` — full control to
+  LocalSystem and BUILTIN\Administrators, OICI inheritance for
+  current and future child files, mirroring the L-16 helper in
+  `AppliedStateStore.cs`. Upgrade-safe: a stale wide-open ACL from
+  a pre-A-4 build is corrected on first start of the new bits.
 - **A-5 (Medium)** ✅ landed 2026-04-25: `dds-node/src/p2p_identity.rs`
   ported L-2 (`O_NOFOLLOW`), L-3 (atomic persist via `NamedTempFile` +
   perm-before-rename + L-4 parent dir `0o700`), and M-10 (Argon2id v=3

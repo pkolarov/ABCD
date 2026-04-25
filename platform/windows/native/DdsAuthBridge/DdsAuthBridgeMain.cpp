@@ -358,27 +358,60 @@ BOOL CDdsAuthBridgeMain::Initialize(_In_ HANDLE hStopEvent)
     // Load configuration from registry
     m_config.Load();
 
-    // Configure dds-node HTTP client
-    m_httpClient.SetPort(m_config.DdsNodePort());
+    // Configure dds-node HTTP client.
+    // **A-2 (security review)**: prefer ApiAddr (which carries the
+    // `pipe:<name>` scheme for H-7 step-2b's named-pipe transport).
+    // Fall back to the legacy DdsNodePort path so installs that
+    // pre-date this field still work against the loopback TCP
+    // listener.
+    if (!m_config.ApiAddr().empty())
+    {
+        FileLog::Writef("DdsAuthBridge: ApiAddr=%s\n", m_config.ApiAddr().c_str());
+        m_httpClient.SetBaseUrl(m_config.ApiAddr());
+    }
+    else
+    {
+        m_httpClient.SetPort(m_config.DdsNodePort());
+    }
 
-    // **H-6 step-2 (security review)**: load the per-install HMAC
-    // secret. If configured, every response from dds-node is
-    // verified against HMAC-SHA256(key, method||0||path||0||body);
-    // mismatched / missing MAC = refused response. Fail-closed on
-    // configured-but-unreadable so an attacker can't strip the
-    // secret by deleting the file.
+    // **H-6 step-2 / A-3 (security review)**: load the per-install
+    // HMAC secret. Every response from dds-node is verified against
+    // HMAC-SHA256(key, method||0||path||0||body); mismatched / missing
+    // MAC = refused response.
+    //
+    // A-3 makes this fail-closed by default: a production build with
+    // `HmacSecretPath` empty refuses to start, so an installer that
+    // skipped the `CA_GenHmacSecret` custom action (or an operator
+    // who hand-deleted the registry value) cannot silently downgrade
+    // to unsigned responses. Dev/test builds may opt into the legacy
+    // behaviour via `DDS_DEV_ALLOW_NO_MAC` (build-time only — the
+    // production MSI never defines this).
     {
         const std::wstring& hmacPath = m_config.HmacSecretPath();
         if (hmacPath.empty())
         {
+#ifdef DDS_DEV_ALLOW_NO_MAC
             FileLog::Write(
                 "DdsAuthBridge: HmacSecretPath not configured — H-6 MAC "
-                "verification disabled (transition-only)\n");
+                "verification disabled (DDS_DEV_ALLOW_NO_MAC dev build)\n");
             CEventLogger::LogWarning(
                 EVENT_ID::SERVICE_START_FAILED,
                 L"HmacSecretPath not configured — response-body MAC "
-                L"verification is disabled. Run `dds-node gen-hmac-secret` "
-                L"and set HKLM\\SOFTWARE\\DDS\\AuthBridge\\HmacSecretPath.");
+                L"verification is disabled. This build was compiled with "
+                L"DDS_DEV_ALLOW_NO_MAC; do not ship.");
+#else
+            FileLog::Write(
+                "DdsAuthBridge: HmacSecretPath not configured — refusing to "
+                "start (A-3: production builds require a per-install HMAC "
+                "secret). Run `dds-node gen-hmac-secret` and set "
+                "HKLM\\SOFTWARE\\DDS\\AuthBridge\\HmacSecretPath.\n");
+            CEventLogger::LogError(
+                EVENT_ID::SERVICE_START_FAILED,
+                L"HmacSecretPath not configured — refusing to start the "
+                L"Auth Bridge. Run `dds-node gen-hmac-secret` and set "
+                L"HKLM\\SOFTWARE\\DDS\\AuthBridge\\HmacSecretPath.");
+            return FALSE;
+#endif
         }
         else if (!m_httpClient.LoadHmacSecret(hmacPath))
         {

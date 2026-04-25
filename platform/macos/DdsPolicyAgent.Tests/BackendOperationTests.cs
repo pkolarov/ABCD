@@ -11,6 +11,15 @@ using Microsoft.Extensions.Options;
 
 namespace DDS.PolicyAgent.MacOS.Tests;
 
+// Pin tests that mutate the process-wide `DDS_POLICYAGENT_ASSUME_ROOT`
+// env var into a single non-parallel collection. Without this, xUnit
+// can interleave another class's `Dispose` (which clears the var) with
+// a still-running test in this class, causing `PrivilegeGuard.DemandRoot`
+// to throw spuriously.
+[CollectionDefinition("PolicyAgentEnvSerial", DisableParallelization = true)]
+public sealed class PolicyAgentEnvSerialCollection { }
+
+[Collection("PolicyAgentEnvSerial")]
 public sealed class BackendOperationTests : IDisposable
 {
     private readonly string _tmpDir;

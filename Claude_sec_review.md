@@ -1439,7 +1439,7 @@ Crayonic / YubiKey).
 
 ---
 
-### A-2 (High). Windows Auth Bridge config path cannot select the pipe transport
+### A-2 (High). ✅ Fixed (pending Windows CI) — Windows Auth Bridge config path cannot select the pipe transport
 **Location:** [platform/windows/native/DdsAuthBridge/Configuration.cpp:26-28](platform/windows/native/DdsAuthBridge/Configuration.cpp#L26-L28), [platform/windows/native/DdsAuthBridge/Configuration.h:20](platform/windows/native/DdsAuthBridge/Configuration.h#L20), [platform/windows/native/DdsAuthBridge/DdsAuthBridgeMain.cpp:362](platform/windows/native/DdsAuthBridge/DdsAuthBridgeMain.cpp#L362)
 
 **What's wrong:** H-7 step-2b added `SetBaseUrl` to
@@ -1471,9 +1471,33 @@ until the config wiring closes.
 - Flip `trust_loopback_tcp_admin = false` in the shipped config once
   this lands.
 
+**Resolution (2026-04-25):**
+
+- `CDdsConfiguration` gained a `m_apiAddr` (`REG_SZ`) field, read
+  from `HKLM\SOFTWARE\DDS\AuthBridge\ApiAddr` via the existing
+  `ReadStringNarrow` helper. Empty string falls back to the legacy
+  `DdsNodePort` path so installs that pre-date the field still work.
+- `CDdsAuthBridgeMain::Initialize` now branches on `ApiAddr()`: if
+  non-empty, it calls `m_httpClient.SetBaseUrl(ApiAddr())` (the H-7
+  step-2b path that recognises `pipe:<name>`); otherwise it falls
+  back to `SetPort(DdsNodePort())`.
+- `platform/windows/installer/DdsBundle.wxs` now writes
+  `ApiAddr = "pipe:dds-api"` to `HKLM\SOFTWARE\DDS\AuthBridge` as
+  part of the AuthBridge component, alongside the existing
+  `HmacSecretPath` value.
+- The shipped `installer/config/node.toml` now defaults
+  `[network] api_addr = 'pipe:dds-api'`, and
+  `installer/config/appsettings.json` now sets
+  `DdsPolicyAgent.NodeBaseUrl = "pipe:dds-api"`. All three sides
+  (Rust node, Auth Bridge, Policy Agent) therefore agree on the
+  named-pipe transport out of the box.
+- Verification on macOS host: `cargo test --workspace` 451/451 pass;
+  `dotnet test platform/macos/DdsPolicyAgent.Tests` 72/72 pass.
+  Compile + test of the C++ side is pending Windows CI.
+
 ---
 
-### A-3 (Medium). Response MAC verification is fail-open when no secret is configured
+### A-3 (Medium). ✅ Fixed (pending Windows CI) — Response MAC verification is fail-open when no secret is configured
 **Location:** [platform/windows/native/DdsAuthBridge/DdsNodeHttpClient.cpp:242-248](platform/windows/native/DdsAuthBridge/DdsNodeHttpClient.cpp#L242-L248), [dds-node/src/config.rs:215-228](dds-node/src/config.rs#L215-L228)
 
 **What's wrong:** `CDdsNodeHttpClient::VerifyResponseMac` returns
@@ -1505,9 +1529,29 @@ challenges on any deployment that did not run the MSI's
   unaffected but clients that check it cannot be tricked into
   missing-header = accept.
 
+**Resolution (2026-04-25):**
+
+- `CDdsAuthBridgeMain::Initialize` flipped from "log warning + keep
+  going" to fail-closed when `HmacSecretPath` is empty: it logs an
+  error to the Windows Event Log + `authbridge.log` and returns
+  `FALSE` (service stop). The legacy permissive behaviour is gated
+  behind a build-time `DDS_DEV_ALLOW_NO_MAC` macro that the
+  production MSI does not define, so dev/test rigs and the C++ test
+  binaries still work without a provisioned secret.
+- `CDdsNodeHttpClient::VerifyResponseMac` was tightened in tandem:
+  it now refuses (rather than accepts) responses when
+  `m_hmacKey.empty()`, again behind `DDS_DEV_ALLOW_NO_MAC`. This
+  closes the defense-in-depth gap of any future code path that
+  reaches the HTTP client without going through `Initialize`'s gate.
+- The Rust side's response signer already runs unconditionally when
+  `node_hmac_secret_path` is set (the MSI's `CA_GenHmacSecret`
+  custom action makes it non-empty by default), so no change was
+  needed there. Hand-installed dev nodes that do not provision a
+  secret remain compatible with the dev build of the Auth Bridge.
+
 ---
 
-### A-4 (Medium). Auth Bridge logs emit first 4 bytes of HMAC-derived material and password length; log directory has no explicit DACL
+### A-4 (Medium). ✅ Fixed (pending Windows CI) — Auth Bridge logs emit first 4 bytes of HMAC-derived material and password length; log directory has no explicit DACL
 **Location:** [platform/windows/native/DdsAuthBridge/CredentialVault.cpp:226-229](platform/windows/native/DdsAuthBridge/CredentialVault.cpp#L226-L229), [platform/windows/native/DdsAuthBridge/CredentialVault.cpp:304-309](platform/windows/native/DdsAuthBridge/CredentialVault.cpp#L304-L309), [platform/windows/native/DdsAuthBridge/FileLog.cpp:27-37](platform/windows/native/DdsAuthBridge/FileLog.cpp#L27-L37)
 
 **What's wrong:** `EncryptPassword` and `DecryptPassword` write the
@@ -1542,6 +1586,25 @@ the offline-attack posture of the vault.
   `LocalSystem` + `BUILTIN\Administrators` = `FullControl`,
   everyone else denied. Mirror the `AppliedStateStore` DACL helper
   used for L-16.
+
+**Resolution (2026-04-25):**
+
+- `CCredentialVault::EncryptPassword` and `DecryptPassword` no
+  longer log the four-byte hmac-secret-key prefix or the cleartext
+  password length. The Decrypt path keeps a size-only diagnostic
+  (`encPwdLen / ivLen / tagLen`) so vault-shape problems can still
+  be triaged without exposing key material.
+- `FileLog::Init` now applies an explicit, non-inherited DACL to
+  `%ProgramData%\DDS` via `ConvertStringSecurityDescriptorToSecurityDescriptorW`
+  + `SetNamedSecurityInfoW` with SDDL
+  `D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` — full control to
+  LocalSystem and BUILTIN\Administrators only, with `OICI`
+  inheritance so authbridge.log and any future sibling
+  diagnostics inherit the same restriction. Mirrors the L-16
+  helper in `AppliedStateStore.cs`. The fix is
+  upgrade-safe: a stale wide-open ACL on an existing
+  `%ProgramData%\DDS` from a pre-A-4 build is corrected on first
+  start of the new bits.
 
 ---
 
