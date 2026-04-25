@@ -43,17 +43,18 @@ host classifications and six operational scenarios (§9).
 
 ```
 enum JoinState {
-    Workgroup,         // not domain-joined, not Entra-joined
-    AdJoined,          // classic Active Directory domain join
-    HybridJoined,      // AD-joined and Entra-registered/joined
-    EntraOnlyJoined,   // Entra-only (no AD)
-    Unknown            // probe failed; fail-closed for mutating ops
+    Workgroup = 0,         // not domain-joined, not device-Entra-joined
+    AdJoined = 1,          // classic Active Directory domain join
+    HybridJoined = 2,      // AD-joined and device-Entra-joined or workplace-registered
+    EntraOnlyJoined = 3,   // device-Entra-joined, no AD
+    Unknown = 4            // probe failed; fail-closed for mutating ops
 }
 ```
 
-The same five values, in the same order, in both managed
+The same five values, with the same explicit numeric values, in both managed
 (`DdsPolicyAgent/HostState/JoinState.cs`) and native
-(`DdsAuthBridge/JoinState.h`) code.
+(`DdsAuthBridge/JoinState.h`) code. Do not rely on implicit enum ordering for
+IPC or persisted state.
 
 ### 2.2 Probe Contract
 
@@ -63,10 +64,24 @@ unavailable.
 | Signal | Outcome |
 |---|---|
 | `NetGetJoinInformation` → `NetSetupDomainName` | `AdJoined` (refined to `HybridJoined` if Entra signal also present) |
-| `NetGetAadJoinInformation` (loaded via `GetProcAddress` / `EntryPointNotFoundException`) reports `IsJoined=TRUE` | Combined with above: `HybridJoined` |
-| `NetGetJoinInformation` → `NetSetupWorkgroupName` AND `NetGetAadJoinInformation` reports `IsJoined=TRUE` | `EntraOnlyJoined` |
-| `NetGetJoinInformation` → `NetSetupWorkgroupName` AND no Entra signal | `Workgroup` |
+| `NetGetAadJoinInformation(NULL, &info)` returns `S_OK`, `info != NULL`, and `info->joinType == DSREG_DEVICE_JOIN` | Device Entra join signal |
+| `NetGetAadJoinInformation(NULL, &info)` returns `S_OK`, `info != NULL`, and `info->joinType == DSREG_WORKPLACE_JOIN` | Workplace registration signal |
+| AD signal + device Entra join or workplace registration signal | `HybridJoined` |
+| Workgroup signal + device Entra join signal | `EntraOnlyJoined` |
+| Workgroup signal + workplace registration signal only | `Workgroup`, with an informational log (`workplace_registered_only`) |
+| `NetGetJoinInformation` → `NetSetupWorkgroupName` AND no Entra/workplace signal | `Workgroup` |
 | Either probe throws / fails / returns `NetSetupUnknownStatus` | `Unknown` |
+
+`NetGetAadJoinInformation` does **not** expose an `IsJoined` Boolean. The
+implementation must inspect `DSREG_JOIN_INFO.joinType` and must free non-null
+join info with `NetFreeAadJoinInformation`. Treat `DSREG_DEVICE_JOIN` as the
+only Entra device-join signal. Treat `DSREG_WORKPLACE_JOIN` as registration
+only; by itself it must not disable normal workgroup behavior. This follows the
+Win32 contracts for
+[`NetGetAadJoinInformation`](https://learn.microsoft.com/en-us/windows/win32/api/lmjoin/nf-lmjoin-netgetaadjoininformation),
+[`DSREG_JOIN_INFO`](https://learn.microsoft.com/en-us/windows/win32/api/lmjoin/ns-lmjoin-dsreg_join_info),
+and
+[`DSREG_JOIN_TYPE`](https://learn.microsoft.com/en-us/windows/win32/api/lmjoin/ne-lmjoin-dsreg_join_type).
 
 **Forbidden inputs.** `dsregcmd /status` parsing is rejected — output is not
 API-stable, and shelling from a LocalSystem service introduces a process-spawn
@@ -76,9 +91,12 @@ fallback is overruled here.
 **Edge cases that must behave identically in both probes:**
 1. `NetGetAadJoinInformation` symbol missing on the host: treat as "no Entra
    signal", not `Unknown`.
-2. `NetGetAadJoinInformation` reports `IsJoined=TRUE` with empty `TenantId`:
-   still treat as Entra-joined.
-3. Domain name non-empty but `joinStatus == NetSetupUnknownStatus`: `Unknown`.
+2. `NetGetAadJoinInformation` returns `S_OK` with `info == NULL`: treat as "no
+   Entra signal".
+3. `DSREG_DEVICE_JOIN` with empty `pszTenantId`: still treat as Entra device
+   joined; tenant metadata is not required for host safety.
+4. `DSREG_UNKNOWN_JOIN`: `Unknown`.
+5. Domain name non-empty but `joinStatus == NetSetupUnknownStatus`: `Unknown`.
 
 ### 2.3 Caching and Re-probe
 
@@ -99,12 +117,12 @@ fallback is overruled here.
 
 | Component | Workgroup | AdJoined / HybridJoined | EntraOnlyJoined | Unknown |
 |---|---|---|---|---|
-| **Policy Agent** | Enforce | Audit-only (all 4 enforcers) | Idle, log unsupported | Audit-only with distinct reason |
+| **Policy Agent** | Requested policy mode | Audit-only for every policy surface | Idle, log unsupported | Audit-only with distinct reason |
 | **Auth Bridge — claim path** | Enabled | Refused (`PRE_ENROLLMENT_REQUIRED`) | Refused (`UNSUPPORTED_HOST`) | Refused (`UNSUPPORTED_HOST`) |
 | **Auth Bridge — sign-in path** | Allowed | Allowed if vault entry exists | Refused (`UNSUPPORTED_HOST`) | Refused |
-| **CP — tile enumeration** | All enrolled DDS users | Vault-backed users only | Empty + unsupported text | Empty + unsupported text |
-| **Tray — initial enrollment** | Allowed | Allowed (must be in active session) | Allowed but warn it is unusable | Warn |
-| **Tray — vault refresh** | Allowed | Allowed | N/A | Allowed |
+| **CP — tile enumeration** | All enrolled DDS users, plus vault fallback | Vault-backed users only | No usable DDS tiles + unsupported provider status | No usable DDS tiles + unknown-state provider status |
+| **Tray — initial enrollment** | Allowed | Allowed (must be in active session) | Blocked before password prompt | Blocked before password prompt |
+| **Tray — vault refresh** | Allowed for current SID | Allowed for current SID | Blocked | Allowed only for an existing vault entry owned by current SID |
 
 Per-scenario detail is in §9.
 
@@ -118,8 +136,31 @@ Per-scenario detail is in §9.
   joined with vault entries. CP shows all.
 - AD/Hybrid: Auth Bridge intersects the dds-node list with the local vault by
   `credential_id`. Users with no local vault entry are dropped.
-- Entra-only / Unknown: Auth Bridge returns an empty list with a single
-  `unsupported` flag. CP shows no DDS tiles; status text from §4.4.
+- If the dds-node list request fails, the Auth Bridge may synthesize
+  `DDS_USER_LIST` entries from local vault records, but it must return the
+  DDS-specific list response shape. Calling the legacy `HandleListUsers`
+  helper is not sufficient because it sends `IPC_MSG::USER_LIST`, which the
+  DDS CP client rejects. Because the current vault does not persist DDS
+  subject URNs, synthesized entries use the vault display name, credential_id,
+  and `subject_urn = userSid` as a local fallback identifier.
+- Entra-only / Unknown: Auth Bridge returns a status-bearing empty
+  `DDS_USER_LIST` response with `count = 0`, `status_code`, and
+  `status_text`. CP shows no usable DDS tiles and displays the provider-level
+  status text from §4.4. An empty vector alone is ambiguous and must not be
+  used to represent unsupported host state.
+
+`IPC_RESP_DDS_USER_LIST` therefore becomes:
+
+```
+struct IPC_RESP_DDS_USER_LIST {
+    UINT32 count;
+    UINT32 status_code; // IPC_ERROR::SUCCESS, UNSUPPORTED_HOST, etc.
+    WCHAR  status_text[IPC_MAX_STATUS_MSG_LEN];
+    // followed by count * IPC_DDS_USER_ENTRY
+};
+```
+
+The bridge and CP must update this struct in the same PR.
 
 ### 4.2 Sign-in Flow (Vault Hit)
 
@@ -129,9 +170,17 @@ Identical across Workgroup and AD/Hybrid:
 2. Auth Bridge invokes WebAuthn `GetAssertion` with `hmac-secret`.
 3. Auth Bridge decrypts vault entry → recovers `(domain\user, password)`.
 4. Auth Bridge resolves `domain\user` from stored SID via `LookupAccountSid`.
-5. Auth Bridge packs `KERB_INTERACTIVE_UNLOCK_LOGON` and calls `LsaLogonUser`.
-6. On success, CP completes the logon. Windows handles online vs. cached
-   credentials transparently.
+5. Auth Bridge returns `(domain, username, password, DDS session token)` to CP
+   over the local pipe.
+6. CP packs `KERB_INTERACTIVE_UNLOCK_LOGON` in `GetSerialization` and returns
+   the credential serialization to LogonUI.
+7. Windows validates the account through the normal logon path. Windows handles
+   online vs. cached domain credentials transparently.
+
+The Auth Bridge does not currently call `LsaLogonUser` on the DDS path. Any
+requirement that depends on post-logon `NTSTATUS` must be implemented through
+the CP `ReportResult` path (§4.4 / §4.5), or by an explicit future preflight
+design that avoids double-submitting bad credentials.
 
 ### 4.3 Sign-in Flow (No Vault Entry)
 
@@ -148,30 +197,39 @@ The current code maps `STATUS_LOGON_FAILURE` and `STATUS_ACCOUNT_RESTRICTION /
 STATUS_ACCOUNT_DISABLED` generically. v1 expands the mapping so the operator
 gets specific guidance:
 
-| NTSTATUS | IPC code | CP status text |
+| NTSTATUS / source | IPC code | CP status text |
 |---|---|---|
-| `STATUS_LOGON_FAILURE` (after vault decrypt succeeded) | `STALE_VAULT_PASSWORD` | "Your DDS stored password may be out of date. Sign in normally with your Windows password, then refresh DDS from the system tray." |
-| `STATUS_PASSWORD_MUST_CHANGE` (`0xC0000224`) | `AD_PASSWORD_CHANGE_REQUIRED` | "AD requires you to set a new password. Sign in normally to change it, then refresh DDS." |
-| `STATUS_PASSWORD_EXPIRED` (`0xC0000071`) | `AD_PASSWORD_EXPIRED` | Same recovery path as above. |
-| `STATUS_ACCOUNT_DISABLED` | (existing) `STATUS_ACCOUNT_RESTRICTION` mapping | "The account is disabled." |
-| `LookupAccountSid` fails (account deleted) | `ACCOUNT_NOT_FOUND` | "This DDS account no longer exists in your directory. Contact your administrator." |
+| CP `ReportResult`: `STATUS_LOGON_FAILURE` after a DDS serialization attempt | `STALE_VAULT_PASSWORD` | "Your DDS stored password may be out of date. Sign in normally with your Windows password, then refresh DDS from the system tray." |
+| CP `ReportResult`: `STATUS_PASSWORD_MUST_CHANGE` (`0xC0000224`) | `AD_PASSWORD_CHANGE_REQUIRED` | "AD requires you to set a new password. Sign in normally to change it, then refresh DDS." |
+| CP `ReportResult`: `STATUS_PASSWORD_EXPIRED` (`0xC0000071`) | `AD_PASSWORD_EXPIRED` | Same recovery path as above. |
+| CP `ReportResult`: `STATUS_ACCOUNT_DISABLED` / `STATUS_ACCOUNT_RESTRICTION` | (existing) `STATUS_ACCOUNT_RESTRICTION` mapping | "The account is disabled." |
+| Bridge `LookupAccountSid` fails before serialization (account deleted) | `ACCOUNT_NOT_FOUND` | "This DDS account no longer exists in your directory. Contact your administrator." |
 | Probe → `EntraOnlyJoined` | `UNSUPPORTED_HOST` | "DDS sign-in is not yet supported on Entra-joined machines." |
 | AD/Hybrid + no vault entry | `PRE_ENROLLMENT_REQUIRED` | "DDS sign-in is available only after enrollment on this AD-joined machine." |
 
-Distinguishing the three password-state codes matters because Windows's default
-UX collapses them, leaving the operator unsure whether the issue is in DDS or
-in AD.
+Distinguishing the three password-state codes matters because the default
+Windows UX collapses them, leaving the operator unsure whether the issue is in
+DDS or AD. The mapping lives in CP `ReportResult`; the Auth Bridge only receives
+these outcomes when CP sends `DDS_REPORT_LOGON_RESULT` (§8).
 
 ### 4.5 Lockout Prevention
 
 Repeating a stale-vault sign-in attempt risks tripping AD lockout policy
-(default 3–10 attempts). The Auth Bridge mitigates as follows:
+(default 3–10 attempts). Because CP owns Kerberos serialization and receives
+the post-logon `NTSTATUS`, mitigation is split:
 
-- After **the first** `STATUS_LOGON_FAILURE` from a vault-decrypted credential
-  (FIDO2 ceremony succeeded; failure is post-decrypt), the bridge marks
-  `(SID, credential_id)` as cooldown for **15 minutes**.
+- CP tracks whether the last serialization came from DDS and stores the
+  `credential_id` / subject for that attempt.
+- On `ReportResult` with `STATUS_LOGON_FAILURE`, `STATUS_PASSWORD_MUST_CHANGE`,
+  or `STATUS_PASSWORD_EXPIRED`, CP sends `DDS_REPORT_LOGON_RESULT` to the Auth
+  Bridge and shows the mapped status text.
+- After the first reported stale-password failure, the bridge marks
+  `(credential_id, SID-if-known)` as cooldown for **15 minutes**.
 - During cooldown, further `START_AUTH` for that pair returns
-  `STALE_VAULT_PASSWORD` immediately without invoking `LsaLogonUser`.
+  `STALE_VAULT_PASSWORD` immediately before WebAuthn and before any Windows
+  credential serialization.
+- CP also keeps a per-process cooldown mirror so immediate retries are blocked
+  even if the report IPC fails. The bridge-side cooldown is canonical.
 - Cooldown is **in-memory**, lost on service restart. A restart is itself a
   reasonable retry boundary; the goal here is rate-limiting, not audit.
 - Successful refresh via the tray (§6.2) clears the cooldown for that pair.
@@ -199,6 +257,12 @@ EnforcementMode EffectiveMode(EnforcementMode requested) =>
   `Worker.cs:177`) routes through the same wrapper.
 - On `EntraOnlyJoined`, `ExecuteAsync` short-circuits before the dispatch: the
   worker logs `unsupported_entra` once per cycle and skips polling entirely.
+- `JoinState` participates in dispatch decisions even when policy content is
+  unchanged. If the cached state changes from the last recorded
+  `host_state_at_apply`, the worker must run one audit evaluation/report for
+  unchanged policies and software instead of skipping solely because
+  `content_hash` matches. Otherwise a workgroup → AD transition can silently
+  skip the audit pass that proves DDS stopped enforcing.
 
 ### 5.2 Reconciliation Matrix
 
@@ -226,6 +290,10 @@ still owns the item:
 - A later transition back to workgroup mode (rare but possible: machine
   unjoined from AD) would clear `audit_frozen` on next reconcile and resume
   active management.
+- Implementation detail: do not overwrite the managed-item store with only the
+  current desired set while in audit mode. Stale records must remain present
+  with metadata so the operator can inspect stranded state and a later
+  workgroup transition can resume cleanup deterministically.
 
 ### 5.4 Entra-Only Idle Behavior
 
@@ -248,10 +316,12 @@ Agent ([EnrollmentFlow.cpp](../platform/windows/native/DdsTrayAgent/EnrollmentFl
 - AD/Hybrid: unchanged mechanically — the user must already have completed a
   normal Windows sign-in (so they know their AD password). Enrollment captures
   SID + AD password and wraps under `hmac-secret`.
-- Entra-only: enrollment is allowed but the tray surfaces a warning that the
-  resulting vault entry will not be usable for sign-in (CP refuses on
-  `UNSUPPORTED_HOST`). This is permitted only because we do not want
-  enrollment to silently fail before the user sees the explanation.
+- Entra-only: enrollment is blocked before prompting for the Windows password.
+  The tray surfaces the same canonical unsupported text as CP. Capturing and
+  storing a password for a host state that cannot use DDS sign-in creates
+  unnecessary credential exposure.
+- Unknown: enrollment is blocked before prompting for the Windows password.
+  The tray asks the user to retry after the DDS services can classify the host.
 
 ### 6.2 Vault Refresh Flow (AD-13)
 
@@ -268,11 +338,15 @@ A new tray menu item "Refresh stored password" runs `RunRefreshVaultFlow`:
 The vault file format is unchanged — this is purely a re-wrap of the password
 bytes under the same credential_id and key.
 
+On `Unknown`, refresh is allowed only when the tray can match the current
+Windows SID to an existing vault entry. This avoids stranding a user after a
+probe failure without allowing first enrollment in an unclassified host state.
+
 ### 6.3 Stale-Vault Detection (AD-14)
 
-Detection happens in the Auth Bridge as described in §4.4 / §4.5. The CP
-surfaces the `STALE_VAULT_PASSWORD` text immediately on first failure; the
-operator path is:
+Detection is split between CP `ReportResult` and the Auth Bridge cooldown as
+described in §4.4 / §4.5. The CP surfaces the `STALE_VAULT_PASSWORD` text
+immediately on first failure; the operator path is:
 
 1. Native Windows sign-in (typing the new password).
 2. From the active session, open the DDS tray menu.
@@ -290,22 +364,35 @@ Security event log 4724/4738) and all are deferred to v2.
 
 ### 7.1 `applied-state.json` Additions
 
-Two new fields per managed-item record:
+The current state store tracks `managed_items` as sets of strings. v1 needs
+per-item metadata, so implementation must migrate that shape to records:
 
 ```jsonc
 {
-  "item": "registry:HKLM\\Software\\DDS\\Foo",
-  "outcome": "applied" | "audit_only" | "drift_detected" | "stale_cleaned" | "would_clean_stale" | ...,
-  "reason": "audit_due_to_ad_coexistence",   // optional, see §7.2
-  "host_state_at_apply": "Workgroup",         // NEW: JoinState in effect when written
-  "audit_frozen": false                        // NEW: true if stranded across host-state transition
+  "managed_items": {
+    "registry": {
+      "HKLM\\Software\\DDS\\Foo": {
+        "last_outcome": "applied",
+        "last_reason": null,
+        "host_state_at_apply": "Workgroup",
+        "audit_frozen": false,
+        "updated_at": 1777046400
+      }
+    },
+    "accounts": {}
+  }
 }
 ```
 
-- `host_state_at_apply` defaults to `"Unknown"` for legacy records on first
-  load.
+- Legacy `HashSet<string>` categories are migrated on first load to records
+  with `host_state_at_apply: "Unknown"`, `audit_frozen: false`, and
+  `last_outcome: "legacy"`.
+- `host_state_at_apply` is updated when an enforcer actually writes state, or
+  when an audit pass intentionally records that no write occurred.
 - `audit_frozen` is set when reconciliation in audit mode would have removed
-  the item but couldn't.
+  the item but could not because the host is AD/Hybrid/Unknown.
+- `SetManagedItems(...)` must not delete stale records in audit mode. Instead,
+  reconciliation marks them frozen and leaves them addressable by category/key.
 
 ### 7.2 Reason Code Taxonomy
 
@@ -339,15 +426,37 @@ New `IPC_ERROR` codes added to
 ```
 IPC_ERROR::UNSUPPORTED_HOST            // Entra-only / Unknown
 IPC_ERROR::PRE_ENROLLMENT_REQUIRED     // AD/Hybrid + no vault entry
-IPC_ERROR::STALE_VAULT_PASSWORD        // post-decrypt LsaLogonUser STATUS_LOGON_FAILURE
+IPC_ERROR::STALE_VAULT_PASSWORD        // CP ReportResult STATUS_LOGON_FAILURE after DDS serialization
 IPC_ERROR::AD_PASSWORD_CHANGE_REQUIRED // STATUS_PASSWORD_MUST_CHANGE
 IPC_ERROR::AD_PASSWORD_EXPIRED         // STATUS_PASSWORD_EXPIRED
 IPC_ERROR::ACCOUNT_NOT_FOUND           // LookupAccountSid failed
 ```
 
-CP-side handling adds branches for each in `CDdsCredential.cpp:369-420` and
-the parallel block at `:516-572`, mapping to the canonical strings from §4.4.
-No new IPC message types are required.
+`IPC_RESP_DDS_USER_LIST` is extended with `status_code` and `status_text`
+before the variable-length entries (§4.1). Both sides must update their
+entry-offset calculation from `sizeof(IPC_RESP_DDS_USER_LIST)`.
+
+New IPC request:
+
+```
+IPC_MSG::DDS_REPORT_LOGON_RESULT
+
+struct IPC_REQ_DDS_REPORT_LOGON_RESULT {
+    WCHAR credential_id[IPC_MAX_CREDENTIAL_ID_LEN];
+    WCHAR subject_urn[IPC_MAX_URN_LEN];
+    NTSTATUS nts_status;
+    NTSTATUS nts_substatus;
+};
+```
+
+CP sends this from `ReportResult` only when the preceding serialization attempt
+came from DDS. The bridge uses it to populate the stale-password cooldown map
+from §4.5. The request returns a small success/error acknowledgement; CP must
+not block LogonUI on acknowledgement beyond a short timeout.
+
+CP-side handling adds branches for each new `IPC_ERROR` in
+`CDdsCredential.cpp:369-420`, the parallel block at `:516-572`, and
+`ReportResult`, mapping to the canonical strings from §4.4.
 
 ---
 
@@ -358,13 +467,14 @@ These six scenarios are the source of truth for behavior. Tests
 
 ### 9.1 PC already AD-joined, then enrolling in DDS
 
-**Probe result:** `AdJoined` (or `HybridJoined` if Entra-registered).
+**Probe result:** `AdJoined` (or `HybridJoined` if device-Entra joined or
+workplace-registered).
 
 | Component | Behavior |
 |---|---|
 | Tray enrollment | Captures current SID + AD password. Wraps under `hmac-secret`. Vault saved. |
-| Policy Agent | All four enforcers run in `Audit` via `EffectiveMode`. Reconciliation read-only. Reason: `audit_due_to_ad_coexistence`. |
-| Auth Bridge sign-in (vault hit) | FIDO2 → decrypt → `KERB_INTERACTIVE_UNLOCK_LOGON` → `LsaLogonUser`. AD validates online; Windows uses cached credentials offline. |
+| Policy Agent | All policy surfaces run in `Audit` via `EffectiveMode`. Reconciliation read-only. Reason: `audit_due_to_ad_coexistence`. |
+| Auth Bridge / CP sign-in (vault hit) | FIDO2 → bridge decrypts vault → CP packs `KERB_INTERACTIVE_UNLOCK_LOGON` → Windows validates through the normal logon path. AD validates online; Windows uses cached credentials offline. |
 | Auth Bridge claim path | Refused before FIDO2 ceremony with `PRE_ENROLLMENT_REQUIRED`. |
 | CP tile list | Vault-backed users only. |
 
@@ -387,7 +497,7 @@ These six scenarios are the source of truth for behavior. Tests
 |---|---|
 | AD/GPO writes a key DDS once owned | Reconciliation in audit mode detects drift, logs `audit_due_to_ad_coexistence:would_correct_drift`. **No write.** Operator sees in audit log that GPO is now authoritative. |
 | DDS writes a key AD wants different (post-Phase 2) | Should not happen on AD/Hybrid — `EffectiveMode` is Audit. If observed, treat as bug. |
-| AD admin disables the user | Vault survives. `LsaLogonUser` returns `STATUS_ACCOUNT_DISABLED` → existing CP mapping shows "The account is disabled." |
+| AD admin disables the user | Vault survives. Windows returns `STATUS_ACCOUNT_DISABLED` to CP `ReportResult` → existing CP mapping shows "The account is disabled." |
 | AD admin deletes the user | `LookupAccountSid` fails → `ACCOUNT_NOT_FOUND` → CP shows guidance. Tray surfaces "Stale vault entry detected" notification with one-click removal. |
 | AD admin renames the user | Transparent — SID-based lookup resolves the new name at sign-in. |
 | AD admin changes group membership | Not relevant to auth path. Policy-side group directives are audit-only on AD/Hybrid. |
@@ -409,9 +519,9 @@ See the matrix in §5.2. Key rules:
 
 | Step | Behavior |
 |---|---|
-| User attempts DDS sign-in with stale vault | FIDO2 succeeds; `LsaLogonUser` returns `STATUS_LOGON_FAILURE`. |
-| First failure | Auth Bridge returns `STALE_VAULT_PASSWORD`; CP shows recovery text; bridge starts 15-min cooldown for `(SID, credential_id)`. |
-| Repeated attempts during cooldown | Bridge returns `STALE_VAULT_PASSWORD` immediately without calling `LsaLogonUser` — **prevents AD lockout**. |
+| User attempts DDS sign-in with stale vault | FIDO2 succeeds; bridge returns the stale password; CP serializes it; Windows rejects the logon and CP receives `STATUS_LOGON_FAILURE` in `ReportResult`. |
+| First failure | CP maps the status to stale-vault recovery text, sends `DDS_REPORT_LOGON_RESULT` to the bridge, and the bridge starts a 15-min cooldown for `(credential_id, SID-if-known)`. |
+| Repeated attempts during cooldown | Bridge returns `STALE_VAULT_PASSWORD` immediately before WebAuthn or Windows credential serialization — **prevents AD lockout** after the first observed failure. |
 | Special: `STATUS_PASSWORD_MUST_CHANGE` | Maps to `AD_PASSWORD_CHANGE_REQUIRED` (distinct from stale). |
 | Special: `STATUS_PASSWORD_EXPIRED` | Maps to `AD_PASSWORD_EXPIRED`. |
 | Recovery | Native Windows sign-in (typing new password) → tray "Refresh stored password" → `GetAssertion` (existing credential_id) → re-wrap → vault saved → cooldown cleared. |
@@ -470,7 +580,8 @@ This phase is complete only if all of the following are true.
 - `EntraIdleTests` — under EntraOnly, assert worker emits the
   `unsupported_entra` heartbeat and skips dispatch.
 - `HostStateTransitionTests` — flip the probe's return value mid-test; assert
-  exactly one `host_state_transition_detected` entry on the next cycle.
+  exactly one `host_state_transition_detected` entry on the next cycle and one
+  audit evaluation even when policy content hashes are unchanged.
 
 ### 11.2 Native Tests
 
@@ -483,7 +594,11 @@ This phase is complete only if all of the following are true.
   2. AdJoined + empty vault → `PRE_ENROLLMENT_REQUIRED`.
   3. EntraOnlyJoined → `UNSUPPORTED_HOST`.
 - `test_lockout_prevention.cpp` — drive two rapid failed sign-ins; assert the
-  second is rejected without invoking `LsaLogonUser`.
+  second is rejected before WebAuthn after CP reports the first failure through
+  `DDS_REPORT_LOGON_RESULT`.
+- `test_dds_user_list_status.cpp` — assert EntraOnly/Unknown list responses
+  carry `status_code/status_text`, and dds-node failure fallback returns
+  `IPC_MSG::DDS_USER_LIST` rather than the legacy `IPC_MSG::USER_LIST`.
 - `test_vault_refresh.cpp` — round-trip refresh: encrypt, decrypt, assert
   password and credential_id integrity.
 
@@ -511,10 +626,11 @@ This phase is complete only if all of the following are true.
 | L2 | No first sign-in bootstrap on AD hosts — user must have a working AD logon first | Documented in §6.1. |
 | L3 | Workgroup → AD-joined transition strands previously-applied state | Inventory preserved with `audit_frozen`; manual cleanup supported via inventory; automatic rollback is explicitly out of scope. |
 | L4 | Probe is cached for service lifetime + 1h re-probe — host-state changes are detected with up to 1h delay | Acceptable for v1; documented. |
-| L5 | `NetGetAadJoinInformation` registry-fallback may report false-positive Hybrid after Entra unjoin | Prefer the API call wherever available; only fall back on `EntryPointNotFoundException`. |
+| L5 | `DSREG_WORKPLACE_JOIN` can look like an Entra signal but is only workplace registration | Treat it as Hybrid only when AD is also joined; workgroup + workplace registration remains Workgroup. |
 | L6 | No proactive AD account-state polling | Detect-on-failure (§9.3) is sufficient for v1. |
 | L7 | Cooldown is in-memory; service restart resets the counter | Acceptable; restart is itself a retry boundary. |
 | L8 | No proactive detection of in-session password change (§9.6) | v2 work via Security event log. |
+| L9 | CP `ReportResult` is the only reliable source of post-logon `NTSTATUS` in the current architecture | Add `DDS_REPORT_LOGON_RESULT`; do not place stale-password requirements solely in the bridge worker. |
 
 ---
 
@@ -528,6 +644,10 @@ This phase is complete only if all of the following are true.
   reason-code taxonomy, six new `IPC_ERROR` codes, 1-failure / 15-minute
   lockout-prevention cooldown, audit-mode reconciliation preserves stranded
   inventory with `audit_frozen`, no proactive AD account polling.
+- **2026-04-25** — Spec corrected after implementation review: Entra detection
+  now uses `DSREG_JOIN_INFO.joinType`, list-users unsupported state has a real
+  IPC shape, stale-password detection is routed through CP `ReportResult`, and
+  Entra-only enrollment is blocked before password capture.
 
 ---
 
@@ -580,7 +700,7 @@ The 5-phase split holds, with these refinements:
 | Task | Files | Function-level change |
 |---|---|---|
 | **AD-01** | New: `JoinState.cs`, `IJoinStateProbe.cs`, `JoinState.h`. Modify: `AccountEnforcer.cs:34,208,250`, `IAccountOperations.cs:53`, `WindowsAccountOperations.cs:18-25`, `InMemoryAccountOperations.cs:118`, `DdsAuthBridgeMain.h:115`, `DdsAuthBridgeMain.cpp:487-500,1035`. | Replace `_ops.IsDomainJoined()` with injected probe; remove interface method; replace native static helper with `GetJoinState()`. |
-| **AD-02** | `WindowsJoinStateProbe.cs`, `JoinState.cpp`. | P/Invoke `NetGetJoinInformation` + `NetGetAadJoinInformation` (managed); load `netapi32.dll` + `GetProcAddress` for `NetGetAadJoinInformation` (native). Catch missing-symbol case → "no Entra signal". Periodic re-probe via `IHostedService` (managed) and a dedicated thread (native). |
+| **AD-02** | `WindowsJoinStateProbe.cs`, `JoinState.cpp`. | P/Invoke `NetGetJoinInformation` + `NetGetAadJoinInformation` (managed); load `netapi32.dll` + `GetProcAddress` for `NetGetAadJoinInformation` (native). Inspect `DSREG_JOIN_INFO.joinType`; `DSREG_DEVICE_JOIN` is device-Entra, `DSREG_WORKPLACE_JOIN` is registration only. Catch missing-symbol case → "no Entra signal"; free non-null join info with `NetFreeAadJoinInformation`. Periodic re-probe via `IHostedService` (managed) and a dedicated thread (native). |
 | **AD-03** | `JoinStateProbeTests.cs`, `test_join_state.cpp` + `build_test_join_state.bat`. | Five managed test cases via `FakeJoinStateProbe`. Native tests run pure helpers; real-host probe is logged not asserted. |
 
 ### Phase 2 — Safe Policy Coexistence
@@ -588,29 +708,30 @@ The 5-phase split holds, with these refinements:
 | Task | Files | Change |
 |---|---|---|
 | **AD-07** | `Client/DdsNodeClient.cs:53-75 AppliedReport`, new `State/AppliedReason.cs`, `Worker.cs:343 ReportAsync`. | Add `Reason` JSON property; declare reason-code constants; thread `reason` through `ReportAsync`. |
-| **AD-04** | `Worker.cs:91 PollAndApplyAsync`, `:64 ExecuteAsync`. | Inject `IJoinStateProbe`, cache result on start. Add `EffectiveMode(EnforcementMode)` helper, wrap every `mode` argument passed to enforcers and reconciliation. |
+| **AD-04** | `Worker.cs:91 PollAndApplyAsync`, `:64 ExecuteAsync`. | Inject `IJoinStateProbe`, cache result on start. Add `EffectiveMode(EnforcementMode)` helper, wrap every `mode` argument passed to enforcers and reconciliation. Force one audit evaluation when JoinState changes even if policy/software content hashes are unchanged. |
 | **AD-05** | `Worker.cs:177` software dispatch, `Worker.cs:284` reconcile dispatch. | Replace hardcoded `EnforcementMode.Enforce` with `EffectiveMode(EnforcementMode.Enforce)`. |
 | **AD-06** | `Program.cs`, `Worker.cs:64`. | On `EntraOnlyJoined`, short-circuit `ExecuteAsync` to a heartbeat-only loop reporting `unsupported_entra`. |
-| **(AD-04/05 schema)** | `State/AppliedStateStore.cs:47`. | Add `host_state_at_apply` and `audit_frozen` fields. Default legacy records to `Unknown` / `false`. |
+| **(AD-04/05 schema)** | `State/AppliedStateStore.cs:47`. | Migrate `managed_items` from sets to per-item metadata records. Add `host_state_at_apply`, `audit_frozen`, `last_outcome`, and `last_reason`. Default legacy records to `Unknown` / `false` / `legacy`. |
 
 ### Phase 3 — Authentication Coexistence
 
 | Task | Files | Change |
 |---|---|---|
 | **AD-08** | `DdsAuthBridgeMain.cpp:696 HandleDdsStartAuth`, `:1035`, `DdsBridgeIPC/ipc_messages.h`. | Move the join-state gate to before the FIDO2 ceremony. Switch on `GetJoinState()` returning `PRE_ENROLLMENT_REQUIRED` / `UNSUPPORTED_HOST` / proceed. Add new `IPC_ERROR` codes. |
-| **AD-09** | `DdsAuthBridgeMain.cpp:1193 HandleDdsListUsers`, `CredentialVault.{h,cpp}`. | Intersect dds-node user list with vault by credential_id on AD/Hybrid. Add `VaultHasCredentialId(...)` helper. EntraOnly returns empty list. |
-| **AD-10** | `CDdsCredential.cpp:369-420`, `:516-572`. | Extend `errorCode` switch for the six new IPC codes; map to canonical strings from §4.4. |
+| **AD-09** | `DdsAuthBridgeMain.cpp:1193 HandleDdsListUsers`, `CredentialVault.{h,cpp}`, `DdsBridgeIPC/ipc_messages.h`, `DdsBridgeClient.cpp`. | Intersect dds-node user list with vault by credential_id on AD/Hybrid. Add `VaultHasCredentialId(...)` helper. Extend `IPC_RESP_DDS_USER_LIST` with `status_code/status_text`. EntraOnly/Unknown return status-bearing empty DDS lists. dds-node failure fallback synthesizes DDS list entries from vault, not legacy `USER_LIST`. |
+| **AD-10** | `CDdsCredential.cpp:369-420`, `:516-572`, `ReportResult`. | Extend `errorCode` switch for the six new IPC codes; map to canonical strings from §4.4. Map DDS-originated `ReportResult` NTSTATUS values to recovery text and send `DDS_REPORT_LOGON_RESULT`. |
 | **AD-11** | `Tests/test_ad_coexistence.cpp`, `build_test_ad_coexistence.bat`, `JoinState.h` (`SetJoinStateForTest` under `-DDDS_TESTING`). | Three native tests per §11.2. Register in `run_all_tests.bat`. |
-| **AD-04/05 NTSTATUS expansion** | `DdsAuthBridgeMain.cpp` (LsaLogonUser result handling). | Map `STATUS_PASSWORD_MUST_CHANGE` / `STATUS_PASSWORD_EXPIRED` / `STATUS_LOGON_FAILURE` (post-decrypt) / `LookupAccountSid` failure to the corresponding new IPC codes. |
-| **(Lockout prevention)** | `DdsAuthBridgeMain.{h,cpp}`. | Per-`(SID, credential_id)` cooldown map (in-memory); 15-min default; cleared on successful refresh. |
+| **AD-10b logon result IPC** | `DdsBridgeIPC/ipc_protocol.h`, `ipc_messages.h`, `ipc_pipe_client.{h,cpp}`, `DdsAuthBridgeMain.{h,cpp}`. | Add `DDS_REPORT_LOGON_RESULT`; bridge records stale-password cooldown from CP-reported NTSTATUS. |
+| **AD-04/05 NTSTATUS expansion** | `CDdsCredential.cpp::ReportResult`, `DdsAuthBridgeMain.cpp` (SID lookup handling). | Map `STATUS_PASSWORD_MUST_CHANGE` / `STATUS_PASSWORD_EXPIRED` / `STATUS_LOGON_FAILURE` from CP `ReportResult`; map bridge-side `LookupAccountSid` failure to `ACCOUNT_NOT_FOUND`. |
+| **(Lockout prevention)** | `DdsAuthBridgeMain.{h,cpp}`, `CDdsCredential.cpp`. | Per-`(SID-if-known, credential_id)` cooldown map (in-memory); 15-min default; CP mirrors cooldown locally; cleared on successful refresh. |
 
 ### Phase 4 — Enrollment And Recovery UX
 
 | Task | Files | Change |
 |---|---|---|
-| **AD-14** | `DdsAuthBridgeMain.cpp` LsaLogonUser handler. | Already covered by AD-08+NTSTATUS expansion above. |
-| **AD-13** | New `DdsTrayAgent/RefreshVaultFlow.{h,cpp}`, modify `DdsTrayAgent.cpp` (menu). | Existing credential_id, `GetAssertion`, re-wrap, save. No new credential. Clear cooldown. |
-| **AD-12** | `docs/windows-ad-coexistence-spec.md` (this doc) operator appendix or a new `docs/windows-ad-enrollment.md`; tray text strings in `EnrollmentFlow.cpp:126`. | Operator workflow documentation; clarify enrollment password prompt on AD hosts. |
+| **AD-14** | `CDdsCredential.cpp::ReportResult`, `DdsAuthBridgeMain.cpp` report handler. | Stale-password detection is driven by CP `ReportResult` plus `DDS_REPORT_LOGON_RESULT`; the bridge does not see post-logon `NTSTATUS` on its own. |
+| **AD-13** | New `DdsTrayAgent/RefreshVaultFlow.{h,cpp}`, modify `DdsTrayAgent.cpp` (menu). | Existing credential_id, `GetAssertion`, re-wrap, save. No new credential. Clear cooldown. Block Entra-only and first enrollment on Unknown before password prompt. |
+| **AD-12** | `docs/windows-ad-coexistence-spec.md` (this doc) operator appendix or a new `docs/windows-ad-enrollment.md`; tray text strings in `EnrollmentFlow.cpp:126`. | Operator workflow documentation; clarify enrollment password prompt on AD hosts and unsupported/unknown host behavior before password capture. |
 
 ### Phase 5 — End-to-End Validation
 
@@ -678,8 +799,9 @@ JoinState seam on both sides without altering any user-visible flow.
 2. The two probes return the same value on the same host. Manual verification
    on a workgroup dev box: managed unit test logs `Detect() == Workgroup`;
    native `test_join_state.exe` prints `Workgroup`.
-3. `NetGetAadJoinInformation` failure modes degrade to `Unknown` rather than
-   throwing.
+3. `NetGetAadJoinInformation` missing-symbol and `S_OK + NULL` cases degrade
+   to "no Entra signal"; real API failures and `DSREG_UNKNOWN_JOIN` degrade to
+   `Unknown` rather than throwing.
 4. No new dependency on `dsregcmd` or `Process.Start`.
 5. The `IJoinStateProbe` seam is clean enough for AD-04 worker tests to use
    without further refactoring.
