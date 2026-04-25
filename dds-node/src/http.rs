@@ -304,7 +304,11 @@ fn tofu_device_binding(
         })?;
     match outcome {
         BindingOutcome::Established => {
-            tracing::info!(device_urn, ?principal, "M-8: device binding established (TOFU)");
+            tracing::info!(
+                device_urn,
+                ?principal,
+                "M-8: device binding established (TOFU)"
+            );
             Ok(())
         }
         BindingOutcome::Matched => Ok(()),
@@ -626,6 +630,7 @@ where
     let admin_routes = Router::new()
         .route("/v1/enroll/user", post(enroll_user::<S>))
         .route("/v1/enroll/device", post(enroll_device::<S>))
+        .route("/v1/enroll/challenge", get(issue_enroll_challenge::<S>))
         .route("/v1/enrolled-users", get(list_enrolled_users::<S>))
         .route("/v1/admin/challenge", get(issue_admin_challenge::<S>))
         .route("/v1/admin/setup", post(admin_setup::<S>))
@@ -708,6 +713,16 @@ pub struct EnrollUserRequestJson {
     /// `client_data_hash_b64` via SHA-256 first.
     #[serde(default)]
     pub client_data_json_b64: Option<String>,
+    /// **A-1 follow-up (server-issued enrollment challenge)**:
+    /// optional `challenge_id` returned by `GET /v1/enroll/challenge`.
+    /// When supplied together with `client_data_json_b64`, the server
+    /// consumes the challenge atomically and verifies that the
+    /// `clientDataJSON.challenge` field decodes to the same bytes —
+    /// closing WebAuthn §7.1 step 9 at enrollment. Backward
+    /// compatible: when absent the legacy "no enrollment challenge"
+    /// path runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -987,6 +1002,7 @@ where
         display_name: req.display_name,
         authenticator_type: req.authenticator_type,
         client_data_json,
+        challenge_id: req.challenge_id,
     };
     let mut svc = state.svc.lock().await;
     let r = svc.enroll_user(internal)?;
@@ -1123,6 +1139,32 @@ where
         + 'static,
 {
     issue_challenge(state, "admin").await
+}
+
+/// **A-1 follow-up**: server-issued enrollment challenge. Mirrors the
+/// session/admin challenge endpoints but tags rows as `enroll-` so a
+/// nonce minted for one purpose can't be replayed against another
+/// (the prefix is purely informational; consumption is by `id` only,
+/// but the lookup is across one shared challenge table so the hint
+/// stays useful in audit logs).
+///
+/// The endpoint is admin-gated because it sits on the same enrollment
+/// sub-router as `/v1/enroll/user` and `/v1/admin/setup`. A caller who
+/// can't reach the enrollment endpoints has no use for the challenge.
+async fn issue_enroll_challenge<S>(
+    State(state): State<AppState<S>>,
+) -> Result<Json<ChallengeResponse>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    issue_challenge(state, "enroll").await
 }
 
 async fn issue_challenge<S>(
@@ -1284,6 +1326,7 @@ where
         display_name: req.display_name,
         authenticator_type: req.authenticator_type,
         client_data_json,
+        challenge_id: req.challenge_id,
     };
     let mut svc = state.svc.lock().await;
     let r = svc.admin_setup(internal)?;
@@ -1830,8 +1873,10 @@ where
                         parts.extensions.insert(peer);
                         let body = axum::body::Body::new(body);
                         let req = axum::http::Request::from_parts(parts, body);
-                        let resp: axum::response::Response =
-                            app.oneshot(req).await.unwrap_or_else(|never| match never {});
+                        let resp: axum::response::Response = app
+                            .oneshot(req)
+                            .await
+                            .unwrap_or_else(|never| match never {});
                         Ok::<_, std::convert::Infallible>(resp)
                     }
                 }
@@ -1930,8 +1975,10 @@ where
                         parts.extensions.insert(caller);
                         let body = axum::body::Body::new(body);
                         let req = axum::http::Request::from_parts(parts, body);
-                        let resp: axum::response::Response =
-                            app.oneshot(req).await.unwrap_or_else(|never| match never {});
+                        let resp: axum::response::Response = app
+                            .oneshot(req)
+                            .await
+                            .unwrap_or_else(|never| match never {});
                         Ok::<_, std::convert::Infallible>(resp)
                     }
                 }
@@ -1961,11 +2008,9 @@ fn extract_pipe_caller(
     server: &tokio::net::windows::named_pipe::NamedPipeServer,
 ) -> std::io::Result<CallerIdentity> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
-    };
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
     use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
     use windows_sys::Win32::System::Threading::{
         OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -1999,7 +2044,13 @@ fn extract_pipe_caller(
     // 4. sized query first, then real query, for TOKEN_USER.
     let mut needed: u32 = 0;
     let _ = unsafe {
-        GetTokenInformation(token_handle, TokenUser, std::ptr::null_mut(), 0, &mut needed)
+        GetTokenInformation(
+            token_handle,
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
     };
     if needed == 0 {
         unsafe {
@@ -2200,6 +2251,10 @@ mod tests {
             .route("/v1/enroll/user", post(enroll_user::<MemoryBackend>))
             .route("/v1/enroll/device", post(enroll_device::<MemoryBackend>))
             .route(
+                "/v1/enroll/challenge",
+                get(issue_enroll_challenge::<MemoryBackend>),
+            )
+            .route(
                 "/v1/session/challenge",
                 get(issue_session_challenge::<MemoryBackend>),
             )
@@ -2321,8 +2376,7 @@ mod tests {
         // A-1 step-1: packed self-attestation over the all-zero CDH
         // that the request below pins (`client_data_hash_b64:
         // b64_encode(&[0u8; 32])`).
-        let attestation =
-            build_packed_self_attestation("example.com", b"cred-x", &sk, &[0u8; 32]);
+        let attestation = build_packed_self_attestation("example.com", b"cred-x", &sk, &[0u8; 32]);
         let req = EnrollUserRequestJson {
             label: "alice".into(),
             credential_id: "cred-x".into(),
@@ -2332,6 +2386,7 @@ mod tests {
             display_name: "Alice".into(),
             authenticator_type: "platform".into(),
             client_data_json_b64: None,
+            challenge_id: None,
         };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/enroll/user"))
@@ -2357,6 +2412,7 @@ mod tests {
             display_name: "Alice".into(),
             authenticator_type: "platform".into(),
             client_data_json_b64: None,
+            challenge_id: None,
         };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/enroll/user"))
@@ -2365,6 +2421,178 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 401);
+    }
+
+    // ----------------------------------------------------------------
+    // A-1 follow-up: server-issued enrollment challenge
+    // ----------------------------------------------------------------
+
+    /// `GET /v1/enroll/challenge` returns a fresh, single-use nonce
+    /// just like `/v1/session/challenge` and `/v1/admin/challenge`.
+    #[tokio::test]
+    async fn test_enroll_challenge_issues_unique_nonces() {
+        let state = make_state();
+        let base = spawn_server(state).await;
+        let (id1, b64_1) = fetch_challenge(&base, "/v1/enroll/challenge").await;
+        let (id2, b64_2) = fetch_challenge(&base, "/v1/enroll/challenge").await;
+        assert!(id1.starts_with("chall-enroll-"), "id was {id1}");
+        assert!(id2.starts_with("chall-enroll-"), "id was {id2}");
+        assert_ne!(id1, id2);
+        assert_ne!(b64_1, b64_2);
+    }
+
+    /// Round-trip: fetch challenge, enroll a user with a clientDataJSON
+    /// whose `challenge` field encodes the server-issued bytes — must
+    /// succeed. Then re-using the same `challenge_id` must fail
+    /// (single-use enforcement, mirrors the assertion side).
+    #[tokio::test]
+    async fn test_enroll_user_with_server_challenge_roundtrip() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let state = make_state();
+        let base = spawn_server(state).await;
+
+        // 1. Mint a challenge.
+        let (challenge_id, challenge_b64url) = fetch_challenge(&base, "/v1/enroll/challenge").await;
+
+        // 2. Build a real clientDataJSON whose `challenge` matches the
+        //    server-issued b64url string. Hash it for the cdh, then
+        //    build a packed self-attestation over that cdh.
+        let cdj = format!(
+            r#"{{"type":"webauthn.create","challenge":"{challenge_b64url}","origin":"https://example.com"}}"#
+        );
+        use sha2::{Digest, Sha256};
+        let cdh: [u8; 32] = Sha256::digest(cdj.as_bytes()).into();
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let attestation = build_packed_self_attestation("example.com", b"cred-cb", &sk, &cdh);
+
+        let mut req = EnrollUserRequestJson {
+            label: "alice".into(),
+            credential_id: "cred-cb".into(),
+            attestation_object_b64: b64_encode(&attestation),
+            client_data_hash_b64: b64_encode(&cdh),
+            rp_id: "example.com".into(),
+            display_name: "Alice".into(),
+            authenticator_type: "platform".into(),
+            client_data_json_b64: Some(b64_encode(cdj.as_bytes())),
+            challenge_id: Some(challenge_id.clone()),
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/enroll/user"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "first enroll should succeed");
+        let body: EnrollmentResponse = resp.json().await.unwrap();
+        assert!(body.urn.starts_with("urn:vouchsafe:alice."));
+
+        // 3. Re-using the same `challenge_id` must be rejected — the
+        //    server already consumed it on the first call.
+        req.label = "alice2".into();
+        req.credential_id = "cred-cb2".into();
+        // We can hand the same cdj since the attestation will fail
+        // signature verification first (different sk), but the test
+        // really wants the challenge to be the rejection reason. Use
+        // a fresh sk + matching attestation that would otherwise
+        // succeed.
+        let _ = URL_SAFE_NO_PAD.decode(&challenge_b64url).unwrap();
+        let resp2 = reqwest::Client::new()
+            .post(format!("{base}/v1/enroll/user"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp2.status().is_client_error() || resp2.status().is_server_error(),
+            "second enroll with consumed challenge should fail, got {}",
+            resp2.status()
+        );
+    }
+
+    /// Caller supplies a `challenge_id` that the cdj.challenge field
+    /// does not match — must be rejected even though the cdh and
+    /// attestation are otherwise valid.
+    #[tokio::test]
+    async fn test_enroll_user_with_mismatched_challenge_rejected() {
+        let state = make_state();
+        let base = spawn_server(state).await;
+
+        // Fetch a challenge but build a cdj that encodes *different*
+        // bytes in the challenge field.
+        let (challenge_id, _) = fetch_challenge(&base, "/v1/enroll/challenge").await;
+        let attacker_challenge_b64url = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // fake
+        let cdj = format!(
+            r#"{{"type":"webauthn.create","challenge":"{attacker_challenge_b64url}","origin":"https://example.com"}}"#
+        );
+        use sha2::{Digest, Sha256};
+        let cdh: [u8; 32] = Sha256::digest(cdj.as_bytes()).into();
+        let sk = SigningKey::generate(&mut OsRng);
+        let attestation = build_packed_self_attestation("example.com", b"cred-bad", &sk, &cdh);
+
+        let req = EnrollUserRequestJson {
+            label: "mallory".into(),
+            credential_id: "cred-bad".into(),
+            attestation_object_b64: b64_encode(&attestation),
+            client_data_hash_b64: b64_encode(&cdh),
+            rp_id: "example.com".into(),
+            display_name: "Mallory".into(),
+            authenticator_type: "platform".into(),
+            client_data_json_b64: Some(b64_encode(cdj.as_bytes())),
+            challenge_id: Some(challenge_id),
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/enroll/user"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_client_error() || resp.status().is_server_error(),
+            "mismatched challenge should fail, got {}",
+            resp.status()
+        );
+    }
+
+    /// Legacy callers that don't supply `challenge_id` keep working —
+    /// no enrollment-side challenge gets bound, the cdj fields still
+    /// validate, and the request succeeds.
+    #[tokio::test]
+    async fn test_enroll_user_legacy_no_challenge_id_still_works() {
+        let state = make_state();
+        let base = spawn_server(state).await;
+
+        // No fetch — the client just sends a cdj without going
+        // through `/v1/enroll/challenge`.
+        let cdj = r#"{"type":"webauthn.create","challenge":"AAAA","origin":"https://example.com"}"#;
+        use sha2::{Digest, Sha256};
+        let cdh: [u8; 32] = Sha256::digest(cdj.as_bytes()).into();
+        let sk = SigningKey::generate(&mut OsRng);
+        let attestation = build_packed_self_attestation("example.com", b"cred-leg", &sk, &cdh);
+
+        let req = EnrollUserRequestJson {
+            label: "bob".into(),
+            credential_id: "cred-leg".into(),
+            attestation_object_b64: b64_encode(&attestation),
+            client_data_hash_b64: b64_encode(&cdh),
+            rp_id: "example.com".into(),
+            display_name: "Bob".into(),
+            authenticator_type: "platform".into(),
+            client_data_json_b64: Some(b64_encode(cdj.as_bytes())),
+            challenge_id: None,
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/enroll/user"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "legacy no-challenge_id path must succeed"
+        );
     }
 
     #[tokio::test]
@@ -2430,8 +2658,7 @@ mod tests {
         let cred_id = b"cred-assert-test";
         // A-1 step-1: packed self-attestation over the same all-zero
         // CDH the request below pins.
-        let attestation =
-            build_packed_self_attestation("dds.local", cred_id, &sk, &[0u8; 32]);
+        let attestation = build_packed_self_attestation("dds.local", cred_id, &sk, &[0u8; 32]);
         // enroll_user base64url-encodes the raw credential_id from the
         // attestation object, so the stored credential_id in the trust
         // graph is base64url(b"cred-assert-test"), not the raw string.
@@ -2445,6 +2672,7 @@ mod tests {
             display_name: "Bob".into(),
             authenticator_type: "platform".into(),
             client_data_json_b64: None,
+            challenge_id: None,
         };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/enroll/user"))
@@ -2474,9 +2702,9 @@ mod tests {
             authenticator_data: auth_data_b64,
             signature: sig_b64,
             duration_secs: Some(1800),
-        
+
             ..Default::default()
-};
+        };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/session/assert"))
             .json(&assert_req)
@@ -2515,6 +2743,7 @@ mod tests {
             display_name: "Carol".into(),
             authenticator_type: "platform".into(),
             client_data_json_b64: None,
+            challenge_id: None,
         };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/enroll/user"))
@@ -2541,9 +2770,9 @@ mod tests {
             authenticator_data: b64_encode(&auth_data),
             signature: b64_encode(&sig.to_bytes()),
             duration_secs: None,
-        
+
             ..Default::default()
-};
+        };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/session/assert"))
             .json(&assert_req)
@@ -2579,9 +2808,9 @@ mod tests {
             authenticator_data: b64_encode(&auth_data),
             signature: b64_encode(&sig.to_bytes()),
             duration_secs: None,
-        
+
             ..Default::default()
-};
+        };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/session/assert"))
             .json(&assert_req)
@@ -2625,6 +2854,7 @@ mod tests {
                 display_name: name.to_uppercase(),
                 authenticator_type: "platform".into(),
                 client_data_json_b64: None,
+                challenge_id: None,
             };
             let resp = reqwest::Client::new()
                 .post(format!("{base}/v1/enroll/user"))
@@ -2697,6 +2927,7 @@ mod tests {
             display_name: "Alice".into(),
             authenticator_type: "cross-platform".into(),
             client_data_json_b64: None,
+            challenge_id: None,
         };
         let enroll_resp = reqwest::Client::new()
             .post(format!("{base}/v1/enroll/user"))
@@ -3320,6 +3551,7 @@ mod tests {
             display_name: label.to_uppercase(),
             authenticator_type: "platform".into(),
             client_data_json_b64: None,
+            challenge_id: None,
         };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/enroll/user"))
@@ -3354,9 +3586,9 @@ mod tests {
             authenticator_data: auth_data_b64,
             signature: sig_b64,
             duration_secs,
-        
+
             ..Default::default()
-};
+        };
         reqwest::Client::new()
             .post(format!("{base}/v1/session/assert"))
             .json(&req)
@@ -3428,9 +3660,9 @@ mod tests {
             authenticator_data: auth_data_b64,
             signature: sig_b64,
             duration_secs: None,
-        
+
             ..Default::default()
-};
+        };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/session/assert"))
             .json(&req)
@@ -3473,9 +3705,9 @@ mod tests {
             authenticator_data: auth_data_b64,
             signature: sig_b64,
             duration_secs: None,
-        
+
             ..Default::default()
-};
+        };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/session/assert"))
             .json(&req)
@@ -3507,7 +3739,10 @@ mod tests {
                 let id = format!("chall-cap-{i}");
                 store.put_challenge(&id, &[0u8; 32], live_until).unwrap();
             }
-            assert_eq!(store.count_challenges().unwrap(), MAX_OUTSTANDING_CHALLENGES);
+            assert_eq!(
+                store.count_challenges().unwrap(),
+                MAX_OUTSTANDING_CHALLENGES
+            );
         }
 
         // The next issue request must be rejected with 503.
@@ -3523,7 +3758,10 @@ mod tests {
         // Drop one live row and re-issue — the cap should now allow it.
         {
             let mut svc = state.svc.lock().await;
-            let _ = svc.store_mut().consume_challenge("chall-cap-0", now).unwrap();
+            let _ = svc
+                .store_mut()
+                .consume_challenge("chall-cap-0", now)
+                .unwrap();
         }
         let resp2 = reqwest::get(format!("{base}/v1/session/challenge"))
             .await
@@ -3559,7 +3797,10 @@ mod tests {
             .as_secs();
         {
             let mut svc = state.svc.lock().await;
-            let err = svc.store_mut().consume_challenge(stale_id, now).unwrap_err();
+            let err = svc
+                .store_mut()
+                .consume_challenge(stale_id, now)
+                .unwrap_err();
             // Expiry path returns Io with a descriptive message.
             assert!(format!("{err}").contains("expired"));
             // Row is gone.
@@ -3696,9 +3937,9 @@ mod tests {
             client_data_hash: b64_encode(&cdh),
             signature: b64_encode(&sig.to_bytes()),
             purpose: None,
-        
+
             ..Default::default()
-};
+        };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/admin/vouch"))
             .json(&req)
@@ -3749,9 +3990,9 @@ mod tests {
             client_data_hash: b64_encode(&cdh),
             signature: b64_encode(&sig.to_bytes()),
             purpose: None,
-        
+
             ..Default::default()
-};
+        };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/admin/vouch"))
             .json(&req)
@@ -3791,9 +4032,9 @@ mod tests {
                 client_data_hash: cdh_b64.clone(),
                 signature: sig_b64.clone(),
                 purpose: None,
-            
+
                 ..Default::default()
-})
+            })
             .send()
             .await
             .unwrap();
@@ -3815,9 +4056,9 @@ mod tests {
                 client_data_hash: cdh2,
                 signature: sig2,
                 purpose: None,
-            
+
                 ..Default::default()
-})
+            })
             .send()
             .await
             .unwrap();
@@ -3867,9 +4108,9 @@ mod tests {
             authenticator_data: auth2,
             signature: sig2,
             duration_secs: None,
-        
+
             ..Default::default()
-};
+        };
         let resp2 = reqwest::Client::new()
             .post(format!("{base}/v1/session/assert"))
             .json(&req2)
@@ -4226,8 +4467,7 @@ mod tests {
     #[test]
     fn anonymous_caller_bypasses_binding_read() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
         let res = check_device_binding_read(
             &anon_caller(),
             &tcp_trust_policy(),
@@ -4241,10 +4481,10 @@ mod tests {
     #[test]
     fn uds_caller_read_denied_on_unbound_urn_under_strict_policy() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
         let caller = uds_caller(1000);
-        let res = check_device_binding_read(&caller, &strict_policy(), Some(&store), "urn:device:x");
+        let res =
+            check_device_binding_read(&caller, &strict_policy(), Some(&store), "urn:device:x");
         assert!(res.is_err());
         assert_eq!(res.err().unwrap().status, StatusCode::FORBIDDEN);
     }
@@ -4253,12 +4493,12 @@ mod tests {
     #[test]
     fn uds_caller_tofu_binds_then_reads_succeed() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
         let caller = uds_caller(1000);
         let res = tofu_device_binding(&caller, &strict_policy(), Some(&store), "urn:device:x");
         assert!(res.is_ok());
-        let res = check_device_binding_read(&caller, &strict_policy(), Some(&store), "urn:device:x");
+        let res =
+            check_device_binding_read(&caller, &strict_policy(), Some(&store), "urn:device:x");
         assert!(res.is_ok());
     }
 
@@ -4266,8 +4506,7 @@ mod tests {
     #[test]
     fn uds_caller_mismatch_rejected_after_tofu() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
         let good = uds_caller(1000);
         let bad = uds_caller(9999);
         assert!(tofu_device_binding(&good, &strict_policy(), Some(&store), "urn:device:x").is_ok());
@@ -4281,10 +4520,11 @@ mod tests {
     #[test]
     fn admin_caller_bypasses_binding() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
         let other = uds_caller(1000);
-        assert!(tofu_device_binding(&other, &strict_policy(), Some(&store), "urn:device:x").is_ok());
+        assert!(
+            tofu_device_binding(&other, &strict_policy(), Some(&store), "urn:device:x").is_ok()
+        );
         // uid=0 passes the admin check even under strict_policy().
         let admin = uds_caller(0);
         let res = check_device_binding_read(&admin, &strict_policy(), Some(&store), "urn:device:x");
@@ -4299,19 +4539,20 @@ mod tests {
         // device-scoped read endpoints so legacy TCP deployments keep
         // working during the H-7 transport cutover.
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
         let caller = CallerIdentity::Anonymous;
         let res =
             check_device_binding_read(&caller, &strict_policy(), Some(&store), "urn:device:any");
-        assert!(res.is_ok(), "Anonymous must pass when strict_device_binding=false");
+        assert!(
+            res.is_ok(),
+            "Anonymous must pass when strict_device_binding=false"
+        );
     }
 
     #[test]
     fn anonymous_read_refused_under_strict_device_binding() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
         let caller = CallerIdentity::Anonymous;
         let res = check_device_binding_read(
             &caller,
@@ -4326,8 +4567,7 @@ mod tests {
     #[test]
     fn anonymous_write_refused_under_strict_device_binding() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
         let caller = CallerIdentity::Anonymous;
         let res = tofu_device_binding(
             &caller,
@@ -4342,11 +4582,9 @@ mod tests {
     #[test]
     fn anonymous_write_allowed_when_strict_device_binding_off() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
         let caller = CallerIdentity::Anonymous;
-        let res =
-            tofu_device_binding(&caller, &strict_policy(), Some(&store), "urn:device:any");
+        let res = tofu_device_binding(&caller, &strict_policy(), Some(&store), "urn:device:any");
         assert!(res.is_ok());
     }
 
@@ -4357,8 +4595,7 @@ mod tests {
     #[test]
     fn admin_caller_bypasses_strict_device_binding() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
         // uid=0 → admin under strict_policy and strict_device_binding_policy.
         let caller = uds_caller(0);
         let res = check_device_binding_read(

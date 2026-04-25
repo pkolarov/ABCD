@@ -59,8 +59,7 @@ fn test_enroll_user() {
     // below. Default `allow_unattested_credentials = false` no longer
     // accepts fmt=none, so this test exercises the packed path.
     let cdh = [0xBB; 32];
-    let attestation =
-        build_packed_self_attestation("example.com", b"cred-123", &cred_sk, &cdh);
+    let attestation = build_packed_self_attestation("example.com", b"cred-123", &cred_sk, &cdh);
     let result = svc
         .enroll_user(EnrollUserRequest {
             label: "alice".into(),
@@ -71,6 +70,7 @@ fn test_enroll_user() {
             display_name: "Alice".into(),
             authenticator_type: "platform".into(),
             client_data_json: None,
+            challenge_id: None,
         })
         .unwrap();
 
@@ -101,6 +101,7 @@ fn test_enroll_user_rejects_invalid_attestation() {
         display_name: "Alice".into(),
         authenticator_type: "platform".into(),
         client_data_json: None,
+        challenge_id: None,
     });
     assert!(result.is_err());
 }

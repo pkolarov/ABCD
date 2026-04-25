@@ -1482,28 +1482,54 @@ and to gate `fmt == "none"` behind an explicit
   compat). HTTP wire layer gains
   `EnrollUserRequestJson::client_data_json_b64: Option<String>`
   (`#[serde(default)]`) on the same backward-compat policy.
-  **Known gap**: today's enrollment flow has no server-issued
-  challenge endpoint, so `cdj.challenge` is *not* validated
-  against a server value (assertion-side does, via
-  `consume_challenge`). Closing that requires introducing
-  `/v1/enroll/challenge` and is tracked separately. The `type`
-  and `origin` checks land here in step-3 because they're
-  independent of the challenge plumbing and the type check alone
-  blocks the practical attack of replaying an assertion-time
-  clientDataJSON to the enrollment endpoint. New unit tests in
-  `service::a1_step3_client_data_tests` (8 tests): legacy
-  no-cdj passthrough, well-formed accepted, cdh mismatch rejected,
-  wrong type rejected, wrong origin rejected, crossOrigin true
-  rejected, crossOrigin false/missing accepted, malformed JSON
-  rejected. `cargo test --workspace` ⇒ 451/451 ok (up from 443);
-  clippy clean.
+  **Step-3 known gap (closed 2026-04-25 follow-up #6)**: at
+  step-3 land time the enrollment flow had no server-issued
+  challenge endpoint, so `cdj.challenge` was *not* validated
+  against a server value (assertion-side already did, via
+  `consume_challenge`). The 2026-04-25 follow-up closes this:
+  - new admin-gated `GET /v1/enroll/challenge` endpoint that
+    mirrors the session/admin challenge issuers — same shared
+    `issue_challenge` body, `chall-enroll-` prefix, 300 s TTL,
+    `MAX_OUTSTANDING_CHALLENGES = 4096` cap with B-5 sweep on
+    every put, returns 503 when full;
+  - `EnrollUserRequest` / `AdminSetupRequest` (and the
+    `EnrollUserRequestJson` wire shape) gain an optional
+    `challenge_id` field. When supplied, `enroll_user` /
+    `admin_setup` call `store.consume_challenge` *atomically*
+    (single-use, identical semantics to the assertion side)
+    before reaching `verify_enrollment_client_data`;
+  - `verify_enrollment_client_data` now takes an
+    `expected_challenge: Option<&[u8]>`. When `Some`, it parses
+    the cdj `challenge` field, decodes it via the same lenient
+    base64url decoder as M-12 (`decode_b64url_any`), and refuses
+    any mismatch. When `None`, the legacy "no enrollment
+    challenge" path runs so existing callers keep working
+    unchanged.
+  - When a caller supplies `challenge_id` but omits
+    `client_data_json`, the helper refuses the request — silently
+    dropping the binding would let a buggy client bypass the
+    freshness check it asked for.
+  9 new tests cover the plumbing — 5 unit tests in
+  `service::a1_step3_client_data_tests` (matching challenge
+  accepted, mismatched challenge rejected, padded base64url
+  accepted, challenge_id without cdj rejected, missing challenge
+  field rejected when expected) and 4 HTTP integration tests in
+  `http::tests` (unique nonces, full round-trip with single-use
+  enforcement, mismatched challenge rejected at the wire layer,
+  legacy no-`challenge_id` path still passes). Original step-3
+  unit tests (8) updated for the new signature; total now 13.
+  Workspace: `cargo test --workspace` ⇒ 477/477 ok (up from 468),
+  clippy `--workspace --all-targets -- -D warnings` clean,
+  `cargo fmt --check` clean.
 
 **A-1 overall**: Step-1 closed the `fmt=none` gap, Step-2 closed
 the `x5c` skipped-signature gap, Step-3 added field-level
-clientDataJSON validation at enrollment. The original A-1
-finding is fully addressed pending real-HW reverification of the
-multinode FIDO2 test (`dds-multinode-fido2-test` against a
-Crayonic / YubiKey).
+clientDataJSON validation at enrollment, and the 2026-04-25
+follow-up closes the §7.1 step-9 challenge-binding gap by
+introducing `/v1/enroll/challenge`. The original A-1 finding is
+fully addressed pending real-HW reverification of the multinode
+FIDO2 test (`dds-multinode-fido2-test` against a Crayonic /
+YubiKey).
 
 ---
 

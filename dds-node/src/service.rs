@@ -47,6 +47,19 @@ pub struct EnrollUserRequest {
     /// rp-id-hash check runs (legacy behaviour). Mirrors the M-12
     /// pattern at the assertion side.
     pub client_data_json: Option<Vec<u8>>,
+    /// **A-1 follow-up (server-issued enrollment challenge)**: optional
+    /// server-issued challenge ID from `GET /v1/enroll/challenge`. When
+    /// present together with `client_data_json`, the server consumes
+    /// the challenge atomically and verifies that the
+    /// `clientDataJSON.challenge` field decodes to the same bytes the
+    /// server issued — closing the last remaining gap in the WebAuthn
+    /// §7.1 step list at enrollment (the assertion side already does
+    /// this via `consume_challenge`). Backward compatible: when absent
+    /// the legacy "no challenge validation at enroll" path runs, so
+    /// existing callers (and code paths that still build the request
+    /// without a server round-trip, e.g. the bootstrap admin) keep
+    /// working unchanged.
+    pub challenge_id: Option<String>,
 }
 
 /// Request to enroll a device.
@@ -600,10 +613,27 @@ impl<
             // A-1 step-3: when the caller supplies raw clientDataJSON,
             // bind it to the signed hash and validate `type` /
             // `origin` / `crossOrigin` per WebAuthn §7.1.
+            //
+            // **A-1 follow-up**: if `challenge_id` is supplied, the
+            // server consumes the challenge atomically here (so a
+            // failed enrollment can't replay the same nonce) and
+            // forwards the raw bytes to the cdj.challenge check.
+            let challenge_bytes = match req.challenge_id.as_deref() {
+                Some(id) => Some(
+                    self.store
+                        .consume_challenge(id, now_epoch())
+                        .map_err(|e| {
+                            ServiceError::Fido2(format!("enrollment challenge invalid: {e}"))
+                        })?
+                        .to_vec(),
+                ),
+                None => None,
+            };
             verify_enrollment_client_data(
                 req.client_data_json.as_deref(),
                 &req.client_data_hash,
                 &req.rp_id,
+                challenge_bytes.as_deref(),
             )?;
 
             let parsed = dds_domain::fido2::verify_attestation(
@@ -1344,8 +1374,7 @@ impl<
                 let cdj_hash = Sha256::digest(cdj_bytes);
                 if cdj_hash.as_slice() != client_data_hash {
                     return Err(ServiceError::Fido2(
-                        "client_data_hash does not match SHA-256 of supplied clientDataJSON"
-                            .into(),
+                        "client_data_hash does not match SHA-256 of supplied clientDataJSON".into(),
                     ));
                 }
                 let cdj: serde_json::Value = serde_json::from_slice(cdj_bytes).map_err(|e| {
@@ -1361,9 +1390,12 @@ impl<
                     )));
                 }
                 // §7.2 step 8: challenge must equal server-issued value.
-                let ch = cdj.get("challenge").and_then(|v| v.as_str()).ok_or_else(|| {
-                    ServiceError::Fido2("clientDataJSON missing challenge field".into())
-                })?;
+                let ch = cdj
+                    .get("challenge")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        ServiceError::Fido2("clientDataJSON missing challenge field".into())
+                    })?;
                 // Clients may send base64url-without-padding (spec) or
                 // base64url-with-padding (some stacks). Decode both
                 // sides to raw bytes and compare.
@@ -1615,10 +1647,27 @@ impl<
         let mut credential_id = req.credential_id.clone();
         if self.verify_fido2 {
             // A-1 step-3: same clientDataJSON checks as `enroll_user`.
+            // **A-1 follow-up**: same challenge consumption as well —
+            // a bootstrapping admin who wants the §7.1 step-9 binding
+            // can fetch `/v1/enroll/challenge` first and supply
+            // `challenge_id` here. Optional; the legacy path preserves
+            // setup ergonomics when no challenge_id is provided.
+            let challenge_bytes = match req.challenge_id.as_deref() {
+                Some(id) => Some(
+                    self.store
+                        .consume_challenge(id, now_epoch())
+                        .map_err(|e| {
+                            ServiceError::Fido2(format!("enrollment challenge invalid: {e}"))
+                        })?
+                        .to_vec(),
+                ),
+                None => None,
+            };
             verify_enrollment_client_data(
                 req.client_data_json.as_deref(),
                 &req.client_data_hash,
                 &req.rp_id,
+                challenge_bytes.as_deref(),
             )?;
 
             let parsed = dds_domain::fido2::verify_attestation(
@@ -2326,23 +2375,30 @@ fn rand_u64() -> u64 {
 ///      `"webauthn.get"` instead).
 ///    - `origin == "https://<rp_id>"`.
 ///    - `crossOrigin != true`.
-///
-/// **Note** on the missing challenge check: the assertion path
-/// validates the cdj `challenge` against a server-issued value
-/// consumed via `consume_challenge`. Today's enrollment flow has no
-/// matching server-issued challenge endpoint — the client supplies
-/// whatever challenge it computed `client_data_hash` over. Closing
-/// that gap is a separate refactor (introduce
-/// `/v1/enroll/challenge`); the `type` and `origin` checks land here
-/// in step-3 because they are independent of that work.
+///    - When `expected_challenge` is supplied, the cdj `challenge`
+///      field decodes (base64url, padded or unpadded) to those exact
+///      bytes — closing the §7.1 step 9 gap that previously needed
+///      the `/v1/enroll/challenge` endpoint to land. The caller is
+///      responsible for atomically consuming the challenge from the
+///      server-side store before passing the bytes in.
 fn verify_enrollment_client_data(
     cdj_bytes: Option<&[u8]>,
     client_data_hash: &[u8],
     rp_id: &str,
+    expected_challenge: Option<&[u8]>,
 ) -> Result<(), ServiceError> {
     use sha2::{Digest, Sha256};
 
     let Some(cdj_bytes) = cdj_bytes else {
+        // No clientDataJSON supplied. If the caller went to the
+        // trouble of consuming a server challenge but didn't include
+        // the JSON, refuse — silently dropping the binding would let
+        // a buggy client bypass the freshness check it requested.
+        if expected_challenge.is_some() {
+            return Err(ServiceError::Fido2(
+                "challenge_id supplied without clientDataJSON; cannot verify cdj.challenge".into(),
+            ));
+        }
         return Ok(());
     };
 
@@ -2367,6 +2423,25 @@ fn verify_enrollment_client_data(
         return Err(ServiceError::Fido2(format!(
             "clientDataJSON type is {ty:?}, expected \"webauthn.create\""
         )));
+    }
+
+    // §7.1 step 9: when a server-issued challenge is supplied, the
+    // cdj challenge field must match it byte-for-byte. Same lenient
+    // base64url decoder as the assertion side (some JS stacks emit
+    // base64url-with-pad).
+    if let Some(expected_bytes) = expected_challenge {
+        let ch = cdj
+            .get("challenge")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ServiceError::Fido2("clientDataJSON missing challenge field".into()))?;
+        let ch_raw = decode_b64url_any(ch).ok_or_else(|| {
+            ServiceError::Fido2("clientDataJSON challenge field is not valid base64url".into())
+        })?;
+        if ch_raw != expected_bytes {
+            return Err(ServiceError::Fido2(
+                "clientDataJSON challenge does not match server-issued enrollment challenge".into(),
+            ));
+        }
     }
 
     // §7.1 step 10: origin must be https://<rp_id>.
@@ -3287,9 +3362,23 @@ mod platform_applier_tests {
         let (mut svc, admin, _) = setup();
         let dev = enroll_device(&mut svc, "ws-b4", vec!["workstation".into()], None);
 
-        let mut p_old = baseline_policy("p:supersede", PolicyScope { device_tags: vec![], org_units: vec![], identity_urns: vec![] });
+        let mut p_old = baseline_policy(
+            "p:supersede",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
         p_old.version = 3;
-        let mut p_new = baseline_policy("p:supersede", PolicyScope { device_tags: vec![], org_units: vec![], identity_urns: vec![] });
+        let mut p_new = baseline_policy(
+            "p:supersede",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
         p_new.version = 7;
 
         // Insert in "wrong" order: the higher version arrives first,
@@ -3318,7 +3407,14 @@ mod platform_applier_tests {
         let (mut svc, admin, _) = setup();
         let dev = enroll_device(&mut svc, "ws-b4-iat", vec!["workstation".into()], None);
 
-        let p = baseline_policy("p:tie", PolicyScope { device_tags: vec![], org_units: vec![], identity_urns: vec![] });
+        let p = baseline_policy(
+            "p:tie",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
         let mut t_early = attest_with_body(&admin, "p-early", &p);
         let mut t_late = attest_with_body(&admin, "p-late", &p);
         // attest_with_body fixes iat at 1_700_000_000; tweak the late
@@ -3332,16 +3428,8 @@ mod platform_applier_tests {
         };
         t_late = Token::sign(p_late_payload, &admin.signing_key).unwrap();
 
-        svc.trust_graph
-            .write()
-            .unwrap()
-            .add_token(t_early)
-            .unwrap();
-        svc.trust_graph
-            .write()
-            .unwrap()
-            .add_token(t_late)
-            .unwrap();
+        svc.trust_graph.write().unwrap().add_token(t_early).unwrap();
+        svc.trust_graph.write().unwrap().add_token(t_late).unwrap();
 
         let hits = svc.list_applicable_windows_policies(&dev).unwrap();
         assert_eq!(hits.len(), 1);
@@ -3406,8 +3494,22 @@ mod platform_applier_tests {
         let (mut svc, admin, _) = setup();
         let dev = enroll_device(&mut svc, "ws-b4-distinct", vec![], None);
 
-        let a = baseline_policy("p:a", PolicyScope { device_tags: vec![], org_units: vec![], identity_urns: vec![] });
-        let b = baseline_policy("p:b", PolicyScope { device_tags: vec![], org_units: vec![], identity_urns: vec![] });
+        let a = baseline_policy(
+            "p:a",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        let b = baseline_policy(
+            "p:b",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
         svc.trust_graph
             .write()
             .unwrap()
@@ -3435,12 +3537,14 @@ mod platform_applier_tests {
 #[cfg(test)]
 mod a1_step3_client_data_tests {
     //! **A-1 step-3**: unit tests for `verify_enrollment_client_data`.
-    //! Mirror the M-12 assertion-side coverage; the only differences
-    //! are `type == "webauthn.create"` (vs `"webauthn.get"`) and the
-    //! absence of a server-issued challenge check (no enrollment
-    //! challenge endpoint exists yet — see helper docstring).
+    //! Mirror the M-12 assertion-side coverage. The original step-3
+    //! pass landed `type` / `origin` / `crossOrigin`; the
+    //! 2026-04-25 follow-up plumbed in the optional server-issued
+    //! enrollment challenge (`expected_challenge`) so cdj.challenge
+    //! can be bound just like at the assertion side.
 
     use super::*;
+    use base64::Engine;
     use sha2::{Digest, Sha256};
 
     fn cdj(ty: &str, origin: &str, cross_origin: Option<bool>) -> Vec<u8> {
@@ -3455,6 +3559,15 @@ mod a1_step3_client_data_tests {
         serde_json::to_vec(&obj).unwrap()
     }
 
+    fn cdj_with_challenge(ty: &str, origin: &str, challenge_b64url: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "type": ty,
+            "origin": origin,
+            "challenge": challenge_b64url,
+        }))
+        .unwrap()
+    }
+
     fn cdh_of(bytes: &[u8]) -> Vec<u8> {
         Sha256::digest(bytes).to_vec()
     }
@@ -3464,24 +3577,27 @@ mod a1_step3_client_data_tests {
         // None means "old client" — helper must succeed without
         // touching anything else. Caller still validates rp-id-hash
         // via verify_attestation.
-        verify_enrollment_client_data(None, &[0u8; 32], "example.com").unwrap();
+        verify_enrollment_client_data(None, &[0u8; 32], "example.com", None).unwrap();
     }
 
     #[test]
     fn well_formed_cdj_accepted() {
         let bytes = cdj("webauthn.create", "https://example.com", None);
         let cdh = cdh_of(&bytes);
-        verify_enrollment_client_data(Some(&bytes), &cdh, "example.com").unwrap();
+        verify_enrollment_client_data(Some(&bytes), &cdh, "example.com", None).unwrap();
     }
 
     #[test]
     fn cdh_mismatch_rejected() {
         let bytes = cdj("webauthn.create", "https://example.com", None);
         // Pass a CDH that doesn't match the JSON.
-        let res = verify_enrollment_client_data(Some(&bytes), &[0u8; 32], "example.com");
+        let res = verify_enrollment_client_data(Some(&bytes), &[0u8; 32], "example.com", None);
         match res {
             Err(ServiceError::Fido2(msg)) => {
-                assert!(msg.contains("client_data_hash does not match"), "msg: {msg}");
+                assert!(
+                    msg.contains("client_data_hash does not match"),
+                    "msg: {msg}"
+                );
             }
             other => panic!("expected Fido2(cdh mismatch), got {other:?}"),
         }
@@ -3494,7 +3610,7 @@ mod a1_step3_client_data_tests {
         // clientDataJSON to the enrollment endpoint must be rejected.
         let bytes = cdj("webauthn.get", "https://example.com", None);
         let cdh = cdh_of(&bytes);
-        let res = verify_enrollment_client_data(Some(&bytes), &cdh, "example.com");
+        let res = verify_enrollment_client_data(Some(&bytes), &cdh, "example.com", None);
         match res {
             Err(ServiceError::Fido2(msg)) => {
                 assert!(msg.contains("webauthn.create"), "msg: {msg}");
@@ -3507,7 +3623,7 @@ mod a1_step3_client_data_tests {
     fn wrong_origin_rejected() {
         let bytes = cdj("webauthn.create", "https://attacker.com", None);
         let cdh = cdh_of(&bytes);
-        let res = verify_enrollment_client_data(Some(&bytes), &cdh, "example.com");
+        let res = verify_enrollment_client_data(Some(&bytes), &cdh, "example.com", None);
         match res {
             Err(ServiceError::Fido2(msg)) => {
                 assert!(msg.contains("origin"), "msg: {msg}");
@@ -3521,7 +3637,7 @@ mod a1_step3_client_data_tests {
     fn cross_origin_rejected() {
         let bytes = cdj("webauthn.create", "https://example.com", Some(true));
         let cdh = cdh_of(&bytes);
-        let res = verify_enrollment_client_data(Some(&bytes), &cdh, "example.com");
+        let res = verify_enrollment_client_data(Some(&bytes), &cdh, "example.com", None);
         match res {
             Err(ServiceError::Fido2(msg)) => {
                 assert!(msg.contains("crossOrigin"), "msg: {msg}");
@@ -3535,23 +3651,103 @@ mod a1_step3_client_data_tests {
         // Explicit `false` is fine.
         let bytes = cdj("webauthn.create", "https://example.com", Some(false));
         let cdh = cdh_of(&bytes);
-        verify_enrollment_client_data(Some(&bytes), &cdh, "example.com").unwrap();
+        verify_enrollment_client_data(Some(&bytes), &cdh, "example.com", None).unwrap();
         // Missing field defaults to `false`.
         let bytes = cdj("webauthn.create", "https://example.com", None);
         let cdh = cdh_of(&bytes);
-        verify_enrollment_client_data(Some(&bytes), &cdh, "example.com").unwrap();
+        verify_enrollment_client_data(Some(&bytes), &cdh, "example.com", None).unwrap();
     }
 
     #[test]
     fn malformed_json_rejected() {
         let bytes = b"this is not json".to_vec();
         let cdh = cdh_of(&bytes);
-        let res = verify_enrollment_client_data(Some(&bytes), &cdh, "example.com");
+        let res = verify_enrollment_client_data(Some(&bytes), &cdh, "example.com", None);
         match res {
             Err(ServiceError::Fido2(msg)) => {
                 assert!(msg.contains("not valid JSON"), "msg: {msg}");
             }
             other => panic!("expected Fido2(json), got {other:?}"),
+        }
+    }
+
+    // -- A-1 follow-up: server-issued enrollment challenge --
+
+    #[test]
+    fn matching_challenge_accepted() {
+        let server_bytes = vec![0xAB; 32];
+        let ch_b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&server_bytes);
+        let bytes = cdj_with_challenge("webauthn.create", "https://example.com", &ch_b64url);
+        let cdh = cdh_of(&bytes);
+        verify_enrollment_client_data(Some(&bytes), &cdh, "example.com", Some(&server_bytes))
+            .unwrap();
+    }
+
+    #[test]
+    fn mismatched_challenge_rejected() {
+        let server_bytes = vec![0xAB; 32];
+        // Client signs over a *different* challenge value.
+        let other_bytes = vec![0xCD; 32];
+        let ch_b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&other_bytes);
+        let bytes = cdj_with_challenge("webauthn.create", "https://example.com", &ch_b64url);
+        let cdh = cdh_of(&bytes);
+        let res =
+            verify_enrollment_client_data(Some(&bytes), &cdh, "example.com", Some(&server_bytes));
+        match res {
+            Err(ServiceError::Fido2(msg)) => {
+                assert!(msg.contains("challenge does not match"), "msg: {msg}");
+            }
+            other => panic!("expected Fido2(challenge mismatch), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn padded_base64url_challenge_accepted() {
+        // Some JS stacks emit base64url *with* padding. Mirror the
+        // M-12 lenient decode.
+        let server_bytes = b"hello world".to_vec();
+        let ch_padded = base64::engine::general_purpose::URL_SAFE.encode(&server_bytes);
+        assert!(ch_padded.contains('='), "expected padded encoding");
+        let bytes = cdj_with_challenge("webauthn.create", "https://example.com", &ch_padded);
+        let cdh = cdh_of(&bytes);
+        verify_enrollment_client_data(Some(&bytes), &cdh, "example.com", Some(&server_bytes))
+            .unwrap();
+    }
+
+    #[test]
+    fn challenge_supplied_without_cdj_rejected() {
+        // The caller went to the trouble of consuming a server
+        // challenge but then withheld the JSON — refuse, otherwise
+        // the freshness binding is silently skipped.
+        let server_bytes = vec![0u8; 32];
+        let res =
+            verify_enrollment_client_data(None, &[0u8; 32], "example.com", Some(&server_bytes));
+        match res {
+            Err(ServiceError::Fido2(msg)) => {
+                assert!(msg.contains("challenge_id supplied without"), "msg: {msg}");
+            }
+            other => panic!("expected Fido2(challenge_id without cdj), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_challenge_field_rejected_when_expected() {
+        // Server expects a challenge to be bound, but the cdj has no
+        // `challenge` field at all.
+        let server_bytes = vec![0u8; 32];
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "type": "webauthn.create",
+            "origin": "https://example.com",
+        }))
+        .unwrap();
+        let cdh = cdh_of(&bytes);
+        let res =
+            verify_enrollment_client_data(Some(&bytes), &cdh, "example.com", Some(&server_bytes));
+        match res {
+            Err(ServiceError::Fido2(msg)) => {
+                assert!(msg.contains("missing challenge"), "msg: {msg}");
+            }
+            other => panic!("expected Fido2(missing challenge), got {other:?}"),
         }
     }
 }

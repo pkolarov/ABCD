@@ -81,6 +81,7 @@ impl Synth {
             display_name: format!("User {s}"),
             authenticator_type: "platform".into(),
             client_data_json: None,
+            challenge_id: None,
         }
     }
 

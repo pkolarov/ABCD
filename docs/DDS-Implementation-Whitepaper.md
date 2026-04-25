@@ -1337,7 +1337,12 @@ Endpoints:
 
 - `POST /v1/enroll/user`
 - `POST /v1/enroll/device`
-- `POST /v1/session`
+- `GET  /v1/enroll/challenge` (server-issued enrollment nonce; closes WebAuthn §7.1 step 9)
+- `POST /v1/session/assert`
+- `GET  /v1/session/challenge`
+- `POST /v1/admin/setup`
+- `POST /v1/admin/vouch`
+- `GET  /v1/admin/challenge`
 - `POST /v1/policy/evaluate`
 - `GET /v1/status`
 

@@ -290,7 +290,7 @@ impl Publisher {
                 idle_timeout_secs: 60,
                 api_addr: format!("127.0.0.1:{}", reserve_port()),
                 api_auth: Default::default(),
-            allow_legacy_v1_tokens: false,
+                allow_legacy_v1_tokens: false,
             },
             org_hash: "e2e-org".to_string(),
             domain: DomainConfig {
@@ -433,6 +433,7 @@ async fn enroll_user_fido2(
             display_name: label.to_string(),
             authenticator_type: "platform".to_string(),
             client_data_json_b64: None,
+            challenge_id: None,
         })
         .send()
         .await
@@ -489,9 +490,9 @@ async fn post_session_assert(
             authenticator_data: encode_b64(&auth_data),
             signature: encode_b64(&sig.to_bytes()),
             duration_secs: Some(300),
-        
+
             ..Default::default()
-})
+        })
         .send()
         .await
         .unwrap()
@@ -666,6 +667,7 @@ async fn binary_http_api_end_to_end() {
             display_name: "Carol".to_string(),
             authenticator_type: "platform".to_string(),
             client_data_json_b64: None,
+            challenge_id: None,
         })
         .send()
         .await
