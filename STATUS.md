@@ -1,7 +1,38 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 (admission cert revocation list — closed the
+> Last updated: 2026-04-26 follow-up (admission revocation
+> gossip-piggyback — closes the "future increment" caveat that the
+> morning revocation-list pass left open in
+> `docs/threat-model-review.md` §1 recommendation #2). Wire format:
+> `dds_net::admission::AdmissionResponse` now carries a
+> `#[serde(default)] revocations: Vec<Vec<u8>>` field with backward-
+> compatible decoding (legacy v1 senders that omit the field
+> deserialize cleanly; legacy readers ignore the unknown v2 field —
+> both pinned by new wire-format unit tests). Sender side
+> (`DdsNode::handle_admission_event`) attaches up to
+> `MAX_REVOCATIONS_PER_RESPONSE = 1024` opaque CBOR-encoded
+> `AdmissionRevocation` blobs from the local store on every H-12
+> handshake response. Receiver side (`verify_peer_admission` →
+> `merge_piggybacked_revocations`) drops the entire vector if the
+> sender over-shoots the cap (DoS guard), then routes survivors
+> through `AdmissionRevocationStore::merge` — which verifies each
+> entry's signature against the domain pubkey before insertion —
+> and atomically rewrites
+> `<data_dir>/admission_revocations.cbor` if any new entries
+> landed. Net effect: an admin issues `dds-node revoke-admission`
+> against any one node and the revocation now propagates
+> domain-wide on the order of a handshake round trip; the
+> manual-file-copy flow remains as an emergency-rollout fallback.
+> Six new tests: 4 unit tests in `dds-net::admission::tests` (cap
+> constant pinned, with-revocations roundtrip, v1→v2 forward decode,
+> v2→v1 backward decode), 2 integration tests in
+> `dds-node/tests/h12_revocation_piggyback.rs` (happy-path
+> propagation + persistence; foreign-domain rejection at the merge
+> boundary). Workspace test count: 509 (up from 503); clippy clean;
+> cargo fmt clean.
+>
+> Previous: 2026-04-26 morning (admission cert revocation list — closed the
 > last remaining High item from `docs/threat-model-review.md` §1 / §8
 > open item #4. New `dds_domain::AdmissionRevocation` type (domain-signed
 > CBOR, mirrors `AdmissionCert`); new `dds_node::admission_revocation_store`
@@ -10,9 +41,8 @@
 > revoked peer ids; `DdsNode::init` refuses to start if the local node's
 > own PeerId is on the list); two new CLI subcommands —
 > `dds-node revoke-admission` issues a revocation,
-> `dds-node import-revocation` adds it to a node's data dir. v1
-> distribution is manual file copy; gossip-piggyback is a future
-> increment. 23 new tests across `dds-domain` (6 unit), `dds-node`
+> `dds-node import-revocation` adds it to a node's data dir.
+> 23 new tests across `dds-domain` (6 unit), `dds-node`
 > (11 unit + 4 integration + 2 CLI integration). Workspace test count:
 > 503 (up from 480); clippy clean; cargo fmt clean.
 >

@@ -1,13 +1,14 @@
 //! DDS node: ties together storage, trust, networking, and sync.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use dds_core::crdt::causal_dag::{CausalDag, Operation};
 use dds_core::token::{TOKEN_WIRE_V1, Token, TokenKind};
 use dds_core::trust::TrustGraph;
-use dds_net::admission::{AdmissionRequest, AdmissionResponse};
+use dds_net::admission::{AdmissionRequest, AdmissionResponse, MAX_REVOCATIONS_PER_RESPONSE};
 use dds_net::gossip::{DdsTopic, DdsTopicSet, GossipMessage};
 use dds_net::sync::{SyncPayload, SyncRequest, SyncResponse, apply_sync_payloads_with_graph};
 use dds_net::transport::{DdsBehaviour, DdsBehaviourEvent, SwarmConfig};
@@ -146,7 +147,17 @@ pub struct DdsNode {
     /// `<data_dir>/admission_revocations.cbor`. Consulted before
     /// admitting a peer in [`Self::verify_peer_admission`] and at
     /// startup in [`Self::init`] so a revoked node refuses to start.
+    /// The store is also extended at runtime via the H-12 admission
+    /// handshake — neighbours piggy-back their local revocation lists
+    /// onto [`AdmissionResponse::revocations`] and the requester
+    /// merges any new entries (gated by signature verification).
     admission_revocations: AdmissionRevocationStore,
+    /// On-disk path that backs [`Self::admission_revocations`]. Held
+    /// here so the H-12 piggy-back path can persist newly-merged
+    /// entries without re-reading the config; the same path is
+    /// computed by [`crate::config::NodeConfig::admission_revocations_path`]
+    /// at startup.
+    admission_revocations_path: PathBuf,
 }
 
 impl DdsNode {
@@ -266,6 +277,7 @@ impl DdsNode {
             mdns_known_peers: BTreeSet::new(),
             admitted_peers: BTreeSet::new(),
             admission_revocations,
+            admission_revocations_path: revocations_path,
         })
     }
 
@@ -523,11 +535,25 @@ impl DdsNode {
                             None
                         }
                     };
+                    // Threat-model §1 / item #4 follow-up — piggy-back
+                    // the local revocation list onto the response so
+                    // newly connected peers pick up revocations
+                    // transitively. Capped by
+                    // `MAX_REVOCATIONS_PER_RESPONSE` to keep a single
+                    // exchange bounded; entries beyond the cap fan
+                    // out on subsequent reconnections.
+                    let revocations = self.serialized_revocations_for_wire();
                     if self
                         .swarm
                         .behaviour_mut()
                         .admission
-                        .send_response(channel, AdmissionResponse { cert_cbor })
+                        .send_response(
+                            channel,
+                            AdmissionResponse {
+                                cert_cbor,
+                                revocations,
+                            },
+                        )
                         .is_err()
                     {
                         warn!(%peer, "H-12: failed to send admission response (channel closed)");
@@ -547,6 +573,27 @@ impl DdsNode {
         }
     }
 
+    /// Encode up to [`MAX_REVOCATIONS_PER_RESPONSE`] entries from the
+    /// local revocation store as opaque CBOR blobs for the H-12
+    /// piggy-back. The order is whatever the store yields (insertion
+    /// order today); deterministic ordering is not required because
+    /// the receiver merges by `(peer_id, signature)` independent of
+    /// position. A serialization failure on any single entry skips
+    /// just that entry — the rest still ship.
+    fn serialized_revocations_for_wire(&self) -> Vec<Vec<u8>> {
+        let entries = self.admission_revocations.entries();
+        let mut out = Vec::with_capacity(entries.len().min(MAX_REVOCATIONS_PER_RESPONSE));
+        for rev in entries.iter().take(MAX_REVOCATIONS_PER_RESPONSE) {
+            match rev.to_cbor() {
+                Ok(b) => out.push(b),
+                Err(e) => {
+                    warn!(error = %e, peer_id = %rev.body.peer_id, "H-12: skipping revocation that failed to encode for piggy-back")
+                }
+            }
+        }
+        out
+    }
+
     /// Verify a peer-supplied admission cert (H-12). On success the
     /// peer is added to `admitted_peers` and an opportunistic sync is
     /// kicked off — at this point we've proven the peer belongs to
@@ -556,7 +603,22 @@ impl DdsNode {
     /// before accepting the cert we consult `admission_revocations`.
     /// A peer whose id appears there is rejected even with a valid
     /// cert, since the cert was issued before the admin revoked them.
+    ///
+    /// Threat-model §1 — gossip-piggyback distribution: any
+    /// revocations the peer attached to its response are merged into
+    /// the local store *regardless* of whether the cert verification
+    /// succeeds. Each entry is independently signed by the domain
+    /// key, so a peer that fails to admit can still legitimately
+    /// hand us a freshly-issued revocation we should honour. Newly-
+    /// merged entries are persisted atomically so the next start-up
+    /// applies them at `init`.
     fn verify_peer_admission(&mut self, peer_id: PeerId, response: AdmissionResponse) {
+        // Process piggy-backed revocations first. We do this even if
+        // the cert later fails to verify — the revocations carry
+        // their own domain-signed authority and `add` rejects any
+        // entry that doesn't verify against our domain pubkey.
+        self.merge_piggybacked_revocations(&peer_id, response.revocations);
+
         let peer_str = peer_id.to_string();
         if self.admission_revocations.is_revoked(&peer_str) {
             warn!(
@@ -594,6 +656,75 @@ impl DdsNode {
             Err(e) => {
                 warn!(%peer_id, error = ?e, "H-12: peer cert rejected — staying unadmitted");
             }
+        }
+    }
+
+    /// Merge piggy-backed admission revocations from a peer's
+    /// `AdmissionResponse` into the local store. Drops the entire
+    /// list if it exceeds [`MAX_REVOCATIONS_PER_RESPONSE`] so a
+    /// hostile sender cannot wedge the handshake by oversending; per-
+    /// entry verification (signature against the domain pubkey) is
+    /// the gating check for everything that survives the cap. If any
+    /// new entries land, the on-disk file is rewritten atomically so
+    /// the next start-up sees them.
+    fn merge_piggybacked_revocations(&mut self, peer_id: &PeerId, revocations: Vec<Vec<u8>>) {
+        if revocations.is_empty() {
+            return;
+        }
+        if revocations.len() > MAX_REVOCATIONS_PER_RESPONSE {
+            warn!(
+                %peer_id,
+                count = revocations.len(),
+                cap = MAX_REVOCATIONS_PER_RESPONSE,
+                "H-12: peer over-sent piggy-backed revocations — dropping"
+            );
+            return;
+        }
+        let mut decoded = Vec::with_capacity(revocations.len());
+        for blob in revocations {
+            match dds_domain::AdmissionRevocation::from_cbor(&blob) {
+                Ok(r) => decoded.push(r),
+                Err(e) => debug!(
+                    %peer_id,
+                    error = %e,
+                    "H-12: skipping piggy-backed revocation that failed to decode"
+                ),
+            }
+        }
+        if decoded.is_empty() {
+            return;
+        }
+        let added =
+            self.admission_revocations
+                .merge(crate::admission_revocation_store::RevocationListV1 {
+                    v: 1,
+                    entries: decoded,
+                });
+        if added == 0 {
+            return;
+        }
+        // Persist the augmented list so the new entries survive
+        // restart. A persistence failure must not break the
+        // admission path — log loudly and leave the in-memory store
+        // updated. The next successful `import-revocation` or
+        // piggy-back will re-attempt the save.
+        match crate::admission_revocation_store::save(
+            &self.admission_revocations_path,
+            &self.admission_revocations,
+        ) {
+            Ok(()) => info!(
+                %peer_id,
+                added,
+                total = self.admission_revocations.len(),
+                "H-12: merged piggy-backed admission revocations from peer"
+            ),
+            Err(e) => warn!(
+                %peer_id,
+                added,
+                error = %e,
+                path = %self.admission_revocations_path.display(),
+                "H-12: merged revocations into memory but failed to persist"
+            ),
         }
     }
 

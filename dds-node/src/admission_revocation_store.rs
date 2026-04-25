@@ -19,12 +19,29 @@
 //!
 //! ## Distribution
 //!
-//! v1 is manual: the admin issues a revocation with `dds-node
-//! revoke-admission` and ships the resulting CBOR file to every node
-//! that should enforce it. A future increment will piggy-back the
-//! list on the H-12 admission response so transitively-connected nodes
-//! pick up new revocations without admin action. For now the explicit
-//! manual flow makes the trust boundary obvious.
+//! Two complementary paths:
+//!
+//! 1. **Admin-driven (`dds-node revoke-admission` + `import-revocation`)**
+//!    — the admin issues a revocation against any node and the
+//!    operator can ship the resulting CBOR file to other nodes
+//!    out-of-band. This is the original v1 manual flow; it stays
+//!    available as a "force-immediate" path for emergency rollouts.
+//!
+//! 2. **H-12 piggy-back (`AdmissionResponse.revocations`)** — every
+//!    H-12 admission handshake also ships the local revocation list
+//!    (capped at `dds_net::admission::MAX_REVOCATIONS_PER_RESPONSE =
+//!    1024` entries per response). Receivers route the list through
+//!    [`AdmissionRevocationStore::merge`], which verifies each entry
+//!    against the domain pubkey before insertion, then atomically
+//!    rewrites the on-disk file via [`save`] so the new entries
+//!    survive restart. As neighbours reconnect they pull and re-fan
+//!    so a single `revoke-admission` against any node propagates
+//!    domain-wide on the order of a handshake round trip.
+//!
+//! Both paths share the same verification gate, so a malicious
+//! admitted peer cannot forge or rewrite revocations — the worst it
+//! can do on the gossip path is *omit* them, which is no worse than
+//! an offline node under the manual flow.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
