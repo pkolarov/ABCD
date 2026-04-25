@@ -59,4 +59,18 @@ public sealed class AgentConfig
     /// Default: 300 seconds.
     /// </summary>
     public int EnvelopeMaxClockSkewSeconds { get; set; } = 300;
+
+    /// <summary>
+    /// <b>A-6 (security review)</b>: hard cap (bytes) on a single
+    /// software-package download. The downloader pre-flights the
+    /// HTTP <c>Content-Length</c> header against this value, then
+    /// enforces it incrementally as bytes are written so a server
+    /// that omits the header (or lies) cannot still fill the disk.
+    /// SHA-256 is computed via <c>IncrementalHash</c> in the same
+    /// loop so the verifier already has the digest by the time the
+    /// stream completes — no second pass over the file. Default:
+    /// 1 GiB. Operators with strict size budgets (kiosks, edge
+    /// devices) should tighten this.
+    /// </summary>
+    public long MaxPackageBytes { get; set; } = 1L * 1024 * 1024 * 1024;
 }

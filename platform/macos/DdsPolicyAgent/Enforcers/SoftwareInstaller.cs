@@ -192,15 +192,92 @@ public sealed class SoftwareInstaller : IEnforcer
             _config.ResolvePackageCacheDir(),
             $"{SanitizeFileName(packageId)}-{SanitizeFileName(version)}{extension}");
 
+        // **A-6 (security review)**: stream-copy the response with a
+        // hard byte cap. Pre-A-6 the agent called `CopyToAsync` with no
+        // bound, so a hostile or MITM'd publisher URL could fill the
+        // disk before the trailing SHA-256 mismatch was caught (the
+        // hash check at the call site still ran, but only *after* the
+        // bytes had already landed). We now:
+        //   1. Pre-flight `Content-Length` against `_config.MaxPackageBytes`.
+        //   2. Stream in 64 KiB chunks; abort the moment the running
+        //      total crosses the cap (closes the case where the server
+        //      omits or lies about the header).
+        // SHA-256 stays at the call site because the file:// path also
+        // needs to be hashed (no download stream there). The hash
+        // comparison is cheap relative to the install, and keeping
+        // both paths through the same `ComputeSha256Async` keeps the
+        // contract simple.
         using var client = _httpClientFactory.CreateClient(nameof(SoftwareInstaller));
-        using var response = await client.GetAsync(uri, ct).ConfigureAwait(false);
-        response.EnsureSuccessStatusCode();
+        try
+        {
+            using var response = await client
+                .GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, ct)
+                .ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
 
-        await using var input = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-        await using var output = File.Create(targetPath);
-        await input.CopyToAsync(output, ct).ConfigureAwait(false);
+            var maxBytes = _config.MaxPackageBytes;
+            var declared = response.Content.Headers.ContentLength;
+            if (declared.HasValue && declared.Value > maxBytes)
+            {
+                throw new InvalidOperationException(
+                    $"package download refused for '{packageId}': server-declared " +
+                    $"Content-Length {declared.Value} exceeds cap {maxBytes} bytes");
+            }
+
+            await using var input = await response.Content
+                .ReadAsStreamAsync(ct)
+                .ConfigureAwait(false);
+            await using var output = File.Create(targetPath);
+            await CopyWithCapAsync(input, output, maxBytes, packageId, ct)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            TryDelete(targetPath);
+            throw;
+        }
 
         return targetPath;
+    }
+
+    /// <summary>
+    /// <b>A-6 (security review)</b>: stream <paramref name="input"/>
+    /// into <paramref name="output"/> with a hard byte cap, aborting
+    /// with <see cref="InvalidOperationException"/> the moment the
+    /// running total crosses <paramref name="maxBytes"/>.
+    /// </summary>
+    private static async Task CopyWithCapAsync(
+        Stream input,
+        Stream output,
+        long maxBytes,
+        string packageId,
+        CancellationToken ct)
+    {
+        var buffer = new byte[64 * 1024];
+        long total = 0;
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            var read = await input
+                .ReadAsync(buffer.AsMemory(0, buffer.Length), ct)
+                .ConfigureAwait(false);
+            if (read == 0) break;
+
+            total += read;
+            if (total > maxBytes)
+            {
+                throw new InvalidOperationException(
+                    $"package download exceeded cap for '{packageId}': read " +
+                    $"{total} bytes, max {maxBytes}");
+            }
+
+            await output.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+        }
+    }
+
+    private static void TryDelete(string path)
+    {
+        try { File.Delete(path); } catch { /* best-effort cleanup */ }
     }
 
     private string? TryGetInstalledVersion(string packageId)

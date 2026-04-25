@@ -126,6 +126,131 @@ public class EnforcerTests
         Assert.Contains("[AUDIT]", outcome.Changes[0]);
     }
 
+    // --- A-6: bounded software downloads -------------------------------------
+
+    /// <summary>
+    /// Helper: build a `SoftwareInstaller` whose HTTP client serves a
+    /// synthetic body of <paramref name="bodyLen"/> bytes (Content-Length
+    /// optional). Sets <c>MaxPackageBytes</c> to <paramref name="cap"/>.
+    /// `pkgutil --pkg-info` is stubbed to return non-zero so the
+    /// "already installed" short-circuit doesn't fire.
+    /// </summary>
+    private static (SoftwareInstaller installer, JsonElement directive) MakeA6Installer(
+        long bodyLen, bool emitContentLength, long cap, string packageId, string version)
+    {
+        var http = new HttpClient(new FakeBytesHandler(bodyLen, emitContentLength));
+        var cfg = new AgentConfig
+        {
+            RequirePackageSignature = false,
+            MaxPackageBytes = cap,
+            PackageCacheDir = Path.Combine(Path.GetTempPath(),
+                $"dds-a6-{Guid.NewGuid():N}"),
+        };
+        var runner = new RecordingCommandRunner(
+            (file, _, _) => file == "/usr/sbin/pkgutil"
+                ? new CommandResult(1, string.Empty, string.Empty)
+                : new CommandResult(0, string.Empty, string.Empty));
+        var installer = new SoftwareInstaller(
+            NullLogger<SoftwareInstaller>.Instance,
+            runner,
+            Options.Create(cfg),
+            new StaticHttpClientFactory(http));
+        var directive = JsonDocument.Parse($$"""
+        {
+            "package_id": "{{packageId}}",
+            "version": "{{version}}",
+            "action": "Install",
+            "source": "https://example.invalid/pkg.pkg",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+        """).RootElement;
+        return (installer, directive);
+    }
+
+    /// <summary>
+    /// Save/restore wrapper around `DDS_POLICYAGENT_ASSUME_ROOT` so
+    /// that A-6 tests don't trample on parallel test classes (e.g.
+    /// `BackendOperationTests`) that also depend on this env var.
+    /// </summary>
+    private readonly struct AssumeRootScope : IDisposable
+    {
+        private readonly string? _prev;
+        public AssumeRootScope(string? prev) { _prev = prev; }
+        public static AssumeRootScope Enter()
+        {
+            var prev = Environment.GetEnvironmentVariable("DDS_POLICYAGENT_ASSUME_ROOT");
+            Environment.SetEnvironmentVariable("DDS_POLICYAGENT_ASSUME_ROOT", "1");
+            return new AssumeRootScope(prev);
+        }
+        public void Dispose()
+            => Environment.SetEnvironmentVariable("DDS_POLICYAGENT_ASSUME_ROOT", _prev);
+    }
+
+    /// <summary>
+    /// A-6: when `Content-Length` declares a body larger than the cap,
+    /// the download is refused before any bytes are written.
+    /// </summary>
+    [Fact]
+    public async Task SoftwareInstaller_a6_refuses_download_when_content_length_exceeds_cap()
+    {
+        using var _ = AssumeRootScope.Enter();
+        var (installer, directive) = MakeA6Installer(
+            bodyLen: 4 * 1024,
+            emitContentLength: true,
+            cap: 1024,
+            packageId: "com.example.a6.declared",
+            version: "1.0");
+        var outcome = await installer.ApplyAsync(directive, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Failed, outcome.Status);
+        Assert.NotNull(outcome.Error);
+        Assert.Contains("Content-Length", outcome.Error);
+        Assert.Contains("exceeds cap", outcome.Error);
+    }
+
+    /// <summary>
+    /// A-6: when no `Content-Length` is sent and the body actually
+    /// exceeds the cap, the streaming loop aborts mid-flight and the
+    /// partial file is deleted.
+    /// </summary>
+    [Fact]
+    public async Task SoftwareInstaller_a6_refuses_download_when_stream_exceeds_cap()
+    {
+        using var _ = AssumeRootScope.Enter();
+        var (installer, directive) = MakeA6Installer(
+            bodyLen: 4 * 1024,
+            emitContentLength: false,
+            cap: 1024,
+            packageId: "com.example.a6.streamed",
+            version: "1.0");
+        var outcome = await installer.ApplyAsync(directive, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Failed, outcome.Status);
+        Assert.NotNull(outcome.Error);
+        Assert.Contains("exceeded cap", outcome.Error);
+    }
+
+    /// <summary>
+    /// A-6: when the body fits under the cap, the download succeeds.
+    /// (The hash check then fails because we feed 0xAA bytes against
+    /// the all-zero placeholder sha — which is the expected next
+    /// failure mode and confirms the download path completed.)
+    /// </summary>
+    [Fact]
+    public async Task SoftwareInstaller_a6_under_cap_proceeds_to_hash_check()
+    {
+        using var _ = AssumeRootScope.Enter();
+        var (installer, directive) = MakeA6Installer(
+            bodyLen: 256,
+            emitContentLength: true,
+            cap: 4096,
+            packageId: "com.example.a6.under",
+            version: "1.0");
+        var outcome = await installer.ApplyAsync(directive, EnforcementMode.Enforce);
+        // Download completes; hash mismatch is the next gate.
+        Assert.Equal(EnforcementStatus.Failed, outcome.Status);
+        Assert.NotNull(outcome.Error);
+        Assert.Contains("hash mismatch", outcome.Error);
+    }
+
     // --- Reconciliation: ExtractManagedKey ---
 
     [Fact]

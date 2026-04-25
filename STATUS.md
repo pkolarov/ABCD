@@ -15,7 +15,7 @@ marked superseded.
 |---|---|---|---|---|
 | **Critical** | 3/3 | — | — | — |
 | **High** | 12/12 | — | 1 (A-2); A-1 landed pending HW verify | H-6 + H-7 step-2b verified on Windows x64 host 2026-04-24 — see "Windows host verification (2026-04-24)" below. |
-| **Medium** | 20/22 | 3 | 3 (A-3, A-4, A-6) | M-13 (FIDO MDS integration — external design), M-15 (node-bound FIDO2 `hmac_salt`; blocked on bundle re-wrap design), M-18 (WiX service-account split — multi-day Windows refactor). |
+| **Medium** | 21/22 | 3 | 2 (A-3, A-4); A-6 macOS landed, Windows pending CI | M-13 (FIDO MDS integration — external design), M-15 (node-bound FIDO2 `hmac_salt`; blocked on bundle re-wrap design), M-18 (WiX service-account split — multi-day Windows refactor). |
 | **Low** | 17/18 | 1 | — | L-17 (service-mutex refactor — 29 HTTP handler lock sites; L-18's atomic `bump_sign_count` already closed the replay race so the remaining gain is throughput not security). |
 
 The "Fixed" column count for Medium tracks A-5 alongside the
@@ -69,10 +69,18 @@ M-1…M-22 ledger; the addendum table below is the per-finding view.
   exactly. Lazy v=2 → v=3 rewrap on first successful load preserves
   PeerId. Three new tests pin the schema, the rewrap, and the symlink
   refusal; all 138 dds-node tests still pass.
-- **A-6 (Medium)**: Both Policy Agent software enforcers (Windows + macOS)
-  stream downloads to disk with no byte cap / `Content-Length` check,
-  then compute SHA-256 afterwards. Local availability DoS (disk-fill)
-  on a compromised publisher URL.
+- **A-6 (Medium) ✅ landed 2026-04-25 (Windows-CI for the Windows half)**:
+  Both Policy Agent software enforcers gained an `AgentConfig.MaxPackageBytes`
+  knob (default 1 GiB), `Content-Length` pre-flight, and a streaming
+  64 KiB copy loop that aborts the moment the running byte total
+  crosses the cap. Windows additionally hashes incrementally via
+  `IncrementalHash` in the same pass so the SHA-256 digest is
+  finalized without a second read over the file. Partial files are
+  deleted on any overrun / cancellation path. 3 new macOS unit tests
+  (`SoftwareInstaller_a6_*` in `EnforcerTests`) cover the
+  Content-Length-declared overrun, streaming overrun without
+  Content-Length, and the under-cap path. macOS suite: 69/69 ok (up
+  from 66). Windows test run pending Windows CI.
 
 **Highlights shipped in the 2026-04-17 → 2026-04-21 sweep:**
 

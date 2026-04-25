@@ -97,7 +97,16 @@ else
 if (OperatingSystem.IsWindows())
 {
     builder.Services.AddSingleton<ISoftwareOperations>(sp =>
-        new WindowsSoftwareOperations(sp.GetRequiredService<IHttpClientFactory>().CreateClient("software")));
+    {
+        var http = sp.GetRequiredService<IHttpClientFactory>().CreateClient("software");
+        // A-6 (security review): cap each package download so a hostile
+        // or MITM'd publisher URL cannot fill the disk before the
+        // SHA-256 mismatch is caught.
+        var cfg = sp
+            .GetRequiredService<Microsoft.Extensions.Options.IOptions<AgentConfig>>()
+            .Value;
+        return new WindowsSoftwareOperations(http, cfg.MaxPackageBytes);
+    });
 }
 else
 {

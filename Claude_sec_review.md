@@ -1522,13 +1522,13 @@ public `load_or_create` entry point. `cargo test -p dds-node` ⇒
 
 ---
 
-### A-6 (Medium). Agent software downloaders stream untrusted content to disk before hash validation, with no byte cap
-**Location:** [platform/windows/DdsPolicyAgent/Enforcers/WindowsSoftwareOperations.cs:27-51](platform/windows/DdsPolicyAgent/Enforcers/WindowsSoftwareOperations.cs#L27-L51), [platform/macos/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs:180-210](platform/macos/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs#L180-L210)
+### A-6 (Medium). ✅ Fixed (Windows-CI for the Windows half) — Agent software downloaders stream untrusted content to disk before hash validation, with no byte cap
+**Location:** [platform/windows/DdsPolicyAgent/Enforcers/WindowsSoftwareOperations.cs](platform/windows/DdsPolicyAgent/Enforcers/WindowsSoftwareOperations.cs), [platform/macos/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs](platform/macos/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs)
 
 **What's wrong:** Both the Windows and macOS Policy Agent software
-enforcers download a package with `response.Content.CopyToAsync(fs,
-ct)` and only compute SHA-256 after the full file is on disk. There
-is no `Content-Length` check, no byte cap, and no streaming hash.
+enforcers downloaded a package with `response.Content.CopyToAsync(fs,
+ct)` and only computed SHA-256 after the full file was on disk. There
+was no `Content-Length` check, no byte cap, and no streaming hash.
 
 **Attack vector:** A compromised or MITM'd publisher URL can return
 an attacker-chosen body of arbitrary size. Even though the SHA-256
@@ -1540,12 +1540,33 @@ response to `%TEMP%\dds-software\…` (Windows) or the package cache
 **Impact:** Local availability on managed endpoints; no change in
 integrity posture (the hash check still runs).
 
-**Fix:**
-- Read `response.Content.Headers.ContentLength` and reject any
-  download larger than a policy-configured cap (default ~1 GiB is
-  a reasonable starting point — MSI/PKG files are typically <200 MiB).
-- Hash while streaming via `IncrementalHash.CreateHash(HashAlgorithmName.SHA256)`
-  and abort the copy loop the moment the running total exceeds the
-  cap.
-- Treat a missing `Content-Length` as "unknown size" and apply the
-  same streaming cap by tracking bytes written.
+**Resolution (2026-04-25):**
+
+- New `AgentConfig.MaxPackageBytes` knob on both Windows and macOS
+  (default 1 GiB).
+- **Windows** (`WindowsSoftwareOperations.DownloadAndVerifyAsync`)
+  now: (1) pre-flights `Content-Length` against the cap and refuses
+  the download outright when it's larger; (2) streams in 64 KiB
+  chunks via a new `CopyAndHashWithCapAsync` helper that maintains a
+  running byte counter and an `IncrementalHash` SHA-256, aborts the
+  moment the counter crosses the cap, and returns the finalized
+  digest in the same pass — no second read over the file. Partial
+  files are deleted on any abort path. Constructor gains a second
+  parameter `long maxPackageBytes`; `Program.cs` wires it from the
+  configured value.
+- **macOS** (`SoftwareInstaller.DownloadPackageAsync`) gets the
+  same `Content-Length` pre-flight + streaming size cap via a new
+  `CopyWithCapAsync` helper. Partial files deleted on overrun.
+  SHA-256 hashing stays at the call site so the file:// path
+  (which doesn't go through the downloader) keeps the same
+  comparison shape.
+- 3 new macOS unit tests in `EnforcerTests` exercise the path
+  through `SoftwareInstaller.ApplyAsync` with a synthetic
+  `FakeBytesHandler` HTTP message handler:
+  `SoftwareInstaller_a6_refuses_download_when_content_length_exceeds_cap`,
+  `SoftwareInstaller_a6_refuses_download_when_stream_exceeds_cap`
+  (no Content-Length declared), and
+  `SoftwareInstaller_a6_under_cap_proceeds_to_hash_check`.
+- macOS test totals: 69/69 (up from 66). Rust: 451/451 unchanged.
+  Windows project compiles clean (`dotnet build`); Windows test
+  run pending Windows CI.
