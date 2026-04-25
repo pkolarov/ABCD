@@ -108,19 +108,30 @@ public sealed class AppliedStateStore : IAppliedStateStore
 
     /// <summary>
     /// Returns true if the agent should re-apply the document
-    /// (either never seen or content hash changed).
+    /// (either never seen, content hash changed, or last apply did
+    /// not succeed — see B-3 in the security review).
     /// </summary>
     public bool HasChanged(string targetId, string contentHash)
     {
         lock (_lock)
         {
-            if (_state.Policies.TryGetValue(targetId, out var p) && p.ContentHash == contentHash)
+            if (_state.Policies.TryGetValue(targetId, out var p)
+                && p.ContentHash == contentHash
+                && IsSuccessfulStatus(p.Status))
                 return false;
-            if (_state.Software.TryGetValue(targetId, out var s) && s.ContentHash == contentHash)
+            if (_state.Software.TryGetValue(targetId, out var s)
+                && s.ContentHash == contentHash
+                && IsSuccessfulStatus(s.Status))
                 return false;
             return true;
         }
     }
+
+    // "skipped" is treated as terminal because the document had nothing
+    // applicable on this host; re-running the same content will produce
+    // the same skip. Anything else (e.g. "failed") forces a retry.
+    private static bool IsSuccessfulStatus(string status)
+        => status == "ok" || status == "skipped";
 
     public void RecordApplied(
         string targetId, string version, string contentHash, string status, bool isSoftware)

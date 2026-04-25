@@ -132,18 +132,22 @@ public sealed class Worker : BackgroundService
                 continue;
             }
 
-            var directives = new List<string>();
-
+            ApplyBundleResult apply;
             if (p.Document.TryGetProperty("windows", out var winApply)
                 && winApply.ValueKind == JsonValueKind.Object)
             {
-                directives.AddRange(
-                    await DispatchWindowsBundle(winApply, enforcement, ct).ConfigureAwait(false));
+                apply = await DispatchWindowsBundle(winApply, enforcement, ct).ConfigureAwait(false);
+            }
+            else
+            {
+                apply = new ApplyBundleResult("skipped", [], null);
             }
 
-            // Report back
-            await ReportAsync(policyId, version, directives, ct).ConfigureAwait(false);
-            _stateStore.RecordApplied(policyId, version, hash, "ok", isSoftware: false);
+            // B-3: report and record the actual outcome status, not a
+            // hardcoded "ok". A failed enforcement must remain re-eligible
+            // on the next poll so transient failures don't latch.
+            await ReportAsync(policyId, version, apply, ct).ConfigureAwait(false);
+            _stateStore.RecordApplied(policyId, version, hash, apply.Status, isSoftware: false);
         }
 
         // --- software ---
@@ -177,9 +181,12 @@ public sealed class Worker : BackgroundService
                 .ApplyAsync(s.Document, EnforcementMode.Enforce, ct)
                 .ConfigureAwait(false);
 
-            var directives = outcome.Changes?.ToList() ?? [];
-            await ReportAsync(pkgId, version, directives, ct).ConfigureAwait(false);
-            _stateStore.RecordApplied(pkgId, version, hash, "ok", isSoftware: true);
+            // B-3: capture the real status from the installer so a
+            // failed install is reported and isn't suppressed by
+            // HasChanged on the next poll.
+            var apply = ApplyBundleResult.FromOutcome(outcome);
+            await ReportAsync(pkgId, version, apply, ct).ConfigureAwait(false);
+            _stateStore.RecordApplied(pkgId, version, hash, apply.Status, isSoftware: true);
         }
 
         // --- reconciliation pass ---
@@ -289,34 +296,34 @@ public sealed class Worker : BackgroundService
         if (reconcileChanges.Count > 0)
         {
             _log.LogInformation("Reconciliation complete: {Count} actions taken", reconcileChanges.Count);
-            await ReportAsync("_reconciliation", "1", reconcileChanges, ct).ConfigureAwait(false);
+            await ReportAsync(
+                "_reconciliation", "1",
+                new ApplyBundleResult("ok", reconcileChanges, null),
+                ct).ConfigureAwait(false);
         }
     }
 
-    private async Task<List<string>> DispatchWindowsBundle(
+    private async Task<ApplyBundleResult> DispatchWindowsBundle(
         JsonElement win, EnforcementMode mode, CancellationToken ct)
     {
-        var directives = new List<string>();
+        var outcomes = new List<EnforcementOutcome>();
 
         if (win.TryGetProperty("registry", out var reg)
             && reg.ValueKind == JsonValueKind.Array)
         {
-            var r = await _registryEnforcer.ApplyAsync(reg, mode, ct).ConfigureAwait(false);
-            if (r.Changes is not null) directives.AddRange(r.Changes);
+            outcomes.Add(await _registryEnforcer.ApplyAsync(reg, mode, ct).ConfigureAwait(false));
         }
 
         if (win.TryGetProperty("local_accounts", out var acct)
             && acct.ValueKind == JsonValueKind.Array)
         {
-            var r = await _accountEnforcer.ApplyAsync(acct, mode, ct).ConfigureAwait(false);
-            if (r.Changes is not null) directives.AddRange(r.Changes);
+            outcomes.Add(await _accountEnforcer.ApplyAsync(acct, mode, ct).ConfigureAwait(false));
         }
 
         if (win.TryGetProperty("password_policy", out var pp)
             && pp.ValueKind == JsonValueKind.Object)
         {
-            var r = await _passwordPolicyEnforcer.ApplyAsync(pp, mode, ct).ConfigureAwait(false);
-            if (r.Changes is not null) directives.AddRange(r.Changes);
+            outcomes.Add(await _passwordPolicyEnforcer.ApplyAsync(pp, mode, ct).ConfigureAwait(false));
         }
 
         if (win.TryGetProperty("services", out var svc)
@@ -325,18 +332,20 @@ public sealed class Worker : BackgroundService
             // Services use the same RegistryEnforcer stub for now;
             // Phase D will split this to a ServiceEnforcer.
             _log.LogInformation("[DRY-RUN] Services: {Count} directives", svc.GetArrayLength());
+            var serviceChanges = new List<string>();
             foreach (var item in svc.EnumerateArray())
             {
                 var name = item.TryGetProperty("name", out var n) ? n.GetString() : "?";
-                directives.Add($"service: {name}");
+                serviceChanges.Add($"service: {name}");
             }
+            outcomes.Add(new EnforcementOutcome(EnforcementStatus.Ok, null, serviceChanges));
         }
 
-        return directives;
+        return ApplyBundleResult.Aggregate(outcomes);
     }
 
     private async Task ReportAsync(
-        string targetId, string version, List<string> directives, CancellationToken ct)
+        string targetId, string version, ApplyBundleResult apply, CancellationToken ct)
     {
         try
         {
@@ -345,8 +354,9 @@ public sealed class Worker : BackgroundService
                 DeviceUrn = _config.DeviceUrn,
                 TargetId = targetId,
                 Version = version,
-                Status = "ok",
-                Directives = directives,
+                Status = apply.Status,
+                Directives = apply.Directives,
+                Error = apply.Error,
                 AppliedAt = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
             }, ct).ConfigureAwait(false);
         }
@@ -368,5 +378,50 @@ public sealed class Worker : BackgroundService
         var raw = doc.GetRawText();
         var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(raw));
         return $"sha256:{Convert.ToHexString(bytes).ToLowerInvariant()}";
+    }
+}
+
+internal sealed record ApplyBundleResult(
+    string Status,
+    List<string> Directives,
+    string? Error)
+{
+    public static ApplyBundleResult FromOutcome(EnforcementOutcome outcome)
+    {
+        var status = outcome.Status switch
+        {
+            EnforcementStatus.Ok => "ok",
+            EnforcementStatus.Failed => "failed",
+            _ => "skipped",
+        };
+
+        return new ApplyBundleResult(
+            status,
+            outcome.Changes?.ToList() ?? [],
+            outcome.Error);
+    }
+
+    public static ApplyBundleResult Aggregate(IEnumerable<EnforcementOutcome> outcomes)
+    {
+        var materialized = outcomes.ToList();
+        if (materialized.Count == 0)
+            return new ApplyBundleResult("skipped", [], null);
+
+        var directives = materialized
+            .Where(o => o.Changes is not null)
+            .SelectMany(o => o.Changes!)
+            .ToList();
+
+        var firstError = materialized
+            .Select(o => o.Error)
+            .FirstOrDefault(e => !string.IsNullOrWhiteSpace(e));
+
+        var status = "ok";
+        if (materialized.Any(o => o.Status == EnforcementStatus.Failed))
+            status = "failed";
+        else if (materialized.All(o => o.Status == EnforcementStatus.Skipped))
+            status = "skipped";
+
+        return new ApplyBundleResult(status, directives, firstError);
     }
 }

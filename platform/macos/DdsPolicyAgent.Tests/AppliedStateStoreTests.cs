@@ -40,6 +40,33 @@ public class AppliedStateStoreTests : IDisposable
         Assert.False(_store.HasChanged("p:test", "sha256:abc"));
     }
 
+    // B-3 (security review): a previously failed apply must remain
+    // re-eligible on the next poll, even when the content hash matches.
+    // Without this, a transient enforcer failure latches forever and
+    // the document is never re-tried.
+    [Fact]
+    public void HasChanged_returns_true_when_last_status_is_failed_policy()
+    {
+        _store.RecordApplied("p:test", "1", "sha256:abc", "failed", isSoftware: false);
+        Assert.True(_store.HasChanged("p:test", "sha256:abc"));
+    }
+
+    [Fact]
+    public void HasChanged_returns_true_when_last_status_is_failed_software()
+    {
+        _store.RecordApplied("com.example.app", "1.0", "sha256:sw", "failed", isSoftware: true);
+        Assert.True(_store.HasChanged("com.example.app", "sha256:sw"));
+    }
+
+    [Fact]
+    public void HasChanged_returns_false_when_last_status_is_skipped_unchanged_content()
+    {
+        // "skipped" means the doc had nothing applicable on this host;
+        // re-running unchanged content cannot change that outcome.
+        _store.RecordApplied("p:other", "1", "sha256:s", "skipped", isSoftware: false);
+        Assert.False(_store.HasChanged("p:other", "sha256:s"));
+    }
+
     [Fact]
     public void Software_entries_are_stored_separately()
     {

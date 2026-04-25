@@ -94,13 +94,24 @@ L-9, A-1, A-3, A-4, or A-6.
   `Token::validate`, and graph ingest; require a matching active
   attestation for every purpose grant; and prefer exact target-token
   references over "first attestation for issuer" lookup.
-- **B-3 (High)**: failed policy/software enforcement can be recorded as
-  applied and skipped forever. The Windows worker records `"ok"` after
-  dispatch even when an enforcer returned `Failed`; the macOS worker
-  records failure status, but `HasChanged` ignores status and therefore
-  skips unchanged failed documents on later polls. **Fix:** record
-  success only for successful outcomes, include status in `HasChanged`,
-  and retry failed entries until they succeed or are superseded.
+- **B-3 (High) ✅ landed 2026-04-25**: failed policy/software enforcement
+  could be recorded as applied and skipped forever. The Windows worker
+  recorded `"ok"` after dispatch even when an enforcer returned
+  `Failed`; the macOS worker recorded the real status, but `HasChanged`
+  ignored status and therefore skipped unchanged failed documents on
+  later polls. **Fix shipped:** both `AppliedStateStore.HasChanged`
+  implementations now require `IsSuccessfulStatus(status)` (where
+  successful = `"ok"` or `"skipped"`) to short-circuit; anything else
+  (e.g. `"failed"`) re-queues the doc on the next poll. The Windows
+  worker now threads the real `EnforcementStatus` from each dispatched
+  bundle through a new `ApplyBundleResult` aggregate (mirroring macOS),
+  passes the aggregated status to `RecordApplied`, and reports it via
+  `ReportAsync` instead of hardcoding `"ok"`. New regression tests:
+  `platform/macos/DdsPolicyAgent.Tests/AppliedStateStoreTests.cs`
+  (`HasChanged_returns_true_when_last_status_is_failed_policy`,
+  `_failed_software`, `_returns_false_when_last_status_is_skipped_unchanged_content`)
+  and the matching three tests in
+  `platform/windows/DdsPolicyAgent.Tests/AppliedStateStoreTests.cs`.
 - **B-4 (Medium)**: active policy/software versions are not resolved
   deterministically. The node returns every matching policy/software
   attestation in implementation-defined order; agents key applied state

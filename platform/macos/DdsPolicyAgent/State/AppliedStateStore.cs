@@ -92,17 +92,32 @@ public sealed class AppliedStateStore : IAppliedStateStore
         }
     }
 
+    // B-3 (security review): a failed apply must not be cached as
+    // "already done". `HasChanged` returns true (force re-apply) if the
+    // last recorded status is anything other than a successful outcome,
+    // even when the content hash matches.
     public bool HasChanged(string targetId, string contentHash)
     {
         lock (_lock)
         {
-            if (_state.Policies.TryGetValue(targetId, out var p) && p.ContentHash == contentHash)
+            if (_state.Policies.TryGetValue(targetId, out var p)
+                && p.ContentHash == contentHash
+                && IsSuccessfulStatus(p.Status))
                 return false;
-            if (_state.Software.TryGetValue(targetId, out var s) && s.ContentHash == contentHash)
+            if (_state.Software.TryGetValue(targetId, out var s)
+                && s.ContentHash == contentHash
+                && IsSuccessfulStatus(s.Status))
                 return false;
             return true;
         }
     }
+
+    // "skipped" means the document had nothing applicable on this
+    // platform (e.g. a Windows-only directive bundle). Re-applying an
+    // unchanged document will produce the same skip, so treat skipped
+    // as a terminal non-retry state alongside "ok".
+    private static bool IsSuccessfulStatus(string status)
+        => status == "ok" || status == "skipped";
 
     public void RecordApplied(
         string targetId, string version, string contentHash, string status, bool isSoftware)
