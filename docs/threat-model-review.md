@@ -195,7 +195,7 @@ Administrators). However:
 | **No deterministic active-version selection (B-4)** ✅ closed 2026-04-25 — `LocalService::list_applicable_*` now collapses duplicate `policy_id` / `package_id` at serve time (highest version → latest iat → lex-smallest jti) and emits in stable id-sorted order. | Medium | (closed — see Claude_sec_review.md) |
 | **No trust graph partitioning** — all tokens are visible to all nodes. | Low | By design for the single-domain model. Multi-domain deployments would need topic-level isolation. |
 | **Challenge store cleanup is passive (B-5)** ✅ closed 2026-04-25 — expired session/admin challenges were not deleted on failed consume and no production sweeper called `sweep_expired_challenges`. | Medium | The issue path (`http::issue_challenge`) now sweeps expired rows on every put, enforces a `MAX_OUTSTANDING_CHALLENGES = 4096` global cap (returning 503 when the backlog is full), and `consume_challenge` deletes expired/malformed rows in the same write transaction. A new `count_challenges` method on `ChallengeStore` backs the cap check; tests added in `dds-store` (4) and `dds-node::http` (2). |
-| **Expiry sweep race** — the expiry sweeper runs on a timer; a token that just expired may be evaluated as valid until the next sweep. | Low | The window is bounded by `expiry_scan_interval_secs` (default 60s). For real-time expiry checking, add an inline expiry check in `evaluate_policy`. |
+| ~~**Expiry sweep race** — the expiry sweeper runs on a timer; a token that just expired may be evaluated as valid until the next sweep.~~ ✅ closed: the trust-graph hot paths (`has_purpose`, `purposes_for`, `walk_chain`, `active_attestation_for_iss`) already filter tokens via `is_expired()` against `SystemTime::now()` on every call, so a token whose `exp` has passed is dropped from policy evaluation immediately — independent of when the periodic `sweep_expired` next runs. The sweep exists only to reclaim store space. Three regression tests in `dds-core::trust::tests` (`realtime_expiry_drops_grant_in_has_purpose_and_purposes_for`, `realtime_expiry_in_target_attestation_drops_grant`, `realtime_expiry_breaks_chain_at_intermediate_vouch`) pin the contract — none of them call `sweep_expired`. | Low | (closed — see regression tests above) |
 | **Admin set is per-node local** — `trusted_roots` is read from local TOML; peers can disagree about who is an admin (I-11). | Medium | A future redesign should chain admins back to a domain-key-signed genesis attestation so the admin set is derived from gossip. |
 
 ---
@@ -294,7 +294,7 @@ application from failed application.
 | 10 | WiX virtual service account split (M-18) | Medium | §3 |
 | 11 | Admin-set coherence via gossip (I-11) | Medium | §5 |
 | 12 | Message-level encryption (opt-in) | Low | §4 |
-| 13 | Real-time expiry in `evaluate_policy` | Low | §5 |
+| 13 | ~~Real-time expiry in `evaluate_policy`~~ ✅ closed 2026-04-25 (already inline-filtered; regression tests added) | Low | §5 |
 
 All Critical findings from the source-validated review are now Fixed
 (pending verify). All six findings (B-1 through B-6) from the

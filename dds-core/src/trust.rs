@@ -726,6 +726,51 @@ mod tests {
         set
     }
 
+    fn make_attest_with_exp(ident: &Identity, exp: Option<u64>) -> Token {
+        let payload = TokenPayload {
+            iss: ident.id.to_urn(),
+            iss_key: ident.public_key.clone(),
+            jti: format!("attest-{}", ident.id.label()),
+            sub: ident.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: Some(String::from("dds:directory-entry")),
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1000,
+            exp,
+            body_type: None,
+            body_cbor: None,
+        };
+        Token::sign(payload, &ident.signing_key).unwrap()
+    }
+
+    fn make_vouch_with_exp(
+        voucher: &Identity,
+        target: &Identity,
+        target_token: &Token,
+        purpose: &str,
+        jti: &str,
+        exp: Option<u64>,
+    ) -> Token {
+        let payload = TokenPayload {
+            iss: voucher.id.to_urn(),
+            iss_key: voucher.public_key.clone(),
+            jti: String::from(jti),
+            sub: target.id.to_urn(),
+            kind: TokenKind::Vouch,
+            purpose: Some(String::from(purpose)),
+            vch_iss: Some(target.id.to_urn()),
+            vch_sum: Some(target_token.payload_hash()),
+            revokes: None,
+            iat: 1000,
+            exp,
+            body_type: None,
+            body_cbor: None,
+        };
+        Token::sign(payload, &voucher.signing_key).unwrap()
+    }
+
     #[test]
     fn test_new_trust_graph() {
         let g = TrustGraph::new();
@@ -1425,5 +1470,132 @@ mod tests {
              B5 regression: trust graph queries are no longer sublinear",
             worst
         );
+    }
+
+    /// **Real-time expiry regression** (closes threat-model-review §8
+    /// item 13). `has_purpose` and `purposes_for` must drop an expired
+    /// vouch in the same call where it crosses its `exp` — they cannot
+    /// rely on the periodic `sweep_expired` having run. The hot paths
+    /// already filter via `is_expired()` against system time; this
+    /// test pins that contract so a future refactor cannot reintroduce
+    /// the sweep-only window. The test never calls `sweep_expired()`.
+    #[test]
+    fn realtime_expiry_drops_grant_in_has_purpose_and_purposes_for() {
+        let mut graph = TrustGraph::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let user = Identity::generate("user", &mut OsRng);
+
+        let user_attest = make_attest(&user);
+        // Vouch that is already past its `exp` at the moment we add it
+        // (epoch second 1 is Jan 1 1970). No sweep call.
+        let vouch = make_vouch_with_exp(
+            &root,
+            &user,
+            &user_attest,
+            "group:dev",
+            "vouch-expired",
+            Some(1),
+        );
+
+        graph.add_token(user_attest).unwrap();
+        graph.add_token(vouch).unwrap();
+
+        let roots = roots_with(&root.id.to_urn());
+
+        assert!(
+            !graph.has_purpose(&user.id.to_urn(), "group:dev", &roots),
+            "has_purpose must filter expired vouches inline, without waiting for sweep"
+        );
+        assert!(
+            !graph
+                .purposes_for(&user.id.to_urn(), &roots)
+                .contains("group:dev"),
+            "purposes_for must filter expired vouches inline, without waiting for sweep"
+        );
+        // Validate_chain (the lower-level building block that
+        // `has_purpose` ultimately calls into) must agree.
+        assert!(
+            graph.validate_chain(&user.id.to_urn(), &roots).is_err(),
+            "validate_chain must reject a chain whose only vouch is expired"
+        );
+
+        // The vouch is still in the graph — it has not been swept. The
+        // sweep-vs-evaluate distinction is the whole point of this test.
+        assert_eq!(graph.vouch_count(), 1);
+    }
+
+    /// **Real-time expiry regression**. The grant must also drop when
+    /// the *target attestation* (the one whose hash is pinned in the
+    /// vouch's `vch_sum`) is past `exp` — even though the vouch
+    /// itself is fresh. `active_attestation_for_iss` filters expired
+    /// attestations the same way `walk_chain` filters expired vouches.
+    #[test]
+    fn realtime_expiry_in_target_attestation_drops_grant() {
+        let mut graph = TrustGraph::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let user = Identity::generate("user", &mut OsRng);
+
+        // Target attestation expires at epoch 1 (already past).
+        let user_attest = make_attest_with_exp(&user, Some(1));
+        // Vouch is fresh (exp 2100-01-01).
+        let vouch = make_vouch(&root, &user, &user_attest, "group:dev", "vouch-fresh");
+
+        graph.add_token(user_attest).unwrap();
+        graph.add_token(vouch).unwrap();
+
+        let roots = roots_with(&root.id.to_urn());
+
+        assert!(
+            !graph.has_purpose(&user.id.to_urn(), "group:dev", &roots),
+            "B-2 / real-time expiry: grant must drop when target attestation is expired"
+        );
+        assert!(
+            !graph
+                .purposes_for(&user.id.to_urn(), &roots)
+                .contains("group:dev"),
+            "B-2 / real-time expiry: purposes_for must drop the grant"
+        );
+        // Sweep was never called.
+        assert_eq!(graph.attestation_count(), 1);
+    }
+
+    /// **Real-time expiry regression** at chain depth 2: an
+    /// intermediate vouch (root → admin) that is expired must break
+    /// the chain for the user vouched by that admin, even when the
+    /// leaf vouch (admin → user) is still fresh.
+    #[test]
+    fn realtime_expiry_breaks_chain_at_intermediate_vouch() {
+        let mut graph = TrustGraph::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let admin = Identity::generate("admin", &mut OsRng);
+        let user = Identity::generate("user", &mut OsRng);
+
+        let admin_attest = make_attest(&admin);
+        let user_attest = make_attest(&user);
+
+        // Root → admin vouch is *expired* (exp = 1).
+        let v1 = make_vouch_with_exp(&root, &admin, &admin_attest, "admin", "v1-expired", Some(1));
+        // Admin → user vouch is fresh.
+        let v2 = make_vouch(&admin, &user, &user_attest, "group:dev", "v2-fresh");
+
+        graph.add_token(admin_attest).unwrap();
+        graph.add_token(user_attest).unwrap();
+        graph.add_token(v1).unwrap();
+        graph.add_token(v2).unwrap();
+
+        let roots = roots_with(&root.id.to_urn());
+
+        assert!(
+            !graph.has_purpose(&user.id.to_urn(), "group:dev", &roots),
+            "real-time expiry: an expired intermediate vouch must break the chain"
+        );
+        assert!(
+            graph.validate_chain(&user.id.to_urn(), &roots).is_err(),
+            "real-time expiry: validate_chain must surface NoValidChain"
+        );
+
+        // Sanity: the structure is correct (the leaf vouch is fresh and
+        // would resolve if the intermediate were not expired).
+        assert_eq!(graph.vouch_count(), 2);
     }
 }
