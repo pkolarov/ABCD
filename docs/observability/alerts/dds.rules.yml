@@ -1,0 +1,281 @@
+# DDS Alertmanager / Prometheus recording + alerting rules
+#
+# Phase E of docs/observability-plan.md. Pairs with the Prometheus
+# `/metrics` endpoint shipped by `dds-node` on the `metrics_addr`
+# listener (default `127.0.0.1:9495` once configured — opt-in).
+#
+# Two tiers:
+#
+#   1. **Active** — rules whose source metrics ship today
+#      (Phase C audit subset: `dds_build_info`, `dds_uptime_seconds`,
+#      `dds_audit_entries_total{action}`, `dds_audit_chain_length`,
+#      `dds_audit_chain_head_age_seconds`, plus the Prometheus-built-in
+#      `up{job=...}` scrape-health series). These rules are uncommented
+#      and ready to load.
+#
+#   2. **Reference (commented)** — rules whose source metrics are still
+#      open under Phase C (network / FIDO2 / store / HTTP). They are
+#      kept verbatim so each Phase C follow-up can uncomment its tier
+#      atomically — the rule expressions are the spec the metric must
+#      satisfy. Do **not** uncomment these without confirming the
+#      underlying metric ships in the `dds-node` build deployed to the
+#      scrape target; an inert rule on a missing series silently never
+#      fires, which is worse than no rule at all.
+#
+# Load with:
+#
+#   # prometheus.yml
+#   rule_files:
+#     - /etc/prometheus/rules/dds.rules.yml
+#
+# Prometheus 2.50+. Annotation/label conventions follow the
+# Prometheus operator community standards: `severity` is one of
+# {info, warning, critical}, `runbook_url` points at the docs
+# section that explains the failure mode, `summary` is one line,
+# `description` is multi-line and may template metric values.
+#
+# Tested with `promtool check rules dds.rules.yml`.
+
+groups:
+
+  # ---------------------------------------------------------------
+  # Audit chain — the Z-3 regression tripwire. Active.
+  # ---------------------------------------------------------------
+  - name: dds-audit
+    interval: 30s
+    rules:
+
+      - alert: DdsAuditChainStalled
+        # Head age is exposed as a gauge in seconds. A sustained value
+        # over 10 minutes on a live node means either (a) the node is
+        # genuinely idle or (b) emit_local_audit regressed. Pair with
+        # the audit-emissions-flat rule below to disambiguate: a node
+        # whose head age climbs *and* whose emission rate is zero is
+        # in case (b) — Z-3 has regressed.
+        expr: dds_audit_chain_head_age_seconds > 600
+        for: 5m
+        labels:
+          severity: warning
+          plan: observability-plan.md#phase-e
+          finding: Z-3
+        annotations:
+          summary: "DDS audit chain head is stale (>10m) on {{ $labels.instance }}"
+          description: |
+            `dds_audit_chain_head_age_seconds` on {{ $labels.instance }}
+            has been > 600 for 5 minutes (current value:
+            {{ $value | humanizeDuration }}). Either the node has
+            genuinely been idle for that long, or the production
+            emit_local_audit hooks have regressed and Z-3 has
+            re-opened.
+
+            Verify with: `dds-cli --node {{ $labels.instance }} audit verify`.
+            If the chain verifies and is genuinely short, this is a
+            false positive — silence on the per-instance label.
+          runbook_url: "https://github.com/ABCD/dds/blob/main/docs/observability-plan.md#phase-a--wire-audit-emission-closes-z-3"
+
+      - alert: DdsAuditEmissionsFlat
+        # Audit entries should appear on any node that handles ingest
+        # or HTTP admin traffic. A node whose entries-total counter
+        # has not advanced for 30 minutes despite serving traffic is
+        # the same regression DdsAuditChainStalled flags from the
+        # other side; we keep both because the head-age check fires
+        # earlier on a busy fleet but the rate-zero check survives a
+        # node that received exactly one entry an hour ago and then
+        # lost emission.
+        #
+        # `sum without(action)` collapses the per-action labels so the
+        # alert is one line per node, not one per action. The 30m
+        # window is long enough to absorb genuinely quiet nodes
+        # (small domains overnight) — tighten the per-environment
+        # silence window if you serve more steady traffic.
+        expr: |
+          sum without(action) (
+            increase(dds_audit_entries_total[30m])
+          ) == 0
+          and on(instance)
+          dds_uptime_seconds > 1800
+        for: 30m
+        labels:
+          severity: info
+          plan: observability-plan.md#phase-e
+          finding: Z-3
+        annotations:
+          summary: "DDS audit entries flat for 30m on {{ $labels.instance }}"
+          description: |
+            No new audit entries have been emitted on
+            {{ $labels.instance }} for 30 minutes despite the node
+            being up for at least 30 minutes. Cross-check with
+            DdsAuditChainStalled; both firing together is the strong
+            Z-3 regression signal.
+          runbook_url: "https://github.com/ABCD/dds/blob/main/docs/observability-plan.md#phase-a--wire-audit-emission-closes-z-3"
+
+      - alert: DdsAuditRejectionSpike
+        # Rejection rate over success rate: spike means an attacker is
+        # probing the admission / token-ingest paths, OR a peer just
+        # shipped a broken build. Either way the operator wants to
+        # know — the absolute rate matters less than the ratio.
+        # Numerator: rejections; denominator: successes + rejections.
+        # Guarded against division-by-zero by the `> 0` denominator
+        # filter.
+        expr: |
+          sum without(action) (
+            rate(dds_audit_entries_total{action=~".+\\.rejected"}[5m])
+          )
+          /
+          ignoring(action) group_left
+          (
+            sum without(action) (
+              rate(dds_audit_entries_total[5m])
+            ) > 0
+          )
+          > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          plan: observability-plan.md#phase-e
+        annotations:
+          summary: "DDS rejection ratio >50% on {{ $labels.instance }}"
+          description: |
+            More than half of the audit entries on
+            {{ $labels.instance }} over the last 5 minutes are
+            *.rejected. Inspect with:
+
+              dds-cli --node {{ $labels.instance }} audit tail \
+                --action attest.rejected --action vouch.rejected \
+                --action revoke.rejected --action burn.rejected
+
+            Common causes: peer with bad clock (replay window), peer
+            shipping a regressed build, or active probing.
+          runbook_url: "https://github.com/ABCD/dds/blob/main/docs/observability-plan.md#phase-a--wire-audit-emission-closes-z-3"
+
+  # ---------------------------------------------------------------
+  # Process / scrape liveness. Active — these only depend on the
+  # Prometheus `up` series and `dds_uptime_seconds`.
+  # ---------------------------------------------------------------
+  - name: dds-process
+    interval: 30s
+    rules:
+
+      - alert: DdsNodeDown
+        # Prometheus' built-in `up` series flips to 0 when a scrape
+        # target is unreachable. On the dedicated `metrics_addr`
+        # listener this catches a crashed dds-node; the API listener
+        # may stay up if only the metrics task panicked (rare —
+        # `serve` returns a fatal error in that case).
+        expr: up{job="dds-node"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          plan: observability-plan.md#phase-e
+        annotations:
+          summary: "dds-node /metrics scrape failing on {{ $labels.instance }}"
+          description: |
+            Prometheus has not been able to scrape
+            {{ $labels.instance }} for 2 minutes. Check:
+
+              - process: `systemctl status dds-node` (or equivalent);
+              - listener: `ss -tlnp | grep 9495`;
+              - readiness: `curl -fsS http://{{ $labels.instance }}/readyz`.
+          runbook_url: "https://github.com/ABCD/dds/blob/main/docs/DDS-Admin-Guide.md"
+
+      - alert: DdsNodeFlapping
+        # Treat repeated short uptime as a crash loop. `dds_uptime_seconds`
+        # resets to a small value on every process start; if it stays
+        # below 5 minutes for more than 15 minutes wall-time the node
+        # is restarting at least every 5 minutes.
+        expr: dds_uptime_seconds < 300
+        for: 15m
+        labels:
+          severity: warning
+          plan: observability-plan.md#phase-e
+        annotations:
+          summary: "dds-node {{ $labels.instance }} restarting frequently"
+          description: |
+            `dds_uptime_seconds` on {{ $labels.instance }} has stayed
+            below 300 for the last 15 minutes — the process is
+            restarting at least every 5 minutes. Look at journalctl /
+            stderr for the panic / config error driving the restart.
+          runbook_url: "https://github.com/ABCD/dds/blob/main/docs/DDS-Admin-Guide.md"
+
+      - alert: DdsBuildSkew
+        # Two distinct `dds_build_info` versions present in the same
+        # Prometheus indicates a partial fleet upgrade. Not always an
+        # incident (rolling deploy) but worth a low-severity ping if
+        # the skew persists past the typical deploy window.
+        expr: count(count by(version) (dds_build_info)) > 1
+        for: 1h
+        labels:
+          severity: info
+          plan: observability-plan.md#phase-e
+        annotations:
+          summary: "DDS fleet running mixed versions for >1h"
+          description: |
+            The fleet has been running more than one
+            `dds_build_info{version=...}` for over an hour. If this is
+            a rolling upgrade, ignore. Otherwise investigate why a
+            host is pinned to an older release.
+
+  # ---------------------------------------------------------------
+  # Reference rules — keyed off Phase C catalog metrics that have
+  # not shipped yet. Each block is gated on a metric name that does
+  # not exist today; uncomment the block once the corresponding
+  # follow-up lands. **Do not load these as-is.**
+  # ---------------------------------------------------------------
+  #
+  # - name: dds-network
+  #   interval: 30s
+  #   rules:
+  #
+  #     - alert: DdsAdmissionFailureSpike
+  #       expr: |
+  #         rate(dds_admission_handshakes_total{result="fail"}[5m]) > 0.1
+  #       for: 5m
+  #       labels: { severity: warning, plan: observability-plan.md#phase-c }
+  #       annotations:
+  #         summary: "DDS admission failures > 0.1/s on {{ $labels.instance }}"
+  #         description: "Sustained admission rejection — peer with bad cert, clock skew, or active probe."
+  #
+  #     - alert: DdsSyncLagHigh
+  #       expr: |
+  #         histogram_quantile(0.99, sum by(le) (rate(dds_sync_lag_seconds_bucket[5m]))) > 60
+  #       for: 10m
+  #       labels: { severity: warning, plan: observability-plan.md#phase-c }
+  #
+  #     - alert: DdsSyncRejectsSpike
+  #       expr: |
+  #         rate(dds_sync_payloads_rejected_total[5m]) > 0.5
+  #       for: 5m
+  #       labels: { severity: warning, plan: observability-plan.md#phase-c }
+  #
+  # - name: dds-fido2
+  #   interval: 30s
+  #   rules:
+  #
+  #     - alert: DdsFido2AssertionFailureSpike
+  #       expr: |
+  #         rate(dds_fido2_assertions_total{result!="ok"}[5m]) > 0.05
+  #       for: 5m
+  #       labels: { severity: warning, plan: observability-plan.md#phase-c }
+  #       annotations:
+  #         description: "Brute-force / replay candidate. Inspect dds_audit_entries_total{action=\"attest.rejected\"} on the same instance."
+  #
+  # - name: dds-storage
+  #   interval: 30s
+  #   rules:
+  #
+  #     - alert: DdsStoreWriteFailures
+  #       expr: |
+  #         rate(dds_store_writes_total{result!="ok"}[5m]) > 0
+  #       for: 5m
+  #       labels: { severity: critical, plan: observability-plan.md#phase-c }
+  #
+  # - name: dds-http
+  #   interval: 30s
+  #   rules:
+  #
+  #     - alert: DdsLoopbackTcpAdminUsed
+  #       # H-7 cutover regression alarm — see Claude_sec_review.md.
+  #       expr: |
+  #         rate(dds_http_caller_identity_total{kind="anonymous"}[5m]) > 0
+  #       for: 5m
+  #       labels: { severity: warning, plan: observability-plan.md#phase-c }

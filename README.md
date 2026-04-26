@@ -258,7 +258,10 @@ Set `network.metrics_addr = "127.0.0.1:9495"` to expose Prometheus
 audit subset only in this build: `dds_build_info`,
 `dds_uptime_seconds`, `dds_audit_entries_total{action}`,
 `dds_audit_chain_length`, `dds_audit_chain_head_age_seconds`).
-Default is `None` so the second port is opt-in.
+Default is `None` so the second port is opt-in. Reference
+Alertmanager rules and two Grafana dashboards keyed off the same
+metrics ship under [`docs/observability/`](docs/observability/)
+(Phase E).
 
 ### Rust API (`dds-core` + `dds-domain`)
 

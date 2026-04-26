@@ -11,9 +11,12 @@ B is now complete. Phase F (`dds-cli stats`, `dds-cli health`,
 audit-metrics subset (`dds_build_info`, `dds_uptime_seconds`,
 `dds_audit_entries_total{action}`, `dds_audit_chain_length`,
 `dds_audit_chain_head_age_seconds` — opt-in via `metrics_addr`)
-landed 2026-04-26 follow-up #22; the rest of the C catalog
-(network / FIDO2 / store / HTTP / process) and Phase E (reference
-Grafana dashboards + Alertmanager rules) remain open.
+landed 2026-04-26 follow-up #22. Phase E **audit-tier subset**
+(reference Grafana dashboards + Alertmanager rules keyed off the
+metrics shipped in #22, plus commented-out reference rules for the
+not-yet-shipped catalog) landed 2026-04-26 follow-up #23; the rest
+of the C catalog (network / FIDO2 / store / HTTP / process) plus
+the Phase E rules/panels that depend on those metrics remain open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -406,30 +409,67 @@ under a strict `AdminPolicy`.
 
 ### Phase E — Reference dashboards & alert rules
 
-Ship as files in the repo so operators can `kubectl apply` / Grafana
-import without DDS-specific tooling.
+**Status: audit-tier subset landed 2026-04-26 follow-up #23.** The
+three reference assets ship today:
+- [`docs/observability/alerts/dds.rules.yml`](observability/alerts/dds.rules.yml)
+- [`docs/observability/grafana/dds-overview.json`](observability/grafana/dds-overview.json)
+- [`docs/observability/grafana/dds-trust-graph.json`](observability/grafana/dds-trust-graph.json)
 
-- `docs/observability/grafana/dds-overview.json` — fleet view: peer
-  count, admission failures, gossip rates, sync lag, audit emission
-  rate, chain head age. One panel per area in the metric catalog.
-- `docs/observability/grafana/dds-trust-graph.json` — attestations,
-  vouches, revocations, FIDO2 verify outcomes.
-- `docs/observability/alerts/dds.rules.yml` — Alertmanager rules:
-  - `DdsAuditChainStalled` — `dds_audit_chain_head_age_seconds > 600`
-    on a node that has accepted any token in the same window
-    (catches Z-3 regressions).
-  - `DdsAdmissionFailureSpike` —
-    `rate(dds_admission_handshakes_total{result="fail"}[5m]) > 0.1`.
-  - `DdsSyncLagHigh` —
-    `histogram_quantile(0.99, ...dds_sync_lag_seconds...) > 60`.
-  - `DdsLoopbackTcpAdminUsed` —
-    `rate(dds_http_caller_identity_total{kind="anonymous"}[5m]) > 0`
-    on a host where `trust_loopback_tcp_admin=false` is the policy
-    (regression alarm for H-7 cutover).
-  - `DdsFido2AssertionFailureSpike` — flags brute-force / replay.
-  - `DdsRevocationsSurge` — operator awareness during incidents.
-  - `DdsStoreWriteFailures` —
-    `rate(dds_store_writes_total{result!="ok"}[5m]) > 0`.
+The rules and panels keyed off the Phase C audit subset (the five
+metrics shipped in follow-up #22 plus the Prometheus-built-in `up`
+series) are active and ready to load. Rules whose source metric is
+still open under Phase C (network / FIDO2 / store / HTTP) ship as
+**commented-out reference blocks** inside `dds.rules.yml` so each
+Phase C follow-up can uncomment its tier atomically — the rule
+expressions are the spec the metric must satisfy. Operators must
+not uncomment those blocks without confirming the underlying metric
+ships in the deployed `dds-node` build; an inert rule on a missing
+series silently never fires, which is worse than no rule at all.
+
+Active rules (`dds.rules.yml` groups `dds-audit` and `dds-process`):
+
+- `DdsAuditChainStalled` — `dds_audit_chain_head_age_seconds > 600`
+  for 5 m. Z-3 regression tripwire.
+- `DdsAuditEmissionsFlat` —
+  `sum without(action) (increase(dds_audit_entries_total[30m])) == 0`
+  on a node up > 30 m. Pairs with `DdsAuditChainStalled` to
+  disambiguate genuinely-idle from emit-broken.
+- `DdsAuditRejectionSpike` — rejection share > 50 % for 10 m.
+  Either active probing or a peer with a regressed build.
+- `DdsNodeDown` — `up{job="dds-node"} == 0` for 2 m.
+- `DdsNodeFlapping` — `dds_uptime_seconds < 300` for 15 m.
+- `DdsBuildSkew` — `count(count by(version) (dds_build_info)) > 1`
+  for 1 h.
+
+Reference (commented) rules — uncomment when Phase C lands the
+metric:
+- `DdsAdmissionFailureSpike` (needs `dds_admission_handshakes_total`).
+- `DdsSyncLagHigh` (needs `dds_sync_lag_seconds_bucket`).
+- `DdsSyncRejectsSpike` (needs `dds_sync_payloads_rejected_total`).
+- `DdsFido2AssertionFailureSpike` (needs `dds_fido2_assertions_total`).
+- `DdsStoreWriteFailures` (needs `dds_store_writes_total`).
+- `DdsLoopbackTcpAdminUsed` (needs `dds_http_caller_identity_total`)
+  — the H-7 cutover regression alarm flagged in
+  [Claude_sec_review.md](../Claude_sec_review.md).
+
+`DdsRevocationsSurge` is implicitly covered by the Trust-Graph
+dashboard's Revocations panel and the rejection-ratio alert; a
+dedicated rate alert is deferred until operators have a baseline
+for what "surge" means in their fleet.
+
+Dashboards:
+- `dds-overview.json` — node count, build-version count, audit
+  chain head age, scrape health, audit emission rate by action,
+  chain length per instance, head-age per instance, uptime per
+  instance. All eight panels render today against the audit
+  subset.
+- `dds-trust-graph.json` — attestation / vouch / revocation / burn
+  ingest activity (success vs `*.rejected` per family), enrollment
+  & admin actions, apply outcomes, and an aggregate rejection-ratio
+  panel matching the `DdsAuditRejectionSpike` alert. All panels
+  render today; FIDO2-specific panels (assertion outcomes,
+  attestation verify) are deferred until the Phase C FIDO2 metrics
+  ship.
 
 ### Phase F — CLI surface for ad-hoc ops ✅
 
