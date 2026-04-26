@@ -104,6 +104,14 @@ dds-node gen-node-key --data-dir ~/.dds
 dds-node admit --domain-key ./acme/domain_key.bin --domain ./acme/domain.toml \
     --peer-id 12D3KooW… [--out admission.cbor] [--ttl-days 365]
 
+# Revoke / inspect / import an admission revocation
+# (revocations propagate domain-wide via H-12 piggy-back gossip;
+#  the manual import path stays as a force-immediate fallback)
+dds-node revoke-admission --domain-key ./acme/domain_key.bin --domain ./acme/domain.toml \
+    --peer-id 12D3KooW… [--reason "key compromise"] [--out admission_revocation.cbor]
+dds-node import-revocation --data-dir ~/.dds --in admission_revocation.cbor
+dds-node list-revocations --data-dir ~/.dds [--json]
+
 # Create a single-file provisioning bundle
 dds-node create-provision-bundle --dir ./acme --org acme [--out provision.dds]
 

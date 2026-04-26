@@ -11,22 +11,23 @@ For background on how DDS works internally, see the [Developer Guide](DDS-Develo
 1. [Concepts](#concepts)
 2. [Creating a Domain](#creating-a-domain)
 3. [Adding Nodes](#adding-nodes)
-4. [Single-File Provisioning](#single-file-provisioning)
-5. [Node Configuration Reference](#node-configuration-reference)
-6. [Enrolling Users](#enrolling-users)
-7. [Enrolling Devices](#enrolling-devices)
-8. [Admin Bootstrap](#admin-bootstrap)
-9. [Sessions and Authentication](#sessions-and-authentication)
-10. [Groups and Trust](#groups-and-trust)
-11. [Policy Management](#policy-management)
-12. [Windows Deployment](#windows-deployment)
-13. [macOS Deployment](#macos-deployment)
-14. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
-15. [Audit Log](#audit-log)
-16. [Debugging](#debugging)
-17. [Air-Gapped Sync (USB Stick / Courier)](#air-gapped-sync-usb-stick--courier)
-18. [Security Reference](#security-reference)
-19. [Troubleshooting](#troubleshooting)
+4. [Revoking a Node's Admission](#revoking-a-nodes-admission)
+5. [Single-File Provisioning](#single-file-provisioning)
+6. [Node Configuration Reference](#node-configuration-reference)
+7. [Enrolling Users](#enrolling-users)
+8. [Enrolling Devices](#enrolling-devices)
+9. [Admin Bootstrap](#admin-bootstrap)
+10. [Sessions and Authentication](#sessions-and-authentication)
+11. [Groups and Trust](#groups-and-trust)
+12. [Policy Management](#policy-management)
+13. [Windows Deployment](#windows-deployment)
+14. [macOS Deployment](#macos-deployment)
+15. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
+16. [Audit Log](#audit-log)
+17. [Debugging](#debugging)
+18. [Air-Gapped Sync (USB Stick / Courier)](#air-gapped-sync-usb-stick--courier)
+19. [Security Reference](#security-reference)
+20. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -186,6 +187,76 @@ The node will:
 3. Discover peers via mDNS (and/or bootstrap peers)
 4. Begin syncing directory state via gossip
 5. Start the local HTTP API on port 5551
+
+---
+
+## Revoking a Node's Admission
+
+Threat-model §1 / open item #4. Once an admission certificate has been
+issued, the only way to disinvite that node from the domain is to issue
+a domain-signed `AdmissionRevocation`. Revocations are permanent — to
+re-admit the same physical machine, generate a fresh libp2p keypair on
+it (`dds-node gen-node-key`) and issue a new admission cert for the new
+PeerId.
+
+### Step 1: Issue the revocation (admin machine)
+
+```bash
+dds-node revoke-admission \
+  --domain-key ./acme/domain_key.bin \
+  --domain ./acme/domain.toml \
+  --peer-id 12D3KooW... \
+  --reason "key compromise" \
+  --out admission_revocation.cbor
+```
+
+### Step 2: Distribute and import (every node)
+
+```bash
+dds-node import-revocation \
+  --data-dir /opt/dds/data \
+  --in admission_revocation.cbor
+```
+
+The new entry takes effect at the next admission handshake — restart
+the node to force-renegotiate connections.
+
+You don't have to import the file on every node manually. Once any one
+node has the revocation, the H-12 admission handshake piggy-backs the
+local revocation list onto every `AdmissionResponse` (capped at 1024
+entries per response). Receivers verify each entry against the domain
+pubkey and persist new ones atomically, so a `revoke-admission` issued
+against any one node propagates domain-wide on the order of a
+handshake round-trip. The manual `import-revocation` flow remains as a
+force-immediate path for emergency rollouts and for nodes that aren't
+currently on the network.
+
+### Step 3: Verify the revocation landed
+
+```bash
+dds-node list-revocations --data-dir /opt/dds/data
+```
+
+Sample output:
+
+```
+Admission revocation list:
+  data_dir: /opt/dds/data
+  file:     /opt/dds/data/admission_revocations.cbor
+  domain:   acme (dds:domain:acme:...)
+  entries:  1
+
+  [0] peer_id:    12D3KooW...
+      revoked_at: 1714086000
+      reason:     key compromise
+```
+
+For scripting, pass `--json` to emit one object per entry on stdout
+(suitable for `jq` / monitoring pipelines). Both modes load the store
+under the same domain-pubkey verification gate as the runtime path —
+entries that fail to verify (corrupt file, foreign-domain
+contamination) are dropped before they appear in the output, so the
+list always reflects what the running node would actually enforce.
 
 ---
 

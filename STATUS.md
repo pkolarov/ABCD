@@ -1,7 +1,38 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up (admission revocation
+> Last updated: 2026-04-26 follow-up #2 (admission revocation
+> operator visibility — `dds-node list-revocations` subcommand).
+> Closes a documented operator-ergonomics gap in the revocation flow:
+> after `dds-node import-revocation` (or after H-12 piggy-back
+> propagation in the morning's same-day follow-up) there was no way
+> to inspect what was actually on disk under
+> `<data_dir>/admission_revocations.cbor` — operators only saw the
+> `total entries: N` summary from `import-revocation`. The new
+> `dds-node list-revocations --data-dir <DIR> [--json]` subcommand
+> reads the store under the same domain-pubkey verification gate as
+> the runtime path (`admission_revocation_store::load_or_empty`), so
+> the listed entries always reflect what the running node would
+> actually enforce — corrupt or foreign-domain entries are dropped
+> before they appear. Default output is human-readable
+> (data_dir / file / domain / count + numbered entries with peer_id,
+> revoked_at, optional reason); `--json` emits one
+> hand-rolled-escaped JSON object per entry on stdout for `jq` /
+> monitoring pipelines (no serde_json dep added for one read-only
+> command). Tests: four new CLI integration tests in
+> `dds-node/tests/admission_revocation_cli.rs` cover the
+> empty-store path, the round-trip with two entries (human + JSON),
+> the JSON-escape path for reasons containing `"` / `\` / newline,
+> and the no-`dds.toml` failure mode. Docs refreshed:
+> [docs/DDS-Admin-Guide.md](docs/DDS-Admin-Guide.md) gains a new
+> "Revoking a Node's Admission" section (TOC entry #4) covering the
+> full issue → distribute → verify flow; [README.md](README.md)'s
+> dds-node command list now shows all three revocation commands;
+> `docs/threat-model-review.md` §1 mitigation row updated to mention
+> the inspection path. Workspace test count: 513 (up from 509);
+> clippy clean; cargo fmt clean.
+>
+> Previous: 2026-04-26 follow-up (admission revocation
 > gossip-piggyback — closes the "future increment" caveat that the
 > morning revocation-list pass left open in
 > `docs/threat-model-review.md` §1 recommendation #2). Wire format:

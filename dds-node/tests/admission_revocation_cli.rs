@@ -17,6 +17,13 @@ fn dds_node_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_dds-node"))
 }
 
+fn run_capture(cmd: &mut Command) -> (bool, String, String) {
+    let out = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    (out.status.success(), stdout, stderr)
+}
+
 fn init_domain_via_cli(dir: &std::path::Path, name: &str) {
     let status = dds_node_bin()
         .args([
@@ -209,5 +216,218 @@ fn import_rejects_revocation_signed_by_foreign_domain() {
                 .len()
                 <= 16, // schema overhead only — empty list at most
         "no foreign revocations should have been persisted"
+    );
+}
+
+#[test]
+fn list_revocations_empty_store_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let domain_dir = tmp.path().join("dom");
+    std::fs::create_dir_all(&domain_dir).unwrap();
+    let data_dir = tmp.path().join("node");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    init_domain_via_cli(&domain_dir, "acme.test");
+    write_minimal_node_config(&data_dir, &domain_dir);
+
+    // No revocations have been imported and no file exists on disk.
+    // list-revocations must succeed and report zero entries.
+    let (ok, stdout, _stderr) = run_capture(dds_node_bin().args([
+        "list-revocations",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]));
+    assert!(ok, "list-revocations on empty store must exit 0");
+    assert!(stdout.contains("entries:  0"), "stdout was: {stdout}");
+    assert!(
+        stdout.contains("(no revocations on file)"),
+        "stdout was: {stdout}",
+    );
+}
+
+#[test]
+fn list_revocations_human_and_json_outputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let domain_dir = tmp.path().join("dom");
+    std::fs::create_dir_all(&domain_dir).unwrap();
+    let data_dir = tmp.path().join("node");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    init_domain_via_cli(&domain_dir, "acme.test");
+    write_minimal_node_config(&data_dir, &domain_dir);
+
+    // Issue + import two revocations with distinct peer ids.
+    for (peer, reason) in [
+        ("12D3KooWPeerOne", Some("key compromise")),
+        ("12D3KooWPeerTwo", None),
+    ] {
+        let rev_out = tmp.path().join(format!("{peer}.cbor"));
+        let mut cmd = dds_node_bin();
+        cmd.args([
+            "revoke-admission",
+            "--domain-key",
+            domain_dir.join("domain_key.bin").to_str().unwrap(),
+            "--domain",
+            domain_dir.join("domain.toml").to_str().unwrap(),
+            "--peer-id",
+            peer,
+            "--out",
+            rev_out.to_str().unwrap(),
+        ]);
+        if let Some(r) = reason {
+            cmd.args(["--reason", r]);
+        }
+        let status = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let status = dds_node_bin()
+            .args([
+                "import-revocation",
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+                "--in",
+                rev_out.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    // Human-readable output mentions both peer ids and the reason
+    // string we attached to the first.
+    let (ok, stdout, _stderr) = run_capture(dds_node_bin().args([
+        "list-revocations",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]));
+    assert!(ok);
+    assert!(stdout.contains("entries:  2"), "stdout was: {stdout}");
+    assert!(stdout.contains("12D3KooWPeerOne"), "stdout was: {stdout}");
+    assert!(stdout.contains("12D3KooWPeerTwo"), "stdout was: {stdout}");
+    assert!(stdout.contains("key compromise"), "stdout was: {stdout}");
+
+    // JSON output is one object per line, parseable by hand.
+    let (ok, stdout, _stderr) = run_capture(dds_node_bin().args([
+        "list-revocations",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--json",
+    ]));
+    assert!(ok);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected 2 JSON lines, got: {stdout}");
+    for line in &lines {
+        assert!(line.starts_with('{') && line.ends_with('}'), "line: {line}");
+        assert!(line.contains("\"peer_id\":"), "line: {line}");
+        assert!(line.contains("\"revoked_at\":"), "line: {line}");
+    }
+    // The line for peer-one carries the reason; peer-two does not.
+    let one = lines
+        .iter()
+        .find(|l| l.contains("12D3KooWPeerOne"))
+        .unwrap();
+    assert!(one.contains("\"reason\":\"key compromise\""), "line: {one}");
+    let two = lines
+        .iter()
+        .find(|l| l.contains("12D3KooWPeerTwo"))
+        .unwrap();
+    assert!(!two.contains("\"reason\""), "line: {two}");
+}
+
+#[test]
+fn list_revocations_json_escapes_special_chars_in_reason() {
+    let tmp = tempfile::tempdir().unwrap();
+    let domain_dir = tmp.path().join("dom");
+    std::fs::create_dir_all(&domain_dir).unwrap();
+    let data_dir = tmp.path().join("node");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    init_domain_via_cli(&domain_dir, "acme.test");
+    write_minimal_node_config(&data_dir, &domain_dir);
+
+    // Reason contains a quote, a backslash, and a newline — all of
+    // which must be escaped in the JSON output for the line to remain
+    // valid one-object-per-line JSON.
+    let nasty = "trip\\1: he said \"go\"\nand left";
+    let rev_out = tmp.path().join("rev.cbor");
+    let status = dds_node_bin()
+        .args([
+            "revoke-admission",
+            "--domain-key",
+            domain_dir.join("domain_key.bin").to_str().unwrap(),
+            "--domain",
+            domain_dir.join("domain.toml").to_str().unwrap(),
+            "--peer-id",
+            "12D3KooWPeerNasty",
+            "--reason",
+            nasty,
+            "--out",
+            rev_out.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let status = dds_node_bin()
+        .args([
+            "import-revocation",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--in",
+            rev_out.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let (ok, stdout, _stderr) = run_capture(dds_node_bin().args([
+        "list-revocations",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--json",
+    ]));
+    assert!(ok);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    // Exactly one line — the embedded newline must be escaped, not
+    // emitted as a real LF that would split the record in two.
+    assert_eq!(
+        lines.len(),
+        1,
+        "embedded newline must be escaped, got lines: {lines:?}"
+    );
+    let line = lines[0];
+    // Quote and backslash escaped per RFC 8259.
+    assert!(line.contains("\\\""), "line: {line}");
+    assert!(line.contains("\\\\"), "line: {line}");
+    assert!(line.contains("\\n"), "line: {line}");
+}
+
+#[test]
+fn list_revocations_without_dds_toml_fails_loudly() {
+    // No dds.toml in the data dir — the command needs the domain
+    // pubkey to verify entries, so it must refuse rather than silently
+    // print whatever happens to be on disk.
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("node");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let (ok, _stdout, stderr) = run_capture(dds_node_bin().args([
+        "list-revocations",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]));
+    assert!(!ok, "list-revocations without dds.toml must exit non-zero");
+    assert!(
+        stderr.contains("dds.toml") || stderr.contains("config"),
+        "stderr should mention the missing config; got: {stderr}",
     );
 }

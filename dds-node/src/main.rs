@@ -32,6 +32,14 @@
 //!   node so the new entry takes effect on the next admission
 //!   handshake.
 //!
+//! - `dds-node list-revocations --data-dir <DIR> [--json]`
+//!   Print the current contents of the on-disk admission revocation
+//!   list. Useful for verifying that an `import-revocation` (or an
+//!   H-12 piggy-back gossip merge — see
+//!   `dds_net::admission::AdmissionResponse.revocations`) actually
+//!   landed. Read-only; safe to run while a node is live. `--json`
+//!   emits one object per entry on stdout for scripting.
+//!
 //! - `dds-node run [config.toml]`
 //!   Default action. Loads config, verifies admission cert, runs the
 //!   P2P node.
@@ -70,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "admit" => cmd_admit(&args[1..]),
         "revoke-admission" => cmd_revoke_admission(&args[1..]),
         "import-revocation" => cmd_import_revocation(&args[1..]),
+        "list-revocations" => cmd_list_revocations(&args[1..]),
         "create-provision-bundle" => cmd_create_bundle(&args[1..]),
         "provision" => cmd_provision(&args[1..]),
         "run" => cmd_run(&args[1..]).await,
@@ -98,6 +107,7 @@ fn print_usage() {
   dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--out <FILE>] [--ttl-days <N>]
   dds-node revoke-admission --domain-key <FILE> --domain <FILE> --peer-id <ID> [--reason <STR>] [--out <FILE>]
   dds-node import-revocation --data-dir <DIR> --in <FILE>
+  dds-node list-revocations --data-dir <DIR> [--json]
   dds-node create-provision-bundle --dir <DIR> --org <ORG> [--out <FILE>]
   dds-node provision <BUNDLE.dds> [--data-dir <DIR>] [--no-start]
   dds-node run [config.toml]"
@@ -378,6 +388,105 @@ fn cmd_import_revocation(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     println!("Restart the node for the new entry to take effect on the next");
     println!("admission handshake.");
     Ok(())
+}
+
+/// Read-only inspection of `<data_dir>/admission_revocations.cbor`.
+/// Used by operators to verify which peers have been revoked locally
+/// — both via manual `import-revocation` and via H-12 piggy-back gossip
+/// (`AdmissionResponse.revocations`). The store is loaded under the
+/// same domain-pubkey verification gate as the runtime path, so any
+/// entries that fail to verify (corrupt file, foreign-domain
+/// contamination) are dropped before they appear in the output.
+///
+/// Default output is human-readable; `--json` emits one JSON object
+/// per revocation on stdout for scripting (e.g. piping into `jq`).
+/// Always returns exit 0 if the store loads cleanly, even when empty
+/// — callers can branch on `total_entries`.
+fn cmd_list_revocations(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use dds_node::admission_revocation_store;
+
+    let data_dir = PathBuf::from(require_flag(args, "--data-dir")?);
+    let json = args.iter().any(|a| a == "--json");
+
+    let cfg_path = data_dir.join("dds.toml");
+    let cfg = if cfg_path.exists() {
+        NodeConfig::from_file(&cfg_path)?
+    } else {
+        return Err(format!(
+            "no dds.toml at {} — list-revocations needs the node's config to know which \
+             domain to verify revocations against",
+            cfg_path.display()
+        )
+        .into());
+    };
+    let domain_id = dds_domain::DomainId::parse(&cfg.domain.id)?;
+    let pk_vec = dds_domain::domain::from_hex(&cfg.domain.pubkey)?;
+    if pk_vec.len() != 32 {
+        return Err("domain pubkey is not 32 bytes".into());
+    }
+    let mut domain_pubkey = [0u8; 32];
+    domain_pubkey.copy_from_slice(&pk_vec);
+
+    let list_path = cfg.admission_revocations_path();
+    let store = admission_revocation_store::load_or_empty(&list_path, domain_id, domain_pubkey)?;
+    let entries = store.entries();
+
+    if json {
+        for rev in entries {
+            // Hand-rolled JSON object so we don't take a serde_json dep
+            // for one read-only command. Field order matches the body
+            // struct; `reason` is omitted when None to mirror CBOR.
+            print!(
+                "{{\"peer_id\":\"{peer}\",\"revoked_at\":{at}",
+                peer = json_escape(&rev.body.peer_id),
+                at = rev.body.revoked_at,
+            );
+            if let Some(r) = &rev.body.reason {
+                print!(",\"reason\":\"{}\"", json_escape(r));
+            }
+            println!("}}");
+        }
+    } else {
+        println!("Admission revocation list:");
+        println!("  data_dir: {}", data_dir.display());
+        println!("  file:     {}", list_path.display());
+        println!("  domain:   {} ({})", cfg.domain.name, cfg.domain.id);
+        println!("  entries:  {}", entries.len());
+        if entries.is_empty() {
+            println!();
+            println!("  (no revocations on file)");
+        } else {
+            println!();
+            for (i, rev) in entries.iter().enumerate() {
+                println!("  [{i}] peer_id:    {}", rev.body.peer_id);
+                println!("      revoked_at: {}", rev.body.revoked_at);
+                if let Some(r) = &rev.body.reason {
+                    println!("      reason:     {r}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Minimal JSON string escape — covers the characters that can appear
+/// in a libp2p peer id (alphanumerics; never a quote or backslash) and
+/// in operator-supplied `reason` strings (free-form, so we must escape
+/// `"`, `\`, and control chars).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn cmd_create_bundle(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
