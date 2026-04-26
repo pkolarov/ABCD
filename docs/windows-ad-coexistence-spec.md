@@ -648,6 +648,26 @@ This phase is complete only if all of the following are true.
   now uses `DSREG_JOIN_INFO.joinType`, list-users unsupported state has a real
   IPC shape, stale-password detection is routed through CP `ReportResult`, and
   Entra-only enrollment is blocked before password capture.
+- **2026-04-26** — **Phase 2 (AD-04, AD-05, AD-06, AD-07) implemented.** The
+  managed Policy Agent now refreshes `IJoinStateProbe` once per poll cycle and
+  routes every `EnforcementMode` argument through
+  `Worker.EffectiveMode`, forcing `Audit` on `AdJoined` / `HybridJoined` /
+  `Unknown`. Software dispatch (previously hardcoded `EnforcementMode.Enforce`)
+  is wrapped through the same helper. Entra-only hosts short-circuit
+  `ExecuteAsync` to a heartbeat-only loop reporting one
+  `_host_state` record per cycle with reason `unsupported_entra`. Reason codes
+  ride on a new `AppliedReport.Reason` field; the canonical taxonomy is
+  centralised in `State/AppliedReason.cs`. The applied-state `managed_items`
+  bucket migrated from `HashSet<string>` to `Dictionary<string, ManagedItemRecord>`
+  with a backward-compatible reader (legacy arrays migrate to records with
+  `last_outcome="legacy"`, `host_state_at_apply="Unknown"`,
+  `audit_frozen=false`). Reconciliation under audit mode marks stale items
+  `audit_frozen=true` instead of unwinding them; a later workgroup transition
+  clears the freeze on the next reconcile that lists the item again.
+  `AppliedEntry.host_state_at_apply` is now stamped on every recorded apply
+  so a JoinState transition since the last apply forces a one-shot audit
+  re-evaluation even when the content hash is unchanged. Native-side AD-08…AD-11
+  remain pending.
 
 ---
 

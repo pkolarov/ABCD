@@ -72,6 +72,15 @@ public sealed class AppliedReport
 
     [JsonPropertyName("applied_at")]
     public ulong AppliedAt { get; set; }
+
+    /// <summary>
+    /// AD-07: structured reason code explaining why the report has the
+    /// status it does. See <see cref="State.AppliedReason"/> for the
+    /// canonical taxonomy. Null when the legacy unconditional-enforce
+    /// path runs on a workgroup host with no transition to report.
+    /// </summary>
+    [JsonPropertyName("reason")]
+    public string? Reason { get; set; }
 }
 
 // ---------- Client ----------

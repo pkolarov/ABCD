@@ -1,7 +1,65 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #8 (FIDO2 AAGUID allow-list —
+> Last updated: 2026-04-26 follow-up #9 (AD coexistence Phase 2 —
+> AD-04, AD-05, AD-06, AD-07 from
+> `docs/windows-ad-coexistence-spec.md` and
+> `docs/AD-gap-plan.md`). The managed Windows Policy Agent
+> (`platform/windows/DdsPolicyAgent`) now refreshes
+> `IJoinStateProbe` once per poll cycle and routes every
+> `EnforcementMode` argument through the new
+> `Worker.EffectiveMode(requested, host)` helper, which forces
+> `Audit` whenever the host classifies as `AdJoined`,
+> `HybridJoined`, or `Unknown` (fail-closed on probe failure).
+> Software dispatch — previously hardcoded to
+> `EnforcementMode.Enforce` — is wrapped through the same helper
+> (AD-05). On `JoinState.EntraOnlyJoined`, `ExecuteAsync`
+> short-circuits before any directive evaluation and emits a
+> single `_host_state` `unsupported` report per cycle with reason
+> `unsupported_entra` (AD-06). A new structured
+> `AppliedReport.Reason` field carries codes from
+> `State/AppliedReason.cs`: `audit_due_to_ad_coexistence`,
+> `audit_due_to_unknown_host_state`, `unsupported_entra`,
+> `host_state_transition_detected`, plus the `would_apply` /
+> `would_correct_drift` / `would_clean_stale` sub-reasons combined
+> via `AppliedReason.Combine` (AD-07). The applied-state schema
+> migrated `managed_items` from `Dictionary<string, HashSet<string>>`
+> to `Dictionary<string, Dictionary<string, ManagedItemRecord>>`,
+> with each record carrying `last_outcome`, `last_reason`,
+> `host_state_at_apply`, `audit_frozen`, and `updated_at`. The
+> custom `ManagedItemsConverter` reads pre-AD-04 array entries
+> back as records with `last_outcome="legacy"`,
+> `host_state_at_apply="Unknown"`, `audit_frozen=false`. New
+> audit-aware reconciliation API
+> `IAppliedStateStore.RecordManagedItems(category, desired,
+> joinState, auditMode, reason)` upserts desired items and
+> either deletes (workgroup) or marks stale items
+> `audit_frozen=true` with the combined `:would_clean_stale`
+> sub-reason (AD/Hybrid/Unknown) — a later workgroup transition
+> that re-lists the item clears the freeze automatically.
+> `AppliedEntry.host_state_at_apply` (new field) is stamped on
+> every recorded apply via the new `RecordApplied(..., JoinState?)`
+> overload, and the worker forces a one-shot audit re-evaluation
+> when `GetHostStateAtApply` reports a different join-state since
+> the last apply — even if the content hash is unchanged. Tests:
+> 17 new tests across the policy-agent suite (10 in `WorkerTests`
+> covering `EffectiveMode` truth table, `EffectiveModeReason`,
+> Entra-only heartbeat-only loop, AD-joined audit-mode dispatch
+> with no host mutation, and AD-joined stale-item freeze; 7 in
+> `AppliedStateStoreTests` covering legacy-array migration,
+> workgroup destructive reconciliation, AD audit-frozen
+> reconciliation with combined reason, workgroup transition
+> clears `audit_frozen`, `host_state` round-trip, legacy entry
+> returns null host state, full record round-trip across
+> instances). DotNet test count: 145 in net9.0 (up from 128);
+> 39 Windows-only integration tests still skipped on macOS.
+> Workspace cargo test count: 546 (unchanged — Rust crates not
+> touched); cargo fmt clean; cargo clippy clean (workspace,
+> all-targets, `-D warnings`). Native-side AD-08…AD-11 (Auth
+> Bridge / Credential Provider join-state gating) and
+> Phase 4/5 work remain pending.
+>
+> Previous: 2026-04-26 follow-up #8 (FIDO2 AAGUID allow-list —
 > closes Phase 1 of `docs/fido2-attestation-allowlist.md`). The
 > Authenticator Attestation GUID is now extracted from `authData`
 > bytes 37..53 in `dds-domain::fido2::parse_auth_data` and surfaced

@@ -272,10 +272,10 @@ Use specific user-facing failures:
 
 | ID | Task | Repo Area | Deliverable |
 | --- | --- | --- | --- |
-| AD-04 | Force audit-only behavior on AD / hybrid hosts | `platform/windows/DdsPolicyAgent/Worker.cs` | Centralized effective-mode override |
-| AD-05 | Prevent software enforcement on AD / hybrid hosts | `platform/windows/DdsPolicyAgent/Worker.cs`, `SoftwareInstaller.cs` | Software assignments become audit-only too |
-| AD-06 | Add unsupported startup path for Entra-only hosts | `platform/windows/DdsPolicyAgent/Program.cs`, `Worker.cs` | Clear service logs and applied-state reason |
-| AD-07 | Add reporting reason codes | `platform/windows/DdsPolicyAgent/Client/`, `State/` | Distinguish `audit_due_to_ad_coexistence` vs `unsupported_entra` |
+| AD-04 ✅ | Force audit-only behavior on AD / hybrid hosts | `platform/windows/DdsPolicyAgent/Worker.cs` | Landed 2026-04-26: `Worker.EffectiveMode(requested, host)` + per-cycle `IJoinStateProbe.Refresh` + `host_state_at_apply` stamping. AD/Hybrid/Unknown force `Audit`; a JoinState transition since the last apply forces a re-evaluation even on unchanged content hashes. Schema migrated `managed_items` from `HashSet<string>` to `Dictionary<string, ManagedItemRecord>` with backward-compat reader. |
+| AD-05 ✅ | Prevent software enforcement on AD / hybrid hosts | `platform/windows/DdsPolicyAgent/Worker.cs`, `SoftwareInstaller.cs` | Landed 2026-04-26: software dispatch now wraps `EnforcementMode.Enforce` through `EffectiveMode`; reconciliation skips destructive unwind in audit mode and marks stale items `audit_frozen=true` so a later workgroup transition can resume cleanup deterministically. |
+| AD-06 ✅ | Add unsupported startup path for Entra-only hosts | `platform/windows/DdsPolicyAgent/Program.cs`, `Worker.cs` | Landed 2026-04-26: `ExecuteAsync` short-circuits on `JoinState.EntraOnlyJoined` to a heartbeat-only loop emitting one `_host_state` `unsupported` report per cycle (reason `unsupported_entra`). No directive evaluation, no reconciliation, no enforcer dispatch. |
+| AD-07 ✅ | Add reporting reason codes | `platform/windows/DdsPolicyAgent/Client/`, `State/` | Landed 2026-04-26: new `State/AppliedReason.cs` carries the canonical taxonomy (`audit_due_to_ad_coexistence`, `audit_due_to_unknown_host_state`, `unsupported_entra`, `host_state_transition_detected`, plus `would_apply` / `would_correct_drift` / `would_clean_stale` sub-reasons combined via `AppliedReason.Combine`). New `AppliedReport.Reason` JSON property and per-record `ManagedItemRecord.LastReason` thread the codes through report emission and persisted state. |
 
 ### Phase 3 - Authentication Coexistence
 
