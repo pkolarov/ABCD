@@ -98,22 +98,85 @@ Implementation:
   the error), bare-hex / mixed-case parsing, and malformed-config
   rejection.
 
-### Phase 2: Full `packed` with x5c Verification
+### Phase 2: Per-AAGUID Attestation Root ✅ Implemented (2026-04-26)
 
-For environments requiring hardware-backed attestation proof:
+Phase 2 ships without FIDO MDS — operators bring the vendor CA root
+themselves. For any AAGUID configured under
+`[[domain.fido2_attestation_roots]]`, enrollment becomes strict:
 
-1. Bundle or fetch the FIDO Alliance MDS blob (JWT-signed, ~2 MB).
-2. On enrollment, if `attStmt` contains an `x5c` array:
-   - Validate the certificate chain against MDS root certificates.
-   - Verify the AAGUID in `authData` matches the leaf certificate's
-     AAGUID extension (OID 1.3.6.1.4.1.45724.1.1.4).
-   - Verify the attestation signature using the leaf certificate's
-     public key (not the credential key).
-3. Reject enrollment if chain validation fails.
+1. `attStmt.x5c` must be present (self-attested `packed` is refused
+   for that AAGUID).
+2. The attestation signature is verified against the leaf cert's
+   `SubjectPublicKeyInfo` (already covered by A-1 step-2; unchanged).
+3. The leaf cert's `id-fido-gen-ce-aaguid` extension
+   (OID `1.3.6.1.4.1.45724.1.1.4`) must equal the AAGUID in
+   `authData` — catches a leaf cert reused under a forged AAGUID
+   claim.
+4. The chain `attStmt.x5c[0..]` is validated up to one of the PEM
+   certs at `ca_pem_path`. Each adjacent pair is verified by
+   signature; the topmost cert is signed by one of the configured
+   roots. Validity windows are checked against the current time.
 
-This is a breaking change for authenticators that only support
-self-attestation. Recommend gating behind a `fido2_require_x5c: bool`
-config flag.
+```toml
+[[domain.fido2_attestation_roots]]
+aaguid    = "2fc0579f-8113-47ea-b116-bb5a8db9202a"      # YubiKey 5 NFC
+ca_pem_path = "/etc/dds/yubico-fido-root-ca.pem"
+
+[[domain.fido2_attestation_roots]]
+aaguid    = "ee882879-721c-4913-9775-3dfcce97072a"      # Crayonic C-Key
+ca_pem_path = "/etc/dds/crayonic-fido-root-ca.pem"
+```
+
+Behavior is opt-in *per AAGUID*. AAGUIDs without a configured root
+fall through to the existing self-attested `packed` path — the
+allow-list (Phase 1) is the right tool for "just refuse this
+AAGUID outright." Multiple PEM-encoded certs in one file are all
+treated as alternative trust anchors (useful for vendors that
+rotate roots without retiring older certs).
+
+Failure modes that surface as explicit errors:
+
+| Symptom | Error |
+|---|---|
+| AAGUID has a root configured but `attStmt.x5c` is absent | `Fido2: AAGUID … requires attStmt.x5c …` |
+| Leaf cert lacks `id-fido-gen-ce-aaguid` extension | `Fido2: AAGUID … requires leaf cert id-fido-gen-ce-aaguid extension; not present` |
+| Leaf cert's AAGUID extension differs from authData AAGUID | `Fido2: leaf cert AAGUID … does not match authData AAGUID …` |
+| Chain does not validate to any configured root | `Fido2: attestation cert chain validation failed for AAGUID …` |
+| `ca_pem_path` cannot be read or contains no `CERTIFICATE` blocks | startup-time error — node refuses to start |
+
+Implementation:
+
+- New `dds_domain::fido2::extract_attestation_cert_aaguid` parses the
+  leaf cert's `id-fido-gen-ce-aaguid` extension into a `[u8; 16]`.
+- New `dds_domain::fido2::verify_attestation_cert_chain` walks
+  leaf → topmost chain cert → configured root, verifying signatures
+  with ECDSA-with-SHA256 (P-256) or Ed25519. RSA chains are not
+  supported in this phase; modern FIDO2 hardware (YubiKey, Crayonic,
+  SoloKey, Feitian) all use ECDSA P-256.
+- New config struct `Fido2AttestationRoot { aaguid, ca_pem_path }`
+  in `dds-node/src/config.rs`, surfaced as
+  `[[domain.fido2_attestation_roots]]`.
+- New service helper `LocalService::enforce_fido2_attestation_roots`,
+  called from both `enroll_user` and `admin_setup` after the Phase 1
+  allow-list check.
+- Six new integration tests in `dds-node/tests/service_tests.rs`
+  cover: valid chain accepted, self-attested rejected for a
+  configured AAGUID, chain to a *different* root rejected, leaf
+  AAGUID-extension mismatch rejected, unconfigured AAGUID still uses
+  the self-attested path, malformed config (bad UUID / missing PEM /
+  PEM with no CERTIFICATE blocks) refused at startup.
+- Eight new unit tests in `dds-domain::fido2::tests` cover AAGUID
+  extension extraction (present, absent, malformed) and chain
+  validation (valid, wrong root, empty chain, no roots, expired).
+
+### Future: FIDO MDS Integration (deferred)
+
+The current design intentionally avoids the FIDO Alliance Metadata
+Service (MDS) blob: it would add a JWT verify, a ~2 MB signed
+download, periodic refresh, and a CA dependency on the FIDO
+Alliance. Operators can paste vendor PEMs into TOML today; an MDS
+loader could be added later behind a feature flag without changing
+the per-AAGUID gate.
 
 ### Phase 3: TPM Attestation
 

@@ -88,6 +88,7 @@ async fn spawn_with_domain(
             enforce_device_scope_vouch: false,
             allow_unattested_credentials: false,
             fido2_allowed_aaguids: Vec::new(),
+            fido2_attestation_roots: Vec::new(),
         },
         trusted_roots: Vec::new(),
         bootstrap_admin_urn: None,

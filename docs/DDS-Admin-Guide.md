@@ -528,6 +528,7 @@ A matching client knob lives in the Policy Agent's
 | `admission_path` | path | `<data_dir>/admission.cbor` | Path to the admission certificate |
 | `audit_log_enabled` | bool | `false` | Enable append-only cryptographic audit log |
 | `fido2_allowed_aaguids` | list of UUID strings | `[]` (any AAGUID accepted) | Phase 1 of [`fido2-attestation-allowlist.md`](fido2-attestation-allowlist.md). When non-empty, enrollment rejects any FIDO2 credential whose AAGUID is not in the list. Each entry is a canonical UUID or a 32-char bare hex string. Unparseable entries make the node refuse to start. |
+| `fido2_attestation_roots` | array of tables `{ aaguid, ca_pem_path }` | `[]` (no per-AAGUID strict mode) | Phase 2 of [`fido2-attestation-allowlist.md`](fido2-attestation-allowlist.md). Per-AAGUID PEM trust roots. For any listed AAGUID, enrollment requires `attStmt.x5c` and validates the chain to one of the certs in `ca_pem_path`. The leaf's `id-fido-gen-ce-aaguid` extension must match the authData AAGUID. Use `[[domain.fido2_attestation_roots]]` table-array entries in TOML. |
 
 ### Example: Minimal Config
 

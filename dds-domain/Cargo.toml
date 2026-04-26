@@ -38,3 +38,8 @@ rcgen = "0.13"
 # attestation `sig` matches the leaf cert's SPKI. Production code paths
 # do not need PKCS8.
 p256 = { workspace = true, features = ["pkcs8"] }
+# Phase 2 (docs/fido2-attestation-allowlist.md) — rcgen exposes
+# `CertificateParams.not_before` / `not_after` as `time::OffsetDateTime`,
+# so the chain-validation expiry test needs a direct dep to construct
+# explicit validity windows. Already a transitive in the workspace.
+time = { version = "0.3", default-features = false, features = ["std"] }

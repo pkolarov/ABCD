@@ -321,6 +321,7 @@ async fn spawn_node(
             // belt-and-braces.
             allow_unattested_credentials: true,
             fido2_allowed_aaguids: Vec::new(),
+            fido2_attestation_roots: Vec::new(),
         },
         trusted_roots: trusted_roots.to_vec(),
         bootstrap_admin_urn: None,

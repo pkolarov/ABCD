@@ -925,6 +925,18 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "FIDO2 AAGUID allow-list enabled — enrollment restricted to listed authenticators"
         );
     }
+    // FIDO2 attestation trust roots (Phase 2 of
+    // docs/fido2-attestation-allowlist.md). Same fail-closed posture:
+    // any I/O or parse error here aborts startup so the operator never
+    // ends up with strict-mode silently disabled.
+    svc.set_fido2_attestation_roots(&config.domain.fido2_attestation_roots)
+        .map_err(|e| format!("invalid fido2_attestation_roots: {e}"))?;
+    if !config.domain.fido2_attestation_roots.is_empty() {
+        info!(
+            count = config.domain.fido2_attestation_roots.len(),
+            "FIDO2 attestation roots configured — listed AAGUIDs require chain to vendor CA"
+        );
+    }
     let shared_svc = Arc::new(tokio::sync::Mutex::new(svc));
     let node_info = http::NodeInfo {
         peer_id: node.peer_id.to_string(),

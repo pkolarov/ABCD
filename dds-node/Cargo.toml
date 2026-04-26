@@ -69,10 +69,21 @@ windows-sys = { version = "0.60", features = [
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 ed25519-dalek = { workspace = true, features = ["std"] }
-p256 = { workspace = true }
+# Phase 2 (docs/fido2-attestation-allowlist.md) — `pkcs8` lets the
+# integration tests re-import an rcgen-generated leaf private key as a
+# `p256::ecdsa::SigningKey` so the synthetic attestation chain can be
+# signed with the leaf cert's matching private key.
+p256 = { workspace = true, features = ["pkcs8"] }
 criterion = { workspace = true }
 http-body-util = "0.1"
 bytes = "1"
+# Phase 2 (docs/fido2-attestation-allowlist.md) — synthesize attestation
+# leaf certs with embedded id-fido-gen-ce-aaguid extensions so the
+# service-level integration tests can exercise the attestation root
+# enforcement without a real authenticator.
+rcgen = "0.13"
+# Phase 2 — rcgen exposes validity windows as `time::OffsetDateTime`.
+time = { version = "0.3", default-features = false, features = ["std"] }
 
 [[bench]]
 name = "session_lifecycle"

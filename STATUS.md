@@ -1,7 +1,84 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #9 (AD coexistence Phase 2 —
+> Last updated: 2026-04-26 follow-up #11 (design pass — hardware-bound
+> admission plan landed at
+> [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md)).
+> No code change in this pass; the plan documents the structural
+> answer to `docs/threat-model-review.md` §1 "Bearer token" risk
+> (admission cert + libp2p keypair are static files; an attacker who
+> exfiltrates both can stand up a clone of the node on different
+> hardware). Approach selected after spiking three options: rather
+> than fork `libp2p_identity` to add a `Signer` variant for the
+> Noise handshake, the integration localises hardware binding to
+> the H-12 admission layer — a new `node_admission_key` (TPM 2.0 /
+> Apple Secure Enclave / software fallback) is generated alongside
+> `p2p_key.bin`, its public half is bound into the
+> `AdmissionCert.body` (v2 schema), and the H-12 handshake adds a
+> challenge-response step that requires a fresh signature from the
+> hardware-resident key. A clone with stolen `p2p_key.bin +
+> admission.cbor` completes Noise but fails H-12 because it cannot
+> produce the admission signature → never added to `admitted_peers`
+> → all gossip and sync from it dropped at the behaviour layer. New
+> `dds-core::key_provider::KeyProvider` trait abstracts the three
+> backends; backends live in `dds-node` (the platform-specific deps
+> stay out of `dds-core`). Phasing: A0 spike → A1 trait + software
+> backend → A2 v2 cert + H-12 challenge-response → A3 TPM 2.0 (Linux
+> + Windows, ECDSA-P256 first) → A4 Secure Enclave (macOS, gated on
+> Developer ID pkg signing) → A5 Ed25519 on capable TPM chips → A6
+> migration tooling + `allow_v1_certs = false` flip → A7
+> threat-model close-out. Estimate ~6–7 weeks dependency-bound
+> (hardware arrival, pkg signing cert). No workspace test count
+> change — design-only pass. Open questions tracked in §11 of the
+> plan doc; review feedback should land before A0 begins.
+>
+> Previous: 2026-04-26 follow-up #10 (FIDO2 attestation cert
+> verification — closes Phase 2 of
+> `docs/fido2-attestation-allowlist.md` *without* FIDO MDS, per
+> operator preference). When the operator binds an AAGUID to a
+> vendor CA root via `[[domain.fido2_attestation_roots]]`, enrollment
+> for that AAGUID becomes strict: `attStmt.x5c` is required
+> (self-attested `packed` is refused), the leaf cert's
+> `id-fido-gen-ce-aaguid` extension (OID `1.3.6.1.4.1.45724.1.1.4`)
+> must equal the authData AAGUID, and the chain `attStmt.x5c[0..]`
+> is validated up to one of the PEM certs at `ca_pem_path`. Three
+> new public dds-domain helpers:
+> `ParsedAttestation::x5c_chain` (the leaf-first DER chain),
+> `extract_attestation_cert_aaguid` (parses the FIDO extension), and
+> `verify_attestation_cert_chain` (walks adjacent pairs by
+> signature, terminates at one of the configured roots, checks
+> validity windows; supports ECDSA-with-SHA256 / P-256 and Ed25519).
+> New `dds-node` config: `Fido2AttestationRoot { aaguid,
+> ca_pem_path }` under `[[domain.fido2_attestation_roots]]`, loaded
+> from PEM at startup; multiple `CERTIFICATE` blocks per file are
+> treated as alternative trust anchors so vendors can rotate roots
+> without retiring older certs. Service-side enforcement
+> (`LocalService::enforce_fido2_attestation_roots`) is wired into
+> both `enroll_user` and `admin_setup` so the bootstrap admin can't
+> sidestep the gate. Behavior is opt-in *per AAGUID* — AAGUIDs
+> without a configured root keep the existing self-attested `packed`
+> path, and Phase 1's `fido2_allowed_aaguids` remains the right
+> tool for "refuse this AAGUID outright." Test coverage: 8 new
+> dds-domain unit tests (extension extraction present / absent /
+> malformed; chain validation valid leaf-only / wrong root / empty
+> chain / no roots / expired) plus 6 new dds-node integration tests
+> (valid chain accepted, self-attested rejected for configured
+> AAGUID, chain to a *different* root rejected, leaf
+> AAGUID-extension mismatch rejected, unconfigured AAGUID still
+> self-attests, malformed config refused at startup — bad UUID /
+> missing PEM / PEM with no `CERTIFICATE` blocks). Workspace test
+> count: 560 (up from 546); cargo fmt clean; cargo clippy clean
+> (workspace, all-targets, `-D warnings`). New direct dev-deps:
+> `time = "0.3"` for rcgen's validity-window types and (on
+> `dds-node`) `rcgen` plus the `pkcs8` feature on `p256` for the
+> synthetic chain fixtures (all already transitive). Production
+> code paths add no new dependencies — `x509-parser` and
+> `ed25519-dalek` were already direct deps. The doc closes Phase 2
+> with an "✅ Implemented" marker; FIDO MDS integration remains
+> explicitly deferred per operator preference (no JWT verify, no
+> ~2 MB signed download, no FIDO Alliance CA dependency).
+>
+> Previous: 2026-04-26 follow-up #9 (AD coexistence Phase 2 —
 > AD-04, AD-05, AD-06, AD-07 from
 > `docs/windows-ad-coexistence-spec.md` and
 > `docs/AD-gap-plan.md`). The managed Windows Policy Agent

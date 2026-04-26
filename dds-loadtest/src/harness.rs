@@ -991,6 +991,7 @@ async fn spawn_node(org: &str) -> Result<(DdsNode, TempDir), Box<dyn std::error:
             // and does not exercise the attestation gate.
             allow_unattested_credentials: true,
             fido2_allowed_aaguids: Vec::new(),
+            fido2_attestation_roots: Vec::new(),
         },
         trusted_roots: Vec::new(),
         bootstrap_admin_urn: None,

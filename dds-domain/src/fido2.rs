@@ -46,6 +46,14 @@ pub struct ParsedAttestation {
     /// `fido2_allowed_aaguids` list is configured and this value is
     /// not in it.
     pub aaguid: [u8; 16],
+    /// X.509 attestation certificate chain (DER-encoded), leaf-first
+    /// per WebAuthn ordering. Empty for `fmt = "none"` and for packed
+    /// self-attestation (no `x5c` array). Phase 2 of
+    /// `docs/fido2-attestation-allowlist.md`: when the dds-node service
+    /// has a configured trust root for the credential's AAGUID, it
+    /// validates this chain against that root and refuses the
+    /// enrollment if the chain is missing or fails to validate.
+    pub x5c_chain: Vec<Vec<u8>>,
 }
 
 /// Errors from FIDO2 parsing/verification.
@@ -125,6 +133,7 @@ pub fn verify_attestation(
 
     let parsed_auth = parse_auth_data(&auth_data)?;
 
+    let mut x5c_chain: Vec<Vec<u8>> = Vec::new();
     match fmt.as_str() {
         "none" => {
             // **A-1 step-1**: refuse `fmt = "none"` unless the caller
@@ -143,7 +152,7 @@ pub fn verify_attestation(
         "packed" => {
             let stmt =
                 att_stmt.ok_or_else(|| Fido2Error::Format("packed missing attStmt".into()))?;
-            verify_packed(
+            x5c_chain = verify_packed(
                 stmt,
                 &auth_data,
                 client_data_hash,
@@ -160,6 +169,7 @@ pub fn verify_attestation(
         credential_public_key: parsed_auth.credential_public_key,
         rp_id_hash: parsed_auth.rp_id_hash,
         aaguid: parsed_auth.aaguid,
+        x5c_chain,
     })
 }
 
@@ -226,7 +236,7 @@ fn verify_packed(
     auth_data: &[u8],
     client_data_hash: &[u8],
     credential_pk: &CredentialPublicKey,
-) -> Result<(), Fido2Error> {
+) -> Result<Vec<Vec<u8>>, Fido2Error> {
     let map = att_stmt
         .as_map()
         .ok_or_else(|| Fido2Error::Format("attStmt not map".into()))?;
@@ -281,7 +291,8 @@ fn verify_packed(
             .first()
             .ok_or_else(|| Fido2Error::Format("x5c empty".into()))?;
         let leaf_pk = leaf_public_key_from_der(leaf, alg)?;
-        return verify_attestation_sig(&leaf_pk, alg, &sig, &signed);
+        verify_attestation_sig(&leaf_pk, alg, &sig, &signed)?;
+        return Ok(x5c);
     }
 
     // Self-attestation (no x5c): the signature is verified under the
@@ -291,7 +302,8 @@ fn verify_packed(
         CredentialPublicKey::Ed25519(vk) => AttestationPublicKey::Ed25519(*vk),
         CredentialPublicKey::P256(vk) => AttestationPublicKey::P256(*vk),
     };
-    verify_attestation_sig(&credential_attest_pk, alg, &sig, &signed)
+    verify_attestation_sig(&credential_attest_pk, alg, &sig, &signed)?;
+    Ok(Vec::new())
 }
 
 /// Public key recovered from an attestation source (the credential
@@ -410,6 +422,320 @@ fn leaf_public_key_from_der(
     Err(Fido2Error::Unsupported(format!(
         "x5c leaf algorithm OID {oid} not supported (only ES256 / EdDSA)"
     )))
+}
+
+// =========================================================================
+// Phase 2 — Attestation cert chain verification
+//
+// `docs/fido2-attestation-allowlist.md` §"Phase 2". When an operator
+// configures a trust root for a specific AAGUID, two things must be
+// checked beyond the existing leaf-key signature:
+//   1. the leaf cert's `id-fido-gen-ce-aaguid` extension matches the
+//      AAGUID in authData (no MDS lookup required — both come from the
+//      same attestation object), and
+//   2. the chain validates up to the configured root via signature.
+//
+// FIDO MDS integration is intentionally NOT done here; the operator is
+// responsible for providing the vendor's CA root PEM out of band.
+// =========================================================================
+
+/// Object identifier for the FIDO ID Attestation Certificate AAGUID
+/// extension: `1.3.6.1.4.1.45724.1.1.4`. Defined in WebAuthn §8.2.1
+/// (`id-fido-gen-ce-aaguid`). The extension value is a DER OCTET STRING
+/// wrapping the 16-byte AAGUID.
+const FIDO_AAGUID_EXTENSION_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 45724, 1, 1, 4];
+
+/// Phase 2 of `docs/fido2-attestation-allowlist.md`. Extract the AAGUID
+/// from a leaf attestation certificate's `id-fido-gen-ce-aaguid`
+/// extension. Returns:
+/// - `Ok(Some(aaguid))` if the extension is present and well-formed.
+/// - `Ok(None)` if the extension is absent — the caller decides whether
+///   that is acceptable. (Hardware attestation certs that follow
+///   WebAuthn §8.2.1 always carry it; the dds-node service treats
+///   absence as a rejection when a per-AAGUID trust root is configured.)
+/// - `Err(Fido2Error::Format)` if the cert or extension bytes do not
+///   decode as expected.
+pub fn extract_attestation_cert_aaguid(cert_der: &[u8]) -> Result<Option<[u8; 16]>, Fido2Error> {
+    use x509_parser::prelude::FromDer;
+
+    let (_rest, cert) = x509_parser::certificate::X509Certificate::from_der(cert_der)
+        .map_err(|e| Fido2Error::Format(format!("attestation cert not valid X.509: {e}")))?;
+
+    let target_oid = x509_parser::der_parser::oid::Oid::from(FIDO_AAGUID_EXTENSION_OID).unwrap();
+    let ext = match cert.extensions().iter().find(|e| e.oid == target_oid) {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+
+    // The extension value is a DER OCTET STRING wrapping a 16-byte
+    // OCTET STRING — i.e., the canonical FIDO encoding `OCTET STRING
+    // (16-byte AAGUID)`. x509-parser strips the outer extnValue OCTET
+    // STRING for us, so `ext.value` should start with the inner OCTET
+    // STRING tag (0x04) followed by length `16` and the 16 AAGUID
+    // bytes.
+    let inner = ext.value;
+    if inner.len() < 2 || inner[0] != 0x04 {
+        return Err(Fido2Error::Format(
+            "fido AAGUID extension: expected inner OCTET STRING".into(),
+        ));
+    }
+    let len = inner[1] as usize;
+    if len != 16 || inner.len() != 2 + 16 {
+        return Err(Fido2Error::Format(format!(
+            "fido AAGUID extension: expected 16-byte AAGUID, got len={}",
+            inner.len().saturating_sub(2)
+        )));
+    }
+    let mut aaguid = [0u8; 16];
+    aaguid.copy_from_slice(&inner[2..18]);
+    Ok(Some(aaguid))
+}
+
+/// Phase 2 of `docs/fido2-attestation-allowlist.md`. Verify that the
+/// `chain` (leaf-first, DER-encoded, as it appears in `attStmt.x5c`)
+/// terminates at one of the operator-configured trust roots in
+/// `roots` (also DER-encoded).
+///
+/// Validation:
+/// 1. Every adjacent pair `chain[i]` / `chain[i+1]` is verified by
+///    treating `chain[i+1]` as the issuer.
+/// 2. The topmost cert's signature is verified against each `root` in
+///    turn; the first match wins.
+/// 3. Each cert's validity window must contain `now_unix`.
+/// 4. Intermediate / root certs must have `BasicConstraints CA = true`
+///    if the extension is present.
+///
+/// Supports ECDSA-with-SHA256 (P-256) and Ed25519 cert signature
+/// algorithms. Returns the index of the matching trust anchor in
+/// `roots` on success.
+pub fn verify_attestation_cert_chain(
+    chain: &[Vec<u8>],
+    roots: &[Vec<u8>],
+    now_unix: u64,
+) -> Result<usize, Fido2Error> {
+    use x509_parser::prelude::FromDer;
+
+    if chain.is_empty() {
+        return Err(Fido2Error::Format(
+            "x5c chain empty; configured trust root demands a leaf certificate".into(),
+        ));
+    }
+    if roots.is_empty() {
+        return Err(Fido2Error::Format(
+            "no trust anchors configured for chain validation".into(),
+        ));
+    }
+
+    // Parse every chain cert once.
+    let parsed_chain: Vec<_> = chain
+        .iter()
+        .enumerate()
+        .map(|(i, der)| {
+            let (rest, cert) = x509_parser::certificate::X509Certificate::from_der(der)
+                .map_err(|e| Fido2Error::Format(format!("x5c[{i}] not valid X.509: {e}")))?;
+            if !rest.is_empty() {
+                return Err(Fido2Error::Format(format!(
+                    "x5c[{i}] has trailing bytes after cert"
+                )));
+            }
+            cert_validity_check(&cert, now_unix, i)?;
+            if i > 0 {
+                // Intermediates must be CA certs.
+                require_ca_basic_constraint(&cert, i)?;
+            }
+            Ok(cert)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Verify each adjacent pair: chain[i] signed by chain[i+1].
+    for i in 0..parsed_chain.len().saturating_sub(1) {
+        let issuer_spki = &parsed_chain[i + 1].tbs_certificate.subject_pki;
+        verify_cert_signed_by(&parsed_chain[i], chain[i].as_slice(), issuer_spki)?;
+    }
+
+    // Verify the topmost chain cert is signed by one of the configured
+    // roots.
+    let top_idx = parsed_chain.len() - 1;
+    let top_cert = &parsed_chain[top_idx];
+    let top_der = chain[top_idx].as_slice();
+
+    for (root_idx, root_der) in roots.iter().enumerate() {
+        let (rest, root) = match x509_parser::certificate::X509Certificate::from_der(root_der) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !rest.is_empty() {
+            continue;
+        }
+        if cert_validity_check(&root, now_unix, usize::MAX).is_err() {
+            continue;
+        }
+        require_ca_basic_constraint(&root, usize::MAX).ok();
+        // Subject DN of root must match issuer DN of topmost chain cert.
+        if root.tbs_certificate.subject != top_cert.tbs_certificate.issuer {
+            continue;
+        }
+        if verify_cert_signed_by(top_cert, top_der, &root.tbs_certificate.subject_pki).is_ok() {
+            return Ok(root_idx);
+        }
+    }
+    Err(Fido2Error::BadSignature)
+}
+
+fn cert_validity_check(
+    cert: &x509_parser::certificate::X509Certificate<'_>,
+    now_unix: u64,
+    pos: usize,
+) -> Result<(), Fido2Error> {
+    let nb = cert.tbs_certificate.validity.not_before.timestamp();
+    let na = cert.tbs_certificate.validity.not_after.timestamp();
+    let now_signed = now_unix as i64;
+    if now_signed < nb || now_signed > na {
+        let where_ = if pos == usize::MAX {
+            "trust root".to_string()
+        } else {
+            format!("x5c[{pos}]")
+        };
+        return Err(Fido2Error::Format(format!(
+            "{where_}: cert not valid at now={now_unix} (notBefore={nb}, notAfter={na})"
+        )));
+    }
+    Ok(())
+}
+
+fn require_ca_basic_constraint(
+    cert: &x509_parser::certificate::X509Certificate<'_>,
+    pos: usize,
+) -> Result<(), Fido2Error> {
+    let bc = match cert.basic_constraints() {
+        Ok(Some(ext)) => ext,
+        // Absence is a soft fail: WebAuthn does not strictly require
+        // BasicConstraints on FIDO intermediates, and several real
+        // YubiKey roots ship without it. Accepting absence keeps real
+        // chains working.
+        _ => return Ok(()),
+    };
+    if !bc.value.ca {
+        let where_ = if pos == usize::MAX {
+            "trust root".to_string()
+        } else {
+            format!("x5c[{pos}]")
+        };
+        return Err(Fido2Error::Format(format!(
+            "{where_}: BasicConstraints.cA=false on intermediate / root cert"
+        )));
+    }
+    Ok(())
+}
+
+/// Verify `cert.signature_value` over `cert.tbs_certificate` (raw DER)
+/// using the supplied issuer SubjectPublicKeyInfo. Supports
+/// ECDSA-with-SHA256 (P-256) and Ed25519 only.
+fn verify_cert_signed_by(
+    cert: &x509_parser::certificate::X509Certificate<'_>,
+    cert_der: &[u8],
+    issuer_spki: &x509_parser::x509::SubjectPublicKeyInfo<'_>,
+) -> Result<(), Fido2Error> {
+    use x509_parser::oid_registry;
+
+    // OID ecdsa-with-SHA256: 1.2.840.10045.4.3.2
+    let ecdsa_with_sha256: x509_parser::der_parser::oid::Oid<'_> =
+        x509_parser::der_parser::oid::Oid::from(&[1, 2, 840, 10045, 4, 3, 2]).unwrap();
+    let sig_alg = &cert.signature_algorithm.algorithm;
+    let issuer_alg = &issuer_spki.algorithm.algorithm;
+    let issuer_raw = issuer_spki.subject_public_key.data.as_ref();
+
+    // Locate the raw TBS bytes inside the original cert DER. We need
+    // the byte-exact TBS for signature verification because re-encoding
+    // is not guaranteed to be bit-identical to the original.
+    let tbs_bytes = locate_tbs_bytes(cert_der)
+        .ok_or_else(|| Fido2Error::Format("cannot locate TBS bytes in cert DER".into()))?;
+
+    if *sig_alg == ecdsa_with_sha256 {
+        if *issuer_alg != oid_registry::OID_KEY_TYPE_EC_PUBLIC_KEY {
+            return Err(Fido2Error::Unsupported(format!(
+                "ECDSA-SHA256 cert signed by issuer with key OID {issuer_alg} (expected EC)"
+            )));
+        }
+        let vk = P256VerifyingKey::from_sec1_bytes(issuer_raw)
+            .map_err(|e| Fido2Error::KeyError(format!("issuer P-256: {e}")))?;
+        let sig = P256Signature::from_der(cert.signature_value.data.as_ref())
+            .or_else(|_| P256Signature::from_slice(cert.signature_value.data.as_ref()))
+            .map_err(|e| Fido2Error::KeyError(format!("cert sig P-256: {e}")))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        return vk
+            .verify(tbs_bytes, &sig)
+            .map_err(|_| Fido2Error::BadSignature);
+    }
+
+    if *sig_alg == oid_registry::OID_SIG_ED25519 {
+        if *issuer_alg != oid_registry::OID_SIG_ED25519 {
+            return Err(Fido2Error::Unsupported(format!(
+                "Ed25519 cert signed by issuer with key OID {issuer_alg} (expected Ed25519)"
+            )));
+        }
+        if issuer_raw.len() != 32 {
+            return Err(Fido2Error::Format(format!(
+                "issuer Ed25519 SPKI len={} expected 32",
+                issuer_raw.len()
+            )));
+        }
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(issuer_raw);
+        let vk = VerifyingKey::from_bytes(&bytes)
+            .map_err(|e| Fido2Error::KeyError(format!("issuer Ed25519: {e}")))?;
+        let sig = Ed25519Signature::from_slice(cert.signature_value.data.as_ref())
+            .map_err(|e| Fido2Error::KeyError(format!("cert sig Ed25519: {e}")))?;
+        return vk
+            .verify(tbs_bytes, &sig)
+            .map_err(|_| Fido2Error::BadSignature);
+    }
+
+    Err(Fido2Error::Unsupported(format!(
+        "cert signature algorithm OID {sig_alg} not supported (only ES256 / EdDSA)"
+    )))
+}
+
+/// Find the raw TBSCertificate bytes inside a DER-encoded
+/// `Certificate` SEQUENCE. The standard layout is `SEQUENCE { TBS,
+/// AlgId, BIT STRING sig }`, so the TBS is the first inner SEQUENCE.
+/// Returns the byte slice including the SEQUENCE tag and length, which
+/// is what every standards-compliant signer hashes.
+fn locate_tbs_bytes(cert_der: &[u8]) -> Option<&[u8]> {
+    if cert_der.len() < 2 || cert_der[0] != 0x30 {
+        return None;
+    }
+    // Skip the outer SEQUENCE header.
+    let (outer_body_off, _outer_body_len) = der_seq_body_offset(cert_der)?;
+    let inner = &cert_der[outer_body_off..];
+    if inner.is_empty() || inner[0] != 0x30 {
+        return None;
+    }
+    let (inner_body_off, inner_body_len) = der_seq_body_offset(inner)?;
+    let tbs_total = inner_body_off + inner_body_len;
+    Some(&inner[..tbs_total])
+}
+
+/// Decode a DER definite-length SEQUENCE header and return
+/// `(body_offset, body_len)` relative to the start of the slice.
+/// Indefinite length is rejected (not used in DER).
+fn der_seq_body_offset(buf: &[u8]) -> Option<(usize, usize)> {
+    if buf.len() < 2 || buf[0] != 0x30 {
+        return None;
+    }
+    let len_byte = buf[1];
+    if len_byte & 0x80 == 0 {
+        return Some((2, len_byte as usize));
+    }
+    let n = (len_byte & 0x7f) as usize;
+    if n == 0 || n > 8 || buf.len() < 2 + n {
+        return None;
+    }
+    let mut len = 0usize;
+    for &b in &buf[2..2 + n] {
+        len = len.checked_shl(8)?.checked_add(b as usize)?;
+    }
+    Some((2 + n, len))
 }
 
 // =========================================================================
@@ -1604,5 +1930,175 @@ mod tests {
         let parsed = verify_attestation(&attestation, &[0u8; 32], true).unwrap();
         assert_eq!(parsed.fmt, "none");
         assert_eq!(parsed.aaguid, aaguid);
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 2 of docs/fido2-attestation-allowlist.md — attestation cert
+    // chain verification.
+    // -------------------------------------------------------------------
+
+    /// Build a `(root_der, leaf_der, leaf_signing_key)` triple where
+    /// the leaf carries an `id-fido-gen-ce-aaguid` extension with the
+    /// supplied AAGUID and the leaf is signed by the root. The leaf
+    /// pubkey ends up in its SPKI; callers can sign attestation data
+    /// with `leaf_signing_key`.
+    fn build_test_chain_p256(aaguid: &[u8; 16]) -> (Vec<u8>, Vec<u8>, p256::ecdsa::SigningKey) {
+        // 1. Self-signed root.
+        let root_kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut root_params = rcgen::CertificateParams::new(vec!["dds-test-root".into()]).unwrap();
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let root_cert = root_params.self_signed(&root_kp).unwrap();
+        let root_der = root_cert.der().to_vec();
+
+        // 2. Leaf signed by root with the FIDO AAGUID extension.
+        let leaf_kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut leaf_params = rcgen::CertificateParams::new(vec!["dds-test-leaf".into()]).unwrap();
+        // extnValue content: OCTET STRING (16 AAGUID bytes).
+        let mut ext_content = Vec::with_capacity(18);
+        ext_content.push(0x04);
+        ext_content.push(0x10);
+        ext_content.extend_from_slice(aaguid);
+        leaf_params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                FIDO_AAGUID_EXTENSION_OID,
+                ext_content,
+            ));
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_kp, &root_cert, &root_kp)
+            .unwrap();
+        let leaf_der = leaf_cert.der().to_vec();
+
+        // 3. Re-import the leaf private key as a p256::ecdsa::SigningKey
+        //    so callers can sign WebAuthn `authData || cdh`.
+        let leaf_sk = {
+            use p256::pkcs8::DecodePrivateKey;
+            p256::ecdsa::SigningKey::from_pkcs8_der(&leaf_kp.serialize_der()).unwrap()
+        };
+
+        (root_der, leaf_der, leaf_sk)
+    }
+
+    #[test]
+    fn extract_attestation_cert_aaguid_present() {
+        let aaguid: [u8; 16] = [
+            0x2f, 0xc0, 0x57, 0x9f, 0x81, 0x13, 0x47, 0xea, 0xb1, 0x16, 0xbb, 0x5a, 0x8d, 0xb9,
+            0x20, 0x2a,
+        ];
+        let (_root, leaf, _sk) = build_test_chain_p256(&aaguid);
+        let got = extract_attestation_cert_aaguid(&leaf).unwrap();
+        assert_eq!(got, Some(aaguid));
+    }
+
+    #[test]
+    fn extract_attestation_cert_aaguid_absent() {
+        // A self-signed cert without the FIDO extension.
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["plain".into()]).unwrap();
+        let cert = params.self_signed(&kp).unwrap();
+        let got = extract_attestation_cert_aaguid(cert.der()).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn extract_attestation_cert_aaguid_malformed_inner_octet_string() {
+        // Hand-craft a cert that has the FIDO extension but with
+        // non-OCTET-STRING content so we exercise the error path.
+        let mut params = rcgen::CertificateParams::new(vec!["bad".into()]).unwrap();
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                FIDO_AAGUID_EXTENSION_OID,
+                vec![0x05, 0x00], // ASN.1 NULL — not OCTET STRING
+            ));
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = params.self_signed(&kp).unwrap();
+        let res = extract_attestation_cert_aaguid(cert.der());
+        assert!(matches!(res, Err(Fido2Error::Format(_))));
+    }
+
+    #[test]
+    fn verify_attestation_cert_chain_valid_leaf_only() {
+        let aaguid = [0x42u8; 16];
+        let (root, leaf, _sk) = build_test_chain_p256(&aaguid);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let chain = vec![leaf];
+        let roots = vec![root];
+        let idx = verify_attestation_cert_chain(&chain, &roots, now).unwrap();
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn verify_attestation_cert_chain_wrong_root_rejected() {
+        let aaguid = [0x42u8; 16];
+        let (_root_a, leaf_a, _sk_a) = build_test_chain_p256(&aaguid);
+        let (root_b, _leaf_b, _sk_b) = build_test_chain_p256(&[0x55u8; 16]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let res = verify_attestation_cert_chain(&[leaf_a], &[root_b], now);
+        assert!(matches!(res, Err(Fido2Error::BadSignature)));
+    }
+
+    #[test]
+    fn verify_attestation_cert_chain_empty_chain_rejected() {
+        let (root, _leaf, _sk) = build_test_chain_p256(&[0x42u8; 16]);
+        let res = verify_attestation_cert_chain(&[], &[root], 0);
+        assert!(matches!(res, Err(Fido2Error::Format(_))));
+    }
+
+    #[test]
+    fn verify_attestation_cert_chain_no_roots_rejected() {
+        let (_root, leaf, _sk) = build_test_chain_p256(&[0x42u8; 16]);
+        let res = verify_attestation_cert_chain(&[leaf], &[], 0);
+        assert!(matches!(res, Err(Fido2Error::Format(_))));
+    }
+
+    #[test]
+    fn verify_attestation_cert_chain_expired_leaf_rejected() {
+        // Build a chain whose leaf has a tight 1h validity window so
+        // we can test the expiry path with realistic timestamps. (The
+        // default rcgen validity is decades long — we'd otherwise need
+        // a very far-future timestamp.)
+        let aaguid = [0x42u8; 16];
+
+        let root_kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut root_params = rcgen::CertificateParams::new(vec!["root".into()]).unwrap();
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let root_cert = root_params.self_signed(&root_kp).unwrap();
+
+        let leaf_kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut leaf_params = rcgen::CertificateParams::new(vec!["leaf".into()]).unwrap();
+        let mut ext_content = Vec::with_capacity(18);
+        ext_content.push(0x04);
+        ext_content.push(0x10);
+        ext_content.extend_from_slice(&aaguid);
+        leaf_params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                FIDO_AAGUID_EXTENSION_OID,
+                ext_content,
+            ));
+        let now_dt = time::OffsetDateTime::now_utc();
+        leaf_params.not_before = now_dt - time::Duration::hours(2);
+        leaf_params.not_after = now_dt - time::Duration::minutes(5);
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_kp, &root_cert, &root_kp)
+            .unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let res = verify_attestation_cert_chain(
+            &[leaf_cert.der().to_vec()],
+            &[root_cert.der().to_vec()],
+            now,
+        );
+        assert!(matches!(res, Err(Fido2Error::Format(_))));
     }
 }

@@ -124,6 +124,34 @@ pub struct DomainConfig {
     /// including all-zero, is accepted).
     #[serde(default)]
     pub fido2_allowed_aaguids: Vec<String>,
+
+    /// FIDO2 attestation trust roots, keyed by AAGUID (Phase 2 of
+    /// `docs/fido2-attestation-allowlist.md`). When an entry exists for
+    /// the credential's AAGUID, enrollment requires `attStmt.x5c` and
+    /// validates the chain against the listed PEM file (any number of
+    /// concatenated certs in the file are treated as alternative trust
+    /// anchors). The leaf cert's `id-fido-gen-ce-aaguid` extension
+    /// (OID `1.3.6.1.4.1.45724.1.1.4`) must equal the AAGUID in
+    /// authData. Without an entry, the credential's AAGUID is only
+    /// gated by `fido2_allowed_aaguids` (if any) and self-attested
+    /// `packed` is still accepted. Empty by default.
+    #[serde(default)]
+    pub fido2_attestation_roots: Vec<Fido2AttestationRoot>,
+}
+
+/// A single AAGUID → trust-root binding for Phase 2 of
+/// `docs/fido2-attestation-allowlist.md`. Lives at the
+/// `[[domain.fido2_attestation_roots]]` array-of-tables in TOML.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fido2AttestationRoot {
+    /// Canonical UUID (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) or
+    /// 32-char bare-hex AAGUID. Case-insensitive.
+    pub aaguid: String,
+    /// Filesystem path to a PEM file containing one or more X.509
+    /// certificates (any cert in the file is a valid trust anchor —
+    /// useful for vendors that rotate roots). The file is read at
+    /// startup; subsequent file changes require a node restart.
+    pub ca_pem_path: PathBuf,
 }
 
 /// Network settings.

@@ -18,7 +18,7 @@ use dds_domain::{
     WindowsPolicyDocument,
 };
 use dds_store::traits::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -352,6 +352,12 @@ pub struct LocalService<
     /// in the set. Wired from
     /// `NodeConfig.domain.fido2_allowed_aaguids` at startup.
     fido2_allowed_aaguids: BTreeSet<[u8; 16]>,
+    /// FIDO2 attestation trust roots keyed by AAGUID (Phase 2 of
+    /// `docs/fido2-attestation-allowlist.md`). For any AAGUID with at
+    /// least one configured root, enrollment requires `attStmt.x5c`
+    /// and validates the chain to one of the listed roots. Loaded at
+    /// startup from `NodeConfig.domain.fido2_attestation_roots`.
+    fido2_attestation_roots: BTreeMap<[u8; 16], Vec<Vec<u8>>>,
 }
 
 impl<
@@ -401,6 +407,7 @@ impl<
             allow_unattested_credentials: false,
             enforce_device_scope_vouch: false,
             fido2_allowed_aaguids: BTreeSet::new(),
+            fido2_attestation_roots: BTreeMap::new(),
         };
         // Best-effort rehydration: pull any pre-existing tokens from the
         // store into the in-memory graph. Only relevant when the store
@@ -523,6 +530,103 @@ impl<
                 self.fido2_allowed_aaguids.len()
             )));
         }
+        Ok(())
+    }
+
+    /// FIDO2 attestation trust roots keyed by AAGUID (Phase 2 of
+    /// `docs/fido2-attestation-allowlist.md`). For each entry, the
+    /// PEM file at `ca_pem_path` is read once here and parsed into a
+    /// list of DER trust anchors that the enroll-time verifier checks
+    /// the `attStmt.x5c` chain against. Multiple PEM-encoded certs in
+    /// one file are all treated as alternative anchors (useful for
+    /// vendors that rotate roots). Empty input clears the map.
+    /// Returns an error naming the offending entry on any parse / I/O
+    /// failure; the caller (startup) is expected to refuse to start
+    /// rather than fall back to "no chain validation".
+    pub fn set_fido2_attestation_roots(
+        &mut self,
+        entries: &[crate::config::Fido2AttestationRoot],
+    ) -> Result<(), ServiceError> {
+        let mut map: BTreeMap<[u8; 16], Vec<Vec<u8>>> = BTreeMap::new();
+        for entry in entries {
+            let aaguid = parse_aaguid(&entry.aaguid).ok_or_else(|| {
+                ServiceError::Fido2(format!(
+                    "fido2_attestation_roots: cannot parse aaguid {:?} as a UUID or 32-char hex",
+                    entry.aaguid
+                ))
+            })?;
+            let pem_bytes = std::fs::read(&entry.ca_pem_path).map_err(|e| {
+                ServiceError::Fido2(format!(
+                    "fido2_attestation_roots: read {}: {e}",
+                    entry.ca_pem_path.display()
+                ))
+            })?;
+            let ders = parse_pem_certificates(&pem_bytes).map_err(|e| {
+                ServiceError::Fido2(format!(
+                    "fido2_attestation_roots: parse {}: {e}",
+                    entry.ca_pem_path.display()
+                ))
+            })?;
+            if ders.is_empty() {
+                return Err(ServiceError::Fido2(format!(
+                    "fido2_attestation_roots: {} contains no PEM CERTIFICATE blocks",
+                    entry.ca_pem_path.display()
+                )));
+            }
+            map.entry(aaguid).or_default().extend(ders);
+        }
+        self.fido2_attestation_roots = map;
+        Ok(())
+    }
+
+    /// Phase 2 of `docs/fido2-attestation-allowlist.md`. When the
+    /// credential's AAGUID has a configured trust root, require
+    /// `attStmt.x5c`, validate the chain to one of the configured
+    /// roots, and require that the leaf cert's `id-fido-gen-ce-aaguid`
+    /// extension equals the AAGUID in authData. Returns `Ok(())` when
+    /// no root is configured for this AAGUID — the operator opted out
+    /// of strict mode for this authenticator model.
+    fn enforce_fido2_attestation_roots(
+        &self,
+        parsed: &dds_domain::fido2::ParsedAttestation,
+    ) -> Result<(), ServiceError> {
+        let roots = match self.fido2_attestation_roots.get(&parsed.aaguid) {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        if parsed.x5c_chain.is_empty() {
+            return Err(ServiceError::Fido2(format!(
+                "AAGUID {} requires attStmt.x5c (configured trust root, no self-attestation accepted)",
+                format_aaguid(&parsed.aaguid)
+            )));
+        }
+        let leaf_aaguid = dds_domain::fido2::extract_attestation_cert_aaguid(&parsed.x5c_chain[0])
+            .map_err(|e| ServiceError::Fido2(format!("attestation cert: {e}")))?;
+        match leaf_aaguid {
+            Some(leaf) if leaf == parsed.aaguid => {}
+            Some(leaf) => {
+                return Err(ServiceError::Fido2(format!(
+                    "leaf cert AAGUID {} does not match authData AAGUID {}",
+                    format_aaguid(&leaf),
+                    format_aaguid(&parsed.aaguid)
+                )));
+            }
+            None => {
+                return Err(ServiceError::Fido2(format!(
+                    "AAGUID {} requires leaf cert id-fido-gen-ce-aaguid extension; not present",
+                    format_aaguid(&parsed.aaguid)
+                )));
+            }
+        }
+        let now = now_epoch();
+        dds_domain::fido2::verify_attestation_cert_chain(&parsed.x5c_chain, roots, now).map_err(
+            |e| {
+                ServiceError::Fido2(format!(
+                    "attestation cert chain validation failed for AAGUID {}: {e}",
+                    format_aaguid(&parsed.aaguid)
+                ))
+            },
+        )?;
         Ok(())
     }
 
@@ -706,6 +810,11 @@ impl<
             // AAGUID allow-list is configured, reject any authenticator
             // whose AAGUID is not on it (covers `fmt = "none"` too).
             self.enforce_fido2_aaguid_allow_list(&parsed)?;
+
+            // Phase 2 of `docs/fido2-attestation-allowlist.md`: when the
+            // operator has bound this AAGUID to a vendor CA root, demand
+            // a real attestation chain that validates to that root.
+            self.enforce_fido2_attestation_roots(&parsed)?;
 
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
@@ -1746,6 +1855,11 @@ impl<
             // cannot be bypassed by going through admin_setup.
             self.enforce_fido2_aaguid_allow_list(&parsed)?;
 
+            // Same for the per-AAGUID attestation root: if the operator
+            // requires a vendor-signed cert chain for this authenticator,
+            // the bootstrap admin must satisfy it as well.
+            self.enforce_fido2_attestation_roots(&parsed)?;
+
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
             hasher.update(req.rp_id.as_bytes());
@@ -2564,6 +2678,37 @@ fn parse_aaguid(raw: &str) -> Option<[u8; 16]> {
         *byte = (nibble(hi)? << 4) | nibble(lo)?;
     }
     Some(out)
+}
+
+/// Parse a PEM blob into a list of DER-encoded X.509 certificates.
+/// Tolerates Unix or Windows newlines, optional whitespace around
+/// blocks, multiple concatenated `-----BEGIN CERTIFICATE-----` blocks
+/// in one file, and other PEM types interleaved (only `CERTIFICATE`
+/// blocks are returned). Returns an empty vec when no CERTIFICATE
+/// blocks are present, leaving the caller to decide whether that is
+/// an error.
+fn parse_pem_certificates(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let text = std::str::from_utf8(bytes).map_err(|e| format!("not UTF-8 PEM: {e}"))?;
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("-----BEGIN CERTIFICATE-----") {
+        rest = &rest[start..];
+        let body_start = rest
+            .find('\n')
+            .ok_or_else(|| "PEM header not newline-terminated".to_string())?
+            + 1;
+        let end = rest
+            .find("-----END CERTIFICATE-----")
+            .ok_or_else(|| "PEM block missing END line".to_string())?;
+        let body = &rest[body_start..end];
+        let cleaned: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(cleaned.as_bytes())
+            .map_err(|e| format!("PEM base64: {e}"))?;
+        out.push(der);
+        rest = &rest[end + "-----END CERTIFICATE-----".len()..];
+    }
+    Ok(out)
 }
 
 /// Format a 16-byte AAGUID as a canonical UUID string. Used in
