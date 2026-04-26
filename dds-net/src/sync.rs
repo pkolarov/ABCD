@@ -88,8 +88,11 @@ impl SyncMessage {
     }
 
     /// Deserialize from CBOR.
+    ///
+    /// Bounded depth: peer-supplied via the sync protocol. Security
+    /// review I-6.
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, String> {
-        ciborium::from_reader(bytes).map_err(|e| e.to_string())
+        dds_core::cbor_bounded::from_reader(bytes).map_err(|e| e.to_string())
     }
 }
 
@@ -158,7 +161,8 @@ pub fn apply_sync_payloads(
     // Phase 1: Deserialize all payloads
     let mut items: Vec<(Operation, Token)> = Vec::new();
     for payload in payloads {
-        let op: Operation = match ciborium::from_reader(payload.op_bytes.as_slice()) {
+        // Bounded depth: op_bytes are peer-supplied. Security review I-6.
+        let op: Operation = match dds_core::cbor_bounded::from_reader(payload.op_bytes.as_slice()) {
             Ok(op) => op,
             Err(e) => {
                 result.errors.push(format!("op deserialize: {e}"));
@@ -301,7 +305,8 @@ pub fn apply_sync_payloads_with_graph(
 
     let mut items: Vec<(Operation, Token)> = Vec::new();
     for payload in payloads {
-        let op: Operation = match ciborium::from_reader(payload.op_bytes.as_slice()) {
+        // Bounded depth: op_bytes are peer-supplied. Security review I-6.
+        let op: Operation = match dds_core::cbor_bounded::from_reader(payload.op_bytes.as_slice()) {
             Ok(op) => op,
             Err(e) => {
                 result.errors.push(format!("op deserialize: {e}"));
@@ -886,5 +891,48 @@ mod tests {
         assert_eq!(second.tokens_stored, 0);
         let on_disk = store.get_token(&original_jti).unwrap();
         assert_eq!(on_disk.payload.iss, alice.id.to_urn());
+    }
+
+    /// **I-6 (security review)**. Peer-supplied sync messages run
+    /// through `SyncMessage::from_cbor` before any field is
+    /// inspected. A depth-bomb wire payload must be rejected at
+    /// decode without growing the deserializer's stack to the depth
+    /// the attacker requested.
+    #[test]
+    fn i6_sync_message_from_cbor_refuses_depth_bomb() {
+        let mut bytes = vec![0x81u8; 2048]; // 2048 × array(1)
+        bytes.push(0x00);
+        let res = SyncMessage::from_cbor(&bytes);
+        assert!(res.is_err(), "depth-bomb sync message must be rejected");
+    }
+
+    /// **I-6 (security review)**. The sync apply loop decodes
+    /// `payload.op_bytes` for every payload — defense in depth on
+    /// the same I-6 vector since callers route through the cap.
+    /// Pin the behaviour with a synthetic depth-bomb op blob so a
+    /// future regression that swaps back to plain
+    /// `ciborium::from_reader` fails this test.
+    #[test]
+    fn i6_apply_sync_payloads_drops_depth_bomb_op_bytes() {
+        let mut depth_bomb = vec![0x81u8; 2048];
+        depth_bomb.push(0x00);
+
+        let payload = SyncPayload {
+            op_bytes: depth_bomb,
+            token_bytes: vec![0x00], // irrelevant: op decode fails first
+        };
+        let mut dag = CausalDag::new();
+        let mut store = MemoryBackend::new();
+        let result = apply_sync_payloads(&[payload], &mut dag, &mut store);
+        assert_eq!(result.tokens_stored, 0);
+        assert!(
+            !result.errors.is_empty(),
+            "expected at least one decode error"
+        );
+        assert!(
+            result.errors.iter().any(|e| e.contains("op deserialize")),
+            "expected an op-deserialize error, got {:?}",
+            result.errors
+        );
     }
 }

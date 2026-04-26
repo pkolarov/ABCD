@@ -279,7 +279,10 @@ impl AdmissionCert {
     }
 
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, DomainError> {
-        ciborium::from_reader(bytes).map_err(|e| DomainError::Deserialize(e.to_string()))
+        // Bounded depth: peer-supplied via H-12 handshake. Security
+        // review I-6.
+        dds_core::cbor_bounded::from_reader(bytes)
+            .map_err(|e| DomainError::Deserialize(e.to_string()))
     }
 
     /// Verify the signature against `domain_pubkey` and confirm the cert
@@ -366,7 +369,10 @@ impl AdmissionRevocation {
     }
 
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, DomainError> {
-        ciborium::from_reader(bytes).map_err(|e| DomainError::Deserialize(e.to_string()))
+        // Bounded depth: peer-supplied via H-12 handshake piggy-back
+        // and via `dds-node import-revocation`. Security review I-6.
+        dds_core::cbor_bounded::from_reader(bytes)
+            .map_err(|e| DomainError::Deserialize(e.to_string()))
     }
 
     /// Verify the signature against `domain_pubkey` and confirm the
@@ -612,5 +618,28 @@ mod tests {
         let r1 = key.revoke_admission("peer-A".into(), 100, None);
         let r2 = key.revoke_admission("peer-B".into(), 100, None);
         assert_ne!(r1.signature, r2.signature);
+    }
+
+    /// **I-6 (security review)**. The H-12 admission handshake reads a
+    /// peer-supplied CBOR blob — `AdmissionCert::from_cbor` must reject a
+    /// depth-bomb input cleanly rather than recursing toward stack
+    /// exhaustion.
+    #[test]
+    fn i6_admission_cert_from_cbor_refuses_depth_bomb() {
+        let mut bytes = vec![0x81u8; 2048]; // 2048 × array(1)
+        bytes.push(0x00); // leaf int
+        let res = AdmissionCert::from_cbor(&bytes);
+        assert!(matches!(res, Err(DomainError::Deserialize(_))));
+    }
+
+    /// **I-6 (security review)**. The H-12 piggy-back path and the
+    /// `import-revocation` CLI both feed bytes to
+    /// `AdmissionRevocation::from_cbor` — same depth-bomb posture.
+    #[test]
+    fn i6_admission_revocation_from_cbor_refuses_depth_bomb() {
+        let mut bytes = vec![0x81u8; 2048];
+        bytes.push(0x00);
+        let res = AdmissionRevocation::from_cbor(&bytes);
+        assert!(matches!(res, Err(DomainError::Deserialize(_))));
     }
 }

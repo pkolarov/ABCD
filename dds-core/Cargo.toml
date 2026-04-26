@@ -17,6 +17,7 @@ sha2 = { workspace = true }
 base32 = { workspace = true }
 serde = { workspace = true }
 ciborium = { workspace = true }
+ciborium-io = { workspace = true }
 uuid = { workspace = true }
 heapless = { workspace = true }
 rand_core = { workspace = true }

@@ -434,9 +434,12 @@ fn cbor_encode<T: Serialize>(value: &T) -> Result<Vec<u8>, TokenError> {
     Ok(buf)
 }
 
-/// Helper: CBOR decode.
+/// Helper: CBOR decode. Uses [`crate::cbor_bounded`] so a peer
+/// that sends a CBOR depth-bomb token is rejected with a
+/// `DeserializationError` instead of pushing the deserializer's
+/// recursion toward stack exhaustion (security review I-6).
 fn cbor_decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, TokenError> {
-    ciborium::from_reader(bytes).map_err(|_| TokenError::DeserializationError)
+    crate::cbor_bounded::from_reader(bytes).map_err(|_| TokenError::DeserializationError)
 }
 
 /// Helper: hex encode bytes to lowercase string.

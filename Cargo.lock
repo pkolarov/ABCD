@@ -898,6 +898,7 @@ version = "0.1.0"
 dependencies = [
  "base32",
  "ciborium",
+ "ciborium-io",
  "criterion",
  "dds-net",
  "dds-store",

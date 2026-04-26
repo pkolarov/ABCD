@@ -230,8 +230,11 @@ fn compute_fingerprint(bundle: &ProvisionBundle) -> String {
 /// Load a provision bundle from a `.dds` file.
 pub fn load_bundle(path: &Path) -> Result<ProvisionBundle, ProvisionError> {
     let bytes = std::fs::read(path).map_err(|e| ProvisionError::Io(e.to_string()))?;
-    let value: CborValue =
-        ciborium::from_reader(&bytes[..]).map_err(|e| ProvisionError::Cbor(e.to_string()))?;
+    // Bounded depth: provision bundles originate from a separate
+    // admin machine and travel as a file the operator drops in.
+    // Security review I-6.
+    let value: CborValue = dds_core::cbor_bounded::from_reader(&bytes[..])
+        .map_err(|e| ProvisionError::Cbor(e.to_string()))?;
     let map = value
         .as_map()
         .ok_or_else(|| ProvisionError::Format("not a CBOR map".into()))?;

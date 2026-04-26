@@ -55,8 +55,14 @@ pub trait DomainDocument: serde::Serialize + serde::de::DeserializeOwned {
     }
 
     /// Deserialize from CBOR bytes.
+    ///
+    /// Uses [`dds_core::cbor_bounded`] (depth cap = 16) because
+    /// `body_cbor` ultimately rides inside attacker-controllable
+    /// token payloads delivered via gossip / sync — security review
+    /// I-6.
     fn from_cbor(bytes: &[u8]) -> Result<Self, DomainError> {
-        ciborium::from_reader(bytes).map_err(|e| DomainError::Deserialize(e.to_string()))
+        dds_core::cbor_bounded::from_reader(bytes)
+            .map_err(|e| DomainError::Deserialize(e.to_string()))
     }
 
     /// Embed this document into a token payload's body fields.

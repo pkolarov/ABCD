@@ -20,6 +20,16 @@ key management, and platform-specific concerns.
 > still requiring Windows CI exercise; the cross-platform tamper
 > defense is green on the dev host. Sections below have been
 > updated to reflect closure.
+>
+> **2026-04-26 update.** I-6 (CBOR depth limit) closed by the new
+> `dds_core::cbor_bounded` module: every untrusted-input boundary
+> in the workspace (gossip / sync ingest, H-12 admission handshake,
+> FIDO2 attestation, provisioning bundle import) now decodes
+> through `ciborium::de::from_reader_with_recursion_limit` with a
+> hard cap of `MAX_DEPTH = 16`. Matches `kMaxCborDepth` in the
+> C++ CTAP2 decoder hardened for M-17. See
+> Claude_sec_review.md I-6 for the per-callsite map and the ten
+> new regression tests.
 
 ---
 

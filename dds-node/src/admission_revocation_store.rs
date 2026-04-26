@@ -201,8 +201,13 @@ pub fn load_or_empty(
     if bytes.is_empty() {
         return Ok(store);
     }
-    let list: RevocationListV1 =
-        ciborium::from_reader(&bytes[..]).map_err(|e| RevocationStoreError::Cbor(e.to_string()))?;
+    // Bounded depth: contents originate from `dds-node import-revocation`
+    // (admin-supplied file) or H-12 piggy-back gossip (peer-supplied). The
+    // outer wrapper is shallow; per-entry CBOR is decoded under the same
+    // cap when the H-12 receive path calls `AdmissionRevocation::from_cbor`.
+    // Security review I-6.
+    let list: RevocationListV1 = dds_core::cbor_bounded::from_reader(&bytes[..])
+        .map_err(|e| RevocationStoreError::Cbor(e.to_string()))?;
     if list.v != SCHEMA_VERSION {
         return Err(RevocationStoreError::Format(format!(
             "unsupported revocation list schema v{} (expected v{SCHEMA_VERSION})",

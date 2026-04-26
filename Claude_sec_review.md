@@ -1238,7 +1238,41 @@ Session `exp` and challenge TTLs computed from `SystemTime::now()`. NTP backstep
 - **I-3.** `subject_urn` binding fix verified — session is bound to credential owner, caller value ignored ([dds-node/src/service.rs:1059-1062](dds-node/src/service.rs#L1059-L1062)).
 - **I-4.** Sign-count replay detection is enforced ([dds-node/src/service.rs:1020](dds-node/src/service.rs#L1020)) — prior review's "remaining work" item now closed.
 - **I-5.** Admission cert TTL capped at 1y — verified.
-- **I-6.** CBOR deserialization has no documented depth limit — `ciborium` is generally safe but deeply-nested inputs can cause stack growth.
+- **I-6.** ✅ **Closed 2026-04-26.** New `dds_core::cbor_bounded` module
+  caps recursion at `MAX_DEPTH = 16` (matches `kMaxCborDepth` in
+  the C++ CTAP2 decoder hardened for M-17). Every untrusted-input
+  CBOR boundary now routes through `cbor_bounded::from_reader`
+  instead of `ciborium::from_reader`:
+  `Token::cbor_decode` ([dds-core/src/token.rs](dds-core/src/token.rs)),
+  `AdmissionCert::from_cbor` / `AdmissionRevocation::from_cbor`
+  ([dds-domain/src/domain.rs](dds-domain/src/domain.rs)),
+  `DomainDocument::from_cbor`
+  ([dds-domain/src/lib.rs](dds-domain/src/lib.rs)),
+  `verify_attestation` + `cose_to_credential_public_key`
+  ([dds-domain/src/fido2.rs](dds-domain/src/fido2.rs)),
+  `SyncMessage::from_cbor` + the per-payload op decode in
+  `apply_sync_payloads{,_with_graph}`
+  ([dds-net/src/sync.rs](dds-net/src/sync.rs)),
+  `GossipMessage::from_cbor`
+  ([dds-net/src/gossip.rs](dds-net/src/gossip.rs)), the gossip
+  `ingest_operation` / `ingest_audit` / sync-cache repopulate
+  ([dds-node/src/node.rs](dds-node/src/node.rs)),
+  the on-disk admission revocation list
+  ([dds-node/src/admission_revocation_store.rs](dds-node/src/admission_revocation_store.rs)),
+  and `load_bundle`
+  ([dds-node/src/provision.rs](dds-node/src/provision.rs)).
+  Depth-bomb inputs are now rejected with
+  `ciborium::de::Error::RecursionLimitExceeded` before the
+  deserializer can grow the host thread's stack to the depth the
+  attacker requested. Local trusted files (own identity key, own
+  domain key, FIDO-protected `domain_store`) keep the standard
+  ciborium reader because the attacker model there is filesystem-write —
+  already covered by L-2 / L-3 / L-4 / M-10 / M-14. Ten new
+  regression tests pin the contract: 4 in
+  `dds-core::cbor_bounded::tests`, 2 in `dds-domain::domain::tests`
+  (admission cert + revocation), 2 in `dds-domain::fido2::tests`
+  (verify_attestation + COSE_Key), 2 in `dds-net::sync::tests`
+  (SyncMessage + apply_sync_payloads).
 - **I-7.** Default-deny policy engine verified correct; logic is subtle but sound ([dds-core/src/policy.rs:69-108](dds-core/src/policy.rs#L69-L108)).
 - **I-8.** ✅ **Closed 2026-04-26.** Credential-ID length is now bounded
   by `MAX_CREDENTIAL_ID_LEN = 1023` (CTAP2.1 §6.1

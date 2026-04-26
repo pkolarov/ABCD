@@ -91,8 +91,10 @@ pub fn verify_attestation(
     client_data_hash: &[u8],
     allow_unattested_credentials: bool,
 ) -> Result<ParsedAttestation, Fido2Error> {
-    let value: CborValue =
-        ciborium::from_reader(attestation_object).map_err(|e| Fido2Error::Cbor(e.to_string()))?;
+    // Bounded depth: attestation_object is supplied by an arbitrary
+    // local HTTP API caller. Security review I-6.
+    let value: CborValue = dds_core::cbor_bounded::from_reader(attestation_object)
+        .map_err(|e| Fido2Error::Cbor(e.to_string()))?;
     let map = value
         .as_map()
         .ok_or_else(|| Fido2Error::Format("top-level not a map".into()))?;
@@ -499,7 +501,10 @@ pub fn verify_assertion(
 /// Parse a COSE_Key from CBOR into a `CredentialPublicKey`.
 /// Supports Ed25519 (kty=1, alg=-8) and P-256 (kty=2, alg=-7).
 pub fn cose_to_credential_public_key(cose_bytes: &[u8]) -> Result<CredentialPublicKey, Fido2Error> {
-    let value: CborValue = ciborium::from_reader(cose_bytes)
+    // Bounded depth: cose_bytes flow in from authData which is
+    // attacker-controlled at the enrollment boundary. Security
+    // review I-6.
+    let value: CborValue = dds_core::cbor_bounded::from_reader(cose_bytes)
         .map_err(|e| Fido2Error::Cbor(format!("COSE_Key: {e}")))?;
     let map = value
         .as_map()
@@ -1468,5 +1473,31 @@ mod tests {
 
         let cpk = cose_to_credential_public_key(&bytes).unwrap();
         assert!(matches!(cpk, CredentialPublicKey::P256(_)));
+    }
+
+    /// **I-6 (security review)**. `verify_attestation` reads
+    /// caller-supplied bytes (every `/v1/enroll/*` and re-parse on
+    /// session assert routes through it). A depth-bomb
+    /// attestation_object must be rejected at decode rather than
+    /// driving ciborium's recursive deserializer toward stack
+    /// exhaustion.
+    #[test]
+    fn i6_verify_attestation_refuses_depth_bomb() {
+        let mut bytes = vec![0x81u8; 2048]; // 2048 × array(1)
+        bytes.push(0x00);
+        let res = verify_attestation(&bytes, &[0u8; 32], false);
+        assert!(matches!(res, Err(Fido2Error::Cbor(_))));
+    }
+
+    /// **I-6 (security review)**. `cose_to_credential_public_key`
+    /// is reachable directly from `parse_auth_data` →
+    /// attacker-controlled `authData`. Same depth-bomb posture as
+    /// the outer `verify_attestation` entry point.
+    #[test]
+    fn i6_cose_to_credential_public_key_refuses_depth_bomb() {
+        let mut bytes = vec![0x81u8; 2048];
+        bytes.push(0x00);
+        let res = cose_to_credential_public_key(&bytes);
+        assert!(matches!(res, Err(Fido2Error::Cbor(_))));
     }
 }

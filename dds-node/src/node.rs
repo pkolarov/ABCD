@@ -837,13 +837,15 @@ impl DdsNode {
     }
 
     fn ingest_operation(&mut self, op_bytes: &[u8], token_bytes: &[u8]) {
-        let op: dds_core::crdt::causal_dag::Operation = match ciborium::from_reader(op_bytes) {
-            Ok(op) => op,
-            Err(e) => {
-                error!("op deserialize: {e}");
-                return;
-            }
-        };
+        // Bounded depth: op_bytes are peer-supplied. Security review I-6.
+        let op: dds_core::crdt::causal_dag::Operation =
+            match dds_core::cbor_bounded::from_reader(op_bytes) {
+                Ok(op) => op,
+                Err(e) => {
+                    error!("op deserialize: {e}");
+                    return;
+                }
+            };
         let token = match Token::from_cbor(token_bytes) {
             Ok(t) => t,
             Err(e) => {
@@ -1032,7 +1034,10 @@ impl DdsNode {
         if !self.config.domain.audit_log_enabled {
             return;
         }
-        let entry = match ciborium::from_reader::<dds_core::audit::AuditLogEntry, _>(entry_bytes) {
+        // Bounded depth: entry_bytes are peer-supplied via gossip. Security review I-6.
+        let entry = match dds_core::cbor_bounded::from_reader::<dds_core::audit::AuditLogEntry, _>(
+            entry_bytes,
+        ) {
             Ok(e) => e,
             Err(e) => {
                 warn!("audit entry deserialize failed: {e}");
@@ -1259,7 +1264,10 @@ impl DdsNode {
         // the FIFO cap applies — the previous raw `insert` here
         // bypassed the bound.
         for payload in &payloads {
-            if let Ok(op) = ciborium::from_reader::<Operation, _>(payload.op_bytes.as_slice()) {
+            // Bounded depth: peer-supplied. Security review I-6.
+            if let Ok(op) =
+                dds_core::cbor_bounded::from_reader::<Operation, _>(payload.op_bytes.as_slice())
+            {
                 let id = op.id.clone();
                 self.cache_sync_payload(&id, &op, &payload.token_bytes);
             }

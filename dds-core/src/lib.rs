@@ -12,6 +12,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
+pub mod cbor_bounded;
 pub mod cbor_canonical;
 pub mod crdt;
 pub mod crypto;

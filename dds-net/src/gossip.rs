@@ -144,8 +144,11 @@ impl GossipMessage {
     }
 
     /// Deserialize from CBOR bytes.
+    ///
+    /// Bounded depth: gossip messages are peer-supplied. Security
+    /// review I-6.
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, String> {
-        ciborium::from_reader(bytes).map_err(|e| e.to_string())
+        dds_core::cbor_bounded::from_reader(bytes).map_err(|e| e.to_string())
     }
 }
 

@@ -1,7 +1,48 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #6 (FFI signing-key leak —
+> Last updated: 2026-04-26 follow-up #7 (CBOR depth-bomb defence —
+> closes `Claude_sec_review.md` informational item I-6). New
+> `dds_core::cbor_bounded` module exposes a single helper,
+> `from_reader`, that wraps `ciborium::de::from_reader_with_recursion_limit`
+> with a hard cap of `MAX_DEPTH = 16` (matches `kMaxCborDepth`
+> in the C++ CTAP2 decoder hardened for M-17). Every
+> untrusted-input CBOR boundary in the workspace was switched
+> from raw `ciborium::from_reader` to the bounded helper:
+> `Token::cbor_decode` (gossip + sync ingest), `AdmissionCert::from_cbor`
+> + `AdmissionRevocation::from_cbor` (H-12 handshake + import +
+> piggy-back), `DomainDocument::from_cbor` (any document body
+> embedded in a peer-supplied token), `verify_attestation` +
+> `cose_to_credential_public_key` (FIDO2 enrollment + COSE_Key),
+> `SyncMessage::from_cbor` + the per-payload op decode in
+> `apply_sync_payloads{,_with_graph}` (peer-supplied sync wire),
+> `GossipMessage::from_cbor`, the gossip `ingest_operation` /
+> `ingest_audit` / sync-cache repopulate paths, the on-disk
+> admission revocation list, and `load_bundle` (admin-supplied
+> provision file). Local trusted files (own identity key, own
+> domain key, FIDO-protected `domain_store`) intentionally keep
+> the standard ciborium reader — the attacker model there is
+> filesystem-write, already covered by L-2 / L-3 / L-4 / M-10 /
+> M-14, not depth bombs. Ten new regression tests pin the
+> contract: 4 in `dds_core::cbor_bounded::tests` (well-formed
+> input accepted, depth-bomb just above cap rejected with
+> `RecursionLimitExceeded`, 4 KiB depth-bomb rejected, just-below-cap
+> accepted), 2 in `dds-domain::domain::tests` (`AdmissionCert::from_cbor`
+> + `AdmissionRevocation::from_cbor` reject 2048-deep blobs), 2
+> in `dds-domain::fido2::tests` (`verify_attestation` +
+> `cose_to_credential_public_key`), 2 in `dds-net::sync::tests`
+> (`SyncMessage::from_cbor` + `apply_sync_payloads` drops
+> depth-bomb `op_bytes`). Workspace test count: 538 (up from 528);
+> cargo fmt clean; cargo clippy clean (workspace, all-targets,
+> `-D warnings`). New workspace dep: `ciborium-io = "0.2"` (already
+> a transitive dep of `ciborium`, now declared explicitly so
+> `dds-core::cbor_bounded` can name `ciborium_io::Read` in its
+> generic bound). No remaining open Critical, High, or Medium
+> items in the security review; only I-1, I-11 (latent design
+> note), and the `M-13` / `M-15` / `M-18` / `L-17` deferred
+> cluster remain open.
+>
+> Previous: 2026-04-26 follow-up #6 (FFI signing-key leak —
 > closes `Claude_sec_review.md` informational item I-9). The
 > classical `dds_identity_create` FFI export was the last DDS API
 > surface that emitted secret key material (`signing_key_hex` in the
