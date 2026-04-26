@@ -1,7 +1,47 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #4 (FIDO2 parser hardening —
+> Last updated: 2026-04-26 follow-up #5 (node identity rotation —
+> partially closes `docs/threat-model-review.md` §2 recommendation #3
+> / §8 open item #9). New `dds-node rotate-identity --data-dir <DIR>
+> [--no-backup]` subcommand rotates the libp2p keypair in place: it
+> reads the existing `<data_dir>/p2p_key.bin` (refusing to proceed
+> if the blob is encrypted but `DDS_NODE_PASSPHRASE` is not set —
+> the operator needs the *old* PeerId to issue a revocation, so
+> silently overwriting an unreadable key would be worse than
+> aborting), backs up the previous file as
+> `p2p_key.bin.rotated.<unix_seconds>` unless `--no-backup`,
+> generates a fresh Ed25519 keypair, and writes it back through the
+> same `p2p_identity::save` path the running node uses (preserving
+> the v=3 ChaCha20-Poly1305 + Argon2id schema when a passphrase is
+> configured, plain v=1 otherwise). Stdout reports both the old and
+> new PeerIds, the backup path, and the explicit `dds-node admit`
+> + `dds-node revoke-admission` commands the admin must run before
+> the operator can restart the node — the existing admission cert
+> is bound to the old PeerId and becomes invalid the moment the
+> rotation lands, so this is a refuse-to-start situation rather
+> than a soft warning. The "automatic admission cert renewal" half
+> of the original recommendation is intentionally left manual:
+> admission certs stay an admin ceremony so a compromised node
+> cannot self-renew its own admission. On error during the new
+> save, the helper attempts to roll the backup back into place so a
+> botched rotation does not strand the operator without a usable
+> key. Tests: six new CLI integration tests in
+> `dds-node/tests/rotate_identity_cli.rs` cover (a) the happy path
+> (new PeerId differs, backup is byte-identical to pre-rotation,
+> backup still loads to the OLD PeerId, follow-up commands name
+> both PeerIds), (b) `--no-backup` (no `p2p_key.bin.rotated.*`
+> sibling created), (c) missing data_dir, (d) missing
+> `p2p_key.bin` (must redirect to `gen-node-key`), (e) the
+> encrypted-blob refuse-without-passphrase guard (file must be
+> byte-identical after refusal), and (f) missing `--data-dir` flag.
+> Docs: `README.md` CLI block gains the new subcommand;
+> `docs/threat-model-review.md` §2 risk row + recommendation #3 +
+> §8 item #9 marked partially closed. Workspace test count: 528
+> (up from 522); cargo fmt clean; cargo clippy clean (workspace,
+> all-targets, `-D warnings`).
+>
+> Previous: 2026-04-26 follow-up #4 (FIDO2 parser hardening —
 > closes Claude_sec_review.md informational items I-8 + I-10). Two
 > small source-validated parser fixes in `dds-domain/src/fido2.rs`:
 > (a) `parse_auth_data` now caps `cred_id_len` at the new public

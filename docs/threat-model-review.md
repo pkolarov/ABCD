@@ -109,7 +109,7 @@ The keyfile has been iterated twice through the remediation sweep:
 | ~~**Low Argon2id memory cost** — 19 MiB is below the preferred 64+ MiB for high-value keys.~~ | ~~Low~~ | **FIXED (M-10)**: v=3 defaults to m=64 MiB, t=3, p=4. Params are carried in the blob so a future bump is a schema-less config change. |
 | **Passphrase in environment variable** — environment variables are visible in `/proc/<pid>/environ` on Linux and via process inspection on Windows. | Medium | Standard practice for containerized deployments. Document that production deployments should use secret managers (HashiCorp Vault, Azure Key Vault) to inject the passphrase and clear the env var after startup. |
 | ~~**Plaintext fallback** — if the passphrase env var is not set, keys are stored unencrypted (version = 1).~~ | ~~High~~ | **FIXED (M-14)**: a sticky `encrypted` marker is written on first encrypted save; subsequent plaintext saves are refused by default. `DDS_NODE_ALLOW_PLAINTEXT_DOWNGRADE=1` is an explicit escape hatch (logged at WARN). Defeats the attack in the original review. |
-| **No key rotation** — there is no built-in mechanism to rotate node identity keys. Rotation requires re-provisioning the node and re-issuing its admission cert. | Medium | **Gap**: Implement `rotate-identity` CLI command that generates a new keypair, re-encrypts, and requests a new admission cert from the domain admin. |
+| ~~**No key rotation** — there is no built-in mechanism to rotate node identity keys. Rotation requires re-provisioning the node and re-issuing its admission cert.~~ | ~~Medium~~ | **PARTIALLY FIXED (2026-04-26)**: `dds-node rotate-identity --data-dir <DIR> [--no-backup]` rotates the libp2p keypair in place. It reads the existing `p2p_key.bin` (refusing to proceed if the blob is encrypted but `DDS_NODE_PASSPHRASE` is not set, so the old PeerId is never silently lost), backs up the previous file as `p2p_key.bin.rotated.<unix_seconds>` unless `--no-backup`, atomically writes the new keypair under the same on-disk schema (v=3 ChaCha20-Poly1305 + Argon2id when a passphrase is configured), and prints both PeerIds plus the explicit follow-up commands the admin must run (`admit` + optional `revoke-admission`). The remaining gap (the recommendation's "automatic" cert renewal — admin signature is intentionally still a manual ceremony so the rotation cannot be initiated by a compromised node) is documented under §8 item #9. |
 
 ### Recommendations
 
@@ -119,7 +119,16 @@ The keyfile has been iterated twice through the remediation sweep:
    passphrase env var is not set.~~ →
    **closed by M-14** (encrypted marker refuses plaintext downgrade
    once encryption has been used).
-3. Implement key rotation with automatic admission cert renewal.
+3. ~~Implement key rotation with automatic admission cert renewal.~~ →
+   **partially closed (2026-04-26)** by `dds-node rotate-identity`,
+   which rotates the libp2p keypair in place and prints the
+   admin / operator follow-up commands needed to land a fresh
+   admission cert (and revoke the old one). The "automatic" half of
+   the recommendation is intentionally left out — admission certs
+   stay a manual admin ceremony so a compromised node cannot
+   self-renew its own admission. Operators can wrap the printed
+   commands in their own automation if they trust the path between
+   the rotating node and the admin signer.
 
 ---
 
@@ -308,7 +317,7 @@ application from failed application.
 | 6 | ~~Challenge-store cleanup and caps (B-5)~~ ✅ closed 2026-04-25 | Medium | §5 |
 | 7 | ~~Windows software staging TOCTOU hardening (B-6)~~ ✅ closed 2026-04-25 (Windows-CI verification of DACL helper still pending) | Medium | §6 |
 | 8 | ~~Windows data directory ACL (dir-level)~~ ✅ closed 2026-04-26 (`CA_RestrictDataDirAcl` MSI custom action + `dds-node restrict-data-dir-acl` subcommand; SDDL `D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` applied before any service writes to the data dir) | Medium | §3 |
-| 9 | Key rotation mechanism | Medium | §2 |
+| 9 | ~~Key rotation mechanism~~ ✅ partially closed 2026-04-26 (`dds-node rotate-identity` rotates the libp2p keypair locally + prints the admin follow-up commands; admission cert renewal stays a manual admin ceremony by design) | Medium | §2 |
 | 10 | WiX virtual service account split (M-18) | Medium | §3 |
 | 11 | Admin-set coherence via gossip (I-11) | Medium | §5 |
 | 12 | Message-level encryption (opt-in) | Low | §4 |

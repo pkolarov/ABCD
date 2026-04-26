@@ -100,6 +100,12 @@ dds-node init-domain --name acme.com --dir ./acme [--fido2]
 # Generate node identity and print PeerId
 dds-node gen-node-key --data-dir ~/.dds
 
+# Rotate the node's libp2p identity in place (threat-model §2 rec #3 /
+# §8 open item #9). Backs up the old key, generates a fresh keypair,
+# and prints the admin / operator follow-up commands needed to issue
+# a new admission cert + revoke the old peer id before restart.
+dds-node rotate-identity --data-dir ~/.dds [--no-backup]
+
 # Issue admission cert for a sibling node
 dds-node admit --domain-key ./acme/domain_key.bin --domain ./acme/domain.toml \
     --peer-id 12D3KooW… [--out admission.cbor] [--ttl-days 365]

@@ -14,6 +14,19 @@
 //!   `PeerId`. Run this on a sibling machine to discover the peer id
 //!   that the admin needs in order to issue an admission cert.
 //!
+//! - `dds-node rotate-identity --data-dir <DIR> [--no-backup]`
+//!   Threat-model §2 recommendation #3 / §8 open item #9. Generates a
+//!   fresh libp2p Ed25519 keypair, atomically replaces
+//!   `<DIR>/p2p_key.bin` with it (encrypted under `DDS_NODE_PASSPHRASE`
+//!   if set), backs up the previous file as
+//!   `p2p_key.bin.rotated.<unix_seconds>` unless `--no-backup` is
+//!   passed, and prints both the old and new PeerIds along with the
+//!   admin / operator next-step commands required to resume the node
+//!   on its new identity (issue a fresh admission cert against the new
+//!   PeerId, optionally revoke the old one, then restart). The
+//!   command refuses to run if `<DIR>/p2p_key.bin` is missing — use
+//!   `gen-node-key` for first-time provisioning.
+//!
 //! - `dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--out FILE] [--ttl-days N]`
 //!   The admin signs an admission cert for a sibling node's peer id.
 //!   Ship the resulting cert to the sibling and place it at
@@ -88,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match sub {
         "init-domain" => cmd_init_domain(&args[1..]),
         "gen-node-key" => cmd_gen_node_key(&args[1..]),
+        "rotate-identity" => cmd_rotate_identity(&args[1..]),
         "gen-hmac-secret" => cmd_gen_hmac_secret(&args[1..]),
         "admit" => cmd_admit(&args[1..]),
         "revoke-admission" => cmd_revoke_admission(&args[1..]),
@@ -118,6 +132,7 @@ fn print_usage() {
         "Usage:
   dds-node init-domain --name <NAME> --dir <DIR> [--fido2]
   dds-node gen-node-key --data-dir <DIR>
+  dds-node rotate-identity --data-dir <DIR> [--no-backup]
   dds-node gen-hmac-secret --out <FILE> [--force] [--keep-existing]
   dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--out <FILE>] [--ttl-days <N>]
   dds-node revoke-admission --domain-key <FILE> --domain <FILE> --peer-id <ID> [--reason <STR>] [--out <FILE>]
@@ -203,6 +218,164 @@ fn cmd_gen_node_key(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("  peer_id:  {}", peer_id);
     println!();
     println!("Send this peer id to the domain admin to obtain an admission cert.");
+    Ok(())
+}
+
+/// Threat-model §2 recommendation #3 / §8 open item #9: rotate the
+/// node's libp2p identity in place.
+///
+/// Reads the existing `<data_dir>/p2p_key.bin` to record the old
+/// PeerId, generates a fresh Ed25519 keypair, atomically replaces the
+/// file with the new key (preserving on-disk encryption based on
+/// `DDS_NODE_PASSPHRASE`), and — unless `--no-backup` — renames the
+/// previous file to `p2p_key.bin.rotated.<unix_seconds>` first so
+/// recovery is possible if the operator botches the restart.
+///
+/// The new PeerId invalidates the existing admission cert (which is
+/// bound to the old PeerId via `AdmissionCert.body.peer_id`), so the
+/// command prints the explicit follow-up commands the admin and
+/// operator must run before the node will start again. The command
+/// itself is purely local — it never contacts the admin, never
+/// touches the admission cert, and never touches the running node.
+///
+/// Refuses to run if `<data_dir>/p2p_key.bin` does not exist; first-
+/// time provisioning should use `gen-node-key` instead. Refuses to
+/// load (and thus refuses to rotate) if the existing file is
+/// encrypted but `DDS_NODE_PASSPHRASE` is unset — the operator must
+/// supply the passphrase so we can read the old PeerId before
+/// overwriting; otherwise the rotation would silently lose track of
+/// the cert that needs to be revoked.
+fn cmd_rotate_identity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = PathBuf::from(require_flag(args, "--data-dir")?);
+    let no_backup = args.iter().any(|a| a == "--no-backup");
+
+    if !data_dir.exists() {
+        return Err(format!(
+            "data_dir {} does not exist — use `gen-node-key` for first-time provisioning",
+            data_dir.display()
+        )
+        .into());
+    }
+
+    let p2p_path = data_dir.join("p2p_key.bin");
+    if !p2p_path.exists() {
+        return Err(format!(
+            "no existing p2p_key.bin at {} — use `gen-node-key --data-dir {}` for first-time \
+             provisioning (rotate-identity refuses to run without a prior key so the old PeerId \
+             can be reported)",
+            p2p_path.display(),
+            data_dir.display()
+        )
+        .into());
+    }
+
+    // Decrypt + parse the old key so we can report the OLD PeerId. If
+    // this fails (wrong passphrase, corrupt blob), abort BEFORE
+    // touching the file — the operator needs the old PeerId in order
+    // to issue a revocation, so silently rotating without it would be
+    // worse than refusing.
+    let old_kp = p2p_identity::load(&p2p_path).map_err(|e| {
+        format!(
+            "failed to load existing p2p_key.bin at {}: {e} — rotate-identity refuses to \
+             overwrite a key it cannot read; if the file is encrypted, set DDS_NODE_PASSPHRASE \
+             to the same value the running node uses",
+            p2p_path.display()
+        )
+    })?;
+    let old_peer_id = libp2p::PeerId::from(old_kp.public());
+
+    let backup_path = if no_backup {
+        None
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let candidate = data_dir.join(format!("p2p_key.bin.rotated.{now}"));
+        // Refuse to clobber an existing backup at the exact same
+        // second. Bumping the suffix is simpler than overwriting a
+        // file the operator may need.
+        let mut final_path = candidate.clone();
+        let mut suffix = 1u32;
+        while final_path.exists() {
+            final_path = data_dir.join(format!("p2p_key.bin.rotated.{now}.{suffix}"));
+            suffix += 1;
+        }
+        std::fs::rename(&p2p_path, &final_path).map_err(|e| {
+            format!(
+                "failed to back up existing p2p_key.bin to {}: {e}",
+                final_path.display()
+            )
+        })?;
+        Some(final_path)
+    };
+
+    // Generate the new keypair via the same path as gen-node-key /
+    // load_or_create so the on-disk encryption schema stays
+    // consistent (v=3 ChaCha20-Poly1305 + Argon2id under
+    // DDS_NODE_PASSPHRASE; v=1 plaintext otherwise). We do NOT use
+    // load_or_create here because, if --no-backup left the file in
+    // place, load_or_create would return the OLD key.
+    let new_kp = libp2p::identity::Keypair::generate_ed25519();
+    if let Err(e) = p2p_identity::save(&p2p_path, &new_kp) {
+        // Best-effort recovery: if we have a backup, try to put it
+        // back. Failure to restore is non-fatal — the operator still
+        // has the named backup file and can rename manually.
+        if let Some(ref bak) = backup_path
+            && let Err(restore_err) = std::fs::rename(bak, &p2p_path)
+        {
+            return Err(format!(
+                "failed to save new p2p_key.bin: {e}; tried to restore backup from {} but \
+                 rename failed: {restore_err}. Manually rename {} back to {} to recover.",
+                bak.display(),
+                bak.display(),
+                p2p_path.display()
+            )
+            .into());
+        }
+        return Err(format!(
+            "failed to save new p2p_key.bin at {}: {e}",
+            p2p_path.display()
+        )
+        .into());
+    }
+    let new_peer_id = libp2p::PeerId::from(new_kp.public());
+
+    println!("Rotated node libp2p identity:");
+    println!("  data_dir:    {}", data_dir.display());
+    println!("  p2p_key:     {}", p2p_path.display());
+    println!("  old_peer_id: {old_peer_id}");
+    println!("  new_peer_id: {new_peer_id}");
+    if let Some(ref bak) = backup_path {
+        println!("  backup:      {}", bak.display());
+    } else {
+        println!("  backup:      (skipped — --no-backup)");
+    }
+    println!();
+    println!("The existing admission cert is now invalid (it was bound to the old peer id).");
+    println!("Before restarting the node, the admin must:");
+    println!();
+    println!("  1. Issue a fresh admission cert for the new peer id and ship it to this node:");
+    println!(
+        "       dds-node admit --domain-key <FILE> --domain <FILE> \\\n         --peer-id {new_peer_id} --out admission.cbor"
+    );
+    println!(
+        "     Then place admission.cbor at {}.",
+        data_dir.join("admission.cbor").display()
+    );
+    println!();
+    println!(
+        "  2. (Recommended) Revoke the old peer id so a stolen copy of the old keypair cannot rejoin:"
+    );
+    println!(
+        "       dds-node revoke-admission --domain-key <FILE> --domain <FILE> \\\n         --peer-id {old_peer_id} --reason \"identity rotated\" --out old_revocation.cbor"
+    );
+    println!(
+        "     Distribute old_revocation.cbor to every peer node and import with `import-revocation`,"
+    );
+    println!("     or rely on H-12 piggy-back gossip once at least one peer has it.");
+    println!();
+    println!("  3. Restart the node so the new identity takes effect.");
     Ok(())
 }
 

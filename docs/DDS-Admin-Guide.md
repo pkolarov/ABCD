@@ -12,22 +12,23 @@ For background on how DDS works internally, see the [Developer Guide](DDS-Develo
 2. [Creating a Domain](#creating-a-domain)
 3. [Adding Nodes](#adding-nodes)
 4. [Revoking a Node's Admission](#revoking-a-nodes-admission)
-5. [Single-File Provisioning](#single-file-provisioning)
-6. [Node Configuration Reference](#node-configuration-reference)
-7. [Enrolling Users](#enrolling-users)
-8. [Enrolling Devices](#enrolling-devices)
-9. [Admin Bootstrap](#admin-bootstrap)
-10. [Sessions and Authentication](#sessions-and-authentication)
-11. [Groups and Trust](#groups-and-trust)
-12. [Policy Management](#policy-management)
-13. [Windows Deployment](#windows-deployment)
-14. [macOS Deployment](#macos-deployment)
-15. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
-16. [Audit Log](#audit-log)
-17. [Debugging](#debugging)
-18. [Air-Gapped Sync (USB Stick / Courier)](#air-gapped-sync-usb-stick--courier)
-19. [Security Reference](#security-reference)
-20. [Troubleshooting](#troubleshooting)
+5. [Rotating a Node's Identity](#rotating-a-nodes-identity)
+6. [Single-File Provisioning](#single-file-provisioning)
+7. [Node Configuration Reference](#node-configuration-reference)
+8. [Enrolling Users](#enrolling-users)
+9. [Enrolling Devices](#enrolling-devices)
+10. [Admin Bootstrap](#admin-bootstrap)
+11. [Sessions and Authentication](#sessions-and-authentication)
+12. [Groups and Trust](#groups-and-trust)
+13. [Policy Management](#policy-management)
+14. [Windows Deployment](#windows-deployment)
+15. [macOS Deployment](#macos-deployment)
+16. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
+17. [Audit Log](#audit-log)
+18. [Debugging](#debugging)
+19. [Air-Gapped Sync (USB Stick / Courier)](#air-gapped-sync-usb-stick--courier)
+20. [Security Reference](#security-reference)
+21. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -257,6 +258,117 @@ under the same domain-pubkey verification gate as the runtime path —
 entries that fail to verify (corrupt file, foreign-domain
 contamination) are dropped before they appear in the output, so the
 list always reflects what the running node would actually enforce.
+
+---
+
+## Rotating a Node's Identity
+
+Threat-model §2 recommendation #3 / §8 open item #9. A node's
+identity is its libp2p Ed25519 keypair stored at
+`<data_dir>/p2p_key.bin`. Rotation is the right response to:
+
+- A suspected compromise of the on-disk key file.
+- A passphrase change for `DDS_NODE_PASSPHRASE` paired with re-wrapping.
+- Routine hygiene on a published rotation cadence.
+
+The flow is two-touch: the operator runs `rotate-identity` locally,
+the admin issues a fresh admission cert (and optionally revokes the
+old PeerId), the operator imports the new cert and restarts. The
+admin signature is intentionally manual — a compromised node must
+not be able to renew its own admission.
+
+### Step 1: Rotate the keypair (operator, on the node)
+
+```bash
+# Stop the node first (the running process keeps the OLD keypair in
+# memory; restarting after rotation will pick up the new one).
+sudo systemctl stop dds-node
+
+# Optional but recommended: set the passphrase the node uses if its
+# p2p_key.bin is encrypted, so rotate-identity can read the OLD
+# PeerId before overwriting.
+export DDS_NODE_PASSPHRASE='…'
+
+sudo -E dds-node rotate-identity --data-dir /opt/dds/data
+```
+
+Sample output:
+
+```
+Rotated node libp2p identity:
+  data_dir:    /opt/dds/data
+  p2p_key:     /opt/dds/data/p2p_key.bin
+  old_peer_id: 12D3KooWOldPeer…
+  new_peer_id: 12D3KooWNewPeer…
+  backup:      /opt/dds/data/p2p_key.bin.rotated.1714090000
+
+The existing admission cert is now invalid (it was bound to the old peer id).
+Before restarting the node, the admin must:
+
+  1. Issue a fresh admission cert for the new peer id and ship it to this node:
+       dds-node admit --domain-key <FILE> --domain <FILE> \
+         --peer-id 12D3KooWNewPeer… --out admission.cbor
+     Then place admission.cbor at /opt/dds/data/admission.cbor.
+
+  2. (Recommended) Revoke the old peer id so a stolen copy of the old keypair cannot rejoin:
+       dds-node revoke-admission --domain-key <FILE> --domain <FILE> \
+         --peer-id 12D3KooWOldPeer… --reason "identity rotated" --out old_revocation.cbor
+     Distribute old_revocation.cbor to every peer node and import with `import-revocation`,
+     or rely on H-12 piggy-back gossip once at least one peer has it.
+
+  3. Restart the node so the new identity takes effect.
+```
+
+`rotate-identity` refuses to run if `p2p_key.bin` is missing
+(redirects you to `gen-node-key`) or if the existing key is
+encrypted but `DDS_NODE_PASSPHRASE` is not set. The backup file is
+byte-identical to the pre-rotation key, so an operator who needs to
+recover from a botched rotation can restore by renaming the
+`p2p_key.bin.rotated.<timestamp>` file back over `p2p_key.bin`. Pass
+`--no-backup` only when on-disk space is constrained or a separate
+backup workflow is in use.
+
+### Step 2: Issue the new admission cert (admin)
+
+Capture both PeerIds from the rotation output and produce a fresh
+admission cert plus the matching revocation:
+
+```bash
+dds-node admit \
+  --domain-key ./acme/domain_key.bin \
+  --domain ./acme/domain.toml \
+  --peer-id 12D3KooWNewPeer… \
+  --out admission.cbor
+
+dds-node revoke-admission \
+  --domain-key ./acme/domain_key.bin \
+  --domain ./acme/domain.toml \
+  --peer-id 12D3KooWOldPeer… \
+  --reason "identity rotated" \
+  --out old_revocation.cbor
+```
+
+### Step 3: Land the new cert + revocation and restart (operator)
+
+```bash
+# Drop the new admission cert in place over the old one.
+sudo cp admission.cbor /opt/dds/data/admission.cbor
+
+# Import the revocation locally so the rotated node refuses to start
+# under its old identity if the backup ever gets restored by mistake.
+# Other nodes will pick the revocation up via H-12 piggy-back gossip
+# the next time they handshake with any node that has it.
+sudo dds-node import-revocation \
+  --data-dir /opt/dds/data \
+  --in old_revocation.cbor
+
+sudo systemctl start dds-node
+```
+
+The node will verify the new admission cert against the freshly-
+rotated PeerId at startup and refuse to start if the cert was
+issued for the wrong PeerId — which is the safety property that
+makes the manual admin signature load-bearing.
 
 ---
 
