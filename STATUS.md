@@ -1,7 +1,56 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #13 (AD coexistence Phase 4 — closes
+> Last updated: 2026-04-26 follow-up #14 (AD coexistence Phase 3 native
+> half — closes AD-08 + AD-09 from
+> [docs/windows-ad-coexistence-spec.md](docs/windows-ad-coexistence-spec.md)
+> §4.1 / §4.3 and [docs/AD-gap-plan.md](docs/AD-gap-plan.md) Phase 3).
+> The `HandleDdsStartAuth` JoinState gate now lives *before* the WebAuthn
+> ceremony, so AD/Hybrid hosts with no vault entry receive
+> `IPC_ERROR::PRE_ENROLLMENT_REQUIRED` (19) and EntraOnly/Unknown hosts
+> receive `IPC_ERROR::UNSUPPORTED_HOST` (20) without ever asking the user
+> to touch their security key. The previous in-worker `AUTH_FAILED` check
+> in the claim branch is rewritten to also return
+> `PRE_ENROLLMENT_REQUIRED` as defence-in-depth; under the new gate it is
+> unreachable, but it keeps a future refactor from silently re-enabling
+> the claim path on AD. `IPC_RESP_DDS_USER_LIST` is extended with
+> `status_code` (UINT32) + `status_text`
+> (`WCHAR[IPC_MAX_STATUS_MSG_LEN]`); the entry-array offset bumps
+> automatically because everyone calls `sizeof(IPC_RESP_DDS_USER_LIST)`.
+> `HandleDdsListUsers` now refuses Entra/Unknown with a status-bearing
+> empty list and intersects the dds-node user list with the local vault
+> by base64url credential_id on AD/Hybrid, dropping users who have no
+> local enrollment. **Pre-existing bug fixed in the same path:** the
+> dds-node-failure fallback used to call `HandleListUsers`, which sends
+> `IPC_MSG::USER_LIST` — the DDS CP rejects any non-`DDS_USER_LIST`
+> message type, so the vault-only fallback was silently producing an
+> empty tile list. The new path synthesizes DDS-shape entries from
+> vault records (subject_urn = SID, base64url credential_id from raw
+> bytes, vault display_name). Also fixes a separate pre-existing
+> regression in [dds-node/benches/session_lifecycle.rs](dds-node/benches/session_lifecycle.rs)
+> that has been broken since the B5b shared-graph change on 2026-04-10:
+> the bench called `issue_session` against a trust graph with no
+> vouches and no roots, so the first iteration panicked with
+> `Domain("subject has no granted purposes; cannot issue session")`,
+> failing `cargo test --workspace --all-targets`. The bench now seeds
+> a root attestation, a user attestation, a root-issued vouch granting
+> the `api` purpose, and adds the root URN to `trusted_roots`. Native
+> standalone tests added in
+> [test_ipc_messages.cpp](platform/windows/native/Tests/test_ipc_messages.cpp)
+> (status-carrier layout) and
+> [test_dds_bridge_selection.cpp](platform/windows/native/Tests/test_dds_bridge_selection.cpp)
+> (eight new AD-08 decision tests covering Workgroup/AD/Hybrid/EntraOnly/Unknown ×
+> vault-present/-absent, four new AD-09 filter tests covering Workgroup pass-through,
+> AD intersection, Hybrid empty-vault, and credential_id case-sensitivity).
+> Phase 3 progress: AD-08 ✅ + AD-09 ✅; AD-10 (CP error-text
+> mapping for the new IPC codes) and AD-11 (full
+> `test_ad_coexistence.cpp` end-to-end) remain pending. Workspace test
+> count unchanged at 560 (Rust untouched in production code; bench fix
+> does not register a new unit test). cargo fmt clean; cargo clippy
+> clean (workspace, all-targets, `-D warnings`). Native C++ build/test
+> on Windows is deferred to CI per the established pattern.
+>
+> Previous: 2026-04-26 follow-up #13 (AD coexistence Phase 4 — closes
 > AD-14 from
 > [docs/windows-ad-coexistence-spec.md](docs/windows-ad-coexistence-spec.md)
 > §6.3 / §7.4 and

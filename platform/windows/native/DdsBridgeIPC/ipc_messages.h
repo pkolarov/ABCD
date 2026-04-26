@@ -315,9 +315,19 @@ struct IPC_DDS_USER_ENTRY
     WCHAR credential_id[IPC_MAX_CREDENTIAL_ID_LEN];  // FIDO2 credential ID
 };
 
+// AD-09: extended with status_code + status_text so the credential provider can
+// distinguish "no users yet" from "this host is unsupported" (Entra-only /
+// Unknown JoinState). status_code carries an IPC_ERROR value (SUCCESS,
+// UNSUPPORTED_HOST, etc.); status_text is a UI-ready wide string. Older clients
+// that only read `count` continue to work — count==0 still surfaces no tiles.
+// IPC_RESP_DDS_USER_LIST is fixed-size before the variable-length entry array,
+// so the entry-offset calculation `sizeof(IPC_RESP_DDS_USER_LIST)` automatically
+// accounts for the new fields on both bridge and CP sides.
 struct IPC_RESP_DDS_USER_LIST
 {
     UINT32 count;                                    // Number of IPC_DDS_USER_ENTRY following
+    UINT32 status_code;                              // IPC_ERROR::SUCCESS, UNSUPPORTED_HOST, etc.
+    WCHAR  status_text[IPC_MAX_STATUS_MSG_LEN];      // UI-ready status (empty when SUCCESS)
     // Followed by count * IPC_DDS_USER_ENTRY structs
 };
 

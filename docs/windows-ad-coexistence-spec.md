@@ -676,8 +676,9 @@ This phase is complete only if all of the following are true.
   clears the freeze on the next reconcile that lists the item again.
   `AppliedEntry.host_state_at_apply` is now stamped on every recorded apply
   so a JoinState transition since the last apply forces a one-shot audit
-  re-evaluation even when the content hash is unchanged. Native-side AD-08…AD-11
-  remain pending.
+  re-evaluation even when the content hash is unchanged. Native-side AD-08
+  and AD-09 landed 2026-04-26 (see Phase 3 below); AD-10 (CP error-text
+  mapping) and AD-11 (`test_ad_coexistence.cpp` end-to-end) remain pending.
 
 ---
 
@@ -747,8 +748,8 @@ The 5-phase split holds, with these refinements:
 
 | Task | Files | Change |
 |---|---|---|
-| **AD-08** | `DdsAuthBridgeMain.cpp:696 HandleDdsStartAuth`, `:1035`, `DdsBridgeIPC/ipc_messages.h`. | Move the join-state gate to before the FIDO2 ceremony. Switch on `GetJoinState()` returning `PRE_ENROLLMENT_REQUIRED` / `UNSUPPORTED_HOST` / proceed. Add new `IPC_ERROR` codes. |
-| **AD-09** | `DdsAuthBridgeMain.cpp:1193 HandleDdsListUsers`, `CredentialVault.{h,cpp}`, `DdsBridgeIPC/ipc_messages.h`, `DdsBridgeClient.cpp`. | Intersect dds-node user list with vault by credential_id on AD/Hybrid. Add `VaultHasCredentialId(...)` helper. Extend `IPC_RESP_DDS_USER_LIST` with `status_code/status_text`. EntraOnly/Unknown return status-bearing empty DDS lists. dds-node failure fallback synthesizes DDS list entries from vault, not legacy `USER_LIST`. |
+| **AD-08** ✅ | `DdsAuthBridgeMain.cpp::HandleDdsStartAuth`, `DdsAuthBridgeMain.cpp::ExecuteDdsAuth` (claim branch), `DdsBridgeIPC/ipc_protocol.h`. | **Landed 2026-04-26.** Gate moved to *before* the WebAuthn ceremony. `GetJoinState()` is consulted right after the AD-14 cooldown check: EntraOnly/Unknown short-circuit with `IPC_ERROR::UNSUPPORTED_HOST` and the §4.4 string; AD/Hybrid + no vault entry short-circuit with `IPC_ERROR::PRE_ENROLLMENT_REQUIRED`. Workgroup behaviour is unchanged. The legacy `AUTH_FAILED` check inside the worker's claim branch is rewritten to return `PRE_ENROLLMENT_REQUIRED` as defence-in-depth — it never fires under the new gate but stops a future refactor from silently re-enabling the claim path on AD. |
+| **AD-09** ✅ | `DdsAuthBridgeMain.cpp::HandleDdsListUsers`, `DdsBridgeIPC/ipc_messages.h`. | **Landed 2026-04-26.** `IPC_RESP_DDS_USER_LIST` extended with `status_code` (UINT32) + `status_text` (`WCHAR[IPC_MAX_STATUS_MSG_LEN]`) per §4.1. The `sizeof(IPC_RESP_DDS_USER_LIST)` offset bumps automatically on both bridge and CP, so the entry-array layout stays consistent. New behaviour: (a) EntraOnly/Unknown returns a status-bearing empty list with `UNSUPPORTED_HOST`; (b) AD/Hybrid intersects the dds-node list with the local vault by base64url credential_id (no helper needed — the existing `m_vault.FindByCredentialId` is reused); (c) **the dds-node-failure fallback no longer calls `HandleListUsers` (which sends `IPC_MSG::USER_LIST` and is rejected by the DDS CP) — it now synthesizes DDS-shape entries from vault records (subject_urn = SID, base64url credential_id from the vault bytes, vault display_name).** CP-side reading of `status_code` / `status_text` is part of AD-10 and not in this PR. |
 | **AD-10** | `CDdsCredential.cpp:369-420`, `:516-572`, `ReportResult`. | Extend `errorCode` switch for the six new IPC codes; map to canonical strings from §4.4. Map DDS-originated `ReportResult` NTSTATUS values to recovery text and send `DDS_REPORT_LOGON_RESULT`. |
 | **AD-11** | `Tests/test_ad_coexistence.cpp`, `build_test_ad_coexistence.bat`, `JoinState.h` (`SetJoinStateForTest` under `-DDDS_TESTING`). | Three native tests per §11.2. Register in `run_all_tests.bat`. |
 | **AD-10b logon result IPC** | `DdsBridgeIPC/ipc_protocol.h`, `ipc_messages.h`, `ipc_pipe_client.{h,cpp}`, `DdsAuthBridgeMain.{h,cpp}`. | Add `DDS_REPORT_LOGON_RESULT`; bridge records stale-password cooldown from CP-reported NTSTATUS. |

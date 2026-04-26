@@ -868,6 +868,23 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
         return TRUE;
     }
 
+    // AD-08: gate the auth path by JoinState *before* the WebAuthn ceremony so
+    // an unsupported host or a missing vault entry never causes the user to
+    // touch their key for a flow that will fail anyway. Spec §4.3 and the
+    // PRE_ENROLLMENT_REQUIRED / UNSUPPORTED_HOST IPC errors carry the
+    // canonical user-visible strings from §4.4.
+    const dds::JoinState joinState = GetJoinState();
+    if (joinState == dds::JoinState::EntraOnlyJoined ||
+        joinState == dds::JoinState::Unknown)
+    {
+        LeaveCriticalSection(&m_csAuth);
+        FileLog::Writef("DdsStartAuth: refusing — JoinState=%ls\n",
+                        dds::JoinStateName(joinState));
+        SendAuthError(pClientCtx, seqId, IPC_ERROR::UNSUPPORTED_HOST,
+            L"DDS sign-in is not yet supported on Entra-joined machines.");
+        return TRUE;
+    }
+
     // Look up vault entry by the credential_id from the request.
     // The credential_id is base64url-encoded; the vault stores raw bytes.
     const VaultEntry* pMatchedEntry = nullptr;
@@ -888,6 +905,21 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
     }
     else
     {
+        // AD-08: AD/Hybrid hosts cannot bootstrap a local account, so refuse
+        // before the FIDO2 ceremony with a specific PRE_ENROLLMENT_REQUIRED
+        // error instead of letting the claim path run and fail later. The
+        // generic in-claim domain-join check at the worker level becomes
+        // dead code once this gate is in place.
+        if (joinState != dds::JoinState::Workgroup)
+        {
+            LeaveCriticalSection(&m_csAuth);
+            FileLog::Writef("DdsStartAuth: refusing claim — JoinState=%ls (no vault entry)\n",
+                            dds::JoinStateName(joinState));
+            SendAuthError(pClientCtx, seqId, IPC_ERROR::PRE_ENROLLMENT_REQUIRED,
+                L"DDS sign-in is available only after enrollment on this AD-joined machine.");
+            return TRUE;
+        }
+
         FileLog::Write("DdsStartAuth: no vault entry yet -- entering first-claim mode\n");
         if (m_config.DeviceUrn().empty())
         {
@@ -1246,15 +1278,18 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
         SendAuthProgress(pOp->pClientCtx, pOp->seqId,
             IPC_AUTH_STATE::PROCESSING, L"Claiming local Windows account...");
 
+        // AD-08: the JoinState gate now lives in HandleDdsStartAuth, which
+        // refuses non-Workgroup claims with PRE_ENROLLMENT_REQUIRED /
+        // UNSUPPORTED_HOST *before* the WebAuthn ceremony. Reaching the worker
+        // in claim mode therefore implies a Workgroup host. Defence-in-depth:
+        // re-check here so a future refactor that bypasses the start-auth
+        // gate cannot silently fall back to the claim path on AD/Hybrid.
         if (GetJoinState() != dds::JoinState::Workgroup)
         {
-            // Phase 1 preserves the previous "block claim on domain-joined"
-            // behavior. AD-08 (Phase 3) will split this into more specific
-            // PRE_ENROLLMENT_REQUIRED / UNSUPPORTED_HOST IPC errors per
-            // JoinState. For now we keep the broader-than-AD-only gate so
-            // Hybrid / EntraOnly / Unknown hosts also fail safe.
-            SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::AUTH_FAILED,
-                L"Account claim is disabled on domain-joined machines");
+            SendAuthError(pOp->pClientCtx, pOp->seqId,
+                IPC_ERROR::PRE_ENROLLMENT_REQUIRED,
+                L"DDS sign-in is available only after enrollment on this "
+                L"AD-joined machine.");
             return;
         }
 
@@ -1409,54 +1444,174 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
 // Retrieves enrolled users from dds-node via HTTP GET
 // ============================================================================
 
+// AD-09: send a status-bearing IPC_RESP_DDS_USER_LIST with the supplied
+// `entries`. `statusCode` follows the IPC_ERROR taxonomy (SUCCESS or one of
+// UNSUPPORTED_HOST / PRE_ENROLLMENT_REQUIRED). `statusText` is a UI-ready wide
+// string that the credential provider can surface verbatim. The response shape
+// matches the DDS contract regardless of count, so legacy CP clients that only
+// read `count` see no entries on unsupported hosts and the new field-aware CP
+// can render the canonical §4.4 strings.
+//
+// The function is local to this translation unit because it owns the buffer
+// management and the wire format of the response.
+namespace {
+
+struct StagedUserEntry
+{
+    std::wstring subjectUrn;
+    std::wstring displayName;
+    std::wstring credentialId; // base64url-encoded
+};
+
+BOOL SendDdsUserListResponse(
+    CIpcPipeServer& pipeServer,
+    IPC_CLIENT_CONTEXT* pClientCtx,
+    UINT32 seqId,
+    UINT32 statusCode,
+    const wchar_t* statusText,
+    const std::vector<StagedUserEntry>& entries)
+{
+    BYTE buffer[IPC_PIPE::BUFFER_SIZE]{};
+    IPC_RESP_DDS_USER_LIST* pList = reinterpret_cast<IPC_RESP_DDS_USER_LIST*>(buffer);
+
+    const size_t maxUsers =
+        (sizeof(buffer) - sizeof(IPC_RESP_DDS_USER_LIST)) / sizeof(IPC_DDS_USER_ENTRY);
+    const UINT32 count = static_cast<UINT32>((std::min)(entries.size(), maxUsers));
+
+    pList->count = count;
+    pList->status_code = statusCode;
+    if (statusText && statusText[0] != L'\0')
+        wcsncpy_s(pList->status_text, statusText, _TRUNCATE);
+
+    IPC_DDS_USER_ENTRY* pEntries = reinterpret_cast<IPC_DDS_USER_ENTRY*>(
+        buffer + sizeof(IPC_RESP_DDS_USER_LIST));
+    for (UINT32 i = 0; i < count; ++i)
+    {
+        ZeroMemory(&pEntries[i], sizeof(IPC_DDS_USER_ENTRY));
+        wcsncpy_s(pEntries[i].subject_urn,   entries[i].subjectUrn.c_str(),   _TRUNCATE);
+        wcsncpy_s(pEntries[i].display_name,  entries[i].displayName.c_str(),  _TRUNCATE);
+        wcsncpy_s(pEntries[i].credential_id, entries[i].credentialId.c_str(), _TRUNCATE);
+    }
+
+    const DWORD totalSize =
+        sizeof(IPC_RESP_DDS_USER_LIST) + count * sizeof(IPC_DDS_USER_ENTRY);
+    return pipeServer.SendResponse(
+        pClientCtx, IPC_MSG::DDS_USER_LIST, seqId, buffer, totalSize);
+}
+
+} // namespace
+
 BOOL CDdsAuthBridgeMain::HandleDdsListUsers(
     _In_ IPC_CLIENT_CONTEXT* pClientCtx,
     _In_ UINT32 seqId)
 {
-    FileLog::Write("DdsListUsers: fetching from dds-node\n");
+    // AD-09: refuse Entra-only / Unknown hosts up front with a status-bearing
+    // empty DDS_USER_LIST so CP can show the §4.4 unsupported text. An empty
+    // vector alone is ambiguous — the new status_code carries the intent.
+    const dds::JoinState joinState = GetJoinState();
+    if (joinState == dds::JoinState::EntraOnlyJoined ||
+        joinState == dds::JoinState::Unknown)
+    {
+        FileLog::Writef("DdsListUsers: refusing — JoinState=%ls\n",
+                        dds::JoinStateName(joinState));
+        return SendDdsUserListResponse(
+            m_pipeServer, pClientCtx, seqId,
+            IPC_ERROR::UNSUPPORTED_HOST,
+            L"DDS sign-in is not yet supported on Entra-joined machines.",
+            {});
+    }
 
+    FileLog::Write("DdsListUsers: fetching from dds-node\n");
     DdsEnrolledUsersResult result = m_httpClient.GetEnrolledUsers(m_config.DeviceUrn());
+
+    // The vault is the source of truth for "this user can actually sign in
+    // here". Refresh it once so the AD/Hybrid intersection (and the synthesized
+    // fallback below) see any enrollments the tray agent just added.
+    m_vault.Load();
+    const auto& vaultEntries = m_vault.GetEntries();
 
     if (!result.success)
     {
         FileLog::Writef("DdsListUsers: dds-node request failed: %s\n",
                         result.errorMessage.c_str());
 
-        // Fall back to local vault entries
-        FileLog::Write("DdsListUsers: falling back to local vault\n");
-        return HandleListUsers(pClientCtx, seqId);
+        // AD-09: the legacy fallback called HandleListUsers, which returned
+        // IPC_MSG::USER_LIST — the DDS CP rejects that message type. Synthesize
+        // DDS-shape entries from the vault so CP gets a usable list. Vault
+        // does not persist DDS subject URNs, so fall back to the SID as a
+        // local identifier (spec §4.1).
+        std::vector<StagedUserEntry> synthesized;
+        synthesized.reserve(vaultEntries.size());
+        for (const auto& v : vaultEntries)
+        {
+            StagedUserEntry e;
+            e.subjectUrn   = v.userSid;
+            e.displayName  = v.displayName.empty() ? v.userSid : v.displayName;
+            std::string b64 = Base64UrlEncode(v.credentialId.data(), v.credentialId.size());
+            std::wstring b64w(b64.begin(), b64.end());
+            e.credentialId = std::move(b64w);
+            synthesized.push_back(std::move(e));
+        }
+
+        FileLog::Writef("DdsListUsers: synthesizing %zu user(s) from vault\n",
+                        synthesized.size());
+        return SendDdsUserListResponse(
+            m_pipeServer, pClientCtx, seqId,
+            IPC_ERROR::SUCCESS, L"", synthesized);
     }
 
-    // Build IPC response from dds-node data using the DDS-specific
-    // structs that the credential provider expects.
-    BYTE buffer[IPC_PIPE::BUFFER_SIZE];
-    IPC_RESP_DDS_USER_LIST* pList = reinterpret_cast<IPC_RESP_DDS_USER_LIST*>(buffer);
+    // AD-09: on AD/Hybrid hosts, intersect the dds-node user list with the
+    // local vault by credential_id. Users without a vault entry on this
+    // machine cannot complete a sign-in here — surfacing them produces
+    // tiles that always fail with PRE_ENROLLMENT_REQUIRED. Workgroup hosts
+    // continue to see the full list (they can still claim).
+    const bool intersectWithVault =
+        (joinState == dds::JoinState::AdJoined ||
+         joinState == dds::JoinState::HybridJoined);
 
-    size_t maxUsers = (sizeof(buffer) - sizeof(IPC_RESP_DDS_USER_LIST)) / sizeof(IPC_DDS_USER_ENTRY);
-    UINT32 count = static_cast<UINT32>((std::min)(result.users.size(), maxUsers));
-    pList->count = count;
-
-    IPC_DDS_USER_ENTRY* pEntries = reinterpret_cast<IPC_DDS_USER_ENTRY*>(buffer + sizeof(IPC_RESP_DDS_USER_LIST));
-    for (UINT32 i = 0; i < count; i++)
+    std::vector<StagedUserEntry> staged;
+    staged.reserve(result.users.size());
+    for (const auto& u : result.users)
     {
-        ZeroMemory(&pEntries[i], sizeof(IPC_DDS_USER_ENTRY));
-        MultiByteToWideChar(CP_UTF8, 0,
-            result.users[i].subjectUrn.c_str(), -1,
-            pEntries[i].subject_urn, _countof(pEntries[i].subject_urn));
-        MultiByteToWideChar(CP_UTF8, 0,
-            result.users[i].displayName.c_str(), -1,
-            pEntries[i].display_name, _countof(pEntries[i].display_name));
-        MultiByteToWideChar(CP_UTF8, 0,
-            result.users[i].credentialId.c_str(), -1,
-            pEntries[i].credential_id, _countof(pEntries[i].credential_id));
+        if (intersectWithVault)
+        {
+            std::vector<uint8_t> credIdBytes = Base64UrlDecode(u.credentialId);
+            if (credIdBytes.empty() || m_vault.FindByCredentialId(credIdBytes) == nullptr)
+            {
+                continue;
+            }
+        }
+
+        StagedUserEntry e;
+        // Convert UTF-8 → UTF-16 with explicit length so the wide buffer is
+        // correctly sized; the existing helper `wcsncpy_s` truncates on
+        // overflow.
+        wchar_t wbuf[IPC_MAX_URN_LEN]{};
+        MultiByteToWideChar(CP_UTF8, 0, u.subjectUrn.c_str(), -1,
+                            wbuf, _countof(wbuf));
+        e.subjectUrn = wbuf;
+
+        wchar_t dbuf[IPC_MAX_DISPLAY_NAME_LEN]{};
+        MultiByteToWideChar(CP_UTF8, 0, u.displayName.c_str(), -1,
+                            dbuf, _countof(dbuf));
+        e.displayName = dbuf;
+
+        wchar_t cbuf[IPC_MAX_CREDENTIAL_ID_LEN]{};
+        MultiByteToWideChar(CP_UTF8, 0, u.credentialId.c_str(), -1,
+                            cbuf, _countof(cbuf));
+        e.credentialId = cbuf;
+
+        staged.push_back(std::move(e));
     }
 
-    DWORD totalSize = sizeof(IPC_RESP_DDS_USER_LIST) + count * sizeof(IPC_DDS_USER_ENTRY);
+    FileLog::Writef("DdsListUsers: returning %zu user(s) from dds-node "
+                    "(intersect=%d, joinState=%ls)\n",
+                    staged.size(), intersectWithVault ? 1 : 0,
+                    dds::JoinStateName(joinState));
 
-    FileLog::Writef("DdsListUsers: returning %u user(s) from dds-node\n", count);
-
-    return m_pipeServer.SendResponse(pClientCtx, IPC_MSG::DDS_USER_LIST, seqId,
-        buffer, totalSize);
+    return SendDdsUserListResponse(
+        m_pipeServer, pClientCtx, seqId,
+        IPC_ERROR::SUCCESS, L"", staged);
 }
 
 // ============================================================================

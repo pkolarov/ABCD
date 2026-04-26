@@ -172,7 +172,11 @@ DDS_TEST(dds_user_list_struct_layout)
     IPC_RESP_DDS_USER_LIST listHeader;
     memset(&listHeader, 0, sizeof(listHeader));
     listHeader.count = 3;
+    listHeader.status_code = IPC_ERROR::SUCCESS;
+    listHeader.status_text[0] = L'\0';
     DDS_ASSERT(listHeader.count == 3, "count field must be settable");
+    DDS_ASSERT(listHeader.status_code == 0, "status_code field must be settable");
+    DDS_ASSERT(listHeader.status_text[0] == L'\0', "status_text field must be accessible");
 
     IPC_DDS_USER_ENTRY entry;
     memset(&entry, 0, sizeof(entry));
@@ -183,6 +187,30 @@ DDS_TEST(dds_user_list_struct_layout)
     DDS_ASSERT(entry.display_name[0] == L'A',  "display_name field must be accessible");
     DDS_ASSERT(entry.subject_urn[0] == L'B',   "subject_urn field must be accessible");
     DDS_ASSERT(entry.credential_id[0] == L'C', "credential_id field must be accessible");
+}
+
+// AD-09 — status_code is the canonical signal that distinguishes "no users yet"
+// from "this host is unsupported". Pin the carrier values so a future field
+// rename / renumber breaks here, not at runtime in the credential provider.
+DDS_TEST(dds_user_list_status_carrier)
+{
+    IPC_RESP_DDS_USER_LIST hdr;
+    memset(&hdr, 0, sizeof(hdr));
+
+    hdr.count = 0;
+    hdr.status_code = IPC_ERROR::UNSUPPORTED_HOST;
+    wcsncpy_s(hdr.status_text,
+              L"DDS sign-in is not yet supported on Entra-joined machines.",
+              _TRUNCATE);
+
+    DDS_ASSERT(hdr.count == 0,
+               "AD-09: empty list with non-success status must remain empty");
+    DDS_ASSERT(hdr.status_code == 20,
+               "AD-09: UNSUPPORTED_HOST must be carried in status_code");
+    DDS_ASSERT(wcslen(hdr.status_text) > 0,
+               "AD-09: status_text must hold the §4.4 canonical message");
+    DDS_ASSERT(_countof(hdr.status_text) == IPC_MAX_STATUS_MSG_LEN,
+               "AD-09: status_text must be sized to IPC_MAX_STATUS_MSG_LEN");
 }
 
 DDS_TEST(dds_auth_error_struct)

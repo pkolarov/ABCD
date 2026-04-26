@@ -319,3 +319,232 @@ DDS_TEST(stale_cooldown_key_preserves_base64url_case)
     DDS_ASSERT(alice != bob,
                "Alice and Bob must be distinct entries; case folding would merge them");
 }
+
+// ============================================================================
+// AD-08 / AD-09 — JoinState-driven gate decisions for the auth path.
+//
+// The bridge's HandleDdsStartAuth and HandleDdsListUsers gates are pure
+// JoinState/vault-presence logic on top of the same `FindByCredentialId`
+// helper exercised above. These tests reproduce just the gate to keep the
+// security contract locked even on macOS CI where the production WinAPI
+// dependencies don't link.
+// ============================================================================
+
+namespace TestAdCoexistenceGate
+{
+
+// Mirror of the JoinState enum at JoinState.h. The numeric values are part of
+// the cross-language (managed/native) contract so they MUST remain stable.
+enum class JoinState : unsigned int
+{
+    Workgroup       = 0,
+    AdJoined        = 1,
+    HybridJoined    = 2,
+    EntraOnlyJoined = 3,
+    Unknown         = 4,
+};
+
+// Mirror of IPC_ERROR codes from ipc_protocol.h relevant to AD-08/AD-09.
+// Pinned numerically here so a renumbering would also break the
+// dds_user_list_status_carrier test next to it.
+constexpr unsigned int IPC_ERROR_SUCCESS                  = 0;
+constexpr unsigned int IPC_ERROR_PRE_ENROLLMENT_REQUIRED  = 19;
+constexpr unsigned int IPC_ERROR_UNSUPPORTED_HOST         = 20;
+
+enum class StartAuthDecision
+{
+    Proceed,                // vault-backed sign-in OK
+    UnsupportedHost,        // Entra-only / Unknown
+    PreEnrollmentRequired,  // AD/Hybrid + no vault entry
+    ClaimMode,              // Workgroup + no vault entry → existing claim path
+};
+
+// AD-08: pure decision function. `vaultMatched` is the result of the
+// FindByCredentialId lookup (already exercised by the older tests above).
+static StartAuthDecision DecideStartAuth(JoinState js, bool vaultMatched)
+{
+    if (js == JoinState::EntraOnlyJoined || js == JoinState::Unknown)
+        return StartAuthDecision::UnsupportedHost;
+    if (vaultMatched)
+        return StartAuthDecision::Proceed;
+    if (js == JoinState::Workgroup)
+        return StartAuthDecision::ClaimMode;
+    return StartAuthDecision::PreEnrollmentRequired;
+}
+
+// AD-09: pure filter function. Returns the entries the bridge would emit
+// over IPC, in order. `vaultCredentialIds` is the set of base64url
+// credential_ids backed by a local vault entry (used as the intersection
+// key on AD/Hybrid hosts).
+struct ListUserEntry
+{
+    std::string subjectUrn;
+    std::string displayName;
+    std::string credentialIdB64;
+};
+
+static std::vector<ListUserEntry> FilterDdsUserList(
+    JoinState js,
+    const std::vector<ListUserEntry>& dsNodeUsers,
+    const std::vector<std::string>& vaultCredentialIds)
+{
+    std::vector<ListUserEntry> out;
+    const bool intersect =
+        (js == JoinState::AdJoined || js == JoinState::HybridJoined);
+
+    for (const auto& u : dsNodeUsers)
+    {
+        if (intersect)
+        {
+            bool found = false;
+            for (const auto& v : vaultCredentialIds)
+            {
+                if (v == u.credentialIdB64)
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) continue;
+        }
+        out.push_back(u);
+    }
+    return out;
+}
+
+} // namespace TestAdCoexistenceGate
+
+// ---- AD-08 ----
+
+DDS_TEST(ad08_workgroup_with_vault_proceeds)
+{
+    using namespace TestAdCoexistenceGate;
+    DDS_ASSERT(DecideStartAuth(JoinState::Workgroup, true) == StartAuthDecision::Proceed,
+               "Workgroup + vault-matched credential must proceed to sign-in");
+}
+
+DDS_TEST(ad08_workgroup_without_vault_falls_back_to_claim)
+{
+    using namespace TestAdCoexistenceGate;
+    DDS_ASSERT(DecideStartAuth(JoinState::Workgroup, false) == StartAuthDecision::ClaimMode,
+               "Workgroup + no vault must enter claim mode (existing behaviour)");
+}
+
+DDS_TEST(ad08_ad_joined_with_vault_proceeds)
+{
+    using namespace TestAdCoexistenceGate;
+    DDS_ASSERT(DecideStartAuth(JoinState::AdJoined, true) == StartAuthDecision::Proceed,
+               "AD-joined host with a prior enrollment must complete FIDO2 sign-in");
+}
+
+DDS_TEST(ad08_hybrid_with_vault_proceeds)
+{
+    using namespace TestAdCoexistenceGate;
+    DDS_ASSERT(DecideStartAuth(JoinState::HybridJoined, true) == StartAuthDecision::Proceed,
+               "Hybrid-joined host behaves as AD-joined for the vault-backed path");
+}
+
+DDS_TEST(ad08_ad_joined_without_vault_returns_pre_enrollment_required)
+{
+    using namespace TestAdCoexistenceGate;
+    DDS_ASSERT(DecideStartAuth(JoinState::AdJoined, false)
+               == StartAuthDecision::PreEnrollmentRequired,
+               "AD-joined + no vault entry must short-circuit before WebAuthn");
+}
+
+DDS_TEST(ad08_hybrid_without_vault_returns_pre_enrollment_required)
+{
+    using namespace TestAdCoexistenceGate;
+    DDS_ASSERT(DecideStartAuth(JoinState::HybridJoined, false)
+               == StartAuthDecision::PreEnrollmentRequired,
+               "Hybrid + no vault entry follows the same pre-enrollment gate");
+}
+
+DDS_TEST(ad08_entra_only_always_unsupported)
+{
+    using namespace TestAdCoexistenceGate;
+    DDS_ASSERT(DecideStartAuth(JoinState::EntraOnlyJoined, true)
+               == StartAuthDecision::UnsupportedHost,
+               "Entra-only is unsupported even if a vault entry happens to exist");
+    DDS_ASSERT(DecideStartAuth(JoinState::EntraOnlyJoined, false)
+               == StartAuthDecision::UnsupportedHost,
+               "Entra-only with no vault entry is also unsupported");
+}
+
+DDS_TEST(ad08_unknown_join_state_is_unsupported)
+{
+    using namespace TestAdCoexistenceGate;
+    // Unknown means probe failed; spec §2.1 says fail closed for mutating
+    // operations. Sign-in is mutating because it serializes a Kerberos blob
+    // back to LogonUI — refuse.
+    DDS_ASSERT(DecideStartAuth(JoinState::Unknown, false)
+               == StartAuthDecision::UnsupportedHost,
+               "Unknown JoinState must fail closed with UNSUPPORTED_HOST");
+    DDS_ASSERT(DecideStartAuth(JoinState::Unknown, true)
+               == StartAuthDecision::UnsupportedHost,
+               "Unknown stays unsupported even with a vault entry — probe must classify first");
+}
+
+// ---- AD-09 ----
+
+DDS_TEST(ad09_workgroup_returns_full_dds_node_list)
+{
+    using namespace TestAdCoexistenceGate;
+    std::vector<ListUserEntry> nodeUsers = {
+        { "urn:vouchsafe:alice", "Alice", "ALICEcred" },
+        { "urn:vouchsafe:bob",   "Bob",   "BOBcred"   },
+    };
+    std::vector<std::string> vault = { "ALICEcred" }; // bob has no vault entry
+
+    auto out = FilterDdsUserList(JoinState::Workgroup, nodeUsers, vault);
+    DDS_ASSERT(out.size() == 2,
+               "Workgroup hosts must surface every dds-node user (claim path can still create the local account)");
+    DDS_ASSERT(out[0].subjectUrn == "urn:vouchsafe:alice",
+               "List order from dds-node must be preserved");
+    DDS_ASSERT(out[1].subjectUrn == "urn:vouchsafe:bob",
+               "Workgroup includes vault-less users");
+}
+
+DDS_TEST(ad09_ad_joined_intersects_with_vault_only)
+{
+    using namespace TestAdCoexistenceGate;
+    std::vector<ListUserEntry> nodeUsers = {
+        { "urn:vouchsafe:alice", "Alice", "ALICEcred" },
+        { "urn:vouchsafe:bob",   "Bob",   "BOBcred"   },
+        { "urn:vouchsafe:carol", "Carol", "CAROLcred" },
+    };
+    std::vector<std::string> vault = { "BOBcred" };
+
+    auto out = FilterDdsUserList(JoinState::AdJoined, nodeUsers, vault);
+    DDS_ASSERT(out.size() == 1,
+               "AD-joined hosts must drop dds-node users with no local vault entry");
+    DDS_ASSERT(out[0].subjectUrn == "urn:vouchsafe:bob",
+               "Intersection key is the credential_id, not the subject_urn");
+}
+
+DDS_TEST(ad09_hybrid_intersects_like_ad)
+{
+    using namespace TestAdCoexistenceGate;
+    std::vector<ListUserEntry> nodeUsers = {
+        { "urn:vouchsafe:alice", "Alice", "ALICEcred" },
+    };
+    std::vector<std::string> vault; // empty vault
+
+    auto out = FilterDdsUserList(JoinState::HybridJoined, nodeUsers, vault);
+    DDS_ASSERT(out.empty(),
+               "Hybrid host with empty vault must show no DDS tiles even when dds-node lists users");
+}
+
+DDS_TEST(ad09_credential_id_is_case_sensitive_in_intersection)
+{
+    using namespace TestAdCoexistenceGate;
+    std::vector<ListUserEntry> nodeUsers = {
+        { "urn:vouchsafe:alice", "Alice", "ABcd" },
+    };
+    // base64url is case-sensitive, so "abcd" != "ABcd"
+    std::vector<std::string> vault = { "abcd" };
+
+    auto out = FilterDdsUserList(JoinState::AdJoined, nodeUsers, vault);
+    DDS_ASSERT(out.empty(),
+               "AD-09 intersection must NOT case-fold the credential_id — base64url is case-sensitive");
+}
