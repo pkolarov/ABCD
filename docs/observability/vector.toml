@@ -1,0 +1,150 @@
+# DDS audit-log → SIEM forwarder reference config (Vector)
+#
+# Phase B.3 of docs/observability-plan.md. Pairs with
+# audit-event-schema.md (the on-wire JSONL contract). Vector handles
+# restart, backpressure, batching, retry — dds-cli does not.
+#
+# Run with:
+#   vector --config /etc/vector/vector.toml
+#
+# Tested against Vector 0.36+. Requires `dds-cli` on $PATH and a
+# running `dds-node` reachable at $DDS_NODE_URL (defaults to the
+# common loopback-TCP address; switch to `unix:` / `pipe:` if the
+# node is not on loopback TCP).
+
+# -----------------------------------------------------------------------------
+# Source: tail the local node's audit chain as JSONL.
+# -----------------------------------------------------------------------------
+#
+# Why `exec`: the JSONL stream is the operator-facing contract (see
+# audit-event-schema.md). `dds-cli` runs the local Ed25519 verify on
+# every line *before* emitting it, so a forwarder cannot be tricked
+# into shipping a line that the node did not actually sign. Reading
+# the redb backing file directly would skip that verification and
+# couple the forwarder to internal storage.
+#
+# `--follow-interval 5` keeps the dds-cli process resident; Vector's
+# `restart_on_exit = true` covers transient node restarts.
+[sources.dds_audit]
+type = "exec"
+mode = "streaming"
+command = [
+    "dds-cli",
+    "audit",
+    "tail",
+    "--format",
+    "jsonl",
+    "--follow-interval",
+    "5",
+]
+# Default; set DDS_NODE_URL in the unit's environment if non-default.
+# environment = { DDS_NODE_URL = "http://127.0.0.1:5551" }
+streaming.respawn_on_exit = true
+streaming.respawn_interval_secs = 2
+decoding.codec = "json"
+
+# -----------------------------------------------------------------------------
+# Transform: parse and tag each event so the sinks below get a stable
+# shape regardless of which fields the dds-cli build emits.
+# -----------------------------------------------------------------------------
+[transforms.dds_audit_parsed]
+type = "remap"
+inputs = ["dds_audit"]
+source = '''
+# `exec` decodes JSON for us; the parsed object is the root event.
+# Drop the raw stdout/stderr framing fields if they leaked through.
+del(.host)
+del(.source_type)
+del(.timestamp)
+
+# Severity hint per audit-event-schema.md §5. Operators usually
+# override; this is a sensible default.
+.severity = "info"
+if exists(.action) {
+    if ends_with(string!(.action), ".rejected") {
+        .severity = "warning"
+    }
+    if .action == "apply.failed" { .severity = "warning" }
+    if .action == "revoke" { .severity = "notice" }
+    if .action == "burn" { .severity = "notice" }
+    if .action == "admin.bootstrap" { .severity = "notice" }
+}
+
+# Hard override: an unverified line is always high-severity. The
+# *line itself* is still forwarded — see audit-event-schema.md §2 on
+# why dropping `sig_ok=false` silently is wrong.
+if exists(.sig_ok) && .sig_ok == false {
+    .severity = "alert"
+}
+
+# Stable RFC3339 timestamp from the node-signed `ts` (Unix seconds).
+# Most SIEMs expect a timestamp field they recognise; keep `ts` too
+# so chain-linking tools see the original integer.
+if exists(.ts) {
+    .timestamp = from_unix_timestamp!(int!(.ts), unit: "seconds")
+}
+
+# Tag the source so a multi-source SIEM can route on it.
+.source = "dds-audit"
+'''
+
+# -----------------------------------------------------------------------------
+# Sink (option A): Loki — the recommended default for a Grafana stack.
+# -----------------------------------------------------------------------------
+[sinks.loki]
+type = "loki"
+inputs = ["dds_audit_parsed"]
+endpoint = "http://loki:3100"
+encoding.codec = "json"
+labels.app = "dds"
+labels.action = "{{ action }}"
+labels.node_urn = "{{ node_urn }}"
+labels.severity = "{{ severity }}"
+# `sig_ok=false` is a small label cardinality (2 values) and worth
+# alerting on — keep it labelled.
+labels.sig_ok = "{{ sig_ok }}"
+healthcheck.enabled = true
+
+# -----------------------------------------------------------------------------
+# Sink (option B): Splunk HEC. Uncomment + set `token`. Splunk indexes
+# the structured fields directly; the action/sig_ok pair is the most
+# useful pair to facet on in dashboards.
+# -----------------------------------------------------------------------------
+# [sinks.splunk]
+# type = "splunk_hec_logs"
+# inputs = ["dds_audit_parsed"]
+# endpoint = "https://splunk.internal:8088"
+# token = "${SPLUNK_HEC_TOKEN}"
+# index = "dds_audit"
+# source = "dds-cli-audit"
+# sourcetype = "_json"
+# healthcheck.enabled = true
+
+# -----------------------------------------------------------------------------
+# Sink (option C): Elasticsearch. Uses the dynamic index pattern
+# `dds-audit-YYYY.MM.DD` so retention can be applied with ILM.
+# -----------------------------------------------------------------------------
+# [sinks.elasticsearch]
+# type = "elasticsearch"
+# inputs = ["dds_audit_parsed"]
+# endpoints = ["https://elastic.internal:9200"]
+# auth.strategy = "basic"
+# auth.user = "${ELASTIC_USER}"
+# auth.password = "${ELASTIC_PASSWORD}"
+# bulk.index = "dds-audit-%Y.%m.%d"
+# healthcheck.enabled = true
+
+# -----------------------------------------------------------------------------
+# Sink (option D): S3 archival. Compressed JSONL, partitioned by day.
+# Useful for long-term retention beyond what the live SIEM keeps.
+# -----------------------------------------------------------------------------
+# [sinks.s3_archive]
+# type = "aws_s3"
+# inputs = ["dds_audit_parsed"]
+# bucket = "dds-audit-archive"
+# region = "us-east-1"
+# key_prefix = "year=%Y/month=%m/day=%d/"
+# compression = "gzip"
+# encoding.codec = "json"
+# batch.max_bytes = 10000000
+# batch.timeout_secs = 300

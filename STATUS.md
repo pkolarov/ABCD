@@ -12,7 +12,7 @@
 > |---|---|---|---|
 > | Z-1 | **Critical** | Encrypted comms (PQC) | Noise/QUIC handshake is X25519/ECDHE only — *not* post-quantum. README "quantum-resistant by default" applies to token signatures, not the transport channel. Harvest-Now-Decrypt-Later exposure on all recorded P2P traffic. |
 > | Z-2 | **High** | HW-bound identity | [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md) is a plan; zero code shipped. libp2p PeerId, admission cert, admin keys, default domain root all software-keyed. |
-> | Z-3 | ✅ **closed (Phase A)** | Immutable audit | Phase A from [docs/observability-plan.md](docs/observability-plan.md) landed: `emit_local_audit` is wired to all production state-mutating paths — `LocalService::{enroll_user, enroll_device, admin_setup, admin_vouch, record_applied}` and `DdsNode::{ingest_operation, ingest_revocation, ingest_burn}` (success and rejection branches both stamp the chain). `AuditLogEntry.reason: Option<String>` is signed-in (Phase A.2) so SIEM consumers can trust rejection reasons without re-deriving. Phase D (`/healthz` + `/readyz` orchestrator probes) also landed (2026-04-26 follow-up #18). Phases B, C, E, F (SIEM export, Prometheus `/metrics`, Alertmanager rules + Grafana dashboards, `dds-cli` ops surface) remain open. |
+> | Z-3 | ✅ **closed (Phase A)** | Immutable audit | Phase A from [docs/observability-plan.md](docs/observability-plan.md) landed: `emit_local_audit` is wired to all production state-mutating paths — `LocalService::{enroll_user, enroll_device, admin_setup, admin_vouch, record_applied}` and `DdsNode::{ingest_operation, ingest_revocation, ingest_burn}` (success and rejection branches both stamp the chain). `AuditLogEntry.reason: Option<String>` is signed-in (Phase A.2) so SIEM consumers can trust rejection reasons without re-deriving. Phase D (`/healthz` + `/readyz` orchestrator probes) also landed (2026-04-26 follow-up #18); Phase B is now complete (B.1 + B.2 in #19, B.3 + B.4 in #20). Phases C, E, F (Prometheus `/metrics`, Alertmanager rules + Grafana dashboards, `dds-cli` ops surface) remain open. |
 > | Z-4 | **High** | Encrypted at rest | redb store (`directory.redb`) is plaintext CBOR — tokens, ops, revocations, audit entries. Confidentiality depends on OS FDE + ACLs only. |
 > | Z-5 | **Medium** | Encrypted at rest | `dds-cli export` dumps are plaintext-CBOR (signed for integrity, not encrypted for confidentiality). |
 > | Z-6 | **Critical** | Supply-chain | DDS releases are unsigned in practice — Windows MSI Authenticode is gated on a `SIGN_CERT` secret that has never been provisioned; macOS `.pkg` is not Developer-ID-signed and not notarized. Operators have no programmatic way to verify a fresh install. **Implementation plan: [docs/supply-chain-plan.md](docs/supply-chain-plan.md) Phase A.** |
@@ -28,7 +28,31 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #19 (observability Phase B.1 +
+> Last updated: 2026-04-26 follow-up #20 (observability Phase B.3 +
+> B.4 landed — completes [docs/observability-plan.md](docs/observability-plan.md)
+> Phase B). New
+> [docs/observability/](docs/observability/) directory ships three
+> operator-facing reference assets: `audit-event-schema.md` pins the
+> JSONL contract that `dds-cli audit tail` produces (top-level keys,
+> action vocabulary, rejection-reason stems, default severity map,
+> CEF + RFC 5424 templates for the B.1 follow-up formats);
+> `vector.toml` configures Vector 0.36+ with an `exec` source running
+> `dds-cli audit tail --format jsonl --follow-interval 5`, a `remap`
+> transform that promotes the node-signed `ts` to the canonical
+> Vector timestamp and stamps severity (escalating any
+> `sig_ok=false` line to `alert` rather than dropping it), and
+> commented sink shapes for Loki / Splunk HEC / Elasticsearch / S3;
+> `fluent-bit.conf` + `parsers.conf` cover fluent-bit 2.2+ with the
+> same source / severity / sink coverage (`[PARSER]` blocks live in
+> the sibling parsers.conf as fluent-bit requires). All three are
+> doc-only — no Rust changes, no test count change. cargo fmt clean;
+> cargo clippy clean (workspace, all-targets, `-D warnings`); cargo
+> test --workspace --all-targets passes (still 578). Phases C
+> (Prometheus `/metrics`), E (reference Grafana / Alertmanager
+> assets), and F (`dds-cli stats` / `health` / `audit export`)
+> remain open and continue to track in the observability plan.
+>
+> Previous: 2026-04-26 follow-up #19 (observability Phase B.1 +
 > B.2 landed — closes the SIEM-export and chain-verify rows of
 > [docs/observability-plan.md](docs/observability-plan.md) Phase B).
 > The admin-gated `GET /v1/audit/entries` endpoint

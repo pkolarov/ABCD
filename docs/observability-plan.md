@@ -3,12 +3,13 @@
 **Status:** Phase A landed 2026-04-26 follow-up #17 (closes Z-3);
 Phase D (`/healthz` + `/readyz`) landed 2026-04-26 follow-up #18;
 Phase B sub-tasks B.1 (`dds-cli audit tail` JSONL stream) and B.2
-(`dds-cli audit verify` chain walk) landed 2026-04-26 follow-up #19.
+(`dds-cli audit verify` chain walk) landed 2026-04-26 follow-up #19;
 Phase B sub-tasks B.3 (Vector / fluent-bit reference configs) and
-B.4 (`audit-event-schema.md`) remain open, plus Phases C
-(Prometheus `/metrics`), E (reference Grafana dashboards +
-Alertmanager rules), and F (the rest of the `dds-cli` ops surface
-— `stats`, `health`, `audit export`).
+B.4 (`audit-event-schema.md`) landed 2026-04-26 follow-up #20 — Phase
+B is now complete. Phases C (Prometheus `/metrics`), E (reference
+Grafana dashboards + Alertmanager rules), and F (the rest of the
+`dds-cli` ops surface — `stats`, `health`, `audit export`) remain
+open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -220,20 +221,39 @@ them from the structured fields. New per-row fields
 chain-link without CBOR decoding when they only want the structured
 shape.
 
-**B.3 — Forwarder integration.** Ship two reference configs:
+**B.3 — Forwarder integration. ✅** Two reference configs landed:
 
-- `docs/observability/vector.toml` — Vector source =
-  `exec` running `dds-cli audit tail --format jsonl`, sink = Loki /
-  Splunk HEC / Elastic / S3.
-- `docs/observability/fluent-bit.conf` — same shape, fluent-bit
-  parsers.
+- [docs/observability/vector.toml](observability/vector.toml) —
+  Vector source = `exec` running
+  `dds-cli audit tail --format jsonl --follow-interval 5`, with
+  `respawn_on_exit=true` for hard exits and an inline `remap`
+  transform that promotes the node-signed `ts` to the canonical
+  Vector timestamp and stamps a default severity per
+  `audit-event-schema.md` §5. Four sink shapes documented (Loki
+  default, Splunk HEC, Elasticsearch with daily index pattern, S3
+  archival).
+- [docs/observability/fluent-bit.conf](observability/fluent-bit.conf)
+  + [docs/observability/parsers.conf](observability/parsers.conf) —
+  same shape on fluent-bit 2.2+. `[FILTER] modify` blocks encode
+  the action → severity mapping; a one-line Lua filter promotes
+  `ts` to the fluent-bit native timestamp; `sig_ok=false` lines
+  are escalated to `alert` rather than dropped (per
+  `audit-event-schema.md` §2). Loki / Splunk / Elasticsearch /
+  rsyslog outputs documented.
 
-Vector / fluent-bit handle restart, backpressure, batching,
-retry — DDS does not.
+Vector / fluent-bit handle restart, backpressure, batching, and
+retry — DDS does not. `dds-cli` runs the Ed25519 verify *before*
+emitting each line, so neither forwarder is in a position to be
+tricked into shipping a line the node did not actually sign.
 
-**B.4 — Schema doc.** `docs/observability/audit-event-schema.md`
-pinning the JSONL key set, action vocabulary, severity mapping,
-and CEF/syslog field maps. SIEM teams need this without reading
+**B.4 — Schema doc. ✅** Landed at
+[docs/observability/audit-event-schema.md](observability/audit-event-schema.md).
+Pins the JSONL field set (top-level `ts` / `action` / `node_urn` /
+`chain_hash` / `prev_hash` / `sig_ok` / `reason` / `token_cbor_b64`),
+the action vocabulary (with explicit reserved/deferred actions),
+the rejection-reason vocabulary, a default severity map for SIEMs
+that need one, and CEF + RFC 5424 syslog field templates for the
+B.1 follow-up formats. SIEM teams can integrate without reading
 Rust.
 
 ### Phase C — Prometheus exposition (`/metrics`)
