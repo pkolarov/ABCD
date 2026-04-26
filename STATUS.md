@@ -1,7 +1,54 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #14 (AD coexistence Phase 3 native
+> Last updated: 2026-04-26 follow-up #15 (AD coexistence Phase 3 — closes
+> AD-10 from
+> [docs/windows-ad-coexistence-spec.md](docs/windows-ad-coexistence-spec.md)
+> §4.4 and [docs/AD-gap-plan.md](docs/AD-gap-plan.md) Phase 3). The
+> credential provider now owns the canonical user-facing string for the six
+> AD-coexistence IPC error codes (16..21) instead of relaying whatever the
+> bridge happened to send. New `s_rgDdsCanonicalErrorText[]` table in
+> [CDdsCredential.cpp](platform/windows/native/DdsCredentialProvider/CDdsCredential.cpp)
+> maps each AD code to a (text, status icon) pair sourced from spec §4.4;
+> `GetSerializationDds` looks up `authResult.errorCode` and uses the
+> canonical CP string + icon when the code is in the AD taxonomy. Older
+> codes (`AUTH_TIMEOUT`, `USER_CANCELLED`, `SERVICE_ERROR`, …) fall through
+> to the bridge-supplied free-form text — those messages are not part of
+> §4.4 and may carry richer detail (e.g. PIN_BLOCKED reason) than a fixed
+> string. Icon assignment matches the spec's recoverable/terminal split:
+> `STALE_VAULT_PASSWORD` (16), `AD_PASSWORD_CHANGE_REQUIRED` (17),
+> `AD_PASSWORD_EXPIRED` (18), and `PRE_ENROLLMENT_REQUIRED` (19) all show
+> `CPSI_WARNING` because the operator can recover (sign in normally and
+> refresh DDS / enroll); `UNSUPPORTED_HOST` (20) and `ACCOUNT_NOT_FOUND`
+> (21) show `CPSI_ERROR` because they require admin reconfiguration. The
+> NTSTATUS → recovery text + `DDS_REPORT_LOGON_RESULT` half of AD-10
+> already shipped with AD-14 (see `s_rgLogonStatusInfo[]` in
+> `ReportResult`); this follow-up closes the IPC-error half. Six new
+> standalone tests in
+> [test_dds_bridge_selection.cpp](platform/windows/native/Tests/test_dds_bridge_selection.cpp)
+> mirror the canonical table and pin: full coverage of codes 16..21
+> (`ad10_canonical_error_text_covers_every_ad_code`), warning-icon mapping
+> for the recoverable codes
+> (`ad10_stale_password_codes_use_warning_icon`), error-icon mapping for
+> unsupported/missing-account
+> (`ad10_unsupported_and_missing_account_use_error_icon`), no-mapping
+> fallthrough for pre-AD codes
+> (`ad10_codes_outside_taxonomy_have_no_canonical_mapping`), the
+> deliberate copy share between AD_PASSWORD_CHANGE_REQUIRED and
+> AD_PASSWORD_EXPIRED
+> (`ad10_password_change_and_expired_share_recovery_text`), and the
+> deliberate copy distinction between PRE_ENROLLMENT_REQUIRED and
+> UNSUPPORTED_HOST
+> (`ad10_pre_enrollment_text_is_distinct_from_unsupported_host`). Smoke
+> compiled and exercised on a non-Windows host to catch typos before CI;
+> Phase 3 progress now AD-08 ✅ + AD-09 ✅ + AD-10 ✅, with AD-11 (full
+> `test_ad_coexistence.cpp` end-to-end) the remaining Phase 3 task.
+> Workspace test count unchanged at 560 (additions are native-only
+> standalone tests). cargo fmt clean; cargo clippy clean (workspace,
+> all-targets, `-D warnings`). Native C++ build/test on Windows is
+> deferred to CI per the established pattern.
+>
+> Previous: 2026-04-26 follow-up #14 (AD coexistence Phase 3 native
 > half — closes AD-08 + AD-09 from
 > [docs/windows-ad-coexistence-spec.md](docs/windows-ad-coexistence-spec.md)
 > §4.1 / §4.3 and [docs/AD-gap-plan.md](docs/AD-gap-plan.md) Phase 3).

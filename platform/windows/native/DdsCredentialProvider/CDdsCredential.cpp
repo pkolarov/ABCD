@@ -22,6 +22,63 @@ extern void CPLog(const char* fmt, ...);
 // Global DDS Bridge client shared across credential instances
 static CDdsBridgeClient g_ddsBridgeClient;
 
+// AD-10 — canonical user-facing text per
+// docs/windows-ad-coexistence-spec.md §4.4. The credential provider, not
+// the bridge, owns the visible string for these IPC error codes so the
+// operator sees a consistent message even if a future bridge build trims,
+// localises, or mistranslates the inline text. Older codes (AUTH_TIMEOUT,
+// USER_CANCELLED, etc.) intentionally keep the bridge-supplied free-form
+// string — they are not part of the AD coexistence taxonomy.
+//
+// Pinned numerically so a renumbering of IPC_ERROR forces the assertion
+// pinning in test_ipc_messages.cpp to fail first, before this map drifts.
+namespace {
+
+struct DdsCanonicalErrorText
+{
+    UINT32                          errorCode;
+    PCWSTR                          text;
+    CREDENTIAL_PROVIDER_STATUS_ICON icon;
+};
+
+static const DdsCanonicalErrorText s_rgDdsCanonicalErrorText[] = {
+    { 16 /* IPC_ERROR::STALE_VAULT_PASSWORD */,
+      L"Your DDS stored password may be out of date. Sign in normally with "
+      L"your Windows password, then refresh DDS from the system tray.",
+      CPSI_WARNING },
+    { 17 /* IPC_ERROR::AD_PASSWORD_CHANGE_REQUIRED */,
+      L"AD requires you to set a new password. Sign in normally to change "
+      L"it, then refresh DDS.",
+      CPSI_WARNING },
+    { 18 /* IPC_ERROR::AD_PASSWORD_EXPIRED */,
+      L"AD requires you to set a new password. Sign in normally to change "
+      L"it, then refresh DDS.",
+      CPSI_WARNING },
+    { 19 /* IPC_ERROR::PRE_ENROLLMENT_REQUIRED */,
+      L"DDS sign-in is available only after enrollment on this AD-joined "
+      L"machine.",
+      CPSI_WARNING },
+    { 20 /* IPC_ERROR::UNSUPPORTED_HOST */,
+      L"DDS sign-in is not yet supported on Entra-joined machines.",
+      CPSI_ERROR },
+    { 21 /* IPC_ERROR::ACCOUNT_NOT_FOUND */,
+      L"This DDS account no longer exists in your directory. Contact your "
+      L"administrator.",
+      CPSI_ERROR },
+};
+
+static const DdsCanonicalErrorText* FindDdsCanonicalErrorText(UINT32 errorCode)
+{
+    for (size_t i = 0; i < ARRAYSIZE(s_rgDdsCanonicalErrorText); ++i)
+    {
+        if (s_rgDdsCanonicalErrorText[i].errorCode == errorCode)
+            return &s_rgDdsCanonicalErrorText[i];
+    }
+    return nullptr;
+}
+
+} // namespace
+
 // CDdsCredential ////////////////////////////////////////////////////////////
 
 CDdsCredential::CDdsCredential():
@@ -422,13 +479,29 @@ HRESULT CDdsCredential::GetSerializationDds(
         OutputDebugString(L"\n");
         // Don't auto-trigger again on next tile select — let user click Submit manually
         auto_tries = 0;
+
+        // AD-10 — map AD-coexistence IPC error codes to the canonical §4.4
+        // status text and icon owned by the credential provider. Codes
+        // outside the taxonomy fall back to the bridge-supplied message
+        // and the generic CPSI_ERROR icon (existing behaviour).
+        const DdsCanonicalErrorText* canonical =
+            FindDdsCanonicalErrorText(authResult.errorCode);
+        PCWSTR statusText = canonical ? canonical->text
+                                      : authResult.errorMessage.c_str();
+        CREDENTIAL_PROVIDER_STATUS_ICON statusIcon =
+            canonical ? canonical->icon : CPSI_ERROR;
+
         if (ppwszOptionalStatusText)
         {
             CoTaskMemFree(*ppwszOptionalStatusText);
-            SHStrDupW(authResult.errorMessage.c_str(), ppwszOptionalStatusText);
+            SHStrDupW(
+                (statusText && statusText[0] != L'\0')
+                    ? statusText
+                    : L"DDS sign-in failed",
+                ppwszOptionalStatusText);
         }
         if (pcpsiOptionalStatusIcon)
-            *pcpsiOptionalStatusIcon = CPSI_ERROR;
+            *pcpsiOptionalStatusIcon = statusIcon;
         *pcpgsr = CPGSR_NO_CREDENTIAL_NOT_FINISHED;
         return S_OK;
     }

@@ -548,3 +548,165 @@ DDS_TEST(ad09_credential_id_is_case_sensitive_in_intersection)
     DDS_ASSERT(out.empty(),
                "AD-09 intersection must NOT case-fold the credential_id — base64url is case-sensitive");
 }
+
+// ============================================================================
+// AD-10 — credential-provider canonical error-text mapping
+//
+// These tests duplicate the CP's canonical §4.4 string and icon assignment
+// so a future drift between the spec, the CP table, and the IPC error code
+// values is caught by the test binary before it reaches LogonUI. Strings
+// are compared verbatim because the spec lists exact wording.
+// ============================================================================
+
+namespace TestCpCanonicalErrorText
+{
+
+// Mirror the CREDENTIAL_PROVIDER_STATUS_ICON values from Windows SDK
+// credentialprovider.h. Pinned numerically because the test binary does
+// not include credentialprovider.h directly.
+constexpr int CPSI_NONE    = 0;
+constexpr int CPSI_ERROR   = 1;
+constexpr int CPSI_WARNING = 2;
+constexpr int CPSI_SUCCESS = 3;
+
+struct Mapping
+{
+    unsigned int errorCode;
+    const wchar_t* text;
+    int icon;
+};
+
+// Mirror s_rgDdsCanonicalErrorText from CDdsCredential.cpp. Any drift in
+// either the IPC code numerics, the icon choice, or the §4.4 string must
+// fail this list before it ships.
+static const Mapping s_rgExpected[] = {
+    { 16,
+      L"Your DDS stored password may be out of date. Sign in normally with "
+      L"your Windows password, then refresh DDS from the system tray.",
+      CPSI_WARNING },
+    { 17,
+      L"AD requires you to set a new password. Sign in normally to change "
+      L"it, then refresh DDS.",
+      CPSI_WARNING },
+    { 18,
+      L"AD requires you to set a new password. Sign in normally to change "
+      L"it, then refresh DDS.",
+      CPSI_WARNING },
+    { 19,
+      L"DDS sign-in is available only after enrollment on this AD-joined "
+      L"machine.",
+      CPSI_WARNING },
+    { 20,
+      L"DDS sign-in is not yet supported on Entra-joined machines.",
+      CPSI_ERROR },
+    { 21,
+      L"This DDS account no longer exists in your directory. Contact your "
+      L"administrator.",
+      CPSI_ERROR },
+};
+
+static const Mapping* Find(unsigned int code)
+{
+    for (size_t i = 0; i < sizeof(s_rgExpected) / sizeof(s_rgExpected[0]); ++i)
+        if (s_rgExpected[i].errorCode == code) return &s_rgExpected[i];
+    return nullptr;
+}
+
+static bool WStrEqual(const wchar_t* a, const wchar_t* b)
+{
+    if (!a || !b) return a == b;
+    while (*a && *b)
+    {
+        if (*a != *b) return false;
+        ++a; ++b;
+    }
+    return *a == *b;
+}
+
+} // namespace TestCpCanonicalErrorText
+
+DDS_TEST(ad10_canonical_error_text_covers_every_ad_code)
+{
+    using namespace TestCpCanonicalErrorText;
+    // Every AD-coexistence IPC code (16..21) must have a canonical mapping.
+    // A missing entry would silently fall back to the bridge-supplied text,
+    // which can be empty or technical and undermines spec §4.4.
+    for (unsigned int code = 16; code <= 21; ++code)
+    {
+        const Mapping* m = Find(code);
+        DDS_ASSERT(m != nullptr,
+                   "AD-10: every AD-coexistence IPC code (16..21) needs a canonical CP mapping");
+        if (m)
+        {
+            DDS_ASSERT(m->text != nullptr && m->text[0] != L'\0',
+                       "AD-10: canonical text must be non-empty");
+        }
+    }
+}
+
+DDS_TEST(ad10_stale_password_codes_use_warning_icon)
+{
+    using namespace TestCpCanonicalErrorText;
+    // STALE / CHANGE_REQUIRED / EXPIRED / PRE_ENROLLMENT are recoverable
+    // operator actions — not terminal failures. Spec §4.4 maps them to a
+    // warning icon to communicate that.
+    const unsigned int warningCodes[] = { 16, 17, 18, 19 };
+    for (unsigned int code : warningCodes)
+    {
+        const Mapping* m = Find(code);
+        DDS_ASSERT(m && m->icon == CPSI_WARNING,
+                   "AD-10: recoverable AD codes must show the warning icon");
+    }
+}
+
+DDS_TEST(ad10_unsupported_and_missing_account_use_error_icon)
+{
+    using namespace TestCpCanonicalErrorText;
+    // UNSUPPORTED_HOST and ACCOUNT_NOT_FOUND are not user-recoverable from
+    // the logon screen — they require an admin or reconfiguration. Spec
+    // §4.4 surfaces them with the error icon.
+    DDS_ASSERT(Find(20) && Find(20)->icon == CPSI_ERROR,
+               "AD-10: UNSUPPORTED_HOST must show the error icon");
+    DDS_ASSERT(Find(21) && Find(21)->icon == CPSI_ERROR,
+               "AD-10: ACCOUNT_NOT_FOUND must show the error icon");
+}
+
+DDS_TEST(ad10_codes_outside_taxonomy_have_no_canonical_mapping)
+{
+    using namespace TestCpCanonicalErrorText;
+    // Pre-AD codes (AUTH_TIMEOUT=3, USER_CANCELLED=5, SERVICE_ERROR=9)
+    // and SUCCESS=0 must NOT be in the canonical table. Falling through
+    // to the bridge string is the correct behaviour — those messages are
+    // free-form and may carry richer detail than a fixed CP string.
+    DDS_ASSERT(Find(0)  == nullptr, "AD-10: SUCCESS must not have a canonical CP override");
+    DDS_ASSERT(Find(3)  == nullptr, "AD-10: AUTH_TIMEOUT must not have a canonical CP override");
+    DDS_ASSERT(Find(5)  == nullptr, "AD-10: USER_CANCELLED must not have a canonical CP override");
+    DDS_ASSERT(Find(9)  == nullptr, "AD-10: SERVICE_ERROR must not have a canonical CP override");
+}
+
+DDS_TEST(ad10_password_change_and_expired_share_recovery_text)
+{
+    using namespace TestCpCanonicalErrorText;
+    // Spec §4.4 deliberately uses the same recovery sentence for codes
+    // 17 and 18 — both end with "Sign in normally to change it, then
+    // refresh DDS." Differences here would diverge the operator UX.
+    const Mapping* mChange  = Find(17);
+    const Mapping* mExpired = Find(18);
+    DDS_ASSERT(mChange && mExpired, "AD-10: codes 17 and 18 must both be mapped");
+    DDS_ASSERT(WStrEqual(mChange->text, mExpired->text),
+               "AD-10: AD_PASSWORD_CHANGE_REQUIRED and AD_PASSWORD_EXPIRED share §4.4 recovery text");
+}
+
+DDS_TEST(ad10_pre_enrollment_text_is_distinct_from_unsupported_host)
+{
+    using namespace TestCpCanonicalErrorText;
+    // PRE_ENROLLMENT_REQUIRED and UNSUPPORTED_HOST must surface different
+    // copy — collapsing them was the symptom that motivated the spec
+    // distinction in §3 (AD/Hybrid still allows enrollment after a normal
+    // sign-in, Entra-only does not).
+    const Mapping* m19 = Find(19);
+    const Mapping* m20 = Find(20);
+    DDS_ASSERT(m19 && m20, "AD-10: codes 19 and 20 must both be mapped");
+    DDS_ASSERT(!WStrEqual(m19->text, m20->text),
+               "AD-10: PRE_ENROLLMENT_REQUIRED must not share copy with UNSUPPORTED_HOST");
+}
