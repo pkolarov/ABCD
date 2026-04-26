@@ -12,7 +12,7 @@
 > |---|---|---|---|
 > | Z-1 | **Critical** | Encrypted comms (PQC) | Noise/QUIC handshake is X25519/ECDHE only — *not* post-quantum. README "quantum-resistant by default" applies to token signatures, not the transport channel. Harvest-Now-Decrypt-Later exposure on all recorded P2P traffic. |
 > | Z-2 | **High** | HW-bound identity | [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md) is a plan; zero code shipped. libp2p PeerId, admission cert, admin keys, default domain root all software-keyed. |
-> | Z-3 | ✅ **closed (Phase A)** | Immutable audit | Phase A from [docs/observability-plan.md](docs/observability-plan.md) landed: `emit_local_audit` is wired to all production state-mutating paths — `LocalService::{enroll_user, enroll_device, admin_setup, admin_vouch, record_applied}` and `DdsNode::{ingest_operation, ingest_revocation, ingest_burn}` (success and rejection branches both stamp the chain). `AuditLogEntry.reason: Option<String>` is signed-in (Phase A.2) so SIEM consumers can trust rejection reasons without re-deriving. Phase D (`/healthz` + `/readyz` orchestrator probes) also landed (2026-04-26 follow-up #18); Phase B is now complete (B.1 + B.2 in #19, B.3 + B.4 in #20); Phase F (`dds-cli stats` / `health` / `audit export`) landed in #21. Phases C (Prometheus `/metrics`) and E (Alertmanager rules + Grafana dashboards) remain open. |
+> | Z-3 | ✅ **closed (Phase A)** | Immutable audit | Phase A from [docs/observability-plan.md](docs/observability-plan.md) landed: `emit_local_audit` is wired to all production state-mutating paths — `LocalService::{enroll_user, enroll_device, admin_setup, admin_vouch, record_applied}` and `DdsNode::{ingest_operation, ingest_revocation, ingest_burn}` (success and rejection branches both stamp the chain). `AuditLogEntry.reason: Option<String>` is signed-in (Phase A.2) so SIEM consumers can trust rejection reasons without re-deriving. Phase D (`/healthz` + `/readyz` orchestrator probes) also landed (2026-04-26 follow-up #18); Phase B is now complete (B.1 + B.2 in #19, B.3 + B.4 in #20); Phase F (`dds-cli stats` / `health` / `audit export`) landed in #21. Phase C audit-metrics subset (`dds_audit_entries_total`, `dds_audit_chain_length`, `dds_audit_chain_head_age_seconds`, plus build_info / uptime) landed in #22 — the rest of the C catalog (network / FIDO2 / store / HTTP) and Phase E (Alertmanager rules + Grafana dashboards) remain open. |
 > | Z-4 | **High** | Encrypted at rest | redb store (`directory.redb`) is plaintext CBOR — tokens, ops, revocations, audit entries. Confidentiality depends on OS FDE + ACLs only. |
 > | Z-5 | **Medium** | Encrypted at rest | `dds-cli export` dumps are plaintext-CBOR (signed for integrity, not encrypted for confidentiality). |
 > | Z-6 | **Critical** | Supply-chain | DDS releases are unsigned in practice — Windows MSI Authenticode is gated on a `SIGN_CERT` secret that has never been provisioned; macOS `.pkg` is not Developer-ID-signed and not notarized. Operators have no programmatic way to verify a fresh install. **Implementation plan: [docs/supply-chain-plan.md](docs/supply-chain-plan.md) Phase A.** |
@@ -28,7 +28,58 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #21 (observability Phase F
+> Last updated: 2026-04-26 follow-up #22 (observability Phase C
+> audit-metrics subset landed — opens the Prometheus `/metrics`
+> endpoint ahead of the full catalog).
+> [dds-node/src/telemetry.rs](dds-node/src/telemetry.rs) is a new
+> module exposing a process-global `Telemetry` handle and a
+> `serve(addr, svc, telemetry)` async fn that binds a *separate*
+> axum listener on `metrics_addr` (new `Option<String>` field on
+> `NetworkConfig`, default `None` so existing deployments do not
+> open a second port). The endpoint answers `GET /metrics` with the
+> Prometheus textual exposition (`text/plain; version=0.0.4`) and
+> 404s every other path so the API surface does not leak. Audit
+> emission paths —
+> [`LocalService::emit_local_audit`](dds-node/src/service.rs) and
+> [`DdsNode::emit_local_audit_with_reason`](dds-node/src/node.rs)
+> — call `crate::telemetry::record_audit_entry(&action)` *after*
+> the redb append succeeds, so the counter only ticks for entries
+> that are actually durable. Five metrics ship in this subset:
+> `dds_build_info{version=...}` (gauge, always 1),
+> `dds_uptime_seconds` (gauge, `now - process_start`),
+> `dds_audit_entries_total{action=...}` (counter, per-action),
+> `dds_audit_chain_length` (gauge, observed via the new
+> `LocalService::audit_chain_length` helper), and
+> `dds_audit_chain_head_age_seconds` (gauge, `now -
+> head.timestamp` via the new `audit_chain_head_timestamp`
+> helper). The rest of the catalog (network, FIDO2, store, HTTP)
+> is deferred — each block needs its own call-site instrumentation
+> pass and a follow-up patch will fold the module into
+> `metrics-exporter-prometheus` once histograms become worth their
+> dependency cost. The Phase F deferrals (`last admission failure`
+> and `store bytes` on `dds-cli stats`) still depend on those
+> follow-up metrics and remain open. No external metrics crate is
+> introduced — the audit subset is a hand-rolled exposition over
+> a `Mutex<BTreeMap<String, u64>>`. Workspace test count: 589
+> (+9: `service::tests::audit_emit_advances_telemetry_counter`
+> pins that `LocalService::emit_local_audit` advances both the
+> per-action counter and the chain-length / head-timestamp
+> helpers, plus eight tests in
+> [dds-node/src/telemetry.rs](dds-node/src/telemetry.rs) covering
+> render shape, label escape, head-age computation, idempotent
+> install, no-panic before install, and two `tokio::test`
+> integration tests that spin up the metrics server on a random
+> port and assert (a) `GET /metrics` returns the expected
+> exposition with audit metrics surfaced and (b) any other path
+> returns 404 so the second listener cannot be confused with the
+> API surface). cargo fmt clean; cargo clippy clean (workspace,
+> all-targets, `-D warnings`); cargo test --workspace
+> --all-targets passes. Phase C remaining metrics
+> (network/FIDO2/store/HTTP/process) and Phase E (reference
+> Grafana dashboards + Alertmanager rules) remain open and
+> continue to track in the observability plan.
+>
+> Previous: 2026-04-26 follow-up #21 (observability Phase F
 > landed — closes the `dds-cli` ops-surface row of
 > [docs/observability-plan.md](docs/observability-plan.md) Phase F).
 > Three new `dds-cli` subcommands ship in

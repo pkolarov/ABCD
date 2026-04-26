@@ -1256,6 +1256,13 @@ impl DdsNode {
         self.store
             .append_audit_entry(&entry)
             .map_err(|e| format!("append: {e}"))?;
+        // observability-plan.md Phase C — bump
+        // `dds_audit_entries_total{action=...}` after the chain
+        // append succeeds. Mirrors the LocalService side of the
+        // funnel (HTTP / admin emissions are funneled through
+        // `LocalService::emit_local_audit`; gossip-ingest uses this
+        // path).
+        crate::telemetry::record_audit_entry(&entry.action);
         Ok(entry)
     }
 

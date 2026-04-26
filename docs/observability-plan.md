@@ -7,9 +7,13 @@ Phase B sub-tasks B.1 (`dds-cli audit tail` JSONL stream) and B.2
 Phase B sub-tasks B.3 (Vector / fluent-bit reference configs) and
 B.4 (`audit-event-schema.md`) landed 2026-04-26 follow-up #20 — Phase
 B is now complete. Phase F (`dds-cli stats`, `dds-cli health`,
-`dds-cli audit export`) landed 2026-04-26 follow-up #21. Phases C
-(Prometheus `/metrics`) and E (reference Grafana dashboards +
-Alertmanager rules) remain open.
+`dds-cli audit export`) landed 2026-04-26 follow-up #21. Phase C
+audit-metrics subset (`dds_build_info`, `dds_uptime_seconds`,
+`dds_audit_entries_total{action}`, `dds_audit_chain_length`,
+`dds_audit_chain_head_age_seconds` — opt-in via `metrics_addr`)
+landed 2026-04-26 follow-up #22; the rest of the C catalog
+(network / FIDO2 / store / HTTP / process) and Phase E (reference
+Grafana dashboards + Alertmanager rules) remain open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -259,18 +263,42 @@ Rust.
 
 ### Phase C — Prometheus exposition (`/metrics`)
 
-**C.1 — Crate.** Add `metrics = "0.23"` and
-`metrics-exporter-prometheus = "0.15"` to `dds-node/Cargo.toml`.
-`metrics-util` for histograms. The `metrics` crate is light — no
-runtime cost when the exporter isn't installed.
+**Status: audit subset landed 2026-04-26 follow-up #22; rest of the
+catalog remains open.** The audit-metrics-only first slice exposes
+the five families needed to alert on Z-3 regressions
+(`dds_build_info`, `dds_uptime_seconds`,
+`dds_audit_entries_total{action}`, `dds_audit_chain_length`,
+`dds_audit_chain_head_age_seconds`) with no new external crate —
+[dds-node/src/telemetry.rs](../dds-node/src/telemetry.rs) is a
+hand-rolled exposition over a `Mutex<BTreeMap<String, u64>>` plus
+on-demand audit-store reads, served on a separate axum listener
+bound to the new `metrics_addr` field on
+[`NetworkConfig`](../dds-node/src/config.rs) (default `None` —
+opt-in). When the rest of the catalog (network / FIDO2 / store /
+HTTP) lands the histograms become worth their weight and the
+module will be folded into `metrics-exporter-prometheus`.
 
-**C.2 — Endpoint.** New axum route `GET /metrics` on a
+**C.1 — Crate.** Add `metrics = "0.24"` and
+`metrics-exporter-prometheus = "0.18"` to `dds-node/Cargo.toml`.
+`metrics-util` for histograms. The `metrics` crate is light — no
+runtime cost when the exporter isn't installed. **Deferred until
+the histogram-bearing metrics in C.3 ship** — the audit subset in
+follow-up #22 is hand-rolled because three counters and two gauges
+do not justify the dependency yet.
+
+**C.2 — Endpoint. ✅** New axum route `GET /metrics` on a
 **separate listener** bound to a configurable address
-(`metrics_addr` in `node.toml`, default `127.0.0.1:9495`). Separate
-from the API listener so:
+(`metrics_addr` in `node.toml`, default `None` so the endpoint is
+opt-in for existing deployments — recommended value
+`127.0.0.1:9495` once an operator wants Prometheus scrape).
+Separate from the API listener so:
 - ops can scope Prometheus scrape ACLs without touching the API
   surface;
 - exposing it on `0.0.0.0` for fleet scrape doesn't open the API.
+
+The metrics router answers only `GET /metrics`; every other path
+returns 404 so the second listener cannot be confused with the API
+surface.
 
 No auth on `/metrics` — Prometheus is expected to be on a trusted
 scrape network. If exposed off-host, operators put a TLS sidecar in
@@ -278,45 +306,46 @@ front (same posture as kube-state-metrics).
 
 **C.3 — Metric catalog.** Metrics are named `dds_<area>_<measure>`,
 labels lower-snake. Counters reset on restart (Prometheus convention
-— compute rates over them).
+— compute rates over them). ✅ rows shipped in follow-up #22; 🔲
+rows remain open.
 
-| Metric | Type | Labels | Purpose |
-|---|---|---|---|
-| `dds_build_info` | gauge | `version, git_sha, rust_version` | Static fingerprint, always 1 |
-| `dds_uptime_seconds` | gauge | — | Process uptime |
-| **Network** | | | |
-| `dds_peers_admitted` | gauge | — | Currently admitted peer count |
-| `dds_peers_connected` | gauge | — | libp2p-connected peers (admitted + un-admitted) |
-| `dds_admission_handshakes_total` | counter | `result=ok|fail|revoked` | H-12 outcomes |
-| `dds_gossip_messages_total` | counter | `topic, direction=in|out, kind` | Gossipsub volume |
-| `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted|invalid_token|duplicate|backpressure` | Why we threw a message away |
-| `dds_sync_pulls_total` | counter | `result=ok|fail` | Anti-entropy pull count |
-| `dds_sync_lag_seconds` | histogram | — | Time from peer's op timestamp to local apply |
-| `dds_sync_payloads_rejected_total` | counter | `reason=signature|graph|duplicate_jti|window` | B-1-style guard hits |
-| **Trust graph** | | | |
-| `dds_attestations_total` | gauge | `kind=user|device|service` | Active count |
-| `dds_attestations_revoked_total` | counter | — | Revocations applied since boot |
-| `dds_burned_identities_total` | gauge | — | Total burned URNs |
-| `dds_purpose_lookups_total` | counter | `result=ok|denied|not_found` | `has_purpose` outcomes |
-| **FIDO2 / sessions** | | | |
-| `dds_fido2_assertions_total` | counter | `result=ok|signature|rp_id|up|uv|sign_count` | Assertion outcomes |
-| `dds_fido2_attestation_verify_total` | counter | `result, fmt=packed|none|tpm` | Enrollment-time verify |
-| `dds_sessions_issued_total` | counter | `via=fido2|legacy` | Session minting |
-| `dds_challenges_outstanding` | gauge | — | Live challenges (B-5 cap reference) |
-| **Audit** | | | |
-| `dds_audit_entries_total` | counter | `action` | Per-action emission rate |
-| `dds_audit_chain_length` | gauge | — | Local chain entry count |
-| `dds_audit_chain_head_age_seconds` | gauge | — | `now - last_entry.timestamp` (alert if > N) |
-| **Storage** | | | |
-| `dds_store_bytes` | gauge | `table=tokens|ops|audit|...` | redb table sizes |
-| `dds_store_writes_total` | counter | `result=ok|conflict|fail` | redb txn outcomes |
-| **HTTP API** | | | |
-| `dds_http_requests_total` | counter | `route, method, status` | Route-level traffic |
-| `dds_http_request_duration_seconds` | histogram | `route, method` | Latency |
-| `dds_http_caller_identity_total` | counter | `kind=anonymous|uds|pipe|admin` | Who's calling — surfaces accidental loopback-TCP regressions |
-| **Process** | | | |
-| `dds_memory_resident_bytes` | gauge | — | RSS (procfs / mach) |
-| `dds_thread_count` | gauge | — | OS thread count |
+| Metric | Type | Labels | Purpose | Status |
+|---|---|---|---|---|
+| `dds_build_info` | gauge | `version` | Static fingerprint, always 1 (`git_sha`, `rust_version` deferred until a build-time env var pipeline lands) | ✅ |
+| `dds_uptime_seconds` | gauge | — | Process uptime | ✅ |
+| **Network** | | | | |
+| `dds_peers_admitted` | gauge | — | Currently admitted peer count | 🔲 |
+| `dds_peers_connected` | gauge | — | libp2p-connected peers (admitted + un-admitted) | 🔲 |
+| `dds_admission_handshakes_total` | counter | `result=ok|fail|revoked` | H-12 outcomes | 🔲 |
+| `dds_gossip_messages_total` | counter | `topic, direction=in|out, kind` | Gossipsub volume | 🔲 |
+| `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted|invalid_token|duplicate|backpressure` | Why we threw a message away | 🔲 |
+| `dds_sync_pulls_total` | counter | `result=ok|fail` | Anti-entropy pull count | 🔲 |
+| `dds_sync_lag_seconds` | histogram | — | Time from peer's op timestamp to local apply | 🔲 |
+| `dds_sync_payloads_rejected_total` | counter | `reason=signature|graph|duplicate_jti|window` | B-1-style guard hits | 🔲 |
+| **Trust graph** | | | | |
+| `dds_attestations_total` | gauge | `kind=user|device|service` | Active count | 🔲 |
+| `dds_attestations_revoked_total` | counter | — | Revocations applied since boot | 🔲 |
+| `dds_burned_identities_total` | gauge | — | Total burned URNs | 🔲 |
+| `dds_purpose_lookups_total` | counter | `result=ok|denied|not_found` | `has_purpose` outcomes | 🔲 |
+| **FIDO2 / sessions** | | | | |
+| `dds_fido2_assertions_total` | counter | `result=ok|signature|rp_id|up|uv|sign_count` | Assertion outcomes | 🔲 |
+| `dds_fido2_attestation_verify_total` | counter | `result, fmt=packed|none|tpm` | Enrollment-time verify | 🔲 |
+| `dds_sessions_issued_total` | counter | `via=fido2|legacy` | Session minting | 🔲 |
+| `dds_challenges_outstanding` | gauge | — | Live challenges (B-5 cap reference) | 🔲 |
+| **Audit** | | | | |
+| `dds_audit_entries_total` | counter | `action` | Per-action emission rate | ✅ |
+| `dds_audit_chain_length` | gauge | — | Local chain entry count | ✅ |
+| `dds_audit_chain_head_age_seconds` | gauge | — | `now - last_entry.timestamp` (alert if > N) | ✅ |
+| **Storage** | | | | |
+| `dds_store_bytes` | gauge | `table=tokens|ops|audit|...` | redb table sizes | 🔲 |
+| `dds_store_writes_total` | counter | `result=ok|conflict|fail` | redb txn outcomes | 🔲 |
+| **HTTP API** | | | | |
+| `dds_http_requests_total` | counter | `route, method, status` | Route-level traffic | 🔲 |
+| `dds_http_request_duration_seconds` | histogram | `route, method` | Latency | 🔲 |
+| `dds_http_caller_identity_total` | counter | `kind=anonymous|uds|pipe|admin` | Who's calling — surfaces accidental loopback-TCP regressions | 🔲 |
+| **Process** | | | | |
+| `dds_memory_resident_bytes` | gauge | — | RSS (procfs / mach) | 🔲 |
+| `dds_thread_count` | gauge | — | OS thread count | 🔲 |
 
 **C.4 — Wiring.** Each call site uses `metrics::counter!`,
 `metrics::gauge!`, `metrics::histogram!` macros. A dedicated

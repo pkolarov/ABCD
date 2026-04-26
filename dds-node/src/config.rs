@@ -197,6 +197,18 @@ pub struct NetworkConfig {
     /// are still live, then flip back to `false`.
     #[serde(default = "default_false")]
     pub allow_legacy_v1_tokens: bool,
+
+    /// observability-plan.md Phase C — Prometheus `/metrics` listen
+    /// address. When `Some` the node spawns a second axum server
+    /// alongside the API listener and answers `GET /metrics` with
+    /// the standard Prometheus text exposition. `None` (the default)
+    /// keeps the endpoint disabled so existing deployments do not
+    /// open a second port without the operator opting in. Recommended
+    /// value for an in-cluster Prometheus is `127.0.0.1:9495` plus a
+    /// scrape-side TLS sidecar; off-host scrape requires the
+    /// operator to supply their own ACL / mTLS posture.
+    #[serde(default)]
+    pub metrics_addr: Option<String>,
 }
 
 impl Default for NetworkConfig {
@@ -210,6 +222,7 @@ impl Default for NetworkConfig {
             api_addr: default_api_addr(),
             api_auth: ApiAuthConfig::default(),
             allow_legacy_v1_tokens: false,
+            metrics_addr: None,
         }
     }
 }

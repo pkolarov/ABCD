@@ -62,6 +62,7 @@ async fn spawn_node(org: &str) -> (DdsNode, TempDir) {
             api_addr: "127.0.0.1:0".to_string(),
             api_auth: Default::default(),
             allow_legacy_v1_tokens: false,
+            metrics_addr: None,
         },
         org_hash: org.to_string(),
         domain: dds_node::config::DomainConfig {

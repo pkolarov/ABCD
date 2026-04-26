@@ -251,6 +251,14 @@ this secret; locally, run
 | `GET` | `/v1/windows/policies` | Windows policy for this device |
 | `GET` | `/v1/macos/policies` | macOS policy for this device |
 | `GET` | `/v1/audit/entries` | Signed audit-log slice |
+| `GET` | `/healthz`, `/readyz` | Orchestrator probes (Phase D) |
+
+Set `network.metrics_addr = "127.0.0.1:9495"` to expose Prometheus
+`/metrics` on a separate listener (observability-plan.md Phase C —
+audit subset only in this build: `dds_build_info`,
+`dds_uptime_seconds`, `dds_audit_entries_total{action}`,
+`dds_audit_chain_length`, `dds_audit_chain_head_age_seconds`).
+Default is `None` so the second port is opt-in.
 
 ### Rust API (`dds-core` + `dds-domain`)
 

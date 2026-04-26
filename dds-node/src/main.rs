@@ -980,6 +980,23 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             },
         )?,
     ));
+    // observability-plan.md Phase C — install the process-global
+    // telemetry handle before any audit emission can fire (admin or
+    // gossip). The `record_audit_entry` helper is a no-op until this
+    // call lands; calling here keeps test fixtures (which never reach
+    // `cmd_run`) telemetry-free.
+    let telemetry_handle = dds_node::telemetry::install();
+    if let Some(metrics_addr) = config.network.metrics_addr.clone() {
+        let svc_for_metrics = Arc::clone(&shared_svc);
+        let handle_for_metrics = Arc::clone(&telemetry_handle);
+        tokio::spawn(async move {
+            if let Err(e) =
+                dds_node::telemetry::serve(&metrics_addr, svc_for_metrics, handle_for_metrics).await
+            {
+                tracing::error!(addr = %metrics_addr, "metrics endpoint server error: {e}");
+            }
+        });
+    }
     tokio::spawn(async move {
         if let Err(e) = http::serve(
             &api_addr,

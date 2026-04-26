@@ -188,6 +188,7 @@ fn write_node_fixture(
             api_addr: api_addr.clone(),
             api_auth: Default::default(),
             allow_legacy_v1_tokens: false,
+            metrics_addr: None,
         },
         org_hash: "cp-e2e-org".to_string(),
         domain: DomainConfig {
