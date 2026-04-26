@@ -1,7 +1,28 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #11 (design pass — hardware-bound
+> Last updated: 2026-04-26 follow-up #12 (docs pass — closes AD-12 from
+> [docs/AD-gap-plan.md](docs/AD-gap-plan.md) Phase 4). New
+> operator-facing guide at
+> [docs/windows-ad-enrollment.md](docs/windows-ad-enrollment.md)
+> covers Windows enrollment per `JoinState` (Workgroup, AD/Hybrid,
+> Entra-only, Unknown), the post-password-change refresh flow, the
+> workgroup→AD transition behaviour, an operator pre-flight checklist,
+> and the canonical user-visible string reference (Entra-only block,
+> Unknown block, AD/Hybrid pre-enrollment-required, the four
+> stale-password-state strings). The doc cross-references the design
+> contract in
+> [docs/windows-ad-coexistence-spec.md](docs/windows-ad-coexistence-spec.md)
+> rather than duplicating rationale. Tray-side text-string updates
+> in `platform/windows/native/DdsTrayAgent/EnrollmentFlow.cpp` are
+> deferred to AD-13 because the Tray Agent does not yet host its own
+> `JoinState` probe seam — wiring that probe is in scope when AD-13
+> (vault-refresh flow) is implemented. Phase 4 progress: AD-12 ✅;
+> AD-13 + AD-14 remain pending. No code change in this pass; workspace
+> test count unchanged at 560; cargo fmt clean; cargo clippy clean
+> (workspace, all-targets, `-D warnings`).
+>
+> Previous: 2026-04-26 follow-up #11 (design pass — hardware-bound
 > admission plan landed at
 > [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md)).
 > No code change in this pass; the plan documents the structural

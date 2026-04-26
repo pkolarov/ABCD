@@ -648,6 +648,16 @@ This phase is complete only if all of the following are true.
   now uses `DSREG_JOIN_INFO.joinType`, list-users unsupported state has a real
   IPC shape, stale-password detection is routed through CP `ReportResult`, and
   Entra-only enrollment is blocked before password capture.
+- **2026-04-26** — **AD-12 implemented.** Operator-facing enrollment
+  guide published at [windows-ad-enrollment.md](windows-ad-enrollment.md):
+  per-`JoinState` enrollment flows (Workgroup, AD/Hybrid, Entra-only,
+  Unknown), post-password-change refresh, host-state transitions,
+  operator pre-flight checklist, and canonical string reference.
+  Tray-side text-string updates in `EnrollmentFlow.cpp` are carried
+  forward to AD-13 because the Tray Agent does not yet host its own
+  `JoinState` probe seam — wiring that probe is in scope when AD-13
+  is implemented. Phase 4 work continues with AD-13 (vault refresh)
+  and AD-14 (stale-password detection).
 - **2026-04-26** — **Phase 2 (AD-04, AD-05, AD-06, AD-07) implemented.** The
   managed Policy Agent now refreshes `IJoinStateProbe` once per poll cycle and
   routes every `EnforcementMode` argument through
@@ -751,7 +761,7 @@ The 5-phase split holds, with these refinements:
 |---|---|---|
 | **AD-14** | `CDdsCredential.cpp::ReportResult`, `DdsAuthBridgeMain.cpp` report handler. | Stale-password detection is driven by CP `ReportResult` plus `DDS_REPORT_LOGON_RESULT`; the bridge does not see post-logon `NTSTATUS` on its own. |
 | **AD-13** | New `DdsTrayAgent/RefreshVaultFlow.{h,cpp}`, modify `DdsTrayAgent.cpp` (menu). | Existing credential_id, `GetAssertion`, re-wrap, save. No new credential. Clear cooldown. Block Entra-only and first enrollment on Unknown before password prompt. |
-| **AD-12** | `docs/windows-ad-coexistence-spec.md` (this doc) operator appendix or a new `docs/windows-ad-enrollment.md`; tray text strings in `EnrollmentFlow.cpp:126`. | Operator workflow documentation; clarify enrollment password prompt on AD hosts and unsupported/unknown host behavior before password capture. |
+| **AD-12** ✅ | New `docs/windows-ad-enrollment.md`. Tray text strings in `EnrollmentFlow.cpp:126` carried forward to AD-13. | **Landed 2026-04-26.** Operator-facing enrollment guide covers per-`JoinState` flow (Workgroup, AD/Hybrid, Entra-only, Unknown), the post-password-change refresh flow, host-state transitions, the operator pre-flight checklist, and a canonical string reference. Tray-side text-string updates wait on AD-13 because the Tray Agent does not yet host its own `JoinState` probe seam. |
 
 ### Phase 5 — End-to-End Validation
 
