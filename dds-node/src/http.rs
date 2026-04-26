@@ -1477,7 +1477,7 @@ where
         state.device_binding.as_deref(),
         &report.device_urn,
     )?;
-    let svc = state.svc.lock().await;
+    let mut svc = state.svc.lock().await;
     svc.record_applied(&report)?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -1627,7 +1627,7 @@ where
         state.device_binding.as_deref(),
         &report.device_urn,
     )?;
-    let svc = state.svc.lock().await;
+    let mut svc = state.svc.lock().await;
     svc.record_applied(&report)?;
     Ok(StatusCode::ACCEPTED)
 }

@@ -35,6 +35,14 @@ pub struct AuditLogEntry {
     /// (correctly-bound) node key.
     #[serde(default, with = "serde_bytes")]
     pub prev_hash: Vec<u8>,
+    /// **Z-3 / Phase A.2 (observability-plan.md)**: free-form reason
+    /// string for rejection paths (e.g. `"revoked-issuer"`,
+    /// `"signature-invalid"`). `None` for success entries. Older
+    /// entries without this field deserialize as `None`, so the
+    /// addition is backward-compatible with on-disk state. Covered by
+    /// `node_signature` via `signing_bytes()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The fields of an `AuditLogEntry` that are covered by the
@@ -54,6 +62,10 @@ struct AuditLogSignedFields<'a> {
     /// rewriting history requires forging every subsequent signature.
     #[serde(with = "serde_bytes")]
     prev_hash: &'a [u8],
+    /// Phase A.2: covered by the signature so a SIEM consumer can
+    /// trust the rejection reason without a side-channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
 }
 
 /// Errors from constructing or verifying an `AuditLogEntry`.
@@ -88,6 +100,7 @@ impl AuditLogEntry {
             node_public_key: &self.node_public_key,
             timestamp: self.timestamp,
             prev_hash: &self.prev_hash,
+            reason: self.reason.as_deref(),
         };
         let mut buf = Vec::new();
         ciborium::into_writer(&signed, &mut buf).map_err(|_| AuditError::Serialization)?;
@@ -120,13 +133,14 @@ impl AuditLogEntry {
         signing_key: &ed25519_dalek::SigningKey,
         timestamp: u64,
     ) -> Result<Self, AuditError> {
-        Self::sign_ed25519_chained(
+        Self::sign_ed25519_chained_with_reason(
             action,
             token_bytes,
             node_urn,
             signing_key,
             timestamp,
             Vec::new(),
+            None,
         )
     }
 
@@ -141,6 +155,30 @@ impl AuditLogEntry {
         signing_key: &ed25519_dalek::SigningKey,
         timestamp: u64,
         prev_hash: Vec<u8>,
+    ) -> Result<Self, AuditError> {
+        Self::sign_ed25519_chained_with_reason(
+            action,
+            token_bytes,
+            node_urn,
+            signing_key,
+            timestamp,
+            prev_hash,
+            None,
+        )
+    }
+
+    /// Phase A.2: chained sign with an optional rejection `reason`. The
+    /// reason field is covered by the signature so a SIEM can trust
+    /// it without re-deriving from the embedded token.
+    #[cfg(feature = "std")]
+    pub fn sign_ed25519_chained_with_reason(
+        action: impl Into<String>,
+        token_bytes: Vec<u8>,
+        node_urn: impl Into<String>,
+        signing_key: &ed25519_dalek::SigningKey,
+        timestamp: u64,
+        prev_hash: Vec<u8>,
+        reason: Option<String>,
     ) -> Result<Self, AuditError> {
         use ed25519_dalek::Signer;
 
@@ -160,6 +198,7 @@ impl AuditLogEntry {
             },
             timestamp,
             prev_hash,
+            reason,
         };
         let bytes = entry.signing_bytes()?;
         let sig = signing_key.sign(&bytes);
@@ -287,6 +326,51 @@ mod tests {
         assert!(e1.verify().is_err());
         let h1_after = e1.chain_hash().unwrap();
         assert_ne!(h1_before, h1_after);
+    }
+
+    /// Phase A.2: a `reason` populated at sign time is covered by the
+    /// signature — flipping it after the fact must invalidate verify.
+    #[test]
+    fn audit_entry_reason_is_signed() {
+        let id = Identity::generate("audit", &mut OsRng);
+        let mut entry = AuditLogEntry::sign_ed25519_chained_with_reason(
+            "attest.rejected",
+            alloc::vec![0xA1],
+            id.id.to_urn(),
+            &id.signing_key,
+            42,
+            Vec::new(),
+            Some(alloc::string::String::from("revoked-issuer")),
+        )
+        .unwrap();
+        assert!(entry.verify().is_ok());
+        entry.reason = Some(alloc::string::String::from("not-the-real-reason"));
+        assert_eq!(entry.verify(), Err(AuditError::InvalidSignature));
+    }
+
+    /// Phase A.2: success entries (`reason = None`) round-trip and the
+    /// CBOR encoding omits the field entirely so older readers stay
+    /// happy.
+    #[test]
+    fn audit_entry_no_reason_roundtrips() {
+        let id = Identity::generate("audit", &mut OsRng);
+        let entry = AuditLogEntry::sign_ed25519(
+            "attest",
+            alloc::vec![0xA0],
+            id.id.to_urn(),
+            &id.signing_key,
+            7,
+        )
+        .unwrap();
+        assert!(entry.reason.is_none());
+        assert!(entry.verify().is_ok());
+        // Round-trip via CBOR to confirm the missing field deserialises
+        // back to None — covers the "old reader, new field" direction.
+        let mut buf = Vec::new();
+        ciborium::into_writer(&entry, &mut buf).unwrap();
+        let decoded: AuditLogEntry = ciborium::from_reader(&buf[..]).unwrap();
+        assert!(decoded.reason.is_none());
+        assert!(decoded.verify().is_ok());
     }
 
     #[test]

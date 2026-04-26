@@ -893,6 +893,15 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let node_identity = identity_store::load_or_create(&identity_path, "dds-node")?;
     info!(urn = %node_identity.id.to_urn(), path = %identity_path.display(), "loaded node identity");
 
+    // Z-3 Phase A.1 (observability-plan.md): hand the same identity
+    // to the swarm event loop so gossip-ingest paths can stamp signed
+    // audit-log entries on the local chain. `Identity` is not Clone
+    // by design (single-copy invariant in security review L-1) — load
+    // it a second time from the on-disk identity store. The store is
+    // idempotent so we get the same Ed25519 keypair both times.
+    let node_identity_for_swarm = identity_store::load_or_create(&identity_path, "dds-node")?;
+    node.set_node_identity(node_identity_for_swarm);
+
     // Start the local HTTP API server alongside the P2P node. Share the
     // trust graph handle (Arc clone) so the swarm event loop and the
     // HTTP service observe the same in-memory state — fixes B5b.

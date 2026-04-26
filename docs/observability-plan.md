@@ -1,13 +1,16 @@
 # DDS Observability Plan — Audit, Metrics, Alerts, SIEM Export
 
-**Status:** Plan — open for implementation
+**Status:** Phase A landed 2026-04-26 follow-up #17 (closes Z-3).
+Phases B–F (SIEM export, Prometheus `/metrics`, Alertmanager rules,
+Grafana dashboards, `dds-cli` ops surface) remain open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
-Principles Audit"; the P2 Monitoring/SIEM row in
+Principles Audit" — **closed by Phase A**; the P2 Monitoring/SIEM
+row in
 [AD-drop-in-replacement-roadmap.md](AD-drop-in-replacement-roadmap.md)
 §4.9 (line 194 — *"JSON/syslog/OpenTelemetry export; health checks;
-audit query tooling"*).
+audit query tooling"*) — open, awaits Phases B + D + F.
 **Owner:** TBD.
 
 ---
@@ -81,57 +84,87 @@ Two pipes out of `dds-node`:
 
 ## 4. Phases
 
-### Phase A — Wire audit emission (closes Z-3)
+### Phase A — Wire audit emission (closes Z-3) ✅
 
-The audit chain mechanism (`AuditLogEntry`, signed, chain-hashed,
-append-only enforced atomically in `RedbBackend`) is correct.
-`DdsNode::emit_local_audit` is the production hook. **Zero
-production call sites today.** Phase A wires the call sites.
+**Status: landed 2026-04-26 follow-up #17.** The audit chain
+mechanism (`AuditLogEntry`, signed, chain-hashed, append-only
+enforced atomically in `RedbBackend`) was already correct. The
+production hook is now `LocalService::emit_local_audit` (HTTP /
+admin paths) and `DdsNode::emit_audit_from_ingest` (gossip paths);
+both delegate to the existing `AuditLogEntry::sign_ed25519_chained_with_reason`
+helper added in Phase A.2. See "Acceptance" below for verified
+behaviour. The wiring matrix shipped looks like this:
 
 **Action vocabulary** (the `AuditLogEntry::action` field — extend
 the existing free-form string into a fixed set):
 
-| `action` | When emitted | Site |
-|---|---|---|
-| `attest` | Attestation token accepted into trust graph | `service.rs::ingest_attestation` (success branch, after `add_token`) |
-| `vouch` | Vouch token accepted | `service.rs::ingest_vouch` |
-| `revoke` | Revocation token accepted | `service.rs::ingest_revocation` |
-| `burn` | Burn token accepted | `service.rs::ingest_burn` |
-| `enroll.user` | User enrollment ceremony completed | `service.rs::complete_enrollment` user branch |
-| `enroll.device` | Device enrollment completed | same, device branch |
-| `admin.bootstrap` | Bootstrap admin established | `service.rs::admin_setup` |
-| `admin.vouch` | Admin vouches another principal | `service.rs::admin_vouch` |
-| `admission.cert.issued` | Admission cert produced for a peer | `service.rs::issue_admission_cert` |
-| `admission.cert.revoked` | Admission revocation accepted | `admission_revocation_store::merge` |
-| `policy.applied` | Agent reports a policy successfully applied (via `POST /v1/.../applied`) | `http.rs::record_applied` |
-| `policy.failed` | Agent reports a failed apply | same path, failure branch |
-| `software.applied` | Agent reports software install success | same path |
-| `software.failed` | Agent reports failure | same path |
-| `secret.released` (deferred) | `SecretReleaseDocument` consumed | reserved for v2 |
+| `action` | When emitted | Site | Status |
+|---|---|---|---|
+| `attest` | Attestation token accepted into trust graph | `node.rs::ingest_operation` (success branch, after `add_token`) | ✅ shipped 2026-04-26 |
+| `attest.rejected` | Attestation refused (bad sig, missing publisher capability, replay window, etc.) | same path, rejection branches | ✅ shipped 2026-04-26 |
+| `vouch` | Vouch token accepted | `node.rs::ingest_operation` (Vouch kind) | ✅ shipped 2026-04-26 |
+| `vouch.rejected` | Vouch refused | same path, rejection branches | ✅ shipped 2026-04-26 |
+| `revoke` | Revocation token accepted | `node.rs::ingest_revocation` | ✅ shipped 2026-04-26 |
+| `revoke.rejected` | Revocation refused | same path, rejection branches | ✅ shipped 2026-04-26 |
+| `burn` | Burn token accepted | `node.rs::ingest_burn` | ✅ shipped 2026-04-26 |
+| `burn.rejected` | Burn refused | same path, rejection branches | ✅ shipped 2026-04-26 |
+| `enroll.user` | User enrollment ceremony completed | `service.rs::enroll_user` | ✅ shipped 2026-04-26 |
+| `enroll.device` | Device enrollment completed | `service.rs::enroll_device` | ✅ shipped 2026-04-26 |
+| `admin.bootstrap` | Bootstrap admin established | `service.rs::admin_setup` | ✅ shipped 2026-04-26 |
+| `admin.vouch` | Admin vouches another principal | `service.rs::admin_vouch` | ✅ shipped 2026-04-26 |
+| `apply.applied` | Agent reports a successful or skipped apply (via `POST /v1/.../applied`); `Skipped` carries `reason="skipped"` | `service.rs::record_applied` | ✅ shipped 2026-04-26 |
+| `apply.failed` | Agent reports a failed apply; `reason` carries the agent's error string | same path, failure branch | ✅ shipped 2026-04-26 |
+| `policy.applied` / `policy.failed` / `software.applied` / `software.failed` | Finer-grained applier outcomes | reserved for when `AppliedReport` grows a `kind` discriminator on the wire (today the report does not distinguish policy vs. software, so v1 collapses them into the `apply.*` family) | 🔲 deferred |
+| `admission.cert.issued` | Admission cert produced for a peer | `service.rs::issue_admission_cert` | 🔲 deferred (cert issuance is a domain-level operation today) |
+| `admission.cert.revoked` | Admission revocation accepted | `admission_revocation_store::merge` | 🔲 deferred |
+| `secret.released` (deferred) | `SecretReleaseDocument` consumed | reserved for v2 | 🔲 deferred |
 
 **Failure paths must also emit.** A rejected-by-graph token still
 emits an audit entry with action `attest.rejected` /
 `vouch.rejected` etc., and the rejection reason in a sidecar field
 (see Phase A.2).
 
-**A.1 — Simple wiring (no schema change).** Each ingest path on
-success calls `emit_local_audit(action, token_bytes, now)`. Action
-strings come from the table above. The existing `AuditLogEntry`
-struct accommodates this with no breaking change.
+**A.1 — Simple wiring (no schema change). ✅** Each ingest path on
+success calls `emit_local_audit(action, token_bytes, reason=None)`.
+LocalService got a public `emit_local_audit` helper; DdsNode got a
+private `emit_audit_from_ingest` plus an `Option<Identity>` field
+populated from a second `identity_store::load_or_create` call in
+`main.rs` (the L-1 "single Ed25519 copy" invariant precludes
+cloning the existing identity, so the swarm event loop opens the
+same on-disk identity store independently). Trust-graph write
+locks are dropped before the audit emit fires.
 
-**A.2 — Reason field for rejections** *(small schema change)*. Add
-`#[serde(default)] pub reason: Option<String>` to `AuditLogEntry`.
-Backward-compatible (older entries deserialize with `reason = None`).
-This lets the SIEM tell `attest` from `attest.rejected → revoked-issuer`
-without parsing the embedded token. Update `AuditLogSignedFields` to
-cover the new field so it stays inside the chain hash.
+**A.2 — Reason field for rejections (small schema change). ✅**
+`AuditLogEntry` gained `pub reason: Option<String>` with
+`#[serde(default, skip_serializing_if = "Option::is_none")]`.
+Backward-compatible: missing field on older entries deserialises to
+`None` and existing chains keep verifying. `AuditLogSignedFields`
+gained the matching field so the reason stays inside the
+chain-hash. Two new round-trip tests in
+[dds-core/src/audit.rs](../dds-core/src/audit.rs)
+(`audit_entry_reason_is_signed`, `audit_entry_no_reason_roundtrips`)
+prove tampering with the reason invalidates verify and that an
+absent field round-trips through CBOR cleanly.
 
-**A.3 — Tests.** One regression test per action confirming the entry
-lands and the chain head advances. One test per rejection path
-confirming `reason` is populated.
+**A.3 — Tests. ✅** Seven new audit-emission regression tests in
+[dds-node/src/service.rs](../dds-node/src/service.rs)
+(`audit_enroll_user_advances_chain`,
+`audit_enroll_device_advances_chain`,
+`audit_apply_applied_advances_chain_with_no_reason`,
+`audit_apply_failed_carries_error_as_reason`,
+`audit_apply_skipped_marks_reason`,
+`audit_chain_links_three_actions_in_order`,
+`audit_rejection_vocabulary_signs_reason`) confirm each action's
+chain advance, the per-entry signature verify, and the rejection
+vocabulary consumed by the gossip-ingest paths. The two new
+audit-schema tests in dds-core lock the on-wire contract.
 
 **Acceptance:** `dds-cli audit entries` returns non-empty after a
 freshly bootstrapped domain has run a single attestation flow.
+Verified locally: a `setup() + enroll_user + enroll_device +
+record_applied` sequence produces three chain-linked entries with
+`prev_hash` matching each predecessor's `chain_hash()`, every entry
+verifies, and the chain head advances after every emission.
 
 ### Phase B — SIEM export
 

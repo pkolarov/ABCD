@@ -183,6 +183,7 @@ mod tests {
             },
             timestamp,
             prev_hash: Vec::new(),
+            reason: None,
         }
     }
 

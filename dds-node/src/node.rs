@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use dds_core::crdt::causal_dag::{CausalDag, Operation};
+use dds_core::identity::Identity;
 use dds_core::token::{TOKEN_WIRE_V1, Token, TokenKind};
 use dds_core::trust::TrustGraph;
 use dds_net::admission::{AdmissionRequest, AdmissionResponse, MAX_REVOCATIONS_PER_RESPONSE};
@@ -158,6 +159,14 @@ pub struct DdsNode {
     /// computed by [`crate::config::NodeConfig::admission_revocations_path`]
     /// at startup.
     admission_revocations_path: PathBuf,
+    /// **Z-3 / Phase A.1 (observability-plan.md)**: optional Vouchsafe
+    /// node identity used to emit signed audit-log entries from the
+    /// gossip-ingest path. Set via [`Self::set_node_identity`] from
+    /// `main.rs` after the identity store has been opened. Tests and
+    /// callers that don't care about audit emission leave it `None` —
+    /// the emit helpers are no-ops in that case so a missing identity
+    /// never crashes the swarm event loop.
+    node_identity: Option<Identity>,
 }
 
 impl DdsNode {
@@ -278,7 +287,17 @@ impl DdsNode {
             admitted_peers: BTreeSet::new(),
             admission_revocations,
             admission_revocations_path: revocations_path,
+            node_identity: None,
         })
+    }
+
+    /// **Z-3 / Phase A.1**: install the Vouchsafe node identity used to
+    /// sign audit-log entries emitted from the gossip-ingest path.
+    /// Should be called once after [`Self::init`] from `main.rs`,
+    /// before [`Self::run`]. Tests omit this and the audit-emit
+    /// helpers stay no-ops.
+    pub fn set_node_identity(&mut self, identity: Identity) {
+        self.node_identity = Some(identity);
     }
 
     /// Start listening and subscribe to gossipsub topics.
@@ -854,10 +873,20 @@ impl DdsNode {
             }
         };
         if self.legacy_token_refused(&token, "gossip-op") {
+            self.emit_audit_from_ingest(
+                rejected_action_for(&token.payload.kind),
+                token_bytes.to_vec(),
+                Some("legacy-v1-refused".to_string()),
+            );
             return;
         }
         if let Err(e) = token.validate() {
             warn!("token validation failed: {e}");
+            self.emit_audit_from_ingest(
+                rejected_action_for(&token.payload.kind),
+                token_bytes.to_vec(),
+                Some(format!("validation-failed: {e}")),
+            );
             return;
         }
         // **C-3 (security review)**: before admitting the token to the
@@ -875,14 +904,25 @@ impl DdsNode {
                 body_type = ?token.payload.body_type,
                 "rejecting inbound token: issuer lacks the required publisher capability"
             );
+            self.emit_audit_from_ingest(
+                rejected_action_for(&token.payload.kind),
+                token_bytes.to_vec(),
+                Some("publisher-capability-missing".to_string()),
+            );
             return;
         }
-        {
+        let graph_err = {
             let mut g = self.trust_graph.write().expect("trust_graph poisoned");
-            if let Err(e) = g.add_token(token.clone()) {
-                warn!("trust graph rejected token: {e}");
-                return;
-            }
+            g.add_token(token.clone()).err()
+        };
+        if let Some(e) = graph_err {
+            warn!("trust graph rejected token: {e}");
+            self.emit_audit_from_ingest(
+                rejected_action_for(&token.payload.kind),
+                token_bytes.to_vec(),
+                Some(format!("trust-graph-rejected: {e}")),
+            );
+            return;
         }
         if let Err(e) = self.store.put_token(&token) {
             error!("store error: {e}");
@@ -893,6 +933,14 @@ impl DdsNode {
             Ok(true) => {
                 info!(jti = %token.payload.jti, "ingested new operation");
                 self.cache_sync_payload(&op_id, &op_for_cache, token_bytes);
+                // Z-3 Phase A.1: stamp the chain only on novel ops; a
+                // duplicate token (DAG returned false) is not a state
+                // change so we don't log it as one.
+                self.emit_audit_from_ingest(
+                    accepted_action_for(&token.payload.kind),
+                    token_bytes.to_vec(),
+                    None,
+                );
             }
             Ok(false) => {} // duplicate
             Err(e) => warn!("DAG insert failed: {e}"),
@@ -935,10 +983,20 @@ impl DdsNode {
             }
         };
         if self.legacy_token_refused(&token, "gossip-revocation") {
+            self.emit_audit_from_ingest(
+                "revoke.rejected",
+                token_bytes.to_vec(),
+                Some("legacy-v1-refused".to_string()),
+            );
             return;
         }
         if let Err(e) = token.validate() {
             warn!("revocation validation failed: {e}");
+            self.emit_audit_from_ingest(
+                "revoke.rejected",
+                token_bytes.to_vec(),
+                Some(format!("validation-failed: {e}")),
+            );
             return;
         }
         // **M-9 (security review)**: reject replays of old revocations.
@@ -954,14 +1012,25 @@ impl DdsNode {
                 iat = token.payload.iat,
                 "rejecting revocation: iat is outside the replay-tolerance window"
             );
+            self.emit_audit_from_ingest(
+                "revoke.rejected",
+                token_bytes.to_vec(),
+                Some("iat-outside-replay-window".to_string()),
+            );
             return;
         }
-        {
+        let graph_err = {
             let mut g = self.trust_graph.write().expect("trust_graph poisoned");
-            if let Err(e) = g.add_token(token.clone()) {
-                warn!("trust graph rejected revocation: {e}");
-                return;
-            }
+            g.add_token(token.clone()).err()
+        };
+        if let Some(e) = graph_err {
+            warn!("trust graph rejected revocation: {e}");
+            self.emit_audit_from_ingest(
+                "revoke.rejected",
+                token_bytes.to_vec(),
+                Some(format!("trust-graph-rejected: {e}")),
+            );
+            return;
         }
         if let Err(e) = self.store.put_token(&token) {
             error!("store error: {e}");
@@ -972,6 +1041,8 @@ impl DdsNode {
             }
             info!(target_jti = %target, "revocation applied");
         }
+        // Z-3 Phase A.1: revocation accepted — record on local chain.
+        self.emit_audit_from_ingest("revoke", token_bytes.to_vec(), None);
         // Seed the sync-payload cache so a peer that reconnects (or
         // joins fresh) AFTER this revoke landed via gossip can still
         // pull it from us via the request_response sync protocol.
@@ -994,10 +1065,20 @@ impl DdsNode {
             }
         };
         if self.legacy_token_refused(&token, "gossip-burn") {
+            self.emit_audit_from_ingest(
+                "burn.rejected",
+                token_bytes.to_vec(),
+                Some("legacy-v1-refused".to_string()),
+            );
             return;
         }
         if let Err(e) = token.validate() {
             warn!("burn validation failed: {e}");
+            self.emit_audit_from_ingest(
+                "burn.rejected",
+                token_bytes.to_vec(),
+                Some(format!("validation-failed: {e}")),
+            );
             return;
         }
         // M-9: same replay window applies to burn tokens.
@@ -1007,14 +1088,25 @@ impl DdsNode {
                 iat = token.payload.iat,
                 "rejecting burn: iat is outside the replay-tolerance window"
             );
+            self.emit_audit_from_ingest(
+                "burn.rejected",
+                token_bytes.to_vec(),
+                Some("iat-outside-replay-window".to_string()),
+            );
             return;
         }
-        {
+        let graph_err = {
             let mut g = self.trust_graph.write().expect("trust_graph poisoned");
-            if let Err(e) = g.add_token(token.clone()) {
-                warn!("trust graph rejected burn: {e}");
-                return;
-            }
+            g.add_token(token.clone()).err()
+        };
+        if let Some(e) = graph_err {
+            warn!("trust graph rejected burn: {e}");
+            self.emit_audit_from_ingest(
+                "burn.rejected",
+                token_bytes.to_vec(),
+                Some(format!("trust-graph-rejected: {e}")),
+            );
+            return;
         }
         if let Err(e) = self.store.put_token(&token) {
             error!("store error: {e}");
@@ -1023,6 +1115,8 @@ impl DdsNode {
             error!("store burn error: {e}");
         }
         info!(urn = %token.payload.iss, "identity burned");
+        // Z-3 Phase A.1: burn accepted — record on local chain.
+        self.emit_audit_from_ingest("burn", token_bytes.to_vec(), None);
         // See comment in `ingest_revocation`: cache the burn so a
         // reconnecting peer can sync it from us, not just from the
         // original publisher.
@@ -1096,24 +1190,80 @@ impl DdsNode {
         signing_key: &ed25519_dalek::SigningKey,
         timestamp: u64,
     ) -> Result<dds_core::audit::AuditLogEntry, String> {
+        self.emit_local_audit_with_reason(
+            action,
+            token_bytes,
+            node_urn,
+            signing_key,
+            timestamp,
+            None,
+        )
+    }
+
+    /// Phase A.2 (observability-plan.md): chained-emit with an
+    /// optional `reason` covering rejection paths. Older callers stay
+    /// on [`Self::emit_local_audit`] for the success-only shape.
+    pub fn emit_local_audit_with_reason(
+        &mut self,
+        action: impl Into<String>,
+        token_bytes: Vec<u8>,
+        node_urn: impl Into<String>,
+        signing_key: &ed25519_dalek::SigningKey,
+        timestamp: u64,
+        reason: Option<String>,
+    ) -> Result<dds_core::audit::AuditLogEntry, String> {
         let prev_hash = self
             .store
             .audit_chain_head()
             .map_err(|e| format!("chain head: {e}"))?
             .unwrap_or_default();
-        let entry = dds_core::audit::AuditLogEntry::sign_ed25519_chained(
+        let entry = dds_core::audit::AuditLogEntry::sign_ed25519_chained_with_reason(
             action,
             token_bytes,
             node_urn,
             signing_key,
             timestamp,
             prev_hash,
+            reason,
         )
         .map_err(|e| format!("sign: {e}"))?;
         self.store
             .append_audit_entry(&entry)
             .map_err(|e| format!("append: {e}"))?;
         Ok(entry)
+    }
+
+    /// **Z-3 / Phase A.1 (observability-plan.md)**: emit an audit
+    /// entry from a gossip-ingest path using the registered node
+    /// identity. No-op when the identity has not been set (tests,
+    /// fixture harnesses) so absence of audit never crashes the swarm
+    /// event loop. Errors during emission are logged and swallowed —
+    /// the inbound token has already been admitted to the trust graph
+    /// by the time this is called.
+    fn emit_audit_from_ingest(
+        &mut self,
+        action: &'static str,
+        token_bytes: Vec<u8>,
+        reason: Option<String>,
+    ) {
+        let (node_urn, signing_key) = match self.node_identity.as_ref() {
+            Some(id) => (id.id.to_urn(), id.signing_key.clone()),
+            None => return,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Err(e) = self.emit_local_audit_with_reason(
+            action,
+            token_bytes,
+            node_urn,
+            &signing_key,
+            now,
+            reason,
+        ) {
+            warn!(action, error = %e, "audit: emit-from-ingest failed");
+        }
     }
 
     // ---------- anti-entropy sync (B6) ----------
@@ -1444,6 +1594,28 @@ fn revocation_within_replay_window(iat: u64) -> bool {
         return false;
     }
     now.saturating_sub(iat) <= REVOCATION_REPLAY_WINDOW_SECS
+}
+
+/// Z-3 Phase A.1 audit-action vocabulary helpers (observability-plan.md).
+/// `Attest` and `Vouch` tokens flow through `ingest_operation`; the
+/// dedicated `Revoke` and `Burn` topics have their own ingest paths
+/// and pass their action strings inline.
+fn accepted_action_for(kind: &TokenKind) -> &'static str {
+    match kind {
+        TokenKind::Attest => "attest",
+        TokenKind::Vouch => "vouch",
+        TokenKind::Revoke => "revoke",
+        TokenKind::Burn => "burn",
+    }
+}
+
+fn rejected_action_for(kind: &TokenKind) -> &'static str {
+    match kind {
+        TokenKind::Attest => "attest.rejected",
+        TokenKind::Vouch => "vouch.rejected",
+        TokenKind::Revoke => "revoke.rejected",
+        TokenKind::Burn => "burn.rejected",
+    }
 }
 
 /// **C-3 (security review)**: return `true` unless the token is an

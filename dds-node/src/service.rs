@@ -8,6 +8,7 @@
 //! - **Status reporting**: health, sync state, peer count, trust stats
 
 use base64::Engine;
+use dds_core::audit::AuditLogEntry;
 use dds_core::identity::Identity;
 use dds_core::policy::{PolicyEngine, PolicyRule};
 use dds_core::token::{Token, TokenKind, TokenPayload};
@@ -855,6 +856,9 @@ impl<
             let _ = g.add_token(token.clone());
         }
 
+        // Z-3 Phase A.1: user enrollment is a state-mutating action; record it.
+        self.emit_local_audit("enroll.user", cbor.clone(), None);
+
         Ok(EnrollmentResult {
             urn: user_ident.id.to_urn(),
             jti: token.payload.jti.clone(),
@@ -931,6 +935,9 @@ impl<
                 .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
             let _ = g.add_token(token.clone());
         }
+
+        // Z-3 Phase A.1: device enrollment is a state-mutating action; record it.
+        self.emit_local_audit("enroll.device", cbor.clone(), None);
 
         Ok(EnrollmentResult {
             urn: device_ident.id.to_urn(),
@@ -1043,6 +1050,51 @@ impl<
     /// provenance alongside its signature check).
     pub fn node_urn(&self) -> String {
         self.node_identity.id.to_urn()
+    }
+
+    /// **Z-3 / Phase A.1 (observability-plan.md)**: emit a locally-
+    /// chained audit entry for an action this service just performed.
+    /// Reads the current chain head from the store, stamps `prev_hash`,
+    /// signs with the node identity's Ed25519 key, and appends.
+    ///
+    /// All HTTP/admin code paths funnel through this single helper so
+    /// we don't end up with three separate "build the entry" sites
+    /// that drift in chain handling. Errors are logged at `warn!` and
+    /// swallowed — a redb-side audit failure must not abort the
+    /// caller's primary operation (the token has already been
+    /// accepted into the trust graph at this point).
+    pub fn emit_local_audit(
+        &mut self,
+        action: impl Into<String>,
+        token_bytes: Vec<u8>,
+        reason: Option<String>,
+    ) {
+        let action_str = action.into();
+        let prev_hash = match self.store.audit_chain_head() {
+            Ok(h) => h.unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(action = %action_str, error = %e, "audit: chain-head read failed");
+                return;
+            }
+        };
+        let entry = match AuditLogEntry::sign_ed25519_chained_with_reason(
+            action_str.clone(),
+            token_bytes,
+            self.node_identity.id.to_urn(),
+            &self.node_identity.signing_key,
+            now_epoch(),
+            prev_hash,
+            reason,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(action = %action_str, error = %e, "audit: sign failed");
+                return;
+            }
+        };
+        if let Err(e) = self.store.append_audit_entry(&entry) {
+            tracing::warn!(action = %action_str, error = %e, "audit: append failed");
+        }
     }
 
     /// The node's raw Ed25519 public-key bytes. The Windows and macOS
@@ -1376,7 +1428,7 @@ impl<
     /// is intentionally distinct from the trust-graph audit log
     /// (`dds_core::audit::AuditLogEntry`) — that one is signed +
     /// gossiped per mutation, this one is local-only telemetry.
-    pub fn record_applied(&self, report: &AppliedReport) -> Result<(), ServiceError> {
+    pub fn record_applied(&mut self, report: &AppliedReport) -> Result<(), ServiceError> {
         tracing::info!(
             device = %report.device_urn,
             target = %report.target_id,
@@ -1387,6 +1439,35 @@ impl<
             error = ?report.error,
             "applier report"
         );
+
+        // Z-3 Phase A.1 (observability-plan.md): record the applier
+        // outcome on the local audit chain. The token_bytes slot
+        // carries a CBOR-encoded copy of the report so a SIEM pipeline
+        // can reconstruct the full applier context from a single
+        // chained line — including target_id, version, and per-
+        // directive notes. Action vocabulary stays generic
+        // (`apply.applied` / `apply.failed`) because AppliedReport
+        // does not yet carry a policy-vs-software discriminator on
+        // the wire; finer-grained `policy.*` / `software.*` actions
+        // are reserved for when the report grows a `kind` field.
+        let action = match report.status {
+            AppliedStatus::Ok | AppliedStatus::Skipped => "apply.applied",
+            AppliedStatus::Failed => "apply.failed",
+        };
+        let reason = match report.status {
+            AppliedStatus::Failed => report.error.clone(),
+            AppliedStatus::Skipped => Some("skipped".to_string()),
+            AppliedStatus::Ok => None,
+        };
+        let mut report_bytes = Vec::new();
+        let token_bytes = match ciborium::into_writer(report, &mut report_bytes) {
+            Ok(()) => report_bytes,
+            Err(e) => {
+                tracing::warn!(error = %e, "audit: serializing applier report failed; emitting empty token_bytes");
+                Vec::new()
+            }
+        };
+        self.emit_local_audit(action, token_bytes, reason);
         Ok(())
     }
 
@@ -1927,6 +2008,10 @@ impl<
         }
         tracing::info!(admin_urn = %admin_urn, "admin identity registered and added to trusted roots");
 
+        // Z-3 Phase A.1: bootstrap admin establishment is one of the
+        // most security-relevant events on a domain — record it.
+        self.emit_local_audit("admin.bootstrap", cbor.clone(), None);
+
         Ok(EnrollmentResult {
             urn: admin_urn,
             jti: token.payload.jti.clone(),
@@ -2064,6 +2149,9 @@ impl<
 
         let vouch_token = Token::sign(vouch_payload, &admin_signing_key)
             .map_err(|e| ServiceError::Token(e.to_string()))?;
+        let vouch_cbor = vouch_token
+            .to_cbor()
+            .map_err(|e| ServiceError::Token(e.to_string()))?;
         self.store
             .put_token(&vouch_token)
             .map_err(|e| ServiceError::Store(e.to_string()))?;
@@ -2074,6 +2162,9 @@ impl<
                 .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
             let _ = g.add_token(vouch_token);
         }
+
+        // Z-3 Phase A.1: admin vouches are policy-relevant events.
+        self.emit_local_audit("admin.vouch", vouch_cbor, None);
 
         // **H-8 (security review)**: if the purpose is `dds:admin`,
         // promote the subject into `trusted_roots` and persist so the
@@ -3170,7 +3261,7 @@ mod platform_applier_tests {
     fn record_applied_does_not_error() {
         // v1 just logs; the contract is "doesn't fail". Future PRs
         // will move this into a queryable applier-audit table.
-        let (svc, _, _) = setup();
+        let (mut svc, _, _) = setup();
         let report = AppliedReport {
             device_urn: "urn:vouchsafe:dev.xxx".into(),
             target_id: "security/baseline".into(),
@@ -3181,6 +3272,196 @@ mod platform_applier_tests {
             applied_at: 1_700_000_000,
         };
         assert!(svc.record_applied(&report).is_ok());
+    }
+
+    // ---------------- Z-3 Phase A.3: audit emission tests ----------------
+    //
+    // observability-plan.md Phase A.3 requires one regression test per
+    // accepted-action vocabulary slot confirming the local chain
+    // advances. These tests exercise the LocalService HTTP-side hooks
+    // (`enroll_user`, `enroll_device`, `admin_setup`, `admin_vouch`,
+    // `record_applied`); the gossip-ingest side (`attest`, `vouch`,
+    // `revoke`, `burn` directly) is exercised through the
+    // `DdsNode::ingest_*` paths and is covered by the multinode
+    // integration tests.
+
+    fn enroll_user_for_audit_test(
+        svc: &mut LocalService<MemoryBackend>,
+        label: &str,
+    ) -> EnrollmentResult {
+        // Use the verify_fido2=false path so we don't need a real
+        // attestation object — the audit emit is the same shape.
+        svc.set_verify_fido2(false);
+        svc.enroll_user(EnrollUserRequest {
+            label: label.into(),
+            credential_id: format!("cred-{label}"),
+            attestation_object: vec![],
+            client_data_hash: vec![0u8; 32],
+            rp_id: "example.com".into(),
+            display_name: label.into(),
+            authenticator_type: "platform".into(),
+            challenge_id: None,
+            client_data_json: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn audit_enroll_user_advances_chain() {
+        let (mut svc, _, _) = setup();
+        let head_before = svc.store.audit_chain_head().unwrap();
+        let count_before = svc.store.count_audit_entries().unwrap();
+        let _ = enroll_user_for_audit_test(&mut svc, "alice");
+        let count_after = svc.store.count_audit_entries().unwrap();
+        let head_after = svc.store.audit_chain_head().unwrap();
+        assert_eq!(count_after, count_before + 1);
+        assert_ne!(head_after, head_before, "chain head must advance");
+        let entries = svc.store.list_audit_entries().unwrap();
+        let last = entries.last().unwrap();
+        assert_eq!(last.action, "enroll.user");
+        assert!(last.reason.is_none());
+        assert!(last.verify().is_ok(), "audit entry signature must verify");
+    }
+
+    #[test]
+    fn audit_enroll_device_advances_chain() {
+        let (mut svc, _, _) = setup();
+        let count_before = svc.store.count_audit_entries().unwrap();
+        let _ = enroll_device(&mut svc, "ws-audit", vec!["workstation".into()], None);
+        let count_after = svc.store.count_audit_entries().unwrap();
+        assert_eq!(count_after, count_before + 1);
+        let entries = svc.store.list_audit_entries().unwrap();
+        let last = entries.last().unwrap();
+        assert_eq!(last.action, "enroll.device");
+        assert!(last.verify().is_ok());
+    }
+
+    #[test]
+    fn audit_apply_applied_advances_chain_with_no_reason() {
+        let (mut svc, _, _) = setup();
+        let count_before = svc.store.count_audit_entries().unwrap();
+        let report = AppliedReport {
+            device_urn: "urn:vouchsafe:dev.audit-ok".into(),
+            target_id: "p:audit-ok".into(),
+            version: "1".into(),
+            status: AppliedStatus::Ok,
+            directives: vec![],
+            error: None,
+            applied_at: 1_700_000_000,
+        };
+        svc.record_applied(&report).unwrap();
+        let entries = svc.store.list_audit_entries().unwrap();
+        assert_eq!(entries.len(), count_before + 1);
+        let last = entries.last().unwrap();
+        assert_eq!(last.action, "apply.applied");
+        assert!(last.reason.is_none());
+    }
+
+    #[test]
+    fn audit_apply_failed_carries_error_as_reason() {
+        let (mut svc, _, _) = setup();
+        let report = AppliedReport {
+            device_urn: "urn:vouchsafe:dev.audit-fail".into(),
+            target_id: "p:audit-fail".into(),
+            version: "1".into(),
+            status: AppliedStatus::Failed,
+            directives: vec![],
+            error: Some("write protected".into()),
+            applied_at: 1_700_000_001,
+        };
+        svc.record_applied(&report).unwrap();
+        let entries = svc.store.list_audit_entries().unwrap();
+        let last = entries.last().unwrap();
+        assert_eq!(last.action, "apply.failed");
+        assert_eq!(last.reason.as_deref(), Some("write protected"));
+        // Reason field must remain inside the signed bytes.
+        assert!(last.verify().is_ok());
+    }
+
+    #[test]
+    fn audit_apply_skipped_marks_reason() {
+        let (mut svc, _, _) = setup();
+        let report = AppliedReport {
+            device_urn: "urn:vouchsafe:dev.audit-skip".into(),
+            target_id: "p:audit-skip".into(),
+            version: "1".into(),
+            status: AppliedStatus::Skipped,
+            directives: vec![],
+            error: None,
+            applied_at: 1_700_000_002,
+        };
+        svc.record_applied(&report).unwrap();
+        let last = svc.store.list_audit_entries().unwrap().pop().unwrap();
+        assert_eq!(last.action, "apply.applied");
+        assert_eq!(last.reason.as_deref(), Some("skipped"));
+    }
+
+    /// Phase A.3 + A.2 cross-check: the rejection vocabulary that the
+    /// gossip path uses (`attest.rejected`, `vouch.rejected`,
+    /// `revoke.rejected`, `burn.rejected`) round-trips through
+    /// `emit_local_audit` with the reason field intact and signed.
+    #[test]
+    fn audit_rejection_vocabulary_signs_reason() {
+        let (mut svc, _, _) = setup();
+        for (action, reason) in [
+            ("attest.rejected", "publisher-capability-missing"),
+            ("vouch.rejected", "trust-graph-rejected: bad-vch_sum"),
+            ("revoke.rejected", "iat-outside-replay-window"),
+            ("burn.rejected", "validation-failed: signature mismatch"),
+        ] {
+            svc.emit_local_audit(action, vec![1, 2, 3], Some(reason.into()));
+        }
+        let entries = svc.store.list_audit_entries().unwrap();
+        // Compare the trailing 4 entries against the expected vocabulary.
+        let tail: Vec<&str> = entries
+            .iter()
+            .rev()
+            .take(4)
+            .map(|e| e.action.as_str())
+            .collect();
+        assert!(tail.contains(&"attest.rejected"));
+        assert!(tail.contains(&"vouch.rejected"));
+        assert!(tail.contains(&"revoke.rejected"));
+        assert!(tail.contains(&"burn.rejected"));
+        for e in entries.iter().rev().take(4) {
+            assert!(e.reason.is_some(), "rejection must carry a reason");
+            assert!(e.verify().is_ok(), "rejection entry must verify");
+        }
+    }
+
+    #[test]
+    fn audit_chain_links_three_actions_in_order() {
+        // Confirm prev_hash threading: enroll_user → enroll_device →
+        // record_applied stamps three entries whose chain is intact.
+        let (mut svc, _, _) = setup();
+        let _ = enroll_user_for_audit_test(&mut svc, "chain-user");
+        let _ = enroll_device(&mut svc, "chain-dev", vec![], None);
+        let report = AppliedReport {
+            device_urn: "urn:vouchsafe:dev.chain".into(),
+            target_id: "p:chain".into(),
+            version: "1".into(),
+            status: AppliedStatus::Ok,
+            directives: vec![],
+            error: None,
+            applied_at: 1_700_000_010,
+        };
+        svc.record_applied(&report).unwrap();
+
+        let entries = svc.store.list_audit_entries().unwrap();
+        assert!(entries.len() >= 3);
+        // Walk the last three, verifying chain linkage and signatures.
+        for window in entries.windows(2) {
+            let prev = &window[0];
+            let curr = &window[1];
+            let expected = prev.chain_hash().unwrap();
+            assert_eq!(
+                curr.prev_hash, expected,
+                "chain prev_hash mismatch on action={}",
+                curr.action
+            );
+            assert!(prev.verify().is_ok());
+            assert!(curr.verify().is_ok());
+        }
     }
 
     #[test]
