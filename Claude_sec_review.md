@@ -1888,3 +1888,164 @@ integrity posture (the hash check still runs).
 - macOS test totals: 69/69 (up from 66). Rust: 451/451 unchanged.
   Windows project compiles clean (`dotnet build`); Windows test
   run pending Windows CI.
+
+---
+
+## 2026-04-26 Zero-Trust Principles Audit — open findings
+
+A first-principles audit against the five core zero-trust principles
+(communications encrypted, identities HW-bound, data encrypted at rest,
+transactions signed, audit trail immutable) surfaced five new findings.
+**All five are open and should be treated as CRITICAL FIXES TO DO.**
+Cross-referenced with the audit summary in conversation log
+2026-04-26.
+
+### Z-1 (Critical) ❌ open — Transport handshake is not post-quantum safe
+
+The README and whitepaper market DDS as "quantum-resistant by default —
+hybrid Ed25519 + ML-DSA-65". That claim applies **only to the token
+signature layer**. The libp2p transport handshake is purely classical:
+
+- `dds-net/src/transport.rs:118-123` — `noise::Config::new` uses the
+  default Noise XX pattern with X25519 DH (libp2p-noise v0.46.1; no
+  hybrid KEM feature flag exists in mainline rust-libp2p as of
+  2026-04-26).
+- `dds-net/src/transport.rs:120-125` — QUIC uses quinn 0.11.x +
+  rustls 0.23.x, ECDHE-only keyshare. No PQ keyshare groups configured.
+- `dds-domain/src/domain.rs` — `AdmissionCert` is signed with plain
+  Ed25519, not hybrid Ed25519+ML-DSA. The H-12 admission handshake
+  therefore inherits the same classical-only verification.
+
+**Attack:** A Harvest-Now-Decrypt-Later adversary records P2P traffic
+today; on a future quantum break, derives the X25519 session keys and
+recovers all gossipsub directory ops, sync deltas, and admission
+exchanges. Token signatures still hold (hybrid PQ), but channel
+confidentiality and forward-secrecy of the recorded traffic are lost.
+
+**Remediation candidates** (require a tracked design doc):
+1. Migrate to a hybrid Noise pattern (X25519 + ML-KEM-768) once
+   rust-libp2p exposes one. Tracking issue rs/9595 is the current
+   upstream pin.
+2. As an interim, wrap gossip / sync payloads in a per-message
+   hybrid KEM envelope so transport compromise alone does not yield
+   plaintext directory state.
+3. Make `AdmissionCert` hybrid-signed (Ed25519+ML-DSA-65) so the
+   admission handshake cannot be retroactively forged in a
+   post-quantum world.
+
+Until at least one of (1)–(3) lands, the README/whitepaper "quantum-
+resistant by default" line **must** be qualified to "tokens only —
+transport handshake is classical." See companion edits to
+[README.md](README.md), [docs/DDS-Design-Document.md](docs/DDS-Design-Document.md)
+§6.1, [docs/DDS-Implementation-Whitepaper.md](docs/DDS-Implementation-Whitepaper.md)
+§6.4, [docs/threat-model-review.md](docs/threat-model-review.md) §4.
+
+### Z-2 (High) ❌ open — Hardware-bound identities not implemented
+
+[docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md)
+(committed 2026-04-26 as `d5c2da5`) is a design document. **Zero
+production code has shipped.** The current node admission stack is
+software-keyed end-to-end:
+
+- libp2p `PeerId` is a software Ed25519 key in
+  `dds-node/src/p2p_identity.rs:115-361`. ChaCha20-Poly1305 + Argon2id
+  at rest, **plaintext in process memory**.
+- `AdmissionBody` (`dds-domain/src/domain.rs`) has no `admission_pubkey`
+  field; H-12 has no challenge-response signing step.
+- Admin-key OS-keystore binding is an explicit TODO in
+  `dds-node/src/service.rs` (deferred as M-22 in this review).
+- User FIDO2 attestation is parsed but `none` and `packed`
+  self-attestation are accepted without x5c chain validation by design
+  ([docs/fido2-attestation-allowlist.md](docs/fido2-attestation-allowlist.md)).
+- Domain root key is software Ed25519 by default; FIDO2 only with
+  `--fido2` flag at `init-domain`.
+
+**Attack:** Exfiltrating `p2p_key.bin + admission.cbor` from any
+domain node clones the node onto attacker-controlled hardware. With
+the new H-12 admission revocation list (closed 2026-04-26 morning),
+the clone can be contained *after* detection — but detection is the
+hard part, exactly the gap the plan exists to close.
+
+**Remediation:** execute Phases A1–A6 of
+[docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md).
+Promote the plan from Draft → CRITICAL.
+
+### Z-3 (High) ❌ open — Audit emission is unwired in production
+
+The audit-log mechanism is correct (SHA-256 hash chain + per-entry
+Ed25519 signature, append-only enforced atomically at
+`dds-store/src/redb_backend.rs:355-405`, inbound chain verification
+at `dds-node/src/node.rs:1040-1070`). But **no production code path
+calls `DdsNode::emit_local_audit`** (`dds-node/src/node.rs:1091`).
+Attestation issuance, revocation, burn, enrollment, and vouch all
+execute without writing an audit entry. `dds-cli audit entries`
+reads from a table nothing writes to.
+
+**Attack:** No record of who did what is being kept. An incident
+response cannot reconstruct a timeline; a malicious admin leaves
+no trail.
+
+**Remediation:** wire `emit_local_audit` into:
+- `dds-node::service::ingest_attestation`
+- `dds-node::service::ingest_vouch`
+- `dds-node::service::ingest_revocation`
+- `dds-node::service::ingest_burn`
+- `dds-node::http::issue_challenge` (enrollment events)
+- `dds-node::service` admin bootstrap / vouch promotion paths
+
+The L-12 follow-up in this review explicitly listed
+`emit_local_audit` as "the production chained-emit hook" — the hook
+exists; the call sites do not.
+
+### Z-4 (High) ❌ open — Persistent store is plaintext on disk
+
+The redb backend (`dds-store/src/redb_backend.rs:37-49`) writes all
+tokens, operations, revocations, burns, and audit entries as plaintext
+CBOR. Confidentiality at rest depends entirely on OS full-disk
+encryption and file ACLs (M-20 closed the umask gap; the data-dir
+DACL closed for Windows on 2026-04-26).
+
+This is a structural gap, not a misconfiguration. An attacker with
+file read on `<data_dir>/directory.redb` reads the entire directory
+state — every credential ID, every device tag, every revocation, the
+entire audit chain.
+
+**Remediation candidates:**
+1. Add a passphrase-or-FIDO2-protected data-encryption key (DEK) and
+   wrap each redb value (or whole-DB envelope) on write. Costs:
+   per-op AEAD, key-rotation story, recovery story.
+2. Mandate a TPM-sealed DEK on platforms that have a TPM (ties into
+   Z-2 hardware-binding work — same key material can wrap both the
+   libp2p key and the redb DEK).
+3. Document and enforce OS-FDE + restrictive ACLs as the v1 floor,
+   and stop claiming at-rest encryption in marketing materials
+   until (1) or (2) lands.
+
+### Z-5 (Medium) ❌ open — Export dumps are plaintext
+
+`dds-cli export` (`dds-cli/src/dump.rs:60-90`) writes a CBOR archive
+containing all tokens, operations, and revocation/burn sets. v2 adds
+an Ed25519 signature for **integrity**, but the dump is **not
+encrypted for confidentiality**. Operators using export/import for
+air-gap sync are shipping plaintext copies of the directory state.
+
+**Remediation:** add an encrypted variant (`dds-cli export
+--encrypt-to <pubkey>` → hybrid-PQ KEM envelope around the existing
+signed CBOR). Document explicitly that unencrypted dumps must be
+treated as Restricted material in transit.
+
+### Cross-reference
+
+These five findings are not duplicates of any prior review item:
+
+- Z-1 is new (the existing transport sections in
+  `docs/threat-model-review.md` §4 mark message-level encryption as
+  "Low / out of scope" but never address the post-quantum question
+  for the handshake itself).
+- Z-2 is the open delivery of the plan introduced by `d5c2da5`.
+- Z-3 is a behavioural gap above L-12 (which fixed *chain integrity
+  on append* — but nothing appends).
+- Z-4 expands M-20's umask hardening into a structural at-rest
+  question rather than a permission question.
+- Z-5 is the confidentiality complement to M-16 (which closed
+  v1-downgrade *integrity*).

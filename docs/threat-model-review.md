@@ -191,8 +191,9 @@ Administrators). However:
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| **No message-level encryption** — gossip messages (tokens, sync payloads) are CBOR-encoded but not encrypted at the application layer. | Low | Transport encryption (Noise) protects against external eavesdroppers. Internal confidentiality is not a current goal — all domain members are expected to see all tokens. |
-| **Peer ID spoofing** — if a node's libp2p keypair is stolen, an attacker can impersonate that peer. | Medium | Addressed by admission cert binding. Stolen keypair alone is not sufficient without the matching admission cert. |
+| **Transport handshake is not post-quantum (Z-1)** ❌ open 2026-04-26 — Noise XX uses X25519 DH; libp2p QUIC uses rustls/ECDHE. No hybrid KEM keyshare is configured. Harvest-Now-Decrypt-Later: recorded gossipsub / sync / admission traffic becomes plaintext on a future quantum break. `AdmissionCert` is also Ed25519-only (not hybrid PQ), so the H-12 admission handshake itself is post-quantum-forgeable on the same break. | **Critical** | Open. Remediation candidates: (1) hybrid Noise upstream (rust-libp2p tracking issue rs/9595, no feature flag yet); (2) interim per-message hybrid-PQ KEM envelope on gossip / sync payloads; (3) hybrid-sign `AdmissionCert` with Ed25519+ML-DSA-65. Until at least one lands, README/whitepaper "quantum-resistant by default" must be qualified to "token signatures only." See [Claude_sec_review.md](../Claude_sec_review.md) Z-1. |
+| **No message-level encryption** — gossip messages (tokens, sync payloads) are CBOR-encoded but not encrypted at the application layer. | Low | Transport encryption (Noise) protects against external eavesdroppers. Internal confidentiality is not a current goal — all domain members are expected to see all tokens. (Note: this assessment assumes a classical adversary; under Z-1 the same risk reappears post-quantum.) |
+| **Peer ID spoofing** — if a node's libp2p keypair is stolen, an attacker can impersonate that peer. | Medium | Addressed by admission cert binding. Stolen keypair alone is not sufficient without the matching admission cert. **Note (Z-2):** the libp2p keypair is software-resident, so any attacker with file or live-process access on a node holds it; the structural fix is hardware binding per [docs/hardware-bound-admission-plan.md](hardware-bound-admission-plan.md). |
 | **No gossip message signing** — gossip messages do not carry an application-level signature. | Low | Individual tokens are signed by their issuer. The trust graph verifies signatures on ingest. Unsigned gossip is acceptable because invalid tokens are rejected. |
 | ~~Pre-admission gossip ingest~~ | ~~High~~ | **FIXED (H-12)**: per-peer admission gating drops gossip / sync from non-admitted peers at the behaviour layer. Combined with C-3's publisher-capability filter, which remains as defense in depth. |
 
@@ -332,6 +333,11 @@ application from failed application.
 | 11 | Admin-set coherence via gossip (I-11) | Medium | §5 |
 | 12 | Message-level encryption (opt-in) | Low | §4 |
 | 13 | ~~Real-time expiry in `evaluate_policy`~~ ✅ closed 2026-04-25 (already inline-filtered; regression tests added) | Low | §5 |
+| 14 | **Transport handshake post-quantum gap (Z-1)** ❌ open 2026-04-26 — Noise X25519 / QUIC ECDHE; no hybrid KEM. AdmissionCert Ed25519-only. Harvest-Now-Decrypt-Later. | **Critical** | §4 |
+| 15 | **Hardware-bound identities not shipped (Z-2)** ❌ open 2026-04-26 — [hardware-bound-admission-plan.md](hardware-bound-admission-plan.md) is design-only; libp2p PeerId, admin keys, default domain root all software-resident. | **High** | §1 / §2 |
+| 16 | **Audit emission unwired (Z-3)** ❌ open 2026-04-26 — chain mechanism + signature verify are correct, but `DdsNode::emit_local_audit` has zero production call-sites. | **High** | (new audit section) |
+| 17 | **redb persistent store plaintext at rest (Z-4)** ❌ open 2026-04-26 — tokens, ops, revocations, audit entries written as plaintext CBOR; confidentiality depends on OS FDE + ACLs only. | **High** | §2 |
+| 18 | **`dds-cli export` dumps plaintext (Z-5)** ❌ open 2026-04-26 — signed for integrity (M-16) but not encrypted; air-gap sync ships plaintext directory state. | **Medium** | (new export section) |
 
 All Critical findings from the source-validated review are now Fixed
 (pending verify). All six findings (B-1 through B-6) from the

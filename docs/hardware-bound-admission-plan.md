@@ -1,6 +1,13 @@
 # DDS Hardware-Bound Admission Plan
 
-**Status:** Draft — design pending review
+**Status:** ⚠ **CRITICAL — design only, no code shipped.** Tracked as
+**Z-2 (High)** in
+[Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
+Principles Audit". Until Phases A1–A6 below land, every libp2p `PeerId`
+in the fleet is a software Ed25519 keypair on disk, and the system fails
+zero-trust principle #2 ("identities bound to hardware"). Promote to
+top-of-queue.
+
 **Date:** 2026-04-26
 **Closes:** [docs/threat-model-review.md](threat-model-review.md) §1 "Bearer
 token" risk; structural answer to node-clone resistance.

@@ -2,7 +2,16 @@
 
 A peer-to-peer identity and access management system built in Rust. DDS provides offline-capable authentication and authorization using cryptographically signed tokens, CRDTs for conflict-free replication, and libp2p for peer-to-peer networking.
 
-**Quantum-resistant by default** — hybrid Ed25519 + ML-DSA-65 (FIPS 204) signatures.
+**Quantum-resistant token signatures** — hybrid Ed25519 + ML-DSA-65 (FIPS 204) on every token.
+
+> ⚠ **Scope of the PQ claim.** The hybrid signature applies to the
+> token / attestation layer only. The libp2p **transport handshake**
+> (Noise XX over X25519, QUIC over rustls/ECDHE) is currently
+> classical — see Z-1 in
+> [Claude_sec_review.md](Claude_sec_review.md) and
+> [docs/threat-model-review.md](docs/threat-model-review.md) §4 for the
+> Harvest-Now-Decrypt-Later exposure and the planned remediation. Do
+> not market DDS as end-to-end post-quantum until Z-1 closes.
 
 **9 crates · 22,000 lines of Rust · 5 platform bindings**
 

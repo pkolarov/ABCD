@@ -1,5 +1,28 @@
 # DDS Implementation Status
 
+> ## ⚠ Zero-Trust Audit (2026-04-26) — CRITICAL FIXES TO DO
+>
+> A first-principles audit against the five core zero-trust principles
+> opened five new findings. **All five are open.** See
+> [Claude_sec_review.md](Claude_sec_review.md) "2026-04-26 Zero-Trust
+> Principles Audit" for the per-finding ledger.
+>
+> | Id | Severity | Principle | Summary |
+> |---|---|---|---|
+> | Z-1 | **Critical** | Encrypted comms (PQC) | Noise/QUIC handshake is X25519/ECDHE only — *not* post-quantum. README "quantum-resistant by default" applies to token signatures, not the transport channel. Harvest-Now-Decrypt-Later exposure on all recorded P2P traffic. |
+> | Z-2 | **High** | HW-bound identity | [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md) is a plan; zero code shipped. libp2p PeerId, admission cert, admin keys, default domain root all software-keyed. |
+> | Z-3 | **High** | Immutable audit | Hash-chain + signature mechanism is correct, but `emit_local_audit` has zero production call sites. Audit log is empty in production. |
+> | Z-4 | **High** | Encrypted at rest | redb store (`directory.redb`) is plaintext CBOR — tokens, ops, revocations, audit entries. Confidentiality depends on OS FDE + ACLs only. |
+> | Z-5 | **Medium** | Encrypted at rest | `dds-cli export` dumps are plaintext-CBOR (signed for integrity, not encrypted for confidentiality). |
+>
+> Until Z-1 lands, the "quantum-resistant by default" marketing line in
+> [README.md](README.md), [docs/DDS-Design-Document.md](docs/DDS-Design-Document.md)
+> §6.1, and [docs/DDS-Implementation-Whitepaper.md](docs/DDS-Implementation-Whitepaper.md)
+> §6.4 has been qualified to **tokens only** — the transport channel is
+> classical.
+>
+> ---
+
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
 > Last updated: 2026-04-26 follow-up #16 (AD coexistence Phase 3 complete —
 > closes AD-11 from

@@ -199,6 +199,19 @@ DDS uses **libp2p** as the networking substrate:
 - **mDNS** — Local network peer discovery for zero-config LAN operation
 - **Noise protocol** — Transport encryption for all peer connections
 
+> ⚠ **Open: post-quantum gap in the transport handshake (Z-1, Critical).**
+> The Noise XX handshake uses X25519 DH and the QUIC keyshare uses
+> classical ECDHE (rustls). Token signatures are hybrid PQ
+> (Ed25519+ML-DSA-65) but the transport channel is **not**. A
+> Harvest-Now-Decrypt-Later adversary can record gossipsub /
+> sync / admission traffic today and recover plaintext on a future
+> quantum break. Tracked in
+> [Claude_sec_review.md](../Claude_sec_review.md) Z-1 and
+> [docs/threat-model-review.md](threat-model-review.md) §4. Remediation
+> waits on hybrid-Noise upstream (rust-libp2p tracking issue rs/9595)
+> or an interim per-message hybrid-KEM envelope on the application
+> layer.
+
 ### 6.2 Domain Isolation & Topic Structure
 
 DDS nodes belong to a **domain** — a cryptographic realm identified by

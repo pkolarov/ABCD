@@ -427,7 +427,17 @@ and verification requires **both** to pass.
 That gives the project two useful properties:
 
 - backward familiarity and compact classical verification;
-- a built-in post-quantum transition story.
+- a built-in post-quantum transition story for the **token layer**.
+
+> ⚠ **Scope.** The hybrid signature applies to tokens only. The libp2p
+> **transport handshake** is classical (Noise XX / X25519, QUIC /
+> rustls / ECDHE). A Harvest-Now-Decrypt-Later adversary recording P2P
+> traffic today recovers plaintext gossipsub / sync / admission flows
+> on a future quantum break — token signatures still hold, but channel
+> confidentiality and forward-secrecy of the recorded traffic do not.
+> Tracked as Z-1 (Critical) in
+> [../Claude_sec_review.md](../Claude_sec_review.md). Until Z-1 closes,
+> do not describe DDS as end-to-end post-quantum.
 
 The relevant standards behind those choices are:
 
