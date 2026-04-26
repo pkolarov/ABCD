@@ -912,6 +912,19 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // operator set the flag explicitly in node.toml. Default is
     // `false` so production deployments require real attestation.
     svc.set_allow_unattested_credentials(config.domain.allow_unattested_credentials);
+    // FIDO2 AAGUID allow-list (Phase 1 of
+    // docs/fido2-attestation-allowlist.md). Refuse to start when the
+    // operator wrote unparseable entries — silent fallback to "any
+    // AAGUID" would be a foot-gun for hardened deployments that meant
+    // to restrict enrollment.
+    svc.set_fido2_allowed_aaguids(&config.domain.fido2_allowed_aaguids)
+        .map_err(|e| format!("invalid fido2_allowed_aaguids: {e}"))?;
+    if !config.domain.fido2_allowed_aaguids.is_empty() {
+        info!(
+            count = config.domain.fido2_allowed_aaguids.len(),
+            "FIDO2 AAGUID allow-list enabled — enrollment restricted to listed authenticators"
+        );
+    }
     let shared_svc = Arc::new(tokio::sync::Mutex::new(svc));
     let node_info = http::NodeInfo {
         peer_id: node.peer_id.to_string(),

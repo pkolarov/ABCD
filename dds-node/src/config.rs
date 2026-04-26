@@ -112,6 +112,18 @@ pub struct DomainConfig {
     /// uses the unattested path is logged at WARN.
     #[serde(default)]
     pub allow_unattested_credentials: bool,
+
+    /// FIDO2 AAGUID allow-list (Phase 1 of
+    /// [`docs/fido2-attestation-allowlist.md`](../../docs/fido2-attestation-allowlist.md)).
+    /// Each entry is a canonical UUID string
+    /// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) or a 32-character
+    /// hex string identifying an authenticator model the operator
+    /// has approved. When the list is non-empty, enrollment rejects
+    /// any FIDO2 credential whose AAGUID is not present. Default is
+    /// empty, which preserves existing behavior (any AAGUID,
+    /// including all-zero, is accepted).
+    #[serde(default)]
+    pub fido2_allowed_aaguids: Vec<String>,
 }
 
 /// Network settings.

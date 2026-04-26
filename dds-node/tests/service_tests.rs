@@ -4,7 +4,7 @@ use dds_core::identity::Identity;
 use dds_core::policy::{Effect, PolicyRule};
 use dds_core::token::{Token, TokenKind, TokenPayload};
 use dds_core::trust::TrustGraph;
-use dds_domain::fido2::build_packed_self_attestation;
+use dds_domain::fido2::{build_packed_self_attestation, build_packed_self_attestation_with_aaguid};
 use dds_domain::{DeviceJoinDocument, DomainDocument, SessionDocument, UserAuthAttestation};
 use dds_node::service::*;
 use dds_store::MemoryBackend;
@@ -104,6 +104,169 @@ fn test_enroll_user_rejects_invalid_attestation() {
         challenge_id: None,
     });
     assert!(result.is_err());
+}
+
+/// Phase 1 of `docs/fido2-attestation-allowlist.md`: when the
+/// allow-list is empty (the default), enrollment must accept any
+/// AAGUID — the all-zero AAGUID, a YubiKey, anything.
+#[test]
+fn aaguid_empty_allow_list_accepts_anything() {
+    let (_root, mut svc) = make_service();
+    svc.set_fido2_allowed_aaguids(&[]).unwrap();
+    let cred_sk = SigningKey::generate(&mut OsRng);
+    let cdh = [0xBB; 32];
+    let yubikey: [u8; 16] = [
+        0x2f, 0xc0, 0x57, 0x9f, 0x81, 0x13, 0x47, 0xea, 0xb1, 0x16, 0xbb, 0x5a, 0x8d, 0xb9, 0x20,
+        0x2a,
+    ];
+    let attestation =
+        build_packed_self_attestation_with_aaguid("example.com", b"cred", &cred_sk, &cdh, &yubikey);
+    let res = svc.enroll_user(EnrollUserRequest {
+        label: "alice".into(),
+        credential_id: "cred".into(),
+        attestation_object: attestation,
+        client_data_hash: cdh.to_vec(),
+        rp_id: "example.com".into(),
+        display_name: "Alice".into(),
+        authenticator_type: "roaming".into(),
+        client_data_json: None,
+        challenge_id: None,
+    });
+    assert!(
+        res.is_ok(),
+        "empty allow-list must accept any AAGUID, got {res:?}"
+    );
+}
+
+/// When the allow-list contains the credential's AAGUID, enrollment
+/// proceeds. Both the canonical UUID layout and the bare-hex layout
+/// must parse successfully.
+#[test]
+fn aaguid_allow_list_accepts_listed_authenticator() {
+    let (_root, mut svc) = make_service();
+    let yubikey_uuid = "2fc0579f-8113-47ea-b116-bb5a8db9202a";
+    svc.set_fido2_allowed_aaguids(&[yubikey_uuid.to_string()])
+        .unwrap();
+    let cred_sk = SigningKey::generate(&mut OsRng);
+    let cdh = [0xBB; 32];
+    let yubikey: [u8; 16] = [
+        0x2f, 0xc0, 0x57, 0x9f, 0x81, 0x13, 0x47, 0xea, 0xb1, 0x16, 0xbb, 0x5a, 0x8d, 0xb9, 0x20,
+        0x2a,
+    ];
+    let attestation =
+        build_packed_self_attestation_with_aaguid("example.com", b"cred", &cred_sk, &cdh, &yubikey);
+    let res = svc.enroll_user(EnrollUserRequest {
+        label: "alice".into(),
+        credential_id: "cred".into(),
+        attestation_object: attestation,
+        client_data_hash: cdh.to_vec(),
+        rp_id: "example.com".into(),
+        display_name: "Alice".into(),
+        authenticator_type: "roaming".into(),
+        client_data_json: None,
+        challenge_id: None,
+    });
+    assert!(
+        res.is_ok(),
+        "AAGUID matching the allow-list must be accepted, got {res:?}"
+    );
+}
+
+/// When the allow-list does not contain the credential's AAGUID,
+/// enrollment must fail before the token is signed/persisted. This
+/// is the load-bearing assertion: an operator who restricts
+/// enrollment to a specific authenticator vendor must be able to
+/// rely on the gate.
+#[test]
+fn aaguid_allow_list_rejects_unlisted_authenticator() {
+    let (_root, mut svc) = make_service();
+    let yubikey_uuid = "2fc0579f-8113-47ea-b116-bb5a8db9202a";
+    svc.set_fido2_allowed_aaguids(&[yubikey_uuid.to_string()])
+        .unwrap();
+    let cred_sk = SigningKey::generate(&mut OsRng);
+    let cdh = [0xBB; 32];
+    // Crayonic C-Key AAGUID — not in the allow-list.
+    let crayonic: [u8; 16] = [
+        0xee, 0x88, 0x28, 0x79, 0x72, 0x1c, 0x49, 0x13, 0x97, 0x75, 0x3d, 0xfc, 0xce, 0x97, 0x07,
+        0x2a,
+    ];
+    let attestation = build_packed_self_attestation_with_aaguid(
+        "example.com",
+        b"cred",
+        &cred_sk,
+        &cdh,
+        &crayonic,
+    );
+    let res = svc.enroll_user(EnrollUserRequest {
+        label: "alice".into(),
+        credential_id: "cred".into(),
+        attestation_object: attestation,
+        client_data_hash: cdh.to_vec(),
+        rp_id: "example.com".into(),
+        display_name: "Alice".into(),
+        authenticator_type: "roaming".into(),
+        client_data_json: None,
+        challenge_id: None,
+    });
+    let err = res.expect_err("non-listed AAGUID must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("AAGUID") && msg.contains("ee882879-721c-4913-9775-3dfcce97072a"),
+        "error must name the rejected AAGUID and the gate, got: {msg}"
+    );
+}
+
+/// Bare 32-character hex (no hyphens) is a valid configuration form
+/// per `docs/fido2-attestation-allowlist.md`. Mixing case across the
+/// list and authData is also fine — the parser is case-insensitive.
+#[test]
+fn aaguid_allow_list_accepts_bare_hex_and_mixed_case() {
+    let (_root, mut svc) = make_service();
+    svc.set_fido2_allowed_aaguids(&[
+        // YubiKey 5 NFC, mixed case, no hyphens.
+        "2FC0579F811347EAB116BB5A8DB9202A".to_string(),
+    ])
+    .unwrap();
+    let cred_sk = SigningKey::generate(&mut OsRng);
+    let cdh = [0xBB; 32];
+    let yubikey: [u8; 16] = [
+        0x2f, 0xc0, 0x57, 0x9f, 0x81, 0x13, 0x47, 0xea, 0xb1, 0x16, 0xbb, 0x5a, 0x8d, 0xb9, 0x20,
+        0x2a,
+    ];
+    let attestation =
+        build_packed_self_attestation_with_aaguid("example.com", b"cred", &cred_sk, &cdh, &yubikey);
+    let res = svc.enroll_user(EnrollUserRequest {
+        label: "alice".into(),
+        credential_id: "cred".into(),
+        attestation_object: attestation,
+        client_data_hash: cdh.to_vec(),
+        rp_id: "example.com".into(),
+        display_name: "Alice".into(),
+        authenticator_type: "roaming".into(),
+        client_data_json: None,
+        challenge_id: None,
+    });
+    assert!(
+        res.is_ok(),
+        "bare-hex AAGUID config must be accepted, got {res:?}"
+    );
+}
+
+/// Unparseable allow-list entries must surface as a configuration
+/// error rather than a silent fallback to "any AAGUID is fine" —
+/// that would defeat the whole point of the gate. The setter is
+/// called before the service starts serving traffic, so a hard
+/// failure here is the right answer.
+#[test]
+fn aaguid_allow_list_rejects_malformed_config() {
+    let (_root, mut svc) = make_service();
+    let res = svc.set_fido2_allowed_aaguids(&["not-a-uuid".to_string()]);
+    assert!(
+        res.is_err(),
+        "malformed AAGUID must be rejected at config time"
+    );
+    let msg = res.unwrap_err().to_string();
+    assert!(msg.contains("not-a-uuid"));
 }
 
 #[test]

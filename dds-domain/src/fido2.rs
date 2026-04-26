@@ -39,6 +39,13 @@ pub struct ParsedAttestation {
     pub credential_public_key: CredentialPublicKey,
     /// Relying-party ID hash (first 32 bytes of authData).
     pub rp_id_hash: [u8; 32],
+    /// Authenticator Attestation GUID, bytes 37..53 of authData. All-zero
+    /// for `fmt = "none"` and self-attested platform authenticators.
+    /// Phase 1 of `docs/fido2-attestation-allowlist.md` — the dds-node
+    /// service rejects enrollment when a non-empty
+    /// `fido2_allowed_aaguids` list is configured and this value is
+    /// not in it.
+    pub aaguid: [u8; 16],
 }
 
 /// Errors from FIDO2 parsing/verification.
@@ -152,6 +159,7 @@ pub fn verify_attestation(
         credential_id: parsed_auth.credential_id,
         credential_public_key: parsed_auth.credential_public_key,
         rp_id_hash: parsed_auth.rp_id_hash,
+        aaguid: parsed_auth.aaguid,
     })
 }
 
@@ -159,6 +167,7 @@ struct AuthDataParts {
     rp_id_hash: [u8; 32],
     credential_id: Vec<u8>,
     credential_public_key: CredentialPublicKey,
+    aaguid: [u8; 16],
 }
 
 fn parse_auth_data(auth_data: &[u8]) -> Result<AuthDataParts, Fido2Error> {
@@ -179,6 +188,8 @@ fn parse_auth_data(auth_data: &[u8]) -> Result<AuthDataParts, Fido2Error> {
     if auth_data.len() < p + 16 + 2 {
         return Err(Fido2Error::Format("authData truncated at AAGUID".into()));
     }
+    let mut aaguid = [0u8; 16];
+    aaguid.copy_from_slice(&auth_data[p..p + 16]);
     p += 16; // AAGUID
     let cred_id_len = u16::from_be_bytes([auth_data[p], auth_data[p + 1]]) as usize;
     p += 2;
@@ -206,6 +217,7 @@ fn parse_auth_data(auth_data: &[u8]) -> Result<AuthDataParts, Fido2Error> {
         rp_id_hash,
         credential_id,
         credential_public_key,
+        aaguid,
     })
 }
 
@@ -593,7 +605,19 @@ pub fn build_assertion_auth_data(rp_id: &str, sign_count: u32) -> Vec<u8> {
 /// Build a synthetic "none" attestation object containing the given Ed25519
 /// credential public key. Useful for tests and bridging non-WebAuthn enrollment.
 pub fn build_none_attestation(rp_id: &str, credential_id: &[u8], pk: &VerifyingKey) -> Vec<u8> {
-    let auth_data = build_auth_data(rp_id, credential_id, pk);
+    build_none_attestation_with_aaguid(rp_id, credential_id, pk, &[0u8; 16])
+}
+
+/// Same as `build_none_attestation` but with an explicit AAGUID embedded
+/// in the authenticator data. Useful for tests covering the
+/// `fido2_allowed_aaguids` allow-list.
+pub fn build_none_attestation_with_aaguid(
+    rp_id: &str,
+    credential_id: &[u8],
+    pk: &VerifyingKey,
+    aaguid: &[u8; 16],
+) -> Vec<u8> {
+    let auth_data = build_auth_data_with_aaguid(rp_id, credential_id, pk, aaguid);
     let map: Vec<(CborValue, CborValue)> = vec![
         (
             CborValue::Text("fmt".into()),
@@ -618,9 +642,28 @@ pub fn build_packed_self_attestation(
     signing_key: &ed25519_dalek::SigningKey,
     client_data_hash: &[u8],
 ) -> Vec<u8> {
+    build_packed_self_attestation_with_aaguid(
+        rp_id,
+        credential_id,
+        signing_key,
+        client_data_hash,
+        &[0u8; 16],
+    )
+}
+
+/// Same as `build_packed_self_attestation` but with an explicit AAGUID
+/// embedded in the authenticator data. Useful for tests covering the
+/// `fido2_allowed_aaguids` allow-list.
+pub fn build_packed_self_attestation_with_aaguid(
+    rp_id: &str,
+    credential_id: &[u8],
+    signing_key: &ed25519_dalek::SigningKey,
+    client_data_hash: &[u8],
+    aaguid: &[u8; 16],
+) -> Vec<u8> {
     use ed25519_dalek::Signer;
     let pk = signing_key.verifying_key();
-    let auth_data = build_auth_data(rp_id, credential_id, &pk);
+    let auth_data = build_auth_data_with_aaguid(rp_id, credential_id, &pk, aaguid);
     let mut signed = Vec::new();
     signed.extend_from_slice(&auth_data);
     signed.extend_from_slice(client_data_hash);
@@ -652,13 +695,18 @@ pub fn build_packed_self_attestation(
     out
 }
 
-fn build_auth_data(rp_id: &str, credential_id: &[u8], pk: &VerifyingKey) -> Vec<u8> {
+fn build_auth_data_with_aaguid(
+    rp_id: &str,
+    credential_id: &[u8],
+    pk: &VerifyingKey,
+    aaguid: &[u8; 16],
+) -> Vec<u8> {
     let rp_id_hash = Sha256::digest(rp_id.as_bytes());
     let mut out = Vec::new();
     out.extend_from_slice(&rp_id_hash);
     out.push(0x41); // UP | AT
     out.extend_from_slice(&[0, 0, 0, 0]); // signCount
-    out.extend_from_slice(&[0u8; 16]); // AAGUID
+    out.extend_from_slice(aaguid); // AAGUID
     let id_len = credential_id.len() as u16;
     out.extend_from_slice(&id_len.to_be_bytes());
     out.extend_from_slice(credential_id);
@@ -1499,5 +1547,62 @@ mod tests {
         bytes.push(0x00);
         let res = cose_to_credential_public_key(&bytes);
         assert!(matches!(res, Err(Fido2Error::Cbor(_))));
+    }
+
+    /// Phase 1 of `docs/fido2-attestation-allowlist.md` requires the
+    /// 16-byte AAGUID to round-trip from authData into
+    /// `ParsedAttestation` so the dds-node service can match it
+    /// against the configured allow-list. The default test builders
+    /// emit all-zero AAGUID, which is a real-world value (FIDO2
+    /// platform authenticators that reveal nothing) — the allow-list
+    /// machinery must therefore distinguish the zero AAGUID from
+    /// "unknown" (the comparison is a plain set membership).
+    #[test]
+    fn aaguid_extracted_into_parsed_attestation_zero() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let cdh = [0u8; 32];
+        let attestation = build_packed_self_attestation("login.example.com", b"cred1", &sk, &cdh);
+        let parsed = verify_attestation(&attestation, &cdh, false).unwrap();
+        assert_eq!(parsed.aaguid, [0u8; 16]);
+    }
+
+    #[test]
+    fn aaguid_extracted_into_parsed_attestation_non_zero() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let cdh = [0u8; 32];
+        // Canonical YubiKey 5 NFC AAGUID per FIDO MDS metadata.
+        let aaguid: [u8; 16] = [
+            0x2f, 0xc0, 0x57, 0x9f, 0x81, 0x13, 0x47, 0xea, 0xb1, 0x16, 0xbb, 0x5a, 0x8d, 0xb9,
+            0x20, 0x2a,
+        ];
+        let attestation = build_packed_self_attestation_with_aaguid(
+            "login.example.com",
+            b"cred1",
+            &sk,
+            &cdh,
+            &aaguid,
+        );
+        let parsed = verify_attestation(&attestation, &cdh, false).unwrap();
+        assert_eq!(parsed.aaguid, aaguid);
+    }
+
+    #[test]
+    fn aaguid_extracted_from_fmt_none() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let aaguid: [u8; 16] = [
+            0xee, 0x88, 0x28, 0x79, 0x72, 0x1c, 0x49, 0x13, 0x97, 0x75, 0x3d, 0xfc, 0xce, 0x97,
+            0x07, 0x2a,
+        ];
+        let attestation = build_none_attestation_with_aaguid(
+            "example.com",
+            b"cred",
+            &sk.verifying_key(),
+            &aaguid,
+        );
+        // fmt=none requires opt-in to verify_attestation; the AAGUID
+        // is still surfaced so the service-side allow-list runs.
+        let parsed = verify_attestation(&attestation, &[0u8; 32], true).unwrap();
+        assert_eq!(parsed.fmt, "none");
+        assert_eq!(parsed.aaguid, aaguid);
     }
 }

@@ -527,6 +527,7 @@ A matching client knob lives in the Policy Agent's
 | `pubkey` | string | required | Hex-encoded 32-byte Ed25519 domain public key |
 | `admission_path` | path | `<data_dir>/admission.cbor` | Path to the admission certificate |
 | `audit_log_enabled` | bool | `false` | Enable append-only cryptographic audit log |
+| `fido2_allowed_aaguids` | list of UUID strings | `[]` (any AAGUID accepted) | Phase 1 of [`fido2-attestation-allowlist.md`](fido2-attestation-allowlist.md). When non-empty, enrollment rejects any FIDO2 credential whose AAGUID is not in the list. Each entry is a canonical UUID or a 32-char bare hex string. Unparseable entries make the node refuse to start. |
 
 ### Example: Minimal Config
 

@@ -346,6 +346,12 @@ pub struct LocalService<
     /// root with purpose `dds:device-scope`. Set from
     /// `NodeConfig.domain.enforce_device_scope_vouch` at startup.
     enforce_device_scope_vouch: bool,
+    /// FIDO2 AAGUID allow-list (Phase 1 of
+    /// `docs/fido2-attestation-allowlist.md`). When non-empty,
+    /// enrollment rejects any FIDO2 credential whose AAGUID is not
+    /// in the set. Wired from
+    /// `NodeConfig.domain.fido2_allowed_aaguids` at startup.
+    fido2_allowed_aaguids: BTreeSet<[u8; 16]>,
 }
 
 impl<
@@ -394,6 +400,7 @@ impl<
             verify_fido2: true,
             allow_unattested_credentials: false,
             enforce_device_scope_vouch: false,
+            fido2_allowed_aaguids: BTreeSet::new(),
         };
         // Best-effort rehydration: pull any pre-existing tokens from the
         // store into the in-memory graph. Only relevant when the store
@@ -476,6 +483,47 @@ impl<
     /// `NodeConfig.domain.allow_unattested_credentials`.
     pub fn set_allow_unattested_credentials(&mut self, allow: bool) {
         self.allow_unattested_credentials = allow;
+    }
+
+    /// FIDO2 AAGUID allow-list (Phase 1 of
+    /// `docs/fido2-attestation-allowlist.md`). Each entry is a
+    /// canonical UUID string (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`)
+    /// or a 32-character hex string. Returns an error naming the
+    /// offending entry if any value cannot be parsed; on success
+    /// the parsed set replaces any previously-configured allow-list.
+    /// Empty input clears the allow-list (any AAGUID is accepted).
+    pub fn set_fido2_allowed_aaguids(&mut self, raw: &[String]) -> Result<(), ServiceError> {
+        let mut set: BTreeSet<[u8; 16]> = BTreeSet::new();
+        for entry in raw {
+            let bytes = parse_aaguid(entry).ok_or_else(|| {
+                ServiceError::Fido2(format!(
+                    "fido2_allowed_aaguids: cannot parse {entry:?} as a UUID or 32-char hex"
+                ))
+            })?;
+            set.insert(bytes);
+        }
+        self.fido2_allowed_aaguids = set;
+        Ok(())
+    }
+
+    /// Reject the parsed attestation when an AAGUID allow-list is
+    /// configured and the credential's AAGUID is not in it. Returns
+    /// `Ok(())` when the allow-list is empty (default).
+    fn enforce_fido2_aaguid_allow_list(
+        &self,
+        parsed: &dds_domain::fido2::ParsedAttestation,
+    ) -> Result<(), ServiceError> {
+        if self.fido2_allowed_aaguids.is_empty() {
+            return Ok(());
+        }
+        if !self.fido2_allowed_aaguids.contains(&parsed.aaguid) {
+            return Err(ServiceError::Fido2(format!(
+                "AAGUID {} not in fido2_allowed_aaguids ({} entries)",
+                format_aaguid(&parsed.aaguid),
+                self.fido2_allowed_aaguids.len()
+            )));
+        }
+        Ok(())
     }
 
     /// Set the data directory for admin key storage.
@@ -653,6 +701,11 @@ impl<
                      allow_unattested_credentials is true"
                 );
             }
+
+            // Phase 1 of `docs/fido2-attestation-allowlist.md`: when an
+            // AAGUID allow-list is configured, reject any authenticator
+            // whose AAGUID is not on it (covers `fmt = "none"` too).
+            self.enforce_fido2_aaguid_allow_list(&parsed)?;
 
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
@@ -1688,6 +1741,11 @@ impl<
                 );
             }
 
+            // AAGUID allow-list also gates the bootstrap admin so an
+            // operator who restricts which authenticators may enroll
+            // cannot be bypassed by going through admin_setup.
+            self.enforce_fido2_aaguid_allow_list(&parsed)?;
+
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
             hasher.update(req.rp_id.as_bytes());
@@ -2480,6 +2538,53 @@ fn decode_b64url_any(s: &str) -> Option<Vec<u8>> {
         .decode(s)
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s))
         .ok()
+}
+
+/// Parse a FIDO2 AAGUID from a configuration string. Accepts the
+/// canonical UUID layout (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`,
+/// 36 chars) and the bare 32-char hex form. Case-insensitive.
+/// Returns `None` for any other input.
+fn parse_aaguid(raw: &str) -> Option<[u8; 16]> {
+    let stripped: String = raw.chars().filter(|c| *c != '-').collect();
+    if stripped.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = stripped.as_bytes()[i * 2];
+        let lo = stripped.as_bytes()[i * 2 + 1];
+        let nibble = |c: u8| -> Option<u8> {
+            match c {
+                b'0'..=b'9' => Some(c - b'0'),
+                b'a'..=b'f' => Some(c - b'a' + 10),
+                b'A'..=b'F' => Some(c - b'A' + 10),
+                _ => None,
+            }
+        };
+        *byte = (nibble(hi)? << 4) | nibble(lo)?;
+    }
+    Some(out)
+}
+
+/// Format a 16-byte AAGUID as a canonical UUID string. Used in
+/// log/error messages so operators see the same string they put in
+/// `fido2_allowed_aaguids`.
+fn format_aaguid(bytes: &[u8; 16]) -> String {
+    let hex = |b: &[u8]| -> String {
+        let mut s = String::with_capacity(b.len() * 2);
+        for byte in b {
+            s.push_str(&format!("{byte:02x}"));
+        }
+        s
+    };
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex(&bytes[0..4]),
+        hex(&bytes[4..6]),
+        hex(&bytes[6..8]),
+        hex(&bytes[8..10]),
+        hex(&bytes[10..16]),
+    )
 }
 
 /// **L-13 (security review)**: compare two credential-id strings by

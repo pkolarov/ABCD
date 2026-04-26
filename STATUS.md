@@ -1,7 +1,34 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #7 (CBOR depth-bomb defence —
+> Last updated: 2026-04-26 follow-up #8 (FIDO2 AAGUID allow-list —
+> closes Phase 1 of `docs/fido2-attestation-allowlist.md`). The
+> Authenticator Attestation GUID is now extracted from `authData`
+> bytes 37..53 in `dds-domain::fido2::parse_auth_data` and surfaced
+> as `ParsedAttestation::aaguid` (a `[u8; 16]`). A new
+> `fido2_allowed_aaguids: Vec<String>` field on `DomainConfig`
+> (defaulting to empty / off) lets operators restrict enrollment to
+> approved authenticator models — entries are canonical UUIDs
+> (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) or 32-char bare hex,
+> case-insensitive. When non-empty, both `LocalService::enroll_user`
+> and the bootstrap `admin_setup` path call
+> `enforce_fido2_aaguid_allow_list` after `verify_attestation` and
+> reject any AAGUID outside the set; the rejection error names the
+> offending AAGUID for operator triage. Unparseable config entries
+> surface as a hard startup error (refuse-to-start) rather than a
+> silent fallback to "any AAGUID". Test coverage: 3 new
+> `dds-domain::fido2::tests` (zero AAGUID, non-zero AAGUID,
+> `fmt = "none"` AAGUID extraction) plus 5 new tests in
+> `dds-node/tests/service_tests.rs` covering empty-allow-list
+> passthrough, listed-authenticator accepted, unlisted-authenticator
+> rejected, bare-hex / mixed-case parsing, and malformed-config
+> rejection. Workspace test count: 546 (up from 538); cargo fmt
+> clean; cargo clippy clean (workspace, all-targets,
+> `-D warnings`). No new dependencies. The doc closes the Phase 1
+> entry with an "✅ Implemented" marker; Phase 2 (full `packed` with
+> x5c + MDS) and Phase 3 (TPM) remain deferred.
+>
+> Previous: 2026-04-26 follow-up #7 (CBOR depth-bomb defence —
 > closes `Claude_sec_review.md` informational item I-6). New
 > `dds_core::cbor_bounded` module exposes a single helper,
 > `from_reader`, that wraps `ciborium::de::from_reader_with_recursion_limit`

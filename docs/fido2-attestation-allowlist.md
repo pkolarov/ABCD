@@ -7,8 +7,8 @@ DDS currently accepts two WebAuthn attestation formats during user enrollment
 
 | Format   | Description | x5c chain | AAGUID checked |
 |----------|-------------|-----------|----------------|
-| `none`   | No attestation statement. The authenticator provides only the credential public key. Suitable for platform authenticators and soft tokens. | No | No |
-| `packed` | Self-attestation only (no x5c certificate chain). The authenticator signs `authData ‖ clientDataHash` with the credential private key. Signature is verified against the extracted COSE public key. | **Skipped** | No |
+| `none`   | No attestation statement. The authenticator provides only the credential public key. Suitable for platform authenticators and soft tokens. | No | Optional, against `fido2_allowed_aaguids` |
+| `packed` | Self-attestation only (no x5c certificate chain). The authenticator signs `authData ‖ clientDataHash` with the credential private key. Signature is verified against the extracted COSE public key. | **Skipped** | Optional, against `fido2_allowed_aaguids` |
 
 Unsupported formats (`tpm`, `android-key`, `android-safetynet`, `apple`,
 `fido-u2f`) are rejected with a `Fido2Error::Format` error at enrollment time.
@@ -48,18 +48,19 @@ currently ignores the `x5c` array even if present. Reasons:
 ## AAGUID Considerations
 
 The Authenticator Attestation GUID (AAGUID) is extracted from the
-`authData` but **not validated** against an allow-list. This means:
-
-- Any FIDO2-compliant authenticator can be used for enrollment.
-- There is no restriction to specific hardware models.
-- Enterprises wanting to restrict enrollment to approved authenticator
-  models should implement an AAGUID allow-list (see upgrade path below).
+`authData` and is now (since 2026-04-26) **optionally** validated against an
+allow-list configured in `dds.toml`. By default the list is empty and any
+FIDO2-compliant authenticator can be used for enrollment; enterprises that
+want to restrict enrollment to approved authenticator models can populate
+the allow-list (see Phase 1 below). The AAGUID is not bound into the
+attestation statement otherwise — that's what Phase 2 (`packed` with
+`x5c` + MDS) and Phase 3 (TPM) add.
 
 ## Upgrade Path
 
-### Phase 1: AAGUID Allow-List (Recommended Near-Term)
+### Phase 1: AAGUID Allow-List ✅ Implemented (2026-04-26)
 
-Add a `fido2_allowed_aaguids` list to `DomainConfig`:
+Add a `fido2_allowed_aaguids` list to the `[domain]` section of `dds.toml`:
 
 ```toml
 [domain]
@@ -69,12 +70,33 @@ fido2_allowed_aaguids = [
 ]
 ```
 
-When non-empty, enrollment rejects any authenticator whose AAGUID is not in
-the list. When empty (default), all authenticators are accepted.
+Each entry must be a canonical UUID (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`)
+or a 32-character bare hex string. The parser is case-insensitive. When
+non-empty, enrollment (`POST /v1/enroll/user` and the bootstrap
+`admin_setup` path) rejects any authenticator whose AAGUID is not in the
+list with a `Fido2` error. When empty (the default), every AAGUID is
+accepted — including the all-zero AAGUID that platform authenticators
+emit. Unparseable entries are surfaced as a hard error at startup; the
+node refuses to serve traffic rather than silently falling back to "any
+AAGUID".
 
-Implementation: parse AAGUID from `authData` bytes 37..53 in
-`verify_attestation`, return it in `ParsedAttestation`, check against the
-config in `LocalService::enroll_user`.
+Implementation:
+
+- AAGUID is parsed from `authData` bytes 37..53 in
+  [`dds-domain/src/fido2.rs`](../dds-domain/src/fido2.rs) (`parse_auth_data`)
+  and surfaced as `ParsedAttestation::aaguid`.
+- The allow-list is configured via `DomainConfig::fido2_allowed_aaguids` in
+  [`dds-node/src/config.rs`](../dds-node/src/config.rs) and enforced by
+  `LocalService::enforce_fido2_aaguid_allow_list` in
+  [`dds-node/src/service.rs`](../dds-node/src/service.rs), called from both
+  `enroll_user` and `admin_setup`.
+- Eight regression tests pin the contract: three in
+  `dds-domain::fido2::tests` cover AAGUID extraction (zero, non-zero, and
+  `fmt = "none"`); five in `dds-node/tests/service_tests.rs` cover the
+  empty-allow-list passthrough, listed-authenticator accepted,
+  unlisted-authenticator rejected (with the offending AAGUID echoed in
+  the error), bare-hex / mixed-case parsing, and malformed-config
+  rejection.
 
 ### Phase 2: Full `packed` with x5c Verification
 

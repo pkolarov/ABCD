@@ -320,6 +320,7 @@ async fn spawn_node(
             // YubiKey hardware produces packed-with-x5c; this flag is
             // belt-and-braces.
             allow_unattested_credentials: true,
+            fido2_allowed_aaguids: Vec::new(),
         },
         trusted_roots: trusted_roots.to_vec(),
         bootstrap_admin_urn: None,
