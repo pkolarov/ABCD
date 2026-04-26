@@ -11,7 +11,7 @@
 > |---|---|---|---|
 > | Z-1 | **Critical** | Encrypted comms (PQC) | Noise/QUIC handshake is X25519/ECDHE only — *not* post-quantum. README "quantum-resistant by default" applies to token signatures, not the transport channel. Harvest-Now-Decrypt-Later exposure on all recorded P2P traffic. |
 > | Z-2 | **High** | HW-bound identity | [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md) is a plan; zero code shipped. libp2p PeerId, admission cert, admin keys, default domain root all software-keyed. |
-> | Z-3 | **High** | Immutable audit | Hash-chain + signature mechanism is correct, but `emit_local_audit` has zero production call sites. Audit log is empty in production. |
+> | Z-3 | **High** | Immutable audit | Hash-chain + signature mechanism is correct, but `emit_local_audit` has zero production call sites. Audit log is empty in production. **Implementation plan: [docs/observability-plan.md](docs/observability-plan.md) Phase A** (also delivers Phases B–F: SIEM export, Prometheus `/metrics`, Alertmanager rules, reference Grafana dashboards, `dds-cli` ops surface). |
 > | Z-4 | **High** | Encrypted at rest | redb store (`directory.redb`) is plaintext CBOR — tokens, ops, revocations, audit entries. Confidentiality depends on OS FDE + ACLs only. |
 > | Z-5 | **Medium** | Encrypted at rest | `dds-cli export` dumps are plaintext-CBOR (signed for integrity, not encrypted for confidentiality). |
 >

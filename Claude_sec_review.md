@@ -1997,6 +1997,14 @@ The L-12 follow-up in this review explicitly listed
 `emit_local_audit` as "the production chained-emit hook" — the hook
 exists; the call sites do not.
 
+**Implementation plan:** [docs/observability-plan.md](docs/observability-plan.md)
+Phase A specifies the action vocabulary, call-site map, and the
+small backward-compatible `reason` field for rejection paths.
+Phases B–F bundle the rest of the operational stack so this work
+delivers SIEM export, Prometheus `/metrics`, Alertmanager rules,
+reference Grafana dashboards, and the `dds-cli` ops surface in one
+coherent sweep instead of as a series of unrelated PRs.
+
 ### Z-4 (High) ❌ open — Persistent store is plaintext on disk
 
 The redb backend (`dds-store/src/redb_backend.rs:37-49`) writes all
