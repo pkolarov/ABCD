@@ -51,6 +51,7 @@ See [DDS Admin Guide — Windows Deployment](docs/DDS-Admin-Guide.md#windows-dep
 | **[Implementation Whitepaper](docs/DDS-Implementation-Whitepaper.md)** | Engineers | Technical deep-dive on implementation choices and performance budgets |
 | **[AD Drop-in Replacement Roadmap](docs/AD-drop-in-replacement-roadmap.md)** | Architects / Product | Gap map and claim-gated roadmap for DDS to become a credible AD DS replacement |
 | **[Observability Plan](docs/observability-plan.md)** | Operators / Engineers | Audit emission, Prometheus `/metrics`, Alertmanager rules, SIEM export, CLI ops surface — closes Z-3 and the AD-roadmap §4.9 Monitoring/SIEM row |
+| **[Supply-Chain Integrity & Self-Update Plan](docs/supply-chain-plan.md)** | Operators / Architects | Code-signing of DDS releases, two-signature gate on managed software, SLSA provenance / SBOM / `cargo-vet`, multi-sig fleet self-update — closes Z-6 / Z-7 / Z-8 |
 | **[Hardware-Bound Admission Plan](docs/hardware-bound-admission-plan.md)** | Architects | Phased plan to bind libp2p admission identity to TPM / Secure Enclave — closes Z-2 |
 | **[STATUS.md](STATUS.md)** | Contributors | Module-by-module implementation tracker with test counts |
 | **[Claude_sec_review.md](Claude_sec_review.md)** | Security reviewers | Source-validated security review with per-finding remediation status (latest pass 2026-04-21 — all Critical + High findings closed; 2026-04-26 zero-trust audit added Z-1..Z-5 open items) |

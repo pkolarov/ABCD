@@ -1970,40 +1970,36 @@ hard part, exactly the gap the plan exists to close.
 [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md).
 Promote the plan from Draft → CRITICAL.
 
-### Z-3 (High) ❌ open — Audit emission is unwired in production
+### Z-3 (High) ✅ closed 2026-04-26 follow-up #17 — Audit emission wired
 
 The audit-log mechanism is correct (SHA-256 hash chain + per-entry
 Ed25519 signature, append-only enforced atomically at
 `dds-store/src/redb_backend.rs:355-405`, inbound chain verification
-at `dds-node/src/node.rs:1040-1070`). But **no production code path
-calls `DdsNode::emit_local_audit`** (`dds-node/src/node.rs:1091`).
-Attestation issuance, revocation, burn, enrollment, and vouch all
-execute without writing an audit entry. `dds-cli audit entries`
-reads from a table nothing writes to.
+at `dds-node/src/node.rs:1040-1070`). The original finding flagged
+that **no production code path called `DdsNode::emit_local_audit`**;
+attestation issuance, revocation, burn, enrollment, and vouch all
+executed without writing an audit entry, and `dds-cli audit entries`
+read from a table nothing wrote to.
 
-**Attack:** No record of who did what is being kept. An incident
-response cannot reconstruct a timeline; a malicious admin leaves
-no trail.
+**Closed by:** `LocalService::emit_local_audit(action, token_bytes,
+reason)` (HTTP / admin paths) and `DdsNode::emit_audit_from_ingest`
+(gossip paths) now stamp the local chain on every state-mutating
+action and on every rejection branch. Phase A.2 added a signed
+`reason: Option<String>` field to `AuditLogEntry` so SIEM consumers
+can trust rejection reasons without re-deriving from the embedded
+token. Phase A.3 added seven regression tests covering each action
+plus the rejection vocabulary; cargo test --workspace passes.
+DdsNode now carries an `Option<Identity>` field populated from a
+second `identity_store::load_or_create` call in `main.rs`, so the
+swarm event loop can sign without violating the L-1 single-copy
+invariant. See [docs/observability-plan.md](docs/observability-plan.md)
+§Phase A for the full wiring matrix and acceptance criteria.
 
-**Remediation:** wire `emit_local_audit` into:
-- `dds-node::service::ingest_attestation`
-- `dds-node::service::ingest_vouch`
-- `dds-node::service::ingest_revocation`
-- `dds-node::service::ingest_burn`
-- `dds-node::http::issue_challenge` (enrollment events)
-- `dds-node::service` admin bootstrap / vouch promotion paths
-
-The L-12 follow-up in this review explicitly listed
-`emit_local_audit` as "the production chained-emit hook" — the hook
-exists; the call sites do not.
-
-**Implementation plan:** [docs/observability-plan.md](docs/observability-plan.md)
-Phase A specifies the action vocabulary, call-site map, and the
-small backward-compatible `reason` field for rejection paths.
-Phases B–F bundle the rest of the operational stack so this work
-delivers SIEM export, Prometheus `/metrics`, Alertmanager rules,
-reference Grafana dashboards, and the `dds-cli` ops surface in one
-coherent sweep instead of as a series of unrelated PRs.
+The remaining observability work — Phases B (SIEM export), C
+(Prometheus `/metrics`), D (health endpoints), E (Grafana
+dashboards + Alertmanager rules), F (`dds-cli` ops surface) — is
+**not Z-3**; it tracks under the same plan but blocks on the AD
+roadmap §4.9 row, not on this finding.
 
 ### Z-4 (High) ❌ open — Persistent store is plaintext on disk
 
@@ -2051,9 +2047,144 @@ These five findings are not duplicates of any prior review item:
   "Low / out of scope" but never address the post-quantum question
   for the handshake itself).
 - Z-2 is the open delivery of the plan introduced by `d5c2da5`.
-- Z-3 is a behavioural gap above L-12 (which fixed *chain integrity
-  on append* — but nothing appends).
+- Z-3 was a behavioural gap above L-12 (which fixed *chain integrity
+  on append* — but nothing appended). Closed 2026-04-26 follow-up
+  #17 by wiring `emit_local_audit` into the production HTTP and
+  gossip-ingest paths plus a signed-in `reason` field for
+  rejection paths.
 - Z-4 expands M-20's umask hardening into a structural at-rest
   question rather than a permission question.
 - Z-5 is the confidentiality complement to M-16 (which closed
   v1-downgrade *integrity*).
+
+---
+
+## 2026-04-26 Zero-Trust Audit — supply-chain follow-up
+
+A second pass against the supply-chain side of the zero-trust model
+(verifying installed updates, fleet propagation safety, admin-signed-
+only deployment) added three more open findings. **All three are
+open and tracked by [docs/supply-chain-plan.md](docs/supply-chain-plan.md)**
+(Phase A closes Z-6; Phase B closes Z-7; Phases C+D close Z-8).
+
+The audit confirmed that several already-known items closed earlier
+in this review remain solid: C-3 (publisher capability gate), B-6
+(software-cache TOCTOU + DACL), A-6 (download size cap), and the
+existing SHA-256 verification path. The findings below are
+**incremental** — they are layered on top of those existing controls.
+
+### Z-6 (Critical) ❌ open — DDS releases are unsigned in practice
+
+The Windows release pipeline at
+[.github/workflows/msi.yml:152-176](.github/workflows/msi.yml) has
+Authenticode scaffolding gated behind `if: env.SIGN_CERT != ''`. The
+`SIGN_CERT_BASE64` repository secret has never been provisioned, so
+the conditional silently skips signing on every release. The macOS
+pipeline at [.github/workflows/pkg.yml:115-130](.github/workflows/pkg.yml)
+does not call `codesign` or `notarytool` at all — only
+`pkgutil --payload-files` as a smoke test. CLI / FFI binaries
+publish to GitHub Releases unsigned. Once installed, the running
+node never re-checks itself.
+
+**Attack:** an attacker who compromises the GitHub Releases CDN, or
+intercepts the download path between CI and an operator host, can
+serve a backdoored `dds-node.exe` / `dds-cli` / macOS pkg. The
+installed binary has zero cryptographic attestation; no stock OS
+tooling (`signtool verify`, `spctl --assess`) succeeds — so an
+operator running a defensive verification step gets a "not signed"
+result regardless of whether the bits are tampered or pristine, and
+has no way to tell the difference.
+
+This finding promotes the recommendation already noted in
+[docs/threat-model-review.md](docs/threat-model-review.md) §3
+("Enable Authenticode signing in CI once the signing certificate is
+provisioned") from "pending" to **Critical**. It is the most
+actionable item in the supply-chain set: the code path exists; the
+work is provisioning the cert and dropping the conditional.
+
+**Remediation:** [docs/supply-chain-plan.md](docs/supply-chain-plan.md)
+Phase A.
+
+### Z-7 (High) ❌ open — Asymmetric package signature verification on managed software
+
+For DDS-managed third-party software, the document signature chain
+is solid: `SoftwareAssignment` is admin-signed, the
+`dds:software-publisher` capability gates publishing (C-3), the
+URL and SHA-256 live inside the signed body, and B-6 closed the
+TOCTOU between hash verify and launch. **But the package blob
+itself has no OS-vendor signature check on Windows.**
+
+- [`platform/windows/DdsPolicyAgent/Enforcers/WindowsSoftwareOperations.cs`](platform/windows/DdsPolicyAgent/Enforcers/WindowsSoftwareOperations.cs)
+  — verified by direct grep: no `WinVerifyTrust`, no `signtool`,
+  no `Authenticode`. SHA-256 is the sole check.
+- [`platform/macos/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs:134-137`](platform/macos/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs)
+  — `pkgutil --check-signature` is called, but only when
+  `_config.RequirePackageSignature` is true. The default is off.
+
+**Attack:** a publisher whose build pipeline is compromised
+(stolen signing material, malicious commit landed unnoticed) ships a
+malicious `.msi` that the publisher then signs with their valid
+DDS admin key. The DDS document chain is clean; the SHA-256 in the
+document matches the malicious blob; Windows endpoints install it
+without ever consulting the OS-vendor trust root. This is a single-
+point-of-failure gap: only the publisher's DDS admin key stands
+between the compromise and remote code execution at LocalSystem on
+every Windows endpoint subscribed to that publisher.
+
+The macOS path is structurally healthier (the call exists; flipping
+the default is small) but ships the unsafe default.
+
+**Remediation:** [docs/supply-chain-plan.md](docs/supply-chain-plan.md)
+Phase B — add `Option<PublisherIdentity>` to `SoftwareAssignment`,
+wire `WinVerifyTrust` on Windows, default `RequirePackageSignature=true`
+on macOS. Backward-compatible field with a documented migration
+window.
+
+### Z-8 (Medium) ❌ open — No fleet update mechanism + no build provenance
+
+Two related but separable gaps:
+
+**No automated fleet update for DDS itself.** Verified by direct
+grep: zero hits for `self.update` / `self_update` / `auto.update` /
+`tauri.updater` / `UpdateChannel` across `*.rs` / `*.cs` / `*.cpp` /
+`*.h` / `*.toml`. The Policy Agent installs third-party software but
+never updates `dds-node` itself. There is no `dds-update` CLI
+subcommand, no documented update procedure, no
+`DdsSelfUpdateDocument` type. Operators must manually re-deploy the
+MSI / pkg on every host for every release. A security patch to
+`dds-node` does not propagate by virtue of being in the gossip mesh.
+
+**No build provenance / SBOM / dependency audit.** `Cargo.lock` is
+pinned, but no SLSA provenance is attached at release time, no
+SBOM is published, `cargo-vet` is not adopted, and `cargo audit`
+is not in CI. The 2026-04-12 `security-gaps.md` flagged the
+dependency-audit gap as an operational item — it has not been
+closed since.
+
+**Attack:** (a) a critical fix to `dds-node` does not reach the
+fleet without manual operator action, leaving a known-vulnerable
+window; (b) a CI compromise injects malicious dependencies or build
+artefacts into a release with no observable change to source and
+no provenance trail to detect it after the fact.
+
+**Remediation:** [docs/supply-chain-plan.md](docs/supply-chain-plan.md)
+Phases C (provenance, SBOM, `cargo-vet`, `cargo audit`) and D
+(`DdsSelfUpdateDocument` with multi-sig admin gating, staged
+canary rollout, dedicated `dds:dds-self-update-publisher` capability
+separate from the regular `dds:software-publisher` so a publisher
+key for third-party apps cannot be repurposed to ship code to
+every node).
+
+### Cross-reference
+
+- Z-6 promotes [docs/threat-model-review.md](docs/threat-model-review.md)
+  §3 from "pending" to Critical.
+- Z-7 is the OS-vendor-trust-root complement to C-3 (DDS-trust-root
+  publisher capability, already closed). Both are required for
+  defense-in-depth.
+- Z-8 (provenance) closes the dependency-audit gap left open since
+  the 2026-04-12 `security-gaps.md`.
+- Z-8 (self-update) interacts with Z-2: the multi-sig compensating
+  control becomes weaker as soon as a single admin key is compromised
+  off a software-resident store. Hardware-binding the publisher keys
+  raises the floor.

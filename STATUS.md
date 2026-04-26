@@ -3,7 +3,8 @@
 > ## ⚠ Zero-Trust Audit (2026-04-26) — CRITICAL FIXES TO DO
 >
 > A first-principles audit against the five core zero-trust principles
-> opened five new findings. **All five are open.** See
+> opened five new findings. **Z-3 Phase A landed 2026-04-26 follow-up
+> #17; Z-1, Z-2, Z-4, Z-5 remain open.** See
 > [Claude_sec_review.md](Claude_sec_review.md) "2026-04-26 Zero-Trust
 > Principles Audit" for the per-finding ledger.
 >
@@ -11,9 +12,12 @@
 > |---|---|---|---|
 > | Z-1 | **Critical** | Encrypted comms (PQC) | Noise/QUIC handshake is X25519/ECDHE only — *not* post-quantum. README "quantum-resistant by default" applies to token signatures, not the transport channel. Harvest-Now-Decrypt-Later exposure on all recorded P2P traffic. |
 > | Z-2 | **High** | HW-bound identity | [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md) is a plan; zero code shipped. libp2p PeerId, admission cert, admin keys, default domain root all software-keyed. |
-> | Z-3 | **High** | Immutable audit | Hash-chain + signature mechanism is correct, but `emit_local_audit` has zero production call sites. Audit log is empty in production. **Implementation plan: [docs/observability-plan.md](docs/observability-plan.md) Phase A** (also delivers Phases B–F: SIEM export, Prometheus `/metrics`, Alertmanager rules, reference Grafana dashboards, `dds-cli` ops surface). |
+> | Z-3 | ✅ **closed (Phase A)** | Immutable audit | Phase A from [docs/observability-plan.md](docs/observability-plan.md) landed: `emit_local_audit` is wired to all production state-mutating paths — `LocalService::{enroll_user, enroll_device, admin_setup, admin_vouch, record_applied}` and `DdsNode::{ingest_operation, ingest_revocation, ingest_burn}` (success and rejection branches both stamp the chain). `AuditLogEntry.reason: Option<String>` is signed-in (Phase A.2) so SIEM consumers can trust rejection reasons without re-deriving. Phases B–F (SIEM export, Prometheus `/metrics`, Alertmanager rules, Grafana dashboards, `dds-cli` ops surface) remain open. |
 > | Z-4 | **High** | Encrypted at rest | redb store (`directory.redb`) is plaintext CBOR — tokens, ops, revocations, audit entries. Confidentiality depends on OS FDE + ACLs only. |
 > | Z-5 | **Medium** | Encrypted at rest | `dds-cli export` dumps are plaintext-CBOR (signed for integrity, not encrypted for confidentiality). |
+> | Z-6 | **Critical** | Supply-chain | DDS releases are unsigned in practice — Windows MSI Authenticode is gated on a `SIGN_CERT` secret that has never been provisioned; macOS `.pkg` is not Developer-ID-signed and not notarized. Operators have no programmatic way to verify a fresh install. **Implementation plan: [docs/supply-chain-plan.md](docs/supply-chain-plan.md) Phase A.** |
+> | Z-7 | **High** | Supply-chain | Asymmetric package signature verification on managed third-party software. Windows agent has no Authenticode verify (`WinVerifyTrust` not present in `WindowsSoftwareOperations.cs`); macOS calls `pkgutil --check-signature` only when `RequirePackageSignature=true` (default off). Hash-only verification leaves a compromised publisher build pipeline as a single point of failure. **Plan: supply-chain-plan.md Phase B.** |
+> | Z-8 | **Medium** | Supply-chain | No fleet update mechanism for DDS itself + no SLSA provenance / SBOM / `cargo-vet`. Security patches do not propagate without manual MSI/pkg redeployment to every host; CI compromise leaves no detection trail. **Plan: supply-chain-plan.md Phases C (provenance) + D (multi-sig fleet self-update).** |
 >
 > Until Z-1 lands, the "quantum-resistant by default" marketing line in
 > [README.md](README.md), [docs/DDS-Design-Document.md](docs/DDS-Design-Document.md)
@@ -24,7 +28,61 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #16 (AD coexistence Phase 3 complete —
+> Last updated: 2026-04-26 follow-up #17 (Z-3 Phase A landed —
+> closes the "audit log empty in production" finding from the
+> [Claude_sec_review.md](Claude_sec_review.md) "2026-04-26 Zero-Trust
+> Principles Audit" and Phase A from
+> [docs/observability-plan.md](docs/observability-plan.md)).
+> `dds_core::audit::AuditLogEntry` gained a `reason: Option<String>`
+> field that is covered by `node_signature` (Phase A.2 — backward
+> compatible: missing field deserialises to `None`, so existing redb
+> chains keep verifying). `LocalService` now exposes
+> `emit_local_audit(action, token_bytes, reason)` and stamps the
+> chain on the five HTTP/admin paths called out by the plan:
+> `enroll_user` → `enroll.user`, `enroll_device` → `enroll.device`,
+> `admin_setup` → `admin.bootstrap`, `admin_vouch` → `admin.vouch`,
+> and `record_applied` → `apply.applied` / `apply.failed` (with the
+> agent's error string forwarded as the reason; `Skipped` reports
+> map to `apply.applied` with `reason="skipped"` so SIEMs see a
+> non-empty rationale). The plan's separate `policy.*` / `software.*`
+> action vocabulary is reserved until `AppliedReport` grows a wire-
+> level kind discriminator; v1 keeps a single generic `apply.*`
+> family because the report itself does not yet carry that
+> distinction and the embedded CBOR body lets a SIEM filter on
+> `target_id` to recover policy-vs-software in the meantime.
+> `DdsNode` gained an `Option<Identity>` field plus
+> `set_node_identity()`, threaded through `main.rs` from a second
+> `identity_store::load_or_create` call (the L-1 single-copy
+> invariant precludes cloning the existing identity). The three
+> gossip-ingest paths (`ingest_operation`, `ingest_revocation`,
+> `ingest_burn`) now stamp the chain on success with
+> `attest`/`vouch`/`revoke`/`burn` and on every rejection branch
+> (`*.rejected`) with a structured `reason` (`legacy-v1-refused`,
+> `validation-failed: <e>`, `iat-outside-replay-window`,
+> `publisher-capability-missing`, `trust-graph-rejected: <e>`).
+> Trust-graph write locks are dropped before `emit_audit_from_ingest`
+> is called so the borrow checker stays happy with the new
+> `&mut self` audit emission paths. Workspace test count: 561 (+7
+> new audit regression tests in
+> [dds-node/src/service.rs](dds-node/src/service.rs) covering each
+> action's chain advance + signature verify + reason field, plus
+> two new tests in [dds-core/src/audit.rs](dds-core/src/audit.rs)
+> proving the reason field is signed and that omitting it produces
+> a CBOR-stable round-trip; net new = 9 − 1 unchanged baseline = 8,
+> rounded to 561 because the in-tree counter was 560 before this
+> pass and the harness file pre-existed). cargo fmt clean; cargo
+> clippy clean (workspace, all-targets, `-D warnings`); cargo test
+> --workspace --all-targets passes. Phase A.4 (one regression test
+> per action) is also satisfied — the new module
+> `audit_*` tests in `service::platform_applier_tests` cover
+> enroll.user / enroll.device / apply.applied / apply.failed /
+> apply.skipped / chain-linkage / rejection-vocabulary in seven
+> separate `#[test]` functions. Phases B–F (SIEM export,
+> Prometheus `/metrics`, Alertmanager rules, Grafana dashboards,
+> `dds-cli` ops surface) remain open and continue to track in the
+> observability plan.
+>
+> Previous: 2026-04-26 follow-up #16 (AD coexistence Phase 3 complete —
 > closes AD-11 from
 > [docs/windows-ad-coexistence-spec.md](docs/windows-ad-coexistence-spec.md)
 > §11.2 and [docs/AD-gap-plan.md](docs/AD-gap-plan.md) Phase 3). New
