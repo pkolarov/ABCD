@@ -15,7 +15,7 @@ fn test_help() {
     // All top-level subcommands should be advertised in --help.
     for cmd in [
         "identity", "group", "policy", "status", "enroll", "admin", "audit", "platform", "cp",
-        "debug", "export", "import",
+        "debug", "stats", "health", "export", "import",
     ] {
         assert!(stdout.contains(cmd), "help missing {cmd}: {stdout}");
     }
@@ -43,6 +43,9 @@ fn test_subcommand_help() {
         vec!["debug", "ping", "--help"],
         vec!["debug", "stats", "--help"],
         vec!["debug", "config", "--help"],
+        vec!["stats", "--help"],
+        vec!["health", "--help"],
+        vec!["audit", "export", "--help"],
         vec!["export", "--help"],
         vec!["import", "--help"],
     ] {
@@ -65,6 +68,9 @@ fn test_remote_commands_fail_when_node_absent() {
         vec!["--node-url", bad_url, "audit", "list"],
         vec!["--node-url", bad_url, "debug", "ping"],
         vec!["--node-url", bad_url, "debug", "stats"],
+        vec!["--node-url", bad_url, "stats"],
+        vec!["--node-url", bad_url, "health"],
+        vec!["--node-url", bad_url, "audit", "export"],
     ] {
         let out = dds_cli().args(&tree).output().unwrap();
         assert!(!out.status.success(), "expected failure for {tree:?}");
@@ -74,6 +80,42 @@ fn test_remote_commands_fail_when_node_absent() {
             "unexpected stderr for {tree:?}: {stderr}"
         );
     }
+}
+
+#[test]
+fn test_audit_export_rejects_unknown_format() {
+    // Format check happens before any HTTP call, so an unreachable
+    // node-url is fine — the CLI must exit non-zero with a clear
+    // message naming the unsupported format.
+    let bad_url = "http://127.0.0.1:1";
+    let out = dds_cli()
+        .args(["--node-url", bad_url, "audit", "export", "--format", "cef"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unsupported audit export format"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_health_rejects_unknown_format_after_reach_failure() {
+    // `health` parses --format only after the HTTP call returns, so an
+    // unreachable URL fails earlier with the standard reach error —
+    // matching the test_remote_commands_fail_when_node_absent posture.
+    let bad_url = "http://127.0.0.1:1";
+    let out = dds_cli()
+        .args(["--node-url", bad_url, "health", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot reach dds-node"),
+        "unexpected stderr: {stderr}"
+    );
 }
 
 #[test]

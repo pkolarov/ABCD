@@ -97,7 +97,7 @@ See [DDS Admin Guide — Windows Deployment](docs/DDS-Admin-Guide.md#windows-dep
 | `dds-net` | lib | libp2p transport, gossipsub, Kademlia, mDNS, delta-sync |
 | `dds-node` | lib + bin | P2P daemon + local authority HTTP API |
 | `dds-ffi` | cdylib | C ABI for Python/C#/Swift/Kotlin bindings |
-| `dds-cli` | bin | CLI: identity, group, policy, status, enroll, admin, audit, platform, cp, debug, export/import |
+| `dds-cli` | bin | CLI: identity, group, policy, status, enroll, admin, audit (list/tail/verify/export), platform, cp, debug, stats, health, export/import |
 | `dds-loadtest` | bin | Multi-node load/soak test harness |
 | `dds-fido2-test` | bin | WebAuthn testing utility |
 
@@ -186,6 +186,9 @@ dds admin vouch --subject-urn urn:vouchsafe:bob.<hash> \
 # Audit log
 dds audit list                           # newest first
 dds audit list --action vouch --limit 50
+dds audit tail --follow-interval 5       # SIEM JSONL stream
+dds audit verify                         # walk + verify the chain
+dds audit export --since 0 --out audit.jsonl   # one-shot range dump for forensics
 
 # Platform applier queries (agent-facing, but useful for debugging)
 dds platform windows policies  --device-urn urn:vouchsafe:laptop.<hash>
@@ -203,6 +206,12 @@ dds cp session-assert --credential-id ... --authenticator-data ... \
 dds debug ping                           # reachability check
 dds debug stats                          # pretty-printed NodeStatus
 dds debug config ./config.toml           # offline TOML validation
+
+# Operational snapshots (observability-plan.md Phase F)
+dds stats                                # peers + trust-graph + audit head age
+dds stats --format json                  # same, scriptable
+dds health                               # /readyz + summary; exit 0 when ready
+dds health --format json                 # checks body for orchestrator parsing
 
 # Air-gapped sync (USB stick / courier)
 dds --data-dir ./node-a export --out sync.ddsdump   # package tokens + CRDT ops + revocations

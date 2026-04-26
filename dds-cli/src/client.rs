@@ -91,6 +91,39 @@ where
     handle_response(resp).await
 }
 
+/// `GET {base}{path}` returning `(StatusCode, body_bytes)` without
+/// exiting on non-success. The caller decides how to interpret the
+/// status code — used by `dds-cli health` because `/readyz` returns
+/// 503 with a JSON body when not ready, which is the expected output
+/// rather than an error.
+pub async fn get_with_status(
+    base: &str,
+    path: &str,
+    query: &[(&str, &str)],
+) -> (StatusCode, Bytes) {
+    enforce_tls_for_non_loopback(base);
+
+    if let Some(sock) = base.strip_prefix("unix:") {
+        let full_path = build_path_with_query(path, query);
+        return uds_request(sock, "GET", &full_path, Bytes::new(), None).await;
+    }
+
+    let client = new_client();
+    let url = format!("{base}{path}");
+    let resp = client
+        .get(&url)
+        .query(query)
+        .send()
+        .await
+        .unwrap_or_else(|e| fail_reach(&url, &e.to_string()));
+    let status = resp.status();
+    let bytes = resp
+        .bytes()
+        .await
+        .unwrap_or_else(|e| fail(&format!("read response body: {e}")));
+    (status, bytes)
+}
+
 /// Run `POST {base}{path}` with a JSON body, deserializing the JSON
 /// response. Same error handling as `get_json`.
 pub async fn post_json<Req, Resp>(base: &str, path: &str, body: &Req) -> Resp

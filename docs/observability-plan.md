@@ -6,10 +6,10 @@ Phase B sub-tasks B.1 (`dds-cli audit tail` JSONL stream) and B.2
 (`dds-cli audit verify` chain walk) landed 2026-04-26 follow-up #19;
 Phase B sub-tasks B.3 (Vector / fluent-bit reference configs) and
 B.4 (`audit-event-schema.md`) landed 2026-04-26 follow-up #20 — Phase
-B is now complete. Phases C (Prometheus `/metrics`), E (reference
-Grafana dashboards + Alertmanager rules), and F (the rest of the
-`dds-cli` ops surface — `stats`, `health`, `audit export`) remain
-open.
+B is now complete. Phase F (`dds-cli stats`, `dds-cli health`,
+`dds-cli audit export`) landed 2026-04-26 follow-up #21. Phases C
+(Prometheus `/metrics`) and E (reference Grafana dashboards +
+Alertmanager rules) remain open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -18,8 +18,9 @@ row in
 [AD-drop-in-replacement-roadmap.md](AD-drop-in-replacement-roadmap.md)
 §4.9 (line 194 — *"JSON/syslog/OpenTelemetry export; health checks;
 audit query tooling"*) — health-checks half closed by Phase D
-(2026-04-26 follow-up #18); SIEM export + audit query tooling still
-open under Phases B + F.
+(2026-04-26 follow-up #18); SIEM export closed by Phase B
+(follow-ups #19/#20); audit query tooling closed by Phase F
+(follow-up #21).
 **Owner:** TBD.
 
 ---
@@ -401,17 +402,23 @@ import without DDS-specific tooling.
   - `DdsStoreWriteFailures` —
     `rate(dds_store_writes_total{result!="ok"}[5m]) > 0`.
 
-### Phase F — CLI surface for ad-hoc ops
+### Phase F — CLI surface for ad-hoc ops ✅
+
+**Status: landed 2026-04-26 follow-up #21.** All four subcommands
+shipped; `last admission failure` and `store bytes` are deferred to
+Phase C because both depend on the Prometheus metrics catalog
+(`dds_admission_handshakes_total{result="fail"}` and
+`dds_store_bytes`) — neither is exposed by `/v1/status` today.
 
 Subcommands added to `dds-cli`:
 
-| Command | Purpose |
-|---|---|
-| `dds-cli stats` | Single-shot snapshot of the most-asked metrics — peer count, attestation count, audit chain length + head age, last admission failure, store bytes. Pretty-prints; `--format json` for scripting. |
-| `dds-cli audit tail` | (Phase B.1) |
-| `dds-cli audit verify` | (Phase B.2) |
-| `dds-cli audit export` | One-shot range dump (JSONL/CEF/syslog) for offline forensics. |
-| `dds-cli health` | Calls `/readyz` + summarizes. |
+| Command | Status | Purpose |
+|---|---|---|
+| `dds-cli stats` | ✅ | Composes `/v1/status` + `/v1/audit/entries` into one snapshot — peer ID + uptime, connected peers, trust-graph + store sizes, audit chain length + head age + head action. Pretty-prints by default; `--format json` emits a single JSON object for scripting / Prometheus textfile fallbacks. `last admission failure` and `store bytes` deferred to Phase C (need the `/metrics` catalog). |
+| `dds-cli audit tail` | ✅ | (Phase B.1) |
+| `dds-cli audit verify` | ✅ | (Phase B.2) |
+| `dds-cli audit export` | ✅ | One-shot range dump — `--since` / `--until` / `--action` filters, `--out <file>` for incident-response bundles, otherwise stdout. JSONL only in this build (cef and syslog tracked under Phase B.1 follow-ups). Each line is verified locally before emission so a tampered entry surfaces as `sig_ok=false` rather than being silently trusted. |
+| `dds-cli health` | ✅ | Calls `/readyz` and prints the `{ready, checks}` body. Exits 0 when ready, 1 otherwise — orchestrator-friendly. `--format json` for scripting; `--format text` (default) for humans. Returns the HTTP status code so a 503-with-body looks distinct from a network failure. |
 
 ## 5. Tradeoffs
 

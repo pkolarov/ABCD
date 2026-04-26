@@ -12,7 +12,7 @@ mod client;
 mod dump;
 
 use clap::{Parser, Subcommand};
-use client::{DEFAULT_NODE_URL, get_json, post_json, post_no_body};
+use client::{DEFAULT_NODE_URL, get_json, get_with_status, post_json, post_no_body};
 use dds_core::identity::Identity;
 use dds_store::RedbBackend;
 use dds_store::traits::*;
@@ -91,6 +91,23 @@ enum Commands {
     Debug {
         #[command(subcommand)]
         action: DebugAction,
+    },
+    /// Snapshot of the most-asked operational metrics — peer count,
+    /// trust-graph + store sizes, audit chain length and head age.
+    /// **observability-plan.md Phase F.** Pretty-prints by default;
+    /// pass `--format json` for scripting.
+    Stats {
+        /// Output format: `text` (pretty, default) or `json`.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Probe the node's `/readyz` endpoint and summarize the result.
+    /// **observability-plan.md Phase F.** Exits 0 when ready, 1 when
+    /// not — suitable for orchestrator health checks and shell pipelines.
+    Health {
+        /// Output format: `text` (pretty, default) or `json`.
+        #[arg(long, default_value = "text")]
+        format: String,
     },
     /// Export the local store to a single `.ddsdump` file for air-gapped sync.
     Export {
@@ -304,6 +321,34 @@ enum AuditAction {
         #[arg(long)]
         action: Option<String>,
     },
+    /// One-shot range dump of audit entries to stdout or a file.
+    /// **observability-plan.md Phase F.** Like a single-pass `audit
+    /// tail` with optional `--until` upper bound and `--out` file
+    /// destination — intended for offline forensics and incident
+    /// response bundles. Each line is verified locally before emission
+    /// so a tampered entry is flagged with `sig_ok=false` rather than
+    /// silently trusted.
+    Export {
+        /// Lower bound: include only entries with `timestamp >= since`
+        /// (Unix seconds). Default 0 = no lower bound.
+        #[arg(long, default_value_t = 0)]
+        since: u64,
+        /// Upper bound: include only entries with `timestamp <= until`
+        /// (Unix seconds). Optional; omit for no upper bound.
+        #[arg(long)]
+        until: Option<u64>,
+        /// Filter by action (forwarded to the server as a query param).
+        #[arg(long)]
+        action: Option<String>,
+        /// Output format. `jsonl` is the canonical format and the only
+        /// one implemented in this build (cef and syslog are tracked
+        /// under Phase B.1 follow-ups).
+        #[arg(long, default_value = "jsonl")]
+        format: String,
+        /// File path to write to. If omitted, writes to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 // ---- Platform ----
@@ -438,6 +483,8 @@ async fn main() {
             handle_cp(action, &url).await;
         }
         Commands::Debug { action } => handle_debug(action, &cli.node_url).await,
+        Commands::Stats { format } => handle_stats(&cli.node_url, &format).await,
+        Commands::Health { format } => handle_health(&cli.node_url, &format).await,
         Commands::Export { out } => handle_export(&cli.data_dir, &out),
         Commands::Import {
             input,
@@ -811,6 +858,23 @@ async fn handle_audit(action: AuditAction, node_url: &str) {
         AuditAction::Verify { action } => {
             run_audit_verify(node_url, action.as_deref()).await;
         }
+        AuditAction::Export {
+            since,
+            until,
+            action,
+            format,
+            out,
+        } => {
+            run_audit_export(
+                node_url,
+                since,
+                until,
+                &format,
+                action.as_deref(),
+                out.as_deref(),
+            )
+            .await;
+        }
     }
 }
 
@@ -962,6 +1026,243 @@ async fn run_audit_verify(node_url: &str, action: Option<&str>) {
         "Audit chain verify: OK ({} entries, signatures + chain links intact).",
         r.entries.len()
     );
+}
+
+/// **observability-plan.md Phase F.** One-shot range dump of audit
+/// entries. Single GET against `/v1/audit/entries` with the
+/// server-side `since` + `action` filters; the `until` upper bound is
+/// applied client-side because the endpoint does not (yet) expose it
+/// — fine for v1 because audit chains are bounded by
+/// `audit_log_max_entries`. Each line is verified locally before
+/// emission, so a tampered entry surfaces as `sig_ok=false` rather
+/// than being silently trusted by an offline forensics consumer.
+async fn run_audit_export(
+    node_url: &str,
+    since: u64,
+    until: Option<u64>,
+    format: &str,
+    action: Option<&str>,
+    out: Option<&Path>,
+) {
+    if !matches!(format, "jsonl") {
+        eprintln!(
+            "Error: unsupported audit export format `{format}` — \
+             only `jsonl` is implemented in this build (cef and \
+             syslog are tracked under Phase B.1 follow-ups)."
+        );
+        std::process::exit(1);
+    }
+
+    let mut q: Vec<(&str, String)> = Vec::new();
+    q.push(("since", since.to_string()));
+    if let Some(a) = action {
+        q.push(("action", a.to_string()));
+    }
+    let query_refs: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let r: AuditEntriesResponse = get_json(node_url, "/v1/audit/entries", &query_refs).await;
+
+    // Collect formatted lines first so a write to `--out` is atomic
+    // from the caller's perspective: either the dump is whole or not
+    // there at all. Audit chains are bounded so the buffer stays small.
+    let mut lines: Vec<String> = Vec::with_capacity(r.entries.len());
+    let mut emitted: usize = 0;
+    for e in &r.entries {
+        if let Some(u) = until {
+            if e.timestamp > u {
+                continue;
+            }
+        }
+        let sig_ok = match decode_audit_entry(e) {
+            Some(decoded) => decoded.verify().is_ok(),
+            None => false,
+        };
+        let line = serde_json::json!({
+            "ts": e.timestamp,
+            "action": e.action,
+            "reason": e.reason,
+            "node_urn": e.node_urn,
+            "chain_hash": e.chain_hash_hex,
+            "prev_hash": e.prev_hash_hex,
+            "sig_ok": sig_ok,
+            "token_cbor_b64": e.token_cbor_b64,
+        });
+        lines.push(line.to_string());
+        emitted += 1;
+    }
+
+    let body = lines.join("\n");
+    match out {
+        Some(path) => {
+            // One trailing newline so the file is POSIX-correct.
+            let mut payload = body.clone();
+            if !payload.is_empty() {
+                payload.push('\n');
+            }
+            std::fs::write(path, payload).unwrap_or_else(|e| {
+                eprintln!("Error: cannot write {}: {e}", path.display());
+                std::process::exit(1);
+            });
+            println!(
+                "Exported {emitted} audit entr{} to {}",
+                if emitted == 1 { "y" } else { "ies" },
+                path.display()
+            );
+        }
+        None => {
+            if !body.is_empty() {
+                println!("{body}");
+            }
+        }
+    }
+}
+
+/// **observability-plan.md Phase F.** Probe the node's `/readyz`
+/// endpoint and summarize. Exits 0 when ready, 1 otherwise — so
+/// `dds-cli health && deploy.sh` works as the natural gate. We use
+/// `get_with_status` rather than `get_json` because `/readyz` returns
+/// HTTP 503 with a JSON body when not ready and that body is the
+/// expected output, not an error to propagate.
+async fn handle_health(node_url: &str, format: &str) {
+    let (status, body) = get_with_status(node_url, "/readyz", &[]).await;
+    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "Error: /readyz returned non-JSON body (HTTP {status}): {e}\n  body: {}",
+                String::from_utf8_lossy(&body)
+            );
+            std::process::exit(1);
+        }
+    };
+    let ready = parsed
+        .get("ready")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    match format {
+        "json" => {
+            let mut envelope = serde_json::Map::new();
+            envelope.insert(
+                "http_status".to_string(),
+                serde_json::Value::from(status.as_u16()),
+            );
+            envelope.insert("ready".to_string(), serde_json::Value::Bool(ready));
+            if let Some(checks) = parsed.get("checks") {
+                envelope.insert("checks".to_string(), checks.clone());
+            }
+            println!("{}", serde_json::Value::Object(envelope));
+        }
+        "text" => {
+            println!(
+                "DDS Node Health: {} (HTTP {})",
+                if ready { "READY" } else { "NOT READY" },
+                status.as_u16()
+            );
+            if let Some(checks) = parsed.get("checks").and_then(|v| v.as_object()) {
+                println!("  Checks:");
+                for (name, value) in checks {
+                    let v = match value {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    println!("    {name}: {v}");
+                }
+            }
+        }
+        other => {
+            eprintln!("Error: unsupported health format `{other}` — use `text` or `json`.");
+            std::process::exit(1);
+        }
+    }
+
+    if !ready {
+        std::process::exit(1);
+    }
+}
+
+/// **observability-plan.md Phase F.** One-shot snapshot of the most-
+/// asked operational metrics. Composes `/v1/status` (peer count,
+/// trust-graph + store sizes, uptime) with a single
+/// `/v1/audit/entries` call to derive audit chain length and head age.
+/// Pretty-prints by default; `--format json` emits a single JSON
+/// object suitable for piping into `jq` or Prometheus textfile
+/// scrapers that have not been migrated to the future `/metrics`
+/// endpoint (Phase C).
+async fn handle_stats(node_url: &str, format: &str) {
+    let status: NodeStatusJson = get_json(node_url, "/v1/status", &[]).await;
+    // Pull the full chain — bounded by `audit_log_max_entries`, so the
+    // request stays small. `total` from the response is the post-filter
+    // count which equals the chain length when no filter is supplied.
+    let audit: AuditEntriesResponse = get_json(node_url, "/v1/audit/entries", &[]).await;
+    let chain_length = audit.total;
+    let head = audit.entries.last();
+    let head_ts = head.map(|e| e.timestamp);
+    let head_action = head.map(|e| e.action.clone());
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let head_age_secs = head_ts.map(|ts| now.saturating_sub(ts));
+
+    match format {
+        "json" => {
+            let body = serde_json::json!({
+                "node": {
+                    "peer_id": status.peer_id,
+                    "uptime_secs": status.uptime_secs,
+                    "connected_peers": status.connected_peers,
+                },
+                "trust_graph": {
+                    "tokens": status.trust_graph_tokens,
+                    "trusted_roots": status.trusted_roots,
+                    "dag_operations": status.dag_operations,
+                },
+                "store": {
+                    "tokens": status.store_tokens,
+                    "revoked": status.store_revoked,
+                    "burned": status.store_burned,
+                },
+                "audit": {
+                    "chain_length": chain_length,
+                    "head_ts": head_ts,
+                    "head_action": head_action,
+                    "head_age_secs": head_age_secs,
+                },
+            });
+            println!("{body}");
+        }
+        "text" => {
+            println!("DDS Node Stats");
+            println!("  Peer ID:          {}", status.peer_id);
+            println!("  Uptime:           {}s", status.uptime_secs);
+            println!("  Connected peers:  {}", status.connected_peers);
+            println!("  Trust graph:");
+            println!("    Tokens:         {}", status.trust_graph_tokens);
+            println!("    Trusted roots:  {}", status.trusted_roots);
+            println!("    DAG operations: {}", status.dag_operations);
+            println!("  Store:");
+            println!("    Tokens:         {}", status.store_tokens);
+            println!("    Revocations:    {}", status.store_revoked);
+            println!("    Burned:         {}", status.store_burned);
+            println!("  Audit:");
+            println!("    Chain length:   {chain_length}");
+            match (head_ts, head_action.as_deref(), head_age_secs) {
+                (Some(ts), Some(act), Some(age)) => {
+                    println!("    Head ts:        {ts}");
+                    println!("    Head action:    {act}");
+                    println!("    Head age:       {age}s");
+                }
+                _ => {
+                    println!("    (chain empty)");
+                }
+            }
+        }
+        other => {
+            eprintln!("Error: unsupported stats format `{other}` — use `text` or `json`.");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Decode the `entry_cbor_b64` field from an `/v1/audit/entries` row
