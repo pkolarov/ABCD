@@ -1887,6 +1887,23 @@ impl<
         Ok(entries.last().map(|e| e.timestamp))
     }
 
+    /// Number of FIDO2 challenges currently outstanding in the
+    /// challenge store (B-5 backstop reference). observability-plan.md
+    /// Phase C — backs the `dds_challenges_outstanding` Prometheus
+    /// gauge. Returns `None` when the underlying store read fails so
+    /// the metrics renderer can degrade to a zero rather than panic
+    /// the scrape task; this matches the `trust_graph_counts`
+    /// poison-tolerance pattern.
+    ///
+    /// **Counts live + expired-but-not-yet-swept rows.** The expiry
+    /// sweeper ([`crate::expiry::ExpiryConfig`]) clears expired
+    /// challenges on its own cadence, so a non-zero gauge between
+    /// sweeps is normal. The B-5 alarm condition is *unbounded
+    /// growth*, which the gauge will surface as a rising baseline.
+    pub fn challenges_outstanding(&self) -> Option<usize> {
+        self.store.count_challenges().ok()
+    }
+
     /// One-shot trust-graph counts under a single read-lock
     /// acquisition. observability-plan.md Phase C — backs the
     /// `dds_trust_graph_attestations`, `dds_trust_graph_vouches`,
@@ -3583,6 +3600,40 @@ mod platform_applier_tests {
         assert_eq!(counts.vouches, 3);
         assert_eq!(counts.revocations, 0);
         assert_eq!(counts.burned, 0);
+    }
+
+    /// observability-plan.md Phase C — regression test for the
+    /// `dds_challenges_outstanding` Prometheus gauge. Pins that
+    /// `LocalService::challenges_outstanding` (a) reports zero on a
+    /// freshly constructed service, (b) increases monotonically as
+    /// challenges are inserted, and (c) drops back as the expiry
+    /// sweeper clears them. The B-5 alarm condition is *unbounded
+    /// growth* — this gauge is the operator-visible signal that the
+    /// sweeper is keeping up.
+    #[test]
+    fn challenges_outstanding_tracks_store_population() {
+        use dds_store::traits::ChallengeStore;
+
+        let (mut svc, _, _) = setup();
+        assert_eq!(svc.challenges_outstanding(), Some(0));
+
+        // Insert two challenges with far-future expiry so the sweep
+        // is a no-op; gauge must report the live row count.
+        let far_future = now_epoch() + 60 * 60;
+        svc.store_mut()
+            .put_challenge("ch-1", &[7u8; 32], far_future)
+            .unwrap();
+        svc.store_mut()
+            .put_challenge("ch-2", &[8u8; 32], far_future)
+            .unwrap();
+        assert_eq!(svc.challenges_outstanding(), Some(2));
+
+        // Sweep with a `now` past `far_future` clears both rows;
+        // gauge returns to zero.
+        svc.store_mut()
+            .sweep_expired_challenges(far_future + 1)
+            .unwrap();
+        assert_eq!(svc.challenges_outstanding(), Some(0));
     }
 
     #[test]

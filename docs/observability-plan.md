@@ -21,10 +21,15 @@ landed 2026-04-26 follow-up #24, also activating the
 **trust-graph subset** (`dds_trust_graph_attestations`,
 `dds_trust_graph_vouches`, `dds_trust_graph_revocations`,
 `dds_trust_graph_burned` — scrape-time gauges read under one
-read-lock acquisition) landed 2026-04-26 follow-up #25. The rest
-of the C catalog (network / FIDO2 / store / process, plus the
-HTTP request / duration histograms) plus the Phase E rules/panels
-that depend on those metrics remain open.
+read-lock acquisition) landed 2026-04-26 follow-up #25. Phase C
+**FIDO2 outstanding-challenges gauge**
+(`dds_challenges_outstanding` — scrape-time read of the existing
+[`ChallengeStore::count_challenges`](../dds-store/src/traits.rs)
+trait method, B-5 backstop reference) landed 2026-04-26 follow-up
+#26. The rest of the C catalog (network / FIDO2 assertion + verify
+counters / sessions / store sizes / process, plus the HTTP request /
+duration histograms) plus the Phase E rules/panels that depend on
+those metrics remain open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -276,18 +281,21 @@ Rust.
 
 **Status: audit subset landed 2026-04-26 follow-up #22; HTTP-tier
 caller-identity counter landed in follow-up #24; trust-graph
-read-side subset landed in follow-up #25; rest of the catalog
-(network / FIDO2 / store / process, plus the HTTP request /
-duration families) remains open.** The audit-metrics first slice
-exposed the five families needed to alert on Z-3 regressions
-(`dds_build_info`, `dds_uptime_seconds`,
+read-side subset landed in follow-up #25; FIDO2 outstanding-challenges
+gauge landed in follow-up #26; rest of the catalog (network / FIDO2
+assertion + verify counters / sessions / store sizes / process, plus
+the HTTP request / duration families) remains open.** The
+audit-metrics first slice exposed the five families needed to alert on
+Z-3 regressions (`dds_build_info`, `dds_uptime_seconds`,
 `dds_audit_entries_total{action}`, `dds_audit_chain_length`,
 `dds_audit_chain_head_age_seconds`); follow-up #24 added
 `dds_http_caller_identity_total{kind}` so the `DdsLoopbackTcpAdminUsed`
 H-7 cutover regression alarm has a real metric to key off; follow-up
 #25 added the four `dds_trust_graph_*` gauges (attestations / vouches
 / revocations / burned) read under a single read-lock acquisition at
-scrape time. The trust-graph series are renamed from the original
+scrape time; follow-up #26 added `dds_challenges_outstanding` (FIDO2
+challenge-store row count, B-5 backstop reference) using the same
+single-svc-lock-per-scrape pattern as the audit / trust-graph reads. The trust-graph series are renamed from the original
 catalog spelling (`dds_attestations_total` → `dds_trust_graph_attestations`,
 `dds_burned_identities_total` → `dds_trust_graph_burned`) to match
 Prometheus convention — `_total` is reserved for monotonic counters,
@@ -355,7 +363,7 @@ rows remain open.
 | `dds_fido2_assertions_total` | counter | `result=ok|signature|rp_id|up|uv|sign_count` | Assertion outcomes | 🔲 |
 | `dds_fido2_attestation_verify_total` | counter | `result, fmt=packed|none|tpm` | Enrollment-time verify | 🔲 |
 | `dds_sessions_issued_total` | counter | `via=fido2|legacy` | Session minting | 🔲 |
-| `dds_challenges_outstanding` | gauge | — | Live challenges (B-5 cap reference) | 🔲 |
+| `dds_challenges_outstanding` | gauge | — | Live challenges (B-5 cap reference) — scrape-time read of [`ChallengeStore::count_challenges`](../dds-store/src/traits.rs) under the existing `LocalService` lock; counts live + expired-but-not-yet-swept rows (the [`expiry`](../dds-node/src/expiry.rs) sweeper clears expired rows on its own cadence). | ✅ |
 | **Audit** | | | | |
 | `dds_audit_entries_total` | counter | `action` | Per-action emission rate | ✅ |
 | `dds_audit_chain_length` | gauge | — | Local chain entry count | ✅ |

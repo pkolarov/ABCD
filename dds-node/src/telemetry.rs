@@ -32,6 +32,18 @@
 //! | `dds_trust_graph_vouches` | gauge | — | same |
 //! | `dds_trust_graph_revocations` | gauge | — | same |
 //! | `dds_trust_graph_burned` | gauge | — | same |
+//! | `dds_challenges_outstanding` | gauge | — | [`crate::service::LocalService::challenges_outstanding`] at scrape |
+//!
+//! ### `dds_challenges_outstanding` semantics
+//!
+//! FIDO2 challenges live in the challenge store with an explicit
+//! `expires_at` — the [`crate::expiry`] sweeper clears expired rows
+//! on its own cadence, so a non-zero gauge between sweeps is normal
+//! and a slowly rising baseline tracks request volume. The B-5
+//! backstop alarm condition is *unbounded* growth (sweeper jammed,
+//! attacker enumerating endpoints to exhaust storage); operators
+//! key the alert off `dds_challenges_outstanding > N` for some
+//! `N` derived from peak healthy traffic.
 //!
 //! ### Trust-graph gauges
 //!
@@ -224,6 +236,10 @@ pub fn record_caller_identity(kind: &str) {
 /// `dds_trust_graph_*` gauges read under the trust-graph `RwLock` —
 /// `None` means the lock was poisoned (or in tests, intentionally
 /// omitted) and the renderer falls back to zeroes.
+/// `challenges_outstanding` carries the FIDO2 challenge-store row
+/// count read under the same `LocalService` lock; `None` means the
+/// store read failed and the renderer reports zero rather than
+/// panicking the scrape task.
 /// Keeping the lock acquisition in the caller avoids forcing a
 /// `where` bound on this function.
 fn render_exposition(
@@ -231,6 +247,7 @@ fn render_exposition(
     chain_length: usize,
     head_timestamp: Option<u64>,
     trust_graph: Option<TrustGraphCounts>,
+    challenges_outstanding: Option<usize>,
 ) -> String {
     let mut out = String::with_capacity(1024);
 
@@ -321,6 +338,20 @@ fn render_exposition(
     );
     out.push_str("# TYPE dds_trust_graph_burned gauge\n");
     out.push_str(&format!("dds_trust_graph_burned {}\n", tg.burned));
+
+    // `dds_challenges_outstanding` — FIDO2 challenge-store row count.
+    // `None` (store read failure) degrades to 0 rather than panic;
+    // see the function-level doc for poison-tolerance rationale.
+    out.push_str(
+        "# HELP dds_challenges_outstanding FIDO2 challenges currently outstanding in the local \
+         challenge store (live + expired-but-not-yet-swept). B-5 backstop reference: alert on \
+         unbounded growth.\n",
+    );
+    out.push_str("# TYPE dds_challenges_outstanding gauge\n");
+    out.push_str(&format!(
+        "dds_challenges_outstanding {}\n",
+        challenges_outstanding.unwrap_or(0)
+    ));
 
     // `dds_http_caller_identity_total` — per-kind caller counter.
     out.push_str(
@@ -442,14 +473,21 @@ where
         + Sync
         + 'static,
 {
-    let (chain_length, head_timestamp, trust_graph) = {
+    let (chain_length, head_timestamp, trust_graph, challenges_outstanding) = {
         let svc = state.svc.lock().await;
         let len = svc.audit_chain_length().unwrap_or(0);
         let head = svc.audit_chain_head_timestamp().unwrap_or(None);
         let tg = svc.trust_graph_counts();
-        (len, head, tg)
+        let ch = svc.challenges_outstanding();
+        (len, head, tg, ch)
     };
-    let body = render_exposition(&state.telemetry, chain_length, head_timestamp, trust_graph);
+    let body = render_exposition(
+        &state.telemetry,
+        chain_length,
+        head_timestamp,
+        trust_graph,
+        challenges_outstanding,
+    );
     (
         StatusCode::OK,
         [(
@@ -513,7 +551,7 @@ mod tests {
     #[test]
     fn render_includes_build_info_and_uptime_for_empty_telemetry() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None);
+        let body = render_exposition(&t, 0, None, None, None);
         assert!(body.contains("dds_build_info{version=\""));
         assert!(body.contains("} 1\n"));
         assert!(body.contains("# TYPE dds_uptime_seconds gauge\n"));
@@ -529,7 +567,7 @@ mod tests {
         t.bump_audit_entry("attest");
         t.bump_audit_entry("revoke");
 
-        let body = render_exposition(&t, 3, Some(0), None);
+        let body = render_exposition(&t, 3, Some(0), None, None);
         assert!(body.contains("dds_audit_entries_total{action=\"attest\"} 2\n"));
         assert!(body.contains("dds_audit_entries_total{action=\"revoke\"} 1\n"));
         assert!(body.contains("dds_audit_chain_length 3\n"));
@@ -542,7 +580,7 @@ mod tests {
         t.bump_caller_identity("anonymous");
         t.bump_caller_identity("admin");
 
-        let body = render_exposition(&t, 0, None, None);
+        let body = render_exposition(&t, 0, None, None, None);
         assert!(body.contains("# TYPE dds_http_caller_identity_total counter\n"));
         assert!(body.contains("dds_http_caller_identity_total{kind=\"anonymous\"} 2\n"));
         assert!(body.contains("dds_http_caller_identity_total{kind=\"admin\"} 1\n"));
@@ -560,7 +598,7 @@ mod tests {
             revocations: 2,
             burned: 1,
         };
-        let body = render_exposition(&t, 0, None, Some(counts));
+        let body = render_exposition(&t, 0, None, Some(counts), None);
         assert!(body.contains("# TYPE dds_trust_graph_attestations gauge\n"));
         assert!(body.contains("dds_trust_graph_attestations 7\n"));
         assert!(body.contains("dds_trust_graph_vouches 3\n"));
@@ -571,11 +609,26 @@ mod tests {
     #[test]
     fn trust_graph_gauges_default_to_zero_when_lock_poisoned() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None);
+        let body = render_exposition(&t, 0, None, None, None);
         assert!(body.contains("dds_trust_graph_attestations 0\n"));
         assert!(body.contains("dds_trust_graph_vouches 0\n"));
         assert!(body.contains("dds_trust_graph_revocations 0\n"));
         assert!(body.contains("dds_trust_graph_burned 0\n"));
+    }
+
+    #[test]
+    fn challenges_outstanding_renders_supplied_count() {
+        let t = Telemetry::new();
+        let body = render_exposition(&t, 0, None, None, Some(12));
+        assert!(body.contains("# TYPE dds_challenges_outstanding gauge\n"));
+        assert!(body.contains("dds_challenges_outstanding 12\n"));
+    }
+
+    #[test]
+    fn challenges_outstanding_defaults_to_zero_when_store_read_fails() {
+        let t = Telemetry::new();
+        let body = render_exposition(&t, 0, None, None, None);
+        assert!(body.contains("dds_challenges_outstanding 0\n"));
     }
 
     #[test]
@@ -586,7 +639,7 @@ mod tests {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         // A timestamp 30 seconds in the past should render head_age >= 30.
-        let body = render_exposition(&t, 1, Some(now.saturating_sub(30)), None);
+        let body = render_exposition(&t, 1, Some(now.saturating_sub(30)), None, None);
         // Parse out the head_age value to allow for clock drift /
         // sub-second rounding inside the renderer.
         let line = body
@@ -683,6 +736,9 @@ mod tests {
         assert!(body.contains("dds_trust_graph_vouches 0\n"));
         assert!(body.contains("dds_trust_graph_revocations 0\n"));
         assert!(body.contains("dds_trust_graph_burned 0\n"));
+        // Empty challenge store on a freshly built service.
+        assert!(body.contains("# TYPE dds_challenges_outstanding gauge\n"));
+        assert!(body.contains("dds_challenges_outstanding 0\n"));
     }
 
     #[tokio::test]

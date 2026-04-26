@@ -12,7 +12,7 @@
 > |---|---|---|---|
 > | Z-1 | **Critical** | Encrypted comms (PQC) | Noise/QUIC handshake is X25519/ECDHE only — *not* post-quantum. README "quantum-resistant by default" applies to token signatures, not the transport channel. Harvest-Now-Decrypt-Later exposure on all recorded P2P traffic. |
 > | Z-2 | **High** | HW-bound identity | [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md) is a plan; zero code shipped. libp2p PeerId, admission cert, admin keys, default domain root all software-keyed. |
-> | Z-3 | ✅ **closed (Phase A)** | Immutable audit | Phase A from [docs/observability-plan.md](docs/observability-plan.md) landed: `emit_local_audit` is wired to all production state-mutating paths — `LocalService::{enroll_user, enroll_device, admin_setup, admin_vouch, record_applied}` and `DdsNode::{ingest_operation, ingest_revocation, ingest_burn}` (success and rejection branches both stamp the chain). `AuditLogEntry.reason: Option<String>` is signed-in (Phase A.2) so SIEM consumers can trust rejection reasons without re-deriving. Phase D (`/healthz` + `/readyz` orchestrator probes) also landed (2026-04-26 follow-up #18); Phase B is now complete (B.1 + B.2 in #19, B.3 + B.4 in #20); Phase F (`dds-cli stats` / `health` / `audit export`) landed in #21. Phase C audit-metrics subset (`dds_audit_entries_total`, `dds_audit_chain_length`, `dds_audit_chain_head_age_seconds`, plus build_info / uptime) landed in #22. Phase E audit-tier subset (Alertmanager rules + two Grafana dashboards keyed off the #22 metrics) landed in #23. Phase C HTTP-tier subset (`dds_http_caller_identity_total{kind}`) landed in #24, also closing the H-7 `DdsLoopbackTcpAdminUsed` reference alert by promoting it to the active `dds-http` Alertmanager group. Phase C trust-graph read-side subset (`dds_trust_graph_attestations`, `dds_trust_graph_vouches`, `dds_trust_graph_revocations`, `dds_trust_graph_burned` — current-state gauges) landed in #25. The rest of the C catalog (network / FIDO2 / store / process, plus the HTTP request / duration histograms) and the Phase E rules gated on those metrics remain open. |
+> | Z-3 | ✅ **closed (Phase A)** | Immutable audit | Phase A from [docs/observability-plan.md](docs/observability-plan.md) landed: `emit_local_audit` is wired to all production state-mutating paths — `LocalService::{enroll_user, enroll_device, admin_setup, admin_vouch, record_applied}` and `DdsNode::{ingest_operation, ingest_revocation, ingest_burn}` (success and rejection branches both stamp the chain). `AuditLogEntry.reason: Option<String>` is signed-in (Phase A.2) so SIEM consumers can trust rejection reasons without re-deriving. Phase D (`/healthz` + `/readyz` orchestrator probes) also landed (2026-04-26 follow-up #18); Phase B is now complete (B.1 + B.2 in #19, B.3 + B.4 in #20); Phase F (`dds-cli stats` / `health` / `audit export`) landed in #21. Phase C audit-metrics subset (`dds_audit_entries_total`, `dds_audit_chain_length`, `dds_audit_chain_head_age_seconds`, plus build_info / uptime) landed in #22. Phase E audit-tier subset (Alertmanager rules + two Grafana dashboards keyed off the #22 metrics) landed in #23. Phase C HTTP-tier subset (`dds_http_caller_identity_total{kind}`) landed in #24, also closing the H-7 `DdsLoopbackTcpAdminUsed` reference alert by promoting it to the active `dds-http` Alertmanager group. Phase C trust-graph read-side subset (`dds_trust_graph_attestations`, `dds_trust_graph_vouches`, `dds_trust_graph_revocations`, `dds_trust_graph_burned` — current-state gauges) landed in #25. Phase C FIDO2 outstanding-challenges gauge (`dds_challenges_outstanding`, B-5 backstop reference) landed in #26. The rest of the C catalog (network / FIDO2 assertion + verify counters / sessions / store sizes / process, plus the HTTP request / duration histograms) and the Phase E rules gated on those metrics remain open. |
 > | Z-4 | **High** | Encrypted at rest | redb store (`directory.redb`) is plaintext CBOR — tokens, ops, revocations, audit entries. Confidentiality depends on OS FDE + ACLs only. |
 > | Z-5 | **Medium** | Encrypted at rest | `dds-cli export` dumps are plaintext-CBOR (signed for integrity, not encrypted for confidentiality). |
 > | Z-6 | **Critical** | Supply-chain | DDS releases are unsigned in practice — Windows MSI Authenticode is gated on a `SIGN_CERT` secret that has never been provisioned; macOS `.pkg` is not Developer-ID-signed and not notarized. Operators have no programmatic way to verify a fresh install. **Implementation plan: [docs/supply-chain-plan.md](docs/supply-chain-plan.md) Phase A.** |
@@ -28,7 +28,45 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #25 (observability Phase C
+> Last updated: 2026-04-26 follow-up #26 (observability Phase C
+> FIDO2 outstanding-challenges gauge landed — one new gauge
+> `dds_challenges_outstanding` ships under the existing opt-in
+> `metrics_addr` listener). The metric reports the row count of the
+> local FIDO2 challenge store (live + expired-but-not-yet-swept) at
+> scrape time via the new
+> [`LocalService::challenges_outstanding`](dds-node/src/service.rs)
+> helper, which delegates to the existing
+> [`ChallengeStore::count_challenges`](dds-store/src/traits.rs)
+> trait method — no per-row locking, just one extra `LocalService`
+> read while the scrape already holds the lock. This is the B-5
+> backstop reference: the [`expiry`](dds-node/src/expiry.rs) sweeper
+> clears expired challenges on its own cadence, so a non-zero gauge
+> between sweeps is normal and a slowly rising baseline tracks
+> request volume; the alert condition is *unbounded* growth
+> (sweeper jammed, attacker enumerating endpoints to exhaust
+> storage). Workspace test count rises from 597 to 600 (+3: the new
+> `service::tests::challenges_outstanding_tracks_store_population`
+> regression test exercises the empty → 2 inserted → swept → empty
+> arc against `MemoryBackend`, plus two new
+> `telemetry::tests::challenges_outstanding_*` render-side tests
+> covering the supplied-count and `None`-on-store-failure
+> fallback paths). The
+> `serve_returns_prometheus_text_with_audit_metrics` integration
+> test is tightened to assert the new gauge round-trips through the
+> served exposition (`dds_challenges_outstanding 0` on a freshly
+> built service). `cargo fmt` clean; `cargo clippy --workspace
+> --all-targets -D warnings` clean; `cargo test --workspace
+> --all-targets` passes. Phase C remaining metrics (network / FIDO2
+> assertion + verify counters / sessions / store sizes / process,
+> plus the HTTP request / request-duration histograms) and the Phase
+> E rules/panels gated on them remain open and continue to track in
+> the observability plan. No new dashboards or alert rules ship in
+> this follow-up — operators can graph the gauge directly today; a
+> `DdsChallengeStoreUnbounded` rule lands in the same `dds-process`
+> Alertmanager group once an operator-derived saturation threshold
+> is chosen.
+>
+> Previous: 2026-04-26 follow-up #25 (observability Phase C
 > trust-graph read-side subset landed — four new gauges
 > (`dds_trust_graph_attestations`, `dds_trust_graph_vouches`,
 > `dds_trust_graph_revocations`, `dds_trust_graph_burned`) ship under
