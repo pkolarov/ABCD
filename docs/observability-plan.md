@@ -26,10 +26,14 @@ read-lock acquisition) landed 2026-04-26 follow-up #25. Phase C
 (`dds_challenges_outstanding` — scrape-time read of the existing
 [`ChallengeStore::count_challenges`](../dds-store/src/traits.rs)
 trait method, B-5 backstop reference) landed 2026-04-26 follow-up
-#26. The rest of the C catalog (network / FIDO2 assertion + verify
-counters / sessions / store sizes / process, plus the HTTP request /
-duration histograms) plus the Phase E rules/panels that depend on
-those metrics remain open.
+#26. Phase C **sessions-issuance counter**
+(`dds_sessions_issued_total{via=fido2|legacy}` — bumped from the
+two [`LocalService`](../dds-node/src/service.rs) entry points after
+a session token is signed successfully) landed 2026-04-27 follow-up
+#27. The rest of the C catalog (network / FIDO2 assertion + verify
+counters / store sizes / process, plus the HTTP request / duration
+histograms) plus the Phase E rules/panels that depend on those
+metrics remain open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -282,9 +286,11 @@ Rust.
 **Status: audit subset landed 2026-04-26 follow-up #22; HTTP-tier
 caller-identity counter landed in follow-up #24; trust-graph
 read-side subset landed in follow-up #25; FIDO2 outstanding-challenges
-gauge landed in follow-up #26; rest of the catalog (network / FIDO2
-assertion + verify counters / sessions / store sizes / process, plus
-the HTTP request / duration families) remains open.** The
+gauge landed in follow-up #26; sessions-issuance counter
+(`dds_sessions_issued_total{via}`) landed 2026-04-27 follow-up #27;
+rest of the catalog (network / FIDO2 assertion + verify counters /
+store sizes / process, plus the HTTP request / duration families)
+remains open.** The
 audit-metrics first slice exposed the five families needed to alert on
 Z-3 regressions (`dds_build_info`, `dds_uptime_seconds`,
 `dds_audit_entries_total{action}`, `dds_audit_chain_length`,
@@ -362,7 +368,7 @@ rows remain open.
 | **FIDO2 / sessions** | | | | |
 | `dds_fido2_assertions_total` | counter | `result=ok|signature|rp_id|up|uv|sign_count` | Assertion outcomes | 🔲 |
 | `dds_fido2_attestation_verify_total` | counter | `result, fmt=packed|none|tpm` | Enrollment-time verify | 🔲 |
-| `dds_sessions_issued_total` | counter | `via=fido2|legacy` | Session minting | 🔲 |
+| `dds_sessions_issued_total` | counter | `via=fido2|legacy` | Session minting — bumped at the tail of [`LocalService::issue_session`](../dds-node/src/service.rs) (`legacy`) and [`LocalService::issue_session_from_assertion`](../dds-node/src/service.rs) (`fido2`) after the session token is signed and CBOR-encoded successfully; the two entry points share a private inner helper so a FIDO2-driven session bumps `fido2` exactly once and does not also tick `legacy`. The unauthenticated `POST /v1/session` HTTP route was removed in the security review (see [security-gaps.md](../security-gaps.md)), so production `via="legacy"` traffic is now expected to be zero — non-zero rate is the regression signal. | ✅ |
 | `dds_challenges_outstanding` | gauge | — | Live challenges (B-5 cap reference) — scrape-time read of [`ChallengeStore::count_challenges`](../dds-store/src/traits.rs) under the existing `LocalService` lock; counts live + expired-but-not-yet-swept rows (the [`expiry`](../dds-node/src/expiry.rs) sweeper clears expired rows on its own cadence). | ✅ |
 | **Audit** | | | | |
 | `dds_audit_entries_total` | counter | `action` | Per-action emission rate | ✅ |

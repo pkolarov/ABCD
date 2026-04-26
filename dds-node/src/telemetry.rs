@@ -28,6 +28,7 @@
 //! | `dds_audit_chain_length` | gauge | — | [`AuditStore::count_audit_entries`] at scrape |
 //! | `dds_audit_chain_head_age_seconds` | gauge | — | `now - head.timestamp` at scrape |
 //! | `dds_http_caller_identity_total` | counter | `kind=anonymous\|uds\|pipe\|admin` | bumped by [`record_caller_identity`] |
+//! | `dds_sessions_issued_total` | counter | `via=fido2\|legacy` | bumped by [`record_sessions_issued`] |
 //! | `dds_trust_graph_attestations` | gauge | — | [`crate::service::LocalService::trust_graph_counts`] at scrape |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
 //! | `dds_trust_graph_revocations` | gauge | — | same |
@@ -64,6 +65,33 @@
 //! classifier would have to embed knowledge of every body type. A
 //! future Phase C follow-up can add the label without changing the
 //! metric name.
+//!
+//! ### `dds_sessions_issued_total` semantics
+//!
+//! Bumped exactly once per successfully minted session — the bump
+//! site is at the tail of the issuance path, after the token has
+//! been signed and the CBOR encoded successfully, so a token that
+//! never reaches the caller does not advance the counter.
+//!
+//! - `via="fido2"` — session minted from a verified FIDO2 assertion
+//!   via [`crate::service::LocalService::issue_session_from_assertion`]
+//!   (the `/v1/session/assert` HTTP path).
+//! - `via="legacy"` — session minted via direct
+//!   [`crate::service::LocalService::issue_session`] entry without an
+//!   accompanying assertion proof. The unauthenticated `POST /v1/session`
+//!   HTTP route was removed in the security review (see
+//!   [`security-gaps.md`](../../security-gaps.md)), so production
+//!   `via="legacy"` traffic is now expected to be zero — a non-zero
+//!   baseline indicates an in-process consumer (loadtest harness,
+//!   Windows account-claim resolver, etc.) is issuing sessions
+//!   without going through the FIDO2 path. Operators key any
+//!   regression alarm off
+//!   `rate(dds_sessions_issued_total{via="legacy"}[5m]) > 0`.
+//!
+//! The two entry points share a private inner helper
+//! ([`crate::service::LocalService::issue_session_inner`]) so a
+//! FIDO2-driven session bumps `fido2` exactly once and does not also
+//! tick `legacy`.
 //!
 //! ### `dds_http_caller_identity_total` semantics
 //!
@@ -133,6 +161,12 @@ pub struct Telemetry {
     /// `anonymous|uds|pipe|admin` — bounded by
     /// [`crate::http::classify_caller_identity`].
     caller_identity: Mutex<BTreeMap<String, u64>>,
+    /// Per-`via` session-issuance counts. `via` is one of
+    /// `fido2|legacy` — bounded by the two
+    /// [`crate::service::LocalService`] entry points
+    /// (`issue_session_from_assertion` → `fido2`,
+    /// `issue_session` → `legacy`).
+    sessions_issued: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Telemetry {
@@ -141,6 +175,7 @@ impl Telemetry {
             start_at: SystemTime::now(),
             audit_entries: Mutex::new(BTreeMap::new()),
             caller_identity: Mutex::new(BTreeMap::new()),
+            sessions_issued: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -194,6 +229,31 @@ impl Telemetry {
         }
     }
 
+    fn bump_sessions_issued(&self, via: &str) {
+        let mut g = match self.sessions_issued.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry(via.to_string()).or_insert(0) += 1;
+    }
+
+    fn sessions_issued_snapshot(&self) -> BTreeMap<String, u64> {
+        match self.sessions_issued.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of `dds_sessions_issued_total{via=...}`. Public
+    /// so the `LocalService` regression tests can take before/after
+    /// snapshots without scraping the renderer.
+    pub fn sessions_issued_count(&self, via: &str) -> u64 {
+        match self.sessions_issued.lock() {
+            Ok(g) => g.get(via).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(via).copied().unwrap_or(0),
+        }
+    }
+
     fn uptime_seconds(&self) -> u64 {
         SystemTime::now()
             .duration_since(self.start_at)
@@ -225,6 +285,16 @@ pub fn record_audit_entry(action: &str) {
 pub fn record_caller_identity(kind: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_caller_identity(kind);
+    }
+}
+
+/// Bump `dds_sessions_issued_total{via=...}` by one. Called from
+/// [`crate::service::LocalService`] after a session token is signed
+/// successfully. `via` is one of `fido2|legacy`. No-op when
+/// telemetry has not been installed (tests, harnesses).
+pub fn record_sessions_issued(via: &str) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_sessions_issued(via);
     }
 }
 
@@ -366,6 +436,21 @@ fn render_exposition(
         out.push_str(&format!(
             "dds_http_caller_identity_total{{kind=\"{}\"}} {}\n",
             escape_label_value(kind),
+            count
+        ));
+    }
+
+    // `dds_sessions_issued_total` — per-`via` session-issuance counter.
+    out.push_str(
+        "# HELP dds_sessions_issued_total Sessions minted since process start, partitioned by \
+         issuance path (fido2 = via /v1/session/assert; legacy = direct LocalService::issue_session).\n",
+    );
+    out.push_str("# TYPE dds_sessions_issued_total counter\n");
+    let sessions_snapshot = telemetry.sessions_issued_snapshot();
+    for (via, count) in sessions_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_sessions_issued_total{{via=\"{}\"}} {}\n",
+            escape_label_value(via),
             count
         ));
     }
@@ -574,6 +659,33 @@ mod tests {
     }
 
     #[test]
+    fn sessions_issued_counter_renders_in_exposition() {
+        let t = Telemetry::new();
+        t.bump_sessions_issued("fido2");
+        t.bump_sessions_issued("fido2");
+        t.bump_sessions_issued("legacy");
+
+        let body = render_exposition(&t, 0, None, None, None);
+        assert!(body.contains("# TYPE dds_sessions_issued_total counter\n"));
+        assert!(body.contains("dds_sessions_issued_total{via=\"fido2\"} 2\n"));
+        assert!(body.contains("dds_sessions_issued_total{via=\"legacy\"} 1\n"));
+        assert_eq!(t.sessions_issued_count("fido2"), 2);
+        assert_eq!(t.sessions_issued_count("legacy"), 1);
+        assert_eq!(t.sessions_issued_count("other"), 0);
+    }
+
+    #[test]
+    fn sessions_issued_renders_empty_family_with_help_and_type() {
+        let t = Telemetry::new();
+        let body = render_exposition(&t, 0, None, None, None);
+        // HELP/TYPE must always be emitted so the family is
+        // discoverable by Prometheus before the first session is
+        // minted; the value lines come once the first bump fires.
+        assert!(body.contains("# TYPE dds_sessions_issued_total counter\n"));
+        assert!(!body.contains("dds_sessions_issued_total{"));
+    }
+
+    #[test]
     fn caller_identity_counter_renders_in_exposition() {
         let t = Telemetry::new();
         t.bump_caller_identity("anonymous");
@@ -739,6 +851,9 @@ mod tests {
         // Empty challenge store on a freshly built service.
         assert!(body.contains("# TYPE dds_challenges_outstanding gauge\n"));
         assert!(body.contains("dds_challenges_outstanding 0\n"));
+        // Sessions-issued family is always discoverable; no value
+        // lines until the first session is minted.
+        assert!(body.contains("# TYPE dds_sessions_issued_total counter\n"));
     }
 
     #[tokio::test]

@@ -959,7 +959,23 @@ impl<
     }
 
     /// Issue a short-lived session token.
+    ///
+    /// Tail-bumps `dds_sessions_issued_total{via="legacy"}`. Callers
+    /// that already account for issuance under a different `via`
+    /// label (e.g. [`issue_session_from_assertion`] which marks
+    /// `via="fido2"`) must invoke [`issue_session_inner`] directly to
+    /// avoid double counting.
     pub fn issue_session(&mut self, req: SessionRequest) -> Result<SessionResult, ServiceError> {
+        let result = self.issue_session_inner(req)?;
+        crate::telemetry::record_sessions_issued("legacy");
+        Ok(result)
+    }
+
+    /// Internal session-mint path — does not bump the
+    /// `dds_sessions_issued_total` counter. The two public entry
+    /// points ([`issue_session`] and [`issue_session_from_assertion`])
+    /// own the correct `via` label and bump exactly once on success.
+    fn issue_session_inner(&mut self, req: SessionRequest) -> Result<SessionResult, ServiceError> {
         // Use the shared in-memory trust graph directly via a read lock.
         // It is the source of truth — see `LocalService::new` doc for
         // the multi-writer contract. Previously this rebuilt from the
@@ -1778,7 +1794,11 @@ impl<
             mfa_verified: out.user_verified,
             tls_binding: None,
         };
-        self.issue_session(session_req)
+        // Use the inner mint path so the `dds_sessions_issued_total`
+        // counter bumps `via="fido2"` once, not also `legacy`.
+        let result = self.issue_session_inner(session_req)?;
+        crate::telemetry::record_sessions_issued("fido2");
+        Ok(result)
     }
 
     /// List enrolled users (UserAuthAttestation documents) for CP tile
@@ -3634,6 +3654,67 @@ mod platform_applier_tests {
             .sweep_expired_challenges(far_future + 1)
             .unwrap();
         assert_eq!(svc.challenges_outstanding(), Some(0));
+    }
+
+    /// observability-plan.md Phase C — regression test for the
+    /// `dds_sessions_issued_total{via="legacy"}` Prometheus counter.
+    /// Pins that direct [`LocalService::issue_session`] callers (the
+    /// loadtest harness, in-process Windows account-claim resolver,
+    /// any non-FIDO2 entry) advance the `via="legacy"` bucket exactly
+    /// once per successful mint. The unauthenticated `POST /v1/session`
+    /// HTTP route was removed in the security review (see
+    /// `security-gaps.md`), so the production baseline is expected to
+    /// be zero — non-zero rate is the regression signal.
+    #[test]
+    fn issue_session_advances_legacy_telemetry_counter() {
+        let (mut svc, admin, _) = setup();
+        let handle = crate::telemetry::install();
+        let before = handle.sessions_issued_count("legacy");
+
+        let result = svc
+            .issue_session(SessionRequest {
+                subject_urn: admin.id.to_urn(),
+                device_urn: None,
+                requested_resources: vec![],
+                duration_secs: 300,
+                mfa_verified: false,
+                tls_binding: None,
+            })
+            .expect("session issuance succeeds for self-vouched admin");
+        assert!(!result.session_id.is_empty());
+
+        let after = handle.sessions_issued_count("legacy");
+        assert_eq!(after, before + 1, "legacy bucket must advance by one");
+    }
+
+    /// observability-plan.md Phase C — pins that a *failed*
+    /// [`LocalService::issue_session`] call (subject with no granted
+    /// purposes) does **not** advance the counter. The bump must
+    /// happen at the tail of the success path so the metric reflects
+    /// tokens actually returned to the caller.
+    #[test]
+    fn issue_session_does_not_bump_telemetry_on_failure() {
+        let (mut svc, _, _) = setup();
+        let handle = crate::telemetry::install();
+        let before = handle.sessions_issued_count("legacy");
+
+        let stranger = Identity::generate("stranger", &mut OsRng);
+        let err = svc
+            .issue_session(SessionRequest {
+                subject_urn: stranger.id.to_urn(),
+                device_urn: None,
+                requested_resources: vec![],
+                duration_secs: 300,
+                mfa_verified: false,
+                tls_binding: None,
+            })
+            .expect_err("subject without granted purposes must be rejected");
+        // Sanity check the rejection comes from the granted-purpose
+        // gate, not somewhere upstream.
+        assert!(format!("{err:?}").contains("granted purposes"));
+
+        let after = handle.sessions_issued_count("legacy");
+        assert_eq!(after, before, "failure path must not advance counter");
     }
 
     #[test]
