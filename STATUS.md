@@ -1,7 +1,52 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #15 (AD coexistence Phase 3 — closes
+> Last updated: 2026-04-26 follow-up #16 (AD coexistence Phase 3 complete —
+> closes AD-11 from
+> [docs/windows-ad-coexistence-spec.md](docs/windows-ad-coexistence-spec.md)
+> §11.2 and [docs/AD-gap-plan.md](docs/AD-gap-plan.md) Phase 3). New
+> [test_ad_coexistence.cpp](platform/windows/native/Tests/test_ad_coexistence.cpp)
+> drives the bridge's auth gate through the *production* JoinState cache
+> (`dds::SetJoinStateForTest` → `dds::GetCachedJoinState()`) instead of
+> reproducing the decision standalone — the unified test
+> [build_tests.bat](platform/windows/native/Tests/build_tests.bat) gains a
+> `/DDDS_TESTING` define so the seam is exposed only in the test binary.
+> Production projects (`DdsAuthBridge.vcxproj`, `DdsCredentialProvider.vcxproj`,
+> `DdsTrayAgent.vcxproj`) still compile without the flag, so
+> `SetJoinStateForTest` remains absent from shipped artifacts. Seven new
+> tests cover spec §11.2 cases 1–3
+> (`ad11_ad_joined_with_vault_proceeds_through_seam`,
+> `ad11_ad_joined_without_vault_returns_pre_enrollment_required`,
+> `ad11_entra_only_returns_unsupported_host`), the §2.1 Hybrid empty-vault
+> parity (`ad11_hybrid_joined_without_vault_returns_pre_enrollment_required`),
+> the §2.1 Unknown fail-closed path
+> (`ad11_unknown_join_state_fails_closed_as_unsupported`), the §9.2
+> Workgroup→AdJoined re-probe transition
+> (`ad11_workgroup_to_ad_transition_flips_gate_decision`), and a numeric pin
+> on the AD-coexistence IPC error codes
+> (`ad11_ipc_error_codes_match_pinned_values`) so a future renumbering
+> breaks here rather than at runtime. The pre-existing standalone
+> `ad08_*`/`ad09_*`/`ad10_*` tests in
+> [test_dds_bridge_selection.cpp](platform/windows/native/Tests/test_dds_bridge_selection.cpp)
+> still pin the pure-decision and CP-text invariants — AD-11 complements
+> them by validating the cache machinery itself. The first AD-11 test is
+> also a tripwire on the seam: if `/DDDS_TESTING` is dropped from
+> `build_tests.bat`, the new file's `#error` directive halts the build
+> before the cache-override assert can lie about test coverage. A separate
+> `build_test_ad_coexistence.bat` was *not* added because the unified
+> `build_tests.bat`/`run_all_tests.bat` already drive every standalone
+> native test in `dds_native_tests.exe`; the convention is now noted in
+> the spec table for §A.3 AD-11. Phase 3 (AD-08 → AD-09 → AD-10 → AD-11)
+> is now complete; remaining AD work is Phase 4's AD-13 (vault refresh
+> tray flow) and Phase 5's AD-15/16/17 (E2E + security review). Workspace
+> test count unchanged at 560 (additions are native-only standalone
+> tests). cargo fmt clean; cargo clippy clean (workspace, all-targets,
+> `-D warnings`); cargo test --workspace --all-targets passes. Native C++
+> build/test on Windows is deferred to CI per the established pattern;
+> smoke `clang++ -std=c++17 -DDDS_TESTING -fsyntax-only` on macOS confirmed
+> the new file has no typos.
+>
+> Previous: 2026-04-26 follow-up #15 (AD coexistence Phase 3 — closes
 > AD-10 from
 > [docs/windows-ad-coexistence-spec.md](docs/windows-ad-coexistence-spec.md)
 > §4.4 and [docs/AD-gap-plan.md](docs/AD-gap-plan.md) Phase 3). The

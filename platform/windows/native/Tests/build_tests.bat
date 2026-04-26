@@ -43,6 +43,9 @@ echo.
 echo === Building DDS Native Tests (x64 Debug) ===
 echo.
 
+REM `/DDDS_TESTING` exposes the dds::SetJoinStateForTest seam in JoinState.cpp
+REM (gated behind the same macro in production). Required by AD-11 tests in
+REM test_ad_coexistence.cpp; production binaries never compile with this flag.
 cl.exe /nologo ^
     /std:c++17 ^
     /EHsc ^
@@ -55,6 +58,7 @@ cl.exe /nologo ^
     /D_WINDOWS ^
     /DUNICODE ^
     /D_UNICODE ^
+    /DDDS_TESTING ^
     /I"%~dp0..\DdsBridgeIPC" ^
     /I"%~dp0..\DdsAuthBridge" ^
     /I"%~dp0..\Helpers" ^

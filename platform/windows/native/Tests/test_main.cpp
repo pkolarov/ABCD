@@ -82,6 +82,11 @@ struct DdsTestRegistrar
 #include "test_dds_bridge_selection.cpp"
 #include "test_join_state.cpp"
 #include "test_api_addr_resolve.cpp"
+// AD-11 — must follow test_join_state.cpp because it pins the JoinState
+// cache via dds::SetJoinStateForTest. The probe-based tests in
+// test_join_state.cpp run first and use DetectJoinState() (which bypasses
+// the cache), so the ordering is safe.
+#include "test_ad_coexistence.cpp"
 
 // ============================================================================
 // main -- run all tests, print summary
