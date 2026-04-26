@@ -266,19 +266,23 @@ Rust.
 
 ### Phase C — Prometheus exposition (`/metrics`)
 
-**Status: audit subset landed 2026-04-26 follow-up #22; rest of the
-catalog remains open.** The audit-metrics-only first slice exposes
-the five families needed to alert on Z-3 regressions
+**Status: audit subset landed 2026-04-26 follow-up #22; HTTP-tier
+caller-identity counter landed in follow-up #24; rest of the catalog
+(network / FIDO2 / store / process, plus the HTTP request /
+duration families) remains open.** The audit-metrics first slice
+exposed the five families needed to alert on Z-3 regressions
 (`dds_build_info`, `dds_uptime_seconds`,
 `dds_audit_entries_total{action}`, `dds_audit_chain_length`,
-`dds_audit_chain_head_age_seconds`) with no new external crate —
+`dds_audit_chain_head_age_seconds`); follow-up #24 added
+`dds_http_caller_identity_total{kind}` so the `DdsLoopbackTcpAdminUsed`
+H-7 cutover regression alarm has a real metric to key off.
 [dds-node/src/telemetry.rs](../dds-node/src/telemetry.rs) is a
-hand-rolled exposition over a `Mutex<BTreeMap<String, u64>>` plus
-on-demand audit-store reads, served on a separate axum listener
+hand-rolled exposition over `Mutex<BTreeMap<String, u64>>` counters
+plus on-demand audit-store reads, served on a separate axum listener
 bound to the new `metrics_addr` field on
 [`NetworkConfig`](../dds-node/src/config.rs) (default `None` —
 opt-in). When the rest of the catalog (network / FIDO2 / store /
-HTTP) lands the histograms become worth their weight and the
+process) lands the histograms become worth their weight and the
 module will be folded into `metrics-exporter-prometheus`.
 
 **C.1 — Crate.** Add `metrics = "0.24"` and
@@ -345,7 +349,7 @@ rows remain open.
 | **HTTP API** | | | | |
 | `dds_http_requests_total` | counter | `route, method, status` | Route-level traffic | 🔲 |
 | `dds_http_request_duration_seconds` | histogram | `route, method` | Latency | 🔲 |
-| `dds_http_caller_identity_total` | counter | `kind=anonymous|uds|pipe|admin` | Who's calling — surfaces accidental loopback-TCP regressions | 🔲 |
+| `dds_http_caller_identity_total` | counter | `kind=anonymous|uds|pipe|admin` | Who's calling — surfaces accidental loopback-TCP regressions; transport buckets (anonymous/uds/pipe) partition the request count, `admin` is bumped orthogonally when the caller passes the admin policy | ✅ |
 | **Process** | | | | |
 | `dds_memory_resident_bytes` | gauge | — | RSS (procfs / mach) | 🔲 |
 | `dds_thread_count` | gauge | — | OS thread count | 🔲 |
@@ -441,6 +445,15 @@ Active rules (`dds.rules.yml` groups `dds-audit` and `dds-process`):
 - `DdsBuildSkew` — `count(count by(version) (dds_build_info)) > 1`
   for 1 h.
 
+Active HTTP-tier rule (group `dds-http`, landed follow-up #24):
+- `DdsLoopbackTcpAdminUsed` — fires on
+  `rate(dds_http_caller_identity_total{kind="anonymous"}[5m]) > 0`
+  for 5 m, the H-7 cutover regression alarm flagged in
+  [Claude_sec_review.md](../Claude_sec_review.md). `kind="anonymous"`
+  corresponds to `CallerIdentity::Anonymous` (no peer credentials,
+  i.e. loopback TCP), so post-cutover any non-zero rate indicates a
+  forgotten config flag or a client still on TCP.
+
 Reference (commented) rules — uncomment when Phase C lands the
 metric:
 - `DdsAdmissionFailureSpike` (needs `dds_admission_handshakes_total`).
@@ -448,9 +461,6 @@ metric:
 - `DdsSyncRejectsSpike` (needs `dds_sync_payloads_rejected_total`).
 - `DdsFido2AssertionFailureSpike` (needs `dds_fido2_assertions_total`).
 - `DdsStoreWriteFailures` (needs `dds_store_writes_total`).
-- `DdsLoopbackTcpAdminUsed` (needs `dds_http_caller_identity_total`)
-  — the H-7 cutover regression alarm flagged in
-  [Claude_sec_review.md](../Claude_sec_review.md).
 
 `DdsRevocationsSurge` is implicitly covered by the Trust-Graph
 dashboard's Revocations panel and the rejection-ratio alert; a

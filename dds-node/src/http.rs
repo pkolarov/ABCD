@@ -595,6 +595,50 @@ async fn rate_limit_middleware(
     next.run(req).await
 }
 
+/// Classify a caller into its transport kind (`anonymous|uds|pipe`)
+/// for the `dds_http_caller_identity_total` metric
+/// (observability-plan.md Phase C). The orthogonal `admin` bucket is
+/// bumped separately by [`caller_identity_observer_middleware`] when
+/// `is_admin(policy)` returns `true`, so callers reading these
+/// counters can rely on `sum(anonymous+uds+pipe) == total request
+/// count` while still seeing admin volume.
+pub(crate) fn classify_caller_identity(caller: &CallerIdentity) -> &'static str {
+    match caller {
+        CallerIdentity::Anonymous => "anonymous",
+        #[cfg(unix)]
+        CallerIdentity::Uds { .. } => "uds",
+        #[cfg(windows)]
+        CallerIdentity::Pipe { .. } => "pipe",
+    }
+}
+
+/// Observer middleware (no policy enforcement) that bumps
+/// `dds_http_caller_identity_total{kind=...}` for every request the
+/// API listener serves. Wraps the entire app so rate-limited and
+/// 4xx-rejected requests are counted too — operators want the full
+/// caller-kind picture, not just successful traffic.
+///
+/// Bumps the transport bucket (anonymous|uds|pipe) for every
+/// request, plus `admin` when the caller passes the admin policy
+/// check; the H-7 `DdsLoopbackTcpAdminUsed` alert keys off
+/// `kind="anonymous"`.
+async fn caller_identity_observer_middleware(
+    State(policy): State<Arc<AdminPolicy>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let caller = req
+        .extensions()
+        .get::<CallerIdentity>()
+        .cloned()
+        .unwrap_or(CallerIdentity::Anonymous);
+    crate::telemetry::record_caller_identity(classify_caller_identity(&caller));
+    if caller.is_admin(&policy) {
+        crate::telemetry::record_caller_identity("admin");
+    }
+    next.run(req).await
+}
+
 /// Build the axum router for the local API.
 ///
 /// `admin_policy` governs which callers may reach admin-gated
@@ -691,7 +735,16 @@ where
             rate_limit_middleware,
         ))
         // M-11: bound deserialization input size.
-        .layer(DefaultBodyLimit::max(HTTP_MAX_BODY_BYTES));
+        .layer(DefaultBodyLimit::max(HTTP_MAX_BODY_BYTES))
+        // observability-plan.md Phase C — count every request by
+        // caller kind. Sits outside rate-limit / body-limit so we
+        // see the rejected traffic too; sits inside the H-6 MAC
+        // signer so the metric reflects what the listener actually
+        // accepted.
+        .layer(axum::middleware::from_fn_with_state(
+            admin_policy.clone(),
+            caller_identity_observer_middleware,
+        ));
 
     // H-6: append the response-body signer as the outermost layer
     // so its MAC covers the bytes the client actually receives
@@ -5310,5 +5363,85 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(body["total"].as_u64().unwrap(), 0);
+    }
+
+    // -- classify_caller_identity (observability-plan.md Phase C) --
+
+    fn make_admin_policy(trust_loopback: bool) -> AdminPolicy {
+        AdminPolicy {
+            trust_loopback_tcp_admin: trust_loopback,
+            admin_uids: Vec::new(),
+            admin_sids: Vec::new(),
+            service_uid: None,
+            strict_device_binding: false,
+        }
+    }
+
+    #[test]
+    fn classify_anonymous_returns_anonymous_regardless_of_admin_trust() {
+        // Transport-kind partition: trust_loopback_tcp_admin does not
+        // shift the bucket — admin is bumped orthogonally by the
+        // observer middleware.
+        assert_eq!(
+            classify_caller_identity(&CallerIdentity::Anonymous),
+            "anonymous"
+        );
+    }
+
+    #[test]
+    fn anonymous_with_admin_trust_is_also_admitted_as_admin() {
+        let policy = make_admin_policy(true);
+        assert!(
+            CallerIdentity::Anonymous.is_admin(&policy),
+            "Anonymous + trust_loopback_tcp_admin must be admin per is_admin policy so the \
+             observer middleware bumps the admin bucket"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_uds_returns_uds() {
+        let caller = CallerIdentity::Uds {
+            uid: 1000,
+            gid: 1000,
+            pid: 1,
+        };
+        assert_eq!(classify_caller_identity(&caller), "uds");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uds_caller_in_admin_uids_is_admin_per_policy() {
+        let mut policy = make_admin_policy(false);
+        policy.admin_uids = vec![1000];
+        let caller = CallerIdentity::Uds {
+            uid: 1000,
+            gid: 1000,
+            pid: 1,
+        };
+        assert_eq!(classify_caller_identity(&caller), "uds");
+        assert!(caller.is_admin(&policy));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classify_pipe_returns_pipe() {
+        let caller = CallerIdentity::Pipe {
+            sid: "S-1-5-21-1-2-3-1001".to_string(),
+            pid: 1,
+        };
+        assert_eq!(classify_caller_identity(&caller), "pipe");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_system_caller_is_admin_per_policy() {
+        let policy = make_admin_policy(false);
+        let caller = CallerIdentity::Pipe {
+            sid: "S-1-5-18".to_string(),
+            pid: 1,
+        };
+        assert_eq!(classify_caller_identity(&caller), "pipe");
+        assert!(caller.is_admin(&policy));
     }
 }

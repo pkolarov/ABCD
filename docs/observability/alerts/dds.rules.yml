@@ -216,6 +216,50 @@ groups:
             host is pinned to an older release.
 
   # ---------------------------------------------------------------
+  # HTTP API caller identity — H-7 cutover regression tripwire.
+  # Active. `dds_http_caller_identity_total` ships in dds-node
+  # follow-up #24 (observability-plan.md Phase C HTTP-tier subset).
+  # ---------------------------------------------------------------
+  - name: dds-http
+    interval: 30s
+    rules:
+
+      - alert: DdsLoopbackTcpAdminUsed
+        # H-7 cutover regression alarm — see Claude_sec_review.md.
+        # `kind="anonymous"` corresponds to `CallerIdentity::Anonymous`,
+        # which is what the API listener sees when a client connects
+        # over loopback TCP (no peer credentials available). Once a
+        # deployment has been migrated to the UDS / named-pipe
+        # transport with `trust_loopback_tcp_admin = false`, any
+        # non-zero rate on this label is a regression — either a
+        # forgotten config flag, a fallback path, or a process
+        # accidentally talking to the API over TCP.
+        #
+        # Tune the deploy-window silence on environments still in the
+        # cutover.
+        expr: |
+          rate(dds_http_caller_identity_total{kind="anonymous"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          plan: observability-plan.md#phase-e
+          finding: H-7
+        annotations:
+          summary: "DDS loopback-TCP traffic on {{ $labels.instance }} after cutover"
+          description: |
+            `dds_http_caller_identity_total{kind="anonymous"}` on
+            {{ $labels.instance }} has been advancing for 5 minutes —
+            non-zero anonymous (loopback TCP) request rate post-cutover
+            indicates either `trust_loopback_tcp_admin = true` is
+            still set in `node.toml` or a client is bypassing the UDS
+            / named pipe path.
+
+            Check: `dds-cli --node {{ $labels.instance }} stats` for
+            the active listener; review `node.toml`'s `[api_auth]`
+            block; grep clients for `http://127.0.0.1:` URLs.
+          runbook_url: "https://github.com/ABCD/dds/blob/main/docs/observability-plan.md#phase-c--prometheus-exposition-metrics"
+
+  # ---------------------------------------------------------------
   # Reference rules — keyed off Phase C catalog metrics that have
   # not shipped yet. Each block is gated on a metric name that does
   # not exist today; uncomment the block once the corresponding
@@ -269,13 +313,6 @@ groups:
   #       for: 5m
   #       labels: { severity: critical, plan: observability-plan.md#phase-c }
   #
-  # - name: dds-http
-  #   interval: 30s
-  #   rules:
-  #
-  #     - alert: DdsLoopbackTcpAdminUsed
-  #       # H-7 cutover regression alarm — see Claude_sec_review.md.
-  #       expr: |
-  #         rate(dds_http_caller_identity_total{kind="anonymous"}[5m]) > 0
-  #       for: 5m
-  #       labels: { severity: warning, plan: observability-plan.md#phase-c }
+  # (DdsLoopbackTcpAdminUsed has shipped — see active group `dds-http`
+  # above; the rule moved out of this reference section in
+  # follow-up #24 along with the underlying metric.)

@@ -12,7 +12,7 @@
 > |---|---|---|---|
 > | Z-1 | **Critical** | Encrypted comms (PQC) | Noise/QUIC handshake is X25519/ECDHE only — *not* post-quantum. README "quantum-resistant by default" applies to token signatures, not the transport channel. Harvest-Now-Decrypt-Later exposure on all recorded P2P traffic. |
 > | Z-2 | **High** | HW-bound identity | [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md) is a plan; zero code shipped. libp2p PeerId, admission cert, admin keys, default domain root all software-keyed. |
-> | Z-3 | ✅ **closed (Phase A)** | Immutable audit | Phase A from [docs/observability-plan.md](docs/observability-plan.md) landed: `emit_local_audit` is wired to all production state-mutating paths — `LocalService::{enroll_user, enroll_device, admin_setup, admin_vouch, record_applied}` and `DdsNode::{ingest_operation, ingest_revocation, ingest_burn}` (success and rejection branches both stamp the chain). `AuditLogEntry.reason: Option<String>` is signed-in (Phase A.2) so SIEM consumers can trust rejection reasons without re-deriving. Phase D (`/healthz` + `/readyz` orchestrator probes) also landed (2026-04-26 follow-up #18); Phase B is now complete (B.1 + B.2 in #19, B.3 + B.4 in #20); Phase F (`dds-cli stats` / `health` / `audit export`) landed in #21. Phase C audit-metrics subset (`dds_audit_entries_total`, `dds_audit_chain_length`, `dds_audit_chain_head_age_seconds`, plus build_info / uptime) landed in #22. Phase E audit-tier subset (Alertmanager rules + two Grafana dashboards keyed off the #22 metrics) landed in #23 — the rest of the C catalog (network / FIDO2 / store / HTTP) and the Phase E rules/panels gated on those metrics remain open. |
+> | Z-3 | ✅ **closed (Phase A)** | Immutable audit | Phase A from [docs/observability-plan.md](docs/observability-plan.md) landed: `emit_local_audit` is wired to all production state-mutating paths — `LocalService::{enroll_user, enroll_device, admin_setup, admin_vouch, record_applied}` and `DdsNode::{ingest_operation, ingest_revocation, ingest_burn}` (success and rejection branches both stamp the chain). `AuditLogEntry.reason: Option<String>` is signed-in (Phase A.2) so SIEM consumers can trust rejection reasons without re-deriving. Phase D (`/healthz` + `/readyz` orchestrator probes) also landed (2026-04-26 follow-up #18); Phase B is now complete (B.1 + B.2 in #19, B.3 + B.4 in #20); Phase F (`dds-cli stats` / `health` / `audit export`) landed in #21. Phase C audit-metrics subset (`dds_audit_entries_total`, `dds_audit_chain_length`, `dds_audit_chain_head_age_seconds`, plus build_info / uptime) landed in #22. Phase E audit-tier subset (Alertmanager rules + two Grafana dashboards keyed off the #22 metrics) landed in #23. Phase C HTTP-tier subset (`dds_http_caller_identity_total{kind}`) landed in #24, also closing the H-7 `DdsLoopbackTcpAdminUsed` reference alert by promoting it to the active `dds-http` Alertmanager group. The rest of the C catalog (network / FIDO2 / store / process, plus the HTTP request / duration histograms) and the Phase E rules gated on those metrics remain open. |
 > | Z-4 | **High** | Encrypted at rest | redb store (`directory.redb`) is plaintext CBOR — tokens, ops, revocations, audit entries. Confidentiality depends on OS FDE + ACLs only. |
 > | Z-5 | **Medium** | Encrypted at rest | `dds-cli export` dumps are plaintext-CBOR (signed for integrity, not encrypted for confidentiality). |
 > | Z-6 | **Critical** | Supply-chain | DDS releases are unsigned in practice — Windows MSI Authenticode is gated on a `SIGN_CERT` secret that has never been provisioned; macOS `.pkg` is not Developer-ID-signed and not notarized. Operators have no programmatic way to verify a fresh install. **Implementation plan: [docs/supply-chain-plan.md](docs/supply-chain-plan.md) Phase A.** |
@@ -28,7 +28,40 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #23 (observability Phase E
+> Last updated: 2026-04-26 follow-up #24 (observability Phase C HTTP-tier
+> subset landed — `dds_http_caller_identity_total{kind}` ships and
+> the `DdsLoopbackTcpAdminUsed` H-7 cutover regression alarm in
+> [`docs/observability/alerts/dds.rules.yml`](docs/observability/alerts/dds.rules.yml)
+> moves from the reference-commented section into the active
+> `dds-http` group). Each request the API listener serves bumps its
+> transport bucket (`anonymous|uds|pipe`) plus an orthogonal `admin`
+> bucket when the caller passes `is_admin(policy)`. The new metric
+> is wired in via a tower middleware
+> ([`caller_identity_observer_middleware`](dds-node/src/http.rs))
+> layered on top of the existing rate-limit / body-limit stack, so
+> rate-limited and 4xx-rejected requests still get counted —
+> operators see the full caller-kind picture, not just successful
+> traffic. The classifier ([`classify_caller_identity`](dds-node/src/http.rs))
+> partitions on transport so
+> `sum(rate(dds_http_caller_identity_total{kind=~"anonymous|uds|pipe"}))`
+> equals the total request rate, and `kind="admin"` is a refinement
+> rather than a partition member — this matches the existing alert
+> expression that keys off `kind="anonymous"` to detect post-cutover
+> loopback-TCP usage. Five unit tests cover the renderer, classifier,
+> and per-platform `Uds` / `Pipe` arms (`#[cfg(unix)]` /
+> `#[cfg(windows)]`); workspace test count rises from 589 to 594.
+> The `dds-http` Alertmanager group is now active alongside
+> `dds-audit` and `dds-process`. Phase C remaining metrics (network /
+> FIDO2 / store / process, plus the HTTP request /
+> request-duration histograms) continue to track open in
+> [docs/observability-plan.md](docs/observability-plan.md). The
+> Grafana dashboards add no new panels in this follow-up — operators
+> can derive a caller-identity view from the metric directly; a
+> dedicated panel ships when the rest of the HTTP-tier metrics
+> (`dds_http_requests_total`, `dds_http_request_duration_seconds`)
+> land.
+>
+> Previous: 2026-04-26 follow-up #23 (observability Phase E
 > audit-tier subset landed — Alertmanager rules + two Grafana
 > dashboards key off the metrics shipped in #22; rules/panels for
 > the not-yet-shipped Phase C catalog ship as commented-out

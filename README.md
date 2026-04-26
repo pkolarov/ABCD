@@ -255,13 +255,17 @@ this secret; locally, run
 
 Set `network.metrics_addr = "127.0.0.1:9495"` to expose Prometheus
 `/metrics` on a separate listener (observability-plan.md Phase C —
-audit subset only in this build: `dds_build_info`,
+audit + HTTP-caller subset in this build: `dds_build_info`,
 `dds_uptime_seconds`, `dds_audit_entries_total{action}`,
-`dds_audit_chain_length`, `dds_audit_chain_head_age_seconds`).
+`dds_audit_chain_length`, `dds_audit_chain_head_age_seconds`,
+`dds_http_caller_identity_total{kind=anonymous|uds|pipe|admin}`).
 Default is `None` so the second port is opt-in. Reference
-Alertmanager rules and two Grafana dashboards keyed off the same
+Alertmanager rules (groups `dds-audit`, `dds-process`, and
+`dds-http`) and two Grafana dashboards keyed off the same
 metrics ship under [`docs/observability/`](docs/observability/)
-(Phase E).
+(Phase E). The `dds-http` group's `DdsLoopbackTcpAdminUsed` alert
+fires when `kind="anonymous"` traffic continues post-cutover —
+the H-7 regression tripwire.
 
 ### Rust API (`dds-core` + `dds-domain`)
 

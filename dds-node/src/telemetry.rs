@@ -15,10 +15,10 @@
 //!
 //! ## Metric catalog (this PR)
 //!
-//! Per the plan §4 Phase C.3 only the audit subset lands in this
-//! patch — the rest of the catalog (network / FIDO2 / store / HTTP)
-//! is deferred to follow-up work because each block requires its own
-//! call-site instrumentation pass.
+//! Per the plan §4 Phase C.3 the audit subset (#22) plus the HTTP
+//! caller-identity subset (this PR) ship; the rest of the catalog
+//! (network / FIDO2 / store / process) remains deferred because each
+//! block still requires its own call-site instrumentation pass.
 //!
 //! | Metric | Type | Labels | Source |
 //! |---|---|---|---|
@@ -27,6 +27,29 @@
 //! | `dds_audit_entries_total` | counter | `action` | bumped by [`record_audit_entry`] |
 //! | `dds_audit_chain_length` | gauge | — | [`AuditStore::count_audit_entries`] at scrape |
 //! | `dds_audit_chain_head_age_seconds` | gauge | — | `now - head.timestamp` at scrape |
+//! | `dds_http_caller_identity_total` | counter | `kind=anonymous\|uds\|pipe\|admin` | bumped by [`record_caller_identity`] |
+//!
+//! ### `dds_http_caller_identity_total` semantics
+//!
+//! Each completed HTTP request bumps **two** buckets — its transport
+//! kind, plus `admin` when the caller passes
+//! `CallerIdentity::is_admin(&policy)`. So
+//! `sum(rate(...{kind=~"anonymous|uds|pipe"}))` equals the total
+//! request rate while `kind="admin"` is an orthogonal refinement.
+//! [`crate::http::classify_caller_identity`] returns the transport
+//! kind; [`crate::http::caller_identity_observer_middleware`] is
+//! responsible for bumping `admin` separately.
+//!
+//! - `anonymous` — `CallerIdentity::Anonymous` (no peer credentials,
+//!   i.e. loopback TCP). The expected bulk of post-cutover traffic
+//!   should be `uds` / `pipe`; any `anonymous` baseline indicates
+//!   loopback TCP is still in use, which is the
+//!   `DdsLoopbackTcpAdminUsed` H-7 cutover regression signal.
+//! - `uds` — UDS transport.
+//! - `pipe` — named-pipe transport.
+//! - `admin` — orthogonal: a caller (any transport) that
+//!   `is_admin(policy)` returns `true` for. Useful for separating
+//!   admin traffic share without re-keying the alert.
 //!
 //! [`record_audit_entry`] is called from the two audit-emit funnels —
 //! [`crate::service::LocalService::emit_local_audit`] and
@@ -58,9 +81,10 @@ use crate::http::SharedService;
 /// through the swarm event loop or every HTTP handler.
 static TELEMETRY: OnceLock<Arc<Telemetry>> = OnceLock::new();
 
-/// In-process counters backing the Prometheus exposition. Currently a
-/// per-action audit counter and a process-start instant; the rest of
-/// the Phase C catalog will land on this struct.
+/// In-process counters backing the Prometheus exposition. Holds a
+/// per-action audit counter, a per-caller-kind HTTP counter, and a
+/// process-start instant; the rest of the Phase C catalog will land
+/// on this struct.
 pub struct Telemetry {
     /// `now - start_at` is the `dds_uptime_seconds` gauge value.
     start_at: SystemTime,
@@ -68,6 +92,10 @@ pub struct Telemetry {
     /// action vocabulary is fixed by `observability-plan.md` §4 Phase
     /// A.
     audit_entries: Mutex<BTreeMap<String, u64>>,
+    /// Per-kind HTTP-caller-identity counts. Kind is one of
+    /// `anonymous|uds|pipe|admin` — bounded by
+    /// [`crate::http::classify_caller_identity`].
+    caller_identity: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Telemetry {
@@ -75,6 +103,7 @@ impl Telemetry {
         Self {
             start_at: SystemTime::now(),
             audit_entries: Mutex::new(BTreeMap::new()),
+            caller_identity: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -104,6 +133,30 @@ impl Telemetry {
         }
     }
 
+    fn bump_caller_identity(&self, kind: &str) {
+        let mut g = match self.caller_identity.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry(kind.to_string()).or_insert(0) += 1;
+    }
+
+    fn caller_identity_snapshot(&self) -> BTreeMap<String, u64> {
+        match self.caller_identity.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of `dds_http_caller_identity_total{kind=...}`.
+    /// Public so integration tests can assert without scraping.
+    pub fn caller_identity_count(&self, kind: &str) -> u64 {
+        match self.caller_identity.lock() {
+            Ok(g) => g.get(kind).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(kind).copied().unwrap_or(0),
+        }
+    }
+
     fn uptime_seconds(&self) -> u64 {
         SystemTime::now()
             .duration_since(self.start_at)
@@ -125,6 +178,16 @@ pub fn install() -> Arc<Telemetry> {
 pub fn record_audit_entry(action: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_audit_entry(action);
+    }
+}
+
+/// Bump `dds_http_caller_identity_total{kind=...}` by one. Called
+/// from [`crate::http::caller_identity_observer_middleware`] for
+/// every request the API listener serves. No-op when telemetry has
+/// not been installed (tests, harnesses).
+pub fn record_caller_identity(kind: &str) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_caller_identity(kind);
     }
 }
 
@@ -200,6 +263,23 @@ fn render_exposition(
         None => 0,
     };
     out.push_str(&format!("dds_audit_chain_head_age_seconds {head_age}\n"));
+
+    // `dds_http_caller_identity_total` — per-kind caller counter.
+    out.push_str(
+        "# HELP dds_http_caller_identity_total HTTP requests served, by caller kind \
+         (anonymous|uds|pipe|admin). Each request bumps its transport bucket \
+         (anonymous|uds|pipe) and additionally bumps `admin` when the caller passes \
+         the admin-policy check; admin is orthogonal to transport.\n",
+    );
+    out.push_str("# TYPE dds_http_caller_identity_total counter\n");
+    let caller_snapshot = telemetry.caller_identity_snapshot();
+    for (kind, count) in caller_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_http_caller_identity_total{{kind=\"{}\"}} {}\n",
+            escape_label_value(kind),
+            count
+        ));
+    }
 
     out
 }
@@ -394,6 +474,22 @@ mod tests {
         assert!(body.contains("dds_audit_entries_total{action=\"attest\"} 2\n"));
         assert!(body.contains("dds_audit_entries_total{action=\"revoke\"} 1\n"));
         assert!(body.contains("dds_audit_chain_length 3\n"));
+    }
+
+    #[test]
+    fn caller_identity_counter_renders_in_exposition() {
+        let t = Telemetry::new();
+        t.bump_caller_identity("anonymous");
+        t.bump_caller_identity("anonymous");
+        t.bump_caller_identity("admin");
+
+        let body = render_exposition(&t, 0, None);
+        assert!(body.contains("# TYPE dds_http_caller_identity_total counter\n"));
+        assert!(body.contains("dds_http_caller_identity_total{kind=\"anonymous\"} 2\n"));
+        assert!(body.contains("dds_http_caller_identity_total{kind=\"admin\"} 1\n"));
+        assert_eq!(t.caller_identity_count("anonymous"), 2);
+        assert_eq!(t.caller_identity_count("admin"), 1);
+        assert_eq!(t.caller_identity_count("uds"), 0);
     }
 
     #[test]
