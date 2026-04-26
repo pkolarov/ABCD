@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -167,6 +168,15 @@ pub struct DdsNode {
     /// the emit helpers are no-ops in that case so a missing identity
     /// never crashes the swarm event loop.
     node_identity: Option<Identity>,
+    /// **observability-plan.md Phase D.2 (`/readyz` peer check)**:
+    /// flipped from `false` to `true` the first time a swarm
+    /// `ConnectionEstablished` event fires. Cloned (`Arc::clone`) into
+    /// [`crate::http::NodeInfo::peer_seen`] before the HTTP task is
+    /// spawned so the readyz handler can observe the same flag without
+    /// reaching into the swarm. Sticky once set — `ConnectionClosed`
+    /// does not reset it; readiness is "have we ever reached a peer",
+    /// not "are we connected right now".
+    peer_seen: Arc<AtomicBool>,
 }
 
 impl DdsNode {
@@ -288,7 +298,18 @@ impl DdsNode {
             admission_revocations,
             admission_revocations_path: revocations_path,
             node_identity: None,
+            peer_seen: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// **observability-plan.md Phase D.2**: hand out an `Arc` clone of
+    /// the peer-seen flag for the HTTP `/readyz` handler. The flag is
+    /// flipped on the first `ConnectionEstablished` event (sticky) and
+    /// must be plumbed into [`crate::http::NodeInfo`] before
+    /// `tokio::spawn(http::serve(...))` so the handler sees the same
+    /// `AtomicBool`.
+    pub fn peer_seen_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.peer_seen)
     }
 
     /// **Z-3 / Phase A.1**: install the Vouchsafe node identity used to
@@ -494,6 +515,11 @@ impl DdsNode {
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 info!(%peer_id, "connection established");
+                // observability-plan.md Phase D.2 — sticky readiness
+                // signal for `/readyz`. Set on every event because the
+                // store is cheap and Relaxed; only the first transition
+                // is observable to readers.
+                self.peer_seen.store(true, Ordering::Relaxed);
                 // H-12: initiate the admission handshake immediately
                 // so the peer is either admitted (and can contribute
                 // gossip / sync) or silently unadmitted (messages

@@ -12,7 +12,7 @@
 > |---|---|---|---|
 > | Z-1 | **Critical** | Encrypted comms (PQC) | Noise/QUIC handshake is X25519/ECDHE only — *not* post-quantum. README "quantum-resistant by default" applies to token signatures, not the transport channel. Harvest-Now-Decrypt-Later exposure on all recorded P2P traffic. |
 > | Z-2 | **High** | HW-bound identity | [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md) is a plan; zero code shipped. libp2p PeerId, admission cert, admin keys, default domain root all software-keyed. |
-> | Z-3 | ✅ **closed (Phase A)** | Immutable audit | Phase A from [docs/observability-plan.md](docs/observability-plan.md) landed: `emit_local_audit` is wired to all production state-mutating paths — `LocalService::{enroll_user, enroll_device, admin_setup, admin_vouch, record_applied}` and `DdsNode::{ingest_operation, ingest_revocation, ingest_burn}` (success and rejection branches both stamp the chain). `AuditLogEntry.reason: Option<String>` is signed-in (Phase A.2) so SIEM consumers can trust rejection reasons without re-deriving. Phases B–F (SIEM export, Prometheus `/metrics`, Alertmanager rules, Grafana dashboards, `dds-cli` ops surface) remain open. |
+> | Z-3 | ✅ **closed (Phase A)** | Immutable audit | Phase A from [docs/observability-plan.md](docs/observability-plan.md) landed: `emit_local_audit` is wired to all production state-mutating paths — `LocalService::{enroll_user, enroll_device, admin_setup, admin_vouch, record_applied}` and `DdsNode::{ingest_operation, ingest_revocation, ingest_burn}` (success and rejection branches both stamp the chain). `AuditLogEntry.reason: Option<String>` is signed-in (Phase A.2) so SIEM consumers can trust rejection reasons without re-deriving. Phase D (`/healthz` + `/readyz` orchestrator probes) also landed (2026-04-26 follow-up #18). Phases B, C, E, F (SIEM export, Prometheus `/metrics`, Alertmanager rules + Grafana dashboards, `dds-cli` ops surface) remain open. |
 > | Z-4 | **High** | Encrypted at rest | redb store (`directory.redb`) is plaintext CBOR — tokens, ops, revocations, audit entries. Confidentiality depends on OS FDE + ACLs only. |
 > | Z-5 | **Medium** | Encrypted at rest | `dds-cli export` dumps are plaintext-CBOR (signed for integrity, not encrypted for confidentiality). |
 > | Z-6 | **Critical** | Supply-chain | DDS releases are unsigned in practice — Windows MSI Authenticode is gated on a `SIGN_CERT` secret that has never been provisioned; macOS `.pkg` is not Developer-ID-signed and not notarized. Operators have no programmatic way to verify a fresh install. **Implementation plan: [docs/supply-chain-plan.md](docs/supply-chain-plan.md) Phase A.** |
@@ -28,7 +28,48 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #17 (Z-3 Phase A landed —
+> Last updated: 2026-04-26 follow-up #18 (observability Phase D
+> landed — closes the orchestrator-probe half of
+> [docs/observability-plan.md](docs/observability-plan.md) and the
+> "health checks" half of the
+> [docs/AD-drop-in-replacement-roadmap.md](docs/AD-drop-in-replacement-roadmap.md)
+> §4.9 Monitoring/SIEM row). Two new public routes on the API
+> listener — `GET /healthz` always answers `200 ok` for liveness,
+> `GET /readyz` answers 200 + `{"ready": true, "checks": {...}}`
+> when (a) `LocalService::readiness_smoketest` round-trips
+> `audit_chain_head()` against redb and (b) the swarm has either
+> observed a `ConnectionEstablished` since boot **or** the
+> configured `bootstrap_peers` list is empty (lone-node mode);
+> otherwise 503 with the failing check named in the JSON body so
+> `dds-cli health` (Phase F, deferred) and `kubectl describe`
+> surface the reason without grep'ing the node log. The peer-seen
+> signal is a sticky `Arc<AtomicBool>` shared between
+> [dds-node/src/node.rs](dds-node/src/node.rs)'s
+> `ConnectionEstablished` arm and
+> [dds-node/src/http.rs](dds-node/src/http.rs)'s `readyz` handler
+> via a new `peer_seen_handle()` accessor; main.rs threads the
+> handle plus `bootstrap_empty: bool` into `http::NodeInfo` before
+> the HTTP task is spawned. Both routes sit on the public sub-
+> router (no admin gate, no FIDO2 gate) — orchestrator probes must
+> work without caller credentials — but they remain inside the
+> H-6 response-MAC layer so a MITM cannot manufacture a bogus
+> 200/503. Domain-pubkey / admission-cert verification is implicit:
+> if either failed, `DdsNode::init` errored before `http::serve`
+> ever bound, so any process answering `/readyz` necessarily passed
+> those gates at startup. Workspace test count: 567 (+6: two for
+> healthz —`healthz_returns_200_ok_body` and the
+> production-router unauthenticated check —and four for readyz
+> covering ready-when-bootstrap-empty, 503-without-peer, the
+> peer_seen flip, and the production-router unauthenticated check;
+> the last two pin the no-admin-gate property even under a strict
+> `AdminPolicy`). cargo fmt clean; cargo clippy clean (workspace,
+> all-targets, `-D warnings`); cargo test --workspace --all-targets
+> passes. Phases B (SIEM export via `dds-cli audit tail`), C
+> (Prometheus `/metrics`), E (reference Grafana / Alertmanager
+> assets), and F (`dds-cli` ops surface) remain open and continue
+> to track in the observability plan.
+>
+> Previous: 2026-04-26 follow-up #17 (Z-3 Phase A landed —
 > closes the "audit log empty in production" finding from the
 > [Claude_sec_review.md](Claude_sec_review.md) "2026-04-26 Zero-Trust
 > Principles Audit" and Phase A from

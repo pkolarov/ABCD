@@ -460,9 +460,21 @@ pub type SharedService<S> = Arc<Mutex<LocalService<S>>>;
 
 /// Static node info captured at server start (peer id never changes for the
 /// life of the process).
+///
+/// `peer_seen` is a shared boolean toggled by [`crate::node::DdsNode`] the
+/// first time a peer connection is established. It feeds the Phase D
+/// `/readyz` check (observability-plan.md): a node with bootstrap peers
+/// configured is "ready" only after it has actually reached one.
+///
+/// `bootstrap_empty` is `true` when the node is configured with zero
+/// bootstrap peers (lone-node deployment). In that case `/readyz` skips
+/// the peer-seen check — the node is ready as soon as the store smoke
+/// test passes.
 #[derive(Clone)]
 pub struct NodeInfo {
     pub peer_id: String,
+    pub peer_seen: Arc<std::sync::atomic::AtomicBool>,
+    pub bootstrap_empty: bool,
 }
 
 struct AppState<
@@ -656,6 +668,9 @@ where
         .route("/v1/policy/evaluate", post(evaluate_policy::<S>))
         .route("/v1/status", get(status::<S>))
         .route("/v1/node/info", get(node_info::<S>))
+        // observability-plan.md Phase D — orchestrator-friendly probes.
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz::<S>))
         .route("/v1/windows/policies", get(list_windows_policies::<S>))
         .route("/v1/windows/software", get(list_windows_software::<S>))
         .route("/v1/windows/applied", post(record_windows_applied::<S>))
@@ -1105,6 +1120,107 @@ where
         node_pubkey_b64: base64::engine::general_purpose::STANDARD.encode(svc.node_pubkey_bytes()),
         peer_id: state.info.peer_id.clone(),
     }))
+}
+
+/// `GET /healthz` — observability-plan.md Phase D.1 liveness probe.
+/// Returns 200 unconditionally as long as the axum task is scheduling.
+/// Orchestrators (kube, systemd, launchd) use this for restart decisions.
+/// No dependency checks here — a poisoned redb still answers liveness so
+/// the orchestrator does not flap a recovering node before it can
+/// actually serve `/readyz`.
+async fn healthz() -> &'static str {
+    "ok"
+}
+
+#[derive(Serialize)]
+struct ReadyzResponse {
+    ready: bool,
+    /// Per-check status. `"ok"` if the check passed, an error string
+    /// otherwise. Operators and the `dds-cli health` subcommand surface
+    /// this body verbatim — the response is the troubleshooting handle.
+    checks: ReadyzChecks,
+}
+
+#[derive(Serialize)]
+struct ReadyzChecks {
+    /// Node Vouchsafe identity is loaded (the service object exists).
+    node_identity: &'static str,
+    /// redb store responds to a read; smoke test for at-rest corruption
+    /// or a permission regression.
+    store: String,
+    /// Either an inbound or outbound peer connection has been observed
+    /// since startup, or `bootstrap_peers` is empty (lone-node mode).
+    peers: &'static str,
+}
+
+/// `GET /readyz` — observability-plan.md Phase D.2 readiness probe.
+/// 200 + `{"ready": true, …}` when every check passes; 503 +
+/// `{"ready": false, …}` when one fails. Orchestrators use this to
+/// decide whether to route traffic to the node.
+///
+/// Checks performed:
+/// - **node_identity** — the `LocalService` exists, so identity is
+///   loaded by construction. (The router is built only after
+///   `LocalService::new` returns.)
+/// - **store** — `audit_chain_head()` round-trips. A redb open / DACL
+///   regression surfaces here as 503 rather than as a stack of 500s
+///   from real traffic.
+/// - **peers** — `peer_seen` is set (we've completed at least one
+///   `ConnectionEstablished`) **or** the bootstrap-peer list is empty
+///   so the node was deployed standalone.
+///
+/// Domain-pubkey / admission-cert verification is implicit: if either
+/// failed, [`crate::node::DdsNode::init`] errored before this server
+/// ever bound to a port, so a process answering `/readyz` necessarily
+/// passed those gates at startup.
+async fn readyz<S>(
+    State(state): State<AppState<S>>,
+) -> (axum::http::StatusCode, Json<ReadyzResponse>)
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    use std::sync::atomic::Ordering;
+
+    let store_status = {
+        let svc = state.svc.lock().await;
+        match svc.readiness_smoketest() {
+            Ok(()) => "ok".to_string(),
+            Err(e) => format!("store smoketest failed: {e}"),
+        }
+    };
+
+    let peers_ok = state.info.bootstrap_empty || state.info.peer_seen.load(Ordering::Relaxed);
+    let peers_status = if peers_ok {
+        "ok"
+    } else {
+        "no peers observed since startup"
+    };
+
+    let store_ok = store_status == "ok";
+    let ready = store_ok && peers_ok;
+
+    let body = ReadyzResponse {
+        ready,
+        checks: ReadyzChecks {
+            node_identity: "ok",
+            store: store_status,
+            peers: peers_status,
+        },
+    };
+
+    let code = if ready {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(body))
 }
 
 // ---------- Credential Provider handlers (Phase III) ----------
@@ -2202,6 +2318,8 @@ mod tests {
                 svc: Arc::new(Mutex::new(svc)),
                 info: NodeInfo {
                     peer_id: "12D3KooWUnit".into(),
+                    peer_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    bootstrap_empty: true,
                 },
                 device_binding: None,
                 admin_policy: Arc::new(tcp_trust_policy()),
@@ -2305,6 +2423,8 @@ mod tests {
                 "/v1/macos/applied",
                 post(record_macos_applied::<MemoryBackend>),
             )
+            .route("/healthz", get(healthz))
+            .route("/readyz", get(readyz::<MemoryBackend>))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4855,5 +4975,115 @@ mod tests {
 
             server.abort();
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // observability-plan.md Phase D — `/healthz` + `/readyz`
+    // ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn healthz_returns_200_ok_body() {
+        let state = make_state();
+        let base = spawn_server(state).await;
+        let resp = reqwest::get(format!("{base}/healthz")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        assert_eq!(body, "ok");
+    }
+
+    #[tokio::test]
+    async fn healthz_via_production_router_is_unauthenticated() {
+        // /healthz must not be gated by `require_admin_middleware`,
+        // even on a strict-admin policy where loopback TCP is not
+        // trusted. Otherwise an orchestrator running on the host
+        // (without UDS / pipe credentials) would never see liveness.
+        let state = make_state();
+        let svc = state.svc.clone();
+        let info = state.info.clone();
+        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{}", addr);
+
+        let resp = reqwest::get(format!("{base}/healthz")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn readyz_is_ready_when_bootstrap_empty_and_store_ok() {
+        // make_state sets bootstrap_empty=true — lone-node deployment.
+        // No peer connection ever needed; readiness depends only on
+        // the store smoke test.
+        let state = make_state();
+        let base = spawn_server(state).await;
+        let resp = reqwest::get(format!("{base}/readyz")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["checks"]["node_identity"], "ok");
+        assert_eq!(body["checks"]["store"], "ok");
+        assert_eq!(body["checks"]["peers"], "ok");
+    }
+
+    #[tokio::test]
+    async fn readyz_returns_503_when_bootstrap_nonempty_and_no_peer_seen() {
+        // Configured bootstrap peers but the swarm has not connected
+        // to anyone — orchestrator should hold traffic.
+        let mut state = make_state();
+        state.info.bootstrap_empty = false;
+        // peer_seen left at default false.
+        let base = spawn_server(state).await;
+        let resp = reqwest::get(format!("{base}/readyz")).await.unwrap();
+        assert_eq!(resp.status(), 503);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["checks"]["peers"], "no peers observed since startup");
+        assert_eq!(body["checks"]["store"], "ok");
+    }
+
+    #[tokio::test]
+    async fn readyz_flips_to_ready_when_peer_seen_set() {
+        // Same configured-bootstrap scenario, but now the swarm has
+        // observed a `ConnectionEstablished`. The shared AtomicBool
+        // is the contract between the swarm and the readyz handler;
+        // once flipped, readiness is sticky.
+        let mut state = make_state();
+        state.info.bootstrap_empty = false;
+        let peer_seen = state.info.peer_seen.clone();
+        let base = spawn_server(state).await;
+
+        // Pre-flip: not ready.
+        let resp = reqwest::get(format!("{base}/readyz")).await.unwrap();
+        assert_eq!(resp.status(), 503);
+
+        // Flip — simulates the swarm event loop catching a peer.
+        peer_seen.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let resp = reqwest::get(format!("{base}/readyz")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ready"], true);
+    }
+
+    #[tokio::test]
+    async fn readyz_via_production_router_is_unauthenticated() {
+        // Same posture as healthz: orchestrator probes must work
+        // without admin caller credentials.
+        let state = make_state();
+        let svc = state.svc.clone();
+        let info = state.info.clone();
+        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{}", addr);
+
+        let resp = reqwest::get(format!("{base}/readyz")).await.unwrap();
+        assert_eq!(resp.status(), 200);
     }
 }

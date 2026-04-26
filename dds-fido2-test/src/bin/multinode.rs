@@ -452,6 +452,8 @@ fn spawn_http(h: &NodeHandle, admin_attest: &Token) -> Result<(), Box<dyn std::e
     let shared_svc = Arc::new(tokio::sync::Mutex::new(svc));
     let info = http::NodeInfo {
         peer_id: h.node.peer_id.to_string(),
+        peer_seen: h.node.peer_seen_handle(),
+        bootstrap_empty: h.node.config.network.bootstrap_peers.is_empty(),
     };
     let admin_policy = http::AdminPolicy::from_config(&h.node.config.network.api_auth);
     let api_addr = h.node.config.network.api_addr.clone();

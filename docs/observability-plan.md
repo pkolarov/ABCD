@@ -1,8 +1,9 @@
 # DDS Observability Plan — Audit, Metrics, Alerts, SIEM Export
 
-**Status:** Phase A landed 2026-04-26 follow-up #17 (closes Z-3).
-Phases B–F (SIEM export, Prometheus `/metrics`, Alertmanager rules,
-Grafana dashboards, `dds-cli` ops surface) remain open.
+**Status:** Phase A landed 2026-04-26 follow-up #17 (closes Z-3);
+Phase D (`/healthz` + `/readyz`) landed 2026-04-26 follow-up #18.
+Phases B, C, E, F (SIEM export, Prometheus `/metrics`, Alertmanager
+rules + Grafana dashboards, `dds-cli` ops surface) remain open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -10,7 +11,9 @@ Principles Audit" — **closed by Phase A**; the P2 Monitoring/SIEM
 row in
 [AD-drop-in-replacement-roadmap.md](AD-drop-in-replacement-roadmap.md)
 §4.9 (line 194 — *"JSON/syslog/OpenTelemetry export; health checks;
-audit query tooling"*) — open, awaits Phases B + D + F.
+audit query tooling"*) — health-checks half closed by Phase D
+(2026-04-26 follow-up #18); SIEM export + audit query tooling still
+open under Phases B + F.
 **Owner:** TBD.
 
 ---
@@ -283,20 +286,52 @@ startup so operators get types/help text from
 free-form URNs, JTIs, or paths land in labels. Cardinality estimate
 ≤ 200 series per node — fits comfortably in a small Prometheus.
 
-### Phase D — Health endpoints
+### Phase D — Health endpoints ✅
 
-**D.1 — `GET /healthz`.** Liveness. 200 if process is up. No
-dependency checks. New route on the API listener.
+**Status: landed 2026-04-26 follow-up #18.** Both routes are wired
+into the public sub-router (no admin gate, no FIDO2 — orchestrator
+probes must work without caller credentials) and the response signer
+(H-6) wraps them, so a MITM cannot manufacture a bogus 200/503.
 
-**D.2 — `GET /readyz`.** Readiness. 200 only if:
-- node identity loaded;
-- domain pubkey loaded and admission cert verifies;
-- redb writable;
-- at least one inbound or outbound peer connection ever observed
-  *or* `peers.bootstrap` is empty (lone-node deployment).
+**D.1 — `GET /healthz`. ✅** Liveness. Returns `200 ok` whenever the
+axum task is scheduling. No dependency checks — a poisoned redb
+still answers liveness so the orchestrator does not flap a recovering
+node before it can serve `/readyz`. Implemented in
+[dds-node/src/http.rs](../dds-node/src/http.rs) `healthz`.
 
-`/v1/node/info` already exists — keep it for content discovery, add
-`/healthz` and `/readyz` as the orchestrator-friendly endpoints.
+**D.2 — `GET /readyz`. ✅** Readiness. Returns
+`{"ready": true|false, "checks": {...}}` with HTTP 200 when ready and
+503 otherwise. Checks performed:
+- **node_identity** — `LocalService` exists, so identity is loaded by
+  construction (the router is only built after `LocalService::new`
+  returns).
+- **store** — `LocalService::readiness_smoketest` round-trips
+  `audit_chain_head()`. A redb open / DACL regression surfaces here
+  as 503 rather than as a stack of 500s from real traffic.
+- **peers** — `peer_seen` (`Arc<AtomicBool>` shared with the swarm
+  event loop, flipped sticky on the first `ConnectionEstablished`)
+  is `true`, **or** `bootstrap_empty` is `true` (lone-node
+  deployment).
+
+Domain-pubkey / admission-cert verification is implicit: if either
+failed, `DdsNode::init` errored before `http::serve` ever bound to a
+port, so a process answering `/readyz` necessarily passed those
+gates at startup.
+
+`/v1/node/info` is preserved for content discovery; `/healthz` and
+`/readyz` are the orchestrator-friendly endpoints.
+
+**D.3 — Tests. ✅** Six new regression tests in
+[dds-node/src/http.rs](../dds-node/src/http.rs) `tests`:
+`healthz_returns_200_ok_body`,
+`healthz_via_production_router_is_unauthenticated`,
+`readyz_is_ready_when_bootstrap_empty_and_store_ok`,
+`readyz_returns_503_when_bootstrap_nonempty_and_no_peer_seen`,
+`readyz_flips_to_ready_when_peer_seen_set` (proves the swarm /
+handler share the same `AtomicBool`),
+`readyz_via_production_router_is_unauthenticated`. The two
+unauthenticated-router tests pin the no-admin-gate property even
+under a strict `AdminPolicy`.
 
 ### Phase E — Reference dashboards & alert rules
 

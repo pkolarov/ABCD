@@ -1052,6 +1052,21 @@ impl<
         self.node_identity.id.to_urn()
     }
 
+    /// observability-plan.md Phase D.2 — store smoke test for `/readyz`.
+    ///
+    /// Issues a single read against the audit chain. A successful
+    /// `audit_chain_head()` proves: the redb file is open, the audit
+    /// table is accessible, and the on-disk DACL allows the node user
+    /// to read it. We deliberately do not write here — readiness is a
+    /// non-mutating probe and the periodic real audit emissions cover
+    /// write-path health.
+    pub fn readiness_smoketest(&self) -> Result<(), ServiceError> {
+        self.store
+            .audit_chain_head()
+            .map(|_| ())
+            .map_err(|e| ServiceError::Store(e.to_string()))
+    }
+
     /// **Z-3 / Phase A.1 (observability-plan.md)**: emit a locally-
     /// chained audit entry for an action this service just performed.
     /// Reads the current chain head from the store, stamps `prev_hash`,
