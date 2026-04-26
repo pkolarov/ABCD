@@ -53,7 +53,9 @@ class TestIdentity:
         assert result["urn"].startswith("urn:vouchsafe:pytest-alice.")
         assert result["scheme"] == "Ed25519"
         assert result["pubkey_len"] == 32
-        assert len(result["signing_key_hex"]) == 64  # 32 bytes hex
+        # I-9: secret signing key must not be exposed across the FFI.
+        assert "signing_key_hex" not in result
+        assert "signing_key" not in result
 
     def test_create_hybrid(self, client):
         result = client.identity_create_hybrid("pytest-quantum")

@@ -80,6 +80,12 @@ fn write_str(out: *mut *mut c_char, s: &str) -> i32 {
 
 /// Generate a classical (Ed25519) identity. Returns JSON.
 ///
+/// I-9: the secret signing key is **not** exposed across the FFI. The
+/// generated identity is dropped after the URN/pubkey metadata is
+/// returned, so language bindings cannot accidentally retain plaintext
+/// key material in GC'd strings. The hybrid variant has always
+/// behaved this way; the classical path is now consistent.
+///
 /// # Safety
 /// `label` must be a valid NUL-terminated C string. `out` must be a valid pointer
 /// to a `*mut c_char` location that this function may write to.
@@ -96,7 +102,6 @@ pub unsafe extern "C" fn dds_identity_create(label: *const c_char, out: *mut *mu
             "urn": ident.id.to_urn(),
             "scheme": format!("{}", ident.public_key.scheme),
             "pubkey_len": ident.public_key.bytes.len(),
-            "signing_key_hex": hex::encode(ident.signing_key.to_bytes()),
         }),
     )
 }

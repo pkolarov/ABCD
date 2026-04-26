@@ -1248,7 +1248,23 @@ Session `exp` and challenge TTLs computed from `SystemTime::now()`. NTP backstep
   error before any allocation. Two regression tests:
   `i8_parse_auth_data_rejects_oversized_credential_id` and
   `i8_parse_auth_data_accepts_max_credential_id_length` (boundary).
-- **I-9.** Secrets in Python bindings linger in GC'd strings ([bindings/python/dds.py:116,132](bindings/python/dds.py#L116)) — use `ctypes.create_string_buffer` for sensitive inputs.
+- **I-9.** ✅ **Closed 2026-04-26.** Closed at the *source* rather than
+  in each binding. `dds_identity_create` no longer emits the
+  `signing_key_hex` field in its JSON response
+  ([dds-ffi/src/ffi_core.rs](dds-ffi/src/ffi_core.rs)); the freshly
+  generated `Identity` is dropped after the URN/pubkey metadata is
+  serialised, so the secret never crosses the FFI boundary into the
+  caller language's heap. The hybrid variant (`dds_identity_create_hybrid`)
+  always behaved this way; the classical path is now consistent. The
+  C and Swift headers (`bindings/c/dds.h`,
+  `bindings/swift/Sources/CDDS/include/dds.h`) document the new
+  contract and point callers at the higher-level
+  `dds_token_create_attest` entry point — which keeps the signing key
+  confined to the FFI — for any flow that needs to sign. Two
+  regression tests pin the absence: `test_identity_create` (Rust,
+  `dds-ffi/src/lib.rs`) and `TestIdentity::test_create_classical`
+  (Python, `bindings/python/test_dds.py`) both assert that neither
+  `signing_key_hex` nor `signing_key` appears in the response.
 - **I-10.** ✅ **Closed 2026-04-26.** `cose_to_credential_public_key`
   now rejects a COSE_Key that omits the `alg` parameter (label 3) per
   RFC 9052 §3.1, instead of falling back to inferring the algorithm

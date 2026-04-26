@@ -1,7 +1,36 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #5 (node identity rotation —
+> Last updated: 2026-04-26 follow-up #6 (FFI signing-key leak —
+> closes `Claude_sec_review.md` informational item I-9). The
+> classical `dds_identity_create` FFI export was the last DDS API
+> surface that emitted secret key material (`signing_key_hex` in the
+> response JSON); the hybrid variant has always been clean. Per I-9
+> in the security review, plaintext key bytes flowing through Python
+> ctypes / C# P/Invoke / Swift / Kotlin land in GC'd strings that
+> cannot be reliably zeroized after use. Fix lives at the source
+> (`dds-ffi/src/ffi_core.rs`) rather than in each binding: the
+> response JSON now carries `{ urn, scheme, pubkey_len }` and the
+> freshly-generated `Identity` is dropped immediately, so the secret
+> never crosses the FFI boundary. Callers that need to sign should
+> use the higher-level `dds_token_create_attest` entry point — it
+> already keeps the signing key confined to Rust and returns only
+> the signed token CBOR. The C and Swift headers
+> (`bindings/c/dds.h`, `bindings/swift/Sources/CDDS/include/dds.h`)
+> document the new contract. Two regression tests pin the absence:
+> `dds-ffi::tests::test_identity_create` (Rust) and
+> `bindings/python/test_dds.py::TestIdentity::test_create_classical`
+> (Python) both assert that neither `signing_key_hex` nor
+> `signing_key` appears in the response. Workspace test count: 528
+> (no test count change — converted positive `is_empty` assertion
+> into negative `is_none` assertions, no new tests added); cargo
+> fmt clean; cargo clippy clean (workspace, all-targets, `-D
+> warnings`); Python binding tests still 13/13 against the rebuilt
+> `target/release/libdds_ffi.dylib`. No remaining open Critical,
+> High, or Medium items in the security review; only I-1, I-6, I-9
+> (now closed) and I-11 remain in the Informational tier.
+>
+> Previous: 2026-04-26 follow-up #5 (node identity rotation —
 > partially closes `docs/threat-model-review.md` §2 recommendation #3
 > / §8 open item #9). New `dds-node rotate-identity --data-dir <DIR>
 > [--no-backup]` subcommand rotates the libp2p keypair in place: it

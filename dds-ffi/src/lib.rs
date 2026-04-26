@@ -51,7 +51,9 @@ mod tests {
         );
         assert_eq!(json["scheme"].as_str().unwrap(), "Ed25519");
         assert_eq!(json["pubkey_len"].as_u64().unwrap(), 32);
-        assert!(!json["signing_key_hex"].as_str().unwrap().is_empty());
+        // I-9: secret signing key must not be exposed across the FFI.
+        assert!(json.get("signing_key_hex").is_none());
+        assert!(json.get("signing_key").is_none());
     }
 
     #[cfg(feature = "pq")]

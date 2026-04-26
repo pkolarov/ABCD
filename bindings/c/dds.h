@@ -38,7 +38,14 @@ extern "C" {
 
 /**
  * Generate a classical (Ed25519) identity.
- * Output JSON: { "urn", "scheme", "pubkey_len", "signing_key_hex" }
+ * Output JSON: { "urn", "scheme", "pubkey_len" }
+ *
+ * The secret signing key is not returned across the FFI (closes I-9):
+ * the freshly generated identity is dropped after the URN/pubkey
+ * metadata is serialised, so caller languages cannot retain plaintext
+ * key material in GC'd strings. To sign a token, use the higher-level
+ * dds_token_create_attest entry point, which keeps the signing key
+ * confined to the FFI.
  */
 int32_t dds_identity_create(const char* label, char** out);
 
