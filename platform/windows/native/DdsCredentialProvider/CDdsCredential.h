@@ -80,6 +80,7 @@ class CDdsCredential : public ICredentialProviderCredential
                        PCWSTR pwzUsername,
                        PCWSTR pwzUsernameInfo,
                        PCWSTR pwzSubjectUrn,
+                       PCWSTR pwzCredentialId,
                        bool noUser = false);
 
     // DDS Auth Bridge FIDO2 authentication path.

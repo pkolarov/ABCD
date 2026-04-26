@@ -327,10 +327,12 @@ static void ResetAuthOperation(AuthOperation& op, HANDLE hResponseEvent)
 CDdsAuthBridgeMain::CDdsAuthBridgeMain()
     : m_hStopEvent(NULL)
     , m_bInitialized(FALSE)
+    , m_staleCooldownMs(STALE_COOLDOWN_DEFAULT_MS)
 {
     m_activeAuth = AuthOperation{};
     m_activeAuth.hResponseEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     InitializeCriticalSection(&m_csAuth);
+    InitializeCriticalSection(&m_csCooldown);
 }
 
 CDdsAuthBridgeMain::~CDdsAuthBridgeMain()
@@ -339,6 +341,7 @@ CDdsAuthBridgeMain::~CDdsAuthBridgeMain()
     if (m_activeAuth.hResponseEvent)
         CloseHandle(m_activeAuth.hResponseEvent);
     DeleteCriticalSection(&m_csAuth);
+    DeleteCriticalSection(&m_csCooldown);
 }
 
 BOOL CDdsAuthBridgeMain::Initialize(_In_ HANDLE hStopEvent)
@@ -435,6 +438,18 @@ BOOL CDdsAuthBridgeMain::Initialize(_In_ HANDLE hStopEvent)
             L"Credential vault failed to load -- starting with empty vault");
     }
 
+    // AD-14: load configurable stale-vault cooldown (default 15 min).
+    // Spec §4.5: cooldown duration MUST remain ≤ AD lockout reset window.
+    {
+        DWORD configured = m_config.GetDword(L"StaleVaultCooldownMs",
+            static_cast<DWORD>(STALE_COOLDOWN_DEFAULT_MS));
+        if (configured == 0)
+            configured = static_cast<DWORD>(STALE_COOLDOWN_DEFAULT_MS);
+        m_staleCooldownMs = static_cast<ULONGLONG>(configured);
+        FileLog::Writef("DdsAuthBridge: stale-vault cooldown = %llu ms\n",
+                        static_cast<unsigned long long>(m_staleCooldownMs));
+    }
+
     // Initialize IPC pipe server
     if (!m_pipeServer.Initialize(OnIpcRequest, this))
     {
@@ -523,6 +538,162 @@ dds::JoinState CDdsAuthBridgeMain::GetJoinState()
 }
 
 // ============================================================================
+// AD-14 — Stale-vault cooldown
+// ============================================================================
+//
+// The cooldown map is keyed on the FIDO2 credential_id (base64url, exact
+// case). base64url is case-sensitive ('A' = byte 0, 'a' = byte 26 in the
+// decode table), so the bridge MUST NOT case-fold the key — doing so would
+// collide truly-different credentials. The CP and bridge always exchange
+// the same exact string for a given enrollment (CP echoes back the same
+// `_pszCredentialId` it received from the tile enumeration), so a literal
+// match is sufficient.
+//
+// One credential_id maps to one vault entry to one SID, so we don't need
+// the SID in the key — the bridge can still resolve the affected SID via
+// the vault if needed.
+//
+// Lifetime: in-memory, lost on service restart (intentional — a restart is
+// itself a reasonable retry boundary and the goal is rate-limiting, not
+// audit). Configurable via HKLM\SOFTWARE\DDS\AuthBridge\StaleVaultCooldownMs.
+
+void CDdsAuthBridgeMain::MarkStaleCooldown(_In_ const std::wstring& credentialId)
+{
+    if (credentialId.empty())
+        return;
+
+    ULONGLONG expiry = GetTickCount64() + m_staleCooldownMs;
+
+    EnterCriticalSection(&m_csCooldown);
+    m_staleCooldown[credentialId] = expiry;
+    LeaveCriticalSection(&m_csCooldown);
+
+    FileLog::Writef("StaleCooldown: marked credId-prefix='%.16ls' expiry+=%llums\n",
+                    credentialId.c_str(),
+                    static_cast<unsigned long long>(m_staleCooldownMs));
+}
+
+BOOL CDdsAuthBridgeMain::IsStaleCooldownActive(_In_ const std::wstring& credentialId)
+{
+    if (credentialId.empty())
+        return FALSE;
+
+    ULONGLONG now = GetTickCount64();
+    BOOL active = FALSE;
+
+    EnterCriticalSection(&m_csCooldown);
+    auto it = m_staleCooldown.find(credentialId);
+    if (it != m_staleCooldown.end())
+    {
+        if (it->second > now)
+        {
+            active = TRUE;
+        }
+        else
+        {
+            // Expired — prune so the map stays bounded.
+            m_staleCooldown.erase(it);
+        }
+    }
+    LeaveCriticalSection(&m_csCooldown);
+
+    return active;
+}
+
+void CDdsAuthBridgeMain::ClearStaleCooldown(_In_ const std::wstring& credentialId)
+{
+    if (credentialId.empty())
+        return;
+
+    EnterCriticalSection(&m_csCooldown);
+    m_staleCooldown.erase(credentialId);
+    LeaveCriticalSection(&m_csCooldown);
+
+    FileLog::Writef("StaleCooldown: cleared credId-prefix='%.16ls'\n",
+                    credentialId.c_str());
+}
+
+UINT32 CDdsAuthBridgeMain::NtStatusToStaleError(_In_ INT32 ntStatus)
+{
+    // Spec §4.4 mapping. The CP only sends a report for these three NTSTATUSes
+    // (any other failure is either non-DDS or not stale-password-related), but
+    // the bridge tolerates anything and silently no-ops on unknown codes.
+    switch (static_cast<UINT32>(ntStatus))
+    {
+    case 0xC000006DUL: // STATUS_LOGON_FAILURE
+        return IPC_ERROR::STALE_VAULT_PASSWORD;
+    case 0xC0000224UL: // STATUS_PASSWORD_MUST_CHANGE
+        return IPC_ERROR::AD_PASSWORD_CHANGE_REQUIRED;
+    case 0xC0000071UL: // STATUS_PASSWORD_EXPIRED
+        return IPC_ERROR::AD_PASSWORD_EXPIRED;
+    default:
+        return 0;
+    }
+}
+
+BOOL CDdsAuthBridgeMain::HandleDdsReportLogonResult(
+    _In_ const BYTE* pPayload,
+    _In_ DWORD payloadLen)
+{
+    if (pPayload == nullptr || payloadLen < sizeof(IPC_REQ_DDS_REPORT_LOGON_RESULT))
+    {
+        FileLog::Writef("ReportLogonResult: ignoring malformed payload (len=%lu)\n",
+                        payloadLen);
+        return TRUE; // fire-and-forget — no error response
+    }
+
+    const IPC_REQ_DDS_REPORT_LOGON_RESULT* pReq =
+        reinterpret_cast<const IPC_REQ_DDS_REPORT_LOGON_RESULT*>(pPayload);
+
+    UINT32 mapped = NtStatusToStaleError(pReq->ntStatus);
+    if (mapped == 0)
+    {
+        FileLog::Writef("ReportLogonResult: NTSTATUS=0x%08lX is not a stale-password code; ignoring\n",
+                        static_cast<unsigned long>(static_cast<UINT32>(pReq->ntStatus)));
+        return TRUE;
+    }
+
+    // Defensive: ensure the credential_id field is null-terminated within bounds.
+    WCHAR credIdBuf[IPC_MAX_CREDENTIAL_ID_LEN]{};
+    wcsncpy_s(credIdBuf, pReq->credential_id, _TRUNCATE);
+    std::wstring credentialId(credIdBuf);
+
+    if (credentialId.empty())
+    {
+        FileLog::Write("ReportLogonResult: empty credential_id; ignoring\n");
+        return TRUE;
+    }
+
+    MarkStaleCooldown(credentialId);
+    FileLog::Writef("ReportLogonResult: cooldown installed (NTSTATUS=0x%08lX -> error=%lu)\n",
+                    static_cast<unsigned long>(static_cast<UINT32>(pReq->ntStatus)),
+                    static_cast<unsigned long>(mapped));
+    return TRUE;
+}
+
+BOOL CDdsAuthBridgeMain::HandleDdsClearStale(
+    _In_ const BYTE* pPayload,
+    _In_ DWORD payloadLen)
+{
+    if (pPayload == nullptr || payloadLen < sizeof(IPC_REQ_DDS_CLEAR_STALE))
+    {
+        FileLog::Writef("ClearStale: ignoring malformed payload (len=%lu)\n",
+                        payloadLen);
+        return TRUE;
+    }
+
+    const IPC_REQ_DDS_CLEAR_STALE* pReq =
+        reinterpret_cast<const IPC_REQ_DDS_CLEAR_STALE*>(pPayload);
+
+    WCHAR credIdBuf[IPC_MAX_CREDENTIAL_ID_LEN]{};
+    wcsncpy_s(credIdBuf, pReq->credential_id, _TRUNCATE);
+    std::wstring credentialId(credIdBuf);
+
+    ClearStaleCooldown(credentialId);
+    return TRUE;
+}
+
+// ============================================================================
 // IPC Request Handler (static dispatch)
 // ============================================================================
 
@@ -561,6 +732,14 @@ BOOL CALLBACK CDdsAuthBridgeMain::OnIpcRequest(
 
     case IPC_MSG::DDS_LIST_USERS:
         return pSelf->HandleDdsListUsers(pClientCtx, pHeader->seqId);
+
+    case IPC_MSG::DDS_REPORT_LOGON_RESULT:
+        // AD-14: fire-and-forget; never replies, even on error.
+        return pSelf->HandleDdsReportLogonResult(pPayload, payloadLen);
+
+    case IPC_MSG::DDS_CLEAR_STALE:
+        // AD-13: fire-and-forget; never replies.
+        return pSelf->HandleDdsClearStale(pPayload, payloadLen);
 
     // --- Legacy Crayonic messages (backwards compat) ---
 
@@ -675,6 +854,18 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
         WideCharToMultiByte(CP_UTF8, 0, credentialId.c_str(), -1, credA, sizeof(credA), nullptr, nullptr);
         FileLog::Writef("DdsStartAuth: subject='%s' device='%s' credId='%s' rp='%s'\n",
                         urnA, m_config.DeviceUrn().c_str(), credA, rpIdA);
+    }
+
+    // AD-14: bail out before WebAuthn / Kerberos serialization if a stale
+    // cooldown is active for this credential. Spec §4.5: short-circuit
+    // STALE_VAULT_PASSWORD before any auth ceremony to avoid AD lockout.
+    if (IsStaleCooldownActive(credentialId))
+    {
+        LeaveCriticalSection(&m_csAuth);
+        SendAuthError(pClientCtx, seqId, IPC_ERROR::STALE_VAULT_PASSWORD,
+            L"Your DDS stored password may be out of date. Sign in normally "
+            L"with your Windows password, then refresh DDS from the system tray.");
+        return TRUE;
     }
 
     // Look up vault entry by the credential_id from the request.

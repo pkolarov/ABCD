@@ -74,7 +74,8 @@ class CDdsProvider : public ICredentialProvider
     HRESULT _EnumerateOneCredential(__in DWORD dwCredentialIndex,
                                     __in PCWSTR pwzUsername,
                                     __in PCWSTR pwUsernameInfo,
-                                    __in PCWSTR pwzSubjectUrn);
+                                    __in PCWSTR pwzSubjectUrn,
+                                    __in PCWSTR pwzCredentialId);
     HRESULT _EnumerateSetSerialization();
     HRESULT _EnumerateCredentials();
     void _ReleaseEnumeratedCredentials();

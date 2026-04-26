@@ -1,7 +1,64 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #12 (docs pass — closes AD-12 from
+> Last updated: 2026-04-26 follow-up #13 (AD coexistence Phase 4 — closes
+> AD-14 from
+> [docs/windows-ad-coexistence-spec.md](docs/windows-ad-coexistence-spec.md)
+> §6.3 / §7.4 and
+> [docs/AD-gap-plan.md](docs/AD-gap-plan.md)). Also fixes a pre-existing
+> credential-provider plumbing bug discovered while wiring the cooldown:
+> `CDdsProvider::_EnumerateCredentials` was passing the literal label
+> `"DDS Passwordless Login"` as the third argument to
+> `_EnumerateOneCredential`, which then propagated through `Initialize`
+> into `_pszCredentialId`. Every enrolled user therefore shared the
+> *label string* as their FIDO2 credential identifier — vault lookups
+> in `HandleDdsStartAuth` would always miss and fall through to
+> first-claim mode (the AD-08 gate later refuses this on AD/Hybrid),
+> and an AD-14 cooldown installed off that key would have stalled all
+> users on the same machine for 15 minutes after a single stale event.
+> Fixed by adding a separate `pwzCredentialId` parameter to
+> `_EnumerateOneCredential` and `CDdsCredential::Initialize`, threading
+> the real `g_ddsUsers.users[i].credentialId` (already populated from
+> the DDS user list) through both. Placeholder tiles
+> ("Connect DDS authenticator", "No enrolled users") pass an empty
+> credential_id, matching their pre-fix behaviour.
+>
+> The Windows credential provider now distinguishes the three stale-AD-password
+> NTSTATUSes — `STATUS_LOGON_FAILURE` (0xC000006D),
+> `STATUS_PASSWORD_MUST_CHANGE` (0xC0000224), and `STATUS_PASSWORD_EXPIRED`
+> (0xC0000071) — surfacing the canonical recovery strings from spec §4.4
+> instead of the default Windows "Incorrect password or username." After
+> CP `ReportResult` matches one of those NTSTATUSes against a credential
+> it just serialized, it sends the new fire-and-forget IPC
+> `DDS_REPORT_LOGON_RESULT` (0x0064) carrying the credential_id and the
+> raw NTSTATUS. The Auth Bridge maps that to the IPC error code via
+> `NtStatusToStaleError`, then installs a 15-minute (configurable via
+> `HKLM\SOFTWARE\DDS\AuthBridge\StaleVaultCooldownMs`) cooldown on a
+> credential_id-keyed `m_staleCooldown` map. While the cooldown is
+> active, `HandleDdsStartAuth` short-circuits with `STALE_VAULT_PASSWORD`
+> (IPC_ERROR 16) **before** the WebAuthn ceremony, so a stale-vault
+> retry can no longer burn an AD lockout slot — the spec §4.5 lockout
+> bound. New IPC error codes: `STALE_VAULT_PASSWORD = 16`,
+> `AD_PASSWORD_CHANGE_REQUIRED = 17`, `AD_PASSWORD_EXPIRED = 18`,
+> `PRE_ENROLLMENT_REQUIRED = 19`, `UNSUPPORTED_HOST = 20`,
+> `ACCOUNT_NOT_FOUND = 21` (the latter three pre-allocated for AD-08 /
+> AD-10 and the deferred SID-deletion path). New IPC message
+> `DDS_CLEAR_STALE` (0x0065) is wired through `HandleDdsClearStale` so
+> AD-13 can clear the cooldown after a successful refresh without a
+> second protocol change. New native cross-platform layout tests in
+> [test_ipc_messages.cpp](platform/windows/native/Tests/test_ipc_messages.cpp)
+> pin the message type and error code numeric values; new
+> standalone-logic tests in
+> [test_dds_bridge_selection.cpp](platform/windows/native/Tests/test_dds_bridge_selection.cpp)
+> verify the `NtStatusToStaleError` mapping and the
+> case-insensitive cooldown key contract. Phase 4 progress: AD-12 ✅
+> + AD-14 ✅; AD-13 (vault-refresh tray flow) remains pending. Workspace
+> test count unchanged at 560 (Rust untouched); .NET test count 145
+> unchanged. cargo fmt clean; cargo clippy clean (workspace,
+> all-targets, `-D warnings`). Native C++ build/test on Windows is
+> deferred to CI per the established pattern for AD-04..07.
+>
+> Previous: 2026-04-26 follow-up #12 (docs pass — closes AD-12 from
 > [docs/AD-gap-plan.md](docs/AD-gap-plan.md) Phase 4). New
 > operator-facing guide at
 > [docs/windows-ad-enrollment.md](docs/windows-ad-enrollment.md)

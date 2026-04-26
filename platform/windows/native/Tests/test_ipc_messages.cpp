@@ -204,6 +204,68 @@ DDS_TEST(dds_error_code_constants)
     DDS_ASSERT(IPC_ERROR::DDS_TOKEN_EXPIRED == 14, "DDS_TOKEN_EXPIRED must be 14");
 }
 
+// AD-14 — pinned numeric values for the AD-coexistence error codes. The
+// IPC contract is shared with the credential provider DLL, so the values
+// must remain stable across MSI upgrades.
+DDS_TEST(ad_coexistence_error_code_constants)
+{
+    DDS_ASSERT(IPC_ERROR::STALE_VAULT_PASSWORD       == 16,
+               "STALE_VAULT_PASSWORD must be 16");
+    DDS_ASSERT(IPC_ERROR::AD_PASSWORD_CHANGE_REQUIRED == 17,
+               "AD_PASSWORD_CHANGE_REQUIRED must be 17");
+    DDS_ASSERT(IPC_ERROR::AD_PASSWORD_EXPIRED        == 18,
+               "AD_PASSWORD_EXPIRED must be 18");
+    DDS_ASSERT(IPC_ERROR::PRE_ENROLLMENT_REQUIRED    == 19,
+               "PRE_ENROLLMENT_REQUIRED must be 19");
+    DDS_ASSERT(IPC_ERROR::UNSUPPORTED_HOST           == 20,
+               "UNSUPPORTED_HOST must be 20");
+    DDS_ASSERT(IPC_ERROR::ACCOUNT_NOT_FOUND          == 21,
+               "ACCOUNT_NOT_FOUND must be 21");
+}
+
+// AD-14 — pinned message-type values and request-side bit semantics.
+DDS_TEST(dds_report_logon_result_message_type)
+{
+    DDS_ASSERT(IPC_MSG::DDS_REPORT_LOGON_RESULT == 0x0064,
+               "DDS_REPORT_LOGON_RESULT must be 0x0064");
+    DDS_ASSERT(IPC_MSG::IsRequest(IPC_MSG::DDS_REPORT_LOGON_RESULT),
+               "DDS_REPORT_LOGON_RESULT must be a request (high bit clear)");
+    DDS_ASSERT(!IPC_MSG::IsResponse(IPC_MSG::DDS_REPORT_LOGON_RESULT),
+               "DDS_REPORT_LOGON_RESULT must not be a response");
+}
+
+DDS_TEST(dds_clear_stale_message_type)
+{
+    DDS_ASSERT(IPC_MSG::DDS_CLEAR_STALE == 0x0065,
+               "DDS_CLEAR_STALE must be 0x0065");
+    DDS_ASSERT(IPC_MSG::IsRequest(IPC_MSG::DDS_CLEAR_STALE),
+               "DDS_CLEAR_STALE must be a request (high bit clear)");
+}
+
+DDS_TEST(dds_report_logon_result_struct_layout)
+{
+    IPC_REQ_DDS_REPORT_LOGON_RESULT req;
+    memset(&req, 0, sizeof(req));
+
+    req.credential_id[0] = L'a';
+    req.ntStatus         = static_cast<INT32>(0xC000006DL); // STATUS_LOGON_FAILURE
+
+    DDS_ASSERT(req.credential_id[0] == L'a',
+               "credential_id field must be accessible");
+    DDS_ASSERT(req.ntStatus == static_cast<INT32>(0xC000006DL),
+               "ntStatus field must round-trip a negative NTSTATUS");
+}
+
+DDS_TEST(dds_clear_stale_struct_layout)
+{
+    IPC_REQ_DDS_CLEAR_STALE req;
+    memset(&req, 0, sizeof(req));
+
+    req.credential_id[0] = L'z';
+    DDS_ASSERT(req.credential_id[0] == L'z',
+               "credential_id field must be accessible");
+}
+
 DDS_TEST(auth_method_dds_constant)
 {
     DDS_ASSERT(IPC_AUTH_METHOD::DDS == 3, "DDS auth method must be 3");

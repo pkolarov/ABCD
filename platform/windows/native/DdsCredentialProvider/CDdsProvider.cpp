@@ -568,11 +568,20 @@ HRESULT CDdsProvider::GetCredentialAt(
 }
 
 // Creates a Credential with the SFI_USERNAME field's value set to pwzUsername.
+// AD-14 precondition: pwzCredentialId is the FIDO2 credential_id
+// (base64url) for this enrollment, sourced from the DDS user list. It is
+// distinct from pwUsernameInfo (which is the human-visible label shown
+// under the username). The credential provider DLL needs the real
+// credential_id to (a) drive `DDS_START_AUTH` against the right vault
+// entry and (b) report stale-vault NTSTATUSes to the bridge cooldown
+// keyed on a per-credential identifier — without this, every enrolled
+// user would share one cooldown bucket.
 HRESULT CDdsProvider::_EnumerateOneCredential(
     DWORD dwCredentialIndex,
     PCWSTR pwzUsername,
     PCWSTR pwUsernameInfo,
-    PCWSTR pwzSubjectUrn
+    PCWSTR pwzSubjectUrn,
+    PCWSTR pwzCredentialId
     )
 {
     OutputDebugString(L"_EnumerateOneCredential()\n");
@@ -594,6 +603,7 @@ HRESULT CDdsProvider::_EnumerateOneCredential(
             _cpus, s_rgCredProvFieldDescriptors, s_rgFieldStatePairs,
             pwzUsername, pwUsernameInfo,
             pwzSubjectUrn,         // DDS subject URN
+            pwzCredentialId,       // FIDO2 credential_id (base64url)
             !g_DeviceConnectedLast // noUser flag
         );
 
@@ -679,12 +689,13 @@ HRESULT CDdsProvider::_EnumerateCredentials()
             hr = _EnumerateOneCredential(credIdx++,
                 g_ddsUsers.users[i].displayName,
                 L"DDS Passwordless Login",
-                g_ddsUsers.users[i].subjectUrn
+                g_ddsUsers.users[i].subjectUrn,
+                g_ddsUsers.users[i].credentialId
             );
         }
         // If all users were filtered out (only admins), show placeholder
         if (credIdx == 0)
-            hr = _EnumerateOneCredential(0, L"Connect DDS authenticator", L"No enrolled users", L"");
+            hr = _EnumerateOneCredential(0, L"Connect DDS authenticator", L"No enrolled users", L"", L"");
     }
     else
     {
@@ -698,7 +709,7 @@ HRESULT CDdsProvider::_EnumerateCredentials()
 
         mbstowcs_s(nullptr, wideTimestamp, wideTimestampSize, narrowTimestamp, len);
 
-        hr = _EnumerateOneCredential(0, L"Connect DDS authenticator", wideTimestamp, L"");
+        hr = _EnumerateOneCredential(0, L"Connect DDS authenticator", wideTimestamp, L"", L"");
     }
     return hr;
 }
@@ -746,7 +757,7 @@ HRESULT CDdsProvider::_EnumerateSetSerialization()
 
             if (pCred)
             {
-                hr = pCred->Initialize(_cpus, s_rgCredProvFieldDescriptors, s_rgFieldStatePairs, L"", L"", L"");
+                hr = pCred->Initialize(_cpus, s_rgCredProvFieldDescriptors, s_rgFieldStatePairs, L"", L"", L"", L"");
 
                 if (SUCCEEDED(hr))
                 {

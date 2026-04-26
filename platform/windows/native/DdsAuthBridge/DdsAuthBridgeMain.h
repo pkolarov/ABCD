@@ -10,6 +10,8 @@
 #pragma once
 
 #include <windows.h>
+#include <map>
+#include <string>
 #include "../DdsBridgeIPC/ipc_pipe_server.h"
 #include "../DdsBridgeIPC/ipc_messages.h"
 #include "Configuration.h"
@@ -92,6 +94,12 @@ private:
         _In_ const BYTE* pPayload, _In_ DWORD payloadLen);
     BOOL HandleDdsListUsers(_In_ IPC_CLIENT_CONTEXT* pClientCtx, _In_ UINT32 seqId);
 
+    // AD-14 — fire-and-forget post-logon NTSTATUS report from CP::ReportResult.
+    BOOL HandleDdsReportLogonResult(_In_ const BYTE* pPayload, _In_ DWORD payloadLen);
+
+    // AD-13 — fire-and-forget cooldown clear from the tray after refresh.
+    BOOL HandleDdsClearStale(_In_ const BYTE* pPayload, _In_ DWORD payloadLen);
+
     // --- Legacy Crayonic handlers (kept for backwards compat) ---
     BOOL HandleGetStatus(_In_ IPC_CLIENT_CONTEXT* pClientCtx, _In_ UINT32 seqId);
     BOOL HandleListUsers(_In_ IPC_CLIENT_CONTEXT* pClientCtx, _In_ UINT32 seqId);
@@ -115,4 +123,31 @@ private:
     // Determine the host's directory join classification.
     // See docs/windows-ad-coexistence-spec.md §2 for the contract.
     static dds::JoinState GetJoinState();
+
+    // --- AD-14: stale-vault cooldown ---
+    //
+    // Default cooldown duration. Spec §4.5 calls for 15 minutes (900 s) so the
+    // bridge cools off well before the AD lockout reset window. Configurable
+    // via the AuthBridge registry value `StaleVaultCooldownMs` for hardened
+    // deployments that need a different value; loaded at startup.
+    static constexpr ULONGLONG STALE_COOLDOWN_DEFAULT_MS = 15ULL * 60ULL * 1000ULL;
+
+    CRITICAL_SECTION                      m_csCooldown;
+    std::map<std::wstring, ULONGLONG>     m_staleCooldown; // key = lowered base64url credential_id, value = expiry tick (GetTickCount64)
+    ULONGLONG                             m_staleCooldownMs;
+
+    // Mark `(credential_id)` as stale until now + STALE_COOLDOWN_*_MS.
+    void MarkStaleCooldown(_In_ const std::wstring& credentialId);
+
+    // Return TRUE if a non-expired cooldown entry exists for `credential_id`.
+    // Always prunes the entry when expired, so the map cannot grow unbounded.
+    BOOL IsStaleCooldownActive(_In_ const std::wstring& credentialId);
+
+    // Remove any cooldown entry for `credential_id` (no-op if absent).
+    void ClearStaleCooldown(_In_ const std::wstring& credentialId);
+
+    // Translate an NTSTATUS reported by CP::ReportResult into the
+    // canonical IPC error code, or 0 if the status does not indicate a
+    // stale/expired/must-change AD password situation.
+    static UINT32 NtStatusToStaleError(_In_ INT32 ntStatus);
 };

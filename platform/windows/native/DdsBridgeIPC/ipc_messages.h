@@ -253,6 +253,32 @@ struct IPC_REQ_DDS_AUTH_RESPONSE
     char   challenge_id[64];                           // Echo of IPC_RESP_DDS_AUTH_CHALLENGE.challenge_id
 };
 
+// DDS_REPORT_LOGON_RESULT (0x0064)
+// Sent by the Credential Provider after `ReportResult` to inform the bridge
+// of the post-logon NTSTATUS for the credential it just serialized. Used by
+// AD-14 to install a stale-vault cooldown so further sign-in attempts with
+// the same credential are short-circuited (no FIDO2 ceremony, no
+// KERB_INTERACTIVE_UNLOCK_LOGON serialization, no AD lockout exposure).
+//
+// Fire-and-forget: the bridge sends no response. The report is best-effort;
+// the CP also keeps a per-process cooldown mirror so an immediate retry is
+// blocked even if delivery fails. See spec §4.5.
+struct IPC_REQ_DDS_REPORT_LOGON_RESULT
+{
+    WCHAR  credential_id[IPC_MAX_CREDENTIAL_ID_LEN]; // FIDO2 credential ID (base64url)
+    INT32  ntStatus;                                  // NTSTATUS reported via CP::ReportResult
+};
+
+// DDS_CLEAR_STALE (0x0065)
+// Sent by the Tray Agent after a successful "Refresh stored password" run
+// (AD-13). Clears any active stale-vault cooldown for the supplied
+// credential_id. Fire-and-forget; the bridge silently no-ops if no entry
+// exists.
+struct IPC_REQ_DDS_CLEAR_STALE
+{
+    WCHAR  credential_id[IPC_MAX_CREDENTIAL_ID_LEN]; // FIDO2 credential ID (base64url)
+};
+
 // DDS_AUTH_PROGRESS (0x8060)
 struct IPC_RESP_DDS_AUTH_PROGRESS
 {

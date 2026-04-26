@@ -231,3 +231,91 @@ DDS_TEST(dds_auth_complete_subject_urn_falls_back_to_sid)
     DDS_ASSERT(subjectUrn == "S-1-5-21-legacy",
                "DDS auth complete must fall back to the SID for legacy callers");
 }
+
+// ============================================================================
+// AD-14 — stale-vault cooldown logic (standalone reimplementation)
+//
+// These tests mirror the security-relevant pieces of
+// `CDdsAuthBridgeMain::NtStatusToStaleError` and the cooldown map's
+// case-folding key contract (see `CooldownKey` in DdsAuthBridgeMain.cpp).
+// Reproducing the logic here keeps the cross-platform CI (macOS) honest
+// without pulling in the WinHTTP / NetAPI dependencies of the bridge.
+// ============================================================================
+
+namespace TestStaleCooldown
+{
+
+// IPC error codes mirrored from ipc_protocol.h. Pin the numeric values so
+// a future renumbering is caught here, not at runtime.
+constexpr uint32_t STALE_VAULT_PASSWORD       = 16;
+constexpr uint32_t AD_PASSWORD_CHANGE_REQUIRED = 17;
+constexpr uint32_t AD_PASSWORD_EXPIRED        = 18;
+
+static uint32_t NtStatusToStaleError(int32_t ntStatus)
+{
+    switch (static_cast<uint32_t>(ntStatus))
+    {
+    case 0xC000006DUL: return STALE_VAULT_PASSWORD;        // STATUS_LOGON_FAILURE
+    case 0xC0000224UL: return AD_PASSWORD_CHANGE_REQUIRED; // STATUS_PASSWORD_MUST_CHANGE
+    case 0xC0000071UL: return AD_PASSWORD_EXPIRED;         // STATUS_PASSWORD_EXPIRED
+    default:           return 0;
+    }
+}
+
+} // namespace TestStaleCooldown
+
+DDS_TEST(stale_cooldown_maps_logon_failure)
+{
+    DDS_ASSERT(TestStaleCooldown::NtStatusToStaleError(static_cast<int32_t>(0xC000006DL))
+               == TestStaleCooldown::STALE_VAULT_PASSWORD,
+               "STATUS_LOGON_FAILURE must map to STALE_VAULT_PASSWORD");
+}
+
+DDS_TEST(stale_cooldown_maps_password_must_change)
+{
+    DDS_ASSERT(TestStaleCooldown::NtStatusToStaleError(static_cast<int32_t>(0xC0000224L))
+               == TestStaleCooldown::AD_PASSWORD_CHANGE_REQUIRED,
+               "STATUS_PASSWORD_MUST_CHANGE must map to AD_PASSWORD_CHANGE_REQUIRED");
+}
+
+DDS_TEST(stale_cooldown_maps_password_expired)
+{
+    DDS_ASSERT(TestStaleCooldown::NtStatusToStaleError(static_cast<int32_t>(0xC0000071L))
+               == TestStaleCooldown::AD_PASSWORD_EXPIRED,
+               "STATUS_PASSWORD_EXPIRED must map to AD_PASSWORD_EXPIRED");
+}
+
+DDS_TEST(stale_cooldown_ignores_success_and_unrelated_codes)
+{
+    DDS_ASSERT(TestStaleCooldown::NtStatusToStaleError(0) == 0,
+               "STATUS_SUCCESS must not install a cooldown");
+    DDS_ASSERT(TestStaleCooldown::NtStatusToStaleError(static_cast<int32_t>(0xC0000022L)) == 0,
+               "STATUS_ACCESS_DENIED must not install a cooldown");
+    DDS_ASSERT(TestStaleCooldown::NtStatusToStaleError(static_cast<int32_t>(0x80000005L)) == 0,
+               "Random NTSTATUSes must not install a cooldown");
+}
+
+DDS_TEST(stale_cooldown_key_preserves_base64url_case)
+{
+    // base64url is case-sensitive: 'A' decodes to byte 0, 'a' decodes to
+    // byte 26. The cooldown key MUST be a literal credential_id match to
+    // avoid collapsing two distinct enrollments onto the same cooldown
+    // entry. This test pins that invariant by exercising the same lookup
+    // helper used by the production code.
+    std::vector<TestDdsBridgeSelection::VaultEntry> entries = {
+        { "S-1-5-21-alice", { 0x00, 0x10, 0x20 } }, // base64url "ABAg"
+        { "S-1-5-21-bob",   { 0x68, 0x40, 0x80 } }, // base64url "aECA"
+    };
+
+    const auto* alice = TestDdsBridgeSelection::MatchVaultEntryForCredentialId(
+        entries, "ABAg");
+    const auto* bob = TestDdsBridgeSelection::MatchVaultEntryForCredentialId(
+        entries, "aECA");
+
+    DDS_ASSERT(alice && alice->userSid == "S-1-5-21-alice",
+               "uppercase-leading credential_id must resolve to Alice");
+    DDS_ASSERT(bob && bob->userSid == "S-1-5-21-bob",
+               "lowercase-leading credential_id must resolve to Bob — not the same bucket as Alice");
+    DDS_ASSERT(alice != bob,
+               "Alice and Bob must be distinct entries; case folding would merge them");
+}

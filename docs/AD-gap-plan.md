@@ -292,7 +292,7 @@ Use specific user-facing failures:
 | --- | --- | --- | --- |
 | AD-12 ✅ | Document AD coexistence enrollment flow | `docs/`, possibly tray text strings | Landed 2026-04-26: new operator-facing guide [windows-ad-enrollment.md](windows-ad-enrollment.md) covers enrollment per JoinState (Workgroup, AD/Hybrid, Entra-only, Unknown), the post-password-change refresh flow, and the canonical string reference. Tray-side text-string updates in `EnrollmentFlow.cpp` deferred to AD-13 (when the tray gains a `JoinState` probe seam). |
 | AD-13 | Add "refresh vault password" workflow for post-password-change recovery | `platform/windows/native/DdsTrayAgent/` | User can re-wrap a new AD password without deleting the credential |
-| AD-14 | Add stale-password detection / guided recovery text | `platform/windows/native/DdsAuthBridge/`, `DdsCredentialProvider/` | Better response after `STATUS_LOGON_FAILURE` scenarios |
+| AD-14 ✅ | Add stale-password detection / guided recovery text | `platform/windows/native/DdsAuthBridge/`, `DdsCredentialProvider/` | Landed 2026-04-26: CP `ReportResult` maps `STATUS_LOGON_FAILURE` / `STATUS_PASSWORD_MUST_CHANGE` / `STATUS_PASSWORD_EXPIRED` to distinct guided-recovery strings and fires a `DDS_REPORT_LOGON_RESULT` IPC; the Auth Bridge installs a 15-minute (configurable) cooldown keyed on the credential_id and returns `STALE_VAULT_PASSWORD` for any `DDS_START_AUTH` against that credential while the cooldown is active, short-circuiting the WebAuthn ceremony before AD lockout exposure. New IPC message `DDS_CLEAR_STALE` lets AD-13 clear the cooldown after a successful refresh; the handler is in place so AD-13 can wire the tray side without a second protocol change. |
 
 ### Phase 5 - End-To-End Validation
 

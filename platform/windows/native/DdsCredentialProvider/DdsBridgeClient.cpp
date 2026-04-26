@@ -677,3 +677,27 @@ DdsBridgeAuthResult CDdsBridgeClient::AuthenticateFido(
 
     return WaitForAuthComplete(seqId, timeoutMs, progressCallback);
 }
+
+// ============================================================================
+// AD-14 — fire-and-forget post-logon NTSTATUS report
+// ============================================================================
+
+BOOL CDdsBridgeClient::ReportLogonResult(
+    _In_ PCWSTR pszCredentialId,
+    _In_ INT32  ntStatus)
+{
+    if (pszCredentialId == nullptr || pszCredentialId[0] == L'\0')
+        return FALSE;
+
+    if (!EnsureConnected())
+        return FALSE;
+
+    IPC_REQ_DDS_REPORT_LOGON_RESULT req{};
+    wcsncpy_s(req.credential_id, pszCredentialId, _TRUNCATE);
+    req.ntStatus = ntStatus;
+
+    return m_client.SendRequestNoReply(
+        IPC_MSG::DDS_REPORT_LOGON_RESULT,
+        reinterpret_cast<const BYTE*>(&req),
+        sizeof(req));
+}

@@ -64,6 +64,7 @@ HRESULT CDdsCredential::Initialize(
     PCWSTR pwzUsername,
     PCWSTR pwzUsernameInfo,
     PCWSTR pwzSubjectUrn,
+    PCWSTR pwzCredentialId,
     bool noUser
     )
 {
@@ -98,10 +99,16 @@ HRESULT CDdsCredential::Initialize(
     {
         hr = SHStrDupW(pwzSubjectUrn, &_pszSubjectUrn);
     }
-    // Store the credential ID (passed via pwzUsernameInfo from tile enumeration)
-    if (SUCCEEDED(hr) && pwzUsernameInfo && pwzUsernameInfo[0] != L'\0')
+    // Store the FIDO2 credential_id (base64url) for the DDS auth + AD-14
+    // cooldown path. AD-14 precondition: this must be the actual
+    // credential_id from tile enumeration, not the human-visible label
+    // shown under the username (which is `pwzUsernameInfo`). Plumbing
+    // these two strings as separate arguments is the fix for a
+    // pre-existing bug where every enrolled user shared the literal
+    // "DDS Passwordless Login" label as their credential_id.
+    if (SUCCEEDED(hr) && pwzCredentialId && pwzCredentialId[0] != L'\0')
     {
-        hr = SHStrDupW(pwzUsernameInfo, &_pszCredentialId);
+        hr = SHStrDupW(pwzCredentialId, &_pszCredentialId);
     }
 
     return S_OK;
@@ -666,10 +673,38 @@ struct REPORT_RESULT_STATUS_INFO
     CREDENTIAL_PROVIDER_STATUS_ICON cpsi;
 };
 
+// AD-14 — STATUS_PASSWORD_MUST_CHANGE / STATUS_PASSWORD_EXPIRED are not in
+// the ntstatus.h shipped with most SDKs as plain identifiers, so use the
+// numeric constants directly (the spec also pins them in §4.4).
+#ifndef STATUS_PASSWORD_MUST_CHANGE
+#define STATUS_PASSWORD_MUST_CHANGE ((NTSTATUS)0xC0000224L)
+#endif
+#ifndef STATUS_PASSWORD_EXPIRED
+#define STATUS_PASSWORD_EXPIRED     ((NTSTATUS)0xC0000071L)
+#endif
+
 static const REPORT_RESULT_STATUS_INFO s_rgLogonStatusInfo[] =
 {
-    { STATUS_LOGON_FAILURE, STATUS_SUCCESS, const_cast<PWSTR>(L"Incorrect password or username."), CPSI_ERROR, },
-    { STATUS_ACCOUNT_RESTRICTION, STATUS_ACCOUNT_DISABLED, const_cast<PWSTR>(L"The account is disabled."), CPSI_WARNING },
+    // AD-14 — stale-vault / AD password recovery text. Distinguishing the
+    // three NTSTATUSes matters because the default Windows UX collapses
+    // them, leaving the operator unsure whether the issue is in DDS or AD.
+    { STATUS_LOGON_FAILURE, STATUS_SUCCESS,
+      const_cast<PWSTR>(
+          L"Your DDS stored password may be out of date. Sign in normally "
+          L"with your Windows password, then refresh DDS from the system tray."),
+      CPSI_WARNING, },
+    { STATUS_PASSWORD_MUST_CHANGE, STATUS_SUCCESS,
+      const_cast<PWSTR>(
+          L"AD requires you to set a new password. Sign in normally to change "
+          L"it, then refresh DDS."),
+      CPSI_WARNING, },
+    { STATUS_PASSWORD_EXPIRED, STATUS_SUCCESS,
+      const_cast<PWSTR>(
+          L"AD requires you to set a new password. Sign in normally to change "
+          L"it, then refresh DDS."),
+      CPSI_WARNING, },
+    { STATUS_ACCOUNT_RESTRICTION, STATUS_ACCOUNT_DISABLED,
+      const_cast<PWSTR>(L"The account is disabled."), CPSI_WARNING },
 };
 
 // ReportResult is completely optional.  Its purpose is to allow a credential to customize the string
@@ -698,6 +733,20 @@ HRESULT CDdsCredential::ReportResult(
 
     *ppwszOptionalStatusText = NULL;
     *pcpsiOptionalStatusIcon = CPSI_NONE;
+
+    // AD-14 — report stale-password NTSTATUSes back to the Auth Bridge so
+    // it can install a 15-min cooldown for this credential. Fire-and-forget;
+    // we never block the logon flow on the report. The credential_id is the
+    // one bound to this CDdsCredential instance — it's the credential we
+    // just serialized via GetSerializationDds.
+    if (_pszCredentialId != nullptr && _pszCredentialId[0] != L'\0' &&
+        (ntsStatus == STATUS_LOGON_FAILURE ||
+         ntsStatus == STATUS_PASSWORD_MUST_CHANGE ||
+         ntsStatus == STATUS_PASSWORD_EXPIRED))
+    {
+        g_ddsBridgeClient.ReportLogonResult(_pszCredentialId,
+            static_cast<INT32>(ntsStatus));
+    }
 
     DWORD dwStatusInfo = (DWORD)-1;
 

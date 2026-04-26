@@ -65,9 +65,11 @@ namespace IPC_MSG
 
     // --- Requests (CP -> Auth Bridge) : DDS cloud auth path (0x0060-0x007F) ---
 
-    constexpr UINT16 DDS_START_AUTH     = 0x0060;  // Begin DDS FIDO2 authentication via cloud
-    constexpr UINT16 DDS_AUTH_RESPONSE  = 0x0061;  // CP sends WebAuthn assertion result to Bridge
-    constexpr UINT16 DDS_LIST_USERS     = 0x0062;  // List DDS-enrolled users for a device
+    constexpr UINT16 DDS_START_AUTH         = 0x0060;  // Begin DDS FIDO2 authentication via cloud
+    constexpr UINT16 DDS_AUTH_RESPONSE      = 0x0061;  // CP sends WebAuthn assertion result to Bridge
+    constexpr UINT16 DDS_LIST_USERS         = 0x0062;  // List DDS-enrolled users for a device
+    constexpr UINT16 DDS_REPORT_LOGON_RESULT = 0x0064; // CP reports post-logon NTSTATUS (AD-14, fire-and-forget)
+    constexpr UINT16 DDS_CLEAR_STALE        = 0x0065;  // Tray clears stale-vault cooldown after refresh (AD-13, fire-and-forget)
 
     // --- Responses (Auth Bridge -> CP) : DDS cloud auth path ---
 
@@ -128,6 +130,15 @@ namespace IPC_ERROR
     constexpr UINT32 DDS_API_ERROR      = 13;
     constexpr UINT32 DDS_TOKEN_EXPIRED  = 14;
     constexpr UINT32 AUTH_CANCELLED     = 15;
+
+    // --- AD coexistence error codes (AD-13 / AD-14, see
+    //     docs/windows-ad-coexistence-spec.md §4.4) ---
+    constexpr UINT32 STALE_VAULT_PASSWORD       = 16;  // Stored Windows password no longer matches AD
+    constexpr UINT32 AD_PASSWORD_CHANGE_REQUIRED = 17; // Domain password marked as must-change
+    constexpr UINT32 AD_PASSWORD_EXPIRED        = 18;  // Domain password expired
+    constexpr UINT32 PRE_ENROLLMENT_REQUIRED    = 19;  // AD/Hybrid host with no vault entry
+    constexpr UINT32 UNSUPPORTED_HOST           = 20;  // Entra-only or other unsupported JoinState
+    constexpr UINT32 ACCOUNT_NOT_FOUND          = 21;  // SID no longer resolves to a directory account
 }
 
 // ============================================================================

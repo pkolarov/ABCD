@@ -75,6 +75,15 @@ public:
         _In_opt_ std::function<void(UINT32 state, PCWSTR message)> progressCallback = nullptr
     );
 
+    // AD-14 — fire-and-forget post-logon NTSTATUS report.
+    // Sends DDS_REPORT_LOGON_RESULT to the bridge so it can install a
+    // stale-vault cooldown for `pszCredentialId`. Returns FALSE only if the
+    // pipe could not be reached; the bridge response (if any) is ignored.
+    BOOL ReportLogonResult(
+        _In_ PCWSTR pszCredentialId,
+        _In_ INT32  ntStatus
+    );
+
 private:
     DdsBridgeAuthResult WaitForDdsAuthComplete(UINT32 seqId, DWORD timeoutMs,
         std::function<void(UINT32, PCWSTR)> progressCallback);
