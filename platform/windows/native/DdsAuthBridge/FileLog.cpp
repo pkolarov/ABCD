@@ -77,6 +77,14 @@ void Init()
     // the same restriction without a per-file pass. Best-effort: a stale
     // pre-existing wide-open ACL on `%ProgramData%\DDS` from an earlier
     // build is corrected here on first start of the new bits.
+    //
+    // 2026-04-26: the MSI now applies the *same* SDDL up front via
+    // `CA_RestrictDataDirAcl` (see DdsBundle.wxs), running before
+    // CA_GenHmacSecret so that node-hmac.key inherits the protected
+    // DACL from creation. This call stays as defense in depth — covers
+    // the dev-host case where the binary was deployed without the MSI
+    // (xcopy install, smoke test rigs) and the upgrade case where a
+    // legacy install left a wide-open ACL behind.
     ApplyRestrictedDacl(dir);
 
     swprintf_s(g_path, L"%s\\authbridge.log", dir);

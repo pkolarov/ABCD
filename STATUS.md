@@ -1,7 +1,35 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #2 (admission revocation
+> Last updated: 2026-04-26 follow-up #3 (Windows data-directory DACL
+> at install time — closes threat-model §3 / §8 open item #8).
+> The MSI now applies the same restricted DACL the C++ Auth Bridge
+> self-heals on every start (`FileLog::Init`) and the .NET Policy
+> Agent applies to its staging cache (B-6) — but it does so
+> *before* anything else writes inside `%ProgramData%\DDS`,
+> closing the install-time race where `node-hmac.key` (created by
+> `CA_GenHmacSecret`) inherited the wide-open
+> `%ProgramData%` parent ACL on first install. New
+> `dds-node restrict-data-dir-acl --data-dir <DIR>` subcommand
+> applies SDDL `D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` via
+> `ConvertStringSecurityDescriptorToSecurityDescriptorW` +
+> `SetNamedSecurityInfoW` (`SE_FILE_OBJECT` +
+> `PROTECTED_DACL_SECURITY_INFORMATION`), mirroring the existing
+> SDDL used by `FileLog::Init` and `AppliedStateStore.SetWindowsDacl`.
+> Cross-platform: no-op on macOS / Linux (Unix path security stays
+> on per-file `0o600` / per-dir `0o700` modes set in
+> `identity_store` / `domain_store` / `redb_backend` —
+> L-2/L-3/L-4/M-20). New `CA_RestrictDataDirAcl` MSI custom action
+> in `installer/DdsBundle.wxs` runs after `InstallFiles` and before
+> `CA_GenHmacSecret`. Tests: 5 new CLI integration tests in
+> `dds-node/tests/restrict_data_dir_acl.rs` cover the success path,
+> missing-dir failure, non-directory rejection, missing-flag failure,
+> and idempotent re-application. The Windows `SetNamedSecurityInfoW`
+> call requires Windows host CI to exercise end-to-end. Workspace
+> test count: 518 (up from 513); cargo fmt clean; cargo clippy clean
+> on both `aarch64-apple-darwin` and `x86_64-pc-windows-gnu`.
+>
+> Previous: 2026-04-26 follow-up #2 (admission revocation
 > operator visibility — `dds-node list-revocations` subcommand).
 > Closes a documented operator-ergonomics gap in the revocation flow:
 > after `dds-node import-revocation` (or after H-12 piggy-back

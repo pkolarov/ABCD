@@ -133,7 +133,7 @@ Administrators). However:
 
 | Gap | Risk | Recommendation |
 |-----|------|----------------|
-| `C:\ProgramData\DDS\node_key.bin` is readable by Administrators group | Medium — any admin-level process can read the node private key | Set an explicit DACL on the DDS data directory granting access only to `NT AUTHORITY\SYSTEM` and the `DDS Node Service` virtual account. |
+| ~~`C:\ProgramData\DDS\node_key.bin` is readable by Administrators group~~ | ~~Medium~~ | **PARTIALLY FIXED (2026-04-26)**: the MSI's new `CA_RestrictDataDirAcl` custom action runs `dds-node restrict-data-dir-acl --data-dir [CommonAppDataFolder]DDS` immediately after `InstallFiles` (and before `CA_GenHmacSecret`), applying SDDL `D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` so the directory inherits `FullControl` only for `LocalSystem` and `BUILTIN\Administrators`, with `OI`+`CI` inheritance to children. `node_key.bin`, `node-hmac.key`, `applied-state.json`, and audit logs created later all pick up the restricted DACL by inheritance. The narrow remaining gap (granting access to `Administrators` rather than to a dedicated service SID) is tracked under M-18. |
 | Policy Agent runs as `LocalSystem` | Low — standard for Windows services, but grants broad privilege | **Deferred (M-18).** Review-tracked as a multi-day refactor: split the HTTP-polling half of PolicyAgent and the Auth Bridge into dedicated service SIDs and impersonate up only when applying policy. |
 | Credential Provider DLL runs in `winlogon.exe` context | Low — inherent to the Windows CP architecture | Ensure the DLL is Authenticode-signed (CI scaffolding exists, signing cert pending). |
 | ~~Credential Provider named-pipe DACL admits `INTERACTIVE`~~ | ~~High~~ | **FIXED (H-5)**: SDDL tightened to `SY`-only; cross-user credential theft vector closed. |
@@ -141,9 +141,14 @@ Administrators). However:
 
 ### Recommendations
 
-1. Add a post-install custom action in the MSI that sets restrictive ACLs on
+1. ~~Add a post-install custom action in the MSI that sets restrictive ACLs on
    `C:\ProgramData\DDS\`. (The file-mode portion of this is already done by
-   M-20 / L-16; the directory-level DACL is still outstanding.)
+   M-20 / L-16; the directory-level DACL is still outstanding.)~~ →
+   **closed (2026-04-26)**: `dds-node restrict-data-dir-acl` subcommand
+   + `CA_RestrictDataDirAcl` MSI custom action sequenced before
+   `CA_GenHmacSecret`. C++ Auth Bridge `FileLog::Init` keeps its
+   self-heal call as defense in depth (covers the dev-host /
+   manually-installed-binary case where the MSI did not run).
 2. Switch the Policy Agent service to run as a virtual service account
    (M-18, deferred — see above).
 3. Enable Authenticode signing in CI once the signing certificate is provisioned.
@@ -302,7 +307,7 @@ application from failed application.
 | 5 | ~~Active-version selection for policies/software (B-4)~~ ✅ closed 2026-04-25 | Medium | §5 |
 | 6 | ~~Challenge-store cleanup and caps (B-5)~~ ✅ closed 2026-04-25 | Medium | §5 |
 | 7 | ~~Windows software staging TOCTOU hardening (B-6)~~ ✅ closed 2026-04-25 (Windows-CI verification of DACL helper still pending) | Medium | §6 |
-| 8 | Windows data directory ACL (dir-level) | Medium | §3 |
+| 8 | ~~Windows data directory ACL (dir-level)~~ ✅ closed 2026-04-26 (`CA_RestrictDataDirAcl` MSI custom action + `dds-node restrict-data-dir-acl` subcommand; SDDL `D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` applied before any service writes to the data dir) | Medium | §3 |
 | 9 | Key rotation mechanism | Medium | §2 |
 | 10 | WiX virtual service account split (M-18) | Medium | §3 |
 | 11 | Admin-set coherence via gossip (I-11) | Medium | §5 |
@@ -319,4 +324,9 @@ morning pass and the gossip-based piggy-back distribution closed
 the afternoon pass (`AdmissionResponse.revocations`, capped at
 `MAX_REVOCATIONS_PER_RESPONSE = 1024`, per-entry domain-signature
 verification on receive, atomic persistence after successful merge).
-**No High items remain open.**
+The Windows data-directory DACL (§8 item #8) closed in the
+2026-04-26 install-time pass — `dds-node restrict-data-dir-acl`
+subcommand wired into the MSI as `CA_RestrictDataDirAcl`, scheduled
+before `CA_GenHmacSecret` so the per-install HMAC secret is created
+underneath the already-restricted DACL rather than inheriting the
+wide-open `%ProgramData%` parent. **No High items remain open.**

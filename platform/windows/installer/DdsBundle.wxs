@@ -177,6 +177,29 @@
     </ComponentGroup>
 
     <!-- ============================================================ -->
+    <!-- Threat-model §3 / open item #8: Custom action — apply a       -->
+    <!-- restrictive DACL to %ProgramData%\DDS so subsequently created -->
+    <!-- vault / HMAC secret / applied-state / log files inherit       -->
+    <!-- LocalSystem + BUILTIN\Administrators only. Without this,      -->
+    <!-- %ProgramData%\DDS inherits BUILTIN\Users:Read from its parent -->
+    <!-- on most Windows SKUs and CA_GenHmacSecret would write the     -->
+    <!-- per-install HMAC secret into a world-readable directory.      -->
+    <!--                                                                -->
+    <!-- Defense-in-depth: the C++ Auth Bridge also self-heals this    -->
+    <!-- DACL on every service start (FileLog::Init), and the .NET     -->
+    <!-- Policy Agent applies the same DACL to the staging cache and   -->
+    <!-- to applied-state.json (B-6 / L-16). The MSI custom action     -->
+    <!-- closes the install-time race so even files written *before*   -->
+    <!-- those services first start are protected.                     -->
+    <!-- ============================================================ -->
+    <CustomAction Id="CA_RestrictDataDirAcl"
+                  FileRef="dds_node_exe"
+                  ExeCommand='restrict-data-dir-acl --data-dir "[CommonAppDataFolder]DDS"'
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <!-- ============================================================ -->
     <!-- H-6 step-2: Custom action — generate the per-install HMAC    -->
     <!-- secret on first install. Runs `dds-node.exe gen-hmac-secret` -->
     <!-- which writes 32 random bytes at the target path unless a     -->
@@ -194,10 +217,17 @@
 
     <InstallExecuteSequence>
       <!-- Run after the files are laid down (so dds-node.exe exists)
+           and the data dir is created (so we have something to ACL),
+           but before CA_GenHmacSecret so node-hmac.key is created
+           underneath the already-restricted DACL — it would otherwise
+           inherit the wide-open %ProgramData% ACL at write time and
+           keep that ACL even after we tighten the parent. -->
+      <Custom Action="CA_RestrictDataDirAcl" After="InstallFiles" Condition="NOT REMOVE" />
+      <!-- Run after the files are laid down (so dds-node.exe exists)
            and the service accounts are created (so the directory is
            writable), but before the services start (so dds-node and
            the Auth Bridge both see the same secret on first boot). -->
-      <Custom Action="CA_GenHmacSecret" After="InstallFiles" Condition="NOT REMOVE" />
+      <Custom Action="CA_GenHmacSecret" After="CA_RestrictDataDirAcl" Condition="NOT REMOVE" />
     </InstallExecuteSequence>
 
     <!-- ============================================================ -->

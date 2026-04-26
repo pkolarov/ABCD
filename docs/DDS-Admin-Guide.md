@@ -1021,7 +1021,7 @@ exact registry keys, service definitions, and COM registration needed.
 | `C:\Program Files\DDS\bin\` | Binaries (dds-node, Auth Bridge, Policy Agent, Tray Agent) |
 | `C:\Program Files\DDS\config\node.toml` | Node configuration |
 | `C:\Program Files\DDS\config\appsettings.json` | Policy Agent configuration |
-| `C:\ProgramData\DDS\` | Runtime data directory (vault, logs, applied-state) |
+| `C:\ProgramData\DDS\` | Runtime data directory (vault, logs, applied-state). MSI install applies SDDL `D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` so only `LocalSystem` and `BUILTIN\Administrators` have access — child files inherit. See `dds-node restrict-data-dir-acl` and the MSI's `CA_RestrictDataDirAcl` custom action. |
 | `C:\ProgramData\DDS\node-data\` | Node database, keys, admission cert |
 | `C:\ProgramData\DDS\node-data\domain.toml` | Domain public identity |
 | `C:\ProgramData\DDS\node-data\admission.cbor` | Admission certificate |

@@ -40,6 +40,20 @@
 //!   landed. Read-only; safe to run while a node is live. `--json`
 //!   emits one object per entry on stdout for scripting.
 //!
+//! - `dds-node restrict-data-dir-acl --data-dir <DIR>`
+//!   Threat-model §3 / open item #8. On Windows, applies an explicit,
+//!   non-inherited DACL to `<DIR>` granting `FullControl` only to
+//!   `LocalSystem` and `BUILTIN\Administrators`, with `OI`+`CI`
+//!   inheritance so files created later (vault, HMAC secret, applied
+//!   state, audit logs) pick up the same restriction without per-file
+//!   work. Mirrors the L-16 helper in `AppliedStateStore` and the C++
+//!   `FileLog::Init` self-heal. The MSI custom action
+//!   `CA_RestrictDataDirAcl` invokes this immediately after
+//!   `InstallFiles` and before `CA_GenHmacSecret` so the per-install
+//!   `node-hmac.key` is created underneath the already-restricted DACL.
+//!   No-op on non-Windows: Unix path security is enforced via per-file
+//!   `0o600` / per-dir `0o700` modes set elsewhere (L-2/L-3/L-4/M-20).
+//!
 //! - `dds-node run [config.toml]`
 //!   Default action. Loads config, verifies admission cert, runs the
 //!   P2P node.
@@ -79,6 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "revoke-admission" => cmd_revoke_admission(&args[1..]),
         "import-revocation" => cmd_import_revocation(&args[1..]),
         "list-revocations" => cmd_list_revocations(&args[1..]),
+        "restrict-data-dir-acl" => cmd_restrict_data_dir_acl(&args[1..]),
         "create-provision-bundle" => cmd_create_bundle(&args[1..]),
         "provision" => cmd_provision(&args[1..]),
         "run" => cmd_run(&args[1..]).await,
@@ -108,6 +123,7 @@ fn print_usage() {
   dds-node revoke-admission --domain-key <FILE> --domain <FILE> --peer-id <ID> [--reason <STR>] [--out <FILE>]
   dds-node import-revocation --data-dir <DIR> --in <FILE>
   dds-node list-revocations --data-dir <DIR> [--json]
+  dds-node restrict-data-dir-acl --data-dir <DIR>
   dds-node create-provision-bundle --dir <DIR> --org <ORG> [--out <FILE>]
   dds-node provision <BUNDLE.dds> [--data-dir <DIR>] [--no-start]
   dds-node run [config.toml]"
@@ -200,10 +216,11 @@ fn cmd_gen_node_key(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// By default refuses to overwrite an existing file — pass `--force`
 /// to replace. On Unix the file is written via atomic rename with
 /// `0o600`. On Windows the default ACL applied by `std::fs::write` is
-/// inherited from `ProgramData\DDS`, which the MSI already restricts
-/// to `LocalSystem` + `BUILTIN\Administrators`; we don't add an
-/// explicit DACL here to avoid drifting from the MSI-installed
-/// permissions.
+/// inherited from `ProgramData\DDS`, which the MSI restricts to
+/// `LocalSystem` + `BUILTIN\Administrators` via the
+/// `CA_RestrictDataDirAcl` custom action (see `restrict-data-dir-acl`,
+/// scheduled to run *before* `CA_GenHmacSecret`); we don't re-apply
+/// the DACL here to avoid drifting from the MSI-installed permissions.
 fn cmd_gen_hmac_secret(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use rand::RngCore;
     let out = PathBuf::from(require_flag(args, "--out")?);
@@ -465,6 +482,144 @@ fn cmd_list_revocations(args: &[String]) -> Result<(), Box<dyn std::error::Error
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Threat-model §3 / open item #8: apply a restrictive DACL to the
+/// node data directory so child files (vault, HMAC secret, applied
+/// state, audit logs) inherit `LocalSystem` + `BUILTIN\Administrators`
+/// — only — full control instead of inheriting the wide-open
+/// `%ProgramData%` parent ACL (which by default grants `BUILTIN\Users`
+/// read on most Windows SKUs).
+///
+/// Mirrors the L-16 helper in `AppliedStateStore.SetWindowsDacl` and
+/// the C++ `FileLog::Init` self-heal. Idempotent — re-applying the
+/// same DACL is a no-op. Fails loudly so the MSI custom action
+/// (`CA_RestrictDataDirAcl`) aborts the install if the call fails.
+///
+/// On non-Windows this is a friendly no-op: directory and file
+/// security on Unix is enforced via `0o700`/`0o600` modes set in
+/// `identity_store`, `domain_store`, and the redb backend (see
+/// L-2/L-3/L-4/M-20). The subcommand still exists so the MSI custom
+/// action can be exercised on cross-built test hosts.
+fn cmd_restrict_data_dir_acl(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = PathBuf::from(require_flag(args, "--data-dir")?);
+    if !data_dir.exists() {
+        return Err(format!("data dir does not exist: {}", data_dir.display()).into());
+    }
+    if !data_dir.is_dir() {
+        return Err(format!("not a directory: {}", data_dir.display()).into());
+    }
+
+    #[cfg(windows)]
+    {
+        apply_windows_data_dir_dacl(&data_dir)?;
+        println!("Applied restricted DACL to {}", data_dir.display());
+        println!(
+            "  Grants: NT AUTHORITY\\SYSTEM (FullControl, OI+CI), \
+             BUILTIN\\Administrators (FullControl, OI+CI)"
+        );
+        println!("  Inheritance from parent: disabled (PROTECTED)");
+    }
+    #[cfg(not(windows))]
+    {
+        println!(
+            "restrict-data-dir-acl is a no-op on non-Windows: {} is \
+             secured via per-file 0o600 + per-dir 0o700 modes set in \
+             identity_store / domain_store / redb_backend.",
+            data_dir.display()
+        );
+    }
+
+    Ok(())
+}
+
+/// Apply the `D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` SDDL via
+/// `ConvertStringSecurityDescriptorToSecurityDescriptorW` +
+/// `SetNamedSecurityInfoW` against the supplied directory. Pulls the
+/// DACL out of the descriptor and writes it back with
+/// `PROTECTED_DACL_SECURITY_INFORMATION` so inheritance from the
+/// `%ProgramData%` parent is severed — children of `<data_dir>` then
+/// inherit from this DACL only.
+#[cfg(windows)]
+fn apply_windows_data_dir_dacl(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
+        SetNamedSecurityInfoW,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+
+    // SDDL identical to FileLog::Init (DdsAuthBridge) and
+    // AppliedStateStore.SetWindowsDacl (DdsPolicyAgent):
+    //   D:PAI               -> protected DACL, auto-inherited (drop parent ACEs)
+    //   (A;OICI;FA;;;SY)   -> Allow, ObjectInherit+ContainerInherit, FileAll, LocalSystem
+    //   (A;OICI;FA;;;BA)   -> Allow, OI+CI, FileAll, BUILTIN\Administrators
+    let sddl: Vec<u16> = std::ffi::OsStr::new("D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut psd,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}",
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+
+    let mut dacl_present: i32 = 0;
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut dacl_defaulted: i32 = 0;
+    let got = unsafe {
+        GetSecurityDescriptorDacl(psd, &mut dacl_present, &mut dacl, &mut dacl_defaulted)
+    };
+    if got == 0 || dacl_present == 0 || dacl.is_null() {
+        unsafe { LocalFree(psd as *mut _) };
+        return Err("SDDL produced no DACL — refusing to widen ACL".into());
+    }
+
+    let path_w: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let rc = unsafe {
+        SetNamedSecurityInfoW(
+            path_w.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+
+    unsafe { LocalFree(psd as *mut _) };
+
+    // SetNamedSecurityInfoW returns ERROR_SUCCESS (0) on success.
+    if rc != 0 {
+        return Err(format!(
+            "SetNamedSecurityInfoW failed (Win32 err = {rc}): {}",
+            std::io::Error::from_raw_os_error(rc as i32)
+        )
+        .into());
     }
     Ok(())
 }

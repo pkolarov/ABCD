@@ -112,6 +112,10 @@ dds-node revoke-admission --domain-key ./acme/domain_key.bin --domain ./acme/dom
 dds-node import-revocation --data-dir ~/.dds --in admission_revocation.cbor
 dds-node list-revocations --data-dir ~/.dds [--json]
 
+# Tighten the data-directory DACL (Windows MSI custom action target;
+# no-op on macOS/Linux where Unix file modes are authoritative)
+dds-node restrict-data-dir-acl --data-dir 'C:\ProgramData\DDS'
+
 # Create a single-file provisioning bundle
 dds-node create-provision-bundle --dir ./acme --org acme [--out provision.dds]
 

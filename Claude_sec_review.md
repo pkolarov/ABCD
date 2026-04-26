@@ -1699,6 +1699,23 @@ the offline-attack posture of the vault.
   upgrade-safe: a stale wide-open ACL on an existing
   `%ProgramData%\DDS` from a pre-A-4 build is corrected on first
   start of the new bits.
+- **2026-04-26 follow-up**: install-time race closed. The
+  `FileLog::Init` self-heal only fires when `DdsAuthBridge` first
+  starts — but `dds-node` and the MSI custom action `CA_GenHmacSecret`
+  both write into `%ProgramData%\DDS` *earlier* in the install
+  sequence, so the per-install HMAC secret was created with the
+  inherited (wide-open) ACL and kept it even after the Auth Bridge
+  later tightened the parent. New `dds-node restrict-data-dir-acl
+  --data-dir <DIR>` subcommand (cross-platform; no-op on non-Windows)
+  applies the same SDDL via the same Win32 calls, and a new
+  `CA_RestrictDataDirAcl` MSI custom action runs it after
+  `InstallFiles` and *before* `CA_GenHmacSecret`. End-state:
+  `node-hmac.key` (and every later child file) inherits the
+  restricted DACL from creation. Five new CLI integration tests in
+  `dds-node/tests/restrict_data_dir_acl.rs` pin the cross-platform
+  contract; the Windows `SetNamedSecurityInfoW` call still requires
+  Windows host CI to exercise end-to-end. Closes threat-model §3 /
+  §8 open item #8.
 
 ---
 
