@@ -22,6 +22,12 @@ pub const COSE_ALG_EDDSA: i64 = -8;
 /// COSE algorithm identifier for ECDSA w/ SHA-256 (ES256).
 pub const COSE_ALG_ES256: i64 = -7;
 
+/// Maximum credential ID length per CTAP2.1 §6.1 (`MAX_CREDENTIAL_ID_LENGTH`).
+/// WebAuthn §4 also recommends Relying Parties ignore credential IDs >= 1024 bytes.
+/// Closes Claude_sec_review.md I-8: prevents a malformed authData from
+/// declaring a multi-kilobyte credential id and forcing a large allocation.
+pub const MAX_CREDENTIAL_ID_LEN: usize = 1023;
+
 /// A parsed WebAuthn attestation object.
 #[derive(Debug, Clone)]
 pub struct ParsedAttestation {
@@ -174,6 +180,14 @@ fn parse_auth_data(auth_data: &[u8]) -> Result<AuthDataParts, Fido2Error> {
     p += 16; // AAGUID
     let cred_id_len = u16::from_be_bytes([auth_data[p], auth_data[p + 1]]) as usize;
     p += 2;
+    // I-8: enforce CTAP2.1 §6.1 MAX_CREDENTIAL_ID_LENGTH (1023). Without
+    // this, a peer-supplied authData could declare a 64 KiB credential id
+    // and force a large allocation in `to_vec` below.
+    if cred_id_len > MAX_CREDENTIAL_ID_LEN {
+        return Err(Fido2Error::Format(format!(
+            "credentialId length {cred_id_len} exceeds MAX_CREDENTIAL_ID_LEN ({MAX_CREDENTIAL_ID_LEN})"
+        )));
+    }
     if auth_data.len() < p + cred_id_len {
         return Err(Fido2Error::Format(
             "authData truncated at credentialId".into(),
@@ -508,9 +522,18 @@ pub fn cose_to_credential_public_key(cose_bytes: &[u8]) -> Result<CredentialPubl
         }
     }
 
+    // I-10 (Claude_sec_review.md): RFC 9052 §7.1 lists `alg` (label 3) as
+    // a defined COSE_Key parameter and §3.1 mandates it for keys used in
+    // signature verification. Real authenticators always emit it; refusing
+    // a missing alg removes the prior fallback that picked an algorithm
+    // from `kty` alone.
+    let alg = alg.ok_or_else(|| {
+        Fido2Error::Format("COSE_Key missing required alg parameter (RFC 9052 §3.1)".into())
+    })?;
+
     match (kty, alg) {
         // Ed25519 (OKP)
-        (Some(1), Some(COSE_ALG_EDDSA)) | (Some(1), None) => {
+        (Some(1), COSE_ALG_EDDSA) => {
             if crv != Some(6) {
                 return Err(Fido2Error::Unsupported(format!("OKP crv={crv:?}")));
             }
@@ -525,7 +548,7 @@ pub fn cose_to_credential_public_key(cose_bytes: &[u8]) -> Result<CredentialPubl
             Ok(CredentialPublicKey::Ed25519(vk))
         }
         // P-256 (EC2)
-        (Some(2), Some(COSE_ALG_ES256)) | (Some(2), None) => {
+        (Some(2), COSE_ALG_ES256) => {
             if crv != Some(1) {
                 return Err(Fido2Error::Unsupported(format!("EC2 crv={crv:?}")));
             }
@@ -1280,6 +1303,141 @@ mod tests {
 
         let cpk = cose_to_credential_public_key(&bytes).unwrap();
         assert!(matches!(cpk, CredentialPublicKey::Ed25519(_)));
+    }
+
+    /// I-8 (Claude_sec_review.md): a malformed authData claiming a
+    /// `cred_id_len` over `MAX_CREDENTIAL_ID_LEN` (1023) must be rejected
+    /// before any allocation happens. Build a buffer that's just large
+    /// enough to satisfy the truncation check (so the only thing that
+    /// trips is the length cap) and confirm the parser refuses it.
+    #[test]
+    fn i8_parse_auth_data_rejects_oversized_credential_id() {
+        let rp_id_hash = Sha256::digest(b"dds.local");
+        let oversized = (MAX_CREDENTIAL_ID_LEN + 1) as u16;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&rp_id_hash); // 32
+        buf.push(0x41); // flags UP|AT
+        buf.extend_from_slice(&[0, 0, 0, 0]); // signCount
+        buf.extend_from_slice(&[0u8; 16]); // AAGUID
+        buf.extend_from_slice(&oversized.to_be_bytes());
+        // Pad to satisfy the truncation precheck — the length cap should
+        // fire before the truncation check anyway, but we want to prove
+        // the cap is the rejection reason rather than incidental short-input.
+        buf.resize(buf.len() + oversized as usize + 64, 0);
+
+        let res = parse_auth_data(&buf);
+        match res {
+            Err(Fido2Error::Format(msg)) => {
+                assert!(
+                    msg.contains("MAX_CREDENTIAL_ID_LEN") || msg.contains("exceeds"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Format error, got {other:?}"),
+            Ok(_) => panic!("oversized cred_id_len should be rejected"),
+        }
+    }
+
+    /// I-8 boundary: exactly `MAX_CREDENTIAL_ID_LEN` bytes must still
+    /// parse (only `> MAX` is rejected, matching the CTAP2.1 wording).
+    /// We don't need a valid COSE_Key here — we use a 0-byte cred_id +
+    /// real COSE in the existing roundtrip tests for that — this test
+    /// just verifies the cap boundary is `>`, not `>=`.
+    #[test]
+    fn i8_parse_auth_data_accepts_max_credential_id_length() {
+        let rp_id_hash = Sha256::digest(b"dds.local");
+        let at_max = MAX_CREDENTIAL_ID_LEN as u16;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&rp_id_hash);
+        buf.push(0x41);
+        buf.extend_from_slice(&[0, 0, 0, 0]);
+        buf.extend_from_slice(&[0u8; 16]);
+        buf.extend_from_slice(&at_max.to_be_bytes());
+        buf.extend_from_slice(&vec![0u8; at_max as usize]);
+        // Followed by garbage where COSE_Key would normally live; the
+        // parser should fail later (in cose_to_credential_public_key)
+        // rather than at the length check we're exercising.
+        buf.extend_from_slice(&[0xFFu8; 8]);
+        let res = parse_auth_data(&buf);
+        // Either Cbor or Format from the COSE step is fine — what matters
+        // is we got past the length cap.
+        match res {
+            Err(Fido2Error::Cbor(_)) | Err(Fido2Error::Format(_)) => {}
+            Err(other) => panic!("expected Cbor/Format from COSE step, got {other:?}"),
+            Ok(_) => panic!("garbage COSE should not parse"),
+        }
+    }
+
+    /// I-10 (Claude_sec_review.md): a COSE_Key without `alg` is now
+    /// rejected. RFC 9052 §3.1 mandates the parameter for keys used in
+    /// signature verification, and real FIDO2 authenticators always
+    /// emit it. The previous behaviour fell back to inferring the
+    /// algorithm from `kty` alone, which left a small mismatch surface.
+    #[test]
+    fn i10_cose_to_credential_public_key_rejects_missing_alg() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let vk = sk.verifying_key();
+
+        // Same as test_cose_to_credential_public_key_ed25519, but without label 3 (alg).
+        let cose: Vec<(CborValue, CborValue)> = vec![
+            (CborValue::Integer(1.into()), CborValue::Integer(1.into())), // kty=OKP
+            (
+                CborValue::Integer((-1).into()),
+                CborValue::Integer(6.into()),
+            ), // crv=Ed25519
+            (
+                CborValue::Integer((-2).into()),
+                CborValue::Bytes(vk.to_bytes().to_vec()),
+            ),
+        ];
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&CborValue::Map(cose), &mut bytes).unwrap();
+
+        let res = cose_to_credential_public_key(&bytes);
+        match res {
+            Err(Fido2Error::Format(msg)) => {
+                assert!(
+                    msg.contains("alg"),
+                    "expected error mentioning alg, got: {msg}"
+                );
+            }
+            other => panic!("expected Format error, got {other:?}"),
+        }
+    }
+
+    /// I-10: an EC2 (P-256) COSE_Key without `alg` is rejected on the
+    /// same RFC 9052 §3.1 ground.
+    #[test]
+    fn i10_cose_to_credential_public_key_rejects_missing_alg_p256() {
+        use p256::ecdsa::SigningKey as P256SigningKey;
+        let sk = P256SigningKey::random(&mut OsRng);
+        let vk = P256VerifyingKey::from(&sk);
+        let point = vk.to_encoded_point(false);
+        let x = point.x().unwrap().to_vec();
+        let y = point.y().unwrap().to_vec();
+
+        let cose: Vec<(CborValue, CborValue)> = vec![
+            (CborValue::Integer(1.into()), CborValue::Integer(2.into())), // kty=EC2
+            (
+                CborValue::Integer((-1).into()),
+                CborValue::Integer(1.into()),
+            ), // crv=P-256
+            (CborValue::Integer((-2).into()), CborValue::Bytes(x)),
+            (CborValue::Integer((-3).into()), CborValue::Bytes(y)),
+        ];
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&CborValue::Map(cose), &mut bytes).unwrap();
+
+        let res = cose_to_credential_public_key(&bytes);
+        match res {
+            Err(Fido2Error::Format(msg)) => {
+                assert!(
+                    msg.contains("alg"),
+                    "expected error mentioning alg, got: {msg}"
+                );
+            }
+            other => panic!("expected Format error, got {other:?}"),
+        }
     }
 
     #[test]

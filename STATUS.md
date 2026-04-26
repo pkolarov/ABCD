@@ -1,7 +1,33 @@
 # DDS Implementation Status
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #3 (Windows data-directory DACL
+> Last updated: 2026-04-26 follow-up #4 (FIDO2 parser hardening —
+> closes Claude_sec_review.md informational items I-8 + I-10). Two
+> small source-validated parser fixes in `dds-domain/src/fido2.rs`:
+> (a) `parse_auth_data` now caps `cred_id_len` at the new public
+> `MAX_CREDENTIAL_ID_LEN = 1023` constant (CTAP2.1 §6.1
+> `MAX_CREDENTIAL_ID_LENGTH`; WebAuthn §4 also recommends RPs ignore
+> credential IDs ≥1024 bytes), so a peer-supplied authData declaring
+> a 64 KiB credential id is rejected with a `Format` error before the
+> `to_vec` allocation; (b) `cose_to_credential_public_key` now
+> requires the COSE_Key `alg` parameter (label 3) per RFC 9052 §3.1
+> instead of falling back to inferring the algorithm from `kty`
+> alone — both the OKP/Ed25519 and EC2/P-256 paths share one upfront
+> required-`alg` check and the kty/alg mismatch arms (`kty=OKP +
+> alg=ES256` etc.) are still handled by the unchanged catch-all
+> `_ => Err(Unsupported)`. Tests: four new regression tests in
+> `dds-domain/src/fido2.rs::tests` —
+> `i8_parse_auth_data_rejects_oversized_credential_id`,
+> `i8_parse_auth_data_accepts_max_credential_id_length` (boundary at
+> 1023 still parses past the cap, fails later in COSE),
+> `i10_cose_to_credential_public_key_rejects_missing_alg`, and
+> `i10_cose_to_credential_public_key_rejects_missing_alg_p256`.
+> Workspace test count: 522 (up from 518); cargo fmt clean; cargo
+> clippy clean (workspace, all-targets, `-D warnings`). No remaining
+> open Critical, High, or Medium items in the security review.
+> Closures recorded in `Claude_sec_review.md` §Informational.
+>
+> Previous: 2026-04-26 follow-up #3 (Windows data-directory DACL
 > at install time — closes threat-model §3 / §8 open item #8).
 > The MSI now applies the same restricted DACL the C++ Auth Bridge
 > self-heals on every start (`FileLog::Init`) and the .NET Policy

@@ -1240,9 +1240,23 @@ Session `exp` and challenge TTLs computed from `SystemTime::now()`. NTP backstep
 - **I-5.** Admission cert TTL capped at 1y — verified.
 - **I-6.** CBOR deserialization has no documented depth limit — `ciborium` is generally safe but deeply-nested inputs can cause stack growth.
 - **I-7.** Default-deny policy engine verified correct; logic is subtle but sound ([dds-core/src/policy.rs:69-108](dds-core/src/policy.rs#L69-L108)).
-- **I-8.** Credential-ID string length for CTAP2 is read as `u16` without upper bound ([dds-domain/src/fido2.rs:147-155](dds-domain/src/fido2.rs#L147-L155)).
+- **I-8.** ✅ **Closed 2026-04-26.** Credential-ID length is now bounded
+  by `MAX_CREDENTIAL_ID_LEN = 1023` (CTAP2.1 §6.1
+  `MAX_CREDENTIAL_ID_LENGTH`) in `parse_auth_data`
+  ([dds-domain/src/fido2.rs](dds-domain/src/fido2.rs)). A peer-supplied
+  authData declaring `cred_id_len > 1023` is rejected with a `Format`
+  error before any allocation. Two regression tests:
+  `i8_parse_auth_data_rejects_oversized_credential_id` and
+  `i8_parse_auth_data_accepts_max_credential_id_length` (boundary).
 - **I-9.** Secrets in Python bindings linger in GC'd strings ([bindings/python/dds.py:116,132](bindings/python/dds.py#L116)) — use `ctypes.create_string_buffer` for sensitive inputs.
-- **I-10.** COSE `alg` field not strictly required in parser ([dds-domain/src/fido2.rs:350,365](dds-domain/src/fido2.rs#L350)); `kty` alone determines the scheme but RFC 9052 mandates `alg`.
+- **I-10.** ✅ **Closed 2026-04-26.** `cose_to_credential_public_key`
+  now rejects a COSE_Key that omits the `alg` parameter (label 3) per
+  RFC 9052 §3.1, instead of falling back to inferring the algorithm
+  from `kty` ([dds-domain/src/fido2.rs](dds-domain/src/fido2.rs)). Both
+  the OKP (Ed25519) and EC2 (P-256) paths share the same upfront
+  required-`alg` check. Two regression tests:
+  `i10_cose_to_credential_public_key_rejects_missing_alg` and
+  `i10_cose_to_credential_public_key_rejects_missing_alg_p256`.
 - **I-11.** `trusted_roots` is not coherent across peers. Each node reads its own set from local TOML config at startup; admin additions (vouches) are gossiped but the *membership of `trusted_roots`* is not. Peers can therefore disagree about who is an admin. Current C-2 fix preserves this property deliberately (see C-2 "Out of scope"). A future redesign should chain admins back to a domain-key-signed genesis attestation so the admin set is derived from the gossip stream rather than configured per node. Tracked here rather than as an open finding because it is a latent design limitation, not a presently-exploitable bug given the C-2 fix.
 
 ---
