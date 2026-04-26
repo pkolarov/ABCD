@@ -560,6 +560,11 @@ impl TrustGraph {
         self.revocations.len()
     }
 
+    /// Get the number of burned identity URNs.
+    pub fn burned_count(&self) -> usize {
+        self.burned.len()
+    }
+
     /// Iterate over every attestation token currently in the graph.
     /// Order is implementation-defined.
     ///
@@ -777,6 +782,7 @@ mod tests {
         assert_eq!(g.attestation_count(), 0);
         assert_eq!(g.vouch_count(), 0);
         assert_eq!(g.revocation_count(), 0);
+        assert_eq!(g.burned_count(), 0);
     }
 
     #[test]
@@ -870,6 +876,7 @@ mod tests {
         g.add_token(burn).unwrap();
 
         assert!(g.is_burned(&user.id.to_urn()));
+        assert_eq!(g.burned_count(), 1);
     }
 
     #[test]

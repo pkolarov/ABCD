@@ -14,9 +14,17 @@ audit-metrics subset (`dds_build_info`, `dds_uptime_seconds`,
 landed 2026-04-26 follow-up #22. Phase E **audit-tier subset**
 (reference Grafana dashboards + Alertmanager rules keyed off the
 metrics shipped in #22, plus commented-out reference rules for the
-not-yet-shipped catalog) landed 2026-04-26 follow-up #23; the rest
-of the C catalog (network / FIDO2 / store / HTTP / process) plus
-the Phase E rules/panels that depend on those metrics remain open.
+not-yet-shipped catalog) landed 2026-04-26 follow-up #23. Phase C
+**HTTP-tier caller-identity counter** (`dds_http_caller_identity_total{kind}`)
+landed 2026-04-26 follow-up #24, also activating the
+`DdsLoopbackTcpAdminUsed` H-7 cutover regression rule. Phase C
+**trust-graph subset** (`dds_trust_graph_attestations`,
+`dds_trust_graph_vouches`, `dds_trust_graph_revocations`,
+`dds_trust_graph_burned` — scrape-time gauges read under one
+read-lock acquisition) landed 2026-04-26 follow-up #25. The rest
+of the C catalog (network / FIDO2 / store / process, plus the
+HTTP request / duration histograms) plus the Phase E rules/panels
+that depend on those metrics remain open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -267,7 +275,8 @@ Rust.
 ### Phase C — Prometheus exposition (`/metrics`)
 
 **Status: audit subset landed 2026-04-26 follow-up #22; HTTP-tier
-caller-identity counter landed in follow-up #24; rest of the catalog
+caller-identity counter landed in follow-up #24; trust-graph
+read-side subset landed in follow-up #25; rest of the catalog
 (network / FIDO2 / store / process, plus the HTTP request /
 duration families) remains open.** The audit-metrics first slice
 exposed the five families needed to alert on Z-3 regressions
@@ -275,7 +284,14 @@ exposed the five families needed to alert on Z-3 regressions
 `dds_audit_entries_total{action}`, `dds_audit_chain_length`,
 `dds_audit_chain_head_age_seconds`); follow-up #24 added
 `dds_http_caller_identity_total{kind}` so the `DdsLoopbackTcpAdminUsed`
-H-7 cutover regression alarm has a real metric to key off.
+H-7 cutover regression alarm has a real metric to key off; follow-up
+#25 added the four `dds_trust_graph_*` gauges (attestations / vouches
+/ revocations / burned) read under a single read-lock acquisition at
+scrape time. The trust-graph series are renamed from the original
+catalog spelling (`dds_attestations_total` → `dds_trust_graph_attestations`,
+`dds_burned_identities_total` → `dds_trust_graph_burned`) to match
+Prometheus convention — `_total` is reserved for monotonic counters,
+and these are gauges of current state.
 [dds-node/src/telemetry.rs](../dds-node/src/telemetry.rs) is a
 hand-rolled exposition over `Mutex<BTreeMap<String, u64>>` counters
 plus on-demand audit-store reads, served on a separate axum listener
@@ -330,9 +346,10 @@ rows remain open.
 | `dds_sync_lag_seconds` | histogram | — | Time from peer's op timestamp to local apply | 🔲 |
 | `dds_sync_payloads_rejected_total` | counter | `reason=signature|graph|duplicate_jti|window` | B-1-style guard hits | 🔲 |
 | **Trust graph** | | | | |
-| `dds_attestations_total` | gauge | `kind=user|device|service` | Active count | 🔲 |
-| `dds_attestations_revoked_total` | counter | — | Revocations applied since boot | 🔲 |
-| `dds_burned_identities_total` | gauge | — | Total burned URNs | 🔲 |
+| `dds_trust_graph_attestations` | gauge | — | Active attestation tokens (renamed from `dds_attestations_total` — Prom convention reserves `_total` for counters; per-kind label deferred until body-type classifier lands) | ✅ |
+| `dds_trust_graph_vouches` | gauge | — | Active vouch tokens | ✅ |
+| `dds_trust_graph_revocations` | gauge | — | Currently tracked revoked JTIs (renamed from `dds_attestations_revoked_total` — semantically a current-state gauge, not a since-boot counter) | ✅ |
+| `dds_trust_graph_burned` | gauge | — | Burned identity URNs (renamed from `dds_burned_identities_total`) | ✅ |
 | `dds_purpose_lookups_total` | counter | `result=ok|denied|not_found` | `has_purpose` outcomes | 🔲 |
 | **FIDO2 / sessions** | | | | |
 | `dds_fido2_assertions_total` | counter | `result=ok|signature|rp_id|up|uv|sign_count` | Assertion outcomes | 🔲 |

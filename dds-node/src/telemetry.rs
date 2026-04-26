@@ -28,6 +28,30 @@
 //! | `dds_audit_chain_length` | gauge | — | [`AuditStore::count_audit_entries`] at scrape |
 //! | `dds_audit_chain_head_age_seconds` | gauge | — | `now - head.timestamp` at scrape |
 //! | `dds_http_caller_identity_total` | counter | `kind=anonymous\|uds\|pipe\|admin` | bumped by [`record_caller_identity`] |
+//! | `dds_trust_graph_attestations` | gauge | — | [`crate::service::LocalService::trust_graph_counts`] at scrape |
+//! | `dds_trust_graph_vouches` | gauge | — | same |
+//! | `dds_trust_graph_revocations` | gauge | — | same |
+//! | `dds_trust_graph_burned` | gauge | — | same |
+//!
+//! ### Trust-graph gauges
+//!
+//! These four gauges report the *current* size of each trust-graph
+//! partition under a single [`std::sync::RwLock`] read acquisition (one
+//! acquire per scrape — no per-token locking). The catalog in
+//! `observability-plan.md` Phase C names the same series with the
+//! `dds_attestations_total` / `dds_burned_identities_total` shape;
+//! these are gauges of *current* counts, not Prometheus counters, so
+//! the rename drops the `_total` suffix to match Prometheus naming
+//! conventions (`_total` is reserved for monotonic counters). The
+//! plan tracker has been updated accordingly.
+//!
+//! `kind=user|device|service` partitioning of `dds_trust_graph_attestations`
+//! is deferred until the body-type catalog ships a single mapping —
+//! today the same `body_type` namespace covers user, device, *and*
+//! domain-policy / software-assignment attestations, so a runtime
+//! classifier would have to embed knowledge of every body type. A
+//! future Phase C follow-up can add the label without changing the
+//! metric name.
 //!
 //! ### `dds_http_caller_identity_total` semantics
 //!
@@ -75,6 +99,7 @@ use dds_store::traits::{
 };
 
 use crate::http::SharedService;
+use crate::service::TrustGraphCounts;
 
 /// Process-global telemetry handle. Initialised once at process start
 /// (idempotent) so call-sites do not need to thread the handle
@@ -195,12 +220,17 @@ pub fn record_caller_identity(kind: &str) {
 ///
 /// `chain_length` and `head_timestamp` are passed in by the caller
 /// because they require an `AuditStore` lock and the lock is owned by
-/// the `LocalService` mutex. Keeping the lock acquisition in the
-/// caller avoids forcing a `where` bound on this function.
+/// the `LocalService` mutex. `trust_graph` carries the four
+/// `dds_trust_graph_*` gauges read under the trust-graph `RwLock` —
+/// `None` means the lock was poisoned (or in tests, intentionally
+/// omitted) and the renderer falls back to zeroes.
+/// Keeping the lock acquisition in the caller avoids forcing a
+/// `where` bound on this function.
 fn render_exposition(
     telemetry: &Telemetry,
     chain_length: usize,
     head_timestamp: Option<u64>,
+    trust_graph: Option<TrustGraphCounts>,
 ) -> String {
     let mut out = String::with_capacity(1024);
 
@@ -263,6 +293,34 @@ fn render_exposition(
         None => 0,
     };
     out.push_str(&format!("dds_audit_chain_head_age_seconds {head_age}\n"));
+
+    // Trust-graph gauges — read under a single RwLock acquisition by
+    // the caller. `None` means the lock was poisoned; degrade to 0
+    // rather than panicking the scrape task.
+    let tg = trust_graph.unwrap_or_default();
+    out.push_str(
+        "# HELP dds_trust_graph_attestations Active attestation tokens currently in the trust graph.\n",
+    );
+    out.push_str("# TYPE dds_trust_graph_attestations gauge\n");
+    out.push_str(&format!(
+        "dds_trust_graph_attestations {}\n",
+        tg.attestations
+    ));
+    out.push_str(
+        "# HELP dds_trust_graph_vouches Active vouch tokens currently in the trust graph.\n",
+    );
+    out.push_str("# TYPE dds_trust_graph_vouches gauge\n");
+    out.push_str(&format!("dds_trust_graph_vouches {}\n", tg.vouches));
+    out.push_str(
+        "# HELP dds_trust_graph_revocations Revoked JTIs currently tracked in the trust graph.\n",
+    );
+    out.push_str("# TYPE dds_trust_graph_revocations gauge\n");
+    out.push_str(&format!("dds_trust_graph_revocations {}\n", tg.revocations));
+    out.push_str(
+        "# HELP dds_trust_graph_burned Burned identity URNs currently tracked in the trust graph.\n",
+    );
+    out.push_str("# TYPE dds_trust_graph_burned gauge\n");
+    out.push_str(&format!("dds_trust_graph_burned {}\n", tg.burned));
 
     // `dds_http_caller_identity_total` — per-kind caller counter.
     out.push_str(
@@ -384,13 +442,14 @@ where
         + Sync
         + 'static,
 {
-    let (chain_length, head_timestamp) = {
+    let (chain_length, head_timestamp, trust_graph) = {
         let svc = state.svc.lock().await;
         let len = svc.audit_chain_length().unwrap_or(0);
         let head = svc.audit_chain_head_timestamp().unwrap_or(None);
-        (len, head)
+        let tg = svc.trust_graph_counts();
+        (len, head, tg)
     };
-    let body = render_exposition(&state.telemetry, chain_length, head_timestamp);
+    let body = render_exposition(&state.telemetry, chain_length, head_timestamp, trust_graph);
     (
         StatusCode::OK,
         [(
@@ -454,7 +513,7 @@ mod tests {
     #[test]
     fn render_includes_build_info_and_uptime_for_empty_telemetry() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None);
+        let body = render_exposition(&t, 0, None, None);
         assert!(body.contains("dds_build_info{version=\""));
         assert!(body.contains("} 1\n"));
         assert!(body.contains("# TYPE dds_uptime_seconds gauge\n"));
@@ -470,7 +529,7 @@ mod tests {
         t.bump_audit_entry("attest");
         t.bump_audit_entry("revoke");
 
-        let body = render_exposition(&t, 3, Some(0));
+        let body = render_exposition(&t, 3, Some(0), None);
         assert!(body.contains("dds_audit_entries_total{action=\"attest\"} 2\n"));
         assert!(body.contains("dds_audit_entries_total{action=\"revoke\"} 1\n"));
         assert!(body.contains("dds_audit_chain_length 3\n"));
@@ -483,13 +542,40 @@ mod tests {
         t.bump_caller_identity("anonymous");
         t.bump_caller_identity("admin");
 
-        let body = render_exposition(&t, 0, None);
+        let body = render_exposition(&t, 0, None, None);
         assert!(body.contains("# TYPE dds_http_caller_identity_total counter\n"));
         assert!(body.contains("dds_http_caller_identity_total{kind=\"anonymous\"} 2\n"));
         assert!(body.contains("dds_http_caller_identity_total{kind=\"admin\"} 1\n"));
         assert_eq!(t.caller_identity_count("anonymous"), 2);
         assert_eq!(t.caller_identity_count("admin"), 1);
         assert_eq!(t.caller_identity_count("uds"), 0);
+    }
+
+    #[test]
+    fn trust_graph_gauges_render_supplied_counts() {
+        let t = Telemetry::new();
+        let counts = TrustGraphCounts {
+            attestations: 7,
+            vouches: 3,
+            revocations: 2,
+            burned: 1,
+        };
+        let body = render_exposition(&t, 0, None, Some(counts));
+        assert!(body.contains("# TYPE dds_trust_graph_attestations gauge\n"));
+        assert!(body.contains("dds_trust_graph_attestations 7\n"));
+        assert!(body.contains("dds_trust_graph_vouches 3\n"));
+        assert!(body.contains("dds_trust_graph_revocations 2\n"));
+        assert!(body.contains("dds_trust_graph_burned 1\n"));
+    }
+
+    #[test]
+    fn trust_graph_gauges_default_to_zero_when_lock_poisoned() {
+        let t = Telemetry::new();
+        let body = render_exposition(&t, 0, None, None);
+        assert!(body.contains("dds_trust_graph_attestations 0\n"));
+        assert!(body.contains("dds_trust_graph_vouches 0\n"));
+        assert!(body.contains("dds_trust_graph_revocations 0\n"));
+        assert!(body.contains("dds_trust_graph_burned 0\n"));
     }
 
     #[test]
@@ -500,7 +586,7 @@ mod tests {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         // A timestamp 30 seconds in the past should render head_age >= 30.
-        let body = render_exposition(&t, 1, Some(now.saturating_sub(30)));
+        let body = render_exposition(&t, 1, Some(now.saturating_sub(30)), None);
         // Parse out the head_age value to allow for clock drift /
         // sub-second rounding inside the renderer.
         let line = body
@@ -590,6 +676,13 @@ mod tests {
         // Empty MemoryBackend audit chain → length 0, head_age 0.
         assert!(body.contains("dds_audit_chain_length 0\n"));
         assert!(body.contains("dds_audit_chain_head_age_seconds 0\n"));
+        // `make_test_service` seeds one root self-attestation; vouches
+        // / revocations / burned remain empty.
+        assert!(body.contains("# TYPE dds_trust_graph_attestations gauge\n"));
+        assert!(body.contains("dds_trust_graph_attestations 1\n"));
+        assert!(body.contains("dds_trust_graph_vouches 0\n"));
+        assert!(body.contains("dds_trust_graph_revocations 0\n"));
+        assert!(body.contains("dds_trust_graph_burned 0\n"));
     }
 
     #[tokio::test]

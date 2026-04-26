@@ -197,6 +197,18 @@ pub struct PolicyResult {
     pub reason: String,
 }
 
+/// One-shot trust-graph counts collected under a single read-lock for
+/// the Prometheus exposition (observability-plan.md Phase C). The
+/// metrics renderer reads all four gauges from a single snapshot so
+/// scrape latency stays bounded by one lock acquisition.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrustGraphCounts {
+    pub attestations: usize,
+    pub vouches: usize,
+    pub revocations: usize,
+    pub burned: usize,
+}
+
 // ----------------------------------------------------------------
 // Platform applier surface (Windows + macOS)
 //
@@ -1875,6 +1887,23 @@ impl<
         Ok(entries.last().map(|e| e.timestamp))
     }
 
+    /// One-shot trust-graph counts under a single read-lock
+    /// acquisition. observability-plan.md Phase C — backs the
+    /// `dds_trust_graph_attestations`, `dds_trust_graph_vouches`,
+    /// `dds_trust_graph_revocations`, and `dds_trust_graph_burned`
+    /// Prometheus gauges. Returns `None` if the trust-graph lock is
+    /// poisoned so the metrics renderer can degrade to the previous
+    /// scrape value rather than panic the scrape task.
+    pub fn trust_graph_counts(&self) -> Option<TrustGraphCounts> {
+        let g = self.trust_graph.read().ok()?;
+        Some(TrustGraphCounts {
+            attestations: g.attestation_count(),
+            vouches: g.vouch_count(),
+            revocations: g.revocation_count(),
+            burned: g.burned_count(),
+        })
+    }
+
     /// Get a clone of the shared trust graph handle. Callers can take a
     /// read or write lock as needed.
     pub fn trust_graph_handle(&self) -> Arc<RwLock<TrustGraph>> {
@@ -3538,6 +3567,22 @@ mod platform_applier_tests {
             .unwrap_or(0);
         assert!(now.saturating_sub(head_ts) < 10);
         assert!(chain_len_after >= 1);
+    }
+
+    /// observability-plan.md Phase C — regression test for the
+    /// `dds_trust_graph_*` Prometheus gauges. Confirms
+    /// `LocalService::trust_graph_counts` reports the four partition
+    /// sizes accurately under a single read-lock acquisition. The
+    /// `setup()` helper seeds 1 admin attestation + 3 self-vouches so
+    /// the baseline is non-empty.
+    #[test]
+    fn trust_graph_counts_reports_partition_sizes() {
+        let (svc, _, _) = setup();
+        let counts = svc.trust_graph_counts().expect("graph not poisoned");
+        assert_eq!(counts.attestations, 1);
+        assert_eq!(counts.vouches, 3);
+        assert_eq!(counts.revocations, 0);
+        assert_eq!(counts.burned, 0);
     }
 
     #[test]
