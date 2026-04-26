@@ -28,7 +28,55 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-26 follow-up #18 (observability Phase D
+> Last updated: 2026-04-26 follow-up #19 (observability Phase B.1 +
+> B.2 landed — closes the SIEM-export and chain-verify rows of
+> [docs/observability-plan.md](docs/observability-plan.md) Phase B).
+> The admin-gated `GET /v1/audit/entries` endpoint
+> ([dds-node/src/http.rs](dds-node/src/http.rs)) now accepts a
+> `since=<unix-seconds>` query parameter and surfaces three new
+> per-row fields: `entry_cbor_b64` (the full CBOR-encoded
+> `AuditLogEntry` so a remote verifier can reconstruct exactly the
+> bytes the node signed), `chain_hash_hex`, `prev_hash_hex`, plus the
+> existing `reason` from Phase A.2 (omitted when `None` via
+> `skip_serializing_if`). The wire shape is additive — older fields
+> (`action`, `node_urn`, `timestamp`, `token_cbor_b64`) are unchanged
+> so existing `dds-cli audit list` callers still parse. New
+> `dds-cli audit tail [--since N] [--format jsonl]
+> [--follow-interval S] [--action ...]` polls the endpoint and
+> emits one JSON object per line with the verify result baked in
+> (`sig_ok` is computed locally by `AuditLogEntry::verify()` after
+> CBOR-decoding `entry_cbor_b64`, so a tampered line is flagged in
+> the stream rather than silently trusted by the SIEM). Cross-poll
+> de-duplication keys off `chain_hash_hex`, falling back to a
+> synthetic `(ts|action|token)` key on older nodes that pre-date the
+> field. New `dds-cli audit verify [--action ...]` walks the chain
+> end-to-end: per entry it CBOR-decodes `entry_cbor_b64`, runs
+> `verify()` (signature + URN-binding) and checks `prev_hash` matches
+> the previous entry's `chain_hash`. Reports the first break with
+> `(index, action, ts, expected, actual)` and exits 1; on success
+> prints `Audit chain verify: OK (N entries, ...)`. Internal
+> plumbing: `HttpError` gained an `internal()` constructor so the
+> CBOR-encode + chain-hash failure paths can return 500 without
+> leaking inner error text; `audit_entry_to_json` is the single
+> conversion site between `dds_core::audit::AuditLogEntry` and the
+> JSON wire shape so the http handler stays a one-liner. Workspace
+> test count: 578 (+3 from the 575 baseline at the prior branch tip;
+> the three new tests are HTTP-level audit-endpoint tests in
+> [dds-node/src/http.rs](dds-node/src/http.rs) — `audit_entries_response_includes_chain_fields_for_verify`
+> pins the new wire fields, `audit_entry_cbor_b64_decodes_and_verifies`
+> exercises the CBOR round-trip + chain link reproduction, and
+> `audit_entries_since_filter_drops_older` covers the `since=N`
+> filter; the 567 figure quoted in follow-up #18 referenced an
+> earlier counting convention and was already off by 8 by the time
+> #19 began). cargo fmt clean; cargo clippy clean (workspace,
+> all-targets, `-D warnings`); cargo test --workspace --all-targets
+> passes. Phase B.3 (Vector / fluent-bit reference configs), B.4
+> (`audit-event-schema.md`), C (Prometheus `/metrics`), E (reference
+> Grafana dashboards + Alertmanager rules), and F (`dds-cli stats` /
+> `health` / `audit export`) remain open and continue to track in
+> the observability plan.
+>
+> Previous: 2026-04-26 follow-up #18 (observability Phase D
 > landed — closes the orchestrator-probe half of
 > [docs/observability-plan.md](docs/observability-plan.md) and the
 > "health checks" half of the

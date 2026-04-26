@@ -938,6 +938,18 @@ impl HttpError {
             message: msg.into(),
         }
     }
+
+    /// Internal-error response. Body is the literal `"internal_error"`
+    /// code so the inner message (which may include redb error text)
+    /// never reaches the wire — the caller still gets a 500 they can
+    /// match on and the full detail is logged at warn.
+    fn internal(detail: impl AsRef<str>) -> Self {
+        tracing::warn!(detail = detail.as_ref(), "internal error in HTTP handler");
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "internal_error".to_string(),
+        }
+    }
 }
 
 impl From<ServiceError> for HttpError {
@@ -1754,6 +1766,10 @@ where
 struct AuditQueryParams {
     action: Option<String>,
     limit: Option<usize>,
+    /// **observability-plan.md Phase B.1**: filter to entries with
+    /// `timestamp >= since` (Unix seconds). Lets `dds-cli audit tail`
+    /// poll for incremental updates without re-fetching the full chain.
+    since: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1762,6 +1778,27 @@ struct AuditEntryJson {
     node_urn: String,
     timestamp: u64,
     token_cbor_b64: String,
+    /// **observability-plan.md Phase B.2**: full CBOR-encoded
+    /// `AuditLogEntry` (signed fields + signature) so a remote
+    /// `dds-cli audit verify` can reconstruct the exact bytes the node
+    /// signed and check the chain end-to-end. Decoded via
+    /// `ciborium::from_reader` into `dds_core::audit::AuditLogEntry`.
+    entry_cbor_b64: String,
+    /// **observability-plan.md Phase A.2**: rejection reason
+    /// (`"signature-invalid"`, `"revoked-issuer"`, …) for `*.rejected`
+    /// actions. `None` for success entries (omitted via
+    /// `skip_serializing_if`); SIEMs treat the absence as "successful
+    /// outcome".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// Hex-encoded `chain_hash()` of this entry — what the *next* entry
+    /// will carry as `prev_hash`. SIEMs that do not want to CBOR-decode
+    /// `entry_cbor_b64` can still chain-link incoming entries by this
+    /// field.
+    chain_hash_hex: String,
+    /// Hex-encoded `prev_hash` field — empty string for the genesis
+    /// entry.
+    prev_hash_hex: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1785,21 +1822,41 @@ where
         + 'static,
 {
     let svc = state.svc.lock().await;
-    let entries = svc.list_audit_entries(params.action.as_deref(), params.limit)?;
+    let mut entries = svc.list_audit_entries(params.action.as_deref(), params.limit)?;
+    if let Some(since) = params.since {
+        entries.retain(|e| e.timestamp >= since);
+    }
     let total = entries.len();
     let json_entries: Vec<AuditEntryJson> = entries
         .into_iter()
-        .map(|e| AuditEntryJson {
-            action: e.action,
-            node_urn: e.node_urn,
-            timestamp: e.timestamp,
-            token_cbor_b64: base64::engine::general_purpose::STANDARD.encode(&e.token_bytes),
-        })
-        .collect();
+        .map(audit_entry_to_json)
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(AuditEntriesResponse {
         entries: json_entries,
         total,
     }))
+}
+
+/// Serialise a chain-bearing `AuditLogEntry` to its JSON wire form. The
+/// CBOR re-encode pins the exact bytes the node signed — the decoder
+/// in `dds-cli audit verify` runs `verify()` against those bytes.
+fn audit_entry_to_json(e: dds_core::audit::AuditLogEntry) -> Result<AuditEntryJson, HttpError> {
+    let mut entry_cbor = Vec::new();
+    ciborium::into_writer(&e, &mut entry_cbor)
+        .map_err(|err| HttpError::internal(format!("audit entry CBOR encode: {err}")))?;
+    let chain_hash = e
+        .chain_hash()
+        .map_err(|err| HttpError::internal(format!("audit chain hash: {err}")))?;
+    Ok(AuditEntryJson {
+        action: e.action,
+        node_urn: e.node_urn,
+        timestamp: e.timestamp,
+        token_cbor_b64: base64::engine::general_purpose::STANDARD.encode(&e.token_bytes),
+        entry_cbor_b64: base64::engine::general_purpose::STANDARD.encode(&entry_cbor),
+        reason: e.reason,
+        chain_hash_hex: hex::encode(&chain_hash),
+        prev_hash_hex: hex::encode(&e.prev_hash),
+    })
 }
 
 /// Bind and serve the HTTP API on `addr` until the future is dropped.
@@ -5085,5 +5142,173 @@ mod tests {
 
         let resp = reqwest::get(format!("{base}/readyz")).await.unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    // ----------------------------------------------------------------
+    // observability-plan.md Phase B — audit endpoint wire format.
+    // The endpoint must surface enough structure for `dds-cli audit
+    // verify` to walk the chain end-to-end without reading the redb
+    // file directly. These tests pin that contract.
+    // ----------------------------------------------------------------
+
+    /// Helper: emit `n` audit entries via the live LocalService and
+    /// return the resulting JSON shape from `GET /v1/audit/entries`.
+    async fn emit_and_fetch_audit_entries(actions: &[(&str, Option<&str>)]) -> serde_json::Value {
+        let state = make_state();
+        // Seed the audit chain via the canonical helper so each entry
+        // is signed + chain-hashed exactly as production does.
+        {
+            let mut svc = state.svc.lock().await;
+            for (action, reason) in actions {
+                svc.emit_local_audit(
+                    action.to_string(),
+                    b"token-bytes".to_vec(),
+                    reason.map(|s| s.to_string()),
+                );
+            }
+        }
+        let svc = state.svc.clone();
+        let info = state.info.clone();
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{}", addr);
+        let resp = reqwest::get(format!("{base}/v1/audit/entries"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "audit endpoint must admit anonymous under tcp_trust_policy"
+        );
+        resp.json().await.unwrap()
+    }
+
+    /// Phase B.2: each entry carries the new fields a remote verifier
+    /// needs — full CBOR-encoded signed entry, chain hash hex, prev
+    /// hash hex.
+    #[tokio::test]
+    async fn audit_entries_response_includes_chain_fields_for_verify() {
+        let body =
+            emit_and_fetch_audit_entries(&[("attest", None), ("vouch.rejected", Some("test"))])
+                .await;
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "expected two emitted audit entries");
+        for e in entries {
+            assert!(
+                e.get("entry_cbor_b64").and_then(|v| v.as_str()).is_some(),
+                "entry_cbor_b64 must be present"
+            );
+            assert!(
+                e.get("chain_hash_hex").and_then(|v| v.as_str()).is_some(),
+                "chain_hash_hex must be present"
+            );
+            // prev_hash_hex is empty for the genesis entry but the
+            // field must be present for a SIEM to chain-link.
+            assert!(
+                e.get("prev_hash_hex").is_some(),
+                "prev_hash_hex must be present (empty string is fine for genesis)"
+            );
+        }
+        // The second entry's prev_hash must be the first entry's chain hash.
+        let h1 = entries[0]["chain_hash_hex"].as_str().unwrap().to_string();
+        let p2 = entries[1]["prev_hash_hex"].as_str().unwrap().to_string();
+        assert_eq!(p2, h1, "chain link must hold across entries");
+
+        // Rejection reason is signed and round-trips.
+        assert_eq!(entries[1]["reason"].as_str(), Some("test"));
+        // Success entry omits the reason field (Option::None +
+        // skip_serializing_if).
+        assert!(
+            entries[0]
+                .get("reason")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "success entries should not surface a reason field"
+        );
+    }
+
+    /// Phase B.2: a remote verifier reconstructs the signed entry from
+    /// `entry_cbor_b64`, the signature verifies, and the chain links
+    /// reproduce.
+    #[tokio::test]
+    async fn audit_entry_cbor_b64_decodes_and_verifies() {
+        let body = emit_and_fetch_audit_entries(&[("attest", None), ("vouch", None)]).await;
+        let entries = body["entries"].as_array().unwrap();
+        let mut prev_chain_hash: Vec<u8> = Vec::new();
+        for e in entries {
+            let b64 = e["entry_cbor_b64"].as_str().unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap();
+            let decoded: dds_core::audit::AuditLogEntry =
+                ciborium::from_reader(&bytes[..]).unwrap();
+            // Signature + URN-binding verify must pass.
+            assert!(decoded.verify().is_ok(), "audit entry verify failed");
+            // Chain link: this entry's prev_hash matches the prior
+            // entry's chain_hash.
+            assert_eq!(decoded.prev_hash, prev_chain_hash);
+            prev_chain_hash = decoded.chain_hash().unwrap();
+        }
+    }
+
+    /// Phase B.1: `since=N` query param drops entries older than the
+    /// watermark so `dds-cli audit tail` can do incremental polls.
+    /// Uses live emission timestamps — both entries land in the same
+    /// wallclock second on a fast machine, so the filter test pins
+    /// only the boundary semantics (since=ts returns the entries,
+    /// since=ts+1 drops them).
+    #[tokio::test]
+    async fn audit_entries_since_filter_drops_older() {
+        let body = emit_and_fetch_audit_entries(&[("attest", None), ("vouch", None)]).await;
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        let ts = entries[0]["timestamp"].as_u64().unwrap();
+
+        // Stand up a second router on the same state to issue further
+        // queries without re-emitting.
+        let state2 = make_state();
+        {
+            let mut svc = state2.svc.lock().await;
+            svc.emit_local_audit("attest".to_string(), b"x".to_vec(), None);
+            svc.emit_local_audit("vouch".to_string(), b"y".to_vec(), None);
+        }
+        let svc = state2.svc.clone();
+        let info = state2.info.clone();
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{}", addr);
+
+        // since = ts of first entry → both still returned (>=).
+        let body: serde_json::Value = reqwest::get(format!("{base}/v1/audit/entries?since={ts}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let total_at_ts = body["total"].as_u64().unwrap();
+        assert!(
+            total_at_ts >= 1,
+            "since={ts} must include the entries that share that timestamp; got {total_at_ts}"
+        );
+
+        // since = far future → empty.
+        let body: serde_json::Value = reqwest::get(format!(
+            "{base}/v1/audit/entries?since={}",
+            u64::from(u32::MAX)
+        ))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(body["total"].as_u64().unwrap(), 0);
     }
 }

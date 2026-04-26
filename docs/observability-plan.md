@@ -1,9 +1,14 @@
 # DDS Observability Plan — Audit, Metrics, Alerts, SIEM Export
 
 **Status:** Phase A landed 2026-04-26 follow-up #17 (closes Z-3);
-Phase D (`/healthz` + `/readyz`) landed 2026-04-26 follow-up #18.
-Phases B, C, E, F (SIEM export, Prometheus `/metrics`, Alertmanager
-rules + Grafana dashboards, `dds-cli` ops surface) remain open.
+Phase D (`/healthz` + `/readyz`) landed 2026-04-26 follow-up #18;
+Phase B sub-tasks B.1 (`dds-cli audit tail` JSONL stream) and B.2
+(`dds-cli audit verify` chain walk) landed 2026-04-26 follow-up #19.
+Phase B sub-tasks B.3 (Vector / fluent-bit reference configs) and
+B.4 (`audit-event-schema.md`) remain open, plus Phases C
+(Prometheus `/metrics`), E (reference Grafana dashboards +
+Alertmanager rules), and F (the rest of the `dds-cli` ops surface
+— `stats`, `health`, `audit export`).
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -171,33 +176,49 @@ verifies, and the chain head advances after every emission.
 
 ### Phase B — SIEM export
 
-**B.1 — `dds-cli audit tail`.** Long-running follow command:
+**B.1 — `dds-cli audit tail`. ✅** Long-running follow command:
 
 ```bash
 dds-cli audit tail \
-    --since 2026-04-26T00:00:00Z \
-    --format jsonl|cef|syslog \
-    --output -          # stdout, or path
+    --since <unix-seconds> \
+    --format jsonl \
+    [--follow-interval <seconds>] \
+    [--action attest|attest.rejected|...]
 ```
 
-Implemented as a polling loop over `GET /v1/audit/entries?since=N`.
-Output formats:
+Implemented as a polling loop over `GET /v1/audit/entries?since=N`
+in [dds-cli/src/main.rs](../dds-cli/src/main.rs) `run_audit_tail`.
+Output format shipped: `jsonl` — one JSON object per line, key set
+`{ts, action, reason, node_urn, chain_hash, prev_hash, sig_ok,
+token_cbor_b64}`. `sig_ok` is computed locally by CBOR-decoding
+`entry_cbor_b64` (Phase B.2 wire field) and running
+`AuditLogEntry::verify()` so a SIEM forwarder cannot be tricked
+into trusting a tampered line.
 
-- `jsonl` (canonical) — one JSON object per line; key set
-  `{ts, action, reason, subject_urn, issuer_urn, jti, node_urn,
-    chain_hash, prev_hash, sig_ok}`.
-- `cef` — ArcSight Common Event Format, RFC-tolerant. Header
-  `CEF:0|DDS|dds-node|<version>|<action>|<action>|<severity>|<extensions>`.
-- `syslog` — RFC 5424 with the JSON object as the structured-data
-  payload.
+`cef` and `syslog` formats are tracked as B.1 follow-ups — the JSONL
+canonical form is enough for Vector / fluent-bit / rsyslog
+forwarders, which all consume `--source exec` JSONL natively. The
+CLI errors with a clear message on any unknown format so an
+operator on an old build does not silently emit nothing.
 
 The decoder runs locally, so the JTI / URNs in the output come from
 the *verified* token, not a copy of the line.
 
-**B.2 — `dds-cli audit verify`.** Walks the chain end-to-end. For
+**B.2 — `dds-cli audit verify`. ✅** Walks the chain end-to-end. For
 each entry: re-derives `chain_hash`, verifies signature against
-`node_public_key`, checks `node_urn`-to-key binding. Reports the
-first break with `(index, expected, actual)`.
+`node_public_key` (which carries the URN-binding check), and checks
+that `prev_hash` matches the previous entry's `chain_hash`. Reports
+the first break with the offending index + entry action and exits 1.
+
+Implemented in [dds-cli/src/main.rs](../dds-cli/src/main.rs)
+`run_audit_verify`. The `/v1/audit/entries` endpoint now returns a
+new field `entry_cbor_b64` per row — the full CBOR-encoded
+`AuditLogEntry` (signed fields + signature) — so the verifier
+reconstructs the exact bytes the node signed without re-deriving
+them from the structured fields. New per-row fields
+`chain_hash_hex`, `prev_hash_hex`, and `reason` let SIEM consumers
+chain-link without CBOR decoding when they only want the structured
+shape.
 
 **B.3 — Forwarder integration.** Ship two reference configs:
 

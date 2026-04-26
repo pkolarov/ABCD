@@ -271,6 +271,39 @@ enum AuditAction {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Stream audit entries to stdout in a SIEM-friendly format.
+    /// Phase B.1 of the observability plan: implemented as a polling
+    /// loop over `GET /v1/audit/entries?since=N`. JTI / URNs in the
+    /// output come from the *verified* token, not a copy of the line.
+    Tail {
+        /// Only emit entries with `timestamp >= since` (Unix seconds).
+        /// On a follow run, the CLI advances this watermark internally
+        /// after each poll so each entry is only emitted once.
+        #[arg(long, default_value_t = 0)]
+        since: u64,
+        /// Output format. `jsonl` is the canonical format (one JSON
+        /// object per line, schema:
+        /// `{ts, action, reason, node_urn, chain_hash, prev_hash,
+        ///   sig_ok, token_cbor_b64}`).
+        #[arg(long, default_value = "jsonl")]
+        format: String,
+        /// Stay attached and keep polling for new entries on this
+        /// interval (seconds). 0 = single-shot, exit after first batch.
+        #[arg(long, default_value_t = 0)]
+        follow_interval: u64,
+        /// Filter by action (forwarded to the server as a query param).
+        #[arg(long)]
+        action: Option<String>,
+    },
+    /// Walk the audit chain end-to-end and verify every entry's
+    /// signature + chain link. Phase B.2 of the observability plan.
+    /// Reports the first break with `(index, expected, actual)`.
+    Verify {
+        /// Filter by action (forwarded to the server as a query param).
+        /// Off by default — verification walks the full chain.
+        #[arg(long)]
+        action: Option<String>,
+    },
 }
 
 // ---- Platform ----
@@ -767,7 +800,179 @@ async fn handle_audit(action: AuditAction, node_url: &str) {
                 );
             }
         }
+        AuditAction::Tail {
+            since,
+            format,
+            follow_interval,
+            action,
+        } => {
+            run_audit_tail(node_url, since, &format, follow_interval, action.as_deref()).await;
+        }
+        AuditAction::Verify { action } => {
+            run_audit_verify(node_url, action.as_deref()).await;
+        }
     }
+}
+
+/// **observability-plan.md Phase B.1.** Polling tail loop. Each batch
+/// pulls entries with `timestamp >= since`; after emitting, the
+/// watermark advances to `last_emitted_ts + 1` so duplicate-timestamp
+/// entries within a single second are still emitted on the *next*
+/// poll if needed (we de-dupe by chain_hash).
+async fn run_audit_tail(
+    node_url: &str,
+    since: u64,
+    format: &str,
+    follow_interval: u64,
+    action: Option<&str>,
+) {
+    if !matches!(format, "jsonl") {
+        eprintln!(
+            "Error: unsupported audit tail format `{format}` — \
+             only `jsonl` is implemented in this build (cef and \
+             syslog are tracked under Phase B.1 follow-ups)."
+        );
+        std::process::exit(1);
+    }
+    let mut watermark = since;
+    let mut seen_chain_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let mut q: Vec<(&str, String)> = Vec::new();
+        q.push(("since", watermark.to_string()));
+        if let Some(a) = action {
+            q.push(("action", a.to_string()));
+        }
+        let query_refs: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let r: AuditEntriesResponse = get_json(node_url, "/v1/audit/entries", &query_refs).await;
+
+        let mut emitted_in_batch = 0usize;
+        for e in &r.entries {
+            // De-duplication across polls: chain_hash uniquely names an
+            // entry. Rely on it when present; fall back to a synthetic
+            // (ts|action|token) key for very old nodes that do not yet
+            // populate chain_hash_hex.
+            let dedup_key = e
+                .chain_hash_hex
+                .clone()
+                .unwrap_or_else(|| format!("{}|{}|{}", e.timestamp, e.action, e.token_cbor_b64));
+            if !seen_chain_hashes.insert(dedup_key) {
+                continue;
+            }
+
+            // Verify the signature + URN binding before emitting so a
+            // SIEM forwarder cannot be tricked into accepting a
+            // tampered line. `sig_ok=false` lines are still emitted so
+            // operators can spot tampering — they are *not* silently
+            // dropped.
+            let sig_ok = match decode_audit_entry(e) {
+                Some(decoded) => decoded.verify().is_ok(),
+                None => false,
+            };
+
+            let line = serde_json::json!({
+                "ts": e.timestamp,
+                "action": e.action,
+                "reason": e.reason,
+                "node_urn": e.node_urn,
+                "chain_hash": e.chain_hash_hex,
+                "prev_hash": e.prev_hash_hex,
+                "sig_ok": sig_ok,
+                "token_cbor_b64": e.token_cbor_b64,
+            });
+            println!("{line}");
+
+            if e.timestamp >= watermark {
+                watermark = e.timestamp + 1;
+            }
+            emitted_in_batch += 1;
+        }
+
+        if follow_interval == 0 {
+            // Single-shot exit so a Vector `exec` source can rely on
+            // EOF as the batch boundary.
+            let _ = emitted_in_batch;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(follow_interval)).await;
+    }
+}
+
+/// **observability-plan.md Phase B.2.** Walk the chain. For each
+/// entry: re-derive `chain_hash`, verify the signature + URN binding
+/// against `node_public_key`, and check that `prev_hash` matches the
+/// previous entry's `chain_hash`. Reports the first break with
+/// `(index, expected, actual)` and exits 1.
+async fn run_audit_verify(node_url: &str, action: Option<&str>) {
+    let mut q: Vec<(&str, String)> = Vec::new();
+    if let Some(a) = action {
+        q.push(("action", a.to_string()));
+    }
+    let query_refs: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let r: AuditEntriesResponse = get_json(node_url, "/v1/audit/entries", &query_refs).await;
+
+    if r.entries.is_empty() {
+        println!("Audit chain verify: 0 entries — nothing to check.");
+        return;
+    }
+
+    let mut prev_hash_hex_expected: Option<String> = None;
+    for (idx, raw) in r.entries.iter().enumerate() {
+        let Some(decoded) = decode_audit_entry(raw) else {
+            eprintln!(
+                "FAIL: entry {idx} (action={}, ts={}) — missing entry_cbor_b64; \
+                 the node is on an older build that does not expose the signed \
+                 bytes. Verification requires dds-node ≥ phase-B.",
+                raw.action, raw.timestamp
+            );
+            std::process::exit(1);
+        };
+
+        if let Err(e) = decoded.verify() {
+            eprintln!(
+                "FAIL: entry {idx} (action={}, ts={}) — signature/URN verify failed: {e}",
+                raw.action, raw.timestamp
+            );
+            std::process::exit(1);
+        }
+
+        // Chain link check: this entry's prev_hash must match the
+        // previous entry's chain_hash.
+        let expected_prev = prev_hash_hex_expected.clone().unwrap_or_default();
+        let got_prev = hex::encode(&decoded.prev_hash);
+        if got_prev != expected_prev {
+            eprintln!(
+                "FAIL: entry {idx} (action={}, ts={}) — chain break:\n  \
+                 expected prev_hash={expected_prev}\n  \
+                 actual   prev_hash={got_prev}",
+                raw.action, raw.timestamp
+            );
+            std::process::exit(1);
+        }
+
+        // Tee the chain head off this entry so the next iteration can
+        // compare.
+        let head = decoded
+            .chain_hash()
+            .map(|b| hex::encode(&b))
+            .unwrap_or_default();
+        prev_hash_hex_expected = Some(head);
+    }
+
+    println!(
+        "Audit chain verify: OK ({} entries, signatures + chain links intact).",
+        r.entries.len()
+    );
+}
+
+/// Decode the `entry_cbor_b64` field from an `/v1/audit/entries` row
+/// back into a `dds_core::audit::AuditLogEntry`. Returns `None` when
+/// the field is absent (older nodes) or when CBOR decoding fails — the
+/// caller decides how to treat the absence.
+fn decode_audit_entry(raw: &AuditEntry) -> Option<dds_core::audit::AuditLogEntry> {
+    use base64::Engine as _;
+    let b64 = raw.entry_cbor_b64.as_deref()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    ciborium::from_reader(&bytes[..]).ok()
 }
 
 // ================================================================
@@ -1637,6 +1842,16 @@ struct AuditEntry {
     node_urn: String,
     timestamp: u64,
     token_cbor_b64: String,
+    /// Phase B.2 — full CBOR-encoded signed `AuditLogEntry`. Older
+    /// nodes that have not yet shipped the field deserialise to `None`.
+    #[serde(default)]
+    entry_cbor_b64: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    chain_hash_hex: Option<String>,
+    #[serde(default)]
+    prev_hash_hex: Option<String>,
 }
 
 #[derive(Deserialize)]

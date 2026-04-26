@@ -878,6 +878,7 @@ dependencies = [
  "dds-node",
  "dds-store",
  "ed25519-dalek",
+ "hex",
  "http-body-util",
  "hyper",
  "hyper-util",
