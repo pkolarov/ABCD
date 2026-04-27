@@ -1575,13 +1575,16 @@ impl DdsNode {
                     // peer belongs to our domain.
                     if !self.admitted_peers.contains(&peer) {
                         debug!(%peer, "H-12: dropping sync response from unadmitted peer");
+                        crate::telemetry::record_sync_pull("fail");
                         return;
                     }
                     self.handle_sync_response(peer, response);
+                    crate::telemetry::record_sync_pull("ok");
                 }
             },
             RrEvent::OutboundFailure { peer, error, .. } => {
                 debug!(%peer, %error, "sync: outbound failure");
+                crate::telemetry::record_sync_pull("fail");
             }
             RrEvent::InboundFailure { peer, error, .. } => {
                 debug!(%peer, %error, "sync: inbound failure");

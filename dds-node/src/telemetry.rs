@@ -35,6 +35,7 @@
 //! | `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted\|unknown_topic\|decode_error\|topic_kind_mismatch` | bumped by [`record_gossip_messages_dropped`] |
 //! | `dds_fido2_attestation_verify_total` | counter | `result=ok\|fail`, `fmt=packed\|none\|unknown` | bumped by [`record_fido2_attestation_verify`] |
 //! | `dds_fido2_assertions_total` | counter | `result=ok\|signature\|rp_id\|up\|sign_count\|other` | bumped by [`record_fido2_assertion`] |
+//! | `dds_sync_pulls_total` | counter | `result=ok\|fail` | bumped by [`record_sync_pull`] |
 //! | `dds_trust_graph_attestations` | gauge | — | [`crate::service::LocalService::trust_graph_counts`] at scrape |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
 //! | `dds_trust_graph_revocations` | gauge | — | same |
@@ -371,6 +372,52 @@
 //! deferred (see above); the `other` bucket is added so the
 //! per-attempt total is preserved.
 //!
+//! ### `dds_sync_pulls_total` semantics
+//!
+//! Bumped exactly once per outbound anti-entropy pull this node
+//! issues — i.e. per [`crate::node::DdsNode::try_sync_with`] request
+//! whose outcome resolves through
+//! [`crate::node::DdsNode::handle_sync_event`]. The bump fires at the
+//! outcome event so the counter records *resolved* attempts, not
+//! send-time attempts. Inbound requests served to *other* peers are
+//! never counted here — those are responder-side and would skew the
+//! pull-rate read.
+//!
+//! Result buckets:
+//!
+//! - `result="ok"` — the request received an
+//!   [`libp2p::request_response::Event::Message`] response from an
+//!   admitted peer and `handle_sync_response` was invoked. The
+//!   response can carry zero payloads (peer reports no diff) and that
+//!   still counts as `ok` — the pull succeeded, the network simply
+//!   converged.
+//! - `result="fail"` — every other resolution branch:
+//!   [`libp2p::request_response::Event::OutboundFailure`] (timeout,
+//!   stream / connection closed, dial-failure, codec error), and the
+//!   H-12 unadmitted-peer drop where a `Response` arrives from a peer
+//!   that is not in `admitted_peers` (the response is discarded
+//!   without applying any payloads, so for the puller the pull did
+//!   not yield usable state).
+//!
+//! Per-peer cooldown skips inside `try_sync_with` are *not* counted —
+//! no request goes on the wire so there is no outcome to partition.
+//! Operators reading the metric should pair it with the per-peer
+//! `connected_peers()` gauge rather than the pull rate alone, since a
+//! quiet network will naturally drive the pull rate to the periodic
+//! `SYNC_PERIODIC_INTERVAL` floor.
+//!
+//! Inbound responder-side outcomes (request received, response sent
+//! / not sent) are not counted here — a future
+//! `dds_sync_serves_total{result}` family can split those out without
+//! renaming this metric. The catalog row in `observability-plan.md`
+//! Phase C names the `dds_sync_lag_seconds` histogram and
+//! `dds_sync_payloads_rejected_total` counter as siblings; both still
+//! ship as separate follow-ups since each requires a distinct
+//! instrumentation pass (`lag_seconds` needs op-timestamp
+//! plumbing; the rejection counter needs the
+//! `apply_sync_payloads_with_graph` outcome to flow back through to
+//! the swarm task).
+//!
 //! ### `dds_http_caller_identity_total` semantics
 //!
 //! Each completed HTTP request bumps **two** buckets — its transport
@@ -481,6 +528,13 @@ pub struct Telemetry {
     /// origin / cdj, clock regression, lookup miss, COSE parse, store
     /// errors, etc.) so the per-attempt total stays accurate.
     fido2_assertions: Mutex<BTreeMap<String, u64>>,
+    /// Per-`result` outbound anti-entropy pull counts. `result` is one
+    /// of `ok|fail` — bounded by the outcome branches of
+    /// [`crate::node::DdsNode::handle_sync_event`]
+    /// (`Message::Response` → `ok` after the H-12 admitted-peer check,
+    /// `OutboundFailure` → `fail`, H-12 unadmitted-peer response drop
+    /// → `fail`).
+    sync_pulls: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Telemetry {
@@ -496,6 +550,7 @@ impl Telemetry {
             gossip_messages_dropped: Mutex::new(BTreeMap::new()),
             fido2_attestation_verifies: Mutex::new(BTreeMap::new()),
             fido2_assertions: Mutex::new(BTreeMap::new()),
+            sync_pulls: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -726,6 +781,31 @@ impl Telemetry {
         }
     }
 
+    fn bump_sync_pull(&self, result: &str) {
+        let mut g = match self.sync_pulls.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry(result.to_string()).or_insert(0) += 1;
+    }
+
+    fn sync_pulls_snapshot(&self) -> BTreeMap<String, u64> {
+        match self.sync_pulls.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of `dds_sync_pulls_total{result=...}`. Public so
+    /// the `DdsNode` regression tests can take before/after snapshots
+    /// without scraping the renderer.
+    pub fn sync_pulls_count(&self, result: &str) -> u64 {
+        match self.sync_pulls.lock() {
+            Ok(g) => g.get(result).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(result).copied().unwrap_or(0),
+        }
+    }
+
     fn uptime_seconds(&self) -> u64 {
         SystemTime::now()
             .duration_since(self.start_at)
@@ -844,6 +924,23 @@ pub fn record_fido2_attestation_verify(result: &str, fmt: &str) {
 pub fn record_fido2_assertion(result: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_fido2_assertion(result);
+    }
+}
+
+/// Bump `dds_sync_pulls_total{result=...}` by one. Called from the
+/// outbound-pull outcome branches of
+/// [`crate::node::DdsNode::handle_sync_event`]. `result` is one of
+/// `ok|fail` — `ok` when an admitted peer's
+/// [`libp2p::request_response::Event::Message`] response is processed
+/// by `handle_sync_response` (zero payloads still counts as `ok`);
+/// `fail` for `OutboundFailure` (timeout, stream/connection closed,
+/// dial failure, codec error) and for the H-12 unadmitted-peer
+/// response drop (we received a response but the peer is no longer
+/// admitted, so its payloads are discarded). No-op when telemetry has
+/// not been installed (tests, harnesses).
+pub fn record_sync_pull(result: &str) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_sync_pull(result);
     }
 }
 
@@ -1155,6 +1252,27 @@ fn render_exposition(
     for (result, count) in fido2_assertions_snapshot.iter() {
         out.push_str(&format!(
             "dds_fido2_assertions_total{{result=\"{}\"}} {}\n",
+            escape_label_value(result),
+            count
+        ));
+    }
+
+    // `dds_sync_pulls_total` — per-`result` outbound anti-entropy pull
+    // outcome counter. Bumped from `DdsNode::handle_sync_event` once
+    // each pull resolves: `ok` for an admitted peer's response (zero
+    // payloads still count as ok), `fail` for OutboundFailure or the
+    // H-12 unadmitted-peer response drop.
+    out.push_str(
+        "# HELP dds_sync_pulls_total Outbound anti-entropy sync pulls resolved since process \
+         start, partitioned by outcome (ok = admitted peer's response was processed; fail = \
+         OutboundFailure / connection closed / codec error / H-12 unadmitted-peer response \
+         drop). Per-peer cooldown skips do not bump the counter — no request goes on the wire.\n",
+    );
+    out.push_str("# TYPE dds_sync_pulls_total counter\n");
+    let sync_pulls_snapshot = telemetry.sync_pulls_snapshot();
+    for (result, count) in sync_pulls_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_sync_pulls_total{{result=\"{}\"}} {}\n",
             escape_label_value(result),
             count
         ));
@@ -1611,6 +1729,34 @@ mod tests {
     }
 
     #[test]
+    fn sync_pulls_counter_renders_in_exposition() {
+        let t = Telemetry::new();
+        t.bump_sync_pull("ok");
+        t.bump_sync_pull("ok");
+        t.bump_sync_pull("ok");
+        t.bump_sync_pull("fail");
+
+        let body = render_exposition(&t, 0, None, None, None, None);
+        assert!(body.contains("# TYPE dds_sync_pulls_total counter\n"));
+        assert!(body.contains("dds_sync_pulls_total{result=\"ok\"} 3\n"));
+        assert!(body.contains("dds_sync_pulls_total{result=\"fail\"} 1\n"));
+        assert_eq!(t.sync_pulls_count("ok"), 3);
+        assert_eq!(t.sync_pulls_count("fail"), 1);
+        assert_eq!(t.sync_pulls_count("other"), 0);
+    }
+
+    #[test]
+    fn sync_pulls_renders_empty_family_with_help_and_type() {
+        let t = Telemetry::new();
+        let body = render_exposition(&t, 0, None, None, None, None);
+        // HELP/TYPE always discoverable before the first sync pull
+        // resolves so a freshly booted node still surfaces the family
+        // in the catalog (alert expressions resolve immediately).
+        assert!(body.contains("# TYPE dds_sync_pulls_total counter\n"));
+        assert!(!body.contains("dds_sync_pulls_total{"));
+    }
+
+    #[test]
     fn caller_identity_counter_renders_in_exposition() {
         let t = Telemetry::new();
         t.bump_caller_identity("anonymous");
@@ -1839,6 +1985,10 @@ mod tests {
         // lines until the first assertion verify exits via the
         // `verify_assertion_common` drop-guard.
         assert!(body.contains("# TYPE dds_fido2_assertions_total counter\n"));
+        // Sync-pulls family is always discoverable; no value lines
+        // until the first outbound pull resolves via
+        // `handle_sync_event`.
+        assert!(body.contains("# TYPE dds_sync_pulls_total counter\n"));
         // Peer-count gauges round-trip through the served exposition.
         assert!(body.contains("# TYPE dds_peers_admitted gauge\n"));
         assert!(body.contains("dds_peers_admitted 2\n"));
