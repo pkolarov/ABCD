@@ -244,6 +244,51 @@ pub trait StoreSizeStats {
     fn table_stored_bytes(&self) -> StoreResult<BTreeMap<&'static str, u64>>;
 }
 
+/// Per-result write-transaction outcome counts for the
+/// `dds_store_writes_total{result=ok|conflict|fail}` Prometheus
+/// counter (observability-plan.md Phase C). Implementations track
+/// monotonic process-lifetime tallies so the metrics renderer can
+/// take a snapshot at scrape time without holding any backend lock.
+///
+/// Buckets:
+/// - `ok`: write transaction committed and changed state.
+/// - `conflict`: caller-visible domain conflict that aborted the
+///   write before commit — `OperationStore::put_operation` returning
+///   `Ok(false)` for a duplicate id, and
+///   `CredentialStateStore::bump_sign_count` returning
+///   `StoreError::SignCountReplay`. v1 collapses
+///   `AuditStore::append_audit_entry` chain-break errors into
+///   `fail` because the chain-break path returns `StoreError::Serde`
+///   today; a future trait change can add a dedicated
+///   `StoreError::Conflict` variant and split the bucket without
+///   renaming the metric.
+/// - `fail`: any other unsuccessful write — redb open/begin/commit
+///   plumbing errors, ciborium serialization errors, audit chain
+///   break, etc.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreWriteCounts {
+    pub ok: u64,
+    pub conflict: u64,
+    pub fail: u64,
+}
+
+/// Snapshot of redb / store write-transaction outcomes for the
+/// `dds_store_writes_total{result}` Prometheus counter
+/// (observability-plan.md Phase C).
+///
+/// Implementations track monotonic counters since process start
+/// (Prometheus convention — operators compute rates over them).
+/// Backends with no notion of write transactions (in-memory test
+/// backend) still implement this so the metric family stays
+/// discoverable and so the trait does not gate the metrics endpoint
+/// on the redb-only impl.
+pub trait StoreWriteStats {
+    /// Snapshot of `(ok, conflict, fail)` write outcomes since
+    /// process start. Reads atomic counters with no locking, so this
+    /// is cheap to call at every scrape.
+    fn store_write_counts(&self) -> StoreWriteCounts;
+}
+
 /// Combined directory store — convenience trait bundling all stores.
 pub trait DirectoryStore:
     TokenStore + RevocationStore + OperationStore + AuditStore + ChallengeStore + CredentialStateStore

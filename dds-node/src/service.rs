@@ -2051,6 +2051,27 @@ impl<
             .map(|tables| StoreByteSizes { tables })
     }
 
+    /// One-shot snapshot of process-lifetime store-write outcomes.
+    /// observability-plan.md Phase C — backs the
+    /// `dds_store_writes_total{result=ok|conflict|fail}` Prometheus
+    /// counter. Reads three atomics with no locking, so it is cheap
+    /// to call at every scrape.
+    ///
+    /// Bucket semantics, mirrored from the
+    /// [`dds_store::traits::StoreWriteStats`] doc:
+    /// - `ok`: write transaction committed and changed state.
+    /// - `conflict`: caller-visible domain conflict that aborted the
+    ///   write before commit (`put_operation` duplicate id,
+    ///   `bump_sign_count` `SignCountReplay`).
+    /// - `fail`: any other unsuccessful write (redb plumbing,
+    ///   serialization, or audit chain break).
+    pub fn store_write_counts(&self) -> dds_store::traits::StoreWriteCounts
+    where
+        S: dds_store::traits::StoreWriteStats,
+    {
+        self.store.store_write_counts()
+    }
+
     /// One-shot trust-graph counts under a single read-lock
     /// acquisition. observability-plan.md Phase C — backs the
     /// `dds_trust_graph_attestations`, `dds_trust_graph_vouches`,

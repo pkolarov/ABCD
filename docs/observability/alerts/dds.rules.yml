@@ -216,6 +216,52 @@ groups:
             host is pinned to an older release.
 
   # ---------------------------------------------------------------
+  # Storage tier — `dds_store_writes_total{result}` ships in dds-node
+  # follow-up #39 (observability-plan.md Phase C store-writes subset).
+  # Active.
+  # ---------------------------------------------------------------
+  - name: dds-storage
+    interval: 30s
+    rules:
+
+      - alert: DdsStoreWriteFailures
+        # Any non-zero rate of `result!="ok"` is suspicious. The
+        # `conflict` bucket fires for legitimate domain rejections
+        # (duplicate operation id, FIDO2 sign-count replay) — those
+        # are normal at low background rates but a sustained spike
+        # is a probe / regression signal. The `fail` bucket fires
+        # for redb plumbing errors (open / commit failure) and audit
+        # chain breaks; any non-zero rate is a hard regression.
+        # Operators wanting to tune severity can split the rule into
+        # two — a `result="fail"`-only critical and a `result="conflict"`
+        # warning — but v1 keeps a single rule keyed off the catalog
+        # spec.
+        expr: |
+          rate(dds_store_writes_total{result!="ok"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          plan: observability-plan.md#phase-e
+        annotations:
+          summary: "DDS store write failures on {{ $labels.instance }}"
+          description: |
+            `dds_store_writes_total{result!="ok"}` on
+            {{ $labels.instance }} has been advancing for 5 minutes.
+            Inspect:
+
+              - `result="conflict"` rate: legitimate at background
+                volume (duplicate ops from gossip dedup, FIDO2 replay
+                attempts on a noisy network), but a sustained spike
+                means an adversarial scanner or a regressed peer
+                build.
+              - `result="fail"` rate: hard error path (redb commit
+                failure, audit chain break, serialization regression).
+                Cross-check with `dds-cli --node {{ $labels.instance }} \
+                audit verify` — a chain break here surfaces in the
+                `fail` bucket.
+          runbook_url: "https://github.com/ABCD/dds/blob/main/docs/observability-plan.md#phase-c--prometheus-exposition-metrics"
+
+  # ---------------------------------------------------------------
   # HTTP API caller identity — H-7 cutover regression tripwire.
   # Active. `dds_http_caller_identity_total` ships in dds-node
   # follow-up #24 (observability-plan.md Phase C HTTP-tier subset).
@@ -310,16 +356,10 @@ groups:
   #       annotations:
   #         description: "Brute-force / replay candidate. Inspect dds_audit_entries_total{action=\"attest.rejected\"} on the same instance."
   #
-  # - name: dds-storage
-  #   interval: 30s
-  #   rules:
-  #
-  #     - alert: DdsStoreWriteFailures
-  #       expr: |
-  #         rate(dds_store_writes_total{result!="ok"}[5m]) > 0
-  #       for: 5m
-  #       labels: { severity: critical, plan: observability-plan.md#phase-c }
-  #
   # (DdsLoopbackTcpAdminUsed has shipped — see active group `dds-http`
   # above; the rule moved out of this reference section in
-  # follow-up #24 along with the underlying metric.)
+  # follow-up #24 along with the underlying metric.
+  # DdsStoreWriteFailures has shipped — see active group `dds-storage`
+  # above; the rule moved out of this reference section in
+  # follow-up #39 along with the underlying metric
+  # `dds_store_writes_total{result}`.)

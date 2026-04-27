@@ -45,6 +45,7 @@
 //! | `dds_challenges_outstanding` | gauge | — | [`crate::service::LocalService::challenges_outstanding`] at scrape |
 //! | `dds_peers_admitted` | gauge | — | [`crate::node::NodePeerCounts::admitted`] refreshed by [`crate::node::DdsNode::refresh_peer_count_gauges`] |
 //! | `dds_peers_connected` | gauge | — | [`crate::node::NodePeerCounts::connected`] refreshed at the same call sites |
+//! | `dds_store_writes_total` | counter | `result=ok\|conflict\|fail` | [`dds_store::traits::StoreWriteStats::store_write_counts`] read at scrape via [`crate::service::LocalService::store_write_counts`] |
 //!
 //! ### `dds_challenges_outstanding` semantics
 //!
@@ -562,7 +563,8 @@ use std::time::SystemTime;
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use dds_store::traits::{
-    AuditStore, ChallengeStore, CredentialStateStore, RevocationStore, StoreSizeStats, TokenStore,
+    AuditStore, ChallengeStore, CredentialStateStore, RevocationStore, StoreSizeStats,
+    StoreWriteCounts, StoreWriteStats, TokenStore,
 };
 
 use crate::http::SharedService;
@@ -1171,9 +1173,15 @@ pub fn record_http_request(route: &str, method: &str, status: u16) {
 /// time via [`crate::service::LocalService::store_byte_sizes`]; `None`
 /// means the underlying store read failed and the renderer ships only
 /// the family's `# HELP` / `# TYPE` headers so the catalog stays
-/// discoverable.
+/// discoverable. `store_write_counts` carries the three
+/// `dds_store_writes_total{result}` counter buckets read at scrape
+/// time via [`crate::service::LocalService::store_write_counts`];
+/// the field is always present (the underlying read is a triple
+/// `Relaxed` atomic load with no failure mode), so the value lines
+/// always ship.
 /// Keeping the lock acquisition in the caller avoids forcing a
 /// `where` bound on this function.
+#[allow(clippy::too_many_arguments)]
 fn render_exposition(
     telemetry: &Telemetry,
     chain_length: usize,
@@ -1182,6 +1190,7 @@ fn render_exposition(
     challenges_outstanding: Option<usize>,
     peer_counts: Option<&NodePeerCounts>,
     store_bytes: Option<&StoreByteSizes>,
+    store_write_counts: StoreWriteCounts,
 ) -> String {
     let mut out = String::with_capacity(1024);
 
@@ -1566,6 +1575,36 @@ fn render_exposition(
         }
     }
 
+    // `dds_store_writes_total` — per-result write-transaction counter.
+    // Read at scrape time through `LocalService::store_write_counts`
+    // which delegates to `dds_store::traits::StoreWriteStats`.
+    // RedbBackend tallies are bumped from every write-path method
+    // exit; MemoryBackend tallies follow the same shape so the family
+    // is uniform across backends. The three buckets are always
+    // emitted (even when zero) so a fresh node scrape exposes the
+    // counter family before any write has happened — matches the
+    // Prometheus convention that a counter family present at zero is
+    // distinguishable from an absent metric.
+    out.push_str(
+        "# HELP dds_store_writes_total Store write-transaction outcomes since process start. \
+         result=\"ok\": committed write that changed state. result=\"conflict\": caller-visible \
+         domain conflict aborted before commit (put_operation duplicate id, bump_sign_count \
+         SignCountReplay). result=\"fail\": redb plumbing / serialization / audit chain break.\n",
+    );
+    out.push_str("# TYPE dds_store_writes_total counter\n");
+    out.push_str(&format!(
+        "dds_store_writes_total{{result=\"ok\"}} {}\n",
+        store_write_counts.ok
+    ));
+    out.push_str(&format!(
+        "dds_store_writes_total{{result=\"conflict\"}} {}\n",
+        store_write_counts.conflict
+    ));
+    out.push_str(&format!(
+        "dds_store_writes_total{{result=\"fail\"}} {}\n",
+        store_write_counts.fail
+    ));
+
     out
 }
 
@@ -1609,6 +1648,7 @@ where
         + ChallengeStore
         + CredentialStateStore
         + StoreSizeStats
+        + StoreWriteStats
         + Send
         + Sync
         + 'static,
@@ -1638,6 +1678,7 @@ struct MetricsState<
         + ChallengeStore
         + CredentialStateStore
         + StoreSizeStats
+        + StoreWriteStats
         + Send
         + Sync
         + 'static,
@@ -1659,6 +1700,7 @@ impl<
         + ChallengeStore
         + CredentialStateStore
         + StoreSizeStats
+        + StoreWriteStats
         + Send
         + Sync
         + 'static,
@@ -1681,18 +1723,27 @@ where
         + ChallengeStore
         + CredentialStateStore
         + StoreSizeStats
+        + StoreWriteStats
         + Send
         + Sync
         + 'static,
 {
-    let (chain_length, head_timestamp, trust_graph, challenges_outstanding, store_bytes) = {
+    let (
+        chain_length,
+        head_timestamp,
+        trust_graph,
+        challenges_outstanding,
+        store_bytes,
+        store_write_counts,
+    ) = {
         let svc = state.svc.lock().await;
         let len = svc.audit_chain_length().unwrap_or(0);
         let head = svc.audit_chain_head_timestamp().unwrap_or(None);
         let tg = svc.trust_graph_counts();
         let ch = svc.challenges_outstanding();
         let sb = svc.store_byte_sizes();
-        (len, head, tg, ch, sb)
+        let sw = svc.store_write_counts();
+        (len, head, tg, ch, sb, sw)
     };
     let body = render_exposition(
         &state.telemetry,
@@ -1702,6 +1753,7 @@ where
         challenges_outstanding,
         state.peer_counts.as_ref(),
         store_bytes.as_ref(),
+        store_write_counts,
     );
     (
         StatusCode::OK,
@@ -1766,7 +1818,16 @@ mod tests {
     #[test]
     fn render_includes_build_info_and_uptime_for_empty_telemetry() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("dds_build_info{version=\""));
         assert!(body.contains("} 1\n"));
         assert!(body.contains("# TYPE dds_uptime_seconds gauge\n"));
@@ -1782,7 +1843,16 @@ mod tests {
         t.bump_audit_entry("attest");
         t.bump_audit_entry("revoke");
 
-        let body = render_exposition(&t, 3, Some(0), None, None, None, None);
+        let body = render_exposition(
+            &t,
+            3,
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("dds_audit_entries_total{action=\"attest\"} 2\n"));
         assert!(body.contains("dds_audit_entries_total{action=\"revoke\"} 1\n"));
         assert!(body.contains("dds_audit_chain_length 3\n"));
@@ -1795,7 +1865,16 @@ mod tests {
         t.bump_sessions_issued("fido2");
         t.bump_sessions_issued("legacy");
 
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_sessions_issued_total counter\n"));
         assert!(body.contains("dds_sessions_issued_total{via=\"fido2\"} 2\n"));
         assert!(body.contains("dds_sessions_issued_total{via=\"legacy\"} 1\n"));
@@ -1807,7 +1886,16 @@ mod tests {
     #[test]
     fn sessions_issued_renders_empty_family_with_help_and_type() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         // HELP/TYPE must always be emitted so the family is
         // discoverable by Prometheus before the first session is
         // minted; the value lines come once the first bump fires.
@@ -1822,7 +1910,16 @@ mod tests {
         t.bump_purpose_lookup("ok");
         t.bump_purpose_lookup("denied");
 
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_purpose_lookups_total counter\n"));
         assert!(body.contains("dds_purpose_lookups_total{result=\"ok\"} 2\n"));
         assert!(body.contains("dds_purpose_lookups_total{result=\"denied\"} 1\n"));
@@ -1834,7 +1931,16 @@ mod tests {
     #[test]
     fn purpose_lookups_renders_empty_family_with_help_and_type() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         // HELP/TYPE always discoverable before the first lookup so
         // dashboards / alert expressions resolve the family on a
         // freshly booted node.
@@ -1851,7 +1957,16 @@ mod tests {
         t.bump_admission_handshake("fail");
         t.bump_admission_handshake("revoked");
 
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_admission_handshakes_total counter\n"));
         assert!(body.contains("dds_admission_handshakes_total{result=\"ok\"} 3\n"));
         assert!(body.contains("dds_admission_handshakes_total{result=\"fail\"} 1\n"));
@@ -1865,7 +1980,16 @@ mod tests {
     #[test]
     fn admission_handshakes_renders_empty_family_with_help_and_type() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         // HELP/TYPE always discoverable before the first inbound
         // handshake fires so a freshly booted node still surfaces
         // the family in the catalog.
@@ -1883,7 +2007,16 @@ mod tests {
         t.bump_gossip_message("burn");
         t.bump_gossip_message("audit");
 
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_gossip_messages_total counter\n"));
         assert!(body.contains("dds_gossip_messages_total{kind=\"op\"} 3\n"));
         assert!(body.contains("dds_gossip_messages_total{kind=\"revocation\"} 1\n"));
@@ -1899,7 +2032,16 @@ mod tests {
     #[test]
     fn gossip_messages_renders_empty_family_with_help_and_type() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         // HELP/TYPE always discoverable before the first inbound
         // gossip envelope is decoded so a freshly booted node still
         // surfaces the family in the catalog.
@@ -1916,7 +2058,16 @@ mod tests {
         t.bump_gossip_messages_dropped("decode_error");
         t.bump_gossip_messages_dropped("topic_kind_mismatch");
 
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_gossip_messages_dropped_total counter\n"));
         assert!(body.contains("dds_gossip_messages_dropped_total{reason=\"unadmitted\"} 2\n"));
         assert!(body.contains("dds_gossip_messages_dropped_total{reason=\"unknown_topic\"} 1\n"));
@@ -1934,7 +2085,16 @@ mod tests {
     #[test]
     fn gossip_messages_dropped_renders_empty_family_with_help_and_type() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         // HELP/TYPE always discoverable before the first dropped
         // envelope is observed so a freshly booted node still surfaces
         // the family in the catalog (alert expressions resolve
@@ -1951,7 +2111,16 @@ mod tests {
         t.bump_fido2_attestation_verify("ok", "none");
         t.bump_fido2_attestation_verify("fail", "unknown");
 
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_fido2_attestation_verify_total counter\n"));
         assert!(
             body.contains("dds_fido2_attestation_verify_total{result=\"ok\",fmt=\"packed\"} 2\n")
@@ -1973,7 +2142,16 @@ mod tests {
     #[test]
     fn fido2_attestation_verify_renders_empty_family_with_help_and_type() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         // HELP/TYPE always discoverable before the first enrollment
         // verifier call so a freshly booted node still surfaces the
         // family in the catalog.
@@ -1992,7 +2170,16 @@ mod tests {
         t.bump_fido2_assertion("sign_count");
         t.bump_fido2_assertion("other");
 
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_fido2_assertions_total counter\n"));
         assert!(body.contains("dds_fido2_assertions_total{result=\"ok\"} 2\n"));
         assert!(body.contains("dds_fido2_assertions_total{result=\"signature\"} 1\n"));
@@ -2014,7 +2201,16 @@ mod tests {
     #[test]
     fn fido2_assertions_renders_empty_family_with_help_and_type() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         // HELP/TYPE always discoverable before the first assertion
         // verify call so a freshly booted node still surfaces the
         // family in the catalog (alert expressions resolve immediately).
@@ -2030,7 +2226,16 @@ mod tests {
         t.bump_sync_pull("ok");
         t.bump_sync_pull("fail");
 
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_sync_pulls_total counter\n"));
         assert!(body.contains("dds_sync_pulls_total{result=\"ok\"} 3\n"));
         assert!(body.contains("dds_sync_pulls_total{result=\"fail\"} 1\n"));
@@ -2042,7 +2247,16 @@ mod tests {
     #[test]
     fn sync_pulls_renders_empty_family_with_help_and_type() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         // HELP/TYPE always discoverable before the first sync pull
         // resolves so a freshly booted node still surfaces the family
         // in the catalog (alert expressions resolve immediately).
@@ -2058,7 +2272,16 @@ mod tests {
         t.bump_sync_payloads_rejected("publisher_capability");
         t.bump_sync_payloads_rejected("replay_window");
 
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_sync_payloads_rejected_total counter\n"));
         assert!(body.contains("dds_sync_payloads_rejected_total{reason=\"legacy_v1\"} 2\n"));
         assert!(
@@ -2078,7 +2301,16 @@ mod tests {
     #[test]
     fn sync_payloads_rejected_renders_empty_family_with_help_and_type() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         // HELP/TYPE always discoverable before the first pre-apply
         // sync rejection fires so a freshly booted node still surfaces
         // the family in the catalog (alert expressions resolve
@@ -2095,7 +2327,16 @@ mod tests {
         t.bump_http_request("/v1/audit/entries", "GET", 401);
         t.bump_http_request("/v1/admin/setup", "POST", 503);
 
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_http_requests_total counter\n"));
         assert!(body.contains(
             "dds_http_requests_total{route=\"/v1/status\",method=\"GET\",status=\"200\"} 2\n"
@@ -2116,7 +2357,16 @@ mod tests {
     #[test]
     fn http_requests_renders_empty_family_with_help_and_type() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         // HELP/TYPE always discoverable before the first matched
         // request so a freshly booted node still surfaces the family
         // in the catalog (alert expressions resolve immediately).
@@ -2131,7 +2381,16 @@ mod tests {
         t.bump_caller_identity("anonymous");
         t.bump_caller_identity("admin");
 
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_http_caller_identity_total counter\n"));
         assert!(body.contains("dds_http_caller_identity_total{kind=\"anonymous\"} 2\n"));
         assert!(body.contains("dds_http_caller_identity_total{kind=\"admin\"} 1\n"));
@@ -2149,7 +2408,16 @@ mod tests {
             revocations: 2,
             burned: 1,
         };
-        let body = render_exposition(&t, 0, None, Some(counts), None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            Some(counts),
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_trust_graph_attestations gauge\n"));
         assert!(body.contains("dds_trust_graph_attestations 7\n"));
         assert!(body.contains("dds_trust_graph_vouches 3\n"));
@@ -2160,7 +2428,16 @@ mod tests {
     #[test]
     fn trust_graph_gauges_default_to_zero_when_lock_poisoned() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("dds_trust_graph_attestations 0\n"));
         assert!(body.contains("dds_trust_graph_vouches 0\n"));
         assert!(body.contains("dds_trust_graph_revocations 0\n"));
@@ -2177,7 +2454,16 @@ mod tests {
         counts
             .connected
             .store(7, std::sync::atomic::Ordering::Relaxed);
-        let body = render_exposition(&t, 0, None, None, None, Some(&counts), None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            Some(&counts),
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_peers_admitted gauge\n"));
         assert!(body.contains("dds_peers_admitted 4\n"));
         assert!(body.contains("# TYPE dds_peers_connected gauge\n"));
@@ -2187,7 +2473,16 @@ mod tests {
     #[test]
     fn peer_count_gauges_default_to_zero_when_no_handle_supplied() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         // HELP/TYPE always discoverable so the family resolves on a
         // freshly booted node before any peer connects (or in
         // deployments running the metrics endpoint without a swarm).
@@ -2206,7 +2501,16 @@ mod tests {
         // deployment scrapes. Pins the discoverability contract used
         // by every per-table snapshot.
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# HELP dds_store_bytes "));
         assert!(body.contains("# TYPE dds_store_bytes gauge\n"));
         assert!(
@@ -2217,7 +2521,16 @@ mod tests {
         // Empty `tables` map (the `MemoryBackend` impl) renders the same
         // way — discoverable family, no value lines.
         let empty = StoreByteSizes::default();
-        let body = render_exposition(&t, 0, None, None, None, None, Some(&empty));
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            Some(&empty),
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_store_bytes gauge\n"));
         assert!(!body.contains("dds_store_bytes{"));
     }
@@ -2234,7 +2547,16 @@ mod tests {
         tables.insert("audit_log", 65_536u64);
         tables.insert("operations", 0u64);
         let snap = StoreByteSizes { tables };
-        let body = render_exposition(&t, 0, None, None, None, None, Some(&snap));
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            Some(&snap),
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_store_bytes gauge\n"));
         assert!(body.contains("dds_store_bytes{table=\"tokens\"} 4096\n"));
         assert!(body.contains("dds_store_bytes{table=\"audit_log\"} 65536\n"));
@@ -2247,7 +2569,16 @@ mod tests {
     #[test]
     fn challenges_outstanding_renders_supplied_count() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, Some(12), None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            Some(12),
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("# TYPE dds_challenges_outstanding gauge\n"));
         assert!(body.contains("dds_challenges_outstanding 12\n"));
     }
@@ -2255,7 +2586,16 @@ mod tests {
     #[test]
     fn challenges_outstanding_defaults_to_zero_when_store_read_fails() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None, None, None);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         assert!(body.contains("dds_challenges_outstanding 0\n"));
     }
 
@@ -2267,7 +2607,16 @@ mod tests {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         // A timestamp 30 seconds in the past should render head_age >= 30.
-        let body = render_exposition(&t, 1, Some(now.saturating_sub(30)), None, None, None, None);
+        let body = render_exposition(
+            &t,
+            1,
+            Some(now.saturating_sub(30)),
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
         // Parse out the head_age value to allow for clock drift /
         // sub-second rounding inside the renderer.
         let line = body
@@ -2427,6 +2776,60 @@ mod tests {
             !body.contains("dds_store_bytes{table="),
             "MemoryBackend should not emit dds_store_bytes value lines (got: {body})"
         );
+        // `dds_store_writes_total` family is always discoverable AND
+        // always emits its three value lines (zero-initialised).
+        // `make_test_service` builds the trust graph in-memory and
+        // wires a fresh `MemoryBackend::new()` without touching the
+        // store traits, so all three buckets render zero. The
+        // freshly-bootstrapped scrape contract (zero counters
+        // explicit, family present) is exactly what Prometheus
+        // expects so a counter rate computation is well-defined from
+        // the first scrape.
+        assert!(body.contains("# TYPE dds_store_writes_total counter\n"));
+        assert!(body.contains("dds_store_writes_total{result=\"ok\"} 0\n"));
+        assert!(body.contains("dds_store_writes_total{result=\"conflict\"} 0\n"));
+        assert!(body.contains("dds_store_writes_total{result=\"fail\"} 0\n"));
+    }
+
+    /// Default (zero) [`StoreWriteCounts`] still ships the three value
+    /// lines so a fresh node scrape exposes the family before any
+    /// write has happened — pins the "counter present at zero" vs.
+    /// "metric absent" distinction the Prometheus exposition uses.
+    #[test]
+    fn store_writes_emits_three_zero_lines_on_default_snapshot() {
+        let t = Telemetry::new();
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
+        assert!(body.contains("# HELP dds_store_writes_total "));
+        assert!(body.contains("# TYPE dds_store_writes_total counter\n"));
+        assert!(body.contains("dds_store_writes_total{result=\"ok\"} 0\n"));
+        assert!(body.contains("dds_store_writes_total{result=\"conflict\"} 0\n"));
+        assert!(body.contains("dds_store_writes_total{result=\"fail\"} 0\n"));
+    }
+
+    /// A populated [`StoreWriteCounts`] renders one value line per
+    /// bucket with the supplied count — pins the per-`result`
+    /// dispatch path the exposition commits to.
+    #[test]
+    fn store_writes_renders_per_result_value_lines() {
+        let t = Telemetry::new();
+        let snap = StoreWriteCounts {
+            ok: 17,
+            conflict: 4,
+            fail: 1,
+        };
+        let body = render_exposition(&t, 0, None, None, None, None, None, snap);
+        assert!(body.contains("dds_store_writes_total{result=\"ok\"} 17\n"));
+        assert!(body.contains("dds_store_writes_total{result=\"conflict\"} 4\n"));
+        assert!(body.contains("dds_store_writes_total{result=\"fail\"} 1\n"));
     }
 
     #[tokio::test]

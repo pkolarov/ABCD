@@ -6,6 +6,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
@@ -26,10 +27,47 @@ const CHALLENGES: TableDefinition<&str, &[u8]> = TableDefinition::new("challenge
 // Value: 4-byte sign_count (u32 big-endian)
 const CREDENTIAL_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("credential_state");
 
+/// Outcome bucket fed into [`RedbBackend::record_write`] from each
+/// write-path method. Maps directly to the
+/// `dds_store_writes_total{result=ok|conflict|fail}` Prometheus
+/// counter (observability-plan.md Phase C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteOutcome {
+    /// Write transaction committed and changed state.
+    Ok,
+    /// Caller-visible domain conflict that aborted the write before
+    /// commit. Today: `put_operation` duplicate id (`Ok(false)`),
+    /// `bump_sign_count` `SignCountReplay`.
+    Conflict,
+    /// Plumbing error — redb open / begin_write / commit / open_table
+    /// / insert / remove failed, ciborium serialization failed, or an
+    /// audit-chain integrity check rejected the entry.
+    Fail,
+}
+
+/// Process-lifetime monotonic counters backing the
+/// `dds_store_writes_total{result}` Prometheus exposition. Three
+/// `AtomicU64`s — one per [`WriteOutcome`] bucket — that the metrics
+/// scrape reads through [`StoreWriteStats::store_write_counts`]
+/// without holding any backend lock.
+#[derive(Debug, Default)]
+struct StoreWriteCounters {
+    ok: AtomicU64,
+    conflict: AtomicU64,
+    fail: AtomicU64,
+}
+
 /// redb-backed persistent storage.
 #[derive(Clone)]
 pub struct RedbBackend {
     db: Arc<Database>,
+    /// Monotonic write-outcome tallies fed into the Prometheus
+    /// `dds_store_writes_total` counter at every write-path exit.
+    /// Cloning a `RedbBackend` (the type derives `Clone`) shares the
+    /// same `Arc<StoreWriteCounters>` so two handles to the same
+    /// database increment the same counters — matching the redb
+    /// semantics where any clone writes to the same on-disk file.
+    write_counts: Arc<StoreWriteCounters>,
 }
 
 impl RedbBackend {
@@ -79,7 +117,46 @@ impl RedbBackend {
             .commit()
             .map_err(|e| StoreError::Io(e.to_string()))?;
 
-        Ok(Self { db: Arc::new(db) })
+        // Note: the table-creation transaction above runs during
+        // `open` (before `Self` exists) so it does not feed into
+        // `dds_store_writes_total`. The counter measures writes to
+        // an already-open backend, not the one-shot bring-up commit.
+        Ok(Self {
+            db: Arc::new(db),
+            write_counts: Arc::new(StoreWriteCounters::default()),
+        })
+    }
+
+    /// Bump the monotonic write-outcome counter for the
+    /// `dds_store_writes_total{result}` Prometheus exposition. Called
+    /// from every write-path method exit — `Ok(_)` paths bump
+    /// [`WriteOutcome::Ok`], `Err(SignCountReplay)` /
+    /// `put_operation` duplicate paths bump [`WriteOutcome::Conflict`],
+    /// and every other error path (redb plumbing, audit chain break,
+    /// serialization) bumps [`WriteOutcome::Fail`].
+    fn record_write(&self, outcome: WriteOutcome) {
+        let counter = match outcome {
+            WriteOutcome::Ok => &self.write_counts.ok,
+            WriteOutcome::Conflict => &self.write_counts.conflict,
+            WriteOutcome::Fail => &self.write_counts.fail,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Run a write-path body and tally its outcome into
+    /// [`StoreWriteCounters`]. Wraps the existing per-method body so
+    /// the diff from the un-instrumented version is one closure per
+    /// method rather than a manual `match` at every error site.
+    /// Errors except `SignCountReplay` map to [`WriteOutcome::Fail`].
+    fn instrumented_write<R>(&self, body: impl FnOnce() -> StoreResult<R>) -> StoreResult<R> {
+        let result = body();
+        let outcome = match &result {
+            Ok(_) => WriteOutcome::Ok,
+            Err(StoreError::SignCountReplay { .. }) => WriteOutcome::Conflict,
+            Err(_) => WriteOutcome::Fail,
+        };
+        self.record_write(outcome);
+        result
     }
 
     fn serialize_token(token: &Token) -> StoreResult<Vec<u8>> {
@@ -105,23 +182,25 @@ impl RedbBackend {
 
 impl TokenStore for RedbBackend {
     fn put_token(&mut self, token: &Token) -> StoreResult<()> {
-        let bytes = Self::serialize_token(token)?;
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        {
-            let mut table = write_txn
-                .open_table(TOKENS)
+        self.instrumented_write(|| {
+            let bytes = Self::serialize_token(token)?;
+            let write_txn = self
+                .db
+                .begin_write()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            table
-                .insert(token.payload.jti.as_str(), bytes.as_slice())
+            {
+                let mut table = write_txn
+                    .open_table(TOKENS)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+                table
+                    .insert(token.payload.jti.as_str(), bytes.as_slice())
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+            }
+            write_txn
+                .commit()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn get_token(&self, jti: &str) -> StoreResult<Token> {
@@ -140,22 +219,24 @@ impl TokenStore for RedbBackend {
     }
 
     fn delete_token(&mut self, jti: &str) -> StoreResult<()> {
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        {
-            let mut table = write_txn
-                .open_table(TOKENS)
+        self.instrumented_write(|| {
+            let write_txn = self
+                .db
+                .begin_write()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            table
-                .remove(jti)
+            {
+                let mut table = write_txn
+                    .open_table(TOKENS)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+                table
+                    .remove(jti)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+            }
+            write_txn
+                .commit()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn has_token(&self, jti: &str) -> bool {
@@ -193,22 +274,24 @@ impl TokenStore for RedbBackend {
 
 impl RevocationStore for RedbBackend {
     fn revoke(&mut self, jti: &str) -> StoreResult<()> {
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        {
-            let mut table = write_txn
-                .open_table(REVOKED)
+        self.instrumented_write(|| {
+            let write_txn = self
+                .db
+                .begin_write()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            table
-                .insert(jti, &[] as &[u8])
+            {
+                let mut table = write_txn
+                    .open_table(REVOKED)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+                table
+                    .insert(jti, &[] as &[u8])
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+            }
+            write_txn
+                .commit()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn is_revoked(&self, jti: &str) -> bool {
@@ -222,22 +305,24 @@ impl RevocationStore for RedbBackend {
     }
 
     fn burn(&mut self, urn: &str) -> StoreResult<()> {
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        {
-            let mut table = write_txn
-                .open_table(BURNED)
+        self.instrumented_write(|| {
+            let write_txn = self
+                .db
+                .begin_write()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            table
-                .insert(urn, &[] as &[u8])
+            {
+                let mut table = write_txn
+                    .open_table(BURNED)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+                table
+                    .insert(urn, &[] as &[u8])
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+            }
+            write_txn
+                .commit()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn is_burned(&self, urn: &str) -> bool {
@@ -285,26 +370,32 @@ impl RevocationStore for RedbBackend {
 
 impl OperationStore for RedbBackend {
     fn put_operation(&mut self, op: &Operation) -> StoreResult<bool> {
+        // Duplicate-id rejection is a domain-level conflict (the
+        // op-log is content-addressed by `id`); record it as
+        // `result="conflict"` and short-circuit before touching redb.
         if self.has_operation(&op.id) {
+            self.record_write(WriteOutcome::Conflict);
             return Ok(false);
         }
-        let bytes = Self::serialize_op(op)?;
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        {
-            let mut table = write_txn
-                .open_table(OPERATIONS)
+        self.instrumented_write(|| {
+            let bytes = Self::serialize_op(op)?;
+            let write_txn = self
+                .db
+                .begin_write()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            table
-                .insert(op.id.as_str(), bytes.as_slice())
+            {
+                let mut table = write_txn
+                    .open_table(OPERATIONS)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+                table
+                    .insert(op.id.as_str(), bytes.as_slice())
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+            }
+            write_txn
+                .commit()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        Ok(true)
+            Ok(true)
+        })
     }
 
     fn get_operation(&self, id: &str) -> StoreResult<Operation> {
@@ -353,53 +444,55 @@ impl OperationStore for RedbBackend {
 }
 impl AuditStore for RedbBackend {
     fn append_audit_entry(&mut self, entry: &AuditLogEntry) -> StoreResult<()> {
-        let mut buf = Vec::new();
-        ciborium::into_writer(entry, &mut buf).map_err(|e| StoreError::Serde(e.to_string()))?;
+        self.instrumented_write(|| {
+            let mut buf = Vec::new();
+            ciborium::into_writer(entry, &mut buf).map_err(|e| StoreError::Serde(e.to_string()))?;
 
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        {
-            let mut table = write_txn
-                .open_table(AUDIT_LOG)
+            let write_txn = self
+                .db
+                .begin_write()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            // **L-12 (security review)**: enforce the hash chain
-            // inside the same write transaction so a chain-break is
-            // either atomically rejected or the append is atomic.
-            let next_id = table.len().unwrap_or(0);
-            if next_id > 0 {
-                // Fetch the last entry (highest id).
-                let last_bytes = table
-                    .get(next_id - 1)
-                    .map_err(|e| StoreError::Io(e.to_string()))?
-                    .ok_or_else(|| StoreError::Io("missing last audit entry".into()))?;
-                let last: AuditLogEntry = ciborium::from_reader(last_bytes.value())
-                    .map_err(|e| StoreError::Serde(format!("prev audit decode: {e}")))?;
-                let expected = last
-                    .chain_hash()
-                    .map_err(|e| StoreError::Serde(format!("prev chain_hash: {e}")))?;
-                if entry.prev_hash != expected {
-                    return Err(StoreError::Serde(format!(
-                        "audit chain break: entry prev_hash does not match last entry's \
-                         chain_hash (expected {} bytes, got {} bytes)",
-                        expected.len(),
-                        entry.prev_hash.len()
-                    )));
+            {
+                let mut table = write_txn
+                    .open_table(AUDIT_LOG)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+                // **L-12 (security review)**: enforce the hash chain
+                // inside the same write transaction so a chain-break is
+                // either atomically rejected or the append is atomic.
+                let next_id = table.len().unwrap_or(0);
+                if next_id > 0 {
+                    // Fetch the last entry (highest id).
+                    let last_bytes = table
+                        .get(next_id - 1)
+                        .map_err(|e| StoreError::Io(e.to_string()))?
+                        .ok_or_else(|| StoreError::Io("missing last audit entry".into()))?;
+                    let last: AuditLogEntry = ciborium::from_reader(last_bytes.value())
+                        .map_err(|e| StoreError::Serde(format!("prev audit decode: {e}")))?;
+                    let expected = last
+                        .chain_hash()
+                        .map_err(|e| StoreError::Serde(format!("prev chain_hash: {e}")))?;
+                    if entry.prev_hash != expected {
+                        return Err(StoreError::Serde(format!(
+                            "audit chain break: entry prev_hash does not match last entry's \
+                             chain_hash (expected {} bytes, got {} bytes)",
+                            expected.len(),
+                            entry.prev_hash.len()
+                        )));
+                    }
+                } else if !entry.prev_hash.is_empty() {
+                    return Err(StoreError::Serde(
+                        "audit chain break: first entry must have empty prev_hash".into(),
+                    ));
                 }
-            } else if !entry.prev_hash.is_empty() {
-                return Err(StoreError::Serde(
-                    "audit chain break: first entry must have empty prev_hash".into(),
-                ));
+                table
+                    .insert(next_id, buf.as_slice())
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
             }
-            table
-                .insert(next_id, buf.as_slice())
+            write_txn
+                .commit()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn list_audit_entries(&self) -> StoreResult<Vec<AuditLogEntry>> {
@@ -432,61 +525,29 @@ impl AuditStore for RedbBackend {
     }
 
     fn prune_audit_entries_before(&mut self, before_timestamp: u64) -> StoreResult<usize> {
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        let mut removed = 0usize;
-        {
-            let mut table = write_txn
-                .open_table(AUDIT_LOG)
+        self.instrumented_write(|| {
+            let write_txn = self
+                .db
+                .begin_write()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            // Collect keys to remove (iterate, then delete)
-            let mut keys_to_remove = Vec::new();
-            for entry in table.iter().map_err(|e| StoreError::Io(e.to_string()))? {
-                let (key, value) = entry.map_err(|e| StoreError::Io(e.to_string()))?;
-                if let Ok(audit_entry) = ciborium::from_reader::<AuditLogEntry, _>(value.value()) {
-                    if audit_entry.timestamp < before_timestamp {
-                        keys_to_remove.push(key.value());
-                    }
-                } else {
-                    keys_to_remove.push(key.value()); // remove corrupt
-                }
-            }
-            for key in &keys_to_remove {
-                let _ = table
-                    .remove(key)
+            let mut removed = 0usize;
+            {
+                let mut table = write_txn
+                    .open_table(AUDIT_LOG)
                     .map_err(|e| StoreError::Io(e.to_string()))?;
-                removed += 1;
-            }
-        }
-        write_txn
-            .commit()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        Ok(removed)
-    }
-
-    fn prune_audit_entries_to_max(&mut self, max_entries: usize) -> StoreResult<usize> {
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        let mut removed = 0usize;
-        {
-            let mut table = write_txn
-                .open_table(AUDIT_LOG)
-                .map_err(|e| StoreError::Io(e.to_string()))?;
-            let count = table.len().unwrap_or(0) as usize;
-            if count > max_entries {
-                let to_remove = count - max_entries;
-                // Keys are sequential u64, so remove the smallest ones
+                // Collect keys to remove (iterate, then delete)
                 let mut keys_to_remove = Vec::new();
                 for entry in table.iter().map_err(|e| StoreError::Io(e.to_string()))? {
-                    if keys_to_remove.len() >= to_remove {
-                        break;
+                    let (key, value) = entry.map_err(|e| StoreError::Io(e.to_string()))?;
+                    if let Ok(audit_entry) =
+                        ciborium::from_reader::<AuditLogEntry, _>(value.value())
+                    {
+                        if audit_entry.timestamp < before_timestamp {
+                            keys_to_remove.push(key.value());
+                        }
+                    } else {
+                        keys_to_remove.push(key.value()); // remove corrupt
                     }
-                    let (key, _) = entry.map_err(|e| StoreError::Io(e.to_string()))?;
-                    keys_to_remove.push(key.value());
                 }
                 for key in &keys_to_remove {
                     let _ = table
@@ -495,127 +556,171 @@ impl AuditStore for RedbBackend {
                     removed += 1;
                 }
             }
-        }
-        write_txn
-            .commit()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        Ok(removed)
+            write_txn
+                .commit()
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            Ok(removed)
+        })
+    }
+
+    fn prune_audit_entries_to_max(&mut self, max_entries: usize) -> StoreResult<usize> {
+        self.instrumented_write(|| {
+            let write_txn = self
+                .db
+                .begin_write()
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            let mut removed = 0usize;
+            {
+                let mut table = write_txn
+                    .open_table(AUDIT_LOG)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+                let count = table.len().unwrap_or(0) as usize;
+                if count > max_entries {
+                    let to_remove = count - max_entries;
+                    // Keys are sequential u64, so remove the smallest ones
+                    let mut keys_to_remove = Vec::new();
+                    for entry in table.iter().map_err(|e| StoreError::Io(e.to_string()))? {
+                        if keys_to_remove.len() >= to_remove {
+                            break;
+                        }
+                        let (key, _) = entry.map_err(|e| StoreError::Io(e.to_string()))?;
+                        keys_to_remove.push(key.value());
+                    }
+                    for key in &keys_to_remove {
+                        let _ = table
+                            .remove(key)
+                            .map_err(|e| StoreError::Io(e.to_string()))?;
+                        removed += 1;
+                    }
+                }
+            }
+            write_txn
+                .commit()
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            Ok(removed)
+        })
     }
 }
 
 impl ChallengeStore for RedbBackend {
     fn put_challenge(&mut self, id: &str, bytes: &[u8; 32], expires_at: u64) -> StoreResult<()> {
-        // Value: 8-byte expires_at (big-endian) || 32-byte nonce
-        let mut value = [0u8; 40];
-        value[..8].copy_from_slice(&expires_at.to_be_bytes());
-        value[8..].copy_from_slice(bytes);
+        self.instrumented_write(|| {
+            // Value: 8-byte expires_at (big-endian) || 32-byte nonce
+            let mut value = [0u8; 40];
+            value[..8].copy_from_slice(&expires_at.to_be_bytes());
+            value[8..].copy_from_slice(bytes);
 
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        {
-            let mut table = write_txn
-                .open_table(CHALLENGES)
+            let write_txn = self
+                .db
+                .begin_write()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            table
-                .insert(id, value.as_slice())
+            {
+                let mut table = write_txn
+                    .open_table(CHALLENGES)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+                table
+                    .insert(id, value.as_slice())
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+            }
+            write_txn
+                .commit()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn consume_challenge(&mut self, id: &str, now: u64) -> StoreResult<[u8; 32]> {
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        // Outer Result lets us delete an expired row in the same write-txn
-        // before returning the expiry error (B-5).
-        let outcome: Result<[u8; 32], StoreError> = {
-            let mut table = write_txn
-                .open_table(CHALLENGES)
+        self.instrumented_write(|| {
+            let write_txn = self
+                .db
+                .begin_write()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            let encoded: Vec<u8> = {
-                let guard = table
-                    .get(id)
-                    .map_err(|e| StoreError::Io(e.to_string()))?
-                    .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
-                guard.value().to_vec()
-            };
-            if encoded.len() < 40 {
-                // Treat malformed rows like expired ones — drop them so a
-                // probe contributes to cleanup.
-                let _ = table.remove(id);
-                Err(StoreError::Serde("challenge record too short".into()))
-            } else {
-                let expires_at = u64::from_be_bytes(encoded[..8].try_into().unwrap());
-                if now >= expires_at {
-                    // B-5: delete the expired row inside the same transaction.
-                    table
-                        .remove(id)
-                        .map_err(|e| StoreError::Io(e.to_string()))?;
-                    Err(StoreError::Io(format!(
-                        "challenge '{}' has expired (expired at {expires_at}, now {now})",
-                        id
-                    )))
+            // Outer Result lets us delete an expired row in the same write-txn
+            // before returning the expiry error (B-5).
+            let outcome: Result<[u8; 32], StoreError> = {
+                let mut table = write_txn
+                    .open_table(CHALLENGES)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+                let encoded: Vec<u8> = {
+                    let guard = table
+                        .get(id)
+                        .map_err(|e| StoreError::Io(e.to_string()))?
+                        .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+                    guard.value().to_vec()
+                };
+                if encoded.len() < 40 {
+                    // Treat malformed rows like expired ones — drop them so a
+                    // probe contributes to cleanup.
+                    let _ = table.remove(id);
+                    Err(StoreError::Serde("challenge record too short".into()))
                 } else {
-                    let mut nonce = [0u8; 32];
-                    nonce.copy_from_slice(&encoded[8..40]);
-                    table
-                        .remove(id)
-                        .map_err(|e| StoreError::Io(e.to_string()))?;
-                    Ok(nonce)
+                    let expires_at = u64::from_be_bytes(encoded[..8].try_into().unwrap());
+                    if now >= expires_at {
+                        // B-5: delete the expired row inside the same transaction.
+                        table
+                            .remove(id)
+                            .map_err(|e| StoreError::Io(e.to_string()))?;
+                        Err(StoreError::Io(format!(
+                            "challenge '{}' has expired (expired at {expires_at}, now {now})",
+                            id
+                        )))
+                    } else {
+                        let mut nonce = [0u8; 32];
+                        nonce.copy_from_slice(&encoded[8..40]);
+                        table
+                            .remove(id)
+                            .map_err(|e| StoreError::Io(e.to_string()))?;
+                        Ok(nonce)
+                    }
                 }
-            }
-        };
-        write_txn
-            .commit()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        outcome
+            };
+            write_txn
+                .commit()
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            outcome
+        })
     }
 
     fn sweep_expired_challenges(&mut self, now: u64) -> StoreResult<usize> {
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        let count = {
-            let mut table = write_txn
-                .open_table(CHALLENGES)
+        self.instrumented_write(|| {
+            let write_txn = self
+                .db
+                .begin_write()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            let expired: Vec<String> = table
-                .iter()
-                .map_err(|e| StoreError::Io(e.to_string()))?
-                .filter_map(|entry| {
-                    let (key, value) = entry.ok()?;
-                    let raw = value.value();
-                    if raw.len() < 8 {
-                        return Some(key.value().to_string());
-                    }
-                    let expires_at = u64::from_be_bytes(raw[..8].try_into().ok()?);
-                    if now >= expires_at {
-                        Some(key.value().to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let n = expired.len();
-            for id in &expired {
-                table
-                    .remove(id.as_str())
+            let count = {
+                let mut table = write_txn
+                    .open_table(CHALLENGES)
                     .map_err(|e| StoreError::Io(e.to_string()))?;
-            }
-            n
-        };
-        write_txn
-            .commit()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        Ok(count)
+                let expired: Vec<String> = table
+                    .iter()
+                    .map_err(|e| StoreError::Io(e.to_string()))?
+                    .filter_map(|entry| {
+                        let (key, value) = entry.ok()?;
+                        let raw = value.value();
+                        if raw.len() < 8 {
+                            return Some(key.value().to_string());
+                        }
+                        let expires_at = u64::from_be_bytes(raw[..8].try_into().ok()?);
+                        if now >= expires_at {
+                            Some(key.value().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let n = expired.len();
+                for id in &expired {
+                    table
+                        .remove(id.as_str())
+                        .map_err(|e| StoreError::Io(e.to_string()))?;
+                }
+                n
+            };
+            write_txn
+                .commit()
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            Ok(count)
+        })
     }
 
     fn count_challenges(&self) -> StoreResult<usize> {
@@ -659,23 +764,25 @@ impl CredentialStateStore for RedbBackend {
     }
 
     fn set_sign_count(&mut self, credential_id: &str, count: u32) -> StoreResult<()> {
-        let value = count.to_be_bytes();
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        {
-            let mut table = write_txn
-                .open_table(CREDENTIAL_STATE)
+        self.instrumented_write(|| {
+            let value = count.to_be_bytes();
+            let write_txn = self
+                .db
+                .begin_write()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            table
-                .insert(credential_id, value.as_slice())
+            {
+                let mut table = write_txn
+                    .open_table(CREDENTIAL_STATE)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+                table
+                    .insert(credential_id, value.as_slice())
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+            }
+            write_txn
+                .commit()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// **L-18 (security review)**: perform the compare and the write
@@ -683,58 +790,78 @@ impl CredentialStateStore for RedbBackend {
     /// transactions, so two concurrent callers cannot both observe
     /// the pre-bump stored value and each commit their own update.
     fn bump_sign_count(&mut self, credential_id: &str, new_count: u32) -> StoreResult<()> {
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        let (stored, should_write) = {
-            let table = write_txn
-                .open_table(CREDENTIAL_STATE)
+        // `instrumented_write` already routes `SignCountReplay` to
+        // `WriteOutcome::Conflict` via its `Err` arm; the rest of the
+        // body matches the un-instrumented version.
+        self.instrumented_write(|| {
+            let write_txn = self
+                .db
+                .begin_write()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            let stored = match table
-                .get(credential_id)
-                .map_err(|e| StoreError::Io(e.to_string()))?
-            {
-                None => 0u32,
-                Some(guard) => {
-                    let raw = guard.value();
-                    if raw.len() < 4 {
-                        return Err(StoreError::Serde(
-                            "credential_state record too short".into(),
-                        ));
+            let (stored, should_write) = {
+                let table = write_txn
+                    .open_table(CREDENTIAL_STATE)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+                let stored = match table
+                    .get(credential_id)
+                    .map_err(|e| StoreError::Io(e.to_string()))?
+                {
+                    None => 0u32,
+                    Some(guard) => {
+                        let raw = guard.value();
+                        if raw.len() < 4 {
+                            return Err(StoreError::Serde(
+                                "credential_state record too short".into(),
+                            ));
+                        }
+                        u32::from_be_bytes(raw[..4].try_into().unwrap())
                     }
-                    u32::from_be_bytes(raw[..4].try_into().unwrap())
-                }
+                };
+                (stored, new_count > stored)
             };
-            (stored, new_count > stored)
-        };
-        if !should_write {
-            // Abort the write transaction without touching the table.
-            // redb does not require an explicit abort — dropping the
-            // txn is sufficient — but we do it explicitly for clarity.
-            drop(write_txn);
-            return Err(StoreError::SignCountReplay {
-                stored,
-                attempted: new_count,
-            });
-        }
-        {
-            let mut table = write_txn
-                .open_table(CREDENTIAL_STATE)
+            if !should_write {
+                // Abort the write transaction without touching the table.
+                // redb does not require an explicit abort — dropping the
+                // txn is sufficient — but we do it explicitly for clarity.
+                drop(write_txn);
+                return Err(StoreError::SignCountReplay {
+                    stored,
+                    attempted: new_count,
+                });
+            }
+            {
+                let mut table = write_txn
+                    .open_table(CREDENTIAL_STATE)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+                let value = new_count.to_be_bytes();
+                table
+                    .insert(credential_id, value.as_slice())
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+            }
+            write_txn
+                .commit()
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            let value = new_count.to_be_bytes();
-            table
-                .insert(credential_id, value.as_slice())
-                .map_err(|e| StoreError::Io(e.to_string()))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|e| StoreError::Io(e.to_string()))?;
-        Ok(())
+            Ok(())
+        })
     }
 }
 
 impl DirectoryStore for RedbBackend {}
+
+impl StoreWriteStats for RedbBackend {
+    /// Snapshot of the three [`StoreWriteCounters`] atomics. Reads
+    /// `Relaxed` because the metric is monotonic-since-process-start
+    /// and a Prometheus scrape doesn't need a globally consistent
+    /// view across the three buckets — operators graph rates, not
+    /// instantaneous totals.
+    fn store_write_counts(&self) -> StoreWriteCounts {
+        StoreWriteCounts {
+            ok: self.write_counts.ok.load(Ordering::Relaxed),
+            conflict: self.write_counts.conflict.load(Ordering::Relaxed),
+            fail: self.write_counts.fail.load(Ordering::Relaxed),
+        }
+    }
+}
 
 impl StoreSizeStats for RedbBackend {
     /// Per-table `stored_bytes` from redb's `TableStats`. Opens a single
@@ -856,6 +983,173 @@ mod store_size_stats_tests {
             after_audit > baseline_audit,
             "audit_log bytes did not grow after append: {baseline_audit} -> {after_audit}"
         );
+    }
+}
+
+#[cfg(test)]
+mod store_write_stats_tests {
+    //! Pins the `dds_store_writes_total{result}` accounting on
+    //! RedbBackend (observability-plan.md Phase C). Each test
+    //! exercises one outcome bucket and asserts the relevant
+    //! counters move (and the others do not).
+
+    use super::*;
+    use dds_core::crdt::causal_dag::Operation;
+    use dds_core::identity::Identity;
+    use dds_core::token::{Token, TokenKind, TokenPayload};
+    use rand::rngs::OsRng;
+    use tempfile::TempDir;
+
+    fn open_temp() -> (TempDir, RedbBackend) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.redb");
+        let be = RedbBackend::open(&path).unwrap();
+        (dir, be)
+    }
+
+    fn make_token(label: &str) -> Token {
+        let id = Identity::generate(label, &mut OsRng);
+        let payload = TokenPayload {
+            iss: id.id.to_urn(),
+            iss_key: id.public_key.clone(),
+            jti: format!("jti-{label}"),
+            sub: format!("sub-{label}"),
+            kind: TokenKind::Attest,
+            purpose: Some("test".to_string()),
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1000,
+            exp: Some(9999),
+            body_type: None,
+            body_cbor: None,
+        };
+        Token::sign(payload, &id.signing_key).unwrap()
+    }
+
+    /// A fresh RedbBackend reports all-zero counters — no write has
+    /// happened on the open backend yet (the table-creation pass
+    /// inside `RedbBackend::open` runs before `Self` exists, so it
+    /// is intentionally not counted).
+    #[test]
+    fn fresh_backend_reports_zero_counts() {
+        let (_dir, be) = open_temp();
+        let counts = be.store_write_counts();
+        assert_eq!(counts, StoreWriteCounts::default());
+    }
+
+    /// Successful `put_token` bumps `ok` and leaves the conflict /
+    /// fail buckets at zero.
+    #[test]
+    fn successful_write_bumps_ok_only() {
+        let (_dir, mut be) = open_temp();
+        let token = make_token("ok-write");
+        be.put_token(&token).expect("put_token");
+        let counts = be.store_write_counts();
+        assert_eq!(
+            counts,
+            StoreWriteCounts {
+                ok: 1,
+                conflict: 0,
+                fail: 0,
+            }
+        );
+    }
+
+    /// `put_operation` returning `Ok(false)` for a duplicate id is
+    /// the canonical conflict outcome — bumps `conflict`, not `ok`,
+    /// and never reaches `fail`.
+    #[test]
+    fn duplicate_put_operation_bumps_conflict() {
+        let (_dir, mut be) = open_temp();
+        let op = Operation {
+            id: "op-1".to_string(),
+            author: "test".to_string(),
+            deps: Default::default(),
+            data: vec![1, 2, 3],
+            timestamp: 0,
+        };
+        assert!(be.put_operation(&op).expect("first put_operation"));
+        let after_first = be.store_write_counts();
+        assert_eq!(after_first.ok, 1);
+
+        // Second put with same id — duplicate-rejection.
+        assert!(!be.put_operation(&op).expect("duplicate put_operation"));
+        let after_second = be.store_write_counts();
+        assert_eq!(after_second.ok, 1, "duplicate must not bump ok");
+        assert_eq!(after_second.conflict, 1, "duplicate must bump conflict");
+        assert_eq!(after_second.fail, 0);
+    }
+
+    /// `bump_sign_count` rejecting a non-monotonic value with
+    /// `SignCountReplay` bumps `conflict`. A successful bump
+    /// preceding the replay confirms the `ok` arm too.
+    #[test]
+    fn sign_count_replay_bumps_conflict() {
+        let (_dir, mut be) = open_temp();
+
+        be.bump_sign_count("cred-1", 5).expect("first bump");
+        let after_first = be.store_write_counts();
+        assert_eq!(after_first.ok, 1);
+        assert_eq!(after_first.conflict, 0);
+
+        // Replay attempt: same value, expect SignCountReplay.
+        let err = be
+            .bump_sign_count("cred-1", 5)
+            .expect_err("replay attempt must error");
+        assert!(matches!(err, StoreError::SignCountReplay { .. }));
+
+        let after_replay = be.store_write_counts();
+        assert_eq!(after_replay.ok, 1, "replay must not bump ok");
+        assert_eq!(after_replay.conflict, 1);
+        assert_eq!(after_replay.fail, 0);
+    }
+
+    /// Audit-chain-break errors — returned as `StoreError::Serde`
+    /// — currently fall through the `Err(_)` arm of
+    /// `instrumented_write` and bump `fail`. A future
+    /// `StoreError::Conflict` variant could route this to the
+    /// `conflict` bucket without renaming the metric; this test pins
+    /// the v1 behaviour so a future refactor is forced to update it
+    /// deliberately.
+    #[test]
+    fn audit_chain_break_bumps_fail() {
+        let (_dir, mut be) = open_temp();
+
+        // Append a real first entry so the second has something to
+        // chain off — but we'll construct it with a wrong prev_hash.
+        let id = Identity::generate("chain-break", &mut OsRng);
+        let entry0 = dds_core::audit::AuditLogEntry::sign_ed25519(
+            "attest",
+            vec![0xA0],
+            id.id.to_urn(),
+            &id.signing_key,
+            1_700_000_000,
+        )
+        .expect("sign first");
+        be.append_audit_entry(&entry0).expect("append first");
+
+        // Now build a second entry with prev_hash deliberately wrong.
+        let mut entry1 = dds_core::audit::AuditLogEntry::sign_ed25519(
+            "attest",
+            vec![0xA1],
+            id.id.to_urn(),
+            &id.signing_key,
+            1_700_000_001,
+        )
+        .expect("sign second");
+        entry1.prev_hash = vec![0xDE, 0xAD, 0xBE, 0xEF];
+
+        let baseline = be.store_write_counts();
+        assert_eq!(baseline.ok, 1, "first append should have bumped ok");
+
+        let err = be.append_audit_entry(&entry1).expect_err("chain break");
+        assert!(matches!(err, StoreError::Serde(_)));
+
+        let after = be.store_write_counts();
+        assert_eq!(after.ok, baseline.ok, "chain break must not bump ok");
+        assert_eq!(after.fail, baseline.fail + 1);
+        assert_eq!(after.conflict, baseline.conflict);
     }
 }
 

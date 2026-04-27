@@ -4,6 +4,7 @@
 //! persistent storage is not available or not needed.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dds_core::audit::AuditLogEntry;
 use dds_core::crdt::causal_dag::Operation;
@@ -11,8 +12,22 @@ use dds_core::token::{Token, TokenKind};
 
 use crate::traits::*;
 
+/// Process-lifetime tallies for the
+/// `dds_store_writes_total{result=ok|conflict|fail}` Prometheus
+/// counter (observability-plan.md Phase C). MemoryBackend's writes
+/// almost never fail (the underlying collections don't fault) so in
+/// practice operators see only `ok` and `conflict`; the `fail`
+/// bucket still ships so the family stays uniform with the
+/// RedbBackend exposition.
+#[derive(Debug, Default)]
+struct StoreWriteCounters {
+    ok: AtomicU64,
+    conflict: AtomicU64,
+    fail: AtomicU64,
+}
+
 /// In-memory storage backend. All data lives in heap-allocated collections.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MemoryBackend {
     tokens: BTreeMap<String, Vec<u8>>,
     revoked: BTreeSet<String>,
@@ -22,19 +37,24 @@ pub struct MemoryBackend {
     /// (nonce_bytes, expires_at)
     challenges: HashMap<String, ([u8; 32], u64)>,
     credential_sign_counts: HashMap<String, u32>,
+    write_counts: StoreWriteCounters,
 }
 
 impl MemoryBackend {
     pub fn new() -> Self {
-        Self {
-            tokens: BTreeMap::new(),
-            revoked: BTreeSet::new(),
-            burned: BTreeSet::new(),
-            operations: BTreeMap::new(),
-            audit_log: Vec::new(),
-            challenges: HashMap::new(),
-            credential_sign_counts: HashMap::new(),
-        }
+        Self::default()
+    }
+
+    fn record_write_ok(&self) {
+        self.write_counts.ok.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_write_conflict(&self) {
+        self.write_counts.conflict.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_write_fail(&self) {
+        self.write_counts.fail.fetch_add(1, Ordering::Relaxed);
     }
 
     fn serialize_token(token: &Token) -> StoreResult<Vec<u8>> {
@@ -58,16 +78,17 @@ impl MemoryBackend {
     }
 }
 
-impl Default for MemoryBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl TokenStore for MemoryBackend {
     fn put_token(&mut self, token: &Token) -> StoreResult<()> {
-        let bytes = Self::serialize_token(token)?;
+        let bytes = match Self::serialize_token(token) {
+            Ok(b) => b,
+            Err(e) => {
+                self.record_write_fail();
+                return Err(e);
+            }
+        };
         self.tokens.insert(token.payload.jti.clone(), bytes);
+        self.record_write_ok();
         Ok(())
     }
 
@@ -81,6 +102,7 @@ impl TokenStore for MemoryBackend {
 
     fn delete_token(&mut self, jti: &str) -> StoreResult<()> {
         self.tokens.remove(jti);
+        self.record_write_ok();
         Ok(())
     }
 
@@ -112,6 +134,7 @@ impl TokenStore for MemoryBackend {
 impl RevocationStore for MemoryBackend {
     fn revoke(&mut self, jti: &str) -> StoreResult<()> {
         self.revoked.insert(jti.to_string());
+        self.record_write_ok();
         Ok(())
     }
 
@@ -121,6 +144,7 @@ impl RevocationStore for MemoryBackend {
 
     fn burn(&mut self, urn: &str) -> StoreResult<()> {
         self.burned.insert(urn.to_string());
+        self.record_write_ok();
         Ok(())
     }
 
@@ -140,10 +164,18 @@ impl RevocationStore for MemoryBackend {
 impl OperationStore for MemoryBackend {
     fn put_operation(&mut self, op: &Operation) -> StoreResult<bool> {
         if self.operations.contains_key(&op.id) {
+            self.record_write_conflict();
             return Ok(false);
         }
-        let bytes = Self::serialize_op(op)?;
+        let bytes = match Self::serialize_op(op) {
+            Ok(b) => b,
+            Err(e) => {
+                self.record_write_fail();
+                return Err(e);
+            }
+        };
         self.operations.insert(op.id.clone(), bytes);
+        self.record_write_ok();
         Ok(true)
     }
 
@@ -184,29 +216,36 @@ impl AuditStore for MemoryBackend {
         // previous entry's `chain_hash`. Breaking the chain here
         // surfaces as a `StoreError::Serde` so the caller can log
         // the forensic event and refuse to persist corrupted state.
-        if let Some(last_bytes) = self.audit_log.last() {
-            let last: AuditLogEntry = ciborium::from_reader(last_bytes.as_slice())
-                .map_err(|e| StoreError::Serde(format!("prev audit decode: {e}")))?;
-            let expected = last
-                .chain_hash()
-                .map_err(|e| StoreError::Serde(format!("prev chain_hash: {e}")))?;
-            if entry.prev_hash != expected {
-                return Err(StoreError::Serde(format!(
-                    "audit chain break: entry prev_hash does not match last entry's chain_hash \
-                     (expected {} bytes, got {} bytes)",
-                    expected.len(),
-                    entry.prev_hash.len()
-                )));
+        let result: StoreResult<()> = (|| {
+            if let Some(last_bytes) = self.audit_log.last() {
+                let last: AuditLogEntry = ciborium::from_reader(last_bytes.as_slice())
+                    .map_err(|e| StoreError::Serde(format!("prev audit decode: {e}")))?;
+                let expected = last
+                    .chain_hash()
+                    .map_err(|e| StoreError::Serde(format!("prev chain_hash: {e}")))?;
+                if entry.prev_hash != expected {
+                    return Err(StoreError::Serde(format!(
+                        "audit chain break: entry prev_hash does not match last entry's chain_hash \
+                         (expected {} bytes, got {} bytes)",
+                        expected.len(),
+                        entry.prev_hash.len()
+                    )));
+                }
+            } else if !entry.prev_hash.is_empty() {
+                return Err(StoreError::Serde(
+                    "audit chain break: first entry must have empty prev_hash".into(),
+                ));
             }
-        } else if !entry.prev_hash.is_empty() {
-            return Err(StoreError::Serde(
-                "audit chain break: first entry must have empty prev_hash".into(),
-            ));
+            let mut buf = Vec::new();
+            ciborium::into_writer(entry, &mut buf).map_err(|e| StoreError::Serde(e.to_string()))?;
+            self.audit_log.push(buf);
+            Ok(())
+        })();
+        match &result {
+            Ok(_) => self.record_write_ok(),
+            Err(_) => self.record_write_fail(),
         }
-        let mut buf = Vec::new();
-        ciborium::into_writer(entry, &mut buf).map_err(|e| StoreError::Serde(e.to_string()))?;
-        self.audit_log.push(buf);
-        Ok(())
+        result
     }
 
     fn list_audit_entries(&self) -> StoreResult<Vec<AuditLogEntry>> {
@@ -232,46 +271,55 @@ impl AuditStore for MemoryBackend {
                 false
             }
         });
+        self.record_write_ok();
         Ok(before_len - self.audit_log.len())
     }
 
     fn prune_audit_entries_to_max(&mut self, max_entries: usize) -> StoreResult<usize> {
         if self.audit_log.len() <= max_entries {
+            self.record_write_ok();
             return Ok(0);
         }
         let remove_count = self.audit_log.len() - max_entries;
         self.audit_log.drain(..remove_count);
+        self.record_write_ok();
         Ok(remove_count)
     }
 }
 impl ChallengeStore for MemoryBackend {
     fn put_challenge(&mut self, id: &str, bytes: &[u8; 32], expires_at: u64) -> StoreResult<()> {
         self.challenges.insert(id.to_string(), (*bytes, expires_at));
+        self.record_write_ok();
         Ok(())
     }
 
     fn consume_challenge(&mut self, id: &str, now: u64) -> StoreResult<[u8; 32]> {
-        let (nonce, expires_at) = self
-            .challenges
-            .get(id)
-            .copied()
-            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        let (nonce, expires_at) = match self.challenges.get(id).copied() {
+            Some(v) => v,
+            None => {
+                self.record_write_fail();
+                return Err(StoreError::NotFound(id.to_string()));
+            }
+        };
         if now >= expires_at {
             // B-5: delete the expired row so a probe of a stale id helps clean
             // up rather than leaving the entry to accumulate.
             self.challenges.remove(id);
+            self.record_write_fail();
             return Err(StoreError::Io(format!(
                 "challenge '{}' has expired (expired at {expires_at}, now {now})",
                 id
             )));
         }
         self.challenges.remove(id);
+        self.record_write_ok();
         Ok(nonce)
     }
 
     fn sweep_expired_challenges(&mut self, now: u64) -> StoreResult<usize> {
         let before = self.challenges.len();
         self.challenges.retain(|_, (_, exp)| now < *exp);
+        self.record_write_ok();
         Ok(before - self.challenges.len())
     }
 
@@ -288,11 +336,47 @@ impl CredentialStateStore for MemoryBackend {
     fn set_sign_count(&mut self, credential_id: &str, count: u32) -> StoreResult<()> {
         self.credential_sign_counts
             .insert(credential_id.to_string(), count);
+        self.record_write_ok();
+        Ok(())
+    }
+
+    /// L-18: atomic check-and-set under MemoryBackend's `&mut self`
+    /// borrow. We override the trait default so that the
+    /// `dds_store_writes_total{result}` counter sees the
+    /// `SignCountReplay` rejection as `result="conflict"` rather
+    /// than the default `set_sign_count` path's `result="ok"` (the
+    /// default impl never reaches `set_sign_count` on replay).
+    fn bump_sign_count(&mut self, credential_id: &str, new_count: u32) -> StoreResult<()> {
+        let stored = self
+            .credential_sign_counts
+            .get(credential_id)
+            .copied()
+            .unwrap_or(0);
+        if new_count <= stored {
+            self.record_write_conflict();
+            return Err(StoreError::SignCountReplay {
+                stored,
+                attempted: new_count,
+            });
+        }
+        self.credential_sign_counts
+            .insert(credential_id.to_string(), new_count);
+        self.record_write_ok();
         Ok(())
     }
 }
 
 impl DirectoryStore for MemoryBackend {}
+
+impl StoreWriteStats for MemoryBackend {
+    fn store_write_counts(&self) -> StoreWriteCounts {
+        StoreWriteCounts {
+            ok: self.write_counts.ok.load(Ordering::Relaxed),
+            conflict: self.write_counts.conflict.load(Ordering::Relaxed),
+            fail: self.write_counts.fail.load(Ordering::Relaxed),
+        }
+    }
+}
 
 impl StoreSizeStats for MemoryBackend {
     /// In-memory backend has no persistent file layout, so the
@@ -350,6 +434,81 @@ mod l18_sign_count_tests {
         // Separate credentials don't interfere.
         be.bump_sign_count("cred-b", 1).unwrap();
         assert_eq!(be.get_sign_count("cred-b").unwrap(), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod store_write_stats_tests {
+    //! Same shape as the RedbBackend `store_write_stats_tests` —
+    //! pins the MemoryBackend [`StoreWriteStats`] accounting for the
+    //! `dds_store_writes_total{result}` Prometheus counter.
+
+    use super::*;
+    use dds_core::crdt::causal_dag::Operation;
+
+    /// Fresh MemoryBackend reports all-zero counters (no write has
+    /// happened on the open backend yet).
+    #[test]
+    fn fresh_backend_reports_zero_counts() {
+        let be = MemoryBackend::new();
+        assert_eq!(be.store_write_counts(), StoreWriteCounts::default());
+    }
+
+    /// `revoke` is one of the simplest write paths — successful
+    /// invocation must bump only `ok`.
+    #[test]
+    fn successful_revoke_bumps_ok_only() {
+        let mut be = MemoryBackend::new();
+        be.revoke("jti-1").expect("revoke");
+        let counts = be.store_write_counts();
+        assert_eq!(
+            counts,
+            StoreWriteCounts {
+                ok: 1,
+                conflict: 0,
+                fail: 0,
+            }
+        );
+    }
+
+    /// `put_operation` returning `Ok(false)` for a duplicate id is
+    /// the canonical conflict outcome — bumps `conflict`, not `ok`.
+    #[test]
+    fn duplicate_put_operation_bumps_conflict() {
+        let mut be = MemoryBackend::new();
+        let op = Operation {
+            id: "op-1".to_string(),
+            author: "test".to_string(),
+            deps: Default::default(),
+            data: vec![1, 2, 3],
+            timestamp: 0,
+        };
+        assert!(be.put_operation(&op).expect("first put_operation"));
+        assert_eq!(be.store_write_counts().ok, 1);
+        assert!(!be.put_operation(&op).expect("duplicate put_operation"));
+        let after = be.store_write_counts();
+        assert_eq!(after.ok, 1, "duplicate must not bump ok");
+        assert_eq!(after.conflict, 1);
+        assert_eq!(after.fail, 0);
+    }
+
+    /// `bump_sign_count` rejecting a non-monotonic value with
+    /// `SignCountReplay` bumps `conflict`. Pins the MemoryBackend
+    /// override of the trait default.
+    #[test]
+    fn sign_count_replay_bumps_conflict() {
+        let mut be = MemoryBackend::new();
+        be.bump_sign_count("cred-1", 5).expect("first bump");
+        assert_eq!(be.store_write_counts().ok, 1);
+
+        let err = be
+            .bump_sign_count("cred-1", 5)
+            .expect_err("replay must error");
+        assert!(matches!(err, StoreError::SignCountReplay { .. }));
+        let after = be.store_write_counts();
+        assert_eq!(after.ok, 1);
+        assert_eq!(after.conflict, 1);
+        assert_eq!(after.fail, 0);
     }
 }
 
