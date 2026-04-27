@@ -726,6 +726,20 @@ impl<
         self.enforce_device_scope_vouch = enforce;
     }
 
+    /// Wrapper around [`TrustGraph::has_purpose`] that funnels the
+    /// outcome through [`crate::telemetry::record_purpose_lookup`].
+    /// Every capability gate inside `LocalService` should go through
+    /// this helper so `dds_purpose_lookups_total{result=ok|denied}`
+    /// reflects the real call rate. The helper is a thin synchronous
+    /// pass-through — it does not hold any new locks (the caller
+    /// already holds the trust-graph read lock as `g`) and adds one
+    /// `record_purpose_lookup` call per invocation.
+    pub fn has_purpose_observed(&self, g: &TrustGraph, subject_urn: &str, purpose: &str) -> bool {
+        let ok = g.has_purpose(subject_urn, purpose, &self.trusted_roots);
+        crate::telemetry::record_purpose_lookup(if ok { "ok" } else { "denied" });
+        ok
+    }
+
     /// **M-7 (security review)**: thin wrapper that reads the
     /// device's self-attested `tags` + `org_unit` via
     /// `device_targeting_facts`, then drops them on the floor when
@@ -742,11 +756,8 @@ impl<
         if !self.enforce_device_scope_vouch {
             return (tags, ou);
         }
-        let scope_vouched = g.has_purpose(
-            device_urn,
-            dds_core::token::purpose::DEVICE_SCOPE,
-            &self.trusted_roots,
-        );
+        let scope_vouched =
+            self.has_purpose_observed(g, device_urn, dds_core::token::purpose::DEVICE_SCOPE);
         if scope_vouched {
             (tags, ou)
         } else {
@@ -1251,10 +1262,10 @@ impl<
             // gossip a self-signed token containing arbitrary policy
             // (registry edits, account creation) and have it served to
             // every Policy Agent in the domain.
-            if !g.has_purpose(
+            if !self.has_purpose_observed(
+                &g,
                 &token.payload.iss,
                 dds_core::token::purpose::POLICY_PUBLISHER_WINDOWS,
-                &self.trusted_roots,
             ) {
                 tracing::warn!(
                     jti = %token.payload.jti,
@@ -1315,10 +1326,10 @@ impl<
                 continue;
             }
             // C-3: same publisher capability gate as Windows policies.
-            if !g.has_purpose(
+            if !self.has_purpose_observed(
+                &g,
                 &token.payload.iss,
                 dds_core::token::purpose::POLICY_PUBLISHER_MACOS,
-                &self.trusted_roots,
             ) {
                 tracing::warn!(
                     jti = %token.payload.jti,
@@ -1380,10 +1391,10 @@ impl<
                 }
             };
             // C-3: same publisher capability gate.
-            if !g.has_purpose(
+            if !self.has_purpose_observed(
+                &g,
                 &token.payload.iss,
                 dds_core::token::purpose::SOFTWARE_PUBLISHER,
-                &self.trusted_roots,
             ) {
                 tracing::warn!(
                     jti = %token.payload.jti,
@@ -2196,7 +2207,7 @@ impl<
                     .trust_graph
                     .read()
                     .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
-                g.has_purpose(&admin_urn, &cap, &self.trusted_roots)
+                self.has_purpose_observed(&g, &admin_urn, &cap)
             };
             if !allowed {
                 return Err(ServiceError::Trust(format!(
@@ -3715,6 +3726,64 @@ mod platform_applier_tests {
 
         let after = handle.sessions_issued_count("legacy");
         assert_eq!(after, before, "failure path must not advance counter");
+    }
+
+    /// observability-plan.md Phase C — regression test for the
+    /// `dds_purpose_lookups_total{result=ok|denied}` Prometheus counter.
+    /// Pins that [`LocalService::has_purpose_observed`] funnels both
+    /// the grant-granted and grant-denied branches through the
+    /// process-global telemetry handle. Uses purposes the `setup()`
+    /// helper actually populates (admin holds the three publisher
+    /// capabilities + a self-attestation) so the `ok` case is
+    /// reproducible without re-deriving the trust-graph fixture.
+    #[test]
+    fn has_purpose_observed_advances_ok_and_denied_telemetry_counters() {
+        let (svc, admin, _) = setup();
+        let handle = crate::telemetry::install();
+        let ok_before = handle.purpose_lookups_count("ok");
+        let denied_before = handle.purpose_lookups_count("denied");
+
+        // OK branch: admin self-vouched for `dds:policy-publisher-windows`
+        // in `setup()`, so the gate must pass.
+        {
+            let g = svc.trust_graph.read().unwrap();
+            assert!(svc.has_purpose_observed(
+                &g,
+                &admin.id.to_urn(),
+                dds_core::token::purpose::POLICY_PUBLISHER_WINDOWS,
+            ));
+        }
+        assert_eq!(
+            handle.purpose_lookups_count("ok"),
+            ok_before + 1,
+            "ok bucket must advance by one on grant-granted"
+        );
+        assert_eq!(
+            handle.purpose_lookups_count("denied"),
+            denied_before,
+            "denied bucket must not advance on grant-granted"
+        );
+
+        // DENIED branch: a fresh stranger URN with no attestation must
+        // fail the gate.
+        {
+            let g = svc.trust_graph.read().unwrap();
+            assert!(!svc.has_purpose_observed(
+                &g,
+                "urn:dds:stranger-test-7l3p",
+                dds_core::token::purpose::SOFTWARE_PUBLISHER,
+            ));
+        }
+        assert_eq!(
+            handle.purpose_lookups_count("ok"),
+            ok_before + 1,
+            "ok bucket must not advance on grant-denied"
+        );
+        assert_eq!(
+            handle.purpose_lookups_count("denied"),
+            denied_before + 1,
+            "denied bucket must advance by one on grant-denied"
+        );
     }
 
     #[test]

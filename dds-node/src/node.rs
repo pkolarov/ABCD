@@ -1705,5 +1705,7 @@ fn publisher_capability_ok(
         // loop or silently admitting a potentially rogue token.
         Err(_) => return false,
     };
-    g.has_purpose(&token.payload.iss, required, trusted_roots)
+    let ok = g.has_purpose(&token.payload.iss, required, trusted_roots);
+    crate::telemetry::record_purpose_lookup(if ok { "ok" } else { "denied" });
+    ok
 }

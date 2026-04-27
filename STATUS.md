@@ -12,7 +12,7 @@
 > |---|---|---|---|
 > | Z-1 | **Critical** | Encrypted comms (PQC) | Noise/QUIC handshake is X25519/ECDHE only — *not* post-quantum. README "quantum-resistant by default" applies to token signatures, not the transport channel. Harvest-Now-Decrypt-Later exposure on all recorded P2P traffic. |
 > | Z-2 | **High** | HW-bound identity | [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md) is a plan; zero code shipped. libp2p PeerId, admission cert, admin keys, default domain root all software-keyed. |
-> | Z-3 | ✅ **closed (Phase A)** | Immutable audit | Phase A from [docs/observability-plan.md](docs/observability-plan.md) landed: `emit_local_audit` is wired to all production state-mutating paths — `LocalService::{enroll_user, enroll_device, admin_setup, admin_vouch, record_applied}` and `DdsNode::{ingest_operation, ingest_revocation, ingest_burn}` (success and rejection branches both stamp the chain). `AuditLogEntry.reason: Option<String>` is signed-in (Phase A.2) so SIEM consumers can trust rejection reasons without re-deriving. Phase D (`/healthz` + `/readyz` orchestrator probes) also landed (2026-04-26 follow-up #18); Phase B is now complete (B.1 + B.2 in #19, B.3 + B.4 in #20); Phase F (`dds-cli stats` / `health` / `audit export`) landed in #21. Phase C audit-metrics subset (`dds_audit_entries_total`, `dds_audit_chain_length`, `dds_audit_chain_head_age_seconds`, plus build_info / uptime) landed in #22. Phase E audit-tier subset (Alertmanager rules + two Grafana dashboards keyed off the #22 metrics) landed in #23. Phase C HTTP-tier subset (`dds_http_caller_identity_total{kind}`) landed in #24, also closing the H-7 `DdsLoopbackTcpAdminUsed` reference alert by promoting it to the active `dds-http` Alertmanager group. Phase C trust-graph read-side subset (`dds_trust_graph_attestations`, `dds_trust_graph_vouches`, `dds_trust_graph_revocations`, `dds_trust_graph_burned` — current-state gauges) landed in #25. Phase C FIDO2 outstanding-challenges gauge (`dds_challenges_outstanding`, B-5 backstop reference) landed in #26. Phase C sessions-issuance counter (`dds_sessions_issued_total{via=fido2|legacy}`) landed in #27 — bumped at the tail of the two `LocalService` issuance entry points after the token is signed, with a private `issue_session_inner` helper preventing FIDO2-driven sessions from also bumping the `legacy` bucket. The rest of the C catalog (network / FIDO2 assertion + verify counters / store sizes / process, plus the HTTP request / duration histograms) and the Phase E rules gated on those metrics remain open. |
+> | Z-3 | ✅ **closed (Phase A)** | Immutable audit | Phase A from [docs/observability-plan.md](docs/observability-plan.md) landed: `emit_local_audit` is wired to all production state-mutating paths — `LocalService::{enroll_user, enroll_device, admin_setup, admin_vouch, record_applied}` and `DdsNode::{ingest_operation, ingest_revocation, ingest_burn}` (success and rejection branches both stamp the chain). `AuditLogEntry.reason: Option<String>` is signed-in (Phase A.2) so SIEM consumers can trust rejection reasons without re-deriving. Phase D (`/healthz` + `/readyz` orchestrator probes) also landed (2026-04-26 follow-up #18); Phase B is now complete (B.1 + B.2 in #19, B.3 + B.4 in #20); Phase F (`dds-cli stats` / `health` / `audit export`) landed in #21. Phase C audit-metrics subset (`dds_audit_entries_total`, `dds_audit_chain_length`, `dds_audit_chain_head_age_seconds`, plus build_info / uptime) landed in #22. Phase E audit-tier subset (Alertmanager rules + two Grafana dashboards keyed off the #22 metrics) landed in #23. Phase C HTTP-tier subset (`dds_http_caller_identity_total{kind}`) landed in #24, also closing the H-7 `DdsLoopbackTcpAdminUsed` reference alert by promoting it to the active `dds-http` Alertmanager group. Phase C trust-graph read-side subset (`dds_trust_graph_attestations`, `dds_trust_graph_vouches`, `dds_trust_graph_revocations`, `dds_trust_graph_burned` — current-state gauges) landed in #25. Phase C FIDO2 outstanding-challenges gauge (`dds_challenges_outstanding`, B-5 backstop reference) landed in #26. Phase C sessions-issuance counter (`dds_sessions_issued_total{via=fido2|legacy}`) landed in #27 — bumped at the tail of the two `LocalService` issuance entry points after the token is signed, with a private `issue_session_inner` helper preventing FIDO2-driven sessions from also bumping the `legacy` bucket. Phase C purpose-lookups counter (`dds_purpose_lookups_total{result=ok|denied}`) landed in #28 — bumped through the shared `LocalService::has_purpose_observed` helper from every trust-graph capability gate (publisher / device-scope / admin-vouch) plus the gossip-ingest publisher-capability filter `node::publisher_capability_ok`; the catalog originally named a third `result=not_found` bucket but the underlying `TrustGraph::has_purpose` returns `bool` only, so v1 collapses no-attestation into `denied` (a future `has_purpose_with_outcome` API can split the bucket without renaming the metric). The rest of the C catalog (network / FIDO2 assertion + verify counters / store sizes / process, plus the HTTP request / duration histograms) and the Phase E rules gated on those metrics remain open. |
 > | Z-4 | **High** | Encrypted at rest | redb store (`directory.redb`) is plaintext CBOR — tokens, ops, revocations, audit entries. Confidentiality depends on OS FDE + ACLs only. |
 > | Z-5 | **Medium** | Encrypted at rest | `dds-cli export` dumps are plaintext-CBOR (signed for integrity, not encrypted for confidentiality). |
 > | Z-6 | **Critical** | Supply-chain | DDS releases are unsigned in practice — Windows MSI Authenticode is gated on a `SIGN_CERT` secret that has never been provisioned; macOS `.pkg` is not Developer-ID-signed and not notarized. Operators have no programmatic way to verify a fresh install. **Implementation plan: [docs/supply-chain-plan.md](docs/supply-chain-plan.md) Phase A.** |
@@ -28,7 +28,55 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-27 follow-up #27 (observability Phase C
+> Last updated: 2026-04-27 follow-up #28 (observability Phase C
+> purpose-lookups counter landed — one new counter
+> `dds_purpose_lookups_total{result=ok|denied}` ships under the
+> existing opt-in `metrics_addr` listener). The counter is bumped
+> through a shared
+> [`LocalService::has_purpose_observed`](dds-node/src/service.rs)
+> helper that wraps every
+> [`TrustGraph::has_purpose`](dds-core/src/trust.rs) call across the
+> service-layer capability gates: the C-3 publisher-capability filters
+> in `list_applicable_windows_policies` /
+> `list_applicable_macos_policies` / `list_applicable_software`,
+> the M-7 `dds:device-scope` gate in `device_targeting_facts_gated`,
+> the H-8 per-purpose admin-vouch capability check in `admin_vouch`,
+> and the gossip-ingest publisher gate
+> [`node::publisher_capability_ok`](dds-node/src/node.rs) (which
+> calls the free-function variant for the same C-3 filter on
+> inbound attestations carrying `WindowsPolicyDocument` /
+> `MacOsPolicyDocument` / `SoftwareAssignment` bodies). The catalog
+> in [docs/observability-plan.md](docs/observability-plan.md)
+> originally named a third bucket `result="not_found"`; partitioning
+> denied further would require an extra trust-graph traversal per
+> call site (the underlying graph API returns `bool`), so v1
+> collapses the no-attestation case into `denied`. A future
+> `has_purpose_with_outcome` API on
+> [`TrustGraph`](dds-core/src/trust.rs) can split the bucket without
+> renaming the metric; the plan tracker reflects the simplification
+> inline. Workspace test count rises from 604 to 607 (+3:
+> `service::platform_applier_tests::has_purpose_observed_advances_ok_and_denied_telemetry_counters`
+> pins both branches against the seeded admin fixture, plus two new
+> `telemetry::tests::purpose_lookups_*` render-side tests covering
+> multi-bump rendering and the empty-family HELP/TYPE discoverability
+> contract). The `serve_returns_prometheus_text_with_audit_metrics`
+> integration test is tightened to assert the new counter family
+> round-trips through the served exposition (`# TYPE
+> dds_purpose_lookups_total counter` is always present even before
+> the first capability check fires). `cargo fmt` clean; `cargo
+> clippy --workspace --all-targets -D warnings` clean; `cargo test
+> --workspace --all-targets` passes. Phase C remaining metrics
+> (network / FIDO2 assertion + verify counters / store sizes /
+> process, plus the HTTP request / request-duration histograms) and
+> the Phase E rules/panels gated on them remain open and continue to
+> track in the observability plan. No new dashboards or alert rules
+> ship in this follow-up — operators can graph the counter directly
+> today; a `DdsPurposeDenialSpike` regression rule (e.g. denied
+> rate > 50% of the total purpose-lookup rate for 10 m) can land in
+> the existing `dds-audit` Alertmanager group once an operator-derived
+> baseline is observed against the current loadtest footprint.
+>
+> Previous: 2026-04-27 follow-up #27 (observability Phase C
 > sessions-issuance counter landed — one new counter
 > `dds_sessions_issued_total{via=fido2|legacy}` ships under the
 > existing opt-in `metrics_addr` listener). The counter is bumped at

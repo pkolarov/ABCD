@@ -30,10 +30,16 @@ trait method, B-5 backstop reference) landed 2026-04-26 follow-up
 (`dds_sessions_issued_total{via=fido2|legacy}` — bumped from the
 two [`LocalService`](../dds-node/src/service.rs) entry points after
 a session token is signed successfully) landed 2026-04-27 follow-up
-#27. The rest of the C catalog (network / FIDO2 assertion + verify
-counters / store sizes / process, plus the HTTP request / duration
-histograms) plus the Phase E rules/panels that depend on those
-metrics remain open.
+#27. Phase C **purpose-lookup counter**
+(`dds_purpose_lookups_total{result=ok|denied}` — bumped from the
+shared [`LocalService::has_purpose_observed`](../dds-node/src/service.rs)
+helper at every trust-graph capability gate, including the
+gossip-ingest publisher-capability filter
+[`node::publisher_capability_ok`](../dds-node/src/node.rs)) landed
+2026-04-27 follow-up #28. The rest of the C catalog (network /
+FIDO2 assertion + verify counters / store sizes / process, plus the
+HTTP request / duration histograms) plus the Phase E rules/panels
+that depend on those metrics remain open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -288,9 +294,10 @@ caller-identity counter landed in follow-up #24; trust-graph
 read-side subset landed in follow-up #25; FIDO2 outstanding-challenges
 gauge landed in follow-up #26; sessions-issuance counter
 (`dds_sessions_issued_total{via}`) landed 2026-04-27 follow-up #27;
-rest of the catalog (network / FIDO2 assertion + verify counters /
-store sizes / process, plus the HTTP request / duration families)
-remains open.** The
+purpose-lookups counter (`dds_purpose_lookups_total{result}`) landed
+2026-04-27 follow-up #28; rest of the catalog (network / FIDO2
+assertion + verify counters / store sizes / process, plus the HTTP
+request / duration families) remains open.** The
 audit-metrics first slice exposed the five families needed to alert on
 Z-3 regressions (`dds_build_info`, `dds_uptime_seconds`,
 `dds_audit_entries_total{action}`, `dds_audit_chain_length`,
@@ -301,7 +308,12 @@ H-7 cutover regression alarm has a real metric to key off; follow-up
 / revocations / burned) read under a single read-lock acquisition at
 scrape time; follow-up #26 added `dds_challenges_outstanding` (FIDO2
 challenge-store row count, B-5 backstop reference) using the same
-single-svc-lock-per-scrape pattern as the audit / trust-graph reads. The trust-graph series are renamed from the original
+single-svc-lock-per-scrape pattern as the audit / trust-graph reads;
+follow-up #28 added `dds_purpose_lookups_total{result=ok|denied}`,
+bumped through the shared [`LocalService::has_purpose_observed`](../dds-node/src/service.rs)
+helper from every capability gate (publisher / device-scope /
+admin-vouch) plus the gossip-ingest publisher-capability filter in
+`node::publisher_capability_ok`. The trust-graph series are renamed from the original
 catalog spelling (`dds_attestations_total` → `dds_trust_graph_attestations`,
 `dds_burned_identities_total` → `dds_trust_graph_burned`) to match
 Prometheus convention — `_total` is reserved for monotonic counters,
@@ -364,7 +376,7 @@ rows remain open.
 | `dds_trust_graph_vouches` | gauge | — | Active vouch tokens | ✅ |
 | `dds_trust_graph_revocations` | gauge | — | Currently tracked revoked JTIs (renamed from `dds_attestations_revoked_total` — semantically a current-state gauge, not a since-boot counter) | ✅ |
 | `dds_trust_graph_burned` | gauge | — | Burned identity URNs (renamed from `dds_burned_identities_total`) | ✅ |
-| `dds_purpose_lookups_total` | counter | `result=ok|denied|not_found` | `has_purpose` outcomes | 🔲 |
+| `dds_purpose_lookups_total` | counter | `result=ok|denied` | `has_purpose` outcomes — bumped from [`LocalService::has_purpose_observed`](../dds-node/src/service.rs) at the five capability gates (`device_targeting_facts_gated`, `list_applicable_windows_policies`, `list_applicable_macos_policies`, `list_applicable_software`, `admin_vouch`) plus the gossip-ingest publisher gate `node::publisher_capability_ok`. The catalog originally named a third bucket `result=not_found`; partitioning denied further would require an extra trust-graph traversal per call site (the underlying [`TrustGraph::has_purpose`](../dds-core/src/trust.rs) returns `bool`), so v1 collapses the no-attestation case into `denied`. A future follow-up can introduce a `has_purpose_with_outcome` API on the graph and split the bucket without renaming the metric. | ✅ |
 | **FIDO2 / sessions** | | | | |
 | `dds_fido2_assertions_total` | counter | `result=ok|signature|rp_id|up|uv|sign_count` | Assertion outcomes | 🔲 |
 | `dds_fido2_attestation_verify_total` | counter | `result, fmt=packed|none|tpm` | Enrollment-time verify | 🔲 |

@@ -29,6 +29,7 @@
 //! | `dds_audit_chain_head_age_seconds` | gauge | — | `now - head.timestamp` at scrape |
 //! | `dds_http_caller_identity_total` | counter | `kind=anonymous\|uds\|pipe\|admin` | bumped by [`record_caller_identity`] |
 //! | `dds_sessions_issued_total` | counter | `via=fido2\|legacy` | bumped by [`record_sessions_issued`] |
+//! | `dds_purpose_lookups_total` | counter | `result=ok\|denied` | bumped by [`record_purpose_lookup`] |
 //! | `dds_trust_graph_attestations` | gauge | — | [`crate::service::LocalService::trust_graph_counts`] at scrape |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
 //! | `dds_trust_graph_revocations` | gauge | — | same |
@@ -92,6 +93,40 @@
 //! ([`crate::service::LocalService::issue_session_inner`]) so a
 //! FIDO2-driven session bumps `fido2` exactly once and does not also
 //! tick `legacy`.
+//!
+//! ### `dds_purpose_lookups_total` semantics
+//!
+//! Bumped exactly once per `TrustGraph::has_purpose` call funnelled
+//! through [`crate::service::LocalService::has_purpose_observed`] —
+//! the helper wraps the underlying graph read and partitions the
+//! outcome on `ok|denied`. Today the call sites are:
+//!
+//! - publisher-capability gates inside
+//!   [`crate::service::LocalService::list_applicable_windows_policies`],
+//!   [`crate::service::LocalService::list_applicable_macos_policies`], and
+//!   [`crate::service::LocalService::list_applicable_software`] (the
+//!   per-attestation `dds:policy-publisher-*` /
+//!   `dds:software-publisher` C-3 filter);
+//! - the `dds:device-scope` gate inside
+//!   `LocalService::device_targeting_facts_gated`;
+//! - the per-purpose admin-vouch capability check inside
+//!   `LocalService::admin_vouch`;
+//! - the gossip-ingest publisher-capability gate inside
+//!   `node::publisher_capability_ok` (the same C-3 filter applied
+//!   to inbound attestations carrying a `WindowsPolicyDocument` /
+//!   `MacOsPolicyDocument` / `SoftwareAssignment`).
+//!
+//! `result="ok"` is the grant-granted branch;
+//! `result="denied"` is every other return path (subject burned,
+//! no matching active vouch / attestation, vch_sum mismatch, expired,
+//! revoked, or chain validation failed). The catalog in
+//! `observability-plan.md` Phase C names a third bucket
+//! `result="not_found"`; partitioning denied further would require an
+//! extra trust-graph traversal per call site (the underlying
+//! [`dds_core::trust::TrustGraph::has_purpose`] returns `bool`), so
+//! v1 collapses the no-attestation case into `denied`. A future
+//! follow-up can introduce a `has_purpose_with_outcome` API on the
+//! graph and split the bucket without renaming the metric.
 //!
 //! ### `dds_http_caller_identity_total` semantics
 //!
@@ -167,6 +202,10 @@ pub struct Telemetry {
     /// (`issue_session_from_assertion` → `fido2`,
     /// `issue_session` → `legacy`).
     sessions_issued: Mutex<BTreeMap<String, u64>>,
+    /// Per-`result` purpose-lookup counts. `result` is one of
+    /// `ok|denied` — bounded by
+    /// [`crate::service::LocalService::has_purpose_observed`].
+    purpose_lookups: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Telemetry {
@@ -176,6 +215,7 @@ impl Telemetry {
             audit_entries: Mutex::new(BTreeMap::new()),
             caller_identity: Mutex::new(BTreeMap::new()),
             sessions_issued: Mutex::new(BTreeMap::new()),
+            purpose_lookups: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -254,6 +294,31 @@ impl Telemetry {
         }
     }
 
+    fn bump_purpose_lookup(&self, result: &str) {
+        let mut g = match self.purpose_lookups.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry(result.to_string()).or_insert(0) += 1;
+    }
+
+    fn purpose_lookups_snapshot(&self) -> BTreeMap<String, u64> {
+        match self.purpose_lookups.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of `dds_purpose_lookups_total{result=...}`.
+    /// Public so the `LocalService` regression tests can take
+    /// before/after snapshots without scraping the renderer.
+    pub fn purpose_lookups_count(&self, result: &str) -> u64 {
+        match self.purpose_lookups.lock() {
+            Ok(g) => g.get(result).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(result).copied().unwrap_or(0),
+        }
+    }
+
     fn uptime_seconds(&self) -> u64 {
         SystemTime::now()
             .duration_since(self.start_at)
@@ -295,6 +360,16 @@ pub fn record_caller_identity(kind: &str) {
 pub fn record_sessions_issued(via: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_sessions_issued(via);
+    }
+}
+
+/// Bump `dds_purpose_lookups_total{result=...}` by one. Called from
+/// [`crate::service::LocalService::has_purpose_observed`] after each
+/// `TrustGraph::has_purpose` call. `result` is one of `ok|denied`.
+/// No-op when telemetry has not been installed (tests, harnesses).
+pub fn record_purpose_lookup(result: &str) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_purpose_lookup(result);
     }
 }
 
@@ -451,6 +526,23 @@ fn render_exposition(
         out.push_str(&format!(
             "dds_sessions_issued_total{{via=\"{}\"}} {}\n",
             escape_label_value(via),
+            count
+        ));
+    }
+
+    // `dds_purpose_lookups_total` — per-`result` capability-check counter.
+    out.push_str(
+        "# HELP dds_purpose_lookups_total TrustGraph::has_purpose calls funnelled through \
+         LocalService::has_purpose_observed since process start, partitioned by outcome \
+         (ok = grant satisfied; denied = burned subject, no active vouch/attestation, \
+         vch_sum mismatch, expired, revoked, or chain validation failed).\n",
+    );
+    out.push_str("# TYPE dds_purpose_lookups_total counter\n");
+    let purpose_snapshot = telemetry.purpose_lookups_snapshot();
+    for (result, count) in purpose_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_purpose_lookups_total{{result=\"{}\"}} {}\n",
+            escape_label_value(result),
             count
         ));
     }
@@ -686,6 +778,33 @@ mod tests {
     }
 
     #[test]
+    fn purpose_lookups_counter_renders_in_exposition() {
+        let t = Telemetry::new();
+        t.bump_purpose_lookup("ok");
+        t.bump_purpose_lookup("ok");
+        t.bump_purpose_lookup("denied");
+
+        let body = render_exposition(&t, 0, None, None, None);
+        assert!(body.contains("# TYPE dds_purpose_lookups_total counter\n"));
+        assert!(body.contains("dds_purpose_lookups_total{result=\"ok\"} 2\n"));
+        assert!(body.contains("dds_purpose_lookups_total{result=\"denied\"} 1\n"));
+        assert_eq!(t.purpose_lookups_count("ok"), 2);
+        assert_eq!(t.purpose_lookups_count("denied"), 1);
+        assert_eq!(t.purpose_lookups_count("not_found"), 0);
+    }
+
+    #[test]
+    fn purpose_lookups_renders_empty_family_with_help_and_type() {
+        let t = Telemetry::new();
+        let body = render_exposition(&t, 0, None, None, None);
+        // HELP/TYPE always discoverable before the first lookup so
+        // dashboards / alert expressions resolve the family on a
+        // freshly booted node.
+        assert!(body.contains("# TYPE dds_purpose_lookups_total counter\n"));
+        assert!(!body.contains("dds_purpose_lookups_total{"));
+    }
+
+    #[test]
     fn caller_identity_counter_renders_in_exposition() {
         let t = Telemetry::new();
         t.bump_caller_identity("anonymous");
@@ -854,6 +973,9 @@ mod tests {
         // Sessions-issued family is always discoverable; no value
         // lines until the first session is minted.
         assert!(body.contains("# TYPE dds_sessions_issued_total counter\n"));
+        // Purpose-lookups family is always discoverable; no value
+        // lines until the first capability check fires.
+        assert!(body.contains("# TYPE dds_purpose_lookups_total counter\n"));
     }
 
     #[tokio::test]
