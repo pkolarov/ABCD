@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -177,6 +177,35 @@ pub struct DdsNode {
     /// does not reset it; readiness is "have we ever reached a peer",
     /// not "are we connected right now".
     peer_seen: Arc<AtomicBool>,
+    /// **observability-plan.md Phase C — network gauges**: shared
+    /// snapshot of `admitted_peers.len()` (`peer_counts.admitted`)
+    /// and `swarm.connected_peers().count()` (`peer_counts.connected`),
+    /// refreshed by [`Self::refresh_peer_count_gauges`] after every
+    /// connection lifecycle event and after every successful inbound
+    /// admission handshake. Cloned (`NodePeerCounts::clone`) into
+    /// [`crate::telemetry::serve`] so the metrics scrape can read both
+    /// gauges without reaching into the swarm task.
+    peer_counts: NodePeerCounts,
+}
+
+/// Shared peer-count snapshot for the Prometheus exposition. Two
+/// `Arc<AtomicU64>` so the swarm task and the metrics scrape task each
+/// own a cheap-to-clone handle without locking. Updated only by the
+/// swarm task in [`DdsNode::refresh_peer_count_gauges`]; reads by the
+/// scrape task are `Relaxed` since neither gauge has a happens-before
+/// dependency on any other state.
+#[derive(Clone, Default)]
+pub struct NodePeerCounts {
+    /// Backing store for `dds_peers_admitted`: count of peers
+    /// currently in [`DdsNode::admitted_peers`]. Reset on
+    /// `ConnectionClosed` (which removes the peer from the set) and
+    /// re-incremented on a successful H-12 admission handshake.
+    pub admitted: Arc<AtomicU64>,
+    /// Backing store for `dds_peers_connected`: count returned by
+    /// `swarm.connected_peers().count()` at the last connection
+    /// lifecycle event. Includes admitted *and* still-unadmitted peers
+    /// — readers compute the unadmitted share as `connected - admitted`.
+    pub connected: Arc<AtomicU64>,
 }
 
 impl DdsNode {
@@ -299,6 +328,7 @@ impl DdsNode {
             admission_revocations_path: revocations_path,
             node_identity: None,
             peer_seen: Arc::new(AtomicBool::new(false)),
+            peer_counts: NodePeerCounts::default(),
         })
     }
 
@@ -310,6 +340,31 @@ impl DdsNode {
     /// `AtomicBool`.
     pub fn peer_seen_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.peer_seen)
+    }
+
+    /// **observability-plan.md Phase C — network gauges**: hand out a
+    /// `Clone` of the shared peer-count snapshot for
+    /// [`crate::telemetry::serve`]. Both gauges are kept in sync by
+    /// [`Self::refresh_peer_count_gauges`] inside the swarm event
+    /// loop; the metrics scrape task only reads.
+    pub fn peer_counts_handle(&self) -> NodePeerCounts {
+        self.peer_counts.clone()
+    }
+
+    /// Refresh `dds_peers_admitted` + `dds_peers_connected` from the
+    /// authoritative state in the swarm task. Called from
+    /// [`Self::handle_swarm_event`] after every connection lifecycle
+    /// transition and after every H-12 admission handshake outcome,
+    /// so the metrics scrape always reads a value that matches a
+    /// recent point-in-time snapshot of the swarm. Cheap — two
+    /// `connected_peers()` iterator counts plus two `Relaxed` stores.
+    fn refresh_peer_count_gauges(&self) {
+        let admitted = self.admitted_peers.len() as u64;
+        let connected = self.swarm.connected_peers().count() as u64;
+        self.peer_counts.admitted.store(admitted, Ordering::Relaxed);
+        self.peer_counts
+            .connected
+            .store(connected, Ordering::Relaxed);
     }
 
     /// **Z-3 / Phase A.1**: install the Vouchsafe node identity used to
@@ -531,6 +586,7 @@ impl DdsNode {
                 // want peers to be admitted before we burn sync-state
                 // transfer on them. The admission-success path fires
                 // `try_sync_with` once the peer is verified.
+                self.refresh_peer_count_gauges();
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 info!(%peer_id, "connection closed");
@@ -541,6 +597,7 @@ impl DdsNode {
                 // afresh — we don't trust a stale admission across
                 // connection lifecycles.
                 self.admitted_peers.remove(&peer_id);
+                self.refresh_peer_count_gauges();
             }
             _ => {}
         }
@@ -699,6 +756,7 @@ impl DdsNode {
                 info!(%peer_id, "H-12: peer admitted to domain");
                 self.admitted_peers.insert(peer_id);
                 crate::telemetry::record_admission_handshake("ok");
+                self.refresh_peer_count_gauges();
                 // Now that we've verified the peer belongs to our
                 // domain, kick off an opportunistic sync.
                 self.try_sync_with(peer_id);

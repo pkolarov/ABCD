@@ -989,9 +989,19 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(metrics_addr) = config.network.metrics_addr.clone() {
         let svc_for_metrics = Arc::clone(&shared_svc);
         let handle_for_metrics = Arc::clone(&telemetry_handle);
+        // observability-plan.md Phase C — share the swarm-task peer
+        // count snapshot with the metrics scrape so dds_peers_admitted
+        // / dds_peers_connected report live values without reaching
+        // into the swarm.
+        let peer_counts_for_metrics = Some(node.peer_counts_handle());
         tokio::spawn(async move {
-            if let Err(e) =
-                dds_node::telemetry::serve(&metrics_addr, svc_for_metrics, handle_for_metrics).await
+            if let Err(e) = dds_node::telemetry::serve(
+                &metrics_addr,
+                svc_for_metrics,
+                handle_for_metrics,
+                peer_counts_for_metrics,
+            )
+            .await
             {
                 tracing::error!(addr = %metrics_addr, "metrics endpoint server error: {e}");
             }

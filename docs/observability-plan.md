@@ -36,10 +36,21 @@ shared [`LocalService::has_purpose_observed`](../dds-node/src/service.rs)
 helper at every trust-graph capability gate, including the
 gossip-ingest publisher-capability filter
 [`node::publisher_capability_ok`](../dds-node/src/node.rs)) landed
-2026-04-27 follow-up #28. The rest of the C catalog (network /
-FIDO2 assertion + verify counters / store sizes / process, plus the
-HTTP request / duration histograms) plus the Phase E rules/panels
-that depend on those metrics remain open.
+2026-04-27 follow-up #28. Phase C **admission-handshakes counter**
+(`dds_admission_handshakes_total{result=ok|fail|revoked}` — bumped
+from [`DdsNode::verify_peer_admission`](../dds-node/src/node.rs)
+at every outcome branch) landed 2026-04-27 follow-up #29. Phase C
+**network peer-count gauges**
+(`dds_peers_admitted` + `dds_peers_connected` — refreshed by the
+swarm task in [`DdsNode::refresh_peer_count_gauges`](../dds-node/src/node.rs)
+on every connection lifecycle event and every successful H-12
+admission handshake; the metrics scrape reads via a shared
+[`NodePeerCounts`](../dds-node/src/node.rs) handle plumbed from
+`main.rs` into `telemetry::serve`) landed 2026-04-27 follow-up #30.
+The rest of the C catalog (gossip / sync / FIDO2 assertion + verify
+counters / store sizes / process, plus the HTTP request / duration
+histograms) plus the Phase E rules/panels that depend on those
+metrics remain open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -297,9 +308,11 @@ gauge landed in follow-up #26; sessions-issuance counter
 purpose-lookups counter (`dds_purpose_lookups_total{result}`) landed
 2026-04-27 follow-up #28; admission-handshakes counter
 (`dds_admission_handshakes_total{result}`) landed 2026-04-27
-follow-up #29; rest of the catalog (network peers / gossip / sync /
-FIDO2 assertion + verify counters / store sizes / process, plus the
-HTTP request / duration families) remains open.** The
+follow-up #29; network peer-count gauges
+(`dds_peers_admitted` + `dds_peers_connected`) landed 2026-04-27
+follow-up #30; rest of the catalog (gossip / sync / FIDO2 assertion
++ verify counters / store sizes / process, plus the HTTP request /
+duration families) remains open.** The
 audit-metrics first slice exposed the five families needed to alert on
 Z-3 regressions (`dds_build_info`, `dds_uptime_seconds`,
 `dds_audit_entries_total{action}`, `dds_audit_chain_length`,
@@ -320,7 +333,17 @@ admin-vouch) plus the gossip-ingest publisher-capability filter in
 from [`DdsNode::verify_peer_admission`](../dds-node/src/node.rs) at
 every exit branch so the H-12 inbound-handshake outcome distribution
 becomes graphable (revoked baseline = peers attempting to rejoin
-after revocation; fail baseline = cert pipeline regression). The trust-graph series are renamed from the original
+after revocation; fail baseline = cert pipeline regression);
+follow-up #30 added the network peer-count gauges
+`dds_peers_admitted` and `dds_peers_connected`, sourced from a
+shared [`NodePeerCounts`](../dds-node/src/node.rs) snapshot
+(two `Arc<AtomicU64>`) refreshed by the swarm task in
+[`DdsNode::refresh_peer_count_gauges`](../dds-node/src/node.rs)
+on every connection lifecycle event and after every successful
+admission handshake — the metrics scrape reads two `Relaxed`
+atomics with no lock acquisition, and operators compute the
+unadmitted share as `dds_peers_connected - dds_peers_admitted` to
+flag handshake stalls. The trust-graph series are renamed from the original
 catalog spelling (`dds_attestations_total` → `dds_trust_graph_attestations`,
 `dds_burned_identities_total` → `dds_trust_graph_burned`) to match
 Prometheus convention — `_total` is reserved for monotonic counters,
@@ -370,8 +393,8 @@ rows remain open.
 | `dds_build_info` | gauge | `version` | Static fingerprint, always 1 (`git_sha`, `rust_version` deferred until a build-time env var pipeline lands) | ✅ |
 | `dds_uptime_seconds` | gauge | — | Process uptime | ✅ |
 | **Network** | | | | |
-| `dds_peers_admitted` | gauge | — | Currently admitted peer count | 🔲 |
-| `dds_peers_connected` | gauge | — | libp2p-connected peers (admitted + un-admitted) | 🔲 |
+| `dds_peers_admitted` | gauge | — | Currently admitted peer count — refreshed from [`DdsNode::admitted_peers`](../dds-node/src/node.rs) by `refresh_peer_count_gauges` after every connection lifecycle event and every successful H-12 admission handshake. | ✅ |
+| `dds_peers_connected` | gauge | — | libp2p-connected peers (admitted + un-admitted) — refreshed from `swarm.connected_peers().count()` at the same call sites. The unadmitted share is `dds_peers_connected - dds_peers_admitted`. | ✅ |
 | `dds_admission_handshakes_total` | counter | `result=ok|fail|revoked` | H-12 inbound-handshake outcomes — bumped from [`DdsNode::verify_peer_admission`](../dds-node/src/node.rs) at every exit branch. `ok` = peer cert verified and peer added to `admitted_peers`; `revoked` = peer is on the local admission revocation list (rejected before signature work); `fail` = no cert / decode error / clock error / cert verify rejected (signature, domain id, peer id, or expiry mismatch). Outbound-side handshake initiation is not counted (would be redundant with the libp2p connection counter). | ✅ |
 | `dds_gossip_messages_total` | counter | `topic, direction=in|out, kind` | Gossipsub volume | 🔲 |
 | `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted|invalid_token|duplicate|backpressure` | Why we threw a message away | 🔲 |

@@ -285,6 +285,30 @@ async fn admitted_peers_populated_and_gossip_flows() {
         ok_after
     );
 
+    // observability-plan.md Phase C — `dds_peers_admitted` /
+    // `dds_peers_connected` are refreshed from the swarm task on every
+    // connection lifecycle event and after every successful admission
+    // handshake. After this point both nodes must report ≥ 1 admitted
+    // and ≥ 1 connected peer in their respective `peer_counts` snapshots.
+    let a_counts = a.peer_counts_handle();
+    let b_counts = b.peer_counts_handle();
+    let a_admitted = a_counts.admitted.load(std::sync::atomic::Ordering::Relaxed);
+    let a_connected = a_counts
+        .connected
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let b_admitted = b_counts.admitted.load(std::sync::atomic::Ordering::Relaxed);
+    let b_connected = b_counts
+        .connected
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        a_admitted >= 1 && a_connected >= 1,
+        "A peer-count gauges did not advance: admitted={a_admitted} connected={a_connected}"
+    );
+    assert!(
+        b_admitted >= 1 && b_connected >= 1,
+        "B peer-count gauges did not advance: admitted={b_admitted} connected={b_connected}"
+    );
+
     // Publish via gossip from A; B must ingest through the production
     // `handle_swarm_event` path (with H-12 gating active).
     let (_id, token) = make_attest_token("alice", "att-h12-ok");

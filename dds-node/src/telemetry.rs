@@ -36,6 +36,8 @@
 //! | `dds_trust_graph_revocations` | gauge | — | same |
 //! | `dds_trust_graph_burned` | gauge | — | same |
 //! | `dds_challenges_outstanding` | gauge | — | [`crate::service::LocalService::challenges_outstanding`] at scrape |
+//! | `dds_peers_admitted` | gauge | — | [`crate::node::NodePeerCounts::admitted`] refreshed by [`crate::node::DdsNode::refresh_peer_count_gauges`] |
+//! | `dds_peers_connected` | gauge | — | [`crate::node::NodePeerCounts::connected`] refreshed at the same call sites |
 //!
 //! ### `dds_challenges_outstanding` semantics
 //!
@@ -129,6 +131,31 @@
 //! follow-up can introduce a `has_purpose_with_outcome` API on the
 //! graph and split the bucket without renaming the metric.
 //!
+//! ### `dds_peers_admitted` / `dds_peers_connected` semantics
+//!
+//! Two gauges sourced from a shared [`crate::node::NodePeerCounts`]
+//! handle (two `Arc<AtomicU64>`). The swarm task is the *only* writer:
+//! [`crate::node::DdsNode::refresh_peer_count_gauges`] re-reads
+//! `admitted_peers.len()` and `swarm.connected_peers().count()` after
+//! every `ConnectionEstablished` / `ConnectionClosed` event and after
+//! every successful inbound H-12 admission handshake (the success
+//! branch of [`crate::node::DdsNode::verify_peer_admission`]). The
+//! metrics scrape reads two `Relaxed` atomics with no lock acquisition.
+//!
+//! Operators compute the *unadmitted share* as
+//! `dds_peers_connected - dds_peers_admitted`. Sustained non-zero
+//! delta is the H-12 cert-pipeline-stall signal (peer reachable on
+//! libp2p but never made it through admission), distinct from the
+//! `dds_admission_handshakes_total{result="fail"}` rate which counts
+//! verify-rejected events. A peer that connects, fails verify, and
+//! disconnects shows in the counter; one that connects and never
+//! responds to the admission request shows in the gauge delta.
+//!
+//! When the metrics endpoint is started without a node handle (in
+//! tests, harnesses, or deployments running only the HTTP API), both
+//! gauges report zero but the `# HELP` / `# TYPE` headers still ship
+//! so the families remain discoverable in the catalog.
+//!
 //! ### `dds_admission_handshakes_total` semantics
 //!
 //! Bumped exactly once per inbound H-12 admission handshake response
@@ -203,6 +230,7 @@ use dds_store::traits::{
 };
 
 use crate::http::SharedService;
+use crate::node::NodePeerCounts;
 use crate::service::TrustGraphCounts;
 
 /// Process-global telemetry handle. Initialised once at process start
@@ -454,7 +482,12 @@ pub fn record_admission_handshake(result: &str) {
 /// `challenges_outstanding` carries the FIDO2 challenge-store row
 /// count read under the same `LocalService` lock; `None` means the
 /// store read failed and the renderer reports zero rather than
-/// panicking the scrape task.
+/// panicking the scrape task. `peer_counts` carries the
+/// `dds_peers_admitted` + `dds_peers_connected` gauges read from the
+/// shared [`NodePeerCounts`] snapshot updated by the swarm task; `None`
+/// means the metrics endpoint was started without a node handle (in
+/// tests, or in deployments where only the HTTP API is wired) and both
+/// gauges report zero.
 /// Keeping the lock acquisition in the caller avoids forcing a
 /// `where` bound on this function.
 fn render_exposition(
@@ -463,6 +496,7 @@ fn render_exposition(
     head_timestamp: Option<u64>,
     trust_graph: Option<TrustGraphCounts>,
     challenges_outstanding: Option<usize>,
+    peer_counts: Option<&NodePeerCounts>,
 ) -> String {
     let mut out = String::with_capacity(1024);
 
@@ -553,6 +587,32 @@ fn render_exposition(
     );
     out.push_str("# TYPE dds_trust_graph_burned gauge\n");
     out.push_str(&format!("dds_trust_graph_burned {}\n", tg.burned));
+
+    // `dds_peers_admitted` + `dds_peers_connected` — network gauges
+    // refreshed by the swarm task in `DdsNode::refresh_peer_count_gauges`
+    // on every connection lifecycle event and every successful H-12
+    // admission handshake. `peer_counts == None` means the metrics
+    // endpoint was started without a node handle (tests, harnesses); we
+    // still emit HELP/TYPE so the family is discoverable in the catalog.
+    let (peers_admitted, peers_connected) = match peer_counts {
+        Some(c) => (
+            c.admitted.load(std::sync::atomic::Ordering::Relaxed),
+            c.connected.load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        None => (0, 0),
+    };
+    out.push_str(
+        "# HELP dds_peers_admitted Peers currently admitted to this node's domain (passed an H-12 \
+         admission handshake on the live connection).\n",
+    );
+    out.push_str("# TYPE dds_peers_admitted gauge\n");
+    out.push_str(&format!("dds_peers_admitted {peers_admitted}\n"));
+    out.push_str(
+        "# HELP dds_peers_connected Peers currently libp2p-connected (admitted plus \
+         not-yet-handshaked). The unadmitted share is dds_peers_connected - dds_peers_admitted.\n",
+    );
+    out.push_str("# TYPE dds_peers_connected gauge\n");
+    out.push_str(&format!("dds_peers_connected {peers_connected}\n"));
 
     // `dds_challenges_outstanding` — FIDO2 challenge-store row count.
     // `None` (store read failure) degrades to 0 rather than panic;
@@ -659,12 +719,18 @@ fn escape_label_value(s: &str) -> String {
 /// to a scrape network if desired) and responds to `GET /metrics`
 /// only — every other path returns 404.
 ///
+/// `peer_counts` carries the swarm-task snapshot of
+/// `dds_peers_admitted` + `dds_peers_connected`. Pass `None` when
+/// running the metrics endpoint without a [`crate::node::DdsNode`]
+/// (tests, harnesses) and both gauges report zero.
+///
 /// Loops forever; returns `Err` only on bind failure or fatal axum
 /// error. The caller spawns this on its own tokio task.
 pub async fn serve<S>(
     addr: &str,
     svc: SharedService<S>,
     telemetry: Arc<Telemetry>,
+    peer_counts: Option<NodePeerCounts>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: TokenStore
@@ -682,7 +748,11 @@ where
     let listener = tokio::net::TcpListener::bind(parsed).await?;
     tracing::info!(%addr, "metrics endpoint listening on TCP");
 
-    let state = MetricsState { svc, telemetry };
+    let state = MetricsState {
+        svc,
+        telemetry,
+        peer_counts,
+    };
     let app = Router::new()
         .route("/metrics", get(metrics_handler::<S>))
         .with_state(state);
@@ -702,6 +772,7 @@ struct MetricsState<
 > {
     svc: SharedService<S>,
     telemetry: Arc<Telemetry>,
+    peer_counts: Option<NodePeerCounts>,
 }
 
 // Manual `Clone` impl mirrors the pattern in `http::AppState`: a
@@ -724,6 +795,7 @@ impl<
         Self {
             svc: self.svc.clone(),
             telemetry: self.telemetry.clone(),
+            peer_counts: self.peer_counts.clone(),
         }
     }
 }
@@ -753,6 +825,7 @@ where
         head_timestamp,
         trust_graph,
         challenges_outstanding,
+        state.peer_counts.as_ref(),
     );
     (
         StatusCode::OK,
@@ -817,7 +890,7 @@ mod tests {
     #[test]
     fn render_includes_build_info_and_uptime_for_empty_telemetry() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None);
+        let body = render_exposition(&t, 0, None, None, None, None);
         assert!(body.contains("dds_build_info{version=\""));
         assert!(body.contains("} 1\n"));
         assert!(body.contains("# TYPE dds_uptime_seconds gauge\n"));
@@ -833,7 +906,7 @@ mod tests {
         t.bump_audit_entry("attest");
         t.bump_audit_entry("revoke");
 
-        let body = render_exposition(&t, 3, Some(0), None, None);
+        let body = render_exposition(&t, 3, Some(0), None, None, None);
         assert!(body.contains("dds_audit_entries_total{action=\"attest\"} 2\n"));
         assert!(body.contains("dds_audit_entries_total{action=\"revoke\"} 1\n"));
         assert!(body.contains("dds_audit_chain_length 3\n"));
@@ -846,7 +919,7 @@ mod tests {
         t.bump_sessions_issued("fido2");
         t.bump_sessions_issued("legacy");
 
-        let body = render_exposition(&t, 0, None, None, None);
+        let body = render_exposition(&t, 0, None, None, None, None);
         assert!(body.contains("# TYPE dds_sessions_issued_total counter\n"));
         assert!(body.contains("dds_sessions_issued_total{via=\"fido2\"} 2\n"));
         assert!(body.contains("dds_sessions_issued_total{via=\"legacy\"} 1\n"));
@@ -858,7 +931,7 @@ mod tests {
     #[test]
     fn sessions_issued_renders_empty_family_with_help_and_type() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None);
+        let body = render_exposition(&t, 0, None, None, None, None);
         // HELP/TYPE must always be emitted so the family is
         // discoverable by Prometheus before the first session is
         // minted; the value lines come once the first bump fires.
@@ -873,7 +946,7 @@ mod tests {
         t.bump_purpose_lookup("ok");
         t.bump_purpose_lookup("denied");
 
-        let body = render_exposition(&t, 0, None, None, None);
+        let body = render_exposition(&t, 0, None, None, None, None);
         assert!(body.contains("# TYPE dds_purpose_lookups_total counter\n"));
         assert!(body.contains("dds_purpose_lookups_total{result=\"ok\"} 2\n"));
         assert!(body.contains("dds_purpose_lookups_total{result=\"denied\"} 1\n"));
@@ -885,7 +958,7 @@ mod tests {
     #[test]
     fn purpose_lookups_renders_empty_family_with_help_and_type() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None);
+        let body = render_exposition(&t, 0, None, None, None, None);
         // HELP/TYPE always discoverable before the first lookup so
         // dashboards / alert expressions resolve the family on a
         // freshly booted node.
@@ -902,7 +975,7 @@ mod tests {
         t.bump_admission_handshake("fail");
         t.bump_admission_handshake("revoked");
 
-        let body = render_exposition(&t, 0, None, None, None);
+        let body = render_exposition(&t, 0, None, None, None, None);
         assert!(body.contains("# TYPE dds_admission_handshakes_total counter\n"));
         assert!(body.contains("dds_admission_handshakes_total{result=\"ok\"} 3\n"));
         assert!(body.contains("dds_admission_handshakes_total{result=\"fail\"} 1\n"));
@@ -916,7 +989,7 @@ mod tests {
     #[test]
     fn admission_handshakes_renders_empty_family_with_help_and_type() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None);
+        let body = render_exposition(&t, 0, None, None, None, None);
         // HELP/TYPE always discoverable before the first inbound
         // handshake fires so a freshly booted node still surfaces
         // the family in the catalog.
@@ -931,7 +1004,7 @@ mod tests {
         t.bump_caller_identity("anonymous");
         t.bump_caller_identity("admin");
 
-        let body = render_exposition(&t, 0, None, None, None);
+        let body = render_exposition(&t, 0, None, None, None, None);
         assert!(body.contains("# TYPE dds_http_caller_identity_total counter\n"));
         assert!(body.contains("dds_http_caller_identity_total{kind=\"anonymous\"} 2\n"));
         assert!(body.contains("dds_http_caller_identity_total{kind=\"admin\"} 1\n"));
@@ -949,7 +1022,7 @@ mod tests {
             revocations: 2,
             burned: 1,
         };
-        let body = render_exposition(&t, 0, None, Some(counts), None);
+        let body = render_exposition(&t, 0, None, Some(counts), None, None);
         assert!(body.contains("# TYPE dds_trust_graph_attestations gauge\n"));
         assert!(body.contains("dds_trust_graph_attestations 7\n"));
         assert!(body.contains("dds_trust_graph_vouches 3\n"));
@@ -960,7 +1033,7 @@ mod tests {
     #[test]
     fn trust_graph_gauges_default_to_zero_when_lock_poisoned() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None);
+        let body = render_exposition(&t, 0, None, None, None, None);
         assert!(body.contains("dds_trust_graph_attestations 0\n"));
         assert!(body.contains("dds_trust_graph_vouches 0\n"));
         assert!(body.contains("dds_trust_graph_revocations 0\n"));
@@ -968,9 +1041,39 @@ mod tests {
     }
 
     #[test]
+    fn peer_count_gauges_render_supplied_values() {
+        let t = Telemetry::new();
+        let counts = NodePeerCounts::default();
+        counts
+            .admitted
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        counts
+            .connected
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        let body = render_exposition(&t, 0, None, None, None, Some(&counts));
+        assert!(body.contains("# TYPE dds_peers_admitted gauge\n"));
+        assert!(body.contains("dds_peers_admitted 4\n"));
+        assert!(body.contains("# TYPE dds_peers_connected gauge\n"));
+        assert!(body.contains("dds_peers_connected 7\n"));
+    }
+
+    #[test]
+    fn peer_count_gauges_default_to_zero_when_no_handle_supplied() {
+        let t = Telemetry::new();
+        let body = render_exposition(&t, 0, None, None, None, None);
+        // HELP/TYPE always discoverable so the family resolves on a
+        // freshly booted node before any peer connects (or in
+        // deployments running the metrics endpoint without a swarm).
+        assert!(body.contains("# TYPE dds_peers_admitted gauge\n"));
+        assert!(body.contains("dds_peers_admitted 0\n"));
+        assert!(body.contains("# TYPE dds_peers_connected gauge\n"));
+        assert!(body.contains("dds_peers_connected 0\n"));
+    }
+
+    #[test]
     fn challenges_outstanding_renders_supplied_count() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, Some(12));
+        let body = render_exposition(&t, 0, None, None, Some(12), None);
         assert!(body.contains("# TYPE dds_challenges_outstanding gauge\n"));
         assert!(body.contains("dds_challenges_outstanding 12\n"));
     }
@@ -978,7 +1081,7 @@ mod tests {
     #[test]
     fn challenges_outstanding_defaults_to_zero_when_store_read_fails() {
         let t = Telemetry::new();
-        let body = render_exposition(&t, 0, None, None, None);
+        let body = render_exposition(&t, 0, None, None, None, None);
         assert!(body.contains("dds_challenges_outstanding 0\n"));
     }
 
@@ -990,7 +1093,7 @@ mod tests {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         // A timestamp 30 seconds in the past should render head_age >= 30.
-        let body = render_exposition(&t, 1, Some(now.saturating_sub(30)), None, None);
+        let body = render_exposition(&t, 1, Some(now.saturating_sub(30)), None, None, None);
         // Parse out the head_age value to allow for clock drift /
         // sub-second rounding inside the renderer.
         let line = body
@@ -1046,9 +1149,20 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        // Hand-rolled `NodePeerCounts` so we can pin the rendered values
+        // without spinning up a real swarm — the swarm-side update path
+        // is tested separately in `tests/h12_admission.rs`.
+        let peer_counts = NodePeerCounts::default();
+        peer_counts
+            .admitted
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        peer_counts
+            .connected
+            .store(3, std::sync::atomic::Ordering::Relaxed);
         let state = MetricsState {
             svc: svc.clone(),
             telemetry: telemetry.clone(),
+            peer_counts: Some(peer_counts),
         };
         let app = Router::new()
             .route("/metrics", get(metrics_handler::<MemoryBackend>))
@@ -1099,6 +1213,11 @@ mod tests {
         // Admission-handshakes family is always discoverable; no
         // value lines until the first inbound handshake completes.
         assert!(body.contains("# TYPE dds_admission_handshakes_total counter\n"));
+        // Peer-count gauges round-trip through the served exposition.
+        assert!(body.contains("# TYPE dds_peers_admitted gauge\n"));
+        assert!(body.contains("dds_peers_admitted 2\n"));
+        assert!(body.contains("# TYPE dds_peers_connected gauge\n"));
+        assert!(body.contains("dds_peers_connected 3\n"));
     }
 
     #[tokio::test]
@@ -1110,6 +1229,7 @@ mod tests {
         let state = MetricsState {
             svc: svc.clone(),
             telemetry: telemetry.clone(),
+            peer_counts: None,
         };
         let app = Router::new()
             .route("/metrics", get(metrics_handler::<MemoryBackend>))
