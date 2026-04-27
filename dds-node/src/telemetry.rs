@@ -33,6 +33,7 @@
 //! | `dds_admission_handshakes_total` | counter | `result=ok\|fail\|revoked` | bumped by [`record_admission_handshake`] |
 //! | `dds_gossip_messages_total` | counter | `kind=op\|revocation\|burn\|audit` | bumped by [`record_gossip_message`] |
 //! | `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted\|unknown_topic\|decode_error\|topic_kind_mismatch` | bumped by [`record_gossip_messages_dropped`] |
+//! | `dds_fido2_attestation_verify_total` | counter | `result=ok\|fail`, `fmt=packed\|none\|unknown` | bumped by [`record_fido2_attestation_verify`] |
 //! | `dds_trust_graph_attestations` | gauge | — | [`crate::service::LocalService::trust_graph_counts`] at scrape |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
 //! | `dds_trust_graph_revocations` | gauge | — | same |
@@ -263,6 +264,54 @@
 //! once a gossipsub backpressure hook is wired) can add those
 //! reasons without renaming the metric.
 //!
+//! ### `dds_fido2_attestation_verify_total` semantics
+//!
+//! Bumped exactly once per call to
+//! [`dds_domain::fido2::verify_attestation`] funnelled through the
+//! enrollment paths
+//! [`crate::service::LocalService::enroll_user`] and
+//! [`crate::service::LocalService::admin_setup`]. The shared helper
+//! [`crate::service::LocalService::verify_attestation_observed`]
+//! invokes the underlying verifier and accounts the outcome on the
+//! way out, partitioned by:
+//!
+//! - `result="ok"` — `verify_attestation` returned `Ok(parsed)`. The
+//!   `fmt` label carries `parsed.fmt` (today, one of `packed|none`).
+//! - `result="fail"` — the verifier rejected the attestation
+//!   (CBOR decode error, missing `fmt` field, unsupported format like
+//!   `tpm` or `fido_u2f`, packed-attestation signature failure,
+//!   unsupported COSE key type, etc.). The format that the
+//!   authenticator advertised is not always reachable on the failure
+//!   path (the verifier may reject before the `fmt` field is parsed,
+//!   or the AAGUID gate may fire post-verify but before the bump
+//!   site sees a parsed value), so the bump site uniformly emits
+//!   `fmt="unknown"` for the failure bucket.
+//!
+//! The catalog in `observability-plan.md` Phase C names the labels
+//! `fmt=packed|none|tpm`. The `tpm` bucket is forward-looking — the
+//! domain verifier does not implement the TPM attestation format
+//! today (it returns `Fido2Error::Unsupported(format!("fmt={other}"))`
+//! for any non-`packed`/non-`none` format), so v1 collapses TPM and
+//! every other unsupported format into the `result="fail",
+//! fmt="unknown"` bucket. A future follow-up that lands a TPM
+//! verifier (and the matching AAGUID-gate plumbing) can split out
+//! `fmt="tpm"` without renaming the metric.
+//!
+//! The `verify_assertion_common` re-parse at
+//! [`crate::service::LocalService::verify_assertion_common`] is *not*
+//! counted here — it is a credential-lookup re-parse during assertion
+//! verification, not an enrollment-time first-verify, and the
+//! catalog row explicitly scopes the counter to enrollment.
+//!
+//! Outcome buckets that fire *after* `verify_attestation` returns
+//! `Ok` (the AAGUID allow-list, the per-AAGUID attestation-root
+//! gate, and the `rp_id` hash equality check downstream) are *not*
+//! counted as `result="fail"` because the underlying
+//! `verify_attestation` call itself succeeded; those gates surface
+//! through the `enroll.user` / `admin.bootstrap` audit-rejection
+//! actions instead and remain visible via
+//! `dds_audit_entries_total{action=*.rejected}`.
+//!
 //! ### `dds_http_caller_identity_total` semantics
 //!
 //! Each completed HTTP request bumps **two** buckets — its transport
@@ -356,6 +405,15 @@ pub struct Telemetry {
     /// [`crate::node::DdsNode::handle_swarm_event`] and
     /// [`crate::node::DdsNode::handle_gossip_message`].
     gossip_messages_dropped: Mutex<BTreeMap<String, u64>>,
+    /// Per-`(result, fmt)` enrollment-time FIDO2 attestation-verify
+    /// counts. `result` is one of `ok|fail`; `fmt` is `packed|none` on
+    /// the success branch (today's verifier supports those two formats)
+    /// and the literal `unknown` on the failure branch — bounded by
+    /// the [`dds_domain::fido2::verify_attestation`] outcome partition
+    /// observed at the two call sites in
+    /// [`crate::service::LocalService::enroll_user`] and
+    /// [`crate::service::LocalService::admin_setup`].
+    fido2_attestation_verifies: Mutex<BTreeMap<(String, String), u64>>,
 }
 
 impl Telemetry {
@@ -369,6 +427,7 @@ impl Telemetry {
             admission_handshakes: Mutex::new(BTreeMap::new()),
             gossip_messages: Mutex::new(BTreeMap::new()),
             gossip_messages_dropped: Mutex::new(BTreeMap::new()),
+            fido2_attestation_verifies: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -547,6 +606,33 @@ impl Telemetry {
         }
     }
 
+    fn bump_fido2_attestation_verify(&self, result: &str, fmt: &str) {
+        let mut g = match self.fido2_attestation_verifies.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry((result.to_string(), fmt.to_string())).or_insert(0) += 1;
+    }
+
+    fn fido2_attestation_verifies_snapshot(&self) -> BTreeMap<(String, String), u64> {
+        match self.fido2_attestation_verifies.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of
+    /// `dds_fido2_attestation_verify_total{result=...,fmt=...}`. Public
+    /// so the `LocalService` regression tests can take before/after
+    /// snapshots without scraping the renderer.
+    pub fn fido2_attestation_verify_count(&self, result: &str, fmt: &str) -> u64 {
+        let key = (result.to_string(), fmt.to_string());
+        match self.fido2_attestation_verifies.lock() {
+            Ok(g) => g.get(&key).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(&key).copied().unwrap_or(0),
+        }
+    }
+
     fn uptime_seconds(&self) -> u64 {
         SystemTime::now()
             .duration_since(self.start_at)
@@ -634,6 +720,22 @@ pub fn record_gossip_message(kind: &str) {
 pub fn record_gossip_messages_dropped(reason: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_gossip_messages_dropped(reason);
+    }
+}
+
+/// Bump `dds_fido2_attestation_verify_total{result=...,fmt=...}` by
+/// one. Called from
+/// [`crate::service::LocalService::verify_attestation_observed`] after
+/// every enrollment-time call to [`dds_domain::fido2::verify_attestation`]
+/// (today: `enroll_user` and `admin_setup`). `result` is one of
+/// `ok|fail`; `fmt` is `packed|none` on the success branch and
+/// `unknown` on the failure branch (the verifier may reject before
+/// the `fmt` field is parsed, so a fmt label is not always reachable
+/// on failure). No-op when telemetry has not been installed (tests,
+/// harnesses).
+pub fn record_fido2_attestation_verify(result: &str, fmt: &str) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_fido2_attestation_verify(result, fmt);
     }
 }
 
@@ -900,6 +1002,31 @@ fn render_exposition(
         out.push_str(&format!(
             "dds_gossip_messages_dropped_total{{reason=\"{}\"}} {}\n",
             escape_label_value(reason),
+            count
+        ));
+    }
+
+    // `dds_fido2_attestation_verify_total` — per-`(result, fmt)`
+    // enrollment-time verifier outcome counter. Bumped from
+    // `LocalService::verify_attestation_observed` after every call to
+    // `dds_domain::fido2::verify_attestation` in `enroll_user` and
+    // `admin_setup`.
+    out.push_str(
+        "# HELP dds_fido2_attestation_verify_total Enrollment-time \
+         dds_domain::fido2::verify_attestation outcomes since process start, partitioned by \
+         result (ok|fail) and the authenticator-advertised attestation format \
+         (packed|none on success; unknown on failure — the verifier may reject before the fmt \
+         field is parsed). The TPM attestation format is reserved by the catalog but not \
+         implemented today; TPM authenticators surface as result=fail,fmt=unknown until a TPM \
+         verifier ships.\n",
+    );
+    out.push_str("# TYPE dds_fido2_attestation_verify_total counter\n");
+    let fido2_verify_snapshot = telemetry.fido2_attestation_verifies_snapshot();
+    for ((result, fmt), count) in fido2_verify_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_fido2_attestation_verify_total{{result=\"{}\",fmt=\"{}\"}} {}\n",
+            escape_label_value(result),
+            escape_label_value(fmt),
             count
         ));
     }
@@ -1276,6 +1403,44 @@ mod tests {
     }
 
     #[test]
+    fn fido2_attestation_verify_counter_renders_in_exposition() {
+        let t = Telemetry::new();
+        t.bump_fido2_attestation_verify("ok", "packed");
+        t.bump_fido2_attestation_verify("ok", "packed");
+        t.bump_fido2_attestation_verify("ok", "none");
+        t.bump_fido2_attestation_verify("fail", "unknown");
+
+        let body = render_exposition(&t, 0, None, None, None, None);
+        assert!(body.contains("# TYPE dds_fido2_attestation_verify_total counter\n"));
+        assert!(
+            body.contains("dds_fido2_attestation_verify_total{result=\"ok\",fmt=\"packed\"} 2\n")
+        );
+        assert!(
+            body.contains("dds_fido2_attestation_verify_total{result=\"ok\",fmt=\"none\"} 1\n")
+        );
+        assert!(
+            body.contains(
+                "dds_fido2_attestation_verify_total{result=\"fail\",fmt=\"unknown\"} 1\n"
+            )
+        );
+        assert_eq!(t.fido2_attestation_verify_count("ok", "packed"), 2);
+        assert_eq!(t.fido2_attestation_verify_count("ok", "none"), 1);
+        assert_eq!(t.fido2_attestation_verify_count("fail", "unknown"), 1);
+        assert_eq!(t.fido2_attestation_verify_count("ok", "tpm"), 0);
+    }
+
+    #[test]
+    fn fido2_attestation_verify_renders_empty_family_with_help_and_type() {
+        let t = Telemetry::new();
+        let body = render_exposition(&t, 0, None, None, None, None);
+        // HELP/TYPE always discoverable before the first enrollment
+        // verifier call so a freshly booted node still surfaces the
+        // family in the catalog.
+        assert!(body.contains("# TYPE dds_fido2_attestation_verify_total counter\n"));
+        assert!(!body.contains("dds_fido2_attestation_verify_total{"));
+    }
+
+    #[test]
     fn caller_identity_counter_renders_in_exposition() {
         let t = Telemetry::new();
         t.bump_caller_identity("anonymous");
@@ -1497,6 +1662,9 @@ mod tests {
         // Gossip-messages-dropped family is always discoverable; no
         // value lines until the first envelope is dropped.
         assert!(body.contains("# TYPE dds_gossip_messages_dropped_total counter\n"));
+        // FIDO2 attestation-verify family is always discoverable; no
+        // value lines until the first enrollment verifier call fires.
+        assert!(body.contains("# TYPE dds_fido2_attestation_verify_total counter\n"));
         // Peer-count gauges round-trip through the served exposition.
         assert!(body.contains("# TYPE dds_peers_admitted gauge\n"));
         assert!(body.contains("dds_peers_admitted 2\n"));

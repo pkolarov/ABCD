@@ -740,6 +740,38 @@ impl<
         ok
     }
 
+    /// Wrapper around [`dds_domain::fido2::verify_attestation`] that
+    /// funnels every enrollment-time call through
+    /// [`crate::telemetry::record_fido2_attestation_verify`] so
+    /// `dds_fido2_attestation_verify_total{result, fmt}` reflects the
+    /// real verifier call rate. The two enrollment entry points
+    /// ([`Self::enroll_user`] and [`Self::admin_setup`]) share this
+    /// helper; the credential-lookup re-parse inside
+    /// [`Self::verify_assertion_common`] does *not* go through this
+    /// path (the catalog scopes the counter to enrollment-time only).
+    ///
+    /// On success the `fmt` label carries `parsed.fmt` (today, one of
+    /// `packed|none`); on failure the verifier may reject before the
+    /// `fmt` field is parsed (CBOR decode error, missing `fmt`,
+    /// unsupported format), so the bump uniformly emits
+    /// `fmt="unknown"` for the failure bucket.
+    fn verify_attestation_observed(
+        attestation_object: &[u8],
+        client_data_hash: &[u8],
+        allow_unattested_credentials: bool,
+    ) -> Result<dds_domain::fido2::ParsedAttestation, dds_domain::fido2::Fido2Error> {
+        let outcome = dds_domain::fido2::verify_attestation(
+            attestation_object,
+            client_data_hash,
+            allow_unattested_credentials,
+        );
+        match &outcome {
+            Ok(parsed) => crate::telemetry::record_fido2_attestation_verify("ok", &parsed.fmt),
+            Err(_) => crate::telemetry::record_fido2_attestation_verify("fail", "unknown"),
+        }
+        outcome
+    }
+
     /// **M-7 (security review)**: thin wrapper that reads the
     /// device's self-attested `tags` + `org_unit` via
     /// `device_targeting_facts`, then drops them on the floor when
@@ -812,7 +844,7 @@ impl<
                 challenge_bytes.as_deref(),
             )?;
 
-            let parsed = dds_domain::fido2::verify_attestation(
+            let parsed = Self::verify_attestation_observed(
                 &req.attestation_object,
                 &req.client_data_hash,
                 self.allow_unattested_credentials,
@@ -2033,7 +2065,7 @@ impl<
                 challenge_bytes.as_deref(),
             )?;
 
-            let parsed = dds_domain::fido2::verify_attestation(
+            let parsed = Self::verify_attestation_observed(
                 &req.attestation_object,
                 &req.client_data_hash,
                 self.allow_unattested_credentials,
@@ -3783,6 +3815,73 @@ mod platform_applier_tests {
             handle.purpose_lookups_count("denied"),
             denied_before + 1,
             "denied bucket must advance by one on grant-denied"
+        );
+    }
+
+    /// observability-plan.md Phase C — regression test for the
+    /// `dds_fido2_attestation_verify_total{result, fmt}` Prometheus
+    /// counter. Pins that the shared helper
+    /// [`LocalService::verify_attestation_observed`] funnels both the
+    /// success branch (a real `fmt=none` attestation built via
+    /// [`dds_domain::fido2::build_none_attestation`]) and the failure
+    /// branch (garbage bytes that fail CBOR decode before `fmt` is
+    /// known) through the process-global telemetry handle. The
+    /// success branch labels `fmt` with the authenticator-advertised
+    /// value (`none`), and the failure branch uniformly labels `fmt`
+    /// as `unknown` because the verifier rejects before the `fmt`
+    /// field is parsed.
+    #[test]
+    fn verify_attestation_observed_advances_ok_and_fail_telemetry_buckets() {
+        use ed25519_dalek::SigningKey;
+        let handle = crate::telemetry::install();
+        let ok_none_before = handle.fido2_attestation_verify_count("ok", "none");
+        let fail_unknown_before = handle.fido2_attestation_verify_count("fail", "unknown");
+
+        // OK branch: synthesize a real `fmt=none` attestation object
+        // and let the verifier accept it via `allow_unattested=true`.
+        let cred_sk = SigningKey::generate(&mut OsRng);
+        let cred_pk = cred_sk.verifying_key();
+        let rp_id = "example.com";
+        let attestation = dds_domain::fido2::build_none_attestation(rp_id, b"cred-tel", &cred_pk);
+        // `client_data_hash` is irrelevant for `fmt=none` (no attStmt
+        // signature to verify); zeros suffice.
+        let client_data_hash = [0u8; 32];
+        let parsed = LocalService::<MemoryBackend>::verify_attestation_observed(
+            &attestation,
+            &client_data_hash,
+            true,
+        )
+        .expect("none-attestation accepted with allow_unattested=true");
+        assert_eq!(parsed.fmt, "none");
+        assert_eq!(
+            handle.fido2_attestation_verify_count("ok", "none"),
+            ok_none_before + 1,
+            "ok/none bucket must advance by one on a successful fmt=none verify"
+        );
+        assert_eq!(
+            handle.fido2_attestation_verify_count("fail", "unknown"),
+            fail_unknown_before,
+            "fail/unknown bucket must not advance on a successful verify"
+        );
+
+        // FAIL branch: garbage bytes — the CBOR decode rejects before
+        // fmt is identified, so the bump emits `fmt="unknown"`.
+        let err = LocalService::<MemoryBackend>::verify_attestation_observed(
+            b"not cbor",
+            &client_data_hash,
+            false,
+        )
+        .expect_err("garbage bytes must be rejected");
+        let _ = err; // we don't pin the error variant — the verifier owns the message.
+        assert_eq!(
+            handle.fido2_attestation_verify_count("fail", "unknown"),
+            fail_unknown_before + 1,
+            "fail/unknown bucket must advance by one on verifier rejection"
+        );
+        assert_eq!(
+            handle.fido2_attestation_verify_count("ok", "none"),
+            ok_none_before + 1,
+            "ok/none bucket must not advance on a failed verify"
         );
     }
 
