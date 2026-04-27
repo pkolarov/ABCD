@@ -84,11 +84,22 @@ branches of [`DdsNode::handle_sync_event`](../dds-node/src/node.rs):
 `ok` when an admitted peer's `Message::Response` is processed by
 `handle_sync_response` (zero payloads still counts as `ok`), `fail`
 on `OutboundFailure` and on the H-12 unadmitted-peer response
-drop) landed 2026-04-27 follow-up #35.
+drop) landed 2026-04-27 follow-up #35. Phase C **HTTP-requests
+counter** (`dds_http_requests_total{route, method, status}` —
+bumped from the new `route_layer`-applied
+[`http_request_observer_middleware`](../dds-node/src/http.rs) wired
+into the merged production router built by
+[`crate::http::router`](../dds-node/src/http.rs); the middleware
+reads `axum::extract::MatchedPath` from the per-route handler stack
+before calling `next.run`, captures the method, then bumps once
+with the inner handler's status. Unmatched 404s served by the
+default fallback are *not* counted because `route_layer` does not
+wrap the fallback — those remain visible via
+`dds_http_caller_identity_total`) landed 2026-04-27 follow-up #36.
 The rest of the C catalog (`dds_sync_lag_seconds` /
 `dds_sync_payloads_rejected_total` / store sizes / process, plus
-the HTTP request / duration histograms) plus the Phase E
-rules/panels that depend on those metrics remain open.
+the `dds_http_request_duration_seconds` histogram sibling) plus
+the Phase E rules/panels that depend on those metrics remain open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -358,9 +369,13 @@ follow-up #32; FIDO2 attestation-verify counter
 (`dds_fido2_assertions_total{result}`) landed 2026-04-27 follow-up
 #34; sync-pulls counter
 (`dds_sync_pulls_total{result=ok|fail}`) landed 2026-04-27
-follow-up #35; rest of the catalog (`dds_sync_lag_seconds`,
-`dds_sync_payloads_rejected_total`, store sizes, process,
-plus the HTTP request / duration families) remains open.** The
+follow-up #35; HTTP-requests counter
+(`dds_http_requests_total{route, method, status}`) landed
+2026-04-27 follow-up #36; rest of the catalog
+(`dds_sync_lag_seconds`, `dds_sync_payloads_rejected_total`,
+store sizes, process, plus the
+`dds_http_request_duration_seconds` histogram sibling) remains
+open.** The
 audit-metrics first slice exposed the five families needed to alert on
 Z-3 regressions (`dds_build_info`, `dds_uptime_seconds`,
 `dds_audit_entries_total{action}`, `dds_audit_chain_length`,
@@ -475,8 +490,8 @@ rows remain open.
 | `dds_store_bytes` | gauge | `table=tokens|ops|audit|...` | redb table sizes | 🔲 |
 | `dds_store_writes_total` | counter | `result=ok|conflict|fail` | redb txn outcomes | 🔲 |
 | **HTTP API** | | | | |
-| `dds_http_requests_total` | counter | `route, method, status` | Route-level traffic | 🔲 |
-| `dds_http_request_duration_seconds` | histogram | `route, method` | Latency | 🔲 |
+| `dds_http_requests_total` | counter | `route, method, status` | Route-level traffic — bumped from the `route_layer`-applied [`http_request_observer_middleware`](../dds-node/src/http.rs) wired into the merged production router built by [`crate::http::router`](../dds-node/src/http.rs). The middleware reads `axum::extract::MatchedPath` from the per-route handler stack (DDS has no path parameters today, so the matched template equals the literal URI path), captures the method, then bumps once with the inner handler's status code on the way out. Unmatched 404s served by the default fallback are *not* counted because `route_layer` does not wrap the fallback — operators read the un-routed call rate off `dds_http_caller_identity_total`. The route layer sits inside the outer `caller_identity_observer_middleware` / `rate_limit_middleware` / `DefaultBodyLimit` stack, so requests rejected before they reach a matched handler (rate-limited 429s, body-too-big 413s) do not bump this counter — those remain visible only via `dds_http_caller_identity_total`. | ✅ |
+| `dds_http_request_duration_seconds` | histogram | `route, method` | Latency — sibling of the `dds_http_requests_total` counter; ships once the hand-rolled exposition rolls over to `metrics-exporter-prometheus` (deferred until the first histogram-bearing metric in the catalog ships, per C.1). | 🔲 |
 | `dds_http_caller_identity_total` | counter | `kind=anonymous|uds|pipe|admin` | Who's calling — surfaces accidental loopback-TCP regressions; transport buckets (anonymous/uds/pipe) partition the request count, `admin` is bumped orthogonally when the caller passes the admin policy | ✅ |
 | **Process** | | | | |
 | `dds_memory_resident_bytes` | gauge | — | RSS (procfs / mach) | 🔲 |

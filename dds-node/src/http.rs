@@ -639,6 +639,34 @@ async fn caller_identity_observer_middleware(
     next.run(req).await
 }
 
+/// Per-route observer middleware (no policy enforcement) that bumps
+/// `dds_http_requests_total{route, method, status}` for every
+/// matched-route request. Applied via [`axum::Router::route_layer`] so
+/// the per-route handler stack populates `MatchedPath` in the request
+/// extensions before this middleware reads it; unmatched 404s served
+/// by the default fallback are not counted (they remain visible via
+/// `dds_http_caller_identity_total`).
+///
+/// `route` falls back to the literal URI path string when (in
+/// principle, never in practice) `MatchedPath` is unset; the DDS
+/// router has no path parameters today, so the matched template
+/// equals the literal URI path.
+async fn http_request_observer_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let method = req.method().as_str().to_string();
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+    crate::telemetry::record_http_request(&route, &method, status);
+    response
+}
+
 /// Build the axum router for the local API.
 ///
 /// `admin_policy` governs which callers may reach admin-gated
@@ -729,6 +757,12 @@ where
     let mut app = admin_routes
         .merge(public_routes)
         .with_state(state)
+        // observability-plan.md Phase C — per-route HTTP request
+        // counter. `route_layer` so the inner handler stack populates
+        // `MatchedPath` before the middleware reads it; unmatched 404s
+        // served by the default fallback are not counted (they remain
+        // visible via `dds_http_caller_identity_total`).
+        .route_layer(axum::middleware::from_fn(http_request_observer_middleware))
         // M-3: rate limit before any handler runs.
         .layer(axum::middleware::from_fn_with_state(
             rate_limiter,
@@ -5195,6 +5229,46 @@ mod tests {
 
         let resp = reqwest::get(format!("{base}/readyz")).await.unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    /// observability-plan.md Phase C — regression test for
+    /// `dds_http_requests_total{route, method, status}`. Confirms the
+    /// `route_layer`-applied `http_request_observer_middleware`
+    /// captures `MatchedPath` from the per-route handler stack and
+    /// bumps the global telemetry counter for a real request through
+    /// the production router. The route template `/healthz` is the
+    /// most stable target — no path parameters, no body, deterministic
+    /// 200 outcome.
+    ///
+    /// `TELEMETRY` is process-global (`OnceLock`), so other tests in
+    /// the suite may also bump `(/healthz, GET, 200)` concurrently.
+    /// The assertion uses `>= before + 1` rather than `== before + 1`
+    /// so the test pins the wiring without over-fitting to scheduling
+    /// — the wire-up is broken iff `after == before` (the middleware
+    /// never ran).
+    #[tokio::test]
+    async fn http_request_observer_advances_per_route_counter() {
+        let state = make_state();
+        let svc = state.svc.clone();
+        let info = state.info.clone();
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{}", addr);
+
+        let handle = crate::telemetry::install();
+        let before = handle.http_requests_count("/healthz", "GET", 200);
+        let resp = reqwest::get(format!("{base}/healthz")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let after = handle.http_requests_count("/healthz", "GET", 200);
+        assert!(
+            after >= before + 1,
+            "middleware did not bump dds_http_requests_total{{/healthz, GET, 200}} \
+             (before={before} after={after})"
+        );
     }
 
     // ----------------------------------------------------------------

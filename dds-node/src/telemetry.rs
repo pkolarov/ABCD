@@ -36,6 +36,7 @@
 //! | `dds_fido2_attestation_verify_total` | counter | `result=ok\|fail`, `fmt=packed\|none\|unknown` | bumped by [`record_fido2_attestation_verify`] |
 //! | `dds_fido2_assertions_total` | counter | `result=ok\|signature\|rp_id\|up\|sign_count\|other` | bumped by [`record_fido2_assertion`] |
 //! | `dds_sync_pulls_total` | counter | `result=ok\|fail` | bumped by [`record_sync_pull`] |
+//! | `dds_http_requests_total` | counter | `route, method, status` | bumped by [`record_http_request`] |
 //! | `dds_trust_graph_attestations` | gauge | — | [`crate::service::LocalService::trust_graph_counts`] at scrape |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
 //! | `dds_trust_graph_revocations` | gauge | — | same |
@@ -418,6 +419,54 @@
 //! `apply_sync_payloads_with_graph` outcome to flow back through to
 //! the swarm task).
 //!
+//! ### `dds_http_requests_total` semantics
+//!
+//! Bumped exactly once per HTTP request that resolves to a *matched*
+//! axum route (i.e. one that hit a handler in the merged router built
+//! by [`crate::http::router`]). Partitioned by three labels:
+//!
+//! - `route` — the axum route template the request matched on
+//!   (e.g. `/v1/audit/entries`, `/healthz`). Bounded by the route
+//!   table in [`crate::http::router`]; no path parameters in DDS
+//!   today, so the template equals the literal URI path. The bump
+//!   site reads
+//!   [`axum::extract::MatchedPath`](https://docs.rs/axum/0.7/axum/extract/struct.MatchedPath.html)
+//!   from the request extensions, which axum populates when the
+//!   route layer wraps each per-route handler. Unmatched requests
+//!   (404s served by the default fallback) are *not* counted — they
+//!   do not pass through the route layer; operators key off
+//!   `dds_http_caller_identity_total` for the un-routed call rate.
+//! - `method` — the HTTP method as upper-case ASCII
+//!   (`GET|POST|PUT|DELETE|...`). Bounded by the verb set the router
+//!   actually exposes (today `GET` and `POST` only).
+//! - `status` — the HTTP status code returned to the client
+//!   (`200|400|401|403|404|...`), as a 3-digit integer. Bounded by
+//!   the small set of status codes DDS handlers actually return; if a
+//!   handler returns an unusual code (e.g. 451), it surfaces as its
+//!   own series rather than being bucketed.
+//!
+//! The bump fires *after* the inner handler returns so the status
+//! reflects what the client actually saw. Middleware that runs
+//! *before* the route layer (rate-limit, body-size, response-MAC,
+//! caller-identity) still counts the request because the route layer
+//! sits inside that outer stack — but rate-limited / body-rejected
+//! traffic that never reached a matched handler is *not* counted
+//! here (it shows up only in `dds_http_caller_identity_total`).
+//! Operators wanting the global request rate (matched + rejected +
+//! 404s) sum across `dds_http_caller_identity_total{kind=~"anonymous|uds|pipe"}`;
+//! `dds_http_requests_total` is the per-route refinement for routing
+//! handler latency and per-route error-rate dashboards. Latency
+//! itself ships separately as `dds_http_request_duration_seconds`
+//! once the histogram-bearing metrics tier lands (catalog row still
+//! open).
+//!
+//! Cardinality budget: 22 routes × 2 methods × ~6 typical statuses ≈
+//! 250 series in the worst case; the actual production set is much
+//! smaller because each route has a fixed verb and a small
+//! distribution of status codes. Well within the per-node ≤ 200
+//! budget the C.5 cardinality envelope targets, especially in
+//! aggregate with the other label-bearing families.
+//!
 //! ### `dds_http_caller_identity_total` semantics
 //!
 //! Each completed HTTP request bumps **two** buckets — its transport
@@ -535,6 +584,14 @@ pub struct Telemetry {
     /// `OutboundFailure` → `fail`, H-12 unadmitted-peer response drop
     /// → `fail`).
     sync_pulls: Mutex<BTreeMap<String, u64>>,
+    /// Per-`(route, method, status)` HTTP request counts. Bounded by
+    /// the static route table in [`crate::http::router`] (no path
+    /// parameters in DDS today) crossed with the verb set the router
+    /// exposes and the status codes handlers actually return.
+    /// Unmatched requests (404 from the default fallback) are not
+    /// counted because the bump site sits inside the per-route layer
+    /// stack — those still surface via `dds_http_caller_identity_total`.
+    http_requests: Mutex<BTreeMap<(String, String, u16), u64>>,
 }
 
 impl Telemetry {
@@ -551,6 +608,7 @@ impl Telemetry {
             fido2_attestation_verifies: Mutex::new(BTreeMap::new()),
             fido2_assertions: Mutex::new(BTreeMap::new()),
             sync_pulls: Mutex::new(BTreeMap::new()),
+            http_requests: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -806,6 +864,34 @@ impl Telemetry {
         }
     }
 
+    fn bump_http_request(&self, route: &str, method: &str, status: u16) {
+        let mut g = match self.http_requests.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry((route.to_string(), method.to_string(), status))
+            .or_insert(0) += 1;
+    }
+
+    fn http_requests_snapshot(&self) -> BTreeMap<(String, String, u16), u64> {
+        match self.http_requests.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of
+    /// `dds_http_requests_total{route=...,method=...,status=...}`.
+    /// Public so the HTTP integration tests can take before/after
+    /// snapshots without scraping the renderer.
+    pub fn http_requests_count(&self, route: &str, method: &str, status: u16) -> u64 {
+        let key = (route.to_string(), method.to_string(), status);
+        match self.http_requests.lock() {
+            Ok(g) => g.get(&key).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(&key).copied().unwrap_or(0),
+        }
+    }
+
     fn uptime_seconds(&self) -> u64 {
         SystemTime::now()
             .duration_since(self.start_at)
@@ -941,6 +1027,22 @@ pub fn record_fido2_assertion(result: &str) {
 pub fn record_sync_pull(result: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_sync_pull(result);
+    }
+}
+
+/// Bump `dds_http_requests_total{route=...,method=...,status=...}` by
+/// one. Called from
+/// [`crate::http::http_request_observer_middleware`] after every
+/// matched-route request returns. `route` is the `axum::extract::MatchedPath`
+/// template (no path parameters in DDS today, so it equals the literal
+/// URI path); `method` is the upper-case HTTP verb; `status` is the
+/// 3-digit response code the inner handler emitted. Unmatched requests
+/// (404s served by the default fallback) are not counted because the
+/// route layer does not wrap the fallback. No-op when telemetry has not
+/// been installed (tests, harnesses).
+pub fn record_http_request(route: &str, method: &str, status: u16) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_http_request(route, method, status);
     }
 }
 
@@ -1274,6 +1376,32 @@ fn render_exposition(
         out.push_str(&format!(
             "dds_sync_pulls_total{{result=\"{}\"}} {}\n",
             escape_label_value(result),
+            count
+        ));
+    }
+
+    // `dds_http_requests_total` — per-`(route, method, status)` matched
+    // HTTP request counter. Bumped from
+    // `crate::http::http_request_observer_middleware` after every
+    // matched-route request returns. Unmatched 404 traffic does not
+    // bump the counter (the route layer wraps each handler, not the
+    // default fallback); operators read the un-routed call rate off
+    // `dds_http_caller_identity_total` instead.
+    out.push_str(
+        "# HELP dds_http_requests_total HTTP requests served by a matched axum route since \
+         process start, partitioned by route template, method, and response status. Unmatched \
+         requests (404 from the default fallback) do not bump this counter — they surface only \
+         in dds_http_caller_identity_total. Latency ships separately as \
+         dds_http_request_duration_seconds once the histogram-bearing tier lands.\n",
+    );
+    out.push_str("# TYPE dds_http_requests_total counter\n");
+    let http_requests_snapshot = telemetry.http_requests_snapshot();
+    for ((route, method, status), count) in http_requests_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_http_requests_total{{route=\"{}\",method=\"{}\",status=\"{}\"}} {}\n",
+            escape_label_value(route),
+            escape_label_value(method),
+            status,
             count
         ));
     }
@@ -1757,6 +1885,43 @@ mod tests {
     }
 
     #[test]
+    fn http_requests_counter_renders_in_exposition() {
+        let t = Telemetry::new();
+        t.bump_http_request("/v1/status", "GET", 200);
+        t.bump_http_request("/v1/status", "GET", 200);
+        t.bump_http_request("/v1/audit/entries", "GET", 401);
+        t.bump_http_request("/v1/admin/setup", "POST", 503);
+
+        let body = render_exposition(&t, 0, None, None, None, None);
+        assert!(body.contains("# TYPE dds_http_requests_total counter\n"));
+        assert!(body.contains(
+            "dds_http_requests_total{route=\"/v1/status\",method=\"GET\",status=\"200\"} 2\n"
+        ));
+        assert!(body.contains(
+            "dds_http_requests_total{route=\"/v1/audit/entries\",method=\"GET\",status=\"401\"} 1\n"
+        ));
+        assert!(body.contains(
+            "dds_http_requests_total{route=\"/v1/admin/setup\",method=\"POST\",status=\"503\"} 1\n"
+        ));
+        assert_eq!(t.http_requests_count("/v1/status", "GET", 200), 2);
+        assert_eq!(t.http_requests_count("/v1/audit/entries", "GET", 401), 1);
+        assert_eq!(t.http_requests_count("/v1/admin/setup", "POST", 503), 1);
+        // Unrelated tuple defaults to zero.
+        assert_eq!(t.http_requests_count("/v1/status", "POST", 200), 0);
+    }
+
+    #[test]
+    fn http_requests_renders_empty_family_with_help_and_type() {
+        let t = Telemetry::new();
+        let body = render_exposition(&t, 0, None, None, None, None);
+        // HELP/TYPE always discoverable before the first matched
+        // request so a freshly booted node still surfaces the family
+        // in the catalog (alert expressions resolve immediately).
+        assert!(body.contains("# TYPE dds_http_requests_total counter\n"));
+        assert!(!body.contains("dds_http_requests_total{"));
+    }
+
+    #[test]
     fn caller_identity_counter_renders_in_exposition() {
         let t = Telemetry::new();
         t.bump_caller_identity("anonymous");
@@ -1989,6 +2154,10 @@ mod tests {
         // until the first outbound pull resolves via
         // `handle_sync_event`.
         assert!(body.contains("# TYPE dds_sync_pulls_total counter\n"));
+        // HTTP-requests family is always discoverable; no value lines
+        // until the first matched-route request returns through
+        // `http_request_observer_middleware`.
+        assert!(body.contains("# TYPE dds_http_requests_total counter\n"));
         // Peer-count gauges round-trip through the served exposition.
         assert!(body.contains("# TYPE dds_peers_admitted gauge\n"));
         assert!(body.contains("dds_peers_admitted 2\n"));
