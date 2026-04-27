@@ -36,6 +36,7 @@
 //! | `dds_fido2_attestation_verify_total` | counter | `result=ok\|fail`, `fmt=packed\|none\|unknown` | bumped by [`record_fido2_attestation_verify`] |
 //! | `dds_fido2_assertions_total` | counter | `result=ok\|signature\|rp_id\|up\|sign_count\|other` | bumped by [`record_fido2_assertion`] |
 //! | `dds_sync_pulls_total` | counter | `result=ok\|fail` | bumped by [`record_sync_pull`] |
+//! | `dds_sync_payloads_rejected_total` | counter | `reason=legacy_v1\|publisher_capability\|replay_window` | bumped by [`record_sync_payloads_rejected`] |
 //! | `dds_http_requests_total` | counter | `route, method, status` | bumped by [`record_http_request`] |
 //! | `dds_trust_graph_attestations` | gauge | — | [`crate::service::LocalService::trust_graph_counts`] at scrape |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
@@ -411,13 +412,65 @@
 //! / not sent) are not counted here — a future
 //! `dds_sync_serves_total{result}` family can split those out without
 //! renaming this metric. The catalog row in `observability-plan.md`
-//! Phase C names the `dds_sync_lag_seconds` histogram and
-//! `dds_sync_payloads_rejected_total` counter as siblings; both still
-//! ship as separate follow-ups since each requires a distinct
-//! instrumentation pass (`lag_seconds` needs op-timestamp
-//! plumbing; the rejection counter needs the
-//! `apply_sync_payloads_with_graph` outcome to flow back through to
-//! the swarm task).
+//! Phase C names the `dds_sync_lag_seconds` histogram as a sibling;
+//! it still ships as a separate follow-up since it needs op-timestamp
+//! plumbing.
+//!
+//! ### `dds_sync_payloads_rejected_total` semantics
+//!
+//! Bumped exactly once per inbound sync payload that
+//! [`crate::node::DdsNode::handle_sync_response`] *skips* before
+//! handing the surviving payloads to
+//! [`dds_net::sync::apply_sync_payloads_with_graph`]. The three
+//! pre-apply skip sites map 1:1 to the `reason` label:
+//!
+//! - `legacy_v1` — M-1/M-2 downgrade guard. The payload's token is
+//!   wire-version 1 and `network.allow_legacy_v1_tokens` is `false`.
+//!   Persisted v1 already on disk is fine; fresh ingest from a peer
+//!   is not.
+//! - `publisher_capability` — C-3 filter. The payload carries a
+//!   publisher-kind attestation (`WindowsPolicyDocument` /
+//!   `MacOsPolicyDocument` / `SoftwareAssignment`) whose issuer
+//!   lacks the matching `dds:policy-publisher-*` / `dds:software-publisher`
+//!   capability vouch. Same gate the gossip ingest path runs via
+//!   [`crate::node::publisher_capability_ok`].
+//! - `replay_window` — M-9 guard. The payload is a `Revoke` or
+//!   `Burn` token whose `iat` falls outside the configured replay
+//!   window (the same check the gossip path runs via
+//!   [`crate::node::revocation_within_replay_window`]).
+//!
+//! Rejections that fire *after* the surviving payloads reach
+//! `apply_sync_payloads_with_graph` (signature verify failures,
+//! trust-graph add rejections, duplicate-JTI store rejections) are
+//! *not* partitioned through this counter today. The post-apply
+//! errors funnel into the single
+//! [`dds_net::sync::SyncResult::errors`] `Vec<String>` which would
+//! need a categorical schema (e.g. `SyncRejectReason` enum) to split
+//! the catalog's `signature|graph|duplicate_jti` buckets out cleanly.
+//! Until that lands, post-apply rejections of attestation/vouch
+//! tokens still surface through the existing
+//! `dds_audit_entries_total{action=*.rejected}` counter that the
+//! gossip ingest path emits — sync-applied rejections do *not* hit
+//! that counter today (no audit emission from the sync apply
+//! path), so a future follow-up that lands the categorical
+//! `SyncResult` will close the post-apply gap.
+//!
+//! Per-peer cooldown skips inside
+//! [`crate::node::DdsNode::try_sync_with`] are *not* counted — no
+//! request goes on the wire and no payload is observed.
+//! `OutboundFailure` and the H-12 unadmitted-peer response drop are
+//! counted under `dds_sync_pulls_total{result="fail"}`, not here.
+//!
+//! The catalog in `observability-plan.md` Phase C names the labels
+//! `reason=signature|graph|duplicate_jti|window`. The v1 partition
+//! ships only the pre-apply surface (similar to the
+//! `dds_gossip_messages_dropped_total` precedent which partitions
+//! only pre-decode drops); `replay_window` ↔ catalog `window`, and
+//! `legacy_v1` / `publisher_capability` are added because the
+//! production node has those guards before the apply funnel runs.
+//! A future follow-up that lands the categorical `SyncResult` can
+//! add the `signature|graph|duplicate_jti` buckets without renaming
+//! the metric.
 //!
 //! ### `dds_http_requests_total` semantics
 //!
@@ -584,6 +637,14 @@ pub struct Telemetry {
     /// `OutboundFailure` → `fail`, H-12 unadmitted-peer response drop
     /// → `fail`).
     sync_pulls: Mutex<BTreeMap<String, u64>>,
+    /// Per-`reason` pre-apply sync-payload rejection counts. `reason`
+    /// is one of `legacy_v1|publisher_capability|replay_window` —
+    /// bounded by the three pre-apply skip sites inside
+    /// [`crate::node::DdsNode::handle_sync_response`]. Post-apply
+    /// rejections from [`dds_net::sync::apply_sync_payloads_with_graph`]
+    /// funnel into a single `Vec<String>` today and would need a
+    /// `SyncResult` schema change to partition cleanly (deferred).
+    sync_payloads_rejected: Mutex<BTreeMap<String, u64>>,
     /// Per-`(route, method, status)` HTTP request counts. Bounded by
     /// the static route table in [`crate::http::router`] (no path
     /// parameters in DDS today) crossed with the verb set the router
@@ -608,6 +669,7 @@ impl Telemetry {
             fido2_attestation_verifies: Mutex::new(BTreeMap::new()),
             fido2_assertions: Mutex::new(BTreeMap::new()),
             sync_pulls: Mutex::new(BTreeMap::new()),
+            sync_payloads_rejected: Mutex::new(BTreeMap::new()),
             http_requests: Mutex::new(BTreeMap::new()),
         }
     }
@@ -864,6 +926,31 @@ impl Telemetry {
         }
     }
 
+    fn bump_sync_payloads_rejected(&self, reason: &str) {
+        let mut g = match self.sync_payloads_rejected.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry(reason.to_string()).or_insert(0) += 1;
+    }
+
+    fn sync_payloads_rejected_snapshot(&self) -> BTreeMap<String, u64> {
+        match self.sync_payloads_rejected.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of `dds_sync_payloads_rejected_total{reason=...}`.
+    /// Public so the `DdsNode` regression tests can take before/after
+    /// snapshots without scraping the renderer.
+    pub fn sync_payloads_rejected_count(&self, reason: &str) -> u64 {
+        match self.sync_payloads_rejected.lock() {
+            Ok(g) => g.get(reason).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(reason).copied().unwrap_or(0),
+        }
+    }
+
     fn bump_http_request(&self, route: &str, method: &str, status: u16) {
         let mut g = match self.http_requests.lock() {
             Ok(g) => g,
@@ -1027,6 +1114,23 @@ pub fn record_fido2_assertion(result: &str) {
 pub fn record_sync_pull(result: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_sync_pull(result);
+    }
+}
+
+/// Bump `dds_sync_payloads_rejected_total{reason=...}` by one. Called
+/// from the three pre-apply skip sites in
+/// [`crate::node::DdsNode::handle_sync_response`]: the M-1/M-2 legacy
+/// v1 token guard, the C-3 publisher-capability filter, and the M-9
+/// revocation replay-window guard. `reason` is one of
+/// `legacy_v1|publisher_capability|replay_window`. Post-apply errors
+/// returned by [`dds_net::sync::apply_sync_payloads_with_graph`] are
+/// not partitioned through this counter today — the SyncResult
+/// `errors: Vec<String>` field would need a categorical schema before
+/// the catalog's `signature|graph|duplicate_jti` buckets can ship.
+/// No-op when telemetry has not been installed (tests, harnesses).
+pub fn record_sync_payloads_rejected(reason: &str) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_sync_payloads_rejected(reason);
     }
 }
 
@@ -1376,6 +1480,33 @@ fn render_exposition(
         out.push_str(&format!(
             "dds_sync_pulls_total{{result=\"{}\"}} {}\n",
             escape_label_value(result),
+            count
+        ));
+    }
+
+    // `dds_sync_payloads_rejected_total` — per-`reason` pre-apply
+    // sync-payload rejection counter. Bumped from the three skip sites
+    // inside `DdsNode::handle_sync_response`: the M-1/M-2 legacy v1
+    // token guard, the C-3 publisher-capability filter, and the M-9
+    // revocation replay-window guard. Post-apply rejections from
+    // `apply_sync_payloads_with_graph` are not partitioned here today.
+    out.push_str(
+        "# HELP dds_sync_payloads_rejected_total Inbound sync payloads rejected before they reach \
+         apply_sync_payloads_with_graph, partitioned by reason (legacy_v1 = M-1/M-2 downgrade \
+         guard tripped on a wire-version-1 token while allow_legacy_v1_tokens=false; \
+         publisher_capability = C-3 filter — issuer lacks the matching \
+         dds:policy-publisher-* / dds:software-publisher capability; replay_window = M-9 guard \
+         — revoke/burn token's `iat` is outside the configured replay window). Post-apply \
+         rejections (signature, graph add, duplicate JTI, store error) funnel into \
+         SyncResult.errors and would need a categorical SyncResult schema to partition \
+         cleanly; deferred.\n",
+    );
+    out.push_str("# TYPE dds_sync_payloads_rejected_total counter\n");
+    let sync_rejected_snapshot = telemetry.sync_payloads_rejected_snapshot();
+    for (reason, count) in sync_rejected_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_sync_payloads_rejected_total{{reason=\"{}\"}} {}\n",
+            escape_label_value(reason),
             count
         ));
     }
@@ -1885,6 +2016,43 @@ mod tests {
     }
 
     #[test]
+    fn sync_payloads_rejected_counter_renders_in_exposition() {
+        let t = Telemetry::new();
+        t.bump_sync_payloads_rejected("legacy_v1");
+        t.bump_sync_payloads_rejected("legacy_v1");
+        t.bump_sync_payloads_rejected("publisher_capability");
+        t.bump_sync_payloads_rejected("replay_window");
+
+        let body = render_exposition(&t, 0, None, None, None, None);
+        assert!(body.contains("# TYPE dds_sync_payloads_rejected_total counter\n"));
+        assert!(body.contains("dds_sync_payloads_rejected_total{reason=\"legacy_v1\"} 2\n"));
+        assert!(
+            body.contains("dds_sync_payloads_rejected_total{reason=\"publisher_capability\"} 1\n")
+        );
+        assert!(body.contains("dds_sync_payloads_rejected_total{reason=\"replay_window\"} 1\n"));
+        assert_eq!(t.sync_payloads_rejected_count("legacy_v1"), 2);
+        assert_eq!(t.sync_payloads_rejected_count("publisher_capability"), 1);
+        assert_eq!(t.sync_payloads_rejected_count("replay_window"), 1);
+        // Catalog labels reserved for the deferred post-apply
+        // partition — must not be silently bumped today.
+        assert_eq!(t.sync_payloads_rejected_count("signature"), 0);
+        assert_eq!(t.sync_payloads_rejected_count("graph"), 0);
+        assert_eq!(t.sync_payloads_rejected_count("duplicate_jti"), 0);
+    }
+
+    #[test]
+    fn sync_payloads_rejected_renders_empty_family_with_help_and_type() {
+        let t = Telemetry::new();
+        let body = render_exposition(&t, 0, None, None, None, None);
+        // HELP/TYPE always discoverable before the first pre-apply
+        // sync rejection fires so a freshly booted node still surfaces
+        // the family in the catalog (alert expressions resolve
+        // immediately).
+        assert!(body.contains("# TYPE dds_sync_payloads_rejected_total counter\n"));
+        assert!(!body.contains("dds_sync_payloads_rejected_total{"));
+    }
+
+    #[test]
     fn http_requests_counter_renders_in_exposition() {
         let t = Telemetry::new();
         t.bump_http_request("/v1/status", "GET", 200);
@@ -2154,6 +2322,10 @@ mod tests {
         // until the first outbound pull resolves via
         // `handle_sync_event`.
         assert!(body.contains("# TYPE dds_sync_pulls_total counter\n"));
+        // Sync-payloads-rejected family is always discoverable; no
+        // value lines until the first pre-apply sync rejection fires
+        // inside `handle_sync_response`.
+        assert!(body.contains("# TYPE dds_sync_payloads_rejected_total counter\n"));
         // HTTP-requests family is always discoverable; no value lines
         // until the first matched-route request returns through
         // `http_request_observer_middleware`.

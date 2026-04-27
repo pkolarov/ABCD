@@ -5265,7 +5265,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let after = handle.http_requests_count("/healthz", "GET", 200);
         assert!(
-            after >= before + 1,
+            after > before,
             "middleware did not bump dds_http_requests_total{{/healthz, GET, 200}} \
              (before={before} after={after})"
         );

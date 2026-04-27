@@ -1472,6 +1472,7 @@ impl DdsNode {
                         issuer = %token.payload.iss,
                         "sync: dropping legacy v1 token (allow_legacy_v1_tokens=false)"
                     );
+                    crate::telemetry::record_sync_payloads_rejected("legacy_v1");
                     return false;
                 }
                 if !publisher_capability_ok(&token, &self.trust_graph, &self.trusted_roots) {
@@ -1482,6 +1483,7 @@ impl DdsNode {
                         body_type = ?token.payload.body_type,
                         "sync: dropping payload whose issuer lacks publisher capability"
                     );
+                    crate::telemetry::record_sync_payloads_rejected("publisher_capability");
                     return false;
                 }
                 // **M-9 (security review)**: the live gossip ingest path
@@ -1500,6 +1502,7 @@ impl DdsNode {
                         kind = ?token.payload.kind,
                         "sync: dropping revoke/burn payload: iat outside replay window"
                     );
+                    crate::telemetry::record_sync_payloads_rejected("replay_window");
                     return false;
                 }
                 true
