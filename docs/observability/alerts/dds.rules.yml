@@ -306,55 +306,189 @@ groups:
           runbook_url: "https://github.com/ABCD/dds/blob/main/docs/observability-plan.md#phase-c--prometheus-exposition-metrics"
 
   # ---------------------------------------------------------------
+  # Network tier — `dds_admission_handshakes_total{result}` ships in
+  # dds-node follow-up #29 and `dds_sync_payloads_rejected_total{reason}`
+  # ships in follow-ups #37/#41 (observability-plan.md Phase C network
+  # subsets). Active.
+  # ---------------------------------------------------------------
+  - name: dds-network
+    interval: 30s
+    rules:
+
+      - alert: DdsAdmissionFailureSpike
+        # H-12 inbound admission-handshake failures. `result="fail"`
+        # collects the four hard-error branches in
+        # `DdsNode::verify_peer_admission`: missing cert, cert CBOR
+        # decode failure, system-clock read failure, and
+        # `AdmissionCert::verify` rejecting the cert (signature /
+        # domain id / peer id / expiry mismatch). All four are
+        # regression signals — peer cert pipeline broken, clock skew,
+        # or an active probe — so any non-zero rate is alertable.
+        # The `result="revoked"` bucket is *excluded* on purpose:
+        # revoked peers legitimately try to rejoin, and a non-zero
+        # rate there is normal background noise rather than a
+        # regression. Operators wanting to monitor probing pressure
+        # should graph `dds_admission_handshakes_total{result="revoked"}`
+        # directly.
+        #
+        # The original spec threshold (0.1/s) is dropped in favour of
+        # the same `> 0` "any failure is bad" pattern used by
+        # `DdsStoreWriteFailures` and `DdsLoopbackTcpAdminUsed`.
+        # Operators with a fleet that has a non-trivial steady-state
+        # cert-rotation gap can tighten the rate threshold without
+        # renaming the rule.
+        expr: |
+          rate(dds_admission_handshakes_total{result="fail"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          plan: observability-plan.md#phase-e
+          finding: H-12
+        annotations:
+          summary: "DDS admission failures on {{ $labels.instance }}"
+          description: |
+            `dds_admission_handshakes_total{result="fail"}` on
+            {{ $labels.instance }} has been advancing for 5 minutes —
+            inbound H-12 handshakes are failing on a hard-error branch
+            (no cert, decode failure, clock read failure, or cert
+            verify rejected on signature / domain id / peer id /
+            expiry).
+
+            Inspect:
+
+              - `dds-cli --node {{ $labels.instance }} stats` for the
+                connected-vs-admitted peer split;
+              - peer system clock vs. dds-node clock (replay-window
+                bound on the cert verify);
+              - the issuing CA chain — a regressed cert-issuance
+                pipeline shows up here before it shows up in any
+                dataplane metric.
+          runbook_url: "https://github.com/ABCD/dds/blob/main/docs/observability-plan.md#phase-c--prometheus-exposition-metrics"
+
+      - alert: DdsSyncRejectsSpike
+        # Per-reason sync-payload rejections — see the catalog entry
+        # for `dds_sync_payloads_rejected_total{reason}` for the full
+        # bucket semantics. `legacy_v1` = peer leaking pre-V2 tokens
+        # while `network.allow_legacy_v1_tokens=false`;
+        # `publisher_capability` = peer signing without the matching
+        # `dds:policy-publisher-*` / `dds:software-publisher` vouch;
+        # `replay_window` = clock skew or replay; the post-apply
+        # `signature` / `duplicate_jti` / `graph` partition surfaces
+        # tampered tokens, B-1 same-JTI replay, and trust-graph
+        # rejection. None of these should fire at steady state on a
+        # healthy fleet — any non-zero rate is alertable, matching
+        # the same `> 0` posture used for `DdsStoreWriteFailures`.
+        # The original spec threshold (0.5/s) is dropped in favour of
+        # the catalog's "any rejection is suspicious" semantic;
+        # operators with a noisy peer that needs cert renewal can
+        # silence per-instance until the peer is fixed.
+        expr: |
+          rate(dds_sync_payloads_rejected_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          plan: observability-plan.md#phase-e
+        annotations:
+          summary: "DDS sync rejections on {{ $labels.instance }}"
+          description: |
+            `dds_sync_payloads_rejected_total` on
+            {{ $labels.instance }} has been advancing for 5 minutes.
+            Per-reason buckets:
+
+              - `legacy_v1`: peer build regression (pre-V2 tokens);
+              - `publisher_capability`: peer signing without a
+                publisher vouch;
+              - `replay_window`: clock skew or replay attempt;
+              - `signature`: token tamper (ed25519 verify failed);
+              - `duplicate_jti`: B-1 same-JTI replay indicator;
+              - `graph`: every other `TrustError` from
+                `TrustGraph::add_token`.
+
+            Cross-check with the audit chain on the same instance:
+
+              dds-cli --node {{ $labels.instance }} audit tail \
+                --action attest.rejected --action vouch.rejected \
+                --action revoke.rejected --action burn.rejected
+          runbook_url: "https://github.com/ABCD/dds/blob/main/docs/observability-plan.md#phase-c--prometheus-exposition-metrics"
+
+  # ---------------------------------------------------------------
+  # FIDO2 tier — `dds_fido2_assertions_total{result}` ships in
+  # dds-node follow-up #34 (observability-plan.md Phase C FIDO2
+  # subset). Active.
+  # ---------------------------------------------------------------
+  - name: dds-fido2
+    interval: 30s
+    rules:
+
+      - alert: DdsFido2AssertionFailureSpike
+        # FIDO2 assertion non-`ok` outcomes. Per the catalog,
+        # `signature` = tampered assertion (ed25519 verify failed);
+        # `rp_id` = cross-site assertion replay (RP-ID hash
+        # mismatch); `up` = missing User-Present flag (synthetic
+        # assertion attempt); `sign_count` = sign-counter rollback
+        # (cloned authenticator); `other` = challenge / origin /
+        # clientDataJSON / parsing rejection. None of these should
+        # fire at steady state on a properly enrolled fleet — any
+        # non-zero rate is alertable, matching the same `> 0`
+        # posture used for `DdsStoreWriteFailures`. The original
+        # spec threshold (0.05/s) is dropped in favour of the
+        # catalog's "any FIDO2 failure is suspicious" semantic.
+        #
+        # Operators may tighten by partitioning the rule per
+        # `result=` label (e.g. a critical-only rule on
+        # `result="signature"` or `result="sign_count"` since those
+        # are unambiguous tamper / cloning indicators) without
+        # renaming the rule.
+        expr: |
+          rate(dds_fido2_assertions_total{result!="ok"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          plan: observability-plan.md#phase-e
+        annotations:
+          summary: "DDS FIDO2 assertion failures on {{ $labels.instance }}"
+          description: |
+            `dds_fido2_assertions_total{result!="ok"}` on
+            {{ $labels.instance }} has been advancing for 5 minutes.
+            Per-result buckets:
+
+              - `signature`: tampered or wrong-key assertion
+                (ed25519 verify failed);
+              - `rp_id`: cross-site assertion replay (the
+                `rp_id_hash` in the assertion did not match
+                SHA-256(enrolled_rp_id));
+              - `up`: missing User-Present flag (synthetic
+                assertion attempt);
+              - `sign_count`: sign-counter rollback (cloned
+                authenticator candidate);
+              - `other`: challenge / origin / clientDataJSON /
+                parsing / clock-regression rejection.
+
+            Cross-check with `dds_audit_entries_total{action=
+            "attest.rejected"}` on the same instance and with
+            `dds-cli --node {{ $labels.instance }} audit tail` for
+            the corresponding rejected entries.
+          runbook_url: "https://github.com/ABCD/dds/blob/main/docs/observability-plan.md#phase-c--prometheus-exposition-metrics"
+
+  # ---------------------------------------------------------------
   # Reference rules — keyed off Phase C catalog metrics that have
   # not shipped yet. Each block is gated on a metric name that does
   # not exist today; uncomment the block once the corresponding
   # follow-up lands. **Do not load these as-is.**
-  #
-  # NOTE — `dds_admission_handshakes_total{result}` itself shipped
-  # in 2026-04-27 follow-up #29. The threshold below (0.1/s) is a
-  # spec placeholder; operators picking up this rule must replace it
-  # with an operator-derived baseline before loading. Until a
-  # baseline lands the recommendation is to graph the counter
-  # directly rather than alert on a guessed threshold.
   # ---------------------------------------------------------------
   #
-  # - name: dds-network
+  # - name: dds-network-deferred
   #   interval: 30s
   #   rules:
-  #
-  #     - alert: DdsAdmissionFailureSpike
-  #       expr: |
-  #         rate(dds_admission_handshakes_total{result="fail"}[5m]) > 0.1
-  #       for: 5m
-  #       labels: { severity: warning, plan: observability-plan.md#phase-c }
-  #       annotations:
-  #         summary: "DDS admission failures > 0.1/s on {{ $labels.instance }}"
-  #         description: "Sustained admission rejection — peer with bad cert, clock skew, or active probe."
   #
   #     - alert: DdsSyncLagHigh
   #       expr: |
   #         histogram_quantile(0.99, sum by(le) (rate(dds_sync_lag_seconds_bucket[5m]))) > 60
   #       for: 10m
   #       labels: { severity: warning, plan: observability-plan.md#phase-c }
-  #
-  #     - alert: DdsSyncRejectsSpike
-  #       expr: |
-  #         rate(dds_sync_payloads_rejected_total[5m]) > 0.5
-  #       for: 5m
-  #       labels: { severity: warning, plan: observability-plan.md#phase-c }
-  #
-  # - name: dds-fido2
-  #   interval: 30s
-  #   rules:
-  #
-  #     - alert: DdsFido2AssertionFailureSpike
-  #       expr: |
-  #         rate(dds_fido2_assertions_total{result!="ok"}[5m]) > 0.05
-  #       for: 5m
-  #       labels: { severity: warning, plan: observability-plan.md#phase-c }
   #       annotations:
-  #         description: "Brute-force / replay candidate. Inspect dds_audit_entries_total{action=\"attest.rejected\"} on the same instance."
+  #         summary: "DDS sync lag p99 > 60s on {{ $labels.instance }}"
+  #         description: "p99 lag from peer op-timestamp to local apply > 60s — gossip / sync degraded."
   #
   # (DdsLoopbackTcpAdminUsed has shipped — see active group `dds-http`
   # above; the rule moved out of this reference section in
@@ -362,4 +496,13 @@ groups:
   # DdsStoreWriteFailures has shipped — see active group `dds-storage`
   # above; the rule moved out of this reference section in
   # follow-up #39 along with the underlying metric
-  # `dds_store_writes_total{result}`.)
+  # `dds_store_writes_total{result}`.
+  # DdsAdmissionFailureSpike + DdsSyncRejectsSpike have shipped — see
+  # active group `dds-network` above; both moved out of this reference
+  # section in follow-up #43 along with their underlying metrics
+  # `dds_admission_handshakes_total{result}` (#29) and
+  # `dds_sync_payloads_rejected_total{reason}` (#37/#41).
+  # DdsFido2AssertionFailureSpike has shipped — see active group
+  # `dds-fido2` above; the rule moved out of this reference section
+  # in follow-up #43 along with the underlying metric
+  # `dds_fido2_assertions_total{result}` (#34).)

@@ -1,6 +1,17 @@
 # DDS Observability Plan — Audit, Metrics, Alerts, SIEM Export
 
-**Status:** Phase C **thread-count gauge** (`dds_thread_count`) landed
+**Status:** Phase E **network + FIDO2 reference rules promoted to
+active** (`DdsAdmissionFailureSpike`, `DdsSyncRejectsSpike`,
+`DdsFido2AssertionFailureSpike`) landed 2026-04-27 follow-up #43 —
+all three move out of the commented reference section in
+[`observability/alerts/dds.rules.yml`](observability/alerts/dds.rules.yml)
+into active groups (`dds-network` and `dds-fido2`) keyed off the
+`> 0` "any failure is suspicious" pattern already used by
+`DdsStoreWriteFailures` (#39) and `DdsLoopbackTcpAdminUsed` (#24).
+The original spec thresholds (0.1/s, 0.5/s, 0.05/s) were spec
+placeholders and are dropped; the catalog metrics shipped under
+follow-ups #29, #37/#41, and #34 respectively. Phase C
+**thread-count gauge** (`dds_thread_count`) landed
 2026-04-27 follow-up #42 — the natural sibling of the memory-resident
 bytes gauge from #40, sourced via a small platform-specific shim
 (`/proc/self/status` parse on Linux, `proc_pidinfo` `PROC_PIDTASKINFO`
@@ -693,12 +704,35 @@ Active storage-tier rule (group `dds-storage`, landed follow-up #39):
   and a soft-conflict warning if their fleet shows a non-trivial
   background conflict rate; v1 keeps a single rule.
 
+Active network-tier rules (group `dds-network`, landed follow-up #43):
+- `DdsAdmissionFailureSpike` — fires on
+  `rate(dds_admission_handshakes_total{result="fail"}[5m]) > 0` for
+  5 m. Covers the four hard-error branches of
+  [`DdsNode::verify_peer_admission`](../dds-node/src/node.rs)
+  (missing cert / decode error / clock read error / cert verify
+  rejected on signature, domain id, peer id, or expiry); the
+  `result="revoked"` bucket is excluded because revoked peers
+  legitimately try to rejoin and a non-zero rate there is normal
+  background noise.
+- `DdsSyncRejectsSpike` — fires on
+  `rate(dds_sync_payloads_rejected_total[5m]) > 0` for 5 m. Any
+  non-zero rate across the six reason buckets (`legacy_v1`,
+  `publisher_capability`, `replay_window`, `signature`,
+  `duplicate_jti`, `graph`) is suspicious; per-reason troubleshooting
+  is in the rule annotations.
+
+Active FIDO2-tier rule (group `dds-fido2`, landed follow-up #43):
+- `DdsFido2AssertionFailureSpike` — fires on
+  `rate(dds_fido2_assertions_total{result!="ok"}[5m]) > 0` for 5 m.
+  Covers the five non-`ok` buckets (`signature`, `rp_id`, `up`,
+  `sign_count`, `other`); operators wanting a per-bucket severity
+  split can partition the rule by `result=` label without renaming
+  it.
+
 Reference (commented) rules — uncomment when Phase C lands the
 metric:
-- `DdsAdmissionFailureSpike` (needs `dds_admission_handshakes_total`).
-- `DdsSyncLagHigh` (needs `dds_sync_lag_seconds_bucket`).
-- `DdsSyncRejectsSpike` (needs `dds_sync_payloads_rejected_total`).
-- `DdsFido2AssertionFailureSpike` (needs `dds_fido2_assertions_total`).
+- `DdsSyncLagHigh` (needs `dds_sync_lag_seconds_bucket`, deferred
+  with the `metrics-exporter-prometheus` rollover).
 
 `DdsRevocationsSurge` is implicitly covered by the Trust-Graph
 dashboard's Revocations panel and the rejection-ratio alert; a
