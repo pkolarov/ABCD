@@ -28,7 +28,45 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-27 follow-up #43 (observability Phase E
+> Last updated: 2026-04-27 follow-up #44 (observability Phase C
+> `dds_build_info` `git_sha` + `rust_version` labels landed — the
+> catalog row's deferred build-time env-var pipeline is now wired up
+> via a new [`dds-node/build.rs`](dds-node/build.rs) that captures
+> `git rev-parse --short HEAD` into `DDS_GIT_SHA` and
+> `rustc --version` into `DDS_RUST_VERSION`, with literal `unknown`
+> fallbacks if either invocation fails (tarball build outside a git
+> tree, sandboxed CI without rustc on `PATH`). `cargo:rerun-if-changed`
+> directives on `.git/HEAD` and `.git/packed-refs` make sure a branch
+> switch or refs repack busts the build cache so the
+> `dds_build_info{git_sha=...}` label cannot lie. The
+> [`render_exposition`](dds-node/src/telemetry.rs) call site for
+> `dds_build_info` adds the new labels in the documented order
+> (`version,git_sha,rust_version`) using `env!("DDS_GIT_SHA")` and
+> `env!("DDS_RUST_VERSION")` to read the build-script outputs at
+> compile time. The `DdsBuildSkew` Alertmanager rule continues to
+> aggregate by `version` only — multiple `git_sha` values on the same
+> `version` are normal during a rebuild rollout and would generate
+> noise — and a new annotation in the rule documents the per-SHA /
+> per-rustc copy-and-tune option for operators that want stricter
+> skew detection. The Phase C catalog row in
+> [`docs/observability-plan.md`](docs/observability-plan.md) is
+> updated with the new labels and a build.rs source pointer; the
+> module-level table in [`dds-node/src/telemetry.rs`](dds-node/src/telemetry.rs)
+> is updated to match. Workspace test count rises from 652 to 653
+> (+1 new test in `telemetry::tests`:
+> `build_info_labels_are_in_documented_order_and_non_empty` pinning
+> the on-wire label order — `version` before `git_sha` before
+> `rust_version` — and the non-empty fallback contract so a
+> regression that swaps the literal `unknown` for `String::new()`
+> surfaces as a test failure rather than silent label loss). The
+> existing `render_includes_build_info_and_uptime_for_empty_telemetry`
+> and `serve_returns_prometheus_text_with_audit_metrics` tests are
+> tightened to assert the two new labels round-trip through the
+> exposition. `cargo fmt` clean; `cargo clippy --workspace
+> --all-targets -D warnings` clean; `cargo test --workspace
+> --all-targets` passes (653 tests).
+>
+> Previous: 2026-04-27 follow-up #43 (observability Phase E
 > network + FIDO2 reference rules promoted to active —
 > `DdsAdmissionFailureSpike`, `DdsSyncRejectsSpike`, and
 > `DdsFido2AssertionFailureSpike` move out of the commented reference

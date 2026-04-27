@@ -202,6 +202,14 @@ groups:
         # Prometheus indicates a partial fleet upgrade. Not always an
         # incident (rolling deploy) but worth a low-severity ping if
         # the skew persists past the typical deploy window.
+        #
+        # The metric also carries `git_sha` and `rust_version` labels
+        # (added in dds-node follow-up #44). The alert intentionally
+        # aggregates by `version` only — multiple git SHAs or rustc
+        # versions on the same `version` are normal during a rebuild
+        # rollout and would generate noise. Operators wanting a
+        # per-SHA skew alert can copy this rule, swap `count by(version)`
+        # for `count by(git_sha)`, and tune the `for:` window separately.
         expr: count(count by(version) (dds_build_info)) > 1
         for: 1h
         labels:

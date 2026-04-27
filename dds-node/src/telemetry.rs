@@ -22,7 +22,7 @@
 //!
 //! | Metric | Type | Labels | Source |
 //! |---|---|---|---|
-//! | `dds_build_info` | gauge | `version` | static, always 1 |
+//! | `dds_build_info` | gauge | `version`, `git_sha`, `rust_version` | static, always 1 — labels captured at build time by [`dds-node/build.rs`](../../build.rs) |
 //! | `dds_uptime_seconds` | gauge | — | `now - process_start` |
 //! | `dds_audit_entries_total` | counter | `action` | bumped by [`record_audit_entry`] |
 //! | `dds_audit_chain_length` | gauge | — | [`AuditStore::count_audit_entries`] at scrape |
@@ -1234,12 +1234,25 @@ fn render_exposition(
 ) -> String {
     let mut out = String::with_capacity(1024);
 
-    // `dds_build_info` — static fingerprint, always 1.
-    out.push_str("# HELP dds_build_info DDS node build fingerprint (always 1).\n");
+    // `dds_build_info` — static fingerprint, always 1. The label
+    // triple (`version`, `git_sha`, `rust_version`) is captured at
+    // build time by `dds-node/build.rs`; the env-var pipeline emits
+    // `unknown` for either of the two non-cargo values when the build
+    // happens outside a git checkout or without a usable rustc on
+    // PATH, so the family is always discoverable. The `DdsBuildSkew`
+    // alert is keyed off `count by(version)` so adding the extra
+    // labels does not change the alert semantics — operators that
+    // want to alarm on git-SHA skew can mirror the same query against
+    // `git_sha`.
+    out.push_str(
+        "# HELP dds_build_info DDS node build fingerprint (always 1; labels: version, git_sha, rust_version).\n",
+    );
     out.push_str("# TYPE dds_build_info gauge\n");
     out.push_str(&format!(
-        "dds_build_info{{version=\"{}\"}} 1\n",
-        env!("CARGO_PKG_VERSION")
+        "dds_build_info{{version=\"{}\",git_sha=\"{}\",rust_version=\"{}\"}} 1\n",
+        env!("CARGO_PKG_VERSION"),
+        env!("DDS_GIT_SHA"),
+        env!("DDS_RUST_VERSION"),
     ));
 
     // `dds_uptime_seconds`.
@@ -2046,11 +2059,66 @@ mod tests {
             StoreWriteCounts::default(),
         );
         assert!(body.contains("dds_build_info{version=\""));
+        // `git_sha` and `rust_version` labels (captured by build.rs)
+        // round-trip through the exposition. Their values are
+        // build-environment dependent (literal `unknown` outside a git
+        // tree or sandboxed rustc), but the labels themselves are
+        // always present.
+        assert!(body.contains(",git_sha=\""));
+        assert!(body.contains(",rust_version=\""));
         assert!(body.contains("} 1\n"));
         assert!(body.contains("# TYPE dds_uptime_seconds gauge\n"));
         assert!(body.contains("# TYPE dds_audit_entries_total counter\n"));
         assert!(body.contains("dds_audit_chain_length 0\n"));
         assert!(body.contains("dds_audit_chain_head_age_seconds 0\n"));
+    }
+
+    #[test]
+    fn build_info_labels_are_in_documented_order_and_non_empty() {
+        // Pin the on-wire label order — Phase E dashboards / alerts
+        // already key off `dds_build_info{version=...}`, and an
+        // accidental reorder would surface as a visual regression in
+        // the Build-Skew panel even though Prometheus accepts label
+        // order anywhere. Also pin that neither `git_sha` nor
+        // `rust_version` empties out at runtime; build.rs falls back
+        // to the literal `unknown` rather than an empty string when
+        // the underlying `git` / `rustc` invocation fails, so an
+        // empty value here would mean someone replaced the fallback
+        // with `String::new()`.
+        let body = render_exposition(
+            &Telemetry::new(),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
+        let line = body
+            .lines()
+            .find(|l| l.starts_with("dds_build_info{"))
+            .expect("dds_build_info value line missing");
+        assert!(
+            line.contains("version=\""),
+            "version label missing from {line}"
+        );
+        let version_idx = line.find(",git_sha=\"").expect("git_sha after version");
+        let git_sha_idx = line
+            .find(",rust_version=\"")
+            .expect("rust_version after git_sha");
+        assert!(
+            version_idx < git_sha_idx,
+            "labels out of documented order in {line}"
+        );
+        // Neither value should be empty — fallback is the literal
+        // string `unknown`, never `""`.
+        assert!(!line.contains("git_sha=\"\""), "git_sha is empty in {line}");
+        assert!(
+            !line.contains("rust_version=\"\""),
+            "rust_version is empty in {line}"
+        );
+        assert!(line.ends_with("} 1"), "value line not `1` in {line}");
     }
 
     #[test]
@@ -2936,6 +3004,10 @@ mod tests {
 
         assert!(body.contains("# TYPE dds_build_info gauge\n"));
         assert!(body.contains("dds_build_info{version=\""));
+        // `git_sha` and `rust_version` labels travel through the
+        // served exposition the same way the `version` label does.
+        assert!(body.contains(",git_sha=\""));
+        assert!(body.contains(",rust_version=\""));
         assert!(body.contains("# TYPE dds_audit_entries_total counter\n"));
         assert!(body.contains("dds_audit_entries_total{action=\"attest\"} 2\n"));
         assert!(body.contains("dds_audit_entries_total{action=\"revoke\"} 1\n"));

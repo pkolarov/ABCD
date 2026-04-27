@@ -1,6 +1,18 @@
 # DDS Observability Plan — Audit, Metrics, Alerts, SIEM Export
 
-**Status:** Phase E **network + FIDO2 reference rules promoted to
+**Status:** Phase C **`dds_build_info` git_sha + rust_version
+labels** landed 2026-04-27 follow-up #44 — the catalog row's
+deferred build-time env-var pipeline shipped via a new
+[`dds-node/build.rs`](../dds-node/build.rs) that captures
+`git rev-parse --short HEAD` into `DDS_GIT_SHA` and
+`rustc --version` into `DDS_RUST_VERSION`, with literal `unknown`
+fallbacks for tarball / sandboxed builds; the `dds_build_info`
+gauge now ships with the documented label triple
+(`version`, `git_sha`, `rust_version`). The `DdsBuildSkew`
+Alertmanager rule continues to aggregate by `version` only so its
+firing semantics are unchanged; an annotation in the rule now
+documents the per-SHA / per-rustc copy-and-tune option.
+Phase E **network + FIDO2 reference rules promoted to
 active** (`DdsAdmissionFailureSpike`, `DdsSyncRejectsSpike`,
 `DdsFido2AssertionFailureSpike`) landed 2026-04-27 follow-up #43 —
 all three move out of the commented reference section in
@@ -559,7 +571,7 @@ rows remain open.
 
 | Metric | Type | Labels | Purpose | Status |
 |---|---|---|---|---|
-| `dds_build_info` | gauge | `version` | Static fingerprint, always 1 (`git_sha`, `rust_version` deferred until a build-time env var pipeline lands) | ✅ |
+| `dds_build_info` | gauge | `version`, `git_sha`, `rust_version` | Static fingerprint, always 1 — labels captured at build time by [`dds-node/build.rs`](../dds-node/build.rs): `version` from `CARGO_PKG_VERSION`, `git_sha` from `git rev-parse --short HEAD` (literal `unknown` outside a git tree), `rust_version` from `rustc --version` (literal `unknown` if rustc fails). The `DdsBuildSkew` alert continues to key off `count by(version)` so adding the extra labels does not change alert semantics; operators wanting per-SHA or per-rustc skew detection mirror the same query against `git_sha` / `rust_version`. | ✅ |
 | `dds_uptime_seconds` | gauge | — | Process uptime | ✅ |
 | **Network** | | | | |
 | `dds_peers_admitted` | gauge | — | Currently admitted peer count — refreshed from [`DdsNode::admitted_peers`](../dds-node/src/node.rs) by `refresh_peer_count_gauges` after every connection lifecycle event and every successful H-12 admission handshake. | ✅ |
