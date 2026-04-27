@@ -53,6 +53,10 @@ sha2.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 toml_edit = "0.22"
 tempfile = "3"
+# observability-plan.md Phase C `dds_memory_resident_bytes` — process RSS at
+# scrape time. Pinned to the same major already in the workspace
+# (dds-loadtest 0.32).
+sysinfo = "0.32"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

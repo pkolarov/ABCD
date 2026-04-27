@@ -1054,6 +1054,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sysinfo",
  "tempfile",
  "time",
  "tokio",

@@ -133,9 +133,16 @@ bucket. The Phase E `DdsStoreWriteFailures` reference rule in
 moves out of the commented-reference section and ships active
 under the new `dds-storage` group keyed off
 `rate(dds_store_writes_total{result!="ok"}[5m]) > 0`) landed
-2026-04-27 follow-up #39. The rest of the C catalog
-(`dds_sync_lag_seconds` / process, plus the
-`dds_http_request_duration_seconds` histogram sibling, and the
+2026-04-27 follow-up #39. Phase C **memory-resident-bytes gauge**
+(`dds_memory_resident_bytes` — scrape-time read of
+[`sysinfo::Process::memory`](https://docs.rs/sysinfo/0.32/sysinfo/struct.Process.html#method.memory)
+for our own pid via the private `process_resident_bytes()` helper
+in [`dds-node/src/telemetry.rs`](../dds-node/src/telemetry.rs)) landed
+2026-04-27 follow-up #40 — sister `dds_thread_count` gauge stays
+deferred because sysinfo 0.32 does not expose per-process thread
+counts directly. The rest of the C catalog
+(`dds_sync_lag_seconds` histogram, `dds_thread_count` gauge, plus
+the `dds_http_request_duration_seconds` histogram sibling, and the
 post-apply `signature|graph|duplicate_jti` partition of
 `dds_sync_payloads_rejected_total`) plus the Phase E rules/panels
 that depend on those metrics remain open.
@@ -545,8 +552,8 @@ rows remain open.
 | `dds_http_request_duration_seconds` | histogram | `route, method` | Latency — sibling of the `dds_http_requests_total` counter; ships once the hand-rolled exposition rolls over to `metrics-exporter-prometheus` (deferred until the first histogram-bearing metric in the catalog ships, per C.1). | 🔲 |
 | `dds_http_caller_identity_total` | counter | `kind=anonymous|uds|pipe|admin` | Who's calling — surfaces accidental loopback-TCP regressions; transport buckets (anonymous/uds/pipe) partition the request count, `admin` is bumped orthogonally when the caller passes the admin policy | ✅ |
 | **Process** | | | | |
-| `dds_memory_resident_bytes` | gauge | — | RSS (procfs / mach) | 🔲 |
-| `dds_thread_count` | gauge | — | OS thread count | 🔲 |
+| `dds_memory_resident_bytes` | gauge | — | Process RSS in bytes — scrape-time read of [`sysinfo::Process::memory`](https://docs.rs/sysinfo/0.32/sysinfo/struct.Process.html#method.memory) for our own pid via the private `process_resident_bytes()` helper in [`dds-node/src/telemetry.rs`](../dds-node/src/telemetry.rs). On Linux this is `RSS` from `/proc/<pid>/status`; on macOS `task_info` `MACH_TASK_BASIC_INFO`; on Windows the working set from `K32GetProcessMemoryInfo`. Read failures (sandbox, transient race) degrade to 0; the family's `# HELP` / `# TYPE` headers always ship so the catalog stays discoverable. | ✅ |
+| `dds_thread_count` | gauge | — | OS thread count — natural sibling of `dds_memory_resident_bytes`, deferred because sysinfo 0.32 does not expose per-process thread counts directly; a follow-up will add a small platform-specific shim (`/proc/<pid>/task` count on Linux, `task_threads()` on macOS, `NtQueryInformationProcess` on Windows). | 🔲 |
 
 **C.4 — Wiring.** Each call site uses `metrics::counter!`,
 `metrics::gauge!`, `metrics::histogram!` macros. A dedicated
