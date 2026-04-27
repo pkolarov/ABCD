@@ -769,11 +769,20 @@ Dashboards:
   subset.
 - `dds-trust-graph.json` — attestation / vouch / revocation / burn
   ingest activity (success vs `*.rejected` per family), enrollment
-  & admin actions, apply outcomes, and an aggregate rejection-ratio
-  panel matching the `DdsAuditRejectionSpike` alert. All panels
-  render today; FIDO2-specific panels (assertion outcomes,
-  attestation verify) are deferred until the Phase C FIDO2 metrics
-  ship.
+  & admin actions, apply outcomes, an aggregate rejection-ratio
+  panel matching the `DdsAuditRejectionSpike` alert, plus three
+  FIDO2-tier panels keyed off the Phase C catalog metrics shipped in
+  follow-ups #27 / #33 / #34: assertion outcomes
+  (`dds_fido2_assertions_total{result}`, the five non-`ok` result
+  buckets coloured red and tracked by `DdsFido2AssertionFailureSpike`),
+  attestation verify (`dds_fido2_attestation_verify_total{result, fmt}`,
+  partitioned by result × fmt so an operator can spot AAGUID
+  allow-list / unsupported-format rejection waves), and session
+  minting (`dds_sessions_issued_total{via}`, with `via="legacy"`
+  coloured red as the regression signal — production traffic should
+  be `fido2`-only after the security review removed the
+  unauthenticated `POST /v1/session` route). All ten panels render
+  today.
 
 ### Phase F — CLI surface for ad-hoc ops ✅
 

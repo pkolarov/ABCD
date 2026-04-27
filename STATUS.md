@@ -10,7 +10,7 @@
 >
 > | Id | Severity | Principle | Summary |
 > |---|---|---|---|
-> | Z-1 | **Critical** | Encrypted comms (PQC) | Noise/QUIC handshake is X25519/ECDHE only — *not* post-quantum. README "quantum-resistant by default" applies to token signatures, not the transport channel. Harvest-Now-Decrypt-Later exposure on all recorded P2P traffic. |
+> | Z-1 | **Critical** | Encrypted comms (PQC) | Noise/QUIC handshake is X25519/ECDHE only — *not* post-quantum. README "quantum-resistant by default" applies to token signatures, not the transport channel. Harvest-Now-Decrypt-Later exposure on all recorded P2P traffic. **Plan: phased PQC rollout — Phase A hybrid-sign `AdmissionCert` (in our control, next) → Phase B per-message hybrid-KEM envelope on gossip/sync payloads → Phase C hybrid-Noise upstream (blocked on rust-libp2p `rs/9595`). Detail in §Z-1 Plan below.** |
 > | Z-2 | **High** | HW-bound identity | [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md) is a plan; zero code shipped. libp2p PeerId, admission cert, admin keys, default domain root all software-keyed. |
 > | Z-3 | ✅ **closed (Phase A)** | Immutable audit | Phase A from [docs/observability-plan.md](docs/observability-plan.md) landed: `emit_local_audit` is wired to all production state-mutating paths — `LocalService::{enroll_user, enroll_device, admin_setup, admin_vouch, record_applied}` and `DdsNode::{ingest_operation, ingest_revocation, ingest_burn}` (success and rejection branches both stamp the chain). `AuditLogEntry.reason: Option<String>` is signed-in (Phase A.2) so SIEM consumers can trust rejection reasons without re-deriving. Phase D (`/healthz` + `/readyz` orchestrator probes) also landed (2026-04-26 follow-up #18); Phase B is now complete (B.1 + B.2 in #19, B.3 + B.4 in #20); Phase F (`dds-cli stats` / `health` / `audit export`) landed in #21. Phase C audit-metrics subset (`dds_audit_entries_total`, `dds_audit_chain_length`, `dds_audit_chain_head_age_seconds`, plus build_info / uptime) landed in #22. Phase E audit-tier subset (Alertmanager rules + two Grafana dashboards keyed off the #22 metrics) landed in #23. Phase C HTTP-tier subset (`dds_http_caller_identity_total{kind}`) landed in #24, also closing the H-7 `DdsLoopbackTcpAdminUsed` reference alert by promoting it to the active `dds-http` Alertmanager group. Phase C trust-graph read-side subset (`dds_trust_graph_attestations`, `dds_trust_graph_vouches`, `dds_trust_graph_revocations`, `dds_trust_graph_burned` — current-state gauges) landed in #25. Phase C FIDO2 outstanding-challenges gauge (`dds_challenges_outstanding`, B-5 backstop reference) landed in #26. Phase C sessions-issuance counter (`dds_sessions_issued_total{via=fido2|legacy}`) landed in #27 — bumped at the tail of the two `LocalService` issuance entry points after the token is signed, with a private `issue_session_inner` helper preventing FIDO2-driven sessions from also bumping the `legacy` bucket. Phase C purpose-lookups counter (`dds_purpose_lookups_total{result=ok|denied}`) landed in #28 — bumped through the shared `LocalService::has_purpose_observed` helper from every trust-graph capability gate (publisher / device-scope / admin-vouch) plus the gossip-ingest publisher-capability filter `node::publisher_capability_ok`; the catalog originally named a third `result=not_found` bucket but the underlying `TrustGraph::has_purpose` returns `bool` only, so v1 collapses no-attestation into `denied` (a future `has_purpose_with_outcome` API can split the bucket without renaming the metric). Phase C admission-handshakes counter (`dds_admission_handshakes_total{result=ok|fail|revoked}`) landed in #29 — bumped from `DdsNode::verify_peer_admission` at every outcome branch of an inbound H-12 admission handshake. Phase C network peer-count gauges (`dds_peers_admitted` + `dds_peers_connected`) landed in #30 — refreshed by the swarm task in `DdsNode::refresh_peer_count_gauges` on every connection lifecycle event and after every successful admission handshake; the metrics scrape reads via a shared `NodePeerCounts` snapshot plumbed from `main.rs` into `telemetry::serve`. Phase C gossip-messages counter (`dds_gossip_messages_total{kind=op|revocation|burn|audit}`) landed in #31 — bumped from `DdsNode::handle_gossip_message` after the inbound envelope clears topic identification and CBOR decode, just before dispatch to the matching `ingest_*` path. Phase C gossip-messages-dropped counter (`dds_gossip_messages_dropped_total{reason=unadmitted|unknown_topic|decode_error|topic_kind_mismatch}`) landed in #32 — bumped from the four pre-decode drop sites in `DdsNode::handle_swarm_event` (H-12 unadmitted-relayer drop) and `DdsNode::handle_gossip_message` (the three early-exit branches). The catalog originally named the labels `unadmitted|invalid_token|duplicate|backpressure`, but `invalid_token`/`duplicate` describe post-decode rejections already covered by `dds_audit_entries_total{action=*.rejected}`, so v1 partitions the pre-decode surface only. Phase C FIDO2 attestation-verify counter (`dds_fido2_attestation_verify_total{result=ok|fail, fmt=packed|none|unknown}`) landed in #33 — bumped from the shared `LocalService::verify_attestation_observed` helper at every enrollment-time call to `dds_domain::fido2::verify_attestation`, i.e. the two call sites in `LocalService::enroll_user` and `LocalService::admin_setup`; the credential-lookup re-parse inside `verify_assertion_common` is *not* counted because the catalog scopes the counter to enrollment-time only. The catalog originally named `fmt=packed|none|tpm`; the TPM bucket is forward-looking — the domain verifier today rejects every non-packed/non-none format with `Fido2Error::Unsupported`, so v1 collapses TPM and every other unsupported format into `result=fail, fmt=unknown` (which also covers failures that reject before `fmt` is parsed). Phase C FIDO2 assertions counter (`dds_fido2_assertions_total{result=ok|signature|rp_id|up|sign_count|other}`) landed in #34 — bumped from the single drop-guarded exit funnel in `LocalService::verify_assertion_common` consumed by both `issue_session_from_assertion` (the `/v1/session/assert` HTTP path) and `admin_vouch`. The catalog originally named a `result=uv` bucket; `verify_assertion_common` does *not* gate on the User-Verified flag today (UV is reported through `CommonAssertionOutput::user_verified` but never rejects), so v1 ships without `uv` and a future UV-required gate can split it out. `result=other` is a catch-all for non-named error exits (challenge / origin / cdj mismatches, clock regression, lookup miss, COSE parse, store errors, etc.) so the per-attempt total stays accurate. Phase C sync-pulls counter (`dds_sync_pulls_total{result=ok|fail}`) landed in #35 — bumped at the outcome branches of `DdsNode::handle_sync_event`: `ok` when an admitted peer's `Message::Response` is processed by `handle_sync_response` (zero payloads still counts as `ok`), `fail` for `OutboundFailure` (timeout / connection closed / dial failure / codec error) and for the H-12 unadmitted-peer response drop. Per-peer cooldown skips inside `try_sync_with` are not counted — no request goes on the wire. Phase C HTTP-requests counter (`dds_http_requests_total{route, method, status}`) landed in #36 — bumped from `LocalService::http_request_observer_middleware` (a `route_layer`-applied per-route observer in [`crate::http::router`](dds-node/src/http.rs)) after every matched-route request returns; the middleware reads `axum::extract::MatchedPath` from the request extensions (DDS has no path parameters today, so the matched template equals the literal URI path), captures the method, and bumps once with the inner handler's status. Unmatched 404s served by the default fallback are *not* counted because `route_layer` does not wrap the fallback — those remain visible via `dds_http_caller_identity_total`. Cardinality budget: 22 routes × 2 methods × ~6 typical statuses ≈ 250 series in the worst case (real production set is much smaller). Phase C sync-payloads-rejected counter (`dds_sync_payloads_rejected_total{reason=legacy_v1|publisher_capability|replay_window|signature|duplicate_jti|graph}`) — pre-apply surface landed in #37 (the three pre-apply skip sites inside `DdsNode::handle_sync_response`: M-1/M-2 wire-version-1 token guard, C-3 publisher-capability filter, M-9 revoke/burn replay-window guard); post-apply partition `signature|duplicate_jti|graph` landed in #41 once `SyncResult` grew the categorical [`SyncRejectReason`](dds-net/src/sync.rs) enum + [`rejected_by_reason`](dds-net/src/sync.rs) `BTreeMap` field that the dds-node sync handler iterates after every `apply_sync_payloads_with_graph` returns. `signature` covers `Token::validate()` rejections (ed25519 / issuer-binding); `duplicate_jti` partitions `TrustError::DuplicateJti` so an operator can alarm on B-1 replay activity directly; `graph` collects every other `TrustError`. Decode failures and store-side write errors stay in `SyncResult.errors` only — corruption / transient signals already covered by `dds_store_writes_total{result=fail}`. Phase C store-bytes gauge (`dds_store_bytes{table=tokens|revoked|burned|operations|audit_log|challenges|credential_state}`) landed in #38 — scrape-time read of the new `dds_store::traits::StoreSizeStats::table_stored_bytes` trait method through `LocalService::store_byte_sizes`. RedbBackend reports `redb::TableStats::stored_bytes()` per table (actual stored payload, excluding metadata bookkeeping and B-tree fragmentation overhead so the gauge tracks "data the table currently holds" rather than "filesystem footprint"); MemoryBackend returns an empty map so harnesses scrape a discoverable family with no series. The `table` label vocabulary is fixed by the seven `TableDefinition` constants in `redb_backend.rs`. Phase C store-writes counter (`dds_store_writes_total{result=ok|conflict|fail}`) landed in #39 — both backends keep three monotonic `AtomicU64` counters bumped from every write-path method exit, exposed via the new `dds_store::traits::StoreWriteStats::store_write_counts` trait method through `LocalService::store_write_counts`; the Phase E `DdsStoreWriteFailures` reference rule was activated under a new `dds-storage` group keyed off `rate(dds_store_writes_total{result!="ok"}[5m]) > 0`. Phase C memory-resident-bytes gauge (`dds_memory_resident_bytes`) landed in #40 — scrape-time read of `sysinfo::Process::memory` for our own pid via the private `process_resident_bytes()` helper in [`dds-node/src/telemetry.rs`](dds-node/src/telemetry.rs); reading failures (sandbox, transient) degrade to 0 and the family's `# HELP` / `# TYPE` headers always ship. Phase C thread-count gauge (`dds_thread_count`) landed in #42 — natural sibling of `dds_memory_resident_bytes`, sourced via the new private `process_thread_count()` helper in [`dds-node/src/telemetry.rs`](dds-node/src/telemetry.rs); Linux parses the `Threads:` line out of `/proc/self/status`, macOS calls `libc::proc_pidinfo` with `PROC_PIDTASKINFO` and reads `pti_threadnum`, Windows walks a `TH32CS_SNAPTHREAD` snapshot via `Thread32First`/`Thread32Next` filtered to the current pid. Read failures and unsupported targets degrade to 0; the family's `# HELP` / `# TYPE` headers always ship. Phase E network + FIDO2 reference rules promoted to active in #43 — `DdsAdmissionFailureSpike` (group `dds-network`, keyed off `dds_admission_handshakes_total{result="fail"}` from #29; `result="revoked"` excluded as background noise), `DdsSyncRejectsSpike` (group `dds-network`, keyed off `dds_sync_payloads_rejected_total` from #37 + #41 across all six reason buckets), and `DdsFido2AssertionFailureSpike` (group `dds-fido2`, keyed off `dds_fido2_assertions_total{result!="ok"}` from #34). All three drop the original spec placeholder thresholds (0.1/s, 0.5/s, 0.05/s) in favour of the same `> 0` for 5 m "any failure is suspicious" pattern proven on `DdsStoreWriteFailures` (#39) and `DdsLoopbackTcpAdminUsed` (#24), and ship with `dds-cli audit tail` cross-check commands in their annotations. The rest of the C catalog (`dds_sync_lag_seconds` histogram and `dds_http_request_duration_seconds` histogram sibling) and the single remaining Phase E reference rule `DdsSyncLagHigh` gated on the histogram remain open — all three ride on the deferred `metrics-exporter-prometheus` rollover called out in §C.1. |
 > | Z-4 | **High** | Encrypted at rest | redb store (`directory.redb`) is plaintext CBOR — tokens, ops, revocations, audit entries. Confidentiality depends on OS FDE + ACLs only. |
@@ -25,10 +25,92 @@
 > §6.4 has been qualified to **tokens only** — the transport channel is
 > classical.
 >
+> ### Z-1 Plan — phased PQC rollout for the comms path
+>
+> The audit ledger at [Claude_sec_review.md](Claude_sec_review.md) Z-1
+> lists three remediation candidates; we will execute them as three
+> phases, sequenced by what is in our control today. Phase A is fully
+> in-tree work; Phase B is an application-layer envelope that does not
+> wait on libp2p; Phase C waits on upstream.
+>
+> **Phase A (next) — hybrid-sign `AdmissionCert` + `AdmissionRevocation`.**
+> Reuse the existing `dds_core::crypto::HybridEdMldsa` (Ed25519 +
+> ML-DSA-65, FIPS 204 — already shipping for tokens) inside
+> `DomainKey::issue_admission` and `AdmissionCert::verify`
+> ([dds-domain/src/domain.rs:191-209, :269-325](dds-domain/src/domain.rs)),
+> mirroring the change on `AdmissionRevocation`
+> ([:354-407](dds-domain/src/domain.rs)). Cert body grows ~3.3 KB
+> (Ed25519 64 B + ML-DSA-65 3,309 B); the opaque CBOR shipping in
+> [dds-net/src/admission.rs](dds-net/src/admission.rs) is unchanged
+> so the network layer stays domain-cert-agnostic. Rolling-upgrade
+> shape mirrors the M-2 v1/v2 token split: a `version: u8` field on
+> `AdmissionBody` with v1-Ed25519 and v2-hybrid verifier dispatch,
+> so v1 nodes accept legacy certs and v2 nodes accept either. Closes
+> the H-12 forgeability piece of Z-1; does **not** close
+> confidentiality — that is Phase B.
+>
+> **Phase B (after A) — per-message hybrid-KEM envelope on gossip + sync
+> payloads.** Wrap each gossipsub `Op` and sync `Response` body in an
+> X25519 + ML-KEM-768 KEM-DEM envelope keyed off each peer's published
+> hybrid pubkey (advertised via `Identify` or piggy-backed on the
+> Phase-A `AdmissionCert`). New workspace dep (`ml-kem` 0.2 or
+> `pqcrypto-mlkem`), new `dds-core::crypto::kem` module, decode-path
+> changes at the gossip + sync ingest sites in
+> [dds-node/src/node.rs](dds-node/src/node.rs) (`handle_gossip_message`,
+> `handle_sync_response`). Feature-gated behind a domain capability so
+> a mixed fleet does not deadlock during rollout. Closes
+> Harvest-Now-Decrypt-Later on application-layer content even while
+> libp2p-noise stays classical.
+>
+> **Phase C (track-only) — adopt hybrid Noise upstream.** rust-libp2p
+> tracking issue `rs/9595`; mainline 0.55 still has no hybrid-KEM
+> feature flag for `libp2p-noise`. No code today — revisit when the
+> feature flag lands upstream and drop it in alongside our existing
+> `noise::Config::new` call at
+> [dds-net/src/transport.rs:118-122](dds-net/src/transport.rs). The
+> QUIC keyshare ([:123](dds-net/src/transport.rs)) gets the same
+> treatment via `quinn` / `rustls` PQ groups when those stabilise.
+>
+> Until Phase A ships, the H-12 admission handshake is
+> post-quantum-forgeable. Until Phase B ships, recorded gossipsub /
+> sync traffic is Harvest-Now-Decrypt-Later exposed. The
+> "quantum-resistant by default" marketing qualifier above stays in
+> place until at least Phase A + Phase B both land.
+>
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-27 follow-up #46 (observability Admin Guide
+> Last updated: 2026-04-27 follow-up #47 (observability Phase E
+> dashboard catch-up — three FIDO2-tier panels added to
+> [`docs/observability/grafana/dds-trust-graph.json`](docs/observability/grafana/dds-trust-graph.json),
+> closing the `docs/observability-plan.md` Phase E note that the
+> FIDO2 panels were "deferred until the Phase C FIDO2 metrics
+> ship". The metrics already shipped — `dds_sessions_issued_total{via}`
+> in #27, `dds_fido2_attestation_verify_total{result, fmt}` in #33,
+> and `dds_fido2_assertions_total{result}` in #34 — so the dashboard
+> note had simply rotted past the catalog. The new panels are
+> `FIDO2 assertion outcomes` (partitioned by `result`, the five
+> non-`ok` buckets coloured red and tracked by the existing
+> `DdsFido2AssertionFailureSpike` Alertmanager rule from #43),
+> `FIDO2 attestation verify (by result × fmt)` (partitioned by
+> `result × fmt` so an operator can spot AAGUID allow-list / unsupported-format
+> rejection waves), and `Session minting (by via)` (24-wide row,
+> `via="legacy"` coloured red because the unauthenticated `POST
+> /v1/session` HTTP route was removed in the security review and
+> production traffic should be `fido2`-only — non-zero legacy rate
+> is the regression signal). Each panel reads through the same
+> `instance` template variable as the rest of the dashboard so the
+> existing per-instance drilldown still works. The dashboard
+> description was updated to drop the "deferred" qualifier and the
+> Phase E §"Dashboards" bullet in
+> [`docs/observability-plan.md`](docs/observability-plan.md) was
+> rewritten to enumerate the three new panels alongside the seven
+> already-shipping audit-action panels (10 total, all rendering
+> today). No code change — documentation / dashboard JSON only;
+> `cargo test --workspace --all-targets` continues to pass (668
+> tests, unchanged).
+>
+> Previous: 2026-04-27 follow-up #46 (observability Admin Guide
 > Monitoring section completed — closes the
 > [`docs/observability-plan.md`](docs/observability-plan.md) §5
 > tradeoffs item that was carrying "Documented in the metric-endpoint

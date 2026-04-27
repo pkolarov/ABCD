@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "DDS trust-graph activity — derived entirely from `dds_audit_entries_total{action}` partitioned by the action vocabulary that ships in observability-plan.md Phase A. Each row pairs the success and *.rejected series so an operator can see the ratio at a glance. Phase C catalog metrics (FIDO2 assertion outcomes, attestation verify, session minting) will gain dedicated panels once those metrics ship; until then the audit-action breakdown below is the canonical view.",
+  "description": "DDS trust-graph activity — derived from `dds_audit_entries_total{action}` partitioned by the action vocabulary that ships in observability-plan.md Phase A, plus the FIDO2-tier Phase C catalog metrics (`dds_fido2_assertions_total{result}`, `dds_fido2_attestation_verify_total{result, fmt}`, `dds_sessions_issued_total{via}`). Each audit-action row pairs the success and *.rejected series so an operator can see the ratio at a glance; the three FIDO2 panels at the bottom partition the assertion / attestation / session-mint outcomes by their respective result labels.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -416,6 +416,187 @@
         }
       ],
       "title": "Rejection ratio per instance",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "FIDO2 assertion outcomes — `dds_fido2_assertions_total{result}` (counter) bumped from the drop-guarded single-exit funnel in `LocalService::verify_assertion_common` consumed by both `/v1/session/assert` and `admin_vouch`. `result=ok` is the green path; the five non-ok buckets (`signature`, `rp_id`, `up`, `sign_count`, `other`) all flag through the `DdsFido2AssertionFailureSpike` Alertmanager rule.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }]
+          },
+          "unit": "ops"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "signature" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "rp_id" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "up" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "sign_count" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "other" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": ["mean", "lastNotNull"],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.4.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by(result) (rate(dds_fido2_assertions_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "FIDO2 assertion outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Enrollment-time FIDO2 attestation verify — `dds_fido2_attestation_verify_total{result, fmt}` (counter) bumped from `LocalService::verify_attestation_observed` at the two enrollment call sites (`enroll_user` + `admin_setup`). `fmt=packed|none|unknown`; `result=ok|fail`. A non-zero `result=fail` rate over time means the AAGUID allow-list / domain root is rejecting attestations — usually a misconfigured allow-list or an unsupported authenticator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }]
+          },
+          "unit": "ops"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*result=\"fail\".*" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "id": 9,
+      "options": {
+        "legend": {
+          "calcs": ["mean", "lastNotNull"],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.4.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by(result, fmt) (rate(dds_fido2_attestation_verify_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "result={{result}} fmt={{fmt}}",
+          "refId": "A"
+        }
+      ],
+      "title": "FIDO2 attestation verify (by result × fmt)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Session minting — `dds_sessions_issued_total{via}` (counter) bumped at the tail of `LocalService::issue_session` (`legacy`) and `issue_session_from_assertion` (`fido2`) after the session token is signed. The unauthenticated `POST /v1/session` HTTP route was removed in the security review, so production `via=\"legacy\"` traffic is expected to be zero — a non-zero rate is the regression signal and is highlighted red.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }]
+          },
+          "unit": "ops"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "legacy" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 40 },
+      "id": 10,
+      "options": {
+        "legend": {
+          "calcs": ["mean", "lastNotNull"],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.4.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by(via) (rate(dds_sessions_issued_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{via}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Session minting (by via)",
       "type": "timeseries"
     }
   ],
