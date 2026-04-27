@@ -47,6 +47,7 @@
 //! | `dds_peers_connected` | gauge | — | [`crate::node::NodePeerCounts::connected`] refreshed at the same call sites |
 //! | `dds_store_writes_total` | counter | `result=ok\|conflict\|fail` | [`dds_store::traits::StoreWriteStats::store_write_counts`] read at scrape via [`crate::service::LocalService::store_write_counts`] |
 //! | `dds_memory_resident_bytes` | gauge | — | [`process_resident_bytes`] (sysinfo `Process::memory`) read at scrape time |
+//! | `dds_thread_count` | gauge | — | [`process_thread_count`] (platform-native syscall) read at scrape time |
 //!
 //! ### `dds_challenges_outstanding` semantics
 //!
@@ -574,11 +575,20 @@
 //! pid (sandbox restrictions, transient race) the helper returns 0
 //! rather than panicking the scrape task — the family's
 //! `# HELP` / `# TYPE` headers still ship so the catalog stays
-//! discoverable. The catalog row for `dds_thread_count` (the OS
-//! thread count gauge) is the natural sibling but ships in a
-//! follow-up: sysinfo 0.32 does not expose per-process thread
-//! counts directly, so a clean cross-platform shim is a small
-//! follow-up of its own.
+//! discoverable.
+//!
+//! ### `dds_thread_count` semantics
+//!
+//! Read at scrape time through the private [`process_thread_count`]
+//! helper. sysinfo 0.32 does not expose per-process thread counts
+//! in a portable accessor, so the helper goes directly to each
+//! platform's native API: `/proc/self/status` `Threads:` parse on
+//! Linux, [`libc::proc_pidinfo`] with `PROC_PIDTASKINFO` on macOS,
+//! and a `TH32CS_SNAPTHREAD` snapshot walk filtered to the current
+//! pid on Windows. Read failures (sandbox restrictions, transient
+//! race) and unsupported targets degrade to 0 rather than panicking
+//! the scrape task; the family's `# HELP` / `# TYPE` headers always
+//! ship so the catalog stays discoverable.
 //!
 //! No external metrics crate is used. The plan suggested
 //! `metrics-exporter-prometheus`, but for the audit subset a few
@@ -1656,6 +1666,22 @@ fn render_exposition(
         process_resident_bytes()
     ));
 
+    // `dds_thread_count` — OS thread count gauge. Read at scrape time
+    // via the platform-specific [`process_thread_count()`] shim; on
+    // unsupported platforms (or read failures) the helper returns 0.
+    // The `# HELP` / `# TYPE` headers always ship so the catalog stays
+    // discoverable even when the read degrades.
+    out.push_str(
+        "# HELP dds_thread_count OS-level thread count of the dds-node process at scrape time. \
+         Read via /proc/self/status (Linux), proc_pidinfo PROC_PIDTASKINFO (macOS), or a \
+         CreateToolhelp32Snapshot walk filtered to the current pid (Windows). 0 indicates the \
+         platform query did not return a value (sandbox restriction, transient race, or \
+         unsupported target) — operators alarming on thread growth should pair the gauge with \
+         dds_uptime_seconds to disambiguate startup transients.\n",
+    );
+    out.push_str("# TYPE dds_thread_count gauge\n");
+    out.push_str(&format!("dds_thread_count {}\n", process_thread_count()));
+
     out
 }
 
@@ -1685,6 +1711,118 @@ fn process_resident_bytes() -> u64 {
         ProcessRefreshKind::new().with_memory(),
     );
     sys.process(pid).map(|p| p.memory()).unwrap_or(0)
+}
+
+/// OS-level thread count of *this* process, read at scrape time via a
+/// platform-specific shim. Returns 0 if the platform query fails
+/// (sandbox restrictions, transient race) or on an unsupported target
+/// so the scrape never panics; the catalog's `# HELP` / `# TYPE`
+/// headers still ship.
+///
+/// sysinfo 0.32 does not expose per-process thread counts in a
+/// portable accessor (its `Process::tasks()` returns `Some` only on
+/// Linux), so this helper goes directly to each platform's native
+/// API:
+///
+/// - **Linux** — parse the `Threads:` line out of `/proc/self/status`.
+///   Single small `read_to_string` + line scan; no directory
+///   enumeration.
+/// - **macOS** — call [`libc::proc_pidinfo`] with `PROC_PIDTASKINFO`
+///   and read [`libc::proc_taskinfo::pti_threadnum`]. One syscall.
+/// - **Windows** — walk a `TH32CS_SNAPTHREAD` snapshot via
+///   [`windows_sys::Win32::System::Diagnostics::ToolHelp::Thread32First`]
+///   / `Thread32Next`, counting entries whose `th32OwnerProcessID`
+///   matches our own pid. The snapshot is a one-shot point-in-time
+///   capture so the gauge does not hold any cross-process locks for
+///   its lifetime.
+/// - **Other targets** — fall through to 0 (currently no DDS build
+///   targets fall here, but the gauge stays discoverable).
+fn process_thread_count() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // /proc/self/status carries a `Threads:` line that is the
+        // kernel-maintained thread count for the current task group.
+        // Cheaper than enumerating /proc/self/task entries.
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("Threads:") {
+                    if let Ok(n) = rest.trim().parse::<u64>() {
+                        return n;
+                    }
+                }
+            }
+        }
+        0
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // proc_pidinfo with PROC_PIDTASKINFO returns a proc_taskinfo
+        // whose pti_threadnum is the current thread count for our
+        // task. The call returns the bytes written; anything other
+        // than the full struct size is treated as a failure.
+        let pid = std::process::id() as i32;
+        let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as i32;
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTASKINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if written != size {
+            return 0;
+        }
+        let info = unsafe { info.assume_init() };
+        if info.pti_threadnum < 0 {
+            0
+        } else {
+            info.pti_threadnum as u64
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) gives a
+        // one-shot point-in-time view of every thread on the system;
+        // we filter to entries whose th32OwnerProcessID matches our
+        // current pid. The snapshot handle is freed via CloseHandle
+        // before the helper returns.
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+
+        let pid = unsafe { GetCurrentProcessId() };
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return 0;
+        }
+        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut count: u64 = 0;
+        if unsafe { Thread32First(snapshot, &mut entry) } != 0 {
+            loop {
+                if entry.th32OwnerProcessID == pid {
+                    count += 1;
+                }
+                if unsafe { Thread32Next(snapshot, &mut entry) } == 0 {
+                    break;
+                }
+            }
+        }
+        unsafe { CloseHandle(snapshot) };
+        count
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        0
+    }
 }
 
 /// Escape a Prometheus label value: backslash, newline, and double
@@ -2887,6 +3025,19 @@ mod tests {
             value_lines, 1,
             "expected exactly one dds_memory_resident_bytes value line"
         );
+        // `dds_thread_count` family ships HELP/TYPE on every scrape and
+        // exactly one value line — no labels. The value itself depends
+        // on the tokio test runtime's thread pool, so the test only
+        // asserts the family contract.
+        assert!(body.contains("# TYPE dds_thread_count gauge\n"));
+        let thread_value_lines = body
+            .lines()
+            .filter(|l| l.starts_with("dds_thread_count "))
+            .count();
+        assert_eq!(
+            thread_value_lines, 1,
+            "expected exactly one dds_thread_count value line"
+        );
     }
 
     /// Default (zero) [`StoreWriteCounts`] still ships the three value
@@ -2975,6 +3126,58 @@ mod tests {
         // u64::MAX would indicate a sysinfo overflow bug, not a real
         // RSS value; assert the read is in a sensible range.
         assert!(bytes < u64::MAX);
+    }
+
+    /// `dds_thread_count` ships its `# HELP` / `# TYPE` header and a
+    /// single value line on every render — pins the "family always
+    /// discoverable" contract the rest of the catalog also commits
+    /// to. The value itself is whatever the platform shim returns
+    /// for the test process (a positive thread count, or 0 in a
+    /// sandbox that hides the count); the test does not assert on a
+    /// specific number because the tokio test runtime spins a varying
+    /// thread pool.
+    #[test]
+    fn thread_count_renders_family_with_help_and_type() {
+        let t = Telemetry::new();
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
+        assert!(body.contains("# HELP dds_thread_count "));
+        assert!(body.contains("# TYPE dds_thread_count gauge\n"));
+        // Exactly one value line — no labels on this gauge.
+        let value_lines = body
+            .lines()
+            .filter(|l| l.starts_with("dds_thread_count "))
+            .count();
+        assert_eq!(value_lines, 1, "expected exactly one value line");
+    }
+
+    /// Direct call to the scrape-time helper. Every running process
+    /// has at least its main thread, so on supported targets
+    /// (Linux / macOS / Windows) the helper should report >= 1; on
+    /// unsupported targets or under sandbox restrictions the helper
+    /// returns 0. The test asserts it does not panic and that, on
+    /// the supported targets we actually build for, the count is
+    /// non-zero — that guards against a regression in the platform
+    /// shim that would silently flat-line the gauge.
+    #[test]
+    fn process_thread_count_returns_a_finite_u64() {
+        let n = process_thread_count();
+        assert!(n < u64::MAX);
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            assert!(
+                n >= 1,
+                "expected at least the main thread on a supported target, got 0"
+            );
+        }
     }
 
     #[tokio::test]

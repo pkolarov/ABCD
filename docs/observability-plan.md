@@ -1,6 +1,11 @@
 # DDS Observability Plan — Audit, Metrics, Alerts, SIEM Export
 
-**Status:** Phase C **sync-payloads-rejected post-apply partition**
+**Status:** Phase C **thread-count gauge** (`dds_thread_count`) landed
+2026-04-27 follow-up #42 — the natural sibling of the memory-resident
+bytes gauge from #40, sourced via a small platform-specific shim
+(`/proc/self/status` parse on Linux, `proc_pidinfo` `PROC_PIDTASKINFO`
+on macOS, `TH32CS_SNAPTHREAD` walk filtered to the current pid on
+Windows). Phase C **sync-payloads-rejected post-apply partition**
 (`dds_sync_payloads_rejected_total{reason=signature|duplicate_jti|graph}`)
 landed 2026-04-27 follow-up #41 — closing the post-apply gap that
 `#37` left open. Phase A landed 2026-04-26 follow-up #17 (closes Z-3);
@@ -146,9 +151,8 @@ under the new `dds-storage` group keyed off
 [`sysinfo::Process::memory`](https://docs.rs/sysinfo/0.32/sysinfo/struct.Process.html#method.memory)
 for our own pid via the private `process_resident_bytes()` helper
 in [`dds-node/src/telemetry.rs`](../dds-node/src/telemetry.rs)) landed
-2026-04-27 follow-up #40 — sister `dds_thread_count` gauge stays
-deferred because sysinfo 0.32 does not expose per-process thread
-counts directly. Phase C **sync-payloads-rejected post-apply
+2026-04-27 follow-up #40 — sister `dds_thread_count` gauge landed in
+2026-04-27 follow-up #42 via a small platform-specific shim. Phase C **sync-payloads-rejected post-apply
 partition**
 (`dds_sync_payloads_rejected_total{reason=signature|duplicate_jti|graph}`) —
 landed 2026-04-27 follow-up #41 — the new
@@ -164,9 +168,11 @@ every other `TrustError` from `TrustGraph::add_token`. Decode
 failures and store-side write errors stay in `SyncResult.errors`
 only — they are corruption / transient signals already covered by
 `dds_store_writes_total{result=fail}`. The rest of the C catalog
-(`dds_sync_lag_seconds` histogram, `dds_thread_count` gauge, plus
-the `dds_http_request_duration_seconds` histogram sibling) plus the
-Phase E rules/panels that depend on those metrics remain open.
+(`dds_sync_lag_seconds` histogram plus the
+`dds_http_request_duration_seconds` histogram sibling) plus the
+Phase E rules/panels that depend on those metrics remain open —
+both ride on the deferred `metrics-exporter-prometheus` rollover
+called out in §C.1.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -452,10 +458,12 @@ landed 2026-04-27 follow-up #38 — scrape-time read of
 [`LocalService::store_byte_sizes`](../dds-node/src/service.rs);
 RedbBackend reports `redb::TableStats::stored_bytes()` per table and
 MemoryBackend returns an empty map so harnesses scrape a
-discoverable family with no series; rest of the catalog
-(`dds_sync_lag_seconds` histogram, `dds_thread_count` gauge, plus
-the `dds_http_request_duration_seconds` histogram sibling)
-remains open.** The
+discoverable family with no series; thread-count gauge
+(`dds_thread_count`) landed 2026-04-27 follow-up #42 via the
+platform-specific shim alongside the memory-resident-bytes helper;
+rest of the catalog (`dds_sync_lag_seconds` histogram plus the
+`dds_http_request_duration_seconds` histogram sibling) remains
+open.** The
 audit-metrics first slice exposed the five families needed to alert on
 Z-3 regressions (`dds_build_info`, `dds_uptime_seconds`,
 `dds_audit_entries_total{action}`, `dds_audit_chain_length`,
@@ -575,7 +583,7 @@ rows remain open.
 | `dds_http_caller_identity_total` | counter | `kind=anonymous|uds|pipe|admin` | Who's calling — surfaces accidental loopback-TCP regressions; transport buckets (anonymous/uds/pipe) partition the request count, `admin` is bumped orthogonally when the caller passes the admin policy | ✅ |
 | **Process** | | | | |
 | `dds_memory_resident_bytes` | gauge | — | Process RSS in bytes — scrape-time read of [`sysinfo::Process::memory`](https://docs.rs/sysinfo/0.32/sysinfo/struct.Process.html#method.memory) for our own pid via the private `process_resident_bytes()` helper in [`dds-node/src/telemetry.rs`](../dds-node/src/telemetry.rs). On Linux this is `RSS` from `/proc/<pid>/status`; on macOS `task_info` `MACH_TASK_BASIC_INFO`; on Windows the working set from `K32GetProcessMemoryInfo`. Read failures (sandbox, transient race) degrade to 0; the family's `# HELP` / `# TYPE` headers always ship so the catalog stays discoverable. | ✅ |
-| `dds_thread_count` | gauge | — | OS thread count — natural sibling of `dds_memory_resident_bytes`, deferred because sysinfo 0.32 does not expose per-process thread counts directly; a follow-up will add a small platform-specific shim (`/proc/<pid>/task` count on Linux, `task_threads()` on macOS, `NtQueryInformationProcess` on Windows). | 🔲 |
+| `dds_thread_count` | gauge | — | OS thread count — read at scrape time through the private [`process_thread_count()`](../dds-node/src/telemetry.rs) helper alongside the memory-resident-bytes shim. Linux parses the `Threads:` line out of `/proc/self/status`; macOS calls [`libc::proc_pidinfo`] with `PROC_PIDTASKINFO` and reads `pti_threadnum`; Windows walks a `TH32CS_SNAPTHREAD` snapshot via [`Thread32First`/`Thread32Next`] filtered to the current pid. Read failures (sandbox restrictions, transient race) and unsupported targets degrade to 0; the family's `# HELP` / `# TYPE` headers always ship so the catalog stays discoverable. | ✅ |
 
 **C.4 — Wiring.** Each call site uses `metrics::counter!`,
 `metrics::gauge!`, `metrics::histogram!` macros. A dedicated
