@@ -311,6 +311,13 @@ async fn admitted_peers_populated_and_gossip_flows() {
 
     // Publish via gossip from A; B must ingest through the production
     // `handle_swarm_event` path (with H-12 gating active).
+    //
+    // observability-plan.md Phase C — delta the
+    // `dds_gossip_messages_total{kind="op"}` counter so we pin that the
+    // post-decode bump in `handle_gossip_message` runs at the same
+    // production call site that ingests the operation.
+    let gossip_op_before = telemetry.gossip_messages_count("op");
+
     let (_id, token) = make_attest_token("alice", "att-h12-ok");
     let op = op_for(&token);
     publish_attest(&mut a, &op, &token);
@@ -323,6 +330,14 @@ async fn admitted_peers_populated_and_gossip_flows() {
     assert!(
         b_attests > 0,
         "attestation did not propagate to B under valid admission"
+    );
+    let gossip_op_after = telemetry.gossip_messages_count("op");
+    assert!(
+        gossip_op_after > gossip_op_before,
+        "dds_gossip_messages_total{{kind=\"op\"}} delta = {} (before {} after {}); expected >= 1",
+        gossip_op_after - gossip_op_before,
+        gossip_op_before,
+        gossip_op_after
     );
 }
 

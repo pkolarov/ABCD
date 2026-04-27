@@ -31,6 +31,7 @@
 //! | `dds_sessions_issued_total` | counter | `via=fido2\|legacy` | bumped by [`record_sessions_issued`] |
 //! | `dds_purpose_lookups_total` | counter | `result=ok\|denied` | bumped by [`record_purpose_lookup`] |
 //! | `dds_admission_handshakes_total` | counter | `result=ok\|fail\|revoked` | bumped by [`record_admission_handshake`] |
+//! | `dds_gossip_messages_total` | counter | `kind=op\|revocation\|burn\|audit` | bumped by [`record_gossip_message`] |
 //! | `dds_trust_graph_attestations` | gauge | — | [`crate::service::LocalService::trust_graph_counts`] at scrape |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
 //! | `dds_trust_graph_revocations` | gauge | — | same |
@@ -184,6 +185,44 @@
 //! caller is the node itself and the metric would be redundant with
 //! the libp2p connection counter.
 //!
+//! ### `dds_gossip_messages_total` semantics
+//!
+//! Bumped exactly once per inbound gossip message that survives topic
+//! identification and CBOR decoding inside
+//! [`crate::node::DdsNode::handle_gossip_message`], partitioned by
+//! message variant (the `kind` label is 1:1 with the originating
+//! [`dds_net::gossip::DdsTopic`] so a separate `topic` label would be
+//! redundant cardinality):
+//!
+//! - `kind="op"` — [`dds_net::gossip::GossipMessage::DirectoryOp`] on a
+//!   [`dds_net::gossip::DdsTopic::Operations`] topic, fed into
+//!   [`crate::node::DdsNode::ingest_operation`].
+//! - `kind="revocation"` — [`dds_net::gossip::GossipMessage::Revocation`]
+//!   on a [`dds_net::gossip::DdsTopic::Revocations`] topic, fed into
+//!   [`crate::node::DdsNode::ingest_revocation`].
+//! - `kind="burn"` — [`dds_net::gossip::GossipMessage::Burn`] on a
+//!   [`dds_net::gossip::DdsTopic::Burns`] topic, fed into
+//!   [`crate::node::DdsNode::ingest_burn`].
+//! - `kind="audit"` — [`dds_net::gossip::GossipMessage::AuditLog`] on a
+//!   [`dds_net::gossip::DdsTopic::AuditLog`] topic, fed into
+//!   [`crate::node::DdsNode::ingest_audit`].
+//!
+//! Counts the *post-decode* surface only — messages dropped earlier
+//! (unknown topic, CBOR decode failure, topic/kind mismatch, or H-12
+//! unadmitted-relayer drop in [`crate::node::DdsNode::handle_swarm_event`])
+//! are *not* counted here. A future follow-up adding
+//! `dds_gossip_messages_dropped_total{reason}` will cover those drop
+//! sites; until then operators correlate the inbound rate against
+//! `dds_audit_entries_total{action=*.rejected}` for per-token rejections
+//! and against `dds_admission_handshakes_total{result="fail"}` for
+//! handshake-side regressions. Outbound-side publish (originating from
+//! the local node) is not currently instrumented because the production
+//! event loop has no centralised publish funnel — the
+//! [`crate::bin::dds_macos_e2e`] harness and the loadtest publisher both
+//! call `gossipsub.publish` directly. A future follow-up that lands a
+//! `LocalService::publish_gossip` funnel can add the `direction=out`
+//! label to this counter without renaming.
+//!
 //! ### `dds_http_caller_identity_total` semantics
 //!
 //! Each completed HTTP request bumps **two** buckets — its transport
@@ -267,6 +306,10 @@ pub struct Telemetry {
     /// `ok|fail|revoked` — bounded by the three outcome branches of
     /// [`crate::node::DdsNode::verify_peer_admission`].
     admission_handshakes: Mutex<BTreeMap<String, u64>>,
+    /// Per-`kind` inbound gossip-message counts. `kind` is one of
+    /// `op|revocation|burn|audit` — bounded by the four message
+    /// variants in [`dds_net::gossip::GossipMessage`].
+    gossip_messages: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Telemetry {
@@ -278,6 +321,7 @@ impl Telemetry {
             sessions_issued: Mutex::new(BTreeMap::new()),
             purpose_lookups: Mutex::new(BTreeMap::new()),
             admission_handshakes: Mutex::new(BTreeMap::new()),
+            gossip_messages: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -406,6 +450,31 @@ impl Telemetry {
         }
     }
 
+    fn bump_gossip_message(&self, kind: &str) {
+        let mut g = match self.gossip_messages.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry(kind.to_string()).or_insert(0) += 1;
+    }
+
+    fn gossip_messages_snapshot(&self) -> BTreeMap<String, u64> {
+        match self.gossip_messages.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of `dds_gossip_messages_total{kind=...}`. Public
+    /// so the `DdsNode` regression tests can take before/after
+    /// snapshots without scraping the renderer.
+    pub fn gossip_messages_count(&self, kind: &str) -> u64 {
+        match self.gossip_messages.lock() {
+            Ok(g) => g.get(kind).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(kind).copied().unwrap_or(0),
+        }
+    }
+
     fn uptime_seconds(&self) -> u64 {
         SystemTime::now()
             .duration_since(self.start_at)
@@ -468,6 +537,18 @@ pub fn record_purpose_lookup(result: &str) {
 pub fn record_admission_handshake(result: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_admission_handshake(result);
+    }
+}
+
+/// Bump `dds_gossip_messages_total{kind=...}` by one. Called from
+/// [`crate::node::DdsNode::handle_gossip_message`] after a gossip
+/// envelope clears topic identification and CBOR decoding, just before
+/// dispatch to the matching `ingest_*` path. `kind` is one of
+/// `op|revocation|burn|audit`. No-op when telemetry has not been
+/// installed (tests, harnesses).
+pub fn record_gossip_message(kind: &str) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_gossip_message(kind);
     }
 }
 
@@ -692,6 +773,26 @@ fn render_exposition(
         out.push_str(&format!(
             "dds_admission_handshakes_total{{result=\"{}\"}} {}\n",
             escape_label_value(result),
+            count
+        ));
+    }
+
+    // `dds_gossip_messages_total` — per-`kind` inbound gossip-message
+    // counter. Bumped from `DdsNode::handle_gossip_message` after the
+    // envelope clears topic identification and CBOR decode, just before
+    // dispatch to the matching `ingest_*` path.
+    out.push_str(
+        "# HELP dds_gossip_messages_total Inbound gossip messages received since process start \
+         (post-decode, pre-ingest), partitioned by message kind (op|revocation|burn|audit). \
+         Drops earlier in the pipeline (unknown topic, CBOR decode failure, topic/kind mismatch, \
+         or H-12 unadmitted-relayer drop) are not counted here.\n",
+    );
+    out.push_str("# TYPE dds_gossip_messages_total counter\n");
+    let gossip_snapshot = telemetry.gossip_messages_snapshot();
+    for (kind, count) in gossip_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_gossip_messages_total{{kind=\"{}\"}} {}\n",
+            escape_label_value(kind),
             count
         ));
     }
@@ -998,6 +1099,40 @@ mod tests {
     }
 
     #[test]
+    fn gossip_messages_counter_renders_in_exposition() {
+        let t = Telemetry::new();
+        t.bump_gossip_message("op");
+        t.bump_gossip_message("op");
+        t.bump_gossip_message("op");
+        t.bump_gossip_message("revocation");
+        t.bump_gossip_message("burn");
+        t.bump_gossip_message("audit");
+
+        let body = render_exposition(&t, 0, None, None, None, None);
+        assert!(body.contains("# TYPE dds_gossip_messages_total counter\n"));
+        assert!(body.contains("dds_gossip_messages_total{kind=\"op\"} 3\n"));
+        assert!(body.contains("dds_gossip_messages_total{kind=\"revocation\"} 1\n"));
+        assert!(body.contains("dds_gossip_messages_total{kind=\"burn\"} 1\n"));
+        assert!(body.contains("dds_gossip_messages_total{kind=\"audit\"} 1\n"));
+        assert_eq!(t.gossip_messages_count("op"), 3);
+        assert_eq!(t.gossip_messages_count("revocation"), 1);
+        assert_eq!(t.gossip_messages_count("burn"), 1);
+        assert_eq!(t.gossip_messages_count("audit"), 1);
+        assert_eq!(t.gossip_messages_count("other"), 0);
+    }
+
+    #[test]
+    fn gossip_messages_renders_empty_family_with_help_and_type() {
+        let t = Telemetry::new();
+        let body = render_exposition(&t, 0, None, None, None, None);
+        // HELP/TYPE always discoverable before the first inbound
+        // gossip envelope is decoded so a freshly booted node still
+        // surfaces the family in the catalog.
+        assert!(body.contains("# TYPE dds_gossip_messages_total counter\n"));
+        assert!(!body.contains("dds_gossip_messages_total{"));
+    }
+
+    #[test]
     fn caller_identity_counter_renders_in_exposition() {
         let t = Telemetry::new();
         t.bump_caller_identity("anonymous");
@@ -1213,6 +1348,9 @@ mod tests {
         // Admission-handshakes family is always discoverable; no
         // value lines until the first inbound handshake completes.
         assert!(body.contains("# TYPE dds_admission_handshakes_total counter\n"));
+        // Gossip-messages family is always discoverable; no value
+        // lines until the first inbound gossip envelope is decoded.
+        assert!(body.contains("# TYPE dds_gossip_messages_total counter\n"));
         // Peer-count gauges round-trip through the served exposition.
         assert!(body.contains("# TYPE dds_peers_admitted gauge\n"));
         assert!(body.contains("dds_peers_admitted 2\n"));

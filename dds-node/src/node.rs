@@ -909,15 +909,19 @@ impl DdsNode {
                     token_bytes,
                 },
             ) => {
+                crate::telemetry::record_gossip_message("op");
                 self.ingest_operation(&op_bytes, &token_bytes);
             }
             (DdsTopic::Revocations(..), GossipMessage::Revocation { token_bytes }) => {
+                crate::telemetry::record_gossip_message("revocation");
                 self.ingest_revocation(&token_bytes);
             }
             (DdsTopic::Burns(..), GossipMessage::Burn { token_bytes }) => {
+                crate::telemetry::record_gossip_message("burn");
                 self.ingest_burn(&token_bytes);
             }
             (DdsTopic::AuditLog(..), GossipMessage::AuditLog { entry_bytes }) => {
+                crate::telemetry::record_gossip_message("audit");
                 self.ingest_audit(&entry_bytes);
             }
             _ => {
