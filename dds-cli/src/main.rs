@@ -8,6 +8,7 @@
 //! `--node-url` flag (defaults to the loopback API at
 //! `http://127.0.0.1:5551`).
 
+mod audit_format;
 mod client;
 mod dump;
 
@@ -298,10 +299,13 @@ enum AuditAction {
         /// after each poll so each entry is only emitted once.
         #[arg(long, default_value_t = 0)]
         since: u64,
-        /// Output format. `jsonl` is the canonical format (one JSON
-        /// object per line, schema:
-        /// `{ts, action, reason, node_urn, chain_hash, prev_hash,
-        ///   sig_ok, token_cbor_b64}`).
+        /// Output format: `jsonl` (canonical, default — one JSON object
+        /// per line, schema `{ts, action, reason, node_urn, chain_hash,
+        /// prev_hash, sig_ok, token_cbor_b64}`); `cef` (ArcSight /
+        /// Splunk Common Event Format, single line); `syslog` (RFC 5424
+        /// with the audit fields in STRUCTURED-DATA `dds@32473`). The
+        /// CEF / syslog severity mapping is fixed by
+        /// `docs/observability/audit-event-schema.md` §5.
         #[arg(long, default_value = "jsonl")]
         format: String,
         /// Stay attached and keep polling for new entries on this
@@ -340,9 +344,11 @@ enum AuditAction {
         /// Filter by action (forwarded to the server as a query param).
         #[arg(long)]
         action: Option<String>,
-        /// Output format. `jsonl` is the canonical format and the only
-        /// one implemented in this build (cef and syslog are tracked
-        /// under Phase B.1 follow-ups).
+        /// Output format: `jsonl` (canonical, default), `cef`
+        /// (ArcSight / Splunk single line), or `syslog` (RFC 5424 with
+        /// the audit fields in STRUCTURED-DATA `dds@32473`). See
+        /// `docs/observability/audit-event-schema.md` §5–§6 for the
+        /// severity map and field templates.
         #[arg(long, default_value = "jsonl")]
         format: String,
         /// File path to write to. If omitted, writes to stdout.
@@ -890,14 +896,19 @@ async fn run_audit_tail(
     follow_interval: u64,
     action: Option<&str>,
 ) {
-    if !matches!(format, "jsonl") {
-        eprintln!(
-            "Error: unsupported audit tail format `{format}` — \
-             only `jsonl` is implemented in this build (cef and \
-             syslog are tracked under Phase B.1 follow-ups)."
-        );
-        std::process::exit(1);
-    }
+    let fmt = match audit_format::AuditFormat::parse(format) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+    // Resolve once per invocation: CEF Device Version is the
+    // dds-cli build (workspace-versioned 1:1 with dds-node), and
+    // syslog hostname is the host running the tail loop.
+    let dds_version = env!("CARGO_PKG_VERSION");
+    let hostname = audit_format::current_hostname();
+
     let mut watermark = since;
     let mut seen_chain_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
@@ -933,17 +944,17 @@ async fn run_audit_tail(
                 None => false,
             };
 
-            let line = serde_json::json!({
-                "ts": e.timestamp,
-                "action": e.action,
-                "reason": e.reason,
-                "node_urn": e.node_urn,
-                "chain_hash": e.chain_hash_hex,
-                "prev_hash": e.prev_hash_hex,
-                "sig_ok": sig_ok,
-                "token_cbor_b64": e.token_cbor_b64,
-            });
-            println!("{line}");
+            let line = audit_format::AuditLine {
+                ts: e.timestamp,
+                action: &e.action,
+                reason: e.reason.as_deref(),
+                node_urn: &e.node_urn,
+                chain_hash: e.chain_hash_hex.as_deref(),
+                prev_hash: e.prev_hash_hex.as_deref(),
+                sig_ok,
+                token_cbor_b64: &e.token_cbor_b64,
+            };
+            println!("{}", render_audit_line(&line, fmt, dds_version, &hostname));
 
             if e.timestamp >= watermark {
                 watermark = e.timestamp + 1;
@@ -958,6 +969,22 @@ async fn run_audit_tail(
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(follow_interval)).await;
+    }
+}
+
+/// Tiny dispatcher that picks the right formatter for a parsed
+/// `AuditFormat`. Kept in `main.rs` so the formatter module stays
+/// free of dispatch glue.
+fn render_audit_line(
+    line: &audit_format::AuditLine<'_>,
+    fmt: audit_format::AuditFormat,
+    dds_version: &str,
+    hostname: &str,
+) -> String {
+    match fmt {
+        audit_format::AuditFormat::Jsonl => audit_format::render_jsonl(line),
+        audit_format::AuditFormat::Cef => audit_format::render_cef(line, dds_version),
+        audit_format::AuditFormat::Syslog => audit_format::render_syslog(line, hostname),
     }
 }
 
@@ -1044,14 +1071,15 @@ async fn run_audit_export(
     action: Option<&str>,
     out: Option<&Path>,
 ) {
-    if !matches!(format, "jsonl") {
-        eprintln!(
-            "Error: unsupported audit export format `{format}` — \
-             only `jsonl` is implemented in this build (cef and \
-             syslog are tracked under Phase B.1 follow-ups)."
-        );
-        std::process::exit(1);
-    }
+    let fmt = match audit_format::AuditFormat::parse(format) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let dds_version = env!("CARGO_PKG_VERSION");
+    let hostname = audit_format::current_hostname();
 
     let mut q: Vec<(&str, String)> = Vec::new();
     q.push(("since", since.to_string()));
@@ -1076,17 +1104,17 @@ async fn run_audit_export(
             Some(decoded) => decoded.verify().is_ok(),
             None => false,
         };
-        let line = serde_json::json!({
-            "ts": e.timestamp,
-            "action": e.action,
-            "reason": e.reason,
-            "node_urn": e.node_urn,
-            "chain_hash": e.chain_hash_hex,
-            "prev_hash": e.prev_hash_hex,
-            "sig_ok": sig_ok,
-            "token_cbor_b64": e.token_cbor_b64,
-        });
-        lines.push(line.to_string());
+        let line = audit_format::AuditLine {
+            ts: e.timestamp,
+            action: &e.action,
+            reason: e.reason.as_deref(),
+            node_urn: &e.node_urn,
+            chain_hash: e.chain_hash_hex.as_deref(),
+            prev_hash: e.prev_hash_hex.as_deref(),
+            sig_ok,
+            token_cbor_b64: &e.token_cbor_b64,
+        };
+        lines.push(render_audit_line(&line, fmt, dds_version, &hostname));
         emitted += 1;
     }
 

@@ -383,11 +383,21 @@ token_cbor_b64}`. `sig_ok` is computed locally by CBOR-decoding
 `AuditLogEntry::verify()` so a SIEM forwarder cannot be tricked
 into trusting a tampered line.
 
-`cef` and `syslog` formats are tracked as B.1 follow-ups — the JSONL
-canonical form is enough for Vector / fluent-bit / rsyslog
-forwarders, which all consume `--source exec` JSONL natively. The
-CLI errors with a clear message on any unknown format so an
-operator on an old build does not silently emit nothing.
+`cef` (ArcSight / Splunk Common Event Format, single line) and
+`syslog` (RFC 5424 with the audit fields in STRUCTURED-DATA `dds@32473`)
+formats now ship alongside the canonical `jsonl` — see
+[audit-event-schema.md §6](observability/audit-event-schema.md) for
+the field templates. CEF Device Version is the `dds-cli` build
+(workspace-versioned 1:1 with `dds-node`); syslog hostname comes from
+`HOSTNAME` / `COMPUTERNAME` / `/etc/hostname` with RFC 5424 `NILVALUE`
+`-` as fallback so the line still parses on hosts where the lookup
+fails. Severity is fixed by [audit-event-schema.md §5](observability/audit-event-schema.md).
+Operators that already run a Vector / fluent-bit transform can keep
+that pipeline; `--format cef` / `--format syslog` are for deployments
+that prefer the canonical line shape directly out of the CLI without
+a forwarder-side rewrite. The CLI errors with a clear message naming
+the supported set on any unknown format so an operator on an old
+build does not silently emit nothing.
 
 The decoder runs locally, so the JTI / URNs in the output come from
 the *verified* token, not a copy of the line.
@@ -780,7 +790,7 @@ Subcommands added to `dds-cli`:
 | `dds-cli stats` | ✅ | Composes `/v1/status` + `/v1/audit/entries` into one snapshot — peer ID + uptime, connected peers, trust-graph + store sizes, audit chain length + head age + head action. Pretty-prints by default; `--format json` emits a single JSON object for scripting / Prometheus textfile fallbacks. `last admission failure` and `store bytes` deferred to Phase C (need the `/metrics` catalog). |
 | `dds-cli audit tail` | ✅ | (Phase B.1) |
 | `dds-cli audit verify` | ✅ | (Phase B.2) |
-| `dds-cli audit export` | ✅ | One-shot range dump — `--since` / `--until` / `--action` filters, `--out <file>` for incident-response bundles, otherwise stdout. JSONL only in this build (cef and syslog tracked under Phase B.1 follow-ups). Each line is verified locally before emission so a tampered entry surfaces as `sig_ok=false` rather than being silently trusted. |
+| `dds-cli audit export` | ✅ | One-shot range dump — `--since` / `--until` / `--action` filters, `--out <file>` for incident-response bundles, otherwise stdout. Output formats: `jsonl` (canonical, default), `cef` (ArcSight / Splunk single line), `syslog` (RFC 5424 with the audit fields in STRUCTURED-DATA `dds@32473`). Each line is verified locally before emission so a tampered entry surfaces as `sig_ok=false` rather than being silently trusted. |
 | `dds-cli health` | ✅ | Calls `/readyz` and prints the `{ready, checks}` body. Exits 0 when ready, 1 otherwise — orchestrator-friendly. `--format json` for scripting; `--format text` (default) for humans. Returns the HTTP status code so a 503-with-body looks distinct from a network failure. |
 
 ## 5. Tradeoffs

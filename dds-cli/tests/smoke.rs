@@ -86,18 +86,48 @@ fn test_remote_commands_fail_when_node_absent() {
 fn test_audit_export_rejects_unknown_format() {
     // Format check happens before any HTTP call, so an unreachable
     // node-url is fine — the CLI must exit non-zero with a clear
-    // message naming the unsupported format.
+    // message naming the unsupported format and the supported set.
+    // `xml` is intentionally unsupported (jsonl / cef / syslog all
+    // ship); historically this test guarded `cef` rejection but those
+    // formats now ship under the Phase B.1 follow-up.
     let bad_url = "http://127.0.0.1:1";
     let out = dds_cli()
-        .args(["--node-url", bad_url, "audit", "export", "--format", "cef"])
+        .args(["--node-url", bad_url, "audit", "export", "--format", "xml"])
         .output()
         .unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("unsupported audit export format"),
+        stderr.contains("unsupported audit format"),
         "unexpected stderr: {stderr}"
     );
+    assert!(
+        stderr.contains("jsonl, cef, syslog"),
+        "expected supported-format hint, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_audit_export_accepts_cef_and_syslog_format_args() {
+    // Negative test: CEF and syslog must NOT be rejected at format
+    // parse time — only the HTTP reach failure should surface.
+    let bad_url = "http://127.0.0.1:1";
+    for fmt in ["cef", "syslog"] {
+        let out = dds_cli()
+            .args(["--node-url", bad_url, "audit", "export", "--format", fmt])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "expected failure for {fmt}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cannot reach dds-node"),
+            "{fmt}: expected reach failure, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("unsupported"),
+            "{fmt}: format should have parsed: {stderr}"
+        );
+    }
 }
 
 #[test]

@@ -129,36 +129,50 @@ that have not built their own mapping yet, a sensible default is:
 Operators are expected to override these per their own runbook; the
 mapping above is a starting point, not a contract.
 
-## 6. CEF / syslog field maps (when implemented)
+## 6. CEF / syslog field maps
 
-Phase B.1 ships JSONL only. CEF and syslog formats are tracked as B.1
-follow-ups; when they land, they will use the field map below. Until
-then, forwarders that need CEF / syslog should run a Vector / fluent-bit
-transform (see [vector.toml](vector.toml) / [fluent-bit.conf](fluent-bit.conf)).
+Both formats are now shipped by `dds-cli audit tail --format <fmt>` and
+`dds-cli audit export --format <fmt>` — the previous "JSONL only" gap
+is closed. Operators that already run a Vector / fluent-bit transform
+can keep that pipeline; `--format cef` / `--format syslog` are for
+deployments that prefer the canonical line shape directly out of the
+CLI without a forwarder-side rewrite. Severity is derived from the
+`(action, sig_ok)` mapping in §5.
 
 ### CEF (ArcSight / Splunk)
 
 ```
-CEF:0|Anthropic|DDS|<dds-node version>|<action>|<action>|<severity>|
-  rt=<ts*1000> dvc=<node_urn> cs1Label=chainHash cs1=<chain_hash>
-  cs2Label=prevHash cs2=<prev_hash> cs3Label=reason cs3=<reason>
-  cs4Label=sigOk cs4=<sig_ok>
+CEF:0|Anthropic|DDS|<dds-cli version>|<action>|<action>|<severity>| rt=<ts*1000> dvc=<node_urn> cs1Label=chainHash cs1=<chain_hash> cs2Label=prevHash cs2=<prev_hash> cs3Label=reason cs3=<reason> cs4Label=sigOk cs4=<sig_ok>
 ```
 
-Bytes inside CEF extension values are escaped per the CEF
-specification (`\\`, `\=`, `\|`, `\n`).
+The Device Version field is the `dds-cli` build (workspace-versioned
+in lockstep with `dds-node`). Bytes inside CEF extension values are
+escaped per the CEF specification (`\\`, `\=`, `\|`, `\n`); header
+fields (the action stem in `Signature` / `Name`, the version in
+`Device Version`) escape `\\`, `\|`, and `\n` only — `=` is reserved
+in extensions, not headers, so it passes through. The full record is a
+single line with no embedded newlines.
 
 ### Syslog (RFC 5424 STRUCTURED-DATA)
 
 ```
-<priority>1 <ts-iso8601> <hostname> dds-cli - audit
-[dds@32473 action="<action>" node_urn="<node_urn>"
- chain_hash="<chain_hash>" prev_hash="<prev_hash>"
- reason="<reason>" sig_ok="<sig_ok>"]
+<priority>1 <ts-iso8601> <hostname> dds-cli - audit [dds@32473 action="<action>" node_urn="<node_urn>" chain_hash="<chain_hash>" prev_hash="<prev_hash>" reason="<reason>" sig_ok="<sig_ok>"]
 ```
 
-`<hostname>` is the host where `dds-cli audit tail` is running, not the
-signing `node_urn` (the latter is in the structured data).
+`<hostname>` is the host where `dds-cli audit tail` is running, not
+the signing `node_urn` (the latter is in the structured data). When
+the host cannot be resolved (sandboxed CI, unset `HOSTNAME` /
+`COMPUTERNAME`, missing `/etc/hostname`) the CLI emits the RFC 5424
+`NILVALUE` `-` so the line still parses cleanly.
+
+`<priority>` is `facility * 8 + severity` with facility = 13 ("log
+audit" per RFC 5424 §6.2.1) and severity from §5; the `dds@32473`
+SD-ID uses the IANA example PEN reserved by RFC 5612 — operators with
+their own PEN can substitute it with a single-line `sed` without
+breaking field parsing.
+
+PARAM-VALUE bytes are escaped per RFC 5424 §6.3.3: `\`, `]`, and `"`
+take a leading backslash. Other characters pass through.
 
 ## 7. Forwarder integration
 

@@ -28,7 +28,60 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-27 follow-up #44 (observability Phase C
+> Last updated: 2026-04-27 follow-up #45 (observability Phase B.1
+> follow-up — CEF + RFC 5424 syslog output formats landed for
+> `dds-cli audit tail` and `dds-cli audit export`, closing the
+> "JSONL-only in this build" gap that
+> [`docs/observability/audit-event-schema.md`](docs/observability/audit-event-schema.md)
+> §6 had been carrying as "when implemented"). The new
+> [`dds-cli/src/audit_format.rs`](dds-cli/src/audit_format.rs) module
+> centralises the three renderers (`render_jsonl`, `render_cef`,
+> `render_syslog`) on a shared [`AuditLine`](dds-cli/src/audit_format.rs)
+> struct so the local Ed25519 verify runs once per row regardless of
+> the chosen format. Severity is fixed by audit-event-schema.md §5:
+> `*.rejected` / `apply.failed` → CEF 4 / syslog warning (4); `revoke`
+> / `burn` / `admin.bootstrap` → CEF 3 / syslog notice (5);
+> everything else → CEF 2 / syslog informational (6); any
+> `sig_ok=false` line escalates to CEF 8 / syslog alert (1) so SIEM
+> operators never silently lose a tampering signal even when the
+> action stem is otherwise informational. CEF Device Version is the
+> `dds-cli` build (workspace-versioned 1:1 with `dds-node` via
+> `env!("CARGO_PKG_VERSION")`); CEF metacharacter escaping (`\\`,
+> `\=`, `\|`, `\n`) follows the spec, with header-tier escaping
+> dropping `\=` since `=` is reserved in extensions only. Syslog
+> hostname is best-effort — `HOSTNAME` / `COMPUTERNAME` /
+> `/etc/hostname` with the RFC 5424 `NILVALUE` `-` as fallback so the
+> line still parses on hosts where the lookup fails; the priority
+> field uses facility = 13 ("log audit"), and the SD-ID `dds@32473`
+> uses the IANA example PEN (RFC 5612) so an operator can substitute
+> their own PEN with a single-line `sed`. STRUCTURED-DATA PARAM-VALUE
+> escaping (`\`, `]`, `"`) follows RFC 5424 §6.3.3. The hand-rolled
+> `format_iso8601_utc` helper avoids pulling `chrono` into `dds-cli`
+> for one call site (Howard Hinnant `civil_from_days` algorithm,
+> public domain). The format-rejection test in
+> [`dds-cli/tests/smoke.rs`](dds-cli/tests/smoke.rs) was updated to
+> reject `xml` (genuinely unsupported) instead of `cef` (now
+> shipping), and a new positive test
+> `test_audit_export_accepts_cef_and_syslog_format_args` pins that
+> CEF and syslog parse without errors and only fail at the HTTP reach
+> layer when the node is unreachable. Workspace test count rises
+> from 653 to 668 (+15 new tests: 13 in
+> `dds-cli::audit_format::tests` covering `parse_format`, severity
+> mapping, escaping rules, full-line shapes, ISO 8601 timestamp
+> conversions across leap-year and decade boundaries; +1 new positive
+> integration test in `dds-cli::tests::smoke`; +1 net from the
+> updated negative integration test). Doc updates:
+> [`docs/observability/audit-event-schema.md`](docs/observability/audit-event-schema.md)
+> §6 promoted from "(when implemented)" to "shipped today" with the
+> updated header-vs-extension escaping rules and the hostname
+> fallback contract; [`docs/observability-plan.md`](docs/observability-plan.md)
+> Phase B.1 prose dropped the "follow-up" qualifier; the Phase F
+> `dds-cli audit export` row in the same doc lists all three
+> formats. `cargo fmt` clean; `cargo clippy --workspace --all-targets
+> -- -D warnings` clean; `cargo test --workspace --all-targets`
+> passes (668 tests).
+>
+> Previous: 2026-04-27 follow-up #44 (observability Phase C
 > `dds_build_info` `git_sha` + `rust_version` labels landed — the
 > catalog row's deferred build-time env-var pipeline is now wired up
 > via a new [`dds-node/build.rs`](dds-node/build.rs) that captures
