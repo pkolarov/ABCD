@@ -528,6 +528,7 @@ impl DdsNode {
                         peer = %propagation_source,
                         "H-12: dropping gossip from unadmitted peer"
                     );
+                    crate::telemetry::record_gossip_messages_dropped("unadmitted");
                     return;
                 }
                 self.handle_gossip_message(&message.topic, &message.data);
@@ -889,6 +890,7 @@ impl DdsNode {
             Some(t) => t,
             None => {
                 warn!(?topic_hash, "received message on unknown topic");
+                crate::telemetry::record_gossip_messages_dropped("unknown_topic");
                 return;
             }
         };
@@ -897,6 +899,7 @@ impl DdsNode {
             Ok(m) => m,
             Err(e) => {
                 warn!("invalid gossip message: {e}");
+                crate::telemetry::record_gossip_messages_dropped("decode_error");
                 return;
             }
         };
@@ -926,6 +929,7 @@ impl DdsNode {
             }
             _ => {
                 warn!("message type mismatch for topic");
+                crate::telemetry::record_gossip_messages_dropped("topic_kind_mismatch");
             }
         }
     }

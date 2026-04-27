@@ -32,6 +32,7 @@
 //! | `dds_purpose_lookups_total` | counter | `result=ok\|denied` | bumped by [`record_purpose_lookup`] |
 //! | `dds_admission_handshakes_total` | counter | `result=ok\|fail\|revoked` | bumped by [`record_admission_handshake`] |
 //! | `dds_gossip_messages_total` | counter | `kind=op\|revocation\|burn\|audit` | bumped by [`record_gossip_message`] |
+//! | `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted\|unknown_topic\|decode_error\|topic_kind_mismatch` | bumped by [`record_gossip_messages_dropped`] |
 //! | `dds_trust_graph_attestations` | gauge | — | [`crate::service::LocalService::trust_graph_counts`] at scrape |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
 //! | `dds_trust_graph_revocations` | gauge | — | same |
@@ -208,20 +209,59 @@
 //!   [`crate::node::DdsNode::ingest_audit`].
 //!
 //! Counts the *post-decode* surface only — messages dropped earlier
-//! (unknown topic, CBOR decode failure, topic/kind mismatch, or H-12
-//! unadmitted-relayer drop in [`crate::node::DdsNode::handle_swarm_event`])
-//! are *not* counted here. A future follow-up adding
-//! `dds_gossip_messages_dropped_total{reason}` will cover those drop
-//! sites; until then operators correlate the inbound rate against
-//! `dds_audit_entries_total{action=*.rejected}` for per-token rejections
-//! and against `dds_admission_handshakes_total{result="fail"}` for
-//! handshake-side regressions. Outbound-side publish (originating from
-//! the local node) is not currently instrumented because the production
-//! event loop has no centralised publish funnel — the
-//! [`crate::bin::dds_macos_e2e`] harness and the loadtest publisher both
-//! call `gossipsub.publish` directly. A future follow-up that lands a
+//! are partitioned by `dds_gossip_messages_dropped_total{reason}`
+//! (see below). Operators get the full inbound funnel from
+//! `sum(rate(dds_gossip_messages_total[5m])) +
+//! sum(rate(dds_gossip_messages_dropped_total[5m]))`. Per-token
+//! rejections that happen *after* decode (signature, graph, duplicate
+//! JTI, capability gate) remain visible via
+//! `dds_audit_entries_total{action=*.rejected}`, and handshake-side
+//! regressions via `dds_admission_handshakes_total{result="fail"}`.
+//! Outbound-side publish (originating from the local node) is not
+//! currently instrumented because the production event loop has no
+//! centralised publish funnel — the [`crate::bin::dds_macos_e2e`]
+//! harness and the loadtest publisher both call `gossipsub.publish`
+//! directly. A future follow-up that lands a
 //! `LocalService::publish_gossip` funnel can add the `direction=out`
 //! label to this counter without renaming.
+//!
+//! ### `dds_gossip_messages_dropped_total` semantics
+//!
+//! Bumped exactly once per inbound gossip message that is rejected
+//! before the matching `ingest_*` path runs, partitioned by the
+//! drop site:
+//!
+//! - `reason="unadmitted"` — H-12 gate in
+//!   [`crate::node::DdsNode::handle_swarm_event`]: the relayer
+//!   (`propagation_source`) is not in `admitted_peers`, so the
+//!   envelope is dropped without inspecting the payload. Pairs with
+//!   `dds_admission_handshakes_total{result="fail"}` to disambiguate
+//!   "peer reachable but never admitted" from "peer admitted but
+//!   subsequently revoked".
+//! - `reason="unknown_topic"` — the gossipsub `TopicHash` did not
+//!   match any [`dds_net::gossip::DdsTopic`] this node subscribed to.
+//!   A non-zero baseline indicates topic-id drift between peers
+//!   (config skew, domain-id mismatch).
+//! - `reason="decode_error"` — the payload bytes did not parse as a
+//!   [`dds_net::gossip::GossipMessage`]. A non-zero rate is the
+//!   gossip-tier wire-format-regression tripwire.
+//! - `reason="topic_kind_mismatch"` — the message decoded
+//!   successfully but its variant did not match the topic family
+//!   (e.g. a `Burn` payload arriving on a `DdsTopic::Operations`
+//!   topic). Indicates a misbehaving or downgraded peer.
+//!
+//! The catalog in `observability-plan.md` Phase C originally named
+//! the labels `unadmitted|invalid_token|duplicate|backpressure`; the
+//! latter three describe *post-decode* drop conditions inside the
+//! `ingest_*` paths and are already covered by
+//! `dds_audit_entries_total{action=*.rejected}` (signature /
+//! validation / duplicate-JTI rejections all funnel through the
+//! audit chain). This counter targets the *pre-decode* drop sites
+//! that audit emission cannot reach because there is no decoded
+//! token to attribute the drop to. A future follow-up that lands an
+//! `invalid_token` / `duplicate` / `backpressure` partition (e.g.
+//! once a gossipsub backpressure hook is wired) can add those
+//! reasons without renaming the metric.
 //!
 //! ### `dds_http_caller_identity_total` semantics
 //!
@@ -310,6 +350,12 @@ pub struct Telemetry {
     /// `op|revocation|burn|audit` — bounded by the four message
     /// variants in [`dds_net::gossip::GossipMessage`].
     gossip_messages: Mutex<BTreeMap<String, u64>>,
+    /// Per-`reason` inbound gossip-message drop counts. `reason` is one
+    /// of `unadmitted|unknown_topic|decode_error|topic_kind_mismatch` —
+    /// bounded by the four pre-decode drop sites in
+    /// [`crate::node::DdsNode::handle_swarm_event`] and
+    /// [`crate::node::DdsNode::handle_gossip_message`].
+    gossip_messages_dropped: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Telemetry {
@@ -322,6 +368,7 @@ impl Telemetry {
             purpose_lookups: Mutex::new(BTreeMap::new()),
             admission_handshakes: Mutex::new(BTreeMap::new()),
             gossip_messages: Mutex::new(BTreeMap::new()),
+            gossip_messages_dropped: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -475,6 +522,31 @@ impl Telemetry {
         }
     }
 
+    fn bump_gossip_messages_dropped(&self, reason: &str) {
+        let mut g = match self.gossip_messages_dropped.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry(reason.to_string()).or_insert(0) += 1;
+    }
+
+    fn gossip_messages_dropped_snapshot(&self) -> BTreeMap<String, u64> {
+        match self.gossip_messages_dropped.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of `dds_gossip_messages_dropped_total{reason=...}`.
+    /// Public so the `DdsNode` regression tests can take before/after
+    /// snapshots without scraping the renderer.
+    pub fn gossip_messages_dropped_count(&self, reason: &str) -> u64 {
+        match self.gossip_messages_dropped.lock() {
+            Ok(g) => g.get(reason).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(reason).copied().unwrap_or(0),
+        }
+    }
+
     fn uptime_seconds(&self) -> u64 {
         SystemTime::now()
             .duration_since(self.start_at)
@@ -549,6 +621,19 @@ pub fn record_admission_handshake(result: &str) {
 pub fn record_gossip_message(kind: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_gossip_message(kind);
+    }
+}
+
+/// Bump `dds_gossip_messages_dropped_total{reason=...}` by one. Called
+/// from the four pre-decode drop sites in
+/// [`crate::node::DdsNode::handle_swarm_event`] (H-12 unadmitted relayer
+/// drop) and [`crate::node::DdsNode::handle_gossip_message`] (unknown
+/// topic, CBOR decode failure, topic/kind mismatch). `reason` is one of
+/// `unadmitted|unknown_topic|decode_error|topic_kind_mismatch`. No-op
+/// when telemetry has not been installed (tests, harnesses).
+pub fn record_gossip_messages_dropped(reason: &str) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_gossip_messages_dropped(reason);
     }
 }
 
@@ -785,7 +870,7 @@ fn render_exposition(
         "# HELP dds_gossip_messages_total Inbound gossip messages received since process start \
          (post-decode, pre-ingest), partitioned by message kind (op|revocation|burn|audit). \
          Drops earlier in the pipeline (unknown topic, CBOR decode failure, topic/kind mismatch, \
-         or H-12 unadmitted-relayer drop) are not counted here.\n",
+         or H-12 unadmitted-relayer drop) are counted in dds_gossip_messages_dropped_total.\n",
     );
     out.push_str("# TYPE dds_gossip_messages_total counter\n");
     let gossip_snapshot = telemetry.gossip_messages_snapshot();
@@ -793,6 +878,28 @@ fn render_exposition(
         out.push_str(&format!(
             "dds_gossip_messages_total{{kind=\"{}\"}} {}\n",
             escape_label_value(kind),
+            count
+        ));
+    }
+
+    // `dds_gossip_messages_dropped_total` — per-`reason` pre-decode
+    // drop counter. Bumped from `DdsNode::handle_swarm_event` (the H-12
+    // unadmitted-relayer drop) and `DdsNode::handle_gossip_message` (the
+    // three pre-decode early-exit branches: unknown topic, CBOR decode
+    // failure, topic/kind mismatch).
+    out.push_str(
+        "# HELP dds_gossip_messages_dropped_total Inbound gossip messages dropped before ingest, \
+         partitioned by reason (unadmitted = H-12 unadmitted-relayer drop in handle_swarm_event; \
+         unknown_topic = topic hash not in the local subscription set; decode_error = CBOR \
+         decode of the GossipMessage envelope failed; topic_kind_mismatch = decoded variant did \
+         not match the topic family).\n",
+    );
+    out.push_str("# TYPE dds_gossip_messages_dropped_total counter\n");
+    let gossip_dropped_snapshot = telemetry.gossip_messages_dropped_snapshot();
+    for (reason, count) in gossip_dropped_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_gossip_messages_dropped_total{{reason=\"{}\"}} {}\n",
+            escape_label_value(reason),
             count
         ));
     }
@@ -1133,6 +1240,42 @@ mod tests {
     }
 
     #[test]
+    fn gossip_messages_dropped_counter_renders_in_exposition() {
+        let t = Telemetry::new();
+        t.bump_gossip_messages_dropped("unadmitted");
+        t.bump_gossip_messages_dropped("unadmitted");
+        t.bump_gossip_messages_dropped("unknown_topic");
+        t.bump_gossip_messages_dropped("decode_error");
+        t.bump_gossip_messages_dropped("topic_kind_mismatch");
+
+        let body = render_exposition(&t, 0, None, None, None, None);
+        assert!(body.contains("# TYPE dds_gossip_messages_dropped_total counter\n"));
+        assert!(body.contains("dds_gossip_messages_dropped_total{reason=\"unadmitted\"} 2\n"));
+        assert!(body.contains("dds_gossip_messages_dropped_total{reason=\"unknown_topic\"} 1\n"));
+        assert!(body.contains("dds_gossip_messages_dropped_total{reason=\"decode_error\"} 1\n"));
+        assert!(
+            body.contains("dds_gossip_messages_dropped_total{reason=\"topic_kind_mismatch\"} 1\n")
+        );
+        assert_eq!(t.gossip_messages_dropped_count("unadmitted"), 2);
+        assert_eq!(t.gossip_messages_dropped_count("unknown_topic"), 1);
+        assert_eq!(t.gossip_messages_dropped_count("decode_error"), 1);
+        assert_eq!(t.gossip_messages_dropped_count("topic_kind_mismatch"), 1);
+        assert_eq!(t.gossip_messages_dropped_count("other"), 0);
+    }
+
+    #[test]
+    fn gossip_messages_dropped_renders_empty_family_with_help_and_type() {
+        let t = Telemetry::new();
+        let body = render_exposition(&t, 0, None, None, None, None);
+        // HELP/TYPE always discoverable before the first dropped
+        // envelope is observed so a freshly booted node still surfaces
+        // the family in the catalog (alert expressions resolve
+        // immediately).
+        assert!(body.contains("# TYPE dds_gossip_messages_dropped_total counter\n"));
+        assert!(!body.contains("dds_gossip_messages_dropped_total{"));
+    }
+
+    #[test]
     fn caller_identity_counter_renders_in_exposition() {
         let t = Telemetry::new();
         t.bump_caller_identity("anonymous");
@@ -1351,6 +1494,9 @@ mod tests {
         // Gossip-messages family is always discoverable; no value
         // lines until the first inbound gossip envelope is decoded.
         assert!(body.contains("# TYPE dds_gossip_messages_total counter\n"));
+        // Gossip-messages-dropped family is always discoverable; no
+        // value lines until the first envelope is dropped.
+        assert!(body.contains("# TYPE dds_gossip_messages_dropped_total counter\n"));
         // Peer-count gauges round-trip through the served exposition.
         assert!(body.contains("# TYPE dds_peers_admitted gauge\n"));
         assert!(body.contains("dds_peers_admitted 2\n"));

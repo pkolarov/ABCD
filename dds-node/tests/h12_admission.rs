@@ -355,6 +355,11 @@ async fn unadmitted_peer_gossip_dropped() {
     // `verify_peer_admission` bumps the right bucket.
     let telemetry = dds_node::telemetry::install();
     let fail_before = telemetry.admission_handshakes_count("fail");
+    // observability-plan.md Phase C — also delta the
+    // `dds_gossip_messages_dropped_total{reason="unadmitted"}` counter
+    // so we pin that the H-12 unadmitted-relayer drop in
+    // `handle_swarm_event` bumps the right pre-decode bucket.
+    let dropped_before = telemetry.gossip_messages_dropped_count("unadmitted");
 
     // Pre-allocate a "wrong" peer id: a fresh keypair whose id is
     // NOT the same as B's actual libp2p peer id. The cert issued for
@@ -413,5 +418,17 @@ async fn unadmitted_peer_gossip_dropped() {
         "dds_admission_handshakes_total{{result=\"fail\"}} did not advance under bad-cert handshake (before {} after {})",
         fail_before,
         fail_after
+    );
+
+    // The H-12 gate in `handle_swarm_event` must have dropped at least
+    // one of B's published envelopes (B is unadmitted from A's POV
+    // because the cert verify failed). Robust to other tests in the
+    // same process bumping the global counter — assert delta only.
+    let dropped_after = telemetry.gossip_messages_dropped_count("unadmitted");
+    assert!(
+        dropped_after > dropped_before,
+        "dds_gossip_messages_dropped_total{{reason=\"unadmitted\"}} did not advance under unadmitted gossip drop (before {} after {})",
+        dropped_before,
+        dropped_after
     );
 }

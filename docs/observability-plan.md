@@ -52,8 +52,13 @@ Phase C **gossip-messages counter**
 from [`DdsNode::handle_gossip_message`](../dds-node/src/node.rs)
 after the inbound envelope clears topic identification and CBOR
 decode, just before dispatch to the matching `ingest_*` path) landed
-2026-04-27 follow-up #31.
-The rest of the C catalog (gossip-dropped / sync / FIDO2 assertion + verify
+2026-04-27 follow-up #31. Phase C **gossip-messages-dropped counter**
+(`dds_gossip_messages_dropped_total{reason=unadmitted|unknown_topic|decode_error|topic_kind_mismatch}` —
+bumped from the four pre-decode drop sites in
+[`DdsNode::handle_swarm_event`](../dds-node/src/node.rs) and
+[`DdsNode::handle_gossip_message`](../dds-node/src/node.rs)) landed
+2026-04-27 follow-up #32.
+The rest of the C catalog (sync / FIDO2 assertion + verify
 counters / store sizes / process, plus the HTTP request / duration
 histograms) plus the Phase E rules/panels that depend on those
 metrics remain open.
@@ -318,9 +323,11 @@ follow-up #29; network peer-count gauges
 (`dds_peers_admitted` + `dds_peers_connected`) landed 2026-04-27
 follow-up #30; gossip-messages counter
 (`dds_gossip_messages_total{kind}`) landed 2026-04-27 follow-up
-#31; rest of the catalog (gossip-dropped / sync / FIDO2 assertion
-+ verify counters / store sizes / process, plus the HTTP request /
-duration families) remains open.** The
+#31; gossip-messages-dropped counter
+(`dds_gossip_messages_dropped_total{reason}`) landed 2026-04-27
+follow-up #32; rest of the catalog (sync / FIDO2 assertion + verify
+counters / store sizes / process, plus the HTTP request / duration
+families) remains open.** The
 audit-metrics first slice exposed the five families needed to alert on
 Z-3 regressions (`dds_build_info`, `dds_uptime_seconds`,
 `dds_audit_entries_total{action}`, `dds_audit_chain_length`,
@@ -412,7 +419,7 @@ rows remain open.
 | `dds_peers_connected` | gauge | — | libp2p-connected peers (admitted + un-admitted) — refreshed from `swarm.connected_peers().count()` at the same call sites. The unadmitted share is `dds_peers_connected - dds_peers_admitted`. | ✅ |
 | `dds_admission_handshakes_total` | counter | `result=ok|fail|revoked` | H-12 inbound-handshake outcomes — bumped from [`DdsNode::verify_peer_admission`](../dds-node/src/node.rs) at every exit branch. `ok` = peer cert verified and peer added to `admitted_peers`; `revoked` = peer is on the local admission revocation list (rejected before signature work); `fail` = no cert / decode error / clock error / cert verify rejected (signature, domain id, peer id, or expiry mismatch). Outbound-side handshake initiation is not counted (would be redundant with the libp2p connection counter). | ✅ |
 | `dds_gossip_messages_total` | counter | `kind=op|revocation|burn|audit` | Inbound gossip volume — bumped from [`DdsNode::handle_gossip_message`](../dds-node/src/node.rs) after the envelope clears topic identification and CBOR decode, just before dispatch to the matching `ingest_*` path. The catalog originally named `topic` + `direction` labels; `kind` is 1:1 with the originating [`DdsTopic`](../dds-net/src/gossip.rs) so a separate `topic` label would be redundant cardinality, and outbound-side publish is not currently instrumented (the production event loop has no centralised publish funnel — the [`dds-macos-e2e`](../dds-node/src/bin/dds-macos-e2e.rs) harness and the loadtest publisher both call `gossipsub.publish` directly), so v1 ships inbound-only. A future follow-up that lands a `LocalService::publish_gossip` funnel can add the `direction=out` label without renaming the metric. | ✅ |
-| `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted|invalid_token|duplicate|backpressure` | Why we threw a message away | 🔲 |
+| `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted|unknown_topic|decode_error|topic_kind_mismatch` | Pre-decode drops — bumped from the H-12 unadmitted-relayer drop in [`DdsNode::handle_swarm_event`](../dds-node/src/node.rs) and the three early-exit branches of [`DdsNode::handle_gossip_message`](../dds-node/src/node.rs) (`unknown_topic` = topic hash not in the local subscription set; `decode_error` = `GossipMessage::from_cbor` rejected the payload; `topic_kind_mismatch` = decoded variant did not match the topic family). The catalog originally named the labels `unadmitted|invalid_token|duplicate|backpressure`; the latter three describe *post-decode* drop conditions inside the `ingest_*` paths and are already covered by `dds_audit_entries_total{action=*.rejected}` (signature / validation / duplicate-JTI rejections all funnel through the audit chain), so v1 partitions the pre-decode surface only. A future follow-up that wires a gossipsub backpressure hook can add `reason=backpressure` without renaming the metric. | ✅ |
 | `dds_sync_pulls_total` | counter | `result=ok|fail` | Anti-entropy pull count | 🔲 |
 | `dds_sync_lag_seconds` | histogram | — | Time from peer's op timestamp to local apply | 🔲 |
 | `dds_sync_payloads_rejected_total` | counter | `reason=signature|graph|duplicate_jti|window` | B-1-style guard hits | 🔲 |
