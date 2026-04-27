@@ -804,7 +804,9 @@ Subcommands added to `dds-cli`:
 - **`/metrics` unauth-on-loopback default.** Same posture as every
   Prometheus exporter ever shipped. Operators who expose it off-host
   carry the standard responsibility (ACL, mTLS sidecar). Documented
-  in the metric-endpoint section of `DDS-Admin-Guide.md` (to add).
+  in the [Monitoring and Diagnostics](DDS-Admin-Guide.md#monitoring-and-diagnostics)
+  section of the Admin Guide alongside `dds stats` / `dds health` /
+  the reference dashboards & alert rules.
 - **Audit chain on a single node is the source of truth for that
   node.** Cross-node consistency comes from gossip; a node that's
   been offline returns audit gaps for the offline window. The SIEM

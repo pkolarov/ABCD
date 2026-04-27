@@ -28,7 +28,41 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-27 follow-up #45 (observability Phase B.1
+> Last updated: 2026-04-27 follow-up #46 (observability Admin Guide
+> Monitoring section completed — closes the
+> [`docs/observability-plan.md`](docs/observability-plan.md) §5
+> tradeoffs item that was carrying "Documented in the metric-endpoint
+> section of `DDS-Admin-Guide.md` (to add)" since Phase C started).
+> The [`Monitoring and Diagnostics`](docs/DDS-Admin-Guide.md#monitoring-and-diagnostics)
+> section now covers all four operator-facing surfaces in one place:
+> the `dds stats` composite snapshot (Phase F), the unauthenticated
+> `/healthz` + `/readyz` orchestrator probes plus the `dds health`
+> wrapper (Phase D), the opt-in `/metrics` Prometheus exposition with
+> the full catalog table (23 rows folding the 27 `dds_*` families
+> currently shipping — every active row from the Phase C catalog
+> across network, trust-graph, FIDO2, sessions, audit, storage,
+> HTTP, and process — plus the two deferred histograms keyed off the
+> `metrics-exporter-prometheus` rollover), and the reference
+> Alertmanager / Grafana assets in
+> [`docs/observability/alerts/dds.rules.yml`](docs/observability/alerts/dds.rules.yml)
+> and [`docs/observability/grafana/`](docs/observability/grafana/).
+> The Audit Log section grows three new sub-sections: `dds audit
+> verify` (Phase B.2), `dds audit tail` / `dds audit export` (Phase
+> B.1 + F) including the CEF and RFC 5424 syslog output formats from
+> follow-up #45, and a forwarder-integration paragraph pointing at
+> the [Vector](docs/observability/vector.toml) and
+> [fluent-bit](docs/observability/fluent-bit.conf) reference configs
+> from follow-up #20. The `[network]` example config in the Node
+> Configuration Reference grows a `metrics_addr = "127.0.0.1:9495"`
+> line with the same opt-in / TLS-sidecar posture note used elsewhere.
+> The §5 tradeoffs bullet in
+> [`docs/observability-plan.md`](docs/observability-plan.md) drops
+> the "(to add)" qualifier and links forward into the new admin-guide
+> section. No code change — documentation only;
+> `cargo test --workspace --all-targets` continues to pass (668
+> tests, unchanged).
+>
+> Previous: 2026-04-27 follow-up #45 (observability Phase B.1
 > follow-up — CEF + RFC 5424 syslog output formats landed for
 > `dds-cli audit tail` and `dds-cli audit export`, closing the
 > "JSONL-only in this build" gap that

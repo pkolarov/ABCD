@@ -254,18 +254,21 @@ this secret; locally, run
 | `GET` | `/healthz`, `/readyz` | Orchestrator probes (Phase D) |
 
 Set `network.metrics_addr = "127.0.0.1:9495"` to expose Prometheus
-`/metrics` on a separate listener (observability-plan.md Phase C —
-audit + HTTP-caller subset in this build: `dds_build_info`,
-`dds_uptime_seconds`, `dds_audit_entries_total{action}`,
-`dds_audit_chain_length`, `dds_audit_chain_head_age_seconds`,
-`dds_http_caller_identity_total{kind=anonymous|uds|pipe|admin}`).
-Default is `None` so the second port is opt-in. Reference
-Alertmanager rules (groups `dds-audit`, `dds-process`, and
-`dds-http`) and two Grafana dashboards keyed off the same
-metrics ship under [`docs/observability/`](docs/observability/)
-(Phase E). The `dds-http` group's `DdsLoopbackTcpAdminUsed` alert
-fires when `kind="anonymous"` traffic continues post-cutover —
-the H-7 regression tripwire.
+`/metrics` on a separate listener (observability-plan.md Phase C).
+Default is `None` so the second port is opt-in. The full catalog
+(27 `dds_*` families across network, trust-graph, FIDO2, sessions,
+audit, storage, HTTP, and process tiers; only `dds_sync_lag_seconds`
+and `dds_http_request_duration_seconds` histograms remain deferred
+on the `metrics-exporter-prometheus` rollover) is documented in the
+admin guide's [Monitoring and Diagnostics](docs/DDS-Admin-Guide.md#monitoring-and-diagnostics)
+section. Reference Alertmanager rules (six active groups —
+`dds-audit`, `dds-process`, `dds-storage`, `dds-http`,
+`dds-network`, `dds-fido2`) and two Grafana dashboards
+(`dds-overview`, `dds-trust-graph`) ship under
+[`docs/observability/`](docs/observability/) (Phase E). The
+`dds-http` group's `DdsLoopbackTcpAdminUsed` alert fires when
+`kind="anonymous"` traffic continues post-cutover — the H-7
+regression tripwire.
 
 ### Rust API (`dds-core` + `dds-domain`)
 

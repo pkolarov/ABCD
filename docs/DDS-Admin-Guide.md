@@ -559,6 +559,11 @@ mdns_enabled = true
 heartbeat_secs = 5
 idle_timeout_secs = 120
 api_addr = "127.0.0.1:5551"
+# Optional Prometheus textual exposition listener (observability-plan.md
+# Phase C). Default is unset so existing deployments do not open a
+# second port without an opt-in. Recommended in-cluster value is
+# 127.0.0.1:9495 plus a TLS sidecar for off-host scrape.
+metrics_addr = "127.0.0.1:9495"
 
 [domain]
 name = "acme.com"
@@ -1455,24 +1460,35 @@ dotnet test platform/macos/DdsPolicyAgent.Tests/DdsPolicyAgent.MacOS.Tests.cspro
 
 ## Monitoring and Diagnostics
 
+DDS exposes four distinct surfaces for operations tooling — pick by the
+question you are trying to answer:
+
+| Surface | Purpose | Auth |
+|---|---|---|
+| `/v1/status` (HTTP) + `dds stats` | Composite snapshot for humans / scripts | Same as the API listener (loopback or H-7 transport) |
+| `/healthz` + `/readyz` (HTTP) + `dds health` | Orchestrator probes (Kubernetes / systemd / Nomad) | Unauthenticated by design — see below |
+| `/metrics` (HTTP, opt-in) | Prometheus textual exposition | Unauthenticated; bind to a trusted scrape network |
+| Audit chain (`dds audit ...`) | Tamper-evident per-action log for SIEM | Same as the API listener |
+
 ### Node Status
 
 ```bash
-# Via HTTP API
-curl http://127.0.0.1:5551/v1/status | jq
+# Composite snapshot — peer ID, uptime, peer count, trust-graph + store
+# sizes, audit chain length and head age. observability-plan.md Phase F.
+dds stats                # pretty-printed
+dds stats --format json  # one JSON object — pipe to jq / Prometheus textfile
 
-# Via CLI — local store counters only (no node contact)
+# Local store counters only (no node contact)
 dds status
 
-# Via CLI — live node status
+# Live node status via the HTTP API
 dds status --remote
+curl http://127.0.0.1:5551/v1/status | jq
 ```
 
-Returns:
-- Connected peer count
-- DAG operation count
-- Trust graph depth and token counts
-- Store statistics
+`dds stats` composes `/v1/status` and `/v1/audit/entries` into one
+report so an operator can answer "is this node healthy and how busy is
+it?" without two separate queries.
 
 ### List Enrolled Users
 
@@ -1485,6 +1501,135 @@ Or via CLI:
 ```bash
 dds cp enrolled-users [--device-urn ...]
 ```
+
+### Health Endpoints (Kubernetes / systemd / Nomad)
+
+The node exposes two **unauthenticated** orchestrator probes on the
+same axum listener as `/v1/status`. Both are H-6-signed so a MITM
+cannot manufacture a bogus 200 / 503; they carry no node-internal
+state, so leaving them open to the orchestrator is safe.
+
+```bash
+# Liveness — returns 200 whenever the axum task is scheduling. A
+# poisoned redb still answers liveness so the orchestrator does not
+# flap a recovering node before /readyz is ready.
+curl -fsS http://127.0.0.1:5551/healthz
+# 200 ok
+
+# Readiness — 200 with {ready: true, checks: {...}} when ready,
+# 503 with {ready: false, checks: {...}} otherwise. Checks: identity
+# loaded, redb round-trip via audit_chain_head, swarm has seen at
+# least one peer (or bootstrap_peers is empty for a lone node).
+curl -fsS http://127.0.0.1:5551/readyz | jq
+```
+
+The `dds health` CLI is the orchestrator-friendly wrapper — exits 0
+when ready, 1 otherwise, and prints the structured `checks` object on
+both branches:
+
+```bash
+dds health                # human-readable
+dds health --format json  # machine-readable
+
+# Kubernetes liveness/readiness probe equivalent
+livenessProbe:
+  httpGet: { path: /healthz, port: 5551 }
+readinessProbe:
+  httpGet: { path: /readyz,  port: 5551 }
+```
+
+### Prometheus Metrics (`/metrics`)
+
+The node can serve a Prometheus textual exposition on a **separate
+listener** from the API. The endpoint is **opt-in** — set
+`network.metrics_addr` in `dds.toml` (default `None`). Recommended
+value for an in-cluster scrape is `127.0.0.1:9495` plus a TLS sidecar
+when scraping off-host:
+
+```toml
+[network]
+api_addr     = "127.0.0.1:5551"      # API listener (existing)
+metrics_addr = "127.0.0.1:9495"      # Prometheus listener (new)
+```
+
+The metrics router answers only `GET /metrics`; every other path
+returns 404 so the second listener cannot be confused with the API
+surface. **No auth on `/metrics` by design** — same posture as every
+Prometheus exporter ever shipped (kube-state-metrics, node_exporter).
+If exposed off-host, operators put a TLS sidecar in front and ACL the
+scrape network. Cardinality budget is ≤ 200 series per node so a small
+Prometheus comfortably handles a fleet of thousands.
+
+```bash
+curl -s http://127.0.0.1:9495/metrics | head -40
+```
+
+Catalog (full list with semantics is in
+[`docs/observability-plan.md`](observability-plan.md#phase-c--prometheus-exposition-metrics)):
+
+| Family | Type | Labels | What it answers |
+|---|---|---|---|
+| `dds_build_info` | gauge | `version`, `git_sha`, `rust_version` | Build fingerprint — alert on `count by(version)` skew across the fleet |
+| `dds_uptime_seconds` | gauge | — | Has this node just restarted? |
+| `dds_peers_admitted` / `dds_peers_connected` | gauge | — | Admitted peers vs. raw libp2p peers — the unadmitted share is `connected − admitted` |
+| `dds_admission_handshakes_total` | counter | `result=ok\|fail\|revoked` | H-12 inbound-handshake outcomes |
+| `dds_gossip_messages_total` | counter | `kind=op\|revocation\|burn\|audit` | Inbound gossip volume |
+| `dds_gossip_messages_dropped_total` | counter | `reason` | Pre-decode drops (unadmitted peer, unknown topic, decode error, kind mismatch) |
+| `dds_sync_pulls_total` | counter | `result=ok\|fail` | Anti-entropy pull outcomes |
+| `dds_sync_payloads_rejected_total` | counter | `reason` | Pre/post-apply sync rejections (legacy v1, publisher capability, replay window, signature, duplicate JTI, graph) |
+| `dds_trust_graph_{attestations,vouches,revocations,burned}` | gauge | — | Current trust-graph state |
+| `dds_purpose_lookups_total` | counter | `result=ok\|denied` | Capability-gate outcomes |
+| `dds_fido2_assertions_total` | counter | `result=ok\|signature\|rp_id\|up\|sign_count\|other` | FIDO2 assertion outcomes |
+| `dds_fido2_attestation_verify_total` | counter | `result, fmt` | Enrollment-time attestation verify outcomes |
+| `dds_sessions_issued_total` | counter | `via=fido2\|legacy` | Session minting (legacy must be 0 in production) |
+| `dds_challenges_outstanding` | gauge | — | Live FIDO2 challenges (B-5 cap reference) |
+| `dds_audit_entries_total` | counter | `action` | Per-action audit emission rate |
+| `dds_audit_chain_length` | gauge | — | Local chain entry count |
+| `dds_audit_chain_head_age_seconds` | gauge | — | `now − last_entry.timestamp` (alert if too old) |
+| `dds_store_bytes` | gauge | `table` | Per-redb-table stored bytes |
+| `dds_store_writes_total` | counter | `result=ok\|conflict\|fail` | Per-result store write outcomes |
+| `dds_http_requests_total` | counter | `route, method, status` | Route-level HTTP traffic |
+| `dds_http_caller_identity_total` | counter | `kind=anonymous\|uds\|pipe\|admin` | Caller transport mix — H-7 cutover regression alarm |
+| `dds_memory_resident_bytes` | gauge | — | Process RSS |
+| `dds_thread_count` | gauge | — | OS thread count |
+
+Histograms (`dds_sync_lag_seconds`, `dds_http_request_duration_seconds`)
+are deferred until the hand-rolled exposition rolls over to
+`metrics-exporter-prometheus`; they will land alongside the Phase E
+`DdsSyncLagHigh` rule.
+
+### Reference Dashboards & Alert Rules
+
+Three reference assets ship with the repo so a fresh deployment can
+load a working monitoring layer in minutes:
+
+- [`docs/observability/alerts/dds.rules.yml`](observability/alerts/dds.rules.yml)
+  — Alertmanager rule groups: `dds-audit` (chain-stalled, emissions-flat,
+  rejection spike), `dds-process` (node down / flapping / build skew),
+  `dds-storage` (write failures), `dds-http` (loopback-TCP H-7
+  regression), `dds-network` (admission failure spike, sync rejects
+  spike), `dds-fido2` (assertion failure spike). Reference rules whose
+  source metric is still open (Phase C histograms) ship as commented
+  blocks — uncomment a tier only after confirming the metric ships in
+  the deployed `dds-node` build.
+- [`docs/observability/grafana/dds-overview.json`](observability/grafana/dds-overview.json)
+  — Node count, build skew, audit chain head age, scrape health, audit
+  emission rate by action, chain length / head age / uptime per
+  instance.
+- [`docs/observability/grafana/dds-trust-graph.json`](observability/grafana/dds-trust-graph.json)
+  — Per-family ingest activity (attest / vouch / revoke / burn,
+  success vs `*.rejected`), enrollment & admin actions, apply
+  outcomes, aggregate rejection-ratio panel matching the
+  `DdsAuditRejectionSpike` rule.
+
+Load with `promtool check rules dds.rules.yml` (Alertmanager) and the
+Grafana "Import dashboard" UI / `grafana-cli` (Grafana 10+).
+
+### SIEM Forwarding
+
+The audit chain ships with two reference forwarder configs that tail
+`dds audit tail --format jsonl` into a SIEM. See
+[Audit Log → Stream to a SIEM](#stream-to-a-siem) below.
 
 ### Logs
 
@@ -1527,11 +1672,19 @@ Exits with status 2 if any KPI fails. See [dds-loadtest/README.md](../dds-loadte
 
 ## Audit Log
 
-Every token accepted by the node — attestations, vouches, revocations,
-burns — is appended to a local audit log (when `audit_log_enabled` is
-set in `[domain]`). Each entry is the full CBOR of the original token
-plus a `timestamp` and a signature from the node that recorded it, so
-the log is tamper-evident even if the redb file is tampered with later.
+Every state-mutating action a node accepts — attestations, vouches,
+revocations, burns, enrollment ceremonies, admin bootstrap / vouch,
+and applier reports — is appended to a local audit log when
+`audit_log_enabled = true` is set in `[domain]`. The flag is
+**off by default**; production deployments should turn it on so
+operators have a tamper-evident record to forward to a SIEM.
+Each entry carries the full CBOR of the original token, a node-signed
+Ed25519 signature, and a `prev_hash` link to the previous entry's
+`chain_hash` so the log is tamper-evident even if the redb file is
+modified later. See
+[`docs/observability/audit-event-schema.md`](observability/audit-event-schema.md)
+for the full action vocabulary, rejection-reason vocabulary, and field
+templates.
 
 ### Query the log
 
@@ -1551,9 +1704,62 @@ curl "http://127.0.0.1:5551/v1/audit/entries?action=vouch&limit=100" | jq
 ```
 
 Output lists the timestamp (Unix seconds), the `action`, the node URN
-that recorded it, and a truncated base64 prefix of the CBOR token. To
-decode the token fully, pipe the full `token_cbor_b64` field to a CBOR
-decoder (e.g. `cbor2diag`).
+that recorded it, and a truncated base64 prefix of the CBOR token. The
+HTTP response also carries `chain_hash_hex`, `prev_hash_hex`, `reason`,
+and the full `entry_cbor_b64` so a SIEM consumer can chain-link or
+replay the on-wire signed bytes without re-deriving them.
+
+### Verify the chain
+
+```bash
+# Walk the chain end-to-end. For each entry: re-derive chain_hash,
+# verify the Ed25519 signature against the embedded node_public_key,
+# and confirm prev_hash matches the previous entry's chain_hash.
+# Reports the first break with the offending index + action and exits 1.
+dds audit verify
+```
+
+This is the on-host integrity check; SIEM forwarders also re-run the
+signature verify locally before emission so a tampered line surfaces
+as `sig_ok=false` rather than being silently trusted.
+
+### Stream to a SIEM
+
+```bash
+# Tail the chain, JSONL one-line-per-entry, polling /v1/audit/entries
+# every 5 s. Output keys: ts, action, reason, node_urn, chain_hash,
+# prev_hash, sig_ok, token_cbor_b64. sig_ok is computed locally so a
+# tampered entry surfaces as false.
+dds audit tail --since $(date +%s) --format jsonl --follow-interval 5
+
+# Same shape in CEF (ArcSight / Splunk) or RFC 5424 syslog
+dds audit tail --format cef
+dds audit tail --format syslog
+
+# One-shot range dump for incident response — --since / --until /
+# --action filters, --out writes to a file, otherwise stdout
+dds audit export --since 1714000000 --until 1714086400 \
+                 --action attest.rejected --out /tmp/audit-incident.jsonl
+```
+
+Two reference forwarder configs ship with the repo so a Vector or
+fluent-bit pipeline drops in without writing it from scratch:
+
+- [`docs/observability/vector.toml`](observability/vector.toml) —
+  Vector source `exec` running `dds audit tail`, with a `remap`
+  transform that promotes `ts` to the canonical Vector timestamp and
+  stamps a default severity per the schema doc. Loki, Splunk HEC,
+  Elasticsearch, and S3 sinks documented.
+- [`docs/observability/fluent-bit.conf`](observability/fluent-bit.conf)
+  + [`docs/observability/parsers.conf`](observability/parsers.conf) —
+  same shape on fluent-bit 2.2+. Loki / Splunk / Elasticsearch /
+  rsyslog outputs documented.
+
+The forwarder handles restart, backpressure, batching, and retry — DDS
+does not. Severity defaults are fixed by
+[`docs/observability/audit-event-schema.md`](observability/audit-event-schema.md)
+§5; any `sig_ok=false` line is escalated to `alert` so a tampering
+signal is never silently downgraded.
 
 ### Retention
 
