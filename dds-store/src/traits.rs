@@ -3,7 +3,7 @@
 //! All storage backends implement these traits, allowing the node
 //! to swap between redb (desktop/mobile) and in-memory (embedded/test).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use dds_core::audit::AuditLogEntry;
@@ -214,6 +214,34 @@ pub trait CredentialStateStore {
         }
         self.set_sign_count(credential_id, new_count)
     }
+}
+
+/// Per-table stored-byte snapshot for the `dds_store_bytes{table=...}`
+/// Prometheus gauge (observability-plan.md Phase C). Implementations
+/// return a map keyed by stable table name (matching the redb table
+/// definitions) whose value is the count of bytes the backend reports
+/// as currently occupied by stored payloads (i.e. the data the table
+/// actually holds, not metadata or fragmentation overhead).
+///
+/// Bytes vs. entries: this trait reports *bytes*. Entry counts are
+/// already exposed by the per-domain methods (`count_tokens`,
+/// `count_audit_entries`, `count_challenges`, …) and need not be
+/// duplicated here.
+///
+/// Backends with no notion of byte size (in-memory backends used in
+/// tests) return an empty map. The metrics renderer treats an empty
+/// snapshot as "family present, no series" so the `# HELP` / `# TYPE`
+/// headers stay discoverable.
+pub trait StoreSizeStats {
+    /// Snapshot of bytes-stored per known table. The keys are static
+    /// table-name strings so the metric `table` label is a fixed
+    /// vocabulary.
+    ///
+    /// Returns a `StoreResult` so a failed read at scrape time can be
+    /// surfaced to the renderer (which degrades to zero rather than
+    /// panicking the scrape task — matches the `trust_graph_counts`
+    /// poison-tolerance pattern).
+    fn table_stored_bytes(&self) -> StoreResult<BTreeMap<&'static str, u64>>;
 }
 
 /// Combined directory store — convenience trait bundling all stores.

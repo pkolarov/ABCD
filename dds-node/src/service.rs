@@ -234,6 +234,18 @@ pub struct TrustGraphCounts {
     pub burned: usize,
 }
 
+/// One-shot per-table byte snapshot for the `dds_store_bytes{table=...}`
+/// Prometheus gauge (observability-plan.md Phase C). Wraps the
+/// [`dds_store::traits::StoreSizeStats::table_stored_bytes`] result so
+/// the renderer's signature stays simple — the renderer takes
+/// `Option<StoreByteSizes>` and emits one gauge series per `table`
+/// entry, falling back to the empty family on `None` (read failed) so
+/// the family's `# HELP` / `# TYPE` headers stay discoverable.
+#[derive(Debug, Clone, Default)]
+pub struct StoreByteSizes {
+    pub tables: std::collections::BTreeMap<&'static str, u64>,
+}
+
 // ----------------------------------------------------------------
 // Platform applier surface (Windows + macOS)
 //
@@ -2014,6 +2026,29 @@ impl<
     /// growth*, which the gauge will surface as a rising baseline.
     pub fn challenges_outstanding(&self) -> Option<usize> {
         self.store.count_challenges().ok()
+    }
+
+    /// One-shot per-table byte snapshot. observability-plan.md Phase C
+    /// — backs the `dds_store_bytes{table=...}` Prometheus gauge.
+    /// Returns `None` when the underlying store read fails so the
+    /// metrics renderer can degrade to a zero rather than panic the
+    /// scrape task; matches the `trust_graph_counts` /
+    /// `challenges_outstanding` poison-tolerance pattern.
+    ///
+    /// Backends that do not expose a meaningful byte size (the
+    /// in-memory backend used in tests / harnesses) implement
+    /// `table_stored_bytes` to return an empty map. The renderer
+    /// treats that as "family present, no series" and the `# HELP` /
+    /// `# TYPE` headers ship anyway so the family stays discoverable
+    /// in the catalog.
+    pub fn store_byte_sizes(&self) -> Option<StoreByteSizes>
+    where
+        S: dds_store::traits::StoreSizeStats,
+    {
+        self.store
+            .table_stored_bytes()
+            .ok()
+            .map(|tables| StoreByteSizes { tables })
     }
 
     /// One-shot trust-graph counts under a single read-lock

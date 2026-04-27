@@ -736,6 +736,129 @@ impl CredentialStateStore for RedbBackend {
 
 impl DirectoryStore for RedbBackend {}
 
+impl StoreSizeStats for RedbBackend {
+    /// Per-table `stored_bytes` from redb's `TableStats`. Opens a single
+    /// read transaction, opens each known table, and pulls
+    /// `TableStats::stored_bytes()` (the actual stored payload, not
+    /// metadata or fragmentation). The 7 entries in the returned map
+    /// match the seven `TableDefinition` constants at the top of this
+    /// module, in stable spelling so the `table` label vocabulary is
+    /// fixed for operators.
+    ///
+    /// Reading the stats requires opening the table, which would error
+    /// if the table has never been created. `RedbBackend::open`
+    /// creates every table on first open (so a fresh database has all
+    /// of them); we still tolerate per-table open / stats failure by
+    /// reporting zero for that single table rather than failing the
+    /// scrape.
+    fn table_stored_bytes(&self) -> StoreResult<std::collections::BTreeMap<&'static str, u64>> {
+        use std::collections::BTreeMap;
+
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+
+        let mut out = BTreeMap::new();
+
+        // Generic accessor for `&str` keyed tables — every table except
+        // `audit_log` uses this shape.
+        fn read_str_table(txn: &redb::ReadTransaction, def: TableDefinition<&str, &[u8]>) -> u64 {
+            match txn.open_table(def) {
+                Ok(t) => t.stats().map(|s| s.stored_bytes()).unwrap_or(0),
+                Err(_) => 0,
+            }
+        }
+
+        out.insert("tokens", read_str_table(&read_txn, TOKENS));
+        out.insert("revoked", read_str_table(&read_txn, REVOKED));
+        out.insert("burned", read_str_table(&read_txn, BURNED));
+        out.insert("operations", read_str_table(&read_txn, OPERATIONS));
+        out.insert("challenges", read_str_table(&read_txn, CHALLENGES));
+        out.insert(
+            "credential_state",
+            read_str_table(&read_txn, CREDENTIAL_STATE),
+        );
+
+        // `audit_log` is keyed by `u64`; same idea, different table type.
+        let audit_bytes = match read_txn.open_table(AUDIT_LOG) {
+            Ok(t) => t.stats().map(|s| s.stored_bytes()).unwrap_or(0),
+            Err(_) => 0,
+        };
+        out.insert("audit_log", audit_bytes);
+
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod store_size_stats_tests {
+    use super::*;
+    use dds_core::identity::Identity;
+    use rand::rngs::OsRng;
+    use tempfile::TempDir;
+
+    fn open_temp() -> (TempDir, RedbBackend) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.redb");
+        let be = RedbBackend::open(&path).unwrap();
+        (dir, be)
+    }
+
+    /// `RedbBackend::table_stored_bytes` reports a fixed seven-table
+    /// vocabulary matching the seven `TableDefinition` constants at the
+    /// top of this module. Pins the `table` label set the
+    /// `dds_store_bytes` Prometheus gauge commits to.
+    #[test]
+    fn table_stored_bytes_reports_fixed_vocabulary() {
+        let (_dir, be) = open_temp();
+        let sizes = be.table_stored_bytes().expect("read sizes");
+        let names: std::collections::BTreeSet<_> = sizes.keys().copied().collect();
+        let expected: std::collections::BTreeSet<&'static str> = [
+            "audit_log",
+            "burned",
+            "challenges",
+            "credential_state",
+            "operations",
+            "revoked",
+            "tokens",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(names, expected, "table label vocabulary drifted: {names:?}");
+    }
+
+    /// Inserting an audit entry must move the `audit_log` per-table
+    /// byte count strictly upward — this is the bytes-stored signal
+    /// operators are graphing on. Uses the same chain-aware audit-entry
+    /// shape as the generic `test_audit_crud` suite in
+    /// [`crate::lib`] tests.
+    #[test]
+    fn table_stored_bytes_grows_for_audit_log_after_append() {
+        let (_dir, mut be) = open_temp();
+        let baseline = be.table_stored_bytes().expect("baseline read");
+        let baseline_audit = baseline.get("audit_log").copied().unwrap_or(0);
+
+        let id = Identity::generate("audit-test", &mut OsRng);
+        let entry = dds_core::audit::AuditLogEntry::sign_ed25519(
+            "attest",
+            vec![0xA0],
+            id.id.to_urn(),
+            &id.signing_key,
+            1_700_000_000,
+        )
+        .expect("sign");
+        be.append_audit_entry(&entry).expect("append");
+
+        let after = be.table_stored_bytes().expect("post-append read");
+        let after_audit = after.get("audit_log").copied().unwrap_or(0);
+        assert!(
+            after_audit > baseline_audit,
+            "audit_log bytes did not grow after append: {baseline_audit} -> {after_audit}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod l18_sign_count_tests {
     use super::*;

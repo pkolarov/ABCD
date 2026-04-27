@@ -110,12 +110,18 @@ Post-apply rejections from
 into a single `SyncResult.errors: Vec<String>` today and need a
 categorical schema before the
 `signature|graph|duplicate_jti` buckets can ship) landed
-2026-04-27 follow-up #37. The rest of the C catalog
-(`dds_sync_lag_seconds` / store sizes / process, plus the
-`dds_http_request_duration_seconds` histogram sibling, and the
-post-apply `signature|graph|duplicate_jti` partition of
-`dds_sync_payloads_rejected_total`) plus the Phase E rules/panels
-that depend on those metrics remain open.
+2026-04-27 follow-up #37. Phase C **store-bytes gauge**
+(`dds_store_bytes{table=tokens|revoked|burned|operations|audit_log|challenges|credential_state}` —
+scrape-time read of [`dds_store::traits::StoreSizeStats::table_stored_bytes`]
+through [`LocalService::store_byte_sizes`](../dds-node/src/service.rs);
+RedbBackend reports `redb::TableStats::stored_bytes()` per table,
+MemoryBackend returns an empty map so harnesses scrape a discoverable
+family with no series) landed 2026-04-27 follow-up #38. The rest of
+the C catalog (`dds_sync_lag_seconds` / `dds_store_writes_total` /
+process, plus the `dds_http_request_duration_seconds` histogram
+sibling, and the post-apply `signature|graph|duplicate_jti`
+partition of `dds_sync_payloads_rejected_total`) plus the Phase E
+rules/panels that depend on those metrics remain open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -392,9 +398,16 @@ follow-up #35; HTTP-requests counter
 pre-apply surface only; post-apply
 `signature|graph|duplicate_jti` partition deferred until
 `SyncResult` grows a categorical reason enum) landed 2026-04-27
-follow-up #37; rest of the catalog (`dds_sync_lag_seconds`,
-store sizes, process, plus the
-`dds_http_request_duration_seconds` histogram sibling, and the
+follow-up #37; store-bytes gauge
+(`dds_store_bytes{table=tokens|revoked|burned|operations|audit_log|challenges|credential_state}`)
+landed 2026-04-27 follow-up #38 — scrape-time read of
+[`dds_store::traits::StoreSizeStats::table_stored_bytes`] through
+[`LocalService::store_byte_sizes`](../dds-node/src/service.rs);
+RedbBackend reports `redb::TableStats::stored_bytes()` per table and
+MemoryBackend returns an empty map so harnesses scrape a
+discoverable family with no series; rest of the catalog
+(`dds_sync_lag_seconds`, `dds_store_writes_total`, process, plus
+the `dds_http_request_duration_seconds` histogram sibling, and the
 post-apply partition of `dds_sync_payloads_rejected_total`)
 remains open.** The
 audit-metrics first slice exposed the five families needed to alert on
@@ -508,7 +521,7 @@ rows remain open.
 | `dds_audit_chain_length` | gauge | — | Local chain entry count | ✅ |
 | `dds_audit_chain_head_age_seconds` | gauge | — | `now - last_entry.timestamp` (alert if > N) | ✅ |
 | **Storage** | | | | |
-| `dds_store_bytes` | gauge | `table=tokens|ops|audit|...` | redb table sizes | 🔲 |
+| `dds_store_bytes` | gauge | `table=tokens|revoked|burned|operations|audit_log|challenges|credential_state` | Per-redb-table stored-byte gauge — scrape-time read of [`dds_store::traits::StoreSizeStats::table_stored_bytes`](../dds-store/src/traits.rs) through [`LocalService::store_byte_sizes`](../dds-node/src/service.rs). RedbBackend opens a single read transaction and pulls `redb::TableStats::stored_bytes()` per table (the actual stored payload, excluding metadata and fragmentation overhead); MemoryBackend returns an empty map so harnesses / tests scrape a discoverable family with no series. The `table` label vocabulary is fixed by the seven redb `TableDefinition` constants in [`dds-store/src/redb_backend.rs`](../dds-store/src/redb_backend.rs). | ✅ |
 | `dds_store_writes_total` | counter | `result=ok|conflict|fail` | redb txn outcomes | 🔲 |
 | **HTTP API** | | | | |
 | `dds_http_requests_total` | counter | `route, method, status` | Route-level traffic — bumped from the `route_layer`-applied [`http_request_observer_middleware`](../dds-node/src/http.rs) wired into the merged production router built by [`crate::http::router`](../dds-node/src/http.rs). The middleware reads `axum::extract::MatchedPath` from the per-route handler stack (DDS has no path parameters today, so the matched template equals the literal URI path), captures the method, then bumps once with the inner handler's status code on the way out. Unmatched 404s served by the default fallback are *not* counted because `route_layer` does not wrap the fallback — operators read the un-routed call rate off `dds_http_caller_identity_total`. The route layer sits inside the outer `caller_identity_observer_middleware` / `rate_limit_middleware` / `DefaultBodyLimit` stack, so requests rejected before they reach a matched handler (rate-limited 429s, body-too-big 413s) do not bump this counter — those remain visible only via `dds_http_caller_identity_total`. | ✅ |

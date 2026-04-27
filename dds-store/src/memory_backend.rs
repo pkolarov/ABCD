@@ -294,6 +294,20 @@ impl CredentialStateStore for MemoryBackend {
 
 impl DirectoryStore for MemoryBackend {}
 
+impl StoreSizeStats for MemoryBackend {
+    /// In-memory backend has no persistent file layout, so the
+    /// "stored bytes" notion is not directly meaningful (heap allocator
+    /// overhead would be the real answer, but exposing that would couple
+    /// metric values to allocator state in unhelpful ways). We return an
+    /// empty map so the metrics renderer emits the family's `# HELP` /
+    /// `# TYPE` headers without any series — the catalog stays
+    /// discoverable and an operator scraping a memory-backed harness
+    /// sees zero series rather than misleading numbers.
+    fn table_stored_bytes(&self) -> StoreResult<std::collections::BTreeMap<&'static str, u64>> {
+        Ok(std::collections::BTreeMap::new())
+    }
+}
+
 #[cfg(test)]
 mod l18_sign_count_tests {
     use super::*;
