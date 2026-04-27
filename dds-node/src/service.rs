@@ -128,9 +128,34 @@ pub struct AdminVouchResult {
 }
 
 /// Internal output of the shared FIDO2 assertion verifier.
+#[derive(Debug)]
 struct CommonAssertionOutput {
     subject_urn: String,
     user_verified: bool,
+}
+
+/// Drop-guard that funnels every exit branch of
+/// [`LocalService::verify_assertion_common`] into a single
+/// `dds_fido2_assertions_total{result=...}` bump. The default bucket
+/// is `"other"`; named branches (`signature`, `rp_id`, `up`,
+/// `sign_count`, `ok`) overwrite the field before the function
+/// returns. Drop-on-return guarantees the metric advances exactly
+/// once per assertion attempt, including paths that exit via `?`
+/// without explicit classification (those collapse into `"other"`).
+struct AssertionMetricGuard {
+    bucket: &'static str,
+}
+
+impl AssertionMetricGuard {
+    fn new() -> Self {
+        Self { bucket: "other" }
+    }
+}
+
+impl Drop for AssertionMetricGuard {
+    fn drop(&mut self) {
+        crate::telemetry::record_fido2_assertion(self.bucket);
+    }
 }
 
 /// Enrolled user info for CP tile enumeration.
@@ -1593,6 +1618,12 @@ impl<
         use dds_domain::fido2::{cose_to_credential_public_key, verify_assertion};
         use sha2::{Digest, Sha256};
 
+        // observability-plan.md Phase C — every exit branch of this
+        // function bumps `dds_fido2_assertions_total{result=...}` exactly
+        // once via the drop-guard. Default bucket is `"other"`; named
+        // branches overwrite the field before returning.
+        let mut metric = AssertionMetricGuard::new();
+
         // M-19 (security review): refuse if the wall clock has regressed
         // since startup. NTP backstep or VM snapshot-restore could
         // un-expire a previously-consumed challenge or session. Compare
@@ -1663,11 +1694,26 @@ impl<
         };
 
         // 2. Cryptographic signature verification.
-        let parsed = verify_assertion(authenticator_data, client_data_hash, signature, &public_key)
-            .map_err(|e| ServiceError::Fido2(e.to_string()))?;
+        let parsed =
+            match verify_assertion(authenticator_data, client_data_hash, signature, &public_key) {
+                Ok(p) => p,
+                Err(dds_domain::fido2::Fido2Error::BadSignature) => {
+                    metric.bucket = "signature";
+                    return Err(ServiceError::Fido2(
+                        dds_domain::fido2::Fido2Error::BadSignature.to_string(),
+                    ));
+                }
+                Err(e) => {
+                    // Format / KeyError / etc. — malformed authenticator
+                    // payload, not a signature mismatch on a parseable
+                    // payload. Collapses into `result="other"`.
+                    return Err(ServiceError::Fido2(e.to_string()));
+                }
+            };
 
         // 3. User-presence (UP) flag — physical touch/biometric required.
         if !parsed.user_present {
+            metric.bucket = "up";
             return Err(ServiceError::Fido2(
                 "assertion failed: user_present (UP) flag not set".into(),
             ));
@@ -1677,6 +1723,7 @@ impl<
         {
             let expected_hash = Sha256::digest(enrolled_rp_id.as_bytes());
             if parsed.rp_id_hash != expected_hash.as_slice() {
+                metric.bucket = "rp_id";
                 return Err(ServiceError::Fido2(
                     "assertion rp_id_hash does not match enrolled relying party".into(),
                 ));
@@ -1790,6 +1837,7 @@ impl<
             match self.store.bump_sign_count(credential_id, parsed.sign_count) {
                 Ok(()) => {}
                 Err(dds_store::traits::StoreError::SignCountReplay { stored, attempted }) => {
+                    metric.bucket = "sign_count";
                     return Err(ServiceError::Fido2(format!(
                         "sign_count replay detected: received {attempted} <= stored {stored} for credential '{credential_id}'"
                     )));
@@ -1803,6 +1851,7 @@ impl<
             );
         }
 
+        metric.bucket = "ok";
         Ok(CommonAssertionOutput {
             subject_urn,
             user_verified: parsed.user_verified,
@@ -3882,6 +3931,291 @@ mod platform_applier_tests {
             handle.fido2_attestation_verify_count("ok", "none"),
             ok_none_before + 1,
             "ok/none bucket must not advance on a failed verify"
+        );
+    }
+
+    /// observability-plan.md Phase C — regression test for the
+    /// `dds_fido2_assertions_total{result}` Prometheus counter. Pins
+    /// that every named exit branch of
+    /// [`LocalService::verify_assertion_common`] (consumed by
+    /// `issue_session_from_assertion` and `admin_vouch`) advances the
+    /// matching bucket exactly once via the [`AssertionMetricGuard`]
+    /// drop-guard. Exercises:
+    ///
+    /// - `result="ok"` — the happy path: enroll a user, fetch a
+    ///   challenge, build a fully-valid assertion, drive
+    ///   `verify_assertion_common`.
+    /// - `result="signature"` — an assertion signed by a different
+    ///   private key than the one enrolled.
+    /// - `result="rp_id"` — an assertion whose `auth_data` carries
+    ///   the SHA-256 of a *different* relying-party identifier.
+    /// - `result="up"` — an assertion whose `auth_data` flags byte
+    ///   has the User-Present (UP) bit cleared.
+    /// - `result="sign_count"` — replay of a previously-presented
+    ///   sign-count value, caught by the
+    ///   `CredentialStateStore::bump_sign_count` atomic check.
+    /// - `result="other"` — a `credential_id` that the trust graph
+    ///   has no record of (lookup miss).
+    ///
+    /// The catalog's `uv` bucket is *not* covered here because
+    /// `verify_assertion_common` does not currently gate on the
+    /// User-Verified flag; UV is reported through
+    /// [`CommonAssertionOutput::user_verified`] but never causes a
+    /// reject. A future UV-required gate can extend both this test
+    /// and the renderer test side-by-side without renaming the
+    /// metric.
+    #[test]
+    fn verify_assertion_common_advances_each_result_bucket() {
+        use dds_domain::fido2::{build_assertion_auth_data, build_packed_self_attestation};
+        use ed25519_dalek::{Signer, SigningKey};
+        use sha2::Digest;
+        let handle = crate::telemetry::install();
+
+        // Enroll a user with an Ed25519 packed self-attestation so the
+        // credential is in the trust graph.
+        let (mut svc, _, _) = setup();
+        svc.set_verify_fido2(true);
+        let cred_sk = SigningKey::generate(&mut OsRng);
+        let cred_bytes = b"cred-assert-bucket-test";
+        let rp_id = "dds.local";
+        let attestation = build_packed_self_attestation(rp_id, cred_bytes, &cred_sk, &[0u8; 32]);
+        let cred_id_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred_bytes);
+        let _ = svc
+            .enroll_user(EnrollUserRequest {
+                label: "alice-bucket".into(),
+                credential_id: cred_id_b64.clone(),
+                attestation_object: attestation,
+                client_data_hash: vec![0u8; 32],
+                rp_id: rp_id.into(),
+                display_name: "Alice".into(),
+                authenticator_type: "platform".into(),
+                challenge_id: None,
+                client_data_json: None,
+            })
+            .expect("enroll_user must succeed for bucket-test setup");
+
+        // Helper: insert a fresh challenge into the store and return
+        // its id + base64url challenge bytes the way the production
+        // path would.
+        let mut next_challenge = 0u32;
+        let mut put_challenge = |svc: &mut LocalService<MemoryBackend>| -> (String, String) {
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            next_challenge += 1;
+            let id = format!("ch-bucket-{next_challenge}");
+            let bytes = [next_challenge as u8; 32];
+            let far_future = now_epoch() + 600;
+            svc.store_mut()
+                .put_challenge(&id, &bytes, far_future)
+                .expect("put_challenge");
+            (id, URL_SAFE_NO_PAD.encode(bytes))
+        };
+
+        // Helper: build a full clientDataJSON-style assertion against
+        // a given (signing key, rp_id, sign_count, challenge,
+        // auth-data override). Returns a populated
+        // `AssertionSessionRequest`.
+        let build_req = |credential_id: &str,
+                         challenge_id: &str,
+                         challenge_b64url: &str,
+                         signing_sk: &SigningKey,
+                         auth_data: Vec<u8>|
+         -> AssertionSessionRequest {
+            let cdj = format!(
+                r#"{{"type":"webauthn.get","challenge":"{challenge_b64url}","origin":"https://{rp_id}"}}"#,
+                rp_id = rp_id,
+            );
+            let cdh = sha2::Sha256::digest(cdj.as_bytes());
+            let mut signed_msg = Vec::new();
+            signed_msg.extend_from_slice(&auth_data);
+            signed_msg.extend_from_slice(&cdh);
+            let sig = signing_sk.sign(&signed_msg);
+            AssertionSessionRequest {
+                subject_urn: None,
+                credential_id: credential_id.to_string(),
+                challenge_id: challenge_id.to_string(),
+                client_data_hash: cdh.to_vec(),
+                client_data_json: Some(cdj.into_bytes()),
+                authenticator_data: auth_data,
+                signature: sig.to_bytes().to_vec(),
+                duration_secs: None,
+            }
+        };
+
+        // -------- result="ok" -------------------------------------------------
+        let ok_before = handle.fido2_assertions_count("ok");
+        let (ch_id, ch_b64) = put_challenge(&mut svc);
+        let req = build_req(
+            &cred_id_b64,
+            &ch_id,
+            &ch_b64,
+            &cred_sk,
+            build_assertion_auth_data(rp_id, 1),
+        );
+        let _ = svc
+            .verify_assertion_common(
+                &req.credential_id,
+                &req.challenge_id,
+                &req.client_data_hash,
+                req.client_data_json.as_deref(),
+                &req.authenticator_data,
+                &req.signature,
+            )
+            .expect("happy-path assertion must verify");
+        assert_eq!(
+            handle.fido2_assertions_count("ok"),
+            ok_before + 1,
+            "ok bucket must advance once on a happy-path assertion"
+        );
+
+        // -------- result="signature" -----------------------------------------
+        let sig_before = handle.fido2_assertions_count("signature");
+        let wrong_sk = SigningKey::generate(&mut OsRng);
+        let (ch_id, ch_b64) = put_challenge(&mut svc);
+        // sign_count=2 (monotonic forward from the ok bucket above).
+        let req = build_req(
+            &cred_id_b64,
+            &ch_id,
+            &ch_b64,
+            &wrong_sk, // wrong key → BadSignature
+            build_assertion_auth_data(rp_id, 2),
+        );
+        let err = svc
+            .verify_assertion_common(
+                &req.credential_id,
+                &req.challenge_id,
+                &req.client_data_hash,
+                req.client_data_json.as_deref(),
+                &req.authenticator_data,
+                &req.signature,
+            )
+            .expect_err("wrong-key assertion must reject");
+        let _ = err;
+        assert_eq!(
+            handle.fido2_assertions_count("signature"),
+            sig_before + 1,
+            "signature bucket must advance on Fido2Error::BadSignature"
+        );
+
+        // -------- result="up" -------------------------------------------------
+        let up_before = handle.fido2_assertions_count("up");
+        let (ch_id, ch_b64) = put_challenge(&mut svc);
+        // Hand-build auth_data with the UP bit cleared. Layout:
+        //   rpIdHash (32) | flags (1) | signCount (4)
+        let mut auth_data = build_assertion_auth_data(rp_id, 3);
+        auth_data[32] &= !0x01; // clear UP bit
+        let req = build_req(
+            &cred_id_b64,
+            &ch_id,
+            &ch_b64,
+            &cred_sk, // correct key — signature verifies, UP fails
+            auth_data,
+        );
+        let err = svc
+            .verify_assertion_common(
+                &req.credential_id,
+                &req.challenge_id,
+                &req.client_data_hash,
+                req.client_data_json.as_deref(),
+                &req.authenticator_data,
+                &req.signature,
+            )
+            .expect_err("UP-clear assertion must reject");
+        let _ = err;
+        assert_eq!(
+            handle.fido2_assertions_count("up"),
+            up_before + 1,
+            "up bucket must advance when UP flag is cleared"
+        );
+
+        // -------- result="rp_id" ---------------------------------------------
+        let rp_before = handle.fido2_assertions_count("rp_id");
+        let (ch_id, ch_b64) = put_challenge(&mut svc);
+        // Build auth_data against a *different* rp_id, then sign over
+        // that auth_data so the signature step passes — only the
+        // rp_id_hash should mismatch the enrolled rp_id.
+        let auth_data = build_assertion_auth_data("evil.example", 4);
+        let req = build_req(&cred_id_b64, &ch_id, &ch_b64, &cred_sk, auth_data);
+        let err = svc
+            .verify_assertion_common(
+                &req.credential_id,
+                &req.challenge_id,
+                &req.client_data_hash,
+                req.client_data_json.as_deref(),
+                &req.authenticator_data,
+                &req.signature,
+            )
+            .expect_err("wrong-rp_id assertion must reject");
+        let _ = err;
+        assert_eq!(
+            handle.fido2_assertions_count("rp_id"),
+            rp_before + 1,
+            "rp_id bucket must advance when rp_id_hash mismatches enrolled relying party"
+        );
+
+        // -------- result="sign_count" ----------------------------------------
+        let sc_before = handle.fido2_assertions_count("sign_count");
+        let (ch_id, ch_b64) = put_challenge(&mut svc);
+        // sign_count=1 — already consumed by the ok bucket above.
+        let req = build_req(
+            &cred_id_b64,
+            &ch_id,
+            &ch_b64,
+            &cred_sk,
+            build_assertion_auth_data(rp_id, 1),
+        );
+        let err = svc
+            .verify_assertion_common(
+                &req.credential_id,
+                &req.challenge_id,
+                &req.client_data_hash,
+                req.client_data_json.as_deref(),
+                &req.authenticator_data,
+                &req.signature,
+            )
+            .expect_err("sign_count replay must reject");
+        let _ = err;
+        assert_eq!(
+            handle.fido2_assertions_count("sign_count"),
+            sc_before + 1,
+            "sign_count bucket must advance on StoreError::SignCountReplay"
+        );
+
+        // -------- result="other" ---------------------------------------------
+        // An unknown credential_id never reaches the named branches —
+        // the trust-graph lookup rejects first, falling through to the
+        // default `other` bucket.
+        let other_before = handle.fido2_assertions_count("other");
+        let (ch_id, ch_b64) = put_challenge(&mut svc);
+        let req = build_req(
+            "no-such-credential-id-b64",
+            &ch_id,
+            &ch_b64,
+            &cred_sk,
+            build_assertion_auth_data(rp_id, 99),
+        );
+        let err = svc
+            .verify_assertion_common(
+                &req.credential_id,
+                &req.challenge_id,
+                &req.client_data_hash,
+                req.client_data_json.as_deref(),
+                &req.authenticator_data,
+                &req.signature,
+            )
+            .expect_err("unknown credential must reject");
+        let _ = err;
+        assert_eq!(
+            handle.fido2_assertions_count("other"),
+            other_before + 1,
+            "other bucket must advance on credential lookup miss"
+        );
+
+        // The catalog's `uv` bucket must remain untouched — no
+        // UV-required gate ships today.
+        assert_eq!(
+            handle.fido2_assertions_count("uv"),
+            0,
+            "uv bucket is reserved and must not advance until a UV-required gate ships"
         );
     }
 

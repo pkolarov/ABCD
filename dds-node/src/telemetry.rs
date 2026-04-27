@@ -34,6 +34,7 @@
 //! | `dds_gossip_messages_total` | counter | `kind=op\|revocation\|burn\|audit` | bumped by [`record_gossip_message`] |
 //! | `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted\|unknown_topic\|decode_error\|topic_kind_mismatch` | bumped by [`record_gossip_messages_dropped`] |
 //! | `dds_fido2_attestation_verify_total` | counter | `result=ok\|fail`, `fmt=packed\|none\|unknown` | bumped by [`record_fido2_attestation_verify`] |
+//! | `dds_fido2_assertions_total` | counter | `result=ok\|signature\|rp_id\|up\|sign_count\|other` | bumped by [`record_fido2_assertion`] |
 //! | `dds_trust_graph_attestations` | gauge | — | [`crate::service::LocalService::trust_graph_counts`] at scrape |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
 //! | `dds_trust_graph_revocations` | gauge | — | same |
@@ -312,6 +313,64 @@
 //! actions instead and remain visible via
 //! `dds_audit_entries_total{action=*.rejected}`.
 //!
+//! ### `dds_fido2_assertions_total` semantics
+//!
+//! Bumped exactly once per call to
+//! [`crate::service::LocalService::verify_assertion_common`] — the
+//! shared assertion verifier consumed by both
+//! [`crate::service::LocalService::issue_session_from_assertion`]
+//! (the `/v1/session/assert` HTTP path) and
+//! [`crate::service::LocalService::admin_vouch`]. The bump site is
+//! at the single `Ok` exit and at every `Err` exit so the total
+//! equals one per assertion attempt that reached the verifier
+//! (after the wall-clock-regression precheck).
+//!
+//! Result buckets:
+//!
+//! - `result="ok"` — every step (credential lookup, signature, UP
+//!   flag, RP-ID, challenge freshness, sign-count monotonicity)
+//!   returned successfully.
+//! - `result="signature"` — [`dds_domain::fido2::verify_assertion`]
+//!   rejected with `Fido2Error::BadSignature` (cryptographic
+//!   verification failed). The COSE-decode and signature-byte
+//!   parsing errors that surface as `Fido2Error::Format` /
+//!   `Fido2Error::KeyError` are *not* in this bucket — those reach
+//!   `result="other"` because they indicate a malformed authenticator
+//!   payload rather than a signature mismatch on a parseable
+//!   payload.
+//! - `result="rp_id"` — `parsed.rp_id_hash` did not match
+//!   `SHA-256(enrolled_rp_id)`. Cross-site replay signal.
+//! - `result="up"` — User-Present (UP) flag was clear in the
+//!   authenticator-data flags byte. The catalog's `uv` bucket
+//!   (User-Verified flag clear) is *not* shipped: `verify_assertion_common`
+//!   surfaces UV through the [`crate::service::CommonAssertionOutput::user_verified`]
+//!   field (consumed downstream as the `mfa_verified` session
+//!   property) but does not currently *gate* on it. Once a
+//!   UV-required gate lands a future follow-up can split out
+//!   `result="uv"` without renaming the metric.
+//! - `result="sign_count"` — sign-count replay detected via
+//!   [`dds_store::traits::CredentialStateStore::bump_sign_count`]
+//!   (`StoreError::SignCountReplay`). Cloned-authenticator signal.
+//! - `result="other"` — every other error exit: credential not
+//!   found in the trust graph, COSE key parse failure, challenge
+//!   invalid / expired, clientDataJSON parse failure, type /
+//!   challenge / origin mismatch, cross-origin assertion rejected,
+//!   client_data_hash / clientDataJSON SHA-256 mismatch, store
+//!   error on `bump_sign_count`, trust-graph lock poisoned, format
+//!   errors from `verify_assertion` (authenticatorData too short,
+//!   etc.), and the wall-clock-regression precheck. Operators
+//!   alarming on the `*.rejected` audit families catch these via a
+//!   different lens; `result="other"` keeps the per-attempt total
+//!   accurate without per-error-class cardinality blow-up. Future
+//!   follow-ups can split sub-buckets (e.g. `result="challenge"`,
+//!   `result="origin"`) out of the `other` partition without
+//!   renaming the metric.
+//!
+//! The catalog in `observability-plan.md` Phase C names the labels
+//! `result=ok|signature|rp_id|up|uv|sign_count`. The `uv` bucket is
+//! deferred (see above); the `other` bucket is added so the
+//! per-attempt total is preserved.
+//!
 //! ### `dds_http_caller_identity_total` semantics
 //!
 //! Each completed HTTP request bumps **two** buckets — its transport
@@ -414,6 +473,14 @@ pub struct Telemetry {
     /// [`crate::service::LocalService::enroll_user`] and
     /// [`crate::service::LocalService::admin_setup`].
     fido2_attestation_verifies: Mutex<BTreeMap<(String, String), u64>>,
+    /// Per-`result` FIDO2 assertion-verify counts. `result` is one of
+    /// `ok|signature|rp_id|up|sign_count|other` — bounded by the exit
+    /// branches of [`crate::service::LocalService::verify_assertion_common`].
+    /// The catalog's `uv` bucket is deferred (no UV-required gate ships
+    /// today); `other` collapses every non-named error exit (challenge,
+    /// origin / cdj, clock regression, lookup miss, COSE parse, store
+    /// errors, etc.) so the per-attempt total stays accurate.
+    fido2_assertions: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Telemetry {
@@ -428,6 +495,7 @@ impl Telemetry {
             gossip_messages: Mutex::new(BTreeMap::new()),
             gossip_messages_dropped: Mutex::new(BTreeMap::new()),
             fido2_attestation_verifies: Mutex::new(BTreeMap::new()),
+            fido2_assertions: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -633,6 +701,31 @@ impl Telemetry {
         }
     }
 
+    fn bump_fido2_assertion(&self, result: &str) {
+        let mut g = match self.fido2_assertions.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry(result.to_string()).or_insert(0) += 1;
+    }
+
+    fn fido2_assertions_snapshot(&self) -> BTreeMap<String, u64> {
+        match self.fido2_assertions.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of `dds_fido2_assertions_total{result=...}`. Public
+    /// so the `LocalService` regression tests can take before/after
+    /// snapshots without scraping the renderer.
+    pub fn fido2_assertions_count(&self, result: &str) -> u64 {
+        match self.fido2_assertions.lock() {
+            Ok(g) => g.get(result).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(result).copied().unwrap_or(0),
+        }
+    }
+
     fn uptime_seconds(&self) -> u64 {
         SystemTime::now()
             .duration_since(self.start_at)
@@ -736,6 +829,21 @@ pub fn record_gossip_messages_dropped(reason: &str) {
 pub fn record_fido2_attestation_verify(result: &str, fmt: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_fido2_attestation_verify(result, fmt);
+    }
+}
+
+/// Bump `dds_fido2_assertions_total{result=...}` by one. Called from
+/// the single exit funnel in
+/// [`crate::service::LocalService::verify_assertion_common`] (consumed
+/// by `issue_session_from_assertion` and `admin_vouch`). `result` is
+/// one of `ok|signature|rp_id|up|sign_count|other`. The catalog's
+/// `uv` bucket is reserved for a future UV-required gate; `other`
+/// collapses non-named error exits so the per-attempt total stays
+/// accurate. No-op when telemetry has not been installed (tests,
+/// harnesses).
+pub fn record_fido2_assertion(result: &str) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_fido2_assertion(result);
     }
 }
 
@@ -1027,6 +1135,27 @@ fn render_exposition(
             "dds_fido2_attestation_verify_total{{result=\"{}\",fmt=\"{}\"}} {}\n",
             escape_label_value(result),
             escape_label_value(fmt),
+            count
+        ));
+    }
+
+    // `dds_fido2_assertions_total` — per-`result` assertion-verify
+    // outcome counter. Bumped from the single funnel in
+    // `LocalService::verify_assertion_common` consumed by
+    // `issue_session_from_assertion` and `admin_vouch`.
+    out.push_str(
+        "# HELP dds_fido2_assertions_total FIDO2 assertion-verify outcomes since process start, \
+         partitioned by result (ok|signature|rp_id|up|sign_count|other). The catalog's `uv` \
+         bucket is reserved for a future UV-required gate; `other` collapses non-named error \
+         exits (challenge / origin / cdj mismatch, clock regression, credential lookup miss, \
+         COSE key parse, store errors) so the per-attempt total stays accurate.\n",
+    );
+    out.push_str("# TYPE dds_fido2_assertions_total counter\n");
+    let fido2_assertions_snapshot = telemetry.fido2_assertions_snapshot();
+    for (result, count) in fido2_assertions_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_fido2_assertions_total{{result=\"{}\"}} {}\n",
+            escape_label_value(result),
             count
         ));
     }
@@ -1441,6 +1570,47 @@ mod tests {
     }
 
     #[test]
+    fn fido2_assertions_counter_renders_in_exposition() {
+        let t = Telemetry::new();
+        t.bump_fido2_assertion("ok");
+        t.bump_fido2_assertion("ok");
+        t.bump_fido2_assertion("signature");
+        t.bump_fido2_assertion("rp_id");
+        t.bump_fido2_assertion("up");
+        t.bump_fido2_assertion("sign_count");
+        t.bump_fido2_assertion("other");
+
+        let body = render_exposition(&t, 0, None, None, None, None);
+        assert!(body.contains("# TYPE dds_fido2_assertions_total counter\n"));
+        assert!(body.contains("dds_fido2_assertions_total{result=\"ok\"} 2\n"));
+        assert!(body.contains("dds_fido2_assertions_total{result=\"signature\"} 1\n"));
+        assert!(body.contains("dds_fido2_assertions_total{result=\"rp_id\"} 1\n"));
+        assert!(body.contains("dds_fido2_assertions_total{result=\"up\"} 1\n"));
+        assert!(body.contains("dds_fido2_assertions_total{result=\"sign_count\"} 1\n"));
+        assert!(body.contains("dds_fido2_assertions_total{result=\"other\"} 1\n"));
+        assert_eq!(t.fido2_assertions_count("ok"), 2);
+        assert_eq!(t.fido2_assertions_count("signature"), 1);
+        assert_eq!(t.fido2_assertions_count("rp_id"), 1);
+        assert_eq!(t.fido2_assertions_count("up"), 1);
+        assert_eq!(t.fido2_assertions_count("sign_count"), 1);
+        assert_eq!(t.fido2_assertions_count("other"), 1);
+        // The catalog's `uv` bucket is reserved for a future
+        // UV-required gate and is not bumped today.
+        assert_eq!(t.fido2_assertions_count("uv"), 0);
+    }
+
+    #[test]
+    fn fido2_assertions_renders_empty_family_with_help_and_type() {
+        let t = Telemetry::new();
+        let body = render_exposition(&t, 0, None, None, None, None);
+        // HELP/TYPE always discoverable before the first assertion
+        // verify call so a freshly booted node still surfaces the
+        // family in the catalog (alert expressions resolve immediately).
+        assert!(body.contains("# TYPE dds_fido2_assertions_total counter\n"));
+        assert!(!body.contains("dds_fido2_assertions_total{"));
+    }
+
+    #[test]
     fn caller_identity_counter_renders_in_exposition() {
         let t = Telemetry::new();
         t.bump_caller_identity("anonymous");
@@ -1665,6 +1835,10 @@ mod tests {
         // FIDO2 attestation-verify family is always discoverable; no
         // value lines until the first enrollment verifier call fires.
         assert!(body.contains("# TYPE dds_fido2_attestation_verify_total counter\n"));
+        // FIDO2 assertions family is always discoverable; no value
+        // lines until the first assertion verify exits via the
+        // `verify_assertion_common` drop-guard.
+        assert!(body.contains("# TYPE dds_fido2_assertions_total counter\n"));
         // Peer-count gauges round-trip through the served exposition.
         assert!(body.contains("# TYPE dds_peers_admitted gauge\n"));
         assert!(body.contains("dds_peers_admitted 2\n"));

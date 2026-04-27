@@ -67,10 +67,21 @@ helper at every enrollment-time call to
 [`LocalService::admin_setup`](../dds-node/src/service.rs); the
 credential-lookup re-parse inside `verify_assertion_common` is
 *not* counted because the catalog scopes the counter to
-enrollment-time only) landed 2026-04-27 follow-up #33.
-The rest of the C catalog (sync / FIDO2 assertion counter / store
-sizes / process, plus the HTTP request / duration histograms) plus
-the Phase E rules/panels that depend on those metrics remain open.
+enrollment-time only) landed 2026-04-27 follow-up #33. Phase C
+**FIDO2 assertions counter**
+(`dds_fido2_assertions_total{result=ok|signature|rp_id|up|sign_count|other}` —
+bumped from the single drop-guarded exit funnel in
+[`LocalService::verify_assertion_common`](../dds-node/src/service.rs)
+consumed by both `issue_session_from_assertion` (the
+`/v1/session/assert` HTTP path) and `admin_vouch`; the catalog's
+`uv` bucket is reserved for a future UV-required gate and `other`
+collapses non-named error exits — challenge / origin / cdj
+mismatch, clock regression, credential-lookup miss, COSE parse,
+store errors — so the per-attempt total stays accurate) landed
+2026-04-27 follow-up #34.
+The rest of the C catalog (sync / store sizes / process, plus the
+HTTP request / duration histograms) plus the Phase E rules/panels
+that depend on those metrics remain open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -336,9 +347,10 @@ follow-up #30; gossip-messages counter
 (`dds_gossip_messages_dropped_total{reason}`) landed 2026-04-27
 follow-up #32; FIDO2 attestation-verify counter
 (`dds_fido2_attestation_verify_total{result, fmt}`) landed
-2026-04-27 follow-up #33; rest of the catalog (sync / FIDO2
-assertion counter / store sizes / process, plus the HTTP request /
-duration families) remains open.** The
+2026-04-27 follow-up #33; FIDO2 assertions counter
+(`dds_fido2_assertions_total{result}`) landed 2026-04-27 follow-up
+#34; rest of the catalog (sync / store sizes / process, plus the
+HTTP request / duration families) remains open.** The
 audit-metrics first slice exposed the five families needed to alert on
 Z-3 regressions (`dds_build_info`, `dds_uptime_seconds`,
 `dds_audit_entries_total{action}`, `dds_audit_chain_length`,
@@ -441,7 +453,7 @@ rows remain open.
 | `dds_trust_graph_burned` | gauge | — | Burned identity URNs (renamed from `dds_burned_identities_total`) | ✅ |
 | `dds_purpose_lookups_total` | counter | `result=ok|denied` | `has_purpose` outcomes — bumped from [`LocalService::has_purpose_observed`](../dds-node/src/service.rs) at the five capability gates (`device_targeting_facts_gated`, `list_applicable_windows_policies`, `list_applicable_macos_policies`, `list_applicable_software`, `admin_vouch`) plus the gossip-ingest publisher gate `node::publisher_capability_ok`. The catalog originally named a third bucket `result=not_found`; partitioning denied further would require an extra trust-graph traversal per call site (the underlying [`TrustGraph::has_purpose`](../dds-core/src/trust.rs) returns `bool`), so v1 collapses the no-attestation case into `denied`. A future follow-up can introduce a `has_purpose_with_outcome` API on the graph and split the bucket without renaming the metric. | ✅ |
 | **FIDO2 / sessions** | | | | |
-| `dds_fido2_assertions_total` | counter | `result=ok|signature|rp_id|up|uv|sign_count` | Assertion outcomes | 🔲 |
+| `dds_fido2_assertions_total` | counter | `result=ok|signature|rp_id|up|sign_count|other` | Assertion outcomes — bumped from the drop-guarded single-exit funnel in [`LocalService::verify_assertion_common`](../dds-node/src/service.rs) consumed by both `issue_session_from_assertion` (the `/v1/session/assert` HTTP path) and `admin_vouch`. `result="ok"` is set immediately before the `Ok(...)` return; `signature` covers `Fido2Error::BadSignature` from the cryptographic verify; `rp_id` covers the `parsed.rp_id_hash != SHA-256(enrolled_rp_id)` check; `up` covers the User-Present flag check; `sign_count` covers `StoreError::SignCountReplay`. The catalog originally named a `result=uv` bucket; `verify_assertion_common` does *not* currently gate on the User-Verified flag (UV is reported through `CommonAssertionOutput::user_verified` but never causes a reject), so v1 ships without `uv` — once a UV-required gate lands a future follow-up can split it out without renaming the metric. The `result=other` catch-all (added vs. the original catalog) collapses every non-named error exit — challenge invalid / expired, clientDataJSON parse / type / origin / challenge / cross-origin mismatches, `client_data_hash` ↔ clientDataJSON SHA-256 mismatch, wall-clock-regression precheck, credential-lookup miss, COSE-key parse failure, trust-graph lock poisoning, generic `Fido2Error::Format` / `KeyError` from `verify_assertion`, and store errors on `bump_sign_count` — so the per-attempt total equals one bump per assertion attempt. | ✅ |
 | `dds_fido2_attestation_verify_total` | counter | `result=ok|fail, fmt=packed|none|unknown` | Enrollment-time verify — bumped from the shared [`LocalService::verify_attestation_observed`](../dds-node/src/service.rs) helper after every call to [`dds_domain::fido2::verify_attestation`] in [`LocalService::enroll_user`](../dds-node/src/service.rs) and [`LocalService::admin_setup`](../dds-node/src/service.rs). The credential-lookup re-parse inside `verify_assertion_common` does *not* go through the helper because the catalog row scopes the counter to enrollment-time only. The catalog originally named `fmt=packed|none|tpm`; the TPM bucket is forward-looking — the domain verifier today rejects TPM (and every other non-packed/non-none format) with `Fido2Error::Unsupported(format!("fmt={other}"))`, so v1 collapses TPM and every other unsupported format into `result=fail, fmt=unknown`. The `unknown` bucket also covers failures that reject before `fmt` is parsed (CBOR decode error, missing `fmt` field). A future follow-up that lands a TPM verifier can split out `fmt=tpm` without renaming the metric. Outcome buckets that fire *after* `verify_attestation` returns Ok (the AAGUID allow-list, the per-AAGUID attestation-root gate, the downstream `rp_id` hash equality check) are *not* counted as `fail` because the underlying verify itself succeeded; those gates surface through `dds_audit_entries_total{action=*.rejected}` instead. | ✅ |
 | `dds_sessions_issued_total` | counter | `via=fido2|legacy` | Session minting — bumped at the tail of [`LocalService::issue_session`](../dds-node/src/service.rs) (`legacy`) and [`LocalService::issue_session_from_assertion`](../dds-node/src/service.rs) (`fido2`) after the session token is signed and CBOR-encoded successfully; the two entry points share a private inner helper so a FIDO2-driven session bumps `fido2` exactly once and does not also tick `legacy`. The unauthenticated `POST /v1/session` HTTP route was removed in the security review (see [security-gaps.md](../security-gaps.md)), so production `via="legacy"` traffic is now expected to be zero — non-zero rate is the regression signal. | ✅ |
 | `dds_challenges_outstanding` | gauge | — | Live challenges (B-5 cap reference) — scrape-time read of [`ChallengeStore::count_challenges`](../dds-store/src/traits.rs) under the existing `LocalService` lock; counts live + expired-but-not-yet-swept rows (the [`expiry`](../dds-node/src/expiry.rs) sweeper clears expired rows on its own cadence). | ✅ |
