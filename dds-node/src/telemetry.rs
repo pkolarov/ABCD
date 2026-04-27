@@ -30,6 +30,7 @@
 //! | `dds_http_caller_identity_total` | counter | `kind=anonymous\|uds\|pipe\|admin` | bumped by [`record_caller_identity`] |
 //! | `dds_sessions_issued_total` | counter | `via=fido2\|legacy` | bumped by [`record_sessions_issued`] |
 //! | `dds_purpose_lookups_total` | counter | `result=ok\|denied` | bumped by [`record_purpose_lookup`] |
+//! | `dds_admission_handshakes_total` | counter | `result=ok\|fail\|revoked` | bumped by [`record_admission_handshake`] |
 //! | `dds_trust_graph_attestations` | gauge | — | [`crate::service::LocalService::trust_graph_counts`] at scrape |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
 //! | `dds_trust_graph_revocations` | gauge | — | same |
@@ -128,6 +129,34 @@
 //! follow-up can introduce a `has_purpose_with_outcome` API on the
 //! graph and split the bucket without renaming the metric.
 //!
+//! ### `dds_admission_handshakes_total` semantics
+//!
+//! Bumped exactly once per inbound H-12 admission handshake response
+//! processed by [`crate::node::DdsNode::verify_peer_admission`] (i.e.
+//! per remote-peer attempt to admit *us* into the domain), partitioned
+//! by outcome:
+//!
+//! - `result="ok"` — peer's admission cert verified against our
+//!   domain pubkey + domain id and the peer is now in
+//!   `admitted_peers`.
+//! - `result="revoked"` — peer is on our local admission revocation
+//!   list (`admission_revocations`); the cert is rejected before any
+//!   signature work runs.
+//! - `result="fail"` — every other early-exit branch: the peer
+//!   returned no cert, the cert failed CBOR decode, the local clock
+//!   read failed, or `AdmissionCert::verify` rejected the cert
+//!   (signature / domain-id / peer-id / expiry mismatch).
+//!
+//! `sum(rate(...))` therefore tracks the total inbound-handshake rate
+//! for this node; a non-zero `revoked` rate is an operator signal
+//! that previously-admitted peers are still attempting to rejoin
+//! after a revocation, and a non-zero `fail` rate is the regression
+//! tripwire that the domain-key / cert-issuance pipeline has drifted.
+//!
+//! Outbound-side handshake initiation is *not* counted here — the
+//! caller is the node itself and the metric would be redundant with
+//! the libp2p connection counter.
+//!
 //! ### `dds_http_caller_identity_total` semantics
 //!
 //! Each completed HTTP request bumps **two** buckets — its transport
@@ -206,6 +235,10 @@ pub struct Telemetry {
     /// `ok|denied` — bounded by
     /// [`crate::service::LocalService::has_purpose_observed`].
     purpose_lookups: Mutex<BTreeMap<String, u64>>,
+    /// Per-`result` admission-handshake counts. `result` is one of
+    /// `ok|fail|revoked` — bounded by the three outcome branches of
+    /// [`crate::node::DdsNode::verify_peer_admission`].
+    admission_handshakes: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Telemetry {
@@ -216,6 +249,7 @@ impl Telemetry {
             caller_identity: Mutex::new(BTreeMap::new()),
             sessions_issued: Mutex::new(BTreeMap::new()),
             purpose_lookups: Mutex::new(BTreeMap::new()),
+            admission_handshakes: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -319,6 +353,31 @@ impl Telemetry {
         }
     }
 
+    fn bump_admission_handshake(&self, result: &str) {
+        let mut g = match self.admission_handshakes.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry(result.to_string()).or_insert(0) += 1;
+    }
+
+    fn admission_handshakes_snapshot(&self) -> BTreeMap<String, u64> {
+        match self.admission_handshakes.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of `dds_admission_handshakes_total{result=...}`.
+    /// Public so the `DdsNode` regression tests can take
+    /// before/after snapshots without scraping the renderer.
+    pub fn admission_handshakes_count(&self, result: &str) -> u64 {
+        match self.admission_handshakes.lock() {
+            Ok(g) => g.get(result).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(result).copied().unwrap_or(0),
+        }
+    }
+
     fn uptime_seconds(&self) -> u64 {
         SystemTime::now()
             .duration_since(self.start_at)
@@ -370,6 +429,17 @@ pub fn record_sessions_issued(via: &str) {
 pub fn record_purpose_lookup(result: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_purpose_lookup(result);
+    }
+}
+
+/// Bump `dds_admission_handshakes_total{result=...}` by one. Called
+/// from [`crate::node::DdsNode::verify_peer_admission`] at every
+/// outcome branch of an inbound H-12 admission handshake. `result` is
+/// one of `ok|fail|revoked`. No-op when telemetry has not been
+/// installed (tests, harnesses).
+pub fn record_admission_handshake(result: &str) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_admission_handshake(result);
     }
 }
 
@@ -542,6 +612,25 @@ fn render_exposition(
     for (result, count) in purpose_snapshot.iter() {
         out.push_str(&format!(
             "dds_purpose_lookups_total{{result=\"{}\"}} {}\n",
+            escape_label_value(result),
+            count
+        ));
+    }
+
+    // `dds_admission_handshakes_total` — per-`result` H-12 inbound
+    // handshake counter. Bumped from `DdsNode::verify_peer_admission`
+    // at every outcome branch.
+    out.push_str(
+        "# HELP dds_admission_handshakes_total Inbound H-12 admission handshakes processed since \
+         process start, partitioned by outcome (ok = peer admitted; revoked = peer on local \
+         admission revocation list; fail = no cert / decode error / clock error / cert verify \
+         rejected).\n",
+    );
+    out.push_str("# TYPE dds_admission_handshakes_total counter\n");
+    let admission_snapshot = telemetry.admission_handshakes_snapshot();
+    for (result, count) in admission_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_admission_handshakes_total{{result=\"{}\"}} {}\n",
             escape_label_value(result),
             count
         ));
@@ -805,6 +894,37 @@ mod tests {
     }
 
     #[test]
+    fn admission_handshakes_counter_renders_in_exposition() {
+        let t = Telemetry::new();
+        t.bump_admission_handshake("ok");
+        t.bump_admission_handshake("ok");
+        t.bump_admission_handshake("ok");
+        t.bump_admission_handshake("fail");
+        t.bump_admission_handshake("revoked");
+
+        let body = render_exposition(&t, 0, None, None, None);
+        assert!(body.contains("# TYPE dds_admission_handshakes_total counter\n"));
+        assert!(body.contains("dds_admission_handshakes_total{result=\"ok\"} 3\n"));
+        assert!(body.contains("dds_admission_handshakes_total{result=\"fail\"} 1\n"));
+        assert!(body.contains("dds_admission_handshakes_total{result=\"revoked\"} 1\n"));
+        assert_eq!(t.admission_handshakes_count("ok"), 3);
+        assert_eq!(t.admission_handshakes_count("fail"), 1);
+        assert_eq!(t.admission_handshakes_count("revoked"), 1);
+        assert_eq!(t.admission_handshakes_count("other"), 0);
+    }
+
+    #[test]
+    fn admission_handshakes_renders_empty_family_with_help_and_type() {
+        let t = Telemetry::new();
+        let body = render_exposition(&t, 0, None, None, None);
+        // HELP/TYPE always discoverable before the first inbound
+        // handshake fires so a freshly booted node still surfaces
+        // the family in the catalog.
+        assert!(body.contains("# TYPE dds_admission_handshakes_total counter\n"));
+        assert!(!body.contains("dds_admission_handshakes_total{"));
+    }
+
+    #[test]
     fn caller_identity_counter_renders_in_exposition() {
         let t = Telemetry::new();
         t.bump_caller_identity("anonymous");
@@ -976,6 +1096,9 @@ mod tests {
         // Purpose-lookups family is always discoverable; no value
         // lines until the first capability check fires.
         assert!(body.contains("# TYPE dds_purpose_lookups_total counter\n"));
+        // Admission-handshakes family is always discoverable; no
+        // value lines until the first inbound handshake completes.
+        assert!(body.contains("# TYPE dds_admission_handshakes_total counter\n"));
     }
 
     #[tokio::test]

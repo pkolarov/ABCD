@@ -239,6 +239,15 @@ async fn admitted_peers_populated_and_gossip_flows() {
     let _ = tracing_subscriber::fmt::try_init();
     let dkey = dds_domain::DomainKey::from_secret_bytes("test.local", [42u8; 32]);
 
+    // observability-plan.md Phase C — pin the
+    // `dds_admission_handshakes_total{result="ok"}` counter against
+    // the production verify path. Install is idempotent across
+    // integration tests in the same process; we delta against the
+    // pre-handshake snapshot to stay robust to other tests bumping
+    // the global counter.
+    let telemetry = dds_node::telemetry::install();
+    let ok_before = telemetry.admission_handshakes_count("ok");
+
     let (mut a, _ad) = spawn_with_domain(&dkey, "h12-ok", None).await;
     let (mut b, _bd) = spawn_with_domain(&dkey, "h12-ok", None).await;
     let a_addr = wait_for_listen(&mut a).await;
@@ -265,6 +274,17 @@ async fn admitted_peers_populated_and_gossip_flows() {
         b.admitted_peers()
     );
 
+    // Each node verified the other's cert successfully, so the
+    // `result="ok"` bucket must have advanced by at least 2.
+    let ok_after = telemetry.admission_handshakes_count("ok");
+    assert!(
+        ok_after >= ok_before + 2,
+        "dds_admission_handshakes_total{{result=\"ok\"}} delta = {} (before {} after {}); expected >= 2",
+        ok_after - ok_before,
+        ok_before,
+        ok_after
+    );
+
     // Publish via gossip from A; B must ingest through the production
     // `handle_swarm_event` path (with H-12 gating active).
     let (_id, token) = make_attest_token("alice", "att-h12-ok");
@@ -289,6 +309,13 @@ async fn admitted_peers_populated_and_gossip_flows() {
 async fn unadmitted_peer_gossip_dropped() {
     let _ = tracing_subscriber::fmt::try_init();
     let dkey = dds_domain::DomainKey::from_secret_bytes("test.local", [42u8; 32]);
+
+    // observability-plan.md Phase C — delta the
+    // `dds_admission_handshakes_total{result="fail"}` counter so we
+    // pin that the cert-verify-rejected branch in
+    // `verify_peer_admission` bumps the right bucket.
+    let telemetry = dds_node::telemetry::install();
+    let fail_before = telemetry.admission_handshakes_count("fail");
 
     // Pre-allocate a "wrong" peer id: a fresh keypair whose id is
     // NOT the same as B's actual libp2p peer id. The cert issued for
@@ -334,5 +361,18 @@ async fn unadmitted_peer_gossip_dropped() {
     assert_eq!(
         a_attests, 0,
         "A ingested a token from unadmitted peer B (H-12 gate failed)"
+    );
+
+    // A processed B's bad cert via `cert.verify(..)` returning Err —
+    // that branch must bump `result="fail"` at least once. (B's view
+    // of A is fine, so this is asymmetric: we only assert the fail
+    // bucket advanced, not by exactly one, since other tests in the
+    // same process can also bump it.)
+    let fail_after = telemetry.admission_handshakes_count("fail");
+    assert!(
+        fail_after > fail_before,
+        "dds_admission_handshakes_total{{result=\"fail\"}} did not advance under bad-cert handshake (before {} after {})",
+        fail_before,
+        fail_after
     );
 }

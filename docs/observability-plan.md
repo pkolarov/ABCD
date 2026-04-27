@@ -295,9 +295,11 @@ read-side subset landed in follow-up #25; FIDO2 outstanding-challenges
 gauge landed in follow-up #26; sessions-issuance counter
 (`dds_sessions_issued_total{via}`) landed 2026-04-27 follow-up #27;
 purpose-lookups counter (`dds_purpose_lookups_total{result}`) landed
-2026-04-27 follow-up #28; rest of the catalog (network / FIDO2
-assertion + verify counters / store sizes / process, plus the HTTP
-request / duration families) remains open.** The
+2026-04-27 follow-up #28; admission-handshakes counter
+(`dds_admission_handshakes_total{result}`) landed 2026-04-27
+follow-up #29; rest of the catalog (network peers / gossip / sync /
+FIDO2 assertion + verify counters / store sizes / process, plus the
+HTTP request / duration families) remains open.** The
 audit-metrics first slice exposed the five families needed to alert on
 Z-3 regressions (`dds_build_info`, `dds_uptime_seconds`,
 `dds_audit_entries_total{action}`, `dds_audit_chain_length`,
@@ -313,7 +315,12 @@ follow-up #28 added `dds_purpose_lookups_total{result=ok|denied}`,
 bumped through the shared [`LocalService::has_purpose_observed`](../dds-node/src/service.rs)
 helper from every capability gate (publisher / device-scope /
 admin-vouch) plus the gossip-ingest publisher-capability filter in
-`node::publisher_capability_ok`. The trust-graph series are renamed from the original
+`node::publisher_capability_ok`; follow-up #29 added
+`dds_admission_handshakes_total{result=ok|fail|revoked}`, bumped
+from [`DdsNode::verify_peer_admission`](../dds-node/src/node.rs) at
+every exit branch so the H-12 inbound-handshake outcome distribution
+becomes graphable (revoked baseline = peers attempting to rejoin
+after revocation; fail baseline = cert pipeline regression). The trust-graph series are renamed from the original
 catalog spelling (`dds_attestations_total` → `dds_trust_graph_attestations`,
 `dds_burned_identities_total` → `dds_trust_graph_burned`) to match
 Prometheus convention — `_total` is reserved for monotonic counters,
@@ -365,7 +372,7 @@ rows remain open.
 | **Network** | | | | |
 | `dds_peers_admitted` | gauge | — | Currently admitted peer count | 🔲 |
 | `dds_peers_connected` | gauge | — | libp2p-connected peers (admitted + un-admitted) | 🔲 |
-| `dds_admission_handshakes_total` | counter | `result=ok|fail|revoked` | H-12 outcomes | 🔲 |
+| `dds_admission_handshakes_total` | counter | `result=ok|fail|revoked` | H-12 inbound-handshake outcomes — bumped from [`DdsNode::verify_peer_admission`](../dds-node/src/node.rs) at every exit branch. `ok` = peer cert verified and peer added to `admitted_peers`; `revoked` = peer is on the local admission revocation list (rejected before signature work); `fail` = no cert / decode error / clock error / cert verify rejected (signature, domain id, peer id, or expiry mismatch). Outbound-side handshake initiation is not counted (would be redundant with the libp2p connection counter). | ✅ |
 | `dds_gossip_messages_total` | counter | `topic, direction=in|out, kind` | Gossipsub volume | 🔲 |
 | `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted|invalid_token|duplicate|backpressure` | Why we threw a message away | 🔲 |
 | `dds_sync_pulls_total` | counter | `result=ok|fail` | Anti-entropy pull count | 🔲 |

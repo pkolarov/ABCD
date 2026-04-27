@@ -28,7 +28,50 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-27 follow-up #28 (observability Phase C
+> Last updated: 2026-04-27 follow-up #29 (observability Phase C
+> admission-handshakes counter landed — one new counter
+> `dds_admission_handshakes_total{result=ok|fail|revoked}` ships
+> under the existing opt-in `metrics_addr` listener). The counter
+> is bumped from
+> [`DdsNode::verify_peer_admission`](dds-node/src/node.rs) at every
+> exit branch of an inbound H-12 admission handshake: `revoked`
+> when the peer is on the local admission revocation list (rejected
+> before any signature work runs), `fail` for the four early-exit
+> branches inside that method (no cert / cert CBOR decode failure /
+> system-clock read failure / `AdmissionCert::verify` rejecting the
+> cert on signature, domain id, peer id, or expiry), and `ok` when
+> the cert verifies and the peer is added to `admitted_peers`.
+> Outbound-side handshake initiation is intentionally not counted
+> (would be redundant with the libp2p connection counter). Workspace
+> test count rises from 607 to 609 (+2: two new
+> `telemetry::tests::admission_handshakes_*` render-side tests
+> covering the multi-bucket bump-and-render path and the empty-family
+> HELP/TYPE discoverability contract). The two existing
+> `tests/h12_admission.rs` end-to-end tests are tightened to delta
+> the global `admission_handshakes_count` counter — the positive
+> test asserts `result="ok"` advances by at least 2 (each side
+> verifies the other's cert), and the negative test asserts
+> `result="fail"` advances when A receives B's bad cert. The
+> `revoked` bucket is render-tested only; the bump call site is one
+> line and obvious from inspection. The
+> `serve_returns_prometheus_text_with_audit_metrics` integration
+> test is tightened to assert the new counter family round-trips
+> through the served exposition (`# TYPE
+> dds_admission_handshakes_total counter` is always present even
+> before the first inbound handshake fires). `cargo fmt` clean;
+> `cargo clippy --workspace --all-targets -D warnings` clean;
+> `cargo test --workspace --all-targets` passes (609 tests). Phase C
+> remaining metrics (network peers / gossip / sync / FIDO2 assertion
+> + verify counters / store sizes / process, plus the HTTP request /
+> request-duration histograms) and the Phase E rules/panels gated on
+> them remain open and continue to track in the observability plan.
+> The reference `DdsAdmissionFailureSpike` rule in
+> [docs/observability/alerts/dds.rules.yml](docs/observability/alerts/dds.rules.yml)
+> stays commented — its 0.1/s threshold is a spec placeholder and
+> needs an operator-derived baseline before promotion to an active
+> rule; until then operators graph the counter directly.
+>
+> Previous: 2026-04-27 follow-up #28 (observability Phase C
 > purpose-lookups counter landed — one new counter
 > `dds_purpose_lookups_total{result=ok|denied}` ships under the
 > existing opt-in `metrics_addr` listener). The counter is bumped

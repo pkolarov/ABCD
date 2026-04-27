@@ -670,16 +670,19 @@ impl DdsNode {
                 %peer_id,
                 "H-12: peer is on the domain admission revocation list — refusing to admit"
             );
+            crate::telemetry::record_admission_handshake("revoked");
             return;
         }
         let Some(cert_cbor) = response.cert_cbor else {
             warn!(%peer_id, "H-12: peer returned no cert — staying unadmitted");
+            crate::telemetry::record_admission_handshake("fail");
             return;
         };
         let cert = match dds_domain::AdmissionCert::from_cbor(&cert_cbor) {
             Ok(c) => c,
             Err(e) => {
                 warn!(%peer_id, error = ?e, "H-12: peer cert failed to decode");
+                crate::telemetry::record_admission_handshake("fail");
                 return;
             }
         };
@@ -687,6 +690,7 @@ impl DdsNode {
             Ok(d) => d.as_secs(),
             Err(e) => {
                 warn!(%peer_id, error = %e, "H-12: system clock error verifying peer cert");
+                crate::telemetry::record_admission_handshake("fail");
                 return;
             }
         };
@@ -694,12 +698,14 @@ impl DdsNode {
             Ok(()) => {
                 info!(%peer_id, "H-12: peer admitted to domain");
                 self.admitted_peers.insert(peer_id);
+                crate::telemetry::record_admission_handshake("ok");
                 // Now that we've verified the peer belongs to our
                 // domain, kick off an opportunistic sync.
                 self.try_sync_with(peer_id);
             }
             Err(e) => {
                 warn!(%peer_id, error = ?e, "H-12: peer cert rejected — staying unadmitted");
+                crate::telemetry::record_admission_handshake("fail");
             }
         }
     }

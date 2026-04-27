@@ -264,6 +264,13 @@ groups:
   # not shipped yet. Each block is gated on a metric name that does
   # not exist today; uncomment the block once the corresponding
   # follow-up lands. **Do not load these as-is.**
+  #
+  # NOTE — `dds_admission_handshakes_total{result}` itself shipped
+  # in 2026-04-27 follow-up #29. The threshold below (0.1/s) is a
+  # spec placeholder; operators picking up this rule must replace it
+  # with an operator-derived baseline before loading. Until a
+  # baseline lands the recommendation is to graph the counter
+  # directly rather than alert on a guessed threshold.
   # ---------------------------------------------------------------
   #
   # - name: dds-network
