@@ -1365,16 +1365,21 @@ This is a practical cross-language choice.
 
 ### 16.7 Current Status Endpoint Limitation
 
-The HTTP status route currently calls:
+The HTTP status route reads the same `connected` snapshot the
+`dds_peers_connected` Prometheus gauge reads — refreshed by the swarm
+task on every connection lifecycle event via `NodePeerCounts` — and
+passes it as the `connected_peers` field in the JSON response. The
+remaining placeholder is the DAG operation count: the route still
+calls
 
-- `svc.status(peer_id, 0, 0)`
+- `svc.status(peer_id, connected_peers, 0)`
 
-which means the HTTP-exposed status does not currently report the live node's actual:
-
-- connected peer count;
-- DAG operation count.
-
-So `/v1/status` is informative, but not yet a full live view of the swarm.
+so `connected_peers` is a live view of the swarm but `dag_operations`
+is hard-coded to `0`. Wiring it requires a second shared snapshot
+(the current `CausalDag` lives behind the swarm task only) and is
+deferred until an operator explicitly asks for it — the audit
+chain length and trust-graph token count already give a more
+operationally useful "how much state is on this node" reading.
 
 ## 17. CLI, FFI, And Language Bindings
 

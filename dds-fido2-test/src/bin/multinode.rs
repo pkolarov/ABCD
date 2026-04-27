@@ -455,6 +455,7 @@ fn spawn_http(h: &NodeHandle, admin_attest: &Token) -> Result<(), Box<dyn std::e
         peer_id: h.node.peer_id.to_string(),
         peer_seen: h.node.peer_seen_handle(),
         bootstrap_empty: h.node.config.network.bootstrap_peers.is_empty(),
+        peer_counts: Some(h.node.peer_counts_handle()),
     };
     let admin_policy = http::AdminPolicy::from_config(&h.node.config.network.api_auth);
     let api_addr = h.node.config.network.api_addr.clone();

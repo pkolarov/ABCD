@@ -470,11 +470,19 @@ pub type SharedService<S> = Arc<Mutex<LocalService<S>>>;
 /// bootstrap peers (lone-node deployment). In that case `/readyz` skips
 /// the peer-seen check — the node is ready as soon as the store smoke
 /// test passes.
+///
+/// `peer_counts` is the same shared snapshot the Prometheus scrape
+/// reads (see [`crate::node::NodePeerCounts`]). When set, the
+/// `/v1/status` handler reports a live `connected_peers` count
+/// instead of the placeholder `0` it returned before; tests that
+/// build a bare router pass `None` and the handler falls back to
+/// `0`.
 #[derive(Clone)]
 pub struct NodeInfo {
     pub peer_id: String,
     pub peer_seen: Arc<std::sync::atomic::AtomicBool>,
     pub bootstrap_empty: bool,
+    pub peer_counts: Option<crate::node::NodePeerCounts>,
 }
 
 struct AppState<
@@ -1196,7 +1204,18 @@ where
         + 'static,
 {
     let svc = state.svc.lock().await;
-    Ok(Json(svc.status(&state.info.peer_id, 0, 0)?))
+    // Read the same `connected` snapshot the Prometheus
+    // `dds_peers_connected` gauge reads — refreshed by the swarm task
+    // after every connection lifecycle event. Falls back to `0` when
+    // the handler is invoked without a populated `peer_counts` (test
+    // fixtures, bare routers).
+    let connected_peers = state
+        .info
+        .peer_counts
+        .as_ref()
+        .map(|pc| pc.connected.load(std::sync::atomic::Ordering::Relaxed) as usize)
+        .unwrap_or(0);
+    Ok(Json(svc.status(&state.info.peer_id, connected_peers, 0)?))
 }
 
 /// `GET /v1/node/info` — discovery endpoint for Policy Agents. See
@@ -2464,6 +2483,7 @@ mod tests {
                     peer_id: "12D3KooWUnit".into(),
                     peer_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     bootstrap_empty: true,
+                    peer_counts: None,
                 },
                 device_binding: None,
                 admin_policy: Arc::new(tcp_trust_policy()),
@@ -2630,6 +2650,32 @@ mod tests {
         let body: NodeStatus = resp.json().await.unwrap();
         assert_eq!(body.peer_id, "12D3KooWUnit");
         assert_eq!(body.trusted_roots, 1);
+        // Default test fixture leaves `peer_counts: None`, so the
+        // handler falls back to the placeholder 0.
+        assert_eq!(body.connected_peers, 0);
+    }
+
+    /// `/v1/status.connected_peers` reports whatever the swarm task
+    /// has stored into the shared `NodePeerCounts.connected` atomic —
+    /// the same snapshot the `dds_peers_connected` Prometheus gauge
+    /// reads. Closes the §16.7 whitepaper note that the route used
+    /// to report a hard-coded 0.
+    #[tokio::test]
+    async fn status_endpoint_reports_connected_peers_when_peer_counts_supplied() {
+        use crate::node::NodePeerCounts;
+        use std::sync::atomic::Ordering;
+
+        let mut state = make_state();
+        let counts = NodePeerCounts::default();
+        // Simulate the swarm task having seen seven connected peers.
+        counts.connected.store(7, Ordering::Relaxed);
+        state.info.peer_counts = Some(counts);
+
+        let base = spawn_server(state).await;
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: NodeStatus = resp.json().await.unwrap();
+        assert_eq!(body.connected_peers, 7);
     }
 
     #[tokio::test]

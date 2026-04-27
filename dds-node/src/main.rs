@@ -953,6 +953,10 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // ever connected to a peer" flag with the `/readyz` handler.
         peer_seen: node.peer_seen_handle(),
         bootstrap_empty: config.network.bootstrap_peers.is_empty(),
+        // Same snapshot the Prometheus scrape reads for
+        // `dds_peers_connected`; lets `/v1/status.connected_peers`
+        // report a live count instead of the placeholder 0.
+        peer_counts: Some(node.peer_counts_handle()),
     };
     let admin_policy = http::AdminPolicy::from_config(&config.network.api_auth);
     let response_mac_key = match &config.network.api_auth.node_hmac_secret_path {
