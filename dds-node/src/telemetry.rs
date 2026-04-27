@@ -36,7 +36,7 @@
 //! | `dds_fido2_attestation_verify_total` | counter | `result=ok\|fail`, `fmt=packed\|none\|unknown` | bumped by [`record_fido2_attestation_verify`] |
 //! | `dds_fido2_assertions_total` | counter | `result=ok\|signature\|rp_id\|up\|sign_count\|other` | bumped by [`record_fido2_assertion`] |
 //! | `dds_sync_pulls_total` | counter | `result=ok\|fail` | bumped by [`record_sync_pull`] |
-//! | `dds_sync_payloads_rejected_total` | counter | `reason=legacy_v1\|publisher_capability\|replay_window` | bumped by [`record_sync_payloads_rejected`] |
+//! | `dds_sync_payloads_rejected_total` | counter | `reason=legacy_v1\|publisher_capability\|replay_window\|signature\|duplicate_jti\|graph` | bumped by [`record_sync_payloads_rejected`] |
 //! | `dds_http_requests_total` | counter | `route, method, status` | bumped by [`record_http_request`] |
 //! | `dds_trust_graph_attestations` | gauge | — | [`crate::service::LocalService::trust_graph_counts`] at scrape |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
@@ -421,10 +421,12 @@
 //! ### `dds_sync_payloads_rejected_total` semantics
 //!
 //! Bumped exactly once per inbound sync payload that
-//! [`crate::node::DdsNode::handle_sync_response`] *skips* before
-//! handing the surviving payloads to
-//! [`dds_net::sync::apply_sync_payloads_with_graph`]. The three
-//! pre-apply skip sites map 1:1 to the `reason` label:
+//! [`crate::node::DdsNode::handle_sync_response`] rejects, partitioned
+//! across both the pre-apply skip sites and the post-apply categorical
+//! reasons returned by
+//! [`dds_net::sync::apply_sync_payloads_with_graph`]:
+//!
+//! Pre-apply (skipped before the apply funnel):
 //!
 //! - `legacy_v1` — M-1/M-2 downgrade guard. The payload's token is
 //!   wire-version 1 and `network.allow_legacy_v1_tokens` is `false`.
@@ -441,21 +443,31 @@
 //!   window (the same check the gossip path runs via
 //!   [`crate::node::revocation_within_replay_window`]).
 //!
-//! Rejections that fire *after* the surviving payloads reach
-//! `apply_sync_payloads_with_graph` (signature verify failures,
-//! trust-graph add rejections, duplicate-JTI store rejections) are
-//! *not* partitioned through this counter today. The post-apply
-//! errors funnel into the single
-//! [`dds_net::sync::SyncResult::errors`] `Vec<String>` which would
-//! need a categorical schema (e.g. `SyncRejectReason` enum) to split
-//! the catalog's `signature|graph|duplicate_jti` buckets out cleanly.
-//! Until that lands, post-apply rejections of attestation/vouch
-//! tokens still surface through the existing
-//! `dds_audit_entries_total{action=*.rejected}` counter that the
-//! gossip ingest path emits — sync-applied rejections do *not* hit
-//! that counter today (no audit emission from the sync apply
-//! path), so a future follow-up that lands the categorical
-//! `SyncResult` will close the post-apply gap.
+//! Post-apply (returned by `apply_sync_payloads_with_graph` through
+//! [`dds_net::sync::SyncResult::rejected_by_reason`]):
+//!
+//! - `signature` — `Token::validate()` rejected the token. Covers
+//!   ed25519 signature failures and the structural / issuer-binding
+//!   mismatches the token's own self-validation catches before the
+//!   trust graph is consulted.
+//! - `duplicate_jti` — the trust graph rejected the token because a
+//!   token with the same JTI is already in the graph (B-1 replay
+//!   indicator). Surfaced as its own bucket so an operator can
+//!   distinguish benign re-delivery rate from the other graph
+//!   rejections.
+//! - `graph` — every other `TrustError` from
+//!   [`dds_core::trust::TrustGraph::add_token`] —
+//!   `IdentityBurned`, `Unauthorized`, `VouchHashMismatch`,
+//!   `NoValidChain`, `ChainTooDeep`, or a graph-layer
+//!   `TokenValidation` re-derivation.
+//!
+//! Decode failures (token / op CBOR), store-side write failures
+//! (`put_token`, `revoke`, `burn`), and DAG missing-deps tally still
+//! flow into [`dds_net::sync::SyncResult::errors`] for diagnostic
+//! logging but are *not* partitioned through this counter — they are
+//! either corruption signals (operator should chase the source) or
+//! transient store-layer failures already covered by
+//! `dds_store_writes_total{result=fail}`.
 //!
 //! Per-peer cooldown skips inside
 //! [`crate::node::DdsNode::try_sync_with`] are *not* counted — no
@@ -464,15 +476,13 @@
 //! counted under `dds_sync_pulls_total{result="fail"}`, not here.
 //!
 //! The catalog in `observability-plan.md` Phase C names the labels
-//! `reason=signature|graph|duplicate_jti|window`. The v1 partition
-//! ships only the pre-apply surface (similar to the
-//! `dds_gossip_messages_dropped_total` precedent which partitions
-//! only pre-decode drops); `replay_window` ↔ catalog `window`, and
-//! `legacy_v1` / `publisher_capability` are added because the
-//! production node has those guards before the apply funnel runs.
-//! A future follow-up that lands the categorical `SyncResult` can
-//! add the `signature|graph|duplicate_jti` buckets without renaming
-//! the metric.
+//! `reason=signature|graph|duplicate_jti|window`. The shipped vocabulary
+//! adds the two pre-apply guards (`legacy_v1` / `publisher_capability`)
+//! that the production node runs before the apply funnel; the catalog's
+//! `window` aliases the pre-apply `replay_window` bucket. Sync-applied
+//! token rejections do *not* emit audit entries today (no audit hook
+//! inside the sync apply path), so this counter is the only signal an
+//! operator gets for sync-vs-gossip post-apply rejection rate parity.
 //!
 //! ### `dds_http_requests_total` semantics
 //!
@@ -1141,16 +1151,15 @@ pub fn record_sync_pull(result: &str) {
 }
 
 /// Bump `dds_sync_payloads_rejected_total{reason=...}` by one. Called
-/// from the three pre-apply skip sites in
-/// [`crate::node::DdsNode::handle_sync_response`]: the M-1/M-2 legacy
+/// from the pre-apply skip sites in
+/// [`crate::node::DdsNode::handle_sync_response`] (the M-1/M-2 legacy
 /// v1 token guard, the C-3 publisher-capability filter, and the M-9
-/// revocation replay-window guard. `reason` is one of
-/// `legacy_v1|publisher_capability|replay_window`. Post-apply errors
-/// returned by [`dds_net::sync::apply_sync_payloads_with_graph`] are
-/// not partitioned through this counter today — the SyncResult
-/// `errors: Vec<String>` field would need a categorical schema before
-/// the catalog's `signature|graph|duplicate_jti` buckets can ship.
-/// No-op when telemetry has not been installed (tests, harnesses).
+/// revocation replay-window guard) plus the post-apply iteration over
+/// [`dds_net::sync::SyncResult::rejected_by_reason`]. `reason` is one
+/// of `legacy_v1|publisher_capability|replay_window` (pre-apply) or
+/// `signature|duplicate_jti|graph` (post-apply, sourced from the
+/// [`dds_net::sync::SyncRejectReason`] catalog). No-op when telemetry
+/// has not been installed (tests, harnesses).
 pub fn record_sync_payloads_rejected(reason: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_sync_payloads_rejected(reason);
@@ -1520,22 +1529,26 @@ fn render_exposition(
         ));
     }
 
-    // `dds_sync_payloads_rejected_total` — per-`reason` pre-apply
-    // sync-payload rejection counter. Bumped from the three skip sites
-    // inside `DdsNode::handle_sync_response`: the M-1/M-2 legacy v1
-    // token guard, the C-3 publisher-capability filter, and the M-9
-    // revocation replay-window guard. Post-apply rejections from
-    // `apply_sync_payloads_with_graph` are not partitioned here today.
+    // `dds_sync_payloads_rejected_total` — per-`reason` sync-payload
+    // rejection counter. Bumped from the pre-apply skip sites inside
+    // `DdsNode::handle_sync_response` (M-1/M-2 legacy_v1, C-3
+    // publisher_capability, M-9 replay_window) plus the post-apply
+    // iteration over `SyncResult::rejected_by_reason` (signature,
+    // duplicate_jti, graph) returned by
+    // `apply_sync_payloads_with_graph`.
     out.push_str(
-        "# HELP dds_sync_payloads_rejected_total Inbound sync payloads rejected before they reach \
-         apply_sync_payloads_with_graph, partitioned by reason (legacy_v1 = M-1/M-2 downgrade \
-         guard tripped on a wire-version-1 token while allow_legacy_v1_tokens=false; \
-         publisher_capability = C-3 filter — issuer lacks the matching \
-         dds:policy-publisher-* / dds:software-publisher capability; replay_window = M-9 guard \
-         — revoke/burn token's `iat` is outside the configured replay window). Post-apply \
-         rejections (signature, graph add, duplicate JTI, store error) funnel into \
-         SyncResult.errors and would need a categorical SyncResult schema to partition \
-         cleanly; deferred.\n",
+        "# HELP dds_sync_payloads_rejected_total Inbound sync payloads rejected, partitioned by \
+         reason. Pre-apply (skipped before the apply funnel): legacy_v1 = M-1/M-2 downgrade guard \
+         tripped on a wire-version-1 token while allow_legacy_v1_tokens=false; \
+         publisher_capability = C-3 filter — issuer lacks the matching dds:policy-publisher-* / \
+         dds:software-publisher capability; replay_window = M-9 guard — revoke/burn token's `iat` \
+         is outside the configured replay window. Post-apply (returned by \
+         apply_sync_payloads_with_graph): signature = Token::validate() rejected the token \
+         (ed25519 signature / issuer-binding); duplicate_jti = trust graph rejected the token as \
+         a same-JTI duplicate (B-1 replay indicator); graph = every other TrustError (burned, \
+         unauthorized, vouch hash mismatch, no valid chain, chain too deep, graph-layer token \
+         re-validation). Decode failures and store-side write errors fall into SyncResult.errors \
+         only and surface separately through dds_store_writes_total{result=fail}.\n",
     );
     out.push_str("# TYPE dds_sync_payloads_rejected_total counter\n");
     let sync_rejected_snapshot = telemetry.sync_payloads_rejected_snapshot();
@@ -2333,10 +2346,17 @@ mod tests {
     #[test]
     fn sync_payloads_rejected_counter_renders_in_exposition() {
         let t = Telemetry::new();
+        // Pre-apply skip sites (M-1/M-2, C-3, M-9).
         t.bump_sync_payloads_rejected("legacy_v1");
         t.bump_sync_payloads_rejected("legacy_v1");
         t.bump_sync_payloads_rejected("publisher_capability");
         t.bump_sync_payloads_rejected("replay_window");
+        // Post-apply categorical reasons sourced from
+        // `SyncResult::rejected_by_reason`.
+        t.bump_sync_payloads_rejected("signature");
+        t.bump_sync_payloads_rejected("duplicate_jti");
+        t.bump_sync_payloads_rejected("graph");
+        t.bump_sync_payloads_rejected("graph");
 
         let body = render_exposition(
             &t,
@@ -2354,14 +2374,15 @@ mod tests {
             body.contains("dds_sync_payloads_rejected_total{reason=\"publisher_capability\"} 1\n")
         );
         assert!(body.contains("dds_sync_payloads_rejected_total{reason=\"replay_window\"} 1\n"));
+        assert!(body.contains("dds_sync_payloads_rejected_total{reason=\"signature\"} 1\n"));
+        assert!(body.contains("dds_sync_payloads_rejected_total{reason=\"duplicate_jti\"} 1\n"));
+        assert!(body.contains("dds_sync_payloads_rejected_total{reason=\"graph\"} 2\n"));
         assert_eq!(t.sync_payloads_rejected_count("legacy_v1"), 2);
         assert_eq!(t.sync_payloads_rejected_count("publisher_capability"), 1);
         assert_eq!(t.sync_payloads_rejected_count("replay_window"), 1);
-        // Catalog labels reserved for the deferred post-apply
-        // partition — must not be silently bumped today.
-        assert_eq!(t.sync_payloads_rejected_count("signature"), 0);
-        assert_eq!(t.sync_payloads_rejected_count("graph"), 0);
-        assert_eq!(t.sync_payloads_rejected_count("duplicate_jti"), 0);
+        assert_eq!(t.sync_payloads_rejected_count("signature"), 1);
+        assert_eq!(t.sync_payloads_rejected_count("duplicate_jti"), 1);
+        assert_eq!(t.sync_payloads_rejected_count("graph"), 2);
     }
 
     #[test]

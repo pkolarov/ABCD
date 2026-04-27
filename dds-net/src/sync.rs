@@ -9,11 +9,11 @@
 //! This module defines the sync messages and the state-machine logic.
 //! Transport is handled by the gossip/transport layers.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dds_core::crdt::causal_dag::{CausalDag, DagError, Operation};
 use dds_core::token::{Token, TokenKind};
-use dds_core::trust::TrustGraph;
+use dds_core::trust::{TrustError, TrustGraph};
 use dds_store::traits::{DirectoryStore, StoreError};
 use serde::{Deserialize, Serialize};
 
@@ -119,6 +119,53 @@ pub fn compute_missing_ops(
     remote_ids.difference(local_ids).cloned().collect()
 }
 
+/// Categorical reason a sync payload was rejected by
+/// [`apply_sync_payloads`] / [`apply_sync_payloads_with_graph`] *after*
+/// the pre-apply guards in
+/// [`crate::node::DdsNode::handle_sync_response`] have already filtered
+/// the response. Surfaces through [`SyncResult::rejected_by_reason`] so
+/// callers can partition the post-apply rejection rate without
+/// re-parsing the free-form `errors` strings; the `dds-node` telemetry
+/// hook bumps `dds_sync_payloads_rejected_total{reason=...}` off this
+/// map.
+///
+/// Pre-apply skip categories (`legacy_v1`, `publisher_capability`,
+/// `replay_window`) are not exposed here — they never enter the apply
+/// path. They share the same Prometheus counter family but originate
+/// in `node.rs::handle_sync_response` directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SyncRejectReason {
+    /// `Token::validate()` rejected the token. Covers ed25519 signature
+    /// failures and structural / issuer-binding mismatches that the
+    /// token's own self-validation catches before the trust graph is
+    /// consulted.
+    Signature,
+    /// The trust graph rejected the token because a token with the same
+    /// JTI is already in the graph. Surfaced as a distinct bucket so an
+    /// operator can distinguish benign re-delivery from other graph
+    /// rejections — a steady non-zero rate is normal under churn, an
+    /// elevated rate is a B-1 replay-attack indicator.
+    DuplicateJti,
+    /// The trust graph rejected the token for any other domain reason —
+    /// `IdentityBurned`, `Unauthorized`, `VouchHashMismatch`,
+    /// `NoValidChain`, `ChainTooDeep`, or a graph-layer
+    /// `TokenValidation` re-derivation. The `errors` string carries the
+    /// specific reason for human inspection.
+    Graph,
+}
+
+impl SyncRejectReason {
+    /// Stable Prometheus label value. Bounded vocabulary so the
+    /// `dds_sync_payloads_rejected_total` counter has fixed cardinality.
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            Self::Signature => "signature",
+            Self::DuplicateJti => "duplicate_jti",
+            Self::Graph => "graph",
+        }
+    }
+}
+
 /// Result of applying a sync payload.
 #[derive(Debug, Default)]
 pub struct SyncResult {
@@ -130,8 +177,38 @@ pub struct SyncResult {
     pub revocations_applied: usize,
     /// Number of new burns applied.
     pub burns_applied: usize,
-    /// Errors encountered (non-fatal — processing continues).
+    /// Errors encountered (non-fatal — processing continues). Free-form
+    /// strings retained for diagnostic logging — every payload that
+    /// trips a categorical reason in [`Self::rejected_by_reason`] also
+    /// pushes a string here, but the converse does not hold (decode
+    /// failures, store side-effect failures, and DAG missing-deps go
+    /// only to `errors`).
     pub errors: Vec<String>,
+    /// Per-reason post-apply rejection tally. Bumped exactly once per
+    /// rejected payload — matches the cardinality of
+    /// `dds_sync_payloads_rejected_total{reason=signature|duplicate_jti|graph}`
+    /// once the consumer (the dds-node sync handler) bumps the counter
+    /// off this map.
+    pub rejected_by_reason: BTreeMap<SyncRejectReason, usize>,
+}
+
+impl SyncResult {
+    fn record_reject(&mut self, reason: SyncRejectReason, message: String) {
+        self.errors.push(message);
+        *self.rejected_by_reason.entry(reason).or_insert(0) += 1;
+    }
+}
+
+/// Map a [`TrustError`] from `TrustGraph::add_token` into the
+/// post-apply categorical reason exposed through
+/// [`SyncResult::rejected_by_reason`]. `DuplicateJti` is partitioned
+/// separately because operators alert on it as a B-1 replay signal;
+/// every other graph-layer rejection collapses into [`SyncRejectReason::Graph`].
+fn classify_trust_error(err: &TrustError) -> SyncRejectReason {
+    match err {
+        TrustError::DuplicateJti(_) => SyncRejectReason::DuplicateJti,
+        _ => SyncRejectReason::Graph,
+    }
 }
 
 /// Apply received sync payloads to the local state.
@@ -179,7 +256,10 @@ pub fn apply_sync_payloads(
 
         // Validate token signature and issuer binding
         if let Err(e) = token.validate() {
-            result.errors.push(format!("token validation: {e}"));
+            result.record_reject(
+                SyncRejectReason::Signature,
+                format!("token validation: {e}"),
+            );
             continue;
         }
 
@@ -321,7 +401,10 @@ pub fn apply_sync_payloads_with_graph(
             }
         };
         if let Err(e) = token.validate() {
-            result.errors.push(format!("token validation: {e}"));
+            result.record_reject(
+                SyncRejectReason::Signature,
+                format!("token validation: {e}"),
+            );
             continue;
         }
         items.push((op, token));
@@ -346,7 +429,7 @@ pub fn apply_sync_payloads_with_graph(
         let graph_accepted = match trust_graph.add_token(token.clone()) {
             Ok(()) => true,
             Err(e) => {
-                result.errors.push(format!("trust graph add: {e}"));
+                result.record_reject(classify_trust_error(&e), format!("trust graph add: {e}"));
                 false
             }
         };
@@ -904,6 +987,238 @@ mod tests {
         bytes.push(0x00);
         let res = SyncMessage::from_cbor(&bytes);
         assert!(res.is_err(), "depth-bomb sync message must be rejected");
+    }
+
+    // ---------- post-apply categorical reject reason tests ----------
+
+    /// `SyncRejectReason::as_label` must return the exact Prometheus
+    /// label values the catalog promises. Pinning the string mapping
+    /// here prevents a future rename from silently breaking the
+    /// `dds_sync_payloads_rejected_total{reason=...}` series.
+    #[test]
+    fn sync_reject_reason_labels_match_catalog() {
+        assert_eq!(SyncRejectReason::Signature.as_label(), "signature");
+        assert_eq!(SyncRejectReason::DuplicateJti.as_label(), "duplicate_jti");
+        assert_eq!(SyncRejectReason::Graph.as_label(), "graph");
+    }
+
+    /// `Token::validate()` failure on a graph-aware apply must surface
+    /// as `SyncRejectReason::Signature` in `rejected_by_reason`. We
+    /// fabricate the failure by tampering with the signed payload bytes
+    /// after `Token::sign` so the ed25519 verify trips.
+    #[test]
+    fn rejected_by_reason_records_signature_for_bad_signature() {
+        let ident = make_identity("alice");
+        let token = make_attest_token(&ident);
+        let mut bad_bytes = token.to_cbor().unwrap();
+        // Flip a byte deep in the token CBOR — chosen far from the CBOR
+        // header so the structural decode still succeeds but
+        // `Token::validate()` fails its sig check. This mirrors a
+        // bit-flip / man-in-the-middle attack.
+        let last = bad_bytes.len() - 1;
+        bad_bytes[last] ^= 0x01;
+
+        let payload = SyncPayload {
+            op_bytes: serialize_op(&make_op("op-1", vec![])),
+            token_bytes: bad_bytes,
+        };
+
+        let mut dag = CausalDag::new();
+        let mut store = MemoryBackend::new();
+        let mut graph = TrustGraph::new();
+        let result = apply_sync_payloads_with_graph(&[payload], &mut dag, &mut store, &mut graph);
+
+        assert_eq!(result.tokens_stored, 0);
+        assert_eq!(
+            result
+                .rejected_by_reason
+                .get(&SyncRejectReason::Signature)
+                .copied(),
+            Some(1),
+            "expected one signature rejection, got {:?}",
+            result.rejected_by_reason
+        );
+        assert_eq!(
+            result.rejected_by_reason.len(),
+            1,
+            "no other reason should fire on a sig-only failure"
+        );
+    }
+
+    /// A duplicate-JTI second submission must surface as
+    /// `SyncRejectReason::DuplicateJti` (not the generic `Graph`
+    /// bucket) so operators can alert on B-1 replay activity directly.
+    #[test]
+    fn rejected_by_reason_records_duplicate_jti() {
+        let alice = make_identity("alice");
+        let mallory = make_identity("mallory");
+        let original = make_attest_token(&alice);
+        let original_jti = original.payload.jti.clone();
+        let attacker = Token::sign(
+            TokenPayload {
+                iss: mallory.id.to_urn(),
+                iss_key: mallory.public_key.clone(),
+                jti: original_jti.clone(),
+                sub: "victim".to_string(),
+                kind: TokenKind::Attest,
+                purpose: Some("admin".to_string()),
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat: 1000,
+                exp: Some(4102444800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &mallory.signing_key,
+        )
+        .unwrap();
+
+        let mut dag = CausalDag::new();
+        let mut store = MemoryBackend::new();
+        let mut graph = TrustGraph::new();
+        let first = apply_sync_payloads_with_graph(
+            &[SyncPayload {
+                op_bytes: serialize_op(&make_op("op-1", vec![])),
+                token_bytes: original.to_cbor().unwrap(),
+            }],
+            &mut dag,
+            &mut store,
+            &mut graph,
+        );
+        assert_eq!(first.tokens_stored, 1);
+        assert!(first.rejected_by_reason.is_empty());
+
+        let second = apply_sync_payloads_with_graph(
+            &[SyncPayload {
+                op_bytes: serialize_op(&make_op("op-2", vec![])),
+                token_bytes: attacker.to_cbor().unwrap(),
+            }],
+            &mut dag,
+            &mut store,
+            &mut graph,
+        );
+        assert_eq!(
+            second
+                .rejected_by_reason
+                .get(&SyncRejectReason::DuplicateJti)
+                .copied(),
+            Some(1),
+            "expected duplicate_jti bucket, got {:?}",
+            second.rejected_by_reason
+        );
+        assert_eq!(
+            second
+                .rejected_by_reason
+                .get(&SyncRejectReason::Graph)
+                .copied(),
+            None,
+            "duplicate_jti must not also tick the generic graph bucket"
+        );
+    }
+
+    /// An unauthorized revoke (signed by someone other than the
+    /// target's issuer) trips `TrustError::Unauthorized` — a non-`DuplicateJti`
+    /// graph rejection — and must surface as `SyncRejectReason::Graph`.
+    #[test]
+    fn rejected_by_reason_records_graph_for_unauthorized_revoke() {
+        let alice = make_identity("alice");
+        let mallory = make_identity("mallory");
+
+        let attest = make_attest_token(&alice);
+        let attest_jti = attest.payload.jti.clone();
+
+        let mut dag = CausalDag::new();
+        let mut store = MemoryBackend::new();
+        let mut graph = TrustGraph::new();
+        let warmup = apply_sync_payloads_with_graph(
+            &[SyncPayload {
+                op_bytes: serialize_op(&make_op("op-attest", vec![])),
+                token_bytes: attest.to_cbor().unwrap(),
+            }],
+            &mut dag,
+            &mut store,
+            &mut graph,
+        );
+        assert_eq!(warmup.tokens_stored, 1);
+
+        let unauthorized_revoke = Token::sign(
+            TokenPayload {
+                iss: mallory.id.to_urn(),
+                iss_key: mallory.public_key.clone(),
+                jti: "evil-revoke".to_string(),
+                sub: alice.id.to_urn(),
+                kind: TokenKind::Revoke,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: Some(attest_jti),
+                iat: 2000,
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &mallory.signing_key,
+        )
+        .unwrap();
+
+        let result = apply_sync_payloads_with_graph(
+            &[SyncPayload {
+                op_bytes: serialize_op(&make_op("op-revoke", vec![])),
+                token_bytes: unauthorized_revoke.to_cbor().unwrap(),
+            }],
+            &mut dag,
+            &mut store,
+            &mut graph,
+        );
+        assert_eq!(
+            result
+                .rejected_by_reason
+                .get(&SyncRejectReason::Graph)
+                .copied(),
+            Some(1),
+            "expected graph bucket for non-DuplicateJti rejection, got {:?}",
+            result.rejected_by_reason
+        );
+        assert_eq!(
+            result
+                .rejected_by_reason
+                .get(&SyncRejectReason::DuplicateJti)
+                .copied(),
+            None,
+            "duplicate_jti must not fire on an unauthorized revoke"
+        );
+    }
+
+    /// The graphless variant only sees `Signature` rejections — there
+    /// is no trust graph in scope so neither `DuplicateJti` nor
+    /// `Graph` can fire. Pin that behaviour so a future regression that
+    /// folds the graphless and graph-aware paths cannot silently widen
+    /// the metric semantics.
+    #[test]
+    fn graphless_apply_only_records_signature_reason() {
+        let ident = make_identity("alice");
+        let token = make_attest_token(&ident);
+        let mut bad_bytes = token.to_cbor().unwrap();
+        let last = bad_bytes.len() - 1;
+        bad_bytes[last] ^= 0x01;
+        let payload = SyncPayload {
+            op_bytes: serialize_op(&make_op("op-1", vec![])),
+            token_bytes: bad_bytes,
+        };
+
+        let mut dag = CausalDag::new();
+        let mut store = MemoryBackend::new();
+        let result = apply_sync_payloads(&[payload], &mut dag, &mut store);
+
+        assert_eq!(
+            result
+                .rejected_by_reason
+                .get(&SyncRejectReason::Signature)
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(result.rejected_by_reason.len(), 1);
     }
 
     /// **I-6 (security review)**. The sync apply loop decodes

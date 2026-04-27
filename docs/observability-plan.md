@@ -1,6 +1,9 @@
 # DDS Observability Plan — Audit, Metrics, Alerts, SIEM Export
 
-**Status:** Phase A landed 2026-04-26 follow-up #17 (closes Z-3);
+**Status:** Phase C **sync-payloads-rejected post-apply partition**
+(`dds_sync_payloads_rejected_total{reason=signature|duplicate_jti|graph}`)
+landed 2026-04-27 follow-up #41 — closing the post-apply gap that
+`#37` left open. Phase A landed 2026-04-26 follow-up #17 (closes Z-3);
 Phase D (`/healthz` + `/readyz`) landed 2026-04-26 follow-up #18;
 Phase B sub-tasks B.1 (`dds-cli audit tail` JSONL stream) and B.2
 (`dds-cli audit verify` chain walk) landed 2026-04-26 follow-up #19;
@@ -101,16 +104,21 @@ Phase C **sync-payloads-rejected counter (pre-apply subset)**
 — bumped from the three pre-apply skip sites inside
 [`DdsNode::handle_sync_response`](../dds-node/src/node.rs): the
 M-1/M-2 wire-version-1 token guard, the C-3 publisher-capability
-filter, and the M-9 revoke/burn replay-window guard. The catalog
-originally named the labels `signature|graph|duplicate_jti|window`;
-v1 ships the pre-apply surface only — `replay_window` ↔ catalog
-`window`, plus the two sync-only guards the gossip path also runs.
-Post-apply rejections from
-[`apply_sync_payloads_with_graph`](../dds-net/src/sync.rs) funnel
-into a single `SyncResult.errors: Vec<String>` today and need a
-categorical schema before the
-`signature|graph|duplicate_jti` buckets can ship) landed
-2026-04-27 follow-up #37. Phase C **store-bytes gauge**
+filter, and the M-9 revoke/burn replay-window guard) landed
+2026-04-27 follow-up #37. Phase C **sync-payloads-rejected
+post-apply partition**
+(`dds_sync_payloads_rejected_total{reason=signature|duplicate_jti|graph}`)
+landed 2026-04-27 follow-up #41 — the new
+[`SyncRejectReason`](../dds-net/src/sync.rs) enum plus a
+[`SyncResult::rejected_by_reason`](../dds-net/src/sync.rs) map carry
+the categorical reason out of the apply funnel; the `dds-node` sync
+handler iterates the map after `apply_sync_payloads_with_graph`
+returns and bumps the same counter family. `signature` covers
+`Token::validate()` failures, `duplicate_jti` partitions the B-1
+replay indicator, and `graph` collects every other
+`TrustError`. Decode failures and store-side write errors stay in
+`SyncResult.errors` only — already covered by
+`dds_store_writes_total{result=fail}`. Phase C **store-bytes gauge**
 (`dds_store_bytes{table=tokens|revoked|burned|operations|audit_log|challenges|credential_state}` —
 scrape-time read of [`dds_store::traits::StoreSizeStats::table_stored_bytes`]
 through [`LocalService::store_byte_sizes`](../dds-node/src/service.rs);
@@ -140,12 +148,25 @@ for our own pid via the private `process_resident_bytes()` helper
 in [`dds-node/src/telemetry.rs`](../dds-node/src/telemetry.rs)) landed
 2026-04-27 follow-up #40 — sister `dds_thread_count` gauge stays
 deferred because sysinfo 0.32 does not expose per-process thread
-counts directly. The rest of the C catalog
+counts directly. Phase C **sync-payloads-rejected post-apply
+partition**
+(`dds_sync_payloads_rejected_total{reason=signature|duplicate_jti|graph}`) —
+landed 2026-04-27 follow-up #41 — the new
+[`dds_net::sync::SyncRejectReason`](../dds-net/src/sync.rs) enum
+plus a [`SyncResult::rejected_by_reason: BTreeMap<SyncRejectReason, usize>`](../dds-net/src/sync.rs)
+field carry the categorical rejection reason out of the apply funnel;
+[`DdsNode::handle_sync_response`](../dds-node/src/node.rs) iterates
+the map after `apply_sync_payloads_with_graph` returns and bumps the
+existing counter through `record_sync_payloads_rejected`. `signature`
+covers `Token::validate()` failures (ed25519 / issuer-binding);
+`duplicate_jti` covers `TrustError::DuplicateJti`; `graph` covers
+every other `TrustError` from `TrustGraph::add_token`. Decode
+failures and store-side write errors stay in `SyncResult.errors`
+only — they are corruption / transient signals already covered by
+`dds_store_writes_total{result=fail}`. The rest of the C catalog
 (`dds_sync_lag_seconds` histogram, `dds_thread_count` gauge, plus
-the `dds_http_request_duration_seconds` histogram sibling, and the
-post-apply `signature|graph|duplicate_jti` partition of
-`dds_sync_payloads_rejected_total`) plus the Phase E rules/panels
-that depend on those metrics remain open.
+the `dds_http_request_duration_seconds` histogram sibling) plus the
+Phase E rules/panels that depend on those metrics remain open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -418,11 +439,13 @@ follow-up #32; FIDO2 attestation-verify counter
 follow-up #35; HTTP-requests counter
 (`dds_http_requests_total{route, method, status}`) landed
 2026-04-27 follow-up #36; sync-payloads-rejected counter
-(`dds_sync_payloads_rejected_total{reason=legacy_v1|publisher_capability|replay_window}` —
-pre-apply surface only; post-apply
-`signature|graph|duplicate_jti` partition deferred until
-`SyncResult` grows a categorical reason enum) landed 2026-04-27
-follow-up #37; store-bytes gauge
+(`dds_sync_payloads_rejected_total{reason=legacy_v1|publisher_capability|replay_window|signature|duplicate_jti|graph}` —
+pre-apply surface landed 2026-04-27 follow-up #37; the post-apply
+`signature|duplicate_jti|graph` partition landed 2026-04-27
+follow-up #41 once `SyncResult` grew the
+[`SyncRejectReason`](../dds-net/src/sync.rs) categorical enum +
+[`rejected_by_reason`](../dds-net/src/sync.rs) `BTreeMap` field
+that the dds-node sync handler iterates after every apply); store-bytes gauge
 (`dds_store_bytes{table=tokens|revoked|burned|operations|audit_log|challenges|credential_state}`)
 landed 2026-04-27 follow-up #38 — scrape-time read of
 [`dds_store::traits::StoreSizeStats::table_stored_bytes`] through
@@ -430,9 +453,8 @@ landed 2026-04-27 follow-up #38 — scrape-time read of
 RedbBackend reports `redb::TableStats::stored_bytes()` per table and
 MemoryBackend returns an empty map so harnesses scrape a
 discoverable family with no series; rest of the catalog
-(`dds_sync_lag_seconds`, `dds_store_writes_total`, process, plus
-the `dds_http_request_duration_seconds` histogram sibling, and the
-post-apply partition of `dds_sync_payloads_rejected_total`)
+(`dds_sync_lag_seconds` histogram, `dds_thread_count` gauge, plus
+the `dds_http_request_duration_seconds` histogram sibling)
 remains open.** The
 audit-metrics first slice exposed the five families needed to alert on
 Z-3 regressions (`dds_build_info`, `dds_uptime_seconds`,
@@ -528,7 +550,7 @@ rows remain open.
 | `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted|unknown_topic|decode_error|topic_kind_mismatch` | Pre-decode drops — bumped from the H-12 unadmitted-relayer drop in [`DdsNode::handle_swarm_event`](../dds-node/src/node.rs) and the three early-exit branches of [`DdsNode::handle_gossip_message`](../dds-node/src/node.rs) (`unknown_topic` = topic hash not in the local subscription set; `decode_error` = `GossipMessage::from_cbor` rejected the payload; `topic_kind_mismatch` = decoded variant did not match the topic family). The catalog originally named the labels `unadmitted|invalid_token|duplicate|backpressure`; the latter three describe *post-decode* drop conditions inside the `ingest_*` paths and are already covered by `dds_audit_entries_total{action=*.rejected}` (signature / validation / duplicate-JTI rejections all funnel through the audit chain), so v1 partitions the pre-decode surface only. A future follow-up that wires a gossipsub backpressure hook can add `reason=backpressure` without renaming the metric. | ✅ |
 | `dds_sync_pulls_total` | counter | `result=ok|fail` | Outbound anti-entropy pull outcomes — bumped from the resolution branches of [`DdsNode::handle_sync_event`](../dds-node/src/node.rs). `ok` = admitted peer's `Message::Response` was processed by `handle_sync_response` (zero payloads still counts as `ok` — the pull resolved, the network simply converged). `fail` = `OutboundFailure` event (timeout / connection closed / dial failure / codec error) or the H-12 unadmitted-peer response drop (response received but the peer is no longer in `admitted_peers`, so its payloads are discarded without applying any state). Per-peer cooldown skips inside `try_sync_with` are *not* counted — no request goes on the wire so there is no outcome to partition. Inbound responder-side outcomes are not counted; a future `dds_sync_serves_total{result}` family would split those out without renaming this metric. | ✅ |
 | `dds_sync_lag_seconds` | histogram | — | Time from peer's op timestamp to local apply | 🔲 |
-| `dds_sync_payloads_rejected_total` | counter | `reason=legacy_v1|publisher_capability|replay_window` (pre-apply subset; catalog-named `signature|graph|duplicate_jti|window` post-apply partition deferred) | Pre-apply skip sites inside [`DdsNode::handle_sync_response`](../dds-node/src/node.rs): `legacy_v1` = M-1/M-2 wire-version-1 token guard tripped while `network.allow_legacy_v1_tokens=false`; `publisher_capability` = C-3 filter — issuer lacks the matching `dds:policy-publisher-*` / `dds:software-publisher` capability vouch (same gate `node::publisher_capability_ok` runs on the gossip path); `replay_window` = M-9 revoke/burn replay-window guard (catalog `window`). The catalog originally named `signature|graph|duplicate_jti|window`; v1 partitions only the pre-apply surface — the post-apply rejections from [`apply_sync_payloads_with_graph`](../dds-net/src/sync.rs) funnel into a single `SyncResult.errors: Vec<String>` and need a categorical schema (e.g. `SyncRejectReason` enum) before the `signature|graph|duplicate_jti` buckets can ship. The pattern matches the `dds_gossip_messages_dropped_total` precedent (#32) which also partitions only its pre-decode surface. Sync-applied post-apply rejections do *not* hit `dds_audit_entries_total` today (no audit emission inside the sync apply path), so the categorical-`SyncResult` follow-up is required to close the post-apply gap. | ✅ (pre-apply only) |
+| `dds_sync_payloads_rejected_total` | counter | `reason=legacy_v1|publisher_capability|replay_window|signature|duplicate_jti|graph` | Pre-apply skip sites inside [`DdsNode::handle_sync_response`](../dds-node/src/node.rs): `legacy_v1` = M-1/M-2 wire-version-1 token guard tripped while `network.allow_legacy_v1_tokens=false`; `publisher_capability` = C-3 filter — issuer lacks the matching `dds:policy-publisher-*` / `dds:software-publisher` capability vouch (same gate `node::publisher_capability_ok` runs on the gossip path); `replay_window` = M-9 revoke/burn replay-window guard (catalog `window`). Post-apply categorical reasons returned by [`apply_sync_payloads_with_graph`](../dds-net/src/sync.rs) through the new [`SyncResult::rejected_by_reason`](../dds-net/src/sync.rs) field: `signature` = `Token::validate()` rejected the token (ed25519 signature / issuer-binding); `duplicate_jti` = trust graph rejected the token as a same-JTI duplicate (B-1 replay indicator); `graph` = every other `TrustError` from `TrustGraph::add_token` (`IdentityBurned`, `Unauthorized`, `VouchHashMismatch`, `NoValidChain`, `ChainTooDeep`, graph-layer `TokenValidation`). Decode failures (token / op CBOR), store-side write failures, and DAG missing-deps tally still flow into `SyncResult.errors` for diagnostic logging but are *not* partitioned through this counter — they are either corruption signals or transient store-layer failures already covered by `dds_store_writes_total{result=fail}`. Sync-applied post-apply rejections do *not* hit `dds_audit_entries_total` today (no audit emission inside the sync apply path), so this counter is the only signal an operator gets for sync-vs-gossip post-apply rejection rate parity. | ✅ |
 | **Trust graph** | | | | |
 | `dds_trust_graph_attestations` | gauge | — | Active attestation tokens (renamed from `dds_attestations_total` — Prom convention reserves `_total` for counters; per-kind label deferred until body-type classifier lands) | ✅ |
 | `dds_trust_graph_vouches` | gauge | — | Active vouch tokens | ✅ |

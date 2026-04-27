@@ -1516,6 +1516,17 @@ impl DdsNode {
             let mut g = self.trust_graph.write().expect("trust_graph poisoned");
             apply_sync_payloads_with_graph(&payloads, &mut self.dag, &mut self.store, &mut g)
         };
+        // Bump `dds_sync_payloads_rejected_total{reason=...}` for every
+        // post-apply rejection partitioned by the dds-net categorical
+        // reason. Pre-apply skips already bumped above so the same
+        // counter family covers both the pre-apply (legacy_v1 /
+        // publisher_capability / replay_window) and the post-apply
+        // (signature / duplicate_jti / graph) surfaces.
+        for (reason, count) in &result.rejected_by_reason {
+            for _ in 0..*count {
+                crate::telemetry::record_sync_payloads_rejected(reason.as_label());
+            }
+        }
         // Repopulate the sync cache so the next inbound request from
         // some other peer can serve these payloads onward. **M-5
         // (security review)**: route through `cache_sync_payload` so
