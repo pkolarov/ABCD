@@ -118,6 +118,122 @@ fn node_refuses_to_start_when_its_own_peer_id_is_revoked() {
     );
 }
 
+/// observability-plan.md Phase A — `admission.cert.revoked` audit
+/// emission on the piggy-backed merge path. Closes the deferred
+/// catalog row at `audit-event-schema.md` §3 and the matching row in
+/// `observability-plan.md` Phase A.1.
+///
+/// Drives `merge_piggybacked_revocations` with two new revocations
+/// plus one duplicate: the audit chain must gain exactly two
+/// `admission.cert.revoked` entries (one per *newly* admitted
+/// revocation; duplicates and verify-failures must not stamp the
+/// chain).
+#[test]
+fn piggybacked_admission_revocation_emits_audit_entry_per_new_entry() {
+    use dds_core::identity::Identity;
+    use dds_store::traits::AuditStore;
+    use rand::rngs::OsRng;
+
+    let (_dir, mut cfg, kp, _peer) = build_node_dir([5u8; 32]);
+    cfg.domain.audit_log_enabled = true;
+    let dkey = dds_domain::DomainKey::from_secret_bytes("test.revocation", [5u8; 32]);
+    let domain = dkey.domain();
+
+    let mut node = DdsNode::init(cfg, kp).expect("init clean node");
+    // A node identity is required for the gossip-ingest audit-emit
+    // funnel — without it the helper returns early (matches the
+    // `revoke` / `burn` ingest contract).
+    node.set_node_identity(Identity::generate("test.revocation", &mut OsRng));
+
+    // Seed the store with one already-known revocation so we can prove
+    // duplicates do *not* re-emit.
+    let known = dkey.revoke_admission("12D3KooWAlreadyKnown".into(), 100, Some("known".into()));
+    let known_blob = known.to_cbor().unwrap();
+
+    let new_a = dkey.revoke_admission("12D3KooWNewAlpha".into(), 200, Some("alpha".into()));
+    let new_b = dkey.revoke_admission("12D3KooWNewBeta".into(), 300, Some("beta".into()));
+
+    // Pre-load the "already known" entry by driving the piggyback
+    // funnel once — afterwards the chain should hold exactly one
+    // `admission.cert.revoked` entry.
+    let fake_peer = libp2p::PeerId::random();
+    node.merge_piggybacked_revocations(&fake_peer, vec![known_blob.clone()]);
+    let after_first = node.store.list_audit_entries().expect("list entries");
+    let revoked_after_first = after_first
+        .iter()
+        .filter(|e| e.action == "admission.cert.revoked")
+        .count();
+    assert_eq!(
+        revoked_after_first, 1,
+        "first merge should stamp exactly one admission.cert.revoked entry"
+    );
+
+    // Now feed the same `known` blob alongside two genuinely new ones.
+    // Only the two new revocations should stamp the audit chain; the
+    // duplicate is a silent no-op per `AdmissionRevocationStore::add`'s
+    // dedupe contract.
+    node.merge_piggybacked_revocations(
+        &fake_peer,
+        vec![
+            known_blob,
+            new_a.to_cbor().unwrap(),
+            new_b.to_cbor().unwrap(),
+        ],
+    );
+    let after_second = node.store.list_audit_entries().expect("list entries");
+    let revoked_after_second = after_second
+        .iter()
+        .filter(|e| e.action == "admission.cert.revoked")
+        .count();
+    assert_eq!(
+        revoked_after_second, 3,
+        "second merge should add exactly two new admission.cert.revoked entries (one per new revocation)"
+    );
+
+    // The new chain entries' token bytes must round-trip back to the
+    // exact CBOR blobs we admitted — this pins the audit-event-schema
+    // §2 `token_cbor_b64` contract for this action.
+    let new_a_blob = new_a.to_cbor().unwrap();
+    let new_b_blob = new_b.to_cbor().unwrap();
+    let entries: Vec<_> = after_second
+        .iter()
+        .filter(|e| e.action == "admission.cert.revoked")
+        .collect();
+    let blobs: Vec<&Vec<u8>> = entries.iter().map(|e| &e.token_bytes).collect();
+    assert!(
+        blobs.contains(&&new_a_blob),
+        "audit chain missing new_a CBOR blob"
+    );
+    assert!(
+        blobs.contains(&&new_b_blob),
+        "audit chain missing new_b CBOR blob"
+    );
+
+    // Sanity: the in-memory revocation store contains all three entries
+    // (one pre-loaded plus two new) and the new peer ids resolve as
+    // revoked.
+    assert_eq!(node.admission_revocations().len(), 3);
+    assert!(node.admission_revocations().is_revoked("12D3KooWNewAlpha"));
+    assert!(node.admission_revocations().is_revoked("12D3KooWNewBeta"));
+
+    // And the saved file matches in-memory so a restart picks up the
+    // same set.
+    let on_disk =
+        admission_revocation_store::load_or_empty(&cfg_path_for(&node), domain.id, domain.pubkey)
+            .expect("load_or_empty");
+    assert_eq!(on_disk.len(), 3);
+}
+
+/// Helper — DdsNode does not expose its data dir directly, so we
+/// recompute the revocations path the same way `init` does. This is
+/// a test-only helper kept private to this module.
+fn cfg_path_for(node: &DdsNode) -> std::path::PathBuf {
+    // The data dir survives on `node.config.data_dir`; the
+    // revocations path mirrors `NodeConfig::admission_revocations_path`
+    // (one shared helper used by both the node and the import CLI).
+    node.config.admission_revocations_path()
+}
+
 #[test]
 fn node_refuses_to_start_when_revocation_file_is_corrupt() {
     let (_dir, cfg, kp, _peer) = build_node_dir([4u8; 32]);

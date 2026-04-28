@@ -71,7 +71,10 @@ pub fn cef_severity(action: &str, sig_ok: bool) -> u8 {
     if action.ends_with(".rejected") || action == "apply.failed" {
         return 4;
     }
-    if matches!(action, "revoke" | "burn" | "admin.bootstrap") {
+    if matches!(
+        action,
+        "revoke" | "burn" | "admin.bootstrap" | "admission.cert.revoked"
+    ) {
         return 3;
     }
     2
@@ -86,7 +89,10 @@ pub fn syslog_severity(action: &str, sig_ok: bool) -> u8 {
     if action.ends_with(".rejected") || action == "apply.failed" {
         return 4;
     }
-    if matches!(action, "revoke" | "burn" | "admin.bootstrap") {
+    if matches!(
+        action,
+        "revoke" | "burn" | "admin.bootstrap" | "admission.cert.revoked"
+    ) {
         return 5;
     }
     6
@@ -323,6 +329,7 @@ mod tests {
         assert_eq!(cef_severity("revoke", true), 3);
         assert_eq!(cef_severity("burn", true), 3);
         assert_eq!(cef_severity("admin.bootstrap", true), 3);
+        assert_eq!(cef_severity("admission.cert.revoked", true), 3);
         // sig_ok=false override always wins, even on informational stems.
         assert_eq!(cef_severity("attest", false), 8);
         assert_eq!(cef_severity("apply.applied", false), 8);
@@ -336,6 +343,7 @@ mod tests {
         assert_eq!(syslog_severity("revoke", true), 5);
         assert_eq!(syslog_severity("burn", true), 5);
         assert_eq!(syslog_severity("admin.bootstrap", true), 5);
+        assert_eq!(syslog_severity("admission.cert.revoked", true), 5);
         // alert (1) on tampering.
         assert_eq!(syslog_severity("attest", false), 1);
     }

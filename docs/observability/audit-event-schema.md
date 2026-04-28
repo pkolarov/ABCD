@@ -78,6 +78,7 @@ attempt".
 | `admin.vouch` | informational | `service.rs::admin_vouch` | An admin vouched another principal. |
 | `apply.applied` | informational | `service.rs::record_applied` | Agent reported a successful apply. `Skipped` reports carry `reason="skipped"`. |
 | `apply.failed` | warning | same | Agent reported a failed apply. `reason` carries the agent's error string. |
+| `admission.cert.revoked` | **notice** | `node.rs::merge_piggybacked_revocations` | An admission revocation arrived via the H-12 piggy-back path and was accepted into the local store. One entry per *newly* admitted revocation; duplicates and verify-failures do not stamp the chain. `token_cbor_b64` is the CBOR-encoded `AdmissionRevocation` payload. |
 
 Reserved (not yet emitted by `dds-node`, will appear in the same JSONL
 shape when they land):
@@ -86,8 +87,9 @@ shape when they land):
   `software.failed` — finer-grained applier outcomes once
   `AppliedReport` grows a `kind` discriminator on the wire (today it
   does not, so v1 collapses these into the `apply.*` family).
-- `admission.cert.issued` / `admission.cert.revoked` — admission cert
-  lifecycle.
+- `admission.cert.issued` — admission cert issuance (cert issuance is
+  a domain-level operation today, not gated through a node ingest
+  path).
 - `secret.released` — `SecretReleaseDocument` consumption (v2).
 
 A SIEM rule that filters on `action` should treat unknown values as
@@ -122,7 +124,7 @@ that have not built their own mapping yet, a sensible default is:
 |---|---|---|
 | `*.rejected` | 4 (medium) | warning (4) |
 | `apply.failed` | 4 (medium) | warning (4) |
-| `revoke`, `burn`, `admin.bootstrap` | 3 (low-medium) | notice (5) |
+| `revoke`, `burn`, `admin.bootstrap`, `admission.cert.revoked` | 3 (low-medium) | notice (5) |
 | everything else | 2 (low) | informational (6) |
 | any line with `sig_ok=false` | 8 (high) | alert (1) — override the action-based row |
 

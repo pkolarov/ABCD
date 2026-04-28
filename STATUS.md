@@ -98,7 +98,53 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-28 follow-up #50 (documentation catch-up —
+> Last updated: 2026-04-28 follow-up #51 (observability Phase A
+> follow-up — `admission.cert.revoked` audit-action emission landed,
+> closing one of the two remaining deferred rows on the
+> [`docs/observability-plan.md`](docs/observability-plan.md) Phase A.1
+> action catalog at §Phase A and the matching reserved bullet at
+> [`docs/observability/audit-event-schema.md`](docs/observability/audit-event-schema.md)
+> §3). The piggy-back merge funnel
+> [`DdsNode::merge_piggybacked_revocations`](dds-node/src/node.rs)
+> previously called the bulk
+> [`AdmissionRevocationStore::merge`](dds-node/src/admission_revocation_store.rs)
+> path and so could not stamp the audit chain on a per-entry basis;
+> the funnel is now a per-entry loop over
+> [`AdmissionRevocationStore::add`](dds-node/src/admission_revocation_store.rs)
+> and emits one `admission.cert.revoked` audit entry through
+> [`DdsNode::emit_audit_from_ingest`](dds-node/src/node.rs) per
+> *newly* admitted revocation — duplicates (already present under the
+> same `(peer_id, signature)` dedupe key) and verify-failures do not
+> stamp the chain. The audit emit fires *before* the on-disk save so a
+> persistence failure cannot silently drop the operator-visible signal
+> that a peer was just revoked; the chain itself is the durability
+> surface for the action. `token_cbor_b64` for the new action carries
+> the exact CBOR-encoded `AdmissionRevocation` payload, matching the
+> §2 `token_cbor_b64` contract. The severity hint is **notice** (CEF
+> 3 / syslog 5) — same bucket as `revoke` / `burn` / `admin.bootstrap`
+> — and the [`dds-cli/src/audit_format.rs`](dds-cli/src/audit_format.rs)
+> `cef_severity` / `syslog_severity` helpers are extended to match,
+> with the pinning unit tests
+> `cef_severity_matches_schema_table` / `syslog_severity_matches_schema_table`
+> updated alongside. One new integration regression test
+> `piggybacked_admission_revocation_emits_audit_entry_per_new_entry`
+> in [`dds-node/tests/admission_revocation.rs`](dds-node/tests/admission_revocation.rs)
+> drives the funnel end-to-end with a mix of new + duplicate entries
+> and asserts (a) the audit chain length grows by exactly the
+> newly-added count, (b) the entry `token_bytes` round-trip back to
+> the exact CBOR blobs admitted, and (c) the on-disk revocation file
+> matches the in-memory store. `merge_piggybacked_revocations` is
+> promoted from `fn` (private) to `pub fn` to keep the test honest
+> without spinning up a libp2p swarm — the catalog row at
+> [`docs/observability-plan.md`](docs/observability-plan.md) §Phase A
+> updates the source path to point at the new emission site.
+> `admission.cert.issued` stays deferred (cert issuance is a
+> domain-level operation today). `cargo fmt` clean; `cargo clippy
+> --workspace --all-targets -- -D warnings` clean; `cargo test
+> --workspace --all-targets` passes (workspace test count rises by 1
+> for the new integration test).
+>
+> Previous: 2026-04-28 follow-up #50 (documentation catch-up —
 > the Z-1 banner above and the
 > [`docs/DDS-Admin-Guide.md`](docs/DDS-Admin-Guide.md) Monitoring
 > section now match the code state on disk). Two pieces had drifted

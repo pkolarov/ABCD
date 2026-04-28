@@ -312,7 +312,7 @@ the existing free-form string into a fixed set):
 | `apply.failed` | Agent reports a failed apply; `reason` carries the agent's error string | same path, failure branch | ✅ shipped 2026-04-26 |
 | `policy.applied` / `policy.failed` / `software.applied` / `software.failed` | Finer-grained applier outcomes | reserved for when `AppliedReport` grows a `kind` discriminator on the wire (today the report does not distinguish policy vs. software, so v1 collapses them into the `apply.*` family) | 🔲 deferred |
 | `admission.cert.issued` | Admission cert produced for a peer | `service.rs::issue_admission_cert` | 🔲 deferred (cert issuance is a domain-level operation today) |
-| `admission.cert.revoked` | Admission revocation accepted | `admission_revocation_store::merge` | 🔲 deferred |
+| `admission.cert.revoked` | Admission revocation accepted | `node.rs::merge_piggybacked_revocations` (piggy-backed H-12 distribution path, per-newly-added entry) | ✅ shipped 2026-04-28 |
 | `secret.released` (deferred) | `SecretReleaseDocument` consumed | reserved for v2 | 🔲 deferred |
 
 **Failure paths must also emit.** A rejected-by-graph token still

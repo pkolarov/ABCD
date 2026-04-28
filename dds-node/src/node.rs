@@ -808,7 +808,13 @@ impl DdsNode {
     /// the gating check for everything that survives the cap. If any
     /// new entries land, the on-disk file is rewritten atomically so
     /// the next start-up sees them.
-    fn merge_piggybacked_revocations(&mut self, peer_id: &PeerId, revocations: Vec<Vec<u8>>) {
+    ///
+    /// Exposed `pub` (rather than private) so an integration test can
+    /// drive the merge funnel directly without spinning up libp2p — the
+    /// existing `dds-node/tests/h12_revocation_piggyback.rs` covers the
+    /// end-to-end handshake; the piggyback-driven audit-emission test
+    /// exercises this entry point with a hand-built revocation list.
+    pub fn merge_piggybacked_revocations(&mut self, peer_id: &PeerId, revocations: Vec<Vec<u8>>) {
         if revocations.is_empty() {
             return;
         }
@@ -821,10 +827,16 @@ impl DdsNode {
             );
             return;
         }
-        let mut decoded = Vec::with_capacity(revocations.len());
+        // Decode + carry the original blob so a successfully-added
+        // revocation can be audited with the exact CBOR bytes the peer
+        // sent — the audit-event-schema.md `token_cbor_b64` field
+        // contract is "the exact CBOR-encoded payload the audited
+        // action operated on".
+        let mut decoded: Vec<(dds_domain::AdmissionRevocation, Vec<u8>)> =
+            Vec::with_capacity(revocations.len());
         for blob in revocations {
             match dds_domain::AdmissionRevocation::from_cbor(&blob) {
-                Ok(r) => decoded.push(r),
+                Ok(r) => decoded.push((r, blob)),
                 Err(e) => debug!(
                     %peer_id,
                     error = %e,
@@ -835,14 +847,36 @@ impl DdsNode {
         if decoded.is_empty() {
             return;
         }
-        let added =
-            self.admission_revocations
-                .merge(crate::admission_revocation_store::RevocationListV1 {
-                    v: 1,
-                    entries: decoded,
-                });
+        // Per-entry add so we can emit one `admission.cert.revoked`
+        // audit entry per *newly* admitted revocation. Mirrors the
+        // existing per-token gossip-ingest funnel — previously the
+        // bulk `merge` path lost the per-entry outcome and so could
+        // not stamp the audit chain.
+        let mut added = 0usize;
+        let mut newly_added: Vec<Vec<u8>> = Vec::new();
+        for (rev, blob) in decoded {
+            match self.admission_revocations.add(rev) {
+                Ok(true) => {
+                    added += 1;
+                    newly_added.push(blob);
+                }
+                Ok(false) => {}
+                Err(e) => warn!(
+                    %peer_id,
+                    error = %e,
+                    "H-12: skipping piggy-backed revocation that failed to verify"
+                ),
+            }
+        }
         if added == 0 {
             return;
+        }
+        // Stamp the audit chain *before* persisting so a write failure
+        // on the on-disk revocation file does not silently drop the
+        // operator-visible signal that a peer was just revoked. The
+        // chain itself is the durability surface for the action.
+        for blob in newly_added {
+            self.emit_audit_from_ingest("admission.cert.revoked", blob, None);
         }
         // Persist the augmented list so the new entries survive
         // restart. A persistence failure must not break the
