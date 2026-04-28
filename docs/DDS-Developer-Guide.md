@@ -1136,7 +1136,7 @@ Navigate to the `dds-domain` crate. This is the most human-readable code. Look a
 
 #### 3. Read the tests
 
-We have over 200 tests. Tests are the absolute best documentation for seeing how the pieces are expected to behave when pushed to their limits.
+We have over 700 tests in the Rust workspace (724 / 724 passing as of 2026-04-28 — `cargo test --workspace`, 1 ignored). Tests are the absolute best documentation for seeing how the pieces are expected to behave when pushed to their limits.
 
 - Want to see how CRDTs work? → Read the tests in `dds-core/src/crdt/`
 - Want to see how access is granted? → Read `dds-core/src/policy.rs`

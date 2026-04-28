@@ -2851,11 +2851,11 @@ M-1…M-22 ledger; the addendum table below is the per-finding view.
 | **Edition** | 2024 |
 | **Workspace crates** | 9 (dds-core, dds-domain, dds-store, dds-net, dds-node, dds-ffi, dds-cli, dds-loadtest, dds-fido2-test) |
 | **Rust LOC** | 8,400+ |
-| **Rust tests** | 480 (up from 305 after B-1, B-2, B-3, B-5 regressions, the A-1 follow-up enrollment-challenge plumbing, and the threat-model §8 item-13 real-time-expiry regression triple; macOS dev host) |
+| **Rust tests** | 724 (workspace, macOS dev host 2026-04-28; up from 480 after the iterative observability Phase A/B/C/D/E/F drops, the Z-1 / Z-3 / supply-chain SC-1..SC-3 follow-ups, and the SC-5 Phase B.1 publisher-identity schema regression suite) |
 | **.NET tests** | 132 (Windows: 89 unit + 43 integration; up from 117 after B-3, B-6 regressions) + 72 (macOS; up from 17 after B-3 regressions and macOS Tests parity) |
 | **C++ native tests** | 47 (Windows) |
 | **Python tests** | 13 |
-| **Total tests** | 735 ✅ all passing on the macOS dev host (Rust + macOS .NET + Python). Windows-side .NET / native counts are CI-verified (last run 2026-04-24). |
+| **Total tests** | 988 ✅ all passing on the macOS dev host (Rust + macOS .NET + Python = 724 + 72 + 13 = 809) plus Windows-side .NET (132) + C++ native (47) = 988, last full CI verification 2026-04-24 (Windows side); 2026-04-28 (Rust + macOS). |
 | **Shared library** | libdds\_ffi.dylib (739 KB) |
 
 Verification note (2026-04-13, Windows 11 ARM64):
