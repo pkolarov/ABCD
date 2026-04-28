@@ -1612,7 +1612,8 @@ Catalog (full list with semantics is in
 | `dds_gossip_messages_dropped_total` | counter | `reason` | Pre-decode drops (unadmitted peer, unknown topic, decode error, kind mismatch) |
 | `dds_sync_pulls_total` | counter | `result=ok\|fail` | Anti-entropy pull outcomes |
 | `dds_sync_payloads_rejected_total` | counter | `reason` | Pre/post-apply sync rejections (legacy v1, publisher capability, replay window, signature, duplicate JTI, graph) |
-| `dds_trust_graph_{attestations,vouches,revocations,burned}` | gauge | — | Current trust-graph state |
+| `dds_trust_graph_attestations` | gauge | `body_type` | Current attestation count, partitioned by `body_type` (the nine `dds_domain::body_types` constants — user-auth-attestation, device-join, windows-policy, macos-policy, macos-account-binding, sso-identity-link, software-assignment, service-principal, session — plus `unknown` for tokens with absent or out-of-catalog `body_type`). `sum(dds_trust_graph_attestations)` is the previous (unlabeled) total. |
+| `dds_trust_graph_{vouches,revocations,burned}` | gauge | — | Current trust-graph state for vouches / revocations / burned identities |
 | `dds_purpose_lookups_total` | counter | `result=ok\|denied` | Capability-gate outcomes |
 | `dds_fido2_assertions_total` | counter | `result=ok\|signature\|rp_id\|up\|sign_count\|other` | FIDO2 assertion outcomes |
 | `dds_fido2_attestation_verify_total` | counter | `result, fmt` | Enrollment-time attestation verify outcomes |

@@ -140,7 +140,62 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-28 follow-up #51 (observability Phase A
+> Last updated: 2026-04-28 follow-up #52 (observability Phase C
+> follow-up — `dds_trust_graph_attestations` Prometheus gauge gained a
+> `body_type` partition, closing the deferred per-kind label row on the
+> [`docs/observability-plan.md`](docs/observability-plan.md) Phase C
+> trust-graph subset). The metric used to ship as a single unlabeled
+> series; the catalog row had been carrying a "per-kind label deferred
+> until body-type classifier lands" qualifier since the trust-graph
+> subset originally landed. The classifier now lives in
+> [`crate::service::body_type_label`](dds-node/src/service.rs) — a
+> single `match` over the nine constants in
+> [`dds_domain::body_types`](dds-domain/src/lib.rs) that strips the
+> `dds:` URI prefix and emits a short label name (e.g.,
+> `dds:user-auth-attestation` →
+> `body_type="user-auth-attestation"`). Tokens whose `payload.body_type`
+> is `None` or outside the catalog fall into `body_type="unknown"` so
+> the partition is total — `sum(dds_trust_graph_attestations)` equals
+> the previous unlabeled total. The catalog originally named
+> `kind=user|device|service`; the `body_type` vocabulary is preferred
+> because the catalog entries do not collapse cleanly to those three
+> buckets (`windows-policy` / `software-assignment` are neither user
+> nor device nor service), so v1 ships the literal stripped catalog
+> spelling. Cardinality is bounded by the nine catalog constants plus
+> `unknown` (10 values total). The renderer in
+> [`crate::telemetry::render_exposition`](dds-node/src/telemetry.rs)
+> iterates the [`crate::service::TrustGraphCounts::attestations_by_body_type`](dds-node/src/service.rs)
+> `BTreeMap` (alphabetical by label so the exposition is stable across
+> scrapes) and emits one `dds_trust_graph_attestations{body_type="..."}`
+> series per non-zero bucket; an empty graph emits a single
+> zero-valued `body_type="unknown"` anchor line so the family always
+> has at least one value line for the discoverability contract pinned
+> by the existing `serve_returns_prometheus_text_with_audit_metrics`
+> integration test. Workspace test count rises by 1 for the new
+> [`crate::service::body_type_label_covers_every_body_types_constant`](dds-node/src/service.rs)
+> regression test, which iterates every `dds_domain::body_types::*`
+> constant and asserts the classifier maps each into a non-`unknown`
+> bucket — a new domain document type added to the catalog without a
+> matching arm in `body_type_label` would silently land in the
+> catch-all `unknown` and dilute the partition signal, so the test
+> fails loudly to force the partition update at the same time the new
+> body type is introduced. The existing
+> `trust_graph_counts_reports_partition_sizes` test was extended to
+> assert the partition's sum equals the unlabeled total and that the
+> root self-attestation lands in `body_type="unknown"` (its
+> `payload.body_type` is `None`); the existing
+> `trust_graph_gauges_render_supplied_counts` and
+> `trust_graph_gauges_default_to_zero_when_lock_poisoned` tests were
+> extended to assert the new labeled exposition shape and the
+> zero-valued anchor line respectively; the existing
+> `serve_returns_prometheus_text_with_audit_metrics` end-to-end test
+> was tightened to assert the served exposition carries
+> `dds_trust_graph_attestations{body_type="unknown"} 1` (the seeded
+> root attestation classified through the new label scheme). `cargo
+> fmt` clean; `cargo clippy --workspace --all-targets -- -D warnings`
+> clean; `cargo test --workspace --all-targets` passes.
+>
+> Previous: 2026-04-28 follow-up #51 (observability Phase A
 > follow-up — `admission.cert.revoked` audit-action emission landed,
 > closing one of the two remaining deferred rows on the
 > [`docs/observability-plan.md`](docs/observability-plan.md) Phase A.1

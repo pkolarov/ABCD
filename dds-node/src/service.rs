@@ -252,12 +252,22 @@ pub struct PolicyResult {
 /// the Prometheus exposition (observability-plan.md Phase C). The
 /// metrics renderer reads all four gauges from a single snapshot so
 /// scrape latency stays bounded by one lock acquisition.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// `attestations_by_body_type` partitions the attestation total by the
+/// `payload.body_type` carried on each token, mapped through the
+/// fixed [`dds_domain::body_types`] vocabulary into a short label name
+/// (the `dds:` URI prefix is stripped — `dds:user-auth-attestation`
+/// becomes `body_type="user-auth-attestation"`). Tokens whose
+/// `body_type` is `None` or does not match any known body-type URI
+/// fall into the `unknown` bucket so the partition's sum is always
+/// equal to the unlabeled `attestations` total.
+#[derive(Debug, Clone, Default)]
 pub struct TrustGraphCounts {
     pub attestations: usize,
     pub vouches: usize,
     pub revocations: usize,
     pub burned: usize,
+    pub attestations_by_body_type: std::collections::BTreeMap<&'static str, usize>,
 }
 
 /// One-shot per-table byte snapshot for the `dds_store_bytes{table=...}`
@@ -270,6 +280,32 @@ pub struct TrustGraphCounts {
 #[derive(Debug, Clone, Default)]
 pub struct StoreByteSizes {
     pub tables: std::collections::BTreeMap<&'static str, u64>,
+}
+
+/// Map a `body_type` URI from a token payload to the short label used
+/// by the `dds_trust_graph_attestations{body_type=...}` Prometheus
+/// gauge partition (observability-plan.md Phase C). The vocabulary is
+/// bounded by the fixed [`dds_domain::body_types`] catalog; tokens
+/// whose `body_type` is `None` or outside that catalog fall into the
+/// `"unknown"` bucket so the partition's sum equals the unlabeled
+/// total. Adding a new body type to `dds_domain::body_types` requires
+/// adding a matching arm here — the
+/// `body_type_label_covers_every_body_types_constant` test pins that
+/// invariant.
+pub(crate) fn body_type_label(body_type: Option<&str>) -> &'static str {
+    use dds_domain::body_types;
+    match body_type {
+        Some(body_types::USER_AUTH_ATTESTATION) => "user-auth-attestation",
+        Some(body_types::DEVICE_JOIN) => "device-join",
+        Some(body_types::WINDOWS_POLICY) => "windows-policy",
+        Some(body_types::MACOS_POLICY) => "macos-policy",
+        Some(body_types::MACOS_ACCOUNT_BINDING) => "macos-account-binding",
+        Some(body_types::SSO_IDENTITY_LINK) => "sso-identity-link",
+        Some(body_types::SOFTWARE_ASSIGNMENT) => "software-assignment",
+        Some(body_types::SERVICE_PRINCIPAL) => "service-principal",
+        Some(body_types::SESSION) => "session",
+        _ => "unknown",
+    }
 }
 
 // ----------------------------------------------------------------
@@ -2115,13 +2151,29 @@ impl<
     /// Prometheus gauges. Returns `None` if the trust-graph lock is
     /// poisoned so the metrics renderer can degrade to the previous
     /// scrape value rather than panic the scrape task.
+    ///
+    /// The attestation total is also partitioned by `body_type` —
+    /// the renderer emits one
+    /// `dds_trust_graph_attestations{body_type="..."}` series per
+    /// non-zero bucket. Bucket vocabulary is bounded by the fixed
+    /// [`dds_domain::body_types`] catalog; tokens whose `body_type`
+    /// is absent or outside that catalog fall into the `unknown`
+    /// bucket, so `sum(dds_trust_graph_attestations) ==
+    /// dds_trust_graph_attestations{body_type=*}` always holds.
     pub fn trust_graph_counts(&self) -> Option<TrustGraphCounts> {
         let g = self.trust_graph.read().ok()?;
+        let mut by_body_type: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
+        for token in g.attestations_iter() {
+            let bucket = body_type_label(token.payload.body_type.as_deref());
+            *by_body_type.entry(bucket).or_insert(0) += 1;
+        }
         Some(TrustGraphCounts {
             attestations: g.attestation_count(),
             vouches: g.vouch_count(),
             revocations: g.revocation_count(),
             burned: g.burned_count(),
+            attestations_by_body_type: by_body_type,
         })
     }
 
@@ -3804,6 +3856,53 @@ mod platform_applier_tests {
         assert_eq!(counts.vouches, 3);
         assert_eq!(counts.revocations, 0);
         assert_eq!(counts.burned, 0);
+        // observability-plan.md Phase C — the body_type partition
+        // sums to the unlabeled total. The `setup()` admin
+        // attestation has `body_type: None` so it lands in the
+        // `unknown` bucket.
+        let by_body_type_sum: usize = counts.attestations_by_body_type.values().sum();
+        assert_eq!(by_body_type_sum, counts.attestations);
+        assert_eq!(counts.attestations_by_body_type.get("unknown"), Some(&1));
+    }
+
+    /// observability-plan.md Phase C — pin the contract that every
+    /// constant in [`dds_domain::body_types`] has a matching arm in
+    /// [`crate::service::body_type_label`]. A new domain document
+    /// type added to the catalog without an arm here would silently
+    /// land in `body_type="unknown"`, so the test fails loudly to
+    /// force the partition update at the same time the new body type
+    /// is introduced.
+    #[test]
+    fn body_type_label_covers_every_body_types_constant() {
+        use dds_domain::body_types;
+        // Every constant in `dds_domain::body_types` must classify
+        // into a non-`unknown` bucket. Adding a new body type
+        // without updating `body_type_label` is the regression this
+        // test prevents.
+        let constants: &[&str] = &[
+            body_types::USER_AUTH_ATTESTATION,
+            body_types::DEVICE_JOIN,
+            body_types::WINDOWS_POLICY,
+            body_types::MACOS_POLICY,
+            body_types::MACOS_ACCOUNT_BINDING,
+            body_types::SSO_IDENTITY_LINK,
+            body_types::SOFTWARE_ASSIGNMENT,
+            body_types::SERVICE_PRINCIPAL,
+            body_types::SESSION,
+        ];
+        for c in constants {
+            let label = body_type_label(Some(c));
+            assert_ne!(
+                label, "unknown",
+                "body_type_label maps {c:?} into the catch-all unknown bucket — \
+                 add a matching arm to body_type_label so the Prometheus \
+                 partition stays bounded by the catalog.",
+            );
+        }
+        // Sanity: the absent and out-of-catalog cases both classify
+        // as `unknown` so the partition is total.
+        assert_eq!(body_type_label(None), "unknown");
+        assert_eq!(body_type_label(Some("dds:not-a-real-body-type")), "unknown");
     }
 
     /// observability-plan.md Phase C — regression test for the

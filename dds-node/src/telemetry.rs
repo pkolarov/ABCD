@@ -39,7 +39,7 @@
 //! | `dds_sync_pulls_total` | counter | `result=ok\|fail` | bumped by [`record_sync_pull`] |
 //! | `dds_sync_payloads_rejected_total` | counter | `reason=legacy_v1\|publisher_capability\|replay_window\|signature\|duplicate_jti\|graph` | bumped by [`record_sync_payloads_rejected`] |
 //! | `dds_http_requests_total` | counter | `route, method, status` | bumped by [`record_http_request`] |
-//! | `dds_trust_graph_attestations` | gauge | — | [`crate::service::LocalService::trust_graph_counts`] at scrape |
+//! | `dds_trust_graph_attestations` | gauge | `body_type=user-auth-attestation\|device-join\|windows-policy\|macos-policy\|macos-account-binding\|sso-identity-link\|software-assignment\|service-principal\|session\|unknown` | [`crate::service::LocalService::trust_graph_counts`] at scrape, partitioned via [`crate::service::body_type_label`] |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
 //! | `dds_trust_graph_revocations` | gauge | — | same |
 //! | `dds_trust_graph_burned` | gauge | — | same |
@@ -73,13 +73,27 @@
 //! conventions (`_total` is reserved for monotonic counters). The
 //! plan tracker has been updated accordingly.
 //!
-//! `kind=user|device|service` partitioning of `dds_trust_graph_attestations`
-//! is deferred until the body-type catalog ships a single mapping —
-//! today the same `body_type` namespace covers user, device, *and*
-//! domain-policy / software-assignment attestations, so a runtime
-//! classifier would have to embed knowledge of every body type. A
-//! future Phase C follow-up can add the label without changing the
-//! metric name.
+//! `dds_trust_graph_attestations` is partitioned by the `body_type`
+//! URI carried on each attestation token, mapped through the fixed
+//! [`dds_domain::body_types`] catalog into a short label name (the
+//! `dds:` URI prefix is stripped — `dds:user-auth-attestation` becomes
+//! `body_type="user-auth-attestation"`). Tokens with no `body_type`
+//! field, or with a value outside the catalog, fall into the
+//! `body_type="unknown"` bucket so the partition's sum is always
+//! equal to the previous (unlabeled) attestations total. Cardinality
+//! is bounded by the nine catalog constants plus `unknown` (10
+//! values total). A new domain document type added to
+//! [`dds_domain::body_types`] also requires adding a matching arm in
+//! [`crate::service::body_type_label`]; the
+//! `body_type_label_covers_every_body_types_constant` test pins
+//! that invariant. The catalog originally named
+//! `kind=user|device|service` — the `body_type` vocabulary is
+//! preferred over `kind` because the catalog entries do not cleanly
+//! collapse to those three categories (e.g.,
+//! `windows-policy` / `software-assignment` are neither user nor
+//! device nor service). A future follow-up can land an additional
+//! label (say `family=user|device|policy|service`) on top of
+//! `body_type` without renaming the metric.
 //!
 //! ### `dds_sessions_issued_total` semantics
 //!
@@ -1369,13 +1383,35 @@ fn render_exposition(
     // rather than panicking the scrape task.
     let tg = trust_graph.unwrap_or_default();
     out.push_str(
-        "# HELP dds_trust_graph_attestations Active attestation tokens currently in the trust graph.\n",
+        "# HELP dds_trust_graph_attestations Active attestation tokens currently in the trust graph, partitioned by body_type.\n",
     );
     out.push_str("# TYPE dds_trust_graph_attestations gauge\n");
-    out.push_str(&format!(
-        "dds_trust_graph_attestations {}\n",
-        tg.attestations
-    ));
+    // observability-plan.md Phase C — emit one labeled series per
+    // non-zero body_type bucket. Vocabulary is bounded by the fixed
+    // `dds_domain::body_types` catalog (mapped through
+    // `service::body_type_label`); the `unknown` bucket catches
+    // tokens whose `body_type` is missing or outside the catalog so
+    // `sum(dds_trust_graph_attestations) == tg.attestations` always
+    // holds. Empty graph still emits the family's HELP / TYPE
+    // headers (above) so the catalog is discoverable on a fresh
+    // node — Prometheus accepts a metric family with no value lines
+    // as long as HELP and TYPE are present, and any subsequent
+    // attestation-ingest will populate the buckets without renaming
+    // the metric.
+    if tg.attestations_by_body_type.is_empty() {
+        // BTreeMap iteration is alphabetical so an empty graph emits
+        // no value lines; emit a single zero-valued `unknown` series
+        // so the family always has at least one anchor line for the
+        // `serve_returns_prometheus_text_with_audit_metrics`
+        // discoverability contract.
+        out.push_str("dds_trust_graph_attestations{body_type=\"unknown\"} 0\n");
+    } else {
+        for (body_type, n) in &tg.attestations_by_body_type {
+            out.push_str(&format!(
+                "dds_trust_graph_attestations{{body_type=\"{body_type}\"}} {n}\n"
+            ));
+        }
+    }
     out.push_str(
         "# HELP dds_trust_graph_vouches Active vouch tokens currently in the trust graph.\n",
     );
@@ -2830,11 +2866,16 @@ mod tests {
     #[test]
     fn trust_graph_gauges_render_supplied_counts() {
         let t = Telemetry::new();
+        let mut by_body_type = std::collections::BTreeMap::new();
+        by_body_type.insert("user-auth-attestation", 4usize);
+        by_body_type.insert("device-join", 2usize);
+        by_body_type.insert("windows-policy", 1usize);
         let counts = TrustGraphCounts {
             attestations: 7,
             vouches: 3,
             revocations: 2,
             burned: 1,
+            attestations_by_body_type: by_body_type,
         };
         let body = render_exposition(
             &t,
@@ -2847,7 +2888,19 @@ mod tests {
             StoreWriteCounts::default(),
         );
         assert!(body.contains("# TYPE dds_trust_graph_attestations gauge\n"));
-        assert!(body.contains("dds_trust_graph_attestations 7\n"));
+        // observability-plan.md Phase C — the body_type partition
+        // closes the deferred row from the original catalog. Sum
+        // across labels equals the unlabeled attestations total
+        // (4 + 2 + 1 == 7).
+        assert!(
+            body.contains("dds_trust_graph_attestations{body_type=\"user-auth-attestation\"} 4\n"),
+        );
+        assert!(body.contains("dds_trust_graph_attestations{body_type=\"device-join\"} 2\n"));
+        assert!(body.contains("dds_trust_graph_attestations{body_type=\"windows-policy\"} 1\n"));
+        // Old shape (unlabeled) must NOT appear — the metric is now
+        // labeled. Operators query `sum(dds_trust_graph_attestations)`
+        // for the previous total.
+        assert!(!body.contains("\ndds_trust_graph_attestations 7\n"));
         assert!(body.contains("dds_trust_graph_vouches 3\n"));
         assert!(body.contains("dds_trust_graph_revocations 2\n"));
         assert!(body.contains("dds_trust_graph_burned 1\n"));
@@ -2866,7 +2919,12 @@ mod tests {
             None,
             StoreWriteCounts::default(),
         );
-        assert!(body.contains("dds_trust_graph_attestations 0\n"));
+        // Empty graph emits a single zero-valued anchor series under
+        // the `unknown` body_type bucket so the family always has at
+        // least one value line — same discoverability pattern as the
+        // other zero-state metrics.
+        assert!(body.contains("# TYPE dds_trust_graph_attestations gauge\n"));
+        assert!(body.contains("dds_trust_graph_attestations{body_type=\"unknown\"} 0\n"));
         assert!(body.contains("dds_trust_graph_vouches 0\n"));
         assert!(body.contains("dds_trust_graph_revocations 0\n"));
         assert!(body.contains("dds_trust_graph_burned 0\n"));
@@ -3149,10 +3207,11 @@ mod tests {
         // Empty MemoryBackend audit chain → length 0, head_age 0.
         assert!(body.contains("dds_audit_chain_length 0\n"));
         assert!(body.contains("dds_audit_chain_head_age_seconds 0\n"));
-        // `make_test_service` seeds one root self-attestation; vouches
-        // / revocations / burned remain empty.
+        // `make_test_service` seeds one root self-attestation with
+        // `body_type: None` → `body_type="unknown"` partition. Vouches /
+        // revocations / burned remain empty.
         assert!(body.contains("# TYPE dds_trust_graph_attestations gauge\n"));
-        assert!(body.contains("dds_trust_graph_attestations 1\n"));
+        assert!(body.contains("dds_trust_graph_attestations{body_type=\"unknown\"} 1\n"));
         assert!(body.contains("dds_trust_graph_vouches 0\n"));
         assert!(body.contains("dds_trust_graph_revocations 0\n"));
         assert!(body.contains("dds_trust_graph_burned 0\n"));
