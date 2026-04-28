@@ -27,10 +27,15 @@ use zeroize::Zeroize;
 
 use crate::{domain_store, identity_store, p2p_identity};
 
-/// Current wire version: v3 bundles carry a mandatory Ed25519
+/// Current wire version. v3 bundles carry a mandatory Ed25519
 /// signature over the canonical signing bytes, verified on load
-/// against the embedded `domain_pubkey`.
-const BUNDLE_VERSION: u64 = 3;
+/// against the embedded `domain_pubkey`. v4 (**SC-1 / Z-1 Phase A
+/// follow-up**) extends the signed payload with the optional
+/// `domain_pq_pubkey` (hex-encoded ML-DSA-65 public key) so a v2-hybrid
+/// domain survives the bundle round-trip; the writer picks v3 vs. v4
+/// based on whether `domain_pq_pubkey` is populated, so a v1 fleet
+/// keeps emitting byte-identical v3 bundles.
+const BUNDLE_VERSION: u64 = 4;
 /// Minimum supported bundle version for read. v1 had no integrity
 /// metadata; v2 carried a SHA-256 fingerprint but no signature; we
 /// still read both but emit a warning because neither prevents a
@@ -82,28 +87,58 @@ pub struct ProvisionBundle {
     pub domain_name: String,
     pub domain_id: String,
     pub domain_pubkey: String,
+    /// **SC-1 / Z-1 Phase A** — hex-encoded ML-DSA-65 public key
+    /// (1,952 bytes ⇒ 3,904 hex chars) when the issuing domain is
+    /// v2-hybrid. `None` for legacy v1 (Ed25519-only) domains.
+    /// When `Some`, the bundle is written / verified as v4 and is
+    /// stamped into both the provisioned node's `domain.toml`
+    /// (`pq_pubkey = "..."`) and `dds.toml` (`[domain].pq_pubkey =
+    /// "..."`) so the new node starts as a v2-hybrid verifier and
+    /// will reject any Ed25519-only admission cert / revocation.
+    pub domain_pq_pubkey: Option<String>,
     pub domain_key_blob: Vec<u8>,
     pub org_hash: String,
     pub listen_port: u16,
     pub api_port: u16,
     pub mdns_enabled: bool,
     /// SHA-256 fingerprint of the integrity-bound metadata fields
-    /// (domain_id + domain_pubkey + org_hash + ports + domain_key_blob).
-    /// Populated on load for v2+ bundles. Operators MUST confirm this
-    /// fingerprint OUT-OF-BAND before importing; the in-bundle
-    /// signature (v3+) catches the common tamper case where the
-    /// metadata is altered without re-deriving a new domain key.
+    /// (domain_id + domain_pubkey + org_hash + ports + domain_key_blob,
+    /// plus `domain_pq_pubkey` for v4). Populated on load for v2+
+    /// bundles. Operators MUST confirm this fingerprint OUT-OF-BAND
+    /// before importing; the in-bundle signature (v3+) catches the
+    /// common tamper case where the metadata is altered without
+    /// re-deriving a new domain key.
     pub fingerprint: String,
+}
+
+/// Pick the on-disk wire version for a bundle. v4 is used when (and
+/// only when) the bundle carries `domain_pq_pubkey` (v2-hybrid
+/// domain); v3 stays the default for legacy Ed25519-only domains so
+/// existing fleets keep emitting byte-identical bundles.
+fn wire_version(bundle: &ProvisionBundle) -> u64 {
+    if bundle.domain_pq_pubkey.is_some() {
+        4
+    } else {
+        3
+    }
 }
 
 /// Canonical bytes covered by the bundle's signature and fingerprint.
 /// Order is fixed; any field added in a future version must go AFTER
-/// the existing fields so v3 consumers continue to verify against the
-/// same prefix. Includes `domain_key_blob` so a MITM swapping the
+/// the existing fields. The version-distinct prefix
+/// (`dds-bundle-v3|` vs. `dds-bundle-v4|`) prevents cross-version
+/// signature replay — a v3 signature does not validate a v4 message
+/// and vice versa. v4 appends the optional `domain_pq_pubkey` hex
+/// (length-prefixed so an empty string and an absent field can never
+/// collide). Includes `domain_key_blob` so a MITM swapping the
 /// encrypted key for one they control invalidates the signature.
 fn signing_bytes(bundle: &ProvisionBundle) -> Vec<u8> {
+    let version = wire_version(bundle);
     let mut h = Sha256::new();
-    h.update(b"dds-bundle-v3|");
+    match version {
+        4 => h.update(b"dds-bundle-v4|"),
+        _ => h.update(b"dds-bundle-v3|"),
+    }
     h.update(bundle.domain_id.as_bytes());
     h.update(b"|");
     h.update(bundle.domain_pubkey.as_bytes());
@@ -118,6 +153,12 @@ fn signing_bytes(bundle: &ProvisionBundle) -> Vec<u8> {
     h.update(b"|");
     h.update((bundle.domain_key_blob.len() as u64).to_be_bytes());
     h.update(&bundle.domain_key_blob);
+    if version >= 4 {
+        h.update(b"|");
+        let pq_hex = bundle.domain_pq_pubkey.as_deref().unwrap_or("");
+        h.update((pq_hex.len() as u64).to_be_bytes());
+        h.update(pq_hex.as_bytes());
+    }
     h.finalize().to_vec()
 }
 
@@ -156,14 +197,51 @@ pub fn save_bundle(
             bundle.domain_pubkey
         )));
     }
+    // **SC-1** — refuse to silently downgrade a v2-hybrid signer:
+    // if the signing key carries an ML-DSA-65 half, the bundle MUST
+    // carry the matching `domain_pq_pubkey`, and conversely a bundle
+    // claiming a hybrid pubkey MUST be backed by a hybrid signer
+    // whose ML-DSA-65 public key matches. (dds-domain is always built
+    // with the `pq` feature in this workspace, so no cfg gate.)
+    {
+        let signer_pq_hex = signer.pq_pubkey_bytes().as_deref().map(to_hex);
+        match (&signer_pq_hex, &bundle.domain_pq_pubkey) {
+            (Some(_), None) => {
+                return Err(ProvisionError::Format(
+                    "signer is v2-hybrid (carries ML-DSA-65) but bundle.domain_pq_pubkey \
+                     is None — refusing to write a v3 bundle that would silently downgrade \
+                     the verifier side of single-file provisioning to Ed25519-only"
+                        .into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(ProvisionError::Format(
+                    "bundle claims domain_pq_pubkey but signer is Ed25519-only — refusing \
+                     to write a v4 bundle whose hybrid pubkey cannot be authenticated by \
+                     the included signer"
+                        .into(),
+                ));
+            }
+            (Some(s), Some(b)) if s != b => {
+                return Err(ProvisionError::Format(format!(
+                    "signer pq_pubkey ({} chars) does not match bundle.domain_pq_pubkey \
+                     ({} chars) — refusing to write an inconsistent hybrid bundle",
+                    s.len(),
+                    b.len()
+                )));
+            }
+            _ => {}
+        }
+    }
     let fingerprint = compute_fingerprint(bundle);
     let msg = signing_bytes(bundle);
     let signature = signer.signing_key.sign(&msg).to_bytes().to_vec();
+    let version = wire_version(bundle);
 
-    let map = vec![
+    let mut map = vec![
         (
             CborValue::Text("version".into()),
-            CborValue::Integer(BUNDLE_VERSION.into()),
+            CborValue::Integer(version.into()),
         ),
         (
             CborValue::Text("domain_name".into()),
@@ -206,6 +284,15 @@ pub fn save_bundle(
             CborValue::Bytes(signature),
         ),
     ];
+    // **SC-1** — v4 carries the hybrid domain PQ pubkey so the verifier
+    // side of single-file provisioning is no longer silently downgraded
+    // from v2-hybrid to v1.
+    if let Some(pq_hex) = &bundle.domain_pq_pubkey {
+        map.push((
+            CborValue::Text("domain_pq_pubkey".into()),
+            CborValue::Text(pq_hex.clone()),
+        ));
+    }
     let mut buf = Vec::new();
     ciborium::into_writer(&CborValue::Map(map), &mut buf)
         .map_err(|e| ProvisionError::Cbor(e.to_string()))?;
@@ -305,10 +392,31 @@ pub fn load_bundle(path: &Path) -> Result<ProvisionBundle, ProvisionError> {
         }
     });
 
+    // **SC-1** — v4 carries `domain_pq_pubkey`; older versions never
+    // do, so a forged v3 bundle that bolts the field on still hashes
+    // under the v3 prefix (which excludes pq_pubkey) and the field is
+    // discarded on load. We additionally require that v1..v3 bundles
+    // never carry the field (defense in depth against a downgrade
+    // attempt that includes the field but uses the v3 prefix).
+    let stored_pq_pubkey: Option<String> = map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some("domain_pq_pubkey") {
+            v.as_text().map(|s| s.to_string())
+        } else {
+            None
+        }
+    });
+    if version < 4 && stored_pq_pubkey.is_some() {
+        return Err(ProvisionError::Format(format!(
+            "v{version} bundle carries `domain_pq_pubkey` — only v4+ may include \
+             a hybrid PQ key, refuse to import to prevent silent downgrade"
+        )));
+    }
+
     let bundle = ProvisionBundle {
         domain_name: get_text("domain_name")?,
         domain_id: get_text("domain_id")?,
         domain_pubkey: get_text("domain_pubkey")?,
+        domain_pq_pubkey: if version >= 4 { stored_pq_pubkey } else { None },
         domain_key_blob: get_bytes("domain_key")?,
         org_hash: get_text("org_hash")?,
         listen_port: get_u64("listen_port", 4001) as u16,
@@ -319,20 +427,23 @@ pub fn load_bundle(path: &Path) -> Result<ProvisionBundle, ProvisionError> {
     let computed_fingerprint = compute_fingerprint(&bundle);
 
     match version {
-        3 => {
-            // **H-10 (security review)**: v3 MUST carry a signature and
-            // MUST carry the fingerprint. Both are verified here; the
-            // caller then prints the fingerprint for operator OOB
-            // confirmation.
+        4 | 3 => {
+            // **H-10 (security review)**: v3 / v4 MUST carry a
+            // signature and MUST carry the fingerprint. Both are
+            // verified here; the caller then prints the fingerprint
+            // for operator OOB confirmation. **SC-1**: v4 also folds
+            // the optional `domain_pq_pubkey` into both the signed
+            // bytes and the fingerprint via the bumped `dds-bundle-v4|`
+            // prefix in [`signing_bytes`].
             let sig_bytes = stored_signature.ok_or_else(|| {
-                ProvisionError::Format(
-                    "v3 bundle missing signature field — refuse to import".into(),
-                )
+                ProvisionError::Format(format!(
+                    "v{version} bundle missing signature field — refuse to import"
+                ))
             })?;
             let stored = stored_fingerprint.ok_or_else(|| {
-                ProvisionError::Format(
-                    "v3 bundle missing fingerprint field — refuse to import".into(),
-                )
+                ProvisionError::Format(format!(
+                    "v{version} bundle missing fingerprint field — refuse to import"
+                ))
             })?;
             if stored != computed_fingerprint {
                 return Err(ProvisionError::Format(format!(
@@ -435,10 +546,15 @@ pub fn create_bundle(
     // Unwrap the signing key (may prompt for passphrase / FIDO2 touch).
     let signer = domain_store::load_domain_key_from_bytes(&key_blob)?;
 
+    // **SC-1** — preserve the hybrid pubkey through the bundle so the
+    // verifier side of single-file provisioning is no longer silently
+    // downgraded from v2-hybrid to v1.
+    let domain_pq_pubkey = domain.pq_pubkey.as_deref().map(to_hex);
     let bundle = ProvisionBundle {
         domain_name: domain.name,
         domain_id: domain.id.to_string(),
         domain_pubkey: to_hex(&domain.pubkey),
+        domain_pq_pubkey,
         domain_key_blob: key_blob,
         org_hash: org_hash.to_string(),
         listen_port: 4001,
@@ -598,23 +714,44 @@ pub fn run_provision(
         .map_err(|e| ProvisionError::Format(format!("bad pubkey hex: {e}")))?;
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&pk_bytes);
+    // **SC-1** — propagate the hybrid PQ pubkey from the bundle so the
+    // provisioned node starts as a v2-hybrid verifier (and therefore
+    // rejects any Ed25519-only admission cert / revocation that targets
+    // this domain).
+    let pq_pubkey_bytes = match bundle.domain_pq_pubkey.as_deref() {
+        Some(hex) if !hex.is_empty() => Some(
+            from_hex(hex).map_err(|e| ProvisionError::Format(format!("bad pq_pubkey hex: {e}")))?,
+        ),
+        _ => None,
+    };
     let domain = Domain {
         name: bundle.domain_name.clone(),
         id: expected_id,
         pubkey,
-        // **Z-1 Phase A**: provisioning bundles are still Ed25519-only
-        // for v1; a future bundle-format bump can carry the v2 pubkey
-        // alongside the Ed25519 one.
-        pq_pubkey: None,
+        pq_pubkey: pq_pubkey_bytes,
     };
+    // `verify_self_consistent` (called inside `save_domain_file ->
+    // DomainFile::into_domain` round-trips below) catches a wrong
+    // ML-DSA-65 length; do an early check too so we fail before
+    // touching disk.
+    domain
+        .verify_self_consistent()
+        .map_err(|e| ProvisionError::Format(format!("provisioned domain inconsistent: {e}")))?;
     domain_store::save_domain_file(&data_dir.join("domain.toml"), &domain)?;
 
     // node_key.bin
     let _node_ident = identity_store::load_or_create(&data_dir.join("node_key.bin"), "dds-node")
         .map_err(|e| ProvisionError::Io(format!("node key: {e}")))?;
 
-    // dds.toml
+    // dds.toml — **SC-1**: when the bundle carries a hybrid pubkey,
+    // stamp `pq_pubkey` into `[domain]` so `cmd_run` loads a v2-hybrid
+    // verifier. Plain Ed25519 deployments emit a byte-identical config
+    // to the pre-SC-1 layout.
     let config_path = config_dir.join("dds.toml");
+    let pq_pubkey_line = match bundle.domain_pq_pubkey.as_deref() {
+        Some(hex) if !hex.is_empty() => format!("pq_pubkey = \"{hex}\"\n"),
+        _ => String::new(),
+    };
     let config_content = format!(
         r#"# DDS Node Configuration — provisioned from bundle
 data_dir = "{data_dir}"
@@ -633,7 +770,7 @@ api_addr = "127.0.0.1:{api_port}"
 name = "{domain_name}"
 id = "{domain_id}"
 pubkey = "{domain_pubkey}"
-admission_path = "{admission}"
+{pq_pubkey_line}admission_path = "{admission}"
 audit_log_enabled = false
 "#,
         data_dir = data_dir.display(),
@@ -644,6 +781,7 @@ audit_log_enabled = false
         domain_name = bundle.domain_name,
         domain_id = bundle.domain_id,
         domain_pubkey = bundle.domain_pubkey,
+        pq_pubkey_line = pq_pubkey_line,
         admission = admission_path.display(),
     );
     std::fs::write(&config_path, &config_content).map_err(|e| ProvisionError::Io(e.to_string()))?;
@@ -871,6 +1009,7 @@ mod tests {
             domain_name: domain.name.clone(),
             domain_id: domain.id.to_string(),
             domain_pubkey: to_hex(&domain.pubkey),
+            domain_pq_pubkey: None,
             domain_key_blob: vec![1, 2, 3, 4],
             org_hash: "test-org".into(),
             listen_port: 4001,
@@ -894,6 +1033,24 @@ mod tests {
         assert_eq!(loaded.listen_port, 4001);
         assert_eq!(loaded.api_port, 5551);
         assert!(loaded.mdns_enabled);
+        assert!(loaded.domain_pq_pubkey.is_none());
+        // Ed25519-only domain ⇒ writer picks v3 (byte-identical to
+        // the pre-SC-1 layout). Verify the on-disk version field.
+        let raw = std::fs::read(&path).unwrap();
+        let cbor: CborValue = ciborium::from_reader(&raw[..]).unwrap();
+        let v = cbor
+            .as_map()
+            .unwrap()
+            .iter()
+            .find_map(|(k, v)| {
+                if k.as_text() == Some("version") {
+                    v.as_integer().and_then(|i| u64::try_from(i).ok())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(v, 3, "ed25519-only bundle stays at v3");
     }
 
     /// H-10 regression: a bundle whose signature doesn't match the
@@ -909,6 +1066,7 @@ mod tests {
             domain_name: domain.name.clone(),
             domain_id: domain.id.to_string(),
             domain_pubkey: to_hex(&domain.pubkey),
+            domain_pq_pubkey: None,
             domain_key_blob: vec![1, 2, 3, 4],
             org_hash: "test-org".into(),
             listen_port: 4001,
@@ -955,6 +1113,7 @@ mod tests {
             domain_name: "x".into(),
             domain_id: legit.id().to_string(),
             domain_pubkey: to_hex(&legit.pubkey()),
+            domain_pq_pubkey: None,
             domain_key_blob: vec![1, 2, 3],
             org_hash: "org".into(),
             listen_port: 4001,
@@ -1118,5 +1277,274 @@ mod tests {
         // Second provision should fail
         let err = run_provision(&bundle_path, Some(&data_dir), false).unwrap_err();
         assert!(matches!(err, ProvisionError::AlreadyProvisioned));
+    }
+
+    // ---- SC-1 (Z-1 Phase A follow-up) — hybrid bundle round-trip ----
+    //
+    // The four tests below cover the gap STATUS.md lists as SC-1:
+    // single-file provisioning silently downgraded a v2-hybrid domain
+    // to a v1 verifier because `ProvisionBundle` did not carry
+    // `domain_pq_pubkey`. The fix bumps the bundle wire to v4 and
+    // pipes the hybrid pubkey through `create_bundle` →
+    // `run_provision` so the provisioned `domain.toml` and `dds.toml`
+    // both keep the ML-DSA-65 component.
+
+    /// **SC-1**: a v2-hybrid bundle round-trips its `domain_pq_pubkey`,
+    /// the on-disk version is v4, and tampering with the embedded PQ
+    /// pubkey is caught by the v4 signature.
+    #[test]
+
+    fn hybrid_bundle_roundtrip_preserves_pq_pubkey() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("hybrid.dds");
+        let key = DomainKey::generate_hybrid("hybrid.local", &mut OsRng);
+        let domain = key.domain();
+        let pq_hex = to_hex(domain.pq_pubkey.as_ref().expect("hybrid domain"));
+
+        let bundle = ProvisionBundle {
+            domain_name: domain.name.clone(),
+            domain_id: domain.id.to_string(),
+            domain_pubkey: to_hex(&domain.pubkey),
+            domain_pq_pubkey: Some(pq_hex.clone()),
+            domain_key_blob: vec![1, 2, 3, 4],
+            org_hash: "hybrid-org".into(),
+            listen_port: 4001,
+            api_port: 5551,
+            mdns_enabled: true,
+            fingerprint: String::new(),
+        };
+
+        save_bundle(&path, &bundle, &key).unwrap();
+
+        // On-disk version is v4 (writer picks v4 when pq_pubkey is set).
+        let raw = std::fs::read(&path).unwrap();
+        let cbor: CborValue = ciborium::from_reader(&raw[..]).unwrap();
+        let v = cbor
+            .as_map()
+            .unwrap()
+            .iter()
+            .find_map(|(k, v)| {
+                if k.as_text() == Some("version") {
+                    v.as_integer().and_then(|i| u64::try_from(i).ok())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(v, 4, "hybrid bundle uses v4 wire");
+
+        let loaded = load_bundle(&path).unwrap();
+        assert_eq!(loaded.domain_pq_pubkey.as_deref(), Some(pq_hex.as_str()));
+
+        // Tamper with the stored pq_pubkey but keep the original
+        // signature; v4 includes pq in the signed bytes so verify
+        // must fail (this is exactly the silent-downgrade defence).
+        let mut map = cbor.into_map().unwrap();
+        for (k, v) in map.iter_mut() {
+            if k.as_text() == Some("domain_pq_pubkey") {
+                if let CborValue::Text(s) = v {
+                    // Flip the first hex digit ('a'..'f' rotate by 1
+                    // stays in-set so the field still parses as hex).
+                    let mut bytes = s.as_bytes().to_vec();
+                    bytes[0] = match bytes[0] {
+                        b'0'..=b'8' => bytes[0] + 1,
+                        b'9' => b'0',
+                        b'a'..=b'e' => bytes[0] + 1,
+                        b'f' => b'a',
+                        _ => bytes[0] ^ 0x01,
+                    };
+                    *s = String::from_utf8(bytes).unwrap();
+                }
+            }
+        }
+        let mut buf = Vec::new();
+        ciborium::into_writer(&CborValue::Map(map), &mut buf).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+        let err = load_bundle(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("signature does not verify")
+                || err.to_string().contains("fingerprint mismatch"),
+            "expected v4 to detect pq_pubkey tamper, got: {err}"
+        );
+    }
+
+    /// **SC-1**: an attacker tries the silent downgrade by forging a
+    /// v3 bundle that bolts a `domain_pq_pubkey` field onto the CBOR
+    /// map. The v3 prefix in `signing_bytes` excludes pq, so
+    /// signature verification would still pass — load_bundle must
+    /// instead refuse the bundle outright.
+    #[test]
+    fn bundle_rejects_v3_with_pq_pubkey_field() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("smuggled.dds");
+        let key = DomainKey::generate("v3-smuggle", &mut OsRng);
+        let domain = key.domain();
+
+        // Build a legitimate v3 bundle, then bolt on `domain_pq_pubkey`.
+        let bundle = ProvisionBundle {
+            domain_name: domain.name.clone(),
+            domain_id: domain.id.to_string(),
+            domain_pubkey: to_hex(&domain.pubkey),
+            domain_pq_pubkey: None,
+            domain_key_blob: vec![9, 8, 7],
+            org_hash: "org".into(),
+            listen_port: 4001,
+            api_port: 5551,
+            mdns_enabled: true,
+            fingerprint: String::new(),
+        };
+        save_bundle(&path, &bundle, &key).unwrap();
+
+        let raw = std::fs::read(&path).unwrap();
+        let cbor: CborValue = ciborium::from_reader(&raw[..]).unwrap();
+        let mut map = cbor.into_map().unwrap();
+        map.push((
+            CborValue::Text("domain_pq_pubkey".into()),
+            CborValue::Text("ab".repeat(1952)),
+        ));
+        let mut buf = Vec::new();
+        ciborium::into_writer(&CborValue::Map(map), &mut buf).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+
+        let err = load_bundle(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("only v4+ may include"),
+            "expected silent-downgrade rejection, got: {err}"
+        );
+    }
+
+    /// **SC-1**: `save_bundle` refuses to write a bundle whose
+    /// signer/bundle pq state disagree (signer is hybrid but bundle
+    /// claims no pq, or vice versa). This is the producer-side gate
+    /// that would have prevented the original SC-1 gap from being
+    /// reachable through the toolchain.
+    #[test]
+
+    fn save_bundle_refuses_signer_bundle_pq_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let hybrid = DomainKey::generate_hybrid("hybrid.local", &mut OsRng);
+        let domain = hybrid.domain();
+
+        // Hybrid signer but bundle drops the pq_pubkey ⇒ refused.
+        let bad = ProvisionBundle {
+            domain_name: domain.name.clone(),
+            domain_id: domain.id.to_string(),
+            domain_pubkey: to_hex(&domain.pubkey),
+            domain_pq_pubkey: None,
+            domain_key_blob: vec![1],
+            org_hash: "org".into(),
+            listen_port: 4001,
+            api_port: 5551,
+            mdns_enabled: true,
+            fingerprint: String::new(),
+        };
+        let err = save_bundle(&dir.path().join("a.dds"), &bad, &hybrid).unwrap_err();
+        assert!(
+            err.to_string().contains("v2-hybrid"),
+            "expected hybrid-signer / no-pq bundle to be refused, got: {err}"
+        );
+
+        // Conversely: Ed25519-only signer but bundle asserts a pq_pubkey.
+        let plain = DomainKey::generate("plain.local", &mut OsRng);
+        let plain_dom = plain.domain();
+        let bogus_pq = "ab".repeat(1952);
+        let bad2 = ProvisionBundle {
+            domain_name: plain_dom.name.clone(),
+            domain_id: plain_dom.id.to_string(),
+            domain_pubkey: to_hex(&plain_dom.pubkey),
+            domain_pq_pubkey: Some(bogus_pq),
+            domain_key_blob: vec![1],
+            org_hash: "org".into(),
+            listen_port: 4001,
+            api_port: 5551,
+            mdns_enabled: true,
+            fingerprint: String::new(),
+        };
+        let err2 = save_bundle(&dir.path().join("b.dds"), &bad2, &plain).unwrap_err();
+        assert!(
+            err2.to_string().contains("Ed25519-only"),
+            "expected ed25519-signer / pq-bundle to be refused, got: {err2}"
+        );
+    }
+
+    /// **SC-1 end-to-end**: provisioning a v2-hybrid bundle stamps
+    /// `pq_pubkey` into both `domain.toml` and `dds.toml`, so the
+    /// provisioned node starts as a v2-hybrid verifier instead of
+    /// the v1 verifier the original gap produced. This is the
+    /// "downgrade rejection" regression: it pins the verifier-side
+    /// state that admission certs / revocations are gated on.
+    #[test]
+
+    fn provision_with_hybrid_domain_key_keeps_pq_pubkey() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = TempDir::new().unwrap();
+        let domain_dir = dir.path().join("domain");
+        std::fs::create_dir_all(&domain_dir).unwrap();
+
+        unsafe { std::env::set_var("DDS_DOMAIN_PASSPHRASE", "") };
+        let key = DomainKey::generate_hybrid("provision-hybrid", &mut OsRng);
+        let domain = key.domain();
+        let expected_pq_hex = to_hex(domain.pq_pubkey.as_ref().expect("hybrid"));
+        domain_store::save_domain_file(&domain_dir.join("domain.toml"), &domain).unwrap();
+        domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
+
+        let bundle_path = dir.path().join("hybrid.dds");
+        create_bundle(&domain_dir, "hybrid-org", &bundle_path).unwrap();
+
+        // The created bundle must be v4 and carry the same pq_pubkey.
+        let loaded = load_bundle(&bundle_path).unwrap();
+        assert_eq!(
+            loaded.domain_pq_pubkey.as_deref(),
+            Some(expected_pq_hex.as_str())
+        );
+
+        let data_dir = dir.path().join("node-data");
+        let result = run_provision(&bundle_path, Some(&data_dir), false).unwrap();
+        assert_eq!(result.domain_name, "provision-hybrid");
+
+        // domain.toml on the provisioned node carries the pq pubkey.
+        let provisioned_domain =
+            domain_store::load_domain_file(&data_dir.join("domain.toml")).unwrap();
+        assert!(
+            provisioned_domain.is_hybrid(),
+            "provisioned domain.toml lost pq_pubkey — silent downgrade"
+        );
+        assert_eq!(
+            provisioned_domain
+                .pq_pubkey
+                .as_deref()
+                .map(to_hex)
+                .as_deref(),
+            Some(expected_pq_hex.as_str())
+        );
+
+        // dds.toml on the provisioned node carries `[domain].pq_pubkey`,
+        // so `cmd_run` will boot a v2-hybrid verifier.
+        let cfg = std::fs::read_to_string(&result.config_path).unwrap();
+        assert!(
+            cfg.contains(&format!("pq_pubkey = \"{expected_pq_hex}\"")),
+            "provisioned dds.toml missing [domain].pq_pubkey line:\n{cfg}"
+        );
+
+        // Sanity: an Ed25519-only admission cert (i.e., one whose
+        // `pq_signature` is None) must fail under the verifier the
+        // provisioned node would build (v2-hybrid). Issue a real
+        // hybrid cert so the Ed25519 part still verifies, then strip
+        // the PQ component to isolate the v2 gate. This pins the
+        // "downgrade rejection" guarantee called out in SC-1.
+        let mut hybrid_cert = key.issue_admission(result.peer_id.clone(), 0, None);
+        assert!(
+            hybrid_cert.pq_signature.is_some(),
+            "hybrid issuer should populate pq_signature"
+        );
+        hybrid_cert.pq_signature = None;
+        let err = hybrid_cert
+            .verify_with_domain(&provisioned_domain, &result.peer_id, 1)
+            .unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("pq_signature") || err_str.contains("hybrid"),
+            "expected v2-hybrid verifier to reject v1-only cert, got: {err_str}"
+        );
     }
 }

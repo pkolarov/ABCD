@@ -432,6 +432,18 @@ This single command:
 3. Writes `dds.toml`
 4. Starts the node
 
+> **Hybrid (Z-1 Phase A) domains:** when the source `domain.toml`
+> advertises `pq_pubkey`, `create-provision-bundle` emits a **v4**
+> `.dds` bundle (`dds-bundle-v4|` signing prefix folds the hybrid
+> pubkey into the SHA-256 fingerprint and the Ed25519 signature),
+> and `provision` writes `pq_pubkey` into both the new node's
+> `domain.toml` and `[domain].pq_pubkey` of `dds.toml` so the
+> provisioned node starts as a v2-hybrid verifier. A v1 (Ed25519-
+> only) source domain still produces a byte-identical v3 bundle.
+> `provision` refuses to load any v1..v3 bundle that smuggles a
+> `domain_pq_pubkey` field — the version-distinct signing prefix
+> would let the field slip past the v3 signature check otherwise.
+
 The `--no-start` flag skips automatic startup if you want to review the config first:
 
 ```bash

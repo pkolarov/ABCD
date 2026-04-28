@@ -17,8 +17,22 @@
 > | Z-4 | **High** | Encrypted at rest | redb store (`directory.redb`) is plaintext CBOR — tokens, ops, revocations, audit entries. Confidentiality depends on OS FDE + ACLs only. |
 > | Z-5 | **Medium** | Encrypted at rest | `dds-cli export` dumps are plaintext-CBOR (signed for integrity, not encrypted for confidentiality). |
 > | Z-6 | **Critical** | Supply-chain | DDS releases are unsigned in practice — Windows MSI Authenticode is gated on a `SIGN_CERT` secret that has never been provisioned; macOS `.pkg` is not Developer-ID-signed and not notarized. Operators have no programmatic way to verify a fresh install. **Implementation plan: [docs/supply-chain-plan.md](docs/supply-chain-plan.md) Phase A.** |
-> | Z-7 | **High** | Supply-chain | Asymmetric package signature verification on managed third-party software. Windows agent has no Authenticode verify (`WinVerifyTrust` not present in `WindowsSoftwareOperations.cs`); macOS calls `pkgutil --check-signature` only when `RequirePackageSignature=true` (default off). Hash-only verification leaves a compromised publisher build pipeline as a single point of failure. **Plan: supply-chain-plan.md Phase B.** |
+> | Z-7 | **High** | Supply-chain | Asymmetric package signature verification on managed third-party software. Windows agent has no Authenticode verify (`WinVerifyTrust` not present in `WindowsSoftwareOperations.cs`); macOS now defaults `RequirePackageSignature=true` in `AgentConfig` / production appsettings, but only runs `pkgutil --check-signature` and does **not** pin the expected Team ID / publisher identity. Hash-only verification on Windows and "any trusted pkg signature" on macOS still leave a compromised or wrong publisher pipeline as a single point of failure. **Plan: supply-chain-plan.md Phase B.** |
 > | Z-8 | **Medium** | Supply-chain | No fleet update mechanism for DDS itself + no SLSA provenance / SBOM / `cargo-vet`. Security patches do not propagate without manual MSI/pkg redeployment to every host; CI compromise leaves no detection trail. **Plan: supply-chain-plan.md Phases C (provenance) + D (multi-sig fleet self-update).** |
+>
+> ### 2026-04-28 Source Cross-Check Addendum — Critical/High Gaps
+>
+> Manual source review of the current tree found five high-impact
+> implementation gaps that were either missing from this tracker or
+> needed sharper source-backed wording:
+>
+> | Id | Severity | Area | Source-validated gap |
+> |---|---|---|---|
+> | SC-1 | ✅ **closed (2026-04-28 follow-up #57)** — was High | Z-1 Phase A / provisioning | Single-file provisioning silently downgraded v2-hybrid domains on the verifier side. `ProvisionBundle` did not carry `domain_pq_pubkey`; `create_bundle` dropped `Domain.pq_pubkey`; `run_provision` wrote `Domain { pq_pubkey: None }` and omitted `[domain].pq_pubkey` from `dds.toml`. **Fix landed 2026-04-28 follow-up #57:** [`dds-node/src/provision.rs`](dds-node/src/provision.rs) bumps `BUNDLE_VERSION` to **v4** with a distinct `dds-bundle-v4|` signing prefix that folds the optional `domain_pq_pubkey` into both the SHA-256 fingerprint and the Ed25519 signature; the writer picks v3 vs. v4 based on whether the bundle carries a hybrid pubkey, so legacy Ed25519-only fleets still emit byte-identical v3 bundles. `save_bundle` refuses to write a hybrid signer + non-hybrid bundle (or vice versa) so the producer side can't accidentally re-introduce the gap; `load_bundle` rejects any v1..v3 bundle that smuggles a `domain_pq_pubkey` field (silent-downgrade defence). `create_bundle` now reads `Domain.pq_pubkey` and propagates it; `run_provision` writes the hybrid pubkey into both `domain.toml` (`Domain { pq_pubkey: Some(..) }`) and `dds.toml` (`[domain].pq_pubkey = "..."`) and runs `verify_self_consistent` before touching disk. 4 new regression tests in [`dds-node/src/provision.rs`](dds-node/src/provision.rs) (`hybrid_bundle_roundtrip_preserves_pq_pubkey` covering v4 wire-version pinning + tampered-pq detection; `bundle_rejects_v3_with_pq_pubkey_field` for the smuggled-field downgrade; `save_bundle_refuses_signer_bundle_pq_mismatch` for both directions of producer-side mismatch; `provision_with_hybrid_domain_key_keeps_pq_pubkey` end-to-end — issues a real hybrid admission cert via `key.issue_admission`, strips `pq_signature`, and asserts the freshly-loaded `provisioned_domain.verify_with_domain` rejects it). 706 → 710 workspace tests passing; `cargo fmt` clean; `cargo clippy --all-targets -- -D warnings` clean. |
+> | SC-2 | **High** | H-7 local API transport | macOS packaged and single-file provisioned deployments still default to anonymous loopback TCP for the local API: `platform/macos/packaging/dds.toml.template`, `dds-bootstrap-domain.sh`, and `run_provision` all write `api_addr = "127.0.0.1:5551"`; `ApiAuthConfig::default()` keeps `trust_loopback_tcp_admin = true`; the macOS agent's production appsettings use `NodeBaseUrl = "http://127.0.0.1:5551"`. The H-7 UDS/pipe implementation exists and Windows MSI is pipe-first, but macOS/Linux/manual/provisioned nodes still admit any local process to admin endpoints unless the operator hand-edits to `unix:...` and flips `trust_loopback_tcp_admin=false`. Fix: make macOS packaging + provisioning UDS-first, configure the agent to the same UDS URL, and write an explicit `trust_loopback_tcp_admin = false` / `strict_device_binding = true` block once clients are on UDS. |
+> | SC-3 | **High** | Managed agents / provisioning | Windows and macOS policy agents fail closed unless `PinnedNodePubkeyB64` and `DeviceUrn` are configured, but packaging/provisioning does not fully stamp them. Both `Program.cs` files throw on empty `PinnedNodePubkeyB64` / `DeviceUrn`; Windows `installer/config/appsettings.json` ships both absent/empty, macOS production appsettings ships both empty, `dds-bootstrap-domain.sh` updates only `DeviceUrn`, and `run_provision` never updates agent appsettings. Result: after package install or single-file provision, policy/software enforcement does not start without manual node-pubkey pinning. Fix: provisioning/bootstrap should fetch or derive `node_pubkey_b64` and write `PinnedNodePubkeyB64` before starting the agent; Windows provisioning must also stamp `DeviceUrn` after enrollment or leave the service disabled with an explicit operator step. |
+> | SC-4 | **Critical** | Z-6 release integrity | Z-6 is confirmed by source, not just plan text: there are no `.github` workflow files in this tree; `platform/windows/installer/Build-Msi.ps1` builds WiX MSIs but has no `signtool` / Authenticode step; `platform/macos/packaging/Makefile` signs only through a separate optional `make sign` target and has no `notarytool` / stapler path. Operators still have no programmatic verification surface for fresh DDS installs. Fix remains supply-chain-plan.md Phase A. |
+> | SC-5 | **High** | Z-7 third-party package trust | Z-7 is confirmed and refined: Windows software install still downloads + SHA-256 verifies + launches MSI/EXE without `WinVerifyTrust`; macOS checks a pkg signature by default, but `SoftwareAssignment` has no publisher identity / Team ID field and the installer does not compare the signer to an expected identity. A wrong-but-trusted signed package, or any correctly hashed package from a compromised publisher pipeline, can still satisfy the agent. Fix: extend `SoftwareAssignment` with publisher identity metadata and enforce `WinVerifyTrust` / parsed `pkgutil --check-signature` identity on every install. |
 >
 > Until Z-1 Phase B lands, the "quantum-resistant by default"
 > marketing line in [README.md](README.md),
@@ -140,7 +154,17 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-28 follow-up #55 (observability follow-up —
+> Last updated: 2026-04-28 follow-up #57 (SC-1 closeout — single-file
+> provisioning no longer silently downgrades a v2-hybrid domain to a
+> v1 verifier; bundle wire bumped to v4 with `domain_pq_pubkey` folded
+> into the signed bytes + provisioning stamps `pq_pubkey` into both
+> `domain.toml` and `dds.toml`. SC-2 / SC-3 / SC-4 / SC-5 still open).
+>
+> Previous: 2026-04-28 manual source cross-check #56 (status/code gap
+> audit — added source-validated SC-1..SC-5 critical/high
+> implementation gaps above). No code change.
+>
+> Previous: 2026-04-28 follow-up #55 (observability follow-up —
 > [`docs/observability-plan.md`](docs/observability-plan.md) Phase A
 > deferred-row closeout: the
 > `policy.applied` / `policy.failed` / `software.applied` /
