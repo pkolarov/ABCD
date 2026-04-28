@@ -215,6 +215,36 @@
                   Impersonate="no"
                   Return="check" />
 
+    <!-- ============================================================ -->
+    <!-- SC-3-W (security review 2026-04-28): Custom action — stamp   -->
+    <!-- the node Ed25519 pubkey into the Policy Agent's              -->
+    <!-- appsettings.json before the DdsPolicyAgent service first     -->
+    <!-- starts. The agent's Program.cs fails closed on an empty      -->
+    <!-- PinnedNodePubkeyB64, so without this stamp the SCM auto-     -->
+    <!-- start would crash-loop on every fresh MSI install until an   -->
+    <!-- operator either ran single-file `dds-node provision` or      -->
+    <!-- hand-edited the JSON. Runs `dds-node.exe stamp-agent-pubkey` -->
+    <!-- which loads (or creates, on first install) %ProgramData%\DDS-->
+    <!-- \node_key.bin, derives the base64 pubkey, and rewrites the   -->
+    <!-- DdsPolicyAgent.PinnedNodePubkeyB64 field in place — every    -->
+    <!-- other appsettings key (Logging, NodeBaseUrl, StateDir, the   -->
+    <!-- empty DeviceUrn placeholder) is preserved. DeviceUrn cannot  -->
+    <!-- be stamped here: it is only known after enrollment with a    -->
+    <!-- domain, which is *not* part of the MSI install path —        -->
+    <!-- operators run `dds-bootstrap-domain` (or single-file         -->
+    <!-- provisioning) post-install to populate it.                   -->
+    <!--                                                                -->
+    <!-- Deferred + Impersonate="no" so the action runs as LocalSystem-->
+    <!-- and the freshly-created node_key.bin inherits the protected  -->
+    <!-- DACL applied above by CA_RestrictDataDirAcl.                 -->
+    <!-- ============================================================ -->
+    <CustomAction Id="CA_StampAgentPubkey"
+                  FileRef="dds_node_exe"
+                  ExeCommand='stamp-agent-pubkey --data-dir "[CommonAppDataFolder]DDS" --config-dir "[INSTALLFOLDER]config"'
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
     <InstallExecuteSequence>
       <!-- Run after the files are laid down (so dds-node.exe exists)
            and the data dir is created (so we have something to ACL),
@@ -228,6 +258,13 @@
            writable), but before the services start (so dds-node and
            the Auth Bridge both see the same secret on first boot). -->
       <Custom Action="CA_GenHmacSecret" After="CA_RestrictDataDirAcl" Condition="NOT REMOVE" />
+      <!-- SC-3-W: stamp the agent pubkey after node_key.bin can be
+           written under the restricted DACL but before service start
+           so the DdsPolicyAgent service finds the pinning field
+           populated on its first run. Sequence after CA_GenHmacSecret
+           so a single re-entrant deferred phase covers all three
+           helpers. -->
+      <Custom Action="CA_StampAgentPubkey" After="CA_GenHmacSecret" Condition="NOT REMOVE" />
     </InstallExecuteSequence>
 
     <!-- ============================================================ -->

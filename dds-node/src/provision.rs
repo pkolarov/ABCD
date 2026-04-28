@@ -1194,7 +1194,7 @@ fn agent_appsettings_path(config_dir: &Path) -> Option<PathBuf> {
 /// Returns `Ok(true)` when the file existed and was rewritten,
 /// `Ok(false)` when no agent config was found (legitimate on hosts
 /// without the agent installed). Errors propagate as `ProvisionError`.
-pub(crate) fn stamp_agent_appsettings(
+pub fn stamp_agent_appsettings(
     config_dir: &Path,
     device_urn: Option<&str>,
     node_pubkey_b64: Option<&str>,
@@ -1238,6 +1238,41 @@ pub(crate) fn stamp_agent_appsettings(
     std::fs::write(&path, &out)
         .map_err(|e| ProvisionError::Io(format!("write {}: {e}", path.display())))?;
     Ok(true)
+}
+
+/// **SC-3-W** — derive the node Ed25519 pubkey from `<data_dir>/node_key.bin`
+/// (creating the identity if it does not yet exist) and stamp it into the
+/// Policy Agent's `appsettings.json`. Used by the Windows MSI custom action
+/// `CA_StampAgentPubkey` so a fresh MSI install ships the pinning field
+/// populated *before* the Policy Agent first starts; the agent fails closed
+/// on an empty `PinnedNodePubkeyB64`, so without this stamp the SCM auto-
+/// start would crash-loop until an operator either runs single-file
+/// `dds-node provision` or hand-edits the JSON.
+///
+/// `config_dir` points at the directory holding `appsettings.json` (the
+/// Windows MSI passes `[INSTALLFOLDER]config`). [`stamp_agent_appsettings`]
+/// falls back to `%ProgramFiles%\DDS\config\appsettings.json` on Windows
+/// when the primary probe does not find the file. Returns `true` when the
+/// file existed and was rewritten, `false` when no agent config could be
+/// located (legitimate on hosts without the .NET agent installed — the MSI
+/// custom action treats this as success so dev/loadtest installs proceed
+/// cleanly). `DeviceUrn` is intentionally **not** stamped here: it is only
+/// known after enrollment with a domain, which is not part of the MSI
+/// install path.
+pub fn stamp_pubkey(data_dir: &Path, config_dir: &Path) -> Result<bool, ProvisionError> {
+    use base64::Engine as _;
+
+    std::fs::create_dir_all(data_dir)
+        .map_err(|e| ProvisionError::Io(format!("create data_dir {}: {e}", data_dir.display())))?;
+
+    let key_path = data_dir.join("node_key.bin");
+    let ident = identity_store::load_or_create(&key_path, "dds-node")
+        .map_err(|e| ProvisionError::Io(format!("node key: {e}")))?;
+    let node_pubkey_b64 = base64::engine::general_purpose::STANDARD
+        .encode(ident.signing_key.verifying_key().to_bytes());
+    drop(ident);
+
+    stamp_agent_appsettings(config_dir, None, Some(&node_pubkey_b64))
 }
 
 // ---- Tests ----
@@ -2024,5 +2059,148 @@ mod tests {
         assert!(s.starts_with("format:"), "expected Format error, got: {s}");
         // Confirm we did NOT rewrite the file.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json {");
+    }
+
+    /// **SC-3-W** — `stamp_pubkey` is the Windows-MSI install-time entry
+    /// point. It must (a) create `node_key.bin` if missing so a fresh
+    /// install gets a stable identity, (b) derive the same base64 pubkey
+    /// that `/v1/node/info` would later return, and (c) write it into
+    /// the agent's `appsettings.json` without touching unrelated keys.
+    #[test]
+    fn stamp_pubkey_creates_node_key_and_writes_appsettings() {
+        use base64::Engine as _;
+
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Make sure the fail-closed gate from security-gaps #4 is off
+        // for this test — load_or_create on a missing file would
+        // otherwise refuse to write a plain v1 identity.
+        // SAFETY: TEST_ENV_LOCK serializes env mutation across the test
+        // binary, so this `remove_var` cannot race with another test.
+        unsafe { std::env::remove_var("DDS_REQUIRE_ENCRYPTED_KEYS") };
+        unsafe { std::env::remove_var("DDS_NODE_PASSPHRASE") };
+
+        let data_dir = TempDir::new().unwrap();
+        let config_dir = TempDir::new().unwrap();
+
+        // Pre-seed a populated agent appsettings.json — `Logging` and
+        // `NodeBaseUrl` must survive untouched, the empty pubkey gets
+        // overwritten with the real one.
+        let appsettings_path = config_dir.path().join("appsettings.json");
+        std::fs::write(
+            &appsettings_path,
+            r#"{
+  "Logging": { "LogLevel": { "Default": "Information" } },
+  "DdsPolicyAgent": {
+    "DeviceUrn": "",
+    "PinnedNodePubkeyB64": "",
+    "NodeBaseUrl": "pipe:dds-api",
+    "PollIntervalSeconds": 60,
+    "StateDir": "C:\\ProgramData\\DDS"
+  }
+}"#,
+        )
+        .unwrap();
+
+        // Pre-condition: no node_key.bin yet.
+        assert!(!data_dir.path().join("node_key.bin").exists());
+
+        let written = stamp_pubkey(data_dir.path(), config_dir.path()).unwrap();
+        assert!(written, "stamp_pubkey returned false despite present file");
+
+        // Post-condition: node_key.bin was created.
+        assert!(
+            data_dir.path().join("node_key.bin").exists(),
+            "node_key.bin must be created on first stamp"
+        );
+
+        // Pubkey on disk matches what `/v1/node/info` would return.
+        let ident = identity_store::load(&data_dir.path().join("node_key.bin")).unwrap();
+        let expected = base64::engine::general_purpose::STANDARD
+            .encode(ident.signing_key.verifying_key().to_bytes());
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&appsettings_path).unwrap()).unwrap();
+        let agent = v.get("DdsPolicyAgent").unwrap();
+        assert_eq!(
+            agent.get("PinnedNodePubkeyB64").and_then(|x| x.as_str()),
+            Some(expected.as_str()),
+            "stamped pubkey must match the freshly-loaded identity"
+        );
+
+        // DeviceUrn is left as an empty string by stamp_pubkey — only
+        // post-enrollment populates it.
+        assert_eq!(
+            agent.get("DeviceUrn").and_then(|x| x.as_str()),
+            Some(""),
+            "stamp_pubkey must not touch DeviceUrn"
+        );
+
+        // Unrelated keys preserved.
+        assert!(v.get("Logging").is_some());
+        assert_eq!(
+            agent.get("NodeBaseUrl").and_then(|x| x.as_str()),
+            Some("pipe:dds-api")
+        );
+        assert_eq!(
+            agent.get("PollIntervalSeconds").and_then(|x| x.as_u64()),
+            Some(60)
+        );
+    }
+
+    /// **SC-3-W** — second invocation must not rotate the identity:
+    /// the MSI repair / upgrade path may re-run the custom action and
+    /// the stamped pubkey must remain stable so the Policy Agent does
+    /// not lose envelope-verification trust. Mirrors the
+    /// `--keep-existing` semantics of `gen-hmac-secret`.
+    #[test]
+    fn stamp_pubkey_is_idempotent_across_repeats() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("DDS_REQUIRE_ENCRYPTED_KEYS") };
+        unsafe { std::env::remove_var("DDS_NODE_PASSPHRASE") };
+
+        let data_dir = TempDir::new().unwrap();
+        let config_dir = TempDir::new().unwrap();
+        std::fs::write(
+            config_dir.path().join("appsettings.json"),
+            r#"{ "DdsPolicyAgent": { "DeviceUrn": "", "PinnedNodePubkeyB64": "" } }"#,
+        )
+        .unwrap();
+
+        stamp_pubkey(data_dir.path(), config_dir.path()).unwrap();
+        let first = std::fs::read_to_string(config_dir.path().join("appsettings.json")).unwrap();
+
+        stamp_pubkey(data_dir.path(), config_dir.path()).unwrap();
+        let second = std::fs::read_to_string(config_dir.path().join("appsettings.json")).unwrap();
+
+        assert_eq!(
+            first, second,
+            "second stamp_pubkey call rotated the identity (MSI repair would break the agent)"
+        );
+    }
+
+    /// **SC-3-W** — when no `appsettings.json` is present (dev /
+    /// loadtest hosts that install only the Rust node, not the .NET
+    /// Policy Agent), `stamp_pubkey` must still seed `node_key.bin`
+    /// (so a later `dds-node run` finds a stable identity) and report
+    /// `false` so the MSI custom action exits cleanly without
+    /// failing the install.
+    #[test]
+    fn stamp_pubkey_returns_false_when_appsettings_absent() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("DDS_REQUIRE_ENCRYPTED_KEYS") };
+        unsafe { std::env::remove_var("DDS_NODE_PASSPHRASE") };
+        // Also clear ProgramFiles so the Windows fallback path inside
+        // `agent_appsettings_path` cannot find an unrelated install.
+        unsafe { std::env::remove_var("ProgramFiles") };
+
+        let data_dir = TempDir::new().unwrap();
+        let config_dir = TempDir::new().unwrap();
+
+        let written = stamp_pubkey(data_dir.path(), config_dir.path()).unwrap();
+        assert!(!written, "expected false when no appsettings.json present");
+        assert!(
+            data_dir.path().join("node_key.bin").exists(),
+            "node_key.bin must still be seeded so dds-node run finds it"
+        );
     }
 }

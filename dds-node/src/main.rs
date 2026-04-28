@@ -117,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "restrict-data-dir-acl" => cmd_restrict_data_dir_acl(&args[1..]),
         "create-provision-bundle" => cmd_create_bundle(&args[1..]),
         "provision" => cmd_provision(&args[1..]),
+        "stamp-agent-pubkey" => cmd_stamp_agent_pubkey(&args[1..]),
         "run" => cmd_run(&args[1..]).await,
         // Back-compat: if first arg looks like a config path (or there are no args)
         // treat it as `run <arg>`.
@@ -148,6 +149,7 @@ fn print_usage() {
   dds-node restrict-data-dir-acl --data-dir <DIR>
   dds-node create-provision-bundle --dir <DIR> --org <ORG> [--out <FILE>]
   dds-node provision <BUNDLE.dds> [--data-dir <DIR>] [--no-start]
+  dds-node stamp-agent-pubkey --data-dir <DIR> --config-dir <DIR>
   dds-node run [config.toml]"
     );
 }
@@ -926,6 +928,37 @@ fn cmd_provision(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("  The node will auto-discover other nodes on the LAN via mDNS.");
     println!("  Enrolled users will sync via gossip within ~60 seconds.");
+    Ok(())
+}
+
+/// **SC-3-W** — Windows MSI install-time helper. Loads (or creates) the
+/// node Ed25519 identity and stamps `PinnedNodePubkeyB64` into the Policy
+/// Agent's `appsettings.json` *before* the agent service first starts.
+/// The agent fails closed on an empty pubkey (see
+/// `platform/windows/DdsPolicyAgent/Program.cs`), so without this stamp
+/// the SCM auto-start would crash-loop on a fresh MSI install. Wired
+/// from `DdsBundle.wxs`'s `CA_StampAgentPubkey` custom action; safe to
+/// run on hosts without the agent installed (returns success with a
+/// notice if `appsettings.json` is absent).
+fn cmd_stamp_agent_pubkey(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = PathBuf::from(require_flag(args, "--data-dir")?);
+    let config_dir = PathBuf::from(require_flag(args, "--config-dir")?);
+    match provision::stamp_pubkey(&data_dir, &config_dir)? {
+        true => {
+            println!(
+                "Stamped Policy Agent PinnedNodePubkeyB64 from {} into appsettings.json (config_dir={})",
+                data_dir.join("node_key.bin").display(),
+                config_dir.display()
+            );
+        }
+        false => {
+            println!(
+                "No Policy Agent appsettings.json found under {} (or %ProgramFiles%\\DDS\\config\\); \
+                 nothing to stamp",
+                config_dir.display()
+            );
+        }
+    }
     Ok(())
 }
 
