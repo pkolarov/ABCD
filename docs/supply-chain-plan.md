@@ -160,32 +160,47 @@ verifies cleanly with the stock OS tooling, including post-cert-expiry
 
 ### Phase B — Two-signature gate on managed software (closes Z-7)
 
-**B.1 — Schema change.** Add an optional field to
-[`SoftwareAssignment`](../dds-domain/src/types.rs) (line ~603):
+**B.1 — Schema change. ✅ Landed 2026-04-28 follow-up #61.**
+[`SoftwareAssignment`](../dds-domain/src/types.rs) gained an optional
+`publisher_identity: Option<PublisherIdentity>` field with
+`#[serde(default, skip_serializing_if = "Option::is_none")]` so a
+pre-Phase-B publisher's CBOR wire bytes round-trip byte-identical and a
+v1 agent decoding a v2 document deserialises the field as `None`. The
+companion enum has two variants:
 
 ```rust
-pub struct SoftwareAssignment {
-    // ... existing fields ...
-
-    /// Required Authenticode subject (Windows) or Team ID (macOS) on
-    /// the package blob, in addition to the SHA-256 hash. When set,
-    /// the agent rejects the package if either the OS-vendor signature
-    /// is invalid OR the signer subject does not match this value.
-    /// `None` preserves v1 hash-only behavior for legacy publishers
-    /// during migration; switch to required by the v2 cutover date.
-    #[serde(default)]
-    pub publisher_identity: Option<PublisherIdentity>,
-}
-
 pub enum PublisherIdentity {
-    Authenticode { subject: String, root_thumbprint: Option<String> },
-    AppleDeveloperId { team_id: String },
+    Authenticode {
+        subject: String,
+        root_thumbprint: Option<String>, // 40 lowercase hex chars
+    },
+    AppleDeveloperId {
+        team_id: String, // 10 uppercase alphanumerics
+    },
 }
 ```
 
-Backward-compatible — older agents deserialize with
-`publisher_identity = None` and behave as today; new publishers
-opt in immediately.
+`PublisherIdentity::validate()` enforces the field-level invariants
+documented on each variant — empty / wrong-shape values would silently
+match nothing on the agent and be observationally indistinguishable
+from "no publisher pinning", so the schema layer fails closed instead.
+The matching error type `PublisherIdentityError` is
+`std::error::Error` so the Phase B.2 / B.3 trust-graph admission path
+can surface a typed reason at ingest. 6 new regression tests in
+[`dds-domain/tests/domain_tests.rs`](../dds-domain/tests/domain_tests.rs):
+`test_software_assignment_with_authenticode_publisher_roundtrip`
+(CBOR round-trip with both `subject` and `root_thumbprint` populated),
+`test_software_assignment_with_apple_publisher_roundtrip`
+(CBOR round-trip with a 10-char Team ID),
+`test_software_assignment_legacy_cbor_decodes_as_none` (v1 wire
+backward-compat), `test_publisher_identity_validate_authenticode`
+(empty subject + thumbprint length / case rejected), and
+`test_publisher_identity_validate_apple_team_id` (length / case /
+non-alphanumeric rejected). Backward-compatible — older agents
+deserialize with `publisher_identity = None` and behave as today; new
+publishers opt in immediately. **Phase B.2 / B.3 (the C# agent
+verifiers) and B.4 / B.5 (cross-platform regression tests + migration
+plan) remain open.**
 
 **B.2 — Windows agent.** Add `WinVerifyTrust` invocation in
 `WindowsSoftwareOperations.DownloadAndVerifyAsync` after the

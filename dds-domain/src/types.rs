@@ -620,6 +620,17 @@ pub struct SoftwareAssignment {
     /// Pre/post install scripts (optional).
     pub pre_install_script: Option<String>,
     pub post_install_script: Option<String>,
+    /// Required OS-vendor-rooted signer identity on the package blob, in
+    /// addition to the SHA-256 hash. When set, the agent must verify the
+    /// platform signature on the downloaded artifact and refuse the
+    /// install if either the OS-vendor signature is invalid or the
+    /// signer subject does not match this value. `None` preserves v1
+    /// hash-only behaviour for legacy publishers; new publishers should
+    /// always supply this field. Closes the schema half of Z-7
+    /// ([docs/supply-chain-plan.md](../../docs/supply-chain-plan.md)
+    /// Phase B.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher_identity: Option<PublisherIdentity>,
 }
 
 /// Software install action.
@@ -628,6 +639,114 @@ pub enum InstallAction {
     Install,
     Uninstall,
     Update,
+}
+
+/// Required signer identity that an agent must observe on the
+/// downloaded package blob, in addition to the SHA-256 check. This is
+/// the schema-level surface of the supply-chain Phase B "two-signature
+/// gate" (DDS document signature + OS-vendor signature on the blob).
+/// The variant tells the agent which native verifier to use; the inner
+/// fields tell it what signer to insist on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PublisherIdentity {
+    /// Windows Authenticode. The Windows agent must call
+    /// `WinVerifyTrust(WINTRUST_ACTION_GENERIC_VERIFY_V2)` on the
+    /// staged file and compare the certificate subject string against
+    /// `subject` (case-sensitive exact match against
+    /// `CertGetNameString(CERT_NAME_SIMPLE_DISPLAY_TYPE)`).
+    /// `root_thumbprint`, when set, additionally pins the chain root —
+    /// the agent walks the chain and refuses the install if no
+    /// certificate in the chain has the given SHA-1 thumbprint
+    /// (40 lowercase hex chars).
+    Authenticode {
+        /// Authenticode signer subject as reported by
+        /// `CertGetNameString(CERT_NAME_SIMPLE_DISPLAY_TYPE)`.
+        subject: String,
+        /// Optional SHA-1 thumbprint (40 lowercase hex chars) of a
+        /// certificate that must appear in the trust chain.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root_thumbprint: Option<String>,
+    },
+    /// macOS Developer ID. The macOS agent must call
+    /// `pkgutil --check-signature` (or `codesign --verify` for app
+    /// bundles) and compare the parsed Team ID against `team_id`
+    /// (case-sensitive exact match — Apple Team IDs are 10
+    /// uppercase alphanumerics).
+    AppleDeveloperId {
+        /// Apple Developer Team ID (10 alphanumerics, e.g.
+        /// "ABCDE12345").
+        team_id: String,
+    },
+}
+
+/// Validation outcome for a [`PublisherIdentity`] value, surfaced as a
+/// distinct error type so the trust-graph admission path can reject
+/// malformed publisher metadata at ingest time without needing to
+/// thread `Result<_, String>` through the document layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublisherIdentityError {
+    /// Authenticode `subject` was empty.
+    EmptyAuthenticodeSubject,
+    /// Authenticode `root_thumbprint` was not a 40-char lowercase hex
+    /// string.
+    InvalidRootThumbprint,
+    /// `team_id` was not exactly 10 uppercase alphanumerics.
+    InvalidAppleTeamId,
+}
+
+impl core::fmt::Display for PublisherIdentityError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::EmptyAuthenticodeSubject => f.write_str("authenticode subject is empty"),
+            Self::InvalidRootThumbprint => {
+                f.write_str("authenticode root_thumbprint must be 40 lowercase hex chars")
+            }
+            Self::InvalidAppleTeamId => {
+                f.write_str("apple team_id must be 10 uppercase alphanumerics")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PublisherIdentityError {}
+
+impl PublisherIdentity {
+    /// Validate the field-level invariants documented on each variant.
+    /// Empty / wrong-shape values would silently match nothing on the
+    /// agent and be observationally indistinguishable from "no
+    /// publisher pinning" — fail closed at the schema layer instead.
+    pub fn validate(&self) -> Result<(), PublisherIdentityError> {
+        match self {
+            Self::Authenticode {
+                subject,
+                root_thumbprint,
+            } => {
+                if subject.trim().is_empty() {
+                    return Err(PublisherIdentityError::EmptyAuthenticodeSubject);
+                }
+                if let Some(tp) = root_thumbprint {
+                    let ok = tp.len() == 40
+                        && tp
+                            .chars()
+                            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+                    if !ok {
+                        return Err(PublisherIdentityError::InvalidRootThumbprint);
+                    }
+                }
+                Ok(())
+            }
+            Self::AppleDeveloperId { team_id } => {
+                let ok = team_id.len() == 10
+                    && team_id
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c.is_ascii_uppercase());
+                if !ok {
+                    return Err(PublisherIdentityError::InvalidAppleTeamId);
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl DomainDocument for SoftwareAssignment {

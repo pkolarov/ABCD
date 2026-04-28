@@ -3543,6 +3543,7 @@ mod tests {
             silent: true,
             pre_install_script: None,
             post_install_script: None,
+            publisher_identity: None,
         };
         pkg.embed(&mut sw_payload).unwrap();
         let sw_token = Token::sign(sw_payload, &admin.signing_key).unwrap();
@@ -3730,6 +3731,7 @@ mod tests {
             silent: true,
             pre_install_script: None,
             post_install_script: None,
+            publisher_identity: None,
         };
         pkg.embed(&mut sw_payload).unwrap();
         let sw_token = Token::sign(sw_payload, &admin.signing_key).unwrap();

@@ -431,9 +431,188 @@ fn test_software_assignment_roundtrip() {
         silent: true,
         pre_install_script: None,
         post_install_script: Some("cleanup.ps1".into()),
+        publisher_identity: None,
     };
     let cbor = doc.to_cbor().unwrap();
     assert_eq!(SoftwareAssignment::from_cbor(&cbor).unwrap(), doc);
+}
+
+#[test]
+fn test_software_assignment_with_authenticode_publisher_roundtrip() {
+    let doc = SoftwareAssignment {
+        package_id: "com.example.editor".into(),
+        display_name: "Example Editor".into(),
+        version: "2.1.0".into(),
+        source: "https://cdn.example.com/editor-2.1.0.msi".into(),
+        sha256: "abc123def456".into(),
+        action: InstallAction::Install,
+        scope: PolicyScope {
+            device_tags: vec!["developer".into()],
+            org_units: vec![],
+            identity_urns: vec![],
+        },
+        silent: true,
+        pre_install_script: None,
+        post_install_script: None,
+        publisher_identity: Some(PublisherIdentity::Authenticode {
+            subject: "Example Software, Inc.".into(),
+            root_thumbprint: Some("a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4".into()),
+        }),
+    };
+    let cbor = doc.to_cbor().unwrap();
+    assert_eq!(SoftwareAssignment::from_cbor(&cbor).unwrap(), doc);
+}
+
+#[test]
+fn test_software_assignment_with_apple_publisher_roundtrip() {
+    let doc = SoftwareAssignment {
+        package_id: "com.example.maceditor".into(),
+        display_name: "Mac Editor".into(),
+        version: "2.1.0".into(),
+        source: "https://cdn.example.com/editor-2.1.0.pkg".into(),
+        sha256: "cafebabe".into(),
+        action: InstallAction::Install,
+        scope: PolicyScope {
+            device_tags: vec!["mac-laptop".into()],
+            org_units: vec![],
+            identity_urns: vec![],
+        },
+        silent: true,
+        pre_install_script: None,
+        post_install_script: None,
+        publisher_identity: Some(PublisherIdentity::AppleDeveloperId {
+            team_id: "ABCDE12345".into(),
+        }),
+    };
+    let cbor = doc.to_cbor().unwrap();
+    assert_eq!(SoftwareAssignment::from_cbor(&cbor).unwrap(), doc);
+}
+
+/// Backward-compat: a v1 CBOR blob (no `publisher_identity` field at
+/// all) must deserialize as `publisher_identity = None`. Pinned by
+/// minting the v1 wire by serializing a clone with the new field set
+/// to `None` — `skip_serializing_if = "Option::is_none"` guarantees the
+/// emitted bytes match what a pre-Phase-B publisher would have written.
+#[test]
+fn test_software_assignment_legacy_cbor_decodes_as_none() {
+    let v1 = SoftwareAssignment {
+        package_id: "com.legacy.app".into(),
+        display_name: "Legacy".into(),
+        version: "1.0.0".into(),
+        source: "https://example.com/legacy.msi".into(),
+        sha256: "ff".into(),
+        action: InstallAction::Install,
+        scope: PolicyScope {
+            device_tags: vec![],
+            org_units: vec![],
+            identity_urns: vec![],
+        },
+        silent: false,
+        pre_install_script: None,
+        post_install_script: None,
+        publisher_identity: None,
+    };
+    let cbor = v1.to_cbor().unwrap();
+    let decoded = SoftwareAssignment::from_cbor(&cbor).unwrap();
+    assert_eq!(decoded.publisher_identity, None);
+    assert_eq!(decoded, v1);
+}
+
+#[test]
+fn test_publisher_identity_validate_authenticode() {
+    assert!(
+        PublisherIdentity::Authenticode {
+            subject: "Example Software, Inc.".into(),
+            root_thumbprint: None,
+        }
+        .validate()
+        .is_ok()
+    );
+    // 40 lowercase hex chars
+    assert!(
+        PublisherIdentity::Authenticode {
+            subject: "Example".into(),
+            root_thumbprint: Some("0123456789abcdef0123456789abcdef01234567".into()),
+        }
+        .validate()
+        .is_ok()
+    );
+    // Empty subject rejected
+    assert_eq!(
+        PublisherIdentity::Authenticode {
+            subject: "   ".into(),
+            root_thumbprint: None,
+        }
+        .validate()
+        .unwrap_err(),
+        PublisherIdentityError::EmptyAuthenticodeSubject
+    );
+    // Wrong thumbprint length
+    assert_eq!(
+        PublisherIdentity::Authenticode {
+            subject: "Example".into(),
+            root_thumbprint: Some("abcd".into()),
+        }
+        .validate()
+        .unwrap_err(),
+        PublisherIdentityError::InvalidRootThumbprint
+    );
+    // Uppercase hex rejected — agents normalise to lowercase
+    assert_eq!(
+        PublisherIdentity::Authenticode {
+            subject: "Example".into(),
+            root_thumbprint: Some("0123456789ABCDEF0123456789ABCDEF01234567".into()),
+        }
+        .validate()
+        .unwrap_err(),
+        PublisherIdentityError::InvalidRootThumbprint
+    );
+}
+
+#[test]
+fn test_publisher_identity_validate_apple_team_id() {
+    assert!(
+        PublisherIdentity::AppleDeveloperId {
+            team_id: "ABCDE12345".into(),
+        }
+        .validate()
+        .is_ok()
+    );
+    // Lowercase rejected (Apple Team IDs are uppercase alphanumerics)
+    assert_eq!(
+        PublisherIdentity::AppleDeveloperId {
+            team_id: "abcde12345".into(),
+        }
+        .validate()
+        .unwrap_err(),
+        PublisherIdentityError::InvalidAppleTeamId
+    );
+    // Wrong length
+    assert_eq!(
+        PublisherIdentity::AppleDeveloperId {
+            team_id: "SHORT".into(),
+        }
+        .validate()
+        .unwrap_err(),
+        PublisherIdentityError::InvalidAppleTeamId
+    );
+    assert_eq!(
+        PublisherIdentity::AppleDeveloperId {
+            team_id: "TOOLONG12345".into(),
+        }
+        .validate()
+        .unwrap_err(),
+        PublisherIdentityError::InvalidAppleTeamId
+    );
+    // Non-alphanumeric rejected
+    assert_eq!(
+        PublisherIdentity::AppleDeveloperId {
+            team_id: "ABC-E12345".into(),
+        }
+        .validate()
+        .unwrap_err(),
+        PublisherIdentityError::InvalidAppleTeamId
+    );
 }
 
 // ============================================================

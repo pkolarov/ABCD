@@ -2105,7 +2105,24 @@ work is provisioning the cert and dropping the conditional.
 **Remediation:** [docs/supply-chain-plan.md](docs/supply-chain-plan.md)
 Phase A.
 
-### Z-7 (High) ❌ open — Asymmetric package signature verification on managed software
+### Z-7 (High) ⚠ partially closed (Phase B.1 schema) — Asymmetric package signature verification on managed software
+
+**Phase B.1 schema landed 2026-04-28 follow-up #61.** The schema half of
+the two-signature gate now ships:
+[`SoftwareAssignment`](dds-domain/src/types.rs) gained an optional
+`publisher_identity: Option<PublisherIdentity>` field with
+`#[serde(default, skip_serializing_if = "Option::is_none")]` so v1
+publishers' CBOR wire bytes round-trip byte-identical and a v1 agent
+decoding a v2 document deserialises the field as `None`. The new
+`PublisherIdentity` enum has variants `Authenticode { subject,
+root_thumbprint }` (Windows) and `AppleDeveloperId { team_id }`
+(macOS). `PublisherIdentity::validate()` enforces field-level
+invariants (non-empty subject, 40-char lowercase-hex thumbprint,
+10-char uppercase-alphanumeric Team ID) so empty / wrong-shape values
+fail closed at the schema layer instead of silently matching nothing
+on the agent. The agent-side enforcement (Phase B.2 / B.3 — wiring
+`WinVerifyTrust` on Windows and the Team-ID match on macOS) remains
+open and the row stays "partially closed" until those land.
 
 For DDS-managed third-party software, the document signature chain
 is solid: `SoftwareAssignment` is admin-signed, the

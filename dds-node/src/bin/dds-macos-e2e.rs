@@ -479,6 +479,7 @@ async fn publish_fixture(
         silent: true,
         pre_install_script: None,
         post_install_script: None,
+        publisher_identity: None,
     };
 
     let policy_token = attest_with_body(

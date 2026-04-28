@@ -3634,6 +3634,7 @@ mod platform_applier_tests {
             silent: true,
             pre_install_script: None,
             post_install_script: None,
+            publisher_identity: None,
         };
         svc.trust_graph
             .write()
@@ -5128,6 +5129,7 @@ mod platform_applier_tests {
             silent: true,
             pre_install_script: None,
             post_install_script: None,
+            publisher_identity: None,
         };
         let pkg_v2 = SoftwareAssignment {
             version: "2.0.0".into(),
