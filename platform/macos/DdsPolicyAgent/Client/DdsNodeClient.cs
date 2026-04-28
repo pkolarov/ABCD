@@ -62,6 +62,19 @@ public sealed class AppliedReport
     [JsonPropertyName("status")]
     public string Status { get; set; } = "ok";
 
+    /// <summary>
+    /// Splits the audit-event vocabulary on the node side into
+    /// <c>policy.applied</c> / <c>policy.failed</c> /
+    /// <c>software.applied</c> / <c>software.failed</c>. Null falls
+    /// back to the generic <c>apply.*</c> family — used by the
+    /// reconciliation pass and the host-state heartbeat where there
+    /// is no single document to attribute to. Lower-case wire form
+    /// matches the Rust enum's <c>#[serde(rename_all = "lowercase")]</c>.
+    /// </summary>
+    [JsonPropertyName("kind")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Kind { get; set; }
+
     [JsonPropertyName("directives")]
     public List<string> Directives { get; set; } = [];
 
@@ -70,6 +83,20 @@ public sealed class AppliedReport
 
     [JsonPropertyName("applied_at")]
     public ulong AppliedAt { get; set; }
+}
+
+/// <summary>
+/// Canonical lower-case wire values for <see cref="AppliedReport.Kind"/>.
+/// Centralised here so every <c>ReportAsync</c> call site uses the
+/// same string and a typo cannot silently disable the audit-action
+/// split on the node.
+/// </summary>
+public static class AppliedKind
+{
+    public const string Policy = "policy";
+    public const string Software = "software";
+    public const string Reconciliation = "reconciliation";
+    public const string HostState = "hoststate";
 }
 
 public interface IDdsNodeClient

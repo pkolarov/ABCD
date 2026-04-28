@@ -379,6 +379,30 @@ pub enum AppliedStatus {
     Skipped,
 }
 
+/// What kind of artifact the applier just processed. Drives the
+/// audit-action vocabulary split so a SIEM can distinguish a failed
+/// software install from a failed Group-Policy-style document apply
+/// without parsing `target_id`. Wire field is optional so
+/// pre-`kind` agents (anything emitting AppliedReport before the
+/// 2026-04-28 wire bump) keep round-tripping under the legacy
+/// `apply.*` action vocabulary.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AppliedKind {
+    /// `WindowsPolicyDocument` or `MacOsPolicyDocument` apply.
+    Policy,
+    /// `SoftwareAssignment` apply.
+    Software,
+    /// Periodic reconciliation pass (stale-item cleanup), not tied
+    /// to a specific document. The Worker uses target_id
+    /// `_reconciliation`.
+    Reconciliation,
+    /// Out-of-band heartbeat reporting host-state classification
+    /// (e.g. AD-06 Entra-only unsupported). Worker target_id
+    /// `_host_state`.
+    HostState,
+}
+
 /// One report from the Windows applier about a single policy or
 /// software assignment that it processed.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -392,6 +416,13 @@ pub struct AppliedReport {
     /// Encoded as a string so both shapes fit one wire field.
     pub version: String,
     pub status: AppliedStatus,
+    /// Discriminator that splits the audit action vocabulary
+    /// (`policy.applied` / `policy.failed` / `software.applied` /
+    /// `software.failed`). Optional so older agents that have not
+    /// rolled to the 2026-04-28 wire bump still report — the absence
+    /// collapses into the legacy `apply.*` family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<AppliedKind>,
     /// Free-form per-directive notes the agent wants to surface.
     /// Empty for `Ok` status with no per-directive detail.
     #[serde(default)]
@@ -1637,14 +1668,26 @@ impl<
         // carries a CBOR-encoded copy of the report so a SIEM pipeline
         // can reconstruct the full applier context from a single
         // chained line — including target_id, version, and per-
-        // directive notes. Action vocabulary stays generic
-        // (`apply.applied` / `apply.failed`) because AppliedReport
-        // does not yet carry a policy-vs-software discriminator on
-        // the wire; finer-grained `policy.*` / `software.*` actions
-        // are reserved for when the report grows a `kind` field.
-        let action = match report.status {
-            AppliedStatus::Ok | AppliedStatus::Skipped => "apply.applied",
-            AppliedStatus::Failed => "apply.failed",
+        // directive notes.
+        //
+        // 2026-04-28: `AppliedReport.kind` now splits the action
+        // vocabulary into `policy.*` / `software.*` per the
+        // observability-plan.md "deferred row" — agents that send
+        // `kind` get the fine-grained slot, agents that don't fall
+        // back to `apply.*` so the on-wire change is forwards/
+        // backwards compatible.
+        let succeeded = matches!(report.status, AppliedStatus::Ok | AppliedStatus::Skipped);
+        let action = match report.kind {
+            Some(AppliedKind::Policy) if succeeded => "policy.applied",
+            Some(AppliedKind::Policy) => "policy.failed",
+            Some(AppliedKind::Software) if succeeded => "software.applied",
+            Some(AppliedKind::Software) => "software.failed",
+            // Reconciliation and HostState heartbeats stay on the
+            // generic family because they do not tie to a single
+            // document outcome — the dashboard reads them through
+            // the `apply.*` rate.
+            _ if succeeded => "apply.applied",
+            _ => "apply.failed",
         };
         let reason = match report.status {
             AppliedStatus::Failed => report.error.clone(),
@@ -3612,6 +3655,7 @@ mod platform_applier_tests {
             target_id: "security/baseline".into(),
             version: "7".into(),
             status: AppliedStatus::Ok,
+            kind: None,
             directives: vec!["registry: HKLM\\... = 1".into()],
             error: None,
             applied_at: 1_700_000_000,
@@ -3690,6 +3734,7 @@ mod platform_applier_tests {
             target_id: "p:audit-ok".into(),
             version: "1".into(),
             status: AppliedStatus::Ok,
+            kind: None,
             directives: vec![],
             error: None,
             applied_at: 1_700_000_000,
@@ -3710,6 +3755,7 @@ mod platform_applier_tests {
             target_id: "p:audit-fail".into(),
             version: "1".into(),
             status: AppliedStatus::Failed,
+            kind: None,
             directives: vec![],
             error: Some("write protected".into()),
             applied_at: 1_700_000_001,
@@ -3723,6 +3769,148 @@ mod platform_applier_tests {
         assert!(last.verify().is_ok());
     }
 
+    /// 2026-04-28 (observability-plan.md "deferred row" closeout):
+    /// when `AppliedReport.kind` is set, `record_applied` must emit
+    /// the fine-grained `policy.applied` / `policy.failed` /
+    /// `software.applied` / `software.failed` action vocabulary
+    /// instead of collapsing into the generic `apply.*` family.
+    /// Reconciliation and HostState heartbeats stay on the legacy
+    /// family because they don't represent a single document.
+    #[test]
+    fn audit_apply_kind_splits_action_vocabulary() {
+        let (mut svc, _, _) = setup();
+        let cases = [
+            (
+                Some(AppliedKind::Policy),
+                AppliedStatus::Ok,
+                "policy.applied",
+            ),
+            (
+                Some(AppliedKind::Policy),
+                AppliedStatus::Skipped,
+                "policy.applied",
+            ),
+            (
+                Some(AppliedKind::Policy),
+                AppliedStatus::Failed,
+                "policy.failed",
+            ),
+            (
+                Some(AppliedKind::Software),
+                AppliedStatus::Ok,
+                "software.applied",
+            ),
+            (
+                Some(AppliedKind::Software),
+                AppliedStatus::Skipped,
+                "software.applied",
+            ),
+            (
+                Some(AppliedKind::Software),
+                AppliedStatus::Failed,
+                "software.failed",
+            ),
+            // Reconciliation and HostState fall back to the generic
+            // family — they do not name a single doc the SIEM can
+            // pivot on.
+            (
+                Some(AppliedKind::Reconciliation),
+                AppliedStatus::Ok,
+                "apply.applied",
+            ),
+            (
+                Some(AppliedKind::Reconciliation),
+                AppliedStatus::Failed,
+                "apply.failed",
+            ),
+            (
+                Some(AppliedKind::HostState),
+                AppliedStatus::Ok,
+                "apply.applied",
+            ),
+            // Backward-compat: agents that never bumped the wire
+            // schema still report under `apply.*`.
+            (None, AppliedStatus::Ok, "apply.applied"),
+            (None, AppliedStatus::Failed, "apply.failed"),
+        ];
+        for (i, (kind, status, want_action)) in cases.iter().enumerate() {
+            let report = AppliedReport {
+                device_urn: "urn:vouchsafe:dev.kind-test".into(),
+                target_id: format!("p:kind-{i}"),
+                version: "1".into(),
+                status: *status,
+                kind: *kind,
+                directives: vec![],
+                error: if matches!(status, AppliedStatus::Failed) {
+                    Some(format!("err-{i}"))
+                } else {
+                    None
+                },
+                applied_at: 1_700_000_100 + i as u64,
+            };
+            svc.record_applied(&report).unwrap();
+            let last = svc.store.list_audit_entries().unwrap().pop().unwrap();
+            assert_eq!(
+                last.action, *want_action,
+                "case {i}: kind={kind:?} status={status:?} got action={}",
+                last.action
+            );
+            assert!(last.verify().is_ok(), "case {i}: signature must verify");
+        }
+    }
+
+    /// Wire-format guard: the `kind` field round-trips through the
+    /// JSON shape exposed at `POST /v1/{windows,macos}/applied` and
+    /// is omitted when `None` so older agents that never carried
+    /// the field still produce a clean report body. Pinning this
+    /// shape prevents a future serde rename from silently breaking
+    /// the C# agents.
+    #[test]
+    fn applied_report_kind_wire_shape() {
+        let with_kind = AppliedReport {
+            device_urn: "urn:vouchsafe:dev.wire".into(),
+            target_id: "p:wire".into(),
+            version: "1".into(),
+            status: AppliedStatus::Ok,
+            kind: Some(AppliedKind::Software),
+            directives: vec![],
+            error: None,
+            applied_at: 1_700_000_200,
+        };
+        let json = serde_json::to_value(&with_kind).unwrap();
+        assert_eq!(json["kind"], "software");
+        let round: AppliedReport = serde_json::from_value(json).unwrap();
+        assert_eq!(round.kind, Some(AppliedKind::Software));
+
+        let no_kind = AppliedReport {
+            device_urn: "urn:vouchsafe:dev.wire".into(),
+            target_id: "p:wire".into(),
+            version: "1".into(),
+            status: AppliedStatus::Ok,
+            kind: None,
+            directives: vec![],
+            error: None,
+            applied_at: 1_700_000_201,
+        };
+        let json = serde_json::to_value(&no_kind).unwrap();
+        assert!(
+            json.get("kind").is_none(),
+            "absent `kind` must be skipped on the wire (got {json:?})"
+        );
+        // A report missing the `kind` field on ingest must
+        // deserialise back to `None` without erroring — protects
+        // pre-2026-04-28 agents.
+        let legacy_body = serde_json::json!({
+            "device_urn": "urn:vouchsafe:dev.wire",
+            "target_id": "p:wire",
+            "version": "1",
+            "status": "ok",
+            "applied_at": 1_700_000_300u64,
+        });
+        let legacy: AppliedReport = serde_json::from_value(legacy_body).unwrap();
+        assert!(legacy.kind.is_none());
+    }
+
     #[test]
     fn audit_apply_skipped_marks_reason() {
         let (mut svc, _, _) = setup();
@@ -3731,6 +3919,7 @@ mod platform_applier_tests {
             target_id: "p:audit-skip".into(),
             version: "1".into(),
             status: AppliedStatus::Skipped,
+            kind: None,
             directives: vec![],
             error: None,
             applied_at: 1_700_000_002,
@@ -3786,6 +3975,7 @@ mod platform_applier_tests {
             target_id: "p:chain".into(),
             version: "1".into(),
             status: AppliedStatus::Ok,
+            kind: None,
             directives: vec![],
             error: None,
             applied_at: 1_700_000_010,

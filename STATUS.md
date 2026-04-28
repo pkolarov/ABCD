@@ -140,7 +140,50 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-28 follow-up #54 (security follow-up —
+> Last updated: 2026-04-28 follow-up #55 (observability follow-up —
+> [`docs/observability-plan.md`](docs/observability-plan.md) Phase A
+> deferred-row closeout: the
+> `policy.applied` / `policy.failed` / `software.applied` /
+> `software.failed` audit-action vocabulary now ships). `AppliedReport`
+> in [`dds-node/src/service.rs`](dds-node/src/service.rs) gained a new
+> optional `kind: Option<AppliedKind>` wire field with serde
+> `#[serde(default, skip_serializing_if = "Option::is_none")]` so a
+> pre-2026-04-28 agent that does not send `kind` keeps emitting under
+> the legacy generic `apply.*` family. `record_applied` keys off
+> `(kind, status)` to map to the fine-grained slot when `kind ∈
+> {Policy, Software}`; `Reconciliation` and `HostState` heartbeats stay
+> on `apply.*` because they don't tie to a single document. The
+> Windows + macOS Policy Agents now stamp `kind` at every
+> `ReportAsync` call site — `AppliedKind.Policy` (per-policy dispatch),
+> `AppliedKind.Software` (per-package install / reconciliation
+> outcome), `AppliedKind.Reconciliation` (the `_reconciliation`
+> heartbeat), and (Windows only today) `AppliedKind.HostState` (the
+> AD-06 `_host_state` Entra-only heartbeat). The shared lower-case
+> wire vocabulary lives in a new `AppliedKind` static class on each
+> agent so a future call site cannot drift from the Rust enum's
+> `#[serde(rename_all = "lowercase")]` form. Two new regression tests
+> in [`dds-node/src/service.rs`](dds-node/src/service.rs)
+> (`audit_apply_kind_splits_action_vocabulary` covering all 11
+> kind/status × success/fail combinations including the
+> reconciliation/hoststate fall-back, plus `applied_report_kind_wire_shape`
+> pinning the lower-case JSON enum form, the `WhenWritingNull` skip,
+> and the legacy-body deserialise path so older agents stay
+> round-tripping). The deferred row in
+> [`docs/observability-plan.md`](docs/observability-plan.md) and the
+> Reserved bullet in
+> [`docs/observability/audit-event-schema.md`](docs/observability/audit-event-schema.md)
+> are flipped to ✅ shipped, with the new actions enumerated in the
+> action-vocabulary table and the severity-mapping row covering
+> `policy.failed` / `software.failed` alongside `apply.failed`. macOS
+> agent test count: 72 (unchanged — wire-shape behaviour is exercised
+> on the Rust side). Windows agent test count: 145 (unchanged — same
+> reason). `cargo fmt` clean; `cargo clippy --all-targets -- -D warnings`
+> clean; `dotnet build` clean on both agents (warnings unchanged from
+> baseline `CA1416`); workspace test count: 706 / 706 passing
+> (was 704 + 2 new = 706 from `audit_apply_kind_splits_action_vocabulary`
+> and `applied_report_kind_wire_shape`).
+>
+> Previous: 2026-04-28 follow-up #54 (security follow-up —
 > [`security-gaps.md`](security-gaps.md) remaining-work item #3
 > closed: per-file Windows DACL hardening for the three node-side
 > key-save paths). New module

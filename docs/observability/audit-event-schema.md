@@ -76,17 +76,17 @@ attempt".
 | `enroll.device` | informational | `service.rs::enroll_device` | New device enrolled. |
 | `admin.bootstrap` | **notice** | `service.rs::admin_setup` | Bootstrap admin established. Only emitted once per domain in steady state. A second occurrence is suspicious. |
 | `admin.vouch` | informational | `service.rs::admin_vouch` | An admin vouched another principal. |
-| `apply.applied` | informational | `service.rs::record_applied` | Agent reported a successful apply. `Skipped` reports carry `reason="skipped"`. |
-| `apply.failed` | warning | same | Agent reported a failed apply. `reason` carries the agent's error string. |
+| `apply.applied` | informational | `service.rs::record_applied` | Agent reported a successful apply *without* a `kind` discriminator (legacy pre-2026-04-28 agents) **or** a kind that does not name a single document (`reconciliation`, `hoststate`). `Skipped` reports carry `reason="skipped"`. |
+| `apply.failed` | warning | same | Agent reported a failed apply under the same legacy / non-document conditions as `apply.applied`. `reason` carries the agent's error string. |
+| `policy.applied` | informational | `service.rs::record_applied` | Agent reported a successful (or `Skipped`) policy-document apply (`AppliedReport.kind == "policy"`). Same `reason="skipped"` convention as `apply.applied`. Emitted by 2026-04-28-and-later Windows + macOS Policy Agents. |
+| `policy.failed` | warning | same | Agent reported a failed policy-document apply (`kind == "policy"`, `status == "failed"`). |
+| `software.applied` | informational | same | Agent reported a successful (or `Skipped`) software-package apply (`kind == "software"`). |
+| `software.failed` | warning | same | Agent reported a failed software-package apply (`kind == "software"`, `status == "failed"`). |
 | `admission.cert.revoked` | **notice** | `node.rs::merge_piggybacked_revocations` | An admission revocation arrived via the H-12 piggy-back path and was accepted into the local store. One entry per *newly* admitted revocation; duplicates and verify-failures do not stamp the chain. `token_cbor_b64` is the CBOR-encoded `AdmissionRevocation` payload. |
 
 Reserved (not yet emitted by `dds-node`, will appear in the same JSONL
 shape when they land):
 
-- `policy.applied` / `policy.failed` / `software.applied` /
-  `software.failed` — finer-grained applier outcomes once
-  `AppliedReport` grows a `kind` discriminator on the wire (today it
-  does not, so v1 collapses these into the `apply.*` family).
 - `admission.cert.issued` — admission cert issuance (cert issuance is
   a domain-level operation today, not gated through a node ingest
   path).
@@ -123,7 +123,7 @@ that have not built their own mapping yet, a sensible default is:
 | `action` pattern | CEF severity (0-10) | Syslog severity (RFC 5424) |
 |---|---|---|
 | `*.rejected` | 4 (medium) | warning (4) |
-| `apply.failed` | 4 (medium) | warning (4) |
+| `apply.failed`, `policy.failed`, `software.failed` | 4 (medium) | warning (4) |
 | `revoke`, `burn`, `admin.bootstrap`, `admission.cert.revoked` | 3 (low-medium) | notice (5) |
 | everything else | 2 (low) | informational (6) |
 | any line with `sig_ok=false` | 8 (high) | alert (1) — override the action-based row |

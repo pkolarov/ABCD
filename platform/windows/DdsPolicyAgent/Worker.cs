@@ -161,7 +161,8 @@ public sealed class Worker : BackgroundService
         var apply = new ApplyBundleResult("unsupported", [], null);
         _previousJoinState = JoinState.EntraOnlyJoined;
         await ReportAsync(
-            "_host_state", "1", apply, AppliedReason.UnsupportedEntra, ct)
+            "_host_state", "1", apply, AppliedReason.UnsupportedEntra,
+            AppliedKind.HostState, ct)
             .ConfigureAwait(false);
         _log.LogInformation(
             "Host is Entra-only joined — DDS policy enforcement is unsupported. Skipping poll.");
@@ -240,7 +241,8 @@ public sealed class Worker : BackgroundService
             // B-3: report and record the actual outcome status, not a
             // hardcoded "ok". A failed enforcement must remain re-eligible
             // on the next poll so transient failures don't latch.
-            await ReportAsync(policyId, version, apply, reason, ct).ConfigureAwait(false);
+            await ReportAsync(policyId, version, apply, reason,
+                AppliedKind.Policy, ct).ConfigureAwait(false);
             _stateStore.RecordApplied(
                 policyId, version, hash, apply.Status, isSoftware: false, hostState);
         }
@@ -287,7 +289,8 @@ public sealed class Worker : BackgroundService
             // HasChanged on the next poll.
             var apply = ApplyBundleResult.FromOutcome(outcome);
             var reason = ResolveReason(modeReason, transitionDetected, hostStateChanged && !contentChanged);
-            await ReportAsync(pkgId, version, apply, reason, ct).ConfigureAwait(false);
+            await ReportAsync(pkgId, version, apply, reason,
+                AppliedKind.Software, ct).ConfigureAwait(false);
             _stateStore.RecordApplied(
                 pkgId, version, hash, apply.Status, isSoftware: true, hostState);
         }
@@ -459,7 +462,7 @@ public sealed class Worker : BackgroundService
             await ReportAsync(
                 "_reconciliation", "1",
                 new ApplyBundleResult("ok", reconcileChanges, null),
-                modeReason, ct).ConfigureAwait(false);
+                modeReason, AppliedKind.Reconciliation, ct).ConfigureAwait(false);
         }
     }
 
@@ -506,7 +509,7 @@ public sealed class Worker : BackgroundService
 
     private async Task ReportAsync(
         string targetId, string version, ApplyBundleResult apply,
-        string? reason, CancellationToken ct)
+        string? reason, string kind, CancellationToken ct)
     {
         try
         {
@@ -516,6 +519,7 @@ public sealed class Worker : BackgroundService
                 TargetId = targetId,
                 Version = version,
                 Status = apply.Status,
+                Kind = kind,
                 Directives = apply.Directives,
                 Error = apply.Error,
                 AppliedAt = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),

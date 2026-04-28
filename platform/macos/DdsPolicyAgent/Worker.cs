@@ -136,7 +136,7 @@ public sealed class Worker : BackgroundService
             }
 
             var apply = await DispatchMacOsBundle(p.Document, enforcement, ct).ConfigureAwait(false);
-            await ReportAsync(policyId, version, apply, ct).ConfigureAwait(false);
+            await ReportAsync(policyId, version, apply, AppliedKind.Policy, ct).ConfigureAwait(false);
             _stateStore.RecordApplied(policyId, version, hash, apply.Status, isSoftware: false);
         }
 
@@ -172,7 +172,7 @@ public sealed class Worker : BackgroundService
                 .ConfigureAwait(false);
             var apply = ApplyBundleResult.FromOutcome(outcome);
 
-            await ReportAsync(pkgId, version, apply, ct).ConfigureAwait(false);
+            await ReportAsync(pkgId, version, apply, AppliedKind.Software, ct).ConfigureAwait(false);
             _stateStore.RecordApplied(pkgId, version, hash, apply.Status, isSoftware: true);
         }
 
@@ -321,7 +321,8 @@ public sealed class Worker : BackgroundService
         {
             _log.LogInformation("Reconciliation complete: {Count} actions taken", reconcileChanges.Count);
             await ReportAsync("_reconciliation", "1",
-                new ApplyBundleResult("ok", reconcileChanges, null), ct).ConfigureAwait(false);
+                new ApplyBundleResult("ok", reconcileChanges, null),
+                AppliedKind.Reconciliation, ct).ConfigureAwait(false);
         }
     }
 
@@ -370,6 +371,7 @@ public sealed class Worker : BackgroundService
         string targetId,
         string version,
         ApplyBundleResult apply,
+        string kind,
         CancellationToken ct)
     {
         try
@@ -380,6 +382,7 @@ public sealed class Worker : BackgroundService
                 TargetId = targetId,
                 Version = version,
                 Status = apply.Status,
+                Kind = kind,
                 Directives = apply.Directives,
                 Error = apply.Error,
                 AppliedAt = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
