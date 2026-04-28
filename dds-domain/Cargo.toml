@@ -7,7 +7,7 @@ description = "DDS domain-specific typed documents that ride inside TokenPayload
 
 [features]
 default = ["pq"]
-pq = ["dds-core/pq"]
+pq = ["dds-core/pq", "pqcrypto-mldsa", "pqcrypto-traits"]
 
 [dependencies]
 dds-core = { workspace = true }
@@ -21,6 +21,10 @@ base32 = { workspace = true }
 rand_core = { workspace = true }
 base64 = "0.22"
 serde_json = { workspace = true }
+# Z-1 Phase A — hybrid-sign AdmissionCert / AdmissionRevocation with
+# Ed25519 + ML-DSA-65 (FIPS 204). Mirrors the dds-core "pq" feature.
+pqcrypto-mldsa = { workspace = true, optional = true }
+pqcrypto-traits = { workspace = true, optional = true }
 # **A-1 step-2 (security review)** — used in `verify_packed` to extract
 # the leaf cert's SubjectPublicKeyInfo from `attStmt.x5c[0]` so the
 # attestation `sig` can be verified under the attestation key (rather

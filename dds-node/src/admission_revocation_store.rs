@@ -46,7 +46,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use dds_domain::{AdmissionRevocation, DomainId};
+use dds_domain::{AdmissionRevocation, Domain, DomainId};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -88,10 +88,20 @@ impl std::error::Error for RevocationStoreError {}
 /// Every contained [`AdmissionRevocation`] has been verified against
 /// the domain pubkey on insert — callers can trust `is_revoked` without
 /// re-verifying signatures on every lookup.
+///
+/// **Z-1 Phase A** — when bound to a v2-hybrid domain via
+/// [`Self::for_hybrid_domain`] / [`load_or_empty_with_pq`], the store
+/// also enforces the ML-DSA-65 component on every inserted revocation;
+/// v1 (Ed25519-only) revocations are rejected with `Verify`.
 #[derive(Debug, Clone, Default)]
 pub struct AdmissionRevocationStore {
     domain_id: Option<DomainId>,
     domain_pubkey: Option<[u8; 32]>,
+    /// **Z-1 Phase A** — ML-DSA-65 public key (1,952 bytes) when the
+    /// store is bound to a v2-hybrid domain. Routes verification
+    /// through `AdmissionRevocation::verify_with_domain` instead of
+    /// the v1 `verify`.
+    domain_pq_pubkey: Option<Vec<u8>>,
     entries: Vec<AdmissionRevocation>,
     revoked_peer_ids: BTreeSet<String>,
 }
@@ -103,12 +113,32 @@ impl AdmissionRevocationStore {
         Self::default()
     }
 
-    /// Empty store bound to a domain. Subsequent `add` / `merge` calls
-    /// will reject revocations that don't verify under this domain.
+    /// Empty store bound to a v1 (Ed25519-only) domain. Subsequent
+    /// `add` / `merge` calls will reject revocations that don't verify
+    /// under this domain.
     pub fn for_domain(domain_id: DomainId, domain_pubkey: [u8; 32]) -> Self {
         Self {
             domain_id: Some(domain_id),
             domain_pubkey: Some(domain_pubkey),
+            domain_pq_pubkey: None,
+            entries: Vec::new(),
+            revoked_peer_ids: BTreeSet::new(),
+        }
+    }
+
+    /// **Z-1 Phase A** — empty store bound to a v2-hybrid domain.
+    /// Inserts now require both the Ed25519 signature *and* the
+    /// ML-DSA-65 `pq_signature` to verify; v1-only revocations are
+    /// rejected.
+    pub fn for_hybrid_domain(
+        domain_id: DomainId,
+        domain_pubkey: [u8; 32],
+        pq_pubkey: Vec<u8>,
+    ) -> Self {
+        Self {
+            domain_id: Some(domain_id),
+            domain_pubkey: Some(domain_pubkey),
+            domain_pq_pubkey: Some(pq_pubkey),
             entries: Vec::new(),
             revoked_peer_ids: BTreeSet::new(),
         }
@@ -137,13 +167,27 @@ impl AdmissionRevocationStore {
     /// the bound domain. Returns `Ok(true)` if the entry is new,
     /// `Ok(false)` if the same `(peer_id, signature)` pair was already
     /// present (idempotent).
+    ///
+    /// **Z-1 Phase A** — verification routes through
+    /// `AdmissionRevocation::verify_with_domain`, which enforces the
+    /// ML-DSA-65 component when the store is bound to a v2-hybrid
+    /// domain.
     pub fn add(&mut self, rev: AdmissionRevocation) -> Result<bool, RevocationStoreError> {
         let (Some(id), Some(pk)) = (self.domain_id.as_ref(), self.domain_pubkey.as_ref()) else {
             return Err(RevocationStoreError::Format(
                 "store is not bound to a domain — call for_domain or load_or_empty first".into(),
             ));
         };
-        rev.verify(pk, id)
+        // Synthesize a Domain for the v2 verifier. `name` is unused by
+        // verification and intentionally empty to avoid cloning a
+        // string we don't need.
+        let domain = Domain {
+            name: String::new(),
+            id: *id,
+            pubkey: *pk,
+            pq_pubkey: self.domain_pq_pubkey.clone(),
+        };
+        rev.verify_with_domain(&domain)
             .map_err(|e| RevocationStoreError::Verify(e.to_string()))?;
         // Dedupe by (peer_id, signature). Two revocations with the same
         // peer_id but different signatures are kept separately so an
@@ -188,12 +232,31 @@ impl AdmissionRevocationStore {
 /// Load the revocation list from `path`, validating every entry
 /// against the domain pubkey. Missing file is treated as an empty
 /// list. Entries that fail verification are dropped with a warn.
+///
+/// V1 shorthand for [`load_or_empty_with_pq`] — equivalent to calling
+/// it with `pq_pubkey = None`.
 pub fn load_or_empty(
     path: &Path,
     domain_id: DomainId,
     domain_pubkey: [u8; 32],
 ) -> Result<AdmissionRevocationStore, RevocationStoreError> {
-    let mut store = AdmissionRevocationStore::for_domain(domain_id, domain_pubkey);
+    load_or_empty_with_pq(path, domain_id, domain_pubkey, None)
+}
+
+/// **Z-1 Phase A** — same as [`load_or_empty`] but optionally binds
+/// the store to a v2-hybrid domain so `add` / `merge` enforce the
+/// ML-DSA-65 component on every entry. Pass `pq_pubkey = None` for a
+/// legacy Ed25519-only domain (identical to [`load_or_empty`]).
+pub fn load_or_empty_with_pq(
+    path: &Path,
+    domain_id: DomainId,
+    domain_pubkey: [u8; 32],
+    pq_pubkey: Option<Vec<u8>>,
+) -> Result<AdmissionRevocationStore, RevocationStoreError> {
+    let mut store = match pq_pubkey {
+        Some(pq) => AdmissionRevocationStore::for_hybrid_domain(domain_id, domain_pubkey, pq),
+        None => AdmissionRevocationStore::for_domain(domain_id, domain_pubkey),
+    };
     if !path.exists() {
         return Ok(store);
     }
@@ -484,5 +547,95 @@ mod tests {
         save(&path, &s).unwrap();
         let perms = std::fs::metadata(&path).unwrap().permissions();
         assert_eq!(perms.mode() & 0o777, 0o600);
+    }
+
+    // -----------------------------------------------------------------
+    // Z-1 Phase A — v2-hybrid store enforcement
+    // -----------------------------------------------------------------
+
+    fn fresh_hybrid_domain() -> (DomainKey, DomainId, [u8; 32], Vec<u8>) {
+        let key = DomainKey::generate_hybrid("acme.com", &mut OsRng);
+        let d = key.domain();
+        let pq_pk = d.pq_pubkey.clone().expect("hybrid pq_pubkey");
+        (key, d.id, d.pubkey, pq_pk)
+    }
+
+    /// A hybrid-bound store accepts a v2-signed revocation (the one
+    /// that carries `pq_signature`) and surfaces `is_revoked` for
+    /// it. Sanity baseline before the negative tests below.
+    #[test]
+    fn hybrid_store_accepts_hybrid_revocation() {
+        let (key, id, pk, pq_pk) = fresh_hybrid_domain();
+        let mut s = AdmissionRevocationStore::for_hybrid_domain(id, pk, pq_pk);
+        let rev = key.revoke_admission("peer-A".into(), 100, None);
+        assert!(rev.pq_signature.is_some());
+        assert!(s.add(rev).unwrap());
+        assert!(s.is_revoked("peer-A"));
+    }
+
+    /// **The store-side Phase A gate.** A hybrid-bound store rejects a
+    /// v1 (Ed25519-only) revocation that lacks `pq_signature` — even
+    /// when issued by the same DomainKey. Mirrors the cert-side gate
+    /// in `dds_domain::AdmissionCert::verify_with_domain`.
+    #[test]
+    fn hybrid_store_rejects_v1_revocation_lacking_pq_signature() {
+        let (key, id, pk, pq_pk) = fresh_hybrid_domain();
+        let mut s = AdmissionRevocationStore::for_hybrid_domain(id, pk, pq_pk);
+        // Strip the pq_signature to simulate an attacker presenting a
+        // v1-shaped revocation under a v2-hybrid domain.
+        let mut rev = key.revoke_admission("peer-A".into(), 100, None);
+        rev.pq_signature = None;
+        let err = s.add(rev).expect_err("hybrid store must reject v1 rev");
+        assert!(matches!(err, RevocationStoreError::Verify(_)));
+        assert!(!s.is_revoked("peer-A"));
+    }
+
+    /// Backward compat: a v1-bound store (no `pq_pubkey`) accepts both
+    /// v1 and v2 revocations from the same key. The PQ component is
+    /// carried as inert metadata and persisted alongside the entry.
+    #[test]
+    fn v1_store_accepts_both_v1_and_v2_revocations() {
+        let key = DomainKey::generate_hybrid("acme.com", &mut OsRng);
+        let d = key.domain();
+        let mut s = AdmissionRevocationStore::for_domain(d.id, d.pubkey);
+        // v2-shaped (carries pq_signature); v1 store ignores the PQ field.
+        let rev_v2 = key.revoke_admission("peer-A".into(), 0, None);
+        assert!(rev_v2.pq_signature.is_some());
+        assert!(s.add(rev_v2).unwrap());
+        // v1-shaped (pq_signature stripped).
+        let mut rev_v1 = key.revoke_admission("peer-B".into(), 0, None);
+        rev_v1.pq_signature = None;
+        assert!(s.add(rev_v1).unwrap());
+        assert!(s.is_revoked("peer-A"));
+        assert!(s.is_revoked("peer-B"));
+    }
+
+    /// `load_or_empty_with_pq` parses the persisted CBOR and re-runs
+    /// the v2 hybrid check at load time — entries that don't carry a
+    /// valid `pq_signature` are silently dropped. Mirrors the existing
+    /// `load_drops_entries_that_fail_to_verify` for foreign-domain
+    /// entries.
+    #[test]
+    fn load_or_empty_with_pq_drops_v1_only_entries() {
+        let (key, id, pk, pq_pk) = fresh_hybrid_domain();
+        // Build a list with one v1-only entry and one v2 entry,
+        // hand-crafted so the file pre-dates the hybrid rotation.
+        let mut rev_v1 = key.revoke_admission("peer-old".into(), 100, None);
+        rev_v1.pq_signature = None;
+        let rev_v2 = key.revoke_admission("peer-new".into(), 200, None);
+        let list = RevocationListV1 {
+            v: SCHEMA_VERSION,
+            entries: vec![rev_v1, rev_v2],
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("revocations.cbor");
+        let mut buf = Vec::new();
+        ciborium::into_writer(&list, &mut buf).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+
+        let loaded = load_or_empty_with_pq(&path, id, pk, Some(pq_pk)).unwrap();
+        assert_eq!(loaded.len(), 1, "v1-only entry must be dropped");
+        assert!(!loaded.is_revoked("peer-old"));
+        assert!(loaded.is_revoked("peer-new"));
     }
 }

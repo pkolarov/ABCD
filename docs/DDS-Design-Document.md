@@ -199,18 +199,21 @@ DDS uses **libp2p** as the networking substrate:
 - **mDNS** — Local network peer discovery for zero-config LAN operation
 - **Noise protocol** — Transport encryption for all peer connections
 
-> ⚠ **Open: post-quantum gap in the transport handshake (Z-1, Critical).**
-> The Noise XX handshake uses X25519 DH and the QUIC keyshare uses
-> classical ECDHE (rustls). Token signatures are hybrid PQ
-> (Ed25519+ML-DSA-65) but the transport channel is **not**. A
-> Harvest-Now-Decrypt-Later adversary can record gossipsub /
-> sync / admission traffic today and recover plaintext on a future
-> quantum break. Tracked in
-> [Claude_sec_review.md](../Claude_sec_review.md) Z-1 and
-> [docs/threat-model-review.md](threat-model-review.md) §4. Remediation
-> waits on hybrid-Noise upstream (rust-libp2p tracking issue rs/9595)
-> or an interim per-message hybrid-KEM envelope on the application
-> layer.
+> ⚠ **Partial: post-quantum gap in the transport handshake (Z-1, High).**
+> The Noise XX handshake still uses X25519 DH and the QUIC keyshare
+> still uses classical ECDHE (rustls). Token signatures are hybrid PQ
+> (Ed25519+ML-DSA-65), and as of **Z-1 Phase A (2026-04-28)** the
+> `AdmissionCert` and `AdmissionRevocation` are also hybrid PQ — a
+> v2-hybrid domain (`Domain.pq_pubkey` populated) rejects any cert or
+> revocation that lacks the ML-DSA-65 component. The transport
+> channel itself is **still not** post-quantum: a
+> Harvest-Now-Decrypt-Later adversary can record gossipsub / sync
+> traffic today and recover plaintext on a future quantum break.
+> Tracked in [Claude_sec_review.md](../Claude_sec_review.md) Z-1 and
+> [docs/threat-model-review.md](threat-model-review.md) §4. Remaining
+> remediation waits on hybrid-Noise upstream (rust-libp2p tracking
+> issue rs/9595) or an interim per-message hybrid-KEM envelope on the
+> application layer.
 
 ### 6.2 Domain Isolation & Topic Structure
 
@@ -384,12 +387,16 @@ To prevent resource exhaustion in trust graph evaluation:
 
 ### 8.4 Per-Peer Admission (H-12)
 
-A DDS node binds to its domain by holding an `AdmissionCert` — an
-Ed25519 signature from the domain key over `(domain_id, peer_id,
-issued_at, expires_at)`. Self-verification at startup is necessary
-but not sufficient: without a peer-facing exchange, any libp2p peer
-that completes Noise can publish into gossip/sync without being
-admitted.
+A DDS node binds to its domain by holding an `AdmissionCert` — a
+domain-key signature over `(domain_id, peer_id, issued_at,
+expires_at)`. The signature is Ed25519 on legacy v1 domains; on
+v2-hybrid domains (Z-1 Phase A, `Domain.pq_pubkey` populated) the
+cert additionally carries an ML-DSA-65 (FIPS 204) signature with the
+`dds-admission-v2/mldsa65\0` domain separator, and the verifier
+rejects any cert lacking the PQ component. Self-verification at
+startup is necessary but not sufficient: without a peer-facing
+exchange, any libp2p peer that completes Noise can publish into
+gossip/sync without being admitted.
 
 Design:
 
@@ -399,9 +406,12 @@ Design:
   its admission cert (carried as opaque CBOR bytes so the network
   layer stays independent of the domain layer).
 - `DdsNode::admitted_peers: BTreeSet<PeerId>` is populated only
-  after `AdmissionCert::verify(&domain_pubkey, &domain_id,
-  &peer_id.to_string(), now)` succeeds. Failure is silently logged;
-  the peer stays unadmitted.
+  after `AdmissionCert::verify_with_domain(&domain,
+  &peer_id.to_string(), now)` succeeds — the v2-aware entry point
+  that re-verifies the body invariants and the Ed25519 signature, and
+  on a v2-hybrid `Domain` also requires the ML-DSA-65 `pq_signature`
+  to verify (Z-1 Phase A). Failure is silently logged; the peer stays
+  unadmitted.
 - Gossipsub `Event::Message { propagation_source, .. }` is gated on
   `propagation_source ∈ admitted_peers` before the message reaches
   `handle_gossip_message`. Sync request/response events are gated

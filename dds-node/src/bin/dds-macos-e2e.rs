@@ -350,6 +350,7 @@ async fn publish_fixture(
             name: domain.name.clone(),
             id: domain.id.to_string(),
             pubkey: to_hex(&domain.pubkey),
+            pq_pubkey: None,
             admission_path: None,
             audit_log_enabled: false,
             max_delegation_depth: 5,

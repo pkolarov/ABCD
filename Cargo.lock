@@ -927,6 +927,8 @@ dependencies = [
  "dds-core",
  "ed25519-dalek",
  "p256",
+ "pqcrypto-mldsa",
+ "pqcrypto-traits",
  "rand 0.8.5",
  "rand_core 0.6.4",
  "rcgen",

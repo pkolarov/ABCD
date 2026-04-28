@@ -111,12 +111,16 @@ pub struct DdsNode {
     pub topics: DdsTopicSet,
     pub config: NodeConfig,
     /// **M-6 (security review)**: retained admission cert + domain
-    /// pubkey + domain id so we can re-verify the cert on every
+    /// descriptor so we can re-verify the cert on every
     /// `ADMISSION_RECHECK_INTERVAL` tick. Without a periodic re-verify
     /// a node whose cert has expired keeps operating until restart.
+    ///
+    /// **Z-1 Phase A**: holds the full [`dds_domain::Domain`]
+    /// (including the optional ML-DSA-65 `pq_pubkey`) so verification
+    /// routes through `verify_with_domain` and enforces the hybrid
+    /// component on every cert / revocation when the domain is v2.
     admission_cert: dds_domain::AdmissionCert,
-    domain_pubkey: [u8; 32],
-    domain_id: DomainId,
+    domain: dds_domain::Domain,
     /// In-memory cache of live `SyncPayload`s, keyed by operation id.
     /// Built up at gossip-ingest time so the anti-entropy responder can
     /// reply without re-deriving op→token mapping at lookup time.
@@ -236,6 +240,27 @@ impl DdsNode {
             return Err("domain.pubkey does not hash to domain.id".into());
         }
 
+        // **Z-1 Phase A** — assemble the full Domain descriptor. The
+        // optional ML-DSA-65 `pq_pubkey` is parsed from
+        // `config.domain.pq_pubkey` when present; absent ⇒ legacy
+        // Ed25519-only domain (the v1 default). `verify_self_consistent`
+        // re-checks both the Ed25519 hash invariant and the PQ pubkey
+        // length so a hand-edited config can't slip past the early-startup
+        // gate.
+        let pq_pubkey = match config.domain.pq_pubkey.as_deref() {
+            Some(hex) if !hex.is_empty() => Some(from_hex(hex)?),
+            _ => None,
+        };
+        let domain = dds_domain::Domain {
+            name: config.domain.name.clone(),
+            id: domain_id,
+            pubkey: domain_pubkey,
+            pq_pubkey,
+        };
+        domain
+            .verify_self_consistent()
+            .map_err(|e| format!("domain config: {e}"))?;
+
         // Open storage
         let store = RedbBackend::open(config.db_path())?;
 
@@ -261,9 +286,14 @@ impl DdsNode {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| format!("system clock error, cannot verify admission cert: {e}"))?
             .as_secs();
-        cert.verify(&domain_pubkey, &domain_id, &peer_id.to_string(), now)
+        cert.verify_with_domain(&domain, &peer_id.to_string(), now)
             .map_err(|e| format!("admission cert verification failed: {e}"))?;
-        info!(domain = %config.domain.name, %peer_id, "admission cert verified");
+        info!(
+            domain = %domain.name,
+            %peer_id,
+            hybrid = domain.is_hybrid(),
+            "admission cert verified"
+        );
 
         // Threat-model §1 — admission cert revocation list (open item #4):
         // Load the domain-signed revocation list and refuse to start if
@@ -271,15 +301,22 @@ impl DdsNode {
         // compromised node could keep restarting after the admin issued
         // a revocation — only peer-side enforcement would stop it from
         // talking to the network.
+        // **Z-1 Phase A**: when the domain is v2-hybrid, route through
+        // `load_or_empty_with_pq` so the store enforces the ML-DSA-65
+        // component on every revocation it loads or merges.
         let revocations_path = config.admission_revocations_path();
-        let admission_revocations =
-            admission_revocation_store::load_or_empty(&revocations_path, domain_id, domain_pubkey)
-                .map_err(|e| {
-                    format!(
-                        "failed to load admission revocation list from {}: {e}",
-                        revocations_path.display()
-                    )
-                })?;
+        let admission_revocations = admission_revocation_store::load_or_empty_with_pq(
+            &revocations_path,
+            domain.id,
+            domain.pubkey,
+            domain.pq_pubkey.clone(),
+        )
+        .map_err(|e| {
+            format!(
+                "failed to load admission revocation list from {}: {e}",
+                revocations_path.display()
+            )
+        })?;
         if admission_revocations.is_revoked(&peer_id.to_string()) {
             return Err(format!(
                 "this node's admission has been revoked (peer_id {peer_id}); refusing to start. \
@@ -319,8 +356,7 @@ impl DdsNode {
             sync_payloads: BTreeMap::new(),
             sync_last_outbound: BTreeMap::new(),
             admission_cert: cert,
-            domain_pubkey,
-            domain_id,
+            domain,
             mdns_rate: (Instant::now(), 0),
             mdns_known_peers: BTreeSet::new(),
             admitted_peers: BTreeSet::new(),
@@ -493,12 +529,7 @@ impl DdsNode {
             .map_err(|e| format!("system clock error: {e}"))?
             .as_secs();
         self.admission_cert
-            .verify(
-                &self.domain_pubkey,
-                &self.domain_id,
-                &self.peer_id.to_string(),
-                now,
-            )
+            .verify_with_domain(&self.domain, &self.peer_id.to_string(), now)
             .map_err(|e| format!("{e}"))
     }
 
@@ -752,7 +783,7 @@ impl DdsNode {
                 return;
             }
         };
-        match cert.verify(&self.domain_pubkey, &self.domain_id, &peer_str, now) {
+        match cert.verify_with_domain(&self.domain, &peer_str, now) {
             Ok(()) => {
                 info!(%peer_id, "H-12: peer admitted to domain");
                 self.admitted_peers.insert(peer_id);

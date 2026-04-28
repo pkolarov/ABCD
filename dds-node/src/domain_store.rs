@@ -58,6 +58,12 @@ impl std::fmt::Display for DomainStoreError {
 impl std::error::Error for DomainStoreError {}
 
 /// On-disk TOML representation of the public [`Domain`].
+///
+/// **Z-1 Phase A** — the optional `pq_pubkey` field carries the
+/// hex-encoded ML-DSA-65 public key (1,952 bytes ⇒ 3,904 hex chars)
+/// when the domain has been rotated to v2-hybrid. Absent on v1
+/// domains; legacy `domain.toml` files without the field
+/// deserialize cleanly under `#[serde(default)]`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DomainFile {
     pub name: String,
@@ -65,6 +71,10 @@ pub struct DomainFile {
     pub id: String,
     /// Hex-encoded 32-byte Ed25519 public key.
     pub pubkey: String,
+    /// **Z-1 Phase A** — hex-encoded ML-DSA-65 public key for v2
+    /// hybrid domains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_pubkey: Option<String>,
 }
 
 impl DomainFile {
@@ -73,6 +83,7 @@ impl DomainFile {
             name: domain.name.clone(),
             id: domain.id.to_string(),
             pubkey: to_hex(&domain.pubkey),
+            pq_pubkey: domain.pq_pubkey.as_deref().map(to_hex),
         }
     }
 
@@ -87,10 +98,17 @@ impl DomainFile {
         }
         let mut pubkey = [0u8; 32];
         pubkey.copy_from_slice(&pk_vec);
+        let pq_pubkey = match self.pq_pubkey {
+            Some(hex) if !hex.is_empty() => {
+                Some(from_hex(&hex).map_err(|e| DomainStoreError::Domain(e.to_string()))?)
+            }
+            _ => None,
+        };
         let domain = Domain {
             name: self.name,
             id,
             pubkey,
+            pq_pubkey,
         };
         domain
             .verify_self_consistent()

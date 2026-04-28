@@ -602,6 +602,10 @@ pub fn run_provision(
         name: bundle.domain_name.clone(),
         id: expected_id,
         pubkey,
+        // **Z-1 Phase A**: provisioning bundles are still Ed25519-only
+        // for v1; a future bundle-format bump can carry the v2 pubkey
+        // alongside the Ed25519 one.
+        pq_pubkey: None,
     };
     domain_store::save_domain_file(&data_dir.join("domain.toml"), &domain)?;
 

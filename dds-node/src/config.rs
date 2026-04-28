@@ -67,6 +67,13 @@ pub struct DomainConfig {
     pub id: String,
     /// Hex-encoded 32-byte Ed25519 public key for the domain.
     pub pubkey: String,
+    /// **Z-1 Phase A** — hex-encoded ML-DSA-65 public key (1,952
+    /// bytes ⇒ 3,904 hex chars) when the domain has been rotated to
+    /// v2-hybrid. Absent (or empty string) ⇒ legacy Ed25519-only
+    /// domain. Once present, the node enforces the hybrid PQ
+    /// component on every admission cert and admission revocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_pubkey: Option<String>,
     /// Path to the admission certificate. Defaults to
     /// `<data_dir>/admission.cbor`.
     #[serde(default)]

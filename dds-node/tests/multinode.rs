@@ -69,6 +69,7 @@ async fn spawn_node(org: &str) -> (DdsNode, TempDir) {
             name: domain.name.clone(),
             id: domain.id.to_string(),
             pubkey: dds_domain::domain::to_hex(&domain.pubkey),
+            pq_pubkey: None,
             admission_path: None,
             audit_log_enabled: false,
             max_delegation_depth: 5,

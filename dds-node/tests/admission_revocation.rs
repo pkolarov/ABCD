@@ -52,6 +52,7 @@ fn build_node_dir(secret: [u8; 32]) -> (TempDir, NodeConfig, libp2p::identity::K
             name: domain.name.clone(),
             id: domain.id.to_string(),
             pubkey: dds_domain::domain::to_hex(&domain.pubkey),
+            pq_pubkey: None,
             admission_path: None,
             audit_log_enabled: false,
             max_delegation_depth: 5,
