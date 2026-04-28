@@ -20,7 +20,10 @@ DDS_ROOT="/Library/Application Support/DDS"
 NODE_DATA="${DDS_ROOT}/node-data"
 NODE_BIN="/usr/local/bin/dds-node"
 DDS_CLI="/usr/local/bin/dds"
-API_URL="http://127.0.0.1:5551"
+# **SC-2** — Local API talks UDS only. Use `curl --unix-socket` to hit
+# the loopback HTTP endpoint via peer-cred-authenticated transport.
+API_SOCK="${DDS_ROOT}/dds.sock"
+API_URL="http://localhost"
 
 # ---- Preflight ----
 if [[ $EUID -ne 0 ]]; then
@@ -119,7 +122,15 @@ bootstrap_peers = []
 mdns_enabled = true
 heartbeat_secs = 5
 idle_timeout_secs = 60
-api_addr = "127.0.0.1:5551"
+# SC-2: peer-cred-authenticated UDS, not anonymous loopback TCP.
+api_addr = "unix:${API_SOCK}"
+
+# SC-2: refuse anonymous loopback-TCP fallback to admin endpoints; all
+# macOS clients now talk over the UDS above and supply a real
+# CallerIdentity. strict_device_binding is the M-8 step-2 partner.
+[network.api_auth]
+trust_loopback_tcp_admin = false
+strict_device_binding = true
 
 [domain]
 name = "${DOMAIN_NAME}"
@@ -139,14 +150,14 @@ launchctl bootstrap system /Library/LaunchDaemons/com.dds.node.plist 2>/dev/null
 # Wait for node to become ready
 printf "  Waiting for node..."
 for i in {1..30}; do
-  if curl -sf "${API_URL}/v1/status" > /dev/null 2>&1; then
+  if curl -sf --unix-socket "${API_SOCK}" "${API_URL}/v1/status" > /dev/null 2>&1; then
     echo " ready!"
     break
   fi
   printf "."
   sleep 1
 done
-curl -sf "${API_URL}/v1/status" > /dev/null 2>&1 || { echo " FAILED (node not responding)" >&2; exit 1; }
+curl -sf --unix-socket "${API_SOCK}" "${API_URL}/v1/status" > /dev/null 2>&1 || { echo " FAILED (node not responding)" >&2; exit 1; }
 
 echo ""
 echo "[6/7] Enrolling this Mac as a device..."
@@ -154,7 +165,7 @@ HOSTNAME_VALUE="$(hostname)"
 OS_VERSION="$(sw_vers -productVersion 2>/dev/null || echo 'unknown')"
 DEVICE_ID="DDS-MACOS-$(hostname -s | tr '[:lower:]' '[:upper:]')"
 
-ENROLL_RESP=$(curl -sf \
+ENROLL_RESP=$(curl -sf --unix-socket "${API_SOCK}" \
   -X POST "${API_URL}/v1/enroll/device" \
   -H 'Content-Type: application/json' \
   -d "{

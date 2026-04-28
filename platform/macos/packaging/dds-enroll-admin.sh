@@ -16,7 +16,10 @@
 set -euo pipefail
 
 DDS_ROOT="/Library/Application Support/DDS"
-API_URL="http://127.0.0.1:5551"
+# **SC-2** — Local API talks UDS only. Use `curl --unix-socket` to hit
+# the loopback HTTP endpoint via peer-cred-authenticated transport.
+API_SOCK="${DDS_ROOT}/dds.sock"
+API_URL="http://localhost"
 DDS_CLI="/usr/local/bin/dds"
 FIDO2_TEST="/usr/local/bin/dds-fido2-test"
 
@@ -27,7 +30,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 [[ -f "${DDS_ROOT}/dds.toml" ]] || { echo "Error: run dds-bootstrap-domain first" >&2; exit 1; }
-curl -sf "${API_URL}/v1/status" > /dev/null 2>&1 || { echo "Error: dds-node not running" >&2; exit 1; }
+curl -sf --unix-socket "${API_SOCK}" "${API_URL}/v1/status" > /dev/null 2>&1 || { echo "Error: dds-node not running" >&2; exit 1; }
 
 echo ""
 echo "=== DDS Admin Enrollment ==="
@@ -119,7 +122,7 @@ launchctl kickstart -k system/com.dds.node 2>/dev/null || true
 # Wait for node to come back
 printf "  Waiting for node..."
 for i in {1..15}; do
-  if curl -sf "${API_URL}/v1/status" > /dev/null 2>&1; then
+  if curl -sf --unix-socket "${API_SOCK}" "${API_URL}/v1/status" > /dev/null 2>&1; then
     echo " ready!"
     break
   fi

@@ -747,7 +747,30 @@ pub fn run_provision(
     // stamp `pq_pubkey` into `[domain]` so `cmd_run` loads a v2-hybrid
     // verifier. Plain Ed25519 deployments emit a byte-identical config
     // to the pre-SC-1 layout.
+    //
+    // **SC-2**: on Unix the local API now defaults to a UDS instead of
+    // anonymous loopback TCP. The Rust node's UDS listener extracts
+    // peer credentials (`getpeereid` / `SO_PEERCRED`) on every accepted
+    // connection so admin endpoints are gated on the caller's UID.
+    // Pair the UDS with `[network.api_auth] trust_loopback_tcp_admin =
+    // false` (refuse anonymous TCP fallbacks) and `strict_device_binding
+    // = true` (M-8 step-2 — refuse Anonymous callers on device-scoped
+    // reads). On Windows the same role is filled by the named-pipe
+    // listener configured by the MSI; until single-file provisioning
+    // grows pipe-first defaults too, the Windows branch keeps the
+    // pre-SC-2 loopback TCP layout.
     let config_path = config_dir.join("dds.toml");
+    #[cfg(unix)]
+    let (api_addr_for_config, api_auth_block) = (
+        format!("unix:{}", config_dir.join("dds.sock").display()),
+        "\n[network.api_auth]\n\
+         trust_loopback_tcp_admin = false\n\
+         strict_device_binding = true\n"
+            .to_string(),
+    );
+    #[cfg(not(unix))]
+    let (api_addr_for_config, api_auth_block) =
+        (format!("127.0.0.1:{}", bundle.api_port), String::new());
     let pq_pubkey_line = match bundle.domain_pq_pubkey.as_deref() {
         Some(hex) if !hex.is_empty() => format!("pq_pubkey = \"{hex}\"\n"),
         _ => String::new(),
@@ -764,7 +787,7 @@ bootstrap_peers = []
 mdns_enabled = {mdns}
 heartbeat_secs = 5
 idle_timeout_secs = 60
-api_addr = "127.0.0.1:{api_port}"
+api_addr = "{api_addr}"
 
 [domain]
 name = "{domain_name}"
@@ -772,12 +795,13 @@ id = "{domain_id}"
 pubkey = "{domain_pubkey}"
 {pq_pubkey_line}admission_path = "{admission}"
 audit_log_enabled = false
-"#,
+{api_auth_block}"#,
         data_dir = data_dir.display(),
         org_hash = bundle.org_hash,
         listen_port = bundle.listen_port,
         mdns = bundle.mdns_enabled,
-        api_port = bundle.api_port,
+        api_addr = api_addr_for_config,
+        api_auth_block = api_auth_block,
         domain_name = bundle.domain_name,
         domain_id = bundle.domain_id,
         domain_pubkey = bundle.domain_pubkey,
@@ -807,12 +831,15 @@ audit_log_enabled = false
         println!("[5/6] Starting node...");
         start_platform_node(&config_path)?;
 
-        // Wait for health
-        let api_url = format!("http://127.0.0.1:{}", bundle.api_port);
+        // Wait for health. SC-2: on Unix the API binds a UDS, so we
+        // route both the readiness check and the enrollment POST
+        // through `curl --unix-socket`. On Windows the loopback TCP
+        // fallback still applies.
+        let api_addr: ApiAddr = api_addr_for_config.as_str().into();
         print!("  Waiting for node...");
         let mut ready = false;
         for _ in 0..30 {
-            if reqwest_blocking_status_check(&api_url) {
+            if api_addr.status_check() {
                 println!(" ready!");
                 ready = true;
                 break;
@@ -827,7 +854,7 @@ audit_log_enabled = false
         // Enroll device
         if ready {
             println!("[6/6] Enrolling this device...");
-            match enroll_this_device(&api_url, &bundle.org_hash) {
+            match enroll_this_device(&api_addr, &bundle.org_hash) {
                 Ok(urn) => {
                     println!("  Device URN: {urn}");
                     summary.device_urn = Some(urn);
@@ -914,17 +941,56 @@ fn start_platform_node(config_path: &Path) -> Result<(), ProvisionError> {
     }
 }
 
-fn reqwest_blocking_status_check(api_url: &str) -> bool {
-    std::process::Command::new("curl")
-        .args(["-sf", &format!("{api_url}/v1/status")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// Local-API address the readiness check and enrollment POST need to
+/// reach. SC-2 introduced `unix:` defaults on Unix, so the `curl`
+/// invocation has to switch to `--unix-socket`.
+enum ApiAddr {
+    /// `unix:/path/to/sock` — pass `/path/to/sock` to `curl --unix-socket`,
+    /// then any HTTP URL works as the request target (we use
+    /// `http://localhost/...`).
+    Unix(String),
+    /// Plain `host:port` — passed through as `http://host:port/...`.
+    Tcp(String),
 }
 
-fn enroll_this_device(api_url: &str, org_hash: &str) -> Result<String, ProvisionError> {
+impl From<&str> for ApiAddr {
+    fn from(addr: &str) -> Self {
+        if let Some(path) = addr.strip_prefix("unix:") {
+            ApiAddr::Unix(path.to_string())
+        } else {
+            ApiAddr::Tcp(addr.to_string())
+        }
+    }
+}
+
+impl ApiAddr {
+    fn curl_args<'a>(&'a self, target_path: &'a str) -> (Option<&'a str>, String) {
+        match self {
+            ApiAddr::Unix(sock) => (
+                Some(sock.as_str()),
+                format!("http://localhost{target_path}"),
+            ),
+            ApiAddr::Tcp(hp) => (None, format!("http://{hp}{target_path}")),
+        }
+    }
+
+    fn status_check(&self) -> bool {
+        let (sock, url) = self.curl_args("/v1/status");
+        let mut cmd = std::process::Command::new("curl");
+        cmd.arg("-sf");
+        if let Some(s) = sock {
+            cmd.args(["--unix-socket", s]);
+        }
+        cmd.arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
+fn enroll_this_device(api_addr: &ApiAddr, org_hash: &str) -> Result<String, ProvisionError> {
     let hostname = gethostname();
     let os_name = match std::env::consts::OS {
         "macos" => "macOS",
@@ -944,12 +1010,17 @@ fn enroll_this_device(api_url: &str, org_hash: &str) -> Result<String, Provision
         org_hash
     );
 
-    let output = std::process::Command::new("curl")
+    let (sock, url) = api_addr.curl_args("/v1/enroll/device");
+    let mut cmd = std::process::Command::new("curl");
+    cmd.arg("-sf");
+    if let Some(s) = sock {
+        cmd.args(["--unix-socket", s]);
+    }
+    let output = cmd
         .args([
-            "-sf",
             "-X",
             "POST",
-            &format!("{api_url}/v1/enroll/device"),
+            &url,
             "-H",
             "Content-Type: application/json",
             "-d",
@@ -1253,6 +1324,92 @@ mod tests {
         let config = std::fs::read_to_string(&result.config_path).unwrap();
         assert!(config.contains("provision-test"));
         assert!(config.contains("test-org"));
+    }
+
+    /// **SC-2** — single-file provisioning emits UDS-first defaults
+    /// on Unix: `api_addr` points at a `unix:` socket inside the
+    /// config dir and `[network.api_auth]` flips
+    /// `trust_loopback_tcp_admin = false` + `strict_device_binding =
+    /// true`. On Windows the legacy loopback TCP layout still applies
+    /// (the named-pipe MSI handles the equivalent role there) and the
+    /// `[network.api_auth]` block must NOT appear.
+    ///
+    /// The domain key is saved under an explicit passphrase so the
+    /// test stays green even when `DDS_REQUIRE_ENCRYPTED_KEYS` happens
+    /// to be set by a sibling test running concurrently under the
+    /// `PASSPHRASE_ENV_LOCK` (a separate mutex from the `ENV_LOCK`
+    /// we hold here — see `identity_store::PASSPHRASE_ENV_LOCK` and
+    /// `crate::TEST_ENV_LOCK`).
+    #[test]
+    fn provision_writes_uds_first_api_defaults() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = TempDir::new().unwrap();
+        let domain_dir = dir.path().join("domain");
+        std::fs::create_dir_all(&domain_dir).unwrap();
+
+        unsafe { std::env::set_var("DDS_DOMAIN_PASSPHRASE", "sc2-test-pass") };
+        let key = DomainKey::generate("sc2-test", &mut OsRng);
+        let domain = key.domain();
+        domain_store::save_domain_file(&domain_dir.join("domain.toml"), &domain).unwrap();
+        domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
+
+        let bundle_path = dir.path().join("test.dds");
+        create_bundle(&domain_dir, "sc2-org", &bundle_path).unwrap();
+
+        let data_dir = dir.path().join("node-data");
+        let result = run_provision(&bundle_path, Some(&data_dir), false).unwrap();
+
+        let cfg = std::fs::read_to_string(&result.config_path).unwrap();
+
+        // SC-2 also re-loads the emitted dds.toml through the real
+        // parser so a typo in the [network.api_auth] block would fail
+        // the test rather than silently regress.
+        let parsed = crate::config::NodeConfig::from_str(&cfg).unwrap();
+
+        #[cfg(unix)]
+        {
+            let expected_sock = data_dir
+                .parent()
+                .expect("config_dir = data_dir.parent()")
+                .join("dds.sock");
+            assert_eq!(
+                parsed.network.api_addr,
+                format!("unix:{}", expected_sock.display()),
+                "Unix provisioning must default to unix: socket api_addr; got: {}",
+                parsed.network.api_addr
+            );
+            assert!(
+                !parsed.network.api_auth.trust_loopback_tcp_admin,
+                "Unix provisioning must disable trust_loopback_tcp_admin"
+            );
+            assert!(
+                parsed.network.api_auth.strict_device_binding,
+                "Unix provisioning must enable strict_device_binding"
+            );
+            assert!(
+                cfg.contains("[network.api_auth]"),
+                "Unix provisioning must emit [network.api_auth] block; got:\n{cfg}"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(
+                parsed.network.api_addr.starts_with("127.0.0.1:"),
+                "Windows provisioning keeps loopback TCP api_addr; got: {}",
+                parsed.network.api_addr
+            );
+            assert!(
+                parsed.network.api_auth.trust_loopback_tcp_admin,
+                "Windows provisioning keeps trust_loopback_tcp_admin = true \
+                 until single-file provisioning grows pipe-first defaults"
+            );
+            assert!(
+                !cfg.contains("[network.api_auth]"),
+                "Windows provisioning must not emit [network.api_auth] block; got:\n{cfg}"
+            );
+        }
+
+        unsafe { std::env::remove_var("DDS_DOMAIN_PASSPHRASE") };
     }
 
     #[test]

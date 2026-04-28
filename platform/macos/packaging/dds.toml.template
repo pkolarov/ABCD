@@ -11,7 +11,19 @@ bootstrap_peers = [__BOOTSTRAP_PEERS__]
 mdns_enabled = true
 heartbeat_secs = 5
 idle_timeout_secs = 60
-api_addr = "127.0.0.1:5551"
+# **SC-2** — Local API binds a UDS by default. The Rust node extracts
+# the caller's UID via `getpeereid` on every accepted connection, so
+# admin-gated endpoints are now peer-cred-authenticated end to end.
+api_addr = "unix:/Library/Application Support/DDS/dds.sock"
+
+# **SC-2** — Refuse anonymous loopback-TCP fallback to admin endpoints
+# now that all macOS clients (the .NET Policy Agent, dds-cli, the
+# bootstrap script) talk over the UDS above. `strict_device_binding`
+# is the M-8 step-2 partner: device-scoped reads require a real
+# CallerIdentity (UDS peer creds) instead of trusting Anonymous.
+[network.api_auth]
+trust_loopback_tcp_admin = false
+strict_device_binding = true
 
 [domain]
 name = "__DOMAIN_NAME__"
