@@ -1054,6 +1054,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sha2",
  "sysinfo",

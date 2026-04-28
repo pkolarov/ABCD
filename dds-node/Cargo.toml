@@ -27,6 +27,7 @@ dds-net = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true, features = ["std", "derive"] }
+serde_bytes = { workspace = true }
 ciborium = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }

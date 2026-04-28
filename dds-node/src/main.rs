@@ -2,12 +2,19 @@
 //!
 //! Subcommands (hand-rolled, no clap dependency):
 //!
-//! - `dds-node init-domain --name <NAME> --dir <DIR>`
-//!   Genesis ceremony. Creates a fresh domain Ed25519 keypair, writes
+//! - `dds-node init-domain --name <NAME> --dir <DIR> [--fido2] [--hybrid]`
+//!   Genesis ceremony. Creates a fresh domain keypair, writes
 //!   `<DIR>/domain.toml` (public — share with siblings) and
 //!   `<DIR>/domain_key.bin` (secret — keep safe; encrypted with
-//!   `DDS_DOMAIN_PASSPHRASE` if set). Stage 2 will replace the secret
-//!   half with a FIDO2-backed signer.
+//!   `DDS_DOMAIN_PASSPHRASE` if set). Plain mode generates an
+//!   Ed25519-only keypair (v1/v2 on-disk format). `--hybrid` (Z-1
+//!   Phase A) generates a hybrid Ed25519 + ML-DSA-65 (FIPS 204) keypair
+//!   so the resulting `Domain` advertises a `pq_pubkey` and every
+//!   `AdmissionCert` / `AdmissionRevocation` minted under it carries a
+//!   PQ signature alongside the Ed25519 one (v4/v5 on-disk format).
+//!   `--fido2` and `--hybrid` are mutually exclusive on this command —
+//!   v3 (FIDO2-protected) is Ed25519-only today; v6 hybrid+FIDO2 is a
+//!   future Phase A-3 follow-up.
 //!
 //! - `dds-node gen-node-key --data-dir <DIR>`
 //!   Generates the persistent libp2p keypair and prints the resulting
@@ -130,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn print_usage() {
     eprintln!(
         "Usage:
-  dds-node init-domain --name <NAME> --dir <DIR> [--fido2]
+  dds-node init-domain --name <NAME> --dir <DIR> [--fido2 | --hybrid]
   dds-node gen-node-key --data-dir <DIR>
   dds-node rotate-identity --data-dir <DIR> [--no-backup]
   dds-node gen-hmac-secret --out <FILE> [--force] [--keep-existing]
@@ -165,14 +172,33 @@ fn cmd_init_domain(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let name = require_flag(args, "--name")?;
     let dir = PathBuf::from(require_flag(args, "--dir")?);
     let use_fido2 = args.iter().any(|a| a == "--fido2");
+    // **Z-1 Phase A** — `--hybrid` opts the new domain into v2 hybrid
+    // (Ed25519 + ML-DSA-65). Without the flag, behaviour is unchanged
+    // (v1 Ed25519-only).
+    let use_hybrid = args.iter().any(|a| a == "--hybrid");
+    if use_hybrid && use_fido2 {
+        return Err(
+            "--hybrid and --fido2 are mutually exclusive: the FIDO2 hmac-secret \
+             vault path only protects the Ed25519 half today (v6 hybrid+FIDO2 is a \
+             future Phase A-3 follow-up)"
+                .into(),
+        );
+    }
     std::fs::create_dir_all(&dir)?;
 
     let mut rng = rand::rngs::OsRng;
-    let key = DomainKey::generate(name, &mut rng);
+    let key = if use_hybrid {
+        DomainKey::generate_hybrid(name, &mut rng)
+    } else {
+        DomainKey::generate(name, &mut rng)
+    };
     let domain = key.domain();
 
     let domain_path = dir.join("domain.toml");
     let key_path = dir.join("domain_key.bin");
+    // `save_domain_file` writes the optional `pq_pubkey` automatically
+    // when the underlying `Domain` carries one (DomainFile field is
+    // `#[serde(default, skip_serializing_if = "Option::is_none")]`).
     domain_store::save_domain_file(&domain_path, &domain)?;
 
     if use_fido2 {
@@ -188,6 +214,9 @@ fn cmd_init_domain(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     } else {
+        // `save_domain_key` picks the right on-disk version (v1 plain,
+        // v2 encrypted, v4 plain hybrid, v5 encrypted hybrid) based on
+        // `key.is_hybrid()` and `DDS_DOMAIN_PASSPHRASE`.
         domain_store::save_domain_key(&key_path, &key)?;
     }
 
@@ -195,11 +224,23 @@ fn cmd_init_domain(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("  name:        {}", domain.name);
     println!("  id:          {}", domain.id);
     println!("  pubkey:      {}", to_hex(&domain.pubkey));
+    if let Some(pq) = &domain.pq_pubkey {
+        println!(
+            "  pq_pubkey:   {} ({} bytes ML-DSA-65)",
+            to_hex(pq),
+            pq.len()
+        );
+    }
     println!(
         "  domain.toml: {} (share with siblings)",
         domain_path.display()
     );
     println!("  domain_key:  {} (keep secret)", key_path.display());
+    if use_hybrid {
+        println!(
+            "  scheme:      v2 hybrid (Ed25519 + ML-DSA-65) — Z-1 Phase A admission cert path"
+        );
+    }
     if use_fido2 {
         println!("  protection:  FIDO2 hardware key (touch to unlock)");
     }
@@ -559,12 +600,29 @@ fn cmd_import_revocation(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     }
     let mut domain_pubkey = [0u8; 32];
     domain_pubkey.copy_from_slice(&pk_vec);
+    // **Z-1 Phase A** — when the configured domain is v2-hybrid,
+    // route through the hybrid-aware import + load so the imported
+    // revocation must carry a valid ML-DSA-65 `pq_signature`.
+    let pq_pubkey = match cfg.domain.pq_pubkey.as_deref() {
+        Some(hex) if !hex.is_empty() => Some(dds_domain::domain::from_hex(hex)?),
+        _ => None,
+    };
 
     let list_path = cfg.admission_revocations_path();
-    let (added, _) =
-        admission_revocation_store::import_into(&list_path, &in_path, domain_id, domain_pubkey)?;
+    let (added, _) = admission_revocation_store::import_into_with_pq(
+        &list_path,
+        &in_path,
+        domain_id,
+        domain_pubkey,
+        pq_pubkey.clone(),
+    )?;
 
-    let store = admission_revocation_store::load_or_empty(&list_path, domain_id, domain_pubkey)?;
+    let store = admission_revocation_store::load_or_empty_with_pq(
+        &list_path,
+        domain_id,
+        domain_pubkey,
+        pq_pubkey,
+    )?;
     if added {
         println!("Imported revocation into {}", list_path.display());
     } else {
@@ -616,9 +674,18 @@ fn cmd_list_revocations(args: &[String]) -> Result<(), Box<dyn std::error::Error
     }
     let mut domain_pubkey = [0u8; 32];
     domain_pubkey.copy_from_slice(&pk_vec);
+    let pq_pubkey = match cfg.domain.pq_pubkey.as_deref() {
+        Some(hex) if !hex.is_empty() => Some(dds_domain::domain::from_hex(hex)?),
+        _ => None,
+    };
 
     let list_path = cfg.admission_revocations_path();
-    let store = admission_revocation_store::load_or_empty(&list_path, domain_id, domain_pubkey)?;
+    let store = admission_revocation_store::load_or_empty_with_pq(
+        &list_path,
+        domain_id,
+        domain_pubkey,
+        pq_pubkey,
+    )?;
     let entries = store.entries();
 
     if json {

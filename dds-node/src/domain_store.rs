@@ -31,6 +31,44 @@ const VERSION_ENCRYPTED: u8 = 2;
 /// alongside the encrypted key. No passphrase needed — touch the
 /// FIDO2 key to decrypt.
 const VERSION_FIDO2: u8 = 3;
+/// **Z-1 Phase A** — Version 4: plain hybrid (Ed25519 + ML-DSA-65)
+/// domain key. Map fields:
+///   `v: 4`, `name: <text>`, `ed: <32B>`, `pq_sk: <4032B>`,
+///   `pq_pk: <1952B>`.
+/// The Ed25519 secret stays a top-level `ed` field for symmetry with
+/// the v5 encrypted variant — `key` was retained for v1/v2/v3 only so
+/// a quick `xxd` of the file shows the v4 schema is hybrid.
+const VERSION_PLAIN_HYBRID: u8 = 4;
+/// **Z-1 Phase A** — Version 5: passphrase-encrypted hybrid domain
+/// key. Map fields:
+///   `v: 5`, `name: <text>`, `salt: <16B argon2 salt>`,
+///   `nonce: <12B chacha20-poly1305 nonce>`,
+///   `blob: <ciphertext over CBOR-encoded HybridKeyMaterial>`.
+/// One nonce + one ciphertext over the whole `{ed, pq_sk, pq_pk}`
+/// CBOR struct rather than three independent fields — simpler than
+/// managing three nonces and avoids the nonce-reuse foot-gun if a
+/// future maintainer copy-pastes the encrypt path.
+const VERSION_ENCRYPTED_HYBRID: u8 = 5;
+
+/// **Z-1 Phase A** — inner CBOR struct that is the plaintext payload
+/// of a v5 encrypted blob (and the conceptual shape of v4 plain
+/// fields). Used only inside `save_domain_key` / `load_domain_key_*`.
+#[derive(Serialize, Deserialize)]
+struct HybridKeyMaterial {
+    /// Ed25519 secret key (32 bytes).
+    #[serde(with = "serde_bytes")]
+    ed: Vec<u8>,
+    /// ML-DSA-65 secret key (4,032 bytes).
+    #[serde(with = "serde_bytes")]
+    pq_sk: Vec<u8>,
+    /// ML-DSA-65 public key (1,952 bytes). Carried alongside the
+    /// secret so `DomainPqKey::from_secret_bytes` can run its
+    /// secret/public self-test at load time without re-deriving the
+    /// public key (which would require an extra round-trip through
+    /// pqcrypto-mldsa internals we don't expose).
+    #[serde(with = "serde_bytes")]
+    pq_pk: Vec<u8>,
+}
 
 #[derive(Debug)]
 pub enum DomainStoreError {
@@ -139,9 +177,33 @@ pub fn save_domain_key(path: &Path, key: &DomainKey) -> Result<(), DomainStoreEr
     }
     let secret = key.signing_key.to_bytes();
     let name = key.name.clone();
+    let passphrase = match std::env::var(DOMAIN_PASSPHRASE_ENV) {
+        Ok(p) if !p.is_empty() => Some(p),
+        _ => None,
+    };
 
-    let map = match std::env::var(DOMAIN_PASSPHRASE_ENV) {
-        Ok(pass) if !pass.is_empty() => {
+    // **Z-1 Phase A** — branch on hybrid vs Ed25519-only and on
+    // whether a passphrase is set, picking one of v1 / v2 / v4 / v5.
+    // (v3 = FIDO2 stays Ed25519-only via `save_domain_key_fido2`.)
+    let map = match (key.is_hybrid(), passphrase) {
+        (false, None) => {
+            tracing::warn!(
+                "{DOMAIN_PASSPHRASE_ENV} not set; domain key will be stored unencrypted at {}",
+                path.display()
+            );
+            vec![
+                (
+                    CborValue::Text("v".into()),
+                    CborValue::Integer(VERSION_PLAIN.into()),
+                ),
+                (CborValue::Text("name".into()), CborValue::Text(name)),
+                (
+                    CborValue::Text("key".into()),
+                    CborValue::Bytes(secret.to_vec()),
+                ),
+            ]
+        }
+        (false, Some(pass)) => {
             let mut salt = [0u8; 16];
             OsRng.fill_bytes(&mut salt);
             let mut nonce = [0u8; 12];
@@ -169,21 +231,72 @@ pub fn save_domain_key(path: &Path, key: &DomainKey) -> Result<(), DomainStoreEr
                 (CborValue::Text("key".into()), CborValue::Bytes(ct)),
             ]
         }
-        _ => {
+        (true, None) => {
             tracing::warn!(
-                "{DOMAIN_PASSPHRASE_ENV} not set; domain key will be stored unencrypted at {}",
+                "{DOMAIN_PASSPHRASE_ENV} not set; hybrid domain key will be stored \
+                 unencrypted at {} (v4 plain hybrid)",
                 path.display()
             );
+            let pq = key.pq.as_ref().expect("hybrid branch implies pq is Some");
             vec![
                 (
                     CborValue::Text("v".into()),
-                    CborValue::Integer(VERSION_PLAIN.into()),
+                    CborValue::Integer(VERSION_PLAIN_HYBRID.into()),
                 ),
                 (CborValue::Text("name".into()), CborValue::Text(name)),
                 (
-                    CborValue::Text("key".into()),
+                    CborValue::Text("ed".into()),
                     CborValue::Bytes(secret.to_vec()),
                 ),
+                (
+                    CborValue::Text("pq_sk".into()),
+                    CborValue::Bytes(pq.secret_key_bytes()),
+                ),
+                (
+                    CborValue::Text("pq_pk".into()),
+                    CborValue::Bytes(pq.public_key_bytes()),
+                ),
+            ]
+        }
+        (true, Some(pass)) => {
+            let pq = key.pq.as_ref().expect("hybrid branch implies pq is Some");
+            // CBOR-encode the inner material, then encrypt the whole
+            // blob under one key + one nonce so we never have to manage
+            // multiple nonces with the same passphrase-derived key.
+            let inner = HybridKeyMaterial {
+                ed: secret.to_vec(),
+                pq_sk: pq.secret_key_bytes(),
+                pq_pk: pq.public_key_bytes(),
+            };
+            let mut inner_bytes = Vec::new();
+            ciborium::into_writer(&inner, &mut inner_bytes)
+                .map_err(|e| DomainStoreError::Cbor(e.to_string()))?;
+            let mut salt = [0u8; 16];
+            OsRng.fill_bytes(&mut salt);
+            let mut nonce = [0u8; 12];
+            OsRng.fill_bytes(&mut nonce);
+            let mut k = derive_key(pass.as_bytes(), &salt)?;
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(&k));
+            let ct = cipher
+                .encrypt(Nonce::from_slice(&nonce), inner_bytes.as_ref())
+                .map_err(|e| DomainStoreError::Crypto(e.to_string()))?;
+            k.zeroize();
+            inner_bytes.zeroize();
+            vec![
+                (
+                    CborValue::Text("v".into()),
+                    CborValue::Integer(VERSION_ENCRYPTED_HYBRID.into()),
+                ),
+                (CborValue::Text("name".into()), CborValue::Text(name)),
+                (
+                    CborValue::Text("salt".into()),
+                    CborValue::Bytes(salt.to_vec()),
+                ),
+                (
+                    CborValue::Text("nonce".into()),
+                    CborValue::Bytes(nonce.to_vec()),
+                ),
+                (CborValue::Text("blob".into()), CborValue::Bytes(ct)),
             ]
         }
     };
@@ -225,6 +338,11 @@ pub fn load_domain_key_from_bytes(bytes: &[u8]) -> Result<DomainKey, DomainStore
     let mut salt: Option<Vec<u8>> = None;
     let mut nonce: Option<Vec<u8>> = None;
     let mut key_field: Option<Vec<u8>> = None;
+    // **Z-1 Phase A** — v4 plain hybrid + v5 encrypted hybrid fields.
+    let mut ed_field: Option<Vec<u8>> = None;
+    let mut pq_sk_field: Option<Vec<u8>> = None;
+    let mut pq_pk_field: Option<Vec<u8>> = None;
+    let mut blob_field: Option<Vec<u8>> = None;
     for (k, v) in map.iter() {
         if let Some(n) = k.as_text() {
             match n {
@@ -233,11 +351,69 @@ pub fn load_domain_key_from_bytes(bytes: &[u8]) -> Result<DomainKey, DomainStore
                 "salt" => salt = v.as_bytes().cloned(),
                 "nonce" => nonce = v.as_bytes().cloned(),
                 "key" => key_field = v.as_bytes().cloned(),
+                "ed" => ed_field = v.as_bytes().cloned(),
+                "pq_sk" => pq_sk_field = v.as_bytes().cloned(),
+                "pq_pk" => pq_pk_field = v.as_bytes().cloned(),
+                "blob" => blob_field = v.as_bytes().cloned(),
                 _ => {}
             }
         }
     }
     let name = name.ok_or_else(|| DomainStoreError::Format("missing name".into()))?;
+
+    // **Z-1 Phase A** — short-circuit for hybrid (v4 / v5) so we can
+    // return a `from_secret_bytes_hybrid` DomainKey before falling
+    // through to the v1 / v2 / v3 Ed25519-only path.
+    match version {
+        Some(v) if v == VERSION_PLAIN_HYBRID as i64 => {
+            let ed = ed_field.ok_or_else(|| DomainStoreError::Format("missing ed".into()))?;
+            let pq_sk =
+                pq_sk_field.ok_or_else(|| DomainStoreError::Format("missing pq_sk".into()))?;
+            let pq_pk =
+                pq_pk_field.ok_or_else(|| DomainStoreError::Format("missing pq_pk".into()))?;
+            if ed.len() != 32 {
+                return Err(DomainStoreError::Format(format!(
+                    "v4 ed: expected 32 bytes, got {}",
+                    ed.len()
+                )));
+            }
+            let mut ed_arr = [0u8; 32];
+            ed_arr.copy_from_slice(&ed);
+            return DomainKey::from_secret_bytes_hybrid(&name, ed_arr, &pq_sk, &pq_pk)
+                .map_err(|e| DomainStoreError::Crypto(e.to_string()));
+        }
+        Some(v) if v == VERSION_ENCRYPTED_HYBRID as i64 => {
+            let pass = std::env::var(DOMAIN_PASSPHRASE_ENV).map_err(|_| {
+                DomainStoreError::Crypto(format!(
+                    "hybrid domain key encrypted but {DOMAIN_PASSPHRASE_ENV} not set"
+                ))
+            })?;
+            let salt = salt.ok_or_else(|| DomainStoreError::Format("missing salt".into()))?;
+            let nonce = nonce.ok_or_else(|| DomainStoreError::Format("missing nonce".into()))?;
+            let blob = blob_field.ok_or_else(|| DomainStoreError::Format("missing blob".into()))?;
+            let mut k = derive_key(pass.as_bytes(), &salt)?;
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(&k));
+            let mut pt = cipher
+                .decrypt(Nonce::from_slice(&nonce), blob.as_ref())
+                .map_err(|e| DomainStoreError::Crypto(format!("decrypt: {e}")))?;
+            k.zeroize();
+            let inner: HybridKeyMaterial = ciborium::from_reader(&pt[..])
+                .map_err(|e| DomainStoreError::Cbor(format!("inner: {e}")))?;
+            pt.zeroize();
+            if inner.ed.len() != 32 {
+                return Err(DomainStoreError::Format(format!(
+                    "v5 ed: expected 32 bytes, got {}",
+                    inner.ed.len()
+                )));
+            }
+            let mut ed_arr = [0u8; 32];
+            ed_arr.copy_from_slice(&inner.ed);
+            return DomainKey::from_secret_bytes_hybrid(&name, ed_arr, &inner.pq_sk, &inner.pq_pk)
+                .map_err(|e| DomainStoreError::Crypto(e.to_string()));
+        }
+        _ => {}
+    }
+
     let key_field = key_field.ok_or_else(|| DomainStoreError::Format("missing key".into()))?;
 
     let raw = match version {
@@ -574,5 +750,127 @@ pubkey = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
         let loaded = load_admission_cert(&path).unwrap();
         let d = key.domain();
         loaded.verify(&d.pubkey, &d.id, "peerX", 100).unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // Z-1 Phase A — v4 (plain hybrid) + v5 (encrypted hybrid) on-disk
+    // -----------------------------------------------------------------
+
+    /// A hybrid `DomainKey` round-trips through the v4 plain on-disk
+    /// format with both the Ed25519 and ML-DSA-65 halves intact: the
+    /// reloaded key still produces a hybrid admission cert that
+    /// verifies under the original `Domain`.
+    #[test]
+    fn domain_key_plain_hybrid_v4_roundtrip() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(DOMAIN_PASSPHRASE_ENV) };
+        let key = DomainKey::generate_hybrid("acme.com", &mut OsRng);
+        let original_domain = key.domain();
+        assert!(original_domain.is_hybrid());
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("domain_key.bin");
+        save_domain_key(&path, &key).unwrap();
+        // Sanity: the on-disk header is v=4.
+        let bytes = std::fs::read(&path).unwrap();
+        let value: CborValue = ciborium::from_reader(&bytes[..]).unwrap();
+        let v = value
+            .as_map()
+            .unwrap()
+            .iter()
+            .find_map(|(k, v)| {
+                (k.as_text() == Some("v"))
+                    .then(|| v.as_integer().and_then(|i| i64::try_from(i).ok()))
+            })
+            .flatten()
+            .unwrap();
+        assert_eq!(v, VERSION_PLAIN_HYBRID as i64);
+
+        let loaded = load_domain_key(&path).unwrap();
+        assert!(loaded.is_hybrid());
+        assert_eq!(loaded.pubkey(), key.pubkey());
+        assert_eq!(loaded.pq_pubkey_bytes(), key.pq_pubkey_bytes());
+        // End-to-end: a hybrid cert from the reloaded key verifies
+        // under the original domain (catches a torn pq secret/public
+        // pair that would silently switch to a different keypair).
+        let cert = loaded.issue_admission("peerX".into(), 0, None);
+        cert.verify_with_domain(&original_domain, "peerX", 0)
+            .unwrap();
+    }
+
+    /// A hybrid `DomainKey` round-trips through the v5 encrypted
+    /// on-disk format. Wrong passphrase rejects.
+    #[test]
+    fn domain_key_encrypted_hybrid_v5_roundtrip() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::set_var(DOMAIN_PASSPHRASE_ENV, "hybrid-pass") };
+        let key = DomainKey::generate_hybrid("acme.com", &mut OsRng);
+        let original_domain = key.domain();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("domain_key.bin");
+        save_domain_key(&path, &key).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let value: CborValue = ciborium::from_reader(&bytes[..]).unwrap();
+        let v = value
+            .as_map()
+            .unwrap()
+            .iter()
+            .find_map(|(k, v)| {
+                (k.as_text() == Some("v"))
+                    .then(|| v.as_integer().and_then(|i| i64::try_from(i).ok()))
+            })
+            .flatten()
+            .unwrap();
+        assert_eq!(v, VERSION_ENCRYPTED_HYBRID as i64);
+
+        let loaded = load_domain_key(&path).unwrap();
+        assert!(loaded.is_hybrid());
+        assert_eq!(loaded.pubkey(), key.pubkey());
+        assert_eq!(loaded.pq_pubkey_bytes(), key.pq_pubkey_bytes());
+        let cert = loaded.issue_admission("peerY".into(), 0, None);
+        cert.verify_with_domain(&original_domain, "peerY", 0)
+            .unwrap();
+
+        // Wrong passphrase → load fails (Crypto error from the
+        // ChaCha20-Poly1305 AEAD tag mismatch).
+        unsafe { std::env::set_var(DOMAIN_PASSPHRASE_ENV, "wrong") };
+        assert!(load_domain_key(&path).is_err());
+
+        // Missing passphrase → load fails with the Crypto missing-env
+        // message (mirrors the v2 behaviour for non-hybrid keys).
+        unsafe { std::env::remove_var(DOMAIN_PASSPHRASE_ENV) };
+        let err = match load_domain_key(&path) {
+            Ok(_) => panic!("missing pass must fail to load encrypted hybrid v5"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains(DOMAIN_PASSPHRASE_ENV));
+    }
+
+    /// **Backward compat.** A v1 plain (Ed25519-only) on-disk key
+    /// still loads after the v4/v5 schema additions. Belt-and-suspenders
+    /// regression test for the `match version` short-circuit ordering.
+    #[test]
+    fn domain_key_plain_v1_still_loads_after_hybrid_additions() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(DOMAIN_PASSPHRASE_ENV) };
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("domain_key.bin");
+        save_domain_key(&path, &key).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let value: CborValue = ciborium::from_reader(&bytes[..]).unwrap();
+        let v = value
+            .as_map()
+            .unwrap()
+            .iter()
+            .find_map(|(k, v)| {
+                (k.as_text() == Some("v"))
+                    .then(|| v.as_integer().and_then(|i| i64::try_from(i).ok()))
+            })
+            .flatten()
+            .unwrap();
+        assert_eq!(v, VERSION_PLAIN as i64);
+        let loaded = load_domain_key(&path).unwrap();
+        assert!(!loaded.is_hybrid());
+        assert_eq!(loaded.pubkey(), key.pubkey());
     }
 }

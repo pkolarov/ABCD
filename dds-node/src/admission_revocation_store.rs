@@ -354,13 +354,29 @@ pub fn save_revocation_file(
 /// into the local store at `<data_dir>/admission_revocations.cbor`.
 /// Used by `dds-node import-revocation` and tests. Returns `true` if
 /// the entry was new, `false` if already present.
+///
+/// V1 shorthand for [`import_into_with_pq`] — equivalent to calling
+/// it with `pq_pubkey = None`.
 pub fn import_into(
     list_path: &Path,
     rev_path: &Path,
     domain_id: DomainId,
     domain_pubkey: [u8; 32],
 ) -> Result<(bool, PathBuf), RevocationStoreError> {
-    let mut store = load_or_empty(list_path, domain_id, domain_pubkey)?;
+    import_into_with_pq(list_path, rev_path, domain_id, domain_pubkey, None)
+}
+
+/// **Z-1 Phase A** — same as [`import_into`] but routes through the
+/// hybrid-aware loader so a v2-hybrid domain enforces the ML-DSA-65
+/// component on the imported revocation.
+pub fn import_into_with_pq(
+    list_path: &Path,
+    rev_path: &Path,
+    domain_id: DomainId,
+    domain_pubkey: [u8; 32],
+    pq_pubkey: Option<Vec<u8>>,
+) -> Result<(bool, PathBuf), RevocationStoreError> {
+    let mut store = load_or_empty_with_pq(list_path, domain_id, domain_pubkey, pq_pubkey)?;
     let rev = load_revocation_file(rev_path)?;
     let added = store.add(rev)?;
     save(list_path, &store)?;

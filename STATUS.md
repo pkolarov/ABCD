@@ -65,6 +65,48 @@
 > forgeability piece of Z-1 (threat-model row #14, remediation
 > candidate (3)); does **not** close confidentiality — that is Phase B.
 >
+> **Phase A follow-up (landed 2026-04-28) — operator surface + on-disk
+> persistence for v2-hybrid domains.** The Phase A core (above) wired
+> the hybrid signing + verification through the runtime, but a hybrid
+> `DomainKey` could not survive a save/load round-trip and the CLI had
+> no way to mint one. This follow-up closes both gaps:
+>
+> - [`dds-node/src/domain_store.rs`](dds-node/src/domain_store.rs)
+>   gained two new on-disk format versions: **v4** (plain hybrid,
+>   stores `ed: 32B`, `pq_sk: 4032B`, `pq_pk: 1952B`) and **v5**
+>   (encrypted hybrid — `salt: 16B` argon2id + `nonce: 12B`
+>   chacha20-poly1305 + `blob:` ciphertext over a CBOR-encoded
+>   `HybridKeyMaterial { ed, pq_sk, pq_pk }`; one nonce + one
+>   ciphertext over the whole inner struct so the encrypt path can
+>   never accidentally reuse a nonce against the same passphrase-
+>   derived key). `save_domain_key` picks v1 / v2 / v4 / v5 based on
+>   `key.is_hybrid()` × `DDS_DOMAIN_PASSPHRASE`; `load_domain_key_*`
+>   short-circuits on v4 / v5 into `DomainKey::from_secret_bytes_hybrid`,
+>   which runs the secret/public self-test sign+verify probe so a
+>   torn or tampered PQ blob is caught at load time. v3 (FIDO2)
+>   stays Ed25519-only — `--fido2` and `--hybrid` are mutually
+>   exclusive on the CLI today; v6 hybrid+FIDO2 is a future
+>   Phase A-3.
+> - [`dds-node/src/main.rs`](dds-node/src/main.rs) `cmd_init_domain`
+>   gained a `--hybrid` flag that swaps `DomainKey::generate` for
+>   `generate_hybrid` and prints the new `pq_pubkey` hex on success.
+>   `cmd_import_revocation` and `cmd_list_revocations` now read
+>   `cfg.domain.pq_pubkey` from `dds.toml` and route through the new
+>   `admission_revocation_store::import_into_with_pq` /
+>   `load_or_empty_with_pq`, so importing a revocation onto a
+>   v2-hybrid node enforces the ML-DSA-65 component (a v1-only rev
+>   that previously slipped past the v1 import path now fails the
+>   v2 verify gate inside `add`).
+> - 3 new `domain_store` round-trip tests
+>   (`domain_key_plain_hybrid_v4_roundtrip`,
+>   `domain_key_encrypted_hybrid_v5_roundtrip`,
+>   `domain_key_plain_v1_still_loads_after_hybrid_additions`) pin the
+>   on-disk header byte (asserting `v=4` / `v=5` / `v=1`) and verify
+>   that a freshly-issued admission cert from the reloaded hybrid
+>   key still verifies under the original `Domain`. End-to-end:
+>   `cargo test --workspace` — 232 passing in `dds-node` lib, 81 in
+>   `dds-domain`, 0 failed across every workspace crate.
+>
 > **Phase B (after A) — per-message hybrid-KEM envelope on gossip + sync
 > payloads.** Wrap each gossipsub `Op` and sync `Response` body in an
 > X25519 + ML-KEM-768 KEM-DEM envelope keyed off each peer's published

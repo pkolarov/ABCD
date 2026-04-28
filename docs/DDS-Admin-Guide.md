@@ -93,12 +93,35 @@ With FIDO2 protection, every admission signing operation requires a physical tou
 
 > **Requires:** `dds-node` built with `--features fido2`
 
+### Hybrid (Post-Quantum) Genesis
+
+For protection against the Harvest-Now-Decrypt-Later threat on the H-12 admission handshake, opt the new domain into the Z-1 Phase A hybrid (Ed25519 + ML-DSA-65 / FIPS 204) signing scheme:
+
+```bash
+export DDS_DOMAIN_PASSPHRASE="strong-passphrase-here"
+dds-node init-domain --name acme.com --dir ./acme --hybrid
+```
+
+A `--hybrid` domain advertises a `pq_pubkey` (1,952 B ML-DSA-65 public) in `domain.toml` and every `AdmissionCert` / `AdmissionRevocation` minted under it carries a 3,309 B `pq_signature` alongside the Ed25519 one. Sibling nodes refuse any cert or revocation that lacks the PQ component once the domain is hybrid, and the on-disk `domain_key.bin` switches to format **v4** (plain hybrid) or **v5** (encrypted hybrid — `DDS_DOMAIN_PASSPHRASE` set) so the PQ secret survives a save/load round-trip.
+
+> **Mutually exclusive with `--fido2`** — v3 (FIDO2-protected) is Ed25519-only today; v6 hybrid+FIDO2 is a future Phase A-3 follow-up.
+
 ### What Happens at Genesis
 
-1. An Ed25519 keypair is generated for the domain
-2. A `DomainId` is derived: `dds-dom:<base32-sha256-of-public-key>`
-3. The public half is written to `domain.toml`
+1. An Ed25519 keypair is generated for the domain (`--hybrid` also generates an ML-DSA-65 keypair alongside)
+2. A `DomainId` is derived: `dds-dom:<base32-sha256-of-public-key>` (the Ed25519 component still defines `DomainId`, so a fleet rotating from v1 to v2 keeps the same ID)
+3. The public half is written to `domain.toml` (with `pq_pubkey` populated under `--hybrid`)
 4. The secret half is encrypted and written to `domain_key.bin`
+
+The on-disk format depends on the protection mode:
+
+| Format | Mode | Notes |
+|---|---|---|
+| **v1** | plain Ed25519 | `DDS_DOMAIN_PASSPHRASE` unset, no flags |
+| **v2** | encrypted Ed25519 | `DDS_DOMAIN_PASSPHRASE` set, no flags |
+| **v3** | FIDO2-encrypted Ed25519 | `--fido2` |
+| **v4** | plain hybrid (Ed25519 + ML-DSA-65) | `--hybrid`, `DDS_DOMAIN_PASSPHRASE` unset |
+| **v5** | encrypted hybrid | `--hybrid`, `DDS_DOMAIN_PASSPHRASE` set |
 
 The domain ID is baked into all libp2p protocol strings, so every node in the domain must share this identity.
 
@@ -1919,7 +1942,9 @@ optimisation.
 
 ### Cryptography
 
-DDS is **quantum-resistant by default**. All identities use hybrid Ed25519 + ML-DSA-65 (FIPS 204) signatures. Both the classical and post-quantum signature must verify for a token to be valid.
+DDS is **quantum-resistant by default** for application-layer signatures. All non-FIDO2 identities use hybrid Ed25519 + ML-DSA-65 (FIPS 204) signatures, and both the classical and post-quantum component must verify for a token to be valid.
+
+Domain trust roots inherit the same hybrid scheme **opt-in** via `init-domain --hybrid` (Z-1 Phase A): a `--hybrid` domain mints `AdmissionCert` and `AdmissionRevocation` records that carry a PQ signature alongside the Ed25519 one, and sibling nodes reject any cert or revocation lacking the PQ component once the domain advertises a `pq_pubkey`. A v1 (Ed25519-only) domain keeps verifying as before. The libp2p Noise XX handshake and QUIC TLS keyshare remain classical pending Phase B (per-message hybrid-KEM envelope on gossip + sync) and Phase C (upstream hybrid Noise via `rust-libp2p` `rs/9595`).
 
 FIDO2 leaf identities use classical Ed25519 or ECDSA-P256 due to hardware limitations. Quantum resistance flows through the vouch chain from hybrid trust roots.
 
@@ -1937,7 +1962,7 @@ When concurrent operations conflict (e.g. one admin adds a user to a group while
 
 ### At-Rest Encryption
 
-- **Domain key**: Argon2id + ChaCha20-Poly1305, keyed with `DDS_DOMAIN_PASSPHRASE` (or FIDO2 hardware binding)
+- **Domain key**: Argon2id + ChaCha20-Poly1305, keyed with `DDS_DOMAIN_PASSPHRASE` (or FIDO2 hardware binding). Five on-disk formats: v1 plain Ed25519, v2 encrypted Ed25519, v3 FIDO2-encrypted Ed25519, v4 plain hybrid (Ed25519 + ML-DSA-65), v5 encrypted hybrid (one nonce + one ciphertext over the whole `{ed, pq_sk, pq_pk}` CBOR struct, so the encrypt path can never accidentally reuse a nonce against the same passphrase-derived key).
 - **Node identity**: Argon2id + ChaCha20-Poly1305, keyed with `DDS_NODE_PASSPHRASE`
 - **Database**: redb (ACID), not encrypted at rest (rely on OS-level full-disk encryption)
 
