@@ -263,7 +263,7 @@ this secret; locally, run
 Set `network.metrics_addr = "127.0.0.1:9495"` to expose Prometheus
 `/metrics` on a separate listener (observability-plan.md Phase C).
 Default is `None` so the second port is opt-in. The full catalog
-(27 `dds_*` families across network, trust-graph, FIDO2, sessions,
+(28 `dds_*` families across network, trust-graph, FIDO2, sessions,
 audit, storage, HTTP, and process tiers; only `dds_sync_lag_seconds`
 and `dds_http_request_duration_seconds` histograms remain deferred
 on the `metrics-exporter-prometheus` rollover) is documented in the

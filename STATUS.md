@@ -445,7 +445,7 @@
 > the `dds stats` composite snapshot (Phase F), the unauthenticated
 > `/healthz` + `/readyz` orchestrator probes plus the `dds health`
 > wrapper (Phase D), the opt-in `/metrics` Prometheus exposition with
-> the full catalog table (23 rows folding the 27 `dds_*` families
+> the full catalog table (25 rows folding the 28 `dds_*` families
 > currently shipping — every active row from the Phase C catalog
 > across network, trust-graph, FIDO2, sessions, audit, storage,
 > HTTP, and process — plus the two deferred histograms keyed off the
