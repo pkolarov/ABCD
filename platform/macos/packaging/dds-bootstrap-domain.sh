@@ -182,15 +182,33 @@ ENROLL_RESP=$(curl -sf --unix-socket "${API_SOCK}" \
 DEVICE_URN="$(echo "${ENROLL_RESP}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["urn"])')"
 echo "  device_urn: ${DEVICE_URN}"
 
-# Update agent config with device URN
+# **SC-3** — stamp Policy Agent install-time pinning fields. The agent's
+# `Program.cs` fails closed unless both `PinnedNodePubkeyB64` and
+# `DeviceUrn` are configured. We fetch the live node pubkey from
+# `/v1/node/info` so the agent rejects any future imposter-node
+# response (H-3 in the security review). Without the pubkey stamp the
+# agent would crash-loop until an operator edited the file by hand.
+NODE_PUBKEY_B64="$(curl -sf --unix-socket "${API_SOCK}" \
+  "${API_URL}/v1/node/info" \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["node_pubkey_b64"])')"
+[[ -n "${NODE_PUBKEY_B64}" ]] || { echo "Error: could not read node_pubkey_b64 from /v1/node/info" >&2; exit 1; }
+
+# Update agent config with device URN + pinned node pubkey.
 if [[ -f "${DDS_ROOT}/appsettings.json" ]]; then
   python3 -c "
 import json, sys
 with open('${DDS_ROOT}/appsettings.json') as f: cfg = json.load(f)
+cfg.setdefault('DdsPolicyAgent', {})
 cfg['DdsPolicyAgent']['DeviceUrn'] = '${DEVICE_URN}'
-with open('${DDS_ROOT}/appsettings.json', 'w') as f: json.dump(cfg, f, indent=2)
+cfg['DdsPolicyAgent']['PinnedNodePubkeyB64'] = '${NODE_PUBKEY_B64}'
+with open('${DDS_ROOT}/appsettings.json', 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
 "
-  echo "  Updated appsettings.json with device URN"
+  echo "  Updated appsettings.json with device URN + pinned node pubkey"
+  # SC-3: nudge launchd so the agent picks up the freshly-stamped
+  # config without waiting for the KeepAlive back-off window.
+  launchctl kickstart -k system/com.dds.policyagent 2>/dev/null || true
 fi
 
 echo ""

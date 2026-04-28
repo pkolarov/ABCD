@@ -739,9 +739,18 @@ pub fn run_provision(
         .map_err(|e| ProvisionError::Format(format!("provisioned domain inconsistent: {e}")))?;
     domain_store::save_domain_file(&data_dir.join("domain.toml"), &domain)?;
 
-    // node_key.bin
-    let _node_ident = identity_store::load_or_create(&data_dir.join("node_key.bin"), "dds-node")
+    // node_key.bin — keep the Identity around so we can derive the
+    // node Ed25519 pubkey for SC-3 (Policy Agent install-time pubkey
+    // pinning). This is the same pubkey served by `/v1/node/info`,
+    // computed locally without an HTTP round-trip.
+    let node_ident = identity_store::load_or_create(&data_dir.join("node_key.bin"), "dds-node")
         .map_err(|e| ProvisionError::Io(format!("node key: {e}")))?;
+    let node_pubkey_b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(node_ident.signing_key.verifying_key().to_bytes())
+    };
+    drop(node_ident);
 
     // dds.toml — **SC-1**: when the bundle carries a hybrid pubkey,
     // stamp `pq_pubkey` into `[domain]` so `cmd_run` loads a v2-hybrid
@@ -826,6 +835,35 @@ audit_log_enabled = false
         config_path: config_path.clone(),
     };
 
+    // **SC-3** — stamp the node Ed25519 pubkey into the Policy Agent's
+    // `appsettings.json` before we start the agent (start_platform_node
+    // boots both `dds-node` and the policy-agent service). The agent's
+    // `Program.cs` fails closed on an empty `PinnedNodePubkeyB64`, so
+    // without this stamp the agent crash-loops until an operator
+    // edits the file by hand. `DeviceUrn` is stamped later, after
+    // enrollment returns the URN.
+    match stamp_agent_appsettings(&config_dir, None, Some(&node_pubkey_b64)) {
+        Ok(true) => {
+            println!("  Pinned node pubkey into Policy Agent appsettings.json");
+        }
+        Ok(false) => {
+            // Agent appsettings.json not present — single-file
+            // provisioning on a host without the .NET Policy Agent
+            // installed (developer / loadtest deploys). Leave a hint
+            // so operators know how to wire it later.
+            println!(
+                "  No Policy Agent appsettings.json found; \
+                 set PinnedNodePubkeyB64 manually if you install the agent later"
+            );
+        }
+        Err(e) => {
+            // Stamp is best-effort: a malformed appsettings.json must
+            // not abort provisioning, the operator can fix it
+            // separately.
+            println!("  Warning: could not pin node pubkey: {e}");
+        }
+    }
+
     // 6. Start node and enroll (if requested)
     if start_node {
         println!("[5/6] Starting node...");
@@ -857,6 +895,28 @@ audit_log_enabled = false
             match enroll_this_device(&api_addr, &bundle.org_hash) {
                 Ok(urn) => {
                     println!("  Device URN: {urn}");
+                    // **SC-3** — stamp the freshly-issued device URN into
+                    // the agent's appsettings.json so the next agent
+                    // start (LaunchDaemon KeepAlive on macOS, SCM auto-
+                    // start on Windows) finds both pinning fields
+                    // populated. The agent self-restarts on launchd
+                    // KeepAlive, so we also kickstart explicitly to
+                    // avoid waiting out the back-off window.
+                    match stamp_agent_appsettings(&config_dir, Some(&urn), None) {
+                        Ok(true) => {
+                            println!("  Stamped DeviceUrn into Policy Agent appsettings.json");
+                            kickstart_policy_agent();
+                        }
+                        Ok(false) => {
+                            println!(
+                                "  No Policy Agent appsettings.json found to stamp DeviceUrn; \
+                                 set DdsPolicyAgent.DeviceUrn manually after installing the agent"
+                            );
+                        }
+                        Err(e) => {
+                            println!("  Warning: could not stamp DeviceUrn: {e}");
+                        }
+                    }
                     summary.device_urn = Some(urn);
                 }
                 Err(e) => {
@@ -870,6 +930,37 @@ audit_log_enabled = false
     }
 
     Ok(summary)
+}
+
+/// **SC-3** — best-effort restart of the Policy Agent service after
+/// `appsettings.json` was rewritten with a fresh `DeviceUrn`. Failure
+/// is silent because the macOS LaunchDaemon already has
+/// `KeepAlive=true` and the Windows service will be restarted by SCM
+/// after the next boot anyway; this just shortens the window between
+/// stamp-time and first-successful-poll.
+fn kickstart_policy_agent() {
+    match std::env::consts::OS {
+        "macos" => {
+            let _ = std::process::Command::new("launchctl")
+                .args(["kickstart", "-k", "system/com.dds.policyagent"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        "windows" => {
+            let _ = std::process::Command::new("sc")
+                .args(["stop", "DdsPolicyAgent"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let _ = std::process::Command::new("sc")
+                .args(["start", "DdsPolicyAgent"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        _ => {}
+    }
 }
 
 fn start_platform_node(config_path: &Path) -> Result<(), ProvisionError> {
@@ -1056,6 +1147,97 @@ fn gethostname() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// **SC-3** — locate the Policy Agent's `appsettings.json` so
+/// `run_provision` can stamp install-time pinning fields
+/// (`PinnedNodePubkeyB64`, `DeviceUrn`) before the agent first reads
+/// its config. Without these the agent fails closed at startup
+/// (`Program.cs` validates both at host build time), so an
+/// unprovisioned packaged install never enforces policy or software
+/// assignments.
+///
+/// On macOS the install layout copies `appsettings.json` into the
+/// shared config dir (`/Library/Application Support/DDS/`) which is
+/// the parent of the node `data_dir`, so probing `<config_dir>/
+/// appsettings.json` finds it. On Windows the MSI puts it under
+/// `%ProgramFiles%\DDS\config\` which is *not* the same as the
+/// node's `%ProgramData%\DDS\` — we probe the standard MSI path as a
+/// fallback.
+fn agent_appsettings_path(config_dir: &Path) -> Option<PathBuf> {
+    let primary = config_dir.join("appsettings.json");
+    if primary.exists() {
+        return Some(primary);
+    }
+    if cfg!(windows) {
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            let p = PathBuf::from(pf)
+                .join("DDS")
+                .join("config")
+                .join("appsettings.json");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// **SC-3** — stamp Policy Agent install-time pinning into
+/// `appsettings.json`. Updates the `DdsPolicyAgent` section in place,
+/// preserving every other key (logging settings, RequirePackageSignature
+/// on macOS, etc). Either field may be `None` to leave it untouched —
+/// the caller stamps the node pubkey before starting the node and
+/// stamps the device URN after enrollment, so the field is updated as
+/// each value becomes available.
+///
+/// Returns `Ok(true)` when the file existed and was rewritten,
+/// `Ok(false)` when no agent config was found (legitimate on hosts
+/// without the agent installed). Errors propagate as `ProvisionError`.
+pub(crate) fn stamp_agent_appsettings(
+    config_dir: &Path,
+    device_urn: Option<&str>,
+    node_pubkey_b64: Option<&str>,
+) -> Result<bool, ProvisionError> {
+    let path = match agent_appsettings_path(config_dir) {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| ProvisionError::Io(format!("read {}: {e}", path.display())))?;
+    let mut root: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| ProvisionError::Format(format!("parse {}: {e}", path.display())))?;
+
+    let agent = root
+        .as_object_mut()
+        .ok_or_else(|| ProvisionError::Format(format!("{} is not a JSON object", path.display())))?
+        .entry("DdsPolicyAgent".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            ProvisionError::Format(format!(
+                "{}: DdsPolicyAgent is not a JSON object",
+                path.display()
+            ))
+        })?;
+
+    if let Some(urn) = device_urn {
+        agent.insert("DeviceUrn".into(), serde_json::Value::String(urn.into()));
+    }
+    if let Some(pk) = node_pubkey_b64 {
+        agent.insert(
+            "PinnedNodePubkeyB64".into(),
+            serde_json::Value::String(pk.into()),
+        );
+    }
+
+    let mut out = serde_json::to_string_pretty(&root)
+        .map_err(|e| ProvisionError::Format(format!("serialize {}: {e}", path.display())))?;
+    out.push('\n');
+    std::fs::write(&path, &out)
+        .map_err(|e| ProvisionError::Io(format!("write {}: {e}", path.display())))?;
+    Ok(true)
 }
 
 // ---- Tests ----
@@ -1703,5 +1885,144 @@ mod tests {
             err_str.contains("pq_signature") || err_str.contains("hybrid"),
             "expected v2-hybrid verifier to reject v1-only cert, got: {err_str}"
         );
+    }
+
+    /// **SC-3** — `stamp_agent_appsettings` must be a no-op (returning
+    /// `false`) on a host without an agent appsettings file. This is
+    /// the dev / loadtest case, where `run_provision` should still
+    /// proceed even though there is no Policy Agent to pin.
+    #[test]
+    fn stamp_agent_appsettings_missing_returns_false() {
+        let dir = TempDir::new().unwrap();
+        let written =
+            stamp_agent_appsettings(dir.path(), Some("urn:vouchsafe:abc"), Some("pk")).unwrap();
+        assert!(!written, "no appsettings.json present ⇒ Ok(false)");
+    }
+
+    /// **SC-3** — happy-path: stamping both fields rewrites them and
+    /// preserves every other key in both the agent section and the
+    /// rest of the file (Logging block, RequirePackageSignature, etc).
+    #[test]
+    fn stamp_agent_appsettings_writes_both_fields() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("appsettings.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "Logging": { "LogLevel": { "Default": "Information" } },
+  "DdsPolicyAgent": {
+    "DeviceUrn": "",
+    "NodeBaseUrl": "unix:/var/run/dds.sock",
+    "PollIntervalSeconds": 60,
+    "RequirePackageSignature": true
+  }
+}"#,
+        )
+        .unwrap();
+
+        let written = stamp_agent_appsettings(
+            dir.path(),
+            Some("urn:vouchsafe:device-xyz"),
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        )
+        .unwrap();
+        assert!(written, "appsettings.json was rewritten");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let agent = v.get("DdsPolicyAgent").unwrap();
+        assert_eq!(
+            agent.get("DeviceUrn").and_then(|x| x.as_str()),
+            Some("urn:vouchsafe:device-xyz")
+        );
+        assert_eq!(
+            agent.get("PinnedNodePubkeyB64").and_then(|x| x.as_str()),
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        );
+        // Unrelated keys preserved.
+        assert_eq!(
+            agent.get("PollIntervalSeconds").and_then(|x| x.as_i64()),
+            Some(60)
+        );
+        assert_eq!(
+            agent.get("NodeBaseUrl").and_then(|x| x.as_str()),
+            Some("unix:/var/run/dds.sock")
+        );
+        assert_eq!(
+            agent
+                .get("RequirePackageSignature")
+                .and_then(|x| x.as_bool()),
+            Some(true)
+        );
+        // Top-level Logging block preserved.
+        assert!(v.get("Logging").is_some());
+    }
+
+    /// **SC-3** — partial stamp: passing `None` for one field must not
+    /// clobber a previously-stamped value. Pubkey is set first (before
+    /// the node starts), then enrollment populates DeviceUrn — the
+    /// pubkey must still be there afterwards.
+    #[test]
+    fn stamp_agent_appsettings_partial_preserves_other_field() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("appsettings.json");
+        std::fs::write(
+            &path,
+            r#"{ "DdsPolicyAgent": { "DeviceUrn": "", "PinnedNodePubkeyB64": "" } }"#,
+        )
+        .unwrap();
+
+        // Phase 1: stamp pubkey only (pre-start of node).
+        stamp_agent_appsettings(dir.path(), None, Some("PUBKEY-PHASE-1")).unwrap();
+        // Phase 2: stamp DeviceUrn only (post-enrollment).
+        stamp_agent_appsettings(dir.path(), Some("urn:vouchsafe:dev"), None).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let agent = v.get("DdsPolicyAgent").unwrap();
+        assert_eq!(
+            agent.get("DeviceUrn").and_then(|x| x.as_str()),
+            Some("urn:vouchsafe:dev")
+        );
+        assert_eq!(
+            agent.get("PinnedNodePubkeyB64").and_then(|x| x.as_str()),
+            Some("PUBKEY-PHASE-1"),
+            "pubkey from phase 1 must survive the phase-2 partial stamp"
+        );
+    }
+
+    /// **SC-3** — agent section absent: a fresh appsettings.json that
+    /// only has unrelated top-level keys (e.g. a loadtest harness)
+    /// should grow a new `DdsPolicyAgent` block rather than fail.
+    #[test]
+    fn stamp_agent_appsettings_creates_section_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("appsettings.json");
+        std::fs::write(&path, r#"{ "Logging": {} }"#).unwrap();
+        let written = stamp_agent_appsettings(dir.path(), Some("urn:x"), Some("pk")).unwrap();
+        assert!(written);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let agent = v.get("DdsPolicyAgent").unwrap().as_object().unwrap();
+        assert_eq!(agent.get("DeviceUrn").unwrap().as_str(), Some("urn:x"));
+        assert_eq!(
+            agent.get("PinnedNodePubkeyB64").unwrap().as_str(),
+            Some("pk")
+        );
+    }
+
+    /// **SC-3** — malformed JSON returns `ProvisionError::Format` so
+    /// the caller can degrade gracefully (we log a warning and
+    /// continue). It must not panic and must not silently overwrite.
+    #[test]
+    fn stamp_agent_appsettings_rejects_malformed_json() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("appsettings.json");
+        std::fs::write(&path, "not json {").unwrap();
+        let err = stamp_agent_appsettings(dir.path(), Some("u"), Some("p")).unwrap_err();
+        let s = err.to_string();
+        assert!(s.starts_with("format:"), "expected Format error, got: {s}");
+        // Confirm we did NOT rewrite the file.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json {");
     }
 }

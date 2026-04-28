@@ -1431,7 +1431,8 @@ The policy agent reads from `/Library/Application Support/DDS/appsettings.json`:
 {
   "DdsPolicyAgent": {
     "DeviceUrn": "urn:vouchsafe:...",
-    "NodeBaseUrl": "http://127.0.0.1:5551",
+    "PinnedNodePubkeyB64": "<base64 ed25519 public key>",
+    "NodeBaseUrl": "unix:/Library/Application Support/DDS/dds.sock",
     "PollIntervalSeconds": 60,
     "StateDir": "/Library/Application Support/DDS/state",
     "ManagedPreferencesDir": "/Library/Managed Preferences",
@@ -1443,6 +1444,17 @@ The policy agent reads from `/Library/Application Support/DDS/appsettings.json`:
 ```
 
 Settings can also be overridden via environment variables (prefix `DdsPolicyAgent__`).
+
+Both `DeviceUrn` and `PinnedNodePubkeyB64` are required: `Program.cs`
+fails closed at host build time on either being empty or malformed
+(SC-3 in the security review). `dds-bootstrap-domain` and
+`dds-node provision` populate both fields automatically — the device
+URN comes from the enrollment response and the pubkey is read from
+`GET /v1/node/info` (or derived locally during single-file
+provisioning). To rotate the pinned pubkey by hand (e.g. after
+`dds-node rotate-identity`), `curl --unix-socket
+/Library/Application\ Support/DDS/dds.sock http://localhost/v1/node/info`
+returns the canonical `node_pubkey_b64` to copy in.
 
 ### Policy Enforcement Capabilities
 
