@@ -85,13 +85,36 @@ This is intentional for ease of deployment — hardened deployments should bind 
 
 ## Dependency Audit Gap
 
-- I could not run `cargo audit` in this environment because `cargo` is not installed.
-- Dependency advisory coverage is therefore still outstanding.
+- ~~I could not run `cargo audit` in this environment because `cargo` is not installed.~~
+- ~~Dependency advisory coverage is therefore still outstanding.~~
+
+**RESOLVED (2026-04-28).** `cargo audit` (cargo-audit v0.22.1) was run
+against `Cargo.lock` on the macOS dev host. Three vulnerabilities were
+flagged in `rustls-webpki 0.103.10` and closed by bumping the lockfile to
+`rustls-webpki 0.103.13` (a SemVer-compatible patch picked up via
+`cargo update -p rustls-webpki`):
+
+| ID | Title |
+|---|---|
+| RUSTSEC-2026-0098 | Name constraints for URI names were incorrectly accepted |
+| RUSTSEC-2026-0099 | Name constraints were accepted for certificates asserting a wildcard name |
+| RUSTSEC-2026-0104 | Reachable panic in certificate revocation list parsing |
+
+Post-update `cargo audit` reports **0 vulnerabilities**; the remaining 8
+warnings are unmaintained / yanked transitive crates from upstream
+ecosystems (`atomic-polyfill` via `postcard`/`heapless`, `core2` via
+`multihash`/`libp2p-noise`, `paste` via `axum-macros`, `lru` via
+`hickory-proto`, `rand 0.8/0.9` via `quinn-proto`/`yamux`/`hickory-*`,
+`fastrand` via `tempfile`) which are not fixable in this tree without
+upstream releases.
+
+Full workspace test run after the bump: **701 / 701** passing
+(macOS 25.3 dev host, `cargo test --workspace`, 1 ignored test).
 
 ## Remaining Work
 
-1. **Sign count enforcement** — persist per-credential assertion counters to detect replay attacks.
+1. ~~**Sign count enforcement** — persist per-credential assertion counters to detect replay attacks.~~ **DONE (already shipped via L-18).** `dds-store::traits::CredentialStateStore::bump_sign_count(credential, new)` is an atomic check-and-set primitive (single redb write transaction); `StoreError::SignCountReplay { stored, attempted }` distinguishes the replay branch from generic I/O. `LocalService::verify_assertion_common` (`dds-node/src/service.rs:1910-1920`) calls `bump_sign_count` on every assertion with `parsed.sign_count > 0` and surfaces the replay outcome through the `dds_fido2_assertions_total{result="sign_count"}` metric bucket. Authenticators reporting `sign_count == 0` skip the check (logged at warn).
 2. **Admin-signed device enrollment** — require a vouch from an admin to validate device tags/org_unit, preventing self-enrollment with privileged scope.
 3. **Windows ACL hardening** — set restrictive ACLs on key files on Windows.
 4. ~~**Passphrase-required mode** — optional config flag to refuse key storage without encryption.~~ **FIXED (2026-04-28).** New env var `DDS_REQUIRE_ENCRYPTED_KEYS` (recognised truthy values: `1`, `true`, `yes`, case-insensitive) gates the three node-side plaintext save paths: `identity_store::save` (node Ed25519 signing key, v=1 plain), `p2p_identity::save` (libp2p Ed25519 keypair, v=1 plain), and `domain_store::save_domain_key` (Ed25519-only v=1 plain and v=4 plain hybrid; the v=3 FIDO2 path is already encrypted and unaffected). When set with `DDS_NODE_PASSPHRASE` / `DDS_DOMAIN_PASSPHRASE` empty, each save returns a `Crypto` error and writes nothing — operators get fail-closed posture instead of the warn-and-write default. Default off so existing dev workflows keep working. Three new regression tests cover the gate for each module.
-5. **Dependency audit** — run `cargo audit` when the Rust toolchain is available.
+5. ~~**Dependency audit** — run `cargo audit` when the Rust toolchain is available.~~ **DONE (2026-04-28).** See "Dependency Audit Gap" above — 3 CVEs closed via `rustls-webpki` 0.103.10 → 0.103.13 lockfile bump.
