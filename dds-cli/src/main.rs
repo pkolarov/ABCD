@@ -1235,6 +1235,22 @@ async fn handle_stats(node_url: &str, format: &str) {
 
     match format {
         "json" => {
+            let mut store = serde_json::json!({
+                "tokens": status.store_tokens,
+                "revoked": status.store_revoked,
+                "burned": status.store_burned,
+            });
+            // observability-plan.md Phase F closure for the deferred
+            // store-bytes row. Older nodes omit the field; we keep the
+            // JSON shape the same in that case so existing scripts still
+            // parse (the `bytes` key is simply absent rather than
+            // `null`). Newer nodes serving an empty map ship `bytes:
+            // {}`, mirroring the "family present, no series" Prometheus
+            // semantics — operators can tell "backend doesn't report"
+            // (missing key) from "backend reports zero" (empty object).
+            if let Some(bytes) = status.store_bytes.as_ref() {
+                store["bytes"] = serde_json::to_value(bytes).unwrap_or(serde_json::Value::Null);
+            }
             let body = serde_json::json!({
                 "node": {
                     "peer_id": status.peer_id,
@@ -1246,11 +1262,7 @@ async fn handle_stats(node_url: &str, format: &str) {
                     "trusted_roots": status.trusted_roots,
                     "dag_operations": status.dag_operations,
                 },
-                "store": {
-                    "tokens": status.store_tokens,
-                    "revoked": status.store_revoked,
-                    "burned": status.store_burned,
-                },
+                "store": store,
                 "audit": {
                     "chain_length": chain_length,
                     "head_ts": head_ts,
@@ -1273,6 +1285,28 @@ async fn handle_stats(node_url: &str, format: &str) {
             println!("    Tokens:         {}", status.store_tokens);
             println!("    Revocations:    {}", status.store_revoked);
             println!("    Burned:         {}", status.store_burned);
+            // observability-plan.md Phase F closure for the deferred
+            // store-bytes row. Pretty-print one indented line per redb
+            // table, sorted by table name (BTreeMap iteration is
+            // already alphabetical) so the output is stable across
+            // runs. `(unsupported)` distinguishes "older node /
+            // MemoryBackend, no snapshot available" from "backend
+            // reports zero tables" (an empty map prints just the
+            // header with no children).
+            match status.store_bytes.as_ref() {
+                Some(bytes) if !bytes.is_empty() => {
+                    println!("    Bytes per table:");
+                    for (table, n) in bytes {
+                        println!("      {table:<18} {n}");
+                    }
+                }
+                Some(_) => {
+                    println!("    Bytes per table: (none)");
+                }
+                None => {
+                    println!("    Bytes per table: (unsupported)");
+                }
+            }
             println!("  Audit:");
             println!("    Chain length:   {chain_length}");
             match (head_ts, head_action.as_deref(), head_age_secs) {
@@ -2037,6 +2071,18 @@ struct NodeStatusJson {
     store_revoked: usize,
     store_burned: usize,
     uptime_secs: u64,
+    /// Per-redb-table stored-byte snapshot. Mirrors the
+    /// `dds_store_bytes{table=...}` Prometheus gauge from
+    /// observability-plan.md Phase C, surfaced via `/v1/status` so
+    /// `dds-cli stats` does not have to scrape `/metrics` to show
+    /// on-disk usage. Absent (deserialised as `None`) when the node
+    /// runs an older build that predates the field, *or* when the
+    /// backend does not implement `StoreSizeStats` (in-memory test
+    /// fixtures); empty (`Some({})`) when the backend supports the
+    /// snapshot but has zero tables of interest, mirroring the
+    /// "family present, no series" semantics of the Prometheus gauge.
+    #[serde(default)]
+    store_bytes: Option<std::collections::BTreeMap<String, u64>>,
 }
 
 #[derive(Serialize)]

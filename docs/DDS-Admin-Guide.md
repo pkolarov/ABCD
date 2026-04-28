@@ -1488,7 +1488,13 @@ curl http://127.0.0.1:5551/v1/status | jq
 
 `dds stats` composes `/v1/status` and `/v1/audit/entries` into one
 report so an operator can answer "is this node healthy and how busy is
-it?" without two separate queries.
+it?" without two separate queries. The pretty-printed `Store` block
+includes a `Bytes per table:` sub-block with one indented row per redb
+table (the same per-table snapshot the `dds_store_bytes{table=...}`
+Prometheus gauge reads — surfaced over `/v1/status` so the CLI does
+not have to scrape `/metrics`); `(unsupported)` denotes an older node
+that omits the field, `(none)` denotes a backend that reports an empty
+map (in-memory test harnesses).
 
 ### List Enrolled Users
 

@@ -213,6 +213,17 @@ pub struct NodeStatus {
     pub store_revoked: usize,
     pub store_burned: usize,
     pub uptime_secs: u64,
+    /// Per-redb-table stored-byte snapshot, mirroring the
+    /// `dds_store_bytes{table=...}` Prometheus gauge from
+    /// observability-plan.md Phase C. `None` on backends that do not
+    /// implement [`dds_store::traits::StoreSizeStats`] (e.g.
+    /// `MemoryBackend` in test fixtures) and on older clients that
+    /// deserialise the response without this field. Closes the
+    /// `dds-cli stats` Phase F deferred row by giving operators a
+    /// single-call snapshot of on-disk usage without scraping
+    /// `/metrics`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_bytes: Option<BTreeMap<String, u64>>,
 }
 
 /// Policy evaluation result.
@@ -1967,6 +1978,10 @@ impl<
             store_revoked: self.store.revoked_set().map(|s| s.len()).unwrap_or(0),
             store_burned: self.store.burned_set().map(|s| s.len()).unwrap_or(0),
             uptime_secs: now_epoch() - self.start_time,
+            // Populated by callers that have a `StoreSizeStats` backend
+            // (production HTTP handler) via [`Self::store_byte_sizes`].
+            // Test fixtures using `MemoryBackend` keep this `None`.
+            store_bytes: None,
         })
     }
 

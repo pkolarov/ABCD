@@ -703,6 +703,7 @@ where
         + AuditStore
         + ChallengeStore
         + CredentialStateStore
+        + dds_store::traits::StoreSizeStats
         + Send
         + Sync
         + 'static,
@@ -1199,6 +1200,7 @@ where
         + AuditStore
         + ChallengeStore
         + CredentialStateStore
+        + dds_store::traits::StoreSizeStats
         + Send
         + Sync
         + 'static,
@@ -1215,7 +1217,24 @@ where
         .as_ref()
         .map(|pc| pc.connected.load(std::sync::atomic::Ordering::Relaxed) as usize)
         .unwrap_or(0);
-    Ok(Json(svc.status(&state.info.peer_id, connected_peers, 0)?))
+    let mut s = svc.status(&state.info.peer_id, connected_peers, 0)?;
+    // observability-plan.md Phase F closure for the deferred `dds-cli stats`
+    // store-bytes row: read the same per-table snapshot the
+    // `dds_store_bytes{table=...}` Prometheus gauge reads, owned-string
+    // it (the Prometheus catalog uses `&'static str` keys for label
+    // economy; the JSON shape uses owned `String` so the response
+    // serialises with serde's BTreeMap impl) and attach to the response.
+    // `MemoryBackend` returns an empty map → field is `Some({})`,
+    // discoverable by the operator as "backend reports zero tables"
+    // rather than "backend does not support the snapshot at all" (which
+    // is what `None` means on the wire).
+    s.store_bytes = svc.store_byte_sizes().map(|b| {
+        b.tables
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()
+    });
+    Ok(Json(s))
 }
 
 /// `GET /v1/node/info` — discovery endpoint for Policy Agents. See
@@ -1999,6 +2018,7 @@ where
         + AuditStore
         + ChallengeStore
         + CredentialStateStore
+        + dds_store::traits::StoreSizeStats
         + Send
         + Sync
         + 'static,
@@ -2081,6 +2101,7 @@ where
         + AuditStore
         + ChallengeStore
         + CredentialStateStore
+        + dds_store::traits::StoreSizeStats
         + Send
         + Sync
         + 'static,
@@ -2192,6 +2213,7 @@ where
         + AuditStore
         + ChallengeStore
         + CredentialStateStore
+        + dds_store::traits::StoreSizeStats
         + Send
         + Sync
         + 'static,
@@ -2676,6 +2698,35 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: NodeStatus = resp.json().await.unwrap();
         assert_eq!(body.connected_peers, 7);
+    }
+
+    /// observability-plan.md Phase F closure for the deferred
+    /// store-bytes row. `/v1/status` carries the per-redb-table
+    /// stored-byte snapshot mirroring the `dds_store_bytes{table=...}`
+    /// Prometheus gauge so `dds-cli stats` does not have to scrape
+    /// `/metrics` to show on-disk usage. `MemoryBackend` reports an
+    /// empty map (the trait impl in `dds-store/src/memory_backend.rs`
+    /// returns `BTreeMap::new()`), which we surface as `Some(empty)`
+    /// rather than `None` — that keeps the "family present, no series"
+    /// semantics of the Prometheus gauge so an operator can tell a
+    /// supported-but-empty backend from a fully-unsupported one.
+    #[tokio::test]
+    async fn status_endpoint_carries_store_bytes_snapshot() {
+        let state = make_state();
+        let base = spawn_server(state).await;
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        // Round-trip through the typed shape to pin the field name
+        // (deserialiser fails if the route ever drops the key).
+        let body: NodeStatus = resp.json().await.unwrap();
+        let bytes = body
+            .store_bytes
+            .expect("memory backend reports an empty map, not None");
+        assert!(
+            bytes.is_empty(),
+            "memory backend has no redb tables, expected empty snapshot got {:?}",
+            bytes
+        );
     }
 
     #[tokio::test]

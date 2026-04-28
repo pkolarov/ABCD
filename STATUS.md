@@ -80,7 +80,46 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-27 follow-up #47 (observability Phase E
+> Last updated: 2026-04-28 follow-up #48 (observability Phase F
+> follow-up — `dds-cli stats` now shows the per-redb-table store-bytes
+> snapshot, closing one of the two deferred rows on the Phase F
+> catalog at [`docs/observability-plan.md`](docs/observability-plan.md)
+> §`dds-cli stats`). The same `dds_store_bytes{table=...}` snapshot
+> the Prometheus gauge already reads — `LocalService::store_byte_sizes`
+> over [`dds_store::traits::StoreSizeStats::table_stored_bytes`](dds-store/src/traits.rs) —
+> is plumbed through `/v1/status` as a new optional
+> `store_bytes: Option<BTreeMap<String, u64>>` field on
+> [`NodeStatus`](dds-node/src/service.rs); the field is
+> `#[serde(default, skip_serializing_if = "Option::is_none")]` so older
+> clients keep deserialising cleanly and the wire shape stays
+> unchanged when the backend cannot report (the future-proofing matters
+> because the http handler's `S` generic now also requires
+> `dds_store::traits::StoreSizeStats` — both `RedbBackend` and
+> `MemoryBackend` already implement it, so the bound propagates
+> through `router<S>` / `serve<S>` / `serve_unix<S>` / `serve_pipe<S>`
+> with no production caller change). The `dds-cli stats` text output
+> grows a `Bytes per table:` block listing each table on its own
+> indented line (BTreeMap iteration is alphabetical so the rows are
+> stable across runs); `(unsupported)` distinguishes "older node, no
+> snapshot available" from `(none)` "backend reports zero tables"
+> (`MemoryBackend` returning an empty map), mirroring the "family
+> present, no series" semantics of the Prometheus gauge. The
+> `--format json` output adds `store.bytes` only when the field is
+> present; existing scripts pinning the older shape keep parsing.
+> Workspace test count rises from 689 to 690 (one new
+> `status_endpoint_carries_store_bytes_snapshot` regression test in
+> [`dds-node/src/http.rs`](dds-node/src/http.rs) that pins
+> `MemoryBackend` reporting `Some(empty)` so a future regression
+> from `Some(empty)` back to `None` would surface as a test failure
+> rather than as silently broken `dds-cli stats` output). The
+> remaining `last admission failure` deferred row stays open — that
+> needs either a `last_admission_failure_ts` gauge or a `/metrics`
+> scrape inside `dds-cli`, neither of which is in scope for this
+> change. `cargo fmt` clean; `cargo clippy --workspace --all-targets
+> -- -D warnings` clean; `cargo test --workspace --all-targets`
+> passes (690 tests).
+>
+> Previous: 2026-04-27 follow-up #47 (observability Phase E
 > dashboard catch-up — three FIDO2-tier panels added to
 > [`docs/observability/grafana/dds-trust-graph.json`](docs/observability/grafana/dds-trust-graph.json),
 > closing the `docs/observability-plan.md` Phase E note that the
