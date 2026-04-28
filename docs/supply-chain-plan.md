@@ -202,6 +202,21 @@ publishers opt in immediately. **Phase B.2 / B.3 (the C# agent
 verifiers) and B.4 / B.5 (cross-platform regression tests + migration
 plan) remain open.**
 
+**B.1 follow-on — node-side fail-closed at agent read path. Landed
+2026-04-29.** [`LocalService::list_applicable_software`](../dds-node/src/service.rs)
+now calls `PublisherIdentity::validate()` on every decoded
+`SoftwareAssignment` and *skips* (warn-log + `continue`) any
+assignment whose publisher metadata fails the schema-layer invariants
+(empty Authenticode subject, wrong-shape SHA-1 root thumbprint,
+malformed Apple Team ID). Without this gate a malformed
+`publisher_identity` would ride all the way to the C# agent, the
+signer-subject string compare would fail to match anything real, and
+the agent would fall through to hash-only — observationally identical
+to "no publisher pinning". One new regression test
+(`b1_software_with_invalid_publisher_identity_is_skipped`) seeds two
+attestations (one with empty Authenticode subject, one with a valid
+Apple Team ID) and asserts only the valid one reaches the read path.
+
 **B.2 — Windows agent.** Add `WinVerifyTrust` invocation in
 `WindowsSoftwareOperations.DownloadAndVerifyAsync` after the
 SHA-256 check and before `Process.Start` (the same window B-6

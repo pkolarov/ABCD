@@ -2120,7 +2120,14 @@ root_thumbprint }` (Windows) and `AppleDeveloperId { team_id }`
 invariants (non-empty subject, 40-char lowercase-hex thumbprint,
 10-char uppercase-alphanumeric Team ID) so empty / wrong-shape values
 fail closed at the schema layer instead of silently matching nothing
-on the agent. The agent-side enforcement (Phase B.2 / B.3 — wiring
+on the agent. **2026-04-29 follow-on:** `validate()` is now wired into
+[`LocalService::list_applicable_software`](dds-node/src/service.rs);
+every decoded `SoftwareAssignment` is run through `validate()` and a
+malformed `publisher_identity` is dropped (warn-log + `continue`)
+before the assignment reaches the agent read path, closing the
+schema-layer fail-closed promise on the node side. New regression
+test `b1_software_with_invalid_publisher_identity_is_skipped` pins
+this. The agent-side enforcement (Phase B.2 / B.3 — wiring
 `WinVerifyTrust` on Windows and the Team-ID match on macOS) remains
 open and the row stays "partially closed" until those land.
 

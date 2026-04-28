@@ -1552,6 +1552,23 @@ impl<
                     continue;
                 }
             };
+            // SC-5 Phase B.1 follow-on: fail closed at decode time when
+            // `publisher_identity` is malformed. An empty Authenticode
+            // subject or a wrong-shape Apple Team ID would silently
+            // match nothing on the agent — observationally identical
+            // to "no publisher pinning", which is exactly the silent
+            // downgrade the two-signature gate is meant to prevent.
+            // Skip the assignment instead of handing it to the agent.
+            if let Some(pi) = doc.publisher_identity.as_ref() {
+                if let Err(e) = pi.validate() {
+                    tracing::warn!(
+                        jti = %token.payload.jti,
+                        issuer = %token.payload.iss,
+                        "rejecting software assignment: malformed publisher_identity: {e}"
+                    );
+                    continue;
+                }
+            }
             // C-3: same publisher capability gate.
             if !self.has_purpose_observed(
                 &g,
@@ -3293,8 +3310,8 @@ mod platform_applier_tests {
         AccountAction, AccountDirective, DeviceJoinDocument, LaunchdAction, LaunchdDirective,
         MacAccountAction, MacAccountDirective, MacOsPolicyDocument, MacOsSettings, PasswordPolicy,
         PolicyScope, PreferenceAction, PreferenceDirective, PreferenceScope, ProfileAction,
-        ProfileDirective, RegistryAction, RegistryDirective, RegistryHive, RegistryValue,
-        SoftwareAssignment, WindowsPolicyDocument, WindowsSettings,
+        ProfileDirective, PublisherIdentity, RegistryAction, RegistryDirective, RegistryHive,
+        RegistryValue, SoftwareAssignment, WindowsPolicyDocument, WindowsSettings,
     };
     use dds_store::MemoryBackend;
     use rand::rngs::OsRng;
@@ -5195,6 +5212,72 @@ mod platform_applier_tests {
         // Stable order: alphabetic by policy_id.
         assert_eq!(hits[0].document.policy_id, "p:a");
         assert_eq!(hits[1].document.policy_id, "p:b");
+    }
+
+    /// **SC-5 Phase B.1 follow-on.** A `SoftwareAssignment` carrying a
+    /// malformed `publisher_identity` (e.g. empty Authenticode subject)
+    /// is dropped at the agent-facing read path. Without this gate the
+    /// blob would land on the agent, the signer-subject compare would
+    /// fail to match anything real, and the agent would fall through
+    /// to hash-only — observationally identical to "no publisher
+    /// pinning" and the exact silent downgrade the two-signature gate
+    /// is meant to prevent.
+    #[test]
+    fn b1_software_with_invalid_publisher_identity_is_skipped() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "ws-b1-bad-pi", vec!["developer".into()], None);
+
+        let bad = SoftwareAssignment {
+            package_id: "com.example.editor".into(),
+            display_name: "Editor".into(),
+            version: "1.0.0".into(),
+            source: "https://cdn.example.com/editor-1.0.0.msi".into(),
+            sha256: "deadbeef".into(),
+            action: dds_domain::InstallAction::Install,
+            scope: PolicyScope {
+                device_tags: vec!["developer".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            silent: true,
+            pre_install_script: None,
+            post_install_script: None,
+            // Invalid: empty Authenticode subject. `validate()`
+            // returns `EmptyAuthenticodeSubject`.
+            publisher_identity: Some(PublisherIdentity::Authenticode {
+                subject: String::new(),
+                root_thumbprint: None,
+            }),
+        };
+        let good = SoftwareAssignment {
+            package_id: "com.example.viewer".into(),
+            sha256: "feedface".into(),
+            source: "https://cdn.example.com/viewer-1.0.0.msi".into(),
+            // Valid Apple Team ID — 10 uppercase alphanumerics.
+            publisher_identity: Some(PublisherIdentity::AppleDeveloperId {
+                team_id: "ABCDE12345".into(),
+            }),
+            ..bad.clone()
+        };
+
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "sw-bad", &bad))
+            .unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "sw-good", &good))
+            .unwrap();
+
+        let hits = svc.list_applicable_software(&dev).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "malformed publisher_identity must be dropped, leaving only the valid assignment"
+        );
+        assert_eq!(hits[0].document.package_id, "com.example.viewer");
     }
 
     // Silence the unused-import warning when only some helpers are
