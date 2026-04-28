@@ -1234,6 +1234,14 @@ where
             .map(|(k, v)| (k.to_string(), v))
             .collect()
     });
+    // observability-plan.md Phase F closure for the deferred
+    // `dds-cli stats` `last admission failure` row: read the
+    // process-global telemetry timestamp the
+    // `dds_admission_handshake_last_failure_seconds` Prometheus gauge
+    // reads. `None` before the first non-`ok` admission handshake
+    // outcome lands; the field is `skip_serializing_if = "Option::is_none"`
+    // so older CLIs deserialising the response keep parsing.
+    s.last_admission_failure_ts = crate::telemetry::last_admission_failure_ts();
     Ok(Json(s))
 }
 
@@ -2726,6 +2734,41 @@ mod tests {
             bytes.is_empty(),
             "memory backend has no redb tables, expected empty snapshot got {:?}",
             bytes
+        );
+    }
+
+    /// observability-plan.md Phase F closure for the deferred
+    /// `last admission failure` row. `/v1/status` carries the unix-seconds
+    /// timestamp of the most recent non-`ok` admission outcome,
+    /// mirroring the `dds_admission_handshake_last_failure_seconds`
+    /// Prometheus gauge so `dds-cli stats` does not have to scrape
+    /// `/metrics` to surface "how long ago was the last admission
+    /// failure".
+    #[tokio::test]
+    async fn status_endpoint_carries_last_admission_failure_timestamp() {
+        // Install the process-global telemetry handle and seed a
+        // failure outcome — the production `verify_peer_admission`
+        // path bumps the same code path, but here we drive the
+        // free-function record helper directly to keep the test
+        // self-contained.
+        let _t = crate::telemetry::install();
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        crate::telemetry::record_admission_handshake("fail");
+
+        let state = make_state();
+        let base = spawn_server(state).await;
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: NodeStatus = resp.json().await.unwrap();
+        let ts = body
+            .last_admission_failure_ts
+            .expect("telemetry seeded a failure stamp");
+        assert!(
+            ts >= before,
+            "stamped ts {ts} should be >= before-bump epoch {before}"
         );
     }
 

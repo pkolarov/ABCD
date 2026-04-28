@@ -224,6 +224,21 @@ pub struct NodeStatus {
     /// `/metrics`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_bytes: Option<BTreeMap<String, u64>>,
+    /// Unix-seconds timestamp of the most recent non-`ok` inbound H-12
+    /// admission handshake (`fail` or `revoked` outcome from
+    /// [`crate::node::DdsNode::verify_peer_admission`]). Mirrors the
+    /// `dds_admission_handshake_last_failure_seconds` Prometheus gauge
+    /// from observability-plan.md Phase C and closes the second
+    /// `dds-cli stats` Phase F deferred row (`last admission failure`):
+    /// `dds_admission_handshakes_total{result="fail"}` is a since-boot
+    /// counter, so a meaningful "how long ago" surface needs the
+    /// timestamp gauge as a sibling.
+    ///
+    /// `None` before the first failure / revocation lands and on
+    /// older clients that deserialise the response without this
+    /// field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_admission_failure_ts: Option<u64>,
 }
 
 /// Policy evaluation result.
@@ -1982,6 +1997,12 @@ impl<
             // (production HTTP handler) via [`Self::store_byte_sizes`].
             // Test fixtures using `MemoryBackend` keep this `None`.
             store_bytes: None,
+            // Populated by the production HTTP handler from the
+            // process-global telemetry handle via
+            // [`crate::telemetry::last_admission_failure_ts`]. Test
+            // fixtures and harnesses without a telemetry install keep
+            // this `None`.
+            last_admission_failure_ts: None,
         })
     }
 

@@ -1232,6 +1232,14 @@ async fn handle_stats(node_url: &str, format: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let head_age_secs = head_ts.map(|ts| now.saturating_sub(ts));
+    // observability-plan.md Phase F closure for the deferred
+    // `last admission failure` row. Older nodes (and freshly booted
+    // ones with no failure yet) omit the timestamp; we render it as
+    // "(none since boot)" so an operator can distinguish "no failures"
+    // from "field unsupported".
+    let last_admission_failure_age_secs = status
+        .last_admission_failure_ts
+        .map(|ts| now.saturating_sub(ts));
 
     match format {
         "json" => {
@@ -1251,6 +1259,18 @@ async fn handle_stats(node_url: &str, format: &str) {
             if let Some(bytes) = status.store_bytes.as_ref() {
                 store["bytes"] = serde_json::to_value(bytes).unwrap_or(serde_json::Value::Null);
             }
+            // Admission section mirrors the
+            // `dds_admission_handshake_last_failure_seconds` Prometheus
+            // gauge. Older nodes omit `last_failure_ts`; the JSON shape
+            // simply leaves the keys absent (no `null`) so existing
+            // scripts pinning the older shape keep parsing.
+            let mut admission = serde_json::Map::new();
+            if let Some(ts) = status.last_admission_failure_ts {
+                admission.insert("last_failure_ts".into(), serde_json::Value::from(ts));
+                if let Some(age) = last_admission_failure_age_secs {
+                    admission.insert("last_failure_age_secs".into(), serde_json::Value::from(age));
+                }
+            }
             let body = serde_json::json!({
                 "node": {
                     "peer_id": status.peer_id,
@@ -1263,6 +1283,7 @@ async fn handle_stats(node_url: &str, format: &str) {
                     "dag_operations": status.dag_operations,
                 },
                 "store": store,
+                "admission": admission,
                 "audit": {
                     "chain_length": chain_length,
                     "head_ts": head_ts,
@@ -1305,6 +1326,32 @@ async fn handle_stats(node_url: &str, format: &str) {
                 }
                 None => {
                     println!("    Bytes per table: (unsupported)");
+                }
+            }
+            // observability-plan.md Phase F closure for the deferred
+            // `last admission failure` row. Pretty-print the unix-seconds
+            // timestamp + a "Xs ago" age so the operator does not need
+            // to subtract the current time. `(none since boot)`
+            // distinguishes "no failures since this process started"
+            // from `(unsupported)` ("older node, field absent on the
+            // wire") — mirrors the store-bytes pretty-printing
+            // semantics above.
+            println!("  Admission:");
+            match (
+                status.last_admission_failure_ts,
+                last_admission_failure_age_secs,
+            ) {
+                (Some(ts), Some(age)) => {
+                    println!("    Last failure ts:  {ts}");
+                    println!("    Last failure age: {age}s");
+                }
+                _ => {
+                    // `last_admission_failure_ts` is `None` either
+                    // because telemetry has not stamped a failure yet
+                    // (fresh process, no rejected peer) or because the
+                    // node predates the field. Both reduce to the same
+                    // operator signal: there is nothing to act on.
+                    println!("    Last failure:     (none since boot)");
                 }
             }
             println!("  Audit:");
@@ -2083,6 +2130,15 @@ struct NodeStatusJson {
     /// "family present, no series" semantics of the Prometheus gauge.
     #[serde(default)]
     store_bytes: Option<std::collections::BTreeMap<String, u64>>,
+    /// Unix-seconds timestamp of the most recent non-`ok` inbound H-12
+    /// admission handshake. Mirrors the
+    /// `dds_admission_handshake_last_failure_seconds` Prometheus
+    /// gauge surfaced via `/v1/status`, closing the Phase F
+    /// `last admission failure` deferred row. Absent (deserialised
+    /// as `None`) on older nodes that predate the field and before
+    /// the first non-`ok` admission outcome lands.
+    #[serde(default)]
+    last_admission_failure_ts: Option<u64>,
 }
 
 #[derive(Serialize)]

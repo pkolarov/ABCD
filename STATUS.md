@@ -80,7 +80,58 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-28 follow-up #48 (observability Phase F
+> Last updated: 2026-04-28 follow-up #49 (observability Phase F
+> follow-up — `dds-cli stats` now shows the last admission failure
+> timestamp + age, closing the second of the two deferred rows on the
+> Phase F catalog at
+> [`docs/observability-plan.md`](docs/observability-plan.md)
+> §`dds-cli stats`). A new
+> `dds_admission_handshake_last_failure_seconds` Prometheus gauge is
+> stamped from the same [`DdsNode::verify_peer_admission`](dds-node/src/node.rs)
+> call sites that already bump
+> `dds_admission_handshakes_total{result=fail|revoked}` — the bump
+> lives inside [`Telemetry::bump_admission_handshake`](dds-node/src/telemetry.rs)
+> so the per-result counter and the timestamp gauge stay in lockstep
+> (an `ok` outcome does *not* advance the timestamp because the gauge
+> is a "last *failure*" surface, not a "last handshake" one). The
+> renderer always emits the gauge with sentinel `0` before the first
+> failure / revocation lands, mirroring the
+> "always-emit HELP/TYPE" pattern shipped on every other metric in
+> the catalog. The same value is plumbed through `/v1/status` as a new
+> optional `last_admission_failure_ts: Option<u64>` field on
+> [`NodeStatus`](dds-node/src/service.rs) (read off the process-global
+> [`Telemetry`](dds-node/src/telemetry.rs) handle by the production
+> http handler via the new
+> [`crate::telemetry::last_admission_failure_ts`](dds-node/src/telemetry.rs)
+> free function); the field is
+> `#[serde(default, skip_serializing_if = "Option::is_none")]` so older
+> clients keep deserialising cleanly and the wire shape stays
+> unchanged before any failure has stamped a value. The `dds-cli stats`
+> text output grows an `Admission:` block with `Last failure ts:` /
+> `Last failure age:` lines (or `Last failure: (none since boot)` for
+> a fresh process / older node — the same operator signal collapses
+> "no failure yet" with "node predates the field"); the `--format
+> json` output adds an `admission` object with `last_failure_ts` +
+> `last_failure_age_secs` only when the field is present so existing
+> scripts pinning the older shape keep parsing. Workspace test count
+> rises from 690 to 692 (one new
+> `admission_handshake_last_failure_seconds_stamps_on_fail_and_revoked`
+> unit test in [`dds-node/src/telemetry.rs`](dds-node/src/telemetry.rs)
+> pinning the bump-on-fail / no-bump-on-ok contract and the sentinel
+> 0 in the empty-family rendering, and one new
+> `status_endpoint_carries_last_admission_failure_timestamp`
+> integration test in [`dds-node/src/http.rs`](dds-node/src/http.rs)
+> pinning that the timestamp round-trips through `/v1/status`). The
+> existing `admission_handshakes_renders_empty_family_with_help_and_type`
+> test was extended to assert the new gauge ships with sentinel 0 in
+> an empty exposition. With this follow-up *both* original
+> Phase F deferred rows (`store bytes` and `last admission failure`)
+> are closed; the Phase F § header drops the "deferred to Phase C"
+> qualifier accordingly. `cargo fmt` clean; `cargo clippy --workspace
+> --all-targets -- -D warnings` clean; `cargo test --workspace
+> --all-targets` passes (692 tests).
+>
+> Previous: 2026-04-28 follow-up #48 (observability Phase F
 > follow-up — `dds-cli stats` now shows the per-redb-table store-bytes
 > snapshot, closing one of the two deferred rows on the Phase F
 > catalog at [`docs/observability-plan.md`](docs/observability-plan.md)

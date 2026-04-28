@@ -1494,7 +1494,12 @@ table (the same per-table snapshot the `dds_store_bytes{table=...}`
 Prometheus gauge reads — surfaced over `/v1/status` so the CLI does
 not have to scrape `/metrics`); `(unsupported)` denotes an older node
 that omits the field, `(none)` denotes a backend that reports an empty
-map (in-memory test harnesses).
+map (in-memory test harnesses). The pretty-printed `Admission` block
+shows the timestamp + age of the most recent non-`ok` H-12 handshake
+(the same `dds_admission_handshake_last_failure_seconds` gauge,
+plumbed through `/v1/status::last_admission_failure_ts`); `(none since
+boot)` denotes a fresh process or older node that has not stamped a
+value.
 
 ### List Enrolled Users
 
@@ -1579,6 +1584,7 @@ Catalog (full list with semantics is in
 | `dds_uptime_seconds` | gauge | — | Has this node just restarted? |
 | `dds_peers_admitted` / `dds_peers_connected` | gauge | — | Admitted peers vs. raw libp2p peers — the unadmitted share is `connected − admitted` |
 | `dds_admission_handshakes_total` | counter | `result=ok\|fail\|revoked` | H-12 inbound-handshake outcomes |
+| `dds_admission_handshake_last_failure_seconds` | gauge | — | Unix-seconds of the most recent non-`ok` handshake (sentinel `0` before any failure lands) |
 | `dds_gossip_messages_total` | counter | `kind=op\|revocation\|burn\|audit` | Inbound gossip volume |
 | `dds_gossip_messages_dropped_total` | counter | `reason` | Pre-decode drops (unadmitted peer, unknown topic, decode error, kind mismatch) |
 | `dds_sync_pulls_total` | counter | `result=ok\|fail` | Anti-entropy pull outcomes |

@@ -31,6 +31,7 @@
 //! | `dds_sessions_issued_total` | counter | `via=fido2\|legacy` | bumped by [`record_sessions_issued`] |
 //! | `dds_purpose_lookups_total` | counter | `result=ok\|denied` | bumped by [`record_purpose_lookup`] |
 //! | `dds_admission_handshakes_total` | counter | `result=ok\|fail\|revoked` | bumped by [`record_admission_handshake`] |
+//! | `dds_admission_handshake_last_failure_seconds` | gauge | — | Unix-seconds of the most recent non-`ok` outcome; bumped at the same call site as the counter; read at scrape via [`last_admission_failure_ts`] |
 //! | `dds_gossip_messages_total` | counter | `kind=op\|revocation\|burn\|audit` | bumped by [`record_gossip_message`] |
 //! | `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted\|unknown_topic\|decode_error\|topic_kind_mismatch` | bumped by [`record_gossip_messages_dropped`] |
 //! | `dds_fido2_attestation_verify_total` | counter | `result=ok\|fail`, `fmt=packed\|none\|unknown` | bumped by [`record_fido2_attestation_verify`] |
@@ -646,6 +647,18 @@ pub struct Telemetry {
     /// `ok|fail|revoked` — bounded by the three outcome branches of
     /// [`crate::node::DdsNode::verify_peer_admission`].
     admission_handshakes: Mutex<BTreeMap<String, u64>>,
+    /// Unix-seconds timestamp of the most recent inbound H-12 admission
+    /// handshake whose outcome was *not* `ok` — i.e. the latest moment
+    /// [`crate::node::DdsNode::verify_peer_admission`] bumped
+    /// `dds_admission_handshakes_total{result="fail"}` or
+    /// `result="revoked"`. Backs the
+    /// `dds_admission_handshake_last_failure_seconds` Prometheus gauge
+    /// and the matching `last_admission_failure_ts` field on
+    /// [`crate::service::NodeStatus`] consumed by `dds-cli stats`. `None`
+    /// before the first failure / revocation lands; the renderer emits
+    /// the literal `0` sentinel in that case so the family is always
+    /// discoverable.
+    admission_handshake_last_failure_ts: Mutex<Option<u64>>,
     /// Per-`kind` inbound gossip-message counts. `kind` is one of
     /// `op|revocation|burn|audit` — bounded by the four message
     /// variants in [`dds_net::gossip::GossipMessage`].
@@ -707,6 +720,7 @@ impl Telemetry {
             sessions_issued: Mutex::new(BTreeMap::new()),
             purpose_lookups: Mutex::new(BTreeMap::new()),
             admission_handshakes: Mutex::new(BTreeMap::new()),
+            admission_handshake_last_failure_ts: Mutex::new(None),
             gossip_messages: Mutex::new(BTreeMap::new()),
             gossip_messages_dropped: Mutex::new(BTreeMap::new()),
             fido2_attestation_verifies: Mutex::new(BTreeMap::new()),
@@ -823,6 +837,36 @@ impl Telemetry {
             Err(p) => p.into_inner(),
         };
         *g.entry(result.to_string()).or_insert(0) += 1;
+        // Stamp the last-failure timestamp on every non-`ok` outcome
+        // so operators can surface "X seconds since last admission
+        // failure" without scraping a since-boot counter rate. `fail`
+        // and `revoked` are both partitioned because both carry
+        // operational signal: `fail` is a verify regression, `revoked`
+        // is a previously-admitted peer still attempting to rejoin.
+        if result != "ok" {
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut ts = match self.admission_handshake_last_failure_ts.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            *ts = Some(now);
+        }
+    }
+
+    /// Most recent Unix-seconds timestamp at which
+    /// [`Self::bump_admission_handshake`] was called with a non-`ok`
+    /// `result`. `None` before the first failure / revocation lands.
+    /// Backs the `dds_admission_handshake_last_failure_seconds`
+    /// Prometheus gauge and the `last_admission_failure_ts` field on
+    /// [`crate::service::NodeStatus`].
+    pub fn admission_handshake_last_failure_ts(&self) -> Option<u64> {
+        match self.admission_handshake_last_failure_ts.lock() {
+            Ok(g) => *g,
+            Err(p) => *p.into_inner(),
+        }
     }
 
     fn admission_handshakes_snapshot(&self) -> BTreeMap<String, u64> {
@@ -1085,6 +1129,19 @@ pub fn record_admission_handshake(result: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_admission_handshake(result);
     }
+}
+
+/// Read the `dds_admission_handshake_last_failure_seconds` gauge value
+/// (Unix seconds of the most recent non-`ok` admission handshake
+/// outcome). Returns `None` before the first failure / revocation
+/// lands, or when telemetry has not been installed (tests, harnesses).
+/// Surfaced through [`crate::service::NodeStatus::last_admission_failure_ts`]
+/// so `dds-cli stats` can render "last admission failure: 12s ago"
+/// without scraping `/metrics`.
+pub fn last_admission_failure_ts() -> Option<u64> {
+    TELEMETRY
+        .get()
+        .and_then(|t| t.admission_handshake_last_failure_ts())
 }
 
 /// Bump `dds_gossip_messages_total{kind=...}` by one. Called from
@@ -1442,6 +1499,23 @@ fn render_exposition(
             count
         ));
     }
+
+    // `dds_admission_handshake_last_failure_seconds` — Unix-seconds
+    // timestamp of the most recent non-`ok` outcome bumped by
+    // `bump_admission_handshake`. Sentinel `0` before the first failure
+    // / revocation lands so the family is always discoverable.
+    out.push_str(
+        "# HELP dds_admission_handshake_last_failure_seconds Unix-seconds timestamp of the most \
+         recent inbound H-12 admission handshake whose outcome was not ok (i.e. the latest moment \
+         the fail or revoked bucket of dds_admission_handshakes_total was bumped). Sentinel 0 \
+         before the first failure / revocation lands. Pairs with the since-boot counter to \
+         surface how long ago without an alerting rate window.\n",
+    );
+    out.push_str("# TYPE dds_admission_handshake_last_failure_seconds gauge\n");
+    out.push_str(&format!(
+        "dds_admission_handshake_last_failure_seconds {}\n",
+        telemetry.admission_handshake_last_failure_ts().unwrap_or(0),
+    ));
 
     // `dds_gossip_messages_total` — per-`kind` inbound gossip-message
     // counter. Bumped from `DdsNode::handle_gossip_message` after the
@@ -2280,6 +2354,67 @@ mod tests {
         // the family in the catalog.
         assert!(body.contains("# TYPE dds_admission_handshakes_total counter\n"));
         assert!(!body.contains("dds_admission_handshakes_total{"));
+        // The sibling last-failure-seconds gauge ships sentinel 0
+        // before any failure lands so the family is still
+        // discoverable in the catalog (matches the "always emit
+        // HELP/TYPE" pattern we use for empty counter families).
+        assert!(body.contains("# TYPE dds_admission_handshake_last_failure_seconds gauge\n"));
+        assert!(body.contains("dds_admission_handshake_last_failure_seconds 0\n"));
+        assert!(t.admission_handshake_last_failure_ts().is_none());
+    }
+
+    #[test]
+    fn admission_handshake_last_failure_seconds_stamps_on_fail_and_revoked() {
+        // `ok` outcomes do *not* advance the timestamp — the gauge is
+        // a "last *failure*" surface, not a "last handshake" one.
+        let t = Telemetry::new();
+        t.bump_admission_handshake("ok");
+        assert!(t.admission_handshake_last_failure_ts().is_none());
+
+        // First non-`ok` outcome stamps a non-zero timestamp.
+        t.bump_admission_handshake("fail");
+        let after_fail = t
+            .admission_handshake_last_failure_ts()
+            .expect("fail outcome stamped a timestamp");
+        assert!(after_fail > 0);
+
+        // `revoked` is partitioned in the counter (so operators can
+        // alert on cert-pipeline regressions vs. expected post-revoke
+        // probing separately) but *both* feed the last-failure gauge
+        // because both carry operational signal: a previously-admitted
+        // peer still attempting to rejoin is a non-trivial event.
+        t.bump_admission_handshake("revoked");
+        let after_revoked = t
+            .admission_handshake_last_failure_ts()
+            .expect("revoked outcome stamped a timestamp");
+        assert!(
+            after_revoked >= after_fail,
+            "revoked stamp ({after_revoked}) should not regress past fail stamp ({after_fail})"
+        );
+
+        // The exposition reflects whatever the Mutex currently
+        // holds; we only assert it is non-zero (we cannot assert an
+        // exact value because the bump uses wall-clock time).
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
+        let line = body
+            .lines()
+            .find(|l| l.starts_with("dds_admission_handshake_last_failure_seconds "))
+            .expect("gauge line present in exposition");
+        let value: u64 = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .expect("gauge value parses as u64");
+        assert!(value >= after_fail);
     }
 
     #[test]
