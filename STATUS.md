@@ -140,7 +140,48 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-28 follow-up #52 (observability Phase C
+> Last updated: 2026-04-28 follow-up #53 (security follow-up —
+> [`security-gaps.md`](security-gaps.md) remaining-work item #4
+> closed: opt-in fail-closed `DDS_REQUIRE_ENCRYPTED_KEYS` env var
+> wired into the three node-side plaintext save paths). The new
+> [`crate::identity_store::REQUIRE_ENCRYPTED_KEYS_ENV`](dds-node/src/identity_store.rs)
+> constant + private
+> [`require_encrypted_keys()`](dds-node/src/identity_store.rs)
+> helper recognise the documented truthy vocabulary (`1` / `true` /
+> `yes`, case-insensitive) and gate the v=1 plain branch of
+> [`identity_store::save`](dds-node/src/identity_store.rs) (node
+> Ed25519 signing key), the v=1 plain branch of
+> [`p2p_identity::save`](dds-node/src/p2p_identity.rs) (libp2p
+> keypair), and both the v=1 Ed25519-only and v=4 plain-hybrid
+> branches of [`domain_store::save_domain_key`](dds-node/src/domain_store.rs)
+> (the v=3 FIDO2 path goes through `save_domain_key_fido2` and is
+> already encrypted, so it is unaffected). When the env var is set
+> with the matching `DDS_NODE_PASSPHRASE` / `DDS_DOMAIN_PASSPHRASE`
+> empty, the save returns a `Crypto` error and writes nothing — the
+> previous behaviour was to log a warning and write plaintext, which
+> meant a misconfigured production deployment silently rolled back to
+> the dev posture. Default off so existing dev workflows keep
+> working; production deployments turn it on alongside the passphrase
+> env vars to fail-closed instead of warn-and-write. Three new
+> regression tests cover the gate
+> (`identity_store::test_save_refuses_plaintext_when_required_env_set`,
+> `p2p_identity::save_refuses_plaintext_when_required_env_set`,
+> `domain_store::domain_key_save_refuses_plaintext_when_required_env_set`)
+> plus a fourth
+> (`identity_store::test_require_encrypted_keys_truthy_vocabulary`)
+> pinning the case-insensitive truthy vocabulary so a future
+> maintainer who tightens the parser cannot silently drift away from
+> the documented `1`/`true`/`yes` triplet. The
+> [`docs/DDS-Admin-Guide.md`](docs/DDS-Admin-Guide.md) Environment
+> Variables table is extended with the new flag (and gains a row for
+> the existing `DDS_NODE_ALLOW_PLAINTEXT_DOWNGRADE` escape hatch that
+> was previously documented only in the source); the
+> [`security-gaps.md`](security-gaps.md) Remaining Work item #4 is
+> struck through and annotated with the implementation summary.
+> `cargo fmt` clean; `cargo test --workspace` passes (workspace
+> test count rises by 4).
+>
+> Previous: 2026-04-28 follow-up #52 (observability Phase C
 > follow-up — `dds_trust_graph_attestations` Prometheus gauge gained a
 > `body_type` partition, closing the deferred per-kind label row on the
 > [`docs/observability-plan.md`](docs/observability-plan.md) Phase C

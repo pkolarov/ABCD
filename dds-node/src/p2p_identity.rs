@@ -45,7 +45,7 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::identity_store::PASSPHRASE_ENV;
+use crate::identity_store::{PASSPHRASE_ENV, REQUIRE_ENCRYPTED_KEYS_ENV, require_encrypted_keys};
 
 const VERSION_PLAIN: u8 = 1;
 const VERSION_ENCRYPTED: u8 = 2;
@@ -139,6 +139,17 @@ pub fn save(path: &Path, kp: &Keypair) -> Result<(), P2pIdentityError> {
     // H-9 hygiene: passphrase wrapped in `Zeroizing` so it's wiped on
     // drop even on the early-error paths below.
     let passphrase = std::env::var(PASSPHRASE_ENV).map(Zeroizing::new);
+    let will_be_plaintext = !matches!(&passphrase, Ok(p) if !p.is_empty());
+    if will_be_plaintext && require_encrypted_keys() {
+        proto.zeroize();
+        return Err(P2pIdentityError::Crypto(format!(
+            "refusing to write plaintext libp2p identity at {} — \
+             {REQUIRE_ENCRYPTED_KEYS_ENV} is set but {PASSPHRASE_ENV} is empty. \
+             Set {PASSPHRASE_ENV} to a non-empty value, or unset \
+             {REQUIRE_ENCRYPTED_KEYS_ENV} on dev hosts.",
+            path.display()
+        )));
+    }
     let map = match passphrase {
         Ok(pass) if !pass.is_empty() => {
             // M-10: emit v=3 with parameters embedded in the blob.
@@ -513,6 +524,43 @@ mod tests {
         let again = load(&path).unwrap();
         assert_eq!(PeerId::from(again.public()), original_peer_id);
 
+        unsafe { std::env::remove_var(PASSPHRASE_ENV) };
+    }
+
+    /// **security-gaps.md remaining work #4** — when
+    /// `DDS_REQUIRE_ENCRYPTED_KEYS` is set and `DDS_NODE_PASSPHRASE`
+    /// is empty, `save` must refuse to write a plaintext libp2p key
+    /// blob. The same call succeeds when a passphrase is set.
+    #[test]
+    fn save_refuses_plaintext_when_required_env_set() {
+        let _g = PASSPHRASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(PASSPHRASE_ENV) };
+        unsafe { std::env::set_var(REQUIRE_ENCRYPTED_KEYS_ENV, "1") };
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("p2p_key.bin");
+        let kp = Keypair::generate_ed25519();
+        let err = save(&path, &kp).expect_err("save must refuse plaintext");
+        match err {
+            P2pIdentityError::Crypto(msg) => {
+                assert!(
+                    msg.contains("refusing to write plaintext libp2p identity")
+                        && msg.contains(REQUIRE_ENCRYPTED_KEYS_ENV),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected Crypto error, got {other:?}"),
+        }
+        assert!(!path.exists(), "file must not be created on refusal");
+
+        // With a passphrase set the save proceeds normally.
+        unsafe { std::env::set_var(PASSPHRASE_ENV, "p2p-require-test") };
+        save(&path, &kp).expect("encrypted save must proceed under require-encrypted");
+        assert!(path.exists());
+
+        unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
         unsafe { std::env::remove_var(PASSPHRASE_ENV) };
     }
 

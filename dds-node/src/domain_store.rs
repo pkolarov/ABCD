@@ -182,6 +182,23 @@ pub fn save_domain_key(path: &Path, key: &DomainKey) -> Result<(), DomainStoreEr
         _ => None,
     };
 
+    // **security-gaps.md remaining work #4** — operator opt-in to
+    // refuse a plaintext domain key. When `DDS_REQUIRE_ENCRYPTED_KEYS`
+    // is set, fail-closed before writing v=1 / v=4 plain blobs. The
+    // FIDO2 path goes through `save_domain_key_fido2` and is already
+    // encrypted, so it is unaffected.
+    if passphrase.is_none() && crate::identity_store::require_encrypted_keys() {
+        return Err(DomainStoreError::Crypto(format!(
+            "refusing to write plaintext domain key at {} — \
+             {} is set but {DOMAIN_PASSPHRASE_ENV} is empty. \
+             Set {DOMAIN_PASSPHRASE_ENV} to a non-empty value, use \
+             `--fido2`, or unset {} on dev hosts.",
+            path.display(),
+            crate::identity_store::REQUIRE_ENCRYPTED_KEYS_ENV,
+            crate::identity_store::REQUIRE_ENCRYPTED_KEYS_ENV,
+        )));
+    }
+
     // **Z-1 Phase A** — branch on hybrid vs Ed25519-only and on
     // whether a passphrase is set, picking one of v1 / v2 / v4 / v5.
     // (v3 = FIDO2 stays Ed25519-only via `save_domain_key_fido2`.)
@@ -872,5 +889,81 @@ pubkey = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
         let loaded = load_domain_key(&path).unwrap();
         assert!(!loaded.is_hybrid());
         assert_eq!(loaded.pubkey(), key.pubkey());
+    }
+
+    /// **security-gaps.md remaining work #4** — when
+    /// `DDS_REQUIRE_ENCRYPTED_KEYS` is set and `DDS_DOMAIN_PASSPHRASE`
+    /// is empty, both the Ed25519-only (v=1) and hybrid (v=4 plain
+    /// hybrid) save paths must refuse to write a plaintext domain
+    /// key. With a passphrase set, the same call succeeds and writes
+    /// v=2 / v=5 respectively.
+    #[test]
+    fn domain_key_save_refuses_plaintext_when_required_env_set() {
+        use crate::identity_store::REQUIRE_ENCRYPTED_KEYS_ENV;
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(DOMAIN_PASSPHRASE_ENV) };
+        unsafe { std::env::set_var(REQUIRE_ENCRYPTED_KEYS_ENV, "1") };
+
+        let dir = TempDir::new().unwrap();
+
+        // (1) Ed25519-only path → would write v=1 plain; must refuse.
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let path = dir.path().join("domain_key.bin");
+        let err = save_domain_key(&path, &key).expect_err("v=1 save must refuse plaintext");
+        match err {
+            DomainStoreError::Crypto(msg) => {
+                assert!(
+                    msg.contains("refusing to write plaintext domain key")
+                        && msg.contains(REQUIRE_ENCRYPTED_KEYS_ENV)
+                        && msg.contains(DOMAIN_PASSPHRASE_ENV),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected Crypto error, got {other:?}"),
+        }
+        assert!(!path.exists(), "v=1 path must not be created on refusal");
+
+        // (2) Hybrid path → would write v=4 plain hybrid; must refuse.
+        let hybrid = DomainKey::generate_hybrid("acme.com", &mut OsRng);
+        let path_h = dir.path().join("domain_key_hybrid.bin");
+        let err = save_domain_key(&path_h, &hybrid).expect_err("v=4 save must refuse plaintext");
+        match err {
+            DomainStoreError::Crypto(msg) => {
+                assert!(
+                    msg.contains("refusing to write plaintext domain key")
+                        && msg.contains(REQUIRE_ENCRYPTED_KEYS_ENV),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected Crypto error, got {other:?}"),
+        }
+        assert!(
+            !path_h.exists(),
+            "v=4 hybrid path must not be created on refusal"
+        );
+
+        // (3) With a passphrase set, both saves proceed (v=2 + v=5).
+        unsafe { std::env::set_var(DOMAIN_PASSPHRASE_ENV, "domain-require-test") };
+        save_domain_key(&path, &key).expect("v=2 encrypted save must proceed");
+        save_domain_key(&path_h, &hybrid).expect("v=5 encrypted save must proceed");
+        let v_ed = std::fs::read(&path).unwrap();
+        let v_h = std::fs::read(&path_h).unwrap();
+        let read_v = |b: &[u8]| -> i64 {
+            let val: CborValue = ciborium::from_reader(b).unwrap();
+            val.as_map()
+                .unwrap()
+                .iter()
+                .find_map(|(k, v)| {
+                    (k.as_text() == Some("v"))
+                        .then(|| v.as_integer().and_then(|i| i64::try_from(i).ok()))
+                })
+                .flatten()
+                .unwrap()
+        };
+        assert_eq!(read_v(&v_ed), VERSION_ENCRYPTED as i64);
+        assert_eq!(read_v(&v_h), VERSION_ENCRYPTED_HYBRID as i64);
+
+        unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+        unsafe { std::env::remove_var(DOMAIN_PASSPHRASE_ENV) };
     }
 }

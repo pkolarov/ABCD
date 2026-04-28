@@ -49,6 +49,32 @@ pub const PASSPHRASE_ENV: &str = "DDS_NODE_PASSPHRASE";
 /// unencrypted blob even when an encrypted marker exists.
 pub const ALLOW_PLAINTEXT_DOWNGRADE_ENV: &str = "DDS_NODE_ALLOW_PLAINTEXT_DOWNGRADE";
 
+/// **security-gaps.md remaining work #4** — operator opt-in to refuse
+/// storing any node-side key in plaintext. When this env var is set
+/// to a truthy value (`1`, `true`, `yes`, case-insensitive), the
+/// three plaintext save paths (`identity_store::save`,
+/// `p2p_identity::save`, `domain_store::save_domain_key` in its
+/// non-FIDO2 plain branches) refuse to write a v=1 / v=4 plain
+/// blob and return a `Crypto` error instructing the operator to
+/// supply `DDS_NODE_PASSPHRASE` / `DDS_DOMAIN_PASSPHRASE` (or use
+/// `--fido2`). Default off so existing dev workflows keep working;
+/// production deployments turn it on alongside the passphrase env
+/// vars to fail-closed instead of silently writing plaintext.
+pub const REQUIRE_ENCRYPTED_KEYS_ENV: &str = "DDS_REQUIRE_ENCRYPTED_KEYS";
+
+/// Returns true when `DDS_REQUIRE_ENCRYPTED_KEYS` is set to a truthy
+/// value. Recognised truthy values: `1`, `true`, `yes` (any case).
+/// Anything else (including empty / unset) is treated as off.
+pub(crate) fn require_encrypted_keys() -> bool {
+    match std::env::var(REQUIRE_ENCRYPTED_KEYS_ENV) {
+        Ok(v) => {
+            let s = v.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes")
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 pub(crate) static PASSPHRASE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -164,6 +190,15 @@ pub fn save(path: &Path, ident: &Identity) -> Result<(), IdentityStoreError> {
     // disk would silently roll back to plaintext.
     let passphrase = std::env::var(PASSPHRASE_ENV).map(Zeroizing::new);
     let will_be_plaintext = !matches!(&passphrase, Ok(p) if !p.is_empty());
+    if will_be_plaintext && require_encrypted_keys() {
+        return Err(IdentityStoreError::Crypto(format!(
+            "refusing to write plaintext node identity at {} — \
+             {REQUIRE_ENCRYPTED_KEYS_ENV} is set but {PASSPHRASE_ENV} is empty. \
+             Set {PASSPHRASE_ENV} to a non-empty value, or unset \
+             {REQUIRE_ENCRYPTED_KEYS_ENV} on dev hosts.",
+            path.display()
+        )));
+    }
     if will_be_plaintext && encrypted_marker_path(path).exists() {
         let allow_downgrade = std::env::var(ALLOW_PLAINTEXT_DOWNGRADE_ENV)
             .map(|s| !s.is_empty())
@@ -675,5 +710,74 @@ mod tests {
         unsafe {
             std::env::remove_var(ALLOW_PLAINTEXT_DOWNGRADE_ENV);
         }
+    }
+
+    /// **security-gaps.md remaining work #4** — when
+    /// `DDS_REQUIRE_ENCRYPTED_KEYS` is set and `DDS_NODE_PASSPHRASE`
+    /// is empty/unset, `save` must refuse to write plaintext on a
+    /// fresh path (no marker yet). With a passphrase set, the same
+    /// `DDS_REQUIRE_ENCRYPTED_KEYS=1` save proceeds normally.
+    #[test]
+    fn test_save_refuses_plaintext_when_required_env_set() {
+        let _g = PASSPHRASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(PASSPHRASE_ENV) };
+        unsafe { std::env::set_var(REQUIRE_ENCRYPTED_KEYS_ENV, "1") };
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("node_key.bin");
+        let ident = Identity::generate("require-test", &mut OsRng);
+        let err = save(&path, &ident).expect_err("save must refuse plaintext");
+        match err {
+            IdentityStoreError::Crypto(msg) => {
+                assert!(
+                    msg.contains("refusing to write plaintext node identity")
+                        && msg.contains(REQUIRE_ENCRYPTED_KEYS_ENV),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected Crypto error, got {other:?}"),
+        }
+        // No file should have been written.
+        assert!(!path.exists(), "file must not be created on refusal");
+
+        // With a passphrase set, the same gate is satisfied and save
+        // succeeds — the gate fails closed only for the plaintext path.
+        unsafe { std::env::set_var(PASSPHRASE_ENV, "require-test-pass") };
+        save(&path, &ident).expect("encrypted save must proceed under require-encrypted");
+        assert!(path.exists());
+        let bytes = std::fs::read(&path).unwrap();
+        let value: CborValue = ciborium::from_reader(&bytes[..]).unwrap();
+        let map = value.as_map().unwrap();
+        let v = map
+            .iter()
+            .find_map(|(k, val)| (k.as_text()? == "v").then(|| val.as_integer()))
+            .flatten()
+            .and_then(|i| i64::try_from(i).ok());
+        assert_eq!(v, Some(VERSION_ENCRYPTED_V3 as i64));
+
+        unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+        unsafe { std::env::remove_var(PASSPHRASE_ENV) };
+    }
+
+    /// `DDS_REQUIRE_ENCRYPTED_KEYS` recognises the documented truthy
+    /// vocabulary (`1`, `true`, `yes`, case-insensitive) and treats
+    /// everything else (including empty / random text / `0`) as off.
+    #[test]
+    fn test_require_encrypted_keys_truthy_vocabulary() {
+        let _g = PASSPHRASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for v in ["1", "true", "TRUE", "True", "yes", "YES"] {
+            unsafe { std::env::set_var(REQUIRE_ENCRYPTED_KEYS_ENV, v) };
+            assert!(require_encrypted_keys(), "expected truthy: {v:?}");
+        }
+        for v in ["", "0", "false", "no", "off", "anythingelse"] {
+            unsafe { std::env::set_var(REQUIRE_ENCRYPTED_KEYS_ENV, v) };
+            assert!(!require_encrypted_keys(), "expected falsy: {v:?}");
+        }
+        unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+        assert!(!require_encrypted_keys(), "unset must be falsy");
     }
 }

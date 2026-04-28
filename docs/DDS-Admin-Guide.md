@@ -602,6 +602,8 @@ audit_log_enabled = true
 |---|---|
 | `DDS_DOMAIN_PASSPHRASE` | Decrypts the domain key for `init-domain` and `admit` commands |
 | `DDS_NODE_PASSPHRASE` | Encrypts/decrypts the node's Vouchsafe signing identity |
+| `DDS_REQUIRE_ENCRYPTED_KEYS` | Fail-closed gate. When set to a truthy value (`1`, `true`, `yes`, case-insensitive), `dds-node` refuses to write any plaintext key blob to disk: the node identity (`node_key.bin`), the libp2p key (`p2p_key.bin`), and the domain key (`domain_key.bin` v=1 / v=4 plain hybrid). The save returns an error and writes nothing — operators must supply `DDS_NODE_PASSPHRASE` / `DDS_DOMAIN_PASSPHRASE` (or use `--fido2`) before re-running. Default off so dev workflows that intentionally write plaintext keep working; production deployments turn it on alongside the passphrase env vars. |
+| `DDS_NODE_ALLOW_PLAINTEXT_DOWNGRADE` | Escape hatch for dev/testing — allows `identity_store::save` to overwrite an encrypted node-key blob with a plaintext one when `DDS_NODE_PASSPHRASE` is empty. Off by default; set to `1` to override the M-14 sticky-marker guard. |
 | `RUST_LOG` | Controls log verbosity (e.g. `info`, `debug`, `dds_node=debug`) |
 
 ---
