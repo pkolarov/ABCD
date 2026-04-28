@@ -1632,7 +1632,18 @@ load a working monitoring layer in minutes:
   — Per-family ingest activity (attest / vouch / revoke / burn,
   success vs `*.rejected`), enrollment & admin actions, apply
   outcomes, aggregate rejection-ratio panel matching the
-  `DdsAuditRejectionSpike` rule.
+  `DdsAuditRejectionSpike` rule, plus three FIDO2-tier panels
+  keyed off the Phase C catalog metrics: assertion outcomes
+  (`dds_fido2_assertions_total{result}`, the five non-`ok` result
+  buckets coloured red and tracked by
+  `DdsFido2AssertionFailureSpike`), attestation verify
+  (`dds_fido2_attestation_verify_total{result, fmt}`, partitioned
+  by result × fmt for AAGUID allow-list / unsupported-format
+  rejection waves), and session minting
+  (`dds_sessions_issued_total{via}`, with `via="legacy"` coloured
+  red as the regression signal — production traffic should be
+  `fido2`-only after the security review removed the
+  unauthenticated `POST /v1/session` route).
 
 Load with `promtool check rules dds.rules.yml` (Alertmanager) and the
 Grafana "Import dashboard" UI / `grafana-cli` (Grafana 10+).
