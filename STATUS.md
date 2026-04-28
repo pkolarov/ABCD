@@ -140,7 +140,47 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-28 follow-up #53 (security follow-up —
+> Last updated: 2026-04-28 follow-up #54 (security follow-up —
+> [`security-gaps.md`](security-gaps.md) remaining-work item #3
+> closed: per-file Windows DACL hardening for the three node-side
+> key-save paths). New module
+> [`crate::file_acl`](dds-node/src/file_acl.rs) exposes a private
+> `restrict_to_owner(path)` helper that — on Windows — applies the
+> protected DACL `D:PAI(A;;FA;;;SY)(A;;FA;;;BA)` (Full-Access for
+> `LocalSystem` and `BUILTIN\Administrators`, no inheritance from
+> parent) via `ConvertStringSecurityDescriptorToSecurityDescriptorW`
+> + `SetNamedSecurityInfoW` with `PROTECTED_DACL_SECURITY_INFORMATION`,
+> mirroring the SDDL used by `restrict-data-dir-acl`,
+> `AppliedStateStore.SetWindowsDacl`, and `FileLog::Init` (without the
+> `OICI` container-inheritance flags, since this targets a file rather
+> than a directory). On Unix the helper preserves the existing
+> `chmod 0o600` semantics. The three duplicated
+> `set_owner_only_permissions` helpers in
+> [`identity_store.rs`](dds-node/src/identity_store.rs),
+> [`p2p_identity.rs`](dds-node/src/p2p_identity.rs), and
+> [`domain_store.rs`](dds-node/src/domain_store.rs) now all delegate
+> to the shared helper, so every per-file save path (node Ed25519
+> key, libp2p keypair, domain key v=1/v=4 plain + v=2/v=3/v=5
+> encrypted, encrypted-marker sidecar) gets the Windows DACL applied
+> at write time. Failures are logged at warn (best-effort) since the
+> data-dir DACL applied by the MSI custom action `CA_RestrictDataDirAcl`
+> remains the production-grade hardening; the per-file call is
+> defense-in-depth for non-MSI deployments and for files that may
+> pre-exist before the data-dir DACL is applied. Three new unit
+> tests pin the cross-platform contract
+> (`file_acl::tests::restrict_to_owner_does_not_panic_on_existing_file`,
+> `file_acl::tests::restrict_to_owner_does_not_panic_on_missing_file`,
+> `file_acl::tests::restrict_to_owner_sets_0o600_on_unix`); the
+> Windows DACL path itself requires a Windows host to exercise
+> end-to-end. Cross-compile to `x86_64-pc-windows-gnu` is clean;
+> `cargo clippy --all-targets -- -D warnings` clean; `cargo test
+> --workspace` 704 passing (was 701, +3 from the new file_acl unit
+> tests). The
+> [`security-gaps.md`](security-gaps.md) Remaining Work item #3 and
+> the "Additional Exposure → Windows: no ACL hardening yet" line are
+> both struck through and annotated with the implementation summary.
+>
+> Previous: 2026-04-28 follow-up #53 (security follow-up —
 > [`security-gaps.md`](security-gaps.md) remaining-work item #4
 > closed: opt-in fail-closed `DDS_REQUIRE_ENCRYPTED_KEYS` env var
 > wired into the three node-side plaintext save paths). The new

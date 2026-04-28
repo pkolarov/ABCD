@@ -319,14 +319,16 @@ pub fn save(path: &Path, ident: &Identity) -> Result<(), IdentityStoreError> {
     Ok(())
 }
 
-/// Best-effort: restrict file to owner-only read/write (0o600 on Unix).
-fn set_owner_only_permissions(_path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(_path, perms);
-    }
+/// Best-effort: restrict file to owner-only access.
+///
+/// - Unix: `chmod 0o600`.
+/// - Windows: protected DACL granting only LocalSystem +
+///   `BUILTIN\Administrators` (defense-in-depth alongside the data-dir
+///   DACL applied by the `CA_RestrictDataDirAcl` MSI custom action;
+///   closes [`security-gaps.md`](../../security-gaps.md) Remaining
+///   Work #3).
+fn set_owner_only_permissions(path: &Path) {
+    crate::file_acl::restrict_to_owner(path);
 }
 
 /// Read a file without following symlinks (L-2). On Unix uses

@@ -325,14 +325,13 @@ pub fn save_domain_key(path: &Path, key: &DomainKey) -> Result<(), DomainStoreEr
     Ok(())
 }
 
-/// Best-effort: restrict file to owner-only read/write (0o600 on Unix).
-fn set_owner_only_permissions(_path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(_path, perms);
-    }
+/// Best-effort: restrict file to owner-only access.
+///
+/// Delegates to [`crate::file_acl::restrict_to_owner`] — `chmod 0o600`
+/// on Unix, protected DACL on Windows. See `file_acl.rs` for the SDDL
+/// detail.
+fn set_owner_only_permissions(path: &Path) {
+    crate::file_acl::restrict_to_owner(path);
 }
 
 pub fn load_domain_key(path: &Path) -> Result<DomainKey, DomainStoreError> {
