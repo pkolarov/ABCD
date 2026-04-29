@@ -66,7 +66,7 @@ The `device_urn` parameter is accepted but intentionally not used for filtering:
 - FIDO2-protected domain keys also get restricted permissions.
 - **Remaining risk**: when passphrases are not set, keys are still stored unencrypted (with a warning). Failing closed (refusing to write without a passphrase) would break development workflows. The warning is the intended design — production deployments should always set `DDS_DOMAIN_PASSPHRASE` and `DDS_NODE_PASSPHRASE`, or use `--fido2` protection.
 - ~~**Windows**: no ACL hardening yet (the `set_permissions` call is Unix-only).~~ **FIXED (2026-04-28).** See Remaining Work item #3.
-- Provision bundles still embed the domain key blob — but it is already encrypted (passphrase or FIDO2), and the bundle is documented as a sensitive artifact.
+- Provision bundles still embed the domain key blob — but it is already encrypted (passphrase or FIDO2), and the bundle is documented as a sensitive artifact. **2026-04-29 follow-on (L-5 idiom):** `save_bundle` now also sets `0o600` on the written `.dds` file under `cfg(unix)`, mirroring `dds export` and `dds-cli audit export --out`, so a co-tenant cannot copy the bundle off disk for an offline passphrase-unwrap attempt. Regression test in `dds-node::provision::tests::save_bundle_writes_owner_only_mode`.
 
 ### ~~Provision bundle admission cert TTL~~
 

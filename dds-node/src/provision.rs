@@ -297,6 +297,18 @@ pub fn save_bundle(
     ciborium::into_writer(&CborValue::Map(map), &mut buf)
         .map_err(|e| ProvisionError::Cbor(e.to_string()))?;
     std::fs::write(path, &buf).map_err(|e| ProvisionError::Io(e.to_string()))?;
+    // L-5 follow-on (security review): the provision bundle carries the
+    // passphrase- or FIDO2-wrapped `domain_key_blob`, the domain pubkey,
+    // org_hash, and an integrity signature — all sensitive provisioning
+    // material, even though the key blob itself is encrypted. Restrict
+    // the file to owner-only on Unix so a co-tenant can't read it and
+    // attempt offline unwrap. Mirrors the same idiom applied to
+    // `dds-cli export` and `dds-cli audit export --out`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
@@ -1339,6 +1351,36 @@ mod tests {
             })
             .unwrap();
         assert_eq!(v, 3, "ed25519-only bundle stays at v3");
+    }
+
+    /// L-5 follow-on regression: the provision bundle file carries the
+    /// passphrase-/FIDO2-wrapped domain key blob and other sensitive
+    /// provisioning metadata; mirror the `dds export` / `dds-cli audit
+    /// export --out` idiom and pin owner-only on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn save_bundle_writes_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("owner-only.dds");
+        let key = DomainKey::generate("test.local", &mut OsRng);
+        let domain = key.domain();
+        let bundle = ProvisionBundle {
+            domain_name: domain.name.clone(),
+            domain_id: domain.id.to_string(),
+            domain_pubkey: to_hex(&domain.pubkey),
+            domain_pq_pubkey: None,
+            domain_key_blob: vec![1, 2, 3, 4],
+            org_hash: "test-org".into(),
+            listen_port: 4001,
+            api_port: 5551,
+            mdns_enabled: true,
+            fingerprint: String::new(),
+        };
+        save_bundle(&path, &bundle, &key).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "bundle file must be owner-only (0o600)");
     }
 
     /// H-10 regression: a bundle whose signature doesn't match the
