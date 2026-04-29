@@ -1921,6 +1921,40 @@ stick.
 Because the format is a plain CBOR document, a `.ddsdump` is exactly the
 same size as the on-disk store contents — no extra framing overhead.
 
+### Confidentiality posture (Z-5)
+
+> **The dump is signed for integrity but is NOT encrypted for
+> confidentiality.** Treat a `.ddsdump` as Restricted material in
+> transit.
+
+The file contains every signed token (credential IDs, device tags,
+attestations), every CRDT operation, and the revoked / burned sets — i.e.
+a complete snapshot of directory state. An attacker who reads a `.ddsdump`
+in transit (intercepted USB stick, courier loss, mis-routed email) learns
+the full enrolled-user list and every device tag, even though the
+records themselves remain cryptographically signed.
+
+Until the encrypted-dump variant lands (Z-5 in
+[Claude_sec_review.md](../Claude_sec_review.md)), the operator MUST add
+their own confidentiality layer before transit:
+
+- **GPG / age:** `gpg --encrypt --recipient <pubkey> sync.ddsdump`
+  (decrypt at the destination before `dds import`).
+- **Encrypted volume:** ship through a LUKS / VeraCrypt / FileVault
+  USB stick rather than a bare filesystem.
+- **Wrapped channel:** `scp` / `sftp` / a corp-pipeline already
+  layered on TLS.
+
+The CLI surfaces this on every export — `dds export` writes a
+`WARNING: The dump file is signed for integrity but is NOT encrypted.`
+line to stderr alongside the success summary, so an operator who pipes
+the dump into a courier flow sees the posture explicitly rather than
+silently shipping plaintext.
+
+The integrity signature (M-16) means a tampered dump fails import even
+when shipped in the clear, so the integrity-vs-confidentiality split is
+deliberate; the warning above is about confidentiality only.
+
 ### Commands
 
 ```bash

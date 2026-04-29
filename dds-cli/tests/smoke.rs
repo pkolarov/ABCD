@@ -402,6 +402,16 @@ fn test_export_import_round_trip() {
     assert!(stdout.contains("Tokens:     1"));
     assert!(dump_path.exists());
 
+    // Z-5 (security review) — the dump is signed for integrity but is
+    // NOT encrypted. The CLI must surface that confidentiality posture
+    // explicitly so an operator who pipes the dump into a courier flow
+    // does not silently ship plaintext directory state.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("WARNING") && stderr.contains("NOT encrypted"),
+        "export must warn that the dump is not encrypted; stderr was: {stderr}"
+    );
+
     // Node B: empty, same domain. Clone the src's domain files so
     // the signed dump verifies against dst's copy of the pubkey.
     let dst = tempfile::tempdir().unwrap();

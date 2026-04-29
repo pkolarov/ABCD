@@ -2025,7 +2025,7 @@ entire audit chain.
    and stop claiming at-rest encryption in marketing materials
    until (1) or (2) lands.
 
-### Z-5 (Medium) ❌ open — Export dumps are plaintext
+### Z-5 (Medium) ⚠ partially closed (doc half landed 2026-04-29) — Export dumps are plaintext
 
 `dds-cli export` (`dds-cli/src/dump.rs:60-90`) writes a CBOR archive
 containing all tokens, operations, and revocation/burn sets. v2 adds
@@ -2037,6 +2037,37 @@ air-gap sync are shipping plaintext copies of the directory state.
 --encrypt-to <pubkey>` → hybrid-PQ KEM envelope around the existing
 signed CBOR). Document explicitly that unencrypted dumps must be
 treated as Restricted material in transit.
+
+**Doc-half landed 2026-04-29.** The "document explicitly" half of the
+remediation now ships:
+
+- `handle_export` in [`dds-cli/src/main.rs`](dds-cli/src/main.rs)
+  emits an explicit stderr advisory after every successful export —
+  `WARNING: The dump file is signed for integrity but is NOT
+  encrypted.` followed by `It contains the full directory state in
+  plaintext CBOR.` and `Treat as Restricted material; encrypt before
+  transit (GPG / age / FDE).` — so an operator piping the dump into
+  a courier flow sees the confidentiality posture rather than
+  silently shipping plaintext. The summary block on stdout is
+  unchanged, so existing scripts that grep `Tokens:`/`Size:` keep
+  working; the warning lives on stderr alongside the existing
+  failure-path messages.
+- [`docs/DDS-Admin-Guide.md`](docs/DDS-Admin-Guide.md) §"Air-Gapped
+  Sync" gained a new "Confidentiality posture (Z-5)" subsection
+  enumerating the three operator-side wrappers (GPG / age,
+  encrypted volume, wrapped channel) until the encrypted-dump
+  variant lands. Cross-links back to this Z-5 row.
+- New regression test in [`dds-cli/tests/smoke.rs`](dds-cli/tests/smoke.rs)
+  `test_export_import_round_trip` asserts the warning appears in
+  stderr (`WARNING` + `NOT encrypted`) so a future regression that
+  silently drops the advisory fails CI.
+
+**Still open:** the encryption half — `dds-cli export --encrypt-to
+<pubkey>` wrapping the existing signed CBOR in a hybrid-PQ KEM
+envelope — rides on the Z-1 Phase B hybrid-KEM machinery (per-message
+hybrid-KEM envelope on gossip + sync) landing first so the export
+path can reuse the same `dds-core::crypto::kem` module rather than
+introducing a parallel KEM API.
 
 ### Cross-reference
 
@@ -2055,7 +2086,9 @@ These five findings are not duplicates of any prior review item:
 - Z-4 expands M-20's umask hardening into a structural at-rest
   question rather than a permission question.
 - Z-5 is the confidentiality complement to M-16 (which closed
-  v1-downgrade *integrity*).
+  v1-downgrade *integrity*). Doc-half (operator advisory + admin
+  guide subsection + regression test) landed 2026-04-29; the
+  encryption half remains open and rides on Z-1 Phase B.
 
 ---
 

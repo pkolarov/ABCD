@@ -1818,6 +1818,18 @@ fn handle_export(data_dir: &Path, out: &Path) {
     println!("  Revoked:    {}", dump.revoked.len());
     println!("  Burned:     {}", dump.burned.len());
     println!("  Size:       {} bytes", bytes.len());
+    // Z-5 (security review) — the dump is signed for integrity but is
+    // NOT encrypted for confidentiality. Treat it as Restricted material
+    // in transit: it contains every signed token (credential IDs, device
+    // tags, attestations), every CRDT operation, and the revoked / burned
+    // sets — i.e. a complete snapshot of directory state. Operators
+    // shipping it through couriers or USB sticks must add their own
+    // confidentiality layer (FDE, GPG, age, etc.) until the encrypted
+    // export variant lands.
+    eprintln!();
+    eprintln!("WARNING: The dump file is signed for integrity but is NOT encrypted.");
+    eprintln!("         It contains the full directory state in plaintext CBOR.");
+    eprintln!("         Treat as Restricted material; encrypt before transit (GPG / age / FDE).");
 }
 
 fn handle_import(data_dir: &Path, input: &Path, dry_run: bool, allow_unsigned: bool) {
