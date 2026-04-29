@@ -154,7 +154,27 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-29 (SC-5 Phase B.1 ingest-time gate — node-side
+> Last updated: 2026-04-29 (audit-event-schema rejection vocabulary
+> caught up — the SC-5 Phase B.1 ingest-time `publisher-identity-invalid`
+> stem (committed earlier today) was being emitted by
+> [`DdsNode::ingest_operation`](dds-node/src/node.rs) but had no row in
+> the [`docs/observability/audit-event-schema.md`](docs/observability/audit-event-schema.md)
+> §4 "Rejection-reason vocabulary" table that SIEM operators consume.
+> Without that row a forwarder rule keyed off the documented stem set
+> would silently miss the new bucket. New row documents the gate
+> (`node::software_publisher_identity_ok`), what it catches (empty
+> Authenticode subject / wrong-shape SHA-1 thumbprint / wrong-shape
+> Apple Team ID), and the matching `dds_sync_payloads_rejected_total{reason="publisher_identity"}`
+> sync-side counterpart so an operator can correlate the two surfaces.
+> [`audit_rejection_vocabulary_signs_reason`](dds-node/src/service.rs)
+> in `LocalService` test mod was extended with a fifth row pinning the
+> new stem so a future refactor that renames the reason cannot land
+> without updating the doc table at the same time. 735 / 735 workspace
+> tests passing (unchanged — same test count, one extra reason in the
+> existing table-driven test); `cargo fmt --all -- --check` clean;
+> `cargo clippy --workspace --all-targets -- -D warnings` clean.
+>
+> Previous: 2026-04-29 (SC-5 Phase B.1 ingest-time gate — node-side
 > fail-closed `software_publisher_identity_ok` helper now runs at both
 > wire ingest paths so a malformed `publisher_identity` cannot enter the
 > trust graph or propagate to peers. Mirrors the C-3 defence-in-depth

@@ -3952,11 +3952,17 @@ mod platform_applier_tests {
     /// gossip path uses (`attest.rejected`, `vouch.rejected`,
     /// `revoke.rejected`, `burn.rejected`) round-trips through
     /// `emit_local_audit` with the reason field intact and signed.
+    /// The `publisher-identity-invalid` row is the SC-5 Phase B.1
+    /// follow-on stem documented in
+    /// [`docs/observability/audit-event-schema.md`](../../../docs/observability/audit-event-schema.md)
+    /// §4 — pinning it here keeps the doc and the wire shape from
+    /// drifting silently if a future refactor renames the reason stem.
     #[test]
     fn audit_rejection_vocabulary_signs_reason() {
         let (mut svc, _, _) = setup();
         for (action, reason) in [
             ("attest.rejected", "publisher-capability-missing"),
+            ("attest.rejected", "publisher-identity-invalid"),
             ("vouch.rejected", "trust-graph-rejected: bad-vch_sum"),
             ("revoke.rejected", "iat-outside-replay-window"),
             ("burn.rejected", "validation-failed: signature mismatch"),
@@ -3964,18 +3970,22 @@ mod platform_applier_tests {
             svc.emit_local_audit(action, vec![1, 2, 3], Some(reason.into()));
         }
         let entries = svc.store.list_audit_entries().unwrap();
-        // Compare the trailing 4 entries against the expected vocabulary.
-        let tail: Vec<&str> = entries
+        // Compare the trailing 5 entries against the expected vocabulary.
+        let tail: Vec<(&str, Option<&str>)> = entries
             .iter()
             .rev()
-            .take(4)
-            .map(|e| e.action.as_str())
+            .take(5)
+            .map(|e| (e.action.as_str(), e.reason.as_deref()))
             .collect();
-        assert!(tail.contains(&"attest.rejected"));
-        assert!(tail.contains(&"vouch.rejected"));
-        assert!(tail.contains(&"revoke.rejected"));
-        assert!(tail.contains(&"burn.rejected"));
-        for e in entries.iter().rev().take(4) {
+        let actions: Vec<&str> = tail.iter().map(|(a, _)| *a).collect();
+        assert!(actions.contains(&"attest.rejected"));
+        assert!(actions.contains(&"vouch.rejected"));
+        assert!(actions.contains(&"revoke.rejected"));
+        assert!(actions.contains(&"burn.rejected"));
+        let reasons: Vec<Option<&str>> = tail.iter().map(|(_, r)| *r).collect();
+        assert!(reasons.contains(&Some("publisher-capability-missing")));
+        assert!(reasons.contains(&Some("publisher-identity-invalid")));
+        for e in entries.iter().rev().take(5) {
             assert!(e.reason.is_some(), "rejection must carry a reason");
             assert!(e.verify().is_ok(), "rejection entry must verify");
         }

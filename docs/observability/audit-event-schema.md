@@ -108,6 +108,7 @@ stem with a prefix predicate, not equality.
 | `legacy-v1-refused` | gossip ingest (op / revocation) | Token signed under the retired v1 envelope; the node rejects on principle. |
 | `validation-failed: <e>` | gossip ingest | `Token::validate` returned an error (signature, structural, expiry). |
 | `publisher-capability-missing` | attestation ingest | Issuer lacked the `dds:policy-publisher-*` / `dds:software-publisher` capability. |
+| `publisher-identity-invalid` | attestation ingest (`SoftwareAssignment` body) | SC-5 Phase B.1 fail-closed gate at `node::software_publisher_identity_ok`: the embedded `SoftwareAssignment.publisher_identity` failed `PublisherIdentity::validate()` (empty Authenticode subject, wrong-shape SHA-1 thumbprint, or wrong-shape Apple Team ID). Agent-side string compare would silently match nothing, so the ingest gate drops the token before it enters the trust graph. The matching sync-side rejection lands in `dds_sync_payloads_rejected_total{reason="publisher_identity"}`. |
 | `trust-graph-rejected: <e>` | gossip ingest | Trust-graph layer refused (e.g. revoked issuer, cycle). |
 | `iat-outside-replay-window` | revocation ingest | Revocation `iat` outside the 7-day replay tolerance. |
 | `skipped` | `apply.applied` only | Agent reported a no-op (target already in desired state). |
