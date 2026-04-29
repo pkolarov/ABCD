@@ -2105,7 +2105,7 @@ work is provisioning the cert and dropping the conditional.
 **Remediation:** [docs/supply-chain-plan.md](docs/supply-chain-plan.md)
 Phase A.
 
-### Z-7 (High) ⚠ partially closed (Phase B.1 schema + Phase B.3 macOS agent) — Asymmetric package signature verification on managed software
+### Z-7 (High) ⚠ partially closed (Phase B.1 schema + Phase B.2 Windows agent + Phase B.3 macOS agent + Phase B.4 cross-platform tests) — Asymmetric package signature verification on managed software
 
 **Phase B.1 schema landed 2026-04-28 follow-up #61.** The schema half of
 the two-signature gate now ships:
@@ -2156,10 +2156,46 @@ fails, signed-but-not-Developer-ID fails, Authenticode-on-macOS fails,
 and the `RequirePackageSignature=false`-but-pinned backward-compat
 angle still gates). 91 / 91 macOS .NET tests passing.
 
-The Windows-side enforcement (Phase B.2 — wiring `WinVerifyTrust` and
-matching against `PublisherIdentity::Authenticode`) remains open. The
-row stays "partially closed" until B.2 lands and the cross-platform
-B.4 / B.5 tests + migration plan ship.
+**Phase B.2 Windows agent landed 2026-04-29 follow-on.**
+[`SoftwareInstaller.ApplyInstallAsync`](platform/windows/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs)
+routes the staged installer through the new
+[`IAuthenticodeVerifier`](platform/windows/DdsPolicyAgent/Enforcers/IAuthenticodeVerifier.cs)
+abstraction; the production
+[`WinTrustAuthenticodeVerifier`](platform/windows/DdsPolicyAgent/Enforcers/WinTrustAuthenticodeVerifier.cs)
+calls `WinVerifyTrust(WINTRUST_ACTION_GENERIC_VERIFY_V2)` for chain
+trust and `X509Certificate2`/`X509Chain` for signer-subject and
+chain-root SHA-1 thumbprint extraction. The directive's
+`publisher_identity` is parsed by the new Windows
+[`PublisherIdentitySpec`](platform/windows/DdsPolicyAgent/Enforcers/PublisherIdentity.cs)
+helper; an `AppleDeveloperId` `publisher_identity` on a Windows scope
+fails closed before the verifier is called. The gate enforces three
+pinning levels (signature-only / signature + signer subject / signature
++ subject + chain-root thumbprint) and runs whenever **either**
+`RequirePackageSignature` is `true` **or** `publisher_identity` is set
+— closes the silent-downgrade window. 30 / 30 Phase B.2 Windows
+signature-gate tests passing (was 29 before B.4 added the legacy
+hash + sig backward-compat assertion).
+
+**Phase B.4 cross-platform tests landed 2026-04-29.** The bilateral
+test matrix — `…rejects_unsigned_blob_when_required` /
+`…rejects_wrong_signer_subject` /
+`…accepts_signed_blob_with_no_publisher_identity_directive` /
+`…rejects_unsigned_blob_when_publisher_identity_set_even_if_require_off`
+— is now mirrored on Windows (`phase_b2_*`) and macOS (`phase_b3_*`).
+The 2026-04-29 follow-on closed the previously-uncovered legacy
+hash + sig backward-compat path: a signed blob with no
+`publisher_identity` directive must proceed past the signature gate
+when `RequirePackageSignature=true`, since pre-Phase-B publishers will
+live on this path during the B.5 migration window. See
+[docs/supply-chain-plan.md](docs/supply-chain-plan.md) Phase B.4 for
+the cross-platform test table.
+
+**Still open:** Phase A (provisioning the Windows code-signing cert +
+Apple Developer ID + notarization for DDS's own release artifacts) is
+the prerequisite for the B.5 migration plan (30-day warn cutover →
+60-day hard-fail for `SoftwareAssignment` documents lacking
+`publisher_identity`). The row stays "partially closed" until A lands
+on a real cert and B.5 flips the cutover dates.
 
 For DDS-managed third-party software, the document signature chain
 is solid: `SoftwareAssignment` is admin-signed, the

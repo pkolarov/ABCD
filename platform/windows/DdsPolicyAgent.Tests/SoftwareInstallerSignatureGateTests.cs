@@ -296,6 +296,34 @@ public sealed class SoftwareInstallerSignatureGateTests
         Assert.Equal(EnforcementStatus.Ok, outcome.Status);
     }
 
+    /// <summary>
+    /// SC-5 Phase B.4 cross-platform test
+    /// <c>software_install_accepts_signed_blob_with_no_publisher_identity_directive</c>:
+    /// when <c>RequirePackageSignature</c> is on but the directive does
+    /// not pin a <c>publisher_identity</c>, a validly-signed blob must
+    /// proceed past the signature gate. This is the legacy hash + sig
+    /// path that pre-Phase-B publishers will live on during the migration
+    /// window; without this test a future regression that always
+    /// requires <c>publisher_identity</c> alongside
+    /// <c>RequirePackageSignature</c> would silently break legacy publishers.
+    /// </summary>
+    [Fact]
+    public async Task SoftwareInstaller_phase_b2_accepts_signed_blob_with_no_publisher_identity_directive()
+    {
+        var verifier = new ScriptedAuthenticodeVerifier(
+            new AuthenticodeVerifyResult(
+                IsValid: true,
+                SignerSubject: "Acme Corp",
+                RootThumbprintSha1Hex: null,
+                Reason: null));
+        var installer = MakeInstaller(verifier, requirePackageSignature: true);
+        var directive = Directive(publisherIdentityJson: null);
+
+        var outcome = await installer.ApplyAsync(directive, EnforcementMode.Enforce);
+
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
+    }
+
     [Fact]
     public async Task SoftwareInstaller_phase_b2_rejects_apple_developer_id_on_windows()
     {

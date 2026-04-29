@@ -859,4 +859,46 @@ public class EnforcerTests
         Assert.NotNull(outcome.Error);
         Assert.Contains("pkgutil --check-signature failed", outcome.Error);
     }
+
+    /// <summary>
+    /// SC-5 Phase B.4 cross-platform test
+    /// <c>software_install_accepts_signed_blob_with_no_publisher_identity_directive</c>:
+    /// when <c>RequirePackageSignature</c> is on but the directive does
+    /// not pin a <c>publisher_identity</c>, a pkg that <c>pkgutil
+    /// --check-signature</c> reports as signed must proceed past the
+    /// signature gate. This is the legacy hash + sig path that pre-Phase-B
+    /// publishers will live on during the migration window; the existing
+    /// "matching team_id" / "mismatched team_id" tests both pin a
+    /// publisher, leaving this no-pin path uncovered. A future regression
+    /// that always required <c>publisher_identity</c> alongside
+    /// <c>RequirePackageSignature</c> would silently break legacy
+    /// publishers without this assertion.
+    /// </summary>
+    [Fact]
+    public async Task SoftwareInstaller_phase_b3_accepts_signed_blob_with_no_publisher_identity_directive()
+    {
+        using var _ = AssumeRootScope.Enter();
+        const string pkgutilStdout = """
+        Package "com.example.legacy.pkg":
+           Status: signed by a developer certificate issued by Apple for distribution
+           Certificate Chain:
+            1. Developer ID Installer: Acme Corp (ABCDE12345)
+            2. Developer ID Certification Authority
+            3. Apple Root CA
+        """;
+        var (installer, directive, _) = MakeB3Installer(
+            payload: new byte[] { 0x60, 0x61, 0x62 },
+            publisherIdentityJson: null,
+            pkgutilHandler: (_, _) => new CommandResult(0, pkgutilStdout, string.Empty));
+
+        var outcome = await installer.ApplyAsync(directive, EnforcementMode.Enforce);
+
+        // The signature gate proceeds without comparing a Team ID
+        // (none was pinned). The next gate ("readable receipt") is what
+        // fails — which confirms the signature path is no longer the
+        // load-bearing block, just like phase_b3_accepts_matching_team_id.
+        Assert.Equal(EnforcementStatus.Failed, outcome.Status);
+        Assert.NotNull(outcome.Error);
+        Assert.Contains("readable receipt", outcome.Error);
+    }
 }

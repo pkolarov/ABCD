@@ -327,13 +327,30 @@ pkg fails closed, Authenticode-on-macOS fails closed, and the
 `RequirePackageSignature=false`-but-`publisher_identity`-set
 backward-compat angle. 91 / 91 macOS .NET tests passing (was 77).
 
-**B.4 — Tests.** Cross-platform regression tests:
+**B.4 — Tests. ✅ Landed 2026-04-29.** The cross-platform regression
+matrix is now mirrored bilaterally on Windows
+[`SoftwareInstallerSignatureGateTests`](../platform/windows/DdsPolicyAgent.Tests/SoftwareInstallerSignatureGateTests.cs)
+and macOS
+[`EnforcerTests`](../platform/macos/DdsPolicyAgent.Tests/EnforcerTests.cs):
 
-- `software_install_rejects_unsigned_blob_when_required`
-- `software_install_rejects_wrong_signer_subject`
-- `software_install_accepts_signed_blob_with_no_publisher_identity_directive`
-  (legacy hash-only backward compat)
-- `software_install_rejects_unsigned_blob_when_publisher_identity_set_even_if_require_off`
+| Spec test | Windows (`phase_b2_*`) | macOS (`phase_b3_*`) |
+|---|---|---|
+| `…rejects_unsigned_blob_when_required` | `rejects_unsigned_when_required` | `rejects_unsigned_pkg_when_publisher_identity_set` |
+| `…rejects_wrong_signer_subject` | `rejects_mismatched_subject` | `rejects_mismatched_team_id` |
+| `…accepts_signed_blob_with_no_publisher_identity_directive` | `accepts_signed_blob_with_no_publisher_identity_directive` (new 2026-04-29) | `accepts_signed_blob_with_no_publisher_identity_directive` (new 2026-04-29) |
+| `…rejects_unsigned_blob_when_publisher_identity_set_even_if_require_off` | `rejects_unsigned_when_publisher_identity_set_even_if_require_off` | `signature_check_runs_when_publisher_identity_set_even_if_require_off` |
+
+The 2026-04-29 follow-on closes the **legacy hash + sig backward-compat
+path**, which was previously uncovered: the existing "matching subject"
+/ "matching team_id" tests both pinned a publisher, and the existing
+"neither require nor pin" test had `RequirePackageSignature=false`. A
+future regression that always required `publisher_identity` alongside
+`RequirePackageSignature` would silently break pre-Phase-B publishers
+during the migration window without these assertions. Result counts:
+30 / 30 Phase B.2 Windows signature-gate tests passing (was 29 / 29) +
+175 total Windows .NET tests passing on the macOS dev host (was 174;
+the 39 skipped tests are Windows-host-only); 92 / 92 macOS .NET tests
+passing (was 91 / 91).
 
 **B.5 — Migration plan.** v2 cutover date: 30 days after Phase A
 ships. Past that date, publishers shipping `SoftwareAssignment`
