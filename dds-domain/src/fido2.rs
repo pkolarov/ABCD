@@ -1,13 +1,18 @@
 //! Minimal FIDO2 / WebAuthn attestation and assertion parsing + verification.
 //!
-//! **Attestation** (enrollment): Supports `none` and `packed` (self-attestation)
-//! formats with Ed25519 (`alg=-8`) and ECDSA P-256 (`alg=-7`, ES256) keys.
+//! **Attestation** (enrollment): Supports `none` and `packed` formats with
+//! Ed25519 (`alg=-8`) and ECDSA P-256 (`alg=-7`, ES256) keys. `packed`
+//! covers both self-attestation (no `x5c`) and full attestation
+//! (`x5c`-bearing); the leaf-cert signature is verified in both sub-modes
+//! since A-1 step-2 (security review, 2026-04-25). Operators can opt
+//! into per-AAGUID chain validation against operator-supplied root certs
+//! via `[[domain.fido2_attestation_roots]]` (Phase 2 of
+//! `docs/fido2-attestation-allowlist.md`); FIDO MDS-rooted chains remain
+//! deferred (M-13).
 //!
 //! **Assertion** (authentication): Supports Ed25519 and ECDSA P-256 (`alg=-7`)
 //! signature verification. Used by the `/v1/session/assert` endpoint to issue
 //! sessions from FIDO2 getAssertion proofs.
-//!
-//! Full attestation with x5c certificate chains is intentionally out of scope.
 //!
 //! Implemented from scratch against the WebAuthn Level 2 spec to avoid
 //! pulling in the (very large) `webauthn-rs` dependency tree.
@@ -48,10 +53,12 @@ pub struct ParsedAttestation {
     pub aaguid: [u8; 16],
     /// X.509 attestation certificate chain (DER-encoded), leaf-first
     /// per WebAuthn ordering. Empty for `fmt = "none"` and for packed
-    /// self-attestation (no `x5c` array). Phase 2 of
+    /// self-attestation (no `x5c` array). When present, the leaf-cert
+    /// signature over `authData || clientDataHash` is verified at parse
+    /// time (A-1 step-2). Phase 2 of
     /// `docs/fido2-attestation-allowlist.md`: when the dds-node service
     /// has a configured trust root for the credential's AAGUID, it
-    /// validates this chain against that root and refuses the
+    /// also validates this chain up to that root and refuses the
     /// enrollment if the chain is missing or fails to validate.
     pub x5c_chain: Vec<Vec<u8>>,
 }
@@ -280,12 +287,13 @@ fn verify_packed(
     // unconditionally when `x5c` was present, which let any local
     // process forge a packed attestation by attaching arbitrary cert
     // bytes. We now extract the leaf cert's SubjectPublicKeyInfo and
-    // verify the `sig` field under that pubkey. Chain validation
-    // against a trust-anchor list remains deferred to M-13 (FIDO MDS
-    // integration); presence-without-validation of a plausible cert
-    // is still strictly stronger than the previous "trust on sight"
-    // posture, because the attacker now has to produce a signature
-    // matching the leaf pubkey on a CDH the server controls.
+    // verify the `sig` field under that pubkey. Per-AAGUID chain
+    // validation against operator-supplied roots is layered on by the
+    // service (Phase 2 of `docs/fido2-attestation-allowlist.md`);
+    // FIDO MDS-rooted chains remain deferred (M-13). The leaf-sig
+    // check here is the floor — even an AAGUID with no configured
+    // root must produce a signature matching the leaf pubkey on a
+    // CDH the server controls.
     if let Some(x5c) = x5c {
         let leaf = x5c
             .first()

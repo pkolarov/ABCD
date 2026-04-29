@@ -7,43 +7,61 @@ DDS currently accepts two WebAuthn attestation formats during user enrollment
 
 | Format   | Description | x5c chain | AAGUID checked |
 |----------|-------------|-----------|----------------|
-| `none`   | No attestation statement. The authenticator provides only the credential public key. Suitable for platform authenticators and soft tokens. | No | Optional, against `fido2_allowed_aaguids` |
-| `packed` | Self-attestation only (no x5c certificate chain). The authenticator signs `authData ‖ clientDataHash` with the credential private key. Signature is verified against the extracted COSE public key. | **Skipped** | Optional, against `fido2_allowed_aaguids` |
+| `none`   | No attestation statement. The authenticator provides only the credential public key. Suitable for platform authenticators and soft tokens. | n/a (no `x5c`) | Optional, against `fido2_allowed_aaguids` |
+| `packed` | Self-attestation (no `x5c`) **or** full attestation with `x5c`. The leaf-cert signature over `authData ‖ clientDataHash` is verified in both sub-modes since A-1 step-2. Self-attestation verifies the signature under the credential pubkey from `authData`; full attestation verifies it under the leaf cert's SubjectPublicKey. | Leaf signature: always when present. Chain to root: optional, opt-in per AAGUID via `[[domain.fido2_attestation_roots]]` (Phase 2 below). | Optional, against `fido2_allowed_aaguids` |
 
 Unsupported formats (`tpm`, `android-key`, `android-safetynet`, `apple`,
 `fido-u2f`) are rejected with a `Fido2Error::Format` error at enrollment time.
 
-## Why Only `none` and `packed` Self-Attestation
+## Why Only `none` and `packed`
 
 1. **Platform coverage**: Windows Hello, macOS Touch ID/Face ID, and most
    roaming FIDO2 keys (YubiKey, Crayonic C-Key, Feitian) emit either `none`
-   or `packed` self-attestation by default when the relying party does not
-   request direct/enterprise attestation.
+   or `packed` (self-attested or with x5c) by default when the relying
+   party does not request enterprise attestation.
 
-2. **No CA trust store required**: Full `packed` with x5c, `tpm`, and
-   `android-key` all require maintaining a trusted root certificate store
-   (FIDO MDS or vendor-specific). DDS intentionally avoids this dependency
-   to keep the trust model self-contained — identity trust flows through
-   the vouch chain, not through hardware vendor PKI.
+2. **No mandatory CA trust store**: `tpm`, `android-key`, and FIDO MDS
+   integration would require maintaining a vendor-specific or MDS-rooted
+   trusted root certificate store. DDS does not mandate any of those —
+   identity trust flows through the vouch chain, not through hardware
+   vendor PKI. Operators who want chain-rooted assurance for a specific
+   authenticator model can opt in per-AAGUID via Phase 2 below; everyone
+   else stays on the leaf-signature floor.
 
 3. **Privacy**: `none` attestation reveals no information about the
    authenticator make/model. This aligns with DDS's design principle
    of minimizing metadata leakage.
 
-## x5c Certificate Chain — Why It Is Skipped
+## x5c Certificate Chain Handling
 
-The `packed` attestation handler (`verify_packed` in `dds-domain/src/fido2.rs`)
-currently ignores the `x5c` array even if present. Reasons:
+The `packed` attestation handler (`verify_packed` in
+`dds-domain/src/fido2.rs`) treats the `x5c` array in two layers:
 
-- **Self-attestation is sufficient for enrollment**: DDS treats the FIDO2
-  credential as a possession factor. The vouch chain provides the trust
-  anchor, not the authenticator vendor's certificate.
-- **x5c validation requires a FIDO Metadata Service (MDS) trust store**:
-  Maintaining an up-to-date MDS blob adds operational complexity and a
-  network dependency at enrollment time.
-- **Mismatch risk**: If x5c validation were enforced but the MDS blob were
-  stale, legitimate authenticators would be rejected — a worse failure mode
-  than accepting self-attestation.
+- **Leaf signature — always verified when `x5c` is present.** Since A-1
+  step-2 (security review, 2026-04-25), the handler extracts the leaf
+  cert's `SubjectPublicKeyInfo`, enforces that the SPKI algorithm OID
+  matches the `attStmt.alg` field (defends against an alg-downgrade
+  where an EC cert is shipped under EdDSA framing), and verifies the
+  `sig` field over `authData ‖ clientDataHash` under that pubkey. Pre-A-1
+  this branch returned `Ok(())` unconditionally as soon as `x5c` was
+  present, which let any local process forge a packed attestation by
+  attaching arbitrary cert bytes; that gap is closed regardless of
+  whether a chain root is configured.
+
+- **Chain to root — opt-in per AAGUID.** When an AAGUID has a
+  `[[domain.fido2_attestation_roots]]` entry (Phase 2 below), the
+  service additionally validates the leaf-first chain up to one of the
+  PEM-encoded roots at `ca_pem_path`. Operators bring their own roots —
+  no MDS dependency. AAGUIDs without a configured root fall through to
+  the leaf-signature floor; the Phase 1 allow-list (below) is the right
+  tool for "refuse this AAGUID outright."
+
+FIDO MDS-rooted chains (which would let DDS automatically trust the set
+of FIDO-Alliance-attested authenticators without per-AAGUID config) are
+the deferred follow-up, tracked as M-13 in
+[Claude_sec_review.md](../Claude_sec_review.md). The current opt-in
+per-AAGUID model lets an operator add a vendor root in TOML today
+without taking on MDS's JWT/refresh/CA-dependency surface.
 
 ## AAGUID Considerations
 
@@ -52,9 +70,11 @@ The Authenticator Attestation GUID (AAGUID) is extracted from the
 allow-list configured in `dds.toml`. By default the list is empty and any
 FIDO2-compliant authenticator can be used for enrollment; enterprises that
 want to restrict enrollment to approved authenticator models can populate
-the allow-list (see Phase 1 below). The AAGUID is not bound into the
-attestation statement otherwise — that's what Phase 2 (`packed` with
-`x5c` + MDS) and Phase 3 (TPM) add.
+the allow-list (see Phase 1 below). Phase 2 layers chain validation on
+top: when an AAGUID has a configured root cert, the leaf cert's
+`id-fido-gen-ce-aaguid` extension must match the AAGUID in `authData`
+and the chain must validate to the configured root. Phase 3 (TPM)
+extends this to TPM-attested credentials.
 
 ## Upgrade Path
 
