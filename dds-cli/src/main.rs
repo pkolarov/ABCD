@@ -1130,6 +1130,17 @@ async fn run_audit_export(
                 eprintln!("Error: cannot write {}: {e}", path.display());
                 std::process::exit(1);
             });
+            // L-5 (security review) parity with `dds-cli export`: the
+            // audit dump exposes node URNs, action labels, base64-encoded
+            // signed token CBOR, and the chain hashes that anchor the
+            // append-only log — sensitive forensic material that should
+            // not be world-readable. Set 0o600 on Unix; Windows inherits
+            // the parent dir DACL applied by the data-dir hardening.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
             println!(
                 "Exported {emitted} audit entr{} to {}",
                 if emitted == 1 { "y" } else { "ies" },

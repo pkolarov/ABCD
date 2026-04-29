@@ -644,7 +644,7 @@ as partial):
 | L-2 | ✅ Fixed (pending verify) | `O_NOFOLLOW` on identity read (Unix) |
 | L-3 | ✅ Fixed (pending verify) | `NamedTempFile::persist` for key and admin-key writes |
 | L-4 | ✅ Fixed (pending verify) | Parent directory set to `0o700` on Unix after creation |
-| L-5 | ✅ Fixed (pending verify) | Dump output file set to `0o600` on Unix |
+| L-5 | ✅ Fixed (pending verify) | Dump output file set to `0o600` on Unix; `dds-cli audit export --out` writes its dump file with the same 0o600 mode (2026-04-29 follow-on — same idiom: `set_permissions(Permissions::from_mode(0o600))` after `fs::write`, so the audit-chain export carrying node URNs, action labels, and base64-encoded signed token CBOR is owner-only). Regression test in `dds-cli/tests/smoke.rs::test_export_import_round_trip` pins the dump-file mode under `cfg(unix)`. |
 | L-6 | ✅ Fixed (pending verify) | CLI refuses non-loopback `http://` URLs |
 | L-7 | ✅ Fixed (pending verify) | FFI `now_epoch` uses `unwrap_or(0)` |
 | L-8 | ✅ Fixed (pending verify) | Caps: 10k rules, 100k tokens |
@@ -1188,7 +1188,7 @@ Session `exp` and challenge TTLs computed from `SystemTime::now()`. NTP backstep
 [dds-node/src/identity_store.rs:81](dds-node/src/identity_store.rs#L81) — `create_dir_all` uses default `0o755`. Set `0o700` after create.
 
 ### L-5. Export file mode `0o644`
-[dds-cli/src/main.rs:1113](dds-cli/src/main.rs#L1113) — revocation/burn list world-readable. Set `0o600`.
+[dds-cli/src/main.rs:1113](dds-cli/src/main.rs#L1113) — revocation/burn list world-readable. Set `0o600`. The same idiom now also applies to `dds-cli audit export --out` (2026-04-29 follow-on) so the audit-chain dump is owner-only; both writers `set_permissions(Permissions::from_mode(0o600))` after `fs::write` under `cfg(unix)`.
 
 ### L-6. No TLS enforcement on non-loopback `--node-url`
 [dds-cli/src/client.rs:22-34](dds-cli/src/client.rs#L22-L34) — CLI silently accepts `http://`. Refuse non-HTTPS for non-loopback.

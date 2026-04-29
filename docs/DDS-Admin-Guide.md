@@ -1810,7 +1810,10 @@ dds audit tail --format cef
 dds audit tail --format syslog
 
 # One-shot range dump for incident response — --since / --until /
-# --action filters, --out writes to a file, otherwise stdout
+# --action filters, --out writes to a file, otherwise stdout. The
+# --out file is created with mode 0o600 on Unix (L-5 parity with
+# `dds export`) so the audit chain — node URNs, action labels,
+# base64-encoded signed token CBOR, chain hashes — is owner-only.
 dds audit export --since 1714000000 --until 1714086400 \
                  --action attest.rejected --out /tmp/audit-incident.jsonl
 ```

@@ -402,6 +402,17 @@ fn test_export_import_round_trip() {
     assert!(stdout.contains("Tokens:     1"));
     assert!(dump_path.exists());
 
+    // L-5 (security review) — the dump carries every signed token plus
+    // the revoked / burned sets, so the writer must restrict the file
+    // to owner-only. Pin the 0o600 mode on Unix so a regression that
+    // drops the `set_permissions` call surfaces here.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&dump_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "dump file mode must be 0o600");
+    }
+
     // Z-5 (security review) — the dump is signed for integrity but is
     // NOT encrypted. The CLI must surface that confidentiality posture
     // explicitly so an operator who pipes the dump into a courier flow
