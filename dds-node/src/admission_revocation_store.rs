@@ -331,9 +331,17 @@ pub fn load_revocation_file(path: &Path) -> Result<AdmissionRevocation, Revocati
     AdmissionRevocation::from_cbor(&bytes).map_err(|e| RevocationStoreError::Cbor(e.to_string()))
 }
 
-/// Write a single CBOR-encoded [`AdmissionRevocation`] to disk
-/// (atomic on Unix; permissions are not restricted because revocations
-/// are public — they only become enforceable once a node loads them).
+/// Write a single CBOR-encoded [`AdmissionRevocation`] to disk.
+///
+/// **L-3 (security review) follow-on (2026-04-29):** atomic via
+/// `tempfile::NamedTempFile::new_in(parent)` + `tmp.persist(path)` so a
+/// crash mid-write cannot leave a torn revocation file on disk — operators
+/// distribute these out-of-band to other nodes (`dds-node revoke-admission
+/// --out` writes through this helper) and a torn file would surface as a
+/// CBOR decode failure on the receiving end. Mirrors the same idiom in
+/// [`save`] above (and in `dds-node::domain_store::atomic_write_owner_only`)
+/// minus the owner-only chmod, since revocations are public — they only
+/// become enforceable once a node loads them.
 pub fn save_revocation_file(
     path: &Path,
     rev: &AdmissionRevocation,
@@ -346,7 +354,17 @@ pub fn save_revocation_file(
     let bytes = rev
         .to_cbor()
         .map_err(|e| RevocationStoreError::Cbor(e.to_string()))?;
-    std::fs::write(path, &bytes).map_err(|e| RevocationStoreError::Io(e.to_string()))?;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    use std::io::Write as _;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| RevocationStoreError::Io(e.to_string()))?;
+    tmp.write_all(&bytes)
+        .map_err(|e| RevocationStoreError::Io(e.to_string()))?;
+    tmp.flush()
+        .map_err(|e| RevocationStoreError::Io(e.to_string()))?;
+    tmp.persist(path)
+        .map_err(|e| RevocationStoreError::Io(e.to_string()))?;
     Ok(())
 }
 
@@ -563,6 +581,46 @@ mod tests {
         save(&path, &s).unwrap();
         let perms = std::fs::metadata(&path).unwrap().permissions();
         assert_eq!(perms.mode() & 0o777, 0o600);
+    }
+
+    /// **L-3 follow-on (2026-04-29)**: `save_revocation_file` writes through
+    /// `tempfile::NamedTempFile::new_in` + `persist`, so a successful call
+    /// (a) leaves no `.tmp*` siblings in the parent dir, (b) round-trips
+    /// the revocation through `load_revocation_file` byte-for-byte, and
+    /// (c) is overwrite-safe across two consecutive saves on the same
+    /// path. Pins the docstring's atomicity claim that the prior
+    /// `std::fs::write` implementation silently violated.
+    #[test]
+    fn save_revocation_file_is_atomic_and_overwrite_safe() {
+        let (k, _id, _pk) = fresh_domain();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rev.cbor");
+
+        let rev1 = k.revoke_admission("peer-1".into(), 100, None);
+        save_revocation_file(&path, &rev1).unwrap();
+
+        // No tempfile leftovers from the persist step.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "rev.cbor")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "tempfile leaked into parent dir: {leftovers:?}"
+        );
+
+        let loaded = load_revocation_file(&path).unwrap();
+        assert_eq!(loaded.body.peer_id, rev1.body.peer_id);
+        assert_eq!(loaded.body.revoked_at, rev1.body.revoked_at);
+
+        // Overwrite with a different revocation; both the rename and the
+        // load must succeed and pick up the *new* contents.
+        let rev2 = k.revoke_admission("peer-2".into(), 200, Some("decom".into()));
+        save_revocation_file(&path, &rev2).unwrap();
+        let loaded2 = load_revocation_file(&path).unwrap();
+        assert_eq!(loaded2.body.peer_id, "peer-2");
+        assert_eq!(loaded2.body.reason.as_deref(), Some("decom"));
     }
 
     // -----------------------------------------------------------------
