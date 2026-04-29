@@ -111,6 +111,19 @@ upstream releases.
 Full workspace test run after the bump: **701 / 701** passing
 (macOS 25.3 dev host, `cargo test --workspace`, 1 ignored test).
 
+**CI HOOK LANDED 2026-04-29 (supply-chain-plan.md Phase C.4).** A new
+`audit` job in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+installs `cargo-audit` via `taiki-e/install-action@v2` and runs
+`cargo audit` on every PR and every push to `main`. Default behaviour:
+exit non-zero on any RUSTSEC *vulnerability* advisory; the eight
+informational warnings above (unmaintained / unsound / yanked) surface
+in the build log but do not block — they are upstream-blocked
+transitive deps tracked here. When upstream releases land and clear
+those warnings, graduate the CI step to `cargo audit -D warnings` so a
+fresh advisory immediately surfaces a PR. Pre-commit `cargo audit`
+re-run on the macOS dev host: **0 vulnerabilities, 8 informational
+warnings** (matches the 2026-04-28 baseline above).
+
 ## Remaining Work
 
 1. ~~**Sign count enforcement** — persist per-credential assertion counters to detect replay attacks.~~ **DONE (already shipped via L-18).** `dds-store::traits::CredentialStateStore::bump_sign_count(credential, new)` is an atomic check-and-set primitive (single redb write transaction); `StoreError::SignCountReplay { stored, attempted }` distinguishes the replay branch from generic I/O. `LocalService::verify_assertion_common` (`dds-node/src/service.rs:1910-1920`) calls `bump_sign_count` on every assertion with `parsed.sign_count > 0` and surfaces the replay outcome through the `dds_fido2_assertions_total{result="sign_count"}` metric bucket. Authenticators reporting `sign_count == 0` skip the check (logged at warn).

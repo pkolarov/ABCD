@@ -94,6 +94,24 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev
       - run: cargo bench --workspace --no-run
 
+  audit:
+    # supply-chain-plan.md Phase C.4 — cargo audit on every PR + push.
+    # Default behaviour: exit non-zero on any RUSTSEC vulnerability advisory.
+    # Informational warnings (unmaintained / unsound / yanked) surface in
+    # the log but do not block — the eight currently-tracked warnings are
+    # upstream-blocked transitive deps documented in security-gaps.md
+    # "Dependency Audit Gap". When upstream releases land, graduate this
+    # step to `-D warnings` so a fresh advisory immediately surfaces a PR.
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
   # cross-embedded: thumbv7em-none-eabihf removed — dds-core dependencies
   # pull in std; re-enable after no_std audit (not in pilot scope)
 

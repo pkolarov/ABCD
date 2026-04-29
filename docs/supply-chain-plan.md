@@ -429,12 +429,22 @@ initial audit set. CI fails if a new dependency or upgraded version
 lacks an audit. Mozilla's public audit set covers most common crates;
 DDS-specific audits commit under `supply-chain/audits.toml`.
 
-**C.4 — `cargo audit` in CI.** Run
-[`cargo-audit`](https://github.com/rustsec/rustsec) on every PR and
-every release; fail the build on any RUSTSEC advisory above a
-configured severity threshold. (The 2026-04-12 security-gaps doc
-already flagged the dependency-audit gap as an open operational item;
-this closes it.)
+**C.4 — `cargo audit` in CI. ✅ Landed 2026-04-29.**
+The new `audit` job in
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) installs
+[`cargo-audit`](https://github.com/rustsec/rustsec) via
+`taiki-e/install-action@v2` and runs `cargo audit` on every PR and
+every push to `main`. Default behaviour: exit non-zero on any RUSTSEC
+*vulnerability* advisory; informational warnings (unmaintained /
+unsound / yanked) surface in the build log but do not block. The
+eight currently-tracked warnings are upstream-blocked transitive
+dependencies documented in [`security-gaps.md`](../security-gaps.md)
+"Dependency Audit Gap" — once those clear, graduate the step to
+`cargo audit -D warnings` so a fresh advisory immediately surfaces a
+PR. Closes the dependency-audit gap originally flagged in the
+2026-04-12 security-gaps doc and confirms in CI what the
+2026-04-28 manual `cargo audit` run validated locally
+(0 vulnerabilities post-`rustls-webpki` 0.103.10 → 0.103.13 bump).
 
 **C.5 — Sigstore signing.** Optional sweetener: `cosign sign-blob`
 the release artifacts with a Sigstore Fulcio identity (workflow OIDC).
