@@ -198,9 +198,12 @@ backward-compat), `test_publisher_identity_validate_authenticode`
 `test_publisher_identity_validate_apple_team_id` (length / case /
 non-alphanumeric rejected). Backward-compatible — older agents
 deserialize with `publisher_identity = None` and behave as today; new
-publishers opt in immediately. **Phase B.2 / B.3 (the C# agent
-verifiers) and B.4 / B.5 (cross-platform regression tests + migration
-plan) remain open.**
+publishers opt in immediately. **Phase B.2 (Windows agent), Phase B.3
+(macOS agent), and Phase B.4 (cross-platform regression tests) all
+landed 2026-04-29 — see the dedicated subsections below. Phase B.5
+(publisher migration cutover) remains open and is gated on Phase A
+(provisioning DDS's own release-artifact code-signing certs)
+shipping first.**
 
 **B.1 follow-on — node-side fail-closed at agent read path. Landed
 2026-04-29.** [`LocalService::list_applicable_software`](../dds-node/src/service.rs)
