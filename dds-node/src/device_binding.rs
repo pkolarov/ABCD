@@ -144,6 +144,16 @@ impl DeviceBindingStore {
         }
     }
 
+    /// L-3 idiom (security review): atomic write — `tempfile::NamedTempFile`
+    /// in the same parent directory + `persist` (POSIX `rename`) so a crash
+    /// mid-write can't leave a torn binding file on disk. Owner-only
+    /// permissions are applied to the *tempfile* before the rename so the
+    /// final file is never observably world-readable. Mirrors the helper
+    /// in [`crate::domain_store::atomic_write_owner_only`] and the per-file
+    /// pattern in [`crate::identity_store::save`] /
+    /// [`crate::p2p_identity::save`]; `crate::file_acl::restrict_to_owner`
+    /// applies the protected DACL on Windows so a co-tenant can't
+    /// enumerate the device⇄principal map either.
     fn persist(path: &Path, data: &OnDisk) -> io::Result<()> {
         let bytes = serde_json::to_vec_pretty(data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -155,14 +165,9 @@ impl DeviceBindingStore {
         use std::io::Write as _;
         tmp.write_all(&bytes)?;
         tmp.flush()?;
+        crate::file_acl::restrict_to_owner(tmp.path());
         tmp.persist(path).map_err(io::Error::other)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mut perms = std::fs::metadata(path)?.permissions();
-            perms.set_mode(0o600);
-            std::fs::set_permissions(path, perms)?;
-        }
+        crate::file_acl::restrict_to_owner(path);
         Ok(())
     }
 }
@@ -246,5 +251,69 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap();
         assert!(store.get("urn:device:missing").is_none());
+    }
+
+    /// **L-3 follow-on (2026-04-29)**: `persist` writes through
+    /// `tempfile::NamedTempFile::new_in` + `restrict_to_owner` on the
+    /// tempfile *before* `persist`, so (a) the parent dir contains no
+    /// stray `.tmp*` siblings after the rename, (b) the final file
+    /// is owner-only at the instant it appears under its target name
+    /// (Unix: `0o600`; Windows: protected DACL via
+    /// [`crate::file_acl::restrict_to_owner`]), and (c) the helper is
+    /// overwrite-safe across two consecutive TOFU bind operations
+    /// against the same path. Closes the L-3 "set-perms-after-rename"
+    /// gap that left a brief observability window on the prior
+    /// implementation.
+    #[test]
+    fn persist_is_atomic_and_owner_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("b.json");
+        let store = DeviceBindingStore::load_or_empty(path.clone()).unwrap();
+
+        store
+            .tofu_bind("urn:device:a", uid_principal(1000))
+            .unwrap();
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "b.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "tempfile leaked into parent dir: {leftovers:?}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        store
+            .tofu_bind("urn:device:b", uid_principal(2000))
+            .unwrap();
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "b.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "tempfile leaked across overwrite: {leftovers:?}"
+        );
+
+        let reopened = DeviceBindingStore::load_or_empty(path.clone()).unwrap();
+        assert_eq!(reopened.get("urn:device:a"), Some(uid_principal(1000)));
+        assert_eq!(reopened.get("urn:device:b"), Some(uid_principal(2000)));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }
