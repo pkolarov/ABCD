@@ -123,16 +123,27 @@
 >   `cargo test --workspace` — 232 passing in `dds-node` lib, 81 in
 >   `dds-domain`, 0 failed across every workspace crate.
 >
-> **Phase B (after A) — per-message hybrid-KEM envelope on gossip + sync
-> payloads.** Wrap each gossipsub `Op` and sync `Response` body in an
-> X25519 + ML-KEM-768 KEM-DEM envelope keyed off each peer's published
-> hybrid pubkey (advertised via `Identify` or piggy-backed on the
-> Phase-A `AdmissionCert`). New workspace dep (`ml-kem` 0.2 or
-> `pqcrypto-mlkem`), new `dds-core::crypto::kem` module, decode-path
-> changes at the gossip + sync ingest sites in
-> [dds-node/src/node.rs](dds-node/src/node.rs) (`handle_gossip_message`,
-> `handle_sync_response`). Feature-gated behind a domain capability so
-> a mixed fleet does not deadlock during rollout. Closes
+> **Phase B (after A, plan landed 2026-04-29) — per-publisher epoch
+> key with hybrid-KEM distribution on gossip + sync payloads.**
+> Detailed design: **[docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md)**.
+> Each publisher generates a 32-byte symmetric AEAD key per epoch
+> (default 24h) and KEM-encapsulates it once per admitted peer using
+> a hybrid X25519 + ML-KEM-768 (FIPS 203) construction; recipients
+> cache `(publisher, epoch_id) → epoch_key` and AEAD-decrypt every
+> gossip / sync envelope from that publisher locally. Resolves the
+> "per-recipient envelope on every message blows up gossipsub
+> bandwidth" problem the original sketch glossed over by amortizing
+> the KEM cost to once per peer per epoch (steady-state per-message
+> overhead = AEAD only, ~5 µs). New workspace dep (`ml-kem = "0.2"`,
+> RustCrypto FIPS 203 final), new `dds-core::crypto::kem` +
+> `dds-core::crypto::epoch_key` modules, `AdmissionCert` grows
+> `pq_kem_pubkey: Option<Vec<u8>>` (1216 B, mirrors Phase A's
+> `pq_signature` wire-compat shape), `Domain` grows
+> `capabilities: Vec<String>` with `enc-v3` flipping the
+> "reject plaintext" gate. New libp2p protocol
+> `/dds/epoch-keys/1.0.0/<domain>` for mid-connection rotation +
+> piggy-back on the existing H-12 `AdmissionResponse`. Phased B.1-B.12
+> totalling ~26 dev-days ⇒ ~2 months wall-clock. Closes
 > Harvest-Now-Decrypt-Later on application-layer content even while
 > libp2p-noise stays classical.
 >

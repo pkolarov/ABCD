@@ -1,0 +1,429 @@
+# DDS Z-1 Phase B Plan — Encrypted Gossip + Sync via Per-Publisher Hybrid KEM
+
+**Status:** Plan — open for implementation.
+**Date:** 2026-04-29.
+**Closes (when implemented):** the confidentiality piece of Z-1 from
+[Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
+Principles Audit". Phase A landed 2026-04-28 and closed the H-12
+admission-cert forgeability piece of Z-1; **Phase B closes the
+Harvest-Now-Decrypt-Later (HNDL) exposure on application-layer
+content** — the gossipsub directory operations, the sync responses,
+and the H-12 piggy-backed revocation distribution.
+**Owner:** TBD.
+
+---
+
+## 1. Problem
+
+Phase A made `AdmissionCert` and `AdmissionRevocation` hybrid-signed
+(Ed25519 + ML-DSA-65) so a future quantum-equipped adversary can't
+mint admission credentials. **It did not** close the bigger HNDL
+story: the libp2p Noise transport handshake is still classical
+X25519 ([dds-net/src/transport.rs:118-122](../dds-net/src/transport.rs)),
+and an adversary recording today's gossip / sync / admission traffic
+recovers all of it once a CRQC arrives. Phase A protects the *who*
+(signatures); Phase B has to protect the *what* (content).
+
+Phase C (hybrid Noise upstream) is the cleanest fix and is blocked on
+rust-libp2p `rs/9595`. Phase B is the application-layer fallback that
+does not wait on libp2p — wrap each gossip / sync payload in a hybrid
+KEM-DEM envelope so transport compromise alone does not yield
+plaintext.
+
+The naive shape — "per-recipient KEM envelope on every message" —
+does not fit gossipsub: gossip is broadcast to N peers and a
+per-recipient envelope means N envelopes per message. The
+architectural choice this doc commits to is **per-publisher epoch
+keys** distributed via per-recipient hybrid KEM at handshake time
+and rotated periodically.
+
+## 2. Goals
+
+1. Every gossipsub `Op` envelope carries an AEAD ciphertext over the
+   original CBOR payload, encrypted with a per-publisher epoch key
+   the sender derived for the current epoch. Plaintext gossip is
+   rejected on a domain that advertises the `enc-v3` capability.
+2. Every sync `Response` payload is wrapped in the same envelope
+   shape, using the responder's epoch key.
+3. Each admitted node carries a Phase-B hybrid KEM keypair (X25519 +
+   ML-KEM-768, FIPS 203). The pubkey is advertised on the existing
+   `AdmissionCert` so distribution rides the H-12 admission
+   handshake we already have.
+4. Epoch keys rotate on a fixed timer (default 24h) **and**
+   immediately on any admission revocation gossiping through the
+   fleet.
+5. Mixed-fleet rollout: Phase-B-capable code can ship first, then
+   the admin flips a `enc-v3` capability bit on the domain to
+   enforce.
+
+## 3. Non-goals (Phase B scope only)
+
+- Hybrid Noise / QUIC keyshare upgrade — Phase C, blocked on
+  rust-libp2p `rs/9595`.
+- Forward secrecy *within* an epoch — there is no per-message
+  ratchet. Compromise of an epoch key reveals every message published
+  in that epoch (default 24h window).
+- MLS-style group-key agreement — out of scope; the per-publisher
+  epoch model is intentionally simpler.
+- Hardware-bound KEM secret keys — hardware binding is Z-2, not
+  coupled to Phase B (the KEM key can be moved to a HW-bound store
+  later without wire-format changes).
+- Encrypted-at-rest of the on-disk redb store — that's Z-4.
+
+## 4. Architecture
+
+### 4.1 Per-publisher epoch key
+
+Every admitted node generates a hybrid KEM keypair at first start.
+The pubkey rides the `AdmissionCert` so every other admitted peer
+learns it via the H-12 handshake. Each node also generates a
+32-byte symmetric AEAD key — the *epoch key* — and KEM-encapsulates
+it once per peer (the recipient list is "every other admitted peer
+the publisher has handshaken with"). For the duration of an epoch
+(default 24h), every gossip message the publisher publishes uses
+that same key with a fresh nonce.
+
+```
+publisher P
+  ├─ epoch_id = 17
+  ├─ K_P_17 = AEAD key (32 random bytes)
+  ├─ for each admitted peer R:
+  │     KEM_encap(R.pq_kem_pubkey, K_P_17) → kem_ct, derived_aead_key
+  │     EpochKeyRelease { publisher: P, epoch_id: 17, kem_ct, ... } → R
+  └─ on every gossip publish:
+        AEAD_encrypt(K_P_17, nonce, op_cbor) → ct
+        GossipEnvelopeV3 { publisher: P, epoch_id: 17, nonce, ct } → gossipsub flood
+```
+
+Recipient `R` caches `(publisher P, epoch_id 17) → K_P_17` and
+AEAD-decrypts every envelope from `P` locally.
+
+### 4.2 Why epochs and not session keys
+
+A session key would require a per-recipient handshake on every
+reconnect — that's the H-12 cost paid every time a peer flaps. An
+epoch key is set up once per peer per ~24h and reused, so the cost
+is amortized and connection churn doesn't trigger rekeying.
+Trade-off accepted: no intra-epoch forward secrecy.
+
+### 4.3 Hybrid KEM construction
+
+X25519 + ML-KEM-768 in parallel, combined via HKDF-SHA256. Mirrors
+IETF `draft-ietf-tls-hybrid-design`:
+
+```
+ss_classical = X25519(eph_x_sk, recipient_x_pk)        # 32 bytes
+(kem_ct_pq, ss_pq) = ML-KEM-768.encap(recipient_pq_pk) # ct=1088 B, ss=32 B
+
+binding = sender_kem_pk || recipient_kem_pk || epoch_id_be
+secret  = HKDF-SHA256-Expand(
+            HKDF-SHA256-Extract(salt = b"dds-pqc-kem-hybrid-v1",
+                                ikm  = ss_classical || ss_pq),
+            info = binding,
+            len  = 32)
+
+# Use `secret` as the AEAD key for one-shot ChaCha20-Poly1305
+# encryption of the 32-byte epoch key K_P_epoch.
+```
+
+Component-lifting defence: the `binding` field includes both peer
+pubkeys and the epoch id, so an attacker can't lift the X25519 leg
+or the ML-KEM leg out of one (publisher, recipient, epoch) tuple
+and replay it elsewhere. Mirrors the M-2 / Phase A domain-separation
+pattern.
+
+### 4.4 Wire formats
+
+Three new types in `dds-net`:
+
+```rust
+/// Replaces the plaintext CBOR `Op` shipping that gossipsub does today.
+/// V3 envelope is the only shape gossiped on a domain with the `enc-v3`
+/// capability. V2 (plaintext) is accepted in the cutover window and
+/// rejected once the capability is set.
+pub struct GossipEnvelopeV3 {
+    pub publisher:  PeerId,        // base58 string
+    pub epoch_id:   u64,
+    pub nonce:      [u8; 12],      // ChaCha20-Poly1305 nonce
+    pub ciphertext: Vec<u8>,       // AEAD over original Op CBOR
+}
+
+/// Sync response payloads use the same shape (responder is the publisher).
+pub struct SyncEnvelopeV3 {
+    pub responder:  PeerId,
+    pub epoch_id:   u64,
+    pub nonce:      [u8; 12],
+    pub ciphertext: Vec<u8>,
+}
+
+/// Per-recipient release of K_publisher_epoch. Signed by the publisher
+/// (Ed25519 + ML-DSA-65 if Phase A v2 hybrid, so the release inherits
+/// Phase A forgeability protection).
+pub struct EpochKeyRelease {
+    pub publisher:        PeerId,
+    pub epoch_id:         u64,
+    pub issued_at:        u64,
+    pub expires_at:       u64,           // when this epoch ends
+    pub recipient:        PeerId,
+    pub kem_ct:           Vec<u8>,       // 1120 B (32 X25519 + 1088 ML-KEM)
+    pub aead_nonce:       [u8; 12],
+    pub aead_ciphertext:  Vec<u8>,       // K_publisher_epoch (32 B) AEAD'd
+    pub signature:        Vec<u8>,       // 64 B Ed25519
+    pub pq_signature:     Option<Vec<u8>>,// 3309 B ML-DSA-65 (Phase A v2)
+}
+```
+
+Gossipsub continues to use the `/dds/ops/.../...` topic; the
+envelope itself versions via the on-wire CBOR shape. A v3 envelope
+is detected by presence of the `epoch_id` + `ciphertext` fields and
+absence of the v2 plaintext op fields.
+
+### 4.5 Distribution
+
+Two delivery channels for `EpochKeyRelease`:
+
+1. **H-12 piggy-back.** `AdmissionResponse` grows an optional
+   `epoch_key_releases: Vec<Vec<u8>>` (opaque CBOR, mirrors the
+   `revocations` piggy-back from
+   [dds-net/src/admission.rs](../dds-net/src/admission.rs)). When
+   peer `A` admits peer `B`, `A` includes its own current
+   `EpochKeyRelease` for `B` in the response. Symmetric: `B`'s
+   response also carries `B`'s release for `A`. Capped via a new
+   `MAX_EPOCH_KEY_RELEASES_PER_RESPONSE` constant.
+
+2. **Dedicated request-response protocol.** A new libp2p
+   `request_response::cbor::Behaviour` on
+   `/dds/epoch-keys/1.0.0/<domain>` so a publisher can push fresh
+   releases to already-admitted peers when it rotates mid-connection.
+   Gossipsub is wrong here — releases are per-recipient, not
+   broadcast.
+
+### 4.6 Rotation policy
+
+| Trigger | Action | Cadence |
+|---|---|---|
+| Time | Publisher rolls a new K_pub_epoch and re-emits `EpochKeyRelease` to every admitted peer | every 24h, configurable per-domain |
+| Revocation | Every node receiving an admission revocation rolls its own epoch key + re-emits releases (excluding the revoked peer) | within 60s of revocation gossip arrival |
+| New peer admission | Publisher emits a release for the new peer; existing receivers' epoch keys unchanged | on H-12 success |
+| Local PQ key rotation | Publisher rolls epoch key + re-emits to everyone (the old key was bound to the old KEM pubkey) | rare, manual via `dds-cli pq rotate` |
+
+Receivers cache the previous epoch key for a short window (default
+5 minutes after `epoch_id` changes) so in-flight messages with the
+old `epoch_id` still decrypt cleanly. After the grace window, the
+old key is dropped from memory.
+
+### 4.7 Mixed-fleet rollout
+
+Three stages, all under a single `Domain.capabilities: Vec<String>`
+field:
+
+| Stage | Capability set | Behaviour |
+|---|---|---|
+| 0 | (empty) | v3-capable code shipped; gossip + sync still plaintext. v3 nodes accept both encrypted and plaintext on receive; publish plaintext. |
+| 1 | (empty) | v3 nodes have generated a hybrid KEM keypair and re-issued their `AdmissionCert` with `pq_kem_pubkey`. Pubkey distribution catches up via H-12. Still plaintext on the wire. |
+| 2 | `["enc-v3"]` | Admin re-issues `domain.toml` with `enc-v3`. v3 nodes flip to encrypted publish + reject plaintext receive. v2-only nodes drop off (they can't decrypt). Admin should run `dds-cli pq list-pubkeys` to confirm 100% v3 coverage before flipping. |
+
+A rollback from Stage 2 → Stage 1 is supported by re-issuing
+`domain.toml` without the capability — receivers go back to
+accepting plaintext, publishers back to plaintext publish on the
+next epoch.
+
+## 5. Crate / module changes
+
+### 5.1 dds-core
+
+- Workspace dep: `ml-kem = "0.2"` (RustCrypto pure-Rust impl of
+  FIPS 203 final). Selection rationale: same family as the existing
+  `ed25519-dalek` / `sha2` / `hkdf` deps, FIPS 203 final-spec
+  compliant, used in upstream `rustls` for TLS hybrid
+  `X25519MLKEM768`. Sibling `pqcrypto-mlkem` was considered for
+  consistency with Phase A's `pqcrypto-mldsa`, but the RustCrypto API
+  integrates more cleanly with the classical crypto already in
+  `dds-core::crypto`.
+- Workspace dep: `hkdf = "0.12"` (RustCrypto, already a transitive).
+- New module `dds_core::crypto::kem`: `HybridKem`,
+  `HybridKemPublicKey`, `HybridKemSecretKey`, `KemCiphertext`,
+  `encap()`, `decap()`. KAT vectors from the FIPS 203 ACVP test
+  suite.
+- New module `dds_core::crypto::epoch_key`: AEAD wrap/unwrap of a
+  32-byte symmetric key under a hybrid-KEM-derived secret. Pure
+  glue; no new primitive.
+- Domain-separation prefix: `b"dds-pqc-kem-hybrid-v1\0"` for
+  HKDF-Extract salt; matches the M-2 / Phase A naming pattern
+  (`dds-hybrid-v2/...`, `dds-admission-v2/...`,
+  `dds-revocation-v2/...`).
+
+### 5.2 dds-domain
+
+- `AdmissionCert.pq_kem_pubkey: Option<Vec<u8>>` (1216 B when set).
+  `#[serde(default, skip_serializing_if = "Option::is_none")]` keeps
+  v1/v2 wire-compat exactly as Phase A's `pq_signature` does.
+- `Domain.capabilities: Vec<String>` (`#[serde(default)]`, empty
+  vec). Recognized values for v3: `["enc-v3"]`. Future expansions
+  reserved.
+- Sibling `DomainKemKey` type next to Phase A's `DomainPqKey` — the
+  X25519 + ML-KEM-768 keypair held by `DomainKey` (or a separate
+  `NodeKemKey` if we keep KEM keys at the node level rather than
+  the domain level — see Open Decision §9.6).
+
+### 5.3 dds-net
+
+- `GossipEnvelopeV3`, `SyncEnvelopeV3`, `EpochKeyRelease` types in a
+  new `dds_net::pq_envelope` module.
+- `AdmissionResponse.epoch_key_releases: Vec<Vec<u8>>` (opaque CBOR,
+  `#[serde(default)]`). Cap mirrors the existing
+  `MAX_REVOCATIONS_PER_RESPONSE` (1024 entries) — actual budget will
+  be ~64 per response since releases are larger (~1.5 KB each vs
+  ~120 B for a revocation).
+- New behaviour
+  `epoch_keys: request_response::cbor::Behaviour<EpochKeyRequest, EpochKeyResponse>`
+  on `/dds/epoch-keys/1.0.0/<domain>` — domain-tagged like `sync` /
+  `admission`.
+- Capability negotiation: nothing in `dds-net`; the `enc-v3` flip
+  is enforced by `dds-node` based on `Domain.capabilities` it loads
+  from `domain.toml`.
+
+### 5.4 dds-node
+
+- New `epoch_key_store` module (mirrors `admission_revocation_store`'s
+  shape):
+  ```rust
+  pub struct EpochKeyStore {
+      kem_keypair: HybridKemSecretKey,
+      my_epoch:    (u64, [u8; 32]),                         // current epoch
+      previous_my_epoch: Option<(u64, [u8; 32], Instant)>,  // grace window
+      peer_releases: BTreeMap<(PeerId, u64), [u8; 32]>,     // cached
+      last_rotation: Instant,
+  }
+  ```
+  Persisted under `<data_dir>/epoch_keys.cbor`. Plaintext today
+  (same posture as the other stores until Z-4 lands DPAPI / per-file
+  encryption).
+- `DdsNode` grows `epoch_keys: EpochKeyStore`, plus a rotation timer
+  task that ticks daily.
+- `handle_gossip_message`: detect envelope shape (v2 plaintext vs v3
+  encrypted); when domain has `enc-v3` capability, reject v2;
+  otherwise accept either. Decrypt v3 with the cached epoch key;
+  drop with `dropped_reason="no_epoch_key"` audit + metric on
+  missing/expired key.
+- `handle_sync_response`: same pattern.
+- `verify_peer_admission`: on H-12 success, emit a fresh
+  `EpochKeyRelease` for the new peer via the dedicated
+  `/dds/epoch-keys/...` channel (and if H-12 was the inbound side,
+  piggy-back our release in the `AdmissionResponse`).
+- `ingest_revocation`: trigger immediate epoch rotation.
+
+### 5.5 dds-cli
+
+- `dds-cli pq status` — show local KEM pubkey hash, current
+  `epoch_id`, count of cached peer releases, time to next rotation.
+- `dds-cli pq rotate` — force-rotate the local epoch key
+  (operator escape hatch).
+- `dds-cli pq list-pubkeys` — list every admitted peer's Phase-B
+  KEM pubkey hash, used by admin to confirm 100% v3 coverage before
+  flipping `enc-v3` on `domain.toml`.
+
+## 6. Performance budget
+
+Per FIPS 203 reference timings on x86_64:
+- ML-KEM-768 keygen ~80 µs (one-shot at first start)
+- ML-KEM-768 encap ~50 µs (per release issued)
+- ML-KEM-768 decap ~70 µs (per release received)
+- ChaCha20-Poly1305 encrypt/decrypt ~5 µs per 1 KB message
+- HKDF-SHA256 ~3 µs
+
+Steady-state per-message overhead (the hot path) is **just AEAD** —
+~5 µs. The KEM ops happen only when an epoch rotates or a new peer
+is admitted. For a 100-peer domain with the default 24h epoch:
+
+- Per-publisher per-epoch KEM cost: 100 × 50 µs = **5 ms once a
+  day** = negligible.
+- Per-receiver per-epoch decap cost: 100 publishers × 70 µs = **7 ms
+  once a day** = negligible.
+
+Wire size:
+- Original `Op` CBOR: ~200-2000 B typical. AEAD overhead = 16 B tag
+  + 12 B nonce + ~32 B envelope framing ≈ 60 B per message.
+- `EpochKeyRelease`: ~1500 B (1120 KEM ct + 64 sig + 3309 ML-DSA +
+  framing). Sent once per peer-pair per epoch.
+
+For a 100-peer domain with 1000 ops/day, the daily wire overhead is:
+- Encrypted gossip: 1000 × 60 B = **60 KB/day per node**.
+- Epoch releases: 100 peers × 1500 B = **150 KB/day per node**.
+
+Both negligible against the existing gossip + sync traffic.
+
+## 7. Test strategy
+
+| Layer | Tests |
+|---|---|
+| `dds_core::crypto::kem` | KAT vectors from FIPS 203 ACVP suite; encap/decap roundtrip; hybrid component lifting (X25519 leg cannot be replayed standalone, ML-KEM leg cannot be replayed standalone — analog of the M-2 hybrid sig test); wrong-recipient decap fails; tampered ciphertext fails. |
+| `dds_core::crypto::epoch_key` | AEAD wrap/unwrap of a 32-byte epoch key; nonce uniqueness across rotations; HKDF binding includes pubkey transcript. |
+| `dds_domain::AdmissionCert` | Cert with `pq_kem_pubkey` round-trips through CBOR; v1 cert wire-decodes under v3 schema with `pq_kem_pubkey: None` (mirrors the Phase A `legacy_v1_domain_wire_decodes_under_v2_schema` test). |
+| `dds_net::pq_envelope` | `GossipEnvelopeV3` / `SyncEnvelopeV3` / `EpochKeyRelease` CBOR round-trips; cap-violation rejection on `AdmissionResponse.epoch_key_releases`; v1 `AdmissionResponse` decodes cleanly under v3 schema. |
+| `dds_node::epoch_key_store` | Persist/load round-trip; rotation increments `epoch_id` monotonically; old epoch key kept in cache for 5 minutes after rotation; revocation triggers immediate rotation. |
+| Integration: mixed fleet | A v2-only node + a v3-capable node coexist on a domain without `enc-v3` capability; gossip flows plaintext both ways. Admin flips `enc-v3`; v2-only node stops receiving (its decrypt is a no-op); v3 node continues. |
+| Integration: rotation | 3-node mesh, all v3 + `enc-v3`; trigger time-based rotation on node A; B and C continue receiving from A across the rotation boundary (old key stays in cache 5 min, new key takes over). |
+| Integration: revocation-triggered rotation | 3-node mesh; admin issues admission revocation against C; A and B both rotate within 60 s; an op published by A after rotation must NOT decrypt under the pre-rotation epoch key cached by C. |
+| Loadtest | Steady-state per-message overhead < 10 µs/message at 1k ops/sec; epoch rotation completes within 5 s for a 100-peer domain. |
+
+## 8. Phased implementation
+
+| Step | Scope | Wall-clock |
+|---|---|---|
+| B.1 | `dds-core::crypto::kem` module + `ml-kem` workspace dep + KAT vectors + hybrid construction tests | 3 d |
+| B.2 | `dds-core::crypto::epoch_key` AEAD wrapper + tests | 1 d |
+| B.3 | `AdmissionCert.pq_kem_pubkey` + `Domain.capabilities` + tests + on-disk persistence (mirrors Phase A `DomainPqKey` shape) | 2 d |
+| B.4 | `dds-net::pq_envelope` types + `AdmissionResponse.epoch_key_releases` field + caps | 2 d |
+| B.5 | `EpochKeyRelease` request-response protocol on `/dds/epoch-keys/1.0.0/<domain>` libp2p behaviour | 3 d |
+| B.6 | `dds-node::epoch_key_store` + on-disk persistence | 2 d |
+| B.7 | Encrypted gossip envelope publish + ingest decode + mixed-fleet enforcement | 3 d |
+| B.8 | Encrypted sync envelope publish + ingest decode | 2 d |
+| B.9 | Rotation timer + revocation hook + 5-minute decay cache | 2 d |
+| B.10 | `dds-cli pq status / rotate / list-pubkeys` operator surface | 1 d |
+| B.11 | Phase C/E observability (metrics + alerts) — `dds_pq_epoch_id`, `dds_pq_releases_emitted_total`, `dds_pq_envelope_decrypt_total{result=ok|key_missing|aead_fail}` | 2 d |
+| B.12 | Mixed-fleet integration test + rotation integration test + revocation-triggered rotation integration test | 3 d |
+| **Total** | | **~26 d ≈ 5-6 weeks dev + buffer ⇒ 2 months wall-clock** |
+
+## 9. Open decisions to confirm before B.1
+
+1. **KEM library**: doc proposes `ml-kem = "0.2"` (RustCrypto, FIPS
+   203 final). Alternative: `pqcrypto-mlkem` (matches Phase A's
+   `pqcrypto-mldsa` family). Confirm direction.
+2. **AEAD primitive**: doc proposes ChaCha20-Poly1305 (already used
+   elsewhere in dds-node — `domain_store.rs`, `identity_store.rs`).
+   Alternative: AES-256-GCM (faster on AES-NI hardware, but
+   cross-platform consistency favours ChaCha).
+3. **Default epoch length**: doc proposes 24h. Shorter (1h) reduces
+   the HNDL window if a key leaks but increases churn.
+   Operator-overridable per-domain.
+4. **5-minute decay cache** for previous epoch key: tunable.
+   Trade-off between in-flight smoothness and post-rotation
+   forward-secrecy.
+5. **Capability negotiation transport**: doc proposes
+   `Domain.capabilities` field (re-using the same admin-signed
+   `domain.toml` distribution that ships `pq_pubkey` today).
+   Alternative: per-peer capability advertisement on libp2p
+   `Identify`.
+6. **KEM key ownership**: domain-level (the domain key holds it,
+   like the Phase A ML-DSA half) vs node-level (each PeerId has its
+   own KEM keypair, advertised via its own `AdmissionCert`). Doc
+   proposes node-level — KEM is per-recipient, and a per-PeerId key
+   matches the H-12 trust binding more naturally. Domain-level
+   would force the admin to be online for every rekey.
+7. **Should `EpochKeyRelease` itself carry the publisher's KEM
+   pubkey** in addition to the recipient looking it up via the
+   publisher's `AdmissionCert`? Doc proposes "no" — the cert is the
+   authoritative source and binding the release to a specific cert
+   avoids confusion if the publisher rotates KEM keys.
+
+## 10. References
+
+- FIPS 203 (ML-KEM): https://csrc.nist.gov/pubs/fips/203/final
+- IETF `draft-ietf-tls-hybrid-design` — hybrid KEM construction
+  reference
+- Phase A landed: [STATUS.md](../STATUS.md) §Z-1 Plan
+- Phase C upstream tracking: rust-libp2p `rs/9595` (no hybrid Noise
+  feature flag in mainline 0.55)
+- M-2 hybrid signature pattern (basis for the domain-separation
+  prefix shape used here): [Claude_sec_review.md](../Claude_sec_review.md)
