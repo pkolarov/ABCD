@@ -2246,10 +2246,16 @@ MSI / pkg on every host for every release. A security patch to
 
 **No build provenance / SBOM / dependency audit.** `Cargo.lock` is
 pinned, but no SLSA provenance is attached at release time, no
-SBOM is published, `cargo-vet` is not adopted, and `cargo audit`
-is not in CI. The 2026-04-12 `security-gaps.md` flagged the
-dependency-audit gap as an operational item — it has not been
-closed since.
+SBOM is published, and `cargo-vet` is not adopted. The
+dependency-audit half of this gap closed 2026-04-29
+(supply-chain-plan.md Phase C.4): the new `audit` job in
+`.github/workflows/ci.yml` runs `cargo audit` on every PR + push to
+`main` and exits non-zero on any RUSTSEC vulnerability advisory
+(eight upstream-blocked informational warnings tracked in
+`security-gaps.md`). The 2026-04-12 `security-gaps.md` flagged
+that as an operational item; the rest of the supply-chain
+sub-gaps (C.1 SLSA, C.2 SBOM, C.3 cargo-vet, C.5 Sigstore) remain
+open.
 
 **Attack:** (a) a critical fix to `dds-node` does not reach the
 fleet without manual operator action, leaving a known-vulnerable
@@ -2272,8 +2278,9 @@ every node).
 - Z-7 is the OS-vendor-trust-root complement to C-3 (DDS-trust-root
   publisher capability, already closed). Both are required for
   defense-in-depth.
-- Z-8 (provenance) closes the dependency-audit gap left open since
-  the 2026-04-12 `security-gaps.md`.
+- Z-8 (dependency-audit half) closed 2026-04-29 via the
+  supply-chain-plan.md Phase C.4 `audit` CI job; the rest of the
+  Z-8 provenance / SBOM / `cargo-vet` work remains open.
 - Z-8 (self-update) interacts with Z-2: the multi-sig compensating
   control becomes weaker as soon as a single admin key is compromised
   off a software-resident store. Hardware-binding the publisher keys
