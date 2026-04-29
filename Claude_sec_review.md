@@ -2105,7 +2105,7 @@ work is provisioning the cert and dropping the conditional.
 **Remediation:** [docs/supply-chain-plan.md](docs/supply-chain-plan.md)
 Phase A.
 
-### Z-7 (High) ⚠ partially closed (Phase B.1 schema) — Asymmetric package signature verification on managed software
+### Z-7 (High) ⚠ partially closed (Phase B.1 schema + Phase B.3 macOS agent) — Asymmetric package signature verification on managed software
 
 **Phase B.1 schema landed 2026-04-28 follow-up #61.** The schema half of
 the two-signature gate now ships:
@@ -2127,9 +2127,39 @@ malformed `publisher_identity` is dropped (warn-log + `continue`)
 before the assignment reaches the agent read path, closing the
 schema-layer fail-closed promise on the node side. New regression
 test `b1_software_with_invalid_publisher_identity_is_skipped` pins
-this. The agent-side enforcement (Phase B.2 / B.3 — wiring
-`WinVerifyTrust` on Windows and the Team-ID match on macOS) remains
-open and the row stays "partially closed" until those land.
+this.
+
+**Phase B.3 macOS agent landed 2026-04-29.**
+[`SoftwareInstaller`](platform/macos/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs)
+now routes `pkgutil --check-signature` through a private
+`EnforcePackageSignature` helper that captures stdout, refuses on a
+non-zero exit, and pins the leaf-cert Team ID against
+`publisher_identity = AppleDeveloperId { team_id }` via the new
+[`PkgutilSignatureParser`](platform/macos/DdsPolicyAgent/Enforcers/PkgutilSignatureParser.cs)
+(regex on the indented `N. <subject-with-colon> (XXXXXXXXXX)` leaf-cert
+shape — comment / status-line parenthesised runs are explicitly
+ignored). The directive's `publisher_identity` field is parsed by the
+new
+[`PublisherIdentitySpec`](platform/macos/DdsPolicyAgent/Enforcers/PublisherIdentity.cs)
+helper that mirrors the Rust externally-tagged enum and fail-closes on
+malformed shape (unknown variant, wrong-shape Team ID, missing inner
+fields). The signature gate now runs whenever **either**
+`RequirePackageSignature` is true **or** `publisher_identity` is set on
+the directive — closes the silent-downgrade window where an operator
+who turned `RequirePackageSignature` off could bypass a Team-ID-pinned
+assignment. An `Authenticode` `publisher_identity` on a macOS scope is
+rejected as a configuration error (the policy author scoped a
+Windows-only signer expectation onto a macOS device). 14 new
+regression tests cover the parser surface and six integration paths
+(matching Team ID proceeds past the gate, mismatch fails, unsigned
+fails, signed-but-not-Developer-ID fails, Authenticode-on-macOS fails,
+and the `RequirePackageSignature=false`-but-pinned backward-compat
+angle still gates). 91 / 91 macOS .NET tests passing.
+
+The Windows-side enforcement (Phase B.2 — wiring `WinVerifyTrust` and
+matching against `PublisherIdentity::Authenticode`) remains open. The
+row stays "partially closed" until B.2 lands and the cross-platform
+B.4 / B.5 tests + migration plan ship.
 
 For DDS-managed third-party software, the document signature chain
 is solid: `SoftwareAssignment` is admin-signed, the

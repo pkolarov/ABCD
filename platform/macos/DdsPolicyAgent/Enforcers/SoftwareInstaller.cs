@@ -131,9 +131,10 @@ public sealed class SoftwareInstaller : IEnforcer
                 $"package hash mismatch for '{packageId}': expected {expectedSha}, got {actualSha}");
         }
 
-        if (_config.RequirePackageSignature)
+        var publisherIdentity = PublisherIdentitySpec.TryParse(directive);
+        if (_config.RequirePackageSignature || publisherIdentity is not null)
         {
-            _runner.RunChecked("/usr/sbin/pkgutil", ["--check-signature", packagePath]);
+            EnforcePackageSignature(packagePath, packageId, publisherIdentity);
         }
 
         if (_config.AllowInlinePackageScripts)
@@ -155,6 +156,64 @@ public sealed class SoftwareInstaller : IEnforcer
             throw new InvalidOperationException($"package '{packageId}' installed without a readable receipt");
 
         return $"{action} {packageId} v{version}";
+    }
+
+    /// <summary>
+    /// SC-5 Phase B.3: run <c>pkgutil --check-signature</c> on the
+    /// staged package, refuse on a non-zero exit, and — when the
+    /// directive specified an Apple Developer ID publisher identity —
+    /// pin the leaf-cert Team ID against the expected value. Both the
+    /// signature check itself and the Team ID match must succeed; a
+    /// mismatch fails closed.
+    /// </summary>
+    private void EnforcePackageSignature(
+        string packagePath,
+        string packageId,
+        PublisherIdentitySpec? publisherIdentity)
+    {
+        if (publisherIdentity is PublisherIdentitySpec.Authenticode)
+        {
+            // Authenticode is Windows-only. A macOS-scoped assignment
+            // carrying an Authenticode pin is a misconfiguration — the
+            // policy author either targeted the wrong device class or
+            // mis-tagged the publisher field. Fail closed instead of
+            // silently downgrading to "RequirePackageSignature only".
+            throw new InvalidOperationException(
+                $"package '{packageId}' carries an Authenticode publisher_identity but " +
+                "this is a macOS agent — refuse to install");
+        }
+
+        var result = _runner.Run("/usr/sbin/pkgutil", ["--check-signature", packagePath]);
+        if (!result.Succeeded)
+        {
+            throw new InvalidOperationException(
+                $"pkgutil --check-signature failed for '{packageId}' (exit {result.ExitCode}): " +
+                $"{Trim(result.StandardError, result.StandardOutput)}");
+        }
+
+        if (publisherIdentity is PublisherIdentitySpec.AppleDeveloperId expected)
+        {
+            var teamId = PkgutilSignatureParser.ExtractTeamId(result.StandardOutput);
+            if (teamId is null)
+            {
+                throw new InvalidOperationException(
+                    $"package '{packageId}' is signed but pkgutil output does not " +
+                    "contain a Developer ID leaf certificate with a Team ID — " +
+                    $"expected Team ID '{expected.TeamId}'");
+            }
+            if (!string.Equals(teamId, expected.TeamId, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"package '{packageId}' signer Team ID mismatch: " +
+                    $"expected '{expected.TeamId}', got '{teamId}'");
+            }
+        }
+    }
+
+    private static string Trim(string stderr, string stdout)
+    {
+        var s = string.IsNullOrWhiteSpace(stderr) ? stdout : stderr;
+        return string.IsNullOrWhiteSpace(s) ? "(no output)" : s.Trim();
     }
 
     private async Task<string> ResolvePackagePathAsync(

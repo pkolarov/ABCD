@@ -243,11 +243,34 @@ if (config.RequirePackageSignature || directive.PublisherIdentity is not null)
 on the staged file inside the SYSTEM-only DACL (B-6) so a TOCTOU
 swap can't inject between verify and launch.
 
-**B.3 — macOS agent.** `_config.RequirePackageSignature` defaults to
-**true** (was false). The existing
-[SoftwareInstaller.cs:134-137](../platform/macos/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs)
-call becomes mandatory. Add Team ID extraction + match against
-`PublisherIdentity::AppleDeveloperId` when the document specifies it.
+**B.3 — macOS agent. ✅ Landed 2026-04-29.**
+[`SoftwareInstaller`](../platform/macos/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs)
+now routes the `pkgutil --check-signature` call through a private
+`EnforcePackageSignature` helper that captures stdout, refuses on a
+non-zero exit, and — when the directive carries
+`publisher_identity = AppleDeveloperId { team_id }` — pins the leaf-cert
+Team ID against the expected value via the new
+[`PkgutilSignatureParser`](../platform/macos/DdsPolicyAgent/Enforcers/PkgutilSignatureParser.cs)
+(regex on the indented `N. <subject-with-colon> (XXXXXXXXXX)` leaf-cert
+shape). The directive's `publisher_identity` field is parsed by the new
+[`PublisherIdentitySpec`](../platform/macos/DdsPolicyAgent/Enforcers/PublisherIdentity.cs)
+helper that mirrors the Rust externally-tagged enum (`{"AppleDeveloperId":
+{"team_id": "..."}}` / `{"Authenticode": {"subject": "..."}}`) and
+fail-closes on malformed shape (unknown variant, wrong-shape Team ID, etc.).
+The signature gate now runs whenever **either** `RequirePackageSignature`
+is true **or** `publisher_identity` is set on the directive — so an
+operator who explicitly turned `RequirePackageSignature` off can still
+not silently downgrade a Team-ID-pinned assignment to hash-only. An
+`Authenticode` `publisher_identity` on a macOS scope is rejected as a
+configuration error (the policy author scoped a Windows-only signer
+expectation onto a macOS device). 14 new regression tests in
+[`platform/macos/DdsPolicyAgent.Tests/EnforcerTests.cs`](../platform/macos/DdsPolicyAgent.Tests/EnforcerTests.cs)
+cover the parser (PublisherIdentitySpec, PkgutilSignatureParser) and the
+six integration paths: matching Team ID proceeds past the gate, Team ID
+mismatch fails closed, unsigned pkg fails closed, signed-but-not-Developer-ID
+pkg fails closed, Authenticode-on-macOS fails closed, and the
+`RequirePackageSignature=false`-but-`publisher_identity`-set
+backward-compat angle. 91 / 91 macOS .NET tests passing (was 77).
 
 **B.4 — Tests.** Cross-platform regression tests:
 
