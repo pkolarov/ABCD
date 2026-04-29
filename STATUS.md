@@ -123,9 +123,10 @@
 >   `cargo test --workspace` — 232 passing in `dds-node` lib, 81 in
 >   `dds-domain`, 0 failed across every workspace crate.
 >
-> **Phase B (after A, plan landed 2026-04-29) — per-publisher epoch
-> key with hybrid-KEM distribution on gossip + sync payloads.**
-> Detailed design: **[docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md)**.
+> **Phase B (after A, plan landed 2026-04-29; B.1 landed 2026-04-29)
+> — per-publisher epoch key with hybrid-KEM distribution on gossip +
+> sync payloads.** Detailed design:
+> **[docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md)**.
 > Each publisher generates a 32-byte symmetric AEAD key per epoch
 > (default 24h) and KEM-encapsulates it once per admitted peer using
 > a hybrid X25519 + ML-KEM-768 (FIPS 203) construction; recipients
@@ -134,9 +135,10 @@
 > "per-recipient envelope on every message blows up gossipsub
 > bandwidth" problem the original sketch glossed over by amortizing
 > the KEM cost to once per peer per epoch (steady-state per-message
-> overhead = AEAD only, ~5 µs). New workspace dep (`ml-kem = "0.2"`,
-> RustCrypto FIPS 203 final), new `dds-core::crypto::kem` +
-> `dds-core::crypto::epoch_key` modules, `AdmissionCert` grows
+> overhead = AEAD only, ~5 µs). New workspace deps
+> (`ml-kem = "0.3"` RustCrypto FIPS 203 final, `x25519-dalek`,
+> `hkdf`), new `dds-core::crypto::kem` (landed) +
+> `dds-core::crypto::epoch_key` (B.2) modules, `AdmissionCert` grows
 > `pq_kem_pubkey: Option<Vec<u8>>` (1216 B, mirrors Phase A's
 > `pq_signature` wire-compat shape), `Domain` grows
 > `capabilities: Vec<String>` with `enc-v3` flipping the
@@ -146,6 +148,46 @@
 > totalling ~26 dev-days ⇒ ~2 months wall-clock. Closes
 > Harvest-Now-Decrypt-Later on application-layer content even while
 > libp2p-noise stays classical.
+>
+> **Phase B.1 landed 2026-04-29** —
+> [`dds-core/src/crypto/kem.rs`](dds-core/src/crypto/kem.rs) ships the
+> hybrid X25519 + ML-KEM-768 KEM primitive that B.2-B.12 will compose
+> on top of. `HybridKemPublicKey` (32 + 1184 = 1216 B wire),
+> `HybridKemSecretKey` (32 + 64 B seed = 96 B on-disk; the FIPS 203
+> §6.1 seed form rather than the 2400 B expanded decapsulation key),
+> `KemCiphertext` (32 + 1088 = 1120 B wire), plus `generate(rng)` /
+> `encap(rng, pk, binding)` / `decap(sk, ct, binding)` /
+> `public_from_secret(sk)`. The combiner is HKDF-SHA256 with
+> version-pinned salt `b"dds-pqc-kem-hybrid-v1"` and an HKDF info
+> string that folds in the sender's ephemeral X25519 pubkey, the
+> recipient's full hybrid pubkey (both legs), the ML-KEM ciphertext,
+> and a caller-supplied `binding_info` slice — the latter is where
+> the `(publisher, recipient, epoch_id)` triple gets domain-separated
+> so an attacker can't lift either leg's shared secret out of one
+> tuple and replay it elsewhere (mirrors the M-2 / Phase A
+> `dds-hybrid-v2/...` prefix pattern). Workspace dep additions:
+> `ml-kem = "0.3"` (RustCrypto FIPS 203 final),
+> `x25519-dalek = "2"` with the `static_secrets` feature so the
+> persisted X25519 secret can be reloaded for decap, and an explicit
+> `hkdf = "0.12"` workspace declaration (was already a transitive
+> through `chacha20poly1305`'s sibling deps). 14 new unit tests in
+> the `crypto::kem::tests` module pin: keypair / ciphertext / pubkey
+> sizes against FIPS 203, encap-decap roundtrip, wire-form parse and
+> length-rejection on both pubkey and ciphertext, generate-vs-derived
+> pubkey equality (load-time tear detection), wrong-recipient decap
+> producing an unequal secret (ML-KEM's implicit-rejection branch),
+> ciphertext tampering on either leg producing an unequal secret,
+> binding-info changes producing different secrets (replay defence),
+> the component-lifting defence (X25519-leg-alone HKDF cannot recover
+> the hybrid secret because the PQ shared-secret is in the IKM),
+> deterministic generate from a seeded RNG, and the version-pinned
+> HKDF salt. `cargo test -p dds-core --lib crypto::kem` — 14 / 14
+> passing. `cargo test --workspace` — 754 / 754 passing across the
+> workspace (was 740 before B.1). `cargo clippy -p dds-core
+> --all-targets -- -D warnings` clean. `cargo fmt --all -- --check`
+> clean. **Next: B.2 `dds-core::crypto::epoch_key`** — AEAD wrap of a
+> 32-byte symmetric key under a hybrid-KEM-derived secret (1 dev-day,
+> per the plan).
 >
 > **Phase C (track-only) — adopt hybrid Noise upstream.** rust-libp2p
 > tracking issue `rs/9595`; mainline 0.55 still has no hybrid-KEM
@@ -167,7 +209,22 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-29 (supply-chain Phase C.4 — `cargo audit`
+> Last updated: 2026-04-29 (Z-1 Phase B.1 — hybrid X25519 + ML-KEM-768
+> KEM module landed in `dds-core::crypto::kem`. New workspace deps
+> `ml-kem = "0.3"`, `x25519-dalek = "2"` (with `static_secrets`
+> feature), and an explicit `hkdf = "0.12"` declaration. 14 new unit
+> tests cover encap/decap roundtrip, wire-form parse + length-reject,
+> tamper detection on both legs, binding-info domain separation, the
+> component-lifting defence (X25519-leg-alone HKDF cannot recover the
+> hybrid secret), deterministic generate-from-RNG, and the
+> version-pinned `b"dds-pqc-kem-hybrid-v1"` HKDF salt. Workspace
+> tests 754 / 754 (was 740); `cargo clippy -p dds-core --all-targets
+> -- -D warnings` clean; `cargo fmt --all -- --check` clean. Closes
+> Phase B.1 of [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md);
+> does *not* close Z-1 (Harvest-Now-Decrypt-Later remains exposed
+> until Phase B.7 / B.8 wrap gossip + sync envelopes in the new
+> primitive). Previous: 2026-04-29 (supply-chain Phase C.4 — `cargo
+> audit`
 > landed in CI. New `audit` job in
 > [`.github/workflows/ci.yml`](.github/workflows/ci.yml) installs
 > `cargo-audit` via `taiki-e/install-action@v2` and runs `cargo audit`

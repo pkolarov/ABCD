@@ -16,6 +16,8 @@ pub mod classical;
 pub mod ecdsa;
 #[cfg(feature = "pq")]
 pub mod hybrid;
+#[cfg(feature = "pq")]
+pub mod kem;
 pub mod traits;
 #[cfg(feature = "pq")]
 pub mod triple_hybrid;
