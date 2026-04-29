@@ -159,6 +159,7 @@ pub fn save_domain_file(path: &Path, domain: &Domain) -> Result<(), DomainStoreE
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| DomainStoreError::Io(e.to_string()))?;
     }
+    tighten_parent_dir_perms(path);
     let f = DomainFile::from_domain(domain);
     let s = toml::to_string_pretty(&f).map_err(|e| DomainStoreError::Toml(e.to_string()))?;
     std::fs::write(path, s).map_err(|e| DomainStoreError::Io(e.to_string()))?;
@@ -175,6 +176,7 @@ pub fn save_domain_key(path: &Path, key: &DomainKey) -> Result<(), DomainStoreEr
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| DomainStoreError::Io(e.to_string()))?;
     }
+    tighten_parent_dir_perms(path);
     let secret = key.signing_key.to_bytes();
     let name = key.name.clone();
     let passphrase = match std::env::var(DOMAIN_PASSPHRASE_ENV) {
@@ -332,6 +334,31 @@ pub fn save_domain_key(path: &Path, key: &DomainKey) -> Result<(), DomainStoreEr
 /// detail.
 fn set_owner_only_permissions(path: &Path) {
     crate::file_acl::restrict_to_owner(path);
+}
+
+/// L-4 (security review): tighten the parent directory of a written
+/// key/cert file to `0o700` on Unix.
+///
+/// `create_dir_all` honours the process umask (typically `0o022`),
+/// which leaves the data directory at `0o755` and a co-tenant readable.
+/// Mirrors the same idiom in [`crate::identity_store::save`] and
+/// [`crate::p2p_identity::save`]. Best-effort: ignore failures so a
+/// pre-existing directory whose mode we cannot change does not break
+/// the save (the per-file `0o600` and the data-dir DACL on Windows
+/// are the authoritative perimeters). On Windows the parent perimeter
+/// is the protected DACL applied by the MSI custom action
+/// `CA_RestrictDataDirAcl` and the per-file DACL via
+/// [`crate::file_acl::restrict_to_owner`], so this helper is a no-op.
+fn tighten_parent_dir_perms(path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 pub fn load_domain_key(path: &Path) -> Result<DomainKey, DomainStoreError> {
@@ -526,6 +553,7 @@ pub fn save_admission_cert(path: &Path, cert: &AdmissionCert) -> Result<(), Doma
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| DomainStoreError::Io(e.to_string()))?;
     }
+    tighten_parent_dir_perms(path);
     let bytes = cert
         .to_cbor()
         .map_err(|e| DomainStoreError::Cbor(e.to_string()))?;
@@ -552,6 +580,7 @@ pub fn save_domain_key_fido2(path: &Path, key: &DomainKey) -> Result<Vec<u8>, Do
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| DomainStoreError::Io(e.to_string()))?;
     }
+    tighten_parent_dir_perms(path);
 
     tracing::info!("Creating FIDO2 credential to protect domain key...");
     tracing::info!(">>> TOUCH YOUR FIDO2 KEY <<<");
@@ -766,6 +795,32 @@ pubkey = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
         let loaded = load_admission_cert(&path).unwrap();
         let d = key.domain();
         loaded.verify(&d.pubkey, &d.id, "peerX", 100).unwrap();
+    }
+
+    /// L-4 (security review): the parent directory of a written
+    /// `domain_key.bin` is tightened to `0o700` so the secret is not
+    /// reachable through a co-tenant-readable directory entry. Mirrors
+    /// the existing idiom in [`crate::identity_store::save`] and
+    /// [`crate::p2p_identity::save`]; closes the "sibling" gap that
+    /// L-4's "+ siblings" qualifier left open in `domain_store.rs`.
+    #[test]
+    #[cfg(unix)]
+    fn save_domain_key_tightens_parent_dir_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(DOMAIN_PASSPHRASE_ENV) };
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let dir = TempDir::new().unwrap();
+        // Pre-loosen the directory so the assertion below proves the
+        // save call is what tightened it (not the umask at create).
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join("domain_key.bin");
+        save_domain_key(&path, &key).unwrap();
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "save_domain_key must tighten parent dir to 0o700 (got {mode:o})"
+        );
     }
 
     // -----------------------------------------------------------------
