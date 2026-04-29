@@ -162,7 +162,7 @@ pub fn save_domain_file(path: &Path, domain: &Domain) -> Result<(), DomainStoreE
     tighten_parent_dir_perms(path);
     let f = DomainFile::from_domain(domain);
     let s = toml::to_string_pretty(&f).map_err(|e| DomainStoreError::Toml(e.to_string()))?;
-    std::fs::write(path, s).map_err(|e| DomainStoreError::Io(e.to_string()))?;
+    atomic_write_owner_only(path, s.as_bytes())?;
     Ok(())
 }
 
@@ -322,8 +322,7 @@ pub fn save_domain_key(path: &Path, key: &DomainKey) -> Result<(), DomainStoreEr
     let mut buf = Vec::new();
     ciborium::into_writer(&CborValue::Map(map), &mut buf)
         .map_err(|e| DomainStoreError::Cbor(e.to_string()))?;
-    std::fs::write(path, &buf).map_err(|e| DomainStoreError::Io(e.to_string()))?;
-    set_owner_only_permissions(path);
+    atomic_write_owner_only(path, &buf)?;
     Ok(())
 }
 
@@ -359,6 +358,32 @@ fn tighten_parent_dir_perms(path: &Path) {
     {
         let _ = path;
     }
+}
+
+/// L-3 (security review): atomic write — `tempfile::NamedTempFile` in
+/// the same parent directory + `persist` (POSIX `rename`) so a crash
+/// mid-write can't leave a torn key/cert blob on disk. Owner-only
+/// permissions are applied to the tempfile *before* the rename so the
+/// final file is never observably world-readable. Mirrors the same
+/// idiom landed in [`crate::identity_store::save`] and
+/// [`crate::p2p_identity::save`]; closes the L-3 follow-on for the
+/// four `domain_store` save paths (`save_domain_file`,
+/// `save_domain_key`, `save_admission_cert`,
+/// `save_domain_key_fido2`) which previously used a non-atomic
+/// `std::fs::write`.
+fn atomic_write_owner_only(path: &Path, buf: &[u8]) -> Result<(), DomainStoreError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| DomainStoreError::Io("path has no parent".into()))?;
+    let tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| DomainStoreError::Io(format!("tempfile: {e}")))?;
+    std::fs::write(tmp.path(), buf)
+        .map_err(|e| DomainStoreError::Io(format!("tempfile write: {e}")))?;
+    set_owner_only_permissions(tmp.path());
+    tmp.persist(path)
+        .map_err(|e| DomainStoreError::Io(format!("rename: {e}")))?;
+    set_owner_only_permissions(path);
+    Ok(())
 }
 
 pub fn load_domain_key(path: &Path) -> Result<DomainKey, DomainStoreError> {
@@ -557,7 +582,7 @@ pub fn save_admission_cert(path: &Path, cert: &AdmissionCert) -> Result<(), Doma
     let bytes = cert
         .to_cbor()
         .map_err(|e| DomainStoreError::Cbor(e.to_string()))?;
-    std::fs::write(path, &bytes).map_err(|e| DomainStoreError::Io(e.to_string()))?;
+    atomic_write_owner_only(path, &bytes)?;
     Ok(())
 }
 
@@ -654,8 +679,7 @@ pub fn save_domain_key_fido2(path: &Path, key: &DomainKey) -> Result<Vec<u8>, Do
     let mut buf = Vec::new();
     ciborium::into_writer(&CborValue::Map(map), &mut buf)
         .map_err(|e| DomainStoreError::Cbor(e.to_string()))?;
-    std::fs::write(path, &buf).map_err(|e| DomainStoreError::Io(e.to_string()))?;
-    set_owner_only_permissions(path);
+    atomic_write_owner_only(path, &buf)?;
 
     tracing::info!(
         "Domain key saved (FIDO2-protected, credential_id={} bytes)",
@@ -821,6 +845,77 @@ pubkey = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
             mode, 0o700,
             "save_domain_key must tighten parent dir to 0o700 (got {mode:o})"
         );
+    }
+
+    /// L-3 follow-on: every `domain_store` save path goes through the
+    /// shared `atomic_write_owner_only` helper (`tempfile::NamedTempFile`
+    /// in the same parent directory + `persist`). The test pins three
+    /// invariants per save call: (1) the target file ends up with mode
+    /// `0o600`; (2) no `tmpfile` leftovers remain in the parent
+    /// directory after success — `NamedTempFile::persist` renames the
+    /// tempfile so only the target should be present; (3) the helper
+    /// is overwrite-safe — saving a second time over an existing file
+    /// succeeds with no orphan tempfile and the new bytes are present.
+    /// Mirrors the L-3 regression coverage already in
+    /// [`crate::identity_store`] and [`crate::p2p_identity`].
+    #[test]
+    #[cfg(unix)]
+    fn save_paths_are_atomic_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(DOMAIN_PASSPHRASE_ENV) };
+        let dir = TempDir::new().unwrap();
+
+        // Closure: assert exactly one entry under `dir`, named `expected`,
+        // and that its mode is `0o600`. The "exactly one entry" check
+        // catches a stray `.tmp*` left over by a future regression that
+        // reverts to non-atomic write semantics.
+        let assert_only_target = |expected: &Path, label: &str| {
+            let entries: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(
+                entries.len(),
+                1,
+                "{label}: expected only the target file in parent dir, got {entries:?}"
+            );
+            assert_eq!(
+                entries[0].to_string_lossy(),
+                expected.file_name().unwrap().to_string_lossy(),
+                "{label}: unexpected entry {entries:?}"
+            );
+            let mode = std::fs::metadata(expected).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{label}: target file mode {mode:o} != 0o600");
+        };
+
+        // 1. save_domain_file: no temp leftover, mode 0o600, overwrite-safe.
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let domain = key.domain();
+        let domain_path = dir.path().join("domain.toml");
+        save_domain_file(&domain_path, &domain).unwrap();
+        assert_only_target(&domain_path, "save_domain_file first call");
+        save_domain_file(&domain_path, &domain).unwrap();
+        assert_only_target(&domain_path, "save_domain_file second call (overwrite)");
+        std::fs::remove_file(&domain_path).unwrap();
+
+        // 2. save_domain_key (plain v=1): same invariants.
+        let key_path = dir.path().join("domain_key.bin");
+        save_domain_key(&key_path, &key).unwrap();
+        assert_only_target(&key_path, "save_domain_key first call");
+        save_domain_key(&key_path, &key).unwrap();
+        assert_only_target(&key_path, "save_domain_key second call (overwrite)");
+        std::fs::remove_file(&key_path).unwrap();
+
+        // 3. save_admission_cert: cert files are public bearer tokens but
+        // the atomicity guarantee still applies — a torn cert would block
+        // node startup just as effectively as a torn key.
+        let cert_path = dir.path().join("admission.cbor");
+        let cert = key.issue_admission("peerL3".into(), 0, None);
+        save_admission_cert(&cert_path, &cert).unwrap();
+        assert_only_target(&cert_path, "save_admission_cert first call");
+        save_admission_cert(&cert_path, &cert).unwrap();
+        assert_only_target(&cert_path, "save_admission_cert second call (overwrite)");
     }
 
     // -----------------------------------------------------------------
