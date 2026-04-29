@@ -37,7 +37,7 @@
 //! | `dds_fido2_attestation_verify_total` | counter | `result=ok\|fail`, `fmt=packed\|none\|unknown` | bumped by [`record_fido2_attestation_verify`] |
 //! | `dds_fido2_assertions_total` | counter | `result=ok\|signature\|rp_id\|up\|sign_count\|other` | bumped by [`record_fido2_assertion`] |
 //! | `dds_sync_pulls_total` | counter | `result=ok\|fail` | bumped by [`record_sync_pull`] |
-//! | `dds_sync_payloads_rejected_total` | counter | `reason=legacy_v1\|publisher_capability\|replay_window\|signature\|duplicate_jti\|graph` | bumped by [`record_sync_payloads_rejected`] |
+//! | `dds_sync_payloads_rejected_total` | counter | `reason=legacy_v1\|publisher_capability\|publisher_identity\|replay_window\|signature\|duplicate_jti\|graph` | bumped by [`record_sync_payloads_rejected`] |
 //! | `dds_http_requests_total` | counter | `route, method, status` | bumped by [`record_http_request`] |
 //! | `dds_trust_graph_attestations` | gauge | `body_type=user-auth-attestation\|device-join\|windows-policy\|macos-policy\|macos-account-binding\|sso-identity-link\|software-assignment\|service-principal\|session\|unknown` | [`crate::service::LocalService::trust_graph_counts`] at scrape, partitioned via [`crate::service::body_type_label`] |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
@@ -454,6 +454,16 @@
 //!   lacks the matching `dds:policy-publisher-*` / `dds:software-publisher`
 //!   capability vouch. Same gate the gossip ingest path runs via
 //!   [`crate::node::publisher_capability_ok`].
+//! - `publisher_identity` — SC-5 Phase B.1 follow-on. The payload
+//!   carries a `SoftwareAssignment` whose `publisher_identity` is
+//!   present but malformed (empty Authenticode subject, wrong-shape
+//!   SHA-1 root thumbprint, wrong-shape Apple Team ID). Same gate
+//!   the gossip ingest path runs via
+//!   [`crate::node::software_publisher_identity_ok`]. A malformed
+//!   `publisher_identity` would silently match nothing on the
+//!   downstream agent — observationally identical to "no publisher
+//!   pinning", which is exactly the silent downgrade the
+//!   two-signature gate is meant to prevent.
 //! - `replay_window` — M-9 guard. The payload is a `Revoke` or
 //!   `Burn` token whose `iat` falls outside the configured replay
 //!   window (the same check the gossip path runs via
@@ -708,8 +718,9 @@ pub struct Telemetry {
     /// → `fail`).
     sync_pulls: Mutex<BTreeMap<String, u64>>,
     /// Per-`reason` pre-apply sync-payload rejection counts. `reason`
-    /// is one of `legacy_v1|publisher_capability|replay_window` —
-    /// bounded by the three pre-apply skip sites inside
+    /// is one of
+    /// `legacy_v1|publisher_capability|publisher_identity|replay_window`
+    /// — bounded by the four pre-apply skip sites inside
     /// [`crate::node::DdsNode::handle_sync_response`]. Post-apply
     /// rejections from [`dds_net::sync::apply_sync_payloads_with_graph`]
     /// funnel into a single `Vec<String>` today and would need a
@@ -1234,13 +1245,15 @@ pub fn record_sync_pull(result: &str) {
 /// Bump `dds_sync_payloads_rejected_total{reason=...}` by one. Called
 /// from the pre-apply skip sites in
 /// [`crate::node::DdsNode::handle_sync_response`] (the M-1/M-2 legacy
-/// v1 token guard, the C-3 publisher-capability filter, and the M-9
-/// revocation replay-window guard) plus the post-apply iteration over
-/// [`dds_net::sync::SyncResult::rejected_by_reason`]. `reason` is one
-/// of `legacy_v1|publisher_capability|replay_window` (pre-apply) or
-/// `signature|duplicate_jti|graph` (post-apply, sourced from the
-/// [`dds_net::sync::SyncRejectReason`] catalog). No-op when telemetry
-/// has not been installed (tests, harnesses).
+/// v1 token guard, the C-3 publisher-capability filter, the SC-5
+/// Phase B.1 `software_publisher_identity_ok` shape gate, and the
+/// M-9 revocation replay-window guard) plus the post-apply iteration
+/// over [`dds_net::sync::SyncResult::rejected_by_reason`]. `reason`
+/// is one of
+/// `legacy_v1|publisher_capability|publisher_identity|replay_window`
+/// (pre-apply) or `signature|duplicate_jti|graph` (post-apply,
+/// sourced from the [`dds_net::sync::SyncRejectReason`] catalog).
+/// No-op when telemetry has not been installed (tests, harnesses).
 pub fn record_sync_payloads_rejected(reason: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_sync_payloads_rejected(reason);
@@ -1665,23 +1678,25 @@ fn render_exposition(
     // `dds_sync_payloads_rejected_total` — per-`reason` sync-payload
     // rejection counter. Bumped from the pre-apply skip sites inside
     // `DdsNode::handle_sync_response` (M-1/M-2 legacy_v1, C-3
-    // publisher_capability, M-9 replay_window) plus the post-apply
-    // iteration over `SyncResult::rejected_by_reason` (signature,
-    // duplicate_jti, graph) returned by
-    // `apply_sync_payloads_with_graph`.
+    // publisher_capability, SC-5 Phase B.1 publisher_identity,
+    // M-9 replay_window) plus the post-apply iteration over
+    // `SyncResult::rejected_by_reason` (signature, duplicate_jti,
+    // graph) returned by `apply_sync_payloads_with_graph`.
     out.push_str(
         "# HELP dds_sync_payloads_rejected_total Inbound sync payloads rejected, partitioned by \
          reason. Pre-apply (skipped before the apply funnel): legacy_v1 = M-1/M-2 downgrade guard \
          tripped on a wire-version-1 token while allow_legacy_v1_tokens=false; \
          publisher_capability = C-3 filter — issuer lacks the matching dds:policy-publisher-* / \
-         dds:software-publisher capability; replay_window = M-9 guard — revoke/burn token's `iat` \
-         is outside the configured replay window. Post-apply (returned by \
-         apply_sync_payloads_with_graph): signature = Token::validate() rejected the token \
-         (ed25519 signature / issuer-binding); duplicate_jti = trust graph rejected the token as \
-         a same-JTI duplicate (B-1 replay indicator); graph = every other TrustError (burned, \
-         unauthorized, vouch hash mismatch, no valid chain, chain too deep, graph-layer token \
-         re-validation). Decode failures and store-side write errors fall into SyncResult.errors \
-         only and surface separately through dds_store_writes_total{result=fail}.\n",
+         dds:software-publisher capability; publisher_identity = SC-5 Phase B.1 fail-closed — \
+         SoftwareAssignment.publisher_identity is present but malformed (empty Authenticode \
+         subject, wrong-shape SHA-1 thumbprint, wrong-shape Apple Team ID); replay_window = M-9 \
+         guard — revoke/burn token's `iat` is outside the configured replay window. Post-apply \
+         (returned by apply_sync_payloads_with_graph): signature = Token::validate() rejected the \
+         token (ed25519 signature / issuer-binding); duplicate_jti = trust graph rejected the \
+         token as a same-JTI duplicate (B-1 replay indicator); graph = every other TrustError \
+         (burned, unauthorized, vouch hash mismatch, no valid chain, chain too deep, graph-layer \
+         token re-validation). Decode failures and store-side write errors fall into \
+         SyncResult.errors only and surface separately through dds_store_writes_total{result=fail}.\n",
     );
     out.push_str("# TYPE dds_sync_payloads_rejected_total counter\n");
     let sync_rejected_snapshot = telemetry.sync_payloads_rejected_snapshot();

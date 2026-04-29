@@ -217,6 +217,50 @@ to "no publisher pinning". One new regression test
 attestations (one with empty Authenticode subject, one with a valid
 Apple Team ID) and asserts only the valid one reaches the read path.
 
+**B.1 follow-on — ingest-time fail-closed at gossip + sync. Landed
+2026-04-29.** The read-path filter (above) still admitted the rogue
+token into the trust graph and let it propagate to peers whose
+serve-time filters might be older or patched differently — the same
+defence-in-depth gap C-3 plugged for `publisher_capability`. The new
+private helper
+[`software_publisher_identity_ok`](../dds-node/src/node.rs) runs
+`PublisherIdentity::validate()` at both ingest call sites:
+
+- **Gossip ingest** —
+  [`DdsNode::ingest_operation`](../dds-node/src/node.rs) calls the
+  helper immediately after the existing C-3
+  `publisher_capability_ok` gate; a malformed publisher_identity
+  emits a `*.rejected` audit entry with reason
+  `publisher-identity-invalid` and the token is dropped before the
+  trust graph is consulted.
+- **Sync apply** —
+  [`DdsNode::handle_sync_response`](../dds-node/src/node.rs) calls
+  the helper from the pre-apply `filter` closure; rejections bump
+  the new `dds_sync_payloads_rejected_total{reason="publisher_identity"}`
+  bucket alongside the existing `legacy_v1` /
+  `publisher_capability` / `replay_window` pre-apply reasons.
+
+The helper short-circuits on non-Attest tokens (revoke / burn /
+vouch), on Attest tokens that don't carry a `SoftwareAssignment`
+body (e.g. `WindowsPolicyDocument`, `MacOsPolicyDocument`), on tokens
+with no body at all, and on CBOR decode failures (those surface
+separately through `SyncResult::errors` and the existing per-token
+validation guard at the top of `ingest_operation`). 10 new unit
+tests in
+[`dds-node/src/node.rs`](../dds-node/src/node.rs)
+`publisher_identity_gate_tests` cover the helper surface: valid
+Authenticode + thumbprint accepted, valid Apple Team ID accepted, no
+publisher_identity accepted (legacy v1 publishers), empty
+Authenticode subject rejected, malformed (uppercase) root_thumbprint
+rejected, malformed (lowercase) Apple Team ID rejected, non-Attest
+tokens admitted unconditionally, Attest tokens with no body
+admitted, Attest tokens carrying a non-software body admitted, and
+torn-CBOR `SoftwareAssignment` bodies admitted. The telemetry
+catalog in [`dds-node/src/telemetry.rs`](../dds-node/src/telemetry.rs)
+and the `# HELP` text on the renderer were extended to document the
+new `publisher_identity` reason bucket alongside the existing
+pre-apply reasons.
+
 **B.2 — Windows agent. ✅ Landed 2026-04-29.**
 The signature gate now lives in
 [`SoftwareInstaller.ApplyInstallAsync`](../platform/windows/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs)

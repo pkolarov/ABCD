@@ -1074,6 +1074,27 @@ impl DdsNode {
             );
             return;
         }
+        // **SC-5 Phase B.1 follow-on**: same authoritative-ingest-gate
+        // pattern as C-3, but for `SoftwareAssignment::publisher_identity`.
+        // A malformed publisher_identity (empty Authenticode subject,
+        // wrong-shape Team ID, etc.) would silently match nothing on
+        // the downstream agent — observationally identical to "no
+        // publisher pinning". Drop at ingest so the rogue token never
+        // enters the trust graph and never propagates to peers.
+        if !software_publisher_identity_ok(&token) {
+            warn!(
+                jti = %token.payload.jti,
+                issuer = %token.payload.iss,
+                body_type = ?token.payload.body_type,
+                "rejecting inbound token: malformed SoftwareAssignment.publisher_identity"
+            );
+            self.emit_audit_from_ingest(
+                rejected_action_for(&token.payload.kind),
+                token_bytes.to_vec(),
+                Some("publisher-identity-invalid".to_string()),
+            );
+            return;
+        }
         let graph_err = {
             let mut g = self.trust_graph.write().expect("trust_graph poisoned");
             g.add_token(token.clone()).err()
@@ -1551,6 +1572,23 @@ impl DdsNode {
                     crate::telemetry::record_sync_payloads_rejected("publisher_capability");
                     return false;
                 }
+                // **SC-5 Phase B.1 follow-on**: same fail-closed shape
+                // gate the gossip ingest path runs via
+                // `software_publisher_identity_ok`. A malformed
+                // `publisher_identity` on a `SoftwareAssignment`
+                // delivered through sync would otherwise silently
+                // downgrade to hash-only on the agent.
+                if !software_publisher_identity_ok(&token) {
+                    warn!(
+                        %peer,
+                        jti = %token.payload.jti,
+                        issuer = %token.payload.iss,
+                        body_type = ?token.payload.body_type,
+                        "sync: dropping payload with malformed SoftwareAssignment.publisher_identity"
+                    );
+                    crate::telemetry::record_sync_payloads_rejected("publisher_identity");
+                    return false;
+                }
                 // **M-9 (security review)**: the live gossip ingest path
                 // runs `revocation_within_replay_window` on
                 // revoke/burn tokens. The sync path has to run the
@@ -1862,4 +1900,261 @@ fn publisher_capability_ok(
     let ok = g.has_purpose(&token.payload.iss, required, trusted_roots);
     crate::telemetry::record_purpose_lookup(if ok { "ok" } else { "denied" });
     ok
+}
+
+/// SC-5 Phase B.1 follow-on — ingest-time fail-closed gate on
+/// `SoftwareAssignment::publisher_identity` shape. Mirrors the C-3
+/// pattern: filtering only at serve time
+/// ([`crate::service::LocalService::list_applicable_software`])
+/// still admits the rogue token into the trust graph and lets it
+/// propagate to peers whose serve-time filters might be older or
+/// patched differently. An empty Authenticode subject or a
+/// wrong-shape Apple Team ID would silently match nothing on the
+/// downstream agent — observationally indistinguishable from "no
+/// publisher pinning", which is exactly the silent downgrade the
+/// two-signature gate is meant to prevent.
+///
+/// Returns `true` (admit) when the token does not carry a
+/// `SoftwareAssignment` body, when the body decodes cleanly without a
+/// `publisher_identity` (legacy v1 publishers), or when the embedded
+/// `publisher_identity` passes
+/// [`dds_domain::PublisherIdentity::validate`]. Returns `false` only
+/// for a CBOR-decodable `SoftwareAssignment` whose `publisher_identity`
+/// is malformed. CBOR decode failures are *not* this gate's
+/// responsibility — they surface separately through the existing
+/// `SyncResult::errors` path and through the per-token validation
+/// guard at the top of [`DdsNode::ingest_operation`].
+fn software_publisher_identity_ok(token: &Token) -> bool {
+    use dds_domain::{DomainDocument, SoftwareAssignment, body_types};
+
+    if token.payload.kind != TokenKind::Attest {
+        return true;
+    }
+    let body_type = match token.payload.body_type.as_deref() {
+        Some(bt) => bt,
+        None => return true,
+    };
+    if body_type != body_types::SOFTWARE_ASSIGNMENT {
+        return true;
+    }
+    let doc = match SoftwareAssignment::extract(&token.payload) {
+        Ok(Some(d)) => d,
+        // No body / different body type — handled by other gates.
+        Ok(None) => return true,
+        // Decode failure — not this gate's concern; the upstream
+        // ingest paths already surface decode errors.
+        Err(_) => return true,
+    };
+    match doc.publisher_identity.as_ref() {
+        Some(pi) => pi.validate().is_ok(),
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod publisher_identity_gate_tests {
+    //! SC-5 Phase B.1 follow-on — unit coverage for
+    //! [`software_publisher_identity_ok`], the ingest-side fail-closed
+    //! gate that mirrors C-3's `publisher_capability_ok` for the
+    //! `SoftwareAssignment::publisher_identity` shape invariants.
+    //!
+    //! Both ingest call sites (gossip in
+    //! [`DdsNode::ingest_operation`] and sync in
+    //! [`DdsNode::handle_sync_response`]) route through this helper, so
+    //! covering it directly covers both wire paths.
+    use super::*;
+    use dds_core::identity::Identity;
+    use dds_core::token::{Token, TokenKind, TokenPayload};
+    use dds_domain::DomainDocument;
+    use dds_domain::body_types;
+    use dds_domain::types::{InstallAction, PolicyScope, PublisherIdentity, SoftwareAssignment};
+    use rand::rngs::OsRng;
+
+    fn make_software_token(publisher_identity: Option<PublisherIdentity>) -> Token {
+        let ident = Identity::generate("publisher", &mut OsRng);
+        let pkg = SoftwareAssignment {
+            package_id: "com.example.app".to_string(),
+            display_name: "Example".to_string(),
+            version: "1.0.0".to_string(),
+            source: "https://example.test/app.msi".to_string(),
+            sha256: "0".repeat(64),
+            action: InstallAction::Install,
+            scope: PolicyScope {
+                device_tags: Vec::new(),
+                org_units: Vec::new(),
+                identity_urns: Vec::new(),
+            },
+            silent: true,
+            pre_install_script: None,
+            post_install_script: None,
+            publisher_identity,
+        };
+        let mut payload = TokenPayload {
+            iss: ident.id.to_urn(),
+            iss_key: ident.public_key.clone(),
+            jti: "ingest-pi-test".to_string(),
+            sub: ident.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1714605000,
+            exp: Some(4102444800),
+            body_type: None,
+            body_cbor: None,
+        };
+        pkg.embed(&mut payload).expect("embed software assignment");
+        Token::sign(payload, &ident.signing_key).expect("sign attest token")
+    }
+
+    #[test]
+    fn admits_software_token_without_publisher_identity() {
+        let token = make_software_token(None);
+        assert!(software_publisher_identity_ok(&token));
+    }
+
+    #[test]
+    fn admits_software_token_with_valid_authenticode_publisher() {
+        let token = make_software_token(Some(PublisherIdentity::Authenticode {
+            subject: "Example Corp".to_string(),
+            root_thumbprint: Some("a".repeat(40)),
+        }));
+        assert!(software_publisher_identity_ok(&token));
+    }
+
+    #[test]
+    fn admits_software_token_with_valid_apple_publisher() {
+        let token = make_software_token(Some(PublisherIdentity::AppleDeveloperId {
+            team_id: "ABCDE12345".to_string(),
+        }));
+        assert!(software_publisher_identity_ok(&token));
+    }
+
+    #[test]
+    fn rejects_software_token_with_empty_authenticode_subject() {
+        let token = make_software_token(Some(PublisherIdentity::Authenticode {
+            subject: String::new(),
+            root_thumbprint: None,
+        }));
+        assert!(!software_publisher_identity_ok(&token));
+    }
+
+    #[test]
+    fn rejects_software_token_with_malformed_root_thumbprint() {
+        let token = make_software_token(Some(PublisherIdentity::Authenticode {
+            subject: "Example Corp".to_string(),
+            // Uppercase hex — validate() requires lowercase.
+            root_thumbprint: Some("A".repeat(40)),
+        }));
+        assert!(!software_publisher_identity_ok(&token));
+    }
+
+    #[test]
+    fn rejects_software_token_with_malformed_apple_team_id() {
+        let token = make_software_token(Some(PublisherIdentity::AppleDeveloperId {
+            // Lowercase — validate() requires uppercase alphanumerics.
+            team_id: "abcde12345".to_string(),
+        }));
+        assert!(!software_publisher_identity_ok(&token));
+    }
+
+    #[test]
+    fn admits_non_attest_tokens_unconditionally() {
+        let ident = Identity::generate("revoker", &mut OsRng);
+        let payload = TokenPayload {
+            iss: ident.id.to_urn(),
+            iss_key: ident.public_key.clone(),
+            jti: "revoke-test".to_string(),
+            sub: ident.id.to_urn(),
+            kind: TokenKind::Revoke,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: Some("target-jti".to_string()),
+            iat: 1714605000,
+            // Revoke tokens must not carry an `exp` (RevocationMustNotExpire).
+            exp: None,
+            body_type: None,
+            body_cbor: None,
+        };
+        let token = Token::sign(payload, &ident.signing_key).expect("sign");
+        assert!(software_publisher_identity_ok(&token));
+    }
+
+    #[test]
+    fn admits_attest_tokens_with_no_body() {
+        let ident = Identity::generate("attester", &mut OsRng);
+        let payload = TokenPayload {
+            iss: ident.id.to_urn(),
+            iss_key: ident.public_key.clone(),
+            jti: "no-body-test".to_string(),
+            sub: ident.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: Some("dds:directory-entry".to_string()),
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1714605000,
+            exp: Some(4102444800),
+            body_type: None,
+            body_cbor: None,
+        };
+        let token = Token::sign(payload, &ident.signing_key).expect("sign");
+        assert!(software_publisher_identity_ok(&token));
+    }
+
+    #[test]
+    fn admits_attest_tokens_carrying_non_software_bodies() {
+        let ident = Identity::generate("policy-publisher", &mut OsRng);
+        // Hand-construct a payload tagged with WINDOWS_POLICY but with
+        // an empty body_cbor so we don't have to round-trip the full
+        // policy document type — `software_publisher_identity_ok` only
+        // looks at body_type and short-circuits before decode.
+        let payload = TokenPayload {
+            iss: ident.id.to_urn(),
+            iss_key: ident.public_key.clone(),
+            jti: "windows-policy-test".to_string(),
+            sub: "device:fake".to_string(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1714605000,
+            exp: Some(4102444800),
+            body_type: Some(body_types::WINDOWS_POLICY.to_string()),
+            body_cbor: Some(vec![0xA0]), // empty CBOR map
+        };
+        let token = Token::sign(payload, &ident.signing_key).expect("sign");
+        assert!(software_publisher_identity_ok(&token));
+    }
+
+    #[test]
+    fn admits_software_token_when_body_decode_fails() {
+        // Decode failures are not this gate's responsibility — they
+        // surface elsewhere (SyncResult::errors / the per-token
+        // validation path). The gate must not panic and must not
+        // silently reject because a malformed CBOR blob *might*
+        // contain a malformed publisher_identity.
+        let ident = Identity::generate("torn-publisher", &mut OsRng);
+        let payload = TokenPayload {
+            iss: ident.id.to_urn(),
+            iss_key: ident.public_key.clone(),
+            jti: "torn-cbor-test".to_string(),
+            sub: "device:fake".to_string(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1714605000,
+            exp: Some(4102444800),
+            body_type: Some(body_types::SOFTWARE_ASSIGNMENT.to_string()),
+            // Junk bytes that won't decode as a SoftwareAssignment.
+            body_cbor: Some(vec![0xFF, 0xFE, 0xFD]),
+        };
+        let token = Token::sign(payload, &ident.signing_key).expect("sign");
+        assert!(software_publisher_identity_ok(&token));
+    }
 }
