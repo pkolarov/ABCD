@@ -73,4 +73,16 @@ public sealed class AgentConfig
     /// devices) should tighten this.
     /// </summary>
     public long MaxPackageBytes { get; set; } = 1L * 1024 * 1024 * 1024;
+
+    /// <summary>
+    /// <b>SC-5 Phase B.2 (security review)</b>: require Authenticode
+    /// verification (<c>WinVerifyTrust</c>) on every staged software
+    /// blob before launching it. Default <c>true</c> — disable only
+    /// for local unsigned dev/test packages. The signature gate
+    /// always runs when a directive carries <c>publisher_identity</c>
+    /// regardless of this flag, so flipping it off cannot silently
+    /// downgrade a Team-ID / signer-subject pinned assignment. Mirrors
+    /// the macOS <c>RequirePackageSignature</c> flag.
+    /// </summary>
+    public bool RequirePackageSignature { get; set; } = true;
 }

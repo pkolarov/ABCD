@@ -217,31 +217,86 @@ to "no publisher pinning". One new regression test
 attestations (one with empty Authenticode subject, one with a valid
 Apple Team ID) and asserts only the valid one reaches the read path.
 
-**B.2 — Windows agent.** Add `WinVerifyTrust` invocation in
-`WindowsSoftwareOperations.DownloadAndVerifyAsync` after the
-SHA-256 check and before `Process.Start` (the same window B-6
-hardened with size+mtime re-check):
+**B.2 — Windows agent. ✅ Landed 2026-04-29.**
+The signature gate now lives in
+[`SoftwareInstaller.ApplyInstallAsync`](../platform/windows/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs)
+between the SHA-256 verify and the `InstallMsi`/`InstallExe` launch
+(within the B-6 size+mtime re-check window). It runs whenever
+**either** `AgentConfig.RequirePackageSignature` is `true` **or**
+the directive carries `publisher_identity` — flipping
+`RequirePackageSignature` off cannot silently downgrade a
+pinned-publisher assignment to hash-only, mirroring the macOS
+Phase B.3 behaviour.
 
-```csharp
-// New, after existing hash check:
-if (config.RequirePackageSignature || directive.PublisherIdentity is not null)
-{
-    var result = WinTrust.VerifyAuthenticode(packagePath);
-    if (!result.IsValid) throw new InvalidOperationException(
-        $"Authenticode verify failed for '{packageId}': {result.Reason}");
-    if (directive.PublisherIdentity is { } expected
-        && !SubjectMatches(result.SignerSubject, expected))
-        throw new InvalidOperationException(
-            $"Authenticode signer mismatch for '{packageId}': " +
-            $"expected '{expected.Subject}', got '{result.SignerSubject}'");
-}
-```
+Three new helpers compose the gate:
 
-`WinTrust.VerifyAuthenticode` is a thin C# wrapper over
-`WinVerifyTrust(WINTRUST_ACTION_GENERIC_VERIFY_V2)` plus
-`CertGetNameString` to extract the signer subject. The check happens
-on the staged file inside the SYSTEM-only DACL (B-6) so a TOCTOU
-swap can't inject between verify and launch.
+- [`PublisherIdentitySpec`](../platform/windows/DdsPolicyAgent/Enforcers/PublisherIdentity.cs)
+  parses the directive's externally-tagged enum
+  (`{"Authenticode": {...}}` / `{"AppleDeveloperId": {...}}`) and
+  fail-closes on malformed shape (unknown variant, empty subject,
+  wrong-shape root thumbprint, wrong-shape Team ID, multiple variant
+  tags). Mirrors the Rust `PublisherIdentity::validate` invariants
+  exactly: 40 lowercase hex chars for the SHA-1 thumbprint and
+  10 uppercase alphanumerics for the Apple Team ID.
+- [`IAuthenticodeVerifier`](../platform/windows/DdsPolicyAgent/Enforcers/IAuthenticodeVerifier.cs) —
+  thin abstraction over `WinVerifyTrust` so the gate can be
+  unit-tested on non-Windows hosts. Returns
+  `AuthenticodeVerifyResult { IsValid, SignerSubject,
+  RootThumbprintSha1Hex, Reason }`.
+- [`WinTrustAuthenticodeVerifier`](../platform/windows/DdsPolicyAgent/Enforcers/WinTrustAuthenticodeVerifier.cs) —
+  Windows production implementation. Calls
+  `WinVerifyTrust(WINTRUST_ACTION_GENERIC_VERIFY_V2)` for chain
+  trust (revocation + system root) plus `X509Certificate2` +
+  `X509Chain` for signer-subject and chain-root SHA-1 thumbprint
+  extraction. The two calls share the same on-disk staged file
+  inside the SYSTEM-only DACL (B-6) so a TOCTOU swap can't inject
+  between verify and launch.
+  [`StubAuthenticodeVerifier`](../platform/windows/DdsPolicyAgent/Enforcers/StubAuthenticodeVerifier.cs)
+  registered on non-Windows builds fail-closes any directive that
+  requires a signature so dev/test hosts cannot accidentally
+  short-circuit the gate.
+
+The gate enforces three pinning levels in order:
+
+1. `RequirePackageSignature` only → `WinVerifyTrust` must succeed.
+2. `Authenticode { subject }` set → also exact-match
+   `CertGetNameString(CERT_NAME_SIMPLE_DISPLAY_TYPE)` against
+   `subject` (case-sensitive ordinal, mirroring the macOS Team-ID
+   match).
+3. `Authenticode { subject, root_thumbprint }` set → also exact-match
+   the chain-root SHA-1 thumbprint against the 40-lowercase-hex
+   value in the directive.
+
+An `AppleDeveloperId` `publisher_identity` on a Windows scope is
+rejected as a configuration error (the policy author scoped a
+macOS-only signer expectation onto a Windows device) before the
+verifier is ever called. A malformed `publisher_identity` fails
+*before* the download so a directive that can never satisfy the
+gate does not burn bandwidth.
+
+[`AgentConfig`](../platform/windows/DdsPolicyAgent/Config/AgentConfig.cs)
+gained `RequirePackageSignature: bool` (default `true`) — the
+`Program.cs` DI wiring registers `WinTrustAuthenticodeVerifier` on
+Windows and `StubAuthenticodeVerifier` on other hosts. The
+`SoftwareInstaller` constructor was extended to accept
+`IAuthenticodeVerifier` + `IOptions<AgentConfig>`; a back-compat
+overload kept the legacy `(ops, log)` constructor working with
+`RequirePackageSignature = false` + the stub verifier, so existing
+tests that pre-date Phase B.2 still compile unchanged.
+
+29 new regression tests in
+[`platform/windows/DdsPolicyAgent.Tests/SoftwareInstallerSignatureGateTests.cs`](../platform/windows/DdsPolicyAgent.Tests/SoftwareInstallerSignatureGateTests.cs)
+cover the parser surface (PublisherIdentitySpec — absent / null /
+empty-object / two-variants / unknown-variant / malformed-thumbprint /
+malformed-team-id / round-trip both variants), the stub verifier
+contract, and the integration paths: matching subject proceeds,
+mismatched subject fails closed, unsigned-when-required fails closed,
+unsigned-when-publisher_identity-set-even-if-require-off still gates,
+neither-required-nor-pinned skips the gate (verifier MUST NOT be
+called), AppleDeveloperId-on-Windows fails closed without calling
+the verifier, missing / mismatched / matching root-thumbprint paths,
+and the malformed-publisher_identity-fails-before-download path.
+174 / 174 Windows .NET tests passing (was 145).
 
 **B.3 — macOS agent. ✅ Landed 2026-04-29.**
 [`SoftwareInstaller`](../platform/macos/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs)

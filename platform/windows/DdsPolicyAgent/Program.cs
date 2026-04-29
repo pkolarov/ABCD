@@ -131,6 +131,19 @@ else
     builder.Services.AddSingleton<ISoftwareOperations, InMemorySoftwareOperations>();
 }
 
+// SC-5 Phase B.2: Authenticode verifier for the staged installer
+// signature gate. Real WinVerifyTrust on Windows; the stub on other
+// platforms fails any directive that requires a signature so dev/test
+// builds on macOS/Linux cannot accidentally short-circuit the gate.
+if (OperatingSystem.IsWindows())
+{
+    builder.Services.AddSingleton<IAuthenticodeVerifier, WinTrustAuthenticodeVerifier>();
+}
+else
+{
+    builder.Services.AddSingleton<IAuthenticodeVerifier, StubAuthenticodeVerifier>();
+}
+
 // Register enforcers.
 builder.Services.AddSingleton<RegistryEnforcer>();
 builder.Services.AddSingleton<AccountEnforcer>();

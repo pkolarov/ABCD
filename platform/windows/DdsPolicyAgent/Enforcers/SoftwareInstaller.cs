@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 using System.Text.Json;
+using DDS.PolicyAgent.Config;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace DDS.PolicyAgent.Enforcers;
 
@@ -19,20 +21,55 @@ namespace DDS.PolicyAgent.Enforcers;
 ///   "installer_type": "msi" | "exe",
 ///   "source_url": "https://...",
 ///   "sha256": "abcdef...",
-///   "silent_args": "/S"
+///   "silent_args": "/S",
+///   "publisher_identity": {"Authenticode":{"subject":"Acme","root_thumbprint":null}}
 /// }
 /// </code>
+///
+/// <b>SC-5 Phase B.2 (security review)</b>: between the SHA-256 verify
+/// and the launch, the installer routes the staged blob through
+/// <see cref="IAuthenticodeVerifier"/>. The signature gate runs whenever
+/// <c>AgentConfig.RequirePackageSignature</c> is <c>true</c> *or* the
+/// directive carries <c>publisher_identity</c> — flipping
+/// <c>RequirePackageSignature</c> off cannot silently downgrade a
+/// pinned-publisher assignment to hash-only.
 /// </summary>
 public sealed class SoftwareInstaller : IEnforcer
 {
     private readonly ISoftwareOperations _ops;
+    private readonly IAuthenticodeVerifier _verifier;
+    private readonly AgentConfig _config;
     private readonly ILogger<SoftwareInstaller> _log;
     public string Name => "Software";
 
-    public SoftwareInstaller(ISoftwareOperations ops, ILogger<SoftwareInstaller> log)
+    /// <summary>
+    /// Production constructor. Used by the DI container.
+    /// </summary>
+    public SoftwareInstaller(
+        ISoftwareOperations ops,
+        IAuthenticodeVerifier verifier,
+        IOptions<AgentConfig> config,
+        ILogger<SoftwareInstaller> log)
     {
         _ops = ops;
+        _verifier = verifier;
+        _config = config.Value;
         _log = log;
+    }
+
+    /// <summary>
+    /// Test/legacy constructor. Defaults the signature gate to
+    /// <c>RequirePackageSignature = false</c> + a permissive verifier
+    /// so existing call sites that pre-date SC-5 Phase B.2 keep
+    /// working without modification.
+    /// </summary>
+    public SoftwareInstaller(ISoftwareOperations ops, ILogger<SoftwareInstaller> log)
+        : this(
+            ops,
+            new StubAuthenticodeVerifier(),
+            Options.Create(new AgentConfig { RequirePackageSignature = false }),
+            log)
+    {
     }
 
     public async Task<EnforcementOutcome> ApplyAsync(
@@ -116,9 +153,46 @@ public sealed class SoftwareInstaller : IEnforcer
                 "sha256 is required for Install",
                 [$"FAILED: {desc} — no sha256"]);
 
+        // Parse the optional publisher_identity pin once, before the
+        // download so a malformed directive fails fast (no point burning
+        // bandwidth on a directive that can never satisfy the gate).
+        PublisherIdentitySpec? publisherIdentity;
+        try
+        {
+            publisherIdentity = PublisherIdentitySpec.TryParse(directive);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return new EnforcementOutcome(
+                EnforcementStatus.Failed,
+                $"publisher_identity parse failed: {ex.Message}",
+                [$"FAILED: {desc} — {ex.Message}"]);
+        }
+
         // Download + verify
         _log.LogInformation("Software: downloading {Url}", sourceUrl);
         var localPath = await _ops.DownloadAndVerifyAsync(sourceUrl, sha256, ct);
+
+        // SC-5 Phase B.2: Authenticode gate. Runs whenever
+        // RequirePackageSignature is on OR a publisher_identity pin is
+        // present, so flipping the flag off cannot silently downgrade a
+        // pinned assignment.
+        if (_config.RequirePackageSignature || publisherIdentity is not null)
+        {
+            try
+            {
+                EnforceAuthenticode(localPath, pkgId, publisherIdentity);
+            }
+            catch (InvalidOperationException ex)
+            {
+                TryDelete(localPath);
+                _log.LogError("Software: {Desc} — Authenticode gate failed: {Reason}",
+                    desc, ex.Message);
+                return new EnforcementOutcome(
+                    EnforcementStatus.Failed, ex.Message,
+                    [$"FAILED: {desc} — {ex.Message}"]);
+            }
+        }
 
         // Install
         int exitCode;
@@ -156,6 +230,76 @@ public sealed class SoftwareInstaller : IEnforcer
         _log.LogInformation("Software: {Desc} — success", desc);
         return new EnforcementOutcome(
             EnforcementStatus.Ok, null, [desc]);
+    }
+
+    /// <summary>
+    /// SC-5 Phase B.2: route the staged installer through
+    /// <see cref="IAuthenticodeVerifier"/>, refuse on a verification
+    /// failure, and — when the directive specified an Authenticode
+    /// publisher identity — pin both the signer subject and (if
+    /// requested) the chain-root SHA-1 thumbprint against the expected
+    /// values. A mismatch fails closed. Mirrors the macOS
+    /// <c>EnforcePackageSignature</c>.
+    /// </summary>
+    private void EnforceAuthenticode(
+        string filePath, string packageId, PublisherIdentitySpec? publisherIdentity)
+    {
+        if (publisherIdentity is PublisherIdentitySpec.AppleDeveloperId)
+        {
+            // AppleDeveloperId is macOS-only. A Windows-scoped
+            // assignment carrying an AppleDeveloperId pin is a
+            // misconfiguration — the policy author either targeted the
+            // wrong device class or mis-tagged the publisher field.
+            // Fail closed instead of silently downgrading.
+            throw new InvalidOperationException(
+                $"package '{packageId}' carries an AppleDeveloperId publisher_identity but " +
+                "this is a Windows agent — refuse to install");
+        }
+
+        var result = _verifier.Verify(filePath);
+        if (!result.IsValid)
+        {
+            throw new InvalidOperationException(
+                $"Authenticode verify failed for '{packageId}': " +
+                $"{result.Reason ?? "unknown reason"}");
+        }
+
+        if (publisherIdentity is PublisherIdentitySpec.Authenticode expected)
+        {
+            if (string.IsNullOrEmpty(result.SignerSubject))
+            {
+                throw new InvalidOperationException(
+                    $"package '{packageId}' is signed but no signer subject could be " +
+                    $"extracted — expected subject '{expected.Subject}'");
+            }
+            if (!string.Equals(result.SignerSubject, expected.Subject, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"package '{packageId}' signer subject mismatch: " +
+                    $"expected '{expected.Subject}', got '{result.SignerSubject}'");
+            }
+            if (expected.RootThumbprintSha1Hex is { } expectedThumb)
+            {
+                var observed = result.RootThumbprintSha1Hex;
+                if (string.IsNullOrEmpty(observed))
+                {
+                    throw new InvalidOperationException(
+                        $"package '{packageId}' chain has no root thumbprint to pin — " +
+                        $"expected '{expectedThumb}'");
+                }
+                if (!string.Equals(observed, expectedThumb, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"package '{packageId}' chain root thumbprint mismatch: " +
+                        $"expected '{expectedThumb}', got '{observed}'");
+                }
+            }
+        }
+    }
+
+    private static void TryDelete(string path)
+    {
+        try { File.Delete(path); } catch { /* best-effort cleanup */ }
     }
 
     /// <summary>
