@@ -941,6 +941,7 @@ name = "dds-core"
 version = "0.1.0"
 dependencies = [
  "base32",
+ "chacha20poly1305",
  "ciborium",
  "ciborium-io",
  "criterion",

@@ -123,7 +123,7 @@
 >   `cargo test --workspace` — 232 passing in `dds-node` lib, 81 in
 >   `dds-domain`, 0 failed across every workspace crate.
 >
-> **Phase B (after A, plan landed 2026-04-29; B.1 landed 2026-04-29)
+> **Phase B (after A, plan landed 2026-04-29; B.1 + B.2 landed 2026-04-30)
 > — per-publisher epoch key with hybrid-KEM distribution on gossip +
 > sync payloads.** Detailed design:
 > **[docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md)**.
@@ -185,9 +185,48 @@
 > passing. `cargo test --workspace` — 754 / 754 passing across the
 > workspace (was 740 before B.1). `cargo clippy -p dds-core
 > --all-targets -- -D warnings` clean. `cargo fmt --all -- --check`
-> clean. **Next: B.2 `dds-core::crypto::epoch_key`** — AEAD wrap of a
-> 32-byte symmetric key under a hybrid-KEM-derived secret (1 dev-day,
-> per the plan).
+> clean.
+>
+> **Phase B.2 landed 2026-04-30** —
+> [`dds-core/src/crypto/epoch_key.rs`](dds-core/src/crypto/epoch_key.rs)
+> ships the AEAD half of the `EpochKeyRelease` construction: a thin
+> ChaCha20-Poly1305 wrapper that encrypts a 32-byte epoch AEAD key
+> under the 32-byte hybrid-KEM-derived shared secret produced by B.1
+> `kem::encap` / `kem::decap`. `wrap(rng, kem_shared, epoch_key) →
+> ([u8; 12], Vec<u8>)` returns a fresh random 12-byte ChaCha20-Poly1305
+> nonce alongside the 48-byte ciphertext (32 B plaintext + 16 B
+> Poly1305 tag); `unwrap(kem_shared, &nonce, &ciphertext) → [u8; 32]`
+> recovers the epoch key, returning `CryptoError::InvalidSignature`
+> on AEAD-tag failure (wrong key, tampered ciphertext, tampered
+> nonce, or tampered AAD). The wrapper is intentionally a thin glue
+> layer — caller-side `(publisher, recipient, epoch_id)`
+> domain-separation already lives in B.1's `binding_info`, so the
+> AEAD's only AAD is a constant version-tag `b"dds-pqc-epoch-key-v1"`
+> (`AAD_V1`) for cross-version replay defence (a future
+> `dds-pqc-epoch-key-v2` lands disjoint from this one). New workspace
+> dep `chacha20poly1305 = "0.10"` (RustCrypto, `default-features =
+> false, features = ["alloc"]`); already a transitive through dds-node
+> so no new vendored crate. The `pq` cargo feature now also gates
+> `chacha20poly1305` so the dds-core classical-only build stays AEAD-free.
+> A `const _: () = assert!(SHARED_SECRET_LEN == EPOCH_KEY_LEN)` sanity
+> guard fails compilation if either constant ever drifts. 11 new unit
+> tests in `crypto::epoch_key::tests` cover: wire sizes match constants;
+> `wrap`/`unwrap` roundtrip; wrong key fails; tampered ciphertext fails;
+> tampered tag fails; tampered nonce fails; wrong-length ciphertext
+> rejected without invoking the cipher; nonce uniqueness across
+> consecutive `wrap`s under the same key; **end-to-end composition
+> with the B.1 KEM** (sender encap → wrap, recipient decap → unwrap,
+> recovers original epoch key); KEM `binding_info` mismatch propagates
+> to AEAD failure (the §4.3 replay-defence property the construction
+> leans on); and AAD constant pinned to `b"dds-pqc-epoch-key-v1"`
+> with a smoke test proving a different AAD ciphertext fails to
+> verify under the canonical AAD. `cargo test -p dds-core --lib
+> crypto::epoch_key` — 11 / 11 passing; `cargo test --workspace` —
+> 765 / 765 passing across the workspace (was 754 before B.2);
+> `cargo clippy --workspace --all-targets -- -D warnings` clean;
+> `cargo fmt --all -- --check` clean. **Next: B.3
+> `AdmissionCert.pq_kem_pubkey` + `Domain.capabilities` +
+> `peer_cert_store`** (3 dev-days, per the plan).
 >
 > **Phase C (track-only) — adopt hybrid Noise upstream.** rust-libp2p
 > tracking issue `rs/9595`; mainline 0.55 still has no hybrid-KEM
@@ -209,7 +248,47 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-29 (Z-1 Phase B.1 — hybrid X25519 + ML-KEM-768
+> Last updated: 2026-04-30 (Z-1 Phase B.2 —
+> `dds-core::crypto::epoch_key` AEAD wrapper landed. Thin
+> ChaCha20-Poly1305 glue layer that wraps a 32-byte epoch AEAD key
+> under the 32-byte hybrid-KEM-derived shared secret produced by B.1
+> `kem::encap` / `kem::decap`. `wrap(rng, kem_shared, epoch_key) →
+> ([u8; 12], Vec<u8>)` returns a fresh random 12-byte nonce + 48-byte
+> ciphertext (32 B plaintext + 16 B Poly1305 tag); `unwrap(kem_shared,
+> &nonce, &ciphertext) → [u8; 32]` recovers the epoch key, returning
+> `CryptoError::InvalidSignature` on AEAD-tag failure. The wrapper is
+> intentionally a thin glue layer — caller-side `(publisher,
+> recipient, epoch_id)` domain separation lives in B.1's
+> `binding_info`, so the AEAD's only AAD is a constant version-tag
+> `b"dds-pqc-epoch-key-v1"` (`AAD_V1`) for cross-version replay
+> defence. New workspace dep `chacha20poly1305 = "0.10"` (RustCrypto,
+> `default-features = false, features = ["alloc"]`); already a
+> transitive through dds-node so no new vendored crate. The `pq`
+> cargo feature now also gates `chacha20poly1305` so the dds-core
+> classical-only build stays AEAD-free. A `const _: () =
+> assert!(SHARED_SECRET_LEN == EPOCH_KEY_LEN)` sanity guard fails
+> compilation if either constant ever drifts. 11 new unit tests in
+> `crypto::epoch_key::tests` pin: wire sizes, `wrap`/`unwrap`
+> roundtrip, wrong-key fails, tampered ciphertext / tag / nonce fail,
+> wrong-length ciphertext rejected without invoking the cipher, nonce
+> uniqueness across consecutive `wrap`s, **end-to-end composition
+> with the B.1 KEM** (sender encap → wrap, recipient decap → unwrap,
+> recovers original epoch key), KEM `binding_info` mismatch propagates
+> to AEAD failure (the §4.3 replay-defence property the construction
+> leans on), and AAD constant pinned to `b"dds-pqc-epoch-key-v1"`
+> with a smoke test proving a different AAD ciphertext fails to
+> verify under the canonical AAD. `cargo test -p dds-core --lib
+> crypto::epoch_key` — 11 / 11 passing; `cargo test --workspace` —
+> 765 / 765 passing across the workspace (was 754 before B.2);
+> `cargo clippy --workspace --all-targets -- -D warnings` clean;
+> `cargo fmt --all -- --check` clean. Closes Phase B.2 of
+> [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md); does *not*
+> close Z-1 (Harvest-Now-Decrypt-Later remains exposed until Phase
+> B.7 / B.8 wrap gossip + sync envelopes in the new primitive). Next:
+> B.3 `AdmissionCert.pq_kem_pubkey` + `Domain.capabilities` +
+> `peer_cert_store` (3 dev-days).
+>
+> Previous: 2026-04-29 (Z-1 Phase B.1 — hybrid X25519 + ML-KEM-768
 > KEM module landed in `dds-core::crypto::kem`. New workspace deps
 > `ml-kem = "0.3"`, `x25519-dalek = "2"` (with `static_secrets`
 > feature), and an explicit `hkdf = "0.12"` declaration. 14 new unit

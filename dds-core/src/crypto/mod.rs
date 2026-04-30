@@ -15,6 +15,8 @@
 pub mod classical;
 pub mod ecdsa;
 #[cfg(feature = "pq")]
+pub mod epoch_key;
+#[cfg(feature = "pq")]
 pub mod hybrid;
 #[cfg(feature = "pq")]
 pub mod kem;
