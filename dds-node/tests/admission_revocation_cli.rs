@@ -50,9 +50,14 @@ fn write_minimal_node_config(data_dir: &std::path::Path, domain_dir: &std::path:
     let pubkey = parsed["pubkey"].as_str().unwrap().to_string();
     let name = parsed["name"].as_str().unwrap().to_string();
 
+    // **Windows path escaping** — TOML basic strings (double-quoted)
+    // interpret backslashes as escape sequences, so a Windows path
+    // like `C:\Users\...` is read as a malformed `\U` Unicode escape.
+    // Single-quoted TOML literal strings take the bytes verbatim, and
+    // path values never contain a single quote on either platform.
     let cfg = format!(
         r#"
-data_dir = "{data}"
+data_dir = '{data}'
 org_hash = "test.org"
 
 [network]
