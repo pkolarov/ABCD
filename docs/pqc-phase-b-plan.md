@@ -69,6 +69,18 @@ and rotated periodically.
   coupled to Phase B (the KEM key can be moved to a HW-bound store
   later without wire-format changes).
 - Encrypted-at-rest of the on-disk redb store — that's Z-4.
+  Plaintext `sync_payloads` cache and plaintext `<data_dir>/epoch_keys.cbor`
+  are the existing per-store posture.
+- **MCU / no_std with the `pq` feature.** dds-core is
+  `#![cfg_attr(not(feature = "std"), no_std)]` for the *classical*
+  feature set, but Phase A's `pqcrypto-mldsa = { features = ["std"] }`
+  workspace pin already gates the `pq` feature on `std` (the crate
+  wraps a C reference implementation that needs libc). Phase B's
+  `ml-kem 0.3` / `x25519-dalek 2` / `hkdf 0.12` deps are all
+  `default-features = false` and stay no_std-friendly, so they don't
+  make this worse — but the `pq` feature as a whole remains
+  std-only until a pure-Rust ML-DSA backend (e.g. `fips204` crate)
+  is swapped in. Tracked separately; not a Phase B goal.
 
 ## 4. Architecture
 
@@ -198,6 +210,39 @@ Two delivery channels for `EpochKeyRelease`:
    Gossipsub is wrong here — releases are per-recipient, not
    broadcast.
 
+### 4.5.1 Replay window + late-join recovery
+
+Mirrors the M-9 token replay window pattern. Two new constants:
+
+- `EPOCH_RELEASE_REPLAY_WINDOW_SECS = 7 * 86_400` — receivers reject
+  any `EpochKeyRelease` whose `issued_at` is more than 7 days in the
+  past relative to local clock. Bounds an attacker's ability to
+  shelve an old release and replay it after the publisher has rotated
+  away.
+- `EPOCH_KEY_GRACE_SECS = 300` — after a publisher rotates, receivers
+  retain the previous `(publisher, prev_epoch_id) → key` entry for 5
+  minutes so in-flight gossip with the older `epoch_id` still
+  decrypts. Cleared on the next rotation tick.
+
+**Late-join request-response shape** on
+`/dds/epoch-keys/1.0.0/<domain>`:
+
+```rust
+pub struct EpochKeyRequest {
+    pub publishers: Vec<PeerId>, // peers we want current epoch keys for
+}
+pub struct EpochKeyResponse {
+    pub releases: Vec<Vec<u8>>,  // opaque CBOR EpochKeyRelease, capped
+}
+```
+
+A receiver that observes a `GossipEnvelopeV3` it can't decrypt
+(no cached key for `(publisher, epoch_id)`) emits one
+`EpochKeyRequest` to the *publisher* (preferred) or to a peer that
+recently spoke for the publisher (fallback). The responder ships
+its current release for the requester. Cap on `releases.len()`
+mirrors `MAX_REVOCATIONS_PER_RESPONSE` semantics.
+
 ### 4.6 Rotation policy
 
 | Trigger | Action | Cadence |
@@ -211,6 +256,43 @@ Receivers cache the previous epoch key for a short window (default
 5 minutes after `epoch_id` changes) so in-flight messages with the
 old `epoch_id` still decrypt cleanly. After the grace window, the
 old key is dropped from memory.
+
+### 4.6.1 Sync responder re-wraps under its own epoch key
+
+A non-obvious decision Phase B has to commit to: **`sync_payloads`
+holds plaintext after the gossip-decrypt step, and the sync
+responder re-encrypts each payload under its own current epoch key
+when serving a `SyncRequest`** — it does *not* forward the
+publisher's original `GossipEnvelopeV3`. Two reasons:
+
+1. The requester may not have the original publisher's epoch key
+   for that `epoch_id` (the publisher may be offline, or the
+   epoch may be far in the past).
+2. Sync gap-fill must work transitively: peer `Q` must be able to
+   ship payloads originally published by peer `P` to a third peer
+   `R`, even if `R` has never directly admitted `P`. Re-wrapping
+   under `Q`'s key makes this composition straightforward.
+
+Trade-off: the in-memory `sync_payloads` cache holds plaintext (same
+posture as the existing on-disk redb store; both gated by Z-4 for
+at-rest encryption). An attacker who compromises the cache reads
+plaintext directory ops — same threat as today. Phase B does not
+regress this; it just means the application-layer encryption stops
+at the per-node trust boundary, not the per-publisher boundary.
+
+### 4.6.2 Receivers cache other peers' AdmissionCerts
+
+Today the H-12 admission handshake verifies a remote cert once and
+records the remote `PeerId` in `admitted_peers` — the cert itself is
+not retained. Phase B needs the cert (specifically `pq_kem_pubkey`)
+to look up the publisher's KEM pubkey for `EpochKeyRelease` decap
+binding. New `peer_cert_store` module in `dds-node`:
+`BTreeMap<PeerId, AdmissionCert>` populated on every successful
+H-12 handshake, persisted at `<data_dir>/peer_certs.cbor`. A
+re-handshake (e.g. after publisher KEM key rotation re-issues the
+cert) overwrites the cached entry. Storage budget for a 1000-peer
+domain: ~1.2 MB (1000 × 1216 B `pq_kem_pubkey` + envelope), plus the
+sigs (~3.4 KB each in v2 hybrid). Acceptable.
 
 ### 4.7 Mixed-fleet rollout
 
@@ -227,6 +309,51 @@ A rollback from Stage 2 → Stage 1 is supported by re-issuing
 `domain.toml` without the capability — receivers go back to
 accepting plaintext, publishers back to plaintext publish on the
 next epoch.
+
+### 4.8 Offline > 24h recovery
+
+A node that has been disconnected for longer than the rotation
+period (default 24h) wakes up with stale cached epoch keys for every
+admitted peer. Three cases, all benign:
+
+**Receiver offline N days, then reconnects.** H-12 fires per
+neighbour as connections come back; each remote piggy-backs its
+*current* `EpochKeyRelease` for us in the `AdmissionResponse`. After
+a few seconds (parallelizable across neighbours), we have fresh
+keys for every publisher we'll see gossip from. New gossip flowing
+in **after** reconnect decrypts cleanly under the freshly-delivered
+keys. Gossip we missed during the offline window is gone — same as
+today (gossipsub is fire-and-forget). The gap-fill story is sync,
+which by §4.6.1 re-wraps payloads under the responder's *current*
+epoch key, so we decrypt cleanly with the freshly-delivered key
+without needing any historical epoch keys.
+
+**Publisher offline N days, then reconnects.** On startup, if
+`now > my_epoch.expires_at`, force-rotate before publishing
+anything. Rotation timer ticks normally afterwards. No special
+"wake up and catch up" code path; the rotation path covers it.
+
+**Both offline simultaneously.** Composes cleanly — same flow on
+each side independently.
+
+**KEM pubkey rotation while offline (the only real cliff).** If a
+publisher's `pq_kem_pubkey` rotated during our offline window, the
+publisher's `AdmissionCert` was re-issued. Our cached cert in
+`peer_cert_store` (§4.6.2) is stale. Resolution: the H-12
+handshake on reconnect ships the publisher's *current* cert, which
+overwrites the stale entry. The piggy-backed `EpochKeyRelease` is
+encapsulated to the new pubkey, so decap works. If the old cert was
+explicitly revoked while we were offline, we pick up the revocation
+via H-12 piggy-back from any admitted peer — same flow as today's
+revocation propagation.
+
+**Cap on offline tolerance:** there is no hard cap. Even a node
+offline for months recovers cleanly via the same H-12 + sync
+catch-up. The only operational consideration is
+`EPOCH_RELEASE_REPLAY_WINDOW_SECS = 7 days` — releases that the
+late-joiner *receives* must have been issued within the last 7 days,
+which is naturally true because the publisher rotates daily and
+re-emits a fresh release on every H-12 handshake.
 
 ## 5. Crate / module changes
 
@@ -353,6 +480,47 @@ For a 100-peer domain with 1000 ops/day, the daily wire overhead is:
 
 Both negligible against the existing gossip + sync traffic.
 
+### 6.1 Scale considerations (1000+ peer domains)
+
+The 100-peer numbers scale linearly until we hit the
+revocation-triggered-rotation thundering-herd cliff. Recomputing for
+1000 peers:
+
+- Per-publisher per-rotation KEM cost: 1000 × 50 µs = **50 ms** —
+  still negligible.
+- Per-publisher per-rotation egress: 1000 × 1500 B = **1.5 MB**.
+- **Revocation thundering herd:** every publisher rotates within
+  60 s of revocation gossip arrival. 1000 publishers × 1000
+  receivers = ~1.5 GB of release traffic mesh-wide in a few
+  seconds. **This is the load-bearing scale concern.**
+
+Mitigations baked into the implementation (B.9):
+
+1. **Stagger by jitter.** Revocation-triggered rotation includes
+   `tokio::time::sleep(rng.gen_range(0..30_secs))` before
+   re-emitting releases. Spreads the herd over a 30-second window;
+   a 1000-publisher domain emits ~33 publishers/sec instead of all
+   at once.
+2. **Per-publisher concurrency cap.** A publisher emits at most 10
+   in-flight `EpochKeyRelease` request-response calls at a time
+   (existing libp2p request_response semantics); the rest queue.
+   Recipient-side parallelism is naturally bounded by the libp2p
+   substream limit.
+3. **Time-based rotation is naturally staggered.** Each publisher's
+   epoch boundary is set at first-start, not synchronized to a
+   wall-clock midnight. So daily rotations are uniformly distributed
+   across a 24h window — no synchronized peak.
+4. **Cert pubkey caching.** `peer_cert_store` (§4.6.2) means we
+   don't re-fetch the 1216-byte `pq_kem_pubkey` on every handshake
+   — only on a re-issued cert. Storage cost for 1000 peers:
+   ~1.2 MB on disk.
+
+If the herd mitigations turn out insufficient at 10k+ peers, the
+follow-up is exponential backoff on retries plus optional sharded
+rotation (rotate only "dirty" peer-pairs touched by the
+revocation, not the full Cartesian product). Out of scope for v1
+Phase B; revisit if loadtest signals a problem.
+
 ## 7. Test strategy
 
 | Layer | Tests |
@@ -365,25 +533,27 @@ Both negligible against the existing gossip + sync traffic.
 | Integration: mixed fleet | A v2-only node + a v3-capable node coexist on a domain without `enc-v3` capability; gossip flows plaintext both ways. Admin flips `enc-v3`; v2-only node stops receiving (its decrypt is a no-op); v3 node continues. |
 | Integration: rotation | 3-node mesh, all v3 + `enc-v3`; trigger time-based rotation on node A; B and C continue receiving from A across the rotation boundary (old key stays in cache 5 min, new key takes over). |
 | Integration: revocation-triggered rotation | 3-node mesh; admin issues admission revocation against C; A and B both rotate within 60 s; an op published by A after rotation must NOT decrypt under the pre-rotation epoch key cached by C. |
-| Loadtest | Steady-state per-message overhead < 10 µs/message at 1k ops/sec; epoch rotation completes within 5 s for a 100-peer domain. |
+| Integration: offline > 24h reconnect (§4.8) | 3-node mesh with `enc-v3`; node C is partitioned for 48h while A and B run normal rotation cycles; C rejoins, completes H-12 with both, and decrypts the next gossip op from each within ~5 s without manual intervention. Variant: A's KEM pubkey rotated during C's offline window (cert re-issued); C's reconnect picks up the new cert via H-12 and decrypts the next release encapsulated to the new pubkey. |
+| Integration: late-join `EpochKeyRequest` recovery (§4.5.1) | Inject a `GossipEnvelopeV3` from publisher P into receiver R that R has no cached key for (simulating a missed release); R must emit a single `EpochKeyRequest{publishers: [P]}` to P, receive a release, and decrypt the envelope. |
+| Loadtest | Steady-state per-message overhead < 10 µs/message at 1k ops/sec; epoch rotation completes within 5 s for a 100-peer domain; revocation-triggered rotation in a 1000-peer simulated mesh stays under 60 s end-to-end thanks to jittered staggering (§6.1). |
 
 ## 8. Phased implementation
 
 | Step | Scope | Wall-clock |
 |---|---|---|
-| B.1 | `dds-core::crypto::kem` module + `ml-kem` workspace dep + KAT vectors + hybrid construction tests | 3 d |
-| B.2 | `dds-core::crypto::epoch_key` AEAD wrapper + tests | 1 d |
-| B.3 | `AdmissionCert.pq_kem_pubkey` + `Domain.capabilities` + tests + on-disk persistence (mirrors Phase A `DomainPqKey` shape) | 2 d |
-| B.4 | `dds-net::pq_envelope` types + `AdmissionResponse.epoch_key_releases` field + caps | 2 d |
+| B.1 | `dds-core::crypto::kem` module — **landed** in commit `da2c706` at [dds-core/src/crypto/kem.rs](../dds-core/src/crypto/kem.rs) (569 lines, matches the §4.3 construction). 14 unit tests cover sizes, encap/decap roundtrip, wire-format parsing and length rejection, wrong-recipient decap, ciphertext tampering on either leg, binding-info replay defence, the component-lifting defence, and the version-pinned HKDF salt. KAT vectors from the FIPS 203 ACVP suite are deferred to a follow-on (the upstream RustCrypto `ml-kem 0.3` crate already runs the ACVP vectors in its own CI; we depend on that). The workspace ML-KEM pin is at `ml-kem = "0.3"` in [Cargo.toml](../Cargo.toml) — note the version is **0.3 (final)**, not the 0.2 the original draft of this doc named. | done |
+| B.2 | `dds-core::crypto::epoch_key` AEAD wrapper — **landed** at [dds-core/src/crypto/epoch_key.rs](../dds-core/src/crypto/epoch_key.rs). Thin ChaCha20-Poly1305 glue layer over the B.1 KEM-derived shared secret: `wrap(rng, kem_shared, epoch_key) → ([u8;12], Vec<u8>)`, `unwrap(kem_shared, &nonce, &ct) → [u8;32]`. Constant version-tag AAD `b"dds-pqc-epoch-key-v1"`. New workspace dep `chacha20poly1305 = "0.10"` (already a transitive through dds-node, so no new vendored crate). 11 unit tests cover roundtrip, wrong-key / tampered-ct / tampered-tag / tampered-nonce failure, wrong-length rejection, nonce uniqueness, end-to-end composition with B.1, and AAD version-pinning. | done |
+| B.3 | `AdmissionCert.pq_kem_pubkey` + `Domain.capabilities` + `peer_cert_store` (§4.6.2) + on-disk persistence (mirrors Phase A `DomainPqKey` shape) | 3 d |
+| B.4 | `dds-net::pq_envelope` types + `AdmissionResponse.epoch_key_releases` field + caps + `EpochKeyRequest` / `EpochKeyResponse` shapes for the late-join recovery protocol (§4.5.1) | 2 d |
 | B.5 | `EpochKeyRelease` request-response protocol on `/dds/epoch-keys/1.0.0/<domain>` libp2p behaviour | 3 d |
-| B.6 | `dds-node::epoch_key_store` + on-disk persistence | 2 d |
-| B.7 | Encrypted gossip envelope publish + ingest decode + mixed-fleet enforcement | 3 d |
+| B.6 | `dds-node::epoch_key_store` + on-disk persistence + `EPOCH_KEY_GRACE_SECS` decay cache + `EPOCH_RELEASE_REPLAY_WINDOW_SECS` enforcement | 2 d |
+| B.7 | Encrypted gossip envelope publish + ingest decode + mixed-fleet enforcement + sync responder re-wrap (§4.6.1) | 3 d |
 | B.8 | Encrypted sync envelope publish + ingest decode | 2 d |
-| B.9 | Rotation timer + revocation hook + 5-minute decay cache | 2 d |
+| B.9 | Rotation timer + revocation hook + jittered staggering (§6.1) + per-publisher concurrency cap | 3 d |
 | B.10 | `dds-cli pq status / rotate / list-pubkeys` operator surface | 1 d |
-| B.11 | Phase C/E observability (metrics + alerts) — `dds_pq_epoch_id`, `dds_pq_releases_emitted_total`, `dds_pq_envelope_decrypt_total{result=ok|key_missing|aead_fail}` | 2 d |
-| B.12 | Mixed-fleet integration test + rotation integration test + revocation-triggered rotation integration test | 3 d |
-| **Total** | | **~26 d ≈ 5-6 weeks dev + buffer ⇒ 2 months wall-clock** |
+| B.11 | Phase C/E observability (metrics + alerts) — `dds_pq_epoch_id`, `dds_pq_releases_emitted_total`, `dds_pq_envelope_decrypt_total{result=ok|key_missing|aead_fail}`, `dds_pq_release_request_total`, `dds_pq_rotation_total{reason=time|revocation|new_peer|manual}` | 2 d |
+| B.12 | Integration tests: mixed-fleet, rotation, revocation-triggered rotation, **offline > 24h reconnect** (§4.8), KEM-pubkey-rotated-while-offline | 4 d |
+| **Total** | | **~27 d ≈ 5-6 weeks dev + buffer ⇒ 2 months wall-clock** |
 
 ## 9. Open decisions to confirm before B.1
 
