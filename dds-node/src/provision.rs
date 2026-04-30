@@ -801,9 +801,17 @@ pub fn run_provision(
         Some(hex) if !hex.is_empty() => format!("pq_pubkey = \"{hex}\"\n"),
         _ => String::new(),
     };
+    // **Windows path escaping** — `data_dir` and `admission_path`
+    // can be Windows-style (`C:\Users\...`) and TOML basic strings
+    // (double-quoted) interpret backslashes as escape sequences, so
+    // `\Users` looks like a malformed `\U` Unicode escape and the
+    // re-load via `NodeConfig::from_str` panics. TOML *literal*
+    // strings (single-quoted) take the bytes verbatim. Path values
+    // never contain a single quote on either Windows or Unix, so
+    // single-quote framing is safe across platforms.
     let config_content = format!(
         r#"# DDS Node Configuration — provisioned from bundle
-data_dir = "{data_dir}"
+data_dir = '{data_dir}'
 org_hash = "{org_hash}"
 trusted_roots = []
 
@@ -819,7 +827,7 @@ api_addr = "{api_addr}"
 name = "{domain_name}"
 id = "{domain_id}"
 pubkey = "{domain_pubkey}"
-{pq_pubkey_line}admission_path = "{admission}"
+{pq_pubkey_line}admission_path = '{admission}'
 audit_log_enabled = false
 {api_auth_block}"#,
         data_dir = data_dir.display(),
