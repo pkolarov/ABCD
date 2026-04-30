@@ -983,6 +983,7 @@ async fn spawn_node(org: &str) -> Result<(DdsNode, TempDir), Box<dyn std::error:
             id: domain.id.to_string(),
             pubkey: dds_domain::domain::to_hex(&domain.pubkey),
             pq_pubkey: None,
+            capabilities: Vec::new(),
             admission_path: None,
             audit_log_enabled: false,
             max_delegation_depth: 5,

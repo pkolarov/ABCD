@@ -102,6 +102,11 @@ impl std::error::Error for DomainStoreError {}
 /// when the domain has been rotated to v2-hybrid. Absent on v1
 /// domains; legacy `domain.toml` files without the field
 /// deserialize cleanly under `#[serde(default)]`.
+///
+/// **Z-1 Phase B.3** — the optional `capabilities` field carries
+/// admin-controlled capability tags (e.g. `["enc-v3"]`). Empty vec
+/// is the v1 / v2 default; an absent field also deserializes to an
+/// empty vec.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DomainFile {
     pub name: String,
@@ -113,6 +118,9 @@ pub struct DomainFile {
     /// hybrid domains.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pq_pubkey: Option<String>,
+    /// **Z-1 Phase B.3** — admin-controlled capability tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 impl DomainFile {
@@ -122,6 +130,7 @@ impl DomainFile {
             id: domain.id.to_string(),
             pubkey: to_hex(&domain.pubkey),
             pq_pubkey: domain.pq_pubkey.as_deref().map(to_hex),
+            capabilities: domain.capabilities.clone(),
         }
     }
 
@@ -147,6 +156,7 @@ impl DomainFile {
             id,
             pubkey,
             pq_pubkey,
+            capabilities: self.capabilities,
         };
         domain
             .verify_self_consistent()

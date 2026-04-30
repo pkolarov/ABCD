@@ -22,8 +22,8 @@ pub mod fido2;
 pub mod types;
 
 pub use domain::{
-    AdmissionBody, AdmissionCert, AdmissionRevocation, Domain, DomainId, DomainKey, DomainSigner,
-    RevocationBody,
+    AdmissionBody, AdmissionCert, AdmissionRevocation, CAPABILITY_ENC_V3, Domain, DomainId,
+    DomainKey, DomainSigner, HYBRID_KEM_PUBKEY_LEN, RevocationBody,
 };
 pub use types::*;
 

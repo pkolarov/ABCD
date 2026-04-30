@@ -74,6 +74,14 @@ pub struct DomainConfig {
     /// component on every admission cert and admission revocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pq_pubkey: Option<String>,
+    /// **Z-1 Phase B.3** — admin-controlled capability tags (e.g.
+    /// `["enc-v3"]` to flip the v3 encrypted-gossip gate from "shipped
+    /// but disabled" to "publish encrypted + reject plaintext receive").
+    /// Empty by default — preserves byte-identical legacy `dds.toml`
+    /// encodings. Recognized tags: `"enc-v3"`. Unknown tags are
+    /// ignored at load time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
     /// Path to the admission certificate. Defaults to
     /// `<data_dir>/admission.cbor`.
     #[serde(default)]

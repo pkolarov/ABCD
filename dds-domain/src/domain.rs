@@ -58,6 +58,23 @@ pub const MLDSA65_PK_LEN: usize = 1952;
 #[cfg(feature = "pq")]
 pub const MLDSA65_SIG_LEN: usize = 3309;
 
+/// **Z-1 Phase B.3** — wire-form length of a hybrid X25519 + ML-KEM-768
+/// public key (32 + 1184 = 1216 bytes), as ridden on
+/// [`AdmissionCert::pq_kem_pubkey`]. Mirrors
+/// [`dds_core::crypto::kem::HYBRID_KEM_PUBKEY_LEN`] without forcing this
+/// crate's verification path through the dds-core KEM module — the
+/// dds-domain layer only needs the length invariant for fail-closed
+/// schema validation. Defined unconditionally so a non-`pq` build can
+/// still length-check a `pq_kem_pubkey` riding on a v1 / v2 cert that
+/// was issued by a `pq`-built peer.
+pub const HYBRID_KEM_PUBKEY_LEN: usize = 1216;
+
+/// **Z-1 Phase B.3** — capability tag flipping the v3 encrypted-gossip
+/// gate from "shipped but disabled" (Stage 1) to "publish encrypted +
+/// reject plaintext receive" (Stage 2). Distributed via
+/// [`Domain::capabilities`] in the admin-signed `domain.toml`.
+pub const CAPABILITY_ENC_V3: &str = "enc-v3";
+
 /// Hex helpers (avoid pulling in another crate).
 pub fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -155,11 +172,23 @@ pub struct Domain {
     /// encodings byte-identical so old peers still deserialize cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pq_pubkey: Option<Vec<u8>>,
+    /// **Z-1 Phase B.3** — admin-controlled capability tags. An empty
+    /// vec is the v1 / v2 default; v3 nodes flip the runtime gate by
+    /// adding [`CAPABILITY_ENC_V3`] (`"enc-v3"`). `#[serde(default)]` +
+    /// `skip_serializing_if = "Vec::is_empty"` keeps legacy v1 / v2
+    /// CBOR encodings byte-identical so old peers still deserialize
+    /// cleanly. Recognized tags are interpreted by individual node
+    /// crates; unknown tags must be ignored (forward-compat for
+    /// future capabilities).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 impl Domain {
     /// Verify that the stored `pubkey` actually hashes to the stored `id`,
-    /// and that any `pq_pubkey` has the correct length for ML-DSA-65.
+    /// that any `pq_pubkey` has the correct length for ML-DSA-65, and
+    /// that every entry in `capabilities` is non-empty (the empty
+    /// string would silently match an `has_capability("")` probe).
     /// Should be called after loading a `Domain` from any untrusted source.
     pub fn verify_self_consistent(&self) -> Result<(), DomainError> {
         let derived = DomainId::from_pubkey(&self.pubkey);
@@ -177,6 +206,13 @@ impl Domain {
                 pq.len()
             )));
         }
+        for cap in &self.capabilities {
+            if cap.is_empty() {
+                return Err(DomainError::Mismatch(
+                    "capability tag must be non-empty".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -189,6 +225,14 @@ impl Domain {
     /// (i.e., requires hybrid PQ signatures on every admission artifact).
     pub fn is_hybrid(&self) -> bool {
         self.pq_pubkey.is_some()
+    }
+
+    /// **Z-1 Phase B.3** — true if `capability` is present in
+    /// [`Self::capabilities`]. Case-sensitive exact match — capability
+    /// tags are admin-signed via `domain.toml` so spelling variants
+    /// must not silently match.
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
     }
 }
 
@@ -376,6 +420,11 @@ impl DomainKey {
             pq_pubkey: self.pq.as_ref().map(|p| p.public_key_bytes()),
             #[cfg(not(feature = "pq"))]
             pq_pubkey: None,
+            // **Z-1 Phase B.3** — capability tags are admin-controlled
+            // via `domain.toml`; the in-memory `DomainKey::domain()`
+            // never injects them. Operators populate the field when
+            // they are ready to flip a v3 gate (e.g., `enc-v3`).
+            capabilities: Vec::new(),
         }
     }
 
@@ -394,6 +443,23 @@ impl DomainKey {
         peer_id: String,
         issued_at: u64,
         expires_at: Option<u64>,
+    ) -> AdmissionCert {
+        self.issue_admission_with_kem(peer_id, issued_at, expires_at, None)
+    }
+
+    /// **Z-1 Phase B.3** — issue an admission cert that also advertises
+    /// the receiving node's hybrid KEM pubkey (`pq_kem_pubkey`,
+    /// 1,216-byte X25519 + ML-KEM-768) so v3-capable peers can later
+    /// encapsulate epoch keys to it without an extra round-trip.
+    /// Equivalent to [`Self::issue_admission`] for callers that pass
+    /// `None`. Length validation lives in [`AdmissionCert::pq_kem_pubkey_validate`]
+    /// so an over- or undersized blob fails closed.
+    pub fn issue_admission_with_kem(
+        &self,
+        peer_id: String,
+        issued_at: u64,
+        expires_at: Option<u64>,
+        pq_kem_pubkey: Option<Vec<u8>>,
     ) -> AdmissionCert {
         let body = AdmissionBody {
             domain_id: self.id(),
@@ -416,6 +482,7 @@ impl DomainKey {
             body,
             signature: sig.to_bytes().to_vec(),
             pq_signature,
+            pq_kem_pubkey,
         }
     }
 
@@ -497,6 +564,14 @@ impl AdmissionBody {
 /// ([`Self::verify_with_domain`]) requires this signature when the
 /// target [`Domain`] has a `pq_pubkey`; legacy v1 nodes ignore the
 /// field and continue to verify Ed25519 only.
+///
+/// **Z-1 Phase B.3** — additionally carries an optional
+/// `pq_kem_pubkey` (1,216-byte hybrid X25519 + ML-KEM-768 KEM public
+/// key) so a v3-capable peer learns the issuing node's KEM pubkey via
+/// the H-12 admission handshake. Distribution rides the same channel
+/// `pq_signature` already does. Forward-compat: a v1 / v2 verifier
+/// ignores the field and continues to operate; a v3 verifier uses the
+/// pubkey to encapsulate per-publisher epoch keys (Phase B.4 onward).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdmissionCert {
     pub body: AdmissionBody,
@@ -507,9 +582,36 @@ pub struct AdmissionCert {
     /// domain has a `pq_pubkey`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pq_signature: Option<Vec<u8>>,
+    /// **Z-1 Phase B.3** — hybrid X25519 + ML-KEM-768 public key
+    /// (1,216 bytes when set, [`HYBRID_KEM_PUBKEY_LEN`]). The issuing
+    /// node attaches its KEM pubkey here so admitted peers can
+    /// encapsulate epoch keys to it without an extra round-trip.
+    /// `#[serde(default)]` + `skip_serializing_if = "Option::is_none"`
+    /// keeps v1 / v2 wire encodings byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_kem_pubkey: Option<Vec<u8>>,
 }
 
 impl AdmissionCert {
+    /// **Z-1 Phase B.3** — fail-closed length check on
+    /// [`Self::pq_kem_pubkey`]. A wrong-length blob (truncated, padded,
+    /// or planted by a hand-edited cert) fails before any downstream
+    /// KEM consumer touches it. `Ok(())` on absent or correctly-sized;
+    /// [`DomainError::Mismatch`] on wrong length. The byte structure
+    /// itself (X25519 || ML-KEM-768) is validated by the KEM module
+    /// in dds-core when the pubkey is actually used for encap.
+    pub fn pq_kem_pubkey_validate(&self) -> Result<(), DomainError> {
+        if let Some(pk) = &self.pq_kem_pubkey
+            && pk.len() != HYBRID_KEM_PUBKEY_LEN
+        {
+            return Err(DomainError::Mismatch(format!(
+                "pq_kem_pubkey: expected {HYBRID_KEM_PUBKEY_LEN} bytes, got {}",
+                pk.len()
+            )));
+        }
+        Ok(())
+    }
+
     pub fn to_cbor(&self) -> Result<Vec<u8>, DomainError> {
         let mut buf = Vec::new();
         ciborium::into_writer(self, &mut buf).map_err(|e| DomainError::Serialize(e.to_string()))?;
@@ -604,6 +706,11 @@ impl AdmissionCert {
                 "domain advertises pq_pubkey but binary built without `pq` feature".into(),
             ));
         }
+
+        // **Z-1 Phase B.3** — schema-layer length check on the optional
+        // `pq_kem_pubkey`. A wrong-length blob fails closed at the H-12
+        // verifier before any KEM consumer in dds-node touches it.
+        self.pq_kem_pubkey_validate()?;
         Ok(())
     }
 }
@@ -1317,5 +1424,166 @@ mod tests {
         let cert = restored.issue_admission("peer".into(), 0, None);
         cert.verify_with_domain(&original.domain(), "peer", 0)
             .unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // Z-1 Phase B.3 — AdmissionCert.pq_kem_pubkey + Domain.capabilities
+    // -----------------------------------------------------------------
+
+    /// `Domain::has_capability` is a case-sensitive exact match. An
+    /// empty / un-flipped domain reports `false` for every probe; a
+    /// domain with `enc-v3` matches that exact tag and rejects close
+    /// variants (case, whitespace, partial).
+    #[test]
+    fn domain_has_capability_matches_exact_tag() {
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let mut domain = key.domain();
+        assert!(domain.capabilities.is_empty());
+        assert!(!domain.has_capability(CAPABILITY_ENC_V3));
+        assert!(!domain.has_capability(""));
+
+        domain.capabilities.push(CAPABILITY_ENC_V3.to_string());
+        assert!(domain.has_capability(CAPABILITY_ENC_V3));
+        assert!(domain.has_capability("enc-v3"));
+        // Case-sensitive: spelling variants must not silently match.
+        assert!(!domain.has_capability("ENC-V3"));
+        assert!(!domain.has_capability("enc-v3 "));
+    }
+
+    /// `Domain` round-trips through CBOR with `capabilities`
+    /// populated.
+    #[test]
+    fn domain_cbor_roundtrip_preserves_capabilities() {
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let mut domain = key.domain();
+        domain.capabilities.push(CAPABILITY_ENC_V3.to_string());
+        domain
+            .capabilities
+            .push("future-capability-tag".to_string());
+        let mut buf = Vec::new();
+        ciborium::into_writer(&domain, &mut buf).unwrap();
+        let decoded: Domain = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(decoded.capabilities, domain.capabilities);
+    }
+
+    /// **Backwards-compat wire format.** A v1 / v2 `Domain` written
+    /// without the `capabilities` field deserializes cleanly under
+    /// the v3 schema with an empty vec. Mirrors the same posture
+    /// `pq_pubkey` already documents (`legacy_v1_domain_wire_decodes_under_v2_schema`).
+    #[test]
+    fn legacy_v2_domain_wire_decodes_under_v3_schema() {
+        // Build a v2-shape Domain (no capabilities field on the wire).
+        #[derive(Serialize)]
+        struct V2Domain<'a> {
+            name: &'a str,
+            id: DomainId,
+            pubkey: [u8; 32],
+        }
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let v2 = V2Domain {
+            name: &key.name,
+            id: key.id(),
+            pubkey: key.pubkey(),
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&v2, &mut buf).unwrap();
+        let decoded: Domain = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(decoded.pubkey, key.pubkey());
+        assert!(decoded.capabilities.is_empty());
+    }
+
+    /// `Domain::verify_self_consistent` rejects a capability tag that
+    /// is the empty string. An empty tag would silently match a future
+    /// `has_capability("")` probe and is never an intended config.
+    #[test]
+    fn domain_verify_self_consistent_rejects_empty_capability_tag() {
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let mut domain = key.domain();
+        domain.capabilities.push(String::new());
+        assert!(matches!(
+            domain.verify_self_consistent(),
+            Err(DomainError::Mismatch(_))
+        ));
+    }
+
+    /// **Phase B.3 — AdmissionCert.pq_kem_pubkey.**
+    /// `issue_admission_with_kem(peer, ts, exp, Some(pk))` populates
+    /// the field; `issue_admission` (the v1 / v2 helper) leaves it
+    /// `None`. Both shapes round-trip through CBOR.
+    #[cfg(feature = "pq")]
+    #[test]
+    fn admission_cert_carries_pq_kem_pubkey_when_supplied() {
+        let key = DomainKey::generate_hybrid("acme.com", &mut OsRng);
+        let pk = vec![0xa5u8; HYBRID_KEM_PUBKEY_LEN];
+        let cert = key.issue_admission_with_kem("peer".into(), 0, None, Some(pk.clone()));
+        assert_eq!(cert.pq_kem_pubkey.as_deref(), Some(pk.as_slice()));
+
+        let no_kem = key.issue_admission("peer".into(), 0, None);
+        assert!(no_kem.pq_kem_pubkey.is_none());
+
+        let bytes = cert.to_cbor().unwrap();
+        let decoded = AdmissionCert::from_cbor(&bytes).unwrap();
+        assert_eq!(decoded.pq_kem_pubkey, cert.pq_kem_pubkey);
+    }
+
+    /// `verify_with_domain` on a hybrid domain still accepts a cert
+    /// that carries `pq_kem_pubkey` — the schema-layer length check
+    /// passes for a 1216-byte blob, and Phase A's Ed25519 + ML-DSA-65
+    /// signatures remain authoritative for trust.
+    #[cfg(feature = "pq")]
+    #[test]
+    fn hybrid_admission_cert_with_kem_pubkey_verifies() {
+        let key = DomainKey::generate_hybrid("acme.com", &mut OsRng);
+        let domain = key.domain();
+        let pk = vec![0u8; HYBRID_KEM_PUBKEY_LEN];
+        let cert = key.issue_admission_with_kem("peer".into(), 0, Some(2000), Some(pk));
+        cert.verify_with_domain(&domain, "peer", 1500).unwrap();
+    }
+
+    /// **The Phase B.3 schema-layer fail-closed.** A wrong-length
+    /// `pq_kem_pubkey` (truncated, padded, or planted by a
+    /// hand-crafted cert) is rejected by `verify_with_domain` with a
+    /// `Mismatch` error before any KEM consumer ever sees the blob.
+    #[cfg(feature = "pq")]
+    #[test]
+    fn hybrid_admission_cert_rejects_wrong_length_pq_kem_pubkey() {
+        let key = DomainKey::generate_hybrid("acme.com", &mut OsRng);
+        let domain = key.domain();
+        let mut cert = key.issue_admission("peer".into(), 0, None);
+        // Plant a 64-byte pubkey — too short to be the hybrid form.
+        cert.pq_kem_pubkey = Some(vec![0u8; 64]);
+        let err = cert
+            .verify_with_domain(&domain, "peer", 0)
+            .expect_err("wrong-length pq_kem_pubkey must be rejected");
+        assert!(
+            matches!(err, DomainError::Mismatch(_)),
+            "expected Mismatch, got {err:?}"
+        );
+    }
+
+    /// **Backwards-compat wire format.** A v1 / v2 `AdmissionCert`
+    /// (no `pq_kem_pubkey` field on the wire) CBOR-decodes under the
+    /// v3 schema with `pq_kem_pubkey: None`. Mirrors the posture
+    /// pinned for the `pq_signature` field.
+    #[test]
+    fn legacy_v1_admission_cert_wire_decodes_under_v3_schema() {
+        #[derive(Serialize)]
+        struct V1AdmissionCert {
+            body: AdmissionBody,
+            signature: Vec<u8>,
+        }
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let original = key.issue_admission("peer".into(), 0, None);
+        let v1 = V1AdmissionCert {
+            body: original.body.clone(),
+            signature: original.signature.clone(),
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&v1, &mut buf).unwrap();
+        let decoded = AdmissionCert::from_cbor(&buf).unwrap();
+        assert!(decoded.pq_kem_pubkey.is_none());
+        assert!(decoded.pq_signature.is_none());
+        let domain = key.domain();
+        decoded.verify_with_domain(&domain, "peer", 0).unwrap();
     }
 }

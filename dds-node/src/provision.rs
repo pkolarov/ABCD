@@ -741,6 +741,11 @@ pub fn run_provision(
         id: expected_id,
         pubkey,
         pq_pubkey: pq_pubkey_bytes,
+        // **Z-1 Phase B.3** — provisioning bundles do not yet ship
+        // capabilities (no `enc-v3` flip at first install). Operators
+        // populate `[domain].capabilities` post-provision once the v3
+        // gate is ready to flip; the field defaults empty here.
+        capabilities: Vec::new(),
     };
     // `verify_self_consistent` (called inside `save_domain_file ->
     // DomainFile::into_domain` round-trips below) catches a wrong

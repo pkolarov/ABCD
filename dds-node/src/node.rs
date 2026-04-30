@@ -251,11 +251,16 @@ impl DdsNode {
             Some(hex) if !hex.is_empty() => Some(from_hex(hex)?),
             _ => None,
         };
+        // **Z-1 Phase B.3** — capability tags from `[domain].capabilities`
+        // in `dds.toml`. Empty by default (legacy v1 / v2 domains); a v3
+        // gate flip drops `["enc-v3"]` here once published.
+        let capabilities = config.domain.capabilities.clone();
         let domain = dds_domain::Domain {
             name: config.domain.name.clone(),
             id: domain_id,
             pubkey: domain_pubkey,
             pq_pubkey,
+            capabilities,
         };
         domain
             .verify_self_consistent()

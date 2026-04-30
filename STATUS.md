@@ -224,9 +224,88 @@
 > crypto::epoch_key` — 11 / 11 passing; `cargo test --workspace` —
 > 765 / 765 passing across the workspace (was 754 before B.2);
 > `cargo clippy --workspace --all-targets -- -D warnings` clean;
-> `cargo fmt --all -- --check` clean. **Next: B.3
-> `AdmissionCert.pq_kem_pubkey` + `Domain.capabilities` +
-> `peer_cert_store`** (3 dev-days, per the plan).
+> `cargo fmt --all -- --check` clean.
+>
+> **Phase B.3 landed 2026-04-30** —
+> [`dds-domain::AdmissionCert`](dds-domain/src/domain.rs) grew an
+> optional `pq_kem_pubkey: Option<Vec<u8>>` (1216 B X25519 + ML-KEM-768
+> wire form, `#[serde(default, skip_serializing_if = "Option::is_none")]`
+> mirrors Phase A's `pq_signature` byte-compat shape so v1 / v2 wire
+> encodings stay byte-identical and a v3 reader of a v1 cert
+> deserialises the field as `None`). New constructor
+> `DomainKey::issue_admission_with_kem(peer, ts, exp, pq_kem_pubkey)`
+> is the only path that populates the field; `DomainKey::issue_admission`
+> keeps the Phase A signature so the existing 7+ call sites (HTTP,
+> tests, loadtest, e2e) compile unchanged.
+> `AdmissionCert::pq_kem_pubkey_validate` is the schema-layer
+> length check (`HYBRID_KEM_PUBKEY_LEN = 1216`) and is folded into
+> `verify_with_domain` so a wrong-length blob fails closed at the
+> H-12 verifier with `DomainError::Mismatch` *before* any KEM
+> consumer in dds-node touches it. A new `legacy_v1_admission_cert_wire_decodes_under_v3_schema`
+> regression pins the wire-format backward-compat promise against a
+> hand-rolled v1 CBOR shape.
+>
+> [`dds-domain::Domain`](dds-domain/src/domain.rs) grew
+> `capabilities: Vec<String>` with the same `skip_serializing_if =
+> "Vec::is_empty"` posture, plus `Domain::has_capability(&str)`
+> (case-sensitive exact match — spelling variants must not silently
+> match an admin-signed gate) and a new pub `CAPABILITY_ENC_V3 = "enc-v3"`
+> constant. `verify_self_consistent` now rejects any empty capability
+> tag (`Mismatch`); the empty-string tag would silently match a
+> future `has_capability("")` probe and is never an intended config.
+> [`DomainConfig`](dds-node/src/config.rs) and
+> [`DomainFile`](dds-node/src/domain_store.rs) grew matching
+> pass-through fields, so `[domain].capabilities = ["enc-v3"]` in
+> `dds.toml` is the v3 operator surface — the runtime
+> [`DdsNode::init`](dds-node/src/node.rs) now plumbs the field into
+> the live `Domain` descriptor. Two new regressions pin the back-compat:
+> `legacy_v2_domain_wire_decodes_under_v3_schema` (a v1 / v2 Domain
+> with no `capabilities` field on the wire decodes as an empty vec)
+> and `domain_cbor_roundtrip_preserves_capabilities`. The 10
+> `DomainConfig { ... }` constructor sites across
+> dds-node tests / loadtest harness / fido2-test / dds-macos-e2e
+> were extended with `capabilities: Vec::new()`.
+>
+> New module
+> [`dds-node::peer_cert_store`](dds-node/src/peer_cert_store.rs)
+> ships `PeerCertStore` (`BTreeMap<String, AdmissionCert>` keyed on
+> stringified `PeerId`, populated post-H-12-success) backed by an
+> on-disk versioned CBOR file at `<data_dir>/peer_certs.cbor`.
+> `save` writes through the same atomic-tempfile + rename + `0o600`
+> idiom used by [`admission_revocation_store::save`](dds-node/src/admission_revocation_store.rs)
+> (L-3 follow-on) — torn writes are impossible by construction.
+> `load_or_empty` returns an empty store on first start and surfaces
+> `Cbor` / `Format` errors loudly on torn or wrong-version blobs
+> rather than silently dropping cached pubkeys; the load path does
+> not re-verify cached certs (the live H-12 path is authoritative on
+> reconnect, so a stale cache can only delay a freshly-issued cert
+> by one handshake — it cannot admit a peer that is not currently
+> re-verified). `iter_kem_pubkeys()` filters to publishers that
+> already advertise a Phase B KEM pubkey on their cached cert; this
+> is the iterator the Phase B.4 epoch-key-release loop will consume.
+> 9 new unit tests in `peer_cert_store::tests` cover empty
+> roundtrip, `(insert, save, load)` roundtrip preserving Phase A
+> `pq_signature` *and* the new `pq_kem_pubkey`, overwrite-returns-prev
+> semantics, `remove`, `iter_kem_pubkeys` filtering, garbage-bytes
+> rejection, unknown-version rejection, and the `0o600` permissions
+> assertion. 8 new dds-domain tests (`domain_has_capability_matches_exact_tag`,
+> `domain_cbor_roundtrip_preserves_capabilities`,
+> `legacy_v2_domain_wire_decodes_under_v3_schema`,
+> `domain_verify_self_consistent_rejects_empty_capability_tag`,
+> `admission_cert_carries_pq_kem_pubkey_when_supplied`,
+> `hybrid_admission_cert_with_kem_pubkey_verifies`,
+> `hybrid_admission_cert_rejects_wrong_length_pq_kem_pubkey`,
+> `legacy_v1_admission_cert_wire_decodes_under_v3_schema`) cover the
+> dds-domain side. 17 new regression tests across the workspace;
+> `cargo test --workspace` — 782 / 782 passing (was 765 before B.3,
+> +17 new); `cargo clippy --workspace --all-targets -- -D warnings`
+> clean; `cargo fmt --all -- --check` clean. Closes Phase B.3 of
+> [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md); does *not*
+> close Z-1 (Harvest-Now-Decrypt-Later remains exposed until B.7 / B.8
+> wrap gossip + sync envelopes in the new primitive). **Next: B.4
+> `dds-net::pq_envelope` types + `AdmissionResponse.epoch_key_releases`
+> + `EpochKeyRequest` / `EpochKeyResponse` for the late-join recovery
+> protocol** (2 dev-days, per the plan).
 >
 > **Phase C (track-only) — adopt hybrid Noise upstream.** rust-libp2p
 > tracking issue `rs/9595`; mainline 0.55 still has no hybrid-KEM
@@ -248,7 +327,38 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-30 (Z-1 Phase B.2 —
+> Last updated: 2026-04-30 (Z-1 Phase B.3 —
+> `AdmissionCert.pq_kem_pubkey` + `Domain.capabilities` +
+> `dds_node::peer_cert_store` landed. `AdmissionCert` grew an optional
+> `pq_kem_pubkey: Option<Vec<u8>>` (1216 B X25519 + ML-KEM-768 wire
+> form) carried alongside the Phase A `pq_signature` field; new
+> `DomainKey::issue_admission_with_kem` is the only constructor that
+> populates the field. `AdmissionCert::pq_kem_pubkey_validate` is
+> wired into `verify_with_domain` so a wrong-length blob fails
+> closed at the H-12 verifier with `DomainError::Mismatch` *before*
+> any KEM consumer touches it. `Domain` grew `capabilities:
+> Vec<String>` with `Domain::has_capability` (case-sensitive exact
+> match) and a new pub `CAPABILITY_ENC_V3 = "enc-v3"` constant;
+> `verify_self_consistent` rejects empty tags. `DomainConfig` and
+> `DomainFile` (TOML) grew matching pass-through fields so
+> `[domain].capabilities = ["enc-v3"]` in `dds.toml` is the v3
+> operator surface. New module `dds_node::peer_cert_store` ships
+> `PeerCertStore` (BTreeMap keyed on stringified PeerId, persisted
+> at `<data_dir>/peer_certs.cbor` via the atomic + `0o600` idiom);
+> `iter_kem_pubkeys()` filters to publishers that advertise a Phase
+> B KEM pubkey on their cached cert (the iterator B.4 will consume).
+> Wire-format backward compat is pinned by the
+> `legacy_v1_admission_cert_wire_decodes_under_v3_schema` and
+> `legacy_v2_domain_wire_decodes_under_v3_schema` regressions. 17 new
+> tests; `cargo test --workspace` — 782 / 782 passing (was 765);
+> `cargo clippy --workspace --all-targets -- -D warnings` clean;
+> `cargo fmt --all -- --check` clean. Closes Phase B.3 of
+> [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md); does *not*
+> close Z-1 (Harvest-Now-Decrypt-Later remains exposed until B.7 / B.8
+> wrap gossip + sync envelopes). Next: B.4 `dds-net::pq_envelope`
+> types + `AdmissionResponse.epoch_key_releases` (2 dev-days).
+>
+> Previous: 2026-04-30 (Z-1 Phase B.2 —
 > `dds-core::crypto::epoch_key` AEAD wrapper landed. Thin
 > ChaCha20-Poly1305 glue layer that wraps a 32-byte epoch AEAD key
 > under the 32-byte hybrid-KEM-derived shared secret produced by B.1

@@ -186,6 +186,8 @@ impl AdmissionRevocationStore {
             id: *id,
             pubkey: *pk,
             pq_pubkey: self.domain_pq_pubkey.clone(),
+            // capabilities don't affect revocation verification.
+            capabilities: Vec::new(),
         };
         rev.verify_with_domain(&domain)
             .map_err(|e| RevocationStoreError::Verify(e.to_string()))?;

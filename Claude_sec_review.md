@@ -1900,7 +1900,7 @@ transactions signed, audit trail immutable) surfaced five new findings.
 Cross-referenced with the audit summary in conversation log
 2026-04-26.
 
-### Z-1 (Critical) ❌ open — Transport handshake is not post-quantum safe
+### Z-1 (High) ⚠ partially closed (Phase A landed; Phase B.1 + B.2 + B.3 landed) — Transport handshake is not post-quantum safe
 
 The README and whitepaper market DDS as "quantum-resistant by default —
 hybrid Ed25519 + ML-DSA-65". That claim applies **only to the token
@@ -1939,6 +1939,76 @@ transport handshake is classical." See companion edits to
 [README.md](README.md), [docs/DDS-Design-Document.md](docs/DDS-Design-Document.md)
 §6.1, [docs/DDS-Implementation-Whitepaper.md](docs/DDS-Implementation-Whitepaper.md)
 §6.4, [docs/threat-model-review.md](docs/threat-model-review.md) §4.
+
+**Phase A landed 2026-04-28** — closes the H-12 forgeability piece of
+candidate (3): `AdmissionCert` and `AdmissionRevocation` are now
+hybrid Ed25519 + ML-DSA-65 (FIPS 204). See [STATUS.md](STATUS.md)
+"Z-1 Plan" for the full ledger. Severity downgraded Critical → High
+because the H-12 admission handshake is no longer post-quantum-forgeable
+on a v2-hybrid domain; the remaining Harvest-Now-Decrypt-Later
+exposure on recorded gossip / sync content is the High-severity
+remainder.
+
+**Phase B.1 landed 2026-04-29** —
+[`dds-core::crypto::kem`](dds-core/src/crypto/kem.rs) ships the
+hybrid X25519 + ML-KEM-768 KEM primitive (FIPS 203) that B.2-B.12
+will compose on top of. 14 unit tests pin sizes, encap/decap
+roundtrip, wire-form parse + length-reject, tamper detection on both
+legs, binding-info domain separation, the component-lifting defence,
+and the version-pinned `b"dds-pqc-kem-hybrid-v1"` HKDF salt. Does
+**not** close Z-1 by itself — the building block; the gossip / sync
+envelopes that consume it land in B.7 / B.8.
+
+**Phase B.2 landed 2026-04-30** —
+[`dds-core::crypto::epoch_key`](dds-core/src/crypto/epoch_key.rs)
+ships the AEAD half of the `EpochKeyRelease` construction: a thin
+ChaCha20-Poly1305 wrapper around the 32-byte hybrid-KEM-derived
+shared secret produced by B.1. 11 unit tests; AAD pinned to
+`b"dds-pqc-epoch-key-v1"` for cross-version replay defence. Does
+**not** close Z-1 — the wire-level wrap of gossip / sync envelopes
+still rides on B.7 / B.8.
+
+**Phase B.3 landed 2026-04-30** —
+[`dds-domain::AdmissionCert`](dds-domain/src/domain.rs) grew an
+optional `pq_kem_pubkey: Option<Vec<u8>>` (1216 B X25519 + ML-KEM-768
+wire form, mirrors Phase A's `pq_signature` byte-compat shape) so a
+v3-capable peer learns the issuing node's KEM pubkey via the H-12
+admission handshake. New constructor
+`DomainKey::issue_admission_with_kem` is the only path that
+populates the field. The schema-layer length check
+`AdmissionCert::pq_kem_pubkey_validate` is wired into
+`verify_with_domain` so a wrong-length blob fails closed at the
+H-12 verifier with `DomainError::Mismatch` *before* any KEM consumer
+in dds-node touches it.
+[`dds-domain::Domain`](dds-domain/src/domain.rs) grew
+`capabilities: Vec<String>` plus `Domain::has_capability`
+(case-sensitive exact match) and a new pub `CAPABILITY_ENC_V3 =
+"enc-v3"` constant; `verify_self_consistent` rejects empty tags.
+[`DomainConfig`](dds-node/src/config.rs) and
+[`DomainFile`](dds-node/src/domain_store.rs) (TOML) grew matching
+pass-through fields, so `[domain].capabilities = ["enc-v3"]` in
+`dds.toml` is the v3 operator surface that B.7 will consume to flip
+"reject plaintext receive". New module
+[`dds_node::peer_cert_store`](dds-node/src/peer_cert_store.rs) ships
+`PeerCertStore` (`BTreeMap<String, AdmissionCert>` keyed on
+stringified `PeerId`) persisted at `<data_dir>/peer_certs.cbor` via
+the same atomic + `0o600` posture as
+[`admission_revocation_store::save`](dds-node/src/admission_revocation_store.rs)
+(L-3 follow-on). `iter_kem_pubkeys()` filters to publishers that
+already advertise a Phase B KEM pubkey on their cached cert (the
+iterator B.4's epoch-key-release loop will consume). Wire-format
+backward compat is pinned by
+`legacy_v1_admission_cert_wire_decodes_under_v3_schema` (a v1 cert
+with no `pq_kem_pubkey` / `pq_signature` fields decodes as `None` /
+`None`) and `legacy_v2_domain_wire_decodes_under_v3_schema` (a
+no-`capabilities` Domain decodes as an empty vec). Does **not**
+close Z-1 — pure plumbing for the wire-level wrap that lands in
+B.7 / B.8.
+
+**Still open:** B.4 (`dds-net::pq_envelope` types +
+`AdmissionResponse.epoch_key_releases`) → B.12 (integration tests).
+See [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md) §8 for the
+full B.1-B.12 roadmap.
 
 ### Z-2 (High) ❌ open — Hardware-bound identities not implemented
 
