@@ -1063,6 +1063,7 @@ dependencies = [
  "libp2p",
  "rand 0.8.5",
  "serde",
+ "serde_bytes",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -85,6 +85,14 @@ pub struct AdmissionResponse {
     /// deserialize cleanly.
     #[serde(default)]
     pub revocations: Vec<Vec<u8>>,
+    /// **Z-1 Phase B (§4.5)** — opaque CBOR-encoded
+    /// [`crate::pq_envelope::EpochKeyRelease`] blobs. Default empty
+    /// so legacy v1/v2 peers (encoded without this field) deserialize
+    /// cleanly. Bounded by
+    /// [`crate::pq_envelope::MAX_EPOCH_KEY_RELEASES_PER_RESPONSE`]
+    /// at the receive site.
+    #[serde(default)]
+    pub epoch_key_releases: Vec<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -103,7 +111,7 @@ mod tests {
     fn admission_response_roundtrip_some() {
         let resp = AdmissionResponse {
             cert_cbor: Some(b"opaque-cbor-bytes".to_vec()),
-            revocations: Vec::new(),
+            ..Default::default()
         };
         let mut buf = Vec::new();
         ciborium::into_writer(&resp, &mut buf).unwrap();
@@ -114,10 +122,7 @@ mod tests {
 
     #[test]
     fn admission_response_roundtrip_none() {
-        let resp = AdmissionResponse {
-            cert_cbor: None,
-            revocations: Vec::new(),
-        };
+        let resp = AdmissionResponse::default();
         let mut buf = Vec::new();
         ciborium::into_writer(&resp, &mut buf).unwrap();
         let round: AdmissionResponse = ciborium::from_reader(&buf[..]).unwrap();
@@ -136,6 +141,7 @@ mod tests {
                 b"rev-blob-2-longer".to_vec(),
                 vec![0xa1, 0x82, 0x03, 0x07, 0x42, 0xde, 0xad],
             ],
+            ..Default::default()
         };
         let mut buf = Vec::new();
         ciborium::into_writer(&resp, &mut buf).unwrap();
@@ -188,6 +194,7 @@ mod tests {
         let v2 = AdmissionResponse {
             cert_cbor: Some(b"v2-cert".to_vec()),
             revocations: vec![b"rev-1".to_vec(), b"rev-2".to_vec()],
+            ..Default::default()
         };
         let mut buf = Vec::new();
         ciborium::into_writer(&v2, &mut buf).unwrap();
@@ -201,5 +208,79 @@ mod tests {
         // Pin the wire-cap constant so a future bump must update the
         // docstring + every receiver that hardcodes a matching number.
         assert_eq!(MAX_REVOCATIONS_PER_RESPONSE, 1024);
+    }
+
+    /// **Z-1 Phase B (§4.5)** — H-12 piggy-back delivers fresh
+    /// `EpochKeyRelease` blobs alongside the cert and revocations.
+    /// Receivers iterate `epoch_key_releases`, decode each via
+    /// `EpochKeyRelease::from_cbor`, verify the publisher signature,
+    /// and install the released key in the local epoch-key store.
+    #[test]
+    fn admission_response_roundtrip_with_epoch_key_releases() {
+        let resp = AdmissionResponse {
+            cert_cbor: Some(b"opaque-cert".to_vec()),
+            revocations: vec![b"rev-blob-1".to_vec()],
+            epoch_key_releases: vec![
+                b"opaque-release-1".to_vec(),
+                b"opaque-release-2-longer".to_vec(),
+            ],
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&resp, &mut buf).unwrap();
+        let round: AdmissionResponse = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(round.cert_cbor, resp.cert_cbor);
+        assert_eq!(round.revocations.len(), 1);
+        assert_eq!(round.epoch_key_releases.len(), 2);
+        assert_eq!(round.epoch_key_releases[0], b"opaque-release-1");
+        assert_eq!(round.epoch_key_releases[1], b"opaque-release-2-longer");
+    }
+
+    /// **Z-1 Phase B** — a v2 sender (cert + revocations, no
+    /// epoch_key_releases) decodes cleanly under the v3 schema with
+    /// `epoch_key_releases` defaulting to empty. Mirrors the v1→v2
+    /// invariant for the new field added in Phase B.4.
+    #[test]
+    fn admission_response_decodes_v2_wire_without_epoch_key_releases_field() {
+        #[derive(Serialize)]
+        struct V2Wire<'a> {
+            cert_cbor: Option<&'a [u8]>,
+            revocations: Vec<&'a [u8]>,
+        }
+        let v2 = V2Wire {
+            cert_cbor: Some(b"v2-cert"),
+            revocations: vec![b"rev-1", b"rev-2"],
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&v2, &mut buf).unwrap();
+
+        let round: AdmissionResponse = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(round.cert_cbor.as_deref(), Some(b"v2-cert".as_ref()));
+        assert_eq!(round.revocations.len(), 2);
+        assert!(round.epoch_key_releases.is_empty());
+    }
+
+    /// **Z-1 Phase B** — symmetric for the new field: a v3 sender
+    /// (with epoch_key_releases) is decodable by a v2 reader that
+    /// only knows about cert + revocations. The field is silently
+    /// dropped, mirroring the existing v1↔v2 invariant.
+    #[test]
+    fn legacy_v2_reader_skips_v3_epoch_key_releases_field() {
+        #[derive(Deserialize)]
+        struct V2Wire {
+            cert_cbor: Option<Vec<u8>>,
+            #[serde(default)]
+            revocations: Vec<Vec<u8>>,
+        }
+        let v3 = AdmissionResponse {
+            cert_cbor: Some(b"v3-cert".to_vec()),
+            revocations: vec![b"rev-1".to_vec()],
+            epoch_key_releases: vec![b"release-1".to_vec(), b"release-2".to_vec()],
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&v3, &mut buf).unwrap();
+
+        let round: V2Wire = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(round.cert_cbor.as_deref(), Some(b"v3-cert".as_ref()));
+        assert_eq!(round.revocations.len(), 1);
     }
 }

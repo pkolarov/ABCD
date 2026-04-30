@@ -11,5 +11,6 @@
 pub mod admission;
 pub mod discovery;
 pub mod gossip;
+pub mod pq_envelope;
 pub mod sync;
 pub mod transport;

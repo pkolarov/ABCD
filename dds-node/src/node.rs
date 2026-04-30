@@ -691,6 +691,14 @@ impl DdsNode {
                             AdmissionResponse {
                                 cert_cbor,
                                 revocations,
+                                // **Z-1 Phase B.4** — placeholder. The
+                                // piggy-back of fresh `EpochKeyRelease`
+                                // blobs lands in B.5/B.6 once the
+                                // local epoch-key store is wired up;
+                                // for now we ship an empty list,
+                                // which is the v1/v2-compatible
+                                // default.
+                                epoch_key_releases: Vec::new(),
                             },
                         )
                         .is_err()
