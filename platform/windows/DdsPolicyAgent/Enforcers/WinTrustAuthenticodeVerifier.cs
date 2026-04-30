@@ -54,7 +54,17 @@ public sealed class WinTrustAuthenticodeVerifier : IAuthenticodeVerifier
         // thumbprint), not for trust.
         try
         {
-            using var leaf = X509CertificateLoader.LoadCertificateFromFile(filePath);
+            // `X509CertificateLoader` is .NET 9+ only. The csproj
+            // multi-targets net8.0 + net9.0, so use the long-stable
+            // `X509Certificate2(string filename)` constructor that
+            // exists on both. It is marked obsolete in net9.0 with
+            // SYSLIB0057 — suppressed locally via the pragma; the
+            // newer loader API is forward-compat work, not a security
+            // boundary (chain trust is already validated by the
+            // `WinVerifyTrust` call above).
+#pragma warning disable SYSLIB0057
+            using var leaf = new System.Security.Cryptography.X509Certificates.X509Certificate2(filePath);
+#pragma warning restore SYSLIB0057
             var subject = leaf.GetNameInfo(X509NameType.SimpleName, forIssuer: false);
 
             string? rootThumbprint = null;
