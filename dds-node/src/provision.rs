@@ -1562,6 +1562,11 @@ mod tests {
         // Use set_var to "" rather than remove_var to avoid racing
         // other tests that check this env var.
         unsafe { std::env::set_var("DDS_DOMAIN_PASSPHRASE", "") };
+        // Sibling test in p2p_identity::tests holds a different lock
+        // (`PASSPHRASE_ENV_LOCK`) and may have set this env var without
+        // unsetting it before our `ENV_LOCK` was acquired. Clear it so
+        // the plaintext save we exercise here is not gated.
+        unsafe { std::env::remove_var("DDS_REQUIRE_ENCRYPTED_KEYS") };
         let key = DomainKey::generate("provision-test", &mut OsRng);
         let domain = key.domain();
         domain_store::save_domain_file(&domain_dir.join("domain.toml"), &domain).unwrap();
@@ -1684,6 +1689,9 @@ mod tests {
         std::fs::create_dir_all(&domain_dir).unwrap();
 
         unsafe { std::env::remove_var("DDS_DOMAIN_PASSPHRASE") };
+        // See provision_with_plain_domain_key: a sibling p2p_identity
+        // test under `PASSPHRASE_ENV_LOCK` may have left this set.
+        unsafe { std::env::remove_var("DDS_REQUIRE_ENCRYPTED_KEYS") };
         let key = DomainKey::generate("double-test", &mut OsRng);
         let domain = key.domain();
         domain_store::save_domain_file(&domain_dir.join("domain.toml"), &domain).unwrap();
@@ -1903,6 +1911,9 @@ mod tests {
         std::fs::create_dir_all(&domain_dir).unwrap();
 
         unsafe { std::env::set_var("DDS_DOMAIN_PASSPHRASE", "") };
+        // See provision_with_plain_domain_key: a sibling p2p_identity
+        // test under `PASSPHRASE_ENV_LOCK` may have left this set.
+        unsafe { std::env::remove_var("DDS_REQUIRE_ENCRYPTED_KEYS") };
         let key = DomainKey::generate_hybrid("provision-hybrid", &mut OsRng);
         let domain = key.domain();
         let expected_pq_hex = to_hex(domain.pq_pubkey.as_ref().expect("hybrid"));
