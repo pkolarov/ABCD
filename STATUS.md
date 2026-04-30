@@ -466,8 +466,48 @@
 > [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md); does *not*
 > close Z-1 (Harvest-Now-Decrypt-Later remains exposed until
 > B.7 / B.8 wrap gossip + sync envelopes in the new primitive).
-> Next: B.5 `EpochKeyRelease` request-response protocol on
-> `/dds/epoch-keys/1.0.0/<domain>` libp2p behaviour (3 dev-days).
+>
+> **2026-04-30 follow-on #2 (this commit) — `EpochKeyRequest` /
+> `EpochKeyResponse` schema-layer gates + B.5 swarm-behaviour
+> wiring.** Companion validators finished the B.4 cap-enforcement
+> story for the request-response wire types. The cap constants
+> were already documented as "receivers drop the entire
+> request/response rather than truncating," but enforcement had no
+> centralised entry point and the B.5 handler would have had to
+> re-derive the gate inline. New
+> [`EpochKeyRequest::validate`](dds-net/src/pq_envelope.rs) returns
+> a typed `EpochKeyRequestValidateError` (`TooManyPublishers
+> { actual, cap }` for over-cap; `EmptyPublisher { index }` for
+> any zero-length PeerId string). New
+> [`EpochKeyResponse::validate`](dds-net/src/pq_envelope.rs) returns
+> a typed `EpochKeyResponseValidateError` (`TooManyReleases
+> { actual, cap }`). Both mirror the `EpochKeyReleaseValidateError`
+> shape so the B.5 audit / log surface gets a uniform typed reason
+> across all three wire types. The response gate is intentionally
+> the *outer* count check only — per-blob
+> `EpochKeyRelease::validate()` still runs at the B.6 ingest call
+> site so cap enforcement and per-release shape enforcement stay
+> separate concerns. 11 new unit tests pin the at-cap accept,
+> over-cap reject, default-empty accept, empty-publisher-string
+> reject, opaque-blob-content-ignored, and `Display`-formatting
+> paths. **Same commit also wires the B.5 libp2p behaviour into
+> the swarm**: [`DdsBehaviour`](dds-net/src/transport.rs) gained an
+> `epoch_keys: request_response::cbor::Behaviour<EpochKeyRequest,
+> EpochKeyResponse>` field on the `/dds/epoch-keys/1.0.0/<domain>`
+> domain-tagged protocol; `SwarmConfig::epoch_keys_protocol()`
+> returns the protocol string; `build_swarm` constructs the
+> behaviour with full-duplex `ProtocolSupport::Full` so either
+> the publisher (push on rotation) or the receiver (late-join
+> recovery pull) can initiate. The transport-level handler is now
+> in place — `dds-node` will hook the request side off the
+> rotation timer and the gossip-decrypt-miss path in B.5. The
+> existing protocol-isolation tests now cover all five
+> domain-tagged protocols (kad, identify, sync, admission,
+> epoch-keys) symmetrically. `cargo test -p dds-net --lib` —
+> 78 / 78 passing.
+> Next: B.5 `EpochKeyRelease` request-response handler in
+> `dds-node` + the per-publisher epoch-key store
+> (`epoch_key_store.rs`).
 >
 > Previous: 2026-04-30 (Z-1 Phase B.3 —
 > `AdmissionCert.pq_kem_pubkey` + `Domain.capabilities` +

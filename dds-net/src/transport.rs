@@ -18,6 +18,7 @@ use libp2p::{
 };
 
 use crate::admission::{AdmissionRequest, AdmissionResponse};
+use crate::pq_envelope::{EpochKeyRequest, EpochKeyResponse};
 use crate::sync::{SyncRequest, SyncResponse};
 
 /// Combined network behaviour for DDS nodes.
@@ -49,6 +50,31 @@ pub struct DdsBehaviour {
     /// (not piggybacked on `sync`) so the protocol version can evolve
     /// independently.
     pub admission: request_response::cbor::Behaviour<AdmissionRequest, AdmissionResponse>,
+    /// **Z-1 Phase B.5 (`docs/pqc-phase-b-plan.md` §4.5 + §4.5.1)**:
+    /// per-recipient epoch-key release exchange on
+    /// `/dds/epoch-keys/1.0.0/<domain>`. Used by:
+    ///
+    /// 1. A publisher pushing fresh
+    ///    [`crate::pq_envelope::EpochKeyRelease`] blobs to
+    ///    already-admitted peers when it rotates mid-connection (the
+    ///    H-12 piggy-back on
+    ///    [`AdmissionResponse::epoch_key_releases`] only fires on
+    ///    fresh handshakes).
+    /// 2. A receiver that observes a
+    ///    [`crate::pq_envelope::GossipEnvelopeV3`] for a
+    ///    `(publisher, epoch_id)` it has no cached key for emitting
+    ///    a single [`EpochKeyRequest`] for late-join recovery.
+    ///
+    /// Both sides advertise the protocol so either party can
+    /// initiate; `dds-node` drives the request side from the
+    /// rotation timer and the gossip-decrypt-miss path. Kept as a
+    /// separate behaviour (not piggybacked on `sync` or `admission`)
+    /// so the protocol version can evolve independently as the
+    /// epoch-key wire format changes — Phase B.4's `EpochKeyRelease`
+    /// already has additive `pq_signature: Option<…>`, but a future
+    /// v4 release shape (e.g., MLS-style rekey) would bump this
+    /// protocol while leaving sync / admission untouched.
+    pub epoch_keys: request_response::cbor::Behaviour<EpochKeyRequest, EpochKeyResponse>,
 }
 
 /// Configuration for building a DDS swarm.
@@ -88,6 +114,13 @@ impl SwarmConfig {
     pub fn admission_protocol(&self) -> String {
         format!("/dds/admission/1.0.0/{}", self.domain_tag)
     }
+    /// **Z-1 Phase B.5** — epoch-key request/response protocol name
+    /// for this domain. Domain-tagged so a peer in a different
+    /// domain (or running an Ed25519-only / pre-Phase-B build)
+    /// cannot complete the exchange.
+    pub fn epoch_keys_protocol(&self) -> String {
+        format!("/dds/epoch-keys/1.0.0/{}", self.domain_tag)
+    }
 }
 
 impl Default for SwarmConfig {
@@ -113,6 +146,7 @@ pub fn build_swarm(
     let identify_protocol = config.identify_protocol();
     let sync_protocol = config.sync_protocol();
     let admission_protocol = config.admission_protocol();
+    let epoch_keys_protocol = config.epoch_keys_protocol();
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -194,6 +228,24 @@ pub fn build_swarm(
                     request_response::Config::default(),
                 );
 
+            // **Z-1 Phase B.5** — epoch-key request/response. Both
+            // sides advertise the protocol so either the publisher
+            // (push on rotation) or the receiver (late-join recovery
+            // pull) can initiate. `dds-node` drives the request side
+            // off the rotation timer and the gossip-decrypt-miss
+            // path; the wire format is CBOR via the built-in codec
+            // and routes the opaque `EpochKeyRelease` blobs from
+            // `pq_envelope`.
+            let epoch_keys =
+                request_response::cbor::Behaviour::<EpochKeyRequest, EpochKeyResponse>::new(
+                    [(
+                        StreamProtocol::try_from_owned(epoch_keys_protocol.clone())
+                            .map_err(|e| std::io::Error::other(format!("invalid protocol: {e}")))?,
+                        request_response::ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default(),
+                );
+
             Ok(DdsBehaviour {
                 gossipsub,
                 kademlia,
@@ -201,6 +253,7 @@ pub fn build_swarm(
                 identify,
                 sync,
                 admission,
+                epoch_keys,
             })
         })?
         .with_swarm_config(|c: libp2p::swarm::Config| {
@@ -236,6 +289,9 @@ mod tests {
         };
         assert_eq!(cfg.kad_protocol(), "/dds/kad/1.0.0/abc123");
         assert_eq!(cfg.identify_protocol(), "/dds/id/1.0.0/abc123");
+        assert_eq!(cfg.sync_protocol(), "/dds/sync/1.0.0/abc123");
+        assert_eq!(cfg.admission_protocol(), "/dds/admission/1.0.0/abc123");
+        assert_eq!(cfg.epoch_keys_protocol(), "/dds/epoch-keys/1.0.0/abc123");
     }
 
     #[test]
@@ -254,6 +310,9 @@ mod tests {
         };
         assert_ne!(a.kad_protocol(), b.kad_protocol());
         assert_ne!(a.identify_protocol(), b.identify_protocol());
+        assert_ne!(a.sync_protocol(), b.sync_protocol());
+        assert_ne!(a.admission_protocol(), b.admission_protocol());
+        assert_ne!(a.epoch_keys_protocol(), b.epoch_keys_protocol());
     }
 
     #[test]

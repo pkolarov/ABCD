@@ -148,6 +148,60 @@ impl std::fmt::Display for EpochKeyReleaseValidateError {
 
 impl std::error::Error for EpochKeyReleaseValidateError {}
 
+/// **Z-1 Phase B.4** — schema-layer validation outcome for
+/// [`EpochKeyRequest::validate`]. Mirrors
+/// [`EpochKeyReleaseValidateError`]: a typed reason a receiver can
+/// audit / log against without having to re-derive which invariant
+/// tripped.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EpochKeyRequestValidateError {
+    /// `publishers.len()` exceeds [`MAX_EPOCH_KEY_REQUEST_PUBLISHERS`].
+    /// Receivers drop the entire request rather than truncating, so a
+    /// hostile peer cannot inflate response work by over-asking.
+    TooManyPublishers { actual: usize, cap: usize },
+    /// `publishers[i]` is an empty string — receivers cannot route
+    /// the request to a publisher key.
+    EmptyPublisher { index: usize },
+}
+
+impl std::fmt::Display for EpochKeyRequestValidateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyPublishers { actual, cap } => {
+                write!(f, "publishers: {actual} entries exceeds cap of {cap}")
+            }
+            Self::EmptyPublisher { index } => {
+                write!(f, "publishers[{index}] is empty")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EpochKeyRequestValidateError {}
+
+/// **Z-1 Phase B.4** — schema-layer validation outcome for
+/// [`EpochKeyResponse::validate`]. Mirrors
+/// [`EpochKeyReleaseValidateError`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum EpochKeyResponseValidateError {
+    /// `releases.len()` exceeds [`MAX_EPOCH_KEY_RELEASES_PER_RESPONSE`].
+    /// Receivers drop the entire response rather than truncating, so
+    /// a hostile peer cannot wedge the handshake by oversending.
+    TooManyReleases { actual: usize, cap: usize },
+}
+
+impl std::fmt::Display for EpochKeyResponseValidateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyReleases { actual, cap } => {
+                write!(f, "releases: {actual} entries exceeds cap of {cap}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EpochKeyResponseValidateError {}
+
 /// Replaces the plaintext gossipsub `Op` envelope on a domain that
 /// has flipped the `enc-v3` capability. The original `GossipMessage`
 /// is AEAD-encrypted under the publisher's current epoch key; the
@@ -358,6 +412,35 @@ pub struct EpochKeyRequest {
     pub publishers: Vec<String>,
 }
 
+impl EpochKeyRequest {
+    /// **Z-1 Phase B.4 schema-layer gate.** Run on the receive side
+    /// after [`ciborium::from_reader`] and before the B.5 responder
+    /// spends any work fetching keys. Mirrors
+    /// [`EpochKeyRelease::validate`]: a malformed shape is rejected at
+    /// the decode boundary so a downstream consumer never has to reason
+    /// about a half-shaped request.
+    ///
+    /// Enforces:
+    /// - `publishers.len() <= MAX_EPOCH_KEY_REQUEST_PUBLISHERS` so a
+    ///   hostile peer cannot inflate response work by over-asking.
+    /// - Each `publishers[i]` is non-empty (an empty string cannot
+    ///   route to a publisher key).
+    pub fn validate(&self) -> Result<(), EpochKeyRequestValidateError> {
+        if self.publishers.len() > MAX_EPOCH_KEY_REQUEST_PUBLISHERS {
+            return Err(EpochKeyRequestValidateError::TooManyPublishers {
+                actual: self.publishers.len(),
+                cap: MAX_EPOCH_KEY_REQUEST_PUBLISHERS,
+            });
+        }
+        for (i, p) in self.publishers.iter().enumerate() {
+            if p.is_empty() {
+                return Err(EpochKeyRequestValidateError::EmptyPublisher { index: i });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Late-join recovery response (§4.5.1). Carries opaque CBOR-encoded
 /// [`EpochKeyRelease`] blobs (one per requested publisher the
 /// responder could honor); same shape as the
@@ -374,6 +457,30 @@ pub struct EpochKeyResponse {
     /// Capped at [`MAX_EPOCH_KEY_RELEASES_PER_RESPONSE`].
     #[serde(default)]
     pub releases: Vec<Vec<u8>>,
+}
+
+impl EpochKeyResponse {
+    /// **Z-1 Phase B.4 schema-layer gate.** Run on the receive side
+    /// after CBOR decode and before per-blob
+    /// [`EpochKeyRelease::from_cbor`] / [`EpochKeyRelease::validate`]
+    /// / cryptographic verify. Mirrors the cap on the AdmissionResponse
+    /// revocations field enforced by dds-node — drop wholesale, do not
+    /// truncate, so a hostile peer cannot wedge the handshake by
+    /// oversending.
+    ///
+    /// Note: this is the *outer* cap. Each individual release blob
+    /// must still be decoded via [`EpochKeyRelease::from_cbor`] and
+    /// shape-checked via [`EpochKeyRelease::validate`] at the B.6
+    /// ingest call site.
+    pub fn validate(&self) -> Result<(), EpochKeyResponseValidateError> {
+        if self.releases.len() > MAX_EPOCH_KEY_RELEASES_PER_RESPONSE {
+            return Err(EpochKeyResponseValidateError::TooManyReleases {
+                actual: self.releases.len(),
+                cap: MAX_EPOCH_KEY_RELEASES_PER_RESPONSE,
+            });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -709,6 +816,133 @@ mod tests {
         assert!(s.contains("999"), "got: {s}");
         assert!(
             s.contains(&EPOCH_KEY_RELEASE_KEM_CT_LEN.to_string()),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn epoch_key_request_validate_accepts_empty_request() {
+        EpochKeyRequest::default().validate().unwrap();
+    }
+
+    #[test]
+    fn epoch_key_request_validate_accepts_well_formed_request() {
+        let req = EpochKeyRequest {
+            publishers: vec!["12D3KooWP1".into(), "12D3KooWP2".into()],
+        };
+        req.validate().unwrap();
+    }
+
+    #[test]
+    fn epoch_key_request_validate_accepts_request_at_cap() {
+        let req = EpochKeyRequest {
+            publishers: (0..MAX_EPOCH_KEY_REQUEST_PUBLISHERS)
+                .map(|i| format!("12D3KooWP{i}"))
+                .collect(),
+        };
+        req.validate().unwrap();
+    }
+
+    #[test]
+    fn epoch_key_request_validate_rejects_request_over_cap() {
+        let req = EpochKeyRequest {
+            publishers: (0..MAX_EPOCH_KEY_REQUEST_PUBLISHERS + 1)
+                .map(|i| format!("12D3KooWP{i}"))
+                .collect(),
+        };
+        assert_eq!(
+            req.validate().unwrap_err(),
+            EpochKeyRequestValidateError::TooManyPublishers {
+                actual: MAX_EPOCH_KEY_REQUEST_PUBLISHERS + 1,
+                cap: MAX_EPOCH_KEY_REQUEST_PUBLISHERS,
+            }
+        );
+    }
+
+    #[test]
+    fn epoch_key_request_validate_rejects_empty_publisher_string() {
+        let req = EpochKeyRequest {
+            publishers: vec!["12D3KooWP1".into(), String::new(), "12D3KooWP3".into()],
+        };
+        assert_eq!(
+            req.validate().unwrap_err(),
+            EpochKeyRequestValidateError::EmptyPublisher { index: 1 }
+        );
+    }
+
+    #[test]
+    fn epoch_key_request_validate_error_display_includes_cap_and_index() {
+        let too_many = EpochKeyRequestValidateError::TooManyPublishers {
+            actual: 999,
+            cap: MAX_EPOCH_KEY_REQUEST_PUBLISHERS,
+        };
+        let s = format!("{too_many}");
+        assert!(s.contains("999"), "got: {s}");
+        assert!(
+            s.contains(&MAX_EPOCH_KEY_REQUEST_PUBLISHERS.to_string()),
+            "got: {s}"
+        );
+
+        let empty = EpochKeyRequestValidateError::EmptyPublisher { index: 7 };
+        let s = format!("{empty}");
+        assert!(s.contains("publishers[7]"), "got: {s}");
+    }
+
+    #[test]
+    fn epoch_key_response_validate_accepts_empty_response() {
+        EpochKeyResponse::default().validate().unwrap();
+    }
+
+    #[test]
+    fn epoch_key_response_validate_accepts_response_at_cap() {
+        let blob = sample_release().to_cbor().unwrap();
+        let resp = EpochKeyResponse {
+            releases: (0..MAX_EPOCH_KEY_RELEASES_PER_RESPONSE)
+                .map(|_| blob.clone())
+                .collect(),
+        };
+        resp.validate().unwrap();
+    }
+
+    #[test]
+    fn epoch_key_response_validate_rejects_response_over_cap() {
+        let blob = sample_release().to_cbor().unwrap();
+        let resp = EpochKeyResponse {
+            releases: (0..MAX_EPOCH_KEY_RELEASES_PER_RESPONSE + 1)
+                .map(|_| blob.clone())
+                .collect(),
+        };
+        assert_eq!(
+            resp.validate().unwrap_err(),
+            EpochKeyResponseValidateError::TooManyReleases {
+                actual: MAX_EPOCH_KEY_RELEASES_PER_RESPONSE + 1,
+                cap: MAX_EPOCH_KEY_RELEASES_PER_RESPONSE,
+            }
+        );
+    }
+
+    #[test]
+    fn epoch_key_response_validate_does_not_decode_inner_releases() {
+        // The outer schema gate is a count check only — it must not
+        // attempt to decode the opaque blobs. Pin the contract so a
+        // future implementer doesn't accidentally fold inner-decode
+        // work into the cap path (which the B.6 ingest site owns).
+        let resp = EpochKeyResponse {
+            releases: vec![vec![0xff, 0xff, 0xff], vec![0x00]],
+        };
+        resp.validate().unwrap();
+    }
+
+    #[test]
+    fn epoch_key_response_validate_error_display_includes_cap() {
+        let e = EpochKeyResponseValidateError::TooManyReleases {
+            actual: 9_999,
+            cap: MAX_EPOCH_KEY_RELEASES_PER_RESPONSE,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("9999") || s.contains("9_999"), "got: {s}");
+        assert!(
+            s.contains(&MAX_EPOCH_KEY_RELEASES_PER_RESPONSE.to_string()),
             "got: {s}"
         );
     }
