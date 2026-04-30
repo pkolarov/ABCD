@@ -64,6 +64,90 @@ pub const EPOCH_RELEASE_REPLAY_WINDOW_SECS: u64 = 7 * 86_400;
 /// to widen the post-rotation forward-secrecy window meaningfully.
 pub const EPOCH_KEY_GRACE_SECS: u64 = 300;
 
+/// **Z-1 Phase B.4** — wire-form length of [`EpochKeyRelease::kem_ct`]:
+/// 32-byte ephemeral X25519 pubkey concatenated with the 1,088-byte
+/// ML-KEM-768 ciphertext = 1,120 B. Mirrors
+/// `dds_core::crypto::kem::HYBRID_KEM_CT_LEN` — re-asserted here so
+/// dds-net stays free of a dds-core dep.
+pub const EPOCH_KEY_RELEASE_KEM_CT_LEN: usize = 32 + 1_088;
+
+/// **Z-1 Phase B.4** — wire-form length of
+/// [`EpochKeyRelease::aead_ciphertext`]: 32-byte epoch key plaintext
+/// + 16-byte Poly1305 tag = 48 B (ChaCha20-Poly1305).
+pub const EPOCH_KEY_RELEASE_AEAD_CT_LEN: usize = 32 + 16;
+
+/// **Z-1 Phase B.4** — Ed25519 signature length on
+/// [`EpochKeyRelease::signature`].
+pub const EPOCH_KEY_RELEASE_ED25519_SIG_LEN: usize = 64;
+
+/// **Z-1 Phase A inheritance** — ML-DSA-65 (FIPS 204) signature
+/// length on the optional [`EpochKeyRelease::pq_signature`]. Mirrors
+/// `dds_domain::MLDSA65_SIG_LEN`; re-asserted here so dds-net stays
+/// free of a dds-domain dep.
+pub const EPOCH_KEY_RELEASE_MLDSA65_SIG_LEN: usize = 3_309;
+
+/// **Z-1 Phase B.4** — schema-layer validation outcome for
+/// [`EpochKeyRelease::validate`]. Mirrors the
+/// `dds_domain::PublisherIdentityError` shape: a typed reason a
+/// receiver can audit / log against without having to re-derive
+/// which length check or invariant tripped.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EpochKeyReleaseValidateError {
+    /// `publisher` field is empty — receivers cannot route the
+    /// release to a publisher key.
+    EmptyPublisher,
+    /// `recipient` field is empty — receivers cannot tell whether
+    /// the release was meant for them.
+    EmptyRecipient,
+    /// `expires_at <= issued_at` — the release is dead on arrival.
+    /// Receivers reject up front so a downstream consumer never has
+    /// to reason about a "valid for 0 seconds" key.
+    InvalidExpiry { issued_at: u64, expires_at: u64 },
+    /// `kem_ct.len()` is not [`EPOCH_KEY_RELEASE_KEM_CT_LEN`].
+    KemCtLen { actual: usize },
+    /// `aead_ciphertext.len()` is not [`EPOCH_KEY_RELEASE_AEAD_CT_LEN`].
+    AeadCtLen { actual: usize },
+    /// `signature.len()` is not [`EPOCH_KEY_RELEASE_ED25519_SIG_LEN`].
+    Ed25519SigLen { actual: usize },
+    /// `pq_signature` is present but length is not
+    /// [`EPOCH_KEY_RELEASE_MLDSA65_SIG_LEN`].
+    Mldsa65SigLen { actual: usize },
+}
+
+impl std::fmt::Display for EpochKeyReleaseValidateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyPublisher => f.write_str("publisher field is empty"),
+            Self::EmptyRecipient => f.write_str("recipient field is empty"),
+            Self::InvalidExpiry {
+                issued_at,
+                expires_at,
+            } => write!(
+                f,
+                "expires_at ({expires_at}) must be greater than issued_at ({issued_at})"
+            ),
+            Self::KemCtLen { actual } => write!(
+                f,
+                "kem_ct: expected {EPOCH_KEY_RELEASE_KEM_CT_LEN} bytes, got {actual}"
+            ),
+            Self::AeadCtLen { actual } => write!(
+                f,
+                "aead_ciphertext: expected {EPOCH_KEY_RELEASE_AEAD_CT_LEN} bytes, got {actual}"
+            ),
+            Self::Ed25519SigLen { actual } => write!(
+                f,
+                "signature: expected {EPOCH_KEY_RELEASE_ED25519_SIG_LEN} bytes, got {actual}"
+            ),
+            Self::Mldsa65SigLen { actual } => write!(
+                f,
+                "pq_signature: expected {EPOCH_KEY_RELEASE_MLDSA65_SIG_LEN} bytes, got {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EpochKeyReleaseValidateError {}
+
 /// Replaces the plaintext gossipsub `Op` envelope on a domain that
 /// has flipped the `enc-v3` capability. The original `GossipMessage`
 /// is AEAD-encrypted under the publisher's current epoch key; the
@@ -198,6 +282,62 @@ impl EpochKeyRelease {
     /// [`dds_domain::AdmissionRevocation::from_cbor`] is wired).
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, ciborium::de::Error<std::io::Error>> {
         ciborium::from_reader(bytes)
+    }
+
+    /// **Z-1 Phase B.4 schema-layer gate.** Run after [`Self::from_cbor`]
+    /// and *before* any cryptographic verify (Ed25519 / ML-DSA-65 /
+    /// hybrid-KEM decap). Mirrors the
+    /// `dds_domain::PublisherIdentity::validate` fail-closed pattern:
+    /// a malformed shape is rejected at the decode boundary so a
+    /// downstream consumer (B.5 epoch-key store, B.6 release ingest,
+    /// B.7 / B.8 envelope decrypt) never has to reason about a
+    /// half-shaped release.
+    ///
+    /// Receivers that are about to spend an ML-KEM-768 decap on the
+    /// release's `kem_ct` can short-circuit the wasted work when the
+    /// blob never could have decapped. Each error variant names a
+    /// single named invariant so the audit / log surface can record
+    /// the typed reason rather than a free-form string.
+    ///
+    /// Note: this is the *schema* gate — it does not check
+    /// `recipient == self.peer_id`, `issued_at` against
+    /// [`EPOCH_RELEASE_REPLAY_WINDOW_SECS`], publisher signatures,
+    /// or anything else that requires runtime context. Those live
+    /// at the B.5 / B.6 ingest call site.
+    pub fn validate(&self) -> Result<(), EpochKeyReleaseValidateError> {
+        if self.publisher.is_empty() {
+            return Err(EpochKeyReleaseValidateError::EmptyPublisher);
+        }
+        if self.recipient.is_empty() {
+            return Err(EpochKeyReleaseValidateError::EmptyRecipient);
+        }
+        if self.expires_at <= self.issued_at {
+            return Err(EpochKeyReleaseValidateError::InvalidExpiry {
+                issued_at: self.issued_at,
+                expires_at: self.expires_at,
+            });
+        }
+        if self.kem_ct.len() != EPOCH_KEY_RELEASE_KEM_CT_LEN {
+            return Err(EpochKeyReleaseValidateError::KemCtLen {
+                actual: self.kem_ct.len(),
+            });
+        }
+        if self.aead_ciphertext.len() != EPOCH_KEY_RELEASE_AEAD_CT_LEN {
+            return Err(EpochKeyReleaseValidateError::AeadCtLen {
+                actual: self.aead_ciphertext.len(),
+            });
+        }
+        if self.signature.len() != EPOCH_KEY_RELEASE_ED25519_SIG_LEN {
+            return Err(EpochKeyReleaseValidateError::Ed25519SigLen {
+                actual: self.signature.len(),
+            });
+        }
+        if let Some(pq) = self.pq_signature.as_ref() {
+            if pq.len() != EPOCH_KEY_RELEASE_MLDSA65_SIG_LEN {
+                return Err(EpochKeyReleaseValidateError::Mldsa65SigLen { actual: pq.len() });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -412,5 +552,164 @@ mod tests {
         assert_eq!(MAX_EPOCH_KEY_REQUEST_PUBLISHERS, 256);
         assert_eq!(EPOCH_RELEASE_REPLAY_WINDOW_SECS, 7 * 86_400);
         assert_eq!(EPOCH_KEY_GRACE_SECS, 300);
+    }
+
+    /// **Z-1 Phase B.4** — pin the wire-form length constants so a
+    /// future bump must update the docstring + every receiver that
+    /// hardcodes a matching number. Each value is also asserted
+    /// against the source-of-truth in `dds_core::crypto::kem` /
+    /// `dds_domain` via the `kem_ct` / `aead_ciphertext` /
+    /// `signature` / `pq_signature` length invariants.
+    #[test]
+    fn release_length_constants_are_documented_values() {
+        assert_eq!(EPOCH_KEY_RELEASE_KEM_CT_LEN, 1_120);
+        assert_eq!(EPOCH_KEY_RELEASE_AEAD_CT_LEN, 48);
+        assert_eq!(EPOCH_KEY_RELEASE_ED25519_SIG_LEN, 64);
+        assert_eq!(EPOCH_KEY_RELEASE_MLDSA65_SIG_LEN, 3_309);
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_v1_release() {
+        sample_release().validate().unwrap();
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_v2_hybrid_release() {
+        let mut r = sample_release();
+        r.pq_signature = Some(ByteBuf::from(vec![0x55; EPOCH_KEY_RELEASE_MLDSA65_SIG_LEN]));
+        r.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_empty_publisher() {
+        let mut r = sample_release();
+        r.publisher.clear();
+        assert_eq!(
+            r.validate().unwrap_err(),
+            EpochKeyReleaseValidateError::EmptyPublisher
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_recipient() {
+        let mut r = sample_release();
+        r.recipient.clear();
+        assert_eq!(
+            r.validate().unwrap_err(),
+            EpochKeyReleaseValidateError::EmptyRecipient
+        );
+    }
+
+    #[test]
+    fn validate_rejects_expires_at_equal_to_issued_at() {
+        let mut r = sample_release();
+        r.expires_at = r.issued_at;
+        assert_eq!(
+            r.validate().unwrap_err(),
+            EpochKeyReleaseValidateError::InvalidExpiry {
+                issued_at: r.issued_at,
+                expires_at: r.expires_at,
+            }
+        );
+    }
+
+    #[test]
+    fn validate_rejects_expires_at_before_issued_at() {
+        let mut r = sample_release();
+        r.expires_at = r.issued_at - 1;
+        let err = r.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            EpochKeyReleaseValidateError::InvalidExpiry { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_short_kem_ct() {
+        let mut r = sample_release();
+        r.kem_ct.truncate(EPOCH_KEY_RELEASE_KEM_CT_LEN - 1);
+        assert_eq!(
+            r.validate().unwrap_err(),
+            EpochKeyReleaseValidateError::KemCtLen {
+                actual: EPOCH_KEY_RELEASE_KEM_CT_LEN - 1
+            }
+        );
+    }
+
+    #[test]
+    fn validate_rejects_long_kem_ct() {
+        let mut r = sample_release();
+        r.kem_ct.push(0);
+        assert_eq!(
+            r.validate().unwrap_err(),
+            EpochKeyReleaseValidateError::KemCtLen {
+                actual: EPOCH_KEY_RELEASE_KEM_CT_LEN + 1
+            }
+        );
+    }
+
+    #[test]
+    fn validate_rejects_wrong_aead_ciphertext_length() {
+        let mut r = sample_release();
+        r.aead_ciphertext.pop();
+        assert_eq!(
+            r.validate().unwrap_err(),
+            EpochKeyReleaseValidateError::AeadCtLen {
+                actual: EPOCH_KEY_RELEASE_AEAD_CT_LEN - 1
+            }
+        );
+    }
+
+    #[test]
+    fn validate_rejects_wrong_signature_length() {
+        let mut r = sample_release();
+        r.signature.pop();
+        assert_eq!(
+            r.validate().unwrap_err(),
+            EpochKeyReleaseValidateError::Ed25519SigLen {
+                actual: EPOCH_KEY_RELEASE_ED25519_SIG_LEN - 1
+            }
+        );
+    }
+
+    #[test]
+    fn validate_rejects_wrong_pq_signature_length() {
+        let mut r = sample_release();
+        r.pq_signature = Some(ByteBuf::from(vec![
+            0x55;
+            EPOCH_KEY_RELEASE_MLDSA65_SIG_LEN - 1
+        ]));
+        assert_eq!(
+            r.validate().unwrap_err(),
+            EpochKeyReleaseValidateError::Mldsa65SigLen {
+                actual: EPOCH_KEY_RELEASE_MLDSA65_SIG_LEN - 1
+            }
+        );
+    }
+
+    /// `pq_signature: None` is the v1 (Ed25519-only domain) wire shape
+    /// and must not trigger the ML-DSA-65 length gate. Pins the
+    /// rolling-upgrade compatibility surface — a v2 hybrid receiver
+    /// that gets a v1 release on a non-hybrid domain stays backward-
+    /// compatible.
+    #[test]
+    fn validate_accepts_absent_pq_signature() {
+        let mut r = sample_release();
+        r.pq_signature = None;
+        r.validate().unwrap();
+    }
+
+    /// `Display` impls feed log lines + audit fields downstream;
+    /// pin the formatting so a renderer change is loud.
+    #[test]
+    fn validate_error_display_strings_include_actual_lengths() {
+        let e = EpochKeyReleaseValidateError::KemCtLen { actual: 999 };
+        let s = format!("{e}");
+        assert!(s.contains("kem_ct"), "got: {s}");
+        assert!(s.contains("999"), "got: {s}");
+        assert!(
+            s.contains(&EPOCH_KEY_RELEASE_KEM_CT_LEN.to_string()),
+            "got: {s}"
+        );
     }
 }

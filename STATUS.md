@@ -302,10 +302,99 @@
 > clean; `cargo fmt --all -- --check` clean. Closes Phase B.3 of
 > [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md); does *not*
 > close Z-1 (Harvest-Now-Decrypt-Later remains exposed until B.7 / B.8
-> wrap gossip + sync envelopes in the new primitive). **Next: B.4
-> `dds-net::pq_envelope` types + `AdmissionResponse.epoch_key_releases`
-> + `EpochKeyRequest` / `EpochKeyResponse` for the late-join recovery
-> protocol** (2 dev-days, per the plan).
+> wrap gossip + sync envelopes in the new primitive).
+>
+> **Phase B.4 landed 2026-04-30** —
+> [`dds-net/src/pq_envelope.rs`](dds-net/src/pq_envelope.rs) ships the
+> Phase B application-layer wire types in a new module that stays
+> cryptography-agnostic so dds-net continues to compile without the
+> `pq` feature flag. Five new types: `GossipEnvelopeV3 { publisher,
+> epoch_id, nonce, ciphertext }` (replaces the plaintext gossipsub
+> `Op` envelope on `enc-v3` domains, AEAD-encrypted under the
+> publisher's current epoch key, decoded in B.7); `SyncEnvelopeV3 {
+> responder, epoch_id, nonce, ciphertext }` (responder-keyed analog
+> for sync responses — §4.6.1: the responder re-wraps under its
+> *own* current epoch key, not the original publisher's, so the
+> requester decrypts via the responder's release); `EpochKeyRelease
+> { publisher, epoch_id, issued_at, expires_at, recipient, kem_ct,
+> aead_nonce, aead_ciphertext, signature, pq_signature:
+> Option<ByteBuf> }` (per-recipient release of the publisher's
+> 32-byte epoch key wrapped via the hybrid X25519 + ML-KEM-768 KEM
+> from B.1; `pq_signature` is `#[serde(default)]` so v1 Ed25519-only
+> domain and v2 Phase A hybrid domain encodings stay byte-identical
+> on the wire); `EpochKeyRequest { publishers }` /
+> `EpochKeyResponse { releases }` (late-join recovery shape — §4.5.1
+> — for the dedicated `/dds/epoch-keys/1.0.0/<domain>` libp2p
+> request-response protocol that B.5 will wire). Cap constants
+> `MAX_EPOCH_KEY_RELEASES_PER_RESPONSE = 256` (~1.2 MB worst case
+> with hybrid sig at 4,700 B per release),
+> `MAX_EPOCH_KEY_REQUEST_PUBLISHERS = 256`,
+> `EPOCH_RELEASE_REPLAY_WINDOW_SECS = 7 days` (mirrors M-9
+> revocation replay), `EPOCH_KEY_GRACE_SECS = 300` (5-minute decay
+> after rotation so in-flight gossip with the older `epoch_id`
+> still decrypts). [`AdmissionResponse`](dds-net/src/admission.rs)
+> grew an optional `epoch_key_releases: Vec<Vec<u8>>` piggy-back
+> field (`#[serde(default)]`) so the H-12 handshake delivers fresh
+> per-recipient releases alongside the cert and revocations on the
+> common path — saves a separate `/dds/epoch-keys/...` round-trip
+> after every reconnect. dds-node ships an empty list for now; B.5
+> wires the real release-builder once the local epoch-key store
+> lands. 14 new unit tests in `pq_envelope.rs` cover CBOR
+> round-trips for all five types, v1 (Ed25519-only) ↔ v2 (hybrid)
+> wire compat for `EpochKeyRelease`'s optional `pq_signature`,
+> default-empty `EpochKeyResponse`, and the cap-constants pin. 3
+> new tests in `admission.rs` cover the v2→v3 wire-compat invariant
+> for the new piggy-back field.
+>
+> **Phase B.4 follow-on (landed 2026-04-30, this commit) —
+> `EpochKeyRelease::validate()` schema-layer gate.** The B.4 commit
+> defined the wire shape but had no centralised schema-layer
+> validator: a downstream consumer (B.5 epoch-key store, B.6
+> release ingest, B.7 / B.8 envelope decrypt) had no fail-closed
+> entry point between the CBOR `from_cbor` and the cryptographic
+> verify. Mirrors the
+> [`dds_domain::PublisherIdentity::validate`](dds-domain/src/types.rs)
+> pattern from the SC-5 Phase B.1 ingest gate: a malformed shape
+> is rejected at the decode boundary instead of burning an
+> ML-KEM-768 decap on garbage input. New
+> [`EpochKeyRelease::validate`](dds-net/src/pq_envelope.rs) returns
+> a typed [`EpochKeyReleaseValidateError`](dds-net/src/pq_envelope.rs)
+> enum with one variant per named invariant (`EmptyPublisher`,
+> `EmptyRecipient`, `InvalidExpiry { issued_at, expires_at }`,
+> `KemCtLen { actual }`, `AeadCtLen { actual }`,
+> `Ed25519SigLen { actual }`, `Mldsa65SigLen { actual }`) so a
+> future B.5 / B.6 audit / log surface records a typed reason
+> rather than a free-form string (mirrors the
+> `dds_sync_payloads_rejected_total{reason=...}` partitioning the
+> C-3 publisher-capability gate set up). Four new wire-form length
+> constants (`EPOCH_KEY_RELEASE_KEM_CT_LEN = 1120` mirroring
+> `dds_core::crypto::kem::HYBRID_KEM_CT_LEN`,
+> `EPOCH_KEY_RELEASE_AEAD_CT_LEN = 48` (32 B epoch key + 16 B
+> Poly1305 tag), `EPOCH_KEY_RELEASE_ED25519_SIG_LEN = 64`,
+> `EPOCH_KEY_RELEASE_MLDSA65_SIG_LEN = 3309` mirroring
+> `dds_domain::MLDSA65_SIG_LEN`) re-asserted in dds-net so the
+> networking crate stays free of dds-core's `pq`-gated module path
+> and free of a dds-domain dep. The validate method explicitly
+> does *not* check `recipient == self.peer_id`, `issued_at` against
+> the replay window, publisher signatures, or any runtime context —
+> those live at the B.5 / B.6 ingest call site. 13 new unit tests
+> in `pq_envelope::tests` pin the well-formed accept path (v1
+> Ed25519-only and v2 hybrid), all seven error variants (empty
+> publisher / recipient, `expires_at == issued_at` boundary +
+> strict-less rejection, short / long `kem_ct`, wrong
+> `aead_ciphertext` length, wrong `signature` length, wrong
+> `pq_signature` length), the v1-compatible `pq_signature: None`
+> accept path, and a `Display` formatting smoke test so a renderer
+> change is loud. `cargo test -p dds-net --lib` — 67 / 67 passing
+> (was 53 before B.4 + this follow-on); `cargo clippy -p dds-net
+> --all-targets -- -D warnings` clean; `cargo fmt --all -- --check`
+> clean. Closes Phase B.4 of
+> [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md); does *not*
+> close Z-1 (Harvest-Now-Decrypt-Later remains exposed until
+> B.7 / B.8 wrap gossip + sync envelopes in the new primitive).
+> **Next: B.5 `EpochKeyRelease` request-response protocol on
+> `/dds/epoch-keys/1.0.0/<domain>` libp2p behaviour** (3 dev-days,
+> per the plan).
 >
 > **Phase C (track-only) — adopt hybrid Noise upstream.** rust-libp2p
 > tracking issue `rs/9595`; mainline 0.55 still has no hybrid-KEM
@@ -327,7 +416,60 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-30 (Z-1 Phase B.3 —
+> Last updated: 2026-04-30 (Z-1 Phase B.4 —
+> `dds-net::pq_envelope` wire types +
+> `AdmissionResponse.epoch_key_releases` piggy-back landed (commit
+> `bb63a91`). New module ships `GossipEnvelopeV3` / `SyncEnvelopeV3`
+> (publisher-keyed and responder-keyed AEAD envelopes for B.7 / B.8),
+> `EpochKeyRelease` (per-recipient release of the publisher's epoch
+> key — KEM ciphertext + AEAD ciphertext + Ed25519 signature +
+> optional ML-DSA-65 signature; `pq_signature: Option<ByteBuf>` is
+> `#[serde(default)]` so v1 Ed25519-only and v2 hybrid wire
+> encodings stay byte-identical), and
+> `EpochKeyRequest { publishers }` / `EpochKeyResponse { releases }`
+> (late-join recovery shape consumed by the B.5
+> `/dds/epoch-keys/1.0.0/<domain>` libp2p protocol). Cap constants:
+> `MAX_EPOCH_KEY_RELEASES_PER_RESPONSE = 256`,
+> `MAX_EPOCH_KEY_REQUEST_PUBLISHERS = 256`,
+> `EPOCH_RELEASE_REPLAY_WINDOW_SECS = 7 days`,
+> `EPOCH_KEY_GRACE_SECS = 300`. `AdmissionResponse` grew an optional
+> `epoch_key_releases: Vec<Vec<u8>>` piggy-back field
+> (`#[serde(default)]`) so the H-12 handshake delivers fresh
+> per-recipient releases alongside the cert and revocations on the
+> common path. **2026-04-30 follow-on (this commit):**
+> `EpochKeyRelease::validate()` schema-layer gate landed alongside
+> four wire-form length constants (`EPOCH_KEY_RELEASE_KEM_CT_LEN =
+> 1120`, `EPOCH_KEY_RELEASE_AEAD_CT_LEN = 48`,
+> `EPOCH_KEY_RELEASE_ED25519_SIG_LEN = 64`,
+> `EPOCH_KEY_RELEASE_MLDSA65_SIG_LEN = 3309`) and a typed
+> `EpochKeyReleaseValidateError` enum. Mirrors the
+> `dds_domain::PublisherIdentity::validate` fail-closed pattern: a
+> malformed shape (empty publisher / recipient,
+> `expires_at <= issued_at`, wrong-length `kem_ct` /
+> `aead_ciphertext` / `signature` / `pq_signature`) is rejected at
+> the decode boundary so a downstream consumer (B.5 epoch-key store,
+> B.6 release ingest, B.7 / B.8 envelope decrypt) never has to
+> reason about a half-shaped release — receivers about to spend an
+> ML-KEM-768 decap on the release's `kem_ct` short-circuit the
+> wasted work when the blob never could have decapped. The validate
+> method is intentionally schema-only — `recipient ==
+> self.peer_id`, `issued_at` against the replay window, publisher
+> signatures, and other runtime context live at the B.5 / B.6
+> ingest call site. 13 new unit tests pin the well-formed accept
+> path (v1 Ed25519-only and v2 hybrid), all seven error variants,
+> the v1-compatible `pq_signature: None` accept path, and a
+> `Display` formatting smoke test so a renderer change is loud.
+> `cargo test -p dds-net --lib` — 67 / 67 passing (was 53 before
+> B.4 + this follow-on); `cargo clippy -p dds-net --all-targets
+> -- -D warnings` clean; `cargo fmt --all -- --check` clean.
+> Closes Phase B.4 of
+> [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md); does *not*
+> close Z-1 (Harvest-Now-Decrypt-Later remains exposed until
+> B.7 / B.8 wrap gossip + sync envelopes in the new primitive).
+> Next: B.5 `EpochKeyRelease` request-response protocol on
+> `/dds/epoch-keys/1.0.0/<domain>` libp2p behaviour (3 dev-days).
+>
+> Previous: 2026-04-30 (Z-1 Phase B.3 —
 > `AdmissionCert.pq_kem_pubkey` + `Domain.capabilities` +
 > `dds_node::peer_cert_store` landed. `AdmissionCert` grew an optional
 > `pq_kem_pubkey: Option<Vec<u8>>` (1216 B X25519 + ML-KEM-768 wire
@@ -355,8 +497,7 @@
 > `cargo fmt --all -- --check` clean. Closes Phase B.3 of
 > [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md); does *not*
 > close Z-1 (Harvest-Now-Decrypt-Later remains exposed until B.7 / B.8
-> wrap gossip + sync envelopes). Next: B.4 `dds-net::pq_envelope`
-> types + `AdmissionResponse.epoch_key_releases` (2 dev-days).
+> wrap gossip + sync envelopes).
 >
 > Previous: 2026-04-30 (Z-1 Phase B.2 —
 > `dds-core::crypto::epoch_key` AEAD wrapper landed. Thin
