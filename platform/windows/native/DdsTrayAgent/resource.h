@@ -11,6 +11,7 @@
 #define IDM_ADMIN_SETUP         1003
 #define IDM_STATUS              1004
 #define IDM_EXIT                1005
+#define IDM_REFRESH_VAULT       1006  // AD-13: "Refresh stored password"
 
 // Internal window messages
 #define WM_TRAYICON             (WM_USER + 1)

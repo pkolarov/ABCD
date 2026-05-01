@@ -648,15 +648,18 @@ This phase is complete only if all of the following are true.
   now uses `DSREG_JOIN_INFO.joinType`, list-users unsupported state has a real
   IPC shape, stale-password detection is routed through CP `ReportResult`, and
   Entra-only enrollment is blocked before password capture.
+- **2026-05-02** — **AD-13 implemented.** New `DdsTrayAgent/RefreshVaultFlow.{h,cpp}` adds a
+  "Refresh Stored Password…" tray menu item. Flow: JoinState check (EntraOnly blocked; Unknown
+  allowed only with existing vault entry) → vault lookup by SID → password prompt →
+  `GetAssertion` hmac-secret with existing `credential_id` + `salt` → re-encrypt new
+  password → save vault → fire-and-forget `DDS_CLEAR_STALE` to Auth Bridge. Phase 4 complete.
 - **2026-04-26** — **AD-12 implemented.** Operator-facing enrollment
   guide published at [windows-ad-enrollment.md](windows-ad-enrollment.md):
   per-`JoinState` enrollment flows (Workgroup, AD/Hybrid, Entra-only,
   Unknown), post-password-change refresh, host-state transitions,
   operator pre-flight checklist, and canonical string reference.
-  Tray-side text-string updates in `EnrollmentFlow.cpp` are carried
-  forward to AD-13 because the Tray Agent does not yet host its own
-  `JoinState` probe seam — wiring that probe is in scope when AD-13
-  is implemented. Phase 4 work continues with AD-13 (vault refresh)
+  Tray-side text-string updates in `EnrollmentFlow.cpp` carried forward
+  to AD-13. Phase 4 work continues with AD-13 (vault refresh)
   and AD-14 (stale-password detection).
 - **2026-04-26** — **Phase 2 (AD-04, AD-05, AD-06, AD-07) implemented.** The
   managed Policy Agent now refreshes `IJoinStateProbe` once per poll cycle and
@@ -761,8 +764,8 @@ The 5-phase split holds, with these refinements:
 | Task | Files | Change |
 |---|---|---|
 | **AD-14** ✅ | `CDdsCredential.cpp::ReportResult`, `DdsAuthBridgeMain.cpp` report handler. | **Landed 2026-04-26.** CP `ReportResult` maps `STATUS_LOGON_FAILURE` (0xC000006D), `STATUS_PASSWORD_MUST_CHANGE` (0xC0000224), and `STATUS_PASSWORD_EXPIRED` (0xC0000071) to distinct guided-recovery strings (§4.4) and fires `DDS_REPORT_LOGON_RESULT` (0x0064) to the bridge with the active credential_id. Bridge maintains a credential_id-keyed cooldown map (`m_staleCooldown`, 15-min default, configurable via `HKLM\SOFTWARE\DDS\AuthBridge\StaleVaultCooldownMs`) and short-circuits subsequent `DDS_START_AUTH` for the same credential with `STALE_VAULT_PASSWORD` *before* the WebAuthn ceremony — so a stale-vault retry can't burn an AD lockout slot. New IPC message `DDS_CLEAR_STALE` (0x0065) is reserved and handled by `HandleDdsClearStale`; AD-13 will issue it from the tray after a successful refresh. |
-| **AD-13** | New `DdsTrayAgent/RefreshVaultFlow.{h,cpp}`, modify `DdsTrayAgent.cpp` (menu). | Existing credential_id, `GetAssertion`, re-wrap, save. No new credential. Clear cooldown via `DDS_CLEAR_STALE` (handler already present). Block Entra-only and first enrollment on Unknown before password prompt. |
-| **AD-12** ✅ | New `docs/windows-ad-enrollment.md`. Tray text strings in `EnrollmentFlow.cpp:126` carried forward to AD-13. | **Landed 2026-04-26.** Operator-facing enrollment guide covers per-`JoinState` flow (Workgroup, AD/Hybrid, Entra-only, Unknown), the post-password-change refresh flow, host-state transitions, the operator pre-flight checklist, and a canonical string reference. Tray-side text-string updates wait on AD-13 because the Tray Agent does not yet host its own `JoinState` probe seam. |
+| **AD-13** ✅ | New [`DdsTrayAgent/RefreshVaultFlow.h`](../platform/windows/native/DdsTrayAgent/RefreshVaultFlow.h), [`RefreshVaultFlow.cpp`](../platform/windows/native/DdsTrayAgent/RefreshVaultFlow.cpp); modified `DdsTrayAgent.cpp` (added `IDM_REFRESH_VAULT` menu item) + `resource.h` + `DdsTrayAgent.vcxproj`. | **Landed 2026-05-02.** New "Refresh Stored Password…" tray menu item calls `RunRefreshVaultFlow(hwnd)`: (1) checks `JoinState` — blocks on `EntraOnlyJoined`; on `Unknown` only proceeds if a vault entry exists for the current SID; (2) loads the vault and finds the current user's `VaultEntry` by SID; (3) prompts for the current Windows password; (4) performs `GetAssertion` with `hmac-secret` using the **existing** `credential_id` + `salt` (no `MakeCredential`); (5) re-encrypts the new password under the derived key via `CCredentialVault::EncryptPassword`; (6) saves the updated vault entry via `CCredentialVault::EnrollUser` + `Save`; (7) sends `DDS_CLEAR_STALE` (0x0065) to the Auth Bridge via `CIpcPipeClient::SendRequestNoReply` to clear any active stale-vault cooldown for that credential — fire-and-forget, failure is best-effort. Tray-side JoinState probe seam is the existing `dds::GetCachedJoinState()` from `DdsAuthBridge/JoinState.h` (already in the include path). Canonical error / status strings follow the `AD-12` reference. |
+| **AD-12** ✅ | New `docs/windows-ad-enrollment.md`. Tray text strings in `EnrollmentFlow.cpp:126` carried forward to AD-13. | **Landed 2026-04-26.** Operator-facing enrollment guide covers per-`JoinState` flow (Workgroup, AD/Hybrid, Entra-only, Unknown), the post-password-change refresh flow, host-state transitions, the operator pre-flight checklist, and a canonical string reference. Tray-side text-string updates carried into the AD-13 `RefreshVaultFlow.cpp` dialog titles. |
 
 ### Phase 5 — End-to-End Validation
 

@@ -159,11 +159,13 @@
     <ClCompile Include="WebAuthnHelper.cpp" />
     <ClCompile Include="EnrollmentFlow.cpp" />
     <ClCompile Include="AdminFlow.cpp" />
+    <ClCompile Include="RefreshVaultFlow.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="WebAuthnHelper.h" />
     <ClInclude Include="EnrollmentFlow.h" />
     <ClInclude Include="AdminFlow.h" />
+    <ClInclude Include="RefreshVaultFlow.h" />
     <ClInclude Include="resource.h" />
   </ItemGroup>
   <ItemGroup>

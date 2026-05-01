@@ -7,6 +7,7 @@
 #include "resource.h"
 #include "EnrollmentFlow.h"
 #include "AdminFlow.h"
+#include "RefreshVaultFlow.h"
 #include "DdsNodeHttpClient.h"
 #include "Configuration.h"
 #include "FileLog.h"
@@ -63,10 +64,11 @@ static void ShowTrayMenu(HWND hwnd)
     HMENU hMenu = CreatePopupMenu();
     if (hMenu == NULL) return;
 
-    AppendMenuW(hMenu, MF_STRING, IDM_ENROLL,        L"Enroll FIDO2 Key...");
+    AppendMenuW(hMenu, MF_STRING, IDM_ENROLL,          L"Enroll FIDO2 Key...");
+    AppendMenuW(hMenu, MF_STRING, IDM_REFRESH_VAULT,   L"Refresh Stored Password...");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(hMenu, MF_STRING, IDM_ADMIN_SETUP,   L"Admin Setup...");
-    AppendMenuW(hMenu, MF_STRING, IDM_ADMIN_APPROVE,  L"Approve Enrollments...");
+    AppendMenuW(hMenu, MF_STRING, IDM_ADMIN_SETUP,     L"Admin Setup...");
+    AppendMenuW(hMenu, MF_STRING, IDM_ADMIN_APPROVE,   L"Approve Enrollments...");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, IDM_STATUS,         L"Status");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
@@ -150,6 +152,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         {
         case IDM_ENROLL:
             RunEnrollmentFlow(hwnd);
+            break;
+        case IDM_REFRESH_VAULT:
+            RunRefreshVaultFlow(hwnd);
             break;
         case IDM_ADMIN_SETUP:
             RunAdminSetupFlow(hwnd);
