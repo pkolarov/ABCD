@@ -425,6 +425,16 @@ impl NodeConfig {
     pub fn peer_certs_path(&self) -> PathBuf {
         self.data_dir.join("peer_certs.cbor")
     }
+
+    /// **Z-1 Phase B.5 / §4.4-§4.6** — path to the local node's
+    /// epoch-key store (hybrid KEM keypair, current epoch AEAD key,
+    /// and the per-publisher cached releases). Atomic-write posture
+    /// (tempfile + rename + 0o600) handled by
+    /// [`crate::epoch_key_store::EpochKeyStore::save`]. Defaults to
+    /// `<data_dir>/epoch_keys.cbor`.
+    pub fn epoch_keys_path(&self) -> PathBuf {
+        self.data_dir.join("epoch_keys.cbor")
+    }
 }
 
 /// Configuration errors.

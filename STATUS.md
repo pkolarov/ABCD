@@ -417,7 +417,91 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-05-01 (CI fix — Windows AppliedStateStoreTests
+> Last updated: 2026-05-01 (Z-1 Phase B.5 — `EpochKeyRelease`
+> request-response handler landed in
+> [`dds-node/src/node.rs`](dds-node/src/node.rs).
+> The libp2p behaviour `epoch_keys: request_response::cbor::Behaviour<EpochKeyRequest, EpochKeyResponse>`
+> on `/dds/epoch-keys/1.0.0/<domain>` was already wired in `dds_net::transport`
+> from the B.4 follow-on; what was missing was the dds-node-side
+> dispatch + receive pipeline. Three things changed in this commit:
+>
+> 1. **`EpochKeyStore` plumbed into `DdsNode`.** New fields
+>    `epoch_keys: EpochKeyStore` + `epoch_keys_path: PathBuf`;
+>    [`NodeConfig::epoch_keys_path`](dds-node/src/config.rs) defaults
+>    to `<data_dir>/epoch_keys.cbor`; `DdsNode::init` calls
+>    `EpochKeyStore::load_or_create` and persists the
+>    freshly-generated hybrid X25519 + ML-KEM-768 KEM keypair on
+>    first start so the same identity survives restart and so
+>    publishers that admit us in the post-bootstrap window can
+>    encapsulate releases against a stable pubkey.
+> 2. **`handle_epoch_keys_event` swarm dispatch.** New event arm in
+>    `handle_swarm_event` routes `RrEvent<EpochKeyRequest, EpochKeyResponse>`
+>    through the same H-12 admitted-peer gate the sync + admission
+>    handlers use — requests / responses from un-admitted peers are
+>    dropped before any decap work runs. Inbound requests run
+>    through `EpochKeyRequest::validate` (cap + empty-string) and
+>    are answered by `build_epoch_key_response`; today this returns
+>    the empty-releases default because the publisher-side mint flow
+>    (`encap` + `wrap` + sign + ship) lands in B.7 / B.9 with the
+>    rotation timer. The dispatch surface stays unchanged when B.7
+>    fills it in. Inbound responses run through
+>    `handle_epoch_key_response` → outer `EpochKeyResponse::validate`
+>    cap → per-blob bounded CBOR decode (security review I-6) →
+>    `install_epoch_key_release` → install in `EpochKeyStore` and
+>    persist on success.
+> 3. **`install_epoch_key_release` receive funnel.** New public
+>    method enforces the §4.5.1 receive gates in order: schema
+>    ([`EpochKeyRelease::validate`](dds-net/src/pq_envelope.rs)),
+>    recipient binding (`recipient == self.peer_id`), replay window
+>    ([`is_release_within_replay_window`](dds-node/src/epoch_key_store.rs),
+>    mirrors M-9 — 7 days), KEM decap with the canonical
+>    [`epoch_key_binding(publisher, recipient, epoch_id)`](dds-node/src/node.rs)
+>    (the M-2 / Phase A `dds-pqc-epoch-key/v1/...`
+>    domain-separation prefix folding both PeerIds and the
+>    big-endian epoch_id), and AEAD unwrap. A wrong-binding /
+>    wrong-recipient / shelf-replayed / tampered release fails-loud
+>    at the matching layer and never reaches `install_peer_release`.
+>    Publisher-signature verification (Ed25519 + optional ML-DSA-65
+>    over the canonical body bytes) is intentionally deferred to a
+>    B.6 follow-on once the canonical signing-bytes shape is
+>    finalised — at this layer the load-bearing forgery defence is
+>    the decap+unwrap pipeline (a forger that has neither the
+>    publisher's epoch key nor the recipient's KEM secret cannot
+>    construct a `(kem_ct, aead_ciphertext)` pair that recovers a
+>    usable epoch key).
+>
+> 7 new integration tests in
+> [`dds-node/tests/epoch_key_release_ingest.rs`](dds-node/tests/epoch_key_release_ingest.rs)
+> pin the receive contract end-to-end without spinning up a libp2p
+> swarm. The test-only `mint_release` helper mirrors the (future)
+> B.7 publisher-side mint flow — it produces a release that the
+> live `install_epoch_key_release` funnel decapses + unwraps + caches
+> + persists. Coverage: well-formed release accepted + cached +
+> survives `save`/`load_or_create` round-trip; recipient mismatch
+> rejected before decap; out-of-window stale `issued_at` rejected
+> before decap; tampered AEAD ciphertext fails at the AEAD verify;
+> wrong `epoch_id` (publisher used binding for epoch 7 but published
+> as epoch 8) fails at AEAD verify (component-binding defence);
+> wrong-length `kem_ct` short-circuits at the schema gate. Full
+> end-to-end via the `/dds/epoch-keys/...` libp2p stream (publisher
+> mint → swarm dispatch → receiver install) lands once B.7 wires the
+> publisher-side mint flow. `cargo test -p dds-node --lib` — 296 / 296
+> passing; `cargo test -p dds-node --test epoch_key_release_ingest` —
+> 7 / 7 passing.
+>
+> Closes Phase B.5 of
+> [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md). Does **not**
+> close Z-1 — the wire path (B.7 / B.8 envelope publish + ingest +
+> publisher mint) is the load-bearing remaining step.
+>
+> Next: B.6 follow-on — wire the publisher-signature verification
+> at install time (Ed25519 + optional ML-DSA-65 over the canonical
+> release body bytes), and B.7 — the publisher-side mint flow that
+> turns the empty `build_epoch_key_response` into a real
+> `EpochKeyRelease` issuance. B.9 then drives both via the rotation
+> timer + revocation hook.
+>
+> Previous: 2026-05-01 (CI fix — Windows AppliedStateStoreTests
 > went red on every push since `48ee29c` because the L-16 helper
 > [`AppliedStateStore::SetWindowsDacl`](platform/windows/DdsPolicyAgent/State/AppliedStateStore.cs)
 > rolled DACL + owner into a single

@@ -12,6 +12,10 @@ use dds_core::token::{TOKEN_WIRE_V1, Token, TokenKind};
 use dds_core::trust::TrustGraph;
 use dds_net::admission::{AdmissionRequest, AdmissionResponse, MAX_REVOCATIONS_PER_RESPONSE};
 use dds_net::gossip::{DdsTopic, DdsTopicSet, GossipMessage};
+use dds_net::pq_envelope::{
+    EPOCH_KEY_RELEASE_AEAD_CT_LEN, EPOCH_KEY_RELEASE_KEM_CT_LEN, EpochKeyRelease, EpochKeyRequest,
+    EpochKeyResponse,
+};
 use dds_net::sync::{SyncPayload, SyncRequest, SyncResponse, apply_sync_payloads_with_graph};
 use dds_net::transport::{DdsBehaviour, DdsBehaviourEvent, SwarmConfig};
 use dds_store::RedbBackend;
@@ -25,6 +29,7 @@ use dds_domain::{DomainId, domain::from_hex};
 
 use crate::admission_revocation_store::{self, AdmissionRevocationStore};
 use crate::config::NodeConfig;
+use crate::epoch_key_store::{EpochKeyStore, InstallOutcome, is_release_within_replay_window};
 use crate::peer_cert_store::{self, PeerCertStore};
 
 /// How often we proactively sync against every connected peer as a
@@ -180,6 +185,23 @@ pub struct DdsNode {
     /// here so the H-12 success branch can persist newly-cached certs
     /// without re-reading the config.
     peer_certs_path: PathBuf,
+    /// **Z-1 Phase B.5 / §4.4-§4.6** — local epoch-key store. Carries
+    /// the node's hybrid X25519 + ML-KEM-768 KEM keypair (the
+    /// `pq_kem_pubkey` peers encrypt `EpochKeyRelease` payloads to),
+    /// the local node's current `(epoch_id, epoch_key)`, and the
+    /// per-publisher cached releases this node has decapped. Loaded
+    /// at startup via [`epoch_key_store::EpochKeyStore::load_or_create`]
+    /// so a fresh KEM keypair is generated on first start and survives
+    /// process restarts. Plaintext at rest today (same posture as
+    /// `peer_cert_store` / `admission_revocation_store`); the eventual
+    /// encrypted-at-rest tier rides the Z-4 plan.
+    epoch_keys: EpochKeyStore,
+    /// On-disk path that backs [`Self::epoch_keys`]. Held here so the
+    /// receive path (`/dds/epoch-keys/...` request-response responses,
+    /// plus the H-12 piggy-back ingest) can persist newly-installed
+    /// releases without re-reading the config. Default
+    /// `<data_dir>/epoch_keys.cbor`.
+    epoch_keys_path: PathBuf,
     /// **Z-3 / Phase A.1 (observability-plan.md)**: optional Vouchsafe
     /// node identity used to emit signed audit-log entries from the
     /// gossip-ingest path. Set via [`Self::set_node_identity`] from
@@ -377,6 +399,48 @@ impl DdsNode {
             );
         }
 
+        // **Z-1 Phase B.5 / §4.4-§4.6** — bring up the local epoch-key
+        // store. `load_or_create` generates a fresh hybrid KEM keypair
+        // + seeds `epoch_id = 1` on first start (without touching disk
+        // — we save below so the freshly-generated keypair survives
+        // restart). Subsequent starts re-load the persisted keypair +
+        // current epoch + cached peer releases (the previous-epoch
+        // grace window is process-scoped and starts empty after a
+        // restart, which is the right posture per the §4.6 design).
+        let epoch_keys_path = config.epoch_keys_path();
+        let mut rng = rand::rngs::OsRng;
+        let was_first_start = !epoch_keys_path.exists();
+        let epoch_keys =
+            EpochKeyStore::load_or_create(&epoch_keys_path, &mut rng).map_err(|e| {
+                format!(
+                    "failed to load epoch-key store from {}: {e}",
+                    epoch_keys_path.display()
+                )
+            })?;
+        if was_first_start {
+            // Persist the freshly-generated KEM keypair so the next
+            // start finds the same identity + so peer releases that
+            // arrive on this start can be decapped after restart.
+            if let Err(e) = epoch_keys.save(&epoch_keys_path) {
+                warn!(
+                    path = %epoch_keys_path.display(),
+                    error = %e,
+                    "failed to persist freshly-generated epoch-key store on first start"
+                );
+            } else {
+                info!(
+                    path = %epoch_keys_path.display(),
+                    "epoch-key store: generated fresh hybrid KEM keypair on first start"
+                );
+            }
+        } else {
+            info!(
+                path = %epoch_keys_path.display(),
+                peer_releases = epoch_keys.peer_release_count(),
+                "loaded epoch-key store"
+            );
+        }
+
         // Build trusted roots set
         let trusted_roots: BTreeSet<String> = config.trusted_roots.iter().cloned().collect();
 
@@ -409,6 +473,8 @@ impl DdsNode {
             admission_revocations_path: revocations_path,
             peer_certs,
             peer_certs_path,
+            epoch_keys,
+            epoch_keys_path,
             node_identity: None,
             peer_seen: Arc::new(AtomicBool::new(false)),
             peer_counts: NodePeerCounts::default(),
@@ -643,6 +709,9 @@ impl DdsNode {
             }
             SwarmEvent::Behaviour(DdsBehaviourEvent::Admission(admission_event)) => {
                 self.handle_admission_event(admission_event);
+            }
+            SwarmEvent::Behaviour(DdsBehaviourEvent::EpochKeys(event)) => {
+                self.handle_epoch_keys_event(event);
             }
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!(%address, "listening on");
@@ -1828,6 +1897,258 @@ impl DdsNode {
         }
     }
 
+    /// **Z-1 Phase B.5 (`docs/pqc-phase-b-plan.md` §4.5 + §4.5.1)** —
+    /// dispatch one libp2p request-response event for the
+    /// `/dds/epoch-keys/1.0.0/<domain>` protocol. Inbound requests
+    /// from admitted peers are answered with the responder's currently-
+    /// available releases for the requested publishers (today: empty,
+    /// because the publisher-side mint path lands in B.7 / B.9 with
+    /// the rotation timer); inbound responses from admitted peers are
+    /// fed through the schema + replay-window + decap pipeline and
+    /// successful releases are installed in [`Self::epoch_keys`].
+    ///
+    /// **H-12 gating** mirrors the `sync` and `admission` handlers:
+    /// requests / responses from un-admitted peers are dropped before
+    /// any decap work runs. A relay attempting to inject epoch-key
+    /// material from an un-admitted peer cannot reach the schema gate.
+    fn handle_epoch_keys_event(&mut self, event: RrEvent<EpochKeyRequest, EpochKeyResponse>) {
+        match event {
+            RrEvent::Message { peer, message, .. } => match message {
+                RrMessage::Request {
+                    request, channel, ..
+                } => {
+                    if !self.admitted_peers.contains(&peer) {
+                        debug!(%peer, "Phase B.5: dropping epoch-key request from unadmitted peer");
+                        drop(channel);
+                        return;
+                    }
+                    // Schema gate (cap + empty-string check) — drop
+                    // wholesale on a malformed shape, mirrors the B.4
+                    // pre-decap fail-closed pattern.
+                    if let Err(e) = request.validate() {
+                        debug!(%peer, error = %e, "Phase B.5: malformed EpochKeyRequest — dropping");
+                        drop(channel);
+                        return;
+                    }
+                    let response = self.build_epoch_key_response(&request);
+                    let release_count = response.releases.len();
+                    if self
+                        .swarm
+                        .behaviour_mut()
+                        .epoch_keys
+                        .send_response(channel, response)
+                        .is_err()
+                    {
+                        warn!(%peer, "Phase B.5: failed to send epoch-key response (channel closed)");
+                    } else {
+                        debug!(
+                            %peer,
+                            release_count,
+                            "Phase B.5: served epoch-key request"
+                        );
+                    }
+                }
+                RrMessage::Response { response, .. } => {
+                    if !self.admitted_peers.contains(&peer) {
+                        debug!(%peer, "Phase B.5: dropping epoch-key response from unadmitted peer");
+                        return;
+                    }
+                    self.handle_epoch_key_response(peer, response);
+                }
+            },
+            RrEvent::OutboundFailure { peer, error, .. } => {
+                debug!(%peer, %error, "Phase B.5: epoch-key outbound failure");
+            }
+            RrEvent::InboundFailure { peer, error, .. } => {
+                debug!(%peer, %error, "Phase B.5: epoch-key inbound failure");
+            }
+            RrEvent::ResponseSent { .. } => {}
+        }
+    }
+
+    /// **Phase B.5 responder.** Build the response payload for a
+    /// freshly-validated [`EpochKeyRequest`]. Today this returns the
+    /// empty-releases default — the publisher-side mint path
+    /// (`encap` + `wrap` + sign + ship) is owned by B.7's rotation
+    /// flow which has not yet landed. The libp2p protocol is wired so
+    /// that once B.7 lands the mint helper, the responder switches
+    /// from "empty" to "fresh release for each requested publisher
+    /// I can speak for" without re-touching the dispatch surface.
+    fn build_epoch_key_response(&self, _request: &EpochKeyRequest) -> EpochKeyResponse {
+        // B.7 / B.9 will fill this in. For now, a v1 (empty) response
+        // tells the requester "I have nothing to release for those
+        // publishers right now"; the requester retries via gossip-
+        // style fan-out to a different peer or directly to the
+        // publisher (see `pq-phase-b-plan.md` §4.5.1).
+        EpochKeyResponse::default()
+    }
+
+    /// **Phase B.5 receiver.** Decode every release in `response`,
+    /// run the schema + replay-window + recipient-binding gates from
+    /// B.4 / B.6, decap each surviving release using
+    /// [`Self::epoch_keys`]'s KEM secret, unwrap the AEAD-wrapped
+    /// epoch key, and install it in [`Self::epoch_keys`]. Persists
+    /// the store on any successful install so a process restart keeps
+    /// the freshly-decapped peer key. Failures at any stage drop only
+    /// the offending release (the rest still process), mirroring the
+    /// `apply_sync_payloads` per-payload error semantics.
+    fn handle_epoch_key_response(&mut self, peer: PeerId, response: EpochKeyResponse) {
+        // Outer cap — drop the whole response wholesale on overflow,
+        // matches the §4.5.1 `MAX_EPOCH_KEY_RELEASES_PER_RESPONSE` cap.
+        if let Err(e) = response.validate() {
+            warn!(%peer, error = %e, "Phase B.5: dropping over-cap EpochKeyResponse");
+            return;
+        }
+
+        let now_unix = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(e) => {
+                warn!(%peer, error = %e, "Phase B.5: clock error, skipping release ingest");
+                return;
+            }
+        };
+        let recipient_str = self.peer_id.to_string();
+
+        let mut installed = 0usize;
+        let mut rejected = 0usize;
+        for blob in &response.releases {
+            // Bounded depth: peer-supplied. Security review I-6.
+            let release: EpochKeyRelease =
+                match dds_core::cbor_bounded::from_reader(blob.as_slice()) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        debug!(%peer, error = %e, "Phase B.5: release CBOR decode failed");
+                        rejected += 1;
+                        continue;
+                    }
+                };
+            match self.install_epoch_key_release(&release, &recipient_str, now_unix) {
+                Ok(outcome) => match outcome {
+                    InstallOutcome::Inserted | InstallOutcome::Rotated => installed += 1,
+                    InstallOutcome::AlreadyCurrent | InstallOutcome::Stale => {}
+                },
+                Err(reason) => {
+                    debug!(%peer, publisher = %release.publisher, reason, "Phase B.5: release rejected");
+                    rejected += 1;
+                }
+            }
+        }
+
+        if installed > 0 {
+            // Persist on any successful install so the new release(s)
+            // survive a restart. Best-effort: a write failure is
+            // logged but the in-memory entry is kept so the process
+            // can still decrypt this epoch's gossip.
+            if let Err(e) = self.epoch_keys.save(&self.epoch_keys_path) {
+                warn!(
+                    path = %self.epoch_keys_path.display(),
+                    error = %e,
+                    "Phase B.5: failed to persist epoch-key store after install"
+                );
+            }
+        }
+        if installed > 0 || rejected > 0 {
+            debug!(
+                %peer,
+                installed,
+                rejected,
+                total = response.releases.len(),
+                "Phase B.5: processed epoch-key response"
+            );
+        }
+    }
+
+    /// **Phase B.5 release ingest funnel** — applies the full set of
+    /// pre-install gates to a single decoded [`EpochKeyRelease`] and,
+    /// on success, decaps the AEAD-wrapped epoch key + installs it in
+    /// [`Self::epoch_keys`]. Returns the [`InstallOutcome`] from
+    /// [`crate::epoch_key_store::EpochKeyStore::install_peer_release`]
+    /// on success, or a `&'static str` reason on rejection (suitable
+    /// for log + metric labels).
+    ///
+    /// Gates, in order:
+    /// 1. Schema validate ([`EpochKeyRelease::validate`]) — empty
+    ///    publisher / recipient, length checks on each fixed-size
+    ///    field, expires_at strictly after issued_at.
+    /// 2. Recipient binding — `release.recipient == our PeerId`.
+    /// 3. Replay window ([`is_release_within_replay_window`]) —
+    ///    `issued_at` within
+    ///    [`dds_net::pq_envelope::EPOCH_RELEASE_REPLAY_WINDOW_SECS`]
+    ///    of `now_unix` (clock-skew futures allowed).
+    /// 4. Decap via [`dds_core::crypto::kem::decap`] using the
+    ///    canonical binding `(publisher || recipient || epoch_id_be)`
+    ///    so a release encapsulated for a different (publisher,
+    ///    recipient, epoch) tuple cannot be lifted into this slot.
+    /// 5. AEAD unwrap via [`dds_core::crypto::epoch_key::unwrap`] —
+    ///    a wrong-key / tampered-ciphertext / tampered-nonce release
+    ///    fails-loud here.
+    /// 6. Install via
+    ///    [`crate::epoch_key_store::EpochKeyStore::install_peer_release`]
+    ///    which classifies the install as Inserted / Rotated /
+    ///    AlreadyCurrent / Stale.
+    ///
+    /// Publisher-signature verification (Ed25519 + optional
+    /// ML-DSA-65) is intentionally **not** performed at this layer —
+    /// see the docstring on [`Self::epoch_keys`] for the threat-model
+    /// note. The release is delivered over an authenticated libp2p
+    /// channel (Noise + admitted-peer gating), and a forger that
+    /// neither has the publisher's epoch key nor the recipient's KEM
+    /// secret cannot construct `(kem_ct, aead_ciphertext)` pair that
+    /// decaps + unwraps to a usable epoch key. Step (4) + (5) are
+    /// the load-bearing forgery defence at this layer; the publisher
+    /// signature verify lands as a B.6 follow-on once the canonical
+    /// signing-bytes shape is finalised.
+    pub fn install_epoch_key_release(
+        &mut self,
+        release: &EpochKeyRelease,
+        recipient_str: &str,
+        now_unix: u64,
+    ) -> Result<InstallOutcome, &'static str> {
+        if let Err(_e) = release.validate() {
+            return Err("schema");
+        }
+        if release.recipient != recipient_str {
+            return Err("recipient_mismatch");
+        }
+        if !is_release_within_replay_window(release.issued_at, now_unix) {
+            return Err("replay_window");
+        }
+        // Defensive re-check on the two length-bound slices. Schema
+        // validate already covered these but we destructure into
+        // fixed-length arrays before handing to the crypto layer.
+        if release.kem_ct.len() != EPOCH_KEY_RELEASE_KEM_CT_LEN
+            || release.aead_ciphertext.len() != EPOCH_KEY_RELEASE_AEAD_CT_LEN
+        {
+            return Err("schema");
+        }
+
+        let kem_ct = dds_core::crypto::kem::KemCiphertext::from_bytes(&release.kem_ct)
+            .map_err(|_| "kem_ct")?;
+        let binding = epoch_key_binding(&release.publisher, recipient_str, release.epoch_id);
+        let shared = dds_core::crypto::kem::decap(self.epoch_keys.kem_secret(), &kem_ct, &binding)
+            .map_err(|_| "decap")?;
+        let epoch_key = dds_core::crypto::epoch_key::unwrap(
+            &shared,
+            &release.aead_nonce,
+            &release.aead_ciphertext,
+        )
+        .map_err(|_| "aead")?;
+
+        Ok(self.epoch_keys.install_peer_release(
+            &release.publisher,
+            release.epoch_id,
+            epoch_key,
+            release.expires_at,
+        ))
+    }
+
+    /// Read-only handle to the epoch-key store. Test-only — the live
+    /// node owns the store and mutates it through the receive path.
+    #[doc(hidden)]
+    pub fn epoch_keys_for_tests(&self) -> &EpochKeyStore {
+        &self.epoch_keys
+    }
+
     /// H-12: read-only view of peers admitted to this node's domain
     /// during the current connection lifecycle. Primarily for tests
     /// that want to assert the admission handshake completed.
@@ -1914,6 +2235,35 @@ impl DdsNode {
         let g = self.trust_graph.read().expect("trust_graph poisoned");
         policy_engine.evaluate(subject_urn, resource, action, &g, &self.trusted_roots)
     }
+}
+
+/// **Z-1 Phase B.5** — canonical hybrid-KEM `binding_info` for a
+/// per-recipient [`dds_net::pq_envelope::EpochKeyRelease`]. The
+/// publisher uses this exact binding when calling
+/// [`dds_core::crypto::kem::encap`]; the receiver re-derives the same
+/// binding before [`dds_core::crypto::kem::decap`] so a release
+/// encapsulated for a different `(publisher, recipient, epoch_id)`
+/// tuple cannot be lifted into another slot. Mirrors the M-2 / Phase
+/// A `dds-hybrid-v2/...` domain-separation pattern: the binding is
+/// `b"dds-pqc-epoch-key/" || publisher || b"|" || recipient || b"|"
+/// || epoch_id_be`. Publisher and recipient are the base58 PeerId
+/// strings exactly as they appear in
+/// [`EpochKeyRelease::publisher`](dds_net::pq_envelope::EpochKeyRelease)
+/// / [`EpochKeyRelease::recipient`](dds_net::pq_envelope::EpochKeyRelease).
+/// The `|` separator + the prefix make a parser-confusion attack
+/// (where one peer's PeerId is a suffix of another's, or where a
+/// publisher's id ends with a digit indistinguishable from the start
+/// of an epoch_id) impossible.
+pub fn epoch_key_binding(publisher: &str, recipient: &str, epoch_id: u64) -> Vec<u8> {
+    const PREFIX: &[u8] = b"dds-pqc-epoch-key/v1/";
+    let mut out = Vec::with_capacity(PREFIX.len() + publisher.len() + 1 + recipient.len() + 1 + 8);
+    out.extend_from_slice(PREFIX);
+    out.extend_from_slice(publisher.as_bytes());
+    out.push(b'|');
+    out.extend_from_slice(recipient.as_bytes());
+    out.push(b'|');
+    out.extend_from_slice(&epoch_id.to_be_bytes());
+    out
 }
 
 /// **M-9 (security review)**: return `true` if a revocation or burn
