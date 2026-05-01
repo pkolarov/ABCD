@@ -417,7 +417,79 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-05-01 (Z-1 Phase B.5 — `EpochKeyRelease`
+> Last updated: 2026-05-01 (Z-1 Phase B.7 step 1 — publisher-side
+> `EpochKeyRelease` mint helper +
+> [`DdsNode::build_epoch_key_response`](dds-node/src/node.rs) responder
+> landed in [`dds-node/src/node.rs`](dds-node/src/node.rs). The B.5
+> handler dispatch was already wiring inbound `EpochKeyRequest` events
+> through `build_epoch_key_response`, but the responder shipped an
+> empty body because the publisher-side mint path was deferred. This
+> commit lands the inverse of `install_epoch_key_release`: a new
+> public free function
+> [`mint_epoch_key_release_for_recipient`](dds-node/src/node.rs)
+> derives the canonical `epoch_key_binding(publisher, recipient,
+> epoch_id)` (M-2 / Phase A `dds-pqc-epoch-key/v1/...` prefix), runs
+> `dds_core::crypto::kem::encap` against the recipient's hybrid
+> X25519 + ML-KEM-768 pubkey, AEAD-wraps the publisher's 32-byte
+> epoch key under the derived shared secret via
+> `dds_core::crypto::epoch_key::wrap`, and returns a fully-formed
+> `EpochKeyRelease` with a 64-byte zero-byte signature placeholder
+> (the canonical signing-bytes shape stays deferred to the B.6 / B.9
+> follow-on; at the install layer the load-bearing forgery defence is
+> the per-recipient hybrid-KEM decap + AEAD unwrap pipeline, which a
+> forger without the recipient's KEM secret cannot get past).
+> `build_epoch_key_response` now mints a real release for any
+> request whose `publishers` list names the responder's own peer id,
+> encapsulated to the requester's KEM pubkey looked up in
+> [`peer_certs`](dds-node/src/peer_cert_store.rs) — closes the
+> publisher-side half of §4.5.1 late-join recovery for any peer whose
+> v3 admission cert has already been cached. Skipped reasons (no
+> cached cert, cert without `pq_kem_pubkey`, malformed cached pubkey,
+> mint failure, or a non-self publisher in the request) all fall
+> through to the empty-releases response so the libp2p
+> request_response channel never times out — a partial response is
+> the wire-level signal for "I could not honor every publisher you
+> asked about", and the requester re-fans-out to the next candidate.
+> The forwarding case ("re-encapsulate a peer's epoch key for a third
+> party") is intentionally **not** wired here: the original
+> publisher's signature would not verify against a re-encapsulation,
+> and the safe semantics until the signing-bytes shape lands are "I
+> speak only for myself".
+>
+> 7 new integration tests in
+> [`dds-node/tests/epoch_key_release_mint.rs`](dds-node/tests/epoch_key_release_mint.rs)
+> pin the publisher-side contract end-to-end without spinning up a
+> libp2p swarm: well-formed mint decapsulates + unwraps cleanly at
+> the recipient (proving the canonical binding matches on both ends);
+> empty-publisher / empty-recipient / `expires_at <= issued_at`
+> rejected at the schema gate; component-binding holds (a release
+> minted for R1 cannot be lifted into R2's slot — fails at
+> `recipient_mismatch` with the original recipient label, fails at
+> `decap` / `aead` with a forged label); responder mints for self
+> when the requester has a cached v3 cert; responder ships an empty
+> body when the request asks for a non-self publisher, when the
+> requester has no cached cert, and when the cached cert is v1/v2
+> (no `pq_kem_pubkey`). New `#[doc(hidden)]` test hook
+> [`DdsNode::build_epoch_key_response_for_tests`](dds-node/src/node.rs)
+> exposes the responder funnel without requiring a request-response
+> round-trip — mirrors the existing `epoch_keys_for_tests` shape.
+> `cargo test -p dds-node --test epoch_key_release_mint` — 7 / 7
+> passing. `cargo test --workspace` — 853 / 853 passing (was 836 before
+> this step). `cargo clippy --workspace --all-targets -- -D warnings`
+> clean; `cargo fmt --all -- --check` clean.
+>
+> Updates [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md) §8 row
+> B.7: marked **partial** with the publisher-side mint + responder
+> step landed; remaining work for the full B.7 row is the encrypted
+> `GossipEnvelopeV3` publish + ingest decode in
+> `handle_gossip_message`, the `Domain.has_capability("enc-v3")`
+> enforcement gate, and the §4.6.1 sync responder re-wrap.
+>
+> Next: complete B.7 — the encrypted gossip envelope publish + ingest
+> path. Then B.6 follow-on (publisher signature verify on install) +
+> B.9 (rotation timer driving the mint loop).
+>
+> Previous: 2026-05-01 (Z-1 Phase B.5 — `EpochKeyRelease`
 > request-response handler landed in
 > [`dds-node/src/node.rs`](dds-node/src/node.rs).
 > The libp2p behaviour `epoch_keys: request_response::cbor::Behaviour<EpochKeyRequest, EpochKeyResponse>`

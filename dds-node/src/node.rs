@@ -13,8 +13,8 @@ use dds_core::trust::TrustGraph;
 use dds_net::admission::{AdmissionRequest, AdmissionResponse, MAX_REVOCATIONS_PER_RESPONSE};
 use dds_net::gossip::{DdsTopic, DdsTopicSet, GossipMessage};
 use dds_net::pq_envelope::{
-    EPOCH_KEY_RELEASE_AEAD_CT_LEN, EPOCH_KEY_RELEASE_KEM_CT_LEN, EpochKeyRelease, EpochKeyRequest,
-    EpochKeyResponse,
+    EPOCH_KEY_RELEASE_AEAD_CT_LEN, EPOCH_KEY_RELEASE_ED25519_SIG_LEN, EPOCH_KEY_RELEASE_KEM_CT_LEN,
+    EpochKeyRelease, EpochKeyRequest, EpochKeyResponse,
 };
 use dds_net::sync::{SyncPayload, SyncRequest, SyncResponse, apply_sync_payloads_with_graph};
 use dds_net::transport::{DdsBehaviour, DdsBehaviourEvent, SwarmConfig};
@@ -1930,7 +1930,7 @@ impl DdsNode {
                         drop(channel);
                         return;
                     }
-                    let response = self.build_epoch_key_response(&request);
+                    let response = self.build_epoch_key_response(&request, &peer);
                     let release_count = response.releases.len();
                     if self
                         .swarm
@@ -1966,21 +1966,143 @@ impl DdsNode {
         }
     }
 
-    /// **Phase B.5 responder.** Build the response payload for a
-    /// freshly-validated [`EpochKeyRequest`]. Today this returns the
-    /// empty-releases default — the publisher-side mint path
-    /// (`encap` + `wrap` + sign + ship) is owned by B.7's rotation
-    /// flow which has not yet landed. The libp2p protocol is wired so
-    /// that once B.7 lands the mint helper, the responder switches
-    /// from "empty" to "fresh release for each requested publisher
-    /// I can speak for" without re-touching the dispatch surface.
-    fn build_epoch_key_response(&self, _request: &EpochKeyRequest) -> EpochKeyResponse {
-        // B.7 / B.9 will fill this in. For now, a v1 (empty) response
-        // tells the requester "I have nothing to release for those
-        // publishers right now"; the requester retries via gossip-
-        // style fan-out to a different peer or directly to the
-        // publisher (see `pq-phase-b-plan.md` §4.5.1).
-        EpochKeyResponse::default()
+    /// **Phase B.5 responder + Phase B.7 publisher-side mint.** Build
+    /// the response payload for a freshly-validated [`EpochKeyRequest`].
+    ///
+    /// Filtering rule: the responder can only mint releases for
+    /// publishers it can authoritatively speak for — i.e. itself. For
+    /// each requested publisher equal to the responder's own PeerId,
+    /// the responder mints a fresh [`EpochKeyRelease`] of its current
+    /// epoch key, encapsulated to the requester's hybrid KEM pubkey
+    /// (looked up in [`Self::peer_certs`]). Requested publishers that
+    /// do not match the responder's PeerId are skipped — the
+    /// requester is expected to fan out to those publishers directly
+    /// (per `pqc-phase-b-plan.md` §4.5.1).
+    ///
+    /// The forwarding case ("re-encapsulate a peer's epoch key under
+    /// my key for a third party") is intentionally **not** wired
+    /// here: the original publisher's signature would not verify
+    /// against a re-encapsulation, and Phase B's signature shape is
+    /// still pending (see [`mint_epoch_key_release_for_recipient`]).
+    /// Until that lands, the safe semantics are "I speak only for
+    /// myself".
+    ///
+    /// Skipped reasons (logged at debug level):
+    /// - the requester has no cached `AdmissionCert` in
+    ///   [`Self::peer_certs`] (handshake never completed, or the
+    ///   cache was wiped);
+    /// - the requester's cached cert has no
+    ///   [`AdmissionCert::pq_kem_pubkey`] (the requester is on a
+    ///   pre-Phase-B build);
+    /// - the cached pubkey is malformed at the
+    ///   [`HybridKemPublicKey::from_bytes`] schema gate;
+    /// - any of the inner mint steps (KEM encap, AEAD wrap, CBOR
+    ///   serialize) fails.
+    ///
+    /// In every skipped case the responder ships an *empty* releases
+    /// vector rather than failing the request: a partial response
+    /// (`releases.len() < requested.len()`) is the wire-level signal
+    /// for "I could not honor every publisher you asked about", and
+    /// the requester re-fans-out to the next candidate peer.
+    fn build_epoch_key_response(
+        &self,
+        request: &EpochKeyRequest,
+        requester: &PeerId,
+    ) -> EpochKeyResponse {
+        let my_peer_id_str = self.peer_id.to_string();
+        let requester_str = requester.to_string();
+
+        // Requester KEM pubkey lookup. Bail early if any prerequisite
+        // is missing — we still ship the (empty) response shape so the
+        // libp2p request_response channel doesn't time out.
+        let recipient_kem_pk = match self
+            .peer_certs
+            .get(&requester_str)
+            .and_then(|cert| cert.pq_kem_pubkey.as_deref())
+        {
+            Some(bytes) => match dds_core::crypto::kem::HybridKemPublicKey::from_bytes(bytes) {
+                Ok(pk) => pk,
+                Err(_) => {
+                    debug!(
+                        peer = %requester,
+                        "Phase B.7: cached requester KEM pubkey is malformed — empty response"
+                    );
+                    return EpochKeyResponse::default();
+                }
+            },
+            None => {
+                debug!(
+                    peer = %requester,
+                    "Phase B.7: requester has no cached KEM pubkey — empty response"
+                );
+                return EpochKeyResponse::default();
+            }
+        };
+
+        let now_unix = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(_) => {
+                debug!("Phase B.7: clock error, returning empty response");
+                return EpochKeyResponse::default();
+            }
+        };
+
+        // Mint at most one release per request: the only publisher we
+        // can speak for is ourselves, so even if the request lists
+        // duplicates of our own peer id (shouldn't happen in practice)
+        // we ship one entry.
+        let asks_for_self = request
+            .publishers
+            .iter()
+            .any(|p| p.as_str() == my_peer_id_str);
+        if !asks_for_self {
+            return EpochKeyResponse::default();
+        }
+
+        let (epoch_id, epoch_key) = self.epoch_keys.my_current_epoch();
+        // Expires_at: same 24h budget the rotation timer (B.9) will
+        // use. Using a static 24h here keeps the schema gate happy
+        // (`expires_at > issued_at`) without coupling to the (still
+        // unset) rotation cadence.
+        const EPOCH_LIFETIME_SECS: u64 = 86_400;
+        let expires_at = now_unix.saturating_add(EPOCH_LIFETIME_SECS);
+
+        let release = match mint_epoch_key_release_for_recipient(
+            &mut rand::rngs::OsRng,
+            &my_peer_id_str,
+            epoch_id,
+            epoch_key,
+            &requester_str,
+            &recipient_kem_pk,
+            now_unix,
+            expires_at,
+        ) {
+            Ok(r) => r,
+            Err(reason) => {
+                debug!(
+                    peer = %requester,
+                    reason,
+                    "Phase B.7: mint failed — empty response"
+                );
+                return EpochKeyResponse::default();
+            }
+        };
+
+        let blob = match release.to_cbor() {
+            Ok(b) => b,
+            Err(e) => {
+                debug!(
+                    peer = %requester,
+                    error = %e,
+                    "Phase B.7: CBOR-encode of fresh release failed — empty response"
+                );
+                return EpochKeyResponse::default();
+            }
+        };
+
+        EpochKeyResponse {
+            releases: vec![blob],
+        }
     }
 
     /// **Phase B.5 receiver.** Decode every release in `response`,
@@ -2149,6 +2271,25 @@ impl DdsNode {
         &self.epoch_keys
     }
 
+    /// **Z-1 Phase B.7 test hook.** Drive the
+    /// [`Self::build_epoch_key_response`] funnel directly without
+    /// having to spin up a libp2p swarm + stage an
+    /// `EpochKeyRequest` round-trip on the
+    /// `/dds/epoch-keys/1.0.0/<domain>` protocol. The contract this
+    /// pins (the publisher-side mint of a release encapsulated to
+    /// the requester's KEM pubkey) is the load-bearing piece of the
+    /// §4.5.1 late-join recovery; the test surface is what unblocks
+    /// the B.9 rotation timer + the B.12 multi-node integration
+    /// harness.
+    #[doc(hidden)]
+    pub fn build_epoch_key_response_for_tests(
+        &self,
+        request: &EpochKeyRequest,
+        requester: &PeerId,
+    ) -> EpochKeyResponse {
+        self.build_epoch_key_response(request, requester)
+    }
+
     /// H-12: read-only view of peers admitted to this node's domain
     /// during the current connection lifecycle. Primarily for tests
     /// that want to assert the admission handshake completed.
@@ -2264,6 +2405,75 @@ pub fn epoch_key_binding(publisher: &str, recipient: &str, epoch_id: u64) -> Vec
     out.push(b'|');
     out.extend_from_slice(&epoch_id.to_be_bytes());
     out
+}
+
+/// **Z-1 Phase B.7** — publisher-side mint of an
+/// [`EpochKeyRelease`] for one specific recipient.
+///
+/// Inverse of [`DdsNode::install_epoch_key_release`]: the publisher
+/// takes its current `(epoch_id, epoch_key)`, derives the canonical
+/// [`epoch_key_binding`] for `(publisher, recipient, epoch_id)`,
+/// runs the hybrid X25519 + ML-KEM-768 KEM via
+/// [`dds_core::crypto::kem::encap`] against `recipient_kem_pk`, and
+/// AEAD-wraps the 32-byte epoch key under the derived shared secret
+/// via [`dds_core::crypto::epoch_key::wrap`]. The receiver — having
+/// the matching KEM secret in its
+/// [`crate::epoch_key_store::EpochKeyStore`] — re-derives the same
+/// shared secret via [`dds_core::crypto::kem::decap`] and unwraps to
+/// recover `epoch_key`.
+///
+/// `signature` is currently a 64-byte zero placeholder. The
+/// canonical signing-bytes shape (Ed25519 + optional ML-DSA-65 over
+/// the wire-encoded body) is intentionally deferred to a B.6 / B.9
+/// follow-on. See the docstring on [`DdsNode::epoch_keys`] for the
+/// threat-model note: at the install layer the load-bearing forgery
+/// defence is the per-recipient hybrid-KEM decap + AEAD unwrap
+/// pipeline; an attacker without `recipient_kem_pk`'s matching
+/// secret cannot construct a `(kem_ct, aead_ciphertext)` pair that
+/// recovers a usable epoch key.
+///
+/// Errors are short `&'static str` reasons suitable for log + metric
+/// labels at the call site, mirroring the receive-side
+/// [`DdsNode::install_epoch_key_release`] return shape.
+#[allow(clippy::too_many_arguments)]
+pub fn mint_epoch_key_release_for_recipient<R: rand_core::CryptoRngCore>(
+    rng: &mut R,
+    publisher_id: &str,
+    epoch_id: u64,
+    epoch_key: &[u8; dds_core::crypto::epoch_key::EPOCH_KEY_LEN],
+    recipient_id: &str,
+    recipient_kem_pk: &dds_core::crypto::kem::HybridKemPublicKey,
+    issued_at: u64,
+    expires_at: u64,
+) -> Result<EpochKeyRelease, &'static str> {
+    if publisher_id.is_empty() {
+        return Err("empty_publisher");
+    }
+    if recipient_id.is_empty() {
+        return Err("empty_recipient");
+    }
+    if expires_at <= issued_at {
+        return Err("invalid_expiry");
+    }
+
+    let binding = epoch_key_binding(publisher_id, recipient_id, epoch_id);
+    let (kem_ct, shared) =
+        dds_core::crypto::kem::encap(rng, recipient_kem_pk, &binding).map_err(|_| "encap")?;
+    let (aead_nonce, aead_ciphertext) =
+        dds_core::crypto::epoch_key::wrap(rng, &shared, epoch_key).map_err(|_| "wrap")?;
+
+    Ok(EpochKeyRelease {
+        publisher: publisher_id.to_string(),
+        epoch_id,
+        issued_at,
+        expires_at,
+        recipient: recipient_id.to_string(),
+        kem_ct: kem_ct.to_bytes(),
+        aead_nonce,
+        aead_ciphertext,
+        signature: vec![0u8; EPOCH_KEY_RELEASE_ED25519_SIG_LEN],
+        pq_signature: None,
+    })
 }
 
 /// **M-9 (security review)**: return `true` if a revocation or burn
