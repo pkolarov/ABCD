@@ -34,6 +34,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 home = "0.5"
 rand = { workspace = true }
+rand_core = { workspace = true }
 futures = { workspace = true }
 libp2p = { workspace = true }
 axum = "0.7"

@@ -10,6 +10,7 @@ pub mod admission_revocation_store;
 pub mod config;
 pub mod device_binding;
 pub mod domain_store;
+pub mod epoch_key_store;
 pub mod expiry;
 pub(crate) mod file_acl;
 pub mod http;

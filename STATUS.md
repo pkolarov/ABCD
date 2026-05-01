@@ -123,7 +123,8 @@
 >   `cargo test --workspace` — 232 passing in `dds-node` lib, 81 in
 >   `dds-domain`, 0 failed across every workspace crate.
 >
-> **Phase B (after A, plan landed 2026-04-29; B.1 + B.2 landed 2026-04-30)
+> **Phase B (after A, plan landed 2026-04-29; B.1 + B.2 landed 2026-04-30;
+> B.3 + B.4 + B.4 follow-ons landed 2026-04-30; B.6 landed 2026-05-01)
 > — per-publisher epoch key with hybrid-KEM distribution on gossip +
 > sync payloads.** Detailed design:
 > **[docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md)**.
@@ -416,7 +417,82 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-04-30 (Z-1 Phase B.4 —
+> Last updated: 2026-05-01 (Z-1 Phase B.6 —
+> `dds-node::epoch_key_store` landed. New
+> [`EpochKeyStore`](dds-node/src/epoch_key_store.rs) carries the local
+> node's hybrid X25519 + ML-KEM-768 keypair (via
+> `dds_core::crypto::kem::generate`), the local node's current
+> `(epoch_id, K_me)` epoch AEAD key, an in-memory `previous_my_epoch`
+> grace entry, the `BTreeMap<String, PeerReleaseEntry>` of cached
+> publisher releases, and a sibling `peer_grace` map for per-publisher
+> previous epochs. The receiver-side state for the "per-publisher
+> epoch keys, distributed via per-recipient hybrid KEM" model now has
+> a single home that B.5 (handler) and B.7 / B.8 (envelope decrypt)
+> can hang off of without re-deriving rotation semantics inline.
+>
+> `rotate_my_epoch(rng)` bumps `epoch_id`, generates a fresh 32-byte
+> AEAD key, and moves the superseded `(epoch_id, K_old)` into the
+> grace cache anchored at `Instant::now()`. `install_peer_release(...)`
+> classifies the inbound release into one of four `InstallOutcome`
+> variants — `Inserted` (first release from this publisher),
+> `Rotated` (newer epoch — old moves to grace), `AlreadyCurrent`
+> (idempotent re-delivery — common during H-12 piggy-back fan-out),
+> `Stale` (epoch_id strictly older than cached current — defends
+> against an out-of-order release slipping past the M-9 issued_at
+> gate). The enum drives B.11 metric labelling at the future ingest
+> site (`dds_pq_release_install_total{outcome=...}` per the §B.11
+> catalog). `prune_grace(now: Instant)` drops both kinds of grace
+> entries past `EPOCH_KEY_GRACE_SECS` (5 min) — uses
+> `Instant::saturating_duration_since` so a wall-clock jump cannot
+> widen or shrink the window.
+>
+> Free function
+> [`is_release_within_replay_window(issued_at, now_unix)`](dds-node/src/epoch_key_store.rs)
+> is the schema-layer pre-decap gate: receivers reject any release
+> older than `EPOCH_RELEASE_REPLAY_WINDOW_SECS` (7 days, mirrors M-9
+> revocation replay window) before spending an ML-KEM-768 decap on
+> the wire `kem_ct`. A release with `issued_at > now_unix` (clock
+> skew) is admitted — receiver-side clock-skew handling lives at the
+> same layer that gates token freshness, and the AEAD verify will
+> fail-loud if the release was actually forged from the future.
+>
+> On-disk format `OnDiskV1` persists `kem_x_sk` (32 B) +
+> `kem_mlkem_seed` (64 B) + `(my_epoch_id, my_epoch_key)` + the
+> per-publisher release map; the in-memory grace caches are
+> runtime-only — a process restart starts with `previous_my_epoch =
+> None` and an empty `peer_grace`. That is the right posture: grace
+> entries are by definition for in-flight gossip in the last 5
+> minutes, and the receiver's connection to us drops on restart, so
+> the receiver's next gossip from us is keyed under our *new* epoch.
+> Atomic write via `tempfile::NamedTempFile::new_in(parent)` +
+> `tmp.persist(path)` with `0o600` on Unix — same posture as
+> `peer_cert_store::save` / `admission_revocation_store::save`
+> (L-3 follow-on). Plaintext today; the eventual encrypted-at-rest
+> tier rides the Z-4 plan.
+>
+> 16 new unit tests pin the surface: bootstrap (`new` seeds
+> `epoch_id = 1`; KEM public matches the derived form),
+> rotation (old → grace, current bumps), the four `InstallOutcome`
+> paths, stale-release ignore, `remove_peer` drops only the current
+> entry, `prune_grace` past the window across both grace caches,
+> save/load round-trip preserves both KEM legs and the release map,
+> `load_or_create` on missing file generates without touching disk,
+> garbage-bytes / unknown-version / wrong-length-x_sk all rejected
+> at load, `0o600` permissions on the persisted file, the three
+> replay-window paths (fresh / stale / clock-skew-future), and end-
+> to-end KEM encap/decap proves the freshly-generated keypair is
+> usable through the `dds_core::crypto::kem` surface. `cargo test
+> --workspace` — 836 / 836 passing (was 820 before B.6); `cargo
+> clippy --workspace --all-targets -- -D warnings` clean; `cargo
+> fmt --all -- --check` clean. New workspace dep `rand_core` on
+> dds-node — matches dds-domain's existing pin (workspace
+> `rand_core = "0.6"`).
+>
+> Next: B.5 `EpochKeyRelease` request-response handler in `dds-node`
+> (now that the store and the swarm behaviour are both in place)
+> and the rotation timer (B.9) that drives `rotate_my_epoch`.
+>
+> Previous: 2026-04-30 (Z-1 Phase B.4 —
 > `dds-net::pq_envelope` wire types +
 > `AdmissionResponse.epoch_key_releases` piggy-back landed (commit
 > `bb63a91`). New module ships `GossipEnvelopeV3` / `SyncEnvelopeV3`

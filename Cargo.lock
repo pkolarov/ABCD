@@ -1099,6 +1099,7 @@ dependencies = [
  "libp2p",
  "p256",
  "rand 0.8.5",
+ "rand_core 0.6.4",
  "rcgen",
  "reqwest",
  "serde",
