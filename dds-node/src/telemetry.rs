@@ -41,6 +41,7 @@
 //! | `dds_pq_releases_installed_total` | counter | `result=ok\|schema\|recipient_mismatch\|replay_window\|kem_ct\|decap\|aead` | bumped by [`record_pq_release_installed`] at every exit branch of [`crate::node::DdsNode::install_epoch_key_release`] |
 //! | `dds_pq_releases_emitted_total` | counter | `result=ok\|no_kem_pk\|malformed_kem_pk\|not_for_self\|clock_error\|mint_fail\|cbor_fail` | bumped by [`record_pq_releases_emitted`] at every exit branch of [`crate::node::DdsNode::build_epoch_key_response`] |
 //! | `dds_pq_envelope_decrypt_total` | counter | `result=ok\|no_key\|aead_fail` | bumped by [`record_pq_envelope_decrypt`] at every exit branch of the gossip/sync envelope decrypt path in [`crate::node::DdsNode::handle_gossip_message`] and [`crate::node::DdsNode::handle_sync_response`] |
+//! | `dds_pq_rotation_total` | counter | `reason=time\|revocation\|manual` | bumped by [`record_pq_rotation`] at every epoch-key rotation trigger in [`crate::node::DdsNode::rotate_and_fan_out`] |
 //! | `dds_http_requests_total` | counter | `route, method, status` | bumped by [`record_http_request`] |
 //! | `dds_trust_graph_attestations` | gauge | `body_type=user-auth-attestation\|device-join\|windows-policy\|macos-policy\|macos-account-binding\|sso-identity-link\|software-assignment\|service-principal\|session\|unknown` | [`crate::service::LocalService::trust_graph_counts`] at scrape, partitioned via [`crate::service::body_type_label`] |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
@@ -769,6 +770,15 @@ pub struct Telemetry {
     /// Bumped from [`crate::node::DdsNode::handle_gossip_message`]
     /// (gossip path) and eventually from the sync decrypt path (B.8).
     pq_envelope_decrypt: Mutex<BTreeMap<String, u64>>,
+    /// **Z-1 Phase B.9 / B.11** — per-`reason` epoch-key rotation
+    /// counter. `reason` is one of `time|revocation|new_peer|manual`:
+    /// - `time` — scheduled 24h (configurable) rotation timer fired.
+    /// - `revocation` — an admission revocation was received; the node
+    ///   rotated immediately (with jitter) to exclude the revoked peer.
+    /// - `new_peer` — reserved for a future "rotate on first new peer"
+    ///   policy; not yet wired.
+    /// - `manual` — operator issued `dds pq rotate`.
+    pq_rotation: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Telemetry {
@@ -791,6 +801,7 @@ impl Telemetry {
             pq_releases_installed: Mutex::new(BTreeMap::new()),
             pq_releases_emitted: Mutex::new(BTreeMap::new()),
             pq_envelope_decrypt: Mutex::new(BTreeMap::new()),
+            pq_rotation: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1203,6 +1214,31 @@ impl Telemetry {
         }
     }
 
+    fn bump_pq_rotation(&self, reason: &str) {
+        let mut g = match self.pq_rotation.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry(reason.to_string()).or_insert(0) += 1;
+    }
+
+    fn pq_rotation_snapshot(&self) -> BTreeMap<String, u64> {
+        match self.pq_rotation.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of `dds_pq_rotation_total{reason=...}`.
+    /// Public so regression tests can take before/after snapshots
+    /// without scraping the renderer.
+    pub fn pq_rotation_count(&self, reason: &str) -> u64 {
+        match self.pq_rotation.lock() {
+            Ok(g) => g.get(reason).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(reason).copied().unwrap_or(0),
+        }
+    }
+
     fn uptime_seconds(&self) -> u64 {
         SystemTime::now()
             .duration_since(self.start_at)
@@ -1466,6 +1502,22 @@ pub fn record_pq_releases_emitted(result: &str) {
 pub fn record_pq_envelope_decrypt(result: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_pq_envelope_decrypt(result);
+    }
+}
+
+/// Bump `dds_pq_rotation_total{reason=...}` by one. Called from
+/// [`crate::node::DdsNode::rotate_and_fan_out`] at every rotation
+/// trigger:
+///
+/// - `time` — scheduled 24h (configurable) rotation timer fired.
+/// - `revocation` — an admission revocation arrived; the node
+///   rotated immediately (with jitter) to exclude the revoked peer.
+/// - `manual` — operator issued `dds pq rotate` via the HTTP API.
+///
+/// No-op when telemetry has not been installed (tests, harnesses).
+pub fn record_pq_rotation(reason: &str) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_pq_rotation(reason);
     }
 }
 
@@ -1970,6 +2022,24 @@ fn render_exposition(
         out.push_str(&format!(
             "dds_pq_envelope_decrypt_total{{result=\"{}\"}} {}\n",
             escape_label_value(result),
+            count
+        ));
+    }
+
+    // `dds_pq_rotation_total` — per-`reason` epoch-key rotation counter.
+    // Bumped from `DdsNode::rotate_and_fan_out` (B.9).
+    out.push_str(
+        "# HELP dds_pq_rotation_total Phase B epoch-key rotations since process start, \
+         partitioned by reason. time = scheduled 24h rotation timer; revocation = triggered by \
+         an inbound admission revocation (rotates to exclude the revoked peer within 60 s, \
+         with jitter); manual = operator-requested via POST /v1/pq/rotate.\n",
+    );
+    out.push_str("# TYPE dds_pq_rotation_total counter\n");
+    let pq_rotation_snapshot = telemetry.pq_rotation_snapshot();
+    for (reason, count) in pq_rotation_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_pq_rotation_total{{reason=\"{}\"}} {}\n",
+            escape_label_value(reason),
             count
         ));
     }

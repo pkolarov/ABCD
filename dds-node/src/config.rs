@@ -152,6 +152,16 @@ pub struct DomainConfig {
     /// `packed` is still accepted. Empty by default.
     #[serde(default)]
     pub fido2_attestation_roots: Vec<Fido2AttestationRoot>,
+
+    /// **Z-1 Phase B.9** — epoch-key rotation interval in seconds.
+    /// Every node with a Phase-B hybrid KEM keypair rolls a new
+    /// 32-byte AEAD epoch key and re-emits `EpochKeyRelease` to every
+    /// admitted peer on this cadence. The default (86400 s = 24 h)
+    /// matches the `EPOCH_LIFETIME_SECS` used when minting releases.
+    /// Shorter values increase rekeying overhead; longer values widen
+    /// the HNDL window if an epoch key is compromised. Must be > 0.
+    #[serde(default = "default_epoch_rotation_secs")]
+    pub epoch_rotation_secs: u64,
 }
 
 /// A single AAGUID → trust-root binding for Phase 2 of
@@ -354,6 +364,10 @@ fn default_false() -> bool {
 
 fn default_max_delegation_depth() -> usize {
     dds_core::trust::DEFAULT_MAX_CHAIN_DEPTH
+}
+
+fn default_epoch_rotation_secs() -> u64 {
+    86_400
 }
 
 fn default_true() -> bool {

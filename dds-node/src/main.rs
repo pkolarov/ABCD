@@ -1111,6 +1111,7 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    let manual_rotate = Some(node.manual_rotate.clone());
     tokio::spawn(async move {
         if let Err(e) = http::serve(
             &api_addr,
@@ -1119,6 +1120,7 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             admin_policy,
             response_mac_key,
             device_binding,
+            manual_rotate,
         )
         .await
         {

@@ -134,9 +134,9 @@ enum Commands {
     },
     /// Z-1 Phase B operator surface — inspect the local node's
     /// post-quantum encryption posture (hybrid KEM pubkey, current
-    /// epoch_id, cached peer cert / release counts). All actions read
-    /// the on-disk state under `--data-dir` directly; they do not
-    /// require a running dds-node.
+    /// epoch_id, cached peer cert / release counts). Most actions read
+    /// the on-disk state under `--data-dir` directly. `rotate` contacts
+    /// the running node via `--node-url`.
     Pq {
         #[command(subcommand)]
         action: PqAction,
@@ -509,6 +509,10 @@ enum PqAction {
     /// coverage of the admitted peer set before flipping `enc-v3` on
     /// the domain.
     ListPubkeys,
+    /// Trigger an immediate epoch-key rotation on the running node and
+    /// fan-out the new release to all admitted peers. Requires admin
+    /// credentials on the target node (loopback TCP or UDS/pipe identity).
+    Rotate,
 }
 
 // ================================================================
@@ -547,7 +551,7 @@ async fn main() {
             dry_run,
             allow_unsigned,
         } => handle_import(&cli.data_dir, &input, dry_run, allow_unsigned),
-        Commands::Pq { action } => handle_pq(action, &cli.data_dir),
+        Commands::Pq { action } => handle_pq(action, &cli.data_dir, &cli.node_url).await,
     }
 }
 
@@ -2121,10 +2125,21 @@ fn handle_import(data_dir: &Path, input: &Path, dry_run: bool, allow_unsigned: b
 // pq (Z-1 Phase B operator surface)
 // ================================================================
 
-fn handle_pq(action: PqAction, data_dir: &Path) {
+async fn handle_pq(action: PqAction, data_dir: &Path, node_url: &str) {
     match action {
         PqAction::Status => handle_pq_status(data_dir),
         PqAction::ListPubkeys => handle_pq_list_pubkeys(data_dir),
+        PqAction::Rotate => handle_pq_rotate(node_url).await,
+    }
+}
+
+async fn handle_pq_rotate(node_url: &str) {
+    let status = post_no_body(node_url, "/v1/pq/rotate", &()).await;
+    if status.is_success() {
+        println!("Epoch key rotation triggered.");
+    } else {
+        eprintln!("Error: node returned HTTP {status}");
+        std::process::exit(1);
     }
 }
 

@@ -1,6 +1,6 @@
 # DDS Implementation Status
 
-## Documentation-to-Code Verification Addendum (2026-05-01, updated 3rd pass)
+## Documentation-to-Code Verification Addendum (2026-05-01, updated 4th pass)
 
 Manual verification pass compared the progress claims in the Markdown
 tracker files against the current source tree. The Rust worktree contains
@@ -43,8 +43,21 @@ Those changes are treated below as current code reality.
   counter added to telemetry; bumped from every exit branch of
   `DdsNode::build_epoch_key_response` with 7 result labels. Renderer and
   tests updated. `dds_pq_envelope_decrypt_total` now wired to both gossip
-  (B.7) and sync (B.8) decrypt paths. Remaining B.11 work:
-  `dds_pq_rotation_total` (rides on B.9), Phase E alert rules.
+  (B.7) and sync (B.8) decrypt paths.
+- ✅ PQ-B9-ROTATION RESOLVED (2026-05-01): Epoch-key rotation timer, revocation
+  hook, jittered staggering, and fan-out to admitted peers fully landed.
+  `DomainConfig.epoch_rotation_secs` (default 86400 s). Three `select!` branches
+  in `DdsNode::run()`: timed, revocation-jittered (0–30 s), manual. Fan-out mints
+  per-recipient releases and sends via `EpochKeyRequest.outbound_releases`. Responder
+  processes pushed releases through the existing `handle_epoch_key_response` pipeline.
+  `EpochKeyRequest` backward-compat field `outbound_releases` with cap enforcement.
+- ✅ PQ-B10-ROTATE RESOLVED (2026-05-01): `dds pq rotate` CLI command landed.
+  `POST /v1/pq/rotate` admin-gated endpoint signals `Arc<Notify>` from HTTP handler
+  to `DdsNode::run()`. `http::serve` / `serve_unix` / `serve_pipe` each threaded with
+  `manual_rotate: Option<Arc<Notify>>` from `main.rs`.
+- ✅ PQ-B11-ROTATION-METRIC RESOLVED (2026-05-01): `dds_pq_rotation_total{reason=time|revocation|manual}`
+  counter added; `Telemetry.pq_rotation` BTreeMap with `bump_pq_rotation` +
+  `record_pq_rotation` public helper; renderer and module doc-table updated.
 - ✅ CI-DOC-DONE: Loadtest smoke reference updated — now notes that
   `loadtest-smoke.yml` does not yet exist and the loadtest is manual.
   CI pipeline entry updated to drop the stale `thumbv7em-none-eabihf`

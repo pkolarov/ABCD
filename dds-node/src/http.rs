@@ -506,6 +506,12 @@ struct AppState<
     /// the check can bypass the binding for admin callers (the CLI
     /// operator inspecting a peer's policy set).
     admin_policy: Arc<AdminPolicy>,
+    /// **Z-1 Phase B.9 / B.10** — manual-rotation notifier. Shared with
+    /// [`crate::node::DdsNode::manual_rotate`]; calling `notify_one()`
+    /// wakes the swarm task's `run()` loop to fire
+    /// `rotate_and_fan_out("manual")`. `None` in tests that construct a
+    /// bare router without a live DdsNode.
+    manual_rotate: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl<
@@ -525,6 +531,7 @@ impl<
             info: self.info.clone(),
             device_binding: self.device_binding.clone(),
             admin_policy: self.admin_policy.clone(),
+            manual_rotate: self.manual_rotate.clone(),
         }
     }
 }
@@ -697,6 +704,7 @@ pub fn router<S>(
     admin_policy: AdminPolicy,
     response_mac_key: Option<ResponseMacKey>,
     device_binding: Option<Arc<DeviceBindingStore>>,
+    manual_rotate: Option<Arc<tokio::sync::Notify>>,
 ) -> Router
 where
     S: TokenStore
@@ -716,6 +724,7 @@ where
         info,
         device_binding,
         admin_policy: admin_policy.clone(),
+        manual_rotate,
     };
 
     // **H-7 (security review)** — admin-gated sub-router. Every route
@@ -730,6 +739,7 @@ where
         .route("/v1/admin/setup", post(admin_setup::<S>))
         .route("/v1/admin/vouch", post(admin_vouch::<S>))
         .route("/v1/audit/entries", get(list_audit_entries::<S>))
+        .route("/v1/pq/rotate", post(pq_rotate::<S>))
         .route_layer(axum::middleware::from_fn_with_state(
             admin_policy.clone(),
             require_admin_middleware,
@@ -2108,6 +2118,27 @@ fn audit_entry_to_json(e: dds_core::audit::AuditLogEntry) -> Result<AuditEntryJs
     })
 }
 
+/// Trigger a manual epoch-key rotation. Returns 200 OK when the signal is
+/// queued; 503 when the node is not running in PQ mode (no `Notify` handle).
+async fn pq_rotate<S>(State(state): State<AppState<S>>) -> impl IntoResponse
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    if let Some(notify) = &state.manual_rotate {
+        notify.notify_one();
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 /// Bind and serve the HTTP API on `addr` until the future is dropped.
 ///
 /// Scheme dispatch (H-7 step-2):
@@ -2135,6 +2166,7 @@ pub async fn serve<S>(
     admin_policy: AdminPolicy,
     response_mac_key: Option<ResponseMacKey>,
     device_binding: Option<Arc<DeviceBindingStore>>,
+    manual_rotate: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: TokenStore
@@ -2157,6 +2189,7 @@ where
                 admin_policy,
                 response_mac_key,
                 device_binding,
+                manual_rotate,
             )
             .await;
         }
@@ -2177,6 +2210,7 @@ where
                 admin_policy,
                 response_mac_key,
                 device_binding,
+                manual_rotate,
             )
             .await;
         }
@@ -2195,7 +2229,7 @@ where
     // `trust_loopback_tcp_admin`.
     axum::serve(
         listener,
-        router(svc, info, admin_policy, response_mac_key, device_binding),
+        router(svc, info, admin_policy, response_mac_key, device_binding, manual_rotate),
     )
     .await?;
     Ok(())
@@ -2218,6 +2252,7 @@ async fn serve_unix<S>(
     admin_policy: AdminPolicy,
     response_mac_key: Option<ResponseMacKey>,
     device_binding: Option<Arc<DeviceBindingStore>>,
+    manual_rotate: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: TokenStore
@@ -2261,7 +2296,7 @@ where
     std::fs::set_permissions(path, perms)?;
     tracing::info!(path = %path.display(), "HTTP API listening on UDS");
 
-    let app = router(svc, info, admin_policy, response_mac_key, device_binding);
+    let app = router(svc, info, admin_policy, response_mac_key, device_binding, manual_rotate);
 
     loop {
         let (stream, _) = match listener.accept().await {
@@ -2330,6 +2365,7 @@ async fn serve_pipe<S>(
     admin_policy: AdminPolicy,
     response_mac_key: Option<ResponseMacKey>,
     device_binding: Option<Arc<DeviceBindingStore>>,
+    manual_rotate: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: TokenStore
@@ -2350,7 +2386,7 @@ where
     let pipe_path = normalize_pipe_name(pipe_spec);
     tracing::info!(pipe = %pipe_path, "HTTP API listening on named pipe");
 
-    let app = router(svc, info, admin_policy, response_mac_key, device_binding);
+    let app = router(svc, info, admin_policy, response_mac_key, device_binding, manual_rotate);
 
     // First instance: `first_pipe_instance(true)` makes `create` fail
     // if another process has already opened a server on this name.
@@ -2633,6 +2669,7 @@ mod tests {
                 },
                 device_binding: None,
                 admin_policy: Arc::new(tcp_trust_policy()),
+                manual_rotate: None,
             },
             root,
         }
@@ -4800,7 +4837,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None);
+        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -4845,7 +4882,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -4932,7 +4969,7 @@ mod tests {
         let svc = state.svc.clone();
         let info = state.info.clone();
         let key = test_mac_key();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), Some(key.clone()), None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), Some(key.clone()), None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -4958,7 +4995,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5140,7 +5177,7 @@ mod tests {
         let svc = state.svc.clone();
         let info = state.info.clone();
         let key = test_mac_key();
-        let app = router::<MemoryBackend>(svc, info, strict_policy(), Some(key.clone()), None);
+        let app = router::<MemoryBackend>(svc, info, strict_policy(), Some(key.clone()), None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5235,7 +5272,7 @@ mod tests {
             };
 
             let server = tokio::spawn(async move {
-                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None)
+                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None, None)
                     .await;
             });
             wait_for_socket(&sock).await;
@@ -5284,7 +5321,7 @@ mod tests {
             };
 
             let server = tokio::spawn(async move {
-                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None)
+                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None, None)
                     .await;
             });
             wait_for_socket(&sock).await;
@@ -5328,7 +5365,7 @@ mod tests {
             };
 
             let server = tokio::spawn(async move {
-                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None)
+                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None, None)
                     .await;
             });
             wait_for_socket(&sock).await;
@@ -5367,7 +5404,7 @@ mod tests {
             };
 
             let server = tokio::spawn(async move {
-                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None)
+                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None, None)
                     .await;
             });
             wait_for_socket(&sock).await;
@@ -5404,7 +5441,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None);
+        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5479,7 +5516,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None);
+        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5511,7 +5548,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5556,7 +5593,7 @@ mod tests {
         }
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5665,7 +5702,7 @@ mod tests {
         }
         let svc = state2.svc.clone();
         let info = state2.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

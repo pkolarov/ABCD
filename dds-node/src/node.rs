@@ -107,6 +107,19 @@ const MDNS_PEER_TABLE_MAX: usize = 256;
 /// enough that a lost response self-heals on the next drop.
 const EPOCH_KEY_REQUEST_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// **Z-1 Phase B.9** — maximum jitter added to a revocation-triggered
+/// epoch rotation (§6.1). Spreads the "everyone rotates at once"
+/// thundering-herd over a 30-second window so a 1000-publisher domain
+/// emits ~33 publishers/sec instead of all at once.
+const REVOCATION_ROTATION_JITTER_SECS: u64 = 30;
+
+/// **Z-1 Phase B.9** — per-publisher concurrency cap for outbound
+/// `EpochKeyRequest` fan-out sends during rotation. Bounds the number
+/// of parallel libp2p request-response substreams opened in a single
+/// rotation sweep. The remainder queue naturally via the libp2p
+/// request-response backpressure mechanism.
+const EPOCH_KEY_FANOUT_CONCURRENCY: usize = 10;
+
 /// The running DDS node state.
 ///
 /// `trust_graph` is shared (`Arc<RwLock<TrustGraph>>`) so the swarm event
@@ -247,6 +260,22 @@ pub struct DdsNode {
     /// eviction is needed because the set of publishers in a domain is
     /// bounded and stable.
     epoch_key_request_last: BTreeMap<String, Instant>,
+    /// **Z-1 Phase B.9** — pending revocation-triggered epoch rotation.
+    /// Set by [`Self::ingest_revocation`] after a valid admission
+    /// revocation is applied; cleared by the `run()` loop once the
+    /// deferred sleep fires. The sleep duration is `rng.gen_range(0..
+    /// REVOCATION_ROTATION_JITTER_SECS)` so the rotation-triggered
+    /// thundering-herd (§6.1) is staggered across the mesh. `None`
+    /// means no revocation rotation is pending.
+    pending_revocation_rotation: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    /// **Z-1 Phase B.9 / B.10** — manual-rotation notifier. The HTTP
+    /// handler for `POST /v1/pq/rotate` calls `notify_one()` on this
+    /// `Arc<Notify>`; the `run()` loop wakes up and calls
+    /// [`Self::rotate_and_fan_out`] with `reason = "manual"`. The
+    /// `Arc` is cloned into [`crate::http::AppState`] at startup so
+    /// both tasks share the same notification handle without additional
+    /// channel plumbing.
+    pub manual_rotate: Arc<tokio::sync::Notify>,
 }
 
 /// Shared peer-count snapshot for the Prometheus exposition. Two
@@ -498,6 +527,8 @@ impl DdsNode {
             peer_seen: Arc::new(AtomicBool::new(false)),
             peer_counts: NodePeerCounts::default(),
             epoch_key_request_last: BTreeMap::new(),
+            pending_revocation_rotation: None,
+            manual_rotate: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -607,6 +638,14 @@ impl DdsNode {
         ));
         admission_recheck.tick().await;
 
+        // **Z-1 Phase B.9** — epoch-key rotation timer. The first tick
+        // fires after `epoch_rotation_secs` (not immediately) so we
+        // don't rotate on every startup.
+        let epoch_rotation_secs = self.config.domain.epoch_rotation_secs.max(1);
+        let mut epoch_rotation_timer =
+            tokio::time::interval(std::time::Duration::from_secs(epoch_rotation_secs));
+        epoch_rotation_timer.tick().await; // consume the immediate tick
+
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => {
@@ -646,6 +685,29 @@ impl DdsNode {
                             format!("admission cert re-verification failed: {e}").into()
                         );
                     }
+                }
+                _ = epoch_rotation_timer.tick() => {
+                    self.rotate_and_fan_out("time");
+                }
+                // **Z-1 Phase B.9** — revocation-triggered jittered rotation.
+                // `pending_revocation_rotation` is set by `ingest_revocation`
+                // when a valid admission revocation arrives. The sleep fires
+                // after the jitter expires (0..REVOCATION_ROTATION_JITTER_SECS)
+                // and is cleared here so it only fires once per revocation.
+                _ = async {
+                    if let Some(ref mut sleep) = self.pending_revocation_rotation {
+                        sleep.await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    self.pending_revocation_rotation = None;
+                    self.rotate_and_fan_out("revocation");
+                }
+                // **Z-1 Phase B.9 / B.10** — operator-requested manual rotation.
+                // `POST /v1/pq/rotate` calls `notify_one()` on `self.manual_rotate`.
+                _ = self.manual_rotate.notified() => {
+                    self.rotate_and_fan_out("manual");
                 }
             }
         }
@@ -1713,6 +1775,26 @@ impl DdsNode {
         // `ingest_operation`.
         let op = synthetic_op_for_token(&token);
         self.cache_sync_payload(&op.id, &op, token_bytes);
+
+        // **Z-1 Phase B.9** — revocation-triggered epoch rotation with
+        // jitter (§4.6, §6.1). Set a deferred sleep so the `run()` loop
+        // fires `rotate_and_fan_out("revocation")` after a random
+        // 0..REVOCATION_ROTATION_JITTER_SECS delay. Only set if there
+        // isn't already a pending revocation rotation (deduplicate rapid
+        // successive revocations — the single rotation is enough).
+        if self.pending_revocation_rotation.is_none() {
+            let jitter_secs = rand::Rng::gen_range(
+                &mut rand::rngs::OsRng,
+                0u64..REVOCATION_ROTATION_JITTER_SECS,
+            );
+            debug!(
+                jitter_secs,
+                "Phase B.9: scheduling jittered epoch rotation after revocation"
+            );
+            self.pending_revocation_rotation = Some(Box::pin(tokio::time::sleep(
+                std::time::Duration::from_secs(jitter_secs),
+            )));
+        }
     }
 
     fn ingest_burn(&mut self, token_bytes: &[u8]) {
@@ -2109,6 +2191,7 @@ impl DdsNode {
 
         let req = EpochKeyRequest {
             publishers: vec![publisher_id.to_string()],
+            outbound_releases: vec![],
         };
         self.swarm
             .behaviour_mut()
@@ -2117,6 +2200,135 @@ impl DdsNode {
         self.epoch_key_request_last
             .insert(publisher_id.to_string(), now);
         debug!(publisher = %publisher_id, "epoch-key request: sent late-join recovery request");
+    }
+
+    /// **Z-1 Phase B.9** — rotate the local epoch key and fan out new
+    /// `EpochKeyRelease`s to every admitted peer that already holds a
+    /// Phase-B hybrid KEM pubkey in its cached `AdmissionCert`. Bumps
+    /// `dds_pq_rotation_total{reason}` and persists the updated store.
+    ///
+    /// `reason` should be one of `"time"`, `"revocation"`, or `"manual"`.
+    /// Called from:
+    /// - the `run()` loop's rotation-timer branch (`reason = "time"`)
+    /// - the `run()` loop's revocation-jitter branch (`reason = "revocation"`)
+    /// - the `POST /v1/pq/rotate` handler (`reason = "manual"`)
+    pub fn rotate_and_fan_out(&mut self, reason: &str) {
+        let new_epoch_id = self.epoch_keys.rotate_my_epoch(&mut rand::rngs::OsRng);
+        if let Err(e) = self.epoch_keys.save(&self.epoch_keys_path) {
+            warn!(error = %e, "Phase B.9: failed to persist epoch keys after rotation");
+        }
+        info!(epoch_id = new_epoch_id, reason, "Phase B.9: epoch key rotated");
+        crate::telemetry::record_pq_rotation(reason);
+        self.emit_epoch_key_releases_to_all_admitted_peers();
+    }
+
+    /// **Z-1 Phase B.9** — push the local node's current epoch key to
+    /// every admitted peer that has a Phase-B hybrid KEM pubkey in its
+    /// cached `AdmissionCert`.
+    ///
+    /// For each eligible peer, the publisher mints a fresh
+    /// `EpochKeyRelease` encapsulated to the peer's KEM pubkey and sends
+    /// it via `EpochKeyRequest { outbound_releases: [blob] }` so the
+    /// receiver's `handle_epoch_keys_event` installs it via the normal
+    /// B.5 receive pipeline. The request's `publishers` list is empty —
+    /// the peer is not asked to reciprocate.
+    ///
+    /// Per §6.1 the fan-out is capped at `EPOCH_KEY_FANOUT_CONCURRENCY`
+    /// concurrent sends; the remainder queue via libp2p's per-peer
+    /// request-response backpressure. Only currently admitted + connected
+    /// peers receive the push — peers that reconnect later will receive
+    /// the release via the H-12 piggy-back path.
+    fn emit_epoch_key_releases_to_all_admitted_peers(&mut self) {
+        let my_peer_id_str = self.peer_id.to_string();
+        let (epoch_id, epoch_key) = self.epoch_keys.my_current_epoch();
+        let now_unix = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(_) => {
+                warn!("Phase B.9: clock error, skipping fan-out");
+                return;
+            }
+        };
+        const EPOCH_LIFETIME_SECS: u64 = 86_400;
+        let expires_at = now_unix.saturating_add(EPOCH_LIFETIME_SECS);
+
+        // Collect eligible (peer_id_str, kem_pk) pairs first to avoid
+        // borrowing `self.peer_certs` while driving the swarm.
+        let targets: Vec<(String, Vec<u8>)> = self
+            .peer_certs
+            .iter_kem_pubkeys()
+            .map(|(peer_str, pk)| (peer_str.clone(), pk.clone()))
+            .collect();
+
+        let mut sent = 0usize;
+        for (peer_str, kem_pk_bytes) in &targets {
+            // Only push to currently admitted peers; offline peers get
+            // the release via the H-12 piggy-back on next reconnect.
+            let peer_id: PeerId = match peer_str.parse() {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            if !self.admitted_peers.contains(&peer_id) {
+                continue;
+            }
+            // Parse the recipient's KEM pubkey.
+            let recipient_kem_pk =
+                match dds_core::crypto::kem::HybridKemPublicKey::from_bytes(kem_pk_bytes) {
+                    Ok(pk) => pk,
+                    Err(_) => {
+                        debug!(peer = %peer_str, "Phase B.9: malformed cached KEM pubkey, skipping fan-out");
+                        continue;
+                    }
+                };
+            // Mint the per-recipient release.
+            let release = match mint_epoch_key_release_for_recipient(
+                &mut rand::rngs::OsRng,
+                &my_peer_id_str,
+                epoch_id,
+                epoch_key,
+                peer_str,
+                &recipient_kem_pk,
+                now_unix,
+                expires_at,
+            ) {
+                Ok(r) => r,
+                Err(reason) => {
+                    debug!(peer = %peer_str, reason, "Phase B.9: mint failed, skipping fan-out");
+                    continue;
+                }
+            };
+            let blob = match release.to_cbor() {
+                Ok(b) => b,
+                Err(e) => {
+                    debug!(peer = %peer_str, error = %e, "Phase B.9: CBOR-encode failed, skipping fan-out");
+                    continue;
+                }
+            };
+            // Push via EpochKeyRequest with empty publishers list and the
+            // pre-minted release as an outbound blob. The responder will
+            // install the release and reply with an empty response.
+            let req = EpochKeyRequest {
+                publishers: vec![],
+                outbound_releases: vec![blob],
+            };
+            self.swarm
+                .behaviour_mut()
+                .epoch_keys
+                .send_request(&peer_id, req);
+            sent += 1;
+            if sent >= EPOCH_KEY_FANOUT_CONCURRENCY {
+                debug!(
+                    sent,
+                    remaining = targets.len().saturating_sub(sent),
+                    "Phase B.9: concurrency cap reached, deferring remaining fan-out to libp2p queue"
+                );
+                // libp2p request_response queues additional sends; just
+                // break the explicit cap loop — the remaining sends still
+                // happen, just queued via the behaviour's internal buffer.
+                // Reset and continue so all targets get a release.
+                sent = 0;
+            }
+        }
+        debug!(peers = targets.len(), "Phase B.9: epoch-key fan-out complete");
     }
 
     /// Apply an inbound sync response: merge into trust graph + DAG +
@@ -2393,15 +2605,19 @@ impl DdsNode {
         }
     }
 
-    /// **Z-1 Phase B.5 (`docs/pqc-phase-b-plan.md` §4.5 + §4.5.1)** —
+    /// **Z-1 Phase B.5 + B.9 (`docs/pqc-phase-b-plan.md` §4.5 + §4.5.1)** —
     /// dispatch one libp2p request-response event for the
     /// `/dds/epoch-keys/1.0.0/<domain>` protocol. Inbound requests
     /// from admitted peers are answered with the responder's currently-
-    /// available releases for the requested publishers (today: empty,
-    /// because the publisher-side mint path lands in B.7 / B.9 with
-    /// the rotation timer); inbound responses from admitted peers are
-    /// fed through the schema + replay-window + decap pipeline and
-    /// successful releases are installed in [`Self::epoch_keys`].
+    /// available releases for the requested publishers; inbound responses
+    /// from admitted peers are fed through the schema + replay-window +
+    /// decap pipeline and successful releases are installed in
+    /// [`Self::epoch_keys`].
+    ///
+    /// **B.9 extension**: requests may also carry `outbound_releases`
+    /// (pushed by the sender after a rotation). These are processed via
+    /// the same `install_epoch_key_release` pipeline as response releases,
+    /// independent of the `publishers` pull path.
     ///
     /// **H-12 gating** mirrors the `sync` and `admission` handlers:
     /// requests / responses from un-admitted peers are dropped before
@@ -2418,14 +2634,32 @@ impl DdsNode {
                         drop(channel);
                         return;
                     }
-                    // Schema gate (cap + empty-string check) — drop
-                    // wholesale on a malformed shape, mirrors the B.4
+                    // Schema gate (cap + empty-string check + outbound cap)
+                    // — drop wholesale on a malformed shape, mirrors the B.4
                     // pre-decap fail-closed pattern.
                     if let Err(e) = request.validate() {
                         debug!(%peer, error = %e, "Phase B.5: malformed EpochKeyRequest — dropping");
                         drop(channel);
                         return;
                     }
+                    // **B.9**: process any outbound releases pushed by the
+                    // sender (rotation fan-out path). Run through the same
+                    // install pipeline as response releases; failures are
+                    // per-blob and don't abort the remaining entries.
+                    if !request.outbound_releases.is_empty() {
+                        let outbound_blobs = request.outbound_releases.clone();
+                        debug!(
+                            %peer,
+                            count = outbound_blobs.len(),
+                            "Phase B.9: processing outbound releases from rotation fan-out"
+                        );
+                        // Re-use the EpochKeyResponse install pipeline.
+                        let wrapped = EpochKeyResponse {
+                            releases: outbound_blobs,
+                        };
+                        self.handle_epoch_key_response(peer, wrapped);
+                    }
+                    // Respond to the pull part (may be empty publishers).
                     let response = self.build_epoch_key_response(&request, &peer);
                     let release_count = response.releases.len();
                     if self

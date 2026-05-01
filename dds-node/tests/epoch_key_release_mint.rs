@@ -100,6 +100,7 @@ fn spawn_node(domain_key: &DomainKey) -> (DdsNode, tempfile::TempDir) {
             allow_unattested_credentials: false,
             fido2_allowed_aaguids: Vec::new(),
             fido2_attestation_roots: Vec::new(),
+            epoch_rotation_secs: 86_400,
         },
         trusted_roots: Vec::new(),
         bootstrap_admin_urn: None,
@@ -326,6 +327,7 @@ fn build_response_returns_release_for_self_when_requester_kem_known() {
     // Request from the requester asking for the publisher's own key.
     let request = EpochKeyRequest {
         publishers: vec![publisher_id_str.clone()],
+        outbound_releases: vec![],
     };
     let response = publisher.build_epoch_key_response_for_tests(&request, &requester_id);
     assert_eq!(response.releases.len(), 1, "expected one minted release");
@@ -382,6 +384,7 @@ fn build_response_is_empty_when_request_does_not_ask_for_self() {
 
     let request = EpochKeyRequest {
         publishers: vec!["12D3KooWSomeOtherPublisher".to_string()],
+        outbound_releases: vec![],
     };
     let response = publisher.build_epoch_key_response_for_tests(&request, &requester_id);
     assert!(
@@ -403,6 +406,7 @@ fn build_response_is_empty_when_requester_kem_unknown() {
 
     let request = EpochKeyRequest {
         publishers: vec![publisher_id_str.clone()],
+        outbound_releases: vec![],
     };
     let response = publisher.build_epoch_key_response_for_tests(&request, &requester_id);
     assert!(response.releases.is_empty());
@@ -426,6 +430,7 @@ fn build_response_is_empty_when_requester_cert_lacks_kem_pubkey() {
 
     let request = EpochKeyRequest {
         publishers: vec![publisher_id_str.clone()],
+        outbound_releases: vec![],
     };
     let response = publisher.build_epoch_key_response_for_tests(&request, &requester_id);
     assert!(response.releases.is_empty());

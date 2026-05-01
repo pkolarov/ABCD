@@ -995,6 +995,7 @@ async fn spawn_node(org: &str) -> Result<(DdsNode, TempDir), Box<dyn std::error:
             allow_unattested_credentials: true,
             fido2_allowed_aaguids: Vec::new(),
             fido2_attestation_roots: Vec::new(),
+            epoch_rotation_secs: 86_400,
         },
         trusted_roots: Vec::new(),
         bootstrap_admin_urn: None,

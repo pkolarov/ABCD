@@ -91,6 +91,7 @@ fn make_node(
             allow_unattested_credentials: false,
             fido2_allowed_aaguids: Vec::new(),
             fido2_attestation_roots: Vec::new(),
+            epoch_rotation_secs: 86_400,
         },
         trusted_roots: Vec::new(),
         bootstrap_admin_urn: None,

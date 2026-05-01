@@ -162,6 +162,10 @@ pub enum EpochKeyRequestValidateError {
     /// `publishers[i]` is an empty string — receivers cannot route
     /// the request to a publisher key.
     EmptyPublisher { index: usize },
+    /// `outbound_releases.len()` exceeds [`MAX_EPOCH_KEY_RELEASES_PER_RESPONSE`].
+    /// Receivers drop the entire request rather than processing partial
+    /// pushes — mirrors the response cap so the same install budget applies.
+    TooManyOutboundReleases { actual: usize, cap: usize },
 }
 
 impl std::fmt::Display for EpochKeyRequestValidateError {
@@ -172,6 +176,12 @@ impl std::fmt::Display for EpochKeyRequestValidateError {
             }
             Self::EmptyPublisher { index } => {
                 write!(f, "publishers[{index}] is empty")
+            }
+            Self::TooManyOutboundReleases { actual, cap } => {
+                write!(
+                    f,
+                    "outbound_releases: {actual} entries exceeds cap of {cap}"
+                )
             }
         }
     }
@@ -438,6 +448,17 @@ pub struct EpochKeyRequest {
     /// receive side rather than truncated.
     #[serde(default)]
     pub publishers: Vec<String>,
+    /// Optional outbound `EpochKeyRelease` blobs the sender is pushing
+    /// to the recipient (e.g. proactive rotation fan-out). Each blob
+    /// is a CBOR-encoded `EpochKeyRelease` encapsulated *to the
+    /// recipient's* hybrid KEM pubkey, processed by the receiver's
+    /// normal `install_epoch_key_release` pipeline. Capped at
+    /// [`MAX_EPOCH_KEY_RELEASES_PER_RESPONSE`] (same budget as a
+    /// response). A request with only `outbound_releases` (empty
+    /// `publishers`) is valid — the responder answers with an empty
+    /// `EpochKeyResponse` and just installs the pushed releases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outbound_releases: Vec<Vec<u8>>,
 }
 
 impl EpochKeyRequest {
@@ -464,6 +485,12 @@ impl EpochKeyRequest {
             if p.is_empty() {
                 return Err(EpochKeyRequestValidateError::EmptyPublisher { index: i });
             }
+        }
+        if self.outbound_releases.len() > MAX_EPOCH_KEY_RELEASES_PER_RESPONSE {
+            return Err(EpochKeyRequestValidateError::TooManyOutboundReleases {
+                actual: self.outbound_releases.len(),
+                cap: MAX_EPOCH_KEY_RELEASES_PER_RESPONSE,
+            });
         }
         Ok(())
     }
@@ -629,6 +656,7 @@ mod tests {
     fn epoch_key_request_cbor_roundtrip_and_default_empty() {
         let req = EpochKeyRequest {
             publishers: vec!["12D3KooWP1".into(), "12D3KooWP2".into()],
+            outbound_releases: vec![],
         };
         let mut buf = Vec::new();
         ciborium::into_writer(&req, &mut buf).unwrap();
@@ -857,6 +885,7 @@ mod tests {
     fn epoch_key_request_validate_accepts_well_formed_request() {
         let req = EpochKeyRequest {
             publishers: vec!["12D3KooWP1".into(), "12D3KooWP2".into()],
+            outbound_releases: vec![],
         };
         req.validate().unwrap();
     }
@@ -867,6 +896,7 @@ mod tests {
             publishers: (0..MAX_EPOCH_KEY_REQUEST_PUBLISHERS)
                 .map(|i| format!("12D3KooWP{i}"))
                 .collect(),
+            outbound_releases: vec![],
         };
         req.validate().unwrap();
     }
@@ -877,6 +907,7 @@ mod tests {
             publishers: (0..MAX_EPOCH_KEY_REQUEST_PUBLISHERS + 1)
                 .map(|i| format!("12D3KooWP{i}"))
                 .collect(),
+            outbound_releases: vec![],
         };
         assert_eq!(
             req.validate().unwrap_err(),
@@ -891,6 +922,7 @@ mod tests {
     fn epoch_key_request_validate_rejects_empty_publisher_string() {
         let req = EpochKeyRequest {
             publishers: vec!["12D3KooWP1".into(), String::new(), "12D3KooWP3".into()],
+            outbound_releases: vec![],
         };
         assert_eq!(
             req.validate().unwrap_err(),

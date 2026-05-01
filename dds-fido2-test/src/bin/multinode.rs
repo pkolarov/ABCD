@@ -325,6 +325,7 @@ async fn spawn_node(
             allow_unattested_credentials: true,
             fido2_allowed_aaguids: Vec::new(),
             fido2_attestation_roots: Vec::new(),
+            epoch_rotation_secs: 86_400,
         },
         trusted_roots: trusted_roots.to_vec(),
         bootstrap_admin_urn: None,
@@ -463,7 +464,7 @@ fn spawn_http(h: &NodeHandle, admin_attest: &Token) -> Result<(), Box<dyn std::e
     let api_addr = h.node.config.network.api_addr.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = http::serve(&api_addr, shared_svc, info, admin_policy, None, None).await {
+        if let Err(e) = http::serve(&api_addr, shared_svc, info, admin_policy, None, None, None).await {
             eprintln!("HTTP serve error on {api_addr}: {e}");
         }
     });
