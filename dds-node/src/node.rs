@@ -25,6 +25,7 @@ use dds_domain::{DomainId, domain::from_hex};
 
 use crate::admission_revocation_store::{self, AdmissionRevocationStore};
 use crate::config::NodeConfig;
+use crate::peer_cert_store::{self, PeerCertStore};
 
 /// How often we proactively sync against every connected peer as a
 /// backstop against gossip drops. The on-connect sync handles fresh
@@ -164,6 +165,21 @@ pub struct DdsNode {
     /// computed by [`crate::config::NodeConfig::admission_revocations_path`]
     /// at startup.
     admission_revocations_path: PathBuf,
+    /// **Z-1 Phase B.3 / §4.6.2** — local cache of remote peers'
+    /// `AdmissionCert`s, keyed by stringified `PeerId`. Populated on
+    /// every successful H-12 admission handshake in
+    /// [`Self::verify_peer_admission`] (and re-populated when a peer
+    /// re-handshakes after rotating its KEM pubkey). Consumed by Phase
+    /// B.7+ to look up a publisher's hybrid KEM pubkey when wrapping
+    /// or unwrapping an `EpochKeyRelease`; the cert is *not* a trust
+    /// anchor in itself, only a write-after-verify cache of the body
+    /// already verified against [`Self::domain`].
+    peer_certs: PeerCertStore,
+    /// On-disk path that backs [`Self::peer_certs`]. Computed once at
+    /// startup by [`crate::config::NodeConfig::peer_certs_path`]; held
+    /// here so the H-12 success branch can persist newly-cached certs
+    /// without re-reading the config.
+    peer_certs_path: PathBuf,
     /// **Z-3 / Phase A.1 (observability-plan.md)**: optional Vouchsafe
     /// node identity used to emit signed audit-log entries from the
     /// gossip-ingest path. Set via [`Self::set_node_identity`] from
@@ -337,6 +353,30 @@ impl DdsNode {
             );
         }
 
+        // **Z-1 Phase B.3 / §4.6.2** — restore the on-disk cache of
+        // peer admission certs (cleared on every reboot would force
+        // every Phase-B publisher to wait for fresh H-12 handshakes
+        // before its KEM pubkey is reachable). The cache is *not* a
+        // trust anchor: every entry is re-verified against the live
+        // domain on the next handshake, and a stale entry can only
+        // delay a freshly-issued cert by one handshake. A torn or
+        // version-mismatched file fails loud rather than silently
+        // dropping cached pubkeys.
+        let peer_certs_path = config.peer_certs_path();
+        let peer_certs = peer_cert_store::load_or_empty(&peer_certs_path).map_err(|e| {
+            format!(
+                "failed to load peer cert cache from {}: {e}",
+                peer_certs_path.display()
+            )
+        })?;
+        if !peer_certs.is_empty() {
+            info!(
+                count = peer_certs.len(),
+                path = %peer_certs_path.display(),
+                "loaded peer cert cache"
+            );
+        }
+
         // Build trusted roots set
         let trusted_roots: BTreeSet<String> = config.trusted_roots.iter().cloned().collect();
 
@@ -367,6 +407,8 @@ impl DdsNode {
             admitted_peers: BTreeSet::new(),
             admission_revocations,
             admission_revocations_path: revocations_path,
+            peer_certs,
+            peer_certs_path,
             node_identity: None,
             peer_seen: Arc::new(AtomicBool::new(false)),
             peer_counts: NodePeerCounts::default(),
@@ -802,6 +844,13 @@ impl DdsNode {
                 self.admitted_peers.insert(peer_id);
                 crate::telemetry::record_admission_handshake("ok");
                 self.refresh_peer_count_gauges();
+                // **Z-1 Phase B.3 / §4.6.2** — cache the freshly-verified
+                // cert so Phase B.7+ can look up the publisher's hybrid
+                // KEM pubkey. Must run *after* `verify_with_domain` so
+                // a malformed / wrong-length / wrong-signer cert never
+                // lands in the cache. Re-handshake on KEM rotation
+                // overwrites the previous entry.
+                self.cache_peer_admission_cert(peer_str, cert);
                 // Now that we've verified the peer belongs to our
                 // domain, kick off an opportunistic sync.
                 self.try_sync_with(peer_id);
@@ -810,6 +859,30 @@ impl DdsNode {
                 warn!(%peer_id, error = ?e, "H-12: peer cert rejected — staying unadmitted");
                 crate::telemetry::record_admission_handshake("fail");
             }
+        }
+    }
+
+    /// **Z-1 Phase B.3 / §4.6.2** — insert (or overwrite) the
+    /// freshly-verified peer cert into [`Self::peer_certs`] and
+    /// persist the cache atomically. Persistence failures are
+    /// best-effort: a `warn!` log is emitted, but the in-memory entry
+    /// is kept so the running process still has the cert available
+    /// for Phase B.7+ KEM lookups. The next successful save will
+    /// flush both the new entry and any older entries that survived
+    /// the failed write.
+    ///
+    /// Exposed `pub` (rather than private) so a unit test can drive
+    /// the cache funnel directly without spinning up libp2p — the
+    /// integration tests at `dds-node/tests/h12_admission.rs` cover
+    /// the end-to-end handshake path.
+    pub fn cache_peer_admission_cert(&mut self, peer_id: String, cert: dds_domain::AdmissionCert) {
+        self.peer_certs.insert(peer_id, cert);
+        if let Err(e) = self.peer_certs.save(&self.peer_certs_path) {
+            warn!(
+                error = %e,
+                path = %self.peer_certs_path.display(),
+                "H-12: failed to persist peer cert cache (in-memory entry kept)"
+            );
         }
     }
 
@@ -867,11 +940,14 @@ impl DdsNode {
         // not stamp the audit chain.
         let mut added = 0usize;
         let mut newly_added: Vec<Vec<u8>> = Vec::new();
+        let mut newly_revoked_peers: Vec<String> = Vec::new();
         for (rev, blob) in decoded {
+            let revoked_peer = rev.body.peer_id.clone();
             match self.admission_revocations.add(rev) {
                 Ok(true) => {
                     added += 1;
                     newly_added.push(blob);
+                    newly_revoked_peers.push(revoked_peer);
                 }
                 Ok(false) => {}
                 Err(e) => warn!(
@@ -883,6 +959,26 @@ impl DdsNode {
         }
         if added == 0 {
             return;
+        }
+        // **Z-1 Phase B.3 / §4.6.2** — drop cached certs for any
+        // newly-revoked peers so a subsequent Phase B.7+ KEM lookup
+        // cannot reuse the revoked publisher's pubkey. Best-effort
+        // persist; the in-memory eviction is the load-bearing
+        // mutation. Idempotent on a peer not currently cached.
+        let mut evicted = false;
+        for revoked_peer in &newly_revoked_peers {
+            if self.peer_certs.remove(revoked_peer).is_some() {
+                evicted = true;
+            }
+        }
+        if evicted {
+            if let Err(e) = self.peer_certs.save(&self.peer_certs_path) {
+                warn!(
+                    error = %e,
+                    path = %self.peer_certs_path.display(),
+                    "H-12: failed to persist peer cert cache after revocation eviction"
+                );
+            }
         }
         // Stamp the audit chain *before* persisting so a write failure
         // on the on-disk revocation file does not silently drop the
@@ -923,6 +1019,15 @@ impl DdsNode {
     /// node, since the H-12 handshake only fires on connect/reconnect.
     pub fn admission_revocations(&self) -> &AdmissionRevocationStore {
         &self.admission_revocations
+    }
+
+    /// **Z-1 Phase B.3 / §4.6.2** — expose the in-memory peer cert
+    /// cache for tests and for Phase B.7+ KEM-pubkey lookup paths.
+    /// Each entry is a write-after-verify cache (verified against
+    /// [`Self::domain`] before insert); callers must not treat it as
+    /// a trust anchor.
+    pub fn peer_certs(&self) -> &PeerCertStore {
+        &self.peer_certs
     }
 
     /// **M-4 (security review)**: decide whether to accept an

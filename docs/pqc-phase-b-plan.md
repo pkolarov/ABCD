@@ -294,6 +294,23 @@ cert) overwrites the cached entry. Storage budget for a 1000-peer
 domain: ~1.2 MB (1000 × 1216 B `pq_kem_pubkey` + envelope), plus the
 sigs (~3.4 KB each in v2 hybrid). Acceptable.
 
+**§4.6.2 wired into `DdsNode` 2026-05-01 follow-on (Phase B.3
+follow-on).** The `peer_cert_store` module landed in B.3 but was not
+yet held by the running node. `DdsNode` now carries
+`peer_certs: PeerCertStore` and `peer_certs_path: PathBuf`; `init`
+restores the cache from disk; `verify_peer_admission` calls a new
+`cache_peer_admission_cert` helper *after* `verify_with_domain`
+succeeds (never before — a wrong-length / wrong-signer cert can
+never pollute the cache); `merge_piggybacked_revocations` drops
+cached certs for any newly-revoked peers and persists the trimmed
+file so a Phase B.7+ KEM lookup cannot reuse a revoked publisher's
+pubkey. Three regression tests in
+[`dds-node/tests/peer_cert_cache.rs`](../dds-node/tests/peer_cert_cache.rs)
+pin the cache-on-success, re-handshake-overwrites, and
+revocation-evicts contracts without depending on a libp2p swarm
+spin-up — the end-to-end H-12 cache path is already exercised by
+[`dds-node/tests/h12_admission.rs`](../dds-node/tests/h12_admission.rs).
+
 ### 4.7 Mixed-fleet rollout
 
 Three stages, all under a single `Domain.capabilities: Vec<String>`

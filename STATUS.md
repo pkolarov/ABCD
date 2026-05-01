@@ -417,7 +417,78 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-05-01 (Z-1 Phase B.6 —
+> Last updated: 2026-05-01 (Z-1 Phase B.3 follow-on —
+> `dds_node::peer_cert_store` wired into `DdsNode`. The store
+> module landed in B.3 but was not yet held by the running node:
+> the H-12 handshake verified each remote cert against the live
+> `Domain` and dropped it on the floor, so a Phase B.7+ KEM-pubkey
+> lookup against a publisher's cached cert had no source of truth.
+> Three things changed in [`dds-node/src/node.rs`](dds-node/src/node.rs)
+> + [`dds-node/src/config.rs`](dds-node/src/config.rs):
+>
+> 1. **Field plumbed.** `DdsNode` grew `peer_certs: PeerCertStore`
+>    (in-memory cache) and `peer_certs_path: PathBuf` (the on-disk
+>    backing file). New `NodeConfig::peer_certs_path()` defaults to
+>    `<data_dir>/peer_certs.cbor`. `DdsNode::init` calls
+>    `peer_cert_store::load_or_empty` so a previously-cached entry
+>    survives restart and a Phase B.7 receiver decapping a release
+>    from `P` can find `P`'s `pq_kem_pubkey` without waiting on the
+>    next H-12 handshake. A torn or version-mismatched file fails
+>    loud rather than silently dropping cached pubkeys (the
+>    `peer_cert_store::load_or_empty` contract). Stale entries are
+>    not a trust anchor — every cert is re-verified against the
+>    live domain on the next handshake.
+> 2. **Cache funnel on H-12 success.** New
+>    [`DdsNode::cache_peer_admission_cert`](dds-node/src/node.rs)
+>    helper inserts (or overwrites) the verified cert in
+>    `peer_certs` and atomically persists the cache to disk
+>    (best-effort: a write failure is logged but the in-memory
+>    entry is kept so the running process keeps the cert available
+>    for KEM lookups). Called from `verify_peer_admission` *after*
+>    `cert.verify_with_domain` succeeds — never before — so a
+>    malformed / wrong-length / wrong-signer cert can never land
+>    in the cache. Re-handshakes overwrite the previous entry —
+>    necessary so a publisher's KEM-key rotation re-issues a
+>    fresh cert and the cache tracks the new pubkey.
+> 3. **Eviction on revocation.** `merge_piggybacked_revocations`
+>    now drops cached certs for any newly-revoked peers and
+>    persists the trimmed cache, so a Phase B.7+ KEM lookup
+>    cannot reuse the revoked publisher's pubkey after a
+>    revocation has propagated. Idempotent on a peer not
+>    currently cached. Mirrors the
+>    [`peer_cert_store::PeerCertStore::remove`](dds-node/src/peer_cert_store.rs)
+>    docstring contract ("Used by the Phase A revocation path so
+>    a revoked peer's pubkey is forgotten as soon as the
+>    revocation is observed").
+>
+> 3 new regression tests in
+> [`dds-node/tests/peer_cert_cache.rs`](dds-node/tests/peer_cert_cache.rs):
+> `cache_peer_admission_cert_persists_to_disk` (in-memory + on-disk
+> insert), `re_handshake_overwrites_cached_entry` (publisher
+> rotation idiom — bumped `issued_at` yields a distinct
+> deterministic-Ed25519 signature so the test pins the *content*
+> change, not just the count), and `revocation_evicts_cached_cert`
+> (domain-signed revocation through `merge_piggybacked_revocations`
+> drops both the in-memory entry and the on-disk file's entry).
+> The integration tests don't spin up libp2p — they call the
+> public cache + revocation funnels directly so the contract is
+> pinned without dependent on a swarm spin-up; the H-12 end-to-end
+> path (cert decode + verify + cache-on-success) is already
+> covered by `h12_admission.rs`. `cargo test -p dds-node` — 296
+> lib + 3 new integration passing; `cargo fmt --all -- --check`
+> clean; clippy clean.
+>
+> Closes the §4.6.2 receiver-cache piece of
+> [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md) on the
+> running-node side. Does **not** close Z-1 — the wire path
+> (B.7 / B.8 envelope publish + ingest) is the load-bearing
+> remaining step.
+>
+> Next: B.5 `EpochKeyRelease` request-response handler in
+> `dds-node` (now hooked off `peer_certs.iter_kem_pubkeys()`) +
+> the rotation timer (B.9) that drives `rotate_my_epoch`.
+>
+> Previous: 2026-05-01 (Z-1 Phase B.6 —
 > `dds-node::epoch_key_store` landed. New
 > [`EpochKeyStore`](dds-node/src/epoch_key_store.rs) carries the local
 > node's hybrid X25519 + ML-KEM-768 keypair (via

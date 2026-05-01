@@ -414,6 +414,17 @@ impl NodeConfig {
     pub fn admission_revocations_path(&self) -> PathBuf {
         self.data_dir.join("admission_revocations.cbor")
     }
+
+    /// **Z-1 Phase B.3 / §4.6.2** — path to the cached remote peer
+    /// admission certs. Populated on every successful H-12 handshake;
+    /// consumed by Phase B.7+ to look up a publisher's hybrid KEM
+    /// pubkey when decapsulating an `EpochKeyRelease`. Atomic-write
+    /// posture (tempfile + rename + 0o600) handled by
+    /// [`crate::peer_cert_store::save`]. Defaults to
+    /// `<data_dir>/peer_certs.cbor`.
+    pub fn peer_certs_path(&self) -> PathBuf {
+        self.data_dir.join("peer_certs.cbor")
+    }
 }
 
 /// Configuration errors.
