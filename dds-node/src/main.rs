@@ -2,19 +2,20 @@
 //!
 //! Subcommands (hand-rolled, no clap dependency):
 //!
-//! - `dds-node init-domain --name <NAME> --dir <DIR> [--fido2] [--hybrid]`
+//! - `dds-node init-domain --name <NAME> --dir <DIR> [--fido2 | --legacy]`
 //!   Genesis ceremony. Creates a fresh domain keypair, writes
 //!   `<DIR>/domain.toml` (public — share with siblings) and
 //!   `<DIR>/domain_key.bin` (secret — keep safe; encrypted with
-//!   `DDS_DOMAIN_PASSPHRASE` if set). Plain mode generates an
-//!   Ed25519-only keypair (v1/v2 on-disk format). `--hybrid` (Z-1
-//!   Phase A) generates a hybrid Ed25519 + ML-DSA-65 (FIPS 204) keypair
-//!   so the resulting `Domain` advertises a `pq_pubkey` and every
-//!   `AdmissionCert` / `AdmissionRevocation` minted under it carries a
-//!   PQ signature alongside the Ed25519 one (v4/v5 on-disk format).
-//!   `--fido2` and `--hybrid` are mutually exclusive on this command —
-//!   v3 (FIDO2-protected) is Ed25519-only today; v6 hybrid+FIDO2 is a
-//!   future Phase A-3 follow-up.
+//!   `DDS_DOMAIN_PASSPHRASE` if set). **Defaults to hybrid** (Ed25519 +
+//!   ML-DSA-65 / FIPS 204) so the resulting `Domain` advertises a
+//!   `pq_pubkey` and every `AdmissionCert` / `AdmissionRevocation`
+//!   minted under it carries a PQ signature alongside the Ed25519 one
+//!   (v4/v5 on-disk format). Pass `--legacy` only for benchmark or
+//!   regression-test fixtures that explicitly need the v1/v2 Ed25519-only
+//!   path; production deployments should never use it. `--fido2` selects
+//!   the FIDO2-protected v3 format (Ed25519-only today); v6 hybrid+FIDO2
+//!   is a future Phase A-3 follow-up. `--fido2`, `--legacy` are mutually
+//!   exclusive.
 //!
 //! - `dds-node gen-node-key --data-dir <DIR>`
 //!   Generates the persistent libp2p keypair and prints the resulting
@@ -138,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn print_usage() {
     eprintln!(
         "Usage:
-  dds-node init-domain --name <NAME> --dir <DIR> [--fido2 | --hybrid]
+  dds-node init-domain --name <NAME> --dir <DIR> [--fido2 | --legacy]
   dds-node gen-node-key --data-dir <DIR>
   dds-node rotate-identity --data-dir <DIR> [--no-backup]
   dds-node gen-hmac-secret --out <FILE> [--force] [--keep-existing]
@@ -174,18 +175,22 @@ fn cmd_init_domain(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let name = require_flag(args, "--name")?;
     let dir = PathBuf::from(require_flag(args, "--dir")?);
     let use_fido2 = args.iter().any(|a| a == "--fido2");
-    // **Z-1 Phase A** — `--hybrid` opts the new domain into v2 hybrid
-    // (Ed25519 + ML-DSA-65). Without the flag, behaviour is unchanged
-    // (v1 Ed25519-only).
-    let use_hybrid = args.iter().any(|a| a == "--hybrid");
-    if use_hybrid && use_fido2 {
+    // PQ-by-default: hybrid (Ed25519 + ML-DSA-65) is now the default for
+    // new domains. `--legacy` opts back into v1/v2 Ed25519-only and is
+    // intended only for benchmarks and regression-test fixtures that
+    // explicitly need the legacy path. Production deployments should
+    // never pass `--legacy`. `--fido2` keeps the v3 path (Ed25519-only
+    // today; v6 hybrid+FIDO2 is a future Phase A-3 follow-up).
+    let use_legacy = args.iter().any(|a| a == "--legacy");
+    if use_legacy && use_fido2 {
         return Err(
-            "--hybrid and --fido2 are mutually exclusive: the FIDO2 hmac-secret \
-             vault path only protects the Ed25519 half today (v6 hybrid+FIDO2 is a \
-             future Phase A-3 follow-up)"
+            "--legacy and --fido2 are mutually exclusive: --legacy selects v1/v2 plain \
+             Ed25519, --fido2 selects v3 FIDO2-protected Ed25519. Pick one or omit both \
+             (the default is hybrid v4/v5)."
                 .into(),
         );
     }
+    let use_hybrid = !use_legacy && !use_fido2;
     std::fs::create_dir_all(&dir)?;
 
     let mut rng = rand::rngs::OsRng;
@@ -240,7 +245,11 @@ fn cmd_init_domain(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("  domain_key:  {} (keep secret)", key_path.display());
     if use_hybrid {
         println!(
-            "  scheme:      v2 hybrid (Ed25519 + ML-DSA-65) — Z-1 Phase A admission cert path"
+            "  scheme:      v2 hybrid (Ed25519 + ML-DSA-65) — Z-1 Phase A admission cert path (default)"
+        );
+    } else if use_legacy {
+        println!(
+            "  scheme:      v1 legacy (Ed25519 only) — for tests/benchmarks; do NOT use in production"
         );
     }
     if use_fido2 {

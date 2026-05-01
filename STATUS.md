@@ -1,6 +1,6 @@
 # DDS Implementation Status
 
-## Documentation-to-Code Verification Addendum (2026-05-01, updated 4th pass)
+## Documentation-to-Code Verification Addendum (2026-05-01, updated 5th pass)
 
 Manual verification pass compared the progress claims in the Markdown
 tracker files against the current source tree. The Rust worktree contains
@@ -8,6 +8,65 @@ Z-1 Phase B encrypted-gossip changes (`dds-core/src/crypto/epoch_key.rs`,
 `dds-net/src/pq_envelope.rs`, `dds-node/src/node.rs`,
 `dds-node/src/telemetry.rs`, and `dds-node/tests/gossip_encrypt.rs`).
 Those changes are treated below as current code reality.
+
+- ✅ PQ-B12-1 RESOLVED (2026-05-01): Z-1 Phase B.12 integration tests landed
+  at [`dds-node/tests/pqc_b12_integration.rs`](dds-node/tests/pqc_b12_integration.rs).
+  10 tests cover all five lifecycle scenarios from §7 of
+  `docs/pqc-phase-b-plan.md` without a live libp2p swarm: mixed-fleet
+  enc-v3 transition, epoch-key rotation + grace window, revocation-triggered
+  rotation blocking a revoked peer, offline >24h reconnect via fresh release
+  install and via `EpochKeyRequest`/response, and KEM-pubkey rotation while
+  offline (component-binding defence). Z-1 Phase B is now **complete** —
+  B.1–B.12 all landed. `cargo test -p dds-node --test pqc_b12_integration`:
+  **10/10 passing**. `cargo test --workspace`: **892/892 passing**.
+  `docs/pqc-phase-b-plan.md` status header updated to "Complete — B.1–B.12
+  all landed".
+
+- ✅ PQ-DEFAULT-1 RESOLVED (2026-05-01): PQ is now on by default for all
+  fresh deployments. `dds-node init-domain` produces a v4/v5 hybrid
+  (Ed25519 + ML-DSA-65) domain unless `--legacy` is passed (kept only
+  for benchmark / regression-test fixtures); FIDO2 stays v3 Ed25519-only
+  pending the Phase A-3 v6 follow-up. `DomainConfig.capabilities`
+  defaults to `["enc-v3"]` via a new `default_capabilities()` serde
+  helper, so any `dds.toml` that omits the field opts the node into v3
+  encrypted gossip publish + reject-plaintext-receive (B.7/B.8).
+  `platform/linux/packaging/config/node.{anchor,member}.toml` templates
+  add a `__DOMAIN_PQ_PUBKEY__` placeholder under `[domain]` and an
+  explicit `capabilities = ["enc-v3"]` line for visibility. Direct
+  Rust-level `DomainConfig { capabilities: Vec::new(), ... }`
+  constructions in tests are unaffected (struct-literal path bypasses
+  serde defaults), so the existing `gossip_encrypt.rs` /
+  `sync_encrypt.rs` / `pqc_b12_integration.rs` fixtures still exercise
+  both legacy and enc-v3 explicitly. Touched: `dds-node/src/main.rs`
+  (`cmd_init_domain`, doc header, usage banner), `dds-node/src/config.rs`
+  (`DomainConfig.capabilities` default + helper), Linux config
+  templates. Decision rationale: no legacy fleet exists in production yet,
+  so the default flip carries no compat burden — caller validation will
+  surface any test fixture that needs to opt into `--legacy` or
+  `capabilities = []` explicitly.
+
+- 🆕 OPEN — NET-REDIAL-1 (2026-05-01): During the L-1 Linux anchor smoke
+  (Alpine VM anchor + macOS member, dds-smoke domain), restarting the
+  anchor while the member stayed up did **not** cause the member to
+  reconnect. Observation: with `mdns_enabled = false` on the member and
+  the anchor's `bootstrap_peers` only dialed at swarm startup, the
+  member sat orphaned (`dds_peers_admitted=0`, `dds_peers_connected=0`)
+  until manually restarted. Once restarted it dialed the bootstrap
+  multiaddr and admission re-completed (`admission_handshakes_total{ok}`
+  ticked from 1→2 on the anchor). Two possible fixes — pick one or do
+  both:
+    1. Keep `mdns_enabled = true` on members by default in
+       `platform/linux/packaging/config/node.member.toml` (current
+       template defaults already do this; the smoke test forced it off
+       to keep mDNS deterministic). Anchor restart then re-broadcasts
+       and the member finds it within ~1 mDNS interval.
+    2. Add a periodic-redial behavior in the swarm: re-attempt
+       `bootstrap_peers` on a backoff (e.g. every 30 s while
+       `connected_peers == 0`). This is the right fix for WAN anchors
+       where mDNS is not available.
+  Required before L-1A exit gate sign-off ("[anchor] serves as the
+  bootstrap peer for at least one second node" implicitly assumes the
+  second node can actually rejoin after a restart).
 
 - ✅ DOC-PROGRESS-DONE: `docs/pqc-phase-b-plan.md` status header updated
   to "Partial implementation in progress — B.1–B.7 (partial) landed".

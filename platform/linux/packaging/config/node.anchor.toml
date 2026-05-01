@@ -22,5 +22,13 @@ strict_device_binding = true
 name = "__DOMAIN_NAME__"
 id = "__DOMAIN_ID__"
 pubkey = "__DOMAIN_PUBKEY__"
+# PQ-by-default: hybrid (Ed25519 + ML-DSA-65) domain, populated from
+# `dds-node init-domain` output. Required when the domain is hybrid;
+# omit only on a legacy Ed25519-only domain.
+pq_pubkey = "__DOMAIN_PQ_PUBKEY__"
 admission_path = "/var/lib/dds/node/admission.cbor"
 audit_log_enabled = false
+# `capabilities` defaults to ["enc-v3"] (encrypted gossip on); explicit
+# here for visibility. Set to [] only on a legacy plaintext-gossip
+# domain (not recommended).
+capabilities = ["enc-v3"]

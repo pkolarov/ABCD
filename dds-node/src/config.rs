@@ -77,10 +77,11 @@ pub struct DomainConfig {
     /// **Z-1 Phase B.3** — admin-controlled capability tags (e.g.
     /// `["enc-v3"]` to flip the v3 encrypted-gossip gate from "shipped
     /// but disabled" to "publish encrypted + reject plaintext receive").
-    /// Empty by default — preserves byte-identical legacy `dds.toml`
-    /// encodings. Recognized tags: `"enc-v3"`. Unknown tags are
-    /// ignored at load time.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Defaults to `["enc-v3"]` (PQ-by-default). Operators who need to
+    /// opt out for a benchmark or legacy-domain regression test must
+    /// set `capabilities = []` explicitly. Recognized tags: `"enc-v3"`.
+    /// Unknown tags are ignored at load time.
+    #[serde(default = "default_capabilities")]
     pub capabilities: Vec<String>,
     /// Path to the admission certificate. Defaults to
     /// `<data_dir>/admission.cbor`.
@@ -368,6 +369,14 @@ fn default_max_delegation_depth() -> usize {
 
 fn default_epoch_rotation_secs() -> u64 {
     86_400
+}
+
+/// PQ-by-default: every fresh `[domain]` block (and every existing
+/// `dds.toml` that omits `capabilities`) opts into v3 encrypted gossip.
+/// Operators who need legacy plaintext gossip must set
+/// `capabilities = []` explicitly.
+fn default_capabilities() -> Vec<String> {
+    vec!["enc-v3".to_string()]
 }
 
 fn default_true() -> bool {
