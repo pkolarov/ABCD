@@ -35,9 +35,11 @@
 //!   command refuses to run if `<DIR>/p2p_key.bin` is missing — use
 //!   `gen-node-key` for first-time provisioning.
 //!
-//! - `dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--out FILE] [--ttl-days N]`
+//! - `dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--out FILE] [--ttl-days N] [--kem-pubkey <HEX> | --kem-pubkey-path <FILE>]`
 //!   The admin signs an admission cert for a sibling node's peer id.
-//!   Ship the resulting cert to the sibling and place it at
+//!   Pass `--kem-pubkey <HEX>` (from the peer's `gen-node-key` output) to
+//!   embed the peer's hybrid KEM pubkey so enc-v3 encrypted gossip works on
+//!   first connect. Ship the resulting cert to the sibling and place it at
 //!   `<data_dir>/admission.cbor`.
 //!
 //! - `dds-node revoke-admission --domain-key <FILE> --domain <FILE> --peer-id <ID> [--reason <STR>] [--out FILE]`
@@ -261,15 +263,37 @@ fn cmd_init_domain(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 fn cmd_gen_node_key(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = PathBuf::from(require_flag(args, "--data-dir")?);
     std::fs::create_dir_all(&data_dir)?;
+
+    // p2p identity
     let p2p_path = data_dir.join("p2p_key.bin");
     let kp = p2p_identity::load_or_create(&p2p_path)?;
     let peer_id = libp2p::PeerId::from(kp.public());
+
+    // Hybrid KEM keypair — generate (or reload) early so the admin can
+    // pass pq_kem_pubkey to `admit` at provisioning time rather than
+    // waiting for the node's first run. (PQ-DEFAULT-2 fix.)
+    let epoch_keys_path = data_dir.join("epoch_keys.cbor");
+    let needs_save = !epoch_keys_path.exists();
+    let mut rng = rand::thread_rng();
+    let epoch_keys =
+        dds_node::epoch_key_store::EpochKeyStore::load_or_create(&epoch_keys_path, &mut rng)
+            .map_err(|e| format!("epoch_keys: {e}"))?;
+    if needs_save {
+        epoch_keys
+            .save(&epoch_keys_path)
+            .map_err(|e| format!("epoch_keys save: {e}"))?;
+    }
+    let kem_pubkey_hex = to_hex(&epoch_keys.kem_public().to_bytes());
+
     println!("Node libp2p identity:");
-    println!("  data_dir: {}", data_dir.display());
-    println!("  p2p_key:  {}", p2p_path.display());
-    println!("  peer_id:  {}", peer_id);
+    println!("  data_dir:       {}", data_dir.display());
+    println!("  p2p_key:        {}", p2p_path.display());
+    println!("  peer_id:        {peer_id}");
+    println!("  kem_pubkey_hex: {kem_pubkey_hex}");
     println!();
-    println!("Send this peer id to the domain admin to obtain an admission cert.");
+    println!("Send the peer_id and kem_pubkey_hex to the domain admin to obtain an");
+    println!("admission cert.  The admin should pass --kem-pubkey <HEX> to `admit`");
+    println!("so that enc-v3 encrypted gossip is enabled immediately on first connect.");
     Ok(())
 }
 
@@ -508,29 +532,73 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let out = PathBuf::from(flag(args, "--out").unwrap_or("admission.cbor"));
     let ttl_days: Option<u64> = flag(args, "--ttl-days").map(|s| s.parse()).transpose()?;
 
+    // PQ-DEFAULT-2: accept the peer's hybrid KEM pubkey so enc-v3 encrypted
+    // gossip can start immediately after admission. The peer obtains the hex
+    // from `gen-node-key` output (printed as `kem_pubkey_hex`).
+    // `--kem-pubkey-path <FILE>` is an alternative for scripted workflows.
+    let kem_pubkey_hex: Option<String> = flag(args, "--kem-pubkey")
+        .map(|s| s.to_string())
+        .or_else(|| {
+            flag(args, "--kem-pubkey-path")
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.trim().to_string())
+        });
+
+    let kem_pubkey_bytes: Option<Vec<u8>> = match kem_pubkey_hex.as_deref() {
+        Some(hex) if !hex.is_empty() => {
+            let bytes = dds_domain::domain::from_hex(hex)
+                .map_err(|e| format!("--kem-pubkey: {e}"))?;
+            if bytes.len() != dds_domain::HYBRID_KEM_PUBKEY_LEN {
+                return Err(format!(
+                    "--kem-pubkey: expected {} bytes, got {}",
+                    dds_domain::HYBRID_KEM_PUBKEY_LEN,
+                    bytes.len()
+                )
+                .into());
+            }
+            Some(bytes)
+        }
+        _ => None,
+    };
+
     let key = domain_store::load_domain_key(&domain_key_path)?;
     let domain = domain_store::load_domain_file(&domain_path)?;
     if key.id() != domain.id {
         return Err("domain key does not match domain.toml id".into());
     }
 
+    // Warn when admitting onto a hybrid enc-v3 domain without a KEM pubkey
+    // — the peer will fall back to the EpochKeyRequest recovery path and
+    // coverage stays at 0% until the cert is re-issued.
+    if kem_pubkey_bytes.is_none() && domain.pq_pubkey.is_some() {
+        eprintln!("WARNING: domain is hybrid but --kem-pubkey was not supplied.");
+        eprintln!("  The peer will still be admitted, but encrypted-gossip (enc-v3) coverage");
+        eprintln!("  will be 0% until the admission cert is re-issued with --kem-pubkey.");
+        eprintln!("  Run `gen-node-key --data-dir <DIR>` on the peer to get kem_pubkey_hex.");
+    }
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
     let expires_at = ttl_days.map(|d| now + d * 86_400);
-    let cert = key.issue_admission(peer_id.to_string(), now, expires_at);
+    let cert = key.issue_admission_with_kem(peer_id.to_string(), now, expires_at, kem_pubkey_bytes);
     domain_store::save_admission_cert(&out, &cert)?;
 
     println!("Admission cert issued:");
-    println!("  domain:    {} ({})", domain.name, domain.id);
-    println!("  peer_id:   {peer_id}");
-    println!("  issued_at: {now}");
+    println!("  domain:      {} ({})", domain.name, domain.id);
+    println!("  peer_id:     {peer_id}");
+    println!("  issued_at:   {now}");
     if let Some(exp) = expires_at {
-        println!("  expires:   {exp}");
+        println!("  expires:     {exp}");
     } else {
-        println!("  expires:   never");
+        println!("  expires:     never");
     }
-    println!("  out:       {}", out.display());
+    if cert.pq_kem_pubkey.is_some() {
+        println!("  kem_pubkey:  set ({} bytes)", dds_domain::HYBRID_KEM_PUBKEY_LEN);
+    } else {
+        println!("  kem_pubkey:  not set");
+    }
+    println!("  out:         {}", out.display());
     Ok(())
 }
 

@@ -706,9 +706,31 @@ pub fn run_provision(
     let peer_id = libp2p::PeerId::from(kp.public());
     println!("  Peer ID: {peer_id}");
 
+    // PQ-DEFAULT-2: generate (or reload) the hybrid KEM keypair so the
+    // admission cert carries pq_kem_pubkey on first connect — enc-v3
+    // coverage is no longer 0% out of the box on hybrid domains.
+    let epoch_keys_path = data_dir.join("epoch_keys.cbor");
+    let needs_save = !epoch_keys_path.exists();
+    let epoch_keys = {
+        let mut rng = rand::thread_rng();
+        crate::epoch_key_store::EpochKeyStore::load_or_create(&epoch_keys_path, &mut rng)
+            .map_err(|e| ProvisionError::Io(format!("epoch_keys: {e}")))?
+    };
+    if needs_save {
+        epoch_keys
+            .save(&epoch_keys_path)
+            .map_err(|e| ProvisionError::Io(format!("epoch_keys save: {e}")))?;
+    }
+    let kem_pubkey_bytes: Option<Vec<u8>> = if bundle.domain_pq_pubkey.is_some() {
+        Some(epoch_keys.kem_public().to_bytes())
+    } else {
+        None
+    };
+    println!("  KEM pubkey: {}", if kem_pubkey_bytes.is_some() { "set" } else { "not set (legacy domain)" });
+
     let now = now_epoch();
     let ttl = 365 * 86400; // 1 year — re-provision or re-admit to renew
-    let cert = domain_key.issue_admission(peer_id.to_string(), now, Some(now + ttl));
+    let cert = domain_key.issue_admission_with_kem(peer_id.to_string(), now, Some(now + ttl), kem_pubkey_bytes);
 
     // Zeroize domain key — never touches disk on this machine
     let mut secret = domain_key.signing_key.to_bytes();
@@ -2267,6 +2289,86 @@ mod tests {
         assert!(
             data_dir.path().join("node_key.bin").exists(),
             "node_key.bin must still be seeded so dds-node run finds it"
+        );
+    }
+
+    /// **PQ-DEFAULT-2** — provisioning a hybrid domain must:
+    /// 1. write `epoch_keys.cbor` to `data_dir`, and
+    /// 2. embed the hybrid KEM pubkey in the issued admission cert.
+    ///
+    /// Before this fix, `run_provision` always called `issue_admission`
+    /// (KEM pubkey = None), which meant `v3 coverage` stayed at 0% even
+    /// when the domain was enc-v3 capable.
+    #[test]
+    fn provision_hybrid_domain_embeds_kem_pubkey_in_admission_cert() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = TempDir::new().unwrap();
+        let domain_dir = dir.path().join("domain");
+        std::fs::create_dir_all(&domain_dir).unwrap();
+
+        unsafe { std::env::set_var("DDS_DOMAIN_PASSPHRASE", "") };
+        unsafe { std::env::remove_var("DDS_REQUIRE_ENCRYPTED_KEYS") };
+
+        let key = DomainKey::generate_hybrid("pqd2-hybrid", &mut OsRng);
+        let domain = key.domain();
+        domain_store::save_domain_file(&domain_dir.join("domain.toml"), &domain).unwrap();
+        domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
+
+        let bundle_path = dir.path().join("pqd2.dds");
+        create_bundle(&domain_dir, "pqd2-org", &bundle_path).unwrap();
+
+        let data_dir = dir.path().join("node-data");
+        let result = run_provision(&bundle_path, Some(&data_dir), false).unwrap();
+
+        // epoch_keys.cbor must be written by run_provision.
+        assert!(
+            data_dir.join("epoch_keys.cbor").exists(),
+            "epoch_keys.cbor must be created by provision (PQ-DEFAULT-2)"
+        );
+
+        // The admission cert must carry the hybrid KEM pubkey.
+        let cert = domain_store::load_admission_cert(&data_dir.join("admission.cbor")).unwrap();
+        assert!(
+            cert.pq_kem_pubkey.is_some(),
+            "admission cert must embed pq_kem_pubkey on hybrid domain (PQ-DEFAULT-2); peer_id={}",
+            result.peer_id
+        );
+        assert_eq!(
+            cert.pq_kem_pubkey.as_ref().unwrap().len(),
+            dds_domain::HYBRID_KEM_PUBKEY_LEN,
+            "pq_kem_pubkey length mismatch"
+        );
+    }
+
+    /// **PQ-DEFAULT-2** — provisioning a legacy (Ed25519-only) domain
+    /// must NOT embed a KEM pubkey in the admission cert (the cert would
+    /// never be used with enc-v3 anyway, and embedding would be a waste
+    /// of bytes).
+    #[test]
+    fn provision_legacy_domain_does_not_embed_kem_pubkey() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = TempDir::new().unwrap();
+        let domain_dir = dir.path().join("domain");
+        std::fs::create_dir_all(&domain_dir).unwrap();
+
+        unsafe { std::env::set_var("DDS_DOMAIN_PASSPHRASE", "") };
+        unsafe { std::env::remove_var("DDS_REQUIRE_ENCRYPTED_KEYS") };
+
+        let key = DomainKey::generate("pqd2-legacy", &mut OsRng);
+        let domain = key.domain();
+        domain_store::save_domain_file(&domain_dir.join("domain.toml"), &domain).unwrap();
+        domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
+
+        let bundle_path = dir.path().join("pqd2-legacy.dds");
+        create_bundle(&domain_dir, "pqd2-legacy-org", &bundle_path).unwrap();
+
+        let data_dir = dir.path().join("node-data");
+        run_provision(&bundle_path, Some(&data_dir), false).unwrap();
+
+        let cert = domain_store::load_admission_cert(&data_dir.join("admission.cbor")).unwrap();
+        assert!(
+            cert.pq_kem_pubkey.is_none(),
+            "legacy domain admission cert must not carry pq_kem_pubkey"
         );
     }
 }

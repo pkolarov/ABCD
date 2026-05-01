@@ -18,42 +18,36 @@
   `DdsTrayAgent.cpp` gains `IDM_REFRESH_VAULT` menu item; `resource.h` gains the
   constant; `DdsTrayAgent.vcxproj` lists both new source files.
   `docs/windows-ad-coexistence-spec.md` AD-13 row marked ✅; Phase 4 complete.
-  (Phase 5 — AD-15 VM E2E, AD-16 Entra E2E, AD-17 password-replay doc — remains open.)
+  (Phase 5 — AD-15 VM E2E, AD-16 Entra E2E remain open; AD-17 password-replay doc ✅ landed 2026-05-02 — see below.)
 
-- 🆕 OPEN — PQ-DEFAULT-2 (2026-05-02): The `dds-node admit` CLI
-  ([dds-node/src/main.rs:521](dds-node/src/main.rs:521)) unconditionally
-  calls `key.issue_admission(peer_id, now, expires_at)`, which produces
-  a hybrid-signed admission cert WITHOUT a `pq_kem_pubkey` field. So
-  even with PQ-DEFAULT-1 in place (hybrid domain + `enc-v3` capability
-  default on), peer-cert PQ coverage stays at 0% and the
-  encrypted-gossip path has no per-peer KEM pubkey to encrypt to.
-  Verified during the L-1 hybrid smoke (Alpine VM anchor + macOS
-  member, `dds-smoke` domain): both ends report `hybrid=true` on
-  admission verify, but `dds pq status` shows `Cached peer certs: 1,
-  With pq_kem_pubkey: 0, v3 coverage: 0.0%` on both sides. To finish
-  PQ-by-default end-to-end the admit flow needs to plumb the
-  admittee's KEM pubkey through:
-    1. `gen-node-key` should emit (or sidecar-write) the freshly-minted
-       hybrid KEM pubkey hex alongside `peer_id` so the admin has a
-       value to pass to admit. Today the KEM keypair is auto-generated
-       on the node's *first run* (`<data_dir>/epoch_keys.cbor`), which
-       is too late for admission.
-    2. `cmd_admit` should accept `--kem-pubkey <HEX>` (or
-       `--kem-pubkey-path <FILE>`) and call
-       `key.issue_admission_with_kem(peer_id, now, expires_at, kem_pk)`
-       when provided, falling back to `issue_admission()` only on
-       `--legacy`. The helper already exists
-       ([dds-node/src/peer_cert_store.rs:265](dds-node/src/peer_cert_store.rs:265)).
-    3. The `provision` bundle path
-       ([dds-node/src/provision.rs:711](dds-node/src/provision.rs:711))
-       has the same legacy-only pattern and needs the same plumbing,
-       otherwise `dds-node provision` produces v3-blind admission
-       certs even on hybrid domains.
-  Until this lands, encrypted-gossip publish on `enc-v3` domains has
-  no per-peer KEM pubkey and falls back to the `EpochKeyRequest`
-  recovery path, which itself depends on the receiver's KEM pubkey
-  being cached on the publisher (so it cannot bootstrap until at
-  least one cert carries `pq_kem_pubkey`).
+- ✅ RESOLVED — PQ-DEFAULT-2 (2026-05-02, fixed 2026-05-02): `enc-v3`
+  coverage was 0% even on hybrid domains because `cmd_admit` and
+  `run_provision` always called `issue_admission()` (no `pq_kem_pubkey`).
+  Fixed in commit (this session):
+    1. `gen-node-key` now generates/loads `epoch_keys.cbor` at key-gen time
+       and prints `kem_pubkey_hex` so the admin has the value at admit time
+       ([dds-node/src/main.rs](dds-node/src/main.rs) `cmd_gen_node_key`).
+    2. `admit` now accepts `--kem-pubkey <HEX>` / `--kem-pubkey-path <FILE>`
+       and calls `issue_admission_with_kem` when supplied; warns on hybrid
+       domain if flag is omitted
+       ([dds-node/src/main.rs](dds-node/src/main.rs) `cmd_admit`).
+    3. `run_provision` now generates/loads `epoch_keys.cbor` and calls
+       `issue_admission_with_kem` (KEM pubkey set on hybrid domains, None on
+       legacy) so provisioned nodes have enc-v3 coverage from day 1
+       ([dds-node/src/provision.rs](dds-node/src/provision.rs)).
+  Regression tests: `dds-node/tests/admit_kem_pubkey_cli.rs` (4 CLI tests)
+  and two unit tests in `provision.rs`
+  (`provision_hybrid_domain_embeds_kem_pubkey_in_admission_cert`,
+  `provision_legacy_domain_does_not_embed_kem_pubkey`).
+
+- ✅ RESOLVED — AD-17 (2026-05-02): Password-replay model and lockout-prevention
+  security review landed in `security-gaps.md` §"AD-17: Password-Replay Model and
+  Lockout-Prevention Review". Documents the vault threat model (DPAPI machine-scope
+  + DACL + physical FIDO2 key requirement), stale-password window, and confirms
+  AD-14 cooldown ensures ≤ 1 failed DC serialisation per stale-vault incident.
+  `docs/windows-ad-coexistence-spec.md` AD-17 row marked ✅. No code changes
+  required — AD-14 + AD-13 controls are adequate for v1. Phase 5 now has only
+  AD-15 (domain-joined VM E2E) and AD-16 (Entra-only VM E2E) remaining.
 
 ## Documentation-to-Code Verification Addendum (2026-05-01, updated 5th pass)
 
