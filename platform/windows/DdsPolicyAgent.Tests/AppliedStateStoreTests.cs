@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+using System.Runtime.Versioning;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text.Json;
 using DDS.PolicyAgent.HostState;
 using DDS.PolicyAgent.State;
@@ -257,5 +260,43 @@ public class AppliedStateStoreTests : IDisposable
         Assert.Equal("audit", record.LastOutcome);
         Assert.Equal(AppliedReason.AuditDueToAdCoexistence, record.LastReason);
         Assert.Equal(nameof(JoinState.AdJoined), record.HostStateAtApply);
+    }
+
+    // L-16 follow-on: Save() must apply the explicit, non-inherited DACL
+    // even when the calling process can't re-own the file to SYSTEM
+    // (xUnit runner under Administrators lacks SeRestorePrivilege —
+    // setting the owner to a well-known SID throws SE_INVALID_OWNER).
+    // The DACL is the load-bearing security boundary; the owner-change
+    // is best-effort defence-in-depth. Pre-fix this test, and every
+    // other test in this file, threw InvalidOperationException because
+    // the helper rolled DACL + owner into a single SetAccessControl call.
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void Save_applies_protected_dacl_even_when_owner_change_is_denied()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+        _store.RecordApplied("p:dacl", "1", "sha256:dacl", "ok", isSoftware: false);
+
+        var path = Path.Combine(_tmpDir, "applied-state.json");
+        Assert.True(File.Exists(path));
+
+        var sec = new FileInfo(path).GetAccessControl();
+        Assert.True(sec.AreAccessRulesProtected,
+            "DACL must be marked protected (no inheritance from parent dir).");
+
+        var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+        var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+        var rules = sec.GetAccessRules(true, false, typeof(SecurityIdentifier))
+            .Cast<FileSystemAccessRule>()
+            .ToList();
+        Assert.Contains(rules, r =>
+            r.IdentityReference.Equals(system) &&
+            r.AccessControlType == AccessControlType.Allow &&
+            r.FileSystemRights.HasFlag(FileSystemRights.FullControl));
+        Assert.Contains(rules, r =>
+            r.IdentityReference.Equals(admins) &&
+            r.AccessControlType == AccessControlType.Allow &&
+            r.FileSystemRights.HasFlag(FileSystemRights.FullControl));
     }
 }

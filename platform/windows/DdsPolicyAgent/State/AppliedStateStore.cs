@@ -411,19 +411,46 @@ public sealed class AppliedStateStore : IAppliedStateStore
     private static void SetWindowsDacl(string path)
     {
         var info = new FileInfo(path);
-        var security = new FileSecurity();
-        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
-
         var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
         var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
-        security.SetOwner(system);
-        security.SetGroup(system);
-        security.AddAccessRule(new FileSystemAccessRule(
-            system, FileSystemRights.FullControl, AccessControlType.Allow));
-        security.AddAccessRule(new FileSystemAccessRule(
-            admins, FileSystemRights.FullControl, AccessControlType.Allow));
 
-        info.SetAccessControl(security);
+        // The DACL is the load-bearing security boundary: applied
+        // unconditionally so a non-SYSTEM caller (e.g. xUnit runner under
+        // Administrators) still locks down the file. Owner-change is
+        // best-effort defence-in-depth (closes WriteOwner re-take by the
+        // original creator) and is skipped when the caller lacks
+        // SeRestorePrivilege — production agent runs as LocalSystem and
+        // always has it.
+        var dacl = new FileSecurity();
+        dacl.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        dacl.AddAccessRule(new FileSystemAccessRule(
+            system, FileSystemRights.FullControl, AccessControlType.Allow));
+        dacl.AddAccessRule(new FileSystemAccessRule(
+            admins, FileSystemRights.FullControl, AccessControlType.Allow));
+        info.SetAccessControl(dacl);
+
+        try
+        {
+            var ownerOnly = new FileSecurity();
+            ownerOnly.SetOwner(system);
+            ownerOnly.SetGroup(system);
+            info.SetAccessControl(ownerOnly);
+        }
+        catch (InvalidOperationException)
+        {
+            // SE_INVALID_OWNER — caller can't assign SYSTEM as owner.
+            // The DACL above is still in place.
+        }
+        catch (PrivilegeNotHeldException)
+        {
+            // SeRestorePrivilege not held / disabled. Subclass of
+            // UnauthorizedAccessException — must come before the
+            // broader catch.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Same scenario, different surface.
+        }
     }
 }
 

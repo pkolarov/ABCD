@@ -417,7 +417,42 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-05-01 (Z-1 Phase B.3 follow-on —
+> Last updated: 2026-05-01 (CI fix — Windows AppliedStateStoreTests
+> went red on every push since `48ee29c` because the L-16 helper
+> [`AppliedStateStore::SetWindowsDacl`](platform/windows/DdsPolicyAgent/State/AppliedStateStore.cs)
+> rolled DACL + owner into a single
+> `info.SetAccessControl(security)` call. The xUnit runner in
+> GitHub Actions runs as a member of `BUILTIN\Administrators` but
+> does **not** hold `SeRestorePrivilege` (disabled by default on
+> any non-SYSTEM token), and `SetOwner(LocalSystemSid)` therefore
+> threw `InvalidOperationException: The security identifier is not
+> allowed to be the owner of this object.` (SE_INVALID_OWNER) every
+> time `RecordApplied` / `Save` / `RecordManagedItems` tried to
+> persist. **All** non-trivial test cases in `AppliedStateStoreTests`
+> (12 of 19) failed identically; the L-16 production path ran fine
+> because the policy agent runs as `LocalSystem`.
+>
+> Fix: split the DACL apply from the owner-change in both
+> [`AppliedStateStore::SetWindowsDacl`](platform/windows/DdsPolicyAgent/State/AppliedStateStore.cs)
+> and the mirror helper in
+> [`WindowsSoftwareOperations::ApplyWindowsDacl`](platform/windows/DdsPolicyAgent/Enforcers/WindowsSoftwareOperations.cs)
+> (which would have failed identically the moment a unit test
+> exercised `EnsureProtectedCacheDir` outside the test sandbox
+> path). The DACL — the load-bearing security boundary — is applied
+> unconditionally; the owner-change is best-effort defence-in-depth
+> wrapped in `try/catch` for `InvalidOperationException` /
+> `UnauthorizedAccessException` / `PrivilegeNotHeldException`. New
+> regression test
+> [`Save_applies_protected_dacl_even_when_owner_change_is_denied`](platform/windows/DdsPolicyAgent.Tests/AppliedStateStoreTests.cs)
+> (Windows-only via `[SupportedOSPlatform("windows")]`) asserts the
+> persisted file's DACL is `AreAccessRulesProtected = true` (no
+> inheritance) and contains exactly two `FullControl` ACEs — one for
+> `LocalSystemSid` and one for `BuiltinAdministratorsSid` — proving
+> the fail-closed contract still holds even on the test-runner code
+> path. The cross-platform `cargo` workspace was unaffected and
+> stays green.
+>
+> Previous: 2026-05-01 (Z-1 Phase B.3 follow-on —
 > `dds_node::peer_cert_store` wired into `DdsNode`. The store
 > module landed in B.3 but was not yet held by the running node:
 > the H-12 handshake verified each remote cert against the live

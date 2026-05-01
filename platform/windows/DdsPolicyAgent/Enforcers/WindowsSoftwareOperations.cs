@@ -334,29 +334,54 @@ public sealed class WindowsSoftwareOperations : ISoftwareOperations
     private static void ApplyWindowsDacl(string dirPath)
     {
         var info = new DirectoryInfo(dirPath);
-        var security = new DirectorySecurity();
-        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
-
         var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
         var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
-        security.SetOwner(system);
-        security.SetGroup(system);
+
+        // DACL first (load-bearing): applied unconditionally so a non-
+        // SYSTEM caller still locks down the directory. Owner-change is
+        // best-effort defence-in-depth and skipped when the caller lacks
+        // SeRestorePrivilege — production agent runs as LocalSystem and
+        // always has it. Mirrors the L-16 helper in
+        // AppliedStateStore.SetWindowsDacl.
+        var dacl = new DirectorySecurity();
+        dacl.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
         // OICI = ObjectInherit + ContainerInherit; PropagationFlags.None
         // matches the SDDL "OICI" used in `FileLog::Init`.
-        security.AddAccessRule(new FileSystemAccessRule(
+        dacl.AddAccessRule(new FileSystemAccessRule(
             system,
             FileSystemRights.FullControl,
             InheritanceFlags.ObjectInherit | InheritanceFlags.ContainerInherit,
             PropagationFlags.None,
             AccessControlType.Allow));
-        security.AddAccessRule(new FileSystemAccessRule(
+        dacl.AddAccessRule(new FileSystemAccessRule(
             admins,
             FileSystemRights.FullControl,
             InheritanceFlags.ObjectInherit | InheritanceFlags.ContainerInherit,
             PropagationFlags.None,
             AccessControlType.Allow));
+        info.SetAccessControl(dacl);
 
-        info.SetAccessControl(security);
+        try
+        {
+            var ownerOnly = new DirectorySecurity();
+            ownerOnly.SetOwner(system);
+            ownerOnly.SetGroup(system);
+            info.SetAccessControl(ownerOnly);
+        }
+        catch (InvalidOperationException)
+        {
+            // SE_INVALID_OWNER — caller can't assign SYSTEM as owner.
+            // The DACL above is still in place.
+        }
+        catch (PrivilegeNotHeldException)
+        {
+            // SeRestorePrivilege not held / disabled. Subclass of
+            // UnauthorizedAccessException — must come before the
+            // broader catch.
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
     }
 
     private record UninstallEntry(string DisplayName, string? ProductCode, string? UninstallString);
