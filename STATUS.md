@@ -45,28 +45,17 @@ Those changes are treated below as current code reality.
   surface any test fixture that needs to opt into `--legacy` or
   `capabilities = []` explicitly.
 
-- 🆕 OPEN — NET-REDIAL-1 (2026-05-01): During the L-1 Linux anchor smoke
-  (Alpine VM anchor + macOS member, dds-smoke domain), restarting the
-  anchor while the member stayed up did **not** cause the member to
-  reconnect. Observation: with `mdns_enabled = false` on the member and
-  the anchor's `bootstrap_peers` only dialed at swarm startup, the
-  member sat orphaned (`dds_peers_admitted=0`, `dds_peers_connected=0`)
-  until manually restarted. Once restarted it dialed the bootstrap
-  multiaddr and admission re-completed (`admission_handshakes_total{ok}`
-  ticked from 1→2 on the anchor). Two possible fixes — pick one or do
-  both:
-    1. Keep `mdns_enabled = true` on members by default in
-       `platform/linux/packaging/config/node.member.toml` (current
-       template defaults already do this; the smoke test forced it off
-       to keep mDNS deterministic). Anchor restart then re-broadcasts
-       and the member finds it within ~1 mDNS interval.
-    2. Add a periodic-redial behavior in the swarm: re-attempt
-       `bootstrap_peers` on a backoff (e.g. every 30 s while
-       `connected_peers == 0`). This is the right fix for WAN anchors
-       where mDNS is not available.
-  Required before L-1A exit gate sign-off ("[anchor] serves as the
-  bootstrap peer for at least one second node" implicitly assumes the
-  second node can actually rejoin after a restart).
+- ✅ RESOLVED — NET-REDIAL-1 (2026-05-01): Member nodes with
+  `mdns_enabled = false` now automatically redial bootstrap peers every
+  30 s while `connected_peers == 0`. Fix: added `bootstrap_addrs` field
+  to `DdsNode`, pre-parsed from config in `init()`, and a
+  `tokio::time::interval(30s)` select-arm in `run()` that calls
+  `try_bootstrap_redial()`. Four integration tests added and passing:
+  `bootstrap_addrs_parsed_from_config`, `bootstrap_redial_triggers_reconnect_when_no_peers`,
+  `bootstrap_redial_noop_without_configured_peers`,
+  `bootstrap_redial_noop_when_already_connected`.
+  Unblocks L-1A exit gate ("[anchor] serves as the bootstrap peer for
+  at least one second node").
 
 - ✅ DOC-PROGRESS-DONE: `docs/pqc-phase-b-plan.md` status header updated
   to "Partial implementation in progress — B.1–B.7 (partial) landed".

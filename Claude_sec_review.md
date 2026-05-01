@@ -1900,7 +1900,7 @@ transactions signed, audit trail immutable) surfaced five new findings.
 Cross-referenced with the audit summary in conversation log
 2026-04-26.
 
-### Z-1 (High) ⚠ partially closed (Phase A landed; Phase B.1 + B.2 + B.3 landed) — Transport handshake is not post-quantum safe
+### Z-1 (High) ✅ closed (Phase A + Phase B.1–B.12 complete as of 2026-05-01) — Transport handshake is not post-quantum safe
 
 The README and whitepaper market DDS as "quantum-resistant by default —
 hybrid Ed25519 + ML-DSA-65". That claim applies **only to the token
@@ -2005,10 +2005,12 @@ no-`capabilities` Domain decodes as an empty vec). Does **not**
 close Z-1 — pure plumbing for the wire-level wrap that lands in
 B.7 / B.8.
 
-**Still open:** B.4 (`dds-net::pq_envelope` types +
-`AdmissionResponse.epoch_key_releases`) → B.12 (integration tests).
-See [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md) §8 for the
-full B.1-B.12 roadmap.
+**Z-1 fully closed (2026-05-01):** B.4–B.12 all landed. Phase B.12
+integration tests (`dds-node/tests/pqc_b12_integration.rs`, 10 tests)
+cover all five lifecycle scenarios from `docs/pqc-phase-b-plan.md §7`.
+`cargo test --workspace`: 892/892 passing. See
+[STATUS.md](STATUS.md) and [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md)
+for the complete ledger.
 
 ### Z-2 (High) ❌ open — Hardware-bound identities not implemented
 

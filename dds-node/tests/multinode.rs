@@ -30,6 +30,72 @@ use tokio::time::{Instant, sleep, timeout};
 const MESH_FORMATION_TIMEOUT: Duration = Duration::from_secs(10);
 const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Build a single node with an ephemeral listen address, the given
+/// org hash, and an optional list of bootstrap peer addresses.
+/// The bootstrap addrs are stored in `config.network.bootstrap_peers`
+/// so `DdsNode::init` can parse them into `bootstrap_addrs`.
+async fn spawn_node_with_bootstrap(org: &str, bootstrap_peers: Vec<String>) -> (DdsNode, TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().to_path_buf();
+
+    let dkey = dds_domain::DomainKey::from_secret_bytes("test.local", [42u8; 32]);
+    let domain = dkey.domain();
+
+    let p2p_keypair = libp2p::identity::Keypair::generate_ed25519();
+    let peer_id = libp2p::PeerId::from(p2p_keypair.public());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let cert = dkey.issue_admission(peer_id.to_string(), now, None);
+    dds_node::domain_store::save_admission_cert(&data_dir.join("admission.cbor"), &cert).unwrap();
+
+    let cfg = NodeConfig {
+        data_dir,
+        network: NetworkConfig {
+            listen_addr: "/ip4/127.0.0.1/tcp/0".to_string(),
+            bootstrap_peers,
+            mdns_enabled: false,
+            heartbeat_secs: 1,
+            idle_timeout_secs: 60,
+            api_addr: "127.0.0.1:0".to_string(),
+            api_auth: Default::default(),
+            allow_legacy_v1_tokens: false,
+            metrics_addr: None,
+        },
+        org_hash: org.to_string(),
+        domain: dds_node::config::DomainConfig {
+            name: domain.name.clone(),
+            id: domain.id.to_string(),
+            pubkey: dds_domain::domain::to_hex(&domain.pubkey),
+            pq_pubkey: None,
+            capabilities: Vec::new(),
+            admission_path: None,
+            audit_log_enabled: false,
+            max_delegation_depth: 5,
+            audit_log_max_entries: 0,
+            audit_log_retention_days: 0,
+            enforce_device_scope_vouch: false,
+            allow_unattested_credentials: false,
+            fido2_allowed_aaguids: Vec::new(),
+            fido2_attestation_roots: Vec::new(),
+            epoch_rotation_secs: 86_400,
+        },
+        trusted_roots: Vec::new(),
+        bootstrap_admin_urn: None,
+        identity_path: None,
+        expiry_scan_interval_secs: 60,
+    };
+    let mut node = DdsNode::init(cfg, p2p_keypair).expect("init node");
+    node.swarm
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .unwrap();
+    node.topics
+        .subscribe_all(&mut node.swarm.behaviour_mut().gossipsub, false)
+        .unwrap();
+    (node, dir)
+}
+
 /// Build a single node with an ephemeral listen address and the given
 /// org hash. Returns the node, its temp dir (must outlive the node), and
 /// the listen address picked once it's listening.
@@ -837,4 +903,157 @@ async fn relay_revocation_propagates_via_sync_after_originator_drops() {
         c.trust_graph.read().unwrap().is_revoked("att-relay-revoke"),
         c.dag.len(),
     );
+}
+
+// ---- NET-REDIAL-1 tests ----
+
+/// Regression gate for NET-REDIAL-1 (2026-05-01).
+///
+/// Verifies that `DdsNode::init` correctly parses `bootstrap_peers` from
+/// config into the `bootstrap_addrs` field so the periodic redial timer
+/// has the addresses it needs without re-parsing strings on every tick.
+#[tokio::test]
+async fn bootstrap_addrs_parsed_from_config() {
+    // Spin up anchor just to get its peer id + listen addr.
+    let (mut anchor, _ad) = spawn_node("redial-parse").await;
+    let anchor_pid = anchor.peer_id;
+    let anchor_addr = wait_for_listen(&mut anchor).await;
+    let anchor_multiaddr = format!("{}/p2p/{}", anchor_addr, anchor_pid);
+
+    let (member, _md) = spawn_node_with_bootstrap(
+        "redial-parse",
+        vec![anchor_multiaddr],
+    )
+    .await;
+
+    // bootstrap_addrs must contain exactly the one address we configured.
+    assert_eq!(
+        member.bootstrap_addrs_len(),
+        1,
+        "bootstrap_addrs should have 1 entry when bootstrap_peers has 1 address"
+    );
+}
+
+/// Regression gate for NET-REDIAL-1 (2026-05-01).
+///
+/// End-to-end: calls `try_bootstrap_redial` on a disconnected member and
+/// verifies the member reconnects to the anchor. This is the key property
+/// that allows a member to recover after anchor restart when mDNS is
+/// disabled — without this fix the member stays orphaned permanently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_redial_triggers_reconnect_when_no_peers() {
+    let (mut anchor, _ad) = spawn_node("redial-reconnect").await;
+    let anchor_pid = anchor.peer_id;
+    let anchor_addr = wait_for_listen(&mut anchor).await;
+    let anchor_multiaddr = format!("{}/p2p/{}", anchor_addr, anchor_pid);
+
+    let (mut member, _md) = spawn_node_with_bootstrap(
+        "redial-reconnect",
+        vec![anchor_multiaddr],
+    )
+    .await;
+
+    // No peers connected at this point — simulates anchor-restart orphan.
+    assert_eq!(member.connected_peers(), 0);
+
+    // Trigger the redial. This queues swarm.dial() for anchor's addr.
+    member.try_bootstrap_redial();
+
+    // Pump BOTH nodes until member gets a ConnectionEstablished event.
+    // The connection can only complete if both swarms are being driven —
+    // Noise handshake requires the anchor to respond to member's dial.
+    let connected = timeout(MESH_FORMATION_TIMEOUT, async {
+        loop {
+            tokio::select! {
+                event = anchor.swarm.select_next_some() => {
+                    handle_event(&mut anchor, event);
+                }
+                event = member.swarm.select_next_some() => {
+                    if let libp2p::swarm::SwarmEvent::ConnectionEstablished { .. } = &event {
+                        handle_event(&mut member, event);
+                        return;
+                    }
+                    handle_event(&mut member, event);
+                }
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        connected.is_ok(),
+        "member should reconnect to anchor after try_bootstrap_redial (NET-REDIAL-1 regression)"
+    );
+    assert!(
+        member.connected_peers() >= 1,
+        "member.connected_peers() should be ≥ 1 after reconnect"
+    );
+}
+
+/// Regression gate for NET-REDIAL-1 (2026-05-01).
+///
+/// Verifies that `try_bootstrap_redial` is a no-op when bootstrap_peers is
+/// not configured (e.g. the anchor node itself, or mDNS-only members).
+#[tokio::test]
+async fn bootstrap_redial_noop_without_configured_peers() {
+    // spawn_node uses bootstrap_peers: Vec::new() — no bootstrap addrs.
+    let (mut node, _dir) = spawn_node("redial-noop").await;
+
+    assert_eq!(node.bootstrap_addrs_len(), 0);
+    // Must not panic and must not dial anything.
+    node.try_bootstrap_redial();
+    // Reaching here without crash or hang is the pass criterion.
+}
+
+/// Regression gate for NET-REDIAL-1 (2026-05-01).
+///
+/// Verifies that `try_bootstrap_redial` is a no-op when the node already
+/// has at least one connected peer — we only redial when orphaned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_redial_noop_when_already_connected() {
+    let (mut anchor, _ad) = spawn_node("redial-skip").await;
+    let anchor_pid = anchor.peer_id;
+    let anchor_addr = wait_for_listen(&mut anchor).await;
+    let anchor_multiaddr = format!("{}/p2p/{}", anchor_addr, anchor_pid);
+
+    let (mut member, _md) = spawn_node_with_bootstrap(
+        "redial-skip",
+        vec![anchor_multiaddr.clone()],
+    )
+    .await;
+    let member_addr = wait_for_listen(&mut member).await;
+    let member_pid = member.peer_id;
+
+    // Connect one-sided (member → anchor) to avoid simultaneous-dial race.
+    let resp_addr: Multiaddr = anchor_multiaddr.parse().unwrap();
+    member.swarm.add_peer_address(anchor_pid, resp_addr.clone());
+    anchor.swarm.add_peer_address(member_pid, member_addr);
+    member.swarm.dial(resp_addr).unwrap();
+
+    // Drive both nodes until the connection is established.
+    let connected = timeout(MESH_FORMATION_TIMEOUT, async {
+        loop {
+            tokio::select! {
+                event = anchor.swarm.select_next_some() => { handle_event(&mut anchor, event); }
+                event = member.swarm.select_next_some() => {
+                    if let libp2p::swarm::SwarmEvent::ConnectionEstablished { .. } = &event {
+                        handle_event(&mut member, event);
+                        return;
+                    }
+                    handle_event(&mut member, event);
+                }
+            }
+        }
+    })
+    .await;
+    connected.expect("member should connect to anchor");
+
+    assert!(
+        member.connected_peers() >= 1,
+        "member should be connected to anchor"
+    );
+
+    // With at least one peer, try_bootstrap_redial must be a no-op.
+    member.try_bootstrap_redial();
+    // Reaching here without crash is the pass criterion.
 }

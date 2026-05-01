@@ -120,6 +120,15 @@ const REVOCATION_ROTATION_JITTER_SECS: u64 = 30;
 /// request-response backpressure mechanism.
 const EPOCH_KEY_FANOUT_CONCURRENCY: usize = 10;
 
+/// **NET-REDIAL-1**: how often to re-attempt `bootstrap_peers` dials when
+/// the node has no connected peers. Kademlia only dials bootstrap addrs at
+/// startup; if the anchor restarts while a member is running the member sits
+/// orphaned until it also restarts or mDNS re-discovers the anchor. This
+/// timer fires every 30 s and re-dials all configured bootstrap addrs
+/// whenever `connected_peers == 0`, so WAN-anchor members recover without
+/// needing mDNS (which is disabled by default in the member config template).
+const BOOTSTRAP_REDIAL_INTERVAL: Duration = Duration::from_secs(30);
+
 /// The running DDS node state.
 ///
 /// `trust_graph` is shared (`Arc<RwLock<TrustGraph>>`) so the swarm event
@@ -276,6 +285,12 @@ pub struct DdsNode {
     /// both tasks share the same notification handle without additional
     /// channel plumbing.
     pub manual_rotate: Arc<tokio::sync::Notify>,
+    /// **NET-REDIAL-1**: parsed bootstrap peer addresses (peer_id +
+    /// multiaddr with /p2p/ suffix) retained so the periodic redial
+    /// timer can call `swarm.dial()` without re-parsing the config
+    /// strings on every tick. Empty when `config.network.bootstrap_peers`
+    /// is empty (e.g. on the anchor itself or on mDNS-only members).
+    bootstrap_addrs: Vec<Multiaddr>,
 }
 
 /// Shared peer-count snapshot for the Prometheus exposition. Two
@@ -495,6 +510,26 @@ impl DdsNode {
         // Create topics for the (domain, org) pair.
         let topics = DdsTopic::for_domain_org(&domain_id.protocol_tag(), &config.org_hash);
 
+        // **NET-REDIAL-1**: pre-parse bootstrap peer multiaddrs so the
+        // periodic redial timer can call `swarm.dial()` without re-parsing
+        // the raw config strings on every 30-second tick. Warn-and-skip any
+        // address that fails to parse — the same behaviour as the addr-book
+        // registration in `start()`.
+        let bootstrap_addrs: Vec<Multiaddr> = config
+            .network
+            .bootstrap_peers
+            .iter()
+            .filter_map(|addr_str| {
+                match dds_net::discovery::parse_peer_multiaddr(addr_str) {
+                    Ok((_pid, addr)) => Some(addr),
+                    Err(e) => {
+                        warn!(addr = %addr_str, "NET-REDIAL-1: invalid bootstrap peer addr: {e}");
+                        None
+                    }
+                }
+            })
+            .collect();
+
         info!(%peer_id, domain = %config.domain.name, org = %config.org_hash, "DDS node initialized");
 
         Ok(Self {
@@ -529,6 +564,7 @@ impl DdsNode {
             epoch_key_request_last: BTreeMap::new(),
             pending_revocation_rotation: None,
             manual_rotate: Arc::new(tokio::sync::Notify::new()),
+            bootstrap_addrs,
         })
     }
 
@@ -646,6 +682,17 @@ impl DdsNode {
             tokio::time::interval(std::time::Duration::from_secs(epoch_rotation_secs));
         epoch_rotation_timer.tick().await; // consume the immediate tick
 
+        // **NET-REDIAL-1**: periodic bootstrap-peer re-dial. When a member
+        // node configured with WAN bootstrap peers loses all connections (e.g.
+        // anchor restart) it stays orphaned because Kademlia only dials
+        // bootstrap addrs at startup. This timer fires every
+        // `BOOTSTRAP_REDIAL_INTERVAL` and re-dials every configured bootstrap
+        // addr whenever `connected_peers == 0`. Skip immediately when
+        // `bootstrap_addrs` is empty (anchor itself, mDNS-only members).
+        let mut bootstrap_redial =
+            tokio::time::interval(BOOTSTRAP_REDIAL_INTERVAL);
+        bootstrap_redial.tick().await; // consume the immediate tick — start first fire after interval
+
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => {
@@ -709,6 +756,12 @@ impl DdsNode {
                 _ = self.manual_rotate.notified() => {
                     self.rotate_and_fan_out("manual");
                 }
+                // **NET-REDIAL-1**: re-dial bootstrap peers when orphaned.
+                // Fires every BOOTSTRAP_REDIAL_INTERVAL; is a no-op when
+                // bootstrap_addrs is empty or when we already have peers.
+                _ = bootstrap_redial.tick() => {
+                    self.try_bootstrap_redial();
+                }
             }
         }
     }
@@ -726,6 +779,29 @@ impl DdsNode {
         self.admission_cert
             .verify_with_domain(&self.domain, &self.peer_id.to_string(), now)
             .map_err(|e| format!("{e}"))
+    }
+
+    /// **NET-REDIAL-1**: attempt to re-dial all configured bootstrap peers.
+    /// Called from the periodic `run()` timer arm when `connected_peers == 0`.
+    /// Exposed as `pub` so integration tests can call it directly without
+    /// running the full async timer loop.
+    pub fn try_bootstrap_redial(&mut self) {
+        if self.bootstrap_addrs.is_empty() || self.swarm.connected_peers().count() != 0 {
+            return;
+        }
+        for addr in self.bootstrap_addrs.clone() {
+            debug!(%addr, "NET-REDIAL-1: re-dialing bootstrap peer");
+            if let Err(e) = self.swarm.dial(addr.clone()) {
+                warn!(%addr, "NET-REDIAL-1: dial error: {e}");
+            }
+        }
+    }
+
+    /// **NET-REDIAL-1**: number of parsed bootstrap peer addresses retained
+    /// for periodic redialing. Exposed so integration tests can verify that
+    /// addresses were parsed from config without running the full async loop.
+    pub fn bootstrap_addrs_len(&self) -> usize {
+        self.bootstrap_addrs.len()
     }
 
     /// Apply one swarm event using the production ingest path (gossip,
