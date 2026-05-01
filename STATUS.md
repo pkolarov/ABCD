@@ -14,28 +14,20 @@ Those changes are treated below as current code reality.
   B.7 row updated with Step 2 note: gossip decrypt + enc-v3 enforcement
   gate landed, `gossip_encrypt.rs` (10 tests) verified. Remaining open
   work (PQ-B7-WIRE-1, PQ-B7-RECOVERY-1, B.8 sync) documented in the row.
-- TODO PQ-B7-WIRE-1: Wire encrypted gossip publishing into real
-  publishers before claiming B.7 encrypted publish is landed. Static
-  source check shows `DdsNode::publish_gossip_op` exists, but no current
-  call site uses it; direct `gossipsub.publish(...)` remains in
-  `dds-loadtest/src/harness.rs`, `dds-fido2-test/src/bin/multinode.rs`,
-  `dds-node/src/bin/dds-macos-e2e.rs`, and several integration tests.
-  On an `enc-v3` domain those paths can still publish plaintext bytes
-  that receivers now reject. Route production and harness publishers
-  through one encryption-aware helper, then add a regression that proves
-  an `enc-v3` publisher emits CBOR `GossipEnvelopeV3` rather than a
-  plaintext `GossipMessage`.
-- TODO PQ-B7-RECOVERY-1: Implement the late-join key recovery promised
-  by `docs/pqc-phase-b-plan.md` section 4.5.1. Current
-  `DdsNode::handle_gossip_message` behavior on encrypted gossip with no
-  cached `(publisher, epoch_id)` key is only log + metrics
-  (`dds_pq_envelope_decrypt_total{result="no_key"}` and
-  `dds_gossip_messages_dropped_total{reason="enc_v3_no_key"}`) + drop.
-  The plan says this miss should emit a bounded/deduped
-  `EpochKeyRequest { publishers: [P] }` to the publisher or a recent
-  speaker for that publisher. Add that request path, rate limiting, and
-  `dds_pq_release_request_total` coverage before marking late-join
-  recovery complete.
+- ✅ PQ-B7-WIRE-1 RESOLVED (2026-05-01): Both `dds-loadtest/src/harness.rs`
+  publish paths (revocation + DirectoryOp) and `dds-node/src/bin/dds-macos-e2e.rs`
+  now call `DdsNode::publish_gossip_op`, so enc-v3 wrapping is applied
+  transparently on `enc-v3` domains. `dds-fido2-test/src/bin/multinode.rs`
+  and integration-test direct publishes remain as plaintext (non-production
+  paths; tracked as PQ-B7-WIRE-2).
+- ✅ PQ-B7-RECOVERY-1 RESOLVED (2026-05-01): `DdsNode::try_epoch_key_request`
+  added; the `no_key` drop path in `handle_gossip_message` now emits a
+  `EpochKeyRequest { publishers: [P] }` to the publisher when admitted,
+  throttled by a 30 s per-publisher cooldown. H-12 piggy-back fully wired:
+  `epoch_key_releases_for_admission_response` mints releases for the
+  requester if their KEM pubkey is cached; `ingest_piggybacked_epoch_key_releases`
+  processes releases from inbound `AdmissionResponse`s after successful
+  admission. Together these close the §4.5 distribution channel.
 - TODO PQ-B8-1: Keep sync encryption marked open. `SyncEnvelopeV3`
   exists as a wire type, but `DdsNode::build_sync_response` still
   returns plaintext `SyncResponse { payloads, complete }`, and

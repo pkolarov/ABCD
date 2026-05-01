@@ -772,11 +772,11 @@ fn publish_probe(
     let publish_at = Instant::now();
     let n0 = &mut nodes[anchor_idx];
     if revocation {
+        // **PQ-B7-WIRE-1**: use `publish_gossip_op` so enc-v3 wrapping
+        // is applied transparently when the domain has the capability.
+        let topic = n0.topics.revocations.to_ident_topic();
         let msg = GossipMessage::Revocation { token_bytes };
-        if let Ok(cbor) = msg.to_cbor() {
-            let topic = n0.topics.revocations.to_ident_topic();
-            let _ = n0.swarm.behaviour_mut().gossipsub.publish(topic, cbor);
-        }
+        let _ = n0.publish_gossip_op(topic, msg);
         // Mirror locally on publisher.
         let _ = n0.trust_graph.write().unwrap().add_token(token.clone());
         probes.push(Probe {
@@ -798,14 +798,14 @@ fn publish_probe(
         if ciborium::into_writer(&op, &mut op_bytes).is_err() {
             return;
         }
+        // **PQ-B7-WIRE-1**: use `publish_gossip_op` so enc-v3 wrapping
+        // is applied transparently when the domain has the capability.
+        let topic = n0.topics.operations.to_ident_topic();
         let msg = GossipMessage::DirectoryOp {
             op_bytes,
             token_bytes,
         };
-        if let Ok(cbor) = msg.to_cbor() {
-            let topic = n0.topics.operations.to_ident_topic();
-            let _ = n0.swarm.behaviour_mut().gossipsub.publish(topic, cbor);
-        }
+        let _ = n0.publish_gossip_op(topic, msg);
         let _ = n0.trust_graph.write().unwrap().add_token(token.clone());
         use dds_store::traits::TokenStore;
         let _ = n0.store.put_token(&token);

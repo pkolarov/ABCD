@@ -609,13 +609,14 @@ fn publish_operation(node: &mut DdsNode, token: &Token) -> Result<(), Box<dyn st
     let token_bytes = token
         .to_cbor()
         .map_err(|e| format!("encode token cbor: {e}"))?;
+    // **PQ-B7-WIRE-1**: use `publish_gossip_op` so enc-v3 wrapping is
+    // applied transparently when the domain has the capability.
     let msg = GossipMessage::DirectoryOp {
         op_bytes,
         token_bytes,
     };
     let topic = node.topics.operations.to_ident_topic();
-    let cbor = msg.to_cbor()?;
-    let _ = node.swarm.behaviour_mut().gossipsub.publish(topic, cbor);
+    let _ = node.publish_gossip_op(topic, msg);
     Ok(())
 }
 

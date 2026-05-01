@@ -46,10 +46,9 @@ fn make_node(
     domain_key: &DomainKey,
     capabilities: Vec<String>,
 ) -> (dds_node::node::DdsNode, tempfile::TempDir) {
-    let _e = unsafe {
+    unsafe {
         std::env::remove_var("DDS_REQUIRE_ENCRYPTED_KEYS");
-        ()
-    };
+    }
 
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().to_path_buf();

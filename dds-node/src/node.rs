@@ -98,6 +98,15 @@ const MDNS_NEW_PEER_ACCEPT_PER_MINUTE: u32 = 60;
 /// evicted via the mDNS TTL.
 const MDNS_PEER_TABLE_MAX: usize = 256;
 
+/// **Z-1 Phase B.7 PQ-B7-RECOVERY-1**: minimum gap between two outbound
+/// `EpochKeyRequest`s for the same publisher. A node that drops many
+/// gossip envelopes for the same missing epoch key should not flood
+/// the publisher with repeated requests before the first response
+/// arrives. 30 seconds is long enough that one request-response
+/// round-trip completes before the next request is allowed; short
+/// enough that a lost response self-heals on the next drop.
+const EPOCH_KEY_REQUEST_COOLDOWN: Duration = Duration::from_secs(30);
+
 /// The running DDS node state.
 ///
 /// `trust_graph` is shared (`Arc<RwLock<TrustGraph>>`) so the swarm event
@@ -228,6 +237,16 @@ pub struct DdsNode {
     /// [`crate::telemetry::serve`] so the metrics scrape can read both
     /// gauges without reaching into the swarm task.
     peer_counts: NodePeerCounts,
+    /// **Z-1 Phase B.7 / PQ-B7-RECOVERY-1**: per-publisher cooldown
+    /// for outbound `EpochKeyRequest`s. Keyed by the publisher's
+    /// stringified `PeerId`; value is the `Instant` at which the last
+    /// request was sent. Prevents request storms when many consecutive
+    /// gossip envelopes arrive for a publisher whose epoch key we
+    /// haven't yet received. Entries are cheap to keep indefinitely
+    /// (one `PeerId` string + one `Instant` per publisher); no explicit
+    /// eviction is needed because the set of publishers in a domain is
+    /// bounded and stable.
+    epoch_key_request_last: BTreeMap<String, Instant>,
 }
 
 /// Shared peer-count snapshot for the Prometheus exposition. Two
@@ -478,6 +497,7 @@ impl DdsNode {
             node_identity: None,
             peer_seen: Arc::new(AtomicBool::new(false)),
             peer_counts: NodePeerCounts::default(),
+            epoch_key_request_last: BTreeMap::new(),
         })
     }
 
@@ -793,6 +813,14 @@ impl DdsNode {
                     // exchange bounded; entries beyond the cap fan
                     // out on subsequent reconnections.
                     let revocations = self.serialized_revocations_for_wire();
+                    // **Z-1 Phase B.5 / §4.5 H-12 piggy-back**: include
+                    // our current epoch-key release for the requester if
+                    // we have a cached cert with their KEM pubkey. A first-
+                    // ever handshake (no cached cert yet) ships an empty
+                    // list — the requester will use `EpochKeyRequest` via
+                    // PQ-B7-RECOVERY-1 once they start receiving gossip.
+                    let epoch_key_releases =
+                        self.epoch_key_releases_for_admission_response(&peer);
                     if self
                         .swarm
                         .behaviour_mut()
@@ -802,14 +830,7 @@ impl DdsNode {
                             AdmissionResponse {
                                 cert_cbor,
                                 revocations,
-                                // **Z-1 Phase B.4** — placeholder. The
-                                // piggy-back of fresh `EpochKeyRelease`
-                                // blobs lands in B.5/B.6 once the
-                                // local epoch-key store is wired up;
-                                // for now we ship an empty list,
-                                // which is the v1/v2-compatible
-                                // default.
-                                epoch_key_releases: Vec::new(),
+                                epoch_key_releases,
                             },
                         )
                         .is_err()
@@ -852,6 +873,94 @@ impl DdsNode {
         out
     }
 
+    /// **Z-1 Phase B.5 / §4.5 H-12 piggy-back** — mint an
+    /// `EpochKeyRelease` for the requesting peer (if we have a cached
+    /// cert with a `pq_kem_pubkey` for them) and return it as an opaque
+    /// CBOR blob ready for inclusion in [`AdmissionResponse::epoch_key_releases`].
+    ///
+    /// Called from the admission-request responder path. Returns an empty
+    /// `Vec` in all skip cases so the caller always ships a valid (though
+    /// possibly empty) `epoch_key_releases` field.
+    ///
+    /// Skip conditions (all logged at debug):
+    /// - requester has no cached cert (first-ever connection; they will
+    ///   use `EpochKeyRequest` after the H-12 handshake completes);
+    /// - cached cert has no `pq_kem_pubkey` (pre-Phase-B requester);
+    /// - KEM pubkey fails the schema gate;
+    /// - any inner mint / serialization step fails.
+    fn epoch_key_releases_for_admission_response(&self, requester: &PeerId) -> Vec<Vec<u8>> {
+        let requester_str = requester.to_string();
+        let recipient_kem_pk = match self
+            .peer_certs
+            .get(&requester_str)
+            .and_then(|cert| cert.pq_kem_pubkey.as_deref())
+        {
+            Some(bytes) => match dds_core::crypto::kem::HybridKemPublicKey::from_bytes(bytes) {
+                Ok(pk) => pk,
+                Err(_) => {
+                    debug!(
+                        peer = %requester,
+                        "H-12 piggy-back: cached requester KEM pubkey is malformed — empty releases"
+                    );
+                    return Vec::new();
+                }
+            },
+            None => {
+                debug!(
+                    peer = %requester,
+                    "H-12 piggy-back: requester has no cached KEM pubkey — empty releases"
+                );
+                return Vec::new();
+            }
+        };
+
+        let now_unix = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(_) => return Vec::new(),
+        };
+        let expires_at = now_unix + 24 * 3600;
+        let my_peer_id_str = self.peer_id.to_string();
+        let (epoch_id, epoch_key) = self.epoch_keys.my_current_epoch();
+
+        let mut rng = rand::rngs::OsRng;
+        let release = match mint_epoch_key_release_for_recipient(
+            &mut rng,
+            &my_peer_id_str,
+            epoch_id,
+            epoch_key,
+            &requester_str,
+            &recipient_kem_pk,
+            now_unix,
+            expires_at,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(
+                    peer = %requester,
+                    error = %e,
+                    "H-12 piggy-back: mint failed — empty releases"
+                );
+                return Vec::new();
+            }
+        };
+
+        let mut blob = Vec::new();
+        match ciborium::into_writer(&release, &mut blob) {
+            Ok(()) => {
+                debug!(peer = %requester, epoch_id, "H-12 piggy-back: minted epoch-key release");
+                vec![blob]
+            }
+            Err(e) => {
+                debug!(
+                    peer = %requester,
+                    error = %e,
+                    "H-12 piggy-back: failed to serialize release — empty releases"
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// Verify a peer-supplied admission cert (H-12). On success the
     /// peer is added to `admitted_peers` and an opportunistic sync is
     /// kicked off — at this point we've proven the peer belongs to
@@ -875,6 +984,7 @@ impl DdsNode {
         // the cert later fails to verify — the revocations carry
         // their own domain-signed authority and `add` rejects any
         // entry that doesn't verify against our domain pubkey.
+        let epoch_key_releases_from_response = response.epoch_key_releases;
         self.merge_piggybacked_revocations(&peer_id, response.revocations);
 
         let peer_str = peer_id.to_string();
@@ -920,6 +1030,14 @@ impl DdsNode {
                 // lands in the cache. Re-handshake on KEM rotation
                 // overwrites the previous entry.
                 self.cache_peer_admission_cert(peer_str, cert);
+                // **Z-1 Phase B.5 / §4.5 H-12 piggy-back ingest** —
+                // install any epoch-key releases the responder included.
+                // Processed after admission so we only install material
+                // from trusted admitted peers. Each blob runs through the
+                // full receive pipeline (schema → recipient binding →
+                // replay-window → KEM decap → AEAD unwrap) so a
+                // malformed or misaddressed blob is rejected harmlessly.
+                self.ingest_piggybacked_epoch_key_releases(&peer_id, epoch_key_releases_from_response);
                 // Now that we've verified the peer belongs to our
                 // domain, kick off an opportunistic sync.
                 self.try_sync_with(peer_id);
@@ -1081,6 +1199,73 @@ impl DdsNode {
         }
     }
 
+    /// **Z-1 Phase B.5 / §4.5 H-12 piggy-back ingest** — process
+    /// `EpochKeyRelease` blobs the responder included in its
+    /// `AdmissionResponse`. Each blob is run through the full receive
+    /// pipeline (schema → recipient binding → replay-window → KEM decap
+    /// → AEAD unwrap) via [`Self::install_epoch_key_release`]. A blob
+    /// that fails any gate is dropped and logged; the remainder are
+    /// installed normally.
+    ///
+    /// Cap enforcement: a responder that over-sends (more than
+    /// [`dds_net::pq_envelope::MAX_EPOCH_KEY_RELEASES_PER_RESPONSE`]
+    /// blobs) is dropped wholesale to bound the per-message decap budget,
+    /// mirroring the same cap in `handle_epoch_key_response`.
+    fn ingest_piggybacked_epoch_key_releases(
+        &mut self,
+        peer_id: &PeerId,
+        releases: Vec<Vec<u8>>,
+    ) {
+        use dds_net::pq_envelope::MAX_EPOCH_KEY_RELEASES_PER_RESPONSE;
+        if releases.is_empty() {
+            return;
+        }
+        if releases.len() > MAX_EPOCH_KEY_RELEASES_PER_RESPONSE {
+            warn!(
+                %peer_id,
+                count = releases.len(),
+                cap = MAX_EPOCH_KEY_RELEASES_PER_RESPONSE,
+                "H-12 piggy-back: peer over-sent epoch-key releases — dropping"
+            );
+            return;
+        }
+        let now_unix = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(_) => return,
+        };
+        let recipient_str = self.peer_id.to_string();
+        let mut installed = 0usize;
+        for blob in releases {
+            // Bounded depth: peer-supplied (mirrors B.5 receive pipeline).
+            let release: EpochKeyRelease =
+                match dds_core::cbor_bounded::from_reader(blob.as_slice()) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        debug!(
+                            %peer_id,
+                            error = %e,
+                            "H-12 piggy-back: skipping release that failed to decode"
+                        );
+                        continue;
+                    }
+                };
+            match self.install_epoch_key_release(&release, &recipient_str, now_unix) {
+                Ok(InstallOutcome::Inserted) | Ok(InstallOutcome::Rotated) => installed += 1,
+                Ok(InstallOutcome::AlreadyCurrent) | Ok(InstallOutcome::Stale) => {}
+                Err(reason) => {
+                    debug!(
+                        %peer_id,
+                        reason,
+                        "H-12 piggy-back: epoch-key release rejected"
+                    );
+                }
+            }
+        }
+        if installed > 0 {
+            debug!(%peer_id, installed, "H-12 piggy-back: installed epoch-key releases");
+        }
+    }
+
     /// Threat-model §1 — open item #4 (admission cert revocation list):
     /// expose the in-memory revocation store for tests. The store is
     /// loaded once at startup; callers that want to force a reload
@@ -1166,6 +1351,11 @@ impl DdsNode {
                     );
                     crate::telemetry::record_pq_envelope_decrypt("no_key");
                     crate::telemetry::record_gossip_messages_dropped("enc_v3_no_key");
+                    // **PQ-B7-RECOVERY-1**: attempt late-join recovery by
+                    // requesting the publisher's current epoch key. The
+                    // request is throttled by EPOCH_KEY_REQUEST_COOLDOWN
+                    // so rapid successive drops don't flood the publisher.
+                    self.try_epoch_key_request(&env.publisher);
                     return;
                 }
                 Some(epoch_key) => {
@@ -1806,6 +1996,62 @@ impl DdsNode {
     pub fn force_sync_with(&mut self, peer: PeerId) {
         self.sync_last_outbound.remove(&peer);
         self.try_sync_with(peer);
+    }
+
+    /// **Z-1 Phase B.7 / PQ-B7-RECOVERY-1** — request the epoch key for
+    /// `publisher_id` from the publisher itself (if currently admitted).
+    ///
+    /// Called from [`Self::handle_gossip_message`] when a
+    /// `GossipEnvelopeV3` arrives for a publisher whose epoch key is not
+    /// yet in the local cache (the `no_key` drop path). Sending a
+    /// targeted `EpochKeyRequest` to the publisher triggers
+    /// `build_epoch_key_response` on their side, which mints a fresh
+    /// `EpochKeyRelease` encapsulated to our hybrid KEM pubkey.
+    ///
+    /// Respects a per-publisher cooldown (`EPOCH_KEY_REQUEST_COOLDOWN`)
+    /// to avoid flooding the publisher on rapid successive drops before
+    /// the first response arrives. If the publisher is not currently
+    /// in `admitted_peers` the request is silently skipped — the next
+    /// reconnect + re-admission will install the release via the H-12
+    /// piggy-back path.
+    fn try_epoch_key_request(&mut self, publisher_id: &str) {
+        let now = Instant::now();
+        if let Some(prev) = self.epoch_key_request_last.get(publisher_id) {
+            if now.duration_since(*prev) < EPOCH_KEY_REQUEST_COOLDOWN {
+                return;
+            }
+        }
+
+        // Parse the publisher string into a PeerId to look up in
+        // admitted_peers. If the publisher is not currently admitted
+        // (offline / not yet handshaken), skip — the H-12 piggy-back
+        // on the next reconnect will deliver the release.
+        let publisher_peer_id: PeerId = match publisher_id.parse() {
+            Ok(id) => id,
+            Err(_) => {
+                debug!(publisher = %publisher_id, "epoch-key request: malformed publisher PeerId — skipping");
+                return;
+            }
+        };
+
+        if !self.admitted_peers.contains(&publisher_peer_id) {
+            debug!(
+                publisher = %publisher_id,
+                "epoch-key request: publisher not currently admitted — skipping"
+            );
+            return;
+        }
+
+        let req = EpochKeyRequest {
+            publishers: vec![publisher_id.to_string()],
+        };
+        self.swarm
+            .behaviour_mut()
+            .epoch_keys
+            .send_request(&publisher_peer_id, req);
+        self.epoch_key_request_last
+            .insert(publisher_id.to_string(), now);
+        debug!(publisher = %publisher_id, "epoch-key request: sent late-join recovery request");
     }
 
     /// Apply an inbound sync response: merge into trust graph + DAG +

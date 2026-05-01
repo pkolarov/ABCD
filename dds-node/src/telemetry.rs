@@ -753,6 +753,7 @@ pub struct Telemetry {
     /// - `ok` — epoch key looked up and AEAD decryption succeeded.
     /// - `no_key` — no cached epoch key for (publisher, epoch_id).
     /// - `aead_fail` — key present but AEAD tag verification failed.
+    ///
     /// Bumped from [`crate::node::DdsNode::handle_gossip_message`]
     /// (gossip path) and eventually from the sync decrypt path (B.8).
     pq_envelope_decrypt: Mutex<BTreeMap<String, u64>>,

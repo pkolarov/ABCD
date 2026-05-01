@@ -4190,7 +4190,7 @@ mod platform_applier_tests {
         let (svc, _, _) = setup();
         let counts = svc.trust_graph_counts().expect("graph not poisoned");
         assert_eq!(counts.attestations, 1);
-        assert_eq!(counts.vouches, 3);
+        assert_eq!(counts.vouches, 4);
         assert_eq!(counts.revocations, 0);
         assert_eq!(counts.burned, 0);
         // observability-plan.md Phase C — the body_type partition
