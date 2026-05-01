@@ -1,5 +1,60 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-02, updated 6th pass)
+
+- ✅ RESOLVED — AD-13 (2026-05-02): Vault refresh flow landed. New
+  [`platform/windows/native/DdsTrayAgent/RefreshVaultFlow.h`](platform/windows/native/DdsTrayAgent/RefreshVaultFlow.h)
+  and [`RefreshVaultFlow.cpp`](platform/windows/native/DdsTrayAgent/RefreshVaultFlow.cpp)
+  implement the "Refresh Stored Password…" tray menu item per
+  `docs/windows-ad-coexistence-spec.md §6.2`. The flow: (1) checks
+  `dds::GetCachedJoinState()` — blocks on `EntraOnlyJoined`; on `Unknown`
+  proceeds only when a vault entry already exists for the current SID;
+  (2) loads `CCredentialVault`, finds the SID's entry; (3) prompts for
+  the current Windows password; (4) calls `CWebAuthnHelper::GetAssertionHmacSecret`
+  with the **existing** `credential_id` and `salt` (no `MakeCredential`);
+  (5) re-encrypts under the derived key via `CCredentialVault::EncryptPassword`;
+  (6) saves via `EnrollUser` + `Save`; (7) fires `DDS_CLEAR_STALE` (0x0065)
+  to the Auth Bridge via `CIpcPipeClient::SendRequestNoReply` (fire-and-forget).
+  `DdsTrayAgent.cpp` gains `IDM_REFRESH_VAULT` menu item; `resource.h` gains the
+  constant; `DdsTrayAgent.vcxproj` lists both new source files.
+  `docs/windows-ad-coexistence-spec.md` AD-13 row marked ✅; Phase 4 complete.
+  (Phase 5 — AD-15 VM E2E, AD-16 Entra E2E, AD-17 password-replay doc — remains open.)
+
+- 🆕 OPEN — PQ-DEFAULT-2 (2026-05-02): The `dds-node admit` CLI
+  ([dds-node/src/main.rs:521](dds-node/src/main.rs:521)) unconditionally
+  calls `key.issue_admission(peer_id, now, expires_at)`, which produces
+  a hybrid-signed admission cert WITHOUT a `pq_kem_pubkey` field. So
+  even with PQ-DEFAULT-1 in place (hybrid domain + `enc-v3` capability
+  default on), peer-cert PQ coverage stays at 0% and the
+  encrypted-gossip path has no per-peer KEM pubkey to encrypt to.
+  Verified during the L-1 hybrid smoke (Alpine VM anchor + macOS
+  member, `dds-smoke` domain): both ends report `hybrid=true` on
+  admission verify, but `dds pq status` shows `Cached peer certs: 1,
+  With pq_kem_pubkey: 0, v3 coverage: 0.0%` on both sides. To finish
+  PQ-by-default end-to-end the admit flow needs to plumb the
+  admittee's KEM pubkey through:
+    1. `gen-node-key` should emit (or sidecar-write) the freshly-minted
+       hybrid KEM pubkey hex alongside `peer_id` so the admin has a
+       value to pass to admit. Today the KEM keypair is auto-generated
+       on the node's *first run* (`<data_dir>/epoch_keys.cbor`), which
+       is too late for admission.
+    2. `cmd_admit` should accept `--kem-pubkey <HEX>` (or
+       `--kem-pubkey-path <FILE>`) and call
+       `key.issue_admission_with_kem(peer_id, now, expires_at, kem_pk)`
+       when provided, falling back to `issue_admission()` only on
+       `--legacy`. The helper already exists
+       ([dds-node/src/peer_cert_store.rs:265](dds-node/src/peer_cert_store.rs:265)).
+    3. The `provision` bundle path
+       ([dds-node/src/provision.rs:711](dds-node/src/provision.rs:711))
+       has the same legacy-only pattern and needs the same plumbing,
+       otherwise `dds-node provision` produces v3-blind admission
+       certs even on hybrid domains.
+  Until this lands, encrypted-gossip publish on `enc-v3` domains has
+  no per-peer KEM pubkey and falls back to the `EpochKeyRequest`
+  recovery path, which itself depends on the receiver's KEM pubkey
+  being cached on the publisher (so it cannot bootstrap until at
+  least one cert carries `pq_kem_pubkey`).
+
 ## Documentation-to-Code Verification Addendum (2026-05-01, updated 5th pass)
 
 Manual verification pass compared the progress claims in the Markdown
