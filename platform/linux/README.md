@@ -162,6 +162,81 @@ are reviewed.
 
 ### L-1: Agent Skeleton
 
+L-1 delivery is not policy enforcement. It is the first usable Linux platform
+runtime: a Linux host can run `dds-node` with stable identity, participate in the
+DDS network, act as a bootstrap/anchor peer, and run a no-op policy agent that
+proves the local trust path.
+
+Split L-1 into two tracks:
+
+1. Linux node runtime and anchor readiness.
+2. Linux policy-agent skeleton with no host mutation.
+
+#### L-1A: Linux Node Runtime and Anchor Readiness
+
+- Add Linux runtime packaging drafts:
+  - `platform/linux/packaging/systemd/dds-node.service`
+  - `platform/linux/packaging/systemd/dds-policy-agent.service`
+  - `platform/linux/packaging/config/node.anchor.toml`
+  - `platform/linux/packaging/config/node.member.toml`
+  - `platform/linux/packaging/config/policy-agent.json`
+- Define production Linux node paths:
+  - node config: `/etc/dds/node.toml`
+  - node state: `/var/lib/dds/node`
+  - node identity: `/var/lib/dds/node/node_key.bin`
+  - admission certificate: `/var/lib/dds/node/admission.cbor`
+  - API socket: `unix:/run/dds/api.sock`
+  - logs: journald, with optional file forwarding under `/var/log/dds/`
+- The anchor node config must set:
+  - `data_dir = "/var/lib/dds/node"`
+  - `listen_addr = "/ip4/0.0.0.0/tcp/4001"`
+  - `bootstrap_peers = []`
+  - `mdns_enabled = true` for LAN labs, documented as optional for WAN anchors
+  - `api_addr = "unix:/run/dds/api.sock"`
+  - `network.api_auth.trust_loopback_tcp_admin = false`
+  - `network.api_auth.strict_device_binding = true`
+  - optional `metrics_addr = "127.0.0.1:9495"`
+- The member node config must use the same state/API defaults, but include a
+  documented `bootstrap_peers` example pointing at the anchor multiaddr:
+
+```toml
+bootstrap_peers = [
+  "/ip4/203.0.113.10/tcp/4001/p2p/12D3KooW..."
+]
+```
+
+- `dds-node.service` requirements:
+  - run `dds-node run /etc/dds/node.toml`
+  - start after `network-online.target`
+  - restart on failure
+  - create or require `dds` runtime/state directories with restrictive
+    permissions
+  - expose the UDS at `/run/dds/api.sock`
+  - keep node identity stable across service restarts
+- Document the identity and admission lifecycle:
+  - first anchor keeps its generated node identity in `/var/lib/dds/node`
+  - anchor is bootstrapped into a domain with `org_hash`, domain identity,
+    trusted roots, and admission certificate
+  - additional Linux members receive an admission certificate and use the
+    anchor's published `/p2p/...` multiaddr as a bootstrap peer
+  - deleting `node_key.bin` creates a different peer and must be treated as
+    node replacement, not routine repair
+- Add a Linux anchor smoke runbook under `platform/linux/e2e/README.md`:
+  - build `dds-node` on Linux
+  - install or stage `dds-node.service`
+  - start one anchor node
+  - capture the anchor peer ID and advertised multiaddr
+  - start a second Linux node or an existing macOS node with that bootstrap peer
+  - confirm `/readyz` is ready and `/v1/status` shows peer connectivity
+  - restart the anchor and confirm the peer ID is unchanged
+  - confirm the policy agent can reach the node through the Unix socket
+
+L-1A exit gate: a Linux host can run `dds-node` as a stable systemd service,
+hold persistent node identity, expose the UDS admin API, advertise a usable
+libp2p multiaddr, and serve as the bootstrap peer for at least one second node.
+
+#### L-1B: No-Op Linux Policy Agent
+
 - Create the first Linux policy agent project:
   - `platform/linux/DdsPolicyAgent/DdsPolicyAgent.Linux.csproj`
   - `platform/linux/DdsPolicyAgent/Program.cs`
@@ -245,10 +320,10 @@ Add development systemd units under `platform/linux/packaging/systemd/`:
 - `dds-node.service`
 - `dds-policy-agent.service`
 
-The policy-agent unit should run as root for L-1 only because later enforcers
-will need privileged host operations. Add a note in the unit comments that L-1
-does not mutate host state, and that L-2 must revisit privilege separation
-before real enforcers land.
+The policy-agent unit may run as root for L-1 only because later enforcers will
+need privileged host operations. Add a note in the unit comments that L-1 does
+not mutate host state, and that L-2 must revisit privilege separation before
+real enforcers land.
 
 Add node and CLI stubs needed by the skeleton:
 
@@ -289,19 +364,24 @@ Tests for L-1:
 
 L-1 implementation order:
 
-1. Add Linux schemas and `/v1/linux/*` routes in `dds-node`.
-2. Add `dds platform linux ...` CLI commands.
-3. Copy the proven client, envelope, UDS transport, config, and state-store
+1. Add Linux node service/config templates and the anchor smoke runbook.
+2. Validate `dds-node` builds and runs on Linux with `/etc/dds/node.toml`.
+3. Prove persistent node identity and anchor/member connectivity.
+4. Add Linux schemas and `/v1/linux/*` routes in `dds-node`.
+5. Add `dds platform linux ...` CLI commands.
+6. Copy the proven client, envelope, UDS transport, config, and state-store
    patterns into the Linux agent namespace.
-4. Implement the no-op worker and empty Linux policy dispatch.
-5. Add the systemd unit drafts and development config.
-6. Add the L-1 tests.
-7. Run `dotnet test` for the Linux agent tests and targeted Rust tests for the
+7. Implement the no-op worker and empty Linux policy dispatch.
+8. Add the policy-agent development config.
+9. Add the L-1 tests.
+10. Run `dotnet test` for the Linux agent tests and targeted Rust tests for the
    new node/CLI route plumbing.
 
-Exit gate: on a clean Linux VM or container with systemd, the agent starts,
-fetches a signed Linux policy envelope through the configured node transport,
-verifies it, writes applied state, posts an empty applied report, and repeats
+Exit gate: on clean Linux VMs with systemd, one host runs as a DDS anchor node,
+a second node joins through its bootstrap multiaddr, both retain stable identity
+across restart, the anchor exposes its local API through `unix:/run/dds/api.sock`,
+and the no-op Linux policy agent fetches a signed Linux policy envelope, verifies
+it, writes applied state, posts an empty applied report, and repeats
 idempotently without mutating host state.
 
 ### L-2: Core Enforcers

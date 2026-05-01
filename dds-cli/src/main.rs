@@ -380,6 +380,11 @@ enum PlatformAction {
         #[command(subcommand)]
         action: MacosAction,
     },
+    /// Linux applier queries.
+    Linux {
+        #[command(subcommand)]
+        action: LinuxAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -423,6 +428,25 @@ enum MacosAction {
         device_urn: String,
     },
     /// POST /v1/macos/applied — reports an AppliedReport JSON file.
+    Applied {
+        #[arg(long)]
+        from_file: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum LinuxAction {
+    /// GET /v1/linux/policies?device_urn=...
+    Policies {
+        #[arg(long)]
+        device_urn: String,
+    },
+    /// GET /v1/linux/software?device_urn=...
+    Software {
+        #[arg(long)]
+        device_urn: String,
+    },
+    /// POST /v1/linux/applied — reports an AppliedReport JSON file.
     Applied {
         #[arg(long)]
         from_file: PathBuf,
@@ -1527,6 +1551,41 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
                 println!("Applied report accepted.");
             }
         },
+        PlatformAction::Linux { action } => match action {
+            LinuxAction::Policies { device_urn } => {
+                let env: dds_core::envelope::SignedPolicyEnvelope = get_json(
+                    node_url,
+                    "/v1/linux/policies",
+                    &[("device_urn", &device_urn)],
+                )
+                .await;
+                let bytes = unwrap_envelope(env, dds_core::envelope::kind::LINUX_POLICIES);
+                let r: LinuxPoliciesPayload = serde_json::from_slice(&bytes).unwrap();
+                println!("Linux policies for {} ({}):", device_urn, r.policies.len());
+                for p in &r.policies {
+                    println!("  - jti={} issuer={} iat={}", p.jti, p.issuer, p.iat);
+                }
+            }
+            LinuxAction::Software { device_urn } => {
+                let env: dds_core::envelope::SignedPolicyEnvelope = get_json(
+                    node_url,
+                    "/v1/linux/software",
+                    &[("device_urn", &device_urn)],
+                )
+                .await;
+                let bytes = unwrap_envelope(env, dds_core::envelope::kind::LINUX_SOFTWARE);
+                let r: LinuxSoftwarePayload = serde_json::from_slice(&bytes).unwrap();
+                println!("Linux software for {} ({}):", device_urn, r.software.len());
+                for s in &r.software {
+                    println!("  - jti={} issuer={} iat={}", s.jti, s.issuer, s.iat);
+                }
+            }
+            LinuxAction::Applied { from_file } => {
+                let report = load_applied_report(&from_file);
+                post_no_body(node_url, "/v1/linux/applied", &report).await;
+                println!("Applied report accepted.");
+            }
+        },
     }
 }
 
@@ -2353,6 +2412,16 @@ struct MacosPoliciesPayload {
 
 #[derive(Deserialize)]
 struct MacosSoftwarePayload {
+    software: Vec<ApplicablePolicyJson>,
+}
+
+#[derive(Deserialize)]
+struct LinuxPoliciesPayload {
+    policies: Vec<ApplicablePolicyJson>,
+}
+
+#[derive(Deserialize)]
+struct LinuxSoftwarePayload {
     software: Vec<ApplicablePolicyJson>,
 }
 

@@ -15,8 +15,8 @@ use dds_core::token::{Token, TokenKind, TokenPayload};
 use dds_core::trust::TrustGraph;
 use dds_domain::{
     AccountAction, AccountDirective, DeviceJoinDocument, DomainDocument, Enforcement,
-    MacOsPolicyDocument, PolicyScope, SessionDocument, SoftwareAssignment, UserAuthAttestation,
-    WindowsPolicyDocument,
+    LinuxPolicyDocument, MacOsPolicyDocument, PolicyScope, SessionDocument, SoftwareAssignment,
+    UserAuthAttestation, WindowsPolicyDocument,
 };
 use dds_store::traits::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -299,6 +299,7 @@ pub(crate) fn body_type_label(body_type: Option<&str>) -> &'static str {
         Some(body_types::DEVICE_JOIN) => "device-join",
         Some(body_types::WINDOWS_POLICY) => "windows-policy",
         Some(body_types::MACOS_POLICY) => "macos-policy",
+        Some(body_types::LINUX_POLICY) => "linux-policy",
         Some(body_types::MACOS_ACCOUNT_BINDING) => "macos-account-binding",
         Some(body_types::SSO_IDENTITY_LINK) => "sso-identity-link",
         Some(body_types::SOFTWARE_ASSIGNMENT) => "software-assignment",
@@ -342,6 +343,15 @@ pub struct ApplicableMacOsPolicy {
     pub issuer: String,
     pub iat: u64,
     pub document: MacOsPolicyDocument,
+}
+
+/// One `LinuxPolicyDocument` packaged for the agent.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ApplicableLinuxPolicy {
+    pub jti: String,
+    pub issuer: String,
+    pub iat: u64,
+    pub document: LinuxPolicyDocument,
 }
 
 /// One `SoftwareAssignment` packaged for the agent.
@@ -1511,6 +1521,63 @@ impl<
             });
         }
         let out = supersede_macos_policies(out);
+        Ok(out)
+    }
+
+    /// List every `LinuxPolicyDocument` whose scope matches the given
+    /// device URN. Skips revoked, burned, and `Disabled` documents.
+    /// Scope semantics are identical to
+    /// `list_applicable_windows_policies`.
+    pub fn list_applicable_linux_policies(
+        &self,
+        device_urn: &str,
+    ) -> Result<Vec<ApplicableLinuxPolicy>, ServiceError> {
+        let g = self
+            .trust_graph
+            .read()
+            .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+
+        let (device_tags, device_ou) = self.device_targeting_facts_gated(&g, device_urn);
+
+        let mut out = Vec::new();
+        for token in g.attestations_iter() {
+            if g.is_revoked(&token.payload.jti) || g.is_burned(&token.payload.iss) {
+                continue;
+            }
+            let doc = match LinuxPolicyDocument::extract(&token.payload) {
+                Ok(Some(d)) => d,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(jti = %token.payload.jti, "linux policy decode failed: {e}");
+                    continue;
+                }
+            };
+            if matches!(doc.enforcement, Enforcement::Disabled) {
+                continue;
+            }
+            if !self.has_purpose_observed(
+                &g,
+                &token.payload.iss,
+                dds_core::token::purpose::POLICY_PUBLISHER_LINUX,
+            ) {
+                tracing::warn!(
+                    jti = %token.payload.jti,
+                    issuer = %token.payload.iss,
+                    "rejecting Linux policy: issuer lacks dds:policy-publisher-linux capability"
+                );
+                continue;
+            }
+            if !scope_matches(&doc.scope, device_urn, &device_tags, device_ou.as_deref()) {
+                continue;
+            }
+            out.push(ApplicableLinuxPolicy {
+                jti: token.payload.jti.clone(),
+                issuer: token.payload.iss.clone(),
+                iat: token.payload.iat,
+                document: doc,
+            });
+        }
+        let out = supersede_linux_policies(out);
         Ok(out)
     }
 
@@ -2983,6 +3050,44 @@ fn supersede_macos_policies(items: Vec<ApplicableMacOsPolicy>) -> Vec<Applicable
     by_id.into_values().collect()
 }
 
+/// **B-4** Linux policy supersession — same rules as
+/// [`supersede_windows_policies`].
+fn supersede_linux_policies(items: Vec<ApplicableLinuxPolicy>) -> Vec<ApplicableLinuxPolicy> {
+    use std::collections::BTreeMap;
+    let mut by_id: BTreeMap<String, ApplicableLinuxPolicy> = BTreeMap::new();
+    for item in items {
+        let key = item.document.policy_id.clone();
+        match by_id.get(&key) {
+            None => {
+                by_id.insert(key, item);
+            }
+            Some(prev) => {
+                let prev_v = prev.document.version;
+                let cur_v = item.document.version;
+                let take = match cur_v.cmp(&prev_v) {
+                    core::cmp::Ordering::Greater => true,
+                    core::cmp::Ordering::Less => false,
+                    core::cmp::Ordering::Equal => match item.iat.cmp(&prev.iat) {
+                        core::cmp::Ordering::Greater => true,
+                        core::cmp::Ordering::Less => false,
+                        core::cmp::Ordering::Equal => item.jti < prev.jti,
+                    },
+                };
+                if take {
+                    tracing::warn!(
+                        policy_id = %key,
+                        winning_jti = %item.jti,
+                        loser_jti = %prev.jti,
+                        "B-4: superseding duplicate linux policy"
+                    );
+                    by_id.insert(key, item);
+                }
+            }
+        }
+    }
+    by_id.into_values().collect()
+}
+
 /// **B-4** software supersession. Software `version` is a free-form
 /// string, so we order by signing timestamp `iat` (latest wins) with a
 /// final lex-smallest-`jti` tiebreaker.
@@ -3308,10 +3413,11 @@ mod platform_applier_tests {
     use dds_core::token::TokenPayload;
     use dds_domain::{
         AccountAction, AccountDirective, DeviceJoinDocument, LaunchdAction, LaunchdDirective,
-        MacAccountAction, MacAccountDirective, MacOsPolicyDocument, MacOsSettings, PasswordPolicy,
-        PolicyScope, PreferenceAction, PreferenceDirective, PreferenceScope, ProfileAction,
-        ProfileDirective, PublisherIdentity, RegistryAction, RegistryDirective, RegistryHive,
-        RegistryValue, SoftwareAssignment, WindowsPolicyDocument, WindowsSettings,
+        LinuxPolicyDocument, MacAccountAction, MacAccountDirective, MacOsPolicyDocument,
+        MacOsSettings, PasswordPolicy, PolicyScope, PreferenceAction, PreferenceDirective,
+        PreferenceScope, ProfileAction, ProfileDirective, PublisherIdentity, RegistryAction,
+        RegistryDirective, RegistryHive, RegistryValue, SoftwareAssignment, WindowsPolicyDocument,
+        WindowsSettings,
     };
     use dds_store::MemoryBackend;
     use rand::rngs::OsRng;
@@ -3345,6 +3451,7 @@ mod platform_applier_tests {
         for purpose in [
             dds_core::token::purpose::POLICY_PUBLISHER_WINDOWS,
             dds_core::token::purpose::POLICY_PUBLISHER_MACOS,
+            dds_core::token::purpose::POLICY_PUBLISHER_LINUX,
             dds_core::token::purpose::SOFTWARE_PUBLISHER,
         ] {
             let v = make_self_vouch(&admin, &admin_attest_hash, purpose);
@@ -3484,6 +3591,18 @@ mod platform_applier_tests {
                 }],
                 ..Default::default()
             }),
+        }
+    }
+
+    fn baseline_linux_policy(id: &str, scope: PolicyScope) -> LinuxPolicyDocument {
+        LinuxPolicyDocument {
+            policy_id: id.into(),
+            display_name: "Linux Test".into(),
+            version: 1,
+            enforcement: Enforcement::Enforce,
+            scope,
+            settings: vec![],
+            linux: None,
         }
     }
 
@@ -4102,6 +4221,7 @@ mod platform_applier_tests {
             body_types::DEVICE_JOIN,
             body_types::WINDOWS_POLICY,
             body_types::MACOS_POLICY,
+            body_types::LINUX_POLICY,
             body_types::MACOS_ACCOUNT_BINDING,
             body_types::SSO_IDENTITY_LINK,
             body_types::SOFTWARE_ASSIGNMENT,
@@ -5288,6 +5408,108 @@ mod platform_applier_tests {
             "malformed publisher_identity must be dropped, leaving only the valid assignment"
         );
         assert_eq!(hits[0].document.package_id, "com.example.viewer");
+    }
+
+    // ============================================================
+    // Linux policy tests
+    // ============================================================
+
+    #[test]
+    fn linux_policy_tag_scope_matches_only_tagged_devices() {
+        let (mut svc, admin, _) = setup();
+        let dev_linux = enroll_device(&mut svc, "linux-1", vec!["linux-server".into()], None);
+        let dev_other = enroll_device(&mut svc, "win-1", vec!["workstation".into()], None);
+
+        let policy = baseline_linux_policy(
+            "p:linux-servers",
+            PolicyScope {
+                device_tags: vec!["linux-server".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-linux", &policy))
+            .unwrap();
+
+        assert_eq!(
+            svc.list_applicable_linux_policies(&dev_linux).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            svc.list_applicable_linux_policies(&dev_other).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn b4_linux_policies_supersede_by_version() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "linux-b4", vec![], None);
+
+        let mut p_old = baseline_linux_policy(
+            "p:linux-supersede",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        p_old.version = 3;
+        let mut p_new = baseline_linux_policy(
+            "p:linux-supersede",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        p_new.version = 7;
+
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-linux-new", &p_new))
+            .unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-linux-old", &p_old))
+            .unwrap();
+
+        let hits = svc.list_applicable_linux_policies(&dev).unwrap();
+        assert_eq!(hits.len(), 1, "duplicate policy_id must collapse to one");
+        assert_eq!(hits[0].document.version, 7);
+        assert_eq!(hits[0].jti, "p-linux-new");
+    }
+
+    #[test]
+    fn linux_policy_disabled_enforcement_is_skipped() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "linux-disabled", vec![], None);
+
+        let mut policy = baseline_linux_policy(
+            "p:linux-disabled",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        policy.enforcement = Enforcement::Disabled;
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-linux-off", &policy))
+            .unwrap();
+
+        assert_eq!(
+            svc.list_applicable_linux_policies(&dev).unwrap().len(),
+            0,
+            "disabled Linux policies must not be returned"
+        );
     }
 
     // Silence the unused-import warning when only some helpers are

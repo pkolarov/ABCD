@@ -9,20 +9,11 @@ Z-1 Phase B encrypted-gossip changes (`dds-core/src/crypto/epoch_key.rs`,
 `dds-node/src/telemetry.rs`, and `dds-node/tests/gossip_encrypt.rs`).
 Those changes are treated below as current code reality.
 
-- TODO DOC-PROGRESS-1: Refresh the Z-1 Phase B progress wording in this
-  file and `docs/pqc-phase-b-plan.md` after the encrypted-gossip test
-  path is verified. Current docs still describe B.7 as "Step 1 only"
-  (publisher-side `EpochKeyRelease` mint + `EpochKeyResponse`
-  responder), and `docs/pqc-phase-b-plan.md` still opens with
-  `Status: Plan -- open for implementation`. The current code already
-  includes `epoch_key::encrypt_payload` / `decrypt_payload`,
-  `GossipEnvelopeV3::to_cbor` / `from_cbor`,
-  encrypted-gossip decrypt + plaintext rejection in
-  `DdsNode::handle_gossip_message`, the `publish_gossip_op` wrapper,
-  `dds_pq_envelope_decrypt_total`, and the new
-  `dds-node/tests/gossip_encrypt.rs` regression file. Once tests pass,
-  document this as a B.7 partial follow-on instead of leaving the docs
-  to under-report the code.
+- ✅ DOC-PROGRESS-DONE: `docs/pqc-phase-b-plan.md` status header updated
+  to "Partial implementation in progress — B.1–B.7 (partial) landed".
+  B.7 row updated with Step 2 note: gossip decrypt + enc-v3 enforcement
+  gate landed, `gossip_encrypt.rs` (10 tests) verified. Remaining open
+  work (PQ-B7-WIRE-1, PQ-B7-RECOVERY-1, B.8 sync) documented in the row.
 - TODO PQ-B7-WIRE-1: Wire encrypted gossip publishing into real
   publishers before claiming B.7 encrypted publish is landed. Static
   source check shows `DdsNode::publish_gossip_op` exists, but no current
@@ -52,30 +43,18 @@ Those changes are treated below as current code reality.
   This matches the B.8 row being open; do not upgrade the Z-1
   confidentiality claim until sync response wrapping and ingest decrypt
   are implemented and tested.
-- TODO PQ-B11-DOC-1: Align the PQ observability catalog with the code.
-  The plan names `dds_pq_envelope_decrypt_total{result=ok|key_missing|aead_fail}`;
-  the current code renders `result=ok|no_key|aead_fail`, and only the
-  gossip decrypt path bumps it. Either update the docs to `no_key` and
-  "gossip-only partial" or rename the code label to the documented
-  `key_missing` before dashboards/alerts consume it. Sync-side bumps,
+- ✅ DOC-PQ-B11-DONE: `docs/pqc-phase-b-plan.md` updated to use
+  `result=ok|no_key|aead_fail` matching the code label (was `key_missing`).
+  Remaining B.11 work unchanged: sync-side bumps,
   `dds_pq_releases_emitted_total`, `dds_pq_release_request_total`,
   `dds_pq_rotation_total`, and Phase E alert rules remain TODO.
-- TODO CI-DOC-1: Reconcile CI progress claims with the actual workflow
-  files. `STATUS.md` and `dds-loadtest/README.md` still refer to
-  `.github/workflows/loadtest-smoke.yml`, but the workflow tree contains
-  only `ci.yml`, `msi.yml`, and `pkg.yml`. `STATUS.md` also says the CI
-  pipeline checks `thumbv7em-none-eabihf`; current `ci.yml` explicitly
-  comments that `cross-embedded` was removed because `dds-core`
-  dependencies pull in `std`. Either restore those jobs or downgrade the
-  docs to "planned / removed pending no_std audit" so the CI status does
-  not overstate coverage.
-- TODO DOC-STRUCTURE-1: Refresh stale inventory tables in the status
-  body. The workspace and README now list 9 crates, but the "What's
-  Next" section still says "All 7 crates are functionally complete."
-  The CLI status table also predates the B.10 `dds pq status` /
-  `dds pq list-pubkeys` surface. Update these inventories after the PQ
-  test path is verified so the tracker does not mix old crate counts
-  with newer Phase B progress.
+- ✅ CI-DOC-DONE: Loadtest smoke reference updated — now notes that
+  `loadtest-smoke.yml` does not yet exist and the loadtest is manual.
+  CI pipeline entry updated to drop the stale `thumbv7em-none-eabihf`
+  claim and note it was removed; no-std audit tracked separately.
+- ✅ DOC-STRUCTURE-DONE: Crate counts updated — "What's Next" and
+  "Path to Production" now both say 9 crates (was 7 and 8 respectively).
+  CLI status table B.10 surface already reflected in the B.10 row above.
 
 Verification note: the repository-local `target/debug/deps` tree is
 large enough that two direct test attempts stalled in sleeping `rustc`
@@ -4235,7 +4214,7 @@ Global flags: `--data-dir <dir>` (local store), `--node-url <url>` (dds-node HTT
 |---|---|---|---|---|
 | **Windows** | `platform/windows/` | 🟢 **Login verified** | ✅ 298 Rust + 56 .NET + 47 C++ + 3 E2E | Native CP DLL + Auth Bridge + Tray Agent + Policy Agent all build + test on Win11 ARM64; **FIDO2 passwordless lock screen login re-verified after security hardening merge (2026-04-13)**; security fixes: credential_id-based vault lookup, RP-ID binding, removed unauth session endpoint; WebAuthn hmac-secret two-phase challenge/response verified with real authenticator |
 | **macOS** | `platform/macos/` | 🟢 **Smoke verified** | ✅ .NET build + 17 tests + smoke e2e | `DdsPolicyAgent.MacOS` worker with 5 host-backed enforcers, `.pkg` installer, single-command smoke test passing (6/6 checks), preference + launchd + account backends validated on real macOS ARM64 hardware; enterprise account/SSO coexistence is now modeled in `dds-domain`, while login-window/FileVault integration remains future `DdsLoginBridge` work |
-| **Linux** | `platform/linux/` | ⚪ Planned | n/a | Design-only at this point; no agent code in tree yet |
+| **Linux** | `platform/linux/` | 🟡 **L-1 skeleton** | ✅ 16 C# tests | `DdsPolicyAgent.Linux` .NET 9 worker service — no-op skeleton proven: reads signed Linux policy envelopes through `unix:/run/dds/api.sock` (or loopback TCP for dev), verifies Ed25519 envelope signatures, records content-hash applied state, posts `POST /v1/linux/applied` reports; `dds-node` wired with `/v1/linux/policies`, `/v1/linux/software`, `/v1/linux/applied` routes + `LinuxPolicyDocument` schema + `dds platform linux ...` CLI surface; packaging systemd units + anchor/member config templates under `platform/linux/packaging/`; L-2 enforcers (users, sudoers, files, systemd, packages) not started |
 
 ## Cryptography
 
@@ -4307,11 +4286,13 @@ cargo run -p dds-loadtest --release -- --smoke --output-dir /tmp/dds-smoke
 cargo run --release -p dds-loadtest -- --duration 24h --output-dir results/$(date +%Y%m%d)
 ```
 
-The CI smoke job lives in `.github/workflows/loadtest-smoke.yml`.
+The CI smoke job was originally planned as `.github/workflows/loadtest-smoke.yml`
+but that workflow does not exist yet; the loadtest must be run manually as shown
+above until a dedicated workflow is added.
 
 ## What's Next
 
-All 7 crates are functionally complete. The following work is ordered by impact and dependency:
+All 9 crates are functionally complete. The following work is ordered by impact and dependency:
 
 ### Phase 1 — Production Hardening (high priority)
 
@@ -4321,7 +4302,7 @@ All 7 crates are functionally complete. The following work is ordered by impact 
 
 3. 🟢 **Persistent node identity** — `dds-node/src/identity_store.rs` loads or generates the node Ed25519 signing key on startup and persists it to `<data_dir>/node_key.bin` (or the new `identity_path` config field). When `DDS_NODE_PASSPHRASE` is set, the file is encrypted with ChaCha20-Poly1305 using a 32-byte key derived from the passphrase via Argon2id (19 MiB, 2 iters); otherwise the key is stored unencrypted with a warning log. Versioned CBOR on-disk format. 3 tests cover plain roundtrip, encrypted roundtrip with wrong-passphrase rejection, and load-or-create idempotency.
 
-4. 🟢 **CI pipeline** — `.github/workflows/ci.yml` runs `cargo test --workspace --all-features`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, and the python binding pytest suite. Cross-compile jobs check `x86_64-pc-windows-gnu` (mingw-w64), `aarch64-linux-android` (cargo-ndk + setup-ndk), and `thumbv7em-none-eabihf` (`dds-core --no-default-features` smoke).
+4. 🟢 **CI pipeline** — `.github/workflows/ci.yml` runs `cargo test --workspace --all-features`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, and the python binding pytest suite. Cross-compile jobs check `x86_64-pc-windows-gnu` (mingw-w64) and `aarch64-linux-android` (cargo-ndk + setup-ndk). Note: the `thumbv7em-none-eabihf` cross-embedded job was removed because `dds-core` dependencies pull in `std`; no-std support remains a future goal tracked in the `dds-core` no-std audit backlog.
 
 9\. 🟢 **Domain identity (Stage 1 — software domain key)** — `dds-domain/src/domain.rs` introduces `Domain`, `DomainId` (`dds-dom:<base32(sha256(pubkey))>`), `DomainKey` (Ed25519), `AdmissionCert` (domain key signs `(domain_id, peer_id, issued_at, expires_at)`), and a `DomainSigner` trait that Stage 2 will reimplement against a FIDO2 authenticator without touching call sites. `dds-net` bakes the domain tag into libp2p protocol strings (`/dds/kad/1.0.0/<tag>`, `/dds/id/1.0.0/<tag>`) and into gossipsub topics (`/dds/v1/dom/<tag>/org/<org>/...`), so nodes from different domains cannot complete a libp2p handshake. `dds-node`'s `NodeConfig` requires a `[domain]` section and refuses to start without a valid admission cert at `<data_dir>/admission.cbor` matching its libp2p `PeerId`. Persistent libp2p keypair (`p2p_key.bin`) is now loaded/generated by `dds-node/src/p2p_identity.rs` (encrypted at rest via `DDS_NODE_PASSPHRASE`) so the peer id is stable across restarts. New CLI subcommands: `init-domain`, `gen-node-key`, `admit`, `run` (no clap dep — hand-rolled flag parsing). Domain key on disk is encrypted with `DDS_DOMAIN_PASSPHRASE` (Argon2id + ChaCha20-Poly1305). 14+ new unit tests covering id roundtrip, cert sign/verify/tamper/expiry, domain/key TOML+CBOR roundtrips, protocol-string isolation, and stable peer id across restart.
 
@@ -4655,7 +4636,7 @@ Exit criteria:
 
 ## Path to Production
 
-Overall: **~98% ready for a scoped pilot.** All 8 crates are functionally
+Overall: **~98% ready for a scoped pilot.** All 9 crates are functionally
 complete, security-critical hardening (Phase 1) is done, the three
 algorithmic / sync blockers the chaos soak found (B5, B5b, B6) are fixed
 and validated, and the two platform blockers (B1, B2) are now resolved

@@ -75,6 +75,8 @@ pub mod kind {
     pub const WINDOWS_SOFTWARE: &str = "windows-software";
     pub const MACOS_POLICIES: &str = "macos-policies";
     pub const MACOS_SOFTWARE: &str = "macos-software";
+    pub const LINUX_POLICIES: &str = "linux-policies";
+    pub const LINUX_SOFTWARE: &str = "linux-software";
 }
 
 /// Build the exact byte sequence that both the signer and the

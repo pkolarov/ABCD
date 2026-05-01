@@ -1,0 +1,28 @@
+# DDS Linux member node configuration template.
+# Replace placeholders and set bootstrap_peers to the anchor multiaddr.
+
+data_dir = "/var/lib/dds/node"
+org_hash = "__ORG_HASH__"
+trusted_roots = [__TRUSTED_ROOTS__]
+
+[network]
+listen_addr = "/ip4/0.0.0.0/tcp/4001"
+bootstrap_peers = [
+  "/ip4/203.0.113.10/tcp/4001/p2p/12D3KooW..."
+]
+mdns_enabled = true
+heartbeat_secs = 5
+idle_timeout_secs = 60
+api_addr = "unix:/run/dds/api.sock"
+metrics_addr = "127.0.0.1:9495"
+
+[network.api_auth]
+trust_loopback_tcp_admin = false
+strict_device_binding = true
+
+[domain]
+name = "__DOMAIN_NAME__"
+id = "__DOMAIN_ID__"
+pubkey = "__DOMAIN_PUBKEY__"
+admission_path = "/var/lib/dds/node/admission.cbor"
+audit_log_enabled = false

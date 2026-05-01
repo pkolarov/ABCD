@@ -1,0 +1,26 @@
+# DDS Linux anchor node configuration template.
+# Replace domain placeholders during bootstrap/provisioning.
+
+data_dir = "/var/lib/dds/node"
+org_hash = "__ORG_HASH__"
+trusted_roots = [__TRUSTED_ROOTS__]
+
+[network]
+listen_addr = "/ip4/0.0.0.0/tcp/4001"
+bootstrap_peers = []
+mdns_enabled = true
+heartbeat_secs = 5
+idle_timeout_secs = 60
+api_addr = "unix:/run/dds/api.sock"
+metrics_addr = "127.0.0.1:9495"
+
+[network.api_auth]
+trust_loopback_tcp_admin = false
+strict_device_binding = true
+
+[domain]
+name = "__DOMAIN_NAME__"
+id = "__DOMAIN_ID__"
+pubkey = "__DOMAIN_PUBKEY__"
+admission_path = "/var/lib/dds/node/admission.cbor"
+audit_log_enabled = false

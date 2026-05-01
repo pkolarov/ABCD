@@ -39,9 +39,10 @@ use zeroize::Zeroizing;
 use crate::config::ApiAuthConfig;
 use crate::device_binding::{BindingOutcome, CallerPrincipal, DeviceBindingStore};
 use crate::service::{
-    AdminSetupRequest, AdminVouchRequest, ApplicableMacOsPolicy, ApplicableSoftware,
-    ApplicableWindowsPolicy, AppliedReport, AssertionSessionRequest, EnrollDeviceRequest,
-    EnrollUserRequest, EnrolledUser, LocalService, NodeStatus, PolicyResult, ServiceError,
+    AdminSetupRequest, AdminVouchRequest, ApplicableLinuxPolicy, ApplicableMacOsPolicy,
+    ApplicableSoftware, ApplicableWindowsPolicy, AppliedReport, AssertionSessionRequest,
+    EnrollDeviceRequest, EnrollUserRequest, EnrolledUser, LocalService, NodeStatus, PolicyResult,
+    ServiceError,
 };
 use dds_store::traits::{
     AuditStore, ChallengeStore, CredentialStateStore, RevocationStore, TokenStore,
@@ -761,7 +762,10 @@ where
         )
         .route("/v1/macos/policies", get(list_macos_policies::<S>))
         .route("/v1/macos/software", get(list_macos_software::<S>))
-        .route("/v1/macos/applied", post(record_macos_applied::<S>));
+        .route("/v1/macos/applied", post(record_macos_applied::<S>))
+        .route("/v1/linux/policies", get(list_linux_policies::<S>))
+        .route("/v1/linux/software", get(list_linux_software::<S>))
+        .route("/v1/linux/applied", post(record_linux_applied::<S>));
 
     let mut app = admin_routes
         .merge(public_routes)
@@ -960,6 +964,12 @@ pub struct MacOsPoliciesResponse {
     pub policies: Vec<ApplicableMacOsPolicy>,
 }
 
+/// Response wrapping a list of Linux policies for a device.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LinuxPoliciesResponse {
+    pub policies: Vec<ApplicableLinuxPolicy>,
+}
+
 /// Response wrapping a list of software assignments for a device.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WindowsSoftwareResponse {
@@ -988,6 +998,12 @@ pub struct WindowsClaimAccountResponse {
 /// Response wrapping a list of software assignments for a macOS device.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MacOsSoftwareResponse {
+    pub software: Vec<ApplicableSoftware>,
+}
+
+/// Response wrapping a list of software assignments for a Linux device.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LinuxSoftwareResponse {
     pub software: Vec<ApplicableSoftware>,
 }
 
@@ -1868,6 +1884,106 @@ where
 }
 
 async fn record_macos_applied<S>(
+    State(state): State<AppState<S>>,
+    caller: CallerIdentity,
+    Json(report): Json<AppliedReport>,
+) -> Result<StatusCode, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    tofu_device_binding(
+        &caller,
+        &state.admin_policy,
+        state.device_binding.as_deref(),
+        &report.device_urn,
+    )?;
+    let mut svc = state.svc.lock().await;
+    svc.record_applied(&report)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn list_linux_policies<S>(
+    State(state): State<AppState<S>>,
+    caller: CallerIdentity,
+    Query(q): Query<DeviceUrnQuery>,
+) -> Result<Json<dds_core::envelope::SignedPolicyEnvelope>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    check_device_binding_read(
+        &caller,
+        &state.admin_policy,
+        state.device_binding.as_deref(),
+        &q.device_urn,
+    )?;
+    tracing::info!(device_urn = %q.device_urn, "list_linux_policies");
+    let svc = state.svc.lock().await;
+    let policies = svc.list_applicable_linux_policies(&q.device_urn)?;
+    let payload = LinuxPoliciesResponse { policies };
+    let payload_json = serde_json::to_vec(&payload).map_err(|e| HttpError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("serialize: {e}"),
+    })?;
+    let env = svc.sign_policy_envelope(
+        &q.device_urn,
+        dds_core::envelope::kind::LINUX_POLICIES,
+        &payload_json,
+    );
+    Ok(Json(env))
+}
+
+async fn list_linux_software<S>(
+    State(state): State<AppState<S>>,
+    caller: CallerIdentity,
+    Query(q): Query<DeviceUrnQuery>,
+) -> Result<Json<dds_core::envelope::SignedPolicyEnvelope>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    check_device_binding_read(
+        &caller,
+        &state.admin_policy,
+        state.device_binding.as_deref(),
+        &q.device_urn,
+    )?;
+    tracing::info!(device_urn = %q.device_urn, "list_linux_software");
+    let svc = state.svc.lock().await;
+    let software = svc.list_applicable_software(&q.device_urn)?;
+    let payload = LinuxSoftwareResponse { software };
+    let payload_json = serde_json::to_vec(&payload).map_err(|e| HttpError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("serialize: {e}"),
+    })?;
+    let env = svc.sign_policy_envelope(
+        &q.device_urn,
+        dds_core::envelope::kind::LINUX_SOFTWARE,
+        &payload_json,
+    );
+    Ok(Json(env))
+}
+
+async fn record_linux_applied<S>(
     State(state): State<AppState<S>>,
     caller: CallerIdentity,
     Json(report): Json<AppliedReport>,

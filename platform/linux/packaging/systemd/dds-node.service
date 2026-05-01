@@ -1,0 +1,22 @@
+[Unit]
+Description=DDS Node
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+RuntimeDirectory=dds
+RuntimeDirectoryMode=0750
+StateDirectory=dds
+StateDirectoryMode=0700
+LogsDirectory=dds
+LogsDirectoryMode=0750
+ExecStart=/usr/local/bin/dds-node run /etc/dds/node.toml
+Restart=on-failure
+RestartSec=5s
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

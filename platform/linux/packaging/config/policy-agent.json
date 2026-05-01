@@ -1,0 +1,11 @@
+{
+  "DdsPolicyAgent": {
+    "DeviceUrn": "__DEVICE_URN__",
+    "NodeBaseUrl": "unix:/run/dds/api.sock",
+    "PollIntervalSeconds": 60,
+    "StateDir": "/var/lib/dds/policy-agent",
+    "PinnedNodePubkeyB64": "__NODE_PUBKEY_B64__",
+    "EnvelopeMaxClockSkewSeconds": 300,
+    "AuditOnly": true
+  }
+}

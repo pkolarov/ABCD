@@ -490,7 +490,42 @@ impl DomainDocument for MacOsPolicyDocument {
 }
 
 // ============================================================
-// 5. MacAccountBindingDocument — subject/device/account binding
+// 5. LinuxPolicyDocument — Linux managed-device policy
+// ============================================================
+
+/// A policy document distributed to managed Linux devices.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinuxPolicyDocument {
+    /// Policy identifier (e.g. "security/sudoers").
+    pub policy_id: String,
+    /// Policy display name.
+    pub display_name: String,
+    /// Policy version (monotonically increasing).
+    pub version: u64,
+    /// Target scope: device tags, org units, or identity URNs.
+    pub scope: PolicyScope,
+    /// Free-form policy settings as key-value pairs. Forward-compatible
+    /// escape hatch for directives not yet represented in `linux`.
+    pub settings: Vec<PolicySetting>,
+    /// Enforcement mode.
+    pub enforcement: Enforcement,
+    /// Strongly-typed Linux-specific directives. L-1 keeps this empty;
+    /// L-2 adds users/groups, sudoers, systemd, files, and package
+    /// directives behind this field without changing the document wrapper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux: Option<LinuxSettings>,
+}
+
+/// Strongly-typed Linux policy directives.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct LinuxSettings {}
+
+impl DomainDocument for LinuxPolicyDocument {
+    const BODY_TYPE: &'static str = body_types::LINUX_POLICY;
+}
+
+// ============================================================
+// 6. MacAccountBindingDocument — subject/device/account binding
 // ============================================================
 
 /// How macOS login and account lifecycle are owned on a device.

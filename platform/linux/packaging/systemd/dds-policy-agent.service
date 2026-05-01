@@ -1,0 +1,21 @@
+[Unit]
+Description=DDS Linux Policy Agent
+Wants=dds-node.service
+After=dds-node.service
+
+[Service]
+Type=simple
+# L-1 does not mutate host state. This runs as root only to match the
+# upcoming L-2 enforcer shape; privilege separation must be revisited
+# before real Linux host mutation lands.
+User=root
+Group=root
+StateDirectory=dds/policy-agent
+StateDirectoryMode=0700
+ExecStart=/usr/bin/dotnet /usr/local/lib/dds/DdsPolicyAgent.Linux/DdsPolicyAgent.Linux.dll
+Restart=on-failure
+RestartSec=5s
+Environment=DOTNET_ENVIRONMENT=Production
+
+[Install]
+WantedBy=multi-user.target

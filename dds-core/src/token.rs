@@ -57,6 +57,8 @@ pub mod purpose {
     pub const POLICY_PUBLISHER_WINDOWS: &str = "dds:policy-publisher-windows";
     /// Authorized to publish `MacOsPolicyDocument` attestations.
     pub const POLICY_PUBLISHER_MACOS: &str = "dds:policy-publisher-macos";
+    /// Authorized to publish `LinuxPolicyDocument` attestations.
+    pub const POLICY_PUBLISHER_LINUX: &str = "dds:policy-publisher-linux";
     /// Authorized to publish `SoftwareAssignment` attestations.
     pub const SOFTWARE_PUBLISHER: &str = "dds:software-publisher";
 
