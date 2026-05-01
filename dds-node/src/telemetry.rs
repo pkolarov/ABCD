@@ -38,6 +38,7 @@
 //! | `dds_fido2_assertions_total` | counter | `result=ok\|signature\|rp_id\|up\|sign_count\|other` | bumped by [`record_fido2_assertion`] |
 //! | `dds_sync_pulls_total` | counter | `result=ok\|fail` | bumped by [`record_sync_pull`] |
 //! | `dds_sync_payloads_rejected_total` | counter | `reason=legacy_v1\|publisher_capability\|publisher_identity\|replay_window\|signature\|duplicate_jti\|graph` | bumped by [`record_sync_payloads_rejected`] |
+//! | `dds_pq_releases_installed_total` | counter | `result=ok\|schema\|recipient_mismatch\|replay_window\|kem_ct\|decap\|aead` | bumped by [`record_pq_release_installed`] at every exit branch of [`crate::node::DdsNode::install_epoch_key_release`] |
 //! | `dds_http_requests_total` | counter | `route, method, status` | bumped by [`record_http_request`] |
 //! | `dds_trust_graph_attestations` | gauge | `body_type=user-auth-attestation\|device-join\|windows-policy\|macos-policy\|macos-account-binding\|sso-identity-link\|software-assignment\|service-principal\|session\|unknown` | [`crate::service::LocalService::trust_graph_counts`] at scrape, partitioned via [`crate::service::body_type_label`] |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
@@ -734,6 +735,18 @@ pub struct Telemetry {
     /// counted because the bump site sits inside the per-route layer
     /// stack — those still surface via `dds_http_caller_identity_total`.
     http_requests: Mutex<BTreeMap<(String, String, u16), u64>>,
+    /// **Z-1 Phase B.11 (partial)** — per-`result`
+    /// `EpochKeyRelease` install outcomes from
+    /// [`crate::node::DdsNode::install_epoch_key_release`]. `result` is
+    /// one of `ok|schema|recipient_mismatch|replay_window|kem_ct|decap|aead`,
+    /// the seven exit branches of the receive funnel. Bounded by that
+    /// fixed return-string vocabulary; an `ok` bump means the schema
+    /// gate, recipient binding, replay-window guard, KEM decap, and
+    /// AEAD unwrap all succeeded (regardless of whether the resulting
+    /// install was Inserted / Rotated / AlreadyCurrent / Stale at the
+    /// store layer — those are storage-side outcomes, not crypto
+    /// outcomes).
+    pq_releases_installed: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Telemetry {
@@ -753,6 +766,7 @@ impl Telemetry {
             sync_pulls: Mutex::new(BTreeMap::new()),
             sync_payloads_rejected: Mutex::new(BTreeMap::new()),
             http_requests: Mutex::new(BTreeMap::new()),
+            pq_releases_installed: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1091,6 +1105,31 @@ impl Telemetry {
         }
     }
 
+    fn bump_pq_release_installed(&self, result: &str) {
+        let mut g = match self.pq_releases_installed.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry(result.to_string()).or_insert(0) += 1;
+    }
+
+    fn pq_releases_installed_snapshot(&self) -> BTreeMap<String, u64> {
+        match self.pq_releases_installed.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of `dds_pq_releases_installed_total{result=...}`.
+    /// Public so the `DdsNode` regression tests can take before/after
+    /// snapshots without scraping the renderer.
+    pub fn pq_releases_installed_count(&self, result: &str) -> u64 {
+        match self.pq_releases_installed.lock() {
+            Ok(g) => g.get(result).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(result).copied().unwrap_or(0),
+        }
+    }
+
     fn uptime_seconds(&self) -> u64 {
         SystemTime::now()
             .duration_since(self.start_at)
@@ -1273,6 +1312,47 @@ pub fn record_sync_payloads_rejected(reason: &str) {
 pub fn record_http_request(route: &str, method: &str, status: u16) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_http_request(route, method, status);
+    }
+}
+
+/// **Z-1 Phase B.11 (partial)** — bump
+/// `dds_pq_releases_installed_total{result=...}` by one. Called from
+/// every exit branch of
+/// [`crate::node::DdsNode::install_epoch_key_release`]. `result` is one
+/// of:
+///
+/// - `ok` — schema gate, recipient binding, replay-window guard, KEM
+///   decap, and AEAD unwrap all succeeded; the unwrapped epoch key was
+///   handed to [`crate::epoch_key_store::EpochKeyStore::install_peer_release`]
+///   (the storage-side `Inserted` / `Rotated` / `AlreadyCurrent` /
+///   `Stale` partition is not surfaced here — those are not crypto
+///   outcomes and would expand the cardinality without adding security
+///   signal).
+/// - `schema` — [`dds_net::pq_envelope::EpochKeyRelease::validate`]
+///   rejected the shape (empty publisher / recipient, invalid expiry,
+///   wrong-length `kem_ct` / `aead_ciphertext` / signatures). Includes
+///   the defensive length re-check that runs before destructuring into
+///   fixed-length arrays.
+/// - `recipient_mismatch` — `release.recipient != self.peer_id`. The
+///   release was meant for a different peer.
+/// - `replay_window` — `issued_at` is more than
+///   [`dds_net::pq_envelope::EPOCH_RELEASE_REPLAY_WINDOW_SECS`] in the
+///   past relative to local clock (M-9-style replay defence).
+/// - `kem_ct` — [`dds_core::crypto::kem::KemCiphertext::from_bytes`]
+///   rejected the ciphertext blob (wrong inner shape after the schema
+///   length check passed — should be unreachable in practice but we
+///   bump anyway so the budget stays accurate).
+/// - `decap` — [`dds_core::crypto::kem::decap`] failed (wrong KEM
+///   secret, tampered ciphertext, or — critically — the publisher
+///   bound the encapsulation to a different `(publisher, recipient,
+///   epoch_id)` tuple than the release advertises).
+/// - `aead` — [`dds_core::crypto::epoch_key::unwrap`] failed (wrong
+///   shared secret, tampered AEAD ciphertext / nonce / tag).
+///
+/// No-op when telemetry has not been installed (tests, harnesses).
+pub fn record_pq_release_installed(result: &str) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_pq_release_installed(result);
     }
 }
 
@@ -1704,6 +1784,35 @@ fn render_exposition(
         out.push_str(&format!(
             "dds_sync_payloads_rejected_total{{reason=\"{}\"}} {}\n",
             escape_label_value(reason),
+            count
+        ));
+    }
+
+    // `dds_pq_releases_installed_total` — per-`result` Phase B
+    // EpochKeyRelease install outcome counter. Bumped from every exit
+    // branch of `DdsNode::install_epoch_key_release` (the receive
+    // funnel for both the H-12 piggy-backed releases and the
+    // /dds/epoch-keys/1.0.0/<domain> request_response responses).
+    out.push_str(
+        "# HELP dds_pq_releases_installed_total Phase B EpochKeyRelease install outcomes since \
+         process start, partitioned by result. ok = schema gate + recipient binding + replay-window \
+         guard + KEM decap + AEAD unwrap all succeeded (storage-side Inserted / Rotated / \
+         AlreadyCurrent / Stale collapsed into ok — those are not crypto outcomes); schema = \
+         EpochKeyRelease::validate rejected the shape (empty publisher / recipient, invalid expiry, \
+         wrong-length kem_ct / aead_ciphertext / signatures); recipient_mismatch = release.recipient \
+         != self.peer_id; replay_window = issued_at older than EPOCH_RELEASE_REPLAY_WINDOW_SECS \
+         (M-9-style replay defence); kem_ct = HybridKemCt::from_bytes rejected the inner shape; \
+         decap = ml-kem decap failed (wrong KEM secret, tampered ciphertext, or — critically — the \
+         publisher bound the encapsulation to a different (publisher, recipient, epoch_id) tuple \
+         than the release advertises); aead = ChaCha20-Poly1305 unwrap failed (wrong shared secret \
+         / tampered AEAD ciphertext or nonce / tag).\n",
+    );
+    out.push_str("# TYPE dds_pq_releases_installed_total counter\n");
+    let pq_releases_snapshot = telemetry.pq_releases_installed_snapshot();
+    for (result, count) in pq_releases_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_pq_releases_installed_total{{result=\"{}\"}} {}\n",
+            escape_label_value(result),
             count
         ));
     }
@@ -2196,6 +2305,39 @@ mod tests {
         assert!(body.contains("# TYPE dds_audit_entries_total counter\n"));
         assert!(body.contains("dds_audit_chain_length 0\n"));
         assert!(body.contains("dds_audit_chain_head_age_seconds 0\n"));
+        // `dds_pq_releases_installed_total` family is always
+        // discoverable (HELP + TYPE headers) even on a fresh node where
+        // no EpochKeyRelease has been processed yet.
+        assert!(body.contains("# TYPE dds_pq_releases_installed_total counter\n"));
+    }
+
+    #[test]
+    fn render_emits_pq_releases_installed_value_lines_after_bumps() {
+        let t = Telemetry::new();
+        // Drive a couple of result buckets through the bump path so the
+        // renderer must emit the value lines (not just HELP / TYPE
+        // headers).
+        t.bump_pq_release_installed("ok");
+        t.bump_pq_release_installed("ok");
+        t.bump_pq_release_installed("aead");
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
+        assert!(body.contains("# TYPE dds_pq_releases_installed_total counter\n"));
+        assert!(body.contains("dds_pq_releases_installed_total{result=\"ok\"} 2\n"));
+        assert!(body.contains("dds_pq_releases_installed_total{result=\"aead\"} 1\n"));
+        // pq_releases_installed_count() reads the same Mutex<BTreeMap>
+        // — pin that the public test hook agrees with the renderer.
+        assert_eq!(t.pq_releases_installed_count("ok"), 2);
+        assert_eq!(t.pq_releases_installed_count("aead"), 1);
+        assert_eq!(t.pq_releases_installed_count("decap"), 0);
     }
 
     #[test]

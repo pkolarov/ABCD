@@ -417,7 +417,57 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-05-01 (Z-1 Phase B.10 step 1 — `dds-cli pq` operator
+> Last updated: 2026-05-01 (Z-1 Phase B.11 partial — receive-funnel
+> observability landed. The Phase B catalog from
+> [`docs/pqc-phase-b-plan.md`](docs/pqc-phase-b-plan.md) §B.11 named five
+> PQC metrics (`dds_pq_epoch_id`, `dds_pq_releases_emitted_total`,
+> `dds_pq_envelope_decrypt_total`, `dds_pq_release_request_total`,
+> `dds_pq_rotation_total`); none of those was wired yet, so the B.5 / B.6 /
+> B.7 step 1 receive funnel was running blind — a malformed or replayed
+> `EpochKeyRelease` would be rejected at one of the seven exit branches of
+> [`DdsNode::install_epoch_key_release`](dds-node/src/node.rs) but the
+> outcome stayed in `debug!` logs only, with no Prometheus signal an
+> operator could alarm on. This commit lands a new
+> `dds_pq_releases_installed_total{result=ok|schema|recipient_mismatch|replay_window|kem_ct|decap|aead}`
+> counter bumped from every install-funnel exit branch via a new public
+> [`telemetry::record_pq_release_installed`](dds-node/src/telemetry.rs)
+> entry point. `result=ok` covers the schema gate + recipient binding +
+> replay-window guard + KEM decap + AEAD unwrap all succeeding (the
+> storage-side `Inserted`/`Rotated`/`AlreadyCurrent`/`Stale` partition
+> from `EpochKeyStore::install_peer_release` is intentionally collapsed
+> into `ok` — those are not crypto outcomes and would expand the
+> cardinality without adding security signal); the six failure buckets
+> each map 1:1 to the matching `&'static str` return reason from the
+> install funnel so an operator alarming on
+> `rate(dds_pq_releases_installed_total{result!="ok"}[5m]) > 0` gets the
+> same "any failure is suspicious" pattern proven on
+> `DdsStoreWriteFailures` (Phase C #39) and `DdsLoopbackTcpAdminUsed`
+> (#24). Renderer ships the family's `# HELP` / `# TYPE` headers even on
+> a fresh node where no release has been processed yet so the catalog
+> stays discoverable. New public
+> [`Telemetry::pq_releases_installed_count(result)`](dds-node/src/telemetry.rs)
+> test hook lets integration tests take before/after deltas without
+> scraping `/metrics`. New regression test
+> `install_bumps_pq_releases_installed_metric` in
+> [`dds-node/tests/epoch_key_release_ingest.rs`](dds-node/tests/epoch_key_release_ingest.rs)
+> drives `ok` plus four failure buckets (`recipient_mismatch`,
+> `replay_window`, `aead`, `schema`) through the funnel under a process-
+> wide `telemetry_guard` mutex and asserts each delta is +1 against a
+> baseline snapshot taken before the test runs. Two new renderer unit
+> tests in [`dds-node/src/telemetry.rs`](dds-node/src/telemetry.rs) pin
+> the empty-family discoverability contract (HELP + TYPE headers ship
+> even with no value lines) and the populated-family value-line shape
+> (e.g. `dds_pq_releases_installed_total{result="ok"} 2`). 837 / 837
+> `cargo test --workspace` passing (was 836); telemetry catalog table at
+> the top of [`dds-node/src/telemetry.rs`](dds-node/src/telemetry.rs)
+> updated. **Remaining B.11 work** rides on B.7 step 2/3 + B.8 + B.9:
+> mint-side `dds_pq_releases_emitted_total` on
+> [`build_epoch_key_response`](dds-node/src/node.rs), envelope-decrypt
+> `dds_pq_envelope_decrypt_total` on the gossip + sync envelope path,
+> rotation `dds_pq_rotation_total` on the rotation timer, and matching
+> Phase E alert rules.
+>
+> Previous: 2026-05-01 (Z-1 Phase B.10 step 1 — `dds-cli pq` operator
 > surface landed. [`dds-cli/src/main.rs`](dds-cli/src/main.rs) gained a
 > new top-level `Pq` subcommand with two read-only actions:
 > `dds pq status` summarizes the local node's PQ posture (hybrid KEM

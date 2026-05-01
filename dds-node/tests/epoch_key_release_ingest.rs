@@ -47,6 +47,16 @@ fn env_guard() -> &'static std::sync::Mutex<()> {
     GUARD.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+/// Process-wide guard for tests that read/write the global telemetry
+/// counters (`pq_releases_installed_count`). Tests share the
+/// `OnceLock`-backed [`dds_node::telemetry`] handle so concurrent
+/// access would race the before/after snapshot. Mirrors `env_guard`
+/// — both are cheap (held only across the single install call).
+fn telemetry_guard() -> &'static std::sync::Mutex<()> {
+    static GUARD: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    GUARD.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 /// Build a node belonging to `domain_key`. Mirrors the helper in
 /// `peer_cert_cache.rs` — fresh libp2p keypair, fresh admission cert
 /// valid for ~24h, fresh data dir.
@@ -390,4 +400,126 @@ fn epoch_key_store_persists_after_install() {
         .copied()
         .expect("release survived restart");
     assert_eq!(cached, epoch_key);
+}
+
+/// **Z-1 Phase B.11 (partial)** — every exit branch of
+/// [`DdsNode::install_epoch_key_release`] bumps
+/// `dds_pq_releases_installed_total{result=...}` by one. The receive
+/// funnel is the load-bearing observability surface for the H-12
+/// piggy-back path and the `/dds/epoch-keys/1.0.0/<domain>` request-
+/// response path; this test pins ok + four failure-path buckets in
+/// one sequential run under a process-wide telemetry guard so the
+/// before/after deltas don't race other tests in the same binary.
+#[test]
+fn install_bumps_pq_releases_installed_metric() {
+    use rand_core::RngCore;
+    let _t_guard = telemetry_guard().lock().unwrap_or_else(|e| e.into_inner());
+    // Lazily initialise the process-global telemetry handle. Idempotent
+    // — the handle survives across tests in this binary.
+    let telemetry = dds_node::telemetry::install();
+
+    let domain_key = DomainKey::generate("test-domain", &mut OsRng);
+    let (mut node, _dir) = spawn_node(&domain_key);
+    let recipient_id = node.peer_id.to_string();
+    let kem_pk = node.epoch_keys_for_tests().kem_public().clone();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let publisher_id = "12D3KooWPublisherSyntheticForTest".to_string();
+    let mut epoch_key = [0u8; 32];
+    OsRng.fill_bytes(&mut epoch_key);
+
+    let baseline_ok = telemetry.pq_releases_installed_count("ok");
+    let baseline_recipient_mismatch = telemetry.pq_releases_installed_count("recipient_mismatch");
+    let baseline_replay_window = telemetry.pq_releases_installed_count("replay_window");
+    let baseline_aead = telemetry.pq_releases_installed_count("aead");
+    let baseline_schema = telemetry.pq_releases_installed_count("schema");
+
+    // 1) ok — well-formed release, decap+unwrap succeeds.
+    let release = mint_release(
+        &publisher_id,
+        &recipient_id,
+        100,
+        now,
+        now + 86_400,
+        &epoch_key,
+        &kem_pk,
+    );
+    node.install_epoch_key_release(&release, &recipient_id, now)
+        .expect("install ok");
+
+    // 2) recipient_mismatch — release.recipient lies about who it's for.
+    let mut wrong_recipient = mint_release(
+        &publisher_id,
+        &recipient_id,
+        101,
+        now,
+        now + 86_400,
+        &epoch_key,
+        &kem_pk,
+    );
+    wrong_recipient.recipient = "12D3KooWNotMe".into();
+    let _ = node.install_epoch_key_release(&wrong_recipient, &recipient_id, now);
+
+    // 3) replay_window — issued_at older than the 7-day window.
+    let stale_now: u64 = 1_700_000_000;
+    let stale_issued = stale_now - EPOCH_RELEASE_REPLAY_WINDOW_SECS - 1;
+    let stale = mint_release(
+        &publisher_id,
+        &recipient_id,
+        102,
+        stale_issued,
+        stale_issued + 86_400,
+        &epoch_key,
+        &kem_pk,
+    );
+    let _ = node.install_epoch_key_release(&stale, &recipient_id, stale_now);
+
+    // 4) aead — single-byte flip in the AEAD ciphertext, Poly1305
+    //    catches it on unwrap.
+    let mut tampered = mint_release(
+        &publisher_id,
+        &recipient_id,
+        103,
+        now,
+        now + 86_400,
+        &epoch_key,
+        &kem_pk,
+    );
+    tampered.aead_ciphertext[0] ^= 0x01;
+    let _ = node.install_epoch_key_release(&tampered, &recipient_id, now);
+
+    // 5) schema — wrong-length kem_ct caught by validate().
+    let bad_schema = EpochKeyRelease {
+        publisher: publisher_id.clone(),
+        epoch_id: 104,
+        issued_at: now,
+        expires_at: now + 86_400,
+        recipient: recipient_id.clone(),
+        kem_ct: vec![0u8; EPOCH_KEY_RELEASE_KEM_CT_LEN - 1],
+        aead_nonce: [0u8; 12],
+        aead_ciphertext: vec![0u8; EPOCH_KEY_RELEASE_AEAD_CT_LEN],
+        signature: vec![0u8; 64],
+        pq_signature: None,
+    };
+    let _ = node.install_epoch_key_release(&bad_schema, &recipient_id, now);
+
+    assert_eq!(telemetry.pq_releases_installed_count("ok"), baseline_ok + 1);
+    assert_eq!(
+        telemetry.pq_releases_installed_count("recipient_mismatch"),
+        baseline_recipient_mismatch + 1
+    );
+    assert_eq!(
+        telemetry.pq_releases_installed_count("replay_window"),
+        baseline_replay_window + 1
+    );
+    assert_eq!(
+        telemetry.pq_releases_installed_count("aead"),
+        baseline_aead + 1
+    );
+    assert_eq!(
+        telemetry.pq_releases_installed_count("schema"),
+        baseline_schema + 1
+    );
 }

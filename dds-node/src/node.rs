@@ -2227,12 +2227,15 @@ impl DdsNode {
         now_unix: u64,
     ) -> Result<InstallOutcome, &'static str> {
         if let Err(_e) = release.validate() {
+            crate::telemetry::record_pq_release_installed("schema");
             return Err("schema");
         }
         if release.recipient != recipient_str {
+            crate::telemetry::record_pq_release_installed("recipient_mismatch");
             return Err("recipient_mismatch");
         }
         if !is_release_within_replay_window(release.issued_at, now_unix) {
+            crate::telemetry::record_pq_release_installed("replay_window");
             return Err("replay_window");
         }
         // Defensive re-check on the two length-bound slices. Schema
@@ -2241,27 +2244,46 @@ impl DdsNode {
         if release.kem_ct.len() != EPOCH_KEY_RELEASE_KEM_CT_LEN
             || release.aead_ciphertext.len() != EPOCH_KEY_RELEASE_AEAD_CT_LEN
         {
+            crate::telemetry::record_pq_release_installed("schema");
             return Err("schema");
         }
 
-        let kem_ct = dds_core::crypto::kem::KemCiphertext::from_bytes(&release.kem_ct)
-            .map_err(|_| "kem_ct")?;
+        let kem_ct = match dds_core::crypto::kem::KemCiphertext::from_bytes(&release.kem_ct) {
+            Ok(ct) => ct,
+            Err(_) => {
+                crate::telemetry::record_pq_release_installed("kem_ct");
+                return Err("kem_ct");
+            }
+        };
         let binding = epoch_key_binding(&release.publisher, recipient_str, release.epoch_id);
-        let shared = dds_core::crypto::kem::decap(self.epoch_keys.kem_secret(), &kem_ct, &binding)
-            .map_err(|_| "decap")?;
-        let epoch_key = dds_core::crypto::epoch_key::unwrap(
+        let shared =
+            match dds_core::crypto::kem::decap(self.epoch_keys.kem_secret(), &kem_ct, &binding) {
+                Ok(s) => s,
+                Err(_) => {
+                    crate::telemetry::record_pq_release_installed("decap");
+                    return Err("decap");
+                }
+            };
+        let epoch_key = match dds_core::crypto::epoch_key::unwrap(
             &shared,
             &release.aead_nonce,
             &release.aead_ciphertext,
-        )
-        .map_err(|_| "aead")?;
+        ) {
+            Ok(k) => k,
+            Err(_) => {
+                crate::telemetry::record_pq_release_installed("aead");
+                return Err("aead");
+            }
+        };
 
-        Ok(self.epoch_keys.install_peer_release(
+        let outcome = self.epoch_keys.install_peer_release(
             &release.publisher,
             release.epoch_id,
             epoch_key,
             release.expires_at,
-        ))
+        );
+        crate::telemetry::record_pq_release_installed("ok");
+        Ok(outcome)
     }
 
     /// Read-only handle to the epoch-key store. Test-only — the live
