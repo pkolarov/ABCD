@@ -15,7 +15,7 @@ fn test_help() {
     // All top-level subcommands should be advertised in --help.
     for cmd in [
         "identity", "group", "policy", "status", "enroll", "admin", "audit", "platform", "cp",
-        "debug", "stats", "health", "export", "import",
+        "debug", "stats", "health", "export", "import", "pq",
     ] {
         assert!(stdout.contains(cmd), "help missing {cmd}: {stdout}");
     }
@@ -48,6 +48,9 @@ fn test_subcommand_help() {
         vec!["audit", "export", "--help"],
         vec!["export", "--help"],
         vec!["import", "--help"],
+        vec!["pq", "--help"],
+        vec!["pq", "status", "--help"],
+        vec!["pq", "list-pubkeys", "--help"],
     ] {
         let out = dds_cli().args(&tree).output().unwrap();
         assert!(
@@ -640,4 +643,86 @@ fn test_group_vouch_then_revoke() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Revocations:  1"));
+}
+
+// ================================================================
+// pq (Z-1 Phase B operator surface)
+// ================================================================
+
+#[test]
+fn test_pq_status_no_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = dds_cli()
+        .args(["--data-dir", tmp.path().to_str().unwrap(), "pq", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("DDS PQ Status"), "stdout: {stdout}");
+    assert!(stdout.contains("Epoch key store:          not initialized"));
+    assert!(stdout.contains("Peer cert cache:          not initialized"));
+}
+
+#[test]
+fn test_pq_list_pubkeys_no_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = dds_cli()
+        .args([
+            "--data-dir",
+            tmp.path().to_str().unwrap(),
+            "pq",
+            "list-pubkeys",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("No peer cert cache"), "stdout: {stdout}");
+}
+
+#[test]
+fn test_pq_status_reports_initialized_store() {
+    use rand::rngs::OsRng;
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path();
+
+    // Seed a fresh epoch_keys.cbor by constructing the store and saving.
+    let mut rng = OsRng;
+    let store = dds_node::epoch_key_store::EpochKeyStore::new(&mut rng);
+    store.save(&data_dir.join("epoch_keys.cbor")).unwrap();
+
+    let out = dds_cli()
+        .args(["--data-dir", data_dir.to_str().unwrap(), "pq", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("KEM pubkey hash"), "stdout: {stdout}");
+    // Fresh store seeds epoch_id = 1 (B.6 contract).
+    assert!(
+        stdout.contains("Current epoch_id:         1"),
+        "stdout: {stdout}"
+    );
+    // Fresh store has no cached peer releases yet.
+    assert!(
+        stdout.contains("Cached peer releases:     0"),
+        "stdout: {stdout}"
+    );
+    // Peer cert cache file still missing.
+    assert!(
+        stdout.contains("Peer cert cache:          not initialized"),
+        "stdout: {stdout}"
+    );
 }

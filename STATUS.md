@@ -417,7 +417,46 @@
 > ---
 
 > Auto-updated tracker referencing [DDS-Design-Document.md](docs/DDS-Design-Document.md).
-> Last updated: 2026-05-01 (Z-1 Phase B.7 step 1 — publisher-side
+> Last updated: 2026-05-01 (Z-1 Phase B.10 step 1 — `dds-cli pq` operator
+> surface landed. [`dds-cli/src/main.rs`](dds-cli/src/main.rs) gained a
+> new top-level `Pq` subcommand with two read-only actions:
+> `dds pq status` summarizes the local node's PQ posture (hybrid KEM
+> pubkey hash via `sha256:8` shorthand, current local epoch_id, cached
+> peer-release count, cached peer-cert count + `pq_kem_pubkey` v3
+> coverage percentage), and `dds pq list-pubkeys` lists every cached
+> peer admission cert with its KEM pubkey hash. Both actions are offline
+> reads against `<data-dir>/epoch_keys.cbor` and
+> `<data-dir>/peer_certs.cbor` directly — no running dds-node needed,
+> matches the offline-first idiom of `dds status` (without `--remote`)
+> and `dds group`. Implementation routes through the already-public
+> [`dds_node::epoch_key_store::EpochKeyStore::load_or_create`](dds-node/src/epoch_key_store.rs)
+> and [`dds_node::peer_cert_store::load_or_empty`](dds-node/src/peer_cert_store.rs)
+> entry points, so the CLI inherits the same wire-version + length gates
+> the node-side ingest paths run; a torn or unknown-version blob fails
+> loud at the load boundary instead of silently zeroing the report.
+> Three new smoke tests in
+> [`dds-cli/tests/smoke.rs`](dds-cli/tests/smoke.rs) — `test_pq_status_no_state`
+> (clean data-dir prints `not initialized` for both stores),
+> `test_pq_list_pubkeys_no_state` (empty cache surfaces a
+> friendly "run dds-node first" hint rather than a stack trace), and
+> `test_pq_status_reports_initialized_store` (a freshly-saved
+> `EpochKeyStore` round-trips through the CLI: epoch_id 1, zero peer
+> releases, KEM pubkey hash printed) — pin the contract end-to-end via
+> the existing `env!("CARGO_BIN_EXE_dds")` smoke harness. The
+> `--help`-coverage tests (`test_help`, `test_subcommand_help`) gained
+> the new `pq` / `pq status` / `pq list-pubkeys` rows so a future
+> rename of either action would fail clap parse before the test
+> binary launches. Closes B.10 step 1 (the read-only operator surface);
+> B.10's `dds-cli pq rotate` write-side action stays deferred to land
+> alongside B.9 (rotation timer + revocation hook) so the manual force-
+> rotate goes through the same mint + per-recipient release fan-out the
+> automated rotation will. The B.7 / B.6 follow-ons (encrypted gossip
+> envelope publish + ingest decode + the publisher-signature verify on
+> install) remain the load-bearing wire-path work for closing Z-1's
+> Harvest-Now-Decrypt-Later confidentiality gap on the gossip + sync
+> channels — see the §B.7 / §B.6-followon entries below.
+>
+> Previous: 2026-05-01 (Z-1 Phase B.7 step 1 — publisher-side
 > `EpochKeyRelease` mint helper +
 > [`DdsNode::build_epoch_key_response`](dds-node/src/node.rs) responder
 > landed in [`dds-node/src/node.rs`](dds-node/src/node.rs). The B.5

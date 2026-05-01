@@ -132,6 +132,15 @@ enum Commands {
         #[arg(long)]
         allow_unsigned: bool,
     },
+    /// Z-1 Phase B operator surface — inspect the local node's
+    /// post-quantum encryption posture (hybrid KEM pubkey, current
+    /// epoch_id, cached peer cert / release counts). All actions read
+    /// the on-disk state under `--data-dir` directly; they do not
+    /// require a running dds-node.
+    Pq {
+        #[command(subcommand)]
+        action: PqAction,
+    },
 }
 
 // ---- Identity ----
@@ -461,6 +470,23 @@ enum DebugAction {
     },
 }
 
+// ---- Pq (Z-1 Phase B operator surface) ----
+
+#[derive(Subcommand)]
+enum PqAction {
+    /// Summarize the local node's PQ posture: hybrid KEM pubkey hash,
+    /// current epoch_id, cached peer-release count, cached peer cert
+    /// count, and the subset of peer certs that already advertise a
+    /// Phase-B `pq_kem_pubkey`. Reads `<data-dir>/epoch_keys.cbor` and
+    /// `<data-dir>/peer_certs.cbor` directly.
+    Status,
+    /// List every cached peer admission cert and its hybrid KEM pubkey
+    /// hash (sha256 prefix). Used by an admin to confirm 100% Phase-B
+    /// coverage of the admitted peer set before flipping `enc-v3` on
+    /// the domain.
+    ListPubkeys,
+}
+
 // ================================================================
 // entry point
 // ================================================================
@@ -497,6 +523,7 @@ async fn main() {
             dry_run,
             allow_unsigned,
         } => handle_import(&cli.data_dir, &input, dry_run, allow_unsigned),
+        Commands::Pq { action } => handle_pq(action, &cli.data_dir),
     }
 }
 
@@ -2029,6 +2056,115 @@ fn handle_import(data_dir: &Path, input: &Path, dry_run: bool, allow_unsigned: b
     println!("  Operations: {new_ops} new, {dup_ops} already present");
     println!("  Revoked:    {} applied", dump.revoked.len());
     println!("  Burned:     {} applied", dump.burned.len());
+}
+
+// ================================================================
+// pq (Z-1 Phase B operator surface)
+// ================================================================
+
+fn handle_pq(action: PqAction, data_dir: &Path) {
+    match action {
+        PqAction::Status => handle_pq_status(data_dir),
+        PqAction::ListPubkeys => handle_pq_list_pubkeys(data_dir),
+    }
+}
+
+/// Hex-encode the first 8 bytes of `sha256(bytes)` (16 lowercase hex
+/// chars) — a stable short fingerprint suitable for human comparison.
+fn pq_pubkey_short_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    hex::encode(&digest[..8])
+}
+
+fn handle_pq_status(data_dir: &Path) {
+    let epoch_path = data_dir.join("epoch_keys.cbor");
+    let cert_path = data_dir.join("peer_certs.cbor");
+    println!("DDS PQ Status (Z-1 Phase B)");
+    println!("  Data dir:                 {}", data_dir.display());
+    if epoch_path.exists() {
+        match dds_node::epoch_key_store::EpochKeyStore::load_or_create(&epoch_path, &mut OsRng) {
+            Ok(store) => {
+                let pk_bytes = store.kem_public().to_bytes();
+                let (epoch_id, _) = store.my_current_epoch();
+                println!(
+                    "  KEM pubkey hash (sha256:8): {}",
+                    pq_pubkey_short_hash(&pk_bytes)
+                );
+                println!("  KEM pubkey size:          {} bytes", pk_bytes.len());
+                println!("  Current epoch_id:         {}", epoch_id);
+                println!("  Cached peer releases:     {}", store.peer_release_count());
+            }
+            Err(e) => {
+                eprintln!("Failed to load {}: {e}", epoch_path.display());
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!(
+            "  Epoch key store:          not initialized ({} missing)",
+            epoch_path.display()
+        );
+    }
+    if cert_path.exists() {
+        match dds_node::peer_cert_store::load_or_empty(&cert_path) {
+            Ok(certs) => {
+                let total = certs.len();
+                let kem_capable = certs.iter_kem_pubkeys().count();
+                println!("  Cached peer certs:        {total}");
+                println!("    With pq_kem_pubkey:     {kem_capable}");
+                if total > 0 {
+                    let pct = (kem_capable as f64 / total as f64) * 100.0;
+                    println!("    v3 coverage:            {pct:.1}%");
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to load {}: {e}", cert_path.display());
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!(
+            "  Peer cert cache:          not initialized ({} missing)",
+            cert_path.display()
+        );
+    }
+}
+
+fn handle_pq_list_pubkeys(data_dir: &Path) {
+    let cert_path = data_dir.join("peer_certs.cbor");
+    if !cert_path.exists() {
+        println!("No peer cert cache at {}", cert_path.display());
+        println!("Run dds-node and complete at least one H-12 admission handshake first.");
+        return;
+    }
+    let certs = match dds_node::peer_cert_store::load_or_empty(&cert_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to load {}: {e}", cert_path.display());
+            std::process::exit(1);
+        }
+    };
+    if certs.is_empty() {
+        println!("No cached peer certs (cache file is empty).");
+        return;
+    }
+    println!("Cached peer admission certs ({} total)", certs.len());
+    println!("{:<60} {:>6}  KEM_HASH (sha256:8)", "PEER_ID", "KEM");
+    for (peer_id, cert) in certs.iter() {
+        match &cert.pq_kem_pubkey {
+            Some(pk) => {
+                println!(
+                    "{peer_id:<60} {:>6}  {}",
+                    pk.len(),
+                    pq_pubkey_short_hash(pk),
+                );
+            }
+            None => {
+                println!("{peer_id:<60} {:>6}  -", "none");
+            }
+        }
+    }
 }
 
 // ================================================================
