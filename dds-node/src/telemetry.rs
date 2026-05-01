@@ -39,6 +39,7 @@
 //! | `dds_sync_pulls_total` | counter | `result=ok\|fail` | bumped by [`record_sync_pull`] |
 //! | `dds_sync_payloads_rejected_total` | counter | `reason=legacy_v1\|publisher_capability\|publisher_identity\|replay_window\|signature\|duplicate_jti\|graph` | bumped by [`record_sync_payloads_rejected`] |
 //! | `dds_pq_releases_installed_total` | counter | `result=ok\|schema\|recipient_mismatch\|replay_window\|kem_ct\|decap\|aead` | bumped by [`record_pq_release_installed`] at every exit branch of [`crate::node::DdsNode::install_epoch_key_release`] |
+//! | `dds_pq_envelope_decrypt_total` | counter | `result=ok\|no_key\|aead_fail` | bumped by [`record_pq_envelope_decrypt`] at every exit branch of the gossip envelope decrypt path in [`crate::node::DdsNode::handle_gossip_message`] |
 //! | `dds_http_requests_total` | counter | `route, method, status` | bumped by [`record_http_request`] |
 //! | `dds_trust_graph_attestations` | gauge | `body_type=user-auth-attestation\|device-join\|windows-policy\|macos-policy\|macos-account-binding\|sso-identity-link\|software-assignment\|service-principal\|session\|unknown` | [`crate::service::LocalService::trust_graph_counts`] at scrape, partitioned via [`crate::service::body_type_label`] |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
@@ -747,6 +748,14 @@ pub struct Telemetry {
     /// store layer — those are storage-side outcomes, not crypto
     /// outcomes).
     pq_releases_installed: Mutex<BTreeMap<String, u64>>,
+    /// **Z-1 Phase B.7 / B.11** — per-`result` gossip/sync envelope
+    /// decrypt outcomes. `result` is one of `ok|no_key|aead_fail`:
+    /// - `ok` — epoch key looked up and AEAD decryption succeeded.
+    /// - `no_key` — no cached epoch key for (publisher, epoch_id).
+    /// - `aead_fail` — key present but AEAD tag verification failed.
+    /// Bumped from [`crate::node::DdsNode::handle_gossip_message`]
+    /// (gossip path) and eventually from the sync decrypt path (B.8).
+    pq_envelope_decrypt: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Telemetry {
@@ -767,6 +776,7 @@ impl Telemetry {
             sync_payloads_rejected: Mutex::new(BTreeMap::new()),
             http_requests: Mutex::new(BTreeMap::new()),
             pq_releases_installed: Mutex::new(BTreeMap::new()),
+            pq_envelope_decrypt: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1130,6 +1140,31 @@ impl Telemetry {
         }
     }
 
+    fn bump_pq_envelope_decrypt(&self, result: &str) {
+        let mut g = match self.pq_envelope_decrypt.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry(result.to_string()).or_insert(0) += 1;
+    }
+
+    fn pq_envelope_decrypt_snapshot(&self) -> BTreeMap<String, u64> {
+        match self.pq_envelope_decrypt.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of `dds_pq_envelope_decrypt_total{result=...}`.
+    /// Public so regression tests can take before/after snapshots
+    /// without scraping the renderer.
+    pub fn pq_envelope_decrypt_count(&self, result: &str) -> u64 {
+        match self.pq_envelope_decrypt.lock() {
+            Ok(g) => g.get(result).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(result).copied().unwrap_or(0),
+        }
+    }
+
     fn uptime_seconds(&self) -> u64 {
         SystemTime::now()
             .duration_since(self.start_at)
@@ -1353,6 +1388,27 @@ pub fn record_http_request(route: &str, method: &str, status: u16) {
 pub fn record_pq_release_installed(result: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_pq_release_installed(result);
+    }
+}
+
+/// Bump `dds_pq_envelope_decrypt_total{result=...}` by one. Called
+/// from [`crate::node::DdsNode::handle_gossip_message`] (and
+/// eventually the sync decrypt path, B.8) at every exit branch of the
+/// per-envelope decrypt pipeline:
+///
+/// - `ok` — epoch key found and AEAD ciphertext verified cleanly.
+/// - `no_key` — no cached epoch key for (publisher, epoch_id). The
+///   envelope is dropped; the receiver should trigger an
+///   `EpochKeyRequest` recovery (§4.5.1) for this publisher.
+/// - `aead_fail` — key present but the AEAD tag did not verify
+///   (tampered ciphertext, tampered nonce, wrong epoch_id, or
+///   publisher used a stale key that the store already evicted from
+///   the grace cache). Envelope is dropped.
+///
+/// No-op when telemetry has not been installed (tests, harnesses).
+pub fn record_pq_envelope_decrypt(result: &str) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_pq_envelope_decrypt(result);
     }
 }
 
@@ -1812,6 +1868,28 @@ fn render_exposition(
     for (result, count) in pq_releases_snapshot.iter() {
         out.push_str(&format!(
             "dds_pq_releases_installed_total{{result=\"{}\"}} {}\n",
+            escape_label_value(result),
+            count
+        ));
+    }
+
+    // `dds_pq_envelope_decrypt_total` — per-`result` gossip/sync
+    // envelope AEAD decrypt outcome counter. Bumped from
+    // `DdsNode::handle_gossip_message` on every `GossipEnvelopeV3`
+    // decode attempt (B.7 wiring); the sync path lands in B.8.
+    out.push_str(
+        "# HELP dds_pq_envelope_decrypt_total Phase B gossip/sync envelope AEAD decrypt outcomes \
+         since process start, partitioned by result. ok = epoch key found and AEAD ciphertext \
+         verified cleanly; no_key = no cached epoch key for (publisher, epoch_id) — receiver \
+         should trigger EpochKeyRequest recovery; aead_fail = key present but AEAD tag \
+         verification failed (tampered ciphertext, wrong epoch_id, or stale key evicted from \
+         grace cache).\n",
+    );
+    out.push_str("# TYPE dds_pq_envelope_decrypt_total counter\n");
+    let pq_decrypt_snapshot = telemetry.pq_envelope_decrypt_snapshot();
+    for (result, count) in pq_decrypt_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_pq_envelope_decrypt_total{{result=\"{}\"}} {}\n",
             escape_label_value(result),
             count
         ));
@@ -2305,10 +2383,13 @@ mod tests {
         assert!(body.contains("# TYPE dds_audit_entries_total counter\n"));
         assert!(body.contains("dds_audit_chain_length 0\n"));
         assert!(body.contains("dds_audit_chain_head_age_seconds 0\n"));
-        // `dds_pq_releases_installed_total` family is always
-        // discoverable (HELP + TYPE headers) even on a fresh node where
-        // no EpochKeyRelease has been processed yet.
+        // `dds_pq_releases_installed_total` and
+        // `dds_pq_envelope_decrypt_total` families are always
+        // discoverable (HELP + TYPE headers) even on a fresh node
+        // where no EpochKeyRelease or gossip envelope has been
+        // processed yet.
         assert!(body.contains("# TYPE dds_pq_releases_installed_total counter\n"));
+        assert!(body.contains("# TYPE dds_pq_envelope_decrypt_total counter\n"));
     }
 
     #[test]
@@ -2338,6 +2419,34 @@ mod tests {
         assert_eq!(t.pq_releases_installed_count("ok"), 2);
         assert_eq!(t.pq_releases_installed_count("aead"), 1);
         assert_eq!(t.pq_releases_installed_count("decap"), 0);
+    }
+
+    #[test]
+    fn render_emits_pq_envelope_decrypt_value_lines_after_bumps() {
+        let t = Telemetry::new();
+        t.bump_pq_envelope_decrypt("ok");
+        t.bump_pq_envelope_decrypt("ok");
+        t.bump_pq_envelope_decrypt("ok");
+        t.bump_pq_envelope_decrypt("no_key");
+        t.bump_pq_envelope_decrypt("aead_fail");
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
+        assert!(body.contains("# TYPE dds_pq_envelope_decrypt_total counter\n"));
+        assert!(body.contains("dds_pq_envelope_decrypt_total{result=\"ok\"} 3\n"));
+        assert!(body.contains("dds_pq_envelope_decrypt_total{result=\"no_key\"} 1\n"));
+        assert!(body.contains("dds_pq_envelope_decrypt_total{result=\"aead_fail\"} 1\n"));
+        assert_eq!(t.pq_envelope_decrypt_count("ok"), 3);
+        assert_eq!(t.pq_envelope_decrypt_count("no_key"), 1);
+        assert_eq!(t.pq_envelope_decrypt_count("aead_fail"), 1);
+        assert_eq!(t.pq_envelope_decrypt_count("other"), 0);
     }
 
     #[test]

@@ -67,6 +67,7 @@ See [DDS Admin Guide — Windows Deployment](docs/DDS-Admin-Guide.md#windows-dep
 | [Windows E2E](platform/windows/e2e/README.md) | Windows smoke test: node + CP + policy agent |
 | [macOS Platform](platform/macos/README.md) | macOS policy agent and installer |
 | [macOS E2E](platform/macos/e2e/README.md) | Two-machine macOS mesh validation |
+| [Linux Platform](platform/linux/README.md) | Linux policy agent implementation plan |
 | [Second Node](platform/macos/packaging/SECOND-NODE.md) | Adding nodes to an existing domain |
 | [Load Test](dds-loadtest/README.md) | Soak/smoke harness and KPI verdicts |
 

@@ -1,5 +1,93 @@
 # DDS Implementation Status
 
+## TODO: Documentation-to-Code Verification Addendum (2026-05-01)
+
+Manual verification pass compared the progress claims in the Markdown
+tracker files against the current source tree. The Rust worktree contains
+Z-1 Phase B encrypted-gossip changes (`dds-core/src/crypto/epoch_key.rs`,
+`dds-net/src/pq_envelope.rs`, `dds-node/src/node.rs`,
+`dds-node/src/telemetry.rs`, and `dds-node/tests/gossip_encrypt.rs`).
+Those changes are treated below as current code reality.
+
+- TODO DOC-PROGRESS-1: Refresh the Z-1 Phase B progress wording in this
+  file and `docs/pqc-phase-b-plan.md` after the encrypted-gossip test
+  path is verified. Current docs still describe B.7 as "Step 1 only"
+  (publisher-side `EpochKeyRelease` mint + `EpochKeyResponse`
+  responder), and `docs/pqc-phase-b-plan.md` still opens with
+  `Status: Plan -- open for implementation`. The current code already
+  includes `epoch_key::encrypt_payload` / `decrypt_payload`,
+  `GossipEnvelopeV3::to_cbor` / `from_cbor`,
+  encrypted-gossip decrypt + plaintext rejection in
+  `DdsNode::handle_gossip_message`, the `publish_gossip_op` wrapper,
+  `dds_pq_envelope_decrypt_total`, and the new
+  `dds-node/tests/gossip_encrypt.rs` regression file. Once tests pass,
+  document this as a B.7 partial follow-on instead of leaving the docs
+  to under-report the code.
+- TODO PQ-B7-WIRE-1: Wire encrypted gossip publishing into real
+  publishers before claiming B.7 encrypted publish is landed. Static
+  source check shows `DdsNode::publish_gossip_op` exists, but no current
+  call site uses it; direct `gossipsub.publish(...)` remains in
+  `dds-loadtest/src/harness.rs`, `dds-fido2-test/src/bin/multinode.rs`,
+  `dds-node/src/bin/dds-macos-e2e.rs`, and several integration tests.
+  On an `enc-v3` domain those paths can still publish plaintext bytes
+  that receivers now reject. Route production and harness publishers
+  through one encryption-aware helper, then add a regression that proves
+  an `enc-v3` publisher emits CBOR `GossipEnvelopeV3` rather than a
+  plaintext `GossipMessage`.
+- TODO PQ-B7-RECOVERY-1: Implement the late-join key recovery promised
+  by `docs/pqc-phase-b-plan.md` section 4.5.1. Current
+  `DdsNode::handle_gossip_message` behavior on encrypted gossip with no
+  cached `(publisher, epoch_id)` key is only log + metrics
+  (`dds_pq_envelope_decrypt_total{result="no_key"}` and
+  `dds_gossip_messages_dropped_total{reason="enc_v3_no_key"}`) + drop.
+  The plan says this miss should emit a bounded/deduped
+  `EpochKeyRequest { publishers: [P] }` to the publisher or a recent
+  speaker for that publisher. Add that request path, rate limiting, and
+  `dds_pq_release_request_total` coverage before marking late-join
+  recovery complete.
+- TODO PQ-B8-1: Keep sync encryption marked open. `SyncEnvelopeV3`
+  exists as a wire type, but `DdsNode::build_sync_response` still
+  returns plaintext `SyncResponse { payloads, complete }`, and
+  `DdsNode::handle_sync_response` consumes plaintext payloads directly.
+  This matches the B.8 row being open; do not upgrade the Z-1
+  confidentiality claim until sync response wrapping and ingest decrypt
+  are implemented and tested.
+- TODO PQ-B11-DOC-1: Align the PQ observability catalog with the code.
+  The plan names `dds_pq_envelope_decrypt_total{result=ok|key_missing|aead_fail}`;
+  the current code renders `result=ok|no_key|aead_fail`, and only the
+  gossip decrypt path bumps it. Either update the docs to `no_key` and
+  "gossip-only partial" or rename the code label to the documented
+  `key_missing` before dashboards/alerts consume it. Sync-side bumps,
+  `dds_pq_releases_emitted_total`, `dds_pq_release_request_total`,
+  `dds_pq_rotation_total`, and Phase E alert rules remain TODO.
+- TODO CI-DOC-1: Reconcile CI progress claims with the actual workflow
+  files. `STATUS.md` and `dds-loadtest/README.md` still refer to
+  `.github/workflows/loadtest-smoke.yml`, but the workflow tree contains
+  only `ci.yml`, `msi.yml`, and `pkg.yml`. `STATUS.md` also says the CI
+  pipeline checks `thumbv7em-none-eabihf`; current `ci.yml` explicitly
+  comments that `cross-embedded` was removed because `dds-core`
+  dependencies pull in `std`. Either restore those jobs or downgrade the
+  docs to "planned / removed pending no_std audit" so the CI status does
+  not overstate coverage.
+- TODO DOC-STRUCTURE-1: Refresh stale inventory tables in the status
+  body. The workspace and README now list 9 crates, but the "What's
+  Next" section still says "All 7 crates are functionally complete."
+  The CLI status table also predates the B.10 `dds pq status` /
+  `dds pq list-pubkeys` surface. Update these inventories after the PQ
+  test path is verified so the tracker does not mix old crate counts
+  with newer Phase B progress.
+
+Verification note: the repository-local `target/debug/deps` tree is
+large enough that two direct test attempts stalled in sleeping `rustc`
+processes. Re-running with a fresh target directory succeeded:
+`CARGO_TARGET_DIR=/tmp/dds-cargo-target-gossip CARGO_INCREMENTAL=0
+RUSTFLAGS='-D warnings' cargo test -p dds-node --test gossip_encrypt`
+(10/10), `CARGO_TARGET_DIR=/tmp/dds-cargo-target-gossip
+CARGO_INCREMENTAL=0 cargo test -p dds-core --lib crypto::epoch_key`
+(11/11), `CARGO_TARGET_DIR=/tmp/dds-cargo-target-gossip
+CARGO_INCREMENTAL=0 cargo test -p dds-net --lib pq_envelope` (35/35),
+and `cargo fmt --all -- --check`.
+
 > ## ⚠ Zero-Trust Audit (2026-04-26) — CRITICAL FIXES TO DO
 >
 > A first-principles audit against the five core zero-trust principles

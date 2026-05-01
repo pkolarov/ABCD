@@ -14,7 +14,7 @@ use dds_net::admission::{AdmissionRequest, AdmissionResponse, MAX_REVOCATIONS_PE
 use dds_net::gossip::{DdsTopic, DdsTopicSet, GossipMessage};
 use dds_net::pq_envelope::{
     EPOCH_KEY_RELEASE_AEAD_CT_LEN, EPOCH_KEY_RELEASE_ED25519_SIG_LEN, EPOCH_KEY_RELEASE_KEM_CT_LEN,
-    EpochKeyRelease, EpochKeyRequest, EpochKeyResponse,
+    EpochKeyRelease, EpochKeyRequest, EpochKeyResponse, GossipEnvelopeV3,
 };
 use dds_net::sync::{SyncPayload, SyncRequest, SyncResponse, apply_sync_payloads_with_graph};
 use dds_net::transport::{DdsBehaviour, DdsBehaviourEvent, SwarmConfig};
@@ -1147,7 +1147,64 @@ impl DdsNode {
             }
         };
 
-        let msg = match GossipMessage::from_cbor(data) {
+        // **Z-1 Phase B.7** — detect envelope shape.
+        // Try to decode as a `GossipEnvelopeV3` first. A v3 envelope is
+        // a CBOR map with `publisher`, `epoch_id`, `nonce`, `ciphertext`
+        // fields; a v2 plaintext envelope is a CBOR map with a
+        // `DirectoryOp`/`Revocation`/`Burn`/`AuditLog` variant tag.
+        // The two shapes are structurally distinct so decoding one won't
+        // silently succeed on the other's bytes in practice.
+        let payload: std::borrow::Cow<[u8]> = if let Ok(env) = GossipEnvelopeV3::from_cbor(data) {
+            // Encrypted envelope — look up epoch key and decrypt.
+            let nonce: [u8; 12] = env.nonce;
+            match self.epoch_keys.peer_epoch_key(&env.publisher, env.epoch_id) {
+                None => {
+                    warn!(
+                        publisher = %env.publisher,
+                        epoch_id = env.epoch_id,
+                        "no cached epoch key for publisher — dropping encrypted gossip"
+                    );
+                    crate::telemetry::record_pq_envelope_decrypt("no_key");
+                    crate::telemetry::record_gossip_messages_dropped("enc_v3_no_key");
+                    return;
+                }
+                Some(epoch_key) => {
+                    match dds_core::crypto::epoch_key::decrypt_payload(
+                        epoch_key,
+                        &nonce,
+                        &env.ciphertext,
+                    ) {
+                        Ok(plaintext) => {
+                            crate::telemetry::record_pq_envelope_decrypt("ok");
+                            std::borrow::Cow::Owned(plaintext)
+                        }
+                        Err(_) => {
+                            warn!(
+                                publisher = %env.publisher,
+                                epoch_id = env.epoch_id,
+                                "AEAD decryption failed for encrypted gossip envelope"
+                            );
+                            crate::telemetry::record_pq_envelope_decrypt("aead_fail");
+                            crate::telemetry::record_gossip_messages_dropped("enc_v3_aead_fail");
+                            return;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Plaintext envelope — check domain enc-v3 capability.
+            if self
+                .domain
+                .has_capability(dds_domain::domain::CAPABILITY_ENC_V3)
+            {
+                warn!("received plaintext gossip on enc-v3 domain — dropping");
+                crate::telemetry::record_gossip_messages_dropped("enc_v3_plaintext_rejected");
+                return;
+            }
+            std::borrow::Cow::Borrowed(data)
+        };
+
+        let msg = match GossipMessage::from_cbor(&payload) {
             Ok(m) => m,
             Err(e) => {
                 warn!("invalid gossip message: {e}");
@@ -1184,6 +1241,47 @@ impl DdsNode {
                 crate::telemetry::record_gossip_messages_dropped("topic_kind_mismatch");
             }
         }
+    }
+
+    /// **Z-1 Phase B.7** — publish a `GossipMessage` on the given topic,
+    /// wrapping it in a `GossipEnvelopeV3` when the domain has the
+    /// `enc-v3` capability.
+    ///
+    /// Returns `Ok(())` even when gossipsub reports `InsufficientPeers`
+    /// (no mesh peers yet) because callers log that condition
+    /// separately via the loadtest / e2e harness. Any other publish
+    /// error is returned as a `String`.
+    pub fn publish_gossip_op(
+        &mut self,
+        topic: libp2p::gossipsub::IdentTopic,
+        msg: GossipMessage,
+    ) -> Result<(), String> {
+        let cbor = msg.to_cbor().map_err(|e| format!("gossip encode: {e}"))?;
+        let wire: Vec<u8> = if self
+            .domain
+            .has_capability(dds_domain::domain::CAPABILITY_ENC_V3)
+        {
+            let (epoch_id, epoch_key) = self.epoch_keys.my_current_epoch();
+            let mut rng = rand::rngs::OsRng;
+            let (nonce, ciphertext) =
+                dds_core::crypto::epoch_key::encrypt_payload(&mut rng, epoch_key, &cbor)
+                    .map_err(|e| format!("gossip encrypt: {e:?}"))?;
+            let env = GossipEnvelopeV3 {
+                publisher: self.peer_id.to_string(),
+                epoch_id,
+                nonce,
+                ciphertext,
+            };
+            env.to_cbor()
+                .map_err(|e| format!("gossip envelope encode: {e}"))?
+        } else {
+            cbor
+        };
+        match self.swarm.behaviour_mut().gossipsub.publish(topic, wire) {
+            Ok(_) | Err(libp2p::gossipsub::PublishError::InsufficientPeers) => {}
+            Err(e) => return Err(format!("gossipsub publish: {e:?}")),
+        }
+        Ok(())
     }
 
     /// **M-1 / M-2 downgrade guard (security review)**. When
@@ -2330,6 +2428,30 @@ impl DdsNode {
     #[doc(hidden)]
     pub fn set_admission_cert_for_tests(&mut self, cert: dds_domain::AdmissionCert) {
         self.admission_cert = cert;
+    }
+
+    /// **Z-1 Phase B.7 test hook.** Drive `handle_gossip_message`
+    /// without spinning up a libp2p swarm. The topic hash must be one
+    /// of the topics this node subscribed to at `start()` time — or a
+    /// synthetic hash that `identify_topic` will match. The `data`
+    /// bytes may be a plaintext CBOR `GossipMessage` or a CBOR-encoded
+    /// `GossipEnvelopeV3` depending on which path the test is exercising.
+    #[doc(hidden)]
+    pub fn handle_gossip_message_for_tests(
+        &mut self,
+        topic_hash: &libp2p::gossipsub::TopicHash,
+        data: &[u8],
+    ) {
+        self.handle_gossip_message(topic_hash, data);
+    }
+
+    /// **Z-1 Phase B.7 test hook.** Mutably borrow the epoch-key store
+    /// so a test can pre-install a peer epoch key via
+    /// `EpochKeyStore::install_peer_release` before calling
+    /// `handle_gossip_message_for_tests`.
+    #[doc(hidden)]
+    pub fn epoch_keys_mut_for_tests(&mut self) -> &mut EpochKeyStore {
+        &mut self.epoch_keys
     }
 
     /// Run a single token-expiry sweep using the current system time.

@@ -250,6 +250,34 @@ pub struct SyncEnvelopeV3 {
     pub ciphertext: Vec<u8>,
 }
 
+impl GossipEnvelopeV3 {
+    /// Encode to CBOR bytes.
+    pub fn to_cbor(&self) -> Result<Vec<u8>, ciborium::ser::Error<std::io::Error>> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Decode from CBOR bytes.
+    pub fn from_cbor(bytes: &[u8]) -> Result<Self, ciborium::de::Error<std::io::Error>> {
+        ciborium::from_reader(bytes)
+    }
+}
+
+impl SyncEnvelopeV3 {
+    /// Encode to CBOR bytes.
+    pub fn to_cbor(&self) -> Result<Vec<u8>, ciborium::ser::Error<std::io::Error>> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Decode from CBOR bytes.
+    pub fn from_cbor(bytes: &[u8]) -> Result<Self, ciborium::de::Error<std::io::Error>> {
+        ciborium::from_reader(bytes)
+    }
+}
+
 /// Per-recipient release of a publisher's epoch key. The publisher
 /// runs the hybrid X25519+ML-KEM-768 KEM (`dds-core::crypto::kem`)
 /// against the recipient's KEM pubkey, derives a one-shot AEAD key

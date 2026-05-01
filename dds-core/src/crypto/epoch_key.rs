@@ -88,6 +88,63 @@ pub fn wrap<R: CryptoRngCore>(
     Ok((nonce_bytes, ct))
 }
 
+/// **Z-1 Phase B.7** — constant AAD for gossip/sync payload AEAD.
+/// Distinct from [`AAD_V1`] (which wraps the epoch key itself) to
+/// prevent cross-construction ciphertext confusion: a blob encrypted
+/// by `encrypt_payload` cannot be passed to `unwrap` and vice-versa.
+pub const PAYLOAD_AAD_V3: &[u8] = b"dds-pqc-gossip-v3";
+
+/// **Z-1 Phase B.7** — encrypt an arbitrary plaintext payload under the
+/// supplied 32-byte epoch AEAD key.
+///
+/// Used by `dds-node` to wrap the CBOR-encoded `GossipMessage` (and
+/// later `SyncPayload`) before publishing on an `enc-v3` domain.
+///
+/// Returns the (random 12-byte nonce, ciphertext + 16-byte Poly1305
+/// tag) tuple. The caller stores both in `GossipEnvelopeV3`.
+pub fn encrypt_payload<R: CryptoRngCore>(
+    rng: &mut R,
+    epoch_key: &[u8; EPOCH_KEY_LEN],
+    plaintext: &[u8],
+) -> Result<([u8; AEAD_NONCE_LEN], Vec<u8>), CryptoError> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(epoch_key.as_slice()));
+    let mut nonce_bytes = [0u8; AEAD_NONCE_LEN];
+    rng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ct = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad: PAYLOAD_AAD_V3,
+            },
+        )
+        .map_err(|_| CryptoError::InvalidSignature)?;
+    Ok((nonce_bytes, ct))
+}
+
+/// **Z-1 Phase B.7** — decrypt a payload previously encrypted by
+/// [`encrypt_payload`]. Returns the plaintext bytes, or
+/// [`CryptoError::InvalidSignature`] if the AEAD tag does not verify
+/// (wrong key, tampered ciphertext, tampered nonce, or tampered AAD).
+pub fn decrypt_payload(
+    epoch_key: &[u8; EPOCH_KEY_LEN],
+    nonce: &[u8; AEAD_NONCE_LEN],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(epoch_key.as_slice()));
+    let nonce_ref = Nonce::from_slice(nonce);
+    cipher
+        .decrypt(
+            nonce_ref,
+            Payload {
+                msg: ciphertext,
+                aad: PAYLOAD_AAD_V3,
+            },
+        )
+        .map_err(|_| CryptoError::InvalidSignature)
+}
+
 /// Unwrap a wrapped epoch key under the supplied hybrid-KEM-derived
 /// shared secret. Returns the recovered 32-byte epoch key, or
 /// [`CryptoError::InvalidSignature`] if the AEAD authentication tag
