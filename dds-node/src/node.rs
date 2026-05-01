@@ -14,7 +14,7 @@ use dds_net::admission::{AdmissionRequest, AdmissionResponse, MAX_REVOCATIONS_PE
 use dds_net::gossip::{DdsTopic, DdsTopicSet, GossipMessage};
 use dds_net::pq_envelope::{
     EPOCH_KEY_RELEASE_AEAD_CT_LEN, EPOCH_KEY_RELEASE_ED25519_SIG_LEN, EPOCH_KEY_RELEASE_KEM_CT_LEN,
-    EpochKeyRelease, EpochKeyRequest, EpochKeyResponse, GossipEnvelopeV3,
+    EpochKeyRelease, EpochKeyRequest, EpochKeyResponse, GossipEnvelopeV3, SyncEnvelopeV3,
 };
 use dds_net::sync::{SyncPayload, SyncRequest, SyncResponse, apply_sync_payloads_with_graph};
 use dds_net::transport::{DdsBehaviour, DdsBehaviourEvent, SwarmConfig};
@@ -1945,8 +1945,18 @@ impl DdsNode {
     /// with no LRU on the cache (M-5) this was an unbounded amplification
     /// attack. Now any peer must page through repeated requests; the
     /// `complete` flag tells them whether more remains.
+    /// **Z-1 Phase B.8** — build a sync response, encrypting each payload
+    /// under our epoch key when the domain advertises `enc-v3`.
+    ///
+    /// On non-`enc-v3` domains the response is plaintext (same behaviour as
+    /// before B.8). On `enc-v3` domains each `SyncPayload` is CBOR-encoded
+    /// then AEAD-encrypted under our current epoch key into a
+    /// `SyncEnvelopeV3` blob; the `payloads` field is left empty and
+    /// `enc_payloads` carries the ciphertext list so v2 requesters (which
+    /// don't know `enc_payloads`) receive an empty `payloads` and do nothing
+    /// — acceptable because they can't decrypt anyway (§4.7 mixed-fleet).
     fn build_sync_response(&self, req: &SyncRequest) -> SyncResponse {
-        let mut payloads: Vec<SyncPayload> =
+        let mut candidate_payloads: Vec<SyncPayload> =
             Vec::with_capacity(SYNC_MAX_RESPONSE_ENTRIES.min(self.sync_payloads.len()));
         let mut bytes_acc: usize = 0;
         let mut complete = true;
@@ -1955,16 +1965,71 @@ impl DdsNode {
                 continue;
             }
             let payload_bytes = payload.op_bytes.len() + payload.token_bytes.len();
-            if payloads.len() >= SYNC_MAX_RESPONSE_ENTRIES
+            if candidate_payloads.len() >= SYNC_MAX_RESPONSE_ENTRIES
                 || bytes_acc.saturating_add(payload_bytes) > SYNC_MAX_RESPONSE_BYTES
             {
                 complete = false;
                 break;
             }
             bytes_acc += payload_bytes;
-            payloads.push(payload.clone());
+            candidate_payloads.push(payload.clone());
         }
-        SyncResponse { payloads, complete }
+
+        if !self
+            .domain
+            .has_capability(dds_domain::domain::CAPABILITY_ENC_V3)
+        {
+            return SyncResponse {
+                payloads: candidate_payloads,
+                complete,
+                enc_payloads: Vec::new(),
+            };
+        }
+
+        // enc-v3: encrypt each payload under our current epoch key.
+        let (epoch_id, epoch_key) = self.epoch_keys.my_current_epoch();
+        let my_peer_id_str = self.peer_id.to_string();
+        let mut rng = rand::rngs::OsRng;
+        let mut enc_payloads: Vec<Vec<u8>> = Vec::with_capacity(candidate_payloads.len());
+
+        for payload in &candidate_payloads {
+            // CBOR-encode the SyncPayload struct.
+            let mut payload_cbor: Vec<u8> = Vec::new();
+            if let Err(e) = ciborium::into_writer(payload, &mut payload_cbor) {
+                warn!(error = %e, "B.8: sync payload CBOR encode failed — skipping entry");
+                continue;
+            }
+            // AEAD-encrypt under our epoch key.
+            let (nonce, ciphertext) = match dds_core::crypto::epoch_key::encrypt_payload(
+                &mut rng,
+                epoch_key,
+                &payload_cbor,
+            ) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!(error = ?e, "B.8: sync payload AEAD encrypt failed — skipping entry");
+                    continue;
+                }
+            };
+            let env = SyncEnvelopeV3 {
+                responder: my_peer_id_str.clone(),
+                epoch_id,
+                nonce,
+                ciphertext,
+            };
+            match env.to_cbor() {
+                Ok(blob) => enc_payloads.push(blob),
+                Err(e) => {
+                    warn!(error = %e, "B.8: SyncEnvelopeV3 CBOR encode failed — skipping entry");
+                }
+            }
+        }
+
+        SyncResponse {
+            payloads: Vec::new(),
+            complete,
+            enc_payloads,
+        }
     }
 
     /// Build a sync request from local DAG state.
@@ -2056,7 +2121,94 @@ impl DdsNode {
 
     /// Apply an inbound sync response: merge into trust graph + DAG +
     /// store, and cache the payloads for future serving to other peers.
+    ///
+    /// **Z-1 Phase B.8** — when the response carries `enc_payloads`
+    /// (non-empty), decrypt each `SyncEnvelopeV3` blob using the
+    /// responder's cached epoch key before proceeding to the existing
+    /// verification + merge pipeline. Plaintext `payloads` are used
+    /// unchanged when `enc_payloads` is absent (non-`enc-v3` peers,
+    /// mixed-fleet window per §4.7).
     fn handle_sync_response(&mut self, peer: PeerId, resp: SyncResponse) {
+        // Resolve the effective payload list.  If `enc_payloads` is
+        // non-empty we decrypt; otherwise fall through to `payloads`.
+        let resp_payloads: Vec<SyncPayload> = if !resp.enc_payloads.is_empty() {
+            let responder_str = peer.to_string();
+            let mut decrypted: Vec<SyncPayload> = Vec::with_capacity(resp.enc_payloads.len());
+            for blob in &resp.enc_payloads {
+                let env = match SyncEnvelopeV3::from_cbor(blob) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        warn!(%peer, error = %e, "B.8: SyncEnvelopeV3 CBOR decode failed — dropping entry");
+                        crate::telemetry::record_pq_envelope_decrypt("aead_fail");
+                        continue;
+                    }
+                };
+                if env.responder != responder_str {
+                    warn!(
+                        %peer,
+                        env_responder = %env.responder,
+                        "B.8: SyncEnvelopeV3 responder mismatch — dropping entry"
+                    );
+                    crate::telemetry::record_pq_envelope_decrypt("aead_fail");
+                    continue;
+                }
+                let epoch_key = match self
+                    .epoch_keys
+                    .peer_epoch_key(&env.responder, env.epoch_id)
+                {
+                    Some(k) => k,
+                    None => {
+                        warn!(
+                            %peer,
+                            epoch_id = env.epoch_id,
+                            "B.8: no cached epoch key for sync responder — dropping entry"
+                        );
+                        crate::telemetry::record_pq_envelope_decrypt("no_key");
+                        self.try_epoch_key_request(&env.responder);
+                        continue;
+                    }
+                };
+                match dds_core::crypto::epoch_key::decrypt_payload(
+                    epoch_key,
+                    &env.nonce,
+                    &env.ciphertext,
+                ) {
+                    Ok(plaintext) => {
+                        crate::telemetry::record_pq_envelope_decrypt("ok");
+                        match ciborium::from_reader::<SyncPayload, _>(plaintext.as_slice()) {
+                            Ok(p) => decrypted.push(p),
+                            Err(e) => {
+                                warn!(%peer, error = %e, "B.8: decrypted sync payload CBOR decode failed — dropping entry");
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        warn!(
+                            %peer,
+                            epoch_id = env.epoch_id,
+                            "B.8: AEAD decryption failed for sync envelope"
+                        );
+                        crate::telemetry::record_pq_envelope_decrypt("aead_fail");
+                    }
+                }
+            }
+            decrypted
+        } else {
+            resp.payloads
+        };
+
+        if resp_payloads.is_empty() {
+            debug!(%peer, "sync: peer reported no diff");
+            return;
+        }
+
+        // Shadow `resp` so the existing pipeline below is unchanged.
+        let resp = SyncResponse {
+            payloads: resp_payloads,
+            complete: resp.complete,
+            enc_payloads: Vec::new(),
+        };
+
         if resp.payloads.is_empty() {
             debug!(%peer, "sync: peer reported no diff");
             return;
@@ -2371,6 +2523,7 @@ impl DdsNode {
                         peer = %requester,
                         "Phase B.7: cached requester KEM pubkey is malformed — empty response"
                     );
+                    crate::telemetry::record_pq_releases_emitted("malformed_kem_pk");
                     return EpochKeyResponse::default();
                 }
             },
@@ -2379,6 +2532,7 @@ impl DdsNode {
                     peer = %requester,
                     "Phase B.7: requester has no cached KEM pubkey — empty response"
                 );
+                crate::telemetry::record_pq_releases_emitted("no_kem_pk");
                 return EpochKeyResponse::default();
             }
         };
@@ -2387,6 +2541,7 @@ impl DdsNode {
             Ok(d) => d.as_secs(),
             Err(_) => {
                 debug!("Phase B.7: clock error, returning empty response");
+                crate::telemetry::record_pq_releases_emitted("clock_error");
                 return EpochKeyResponse::default();
             }
         };
@@ -2400,6 +2555,7 @@ impl DdsNode {
             .iter()
             .any(|p| p.as_str() == my_peer_id_str);
         if !asks_for_self {
+            crate::telemetry::record_pq_releases_emitted("not_for_self");
             return EpochKeyResponse::default();
         }
 
@@ -2428,6 +2584,7 @@ impl DdsNode {
                     reason,
                     "Phase B.7: mint failed — empty response"
                 );
+                crate::telemetry::record_pq_releases_emitted("mint_fail");
                 return EpochKeyResponse::default();
             }
         };
@@ -2440,10 +2597,12 @@ impl DdsNode {
                     error = %e,
                     "Phase B.7: CBOR-encode of fresh release failed — empty response"
                 );
+                crate::telemetry::record_pq_releases_emitted("cbor_fail");
                 return EpochKeyResponse::default();
             }
         };
 
+        crate::telemetry::record_pq_releases_emitted("ok");
         EpochKeyResponse {
             releases: vec![blob],
         }
@@ -2698,6 +2857,24 @@ impl DdsNode {
     #[doc(hidden)]
     pub fn epoch_keys_mut_for_tests(&mut self) -> &mut EpochKeyStore {
         &mut self.epoch_keys
+    }
+
+    /// **Z-1 Phase B.8 test hook.** Drive [`Self::build_sync_response`]
+    /// without a live libp2p swarm or sync protocol session. Allows tests
+    /// to verify encrypted vs. plaintext response shapes depending on the
+    /// `enc-v3` capability.
+    #[doc(hidden)]
+    pub fn build_sync_response_for_tests(&self, req: &SyncRequest) -> SyncResponse {
+        self.build_sync_response(req)
+    }
+
+    /// **Z-1 Phase B.8 test hook.** Drive [`Self::handle_sync_response`]
+    /// without a live libp2p swarm. Allows tests to verify that an
+    /// encrypted `SyncResponse` (carrying `enc_payloads`) is correctly
+    /// decrypted and merged into the node's state.
+    #[doc(hidden)]
+    pub fn handle_sync_response_for_tests(&mut self, peer: PeerId, resp: SyncResponse) {
+        self.handle_sync_response(peer, resp);
     }
 
     /// Run a single token-expiry sweep using the current system time.

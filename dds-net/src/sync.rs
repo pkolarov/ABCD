@@ -70,6 +70,19 @@ pub struct SyncRequest {
 }
 
 /// One-shot pull-sync response.
+///
+/// **Z-1 Phase B.8** — when the responder's domain carries the `enc-v3`
+/// capability the plaintext [`SyncPayload`] list is replaced by
+/// `enc_payloads`: a list of CBOR-encoded [`crate::pq_envelope::SyncEnvelopeV3`]
+/// blobs, one per diff entry. Each blob is the CBOR-encoded `SyncPayload`
+/// AEAD-encrypted under the responder's current epoch key (see §4.6.1).
+/// The requester decrypts using the responder's epoch key, then processes
+/// the resulting `SyncPayload` list exactly as it would a plaintext response.
+///
+/// On non-`enc-v3` domains `enc_payloads` is empty and `payloads` carries
+/// plaintext as before (`#[serde(default)]` keeps v2 requesters readable by
+/// v3 responders and v3 requesters readable by v2 responders — both sides
+/// gracefully fall back to the non-empty list they understand).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncResponse {
     pub payloads: Vec<SyncPayload>,
@@ -77,6 +90,11 @@ pub struct SyncResponse {
     /// was missing. Reserved for future paginated transfers; currently
     /// always `true` because we ship the full diff in one message.
     pub complete: bool,
+    /// **Z-1 Phase B.8** — CBOR-encoded `SyncEnvelopeV3` blobs (one per
+    /// diff entry). Non-empty only on `enc-v3` domains; `payloads` is
+    /// empty when this field is used.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enc_payloads: Vec<Vec<u8>>,
 }
 
 impl SyncMessage {

@@ -1,6 +1,6 @@
 # DDS Implementation Status
 
-## TODO: Documentation-to-Code Verification Addendum (2026-05-01)
+## Documentation-to-Code Verification Addendum (2026-05-01, updated 3rd pass)
 
 Manual verification pass compared the progress claims in the Markdown
 tracker files against the current source tree. The Rust worktree contains
@@ -28,18 +28,23 @@ Those changes are treated below as current code reality.
   requester if their KEM pubkey is cached; `ingest_piggybacked_epoch_key_releases`
   processes releases from inbound `AdmissionResponse`s after successful
   admission. Together these close the §4.5 distribution channel.
-- TODO PQ-B8-1: Keep sync encryption marked open. `SyncEnvelopeV3`
-  exists as a wire type, but `DdsNode::build_sync_response` still
-  returns plaintext `SyncResponse { payloads, complete }`, and
-  `DdsNode::handle_sync_response` consumes plaintext payloads directly.
-  This matches the B.8 row being open; do not upgrade the Z-1
-  confidentiality claim until sync response wrapping and ingest decrypt
-  are implemented and tested.
+- ✅ PQ-B8-1 RESOLVED (2026-05-01): `SyncResponse` gained `enc_payloads:
+  Vec<Vec<u8>>` (`#[serde(default, skip_serializing_if = "Vec::is_empty")]`)
+  for backward-compat encrypted payload transport. `DdsNode::build_sync_response`
+  now AEAD-encrypts each `SyncPayload` under the responder's epoch key on
+  `enc-v3` domains (§4.6.1); `DdsNode::handle_sync_response` decrypts
+  `enc_payloads` before the existing merge pipeline. `try_epoch_key_request`
+  is also invoked from the sync `no_key` path. 8 regression tests in
+  `dds-node/tests/sync_encrypt.rs` pin the full contract. The Z-1
+  confidentiality claim may now be upgraded to cover the sync path.
 - ✅ DOC-PQ-B11-DONE: `docs/pqc-phase-b-plan.md` updated to use
   `result=ok|no_key|aead_fail` matching the code label (was `key_missing`).
-  Remaining B.11 work unchanged: sync-side bumps,
-  `dds_pq_releases_emitted_total`, `dds_pq_release_request_total`,
-  `dds_pq_rotation_total`, and Phase E alert rules remain TODO.
+- ✅ PQ-B11-EMITTED RESOLVED (2026-05-01): `dds_pq_releases_emitted_total`
+  counter added to telemetry; bumped from every exit branch of
+  `DdsNode::build_epoch_key_response` with 7 result labels. Renderer and
+  tests updated. `dds_pq_envelope_decrypt_total` now wired to both gossip
+  (B.7) and sync (B.8) decrypt paths. Remaining B.11 work:
+  `dds_pq_rotation_total` (rides on B.9), Phase E alert rules.
 - ✅ CI-DOC-DONE: Loadtest smoke reference updated — now notes that
   `loadtest-smoke.yml` does not yet exist and the loadtest is manual.
   CI pipeline entry updated to drop the stale `thumbv7em-none-eabihf`
