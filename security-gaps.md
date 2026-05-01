@@ -124,6 +124,99 @@ fresh advisory immediately surfaces a PR. Pre-commit `cargo audit`
 re-run on the macOS dev host: **0 vulnerabilities, 8 informational
 warnings** (matches the 2026-04-28 baseline above).
 
+## AD-17: Password-Replay Model and Lockout-Prevention Review
+
+**Filed 2026-05-02** (Phase 5 follow-up item from
+[docs/windows-ad-coexistence-spec.md](docs/windows-ad-coexistence-spec.md) §A.3 AD-17).
+
+### Threat model: password replay on AD-joined hosts
+
+On AD/Hybrid-joined machines the DDS vault stores the user's Windows password
+encrypted under the FIDO2 hmac-secret extension output.  At sign-in the Auth
+Bridge derives the hmac-secret from the physical security key and decrypts the
+password, then passes it to the Windows credential serialisation path as if the
+user had typed it.  Two replay surfaces exist:
+
+**Surface 1 — vault file access.**
+`%ProgramData%\DDS\vault.dat` is DPAPI-protected at machine scope and locked
+under the data-dir DACL (`D:PAI(A;;FA;;;SY)(A;;FA;;;BA)` — LocalSystem and
+BUILTIN\Administrators only, applied by the MSI custom action
+`CA_RestrictDataDirAcl` and reinforced by per-file `restrict_to_owner` on
+write).  A local attacker who can read the vault (requires LocalSystem or
+BUILTIN\Administrators privilege, or physical disk access) obtains an
+AES-256-GCM blob of the password keyed by the hmac-secret.  Decrypting the
+blob without the physical FIDO2 key is computationally infeasible.  Copying
+the raw blob to another machine does not help: the DPAPI wrapping is
+machine-scoped (not portable).
+
+**Residual risk:** A compromised LocalSystem process on the host machine could
+read the vault, call `GetAssertion` with `hmac-secret` on the enrolled
+credential_id, decrypt the password blob, and pass it directly to
+`LogonUserW`/`LsaLogonUser` without going through the Auth Bridge.  This is
+equivalent to the risk profile of a software credential manager on the same
+machine — mitigated by the DACL hardening and the Windows security boundary
+between LocalSystem and unprivileged processes.
+
+**Surface 2 — in-flight replay (stale password).**
+After an AD admin resets the user's password (or the user changes it on a
+different machine), the vault holds the previous password.  A brief window
+exists between the password change and the next vault refresh in which an
+attacker with vault read access could replay the stale password.  This window
+collapses once the user performs a tray refresh (§6.2 / AD-13).
+
+### Lockout-prevention mechanism (AD-14 + AD-13)
+
+AD default lockout policy (typically 3–10 failed logon attempts) creates a
+denial-of-service vector if stale-vault attempts are not rate-limited.
+The mitigation is layered across the Credential Provider and the Auth Bridge:
+
+1. **First failure detected.**  CP `ReportResult` receives `STATUS_LOGON_FAILURE`
+   after a DDS serialisation attempt.  CP sends `DDS_REPORT_LOGON_RESULT`
+   (0x0064) to the Auth Bridge carrying the `credential_id`.
+
+2. **Bridge starts a cooldown.**  The bridge marks `(credential_id, SID-if-known)`
+   as stale for 900 s (15 min, configurable via
+   `HKLM\SOFTWARE\DDS\AuthBridge\StaleVaultCooldownMs`).  Subsequent
+   `DDS_START_AUTH` for that pair return `STALE_VAULT_PASSWORD` immediately,
+   *before* any WebAuthn gesture or Windows credential serialisation — so at
+   most **one** failed serialisation attempt reaches the DC per stale-vault
+   incident.
+
+3. **CP-side mirror.**  CP maintains a per-process cooldown map as a backup
+   so that even if the IPC call to the bridge fails, immediate retries inside
+   the same CP session are blocked.  The bridge-side cooldown is canonical
+   and survives CP process restarts.
+
+4. **Cooldown cleared on recovery.**  After a successful tray vault refresh
+   (AD-13, `RunRefreshVaultFlow`), the tray sends `DDS_CLEAR_STALE` (0x0065)
+   to the bridge, clearing the cooldown for that credential.  Subsequent
+   sign-in attempts use the fresh password.
+
+5. **Cooldown survives service restart?**  No — the cooldown is in-memory.
+   A bridge service restart is itself a natural retry boundary; the design
+   accepts this trade-off.  A policy-guided post-restart cooldown is a
+   future hardening option.
+
+### Risk summary
+
+| Scenario | Risk | Control |
+|---|---|---|
+| Attacker reads vault file | Low (requires admin/physical access + physical FIDO2 key to decrypt) | DPAPI machine-scope + DACL |
+| Stale password replay after AD password change | Medium (brief window, limited to already-privileged attacker) | Tray refresh clears stale state; cooldown prevents lockout |
+| Rapid stale-vault retries → AD lockout DoS | Mitigated | AD-14 cooldown: ≤ 1 failed serialisation per incident reaches DC |
+| Cooldown survives service restart | Not guaranteed | Accepted; service restart is a natural retry point |
+| Attacker bypasses bridge, calls LogonUserW directly | Equivalent to general credential-manager risk | OS security boundary + DACL on vault |
+
+### Conclusion
+
+The password-replay threat on AD-joined hosts is bounded by:
+- The physical FIDO2 key requirement (vault is unreadable without it), and
+- The AD-14 cooldown ensuring at most one DC serialisation attempt per
+  stale-vault incident (preventing AD lockout).
+
+No new code changes are required; this section closes AD-17 by documenting
+the model and confirming the AD-14 + AD-13 controls are adequate for v1.
+
 ## Remaining Work
 
 1. ~~**Sign count enforcement** — persist per-credential assertion counters to detect replay attacks.~~ **DONE (already shipped via L-18).** `dds-store::traits::CredentialStateStore::bump_sign_count(credential, new)` is an atomic check-and-set primitive (single redb write transaction); `StoreError::SignCountReplay { stored, attempted }` distinguishes the replay branch from generic I/O. `LocalService::verify_assertion_common` (`dds-node/src/service.rs:1910-1920`) calls `bump_sign_count` on every assertion with `parsed.sign_count > 0` and surfaces the replay outcome through the `dds_fido2_assertions_total{result="sign_count"}` metric bucket. Authenticators reporting `sign_count == 0` skip the check (logged at warn).

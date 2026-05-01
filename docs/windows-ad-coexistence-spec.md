@@ -773,7 +773,7 @@ The 5-phase split holds, with these refinements:
 |---|---|---|
 | **AD-15** | `e2e/ad_joined_smoke.ps1`, `e2e/README.md`. | Domain-joined VM E2E covering §11.3 cases. |
 | **AD-16** | `e2e/entra_only_unsupported.ps1`. | Entra-only VM E2E. |
-| **AD-17** | `security-gaps.md` follow-up section. | Document password-replay model on domain accounts; lockout-prevention security review. |
+| **AD-17** ✅ | `security-gaps.md` §"AD-17: Password-Replay Model and Lockout-Prevention Review". | **Landed 2026-05-02.** Password-replay threat model documented: vault is DPAPI-machine-scope + DACL-protected and decryption requires the physical FIDO2 key; stale-password window is bounded by the AD-13 tray refresh. Lockout-prevention review confirms AD-14 cooldown ensures ≤ 1 failed DC serialisation per stale-vault incident. No new code required — AD-14 + AD-13 controls are adequate for v1. |
 
 ## A.4 Test Strategy
 
