@@ -28,7 +28,7 @@ use dds_core::crdt::causal_dag::Operation;
 use dds_core::crypto::epoch_key as ek_crypto;
 use dds_domain::DomainKey;
 use dds_net::pq_envelope::SyncEnvelopeV3;
-use dds_net::sync::{SyncPayload, SyncRequest, SyncResponse};
+use dds_net::sync::{SyncRequest, SyncResponse};
 use dds_node::config::{DomainConfig, NetworkConfig, NodeConfig};
 use dds_node::epoch_key_store::InstallOutcome;
 use rand::rngs::OsRng;
