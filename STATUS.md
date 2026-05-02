@@ -2,6 +2,27 @@
 
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 15th pass)
 
+- ✅ Windows MSI installer hardening + Bootstrap-DdsDomain.ps1 wizard landed
+  (2026-05-02, 4 commits):
+  **fix: defer service start until post-provision** — removed `Start="install"`
+  from the three `ServiceControl` elements in `DdsBundle.wxs`. The shipped
+  `node.toml` template has no `org_hash` / `domain`, so the service started and
+  immediately exited → SCM fired Error 1920 → MSI rolled back entirely.
+  Services still register as auto-start; operators run provision first, then
+  start manually (or the `Bootstrap-DdsDomain.ps1` wizard does it).
+  **fix: make Build-Msi.ps1 work under PowerShell 5.1** — PS 5.1 ships on
+  Windows Server 2019/2022; the script used PS 6+ hash-literal syntax.
+  **fix: link JoinState.cpp into DdsTrayAgent** — the tray agent's
+  `DdsAuthBridgeMain::Initialize` calls `dds::GetCachedJoinState()` but
+  `JoinState.cpp` was absent from `DdsTrayAgent.vcxproj`, causing a linker
+  error on a clean build.
+  **feat: Start menu shortcuts + Bootstrap-DdsDomain.ps1** — MSI now ships
+  `Start Menu\Programs\DDS\DDS Bootstrap Domain` shortcut pointing at
+  `Bootstrap-DdsDomain.ps1`, a self-elevating wizard that walks all 9 founding
+  steps (init-domain, bundle, gen-node-key, admit, write node.toml, start
+  DdsNode, enroll-device, stamp appsettings, start bridge + agent).
+  No Rust / .NET code changes; all 4 commits are WiX + C++ + PowerShell only.
+
 - ✅ CLI smoke test coverage gaps closed (2026-05-02):
   `dds-cli/tests/smoke.rs` `test_subcommand_help` was missing help-flag
   coverage for 9 command paths that exist in the production binary:
