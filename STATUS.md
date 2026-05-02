@@ -71,6 +71,19 @@
   and two unit tests in `provision.rs`
   (`provision_hybrid_domain_embeds_kem_pubkey_in_admission_cert`,
   `provision_legacy_domain_does_not_embed_kem_pubkey`).
+  **Live-smoke verification (2026-05-02):** end-to-end re-bootstrap on
+  the L-1 hybrid smoke (Alpine VM anchor + macOS member, dds-smoke
+  domain) confirmed `dds pq status` reports **v3 coverage: 100.0%** on
+  both ends. Each side's *cached peer cert* KEM hash matches the
+  *other* side's *local* KEM hash, proving the cert exchange carried
+  the right `pq_kem_pubkey` end-to-end (anchor caches Mac at hash
+  `d9226a3629893865`; Mac caches anchor at hash `f928ffebc849c135`).
+  Same run also re-verified NET-REDIAL-1: killing the anchor while
+  the member stayed up, the member auto-reconnected within ~5 s of
+  anchor restart and `dds_admission_handshakes_total{ok}` ticked from
+  1→2 on the member, confirming a fresh hybrid admission handshake
+  (not just a TCP reconnect). PQ is now genuinely on by default on
+  the wire.
 
 - ✅ RESOLVED — AD-17 (2026-05-02): Password-replay model and lockout-prevention
   security review landed in `security-gaps.md` §"AD-17: Password-Replay Model and
