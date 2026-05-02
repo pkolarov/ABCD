@@ -436,3 +436,147 @@ fn list_revocations_without_dds_toml_fails_loudly() {
         "stderr should mention the missing config; got: {stderr}",
     );
 }
+
+#[test]
+fn import_and_list_accept_explicit_config_flag() {
+    // OPS-IMPORT-CONFIG-1 fix: production puts the node config at
+    // `/etc/dds/node.toml`, not under `<data_dir>/dds.toml`. Verify
+    // that `--config <PATH>` is honored by both `import-revocation`
+    // and `list-revocations`, with the file living OUTSIDE the data
+    // dir (no `data_dir/dds.toml` present).
+    let tmp = tempfile::tempdir().unwrap();
+    let domain_dir = tmp.path().join("dom");
+    std::fs::create_dir_all(&domain_dir).unwrap();
+    let data_dir = tmp.path().join("node");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let etc_dir = tmp.path().join("etc-dds");
+    std::fs::create_dir_all(&etc_dir).unwrap();
+
+    init_domain_via_cli(&domain_dir, "explicit-cfg.test");
+
+    // Build the node config under a non-data-dir location and write
+    // *only* there. `<data_dir>/dds.toml` is intentionally absent so
+    // the test can only succeed via the explicit `--config` flag.
+    let domain_toml = std::fs::read_to_string(domain_dir.join("domain.toml")).unwrap();
+    let parsed: toml::Value = toml::from_str(&domain_toml).unwrap();
+    let id = parsed["id"].as_str().unwrap().to_string();
+    let pubkey = parsed["pubkey"].as_str().unwrap().to_string();
+    let pq_pubkey = parsed
+        .get("pq_pubkey")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let name = parsed["name"].as_str().unwrap().to_string();
+
+    let cfg = if pq_pubkey.is_empty() {
+        format!(
+            r#"
+data_dir = '{data}'
+org_hash = "test.org"
+[network]
+listen_addr = "/ip4/127.0.0.1/tcp/0"
+api_addr = "127.0.0.1:0"
+[domain]
+name = "{name}"
+id = "{id}"
+pubkey = "{pubkey}"
+"#,
+            data = data_dir.display(),
+        )
+    } else {
+        format!(
+            r#"
+data_dir = '{data}'
+org_hash = "test.org"
+[network]
+listen_addr = "/ip4/127.0.0.1/tcp/0"
+api_addr = "127.0.0.1:0"
+[domain]
+name = "{name}"
+id = "{id}"
+pubkey = "{pubkey}"
+pq_pubkey = "{pq_pubkey}"
+"#,
+            data = data_dir.display(),
+        )
+    };
+    let cfg_path = etc_dir.join("node.toml");
+    std::fs::write(&cfg_path, cfg).unwrap();
+    assert!(
+        !data_dir.join("dds.toml").exists(),
+        "test setup: data_dir/dds.toml must NOT exist for this test to be meaningful"
+    );
+
+    // Mint a revocation under the test domain key.
+    let rev_out = tmp.path().join("rev.cbor");
+    let status = dds_node_bin()
+        .args([
+            "revoke-admission",
+            "--domain-key",
+            domain_dir.join("domain_key.bin").to_str().unwrap(),
+            "--domain",
+            domain_dir.join("domain.toml").to_str().unwrap(),
+            "--peer-id",
+            "12D3KooWExplicitCfgPeer",
+            "--reason",
+            "explicit-cfg drill",
+            "--out",
+            rev_out.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "revoke-admission should succeed");
+
+    // Import via --config — should succeed despite missing data_dir/dds.toml.
+    let (ok, stdout, stderr) = run_capture(dds_node_bin().args([
+        "import-revocation",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--config",
+        cfg_path.to_str().unwrap(),
+        "--in",
+        rev_out.to_str().unwrap(),
+    ]));
+    assert!(
+        ok,
+        "import-revocation with --config must succeed. stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Imported revocation"),
+        "stdout should confirm import; got: {stdout}"
+    );
+
+    // List via --config — should see the imported entry.
+    let (ok, stdout, stderr) = run_capture(dds_node_bin().args([
+        "list-revocations",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--config",
+        cfg_path.to_str().unwrap(),
+    ]));
+    assert!(
+        ok,
+        "list-revocations with --config must succeed. stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("12D3KooWExplicitCfgPeer"),
+        "list-revocations stdout should include the revoked peer; got: {stdout}"
+    );
+
+    // --config <missing path> should fail with a clear error.
+    let bogus_cfg = tmp.path().join("does-not-exist.toml");
+    let (ok, _stdout, stderr) = run_capture(dds_node_bin().args([
+        "list-revocations",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--config",
+        bogus_cfg.to_str().unwrap(),
+    ]));
+    assert!(!ok, "list-revocations with bogus --config must fail");
+    assert!(
+        stderr.contains("does not exist") || stderr.contains("--config"),
+        "stderr should explain missing config path; got: {stderr}"
+    );
+}

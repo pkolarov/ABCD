@@ -49,19 +49,23 @@
 //!   then refuses to admit (or, on its own peer id, refuses to start)
 //!   the revoked peer.
 //!
-//! - `dds-node import-revocation --data-dir <DIR> --in <FILE>`
+//! - `dds-node import-revocation --data-dir <DIR> --in <FILE> [--config <PATH>]`
 //!   Append a revocation file to the local
 //!   `<data_dir>/admission_revocations.cbor`. Idempotent. Restart the
 //!   node so the new entry takes effect on the next admission
-//!   handshake.
+//!   handshake. Pass `--config <PATH>` to point at the node's
+//!   `node.toml` (typical: `/etc/dds/node.toml`); without the flag
+//!   the command falls back to `<data_dir>/dds.toml` for back-compat
+//!   with older runbooks.
 //!
-//! - `dds-node list-revocations --data-dir <DIR> [--json]`
+//! - `dds-node list-revocations --data-dir <DIR> [--json] [--config <PATH>]`
 //!   Print the current contents of the on-disk admission revocation
 //!   list. Useful for verifying that an `import-revocation` (or an
 //!   H-12 piggy-back gossip merge — see
 //!   `dds_net::admission::AdmissionResponse.revocations`) actually
 //!   landed. Read-only; safe to run while a node is live. `--json`
-//!   emits one object per entry on stdout for scripting.
+//!   emits one object per entry on stdout for scripting. `--config`
+//!   has the same semantics as `import-revocation`.
 //!
 //! - `dds-node restrict-data-dir-acl --data-dir <DIR>`
 //!   Threat-model §3 / open item #8. On Windows, applies an explicit,
@@ -147,8 +151,8 @@ fn print_usage() {
   dds-node gen-hmac-secret --out <FILE> [--force] [--keep-existing]
   dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--out <FILE>] [--ttl-days <N>]
   dds-node revoke-admission --domain-key <FILE> --domain <FILE> --peer-id <ID> [--reason <STR>] [--out <FILE>]
-  dds-node import-revocation --data-dir <DIR> --in <FILE>
-  dds-node list-revocations --data-dir <DIR> [--json]
+  dds-node import-revocation --data-dir <DIR> --in <FILE> [--config <PATH>]
+  dds-node list-revocations --data-dir <DIR> [--json] [--config <PATH>]
   dds-node restrict-data-dir-acl --data-dir <DIR>
   dds-node create-provision-bundle --dir <DIR> --org <ORG> [--out <FILE>]
   dds-node provision <BUNDLE.dds> [--data-dir <DIR>] [--no-start]
@@ -655,6 +659,41 @@ fn cmd_revoke_admission(args: &[String]) -> Result<(), Box<dyn std::error::Error
 /// only takes effect at the next node restart, since the H-12
 /// admission handshake is a per-connection event and the loaded list
 /// is cached for the lifetime of the running process.
+/// Locate and load the [`NodeConfig`] for a revocation command. Tries
+/// `--config <PATH>` first (operator's explicit override — typical
+/// production location is `/etc/dds/node.toml`), then falls back to
+/// `<data_dir>/dds.toml` for back-compat with older runbooks. Emits
+/// a single error message naming both possibilities so the operator
+/// doesn't have to guess.
+fn load_revocation_config(
+    args: &[String],
+    data_dir: &Path,
+    cmd: &str,
+) -> Result<NodeConfig, Box<dyn std::error::Error>> {
+    if let Some(explicit) = flag(args, "--config") {
+        let p = PathBuf::from(explicit);
+        if !p.exists() {
+            return Err(format!(
+                "--config {}: file does not exist",
+                p.display()
+            )
+            .into());
+        }
+        return Ok(NodeConfig::from_file(&p)?);
+    }
+    let fallback = data_dir.join("dds.toml");
+    if fallback.exists() {
+        return Ok(NodeConfig::from_file(&fallback)?);
+    }
+    Err(format!(
+        "{cmd} needs the node's config to know which domain to verify the \
+         revocation against. Pass --config <PATH> (e.g. /etc/dds/node.toml), \
+         or place the config at {} so the data-dir fallback finds it.",
+        fallback.display()
+    )
+    .into())
+}
+
 fn cmd_import_revocation(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use dds_node::admission_revocation_store;
 
@@ -662,20 +701,10 @@ fn cmd_import_revocation(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     let in_path = PathBuf::from(require_flag(args, "--in")?);
 
     // We need the domain pubkey + id to verify the revocation on
-    // import. Read them from the node's config — this guarantees the
-    // operator has explicitly placed a config under data_dir, and
-    // mirrors how the node itself loads them.
-    let cfg_path = data_dir.join("dds.toml");
-    let cfg = if cfg_path.exists() {
-        NodeConfig::from_file(&cfg_path)?
-    } else {
-        return Err(format!(
-            "no dds.toml at {} — import-revocation needs the node's config to know which \
-             domain to verify the revocation against",
-            cfg_path.display()
-        )
-        .into());
-    };
+    // import. Read them from the node's config — typically
+    // `/etc/dds/node.toml` (passed via `--config`); for back-compat
+    // we also accept a copy at `<data_dir>/dds.toml`.
+    let cfg = load_revocation_config(args, &data_dir, "import-revocation")?;
     let domain_id = dds_domain::DomainId::parse(&cfg.domain.id)?;
     let pk_vec = dds_domain::domain::from_hex(&cfg.domain.pubkey)?;
     if pk_vec.len() != 32 {
@@ -739,17 +768,7 @@ fn cmd_list_revocations(args: &[String]) -> Result<(), Box<dyn std::error::Error
     let data_dir = PathBuf::from(require_flag(args, "--data-dir")?);
     let json = args.iter().any(|a| a == "--json");
 
-    let cfg_path = data_dir.join("dds.toml");
-    let cfg = if cfg_path.exists() {
-        NodeConfig::from_file(&cfg_path)?
-    } else {
-        return Err(format!(
-            "no dds.toml at {} — list-revocations needs the node's config to know which \
-             domain to verify revocations against",
-            cfg_path.display()
-        )
-        .into());
-    };
+    let cfg = load_revocation_config(args, &data_dir, "list-revocations")?;
     let domain_id = dds_domain::DomainId::parse(&cfg.domain.id)?;
     let pk_vec = dds_domain::domain::from_hex(&cfg.domain.pubkey)?;
     if pk_vec.len() != 32 {
