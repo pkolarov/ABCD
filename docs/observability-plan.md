@@ -1,6 +1,11 @@
 # DDS Observability Plan — Audit, Metrics, Alerts, SIEM Export
 
-**Status:** Phase C **histogram metrics** (`dds_sync_lag_seconds`,
+**Status:** Phase C and Phase E **complete** as of 2026-05-02 follow-up
+#47. `DdsSyncLagHigh` alert rule activated in
+[`observability/alerts/dds.rules.yml`](observability/alerts/dds.rules.yml)
+new `dds-sync-lag` group — the last remaining Phase E reference rule is
+now active. All Phase C catalog rows are ✅; all Phase E alert rules are
+active. Phase C **histogram metrics** (`dds_sync_lag_seconds`,
 `dds_http_request_duration_seconds`) landed 2026-05-02 follow-up #46 —
 the two remaining 🔲 rows in the metric catalog are now fully
 implemented. `dds_sync_lag_seconds` is a hand-rolled histogram
@@ -14,21 +19,14 @@ rendered in Prometheus histogram text format (cumulative `_bucket`
 lines + `_sum` + `_count`) by the existing hand-rolled exposition in
 `dds-node/src/telemetry.rs`. Two new unit tests
 (`render_emits_sync_lag_histogram`, `render_emits_http_duration_histogram`)
-pin the exposition output. Phase C is now fully complete — all
-catalog rows are ✅; Phase E (`DdsSyncLagHigh` reference rule) is
-unblocked. Phase E **PQC alert rules** (`DdsPqcDecryptFailureSpike`,
-`DdsPqcKeyRequestSpike`) landed 2026-05-02 follow-up #45 — the two
-deferred B.11 alert rules are now active in
-[`observability/alerts/dds.rules.yml`](observability/alerts/dds.rules.yml)
-`dds-pqc` group. `DdsPqcDecryptFailureSpike` fires when
-`dds_pq_envelope_decrypt_total{result!="ok"}` advances for > 5 min
-(no-key = late-join recovery stuck; aead_fail = hard tamper on
-enc-v3 domain). `DdsPqcKeyRequestSpike` fires when
-`dds_pq_release_requests_total{result="sent"}` exceeds 0.1/s for
-> 10 min (sustained late-join recovery failure). Both rules were
-blocked on the underlying metrics shipping (B.11 follow-on); they
-are now active alongside the `dds-audit`, `dds-process`,
-`dds-storage`, `dds-http`, `dds-network`, and `dds-fido2` groups.
+pin the exposition output. Phase E **PQC alert rules**
+(`DdsPqcDecryptFailureSpike`, `DdsPqcKeyRequestSpike`) landed
+2026-05-02 follow-up #45 — the two deferred B.11 alert rules are now
+active in `dds-pqc` group. Phase E **network + FIDO2 reference rules
+promoted to active** (`DdsAdmissionFailureSpike`, `DdsSyncRejectsSpike`,
+`DdsFido2AssertionFailureSpike`) landed follow-up #43. All seven alert
+groups are now active: `dds-audit`, `dds-process`, `dds-storage`,
+`dds-http`, `dds-network`, `dds-fido2`, `dds-pqc`, and `dds-sync-lag`.
 Phase C **`dds_build_info` git_sha + rust_version
 labels** landed 2026-04-27 follow-up #44 — the catalog row's
 deferred build-time env-var pipeline shipped via a new
@@ -792,10 +790,10 @@ Active FIDO2-tier rule (group `dds-fido2`, landed follow-up #43):
   split can partition the rule by `result=` label without renaming
   it.
 
-Reference (commented) rules — ready to activate now that Phase C
-landed `dds_sync_lag_seconds` (follow-up #46):
-- `DdsSyncLagHigh` (needs `dds_sync_lag_seconds_bucket` — now
-  available; operators can uncomment and tune the threshold).
+All Phase E reference rules are now active (follow-up #47):
+- `DdsSyncLagHigh` — activated in new `dds-sync-lag` group (follow-up
+  #47). `dds_sync_lag_seconds` histogram landed follow-up #46; rule
+  fires when p99 sync lag > 60s for 10 min.
 
 `DdsRevocationsSurge` is implicitly covered by the Trust-Graph
 dashboard's Revocations panel and the rejection-ratio alert; a

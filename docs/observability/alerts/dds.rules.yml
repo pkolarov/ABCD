@@ -572,38 +572,58 @@ groups:
           runbook_url: "https://github.com/ABCD/dds/blob/main/docs/pqc-phase-b-plan.md"
 
   # ---------------------------------------------------------------
-  # Reference rules — keyed off Phase C catalog metrics that have
-  # not shipped yet. Each block is gated on a metric name that does
-  # not exist today; uncomment the block once the corresponding
-  # follow-up lands. **Do not load these as-is.**
+  # Sync lag — `dds_sync_lag_seconds` histogram ships in dds-node
+  # follow-up #46 (observability-plan.md Phase C). Active.
   # ---------------------------------------------------------------
+  - name: dds-sync-lag
+    interval: 30s
+    rules:
+
+      - alert: DdsSyncLagHigh
+        # p99 sync lag > 60s sustained for 10 minutes means gossip /
+        # sync delivery to this node is severely degraded. The metric
+        # is `iat`-to-apply wall time (seconds from token issued-at to
+        # when handle_sync_response applied it), so it captures both
+        # propagation delay and ingest backlog.
+        #
+        # A single spike (reconnect + catch-up) is expected to resolve
+        # within one rotation window (default 24h); a sustained p99
+        # above 60s on a live node warrants investigation.
+        expr: |
+          histogram_quantile(0.99, sum by(le) (rate(dds_sync_lag_seconds_bucket[5m]))) > 60
+        for: 10m
+        labels:
+          severity: warning
+          plan: observability-plan.md#phase-e
+        annotations:
+          summary: "DDS sync lag p99 > 60s on {{ $labels.instance }}"
+          description: |
+            p99 sync lag (token iat → local apply) on
+            {{ $labels.instance }} has been > 60s for 10 minutes
+            (current p99: {{ $value | humanizeDuration }}). Gossip /
+            sync delivery is degraded.
+
+            Possible causes:
+              - Network partition or high-latency path to peer;
+              - Sync pull backpressure (peer sending large batches);
+              - Node CPU starvation delaying ingest loop;
+              - Peer clock skew widening the iat delta.
+
+            Check `dds_sync_pulls_total{result}` for pull failures and
+            `dds_peers_admitted` / `dds_peers_connected` for peer-count
+            anomalies. Cross-check with `dds-cli --node
+            {{ $labels.instance }} stats` for connected-vs-admitted split.
+          runbook_url: "https://github.com/ABCD/dds/blob/main/docs/observability-plan.md#phase-c--prometheus-exposition-metrics"
+
+  # ---------------------------------------------------------------
+  # Reference rules — all Phase C catalog metrics have shipped as of
+  # follow-up #46 (dds_sync_lag_seconds + dds_http_request_duration_seconds).
+  # There are no remaining commented-out reference rules.
   #
-  # - name: dds-network-deferred
-  #   interval: 30s
-  #   rules:
-  #
-  #     - alert: DdsSyncLagHigh
-  #       expr: |
-  #         histogram_quantile(0.99, sum by(le) (rate(dds_sync_lag_seconds_bucket[5m]))) > 60
-  #       for: 10m
-  #       labels: { severity: warning, plan: observability-plan.md#phase-c }
-  #       annotations:
-  #         summary: "DDS sync lag p99 > 60s on {{ $labels.instance }}"
-  #         description: "p99 lag from peer op-timestamp to local apply > 60s — gossip / sync degraded."
-  #
-  # (DdsLoopbackTcpAdminUsed has shipped — see active group `dds-http`
-  # above; the rule moved out of this reference section in
-  # follow-up #24 along with the underlying metric.
-  # DdsStoreWriteFailures has shipped — see active group `dds-storage`
-  # above; the rule moved out of this reference section in
-  # follow-up #39 along with the underlying metric
-  # `dds_store_writes_total{result}`.
-  # DdsAdmissionFailureSpike + DdsSyncRejectsSpike have shipped — see
-  # active group `dds-network` above; both moved out of this reference
-  # section in follow-up #43 along with their underlying metrics
-  # `dds_admission_handshakes_total{result}` (#29) and
-  # `dds_sync_payloads_rejected_total{reason}` (#37/#41).
-  # DdsFido2AssertionFailureSpike has shipped — see active group
-  # `dds-fido2` above; the rule moved out of this reference section
-  # in follow-up #43 along with the underlying metric
-  # `dds_fido2_assertions_total{result}` (#34).)
+  # Historical note — rules that previously lived here and are now active:
+  # DdsLoopbackTcpAdminUsed → active group `dds-http` (follow-up #24)
+  # DdsStoreWriteFailures   → active group `dds-storage` (follow-up #39)
+  # DdsAdmissionFailureSpike + DdsSyncRejectsSpike → active group `dds-network` (#43)
+  # DdsFido2AssertionFailureSpike → active group `dds-fido2` (follow-up #43)
+  # DdsSyncLagHigh          → active group `dds-sync-lag` (follow-up #47)
+  # ---------------------------------------------------------------

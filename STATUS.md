@@ -1,5 +1,24 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-02, updated 12th pass)
+
+- ✅ Observability Phase E complete — `DdsSyncLagHigh` alert rule activated
+  (follow-up #47, 2026-05-02):
+  The last remaining Phase E reference rule is now active in
+  [`docs/observability/alerts/dds.rules.yml`](docs/observability/alerts/dds.rules.yml)
+  new `dds-sync-lag` group. `DdsSyncLagHigh` fires when
+  `histogram_quantile(0.99, sum by(le) (rate(dds_sync_lag_seconds_bucket[5m]))) > 60`
+  for 10 minutes — p99 sync lag (token `iat` → local apply) > 60s sustained,
+  indicating gossip / sync delivery is degraded. The rule was blocked on
+  `dds_sync_lag_seconds` shipping (follow-up #46, 2026-05-02); it is now
+  unblocked. The commented-out `dds-network-deferred` block and its surrounding
+  "Reference rules — not shipped yet" comment were removed; a historical note
+  lists all rules that have graduated from reference → active status.
+  `docs/observability-plan.md` Phase E status updated to **complete** — all
+  seven alert groups are now active (`dds-audit`, `dds-process`, `dds-storage`,
+  `dds-http`, `dds-network`, `dds-fido2`, `dds-pqc`, `dds-sync-lag`). No Rust
+  code changes — alert rule YAML only.
+
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 11th pass)
 
 - ✅ Supply chain C.3 (`cargo-vet` baseline) landed (2026-05-02):
