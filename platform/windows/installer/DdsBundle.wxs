@@ -116,9 +116,15 @@
                         Account="LocalSystem"
                         ErrorControl="normal"
                         Arguments="run --config &quot;[DIR_CONFIG]node.toml&quot;" />
+        <!-- Do NOT Start="install": the shipped node.toml is an unprovisioned
+             template (no org_hash / domain) and dds-node refuses to load it
+             with TOML parse error "missing field `org_hash`", causing MSI
+             error 1920 + rollback. The service is registered with Start="auto"
+             above so it comes up on next boot; the documented post-install
+             workflow is `dds-node provision <bundle.dds>` which writes a real
+             config and starts the service. -->
         <ServiceControl Id="SC_DdsNode"
                         Name="DdsNode"
-                        Start="install"
                         Stop="both"
                         Remove="uninstall"
                         Wait="yes" />
@@ -144,9 +150,9 @@
                         ErrorControl="normal">
           <ServiceDependency Id="DdsNode" />
         </ServiceInstall>
+        <!-- See SC_DdsNode: deferred to first boot / post-provision. -->
         <ServiceControl Id="SC_AuthBridge"
                         Name="DdsAuthBridge"
-                        Start="install"
                         Stop="both"
                         Remove="uninstall"
                         Wait="yes" />
@@ -316,9 +322,9 @@
                         Arguments="--contentRoot &quot;[INSTALLFOLDER]&quot;">
           <ServiceDependency Id="DdsNode" />
         </ServiceInstall>
+        <!-- See SC_DdsNode: deferred to first boot / post-provision. -->
         <ServiceControl Id="SC_PolicyAgent"
                         Name="DdsPolicyAgent"
-                        Start="install"
                         Stop="both"
                         Remove="uninstall"
                         Wait="yes" />
