@@ -1,0 +1,186 @@
+name: CLI Binaries
+
+# supply-chain-plan.md Phase C.1 — standalone dds CLI binaries with
+# SLSA Level 3 in-toto provenance attestations.
+#
+# Builds the `dds` CLI for every supported platform and attaches a
+# Sigstore-backed provenance attestation so operators can verify the
+# binary they downloaded was produced from the expected source commit
+# with an unmodified build environment.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'dds-cli/**'
+      - 'dds-node/**'
+      - 'dds-core/**'
+      - 'dds-domain/**'
+      - 'dds-store/**'
+      - 'dds-net/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/cli.yml'
+  pull_request:
+    paths:
+      - 'dds-cli/**'
+      - 'dds-node/**'
+      - 'dds-core/**'
+      - 'dds-domain/**'
+      - 'dds-store/**'
+      - 'dds-net/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/cli.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Build matrix ──────────────────────────────────────────────────
+  build-cli:
+    name: CLI (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary: dds
+            artifact_name: dds-linux-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            binary: dds
+            artifact_name: dds-macos-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            binary: dds
+            artifact_name: dds-macos-x86_64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            binary: dds.exe
+            artifact_name: dds-windows-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.target }}
+
+      - name: Install libudev-dev (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
+      - name: Build dds CLI
+        run: cargo build -p dds-cli --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          SRC="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          DST="out/${{ matrix.artifact_name }}"
+          mkdir -p out
+          cp "$SRC" "$DST"
+          echo "Built: $DST"
+          ls -lh out/
+
+      - name: Upload CLI binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: out/${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  # ── Collect SLSA hashes (all targets) ────────────────────────────
+  # Download all platform binaries and compute their combined SHA-256
+  # subjects for the SLSA provenance generator.
+  collect-hashes:
+    name: Collect artifact hashes
+    needs: [build-cli]
+    runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - name: Download all CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: dds-*
+          merge-multiple: true
+
+      - name: Compute SHA-256 hashes
+        id: hash
+        run: |
+          echo "hashes=$(sha256sum artifacts/dds-* | base64 -w0)" >> "$GITHUB_OUTPUT"
+          echo "SLSA subjects:"
+          sha256sum artifacts/dds-*
+
+  # ── SLSA Level 3 provenance ──────────────────────────────────────
+  # supply-chain-plan.md Phase C.1 — in-toto SLSA Level 3 attestation
+  # covering all CLI binaries produced above. The attestation is signed
+  # by GitHub's OIDC-backed Sigstore Fulcio identity and uploaded as a
+  # workflow artifact and (on tags) as a release asset.
+  #
+  # Verify with:
+  #   slsa-verifier verify-artifact dds-linux-x86_64 \
+  #     --provenance-path dds-linux-x86_64.intoto.jsonl \
+  #     --source-uri github.com/<org>/<repo>
+  provenance:
+    needs: [collect-hashes]
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: "${{ needs.collect-hashes.outputs.hashes }}"
+      upload-assets: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+  # ── Release job (only on tags) ───────────────────────────────────
+  release:
+    name: Create CLI Release
+    needs: [build-cli, provenance]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: dds-*
+          merge-multiple: true
+
+      - name: Download provenance attestations
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: "*.intoto.jsonl"
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd artifacts
+          sha256sum dds-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Create GitHub Release (CLI)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/dds-*
+            artifacts/SHA256SUMS.txt
+            artifacts/*.intoto.jsonl
+          generate_release_notes: false
+          draft: true

@@ -2357,8 +2357,13 @@ dependency-audit half of this gap closed 2026-04-29
 `security-gaps.md`). The 2026-04-12 `security-gaps.md` flagged
 that as an operational item; **C.2 SBOM landed 2026-05-02** — the new
 `sbom` CI job runs `cargo cyclonedx --format json --all` on every PR
-and push, uploading the resulting `*.cdx.json` artifacts. The remaining
-sub-gaps (C.1 SLSA, C.3 cargo-vet, C.5 Sigstore) remain open.
+and push, uploading the resulting `*.cdx.json` artifacts. **C.1 SLSA
+Level 3 provenance landed 2026-05-02** — `provenance` jobs added to
+`msi.yml` and `pkg.yml`, and new `cli.yml` created for standalone CLI
+binaries on 4 platforms; each job calls the
+`slsa-framework/slsa-github-generator` reusable workflow and uploads
+`.intoto.jsonl` attestations as release assets. The remaining
+sub-gaps (C.3 cargo-vet, C.5 Sigstore) remain open.
 
 **Attack:** (a) a critical fix to `dds-node` does not reach the
 fleet without manual operator action, leaving a known-vulnerable

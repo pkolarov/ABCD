@@ -1,5 +1,32 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-02, updated 9th pass)
+
+- ✅ Supply chain C.1 (SLSA Level 3 provenance) landed (2026-05-02):
+  Added `provenance` jobs to [`.github/workflows/msi.yml`](.github/workflows/msi.yml)
+  and [`.github/workflows/pkg.yml`](.github/workflows/pkg.yml), and created a new
+  [`.github/workflows/cli.yml`](.github/workflows/cli.yml) for standalone CLI binaries.
+  Each provenance job calls
+  `slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0`
+  and produces a Sigstore-backed in-toto SLSA Level 3 attestation (`.intoto.jsonl`)
+  for every artifact.  On tag pushes the attestation files are uploaded as release
+  assets alongside the binaries.
+  - `msi.yml`: `build-msi` job computes SHA-256 hashes of the `.msi` via PowerShell
+    and exposes them as a `hashes` output for the provenance job.
+  - `pkg.yml`: a new `collect-hashes` job downloads all matrix-produced `.pkg` files
+    after both arch legs complete and emits a combined `base64-subjects` string.
+  - `cli.yml` (new): builds the `dds` CLI for linux-x86_64, macos-arm64, macos-x86_64,
+    and windows-x86_64; a `collect-hashes` job gathers all four binaries; the `provenance`
+    job signs them as a group.
+  Operators can verify any released artifact with:
+  ```
+  slsa-verifier verify-artifact dds-linux-x86_64 \
+    --provenance-path dds-linux-x86_64.intoto.jsonl \
+    --source-uri github.com/<org>/<repo>
+  ```
+  `docs/supply-chain-plan.md` C.1 row updated to ✅.
+  `Claude_sec_review.md` Z-8 status still references C.3 cargo-vet and C.5 Sigstore as remaining open.
+
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 8th pass)
 
 - ✅ PQC Phase E alert rules landed (2026-05-02, follow-up #45):
@@ -29,8 +56,8 @@
   Uploads the resulting `*.cdx.json` per-crate SBOM artifacts under the
   `sbom-cyclonedx` workflow artifact name. Closes supply-chain-plan.md Phase C.2.
   `docs/supply-chain-plan.md` C.2 row updated to ✅. `Claude_sec_review.md` Z-8
-  updated to reflect C.2 landing (remaining open: C.1 SLSA, C.3 cargo-vet,
-  C.5 Sigstore).
+  updated to reflect C.2 landing (remaining open at the time: C.1 SLSA, C.3 cargo-vet,
+  C.5 Sigstore; C.1 subsequently closed 2026-05-02 — see entry above).
 
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 7th pass)
 

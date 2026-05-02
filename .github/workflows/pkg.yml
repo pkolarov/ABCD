@@ -137,6 +137,45 @@ jobs:
           path: platform/macos/packaging/build/*.pkg
           if-no-files-found: error
 
+  # ── Collect SLSA hashes (all arches) ────────────────────────────
+  # supply-chain-plan.md Phase C.1 — download every .pkg artifact from
+  # both matrix legs, compute their SHA-256 digests, and emit the
+  # base64-encoded subjects consumed by the provenance job below.
+  collect-hashes:
+    name: Collect artifact hashes
+    needs: [build-pkg]
+    runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - name: Download all .pkg artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: DDS-macOS-*
+          merge-multiple: true
+
+      - name: Compute SHA-256 hashes
+        id: hash
+        run: |
+          echo "hashes=$(sha256sum artifacts/*.pkg | base64 -w0)" >> "$GITHUB_OUTPUT"
+          echo "SLSA subjects:"
+          sha256sum artifacts/*.pkg
+
+  # ── SLSA Level 3 provenance ──────────────────────────────────────
+  # supply-chain-plan.md Phase C.1 — generate an in-toto SLSA Level 3
+  # provenance attestation for all .pkg artifacts.
+  provenance:
+    needs: [collect-hashes]
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: "${{ needs.collect-hashes.outputs.hashes }}"
+      upload-assets: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
   # ── Smoke test (ARM64 only) ──────────────────────────────────────
   smoke-test:
     name: macOS smoke test
@@ -166,7 +205,7 @@ jobs:
   # ── Release job (only on tags) ─────────────────────────────────
   release:
     name: Create Release
-    needs: [build-pkg, smoke-test]
+    needs: [build-pkg, smoke-test, provenance]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -179,12 +218,21 @@ jobs:
           pattern: DDS-macOS-*
           merge-multiple: true
 
+      - name: Download provenance attestations
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: "*.intoto.jsonl"
+          merge-multiple: true
+
       - name: List artifacts
         run: ls -lh artifacts/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.pkg
+          files: |
+            artifacts/*.pkg
+            artifacts/*.intoto.jsonl
           generate_release_notes: true
           draft: true

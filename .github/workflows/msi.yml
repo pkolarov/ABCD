@@ -43,6 +43,8 @@ jobs:
     # GitHub does not offer hosted Windows ARM64 runners; cross-compiling
     # the ring crate from x64→ARM64 is unreliable. Add an ARM64 matrix
     # entry here once a self-hosted ARM64 runner is available.
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
 
     steps:
       - uses: actions/checkout@v4
@@ -211,6 +213,22 @@ jobs:
           Write-Host "Checksums:"
           Get-Content $checksumFile
 
+      # ── SLSA subject hashes ─────────────────────────────────────
+      # supply-chain-plan.md Phase C.1 — compute SHA-256 over each MSI
+      # and base64-encode the subjects so the provenance job can sign them.
+      - name: Compute artifact hashes
+        id: hash
+        shell: pwsh
+        run: |
+          $lines = Get-ChildItem "out\*.msi" | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)"
+          }
+          $raw = $lines -join "`n"
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($raw))
+          "hashes=$encoded" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+          Write-Host "SLSA subjects: $raw"
+
       # ── Upload artifact ──────────────────────────────────────────
       - name: Upload MSI
         uses: actions/upload-artifact@v4
@@ -221,10 +239,30 @@ jobs:
             out/SHA256SUMS.txt
           if-no-files-found: error
 
+  # ── SLSA Level 3 provenance ─────────────────────────────────────
+  # supply-chain-plan.md Phase C.1 — generate an in-toto SLSA Level 3
+  # provenance attestation for every MSI produced by build-msi.
+  # The attestation is signed by GitHub's OIDC-backed Sigstore Fulcio
+  # identity and uploaded as a workflow artifact and (on tags) as a
+  # release asset alongside the MSI.
+  #
+  # Pin by commit SHA rather than semver tag for supply-chain safety;
+  # update the SHA when bumping the generator version.
+  provenance:
+    needs: [build-msi]
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: "${{ needs.build-msi.outputs.hashes }}"
+      upload-assets: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
   # ── Release job (only on tags) ─────────────────────────────────
   release:
     name: Create Release
-    needs: build-msi
+    needs: [build-msi, provenance]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -237,6 +275,13 @@ jobs:
           pattern: DDS-MSI-*
           merge-multiple: true
 
+      - name: Download provenance attestations
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: "*.intoto.jsonl"
+          merge-multiple: true
+
       - name: List artifacts
         run: ls -lh artifacts/
 
@@ -246,5 +291,6 @@ jobs:
           files: |
             artifacts/*.msi
             artifacts/SHA256SUMS.txt
+            artifacts/*.intoto.jsonl
           generate_release_notes: true
           draft: true

@@ -558,7 +558,9 @@ async fn main() {
         Commands::Debug { action } => handle_debug(action, &cli.node_url).await,
         Commands::Stats { format } => handle_stats(&cli.node_url, &format).await,
         Commands::Health { format } => handle_health(&cli.node_url, &format).await,
-        Commands::Export { out, encrypt_to } => handle_export(&cli.data_dir, &out, encrypt_to.as_deref()),
+        Commands::Export { out, encrypt_to } => {
+            handle_export(&cli.data_dir, &out, encrypt_to.as_deref())
+        }
         Commands::Import {
             input,
             dry_run,
@@ -1931,8 +1933,8 @@ fn handle_export(data_dir: &Path, out: &Path, encrypt_to: Option<&str>) {
                 eprintln!("KEM encap failed");
                 std::process::exit(1);
             });
-        let (aead_nonce, aead_ct) =
-            epoch_key::encrypt_export(&mut rng, &shared, &signed_cbor).unwrap_or_else(|_| {
+        let (aead_nonce, aead_ct) = epoch_key::encrypt_export(&mut rng, &shared, &signed_cbor)
+            .unwrap_or_else(|_| {
                 eprintln!("AEAD encrypt failed");
                 std::process::exit(1);
             });
@@ -1993,7 +1995,9 @@ fn handle_export(data_dir: &Path, out: &Path, encrypt_to: Option<&str>) {
         eprintln!();
         eprintln!("WARNING: The dump file is signed for integrity but is NOT encrypted.");
         eprintln!("         It contains the full directory state in plaintext CBOR.");
-        eprintln!("         Use --encrypt-to <hex-pubkey> or encrypt before transit (GPG / age / FDE).");
+        eprintln!(
+            "         Use --encrypt-to <hex-pubkey> or encrypt before transit (GPG / age / FDE)."
+        );
     }
 }
 
@@ -2038,22 +2042,29 @@ fn handle_import(data_dir: &Path, input: &Path, dry_run: bool, allow_unsigned: b
                 "Error: encrypted dump requires the KEM secret key at {}",
                 epoch_path.display()
             );
-            eprintln!("       Run `dds-node` on this host first to initialise the epoch key store,");
-            eprintln!("       or re-export targeting a node whose epoch_keys.cbor is present here.");
+            eprintln!(
+                "       Run `dds-node` on this host first to initialise the epoch key store,"
+            );
+            eprintln!(
+                "       or re-export targeting a node whose epoch_keys.cbor is present here."
+            );
             std::process::exit(1);
         }
-        let epoch_store = dds_node::epoch_key_store::EpochKeyStore::load_or_create(
-            &epoch_path,
-            &mut OsRng,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to load epoch key store at {}: {e}", epoch_path.display());
-            std::process::exit(1);
-        });
+        let epoch_store =
+            dds_node::epoch_key_store::EpochKeyStore::load_or_create(&epoch_path, &mut OsRng)
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "Failed to load epoch key store at {}: {e}",
+                        epoch_path.display()
+                    );
+                    std::process::exit(1);
+                });
 
         let shared = kem::decap(epoch_store.kem_secret(), &kem_ct, b"dds-export-v1")
             .unwrap_or_else(|_| {
-                eprintln!("Error: KEM decapsulation failed — wrong KEM secret key or corrupted file");
+                eprintln!(
+                    "Error: KEM decapsulation failed — wrong KEM secret key or corrupted file"
+                );
                 std::process::exit(1);
             });
 
@@ -2064,7 +2075,10 @@ fn handle_import(data_dir: &Path, input: &Path, dry_run: bool, allow_unsigned: b
             std::process::exit(1);
         });
 
-        eprintln!("Decrypted hybrid-KEM-encrypted dump ({} bytes).", raw_bytes.len());
+        eprintln!(
+            "Decrypted hybrid-KEM-encrypted dump ({} bytes).",
+            raw_bytes.len()
+        );
         plaintext
     } else {
         raw_bytes

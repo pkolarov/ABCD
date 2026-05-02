@@ -414,12 +414,26 @@ unless they also hold an OS-vendor-trusted code-signing cert.
 
 ### Phase C — Provenance & SBOM (partial Z-8)
 
-**C.1 — SLSA Level 3 provenance.** Use the
-[slsa-github-generator](https://github.com/slsa-framework/slsa-github-generator)
-to attach an in-toto provenance attestation to every artifact in
-`msi.yml`, `pkg.yml`, and a new `cli.yml` (currently the CLI is
-built inside `msi.yml` only). The provenance records the source
-commit, build environment, builder identity, and material hashes.
+**C.1 — SLSA Level 3 provenance. ✅ Landed 2026-05-02.** Added
+`provenance` jobs calling
+`slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0`
+to [`.github/workflows/msi.yml`](../.github/workflows/msi.yml) and
+[`.github/workflows/pkg.yml`](../.github/workflows/pkg.yml), and
+created a new [`.github/workflows/cli.yml`](../.github/workflows/cli.yml)
+that builds the standalone `dds` CLI for Linux (x86_64), macOS (arm64 +
+x86_64), and Windows (x86_64) with matching SLSA provenance. For the matrix
+`pkg.yml` build a `collect-hashes` job downloads all platform `.pkg`
+artifacts after both matrix legs complete and emits a single combined
+`base64-subjects` string. On tag pushes the `.intoto.jsonl` attestation
+files are uploaded as release assets alongside the binaries.
+Operators can verify with:
+```
+slsa-verifier verify-artifact dds-linux-x86_64 \
+  --provenance-path dds-linux-x86_64.intoto.jsonl \
+  --source-uri github.com/<org>/<repo>
+```
+Closes Z-7/Z-8 supply-chain Phase C.1 acceptance criteria ("every released
+artifact has a verifiable in-toto provenance attestation").
 
 **C.2 — SBOM. ✅ Landed 2026-05-02.** A new `sbom` job in
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) installs

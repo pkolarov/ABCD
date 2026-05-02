@@ -696,7 +696,11 @@ fn test_export_import_encrypted_round_trip() {
         ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "vouch failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "vouch failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // ---- Destination node: create epoch key store ----
     let dst = tempfile::tempdir().unwrap();
@@ -745,7 +749,11 @@ fn test_export_import_encrypted_round_trip() {
     );
 
     // ---- Destination node: copy domain.toml so signature verifies ----
-    std::fs::copy(src.path().join("domain.toml"), dst.path().join("domain.toml")).unwrap();
+    std::fs::copy(
+        src.path().join("domain.toml"),
+        dst.path().join("domain.toml"),
+    )
+    .unwrap();
 
     let out = dds_cli()
         .args([
