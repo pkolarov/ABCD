@@ -162,6 +162,26 @@
 
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 6th pass)
 
+- 🆕 PROPOSAL — BLOB-1 (2026-05-02): New design doc at
+  [`docs/blob-distribution-proposal.md`](docs/blob-distribution-proposal.md)
+  proposes a libp2p request-response protocol
+  `/dds/blob/1.0.0/<domain>` for content-addressed, peer-to-peer
+  blob distribution. Surfaced by the L-1 Linux smoke when the user
+  asked "could we update node SW with this?" — gossipsub caps at
+  64 KiB/message ([dds-net/src/transport.rs:168](dds-net/src/transport.rs:168)),
+  so the existing `/v1/{platform}/software` envelope can carry a
+  signed manifest but the bytes themselves need a different
+  transport. Proposal extends `SoftwareBundle` with an optional
+  `blob_manifest` (root_hash, chunk_size, chunks_root, seed_peers,
+  hybrid-signed via the existing envelope), and adds a chunked
+  request-response protocol with merkle-proof per chunk + AEAD
+  wrap on `enc-v3` domains (reuses `SyncEnvelopeV3` shape from B.8).
+  Seven implementation phases (D-0 design freeze through D-7
+  rollout); D-1 wire layer + responder is the smallest standalone
+  ship. Open questions captured in §11. Reviewer sign-off needed
+  before D-0 exits. **No code changes yet** — this is a proposal,
+  not a commitment.
+
 - ✅ RESOLVED — AD-13 (2026-05-02): Vault refresh flow landed. New
   [`platform/windows/native/DdsTrayAgent/RefreshVaultFlow.h`](platform/windows/native/DdsTrayAgent/RefreshVaultFlow.h)
   and [`RefreshVaultFlow.cpp`](platform/windows/native/DdsTrayAgent/RefreshVaultFlow.cpp)
