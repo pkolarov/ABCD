@@ -202,10 +202,57 @@ jobs:
       - name: Run smoke test
         run: platform/macos/e2e/smoke-test.sh
 
+  # ── Sigstore cosign signing (tags only) ──────────────────────────
+  # supply-chain-plan.md Phase C.5 — keyless cosign sign-blob using
+  # GitHub Actions OIDC as the Fulcio identity.  Each .pkg gets a
+  # <name>.bundle file (certificate + signature + Rekor tlog entry).
+  #
+  # Operators can verify any released .pkg with:
+  #   cosign verify-blob \
+  #     --bundle DDS-Platform-macOS-1.0.0-arm64.pkg.bundle \
+  #     --certificate-identity-regexp \
+  #       "https://github.com/.*/\.github/workflows/pkg\.yml@.*" \
+  #     --certificate-oidc-issuer \
+  #       "https://token.actions.githubusercontent.com" \
+  #     DDS-Platform-macOS-1.0.0-arm64.pkg
+  sign:
+    name: Sign with cosign
+    needs: [build-pkg]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # required for keyless OIDC Fulcio signing
+      contents: read
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Download all .pkg artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: DDS-macOS-*
+          merge-multiple: true
+
+      - name: Sign .pkg artifacts
+        working-directory: artifacts
+        run: |
+          for f in *.pkg; do
+            cosign sign-blob --bundle "${f}.bundle" "$f"
+            echo "Signed: $f  →  ${f}.bundle"
+          done
+
+      - name: Upload signature bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosign-bundles-pkg
+          path: artifacts/*.bundle
+          if-no-files-found: error
+
   # ── Release job (only on tags) ─────────────────────────────────
   release:
     name: Create Release
-    needs: [build-pkg, smoke-test, provenance]
+    needs: [build-pkg, smoke-test, provenance, sign]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -225,6 +272,13 @@ jobs:
           pattern: "*.intoto.jsonl"
           merge-multiple: true
 
+      - name: Download cosign bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: cosign-bundles-pkg
+          merge-multiple: true
+
       - name: List artifacts
         run: ls -lh artifacts/
 
@@ -234,5 +288,6 @@ jobs:
           files: |
             artifacts/*.pkg
             artifacts/*.intoto.jsonl
+            artifacts/*.bundle
           generate_release_notes: true
           draft: true

@@ -259,10 +259,57 @@ jobs:
       base64-subjects: "${{ needs.build-msi.outputs.hashes }}"
       upload-assets: ${{ startsWith(github.ref, 'refs/tags/v') }}
 
+  # ── Sigstore cosign signing (tags only) ──────────────────────────
+  # supply-chain-plan.md Phase C.5 — keyless cosign sign-blob using
+  # GitHub Actions OIDC as the Fulcio identity.  Each MSI gets a
+  # <name>.bundle file (certificate + signature + Rekor tlog entry).
+  #
+  # Operators can verify any released MSI with:
+  #   cosign verify-blob \
+  #     --bundle DDS-1.0.0.0-x64.msi.bundle \
+  #     --certificate-identity-regexp \
+  #       "https://github.com/.*/\.github/workflows/msi\.yml@.*" \
+  #     --certificate-oidc-issuer \
+  #       "https://token.actions.githubusercontent.com" \
+  #     DDS-1.0.0.0-x64.msi
+  sign:
+    name: Sign with cosign
+    needs: [build-msi]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # required for keyless OIDC Fulcio signing
+      contents: read
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Download MSI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: DDS-MSI-*
+          merge-multiple: true
+
+      - name: Sign MSI artifacts
+        working-directory: artifacts
+        run: |
+          for f in *.msi; do
+            cosign sign-blob --bundle "${f}.bundle" "$f"
+            echo "Signed: $f  →  ${f}.bundle"
+          done
+
+      - name: Upload signature bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosign-bundles-msi
+          path: artifacts/*.bundle
+          if-no-files-found: error
+
   # ── Release job (only on tags) ─────────────────────────────────
   release:
     name: Create Release
-    needs: [build-msi, provenance]
+    needs: [build-msi, provenance, sign]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -282,6 +329,13 @@ jobs:
           pattern: "*.intoto.jsonl"
           merge-multiple: true
 
+      - name: Download cosign bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: cosign-bundles-msi
+          merge-multiple: true
+
       - name: List artifacts
         run: ls -lh artifacts/
 
@@ -292,5 +346,6 @@ jobs:
             artifacts/*.msi
             artifacts/SHA256SUMS.txt
             artifacts/*.intoto.jsonl
+            artifacts/*.bundle
           generate_release_notes: true
           draft: true

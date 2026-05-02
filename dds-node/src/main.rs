@@ -673,11 +673,7 @@ fn load_revocation_config(
     if let Some(explicit) = flag(args, "--config") {
         let p = PathBuf::from(explicit);
         if !p.exists() {
-            return Err(format!(
-                "--config {}: file does not exist",
-                p.display()
-            )
-            .into());
+            return Err(format!("--config {}: file does not exist", p.display()).into());
         }
         return Ok(NodeConfig::from_file(&p)?);
     }

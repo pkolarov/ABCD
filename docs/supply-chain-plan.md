@@ -482,11 +482,29 @@ PR. Closes the dependency-audit gap originally flagged in the
 2026-04-28 manual `cargo audit` run validated locally
 (0 vulnerabilities post-`rustls-webpki` 0.103.10 → 0.103.13 bump).
 
-**C.5 — Sigstore signing.** Optional sweetener: `cosign sign-blob`
-the release artifacts with a Sigstore Fulcio identity (workflow OIDC).
-Operators can verify with `cosign verify-blob` and a transparency-log
-proof. Lower priority than A.1/A.2 but a strict superset on the
-audit-trail side.
+**C.5 — Sigstore signing. ✅ Landed 2026-05-02.** A new `sign` job
+added to each release workflow
+([`cli.yml`](../.github/workflows/cli.yml),
+[`msi.yml`](../.github/workflows/msi.yml),
+[`pkg.yml`](../.github/workflows/pkg.yml)) runs
+`cosign sign-blob --bundle` for every release artifact using the
+GitHub Actions OIDC identity (keyless, Fulcio CA, Rekor tlog).
+Each artifact now ships alongside a `<name>.bundle` file.
+Operators can verify any released binary offline with:
+
+```bash
+cosign verify-blob \
+  --bundle dds-linux-x86_64.bundle \
+  --certificate-identity-regexp \
+    "https://github.com/.*/\.github/workflows/cli\.yml@.*" \
+  --certificate-oidc-issuer \
+    "https://token.actions.githubusercontent.com" \
+  dds-linux-x86_64
+```
+
+The signing is tag-only (no overhead on every PR/push); `id-token:
+write` permission is scoped to the `sign` job only. Closes the last
+remaining Phase C item; Z-8 supply-chain phase is now complete.
 
 **Acceptance:** every released artifact has a verifiable in-toto
 provenance attestation; CI rejects builds with un-audited dependency

@@ -1,5 +1,27 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-02, updated 13th pass)
+
+- ✅ Supply chain C.5 (Sigstore cosign signing) landed (2026-05-02):
+  A `sign` job added to each of the three release workflows
+  ([`cli.yml`](.github/workflows/cli.yml),
+  [`msi.yml`](.github/workflows/msi.yml),
+  [`pkg.yml`](.github/workflows/pkg.yml)) runs `cosign sign-blob
+  --bundle` (keyless, GitHub Actions OIDC → Fulcio CA → Rekor tlog)
+  on every release artifact. Each binary ships a `<name>.bundle`
+  file alongside it so operators can verify offline with
+  `cosign verify-blob --bundle`. The `sign` job is tag-only and
+  scoped to `id-token: write` only; the `release` job in each
+  workflow gained `sign` in its `needs` list and downloads +
+  publishes the bundle files as release assets.
+  Also fixed a `cargo fmt` whitespace regression in
+  [`dds-node/src/main.rs`](dds-node/src/main.rs) (single-line
+  `format!` that `rustfmt` wants on one line).
+  - `docs/supply-chain-plan.md` C.5 row updated to ✅ with
+    verification instructions.
+  - `Claude_sec_review.md` Z-8 status: C.5 now closed; Phase C
+    is complete. Phase D (fleet self-update) remains open.
+
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 12th pass)
 
 - ✅ Observability Phase E complete — `DdsSyncLagHigh` alert rule activated

@@ -2366,7 +2366,11 @@ binaries on 4 platforms; each job calls the
 initialised, 509 pre-existing deps exempted in
 `supply-chain/config.toml`, Mozilla public audit set imported, `vet`
 job added to `ci.yml`; new deps without an audit or explicit exemption
-fail CI. The remaining sub-gap (C.5 Sigstore) remains open.
+fail CI. **C.5 Sigstore signing landed 2026-05-02** — a `sign` job
+added to `cli.yml`, `msi.yml`, and `pkg.yml` runs `cosign sign-blob
+--bundle` (keyless OIDC / Fulcio / Rekor) for every tag-based release
+artifact; each binary ships a `<name>.bundle` alongside it. Phase C
+is now complete.
 
 **Attack:** (a) a critical fix to `dds-node` does not reach the
 fleet without manual operator action, leaving a known-vulnerable
@@ -2392,8 +2396,8 @@ every node).
 - Z-8 (dependency-audit half) closed 2026-04-29 via the
   supply-chain-plan.md Phase C.4 `audit` CI job; C.1 SLSA provenance
   closed 2026-05-02; C.2 SBOM closed 2026-05-02; C.3 `cargo-vet`
-  closed 2026-05-02; C.5 Sigstore remains open. Fleet self-update
-  (Phase D) remains open.
+  closed 2026-05-02; C.5 Sigstore closed 2026-05-02. Phase C is
+  complete. Fleet self-update (Phase D) remains open.
 - Z-8 (self-update) interacts with Z-2: the multi-sig compensating
   control becomes weaker as soon as a single admin key is compromised
   off a software-resident store. Hardware-binding the publisher keys
