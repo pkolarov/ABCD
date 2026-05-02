@@ -1,5 +1,41 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-02, updated 16th pass)
+
+- ✅ AD-15 + AD-16 E2E test scripts landed (2026-05-02):
+  Two missing PowerShell E2E scripts from
+  [docs/windows-ad-coexistence-spec.md](docs/windows-ad-coexistence-spec.md) §11.3
+  (Phase 5) now exist in [`platform/windows/e2e/`](platform/windows/e2e/):
+
+  **`ad_joined_smoke.ps1` (AD-15)** — Domain-joined VM E2E.
+  Exits 0 with SKIP if the machine is not AD/Hybrid-joined; otherwise
+  asserts:
+  (0) workgroup baseline regression (binaries respond),
+  (1) dds-node initialises a test domain and becomes healthy,
+  (2) policy agent runs in Audit mode on AD-joined hosts,
+  (3) stale-vault detection — `STALE_VAULT_PASSWORD` path verified
+  via HTTP API + AD-14 registry key,
+  (4) lockout-prevention invariant documented (≤1 DC failure per
+  stale-vault incident, AD-14 design contract),
+  (5) `RefreshVaultFlow.cpp` sends `DDS_CLEAR_STALE` (0x0065) to the
+  Auth Bridge after a successful vault refresh (AD-13 + AD-14 integration).
+
+  **`entra_only_unsupported.ps1` (AD-16)** — Entra-only VM E2E.
+  Exits 0 with SKIP if the machine is not Entra-only joined; otherwise
+  asserts:
+  (1) `IPC_ERROR::UNSUPPORTED_HOST = 20` in `ipc_protocol.h`,
+  (2) Auth Bridge logs Entra-only unsupported state at startup,
+  (3) policy agent emits `unsupported_entra` reason code in applied-state,
+  (4) `CDdsCredential.cpp` contains canonical
+  "not yet supported on Entra-joined machines" string,
+  (5) `AppliedReason.UnsupportedEntra = "unsupported_entra"` constant.
+
+  `platform/windows/e2e/README.md` updated to document all three E2E
+  scripts (workgroup / AD-joined / Entra-only) with run instructions.
+  No Rust, C++, or .NET production code changes.
+  `cargo test --workspace` + `cargo clippy --workspace --all-targets -- -D warnings`
+  both clean after this change (tests are PowerShell only).
+
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 15th pass)
 
 - ✅ Windows MSI installer hardening + Bootstrap-DdsDomain.ps1 wizard landed

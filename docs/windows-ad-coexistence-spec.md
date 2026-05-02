@@ -648,6 +648,14 @@ This phase is complete only if all of the following are true.
   now uses `DSREG_JOIN_INFO.joinType`, list-users unsupported state has a real
   IPC shape, stale-password detection is routed through CP `ReportResult`, and
   Entra-only enrollment is blocked before password capture.
+- **2026-05-02** — **AD-15 + AD-16 implemented.** Phase 5 (End-to-End Validation) complete.
+  `platform/windows/e2e/ad_joined_smoke.ps1` covers the five §11.3 AD-joined cases (workgroup
+  regression, node init, audit-mode policy agent, stale-vault detection, lockout-prevention
+  invariant, vault-refresh clears cooldown). `entra_only_unsupported.ps1` covers the
+  §11.3 Entra-only case (UNSUPPORTED_HOST IPC code, bridge startup log, policy agent heartbeat,
+  CP string, AppliedReason constant). Both scripts skip gracefully when not on the correct
+  host type. `e2e/README.md` updated with documentation for all three scripts.
+  All AD gaps (AD-01 through AD-17) now resolved.
 - **2026-05-02** — **AD-13 implemented.** New `DdsTrayAgent/RefreshVaultFlow.{h,cpp}` adds a
   "Refresh Stored Password…" tray menu item. Flow: JoinState check (EntraOnly blocked; Unknown
   allowed only with existing vault entry) → vault lookup by SID → password prompt →
@@ -771,8 +779,8 @@ The 5-phase split holds, with these refinements:
 
 | Task | Files | Change |
 |---|---|---|
-| **AD-15** | `e2e/ad_joined_smoke.ps1`, `e2e/README.md`. | Domain-joined VM E2E covering §11.3 cases. |
-| **AD-16** | `e2e/entra_only_unsupported.ps1`. | Entra-only VM E2E. |
+| **AD-15** ✅ | `e2e/ad_joined_smoke.ps1`, `e2e/README.md`. | **Landed 2026-05-02.** Domain-joined VM E2E covering §11.3 cases: workgroup baseline regression; dds-node domain init; policy-agent audit mode on AD-joined host; stale-vault detection (AD-14 cooldown + registry key); lockout-prevention invariant (≤1 DC failure per stale-vault incident); `RefreshVaultFlow` sends `DDS_CLEAR_STALE` (0x0065) to Auth Bridge (AD-13 + AD-14 integration). Script skips gracefully on non-AD-joined machines. |
+| **AD-16** ✅ | `e2e/entra_only_unsupported.ps1`. | **Landed 2026-05-02.** Entra-only VM E2E: asserts `IPC_ERROR::UNSUPPORTED_HOST = 20` in `ipc_protocol.h`; Auth Bridge logs Entra-only state at startup; policy agent emits `unsupported_entra` reason code; `CDdsCredential.cpp` contains canonical "not yet supported on Entra-joined machines" string; `AppliedReason.UnsupportedEntra = "unsupported_entra"` constant. Script skips gracefully on non-Entra-only hosts. |
 | **AD-17** ✅ | `security-gaps.md` §"AD-17: Password-Replay Model and Lockout-Prevention Review". | **Landed 2026-05-02.** Password-replay threat model documented: vault is DPAPI-machine-scope + DACL-protected and decryption requires the physical FIDO2 key; stale-password window is bounded by the AD-13 tray refresh. Lockout-prevention review confirms AD-14 cooldown ensures ≤ 1 failed DC serialisation per stale-vault incident. No new code required — AD-14 + AD-13 controls are adequate for v1. |
 
 ## A.4 Test Strategy
