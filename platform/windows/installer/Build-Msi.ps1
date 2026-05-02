@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+# #Requires -Version 7.0  -- relaxed: script uses only 5.1-compatible features
 <#
 .SYNOPSIS
     Builds DDS Windows MSI installers for x64 and/or ARM64 platforms.
@@ -46,7 +46,7 @@ param(
     [ValidateSet("Release", "Debug")]
     [string]$Configuration = "Release",
 
-    [string]$OutputDir = (Join-Path $PSScriptRoot "out"),
+    [string]$OutputDir = "",
 
     [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
     [string]$Version = "1.0.0.0",
@@ -58,6 +58,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+if ([string]::IsNullOrEmpty($OutputDir)) { $OutputDir = Join-Path $PSScriptRoot "out" }
 
 # ── Paths ──────────────────────────────���───────────────────────────
 $RepoRoot      = Resolve-Path (Join-Path $PSScriptRoot "..\..\..")
@@ -156,8 +158,8 @@ trust_loopback_tcp_admin = false
 function Build-Rust([string]$target, [string]$stageDir) {
     Write-Host "`n--- [Rust] Building dds-node for $target ---" -ForegroundColor Green
 
-    # Ensure the target is installed
-    & rustup target add $target 2>&1 | Out-Null
+    # Ensure the target is installed (avoid 2>&1 — PS 5.1 turns native stderr into terminating ErrorRecords)
+    & rustup target add $target | Out-Null
 
     $cargoArgs = @("build", "--package", "dds-node", "--target", $target)
     if ($Configuration -eq "Release") { $cargoArgs += "--release" }
@@ -222,7 +224,7 @@ function Build-Dotnet([string]$rid, [string]$stageDir) {
     if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed for RID $rid" }
 
     # Copy the single-file executable to stage
-    $src = Join-Path $StageRoot "dotnet-$rid" "DdsPolicyAgent.exe"
+    $src = Join-Path (Join-Path $StageRoot "dotnet-$rid") "DdsPolicyAgent.exe"
     if (Test-Path $src) {
         Copy-Item $src -Destination $stageDir -Force
         Write-Host "  -> Staged: $stageDir\DdsPolicyAgent.exe"
