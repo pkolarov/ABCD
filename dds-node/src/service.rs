@@ -3422,7 +3422,13 @@ mod platform_applier_tests {
     use dds_store::MemoryBackend;
     use rand::rngs::OsRng;
     use serde_json::json;
-    use std::sync::{Arc, RwLock};
+    use std::sync::{Arc, Mutex, RwLock};
+
+    // Tests that read/compare process-global telemetry counters must hold
+    // this lock for the duration of the before→action→after window so that
+    // concurrent tests issuing sessions don't spuriously advance the counter
+    // between the two snapshots.
+    static TELEMETRY_SERIAL: Mutex<()> = Mutex::new(());
 
     fn setup() -> (LocalService<MemoryBackend>, Identity, BTreeSet<String>) {
         let admin = Identity::generate("admin", &mut OsRng);
@@ -4288,6 +4294,7 @@ mod platform_applier_tests {
     /// be zero — non-zero rate is the regression signal.
     #[test]
     fn issue_session_advances_legacy_telemetry_counter() {
+        let _tel_guard = TELEMETRY_SERIAL.lock().unwrap();
         let (mut svc, admin, _) = setup();
         let handle = crate::telemetry::install();
         let before = handle.sessions_issued_count("legacy");
@@ -4315,6 +4322,7 @@ mod platform_applier_tests {
     /// tokens actually returned to the caller.
     #[test]
     fn issue_session_does_not_bump_telemetry_on_failure() {
+        let _tel_guard = TELEMETRY_SERIAL.lock().unwrap();
         let (mut svc, _, _) = setup();
         let handle = crate::telemetry::install();
         let before = handle.sessions_issued_count("legacy");
