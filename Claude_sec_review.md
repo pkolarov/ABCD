@@ -2362,8 +2362,11 @@ Level 3 provenance landed 2026-05-02** — `provenance` jobs added to
 `msi.yml` and `pkg.yml`, and new `cli.yml` created for standalone CLI
 binaries on 4 platforms; each job calls the
 `slsa-framework/slsa-github-generator` reusable workflow and uploads
-`.intoto.jsonl` attestations as release assets. The remaining
-sub-gaps (C.3 cargo-vet, C.5 Sigstore) remain open.
+`.intoto.jsonl` attestations as release assets. **C.3 `cargo-vet` baseline landed 2026-05-02** — `cargo-vet` v0.10.2
+initialised, 509 pre-existing deps exempted in
+`supply-chain/config.toml`, Mozilla public audit set imported, `vet`
+job added to `ci.yml`; new deps without an audit or explicit exemption
+fail CI. The remaining sub-gap (C.5 Sigstore) remains open.
 
 **Attack:** (a) a critical fix to `dds-node` does not reach the
 fleet without manual operator action, leaving a known-vulnerable
@@ -2387,8 +2390,10 @@ every node).
   publisher capability, already closed). Both are required for
   defense-in-depth.
 - Z-8 (dependency-audit half) closed 2026-04-29 via the
-  supply-chain-plan.md Phase C.4 `audit` CI job; the rest of the
-  Z-8 provenance / SBOM / `cargo-vet` work remains open.
+  supply-chain-plan.md Phase C.4 `audit` CI job; C.1 SLSA provenance
+  closed 2026-05-02; C.2 SBOM closed 2026-05-02; C.3 `cargo-vet`
+  closed 2026-05-02; C.5 Sigstore remains open. Fleet self-update
+  (Phase D) remains open.
 - Z-8 (self-update) interacts with Z-2: the multi-sig compensating
   control becomes weaker as soon as a single admin key is compromised
   off a software-resident store. Hardware-binding the publisher keys

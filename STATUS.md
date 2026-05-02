@@ -1,5 +1,22 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-02, updated 11th pass)
+
+- ✅ Supply chain C.3 (`cargo-vet` baseline) landed (2026-05-02):
+  `cargo-vet` v0.10.2 is now wired into the repo. `cargo vet init` generated
+  [`supply-chain/config.toml`](supply-chain/config.toml) and
+  [`supply-chain/audits.toml`](supply-chain/audits.toml). The Mozilla public
+  audit set is imported under `[imports.mozilla]` in `config.toml`;
+  `cargo vet prune` ran to remove exemptions already covered by that import.
+  Final state: **14 fully audited** (via Mozilla), **495 exempted** (pre-existing
+  deps blanket-exempted at init). A new `vet` job in
+  [`.github/workflows/ci.yml`](.github/workflows/ci.yml) installs `cargo-vet`
+  via `taiki-e/install-action@v2` and runs `cargo vet` on every PR and push
+  to `main` — CI fails if a new dep or upgraded version is added without an
+  audit or explicit exemption. `cargo vet` clean on the macOS dev host.
+  - `docs/supply-chain-plan.md` C.3 row updated to ✅.
+  - `Claude_sec_review.md` Z-8 status: C.3 now closed; C.5 Sigstore remains open.
+
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 10th pass)
 
 - ✅ Phase C histogram metrics landed (2026-05-02, follow-up #46):

@@ -136,6 +136,22 @@ jobs:
           tool: cargo-audit
       - run: cargo audit
 
+  vet:
+    # supply-chain-plan.md Phase C.3 — cargo-vet baseline.
+    # All pre-existing deps are exempted in supply-chain/config.toml.
+    # Any new dependency added after this job landed must be audited
+    # (or explicitly exempted with justification) — CI fails otherwise.
+    name: cargo vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-vet
+      - run: cargo vet
+
   # cross-embedded: thumbv7em-none-eabihf removed — dds-core dependencies
   # pull in std; re-enable after no_std audit (not in pilot scope)
 

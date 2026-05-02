@@ -446,11 +446,24 @@ artifact and including them in the GitHub Release body. Generates
 one CycloneDX JSON SBOM per crate in the workspace, capturing all
 transitive Cargo dependencies with their versions and source hashes.
 
-**C.3 — `cargo-vet` baseline.** Adopt
-[`cargo-vet`](https://github.com/mozilla/cargo-vet); commit the
-initial audit set. CI fails if a new dependency or upgraded version
-lacks an audit. Mozilla's public audit set covers most common crates;
-DDS-specific audits commit under `supply-chain/audits.toml`.
+**C.3 — `cargo-vet` baseline. ✅ Landed 2026-05-02.**
+[`cargo-vet`](https://github.com/mozilla/cargo-vet) v0.10.2 is now
+wired into the project. `cargo vet init` generated
+[`supply-chain/config.toml`](../supply-chain/config.toml) and
+[`supply-chain/audits.toml`](../supply-chain/audits.toml). The Mozilla
+public audit set is imported in `config.toml` under `[imports.mozilla]`
+so their audits automatically satisfy our criteria for common crates.
+`cargo vet prune` removed exemptions covered by the Mozilla import;
+final state: **14 fully audited** (via Mozilla), **495 exempted**
+(pre-existing deps blanket-exempted at init, `safe-to-deploy` for
+production path deps / `safe-to-run` for dev/bench deps). A new `vet`
+job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
+installs `cargo-vet` via `taiki-e/install-action@v2` and runs
+`cargo vet` on every PR and push to `main`; CI fails if a new
+dependency or upgraded version is added without an audit entry or an
+explicit exemption. DDS-specific audits live in
+`supply-chain/audits.toml`; the Mozilla import covers most common
+crates without per-crate manual review.
 
 **C.4 — `cargo audit` in CI. ✅ Landed 2026-04-29.**
 The new `audit` job in
