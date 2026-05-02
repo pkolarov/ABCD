@@ -1,5 +1,37 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-02, updated 8th pass)
+
+- ✅ PQC Phase E alert rules landed (2026-05-02, follow-up #45):
+  Two deferred B.11 Prometheus alert rules are now active in
+  [`docs/observability/alerts/dds.rules.yml`](docs/observability/alerts/dds.rules.yml)
+  under a new `dds-pqc` group:
+  1. **`DdsPqcDecryptFailureSpike`** — fires when
+     `dds_pq_envelope_decrypt_total{result!="ok"}` advances for > 5 min.
+     `result="no_key"` = late-join recovery not completing (epoch key not
+     received from publisher — should self-heal via EpochKeyRequest within
+     30 s; sustained means recovery is broken or fan-out not reaching peer).
+     `result="aead_fail"` = ciphertext tampered or epoch-key mismatch (hard
+     tamper signal on enc-v3 domain).
+  2. **`DdsPqcKeyRequestSpike`** — fires when
+     `dds_pq_release_requests_total{result="sent"}` exceeds 0.1/s for > 10 min
+     (sustained late-join recovery failure — node continuously requesting epoch
+     keys without success; correlate with admission handshake and fan-out
+     metrics to diagnose root cause).
+  `docs/observability-plan.md` status header updated (follow-up #45).
+  `docs/pqc-phase-b-plan.md` B.11 row updated to mark Phase E alert rules done.
+  No Rust code changes — alert rules are Prometheus YAML only.
+
+- ✅ Supply chain C.2 (SBOM) landed (2026-05-02):
+  New `sbom` job added to [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+  installs `cargo-cyclonedx` via `taiki-e/install-action@v2` and runs
+  `cargo cyclonedx --format json --all` on every PR and push to `main`.
+  Uploads the resulting `*.cdx.json` per-crate SBOM artifacts under the
+  `sbom-cyclonedx` workflow artifact name. Closes supply-chain-plan.md Phase C.2.
+  `docs/supply-chain-plan.md` C.2 row updated to ✅. `Claude_sec_review.md` Z-8
+  updated to reflect C.2 landing (remaining open: C.1 SLSA, C.3 cargo-vet,
+  C.5 Sigstore).
+
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 7th pass)
 
 - ✅ PQ-B11-METRICS RESOLVED (2026-05-02): The two deferred B.11 PQC

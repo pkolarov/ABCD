@@ -421,10 +421,16 @@ to attach an in-toto provenance attestation to every artifact in
 built inside `msi.yml` only). The provenance records the source
 commit, build environment, builder identity, and material hashes.
 
-**C.2 — SBOM.** Generate a CycloneDX SBOM with
-[cargo-cyclonedx](https://github.com/CycloneDX/cyclonedx-rust-cargo)
-during the build job. Publish alongside the binary on the GitHub
-Release page.
+**C.2 — SBOM. ✅ Landed 2026-05-02.** A new `sbom` job in
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) installs
+`cargo-cyclonedx` via `taiki-e/install-action@v2` and runs
+`cargo cyclonedx --format json --all` on every PR and push to `main`.
+The resulting `*.cdx.json` files are uploaded as the `sbom-cyclonedx`
+workflow artifact via `actions/upload-artifact@v4`. The release workflow
+can attach these alongside the MSI / pkg binaries by downloading the
+artifact and including them in the GitHub Release body. Generates
+one CycloneDX JSON SBOM per crate in the workspace, capturing all
+transitive Cargo dependencies with their versions and source hashes.
 
 **C.3 — `cargo-vet` baseline.** Adopt
 [`cargo-vet`](https://github.com/mozilla/cargo-vet); commit the

@@ -94,6 +94,30 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev
       - run: cargo bench --workspace --no-run
 
+  sbom:
+    # supply-chain-plan.md Phase C.2 — CycloneDX SBOM generation.
+    # Generates a machine-readable software bill of materials on every
+    # PR and push to main and uploads it as a workflow artifact so it
+    # can be attached to a GitHub Release by the release workflow.
+    name: generate SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev
+      - name: Generate CycloneDX SBOM
+        run: cargo cyclonedx --format json --all
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: "**/*.cdx.json"
+          if-no-files-found: error
+
   audit:
     # supply-chain-plan.md Phase C.4 — cargo audit on every PR + push.
     # Default behaviour: exit non-zero on any RUSTSEC vulnerability advisory.

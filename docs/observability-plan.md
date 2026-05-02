@@ -1,6 +1,19 @@
 # DDS Observability Plan — Audit, Metrics, Alerts, SIEM Export
 
-**Status:** Phase C **`dds_build_info` git_sha + rust_version
+**Status:** Phase E **PQC alert rules** (`DdsPqcDecryptFailureSpike`,
+`DdsPqcKeyRequestSpike`) landed 2026-05-02 follow-up #45 — the two
+deferred B.11 alert rules are now active in
+[`observability/alerts/dds.rules.yml`](observability/alerts/dds.rules.yml)
+`dds-pqc` group. `DdsPqcDecryptFailureSpike` fires when
+`dds_pq_envelope_decrypt_total{result!="ok"}` advances for > 5 min
+(no-key = late-join recovery stuck; aead_fail = hard tamper on
+enc-v3 domain). `DdsPqcKeyRequestSpike` fires when
+`dds_pq_release_requests_total{result="sent"}` exceeds 0.1/s for
+> 10 min (sustained late-join recovery failure). Both rules were
+blocked on the underlying metrics shipping (B.11 follow-on); they
+are now active alongside the `dds-audit`, `dds-process`,
+`dds-storage`, `dds-http`, `dds-network`, and `dds-fido2` groups.
+Phase C **`dds_build_info` git_sha + rust_version
 labels** landed 2026-04-27 follow-up #44 — the catalog row's
 deferred build-time env-var pipeline shipped via a new
 [`dds-node/build.rs`](../dds-node/build.rs) that captures

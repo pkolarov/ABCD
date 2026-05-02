@@ -479,6 +479,99 @@ groups:
           runbook_url: "https://github.com/ABCD/dds/blob/main/docs/observability-plan.md#phase-c--prometheus-exposition-metrics"
 
   # ---------------------------------------------------------------
+  # PQC encryption tier — Phase B metrics (B.11).
+  # `dds_pq_envelope_decrypt_total{result}` and
+  # `dds_pq_release_requests_total{result}` ship in dds-node
+  # telemetry (observability-plan.md Phase B.11 / B.11 follow-on).
+  # Active.
+  # ---------------------------------------------------------------
+  - name: dds-pqc
+    interval: 30s
+    rules:
+
+      - alert: DdsPqcDecryptFailureSpike
+        # Non-`ok` decrypt outcomes for enc-v3 gossip and sync envelopes.
+        # `result="no_key"` = node hasn't received the publisher's epoch
+        # key release yet (late-join recovery in progress — expected on
+        # fresh reconnect for < 30s, sustained spike means the
+        # EpochKeyRequest / late-join recovery path is broken or the
+        # publisher's fan-out is not reaching this peer);
+        # `result="aead_fail"` = ciphertext tampered or epoch key mismatch
+        # (hard tamper signal on an enc-v3 domain — any non-zero rate is
+        # a regression unless a peer is in mid-rotation).
+        #
+        # Operators may split this rule into two with different severities:
+        # critical for `aead_fail` (hard tamper indicator) and warning for
+        # `no_key` (transient but must self-heal within 30s via
+        # EpochKeyRequest recovery).
+        expr: |
+          rate(dds_pq_envelope_decrypt_total{result!="ok"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          plan: pqc-phase-b-plan.md#b11
+          finding: Z-1
+        annotations:
+          summary: "DDS PQC envelope decrypt failures on {{ $labels.instance }}"
+          description: |
+            `dds_pq_envelope_decrypt_total{result!="ok"}` on
+            {{ $labels.instance }} has been advancing for 5 minutes.
+            Per-result buckets:
+
+              - `no_key`: epoch key not yet received from the publisher;
+                should self-heal within 30s via EpochKeyRequest
+                (late-join recovery). Sustained means recovery path
+                is broken or fan-out is not reaching this peer.
+              - `aead_fail`: ciphertext tampered or key mismatch —
+                hard tamper / key-mismatch signal on an enc-v3 domain.
+
+            Check `dds_pq_epoch_id` on the affected peer and the
+            publisher for epoch alignment; inspect
+            `dds_pq_release_requests_total{result="sent"}` to confirm
+            EpochKeyRequest recovery is firing.
+          runbook_url: "https://github.com/ABCD/dds/blob/main/docs/pqc-phase-b-plan.md"
+
+      - alert: DdsPqcKeyRequestSpike
+        # Sustained EpochKeyRequest spike. `result="sent"` means the
+        # node is continuously requesting epoch keys — expected briefly
+        # on join / re-join (one request per publisher per reconnect)
+        # but a spike sustained over 10 minutes means late-join recovery
+        # is not succeeding and the node is burning request budget.
+        # `result="cooldown"` spiking means the per-publisher 30s
+        # cooldown is being hit repeatedly — normal during a reconnect
+        # storm; sustained means a deeper issue.
+        # `result="not_admitted"` = publisher has no admitted peer entry
+        # for the requester — H-12 admission may have failed.
+        # `result="malformed_peer_id"` = bad peer ID in inbound
+        # gossip — regression signal.
+        expr: |
+          rate(dds_pq_release_requests_total{result="sent"}[10m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          plan: pqc-phase-b-plan.md#b11
+          finding: Z-1
+        annotations:
+          summary: "DDS PQC epoch-key requests elevated on {{ $labels.instance }}"
+          description: |
+            `dds_pq_release_requests_total{result="sent"}` on
+            {{ $labels.instance }} has averaged > 0.1/s for the last
+            10 minutes — late-join recovery is not completing and the
+            node is continuously requesting epoch keys.
+
+            Correlate with `dds_pq_envelope_decrypt_total{result="no_key"}`
+            and `dds_admission_handshakes_total{result}` to distinguish
+            between:
+
+              - Epoch-fan-out delay (publisher not delivering releases
+                after rotation — check `dds_pq_releases_emitted_total`);
+              - H-12 admission failure (publisher doesn't recognise this
+                peer — check `dds_admission_handshakes_total{result="fail"}`);
+              - Network partition (peer connected but enc-v3 EpochKeyRequest
+                / Response protocol is being dropped).
+          runbook_url: "https://github.com/ABCD/dds/blob/main/docs/pqc-phase-b-plan.md"
+
+  # ---------------------------------------------------------------
   # Reference rules — keyed off Phase C catalog metrics that have
   # not shipped yet. Each block is gated on a metric name that does
   # not exist today; uncomment the block once the corresponding

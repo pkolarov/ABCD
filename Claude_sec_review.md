@@ -2355,9 +2355,10 @@ dependency-audit half of this gap closed 2026-04-29
 `main` and exits non-zero on any RUSTSEC vulnerability advisory
 (eight upstream-blocked informational warnings tracked in
 `security-gaps.md`). The 2026-04-12 `security-gaps.md` flagged
-that as an operational item; the rest of the supply-chain
-sub-gaps (C.1 SLSA, C.2 SBOM, C.3 cargo-vet, C.5 Sigstore) remain
-open.
+that as an operational item; **C.2 SBOM landed 2026-05-02** — the new
+`sbom` CI job runs `cargo cyclonedx --format json --all` on every PR
+and push, uploading the resulting `*.cdx.json` artifacts. The remaining
+sub-gaps (C.1 SLSA, C.3 cargo-vet, C.5 Sigstore) remain open.
 
 **Attack:** (a) a critical fix to `dds-node` does not reach the
 fleet without manual operator action, leaving a known-vulnerable
