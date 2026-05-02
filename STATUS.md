@@ -30,8 +30,8 @@
   is now unblocked.
   `cargo clippy --workspace --all-targets -- -D warnings` clean;
   `cargo fmt --all -- --check` clean;
-  `cargo test -p dds-node` **413 / 413 passing** (was 411 before follow-up
-  #46 added the 2 new histogram unit tests).
+  `cargo test -p dds-node` **422 / 422 passing** (2 new histogram unit tests
+  added; full integration suite total matches post-#46 workspace run).
 
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 9th pass)
 
