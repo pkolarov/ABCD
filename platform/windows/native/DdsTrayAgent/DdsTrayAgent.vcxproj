@@ -160,6 +160,7 @@
     <ClCompile Include="EnrollmentFlow.cpp" />
     <ClCompile Include="AdminFlow.cpp" />
     <ClCompile Include="RefreshVaultFlow.cpp" />
+    <ClCompile Include="..\DdsAuthBridge\JoinState.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="WebAuthnHelper.h" />
