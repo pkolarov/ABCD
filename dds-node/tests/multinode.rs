@@ -393,9 +393,8 @@ fn publish_attest(node: &mut DdsNode, op: &Operation, token: &Token) {
         op_bytes,
         token_bytes: token_bytes.clone(),
     };
-    let cbor = msg.to_cbor().unwrap();
     let topic = node.topics.operations.to_ident_topic();
-    let _ = node.swarm.behaviour_mut().gossipsub.publish(topic, cbor);
+    let _ = node.publish_gossip_op(topic, msg);
     // Gossipsub does NOT echo messages back to the publisher, so apply
     // the same effect locally to mirror the real ingest path on the
     // node that originated the op.
@@ -415,9 +414,8 @@ fn publish_revocation(node: &mut DdsNode, token: &Token) {
     let msg = GossipMessage::Revocation {
         token_bytes: token_bytes.clone(),
     };
-    let cbor = msg.to_cbor().unwrap();
     let topic = node.topics.revocations.to_ident_topic();
-    let _ = node.swarm.behaviour_mut().gossipsub.publish(topic, cbor);
+    let _ = node.publish_gossip_op(topic, msg);
     let _ = node.trust_graph.write().unwrap().add_token(token.clone());
     if let Some(target) = token.payload.revokes.clone() {
         use dds_store::traits::RevocationStore;

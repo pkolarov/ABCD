@@ -213,9 +213,8 @@ fn publish_attest(node: &mut DdsNode, op: &Operation, token: &Token) {
         op_bytes,
         token_bytes,
     };
-    let cbor = msg.to_cbor().unwrap();
     let topic = node.topics.operations.to_ident_topic();
-    let _ = node.swarm.behaviour_mut().gossipsub.publish(topic, cbor);
+    let _ = node.publish_gossip_op(topic, msg);
 }
 
 fn connect_one_sided(

@@ -707,10 +707,9 @@ fn publish_vouch_or_revoke(node: &mut DdsNode, token: &Token) {
         op_bytes,
         token_bytes: token_bytes.clone(),
     };
-    let cbor = msg.to_cbor().unwrap();
     let topic = node.topics.operations.to_ident_topic();
-    if let Err(e) = node.swarm.behaviour_mut().gossipsub.publish(topic, cbor) {
-        eprintln!("  [pump] gossipsub.publish (DirectoryOp) failed: {e:?}");
+    if let Err(e) = node.publish_gossip_op(topic, msg) {
+        eprintln!("  [pump] publish_gossip_op (DirectoryOp) failed: {e}");
     }
     // Mirror locally — gossipsub does not echo to the publisher.
     let _ = node.trust_graph.write().unwrap().add_token(token.clone());
@@ -727,10 +726,9 @@ fn publish_revoke(node: &mut DdsNode, token: &Token) {
     let msg = GossipMessage::Revocation {
         token_bytes: token_bytes.clone(),
     };
-    let cbor = msg.to_cbor().unwrap();
     let topic = node.topics.revocations.to_ident_topic();
-    if let Err(e) = node.swarm.behaviour_mut().gossipsub.publish(topic, cbor) {
-        eprintln!("  [pump] gossipsub.publish (Revocation) failed: {e:?}");
+    if let Err(e) = node.publish_gossip_op(topic, msg) {
+        eprintln!("  [pump] publish_gossip_op (Revocation) failed: {e}");
     }
     let _ = node.trust_graph.write().unwrap().add_token(token.clone());
     if let Some(target) = token.payload.revokes.clone() {

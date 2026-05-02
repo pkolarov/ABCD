@@ -114,9 +114,19 @@ Those changes are treated below as current code reality.
 - ✅ PQ-B7-WIRE-1 RESOLVED (2026-05-01): Both `dds-loadtest/src/harness.rs`
   publish paths (revocation + DirectoryOp) and `dds-node/src/bin/dds-macos-e2e.rs`
   now call `DdsNode::publish_gossip_op`, so enc-v3 wrapping is applied
-  transparently on `enc-v3` domains. `dds-fido2-test/src/bin/multinode.rs`
-  and integration-test direct publishes remain as plaintext (non-production
-  paths; tracked as PQ-B7-WIRE-2).
+  transparently on `enc-v3` domains.
+- ✅ PQ-B7-WIRE-2 RESOLVED (2026-05-02): The remaining non-production publish
+  paths now also go through `DdsNode::publish_gossip_op` instead of raw
+  `gossipsub.publish`:
+  `dds-fido2-test/src/bin/multinode.rs` (`publish_vouch_or_revoke`,
+  `publish_revoke`), `dds-node/tests/multinode.rs` (`publish_attest`,
+  `publish_revocation`), `dds-node/tests/h12_admission.rs` (`publish_attest`),
+  and `dds-node/tests/http_binary_e2e.rs` (`publish_operation`,
+  `publish_revocation`). All test-domain configs use `capabilities: Vec::new()`
+  (legacy) so enc-v3 encryption is not exercised in these paths today; the
+  wiring ensures they will pick it up transparently when test fixtures are
+  eventually migrated to hybrid domains. `cargo test --workspace`: **902/902
+  passing**.
 - ✅ PQ-B7-RECOVERY-1 RESOLVED (2026-05-01): `DdsNode::try_epoch_key_request`
   added; the `no_key` drop path in `handle_gossip_message` now emits a
   `EpochKeyRequest { publishers: [P] }` to the publisher when admitted,

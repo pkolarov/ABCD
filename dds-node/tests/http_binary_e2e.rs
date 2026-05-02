@@ -390,17 +390,15 @@ fn publish_operation(node: &mut DdsNode, token: &Token) {
         op_bytes,
         token_bytes,
     };
-    let cbor = msg.to_cbor().unwrap();
     let topic = node.topics.operations.to_ident_topic();
-    let _ = node.swarm.behaviour_mut().gossipsub.publish(topic, cbor);
+    let _ = node.publish_gossip_op(topic, msg);
 }
 
 fn publish_revocation(node: &mut DdsNode, token: &Token) {
     let token_bytes = token.to_cbor().unwrap();
     let msg = dds_net::gossip::GossipMessage::Revocation { token_bytes };
-    let cbor = msg.to_cbor().unwrap();
     let topic = node.topics.revocations.to_ident_topic();
-    let _ = node.swarm.behaviour_mut().gossipsub.publish(topic, cbor);
+    let _ = node.publish_gossip_op(topic, msg);
 }
 
 async fn wait_for_status(client: &Client, api_url: &str) -> NodeStatus {
