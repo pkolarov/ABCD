@@ -83,8 +83,9 @@ cargo run -p dds-loadtest --release -- --smoke --output-dir /tmp/dds-smoke
 
 `--smoke` overrides duration to 60 s and node count to 3. The process
 exits with status `2` if any KPI verdict is `FAIL` or any op-type error
-rate exceeds 1 % — intended as a CI gate once `.github/workflows/loadtest-smoke.yml`
-is added; currently run manually.
+rate exceeds 1 % — wired as a CI gate in
+`.github/workflows/loadtest-smoke.yml` (triggers on push to `main` and
+`workflow_dispatch`).
 A `WARN` verdict (e.g. ed25519 throughput within 20 % of target on a
 noisy CI runner) does not fail the gate.
 

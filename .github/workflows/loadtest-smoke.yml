@@ -1,0 +1,48 @@
+name: loadtest smoke
+
+# supply-chain-plan.md / README.md (dds-loadtest) — 60-second multinode
+# smoke run that enforces KPI verdicts and a ≤1% per-op error rate.
+# Triggers on push to main (not PRs — release-mode build + 60s runtime
+# would slow PR feedback too much; run manually via workflow_dispatch for
+# pre-merge checks on perf-sensitive changes).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warnings-as-errors keeps the smoke binary consistent with CI.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  smoke:
+    name: loadtest smoke (60s, 3 nodes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
+      - name: Build loadtest (release)
+        run: cargo build -p dds-loadtest --release
+
+      - name: Run smoke (60 s, 3 nodes)
+        run: |
+          cargo run -p dds-loadtest --release -- \
+            --smoke \
+            --output-dir "$GITHUB_WORKSPACE/loadtest-output"
+
+      - name: Upload smoke summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loadtest-smoke-${{ github.sha }}
+          path: loadtest-output/
+          if-no-files-found: warn

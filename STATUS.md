@@ -1,5 +1,26 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-02, updated 14th pass)
+
+- ✅ Loadtest smoke CI workflow landed (2026-05-02):
+  New [`.github/workflows/loadtest-smoke.yml`](.github/workflows/loadtest-smoke.yml)
+  wires the `dds-loadtest --smoke` run as a CI gate on every push to
+  `main` and on `workflow_dispatch`. The job builds the loadtest crate
+  in release mode, runs a 60-second 3-node smoke with
+  `cargo run -p dds-loadtest --release -- --smoke --output-dir
+  $GITHUB_WORKSPACE/loadtest-output`, and uploads the summary artifacts
+  (snapshots + `summary.json` + `summary.md`) under
+  `loadtest-smoke-<sha>` for visibility.  The harness already exits
+  with code 2 on any KPI FAIL or per-op error rate > 1 %; the
+  workflow propagates that exit code so CI fails immediately.
+  `WARN` verdicts (e.g. ed25519 throughput within 20 % of target on a
+  noisy runner) do not block the gate.  `dds-loadtest/README.md`
+  updated to remove the "currently run manually" note and reference the
+  new workflow path and trigger conditions.
+  This closes the `loadtest-smoke.yml does not yet exist` item from the
+  STATUS.md pass-13 CI-DOC-DONE entry and the `dds-loadtest/README.md`
+  smoke mode section.
+
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 13th pass)
 
 - ✅ Supply chain C.5 (Sigstore cosign signing) landed (2026-05-02):
