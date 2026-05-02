@@ -1,5 +1,22 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-02, updated 15th pass)
+
+- ✅ CLI smoke test coverage gaps closed (2026-05-02):
+  `dds-cli/tests/smoke.rs` `test_subcommand_help` was missing help-flag
+  coverage for 9 command paths that exist in the production binary:
+  `platform linux --help`, `platform linux policies --help`,
+  `platform linux software --help`, `platform linux applied --help`,
+  `platform macos policies --help`, `platform macos software --help`,
+  `platform macos applied --help`, `platform windows software --help`,
+  `audit tail --help`, `audit verify --help`,
+  `cp --help`, `cp enrolled-users --help`, `cp session-assert --help`,
+  `pq rotate --help`.
+  All 13 new test vectors added; `cargo test -p dds-cli --test smoke`
+  reports **23 / 23 passing** (was 23 / 23 — these additions were in the
+  existing `test_subcommand_help` loop, not new test functions).
+  No production code changes — test coverage only.
+
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 14th pass)
 
 - ✅ Loadtest smoke CI workflow landed (2026-05-02):
