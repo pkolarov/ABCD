@@ -1,0 +1,16 @@
+# Optional OpenRC overrides for /etc/init.d/dds-policy-agent.
+#
+# Framework-dependent .NET install:
+# DDS_POLICY_AGENT_COMMAND="/usr/bin/dotnet"
+# DDS_POLICY_AGENT_ARGS="/usr/local/lib/dds/DdsPolicyAgent.Linux/DdsPolicyAgent.Linux.dll"
+#
+# Self-contained publish:
+# DDS_POLICY_AGENT_COMMAND="/usr/local/lib/dds/DdsPolicyAgent.Linux/DdsPolicyAgent.Linux"
+# DDS_POLICY_AGENT_ARGS=""
+
+DDS_POLICY_AGENT_COMMAND="/usr/bin/dotnet"
+DDS_POLICY_AGENT_ARGS="/usr/local/lib/dds/DdsPolicyAgent.Linux/DdsPolicyAgent.Linux.dll"
+DDS_POLICY_AGENT_PIDFILE="/run/dds/dds-policy-agent.pid"
+DDS_POLICY_AGENT_OUTPUT_LOG="/var/log/dds/dds-policy-agent.log"
+DDS_POLICY_AGENT_ERROR_LOG="/var/log/dds/dds-policy-agent.err"
+DDS_POLICY_AGENT_CONFIG="/etc/dds/policy-agent.json"

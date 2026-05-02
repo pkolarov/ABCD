@@ -1,0 +1,51 @@
+# DDS Linux Debian Package
+
+This package is an L-1 runtime package. It installs:
+
+- `/usr/bin/dds-node`
+- `/usr/bin/dds-cli`
+- `/usr/local/lib/dds/DdsPolicyAgent.Linux/`
+- `dds-node.service`
+- `dds-policy-agent.service`
+- example config under `/usr/share/doc/dds-linux/examples/`
+
+The package does not enable or start services automatically. A node cannot join
+or anchor a DDS network until `/etc/dds/node.toml` and
+`/var/lib/dds/node/admission.cbor` are provisioned.
+
+## First Anchor
+
+```sh
+sudo cp /usr/share/doc/dds-linux/examples/node.anchor.toml /etc/dds/node.toml
+sudo editor /etc/dds/node.toml
+sudo install -m 0600 admission.cbor /var/lib/dds/node/admission.cbor
+sudo systemctl enable --now dds-node.service
+```
+
+Then check:
+
+```sh
+sudo systemctl status dds-node.service
+sudo ls -l /run/dds/api.sock
+curl --unix-socket /run/dds/api.sock http://localhost/readyz
+curl --unix-socket /run/dds/api.sock http://localhost/v1/status
+```
+
+## Policy Agent
+
+```sh
+sudo cp /usr/share/doc/dds-linux/examples/policy-agent.json /etc/dds/policy-agent.json
+sudo editor /etc/dds/policy-agent.json
+sudo systemctl enable --now dds-policy-agent.service
+```
+
+`PinnedNodePubkeyB64` should come from:
+
+```sh
+curl --unix-socket /run/dds/api.sock http://localhost/v1/node/info
+```
+
+## Identity Preservation
+
+Do not delete `/var/lib/dds/node/node_key.bin` during routine repair. Removing
+it creates a new peer identity and should be treated as node replacement.

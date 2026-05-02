@@ -5,8 +5,15 @@ using DDS.PolicyAgent.Linux.Client;
 using DDS.PolicyAgent.Linux.Config;
 using DDS.PolicyAgent.Linux.Runtime;
 using DDS.PolicyAgent.Linux.State;
+using Microsoft.Extensions.Configuration;
 
 var builder = Host.CreateApplicationBuilder(args);
+
+var configPath = Environment.GetEnvironmentVariable("DDS_POLICY_AGENT_CONFIG");
+if (string.IsNullOrWhiteSpace(configPath) && OperatingSystem.IsLinux())
+    configPath = "/etc/dds/policy-agent.json";
+if (!string.IsNullOrWhiteSpace(configPath))
+    builder.Configuration.AddJsonFile(configPath, optional: true, reloadOnChange: true);
 
 builder.Services.Configure<AgentConfig>(
     builder.Configuration.GetSection(AgentConfig.SectionName));

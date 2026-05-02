@@ -1,0 +1,23 @@
+#!/sbin/openrc-run
+
+description="DDS Linux Policy Agent"
+
+command="${DDS_POLICY_AGENT_COMMAND:-/usr/bin/dotnet}"
+command_args="${DDS_POLICY_AGENT_ARGS:-/usr/local/lib/dds/DdsPolicyAgent.Linux/DdsPolicyAgent.Linux.dll}"
+command_background=true
+pidfile="${DDS_POLICY_AGENT_PIDFILE:-/run/dds/dds-policy-agent.pid}"
+output_log="${DDS_POLICY_AGENT_OUTPUT_LOG:-/var/log/dds/dds-policy-agent.log}"
+error_log="${DDS_POLICY_AGENT_ERROR_LOG:-/var/log/dds/dds-policy-agent.err}"
+export DDS_POLICY_AGENT_CONFIG="${DDS_POLICY_AGENT_CONFIG:-/etc/dds/policy-agent.json}"
+
+depend() {
+    need dds-node
+    after dds-node
+}
+
+start_pre() {
+    checkpath -d -m 0750 -o root:root /run/dds
+    checkpath -d -m 0700 -o root:root /var/lib/dds/policy-agent
+    checkpath -d -m 0750 -o root:root /var/log/dds
+    checkpath -d -m 0755 -o root:root /usr/local/lib/dds/DdsPolicyAgent.Linux
+}

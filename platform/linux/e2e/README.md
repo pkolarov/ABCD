@@ -3,6 +3,15 @@
 This L-1 smoke proves Linux can run `dds-node` with stable identity and serve as
 a network anchor. It does not validate Linux policy enforcement.
 
+For Alpine in UTM, use the OpenRC-specific runbook:
+[ALPINE-UTM.md](ALPINE-UTM.md).
+
+For Debian package validation, use:
+[DEBIAN.md](DEBIAN.md).
+
+For Ubuntu 24.04 LTS package validation, use:
+[UBUNTU.md](UBUNTU.md).
+
 ## Build
 
 ```bash
@@ -13,7 +22,8 @@ dotnet build platform/linux/DdsPolicyAgent/DdsPolicyAgent.Linux.csproj -c Debug
 ## Anchor
 
 1. Install or stage `dds-node` at `/usr/local/bin/dds-node`.
-2. Install `platform/linux/packaging/systemd/dds-node.service`.
+2. Install `platform/linux/packaging/systemd/dds-node.service` on systemd
+   distributions, or `platform/linux/packaging/openrc/dds-node` on Alpine.
 3. Write `/etc/dds/node.toml` from
    `platform/linux/packaging/config/node.anchor.toml`.
 4. Bootstrap the domain and place the admission certificate at
@@ -24,6 +34,14 @@ dotnet build platform/linux/DdsPolicyAgent/DdsPolicyAgent.Linux.csproj -c Debug
 sudo systemctl daemon-reload
 sudo systemctl enable --now dds-node.service
 sudo systemctl status dds-node.service
+```
+
+On Alpine/OpenRC:
+
+```sh
+sudo rc-update add dds-node default
+sudo rc-service dds-node start
+sudo rc-service dds-node status
 ```
 
 6. Record the node peer ID and advertised `/ip4/.../tcp/4001/p2p/...`
