@@ -45,6 +45,8 @@
 //! | `dds_pq_epoch_id` | gauge | — | current epoch_id of the local node's AEAD epoch key; set by [`record_pq_epoch_id`] at init and on every rotation |
 //! | `dds_pq_release_requests_total` | counter | `result=sent\|cooldown\|not_admitted\|malformed_peer_id` | bumped by [`record_pq_release_request`] at every exit branch of [`crate::node::DdsNode::try_epoch_key_request`] |
 //! | `dds_http_requests_total` | counter | `route, method, status` | bumped by [`record_http_request`] |
+//! | `dds_sync_lag_seconds` | histogram | — | seconds from token `iat` to local apply via sync; buckets 1s–86400s; bumped by [`record_sync_lag_seconds`] in [`crate::node::DdsNode::handle_sync_response`] |
+//! | `dds_http_request_duration_seconds` | histogram | `route, method` | handler wall-clock latency; buckets 5ms–5s; bumped by [`record_http_request_duration`] in [`crate::http::http_request_observer_middleware`] |
 //! | `dds_trust_graph_attestations` | gauge | `body_type=user-auth-attestation\|device-join\|windows-policy\|macos-policy\|macos-account-binding\|sso-identity-link\|software-assignment\|service-principal\|session\|unknown` | [`crate::service::LocalService::trust_graph_counts`] at scrape, partitioned via [`crate::service::body_type_label`] |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
 //! | `dds_trust_graph_revocations` | gauge | — | same |
@@ -644,6 +646,81 @@ use crate::http::SharedService;
 use crate::node::NodePeerCounts;
 use crate::service::{StoreByteSizes, TrustGraphCounts};
 
+/// Upper bounds for `dds_sync_lag_seconds` histogram buckets (seconds).
+static SYNC_LAG_BOUNDS: &[f64] = &[1.0, 5.0, 15.0, 60.0, 300.0, 900.0, 3600.0, 86400.0];
+
+/// Upper bounds for `dds_http_request_duration_seconds` histogram buckets (seconds).
+static HTTP_DURATION_BOUNDS: &[f64] = &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0];
+
+/// Hand-rolled Prometheus histogram for use in the text-format exposition.
+/// Stores cumulative bucket counts (index `i` = observations ≤ `bounds[i]`),
+/// the +Inf bucket (index `bounds.len()`), running sum, and total count.
+#[derive(Clone)]
+struct Histogram {
+    bounds: &'static [f64],
+    /// Length == bounds.len() + 1; last entry is the cumulative +Inf bucket.
+    counts: Vec<u64>,
+    sum: f64,
+    count: u64,
+}
+
+impl Histogram {
+    fn new(bounds: &'static [f64]) -> Self {
+        Self {
+            bounds,
+            counts: vec![0; bounds.len() + 1],
+            sum: 0.0,
+            count: 0,
+        }
+    }
+
+    fn observe(&mut self, val: f64) {
+        self.count += 1;
+        self.sum += val;
+        for (i, &bound) in self.bounds.iter().enumerate() {
+            if val <= bound {
+                self.counts[i] += 1;
+            }
+        }
+        // +Inf bucket always incremented.
+        *self.counts.last_mut().expect("counts non-empty") += 1;
+    }
+
+    /// Render histogram lines with no labels (e.g. `dds_sync_lag_seconds`).
+    fn render_unlabeled(&self, out: &mut String, name: &str) {
+        for (i, &bound) in self.bounds.iter().enumerate() {
+            out.push_str(&format!(
+                "{name}_bucket{{le=\"{bound}\"}} {}\n",
+                self.counts[i]
+            ));
+        }
+        out.push_str(&format!(
+            "{name}_bucket{{le=\"+Inf\"}} {}\n",
+            self.counts.last().copied().unwrap_or(0)
+        ));
+        out.push_str(&format!("{name}_sum {}\n", self.sum));
+        out.push_str(&format!("{name}_count {}\n", self.count));
+    }
+
+    /// Render histogram lines where each series already has labels, e.g.
+    /// `dds_http_request_duration_seconds{route="…",method="…"}`.
+    /// `extra_labels` is a pre-formatted `key="val",…` string (no braces).
+    fn render_with_labels(&self, out: &mut String, name: &str, extra_labels: &str) {
+        for (i, &bound) in self.bounds.iter().enumerate() {
+            out.push_str(&format!(
+                "{name}_bucket{{{extra_labels},le=\"{bound}\"}} {}\n",
+                self.counts[i]
+            ));
+        }
+        out.push_str(&format!(
+            "{name}_bucket{{{extra_labels},le=\"+Inf\"}} {}\n",
+            self.counts.last().copied().unwrap_or(0)
+        ));
+        out.push_str(&format!("{name}_sum{{{extra_labels}}} {}\n", self.sum));
+        out.push_str(&format!("{name}_count{{{extra_labels}}} {}\n", self.count));
+    }
+}
+
 /// Process-global telemetry handle. Initialised once at process start
 /// (idempotent) so call-sites do not need to thread the handle
 /// through the swarm event loop or every HTTP handler.
@@ -802,6 +879,18 @@ pub struct Telemetry {
     /// - `malformed_peer_id` — publisher string failed `PeerId::parse`;
     ///   skipped (indicates a gossip-envelope decode bug upstream).
     pq_release_requests: Mutex<BTreeMap<String, u64>>,
+    /// `dds_sync_lag_seconds` histogram — seconds from token `iat` to
+    /// local apply via anti-entropy sync. One observation per token in
+    /// the pre-apply-filtered list of each
+    /// [`crate::node::DdsNode::handle_sync_response`] call (bumped by
+    /// [`record_sync_lag_seconds`]).
+    sync_lag: Mutex<Histogram>,
+    /// `dds_http_request_duration_seconds` histogram — per-`(route,
+    /// method)` handler wall-clock latency in seconds. One observation
+    /// per matched request, keyed by the same `(route, method)` pair
+    /// used in `dds_http_requests_total` (bumped by
+    /// [`record_http_request_duration`]).
+    http_durations: Mutex<BTreeMap<(String, String), Histogram>>,
 }
 
 impl Telemetry {
@@ -827,6 +916,8 @@ impl Telemetry {
             pq_rotation: Mutex::new(BTreeMap::new()),
             pq_epoch_id: AtomicU64::new(0),
             pq_release_requests: Mutex::new(BTreeMap::new()),
+            sync_lag: Mutex::new(Histogram::new(SYNC_LAG_BOUNDS)),
+            http_durations: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1302,6 +1393,38 @@ impl Telemetry {
             Err(p) => p.into_inner().get(result).copied().unwrap_or(0),
         }
     }
+
+    fn bump_sync_lag(&self, secs: f64) {
+        let mut g = match self.sync_lag.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.observe(secs);
+    }
+
+    fn sync_lag_snapshot(&self) -> Histogram {
+        match self.sync_lag.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    fn bump_http_duration(&self, route: &str, method: &str, secs: f64) {
+        let mut g = match self.http_durations.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.entry((route.to_string(), method.to_string()))
+            .or_insert_with(|| Histogram::new(HTTP_DURATION_BOUNDS))
+            .observe(secs);
+    }
+
+    fn http_durations_snapshot(&self) -> BTreeMap<(String, String), Histogram> {
+        match self.http_durations.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
 }
 
 /// Initialise the process-global telemetry handle. Idempotent: the
@@ -1604,6 +1727,32 @@ pub fn record_pq_epoch_id(epoch_id: u64) {
 pub fn record_pq_release_request(result: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_pq_release_request(result);
+    }
+}
+
+/// Observe one `dds_sync_lag_seconds` sample. `secs` is the number of
+/// seconds between the token's `iat` (Unix seconds) and the current
+/// wall-clock time at the moment the payload list is handed to the
+/// apply funnel in
+/// [`crate::node::DdsNode::handle_sync_response`]. No-op when
+/// telemetry has not been installed (tests, harnesses).
+pub fn record_sync_lag_seconds(secs: f64) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_sync_lag(secs);
+    }
+}
+
+/// Observe one `dds_http_request_duration_seconds` sample. `secs` is
+/// the wall-clock elapsed time between the middleware receiving the
+/// request and the inner handler returning a response, measured by
+/// [`std::time::Instant`] in
+/// [`crate::http::http_request_observer_middleware`]. `route` and
+/// `method` match the same pair used in
+/// `dds_http_requests_total{route,method}`. No-op when telemetry has
+/// not been installed (tests, harnesses).
+pub fn record_http_request_duration(route: &str, method: &str, secs: f64) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_http_duration(route, method, secs);
     }
 }
 
@@ -2278,6 +2427,41 @@ fn render_exposition(
     );
     out.push_str("# TYPE dds_thread_count gauge\n");
     out.push_str(&format!("dds_thread_count {}\n", process_thread_count()));
+
+    // `dds_sync_lag_seconds` — histogram of seconds from token iat to
+    // local apply via anti-entropy sync. Observability-plan.md Phase C.
+    // Buckets cover sub-second gossip convergence through multi-day
+    // offline-node reconnect scenarios (1s → 86400s).
+    out.push_str(
+        "# HELP dds_sync_lag_seconds Seconds from a token's issued-at timestamp (iat) to \
+         local apply via anti-entropy sync.\n",
+    );
+    out.push_str("# TYPE dds_sync_lag_seconds histogram\n");
+    {
+        let h = telemetry.sync_lag_snapshot();
+        h.render_unlabeled(&mut out, "dds_sync_lag_seconds");
+    }
+
+    // `dds_http_request_duration_seconds` — per-route/method handler
+    // latency histogram. Sibling of `dds_http_requests_total`.
+    // Observability-plan.md Phase C; deferred until C.1 histogram
+    // support lands — landed here alongside `dds_sync_lag_seconds`.
+    out.push_str(
+        "# HELP dds_http_request_duration_seconds HTTP handler wall-clock latency in seconds, \
+         partitioned by route and method.\n",
+    );
+    out.push_str("# TYPE dds_http_request_duration_seconds histogram\n");
+    {
+        let snapshot = telemetry.http_durations_snapshot();
+        for ((route, method), h) in &snapshot {
+            let labels = format!(
+                "route=\"{}\",method=\"{}\"",
+                escape_label_value(route),
+                escape_label_value(method),
+            );
+            h.render_with_labels(&mut out, "dds_http_request_duration_seconds", &labels);
+        }
+    }
 
     out
 }
@@ -4113,5 +4297,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
+    }
+
+    #[test]
+    fn render_emits_sync_lag_histogram() {
+        let t = Telemetry::new();
+        // Observe two lag values: 2 s (falls in ≤5 bucket) and 120 s (falls in ≤300 bucket).
+        t.bump_sync_lag(2.0);
+        t.bump_sync_lag(120.0);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
+        assert!(
+            body.contains("# TYPE dds_sync_lag_seconds histogram\n"),
+            "missing histogram TYPE header"
+        );
+        // ≤1 s bucket: neither observation qualifies.
+        assert!(
+            body.contains("dds_sync_lag_seconds_bucket{le=\"1\"} 0\n"),
+            "1s bucket wrong"
+        );
+        // ≤5 s bucket: only 2.0 qualifies.
+        assert!(
+            body.contains("dds_sync_lag_seconds_bucket{le=\"5\"} 1\n"),
+            "5s bucket wrong"
+        );
+        // ≤300 s bucket: both 2.0 and 120.0 qualify.
+        assert!(
+            body.contains("dds_sync_lag_seconds_bucket{le=\"300\"} 2\n"),
+            "300s bucket wrong"
+        );
+        // +Inf bucket == total count.
+        assert!(
+            body.contains("dds_sync_lag_seconds_bucket{le=\"+Inf\"} 2\n"),
+            "+Inf bucket wrong"
+        );
+        assert!(
+            body.contains("dds_sync_lag_seconds_count 2\n"),
+            "count wrong"
+        );
+        // sum = 122; format!("{}", 122.0_f64) == "122".
+        assert!(body.contains("dds_sync_lag_seconds_sum 122\n"), "sum wrong");
+    }
+
+    #[test]
+    fn render_emits_http_duration_histogram() {
+        let t = Telemetry::new();
+        // Two observations on the same (route, method) series.
+        t.bump_http_duration("/v1/ping", "GET", 0.003); // ≤0.005 s
+        t.bump_http_duration("/v1/ping", "GET", 0.150); // ≤0.25 s
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
+        assert!(
+            body.contains("# TYPE dds_http_request_duration_seconds histogram\n"),
+            "missing histogram TYPE header"
+        );
+        // ≤0.005 s bucket: only 0.003 qualifies.
+        assert!(
+            body.contains(
+                "dds_http_request_duration_seconds_bucket{route=\"/v1/ping\",method=\"GET\",le=\"0.005\"} 1\n"
+            ),
+            "0.005s bucket wrong"
+        );
+        // ≤0.25 s bucket: both observations qualify.
+        assert!(
+            body.contains(
+                "dds_http_request_duration_seconds_bucket{route=\"/v1/ping\",method=\"GET\",le=\"0.25\"} 2\n"
+            ),
+            "0.25s bucket wrong"
+        );
+        // +Inf bucket == total count.
+        assert!(
+            body.contains(
+                "dds_http_request_duration_seconds_bucket{route=\"/v1/ping\",method=\"GET\",le=\"+Inf\"} 2\n"
+            ),
+            "+Inf bucket wrong"
+        );
+        assert!(
+            body.contains(
+                "dds_http_request_duration_seconds_count{route=\"/v1/ping\",method=\"GET\"} 2\n"
+            ),
+            "count wrong"
+        );
     }
 }

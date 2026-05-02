@@ -1,6 +1,22 @@
 # DDS Observability Plan — Audit, Metrics, Alerts, SIEM Export
 
-**Status:** Phase E **PQC alert rules** (`DdsPqcDecryptFailureSpike`,
+**Status:** Phase C **histogram metrics** (`dds_sync_lag_seconds`,
+`dds_http_request_duration_seconds`) landed 2026-05-02 follow-up #46 —
+the two remaining 🔲 rows in the metric catalog are now fully
+implemented. `dds_sync_lag_seconds` is a hand-rolled histogram
+(buckets 1s–86400s) observing one sample per token in
+`DdsNode::handle_sync_response` after the pre-apply filter; the
+sample value is `now_unix.saturating_sub(token.payload.iat)` seconds.
+`dds_http_request_duration_seconds` is a hand-rolled histogram
+(buckets 5ms–5s) observing one sample per matched HTTP request in
+`http_request_observer_middleware` via `Instant::elapsed()`. Both are
+rendered in Prometheus histogram text format (cumulative `_bucket`
+lines + `_sum` + `_count`) by the existing hand-rolled exposition in
+`dds-node/src/telemetry.rs`. Two new unit tests
+(`render_emits_sync_lag_histogram`, `render_emits_http_duration_histogram`)
+pin the exposition output. Phase C is now fully complete — all
+catalog rows are ✅; Phase E (`DdsSyncLagHigh` reference rule) is
+unblocked. Phase E **PQC alert rules** (`DdsPqcDecryptFailureSpike`,
 `DdsPqcKeyRequestSpike`) landed 2026-05-02 follow-up #45 — the two
 deferred B.11 alert rules are now active in
 [`observability/alerts/dds.rules.yml`](observability/alerts/dds.rules.yml)
@@ -213,10 +229,10 @@ failures and store-side write errors stay in `SyncResult.errors`
 only — they are corruption / transient signals already covered by
 `dds_store_writes_total{result=fail}`. The rest of the C catalog
 (`dds_sync_lag_seconds` histogram plus the
-`dds_http_request_duration_seconds` histogram sibling) plus the
-Phase E rules/panels that depend on those metrics remain open —
-both ride on the deferred `metrics-exporter-prometheus` rollover
-called out in §C.1.
+`dds_http_request_duration_seconds` histogram sibling) **landed
+2026-05-02 follow-up #46** — Phase C is now fully complete; the
+`metrics-exporter-prometheus` rollover is no longer a blocker since
+histograms ship hand-rolled in the existing exposition (see §C.1).
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-3 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -519,8 +535,8 @@ discoverable family with no series; thread-count gauge
 (`dds_thread_count`) landed 2026-04-27 follow-up #42 via the
 platform-specific shim alongside the memory-resident-bytes helper;
 rest of the catalog (`dds_sync_lag_seconds` histogram plus the
-`dds_http_request_duration_seconds` histogram sibling) remains
-open.** The
+`dds_http_request_duration_seconds` histogram sibling) **landed
+2026-05-02 follow-up #46 — Phase C is now fully complete.** The
 audit-metrics first slice exposed the five families needed to alert on
 Z-3 regressions (`dds_build_info`, `dds_uptime_seconds`,
 `dds_audit_entries_total{action}`, `dds_audit_chain_length`,
@@ -615,7 +631,7 @@ rows remain open.
 | `dds_gossip_messages_total` | counter | `kind=op|revocation|burn|audit` | Inbound gossip volume — bumped from [`DdsNode::handle_gossip_message`](../dds-node/src/node.rs) after the envelope clears topic identification and CBOR decode, just before dispatch to the matching `ingest_*` path. The catalog originally named `topic` + `direction` labels; `kind` is 1:1 with the originating [`DdsTopic`](../dds-net/src/gossip.rs) so a separate `topic` label would be redundant cardinality, and outbound-side publish is not currently instrumented (the production event loop has no centralised publish funnel — the [`dds-macos-e2e`](../dds-node/src/bin/dds-macos-e2e.rs) harness and the loadtest publisher both call `gossipsub.publish` directly), so v1 ships inbound-only. A future follow-up that lands a `LocalService::publish_gossip` funnel can add the `direction=out` label without renaming the metric. | ✅ |
 | `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted|unknown_topic|decode_error|topic_kind_mismatch` | Pre-decode drops — bumped from the H-12 unadmitted-relayer drop in [`DdsNode::handle_swarm_event`](../dds-node/src/node.rs) and the three early-exit branches of [`DdsNode::handle_gossip_message`](../dds-node/src/node.rs) (`unknown_topic` = topic hash not in the local subscription set; `decode_error` = `GossipMessage::from_cbor` rejected the payload; `topic_kind_mismatch` = decoded variant did not match the topic family). The catalog originally named the labels `unadmitted|invalid_token|duplicate|backpressure`; the latter three describe *post-decode* drop conditions inside the `ingest_*` paths and are already covered by `dds_audit_entries_total{action=*.rejected}` (signature / validation / duplicate-JTI rejections all funnel through the audit chain), so v1 partitions the pre-decode surface only. A future follow-up that wires a gossipsub backpressure hook can add `reason=backpressure` without renaming the metric. | ✅ |
 | `dds_sync_pulls_total` | counter | `result=ok|fail` | Outbound anti-entropy pull outcomes — bumped from the resolution branches of [`DdsNode::handle_sync_event`](../dds-node/src/node.rs). `ok` = admitted peer's `Message::Response` was processed by `handle_sync_response` (zero payloads still counts as `ok` — the pull resolved, the network simply converged). `fail` = `OutboundFailure` event (timeout / connection closed / dial failure / codec error) or the H-12 unadmitted-peer response drop (response received but the peer is no longer in `admitted_peers`, so its payloads are discarded without applying any state). Per-peer cooldown skips inside `try_sync_with` are *not* counted — no request goes on the wire so there is no outcome to partition. Inbound responder-side outcomes are not counted; a future `dds_sync_serves_total{result}` family would split those out without renaming this metric. | ✅ |
-| `dds_sync_lag_seconds` | histogram | — | Time from peer's op timestamp to local apply | 🔲 |
+| `dds_sync_lag_seconds` | histogram | — | Time from peer's op timestamp to local apply — **landed 2026-05-02 follow-up #46** (see status header). Hand-rolled histogram (buckets 1s–86400s) in [`dds-node/src/telemetry.rs`](../dds-node/src/telemetry.rs); bumped from [`DdsNode::handle_sync_response`](../dds-node/src/node.rs) after pre-apply filtering via [`record_sync_lag_seconds`]. | ✅ |
 | `dds_sync_payloads_rejected_total` | counter | `reason=legacy_v1|publisher_capability|publisher_identity|replay_window|signature|duplicate_jti|graph` | Pre-apply skip sites inside [`DdsNode::handle_sync_response`](../dds-node/src/node.rs): `legacy_v1` = M-1/M-2 wire-version-1 token guard tripped while `network.allow_legacy_v1_tokens=false`; `publisher_capability` = C-3 filter — issuer lacks the matching `dds:policy-publisher-*` / `dds:software-publisher` capability vouch (same gate `node::publisher_capability_ok` runs on the gossip path); `publisher_identity` = SC-5 Phase B.1 fail-closed — `SoftwareAssignment.publisher_identity` is present but malformed (empty Authenticode subject, wrong-shape SHA-1 thumbprint, wrong-shape Apple Team ID); same gate `node::software_publisher_identity_ok` runs on the gossip path with `*.rejected` audit reason `publisher-identity-invalid`; `replay_window` = M-9 revoke/burn replay-window guard (catalog `window`). Post-apply categorical reasons returned by [`apply_sync_payloads_with_graph`](../dds-net/src/sync.rs) through the new [`SyncResult::rejected_by_reason`](../dds-net/src/sync.rs) field: `signature` = `Token::validate()` rejected the token (ed25519 signature / issuer-binding); `duplicate_jti` = trust graph rejected the token as a same-JTI duplicate (B-1 replay indicator); `graph` = every other `TrustError` from `TrustGraph::add_token` (`IdentityBurned`, `Unauthorized`, `VouchHashMismatch`, `NoValidChain`, `ChainTooDeep`, graph-layer `TokenValidation`). Decode failures (token / op CBOR), store-side write failures, and DAG missing-deps tally still flow into `SyncResult.errors` for diagnostic logging but are *not* partitioned through this counter — they are either corruption signals or transient store-layer failures already covered by `dds_store_writes_total{result=fail}`. Sync-applied post-apply rejections do *not* hit `dds_audit_entries_total` today (no audit emission inside the sync apply path), so this counter is the only signal an operator gets for sync-vs-gossip post-apply rejection rate parity. | ✅ |
 | **Trust graph** | | | | |
 | `dds_trust_graph_attestations` | gauge | `body_type=user-auth-attestation\|device-join\|windows-policy\|macos-policy\|macos-account-binding\|sso-identity-link\|software-assignment\|service-principal\|session\|unknown` | Active attestation tokens (renamed from `dds_attestations_total` — Prom convention reserves `_total` for counters). Partitioned by [`payload.body_type`](../dds-core/src/token.rs) mapped through the fixed [`dds_domain::body_types`](../dds-domain/src/lib.rs) catalog into a short label name (the `dds:` URI prefix is stripped). Tokens whose `body_type` is `None` or outside the catalog land in `body_type="unknown"` so the partition is total — `sum(dds_trust_graph_attestations) == previous_unlabeled_total`. Cardinality is bounded by the nine catalog constants plus `unknown` (10 values total). The catalog originally named `kind=user\|device\|service`; the `body_type` vocabulary is preferred because the catalog entries do not collapse cleanly to those three buckets (`windows-policy` / `software-assignment` are neither user nor device nor service). A future follow-up can land an additional aggregation label on top of `body_type` without renaming the metric. | ✅ |
@@ -637,7 +653,7 @@ rows remain open.
 | `dds_store_writes_total` | counter | `result=ok|conflict|fail` | Per-result store write-transaction outcome counter — scrape-time read of [`dds_store::traits::StoreWriteStats::store_write_counts`](../dds-store/src/traits.rs) through [`LocalService::store_write_counts`](../dds-node/src/service.rs). Backends keep three monotonic `AtomicU64` counters (one per [`WriteOutcome`] bucket) bumped from every write-path method exit. `result="ok"` counts committed writes that changed state; `result="conflict"` counts caller-visible domain rejections aborted before commit (`put_operation` duplicate id returning `Ok(false)`, `bump_sign_count` `SignCountReplay`); `result="fail"` collects every other unsuccessful write — redb plumbing (open / begin / commit / open_table / insert / remove failure), ciborium serialization, and audit chain break (`StoreError::Serde("audit chain break: …")`). v1 collapses the chain-break path into `fail` because `StoreError` does not yet have a `Conflict` variant; a future trait change can split the bucket without renaming the metric. The renderer always emits all three value lines (zero-initialised) so the family is discoverable on a fresh node before any write has happened. | ✅ |
 | **HTTP API** | | | | |
 | `dds_http_requests_total` | counter | `route, method, status` | Route-level traffic — bumped from the `route_layer`-applied [`http_request_observer_middleware`](../dds-node/src/http.rs) wired into the merged production router built by [`crate::http::router`](../dds-node/src/http.rs). The middleware reads `axum::extract::MatchedPath` from the per-route handler stack (DDS has no path parameters today, so the matched template equals the literal URI path), captures the method, then bumps once with the inner handler's status code on the way out. Unmatched 404s served by the default fallback are *not* counted because `route_layer` does not wrap the fallback — operators read the un-routed call rate off `dds_http_caller_identity_total`. The route layer sits inside the outer `caller_identity_observer_middleware` / `rate_limit_middleware` / `DefaultBodyLimit` stack, so requests rejected before they reach a matched handler (rate-limited 429s, body-too-big 413s) do not bump this counter — those remain visible only via `dds_http_caller_identity_total`. | ✅ |
-| `dds_http_request_duration_seconds` | histogram | `route, method` | Latency — sibling of the `dds_http_requests_total` counter; ships once the hand-rolled exposition rolls over to `metrics-exporter-prometheus` (deferred until the first histogram-bearing metric in the catalog ships, per C.1). | 🔲 |
+| `dds_http_request_duration_seconds` | histogram | `route, method` | Latency — sibling of the `dds_http_requests_total` counter — **landed 2026-05-02 follow-up #46** (see status header). Hand-rolled histogram (buckets 5ms–5s) in [`dds-node/src/telemetry.rs`](../dds-node/src/telemetry.rs); bumped from [`http_request_observer_middleware`](../dds-node/src/http.rs) via [`record_http_request_duration`] using `Instant::elapsed()`. | ✅ |
 | `dds_http_caller_identity_total` | counter | `kind=anonymous|uds|pipe|admin` | Who's calling — surfaces accidental loopback-TCP regressions; transport buckets (anonymous/uds/pipe) partition the request count, `admin` is bumped orthogonally when the caller passes the admin policy | ✅ |
 | **Process** | | | | |
 | `dds_memory_resident_bytes` | gauge | — | Process RSS in bytes — scrape-time read of [`sysinfo::Process::memory`](https://docs.rs/sysinfo/0.32/sysinfo/struct.Process.html#method.memory) for our own pid via the private `process_resident_bytes()` helper in [`dds-node/src/telemetry.rs`](../dds-node/src/telemetry.rs). On Linux this is `RSS` from `/proc/<pid>/status`; on macOS `task_info` `MACH_TASK_BASIC_INFO`; on Windows the working set from `K32GetProcessMemoryInfo`. Read failures (sandbox, transient race) degrade to 0; the family's `# HELP` / `# TYPE` headers always ship so the catalog stays discoverable. | ✅ |
@@ -776,10 +792,10 @@ Active FIDO2-tier rule (group `dds-fido2`, landed follow-up #43):
   split can partition the rule by `result=` label without renaming
   it.
 
-Reference (commented) rules — uncomment when Phase C lands the
-metric:
-- `DdsSyncLagHigh` (needs `dds_sync_lag_seconds_bucket`, deferred
-  with the `metrics-exporter-prometheus` rollover).
+Reference (commented) rules — ready to activate now that Phase C
+landed `dds_sync_lag_seconds` (follow-up #46):
+- `DdsSyncLagHigh` (needs `dds_sync_lag_seconds_bucket` — now
+  available; operators can uncomment and tune the threshold).
 
 `DdsRevocationsSurge` is implicitly covered by the Trust-Graph
 dashboard's Revocations panel and the rejection-ratio alert; a

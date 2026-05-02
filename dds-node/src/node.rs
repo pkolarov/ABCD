@@ -2610,6 +2610,24 @@ impl DdsNode {
                 crate::telemetry::record_sync_payloads_rejected(reason.as_label());
             }
         }
+        // Record `dds_sync_lag_seconds` — one observation per token that
+        // made it through the pre-apply filters, measuring seconds from
+        // the token's issued-at time to now (how stale were the ops
+        // when they arrived via anti-entropy sync).
+        {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if now_unix > 0 {
+                for payload in &payloads {
+                    if let Ok(token) = Token::from_cbor(&payload.token_bytes) {
+                        let lag_secs = now_unix.saturating_sub(token.payload.iat) as f64;
+                        crate::telemetry::record_sync_lag_seconds(lag_secs);
+                    }
+                }
+            }
+        }
         // Repopulate the sync cache so the next inbound request from
         // some other peer can serve these payloads onward. **M-5
         // (security review)**: route through `cache_sync_payload` so

@@ -1,5 +1,38 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-02, updated 10th pass)
+
+- ✅ Phase C histogram metrics landed (2026-05-02, follow-up #46):
+  The last two 🔲 rows in the `observability-plan.md` Phase C catalog are now
+  fully implemented — **Phase C is complete**.
+  1. **`dds_sync_lag_seconds`** — hand-rolled histogram (buckets 1s, 5s, 15s,
+     60s, 300s, 900s, 3600s, 86400s). `Telemetry` grew a `sync_lag:
+     Mutex<Histogram>` field; `record_sync_lag_seconds(secs)` bumps it from
+     [`DdsNode::handle_sync_response`](dds-node/src/node.rs) immediately after
+     the pre-apply filter and before the apply step — one observation per token,
+     value = `now_unix.saturating_sub(token.payload.iat)` seconds.
+  2. **`dds_http_request_duration_seconds`** — hand-rolled histogram (buckets
+     5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 5s), labelled by
+     `route` and `method`. `Telemetry` grew an
+     `http_durations: Mutex<BTreeMap<(String, String), Histogram>>` field;
+     `record_http_request_duration(route, method, secs)` bumps it from
+     [`http_request_observer_middleware`](dds-node/src/http.rs) via
+     `Instant::elapsed()` alongside the existing `record_http_request` call.
+  Both histograms render in Prometheus histogram text format (cumulative
+  `_bucket` lines + `_sum` + `_count`) via the existing hand-rolled
+  exposition in `dds-node/src/telemetry.rs`. The `metrics-exporter-prometheus`
+  rollover (observability-plan.md §C.1) is no longer a prerequisite — histograms
+  now ship without the external crate.
+  **2 new unit tests** (`render_emits_sync_lag_histogram`,
+  `render_emits_http_duration_histogram`) pin the exposition output.
+  `docs/observability-plan.md` Phase C status updated to complete (#46);
+  both catalog rows now ✅. The `DdsSyncLagHigh` Phase E reference rule
+  is now unblocked.
+  `cargo clippy --workspace --all-targets -- -D warnings` clean;
+  `cargo fmt --all -- --check` clean;
+  `cargo test -p dds-node` **413 / 413 passing** (was 411 before follow-up
+  #46 added the 2 new histogram unit tests).
+
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 9th pass)
 
 - ✅ Supply chain C.1 (SLSA Level 3 provenance) landed (2026-05-02):

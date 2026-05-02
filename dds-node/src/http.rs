@@ -677,9 +677,12 @@ async fn http_request_observer_middleware(
         .get::<axum::extract::MatchedPath>()
         .map(|m| m.as_str().to_string())
         .unwrap_or_else(|| req.uri().path().to_string());
+    let start = std::time::Instant::now();
     let response = next.run(req).await;
+    let elapsed_secs = start.elapsed().as_secs_f64();
     let status = response.status().as_u16();
     crate::telemetry::record_http_request(&route, &method, status);
+    crate::telemetry::record_http_request_duration(&route, &method, elapsed_secs);
     response
 }
 
