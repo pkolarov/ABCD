@@ -18,6 +18,10 @@ use dds_core::identity::Identity;
 use dds_store::RedbBackend;
 use dds_store::traits::*;
 use dump::{DUMP_VERSION, DdsDump};
+/// **Z-5** — magic prefix for hybrid-KEM-encrypted export files.
+/// Distinct from the CBOR dump so `handle_import` can detect the
+/// encrypted format without ambiguity.
+const EXPORT_ENC_MAGIC: &[u8] = b"DDSDUMP_ENC_V1\0";
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -115,6 +119,15 @@ enum Commands {
         /// Destination path for the dump file.
         #[arg(long)]
         out: PathBuf,
+        /// **Z-5 (security review)** — encrypt the dump for a specific
+        /// recipient using their hybrid X25519 + ML-KEM-768 public key
+        /// (1,216 bytes as hex). Obtain the recipient's pubkey with
+        /// `dds pq status` on the target node (printed as "KEM pubkey (hex)"). When set,
+        /// the dump is wrapped in a hybrid-KEM AEAD envelope so only the
+        /// holder of the matching KEM secret key can read it. Suppresses
+        /// the "NOT encrypted" warning.
+        #[arg(long, value_name = "HEX")]
+        encrypt_to: Option<String>,
     },
     /// Import a `.ddsdump` file into the local store (idempotent).
     Import {
@@ -545,7 +558,7 @@ async fn main() {
         Commands::Debug { action } => handle_debug(action, &cli.node_url).await,
         Commands::Stats { format } => handle_stats(&cli.node_url, &format).await,
         Commands::Health { format } => handle_health(&cli.node_url, &format).await,
-        Commands::Export { out } => handle_export(&cli.data_dir, &out),
+        Commands::Export { out, encrypt_to } => handle_export(&cli.data_dir, &out, encrypt_to.as_deref()),
         Commands::Import {
             input,
             dry_run,
@@ -1786,7 +1799,7 @@ fn open_store_or_exit(data_dir: &Path, create: bool) -> RedbBackend {
     })
 }
 
-fn handle_export(data_dir: &Path, out: &Path) {
+fn handle_export(data_dir: &Path, out: &Path, encrypt_to: Option<&str>) {
     let store = open_store_or_exit(data_dir, false);
 
     let domain_id = read_domain_id(data_dir).unwrap_or_else(|| {
@@ -1886,10 +1899,57 @@ fn handle_export(data_dir: &Path, out: &Path) {
         .to_bytes()
         .to_vec();
 
-    let bytes = dump.to_cbor().unwrap_or_else(|e| {
+    let signed_cbor = dump.to_cbor().unwrap_or_else(|e| {
         eprintln!("Failed to encode dump: {e}");
         std::process::exit(1);
     });
+
+    // **Z-5 (security review)**: if `--encrypt-to` is set, wrap the signed
+    // CBOR in a hybrid-KEM AEAD envelope (X25519 + ML-KEM-768 key agreement,
+    // ChaCha20-Poly1305 bulk encryption). The recipient decrypts with
+    // `dds import --in <file>` after presenting the matching KEM secret key
+    // (from their `epoch_keys.cbor`).
+    let (write_bytes, encrypted) = if let Some(pubkey_hex) = encrypt_to {
+        use dds_core::crypto::{epoch_key, kem};
+
+        let pk_bytes = hex::decode(pubkey_hex).unwrap_or_else(|e| {
+            eprintln!("--encrypt-to: invalid hex: {e}");
+            std::process::exit(1);
+        });
+        let recipient_pk = kem::HybridKemPublicKey::from_bytes(&pk_bytes).unwrap_or_else(|_| {
+            eprintln!(
+                "--encrypt-to: expected {} bytes (hybrid X25519 + ML-KEM-768 pubkey), got {}",
+                kem::HYBRID_KEM_PUBKEY_LEN,
+                pk_bytes.len()
+            );
+            std::process::exit(1);
+        });
+
+        let mut rng = OsRng;
+        let (kem_ct, shared) = kem::encap(&mut rng, &recipient_pk, b"dds-export-v1")
+            .unwrap_or_else(|_| {
+                eprintln!("KEM encap failed");
+                std::process::exit(1);
+            });
+        let (aead_nonce, aead_ct) =
+            epoch_key::encrypt_export(&mut rng, &shared, &signed_cbor).unwrap_or_else(|_| {
+                eprintln!("AEAD encrypt failed");
+                std::process::exit(1);
+            });
+
+        // Wire format: MAGIC ∥ kem_ct (1120 B) ∥ aead_nonce (12 B) ∥ aead_ct
+        let kem_ct_bytes = kem_ct.to_bytes();
+        let mut enc = Vec::with_capacity(
+            EXPORT_ENC_MAGIC.len() + kem_ct_bytes.len() + aead_nonce.len() + aead_ct.len(),
+        );
+        enc.extend_from_slice(EXPORT_ENC_MAGIC);
+        enc.extend_from_slice(&kem_ct_bytes);
+        enc.extend_from_slice(&aead_nonce);
+        enc.extend_from_slice(&aead_ct);
+        (enc, true)
+    } else {
+        (signed_cbor, false)
+    };
 
     if let Some(parent) = out.parent()
         && !parent.as_os_str().is_empty()
@@ -1899,13 +1959,11 @@ fn handle_export(data_dir: &Path, out: &Path) {
             std::process::exit(1);
         });
     }
-    std::fs::write(out, &bytes).unwrap_or_else(|e| {
+    std::fs::write(out, &write_bytes).unwrap_or_else(|e| {
         eprintln!("Failed to write {}: {e}", out.display());
         std::process::exit(1);
     });
     // L-5 (security review): restrict dump file to owner-only read.
-    // The dump contains revocation/burn lists that can reveal trust
-    // graph internals; prior default permissions left it world-readable.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1918,28 +1976,100 @@ fn handle_export(data_dir: &Path, out: &Path) {
     println!("  Operations: {}", dump.operations.len());
     println!("  Revoked:    {}", dump.revoked.len());
     println!("  Burned:     {}", dump.burned.len());
-    println!("  Size:       {} bytes", bytes.len());
-    // Z-5 (security review) — the dump is signed for integrity but is
-    // NOT encrypted for confidentiality. Treat it as Restricted material
-    // in transit: it contains every signed token (credential IDs, device
-    // tags, attestations), every CRDT operation, and the revoked / burned
-    // sets — i.e. a complete snapshot of directory state. Operators
-    // shipping it through couriers or USB sticks must add their own
-    // confidentiality layer (FDE, GPG, age, etc.) until the encrypted
-    // export variant lands.
-    eprintln!();
-    eprintln!("WARNING: The dump file is signed for integrity but is NOT encrypted.");
-    eprintln!("         It contains the full directory state in plaintext CBOR.");
-    eprintln!("         Treat as Restricted material; encrypt before transit (GPG / age / FDE).");
+    println!("  Size:       {} bytes", write_bytes.len());
+    if encrypted {
+        eprintln!();
+        eprintln!("Dump is hybrid-KEM encrypted (X25519 + ML-KEM-768 + ChaCha20-Poly1305).");
+        eprintln!("Only the holder of the matching KEM secret key can import it.");
+    } else {
+        // Z-5 (security review) — the dump is signed for integrity but is
+        // NOT encrypted for confidentiality. Treat it as Restricted material
+        // in transit: it contains every signed token (credential IDs, device
+        // tags, attestations), every CRDT operation, and the revoked / burned
+        // sets — i.e. a complete snapshot of directory state. Operators
+        // shipping it through couriers or USB sticks must add their own
+        // confidentiality layer (FDE, GPG, age, etc.) until the encrypted
+        // export variant lands, or use `--encrypt-to <kem-pubkey>`.
+        eprintln!();
+        eprintln!("WARNING: The dump file is signed for integrity but is NOT encrypted.");
+        eprintln!("         It contains the full directory state in plaintext CBOR.");
+        eprintln!("         Use --encrypt-to <hex-pubkey> or encrypt before transit (GPG / age / FDE).");
+    }
 }
 
 fn handle_import(data_dir: &Path, input: &Path, dry_run: bool, allow_unsigned: bool) {
     // Parse dump first — validating the file before opening the store means
     // a bad file never perturbs on-disk state.
-    let bytes = std::fs::read(input).unwrap_or_else(|e| {
+    let raw_bytes = std::fs::read(input).unwrap_or_else(|e| {
         eprintln!("Failed to read {}: {e}", input.display());
         std::process::exit(1);
     });
+
+    // **Z-5 (security review)**: detect and decrypt a hybrid-KEM-encrypted
+    // dump. The encrypted format starts with `EXPORT_ENC_MAGIC`; plaintext
+    // CBOR dumps start with 0xa4..0xa7 (CBOR map headers).
+    let bytes: Vec<u8> = if raw_bytes.starts_with(EXPORT_ENC_MAGIC) {
+        use dds_core::crypto::{epoch_key, kem};
+
+        let rest = &raw_bytes[EXPORT_ENC_MAGIC.len()..];
+        let ct_len = kem::HYBRID_KEM_CT_LEN;
+        if rest.len() < ct_len + epoch_key::AEAD_NONCE_LEN {
+            eprintln!(
+                "Error: encrypted dump is truncated (need at least {} bytes after magic, got {})",
+                ct_len + epoch_key::AEAD_NONCE_LEN,
+                rest.len()
+            );
+            std::process::exit(1);
+        }
+        let (kem_ct_bytes, rest) = rest.split_at(ct_len);
+        let (nonce_bytes, aead_ct) = rest.split_at(epoch_key::AEAD_NONCE_LEN);
+
+        let kem_ct = kem::KemCiphertext::from_bytes(kem_ct_bytes).unwrap_or_else(|_| {
+            eprintln!("Error: malformed KEM ciphertext in encrypted dump");
+            std::process::exit(1);
+        });
+        let mut nonce = [0u8; epoch_key::AEAD_NONCE_LEN];
+        nonce.copy_from_slice(nonce_bytes);
+
+        // Load the local node's KEM secret key from epoch_keys.cbor.
+        let epoch_path = data_dir.join("epoch_keys.cbor");
+        if !epoch_path.exists() {
+            eprintln!(
+                "Error: encrypted dump requires the KEM secret key at {}",
+                epoch_path.display()
+            );
+            eprintln!("       Run `dds-node` on this host first to initialise the epoch key store,");
+            eprintln!("       or re-export targeting a node whose epoch_keys.cbor is present here.");
+            std::process::exit(1);
+        }
+        let epoch_store = dds_node::epoch_key_store::EpochKeyStore::load_or_create(
+            &epoch_path,
+            &mut OsRng,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to load epoch key store at {}: {e}", epoch_path.display());
+            std::process::exit(1);
+        });
+
+        let shared = kem::decap(epoch_store.kem_secret(), &kem_ct, b"dds-export-v1")
+            .unwrap_or_else(|_| {
+                eprintln!("Error: KEM decapsulation failed — wrong KEM secret key or corrupted file");
+                std::process::exit(1);
+            });
+
+        let plaintext = epoch_key::decrypt_export(&shared, &nonce, aead_ct).unwrap_or_else(|_| {
+            eprintln!(
+                "Error: AEAD decryption failed — wrong key, tampered ciphertext, or corrupted file"
+            );
+            std::process::exit(1);
+        });
+
+        eprintln!("Decrypted hybrid-KEM-encrypted dump ({} bytes).", raw_bytes.len());
+        plaintext
+    } else {
+        raw_bytes
+    };
+
     let dump = DdsDump::from_cbor(&bytes).unwrap_or_else(|e| {
         eprintln!("Failed to parse dump: {e}");
         std::process::exit(1);
@@ -2166,6 +2296,7 @@ fn handle_pq_status(data_dir: &Path) {
                     pq_pubkey_short_hash(&pk_bytes)
                 );
                 println!("  KEM pubkey size:          {} bytes", pk_bytes.len());
+                println!("  KEM pubkey (hex):         {}", hex::encode(&pk_bytes));
                 println!("  Current epoch_id:         {}", epoch_id);
                 println!("  Cached peer releases:     {}", store.peer_release_count());
             }

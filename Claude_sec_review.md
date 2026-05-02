@@ -2097,7 +2097,7 @@ entire audit chain.
    and stop claiming at-rest encryption in marketing materials
    until (1) or (2) lands.
 
-### Z-5 (Medium) ⚠ partially closed (doc half landed 2026-04-29) — Export dumps are plaintext
+### Z-5 (Medium) ✅ closed (2026-05-02) — Export dumps are plaintext
 
 `dds-cli export` (`dds-cli/src/dump.rs:60-90`) writes a CBOR archive
 containing all tokens, operations, and revocation/burn sets. v2 adds
@@ -2110,36 +2110,32 @@ air-gap sync are shipping plaintext copies of the directory state.
 signed CBOR). Document explicitly that unencrypted dumps must be
 treated as Restricted material in transit.
 
-**Doc-half landed 2026-04-29.** The "document explicitly" half of the
-remediation now ships:
+**Doc-half landed 2026-04-29.** The "document explicitly" half:
 
 - `handle_export` in [`dds-cli/src/main.rs`](dds-cli/src/main.rs)
-  emits an explicit stderr advisory after every successful export —
-  `WARNING: The dump file is signed for integrity but is NOT
-  encrypted.` followed by `It contains the full directory state in
-  plaintext CBOR.` and `Treat as Restricted material; encrypt before
-  transit (GPG / age / FDE).` — so an operator piping the dump into
-  a courier flow sees the confidentiality posture rather than
-  silently shipping plaintext. The summary block on stdout is
-  unchanged, so existing scripts that grep `Tokens:`/`Size:` keep
-  working; the warning lives on stderr alongside the existing
-  failure-path messages.
+  emits an explicit stderr advisory after every unencrypted export.
 - [`docs/DDS-Admin-Guide.md`](docs/DDS-Admin-Guide.md) §"Air-Gapped
-  Sync" gained a new "Confidentiality posture (Z-5)" subsection
-  enumerating the three operator-side wrappers (GPG / age,
-  encrypted volume, wrapped channel) until the encrypted-dump
-  variant lands. Cross-links back to this Z-5 row.
-- New regression test in [`dds-cli/tests/smoke.rs`](dds-cli/tests/smoke.rs)
-  `test_export_import_round_trip` asserts the warning appears in
-  stderr (`WARNING` + `NOT encrypted`) so a future regression that
-  silently drops the advisory fails CI.
+  Sync" § "Confidentiality posture (Z-5)" documents the posture and
+  operator-side wrappers.
+- Regression test `test_export_import_round_trip` in
+  [`dds-cli/tests/smoke.rs`](dds-cli/tests/smoke.rs) pins the warning.
 
-**Still open:** the encryption half — `dds-cli export --encrypt-to
-<pubkey>` wrapping the existing signed CBOR in a hybrid-PQ KEM
-envelope — rides on the Z-1 Phase B hybrid-KEM machinery (per-message
-hybrid-KEM envelope on gossip + sync) landing first so the export
-path can reuse the same `dds-core::crypto::kem` module rather than
-introducing a parallel KEM API.
+**Encryption half landed 2026-05-02.** `dds export --encrypt-to
+<hex-pubkey>` wraps the signed CBOR in a hybrid X25519 + ML-KEM-768
+KEM envelope (ChaCha20-Poly1305 AEAD, domain-separated AAD
+`b"dds-export-v1"`). Wire format: `DDSDUMP_ENC_V1\0` (15 B) ∥ KEM
+ciphertext (1120 B) ∥ nonce (12 B) ∥ AEAD ciphertext. `dds import`
+auto-detects the magic prefix and decrypts using the node's
+`epoch_keys.cbor` KEM secret key — no extra flags on the import side.
+`encrypt_export`/`decrypt_export` helpers in
+`dds-core/src/crypto/epoch_key`; constant `EXPORT_AAD_V1 =
+b"dds-export-v1"` ensures export ciphertext is domain-separated from
+gossip/sync and epoch-key-wrap ciphertext. Regression test
+`test_export_import_encrypted_round_trip` in
+[`dds-cli/tests/smoke.rs`](dds-cli/tests/smoke.rs) covers the full
+round-trip plus idempotency.  `dds pq status` now prints the full
+hex KEM pubkey (`KEM pubkey (hex):` line) so operators know what to
+pass to `--encrypt-to`.
 
 ### Cross-reference
 
@@ -2159,8 +2155,9 @@ These five findings are not duplicates of any prior review item:
   question rather than a permission question.
 - Z-5 is the confidentiality complement to M-16 (which closed
   v1-downgrade *integrity*). Doc-half (operator advisory + admin
-  guide subsection + regression test) landed 2026-04-29; the
-  encryption half remains open and rides on Z-1 Phase B.
+  guide subsection + regression test) landed 2026-04-29; encryption
+  half (`--encrypt-to` hybrid-KEM envelope + auto-decrypt on import)
+  landed 2026-05-02. Fully closed.
 
 ---
 

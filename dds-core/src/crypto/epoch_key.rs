@@ -177,6 +177,71 @@ pub fn unwrap(
     Ok(out)
 }
 
+/// **Z-5 (security review)** — constant AAD for encrypted `dds export` dump
+/// envelopes. Distinct from [`AAD_V1`] (epoch-key wrap) and
+/// [`PAYLOAD_AAD_V3`] (gossip/sync payload) to prevent cross-construction
+/// ciphertext confusion.
+pub const EXPORT_AAD_V1: &[u8] = b"dds-export-v1";
+
+/// **Z-5 (security review)** — encrypt a signed dump payload under a
+/// hybrid-KEM-derived shared secret for confidential air-gapped export.
+///
+/// This is the AEAD half of `dds export --encrypt-to`. The caller
+/// supplies the 32-byte shared secret produced by
+/// [`crate::crypto::kem::encap`] with binding
+/// `b"dds-export-v1"` and the full dump CBOR bytes.
+///
+/// Returns `(nonce, ciphertext)`. The ciphertext is `plaintext.len() +
+/// AEAD_TAG_LEN` bytes long (16-byte Poly1305 tag).
+///
+/// # Errors
+/// [`CryptoError::InvalidSignature`] if the AEAD operation fails (in
+/// practice only on allocator failure).
+#[cfg(feature = "pq")]
+pub fn encrypt_export<R: CryptoRngCore>(
+    rng: &mut R,
+    kem_shared: &[u8; SHARED_SECRET_LEN],
+    plaintext: &[u8],
+) -> Result<([u8; AEAD_NONCE_LEN], Vec<u8>), CryptoError> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(kem_shared.as_slice()));
+    let mut nonce_bytes = [0u8; AEAD_NONCE_LEN];
+    rng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ct = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad: EXPORT_AAD_V1,
+            },
+        )
+        .map_err(|_| CryptoError::InvalidSignature)?;
+    Ok((nonce_bytes, ct))
+}
+
+/// **Z-5 (security review)** — decrypt a payload previously encrypted
+/// by [`encrypt_export`]. Returns the plaintext bytes, or
+/// [`CryptoError::InvalidSignature`] if the AEAD tag does not verify
+/// (wrong key, tampered ciphertext, tampered nonce, or tampered AAD).
+#[cfg(feature = "pq")]
+pub fn decrypt_export(
+    kem_shared: &[u8; SHARED_SECRET_LEN],
+    nonce: &[u8; AEAD_NONCE_LEN],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(kem_shared.as_slice()));
+    let nonce_ref = Nonce::from_slice(nonce);
+    cipher
+        .decrypt(
+            nonce_ref,
+            Payload {
+                msg: ciphertext,
+                aad: EXPORT_AAD_V1,
+            },
+        )
+        .map_err(|_| CryptoError::InvalidSignature)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

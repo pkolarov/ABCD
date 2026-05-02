@@ -1926,20 +1926,53 @@ same size as the on-disk store contents — no extra framing overhead.
 
 ### Confidentiality posture (Z-5)
 
-> **The dump is signed for integrity but is NOT encrypted for
-> confidentiality.** Treat a `.ddsdump` as Restricted material in
-> transit.
+A `.ddsdump` contains every signed token (credential IDs, device tags,
+attestations), every CRDT operation, and the revoked / burned sets — a
+complete snapshot of directory state. The file is **signed for integrity
+(M-16) but optionally encrypted for confidentiality.**
 
-The file contains every signed token (credential IDs, device tags,
-attestations), every CRDT operation, and the revoked / burned sets — i.e.
-a complete snapshot of directory state. An attacker who reads a `.ddsdump`
-in transit (intercepted USB stick, courier loss, mis-routed email) learns
-the full enrolled-user list and every device tag, even though the
-records themselves remain cryptographically signed.
+#### Encrypted export (recommended)
 
-Until the encrypted-dump variant lands (Z-5 in
-[Claude_sec_review.md](../Claude_sec_review.md)), the operator MUST add
-their own confidentiality layer before transit:
+Use `--encrypt-to <hex-pubkey>` to wrap the dump in a hybrid
+X25519 + ML-KEM-768 KEM envelope (ChaCha20-Poly1305 AEAD). Only the
+holder of the matching KEM secret key can import it.
+
+```bash
+# Step 1: obtain node B's hybrid KEM public key.
+dds --data-dir /var/lib/dds pq status
+#   …
+#   KEM pubkey (hex):  04ab3c…  (2432 hex chars = 1216 bytes)
+
+# Step 2: on node A, export encrypted for node B.
+dds --data-dir /var/lib/dds export \
+    --out /mnt/usb/acme-2026-05.ddsdump \
+    --encrypt-to 04ab3c…
+# Dump is hybrid-KEM encrypted (X25519 + ML-KEM-768 + ChaCha20-Poly1305).
+# Only the holder of the matching KEM secret key can import it.
+
+# Step 3: on node B, import as usual — decryption is automatic.
+dds --data-dir /var/lib/dds import --in /mnt/usb/acme-2026-05.ddsdump
+# Decrypted hybrid-KEM-encrypted dump (…B).
+# Imported:
+#   Tokens:     140 new, 2 already present
+```
+
+Node B's KEM secret key lives in `<data-dir>/epoch_keys.cbor` and is
+created automatically when `dds-node` first starts. The `dds import`
+command loads it automatically — no extra flags are needed.
+
+#### Plaintext export (fallback)
+
+When `--encrypt-to` is omitted the dump is written as plain signed CBOR.
+The CLI warns on every such export:
+
+```
+WARNING: The dump file is signed for integrity but is NOT encrypted.
+         Use --encrypt-to <hex-pubkey> or encrypt before transit (GPG / age / FDE).
+```
+
+If the destination node has not yet initialized its epoch key store (no
+`epoch_keys.cbor`), add your own confidentiality layer before transit:
 
 - **GPG / age:** `gpg --encrypt --recipient <pubkey> sync.ddsdump`
   (decrypt at the destination before `dds import`).
@@ -1948,12 +1981,6 @@ their own confidentiality layer before transit:
 - **Wrapped channel:** `scp` / `sftp` / a corp-pipeline already
   layered on TLS.
 
-The CLI surfaces this on every export — `dds export` writes a
-`WARNING: The dump file is signed for integrity but is NOT encrypted.`
-line to stderr alongside the success summary, so an operator who pipes
-the dump into a courier flow sees the posture explicitly rather than
-silently shipping plaintext.
-
 The integrity signature (M-16) means a tampered dump fails import even
 when shipped in the clear, so the integrity-vs-confidentiality split is
 deliberate; the warning above is about confidentiality only.
@@ -1961,18 +1988,26 @@ deliberate; the warning above is about confidentiality only.
 ### Commands
 
 ```bash
-# On node A: package the current state.
-dds --data-dir /var/lib/dds export --out /mnt/usb/acme-2026-04.ddsdump
-# Exported dump to /mnt/usb/acme-2026-04.ddsdump
+# On node A: package the current state (plaintext).
+dds --data-dir /var/lib/dds export --out /mnt/usb/acme-2026-05.ddsdump
+# Exported dump to /mnt/usb/acme-2026-05.ddsdump
 #   Domain:     dds-dom:acme-7x4q…
 #   Tokens:     142
 #   Operations: 318
 #   Revoked:    3
 #   Burned:     0
 #   Size:       412803 bytes
+# WARNING: The dump file is signed for integrity but is NOT encrypted.
+#          Use --encrypt-to <hex-pubkey> or encrypt before transit (GPG / age / FDE).
+
+# On node A: package encrypted for node B's KEM pubkey.
+dds --data-dir /var/lib/dds export \
+    --out /mnt/usb/acme-2026-05-enc.ddsdump \
+    --encrypt-to 04ab3c…   # from: dds pq status on node B
+# Dump is hybrid-KEM encrypted (X25519 + ML-KEM-768 + ChaCha20-Poly1305).
 
 # On node B (different site, no network path): replay it.
-dds --data-dir /var/lib/dds import --in /mnt/usb/acme-2026-04.ddsdump
+dds --data-dir /var/lib/dds import --in /mnt/usb/acme-2026-05.ddsdump
 # Imported:
 #   Tokens:     140 new, 2 already present
 #   Operations: 316 new, 2 already present
@@ -1980,7 +2015,7 @@ dds --data-dir /var/lib/dds import --in /mnt/usb/acme-2026-04.ddsdump
 #   Burned:     0 applied
 
 # Preview-only (no writes). Useful when verifying a dump before applying.
-dds --data-dir /var/lib/dds import --in /mnt/usb/acme-2026-04.ddsdump --dry-run
+dds --data-dir /var/lib/dds import --in /mnt/usb/acme-2026-05.ddsdump --dry-run
 ```
 
 ### Domain-id enforcement

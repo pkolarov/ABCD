@@ -667,6 +667,131 @@ fn test_pq_status_no_state() {
     assert!(stdout.contains("Peer cert cache:          not initialized"));
 }
 
+/// Z-5 — encrypted export/import round-trip using hybrid-KEM envelope.
+///
+/// The destination's KEM keypair is created ahead of time via
+/// `EpochKeyStore::new`. The source exports with `--encrypt-to <hex>` and the
+/// destination imports transparently (auto-loading `epoch_keys.cbor` to decap).
+#[test]
+fn test_export_import_encrypted_round_trip() {
+    use dds_node::epoch_key_store::EpochKeyStore;
+    use rand::rngs::OsRng;
+
+    // ---- Source node: seed domain + one vouch ----
+    let src = tempfile::tempdir().unwrap();
+    let src_dir = src.path().to_str().unwrap();
+    let _domain_id = seed_domain_returning_id(src.path());
+    let out = dds_cli()
+        .args([
+            "--data-dir",
+            src_dir,
+            "group",
+            "vouch",
+            "--as-label",
+            "admin",
+            "--user",
+            "urn:vouchsafe:encrypted.fakehash",
+            "--purpose",
+            "group:backend",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "vouch failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // ---- Destination node: create epoch key store ----
+    let dst = tempfile::tempdir().unwrap();
+    let dst_dir = dst.path().to_str().unwrap();
+    let mut rng = OsRng;
+    let dst_store = EpochKeyStore::new(&mut rng);
+    let epoch_path = dst.path().join("epoch_keys.cbor");
+    dst_store.save(&epoch_path).unwrap();
+    let kem_pubkey_hex = hex::encode(dst_store.kem_public().to_bytes());
+
+    // ---- Export from source with --encrypt-to ----
+    let dump_path = src.path().join("encrypted.ddsdump");
+    let out = dds_cli()
+        .args([
+            "--data-dir",
+            src_dir,
+            "export",
+            "--out",
+            dump_path.to_str().unwrap(),
+            "--encrypt-to",
+            &kem_pubkey_hex,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "export failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Should NOT warn about plaintext since we encrypted.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("NOT encrypted"),
+        "encrypted export must not warn about plaintext; stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("hybrid-KEM encrypted"),
+        "encrypted export must confirm encryption; stderr was: {stderr}"
+    );
+
+    // Verify the file has the MAGIC prefix.
+    let raw = std::fs::read(&dump_path).unwrap();
+    assert!(
+        raw.starts_with(b"DDSDUMP_ENC_V1\0"),
+        "encrypted dump must start with DDSDUMP_ENC_V1\\0 magic"
+    );
+
+    // ---- Destination node: copy domain.toml so signature verifies ----
+    std::fs::copy(src.path().join("domain.toml"), dst.path().join("domain.toml")).unwrap();
+
+    let out = dds_cli()
+        .args([
+            "--data-dir",
+            dst_dir,
+            "import",
+            "--in",
+            dump_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "import failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Decrypted hybrid-KEM-encrypted dump"),
+        "import must confirm decryption; stderr was: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Tokens:     1 new"),
+        "import must report 1 new token; stdout was: {stdout}"
+    );
+
+    // Second import is idempotent.
+    let out = dds_cli()
+        .args([
+            "--data-dir",
+            dst_dir,
+            "import",
+            "--in",
+            dump_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("0 new, 1 already present"),
+        "second encrypted import must be idempotent; stdout was: {stdout}"
+    );
+}
+
 #[test]
 fn test_pq_list_pubkeys_no_state() {
     let tmp = tempfile::tempdir().unwrap();
