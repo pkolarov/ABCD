@@ -284,6 +284,15 @@ foreach ($plat in $Targets) {
         Build-Dotnet -rid $info.DotnetRid -stageDir $stageDir
     }
 
+    # Step 3.5: copy installer-side scripts into stage so WiX can reference them
+    $bootstrapSrc = Join-Path $InstallerDir "scripts\Bootstrap-DdsDomain.ps1"
+    if (Test-Path $bootstrapSrc) {
+        Copy-Item $bootstrapSrc -Destination $stageDir -Force
+        Write-Host "  -> Staged: $stageDir\Bootstrap-DdsDomain.ps1"
+    } else {
+        Write-Warning "  Bootstrap-DdsDomain.ps1 not found at $bootstrapSrc"
+    }
+
     # Step 4: WiX MSI
     $msi = Build-Msi -platformKey $plat -stageDir $stageDir
     $results += @{ Platform = $plat; MSI = $msi }
