@@ -22,7 +22,13 @@ fn run_capture(cmd: &mut Command) -> (bool, String, String) {
 
 fn init_hybrid_domain(dir: &std::path::Path, name: &str) {
     let status = dds_node_bin()
-        .args(["init-domain", "--name", name, "--dir", dir.to_str().unwrap()])
+        .args([
+            "init-domain",
+            "--name",
+            name,
+            "--dir",
+            dir.to_str().unwrap(),
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -136,8 +142,14 @@ fn admit_with_kem_pubkey_embeds_pubkey_in_cert() {
         .map(str::trim)
         .unwrap_or("")
         .to_string();
-    assert!(!peer_id.is_empty(), "peer_id missing from gen-node-key output");
-    assert!(!kem_hex.is_empty(), "kem_pubkey_hex missing from gen-node-key output");
+    assert!(
+        !peer_id.is_empty(),
+        "peer_id missing from gen-node-key output"
+    );
+    assert!(
+        !kem_hex.is_empty(),
+        "kem_pubkey_hex missing from gen-node-key output"
+    );
 
     let cert_path = tmp.path().join("admission.cbor");
     let (ok, _stdout, stderr) = run_capture(dds_node_bin().args([

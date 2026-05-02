@@ -1,5 +1,37 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-02, updated 7th pass)
+
+- ✅ PQ-B11-METRICS RESOLVED (2026-05-02): The two deferred B.11 PQC
+  observability metrics are now fully implemented:
+  1. **`dds_pq_epoch_id`** — current epoch_id gauge. `Telemetry` grew
+     `pq_epoch_id: AtomicU64`; `set_pq_epoch_id_inner` / `pq_epoch_id_value`
+     private methods; public `record_pq_epoch_id(epoch_id)`. Called from
+     `DdsNode::init` (after `EpochKeyStore::load_or_create`) and from
+     `rotate_and_fan_out` on every rotation. Emits `dds_pq_epoch_id 0` on an
+     uninitialised node; non-zero from the first scrape after `init` completes.
+  2. **`dds_pq_release_requests_total`** — per-`result` late-join
+     `EpochKeyRequest` dispatch counter. `Telemetry` grew
+     `pq_release_requests: Mutex<BTreeMap<String, u64>>` with full
+     bump/snapshot/count methods; public `record_pq_release_request(result)`.
+     Bumped from every exit branch of `DdsNode::try_epoch_key_request`:
+     `sent` (request dispatched), `cooldown` (30 s per-publisher cooldown
+     active), `not_admitted` (publisher not in `admitted_peers`),
+     `malformed_peer_id` (PeerId parse failure).
+  Module-doc catalog table updated with the two new rows. Also fixed 3
+  pre-existing `needless_borrow` clippy warnings in
+  `dds-node/tests/sync_encrypt.rs` and pre-existing `cargo fmt` drift in
+  `dds-fido2-test/src/bin/multinode.rs` and `dds-node/src/http.rs`.
+  **2 new unit tests** (`render_emits_pq_epoch_id_gauge`,
+  `render_emits_pq_release_requests_total_after_bumps`) + existing
+  `render_includes_build_info_and_uptime_for_empty_telemetry` extended.
+  `cargo clippy --workspace --all-targets -- -D warnings` clean;
+  `cargo fmt --all -- --check` clean;
+  `cargo test -p dds-node` **411 / 411 passing**. Phase E Prometheus alert
+  rules for non-`ok` decrypt rates remain deferred (YAML config, not
+  code — blocked on operator deploying the metrics endpoint).
+  `docs/pqc-phase-b-plan.md` B.11 row updated to reflect completion.
+
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 6th pass)
 
 - ✅ RESOLVED — AD-13 (2026-05-02): Vault refresh flow landed. New

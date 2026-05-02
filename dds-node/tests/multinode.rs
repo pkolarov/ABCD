@@ -918,11 +918,7 @@ async fn bootstrap_addrs_parsed_from_config() {
     let anchor_addr = wait_for_listen(&mut anchor).await;
     let anchor_multiaddr = format!("{}/p2p/{}", anchor_addr, anchor_pid);
 
-    let (member, _md) = spawn_node_with_bootstrap(
-        "redial-parse",
-        vec![anchor_multiaddr],
-    )
-    .await;
+    let (member, _md) = spawn_node_with_bootstrap("redial-parse", vec![anchor_multiaddr]).await;
 
     // bootstrap_addrs must contain exactly the one address we configured.
     assert_eq!(
@@ -945,11 +941,8 @@ async fn bootstrap_redial_triggers_reconnect_when_no_peers() {
     let anchor_addr = wait_for_listen(&mut anchor).await;
     let anchor_multiaddr = format!("{}/p2p/{}", anchor_addr, anchor_pid);
 
-    let (mut member, _md) = spawn_node_with_bootstrap(
-        "redial-reconnect",
-        vec![anchor_multiaddr],
-    )
-    .await;
+    let (mut member, _md) =
+        spawn_node_with_bootstrap("redial-reconnect", vec![anchor_multiaddr]).await;
 
     // No peers connected at this point — simulates anchor-restart orphan.
     assert_eq!(member.connected_peers(), 0);
@@ -1014,11 +1007,8 @@ async fn bootstrap_redial_noop_when_already_connected() {
     let anchor_addr = wait_for_listen(&mut anchor).await;
     let anchor_multiaddr = format!("{}/p2p/{}", anchor_addr, anchor_pid);
 
-    let (mut member, _md) = spawn_node_with_bootstrap(
-        "redial-skip",
-        vec![anchor_multiaddr.clone()],
-    )
-    .await;
+    let (mut member, _md) =
+        spawn_node_with_bootstrap("redial-skip", vec![anchor_multiaddr.clone()]).await;
     let member_addr = wait_for_listen(&mut member).await;
     let member_pid = member.peer_id;
 

@@ -42,6 +42,8 @@
 //! | `dds_pq_releases_emitted_total` | counter | `result=ok\|no_kem_pk\|malformed_kem_pk\|not_for_self\|clock_error\|mint_fail\|cbor_fail` | bumped by [`record_pq_releases_emitted`] at every exit branch of [`crate::node::DdsNode::build_epoch_key_response`] |
 //! | `dds_pq_envelope_decrypt_total` | counter | `result=ok\|no_key\|aead_fail` | bumped by [`record_pq_envelope_decrypt`] at every exit branch of the gossip/sync envelope decrypt path in [`crate::node::DdsNode::handle_gossip_message`] and [`crate::node::DdsNode::handle_sync_response`] |
 //! | `dds_pq_rotation_total` | counter | `reason=time\|revocation\|manual` | bumped by [`record_pq_rotation`] at every epoch-key rotation trigger in [`crate::node::DdsNode::rotate_and_fan_out`] |
+//! | `dds_pq_epoch_id` | gauge | — | current epoch_id of the local node's AEAD epoch key; set by [`record_pq_epoch_id`] at init and on every rotation |
+//! | `dds_pq_release_requests_total` | counter | `result=sent\|cooldown\|not_admitted\|malformed_peer_id` | bumped by [`record_pq_release_request`] at every exit branch of [`crate::node::DdsNode::try_epoch_key_request`] |
 //! | `dds_http_requests_total` | counter | `route, method, status` | bumped by [`record_http_request`] |
 //! | `dds_trust_graph_attestations` | gauge | `body_type=user-auth-attestation\|device-join\|windows-policy\|macos-policy\|macos-account-binding\|sso-identity-link\|software-assignment\|service-principal\|session\|unknown` | [`crate::service::LocalService::trust_graph_counts`] at scrape, partitioned via [`crate::service::body_type_label`] |
 //! | `dds_trust_graph_vouches` | gauge | — | same |
@@ -628,6 +630,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
@@ -779,6 +782,26 @@ pub struct Telemetry {
     ///   policy; not yet wired.
     /// - `manual` — operator issued `dds pq rotate`.
     pq_rotation: Mutex<BTreeMap<String, u64>>,
+    /// **Z-1 Phase B.11** — current epoch_id of the local node's AEAD
+    /// epoch key. Set by [`record_pq_epoch_id`] at
+    /// [`crate::node::DdsNode::init`] (after the EpochKeyStore is loaded)
+    /// and updated on every rotation in
+    /// [`crate::node::DdsNode::rotate_and_fan_out`]. `0` means the node
+    /// has not yet reported its epoch_id (start of process before `init`
+    /// completes, or running outside a full DdsNode context such as in a
+    /// test). Backs the `dds_pq_epoch_id` Prometheus gauge.
+    pq_epoch_id: AtomicU64,
+    /// **Z-1 Phase B.11** — per-`result` late-join epoch-key request
+    /// dispatch outcomes from [`crate::node::DdsNode::try_epoch_key_request`].
+    /// `result` is one of:
+    /// - `sent` — request dispatched to the publisher's libp2p peer.
+    /// - `cooldown` — within 30 s of a previous request to the same
+    ///   publisher; skipped to avoid flooding.
+    /// - `not_admitted` — publisher not in `admitted_peers` at call time;
+    ///   skipped (H-12 piggy-back will deliver the release on reconnect).
+    /// - `malformed_peer_id` — publisher string failed `PeerId::parse`;
+    ///   skipped (indicates a gossip-envelope decode bug upstream).
+    pq_release_requests: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Telemetry {
@@ -802,6 +825,8 @@ impl Telemetry {
             pq_releases_emitted: Mutex::new(BTreeMap::new()),
             pq_envelope_decrypt: Mutex::new(BTreeMap::new()),
             pq_rotation: Mutex::new(BTreeMap::new()),
+            pq_epoch_id: AtomicU64::new(0),
+            pq_release_requests: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1245,6 +1270,38 @@ impl Telemetry {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     }
+
+    fn set_pq_epoch_id_inner(&self, epoch_id: u64) {
+        self.pq_epoch_id.store(epoch_id, Ordering::Relaxed);
+    }
+
+    fn pq_epoch_id_value(&self) -> u64 {
+        self.pq_epoch_id.load(Ordering::Relaxed)
+    }
+
+    fn bump_pq_release_request(&self, result: &str) {
+        let mut g = match self.pq_release_requests.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry(result.to_string()).or_insert(0) += 1;
+    }
+
+    fn pq_release_requests_snapshot(&self) -> BTreeMap<String, u64> {
+        match self.pq_release_requests.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of `dds_pq_release_requests_total{result=...}`.
+    /// Public so regression tests can snapshot without scraping.
+    pub fn pq_release_request_count(&self, result: &str) -> u64 {
+        match self.pq_release_requests.lock() {
+            Ok(g) => g.get(result).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(result).copied().unwrap_or(0),
+        }
+    }
 }
 
 /// Initialise the process-global telemetry handle. Idempotent: the
@@ -1518,6 +1575,35 @@ pub fn record_pq_envelope_decrypt(result: &str) {
 pub fn record_pq_rotation(reason: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_pq_rotation(reason);
+    }
+}
+
+/// Set `dds_pq_epoch_id` to `epoch_id`. Called from
+/// [`crate::node::DdsNode::init`] after the `EpochKeyStore` is loaded,
+/// and from [`crate::node::DdsNode::rotate_and_fan_out`] on every
+/// epoch-key rotation so the gauge tracks the live value.
+///
+/// No-op when telemetry has not been installed.
+pub fn record_pq_epoch_id(epoch_id: u64) {
+    if let Some(t) = TELEMETRY.get() {
+        t.set_pq_epoch_id_inner(epoch_id);
+    }
+}
+
+/// Bump `dds_pq_release_requests_total{result=...}` by one. Called from
+/// [`crate::node::DdsNode::try_epoch_key_request`] at every exit branch:
+///
+/// - `sent` — `EpochKeyRequest` dispatched over the libp2p
+///   `/dds/epoch-keys/...` channel.
+/// - `cooldown` — within 30 s of a previous request to the same
+///   publisher; skipped.
+/// - `not_admitted` — publisher not in `admitted_peers`; skipped.
+/// - `malformed_peer_id` — publisher string failed `PeerId::parse`.
+///
+/// No-op when telemetry has not been installed.
+pub fn record_pq_release_request(result: &str) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_pq_release_request(result);
     }
 }
 
@@ -2044,6 +2130,43 @@ fn render_exposition(
         ));
     }
 
+    // `dds_pq_epoch_id` — current epoch_id gauge. Set once at init
+    // (after EpochKeyStore is loaded / generated) and on every rotation.
+    // `0` means the value has not been reported yet (pre-init, or test
+    // harness running without a full DdsNode). The gauge is always emitted
+    // so it is discoverable in the Prometheus catalog even on a fresh start.
+    out.push_str(
+        "# HELP dds_pq_epoch_id Current epoch_id of the local node's Phase B AEAD epoch key. \
+         Starts at 1 on a fresh node; incremented by each epoch-key rotation. 0 means the \
+         node has not yet initialised its epoch store.\n",
+    );
+    out.push_str("# TYPE dds_pq_epoch_id gauge\n");
+    out.push_str(&format!(
+        "dds_pq_epoch_id {}\n",
+        telemetry.pq_epoch_id_value()
+    ));
+
+    // `dds_pq_release_requests_total` — per-`result` late-join epoch-key
+    // request dispatch counter. Bumped from
+    // `DdsNode::try_epoch_key_request` at every exit branch (B.11).
+    out.push_str(
+        "# HELP dds_pq_release_requests_total Phase B late-join EpochKeyRequest dispatch \
+         outcomes since process start, partitioned by result. sent = request dispatched to \
+         the publisher's libp2p peer; cooldown = within the 30 s per-publisher cooldown \
+         window (skipped); not_admitted = publisher not currently in admitted_peers (skipped; \
+         H-12 piggy-back will deliver the release on reconnect); malformed_peer_id = publisher \
+         string failed PeerId::parse (indicates a gossip-envelope decode bug).\n",
+    );
+    out.push_str("# TYPE dds_pq_release_requests_total counter\n");
+    let pq_req_snapshot = telemetry.pq_release_requests_snapshot();
+    for (result, count) in pq_req_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_pq_release_requests_total{{result=\"{}\"}} {}\n",
+            escape_label_value(result),
+            count
+        ));
+    }
+
     // `dds_http_requests_total` — per-`(route, method, status)` matched
     // HTTP request counter. Bumped from
     // `crate::http::http_request_observer_middleware` after every
@@ -2532,14 +2655,15 @@ mod tests {
         assert!(body.contains("# TYPE dds_audit_entries_total counter\n"));
         assert!(body.contains("dds_audit_chain_length 0\n"));
         assert!(body.contains("dds_audit_chain_head_age_seconds 0\n"));
-        // `dds_pq_releases_installed_total`, `dds_pq_releases_emitted_total`,
-        // and `dds_pq_envelope_decrypt_total` families are always
-        // discoverable (HELP + TYPE headers) even on a fresh node
-        // where no EpochKeyRelease or gossip/sync envelope has been
-        // processed yet.
+        // All Phase B PQC metric families are always discoverable (HELP + TYPE
+        // headers) even on a fresh node where no operations have fired yet.
         assert!(body.contains("# TYPE dds_pq_releases_installed_total counter\n"));
         assert!(body.contains("# TYPE dds_pq_releases_emitted_total counter\n"));
         assert!(body.contains("# TYPE dds_pq_envelope_decrypt_total counter\n"));
+        assert!(body.contains("# TYPE dds_pq_rotation_total counter\n"));
+        assert!(body.contains("# TYPE dds_pq_epoch_id gauge\n"));
+        assert!(body.contains("dds_pq_epoch_id 0\n"));
+        assert!(body.contains("# TYPE dds_pq_release_requests_total counter\n"));
     }
 
     #[test]
@@ -2623,6 +2747,83 @@ mod tests {
         assert_eq!(t.pq_releases_emitted_count("ok"), 2);
         assert_eq!(t.pq_releases_emitted_count("no_kem_pk"), 1);
         assert_eq!(t.pq_releases_emitted_count("cbor_fail"), 0);
+    }
+
+    #[test]
+    fn render_emits_pq_epoch_id_gauge() {
+        let t = Telemetry::new();
+        // Default is 0 (not yet set).
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
+        assert!(body.contains("# TYPE dds_pq_epoch_id gauge\n"));
+        assert!(body.contains("dds_pq_epoch_id 0\n"));
+
+        // After set_pq_epoch_id_inner the gauge updates.
+        t.set_pq_epoch_id_inner(7);
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
+        assert!(body.contains("dds_pq_epoch_id 7\n"));
+        assert_eq!(t.pq_epoch_id_value(), 7);
+
+        // A second set overwrites.
+        t.set_pq_epoch_id_inner(12);
+        assert_eq!(t.pq_epoch_id_value(), 12);
+    }
+
+    #[test]
+    fn render_emits_pq_release_requests_total_after_bumps() {
+        let t = Telemetry::new();
+        // Empty family: HELP/TYPE present but no value lines.
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
+        assert!(body.contains("# TYPE dds_pq_release_requests_total counter\n"));
+        assert!(!body.contains("dds_pq_release_requests_total{result="));
+
+        // After bumping several buckets.
+        t.bump_pq_release_request("sent");
+        t.bump_pq_release_request("sent");
+        t.bump_pq_release_request("cooldown");
+        t.bump_pq_release_request("not_admitted");
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
+        assert!(body.contains("dds_pq_release_requests_total{result=\"sent\"} 2\n"));
+        assert!(body.contains("dds_pq_release_requests_total{result=\"cooldown\"} 1\n"));
+        assert!(body.contains("dds_pq_release_requests_total{result=\"not_admitted\"} 1\n"));
+        assert_eq!(t.pq_release_request_count("sent"), 2);
+        assert_eq!(t.pq_release_request_count("cooldown"), 1);
+        assert_eq!(t.pq_release_request_count("malformed_peer_id"), 0);
     }
 
     #[test]

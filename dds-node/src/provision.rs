@@ -726,11 +726,23 @@ pub fn run_provision(
     } else {
         None
     };
-    println!("  KEM pubkey: {}", if kem_pubkey_bytes.is_some() { "set" } else { "not set (legacy domain)" });
+    println!(
+        "  KEM pubkey: {}",
+        if kem_pubkey_bytes.is_some() {
+            "set"
+        } else {
+            "not set (legacy domain)"
+        }
+    );
 
     let now = now_epoch();
     let ttl = 365 * 86400; // 1 year — re-provision or re-admit to renew
-    let cert = domain_key.issue_admission_with_kem(peer_id.to_string(), now, Some(now + ttl), kem_pubkey_bytes);
+    let cert = domain_key.issue_admission_with_kem(
+        peer_id.to_string(),
+        now,
+        Some(now + ttl),
+        kem_pubkey_bytes,
+    );
 
     // Zeroize domain key — never touches disk on this machine
     let mut secret = domain_key.signing_key.to_bytes();

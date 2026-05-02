@@ -173,8 +173,7 @@ fn build_sync_response_plaintext_on_non_enc_v3_domain() {
 #[test]
 fn build_sync_response_encrypted_on_enc_v3_domain() {
     let domain_key = DomainKey::generate("test-domain", &mut OsRng);
-    let (mut node, _dir) =
-        make_node(&domain_key, vec!["enc-v3".to_string()]);
+    let (mut node, _dir) = make_node(&domain_key, vec!["enc-v3".to_string()]);
 
     seed_sync_payload(&mut node, "op-001");
 
@@ -199,8 +198,7 @@ fn build_sync_response_encrypted_on_enc_v3_domain() {
 #[test]
 fn build_sync_response_enc_v3_respects_known_op_ids() {
     let domain_key = DomainKey::generate("test-domain", &mut OsRng);
-    let (mut node, _dir) =
-        make_node(&domain_key, vec!["enc-v3".to_string()]);
+    let (mut node, _dir) = make_node(&domain_key, vec!["enc-v3".to_string()]);
 
     seed_sync_payload(&mut node, "op-already-known");
 
@@ -213,7 +211,10 @@ fn build_sync_response_enc_v3_respects_known_op_ids() {
         resp.enc_payloads.is_empty(),
         "no diff: enc_payloads must be empty when requester knows all ops"
     );
-    assert!(resp.complete, "complete flag must be true when diff is empty");
+    assert!(
+        resp.complete,
+        "complete flag must be true when diff is empty"
+    );
 }
 
 /// Encrypted response with a cached epoch key → AEAD decrypt succeeds and
@@ -226,8 +227,7 @@ fn handle_sync_response_decrypts_with_cached_epoch_key() {
     let domain_key = DomainKey::generate("test-domain", &mut OsRng);
 
     // Responder: enc-v3, has payload in cache.
-    let (mut responder, _rdir) =
-        make_node(&domain_key, vec!["enc-v3".to_string()]);
+    let (mut responder, _rdir) = make_node(&domain_key, vec!["enc-v3".to_string()]);
     seed_sync_payload(&mut responder, "op-001");
     let responder_peer_id = responder.peer_id;
     let (responder_epoch_id, responder_epoch_key) =
@@ -235,7 +235,10 @@ fn handle_sync_response_decrypts_with_cached_epoch_key() {
 
     // Build encrypted response.
     let enc_resp = responder.build_sync_response_for_tests(&empty_sync_request());
-    assert!(!enc_resp.enc_payloads.is_empty(), "responder should have produced enc_payloads");
+    assert!(
+        !enc_resp.enc_payloads.is_empty(),
+        "responder should have produced enc_payloads"
+    );
 
     // Requester: install responder's epoch key.
     let (mut requester, _qdir) = make_node(&domain_key, Vec::new());
@@ -243,7 +246,7 @@ fn handle_sync_response_decrypts_with_cached_epoch_key() {
         &mut requester,
         &responder_peer_id.to_string(),
         responder_epoch_id,
-        &responder_epoch_key,
+        responder_epoch_key,
     );
 
     let ok_before = tel.pq_envelope_decrypt_count("ok");
@@ -277,8 +280,7 @@ fn handle_sync_response_no_cached_key_drops_with_no_key() {
 
     let domain_key = DomainKey::generate("test-domain", &mut OsRng);
 
-    let (mut responder, _rdir) =
-        make_node(&domain_key, vec!["enc-v3".to_string()]);
+    let (mut responder, _rdir) = make_node(&domain_key, vec!["enc-v3".to_string()]);
     seed_sync_payload(&mut responder, "op-001");
     let responder_peer_id = responder.peer_id;
 
@@ -313,8 +315,7 @@ fn handle_sync_response_tampered_ciphertext_drops_with_aead_fail() {
 
     let domain_key = DomainKey::generate("test-domain", &mut OsRng);
 
-    let (mut responder, _rdir) =
-        make_node(&domain_key, vec!["enc-v3".to_string()]);
+    let (mut responder, _rdir) = make_node(&domain_key, vec!["enc-v3".to_string()]);
     seed_sync_payload(&mut responder, "op-001");
     let responder_peer_id = responder.peer_id;
     let (responder_epoch_id, responder_epoch_key) =
@@ -328,8 +329,7 @@ fn handle_sync_response_tampered_ciphertext_drops_with_aead_fail() {
         .enc_payloads
         .iter()
         .map(|blob| {
-            let mut env =
-                SyncEnvelopeV3::from_cbor(blob).expect("decode env");
+            let mut env = SyncEnvelopeV3::from_cbor(blob).expect("decode env");
             // Flip the last byte of the ciphertext to corrupt the AEAD tag.
             if let Some(last) = env.ciphertext.last_mut() {
                 *last ^= 0xff;
@@ -348,7 +348,7 @@ fn handle_sync_response_tampered_ciphertext_drops_with_aead_fail() {
         &mut requester,
         &responder_peer_id.to_string(),
         responder_epoch_id,
-        &responder_epoch_key,
+        responder_epoch_key,
     );
 
     let aead_fail_before = tel.pq_envelope_decrypt_count("aead_fail");
@@ -384,8 +384,14 @@ fn handle_sync_response_accepts_plaintext_on_non_enc_v3_node() {
     let responder_peer_id = responder.peer_id;
 
     let plain_resp = responder.build_sync_response_for_tests(&empty_sync_request());
-    assert!(plain_resp.enc_payloads.is_empty(), "non-enc-v3 must send plaintext");
-    assert!(!plain_resp.payloads.is_empty(), "non-enc-v3 must have payloads");
+    assert!(
+        plain_resp.enc_payloads.is_empty(),
+        "non-enc-v3 must send plaintext"
+    );
+    assert!(
+        !plain_resp.payloads.is_empty(),
+        "non-enc-v3 must have payloads"
+    );
 
     let (mut requester, _qdir) = make_node(&domain_key, Vec::new());
 
@@ -412,20 +418,31 @@ fn encrypted_sync_round_trip_end_to_end() {
     let domain_key = DomainKey::generate("test-domain", &mut OsRng);
 
     // Responder: enc-v3, two payloads cached.
-    let (mut responder, _rdir) =
-        make_node(&domain_key, vec!["enc-v3".to_string()]);
+    let (mut responder, _rdir) = make_node(&domain_key, vec!["enc-v3".to_string()]);
     seed_sync_payload(&mut responder, "op-A");
     seed_sync_payload(&mut responder, "op-B");
     let responder_peer_id = responder.peer_id;
     let (epoch_id, epoch_key) = responder.epoch_keys_for_tests().my_current_epoch();
 
     let enc_resp = responder.build_sync_response_for_tests(&empty_sync_request());
-    assert_eq!(enc_resp.enc_payloads.len(), 2, "two payloads → two encrypted blobs");
-    assert!(enc_resp.payloads.is_empty(), "enc-v3 must not send plaintext");
+    assert_eq!(
+        enc_resp.enc_payloads.len(),
+        2,
+        "two payloads → two encrypted blobs"
+    );
+    assert!(
+        enc_resp.payloads.is_empty(),
+        "enc-v3 must not send plaintext"
+    );
 
     // Requester: install responder's epoch key, then process encrypted response.
     let (mut requester, _qdir) = make_node(&domain_key, Vec::new());
-    install_epoch_key(&mut requester, &responder_peer_id.to_string(), epoch_id, &epoch_key);
+    install_epoch_key(
+        &mut requester,
+        &responder_peer_id.to_string(),
+        epoch_id,
+        epoch_key,
+    );
 
     let ok_before = tel.pq_envelope_decrypt_count("ok");
 
@@ -466,8 +483,7 @@ fn sync_envelope_v3_cbor_round_trip() {
     assert_eq!(decoded.ciphertext, env.ciphertext);
 
     // Decrypt the ciphertext from the decoded envelope.
-    let plaintext =
-        ek_crypto::decrypt_payload(&epoch_key, &decoded.nonce, &decoded.ciphertext)
-            .expect("decrypt");
+    let plaintext = ek_crypto::decrypt_payload(&epoch_key, &decoded.nonce, &decoded.ciphertext)
+        .expect("decrypt");
     assert_eq!(plaintext, payload_cbor);
 }

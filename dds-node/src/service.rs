@@ -5435,11 +5435,15 @@ mod platform_applier_tests {
             .unwrap();
 
         assert_eq!(
-            svc.list_applicable_linux_policies(&dev_linux).unwrap().len(),
+            svc.list_applicable_linux_policies(&dev_linux)
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
-            svc.list_applicable_linux_policies(&dev_other).unwrap().len(),
+            svc.list_applicable_linux_policies(&dev_other)
+                .unwrap()
+                .len(),
             0
         );
     }

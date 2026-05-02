@@ -536,18 +536,19 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // gossip can start immediately after admission. The peer obtains the hex
     // from `gen-node-key` output (printed as `kem_pubkey_hex`).
     // `--kem-pubkey-path <FILE>` is an alternative for scripted workflows.
-    let kem_pubkey_hex: Option<String> = flag(args, "--kem-pubkey")
-        .map(|s| s.to_string())
-        .or_else(|| {
-            flag(args, "--kem-pubkey-path")
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .map(|s| s.trim().to_string())
-        });
+    let kem_pubkey_hex: Option<String> =
+        flag(args, "--kem-pubkey")
+            .map(|s| s.to_string())
+            .or_else(|| {
+                flag(args, "--kem-pubkey-path")
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .map(|s| s.trim().to_string())
+            });
 
     let kem_pubkey_bytes: Option<Vec<u8>> = match kem_pubkey_hex.as_deref() {
         Some(hex) if !hex.is_empty() => {
-            let bytes = dds_domain::domain::from_hex(hex)
-                .map_err(|e| format!("--kem-pubkey: {e}"))?;
+            let bytes =
+                dds_domain::domain::from_hex(hex).map_err(|e| format!("--kem-pubkey: {e}"))?;
             if bytes.len() != dds_domain::HYBRID_KEM_PUBKEY_LEN {
                 return Err(format!(
                     "--kem-pubkey: expected {} bytes, got {}",
@@ -594,7 +595,10 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         println!("  expires:     never");
     }
     if cert.pq_kem_pubkey.is_some() {
-        println!("  kem_pubkey:  set ({} bytes)", dds_domain::HYBRID_KEM_PUBKEY_LEN);
+        println!(
+            "  kem_pubkey:  set ({} bytes)",
+            dds_domain::HYBRID_KEM_PUBKEY_LEN
+        );
     } else {
         println!("  kem_pubkey:  not set");
     }

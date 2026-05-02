@@ -2229,7 +2229,14 @@ where
     // `trust_loopback_tcp_admin`.
     axum::serve(
         listener,
-        router(svc, info, admin_policy, response_mac_key, device_binding, manual_rotate),
+        router(
+            svc,
+            info,
+            admin_policy,
+            response_mac_key,
+            device_binding,
+            manual_rotate,
+        ),
     )
     .await?;
     Ok(())
@@ -2296,7 +2303,14 @@ where
     std::fs::set_permissions(path, perms)?;
     tracing::info!(path = %path.display(), "HTTP API listening on UDS");
 
-    let app = router(svc, info, admin_policy, response_mac_key, device_binding, manual_rotate);
+    let app = router(
+        svc,
+        info,
+        admin_policy,
+        response_mac_key,
+        device_binding,
+        manual_rotate,
+    );
 
     loop {
         let (stream, _) = match listener.accept().await {
@@ -2386,7 +2400,14 @@ where
     let pipe_path = normalize_pipe_name(pipe_spec);
     tracing::info!(pipe = %pipe_path, "HTTP API listening on named pipe");
 
-    let app = router(svc, info, admin_policy, response_mac_key, device_binding, manual_rotate);
+    let app = router(
+        svc,
+        info,
+        admin_policy,
+        response_mac_key,
+        device_binding,
+        manual_rotate,
+    );
 
     // First instance: `first_pipe_instance(true)` makes `create` fail
     // if another process has already opened a server on this name.
@@ -4969,7 +4990,8 @@ mod tests {
         let svc = state.svc.clone();
         let info = state.info.clone();
         let key = test_mac_key();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), Some(key.clone()), None, None);
+        let app =
+            router::<MemoryBackend>(svc, info, tcp_trust_policy(), Some(key.clone()), None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5177,7 +5199,8 @@ mod tests {
         let svc = state.svc.clone();
         let info = state.info.clone();
         let key = test_mac_key();
-        let app = router::<MemoryBackend>(svc, info, strict_policy(), Some(key.clone()), None, None);
+        let app =
+            router::<MemoryBackend>(svc, info, strict_policy(), Some(key.clone()), None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5272,8 +5295,10 @@ mod tests {
             };
 
             let server = tokio::spawn(async move {
-                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None, None)
-                    .await;
+                let _ = super::super::serve::<MemoryBackend>(
+                    &addr, svc, info, policy, None, None, None,
+                )
+                .await;
             });
             wait_for_socket(&sock).await;
 
@@ -5321,8 +5346,10 @@ mod tests {
             };
 
             let server = tokio::spawn(async move {
-                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None, None)
-                    .await;
+                let _ = super::super::serve::<MemoryBackend>(
+                    &addr, svc, info, policy, None, None, None,
+                )
+                .await;
             });
             wait_for_socket(&sock).await;
 
@@ -5365,8 +5392,10 @@ mod tests {
             };
 
             let server = tokio::spawn(async move {
-                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None, None)
-                    .await;
+                let _ = super::super::serve::<MemoryBackend>(
+                    &addr, svc, info, policy, None, None, None,
+                )
+                .await;
             });
             wait_for_socket(&sock).await;
 
@@ -5404,8 +5433,10 @@ mod tests {
             };
 
             let server = tokio::spawn(async move {
-                let _ = super::super::serve::<MemoryBackend>(&addr, svc, info, policy, None, None, None)
-                    .await;
+                let _ = super::super::serve::<MemoryBackend>(
+                    &addr, svc, info, policy, None, None, None,
+                )
+                .await;
             });
             wait_for_socket(&sock).await;
 

@@ -243,7 +243,10 @@ fn mixed_fleet_encrypted_gossip_flows_between_two_enc_v3_nodes() {
 
     // Distribute A's epoch key to B.
     let outcome = distribute_epoch_key(&node_a, &mut node_b).expect("distribute ok");
-    assert!(matches!(outcome, InstallOutcome::Inserted | InstallOutcome::Rotated));
+    assert!(matches!(
+        outcome,
+        InstallOutcome::Inserted | InstallOutcome::Rotated
+    ));
 
     let (epoch_id, epoch_key) = node_a.epoch_keys_for_tests().my_current_epoch();
     let envelope = make_encrypted_gossip(&node_a.peer_id.to_string(), epoch_id, epoch_key);
@@ -276,7 +279,10 @@ fn rotation_grace_window_then_new_release() {
 
     // Step 1: distribute A's initial epoch key (epoch_id=1) to B.
     let outcome = distribute_epoch_key(&node_a, &mut node_b).expect("initial distribute");
-    assert!(matches!(outcome, InstallOutcome::Inserted | InstallOutcome::Rotated));
+    assert!(matches!(
+        outcome,
+        InstallOutcome::Inserted | InstallOutcome::Rotated
+    ));
 
     let (old_epoch_id, old_epoch_key) = {
         let (id, k) = node_a.epoch_keys_for_tests().my_current_epoch();
@@ -285,7 +291,8 @@ fn rotation_grace_window_then_new_release() {
 
     // Step 2: B can decrypt A's gossip under epoch_id=old.
     let topic_b = ops_topic(&node_b);
-    let old_envelope = make_encrypted_gossip(&node_a.peer_id.to_string(), old_epoch_id, &old_epoch_key);
+    let old_envelope =
+        make_encrypted_gossip(&node_a.peer_id.to_string(), old_epoch_id, &old_epoch_key);
     let ok_before = tel.pq_envelope_decrypt_count("ok");
     node_b.handle_gossip_message_for_tests(&topic_b, &old_envelope);
     assert_eq!(
@@ -300,7 +307,10 @@ fn rotation_grace_window_then_new_release() {
         let (id, k) = node_a.epoch_keys_for_tests().my_current_epoch();
         (id, *k)
     };
-    assert!(new_epoch_id > old_epoch_id, "epoch_id must increment after rotation");
+    assert!(
+        new_epoch_id > old_epoch_id,
+        "epoch_id must increment after rotation"
+    );
 
     // Step 4: B still has the old key in its current release cache
     // (it hasn't been overwritten yet by a new release).  Messages
@@ -324,7 +334,8 @@ fn rotation_grace_window_then_new_release() {
     );
 
     // Step 6: B can now decrypt A's gossip under the new epoch_id.
-    let new_envelope = make_encrypted_gossip(&node_a.peer_id.to_string(), new_epoch_id, &new_epoch_key);
+    let new_envelope =
+        make_encrypted_gossip(&node_a.peer_id.to_string(), new_epoch_id, &new_epoch_key);
     let ok_before2 = tel.pq_envelope_decrypt_count("ok");
     node_b.handle_gossip_message_for_tests(&topic_b, &new_envelope);
     assert_eq!(
@@ -335,11 +346,8 @@ fn rotation_grace_window_then_new_release() {
 
     // Step 7: The old epoch key is now in B's grace cache (not evicted
     // yet).  Gossip that was in-flight under old_epoch_id still decrypts.
-    let inflight_envelope = make_encrypted_gossip(
-        &node_a.peer_id.to_string(),
-        old_epoch_id,
-        &old_epoch_key,
-    );
+    let inflight_envelope =
+        make_encrypted_gossip(&node_a.peer_id.to_string(), old_epoch_id, &old_epoch_key);
     let ok_before3 = tel.pq_envelope_decrypt_count("ok");
     node_b.handle_gossip_message_for_tests(&topic_b, &inflight_envelope);
     assert_eq!(
@@ -375,7 +383,10 @@ fn rotation_grace_pruned_old_epoch_key_no_longer_decryptable() {
     use std::time::{Duration, Instant};
     let far_future = Instant::now() + Duration::from_secs(86_400); // 24h in the future
     let pruned = node_b.epoch_keys_mut_for_tests().prune_grace(far_future);
-    assert!(pruned >= 1, "prune must evict at least the old peer grace entry");
+    assert!(
+        pruned >= 1,
+        "prune must evict at least the old peer grace entry"
+    );
 
     // Now the old epoch_id is gone from the cache.
     let still_cached = node_b
@@ -387,7 +398,8 @@ fn rotation_grace_pruned_old_epoch_key_no_longer_decryptable() {
     );
 
     // Attempting to decrypt a message encrypted under the old epoch_id → no_key.
-    let old_envelope = make_encrypted_gossip(&node_a.peer_id.to_string(), old_epoch_id, &old_epoch_key);
+    let old_envelope =
+        make_encrypted_gossip(&node_a.peer_id.to_string(), old_epoch_id, &old_epoch_key);
     let topic_b = ops_topic(&node_b);
     let no_key_before = tel.pq_envelope_decrypt_count("no_key");
     node_b.handle_gossip_message_for_tests(&topic_b, &old_envelope);
@@ -426,7 +438,8 @@ fn revocation_triggered_rotation_blocks_peer_without_new_release() {
     // All three can decrypt pre-rotation gossip.
     let topic_b = ops_topic(&node_b);
     let topic_c = ops_topic(&node_c);
-    let pre_envelope = make_encrypted_gossip(&node_a.peer_id.to_string(), pre_epoch_id, &pre_epoch_key);
+    let pre_envelope =
+        make_encrypted_gossip(&node_a.peer_id.to_string(), pre_epoch_id, &pre_epoch_key);
     let ok_b = tel.pq_envelope_decrypt_count("ok");
     node_b.handle_gossip_message_for_tests(&topic_b, &pre_envelope);
     node_c.handle_gossip_message_for_tests(&topic_c, &pre_envelope);
@@ -449,13 +462,17 @@ fn revocation_triggered_rotation_blocks_peer_without_new_release() {
         let (id, k) = node_a.epoch_keys_for_tests().my_current_epoch();
         (id, *k)
     };
-    assert!(post_epoch_id > pre_epoch_id, "epoch_id must advance on rotation");
+    assert!(
+        post_epoch_id > pre_epoch_id,
+        "epoch_id must advance on rotation"
+    );
 
     // B gets the new release; C does NOT.
     distribute_epoch_key(&node_a, &mut node_b).expect("post-rotation B");
     // C intentionally not updated — simulates revoked peer.
 
-    let post_envelope = make_encrypted_gossip(&node_a.peer_id.to_string(), post_epoch_id, &post_epoch_key);
+    let post_envelope =
+        make_encrypted_gossip(&node_a.peer_id.to_string(), post_epoch_id, &post_epoch_key);
 
     // B can decrypt post-rotation gossip.
     let ok_before_b = tel.pq_envelope_decrypt_count("ok");
@@ -527,10 +544,13 @@ fn offline_reconnect_fresh_release_restores_decryption() {
     // B "reconnects": receives a fresh release from A (simulating the
     // EpochKeyRequest → EpochKeyResponse path from §4.5.1).
     // We use the same mint+install path the request-response handler drives.
-    let reconnect_outcome = distribute_epoch_key(&node_a, &mut node_b)
-        .expect("reconnect distribute");
+    let reconnect_outcome =
+        distribute_epoch_key(&node_a, &mut node_b).expect("reconnect distribute");
     assert!(
-        matches!(reconnect_outcome, InstallOutcome::Inserted | InstallOutcome::Rotated),
+        matches!(
+            reconnect_outcome,
+            InstallOutcome::Inserted | InstallOutcome::Rotated
+        ),
         "reconnect must install or rotate the cached release; got {reconnect_outcome:?}"
     );
 
@@ -575,7 +595,11 @@ fn offline_reconnect_via_epoch_key_request_response() {
         outbound_releases: vec![],
     };
     let response = node_a.build_epoch_key_response_for_tests(&request, &node_b.peer_id);
-    assert_eq!(response.releases.len(), 1, "A must return one release for its own epoch key");
+    assert_eq!(
+        response.releases.len(),
+        1,
+        "A must return one release for its own epoch key"
+    );
 
     // B installs the release from A's response.
     use dds_net::pq_envelope::EpochKeyRelease;
@@ -588,7 +612,10 @@ fn offline_reconnect_via_epoch_key_request_response() {
         .install_epoch_key_release(&release, &node_b.peer_id.to_string(), now)
         .expect("install release");
     assert!(
-        matches!(install_outcome, InstallOutcome::Inserted | InstallOutcome::Rotated),
+        matches!(
+            install_outcome,
+            InstallOutcome::Inserted | InstallOutcome::Rotated
+        ),
         "install outcome unexpected: {install_outcome:?}"
     );
 
@@ -639,8 +666,7 @@ fn kem_pubkey_rotation_while_offline_receiver_updates_cert_and_decrypts() {
 
     // The new KEM pubkey must differ from the old one (new node = new keypair).
     assert_ne!(
-        old_a_kem_pk_bytes,
-        new_a_kem_pk_bytes,
+        old_a_kem_pk_bytes, new_a_kem_pk_bytes,
         "new node must have a different KEM keypair"
     );
 
@@ -686,7 +712,10 @@ fn kem_pubkey_rotation_while_offline_receiver_updates_cert_and_decrypts() {
         .install_epoch_key_release(&release, &b_id, now)
         .expect("install release with new KEM pubkey");
     assert!(
-        matches!(install_outcome, InstallOutcome::Inserted | InstallOutcome::Rotated),
+        matches!(
+            install_outcome,
+            InstallOutcome::Inserted | InstallOutcome::Rotated
+        ),
         "expected Inserted or Rotated, got {install_outcome:?}"
     );
 

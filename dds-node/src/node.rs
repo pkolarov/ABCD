@@ -503,6 +503,9 @@ impl DdsNode {
                 "loaded epoch-key store"
             );
         }
+        // Report initial epoch_id so the dds_pq_epoch_id gauge is
+        // non-zero from the first Prometheus scrape after init.
+        crate::telemetry::record_pq_epoch_id(epoch_keys.my_current_epoch().0);
 
         // Build trusted roots set
         let trusted_roots: BTreeSet<String> = config.trusted_roots.iter().cloned().collect();
@@ -519,15 +522,15 @@ impl DdsNode {
             .network
             .bootstrap_peers
             .iter()
-            .filter_map(|addr_str| {
-                match dds_net::discovery::parse_peer_multiaddr(addr_str) {
+            .filter_map(
+                |addr_str| match dds_net::discovery::parse_peer_multiaddr(addr_str) {
                     Ok((_pid, addr)) => Some(addr),
                     Err(e) => {
                         warn!(addr = %addr_str, "NET-REDIAL-1: invalid bootstrap peer addr: {e}");
                         None
                     }
-                }
-            })
+                },
+            )
             .collect();
 
         info!(%peer_id, domain = %config.domain.name, org = %config.org_hash, "DDS node initialized");
@@ -689,8 +692,7 @@ impl DdsNode {
         // `BOOTSTRAP_REDIAL_INTERVAL` and re-dials every configured bootstrap
         // addr whenever `connected_peers == 0`. Skip immediately when
         // `bootstrap_addrs` is empty (anchor itself, mDNS-only members).
-        let mut bootstrap_redial =
-            tokio::time::interval(BOOTSTRAP_REDIAL_INTERVAL);
+        let mut bootstrap_redial = tokio::time::interval(BOOTSTRAP_REDIAL_INTERVAL);
         bootstrap_redial.tick().await; // consume the immediate tick — start first fire after interval
 
         loop {
@@ -957,8 +959,7 @@ impl DdsNode {
                     // ever handshake (no cached cert yet) ships an empty
                     // list — the requester will use `EpochKeyRequest` via
                     // PQ-B7-RECOVERY-1 once they start receiving gossip.
-                    let epoch_key_releases =
-                        self.epoch_key_releases_for_admission_response(&peer);
+                    let epoch_key_releases = self.epoch_key_releases_for_admission_response(&peer);
                     if self
                         .swarm
                         .behaviour_mut()
@@ -1175,7 +1176,10 @@ impl DdsNode {
                 // full receive pipeline (schema → recipient binding →
                 // replay-window → KEM decap → AEAD unwrap) so a
                 // malformed or misaddressed blob is rejected harmlessly.
-                self.ingest_piggybacked_epoch_key_releases(&peer_id, epoch_key_releases_from_response);
+                self.ingest_piggybacked_epoch_key_releases(
+                    &peer_id,
+                    epoch_key_releases_from_response,
+                );
                 // Now that we've verified the peer belongs to our
                 // domain, kick off an opportunistic sync.
                 self.try_sync_with(peer_id);
@@ -1349,11 +1353,7 @@ impl DdsNode {
     /// [`dds_net::pq_envelope::MAX_EPOCH_KEY_RELEASES_PER_RESPONSE`]
     /// blobs) is dropped wholesale to bound the per-message decap budget,
     /// mirroring the same cap in `handle_epoch_key_response`.
-    fn ingest_piggybacked_epoch_key_releases(
-        &mut self,
-        peer_id: &PeerId,
-        releases: Vec<Vec<u8>>,
-    ) {
+    fn ingest_piggybacked_epoch_key_releases(&mut self, peer_id: &PeerId, releases: Vec<Vec<u8>>) {
         use dds_net::pq_envelope::MAX_EPOCH_KEY_RELEASES_PER_RESPONSE;
         if releases.is_empty() {
             return;
@@ -2241,6 +2241,7 @@ impl DdsNode {
         let now = Instant::now();
         if let Some(prev) = self.epoch_key_request_last.get(publisher_id) {
             if now.duration_since(*prev) < EPOCH_KEY_REQUEST_COOLDOWN {
+                crate::telemetry::record_pq_release_request("cooldown");
                 return;
             }
         }
@@ -2253,6 +2254,7 @@ impl DdsNode {
             Ok(id) => id,
             Err(_) => {
                 debug!(publisher = %publisher_id, "epoch-key request: malformed publisher PeerId — skipping");
+                crate::telemetry::record_pq_release_request("malformed_peer_id");
                 return;
             }
         };
@@ -2262,6 +2264,7 @@ impl DdsNode {
                 publisher = %publisher_id,
                 "epoch-key request: publisher not currently admitted — skipping"
             );
+            crate::telemetry::record_pq_release_request("not_admitted");
             return;
         }
 
@@ -2275,6 +2278,7 @@ impl DdsNode {
             .send_request(&publisher_peer_id, req);
         self.epoch_key_request_last
             .insert(publisher_id.to_string(), now);
+        crate::telemetry::record_pq_release_request("sent");
         debug!(publisher = %publisher_id, "epoch-key request: sent late-join recovery request");
     }
 
@@ -2293,8 +2297,12 @@ impl DdsNode {
         if let Err(e) = self.epoch_keys.save(&self.epoch_keys_path) {
             warn!(error = %e, "Phase B.9: failed to persist epoch keys after rotation");
         }
-        info!(epoch_id = new_epoch_id, reason, "Phase B.9: epoch key rotated");
+        info!(
+            epoch_id = new_epoch_id,
+            reason, "Phase B.9: epoch key rotated"
+        );
         crate::telemetry::record_pq_rotation(reason);
+        crate::telemetry::record_pq_epoch_id(new_epoch_id);
         self.emit_epoch_key_releases_to_all_admitted_peers();
     }
 
@@ -2347,14 +2355,15 @@ impl DdsNode {
                 continue;
             }
             // Parse the recipient's KEM pubkey.
-            let recipient_kem_pk =
-                match dds_core::crypto::kem::HybridKemPublicKey::from_bytes(kem_pk_bytes) {
-                    Ok(pk) => pk,
-                    Err(_) => {
-                        debug!(peer = %peer_str, "Phase B.9: malformed cached KEM pubkey, skipping fan-out");
-                        continue;
-                    }
-                };
+            let recipient_kem_pk = match dds_core::crypto::kem::HybridKemPublicKey::from_bytes(
+                kem_pk_bytes,
+            ) {
+                Ok(pk) => pk,
+                Err(_) => {
+                    debug!(peer = %peer_str, "Phase B.9: malformed cached KEM pubkey, skipping fan-out");
+                    continue;
+                }
+            };
             // Mint the per-recipient release.
             let release = match mint_epoch_key_release_for_recipient(
                 &mut rand::rngs::OsRng,
@@ -2404,7 +2413,10 @@ impl DdsNode {
                 sent = 0;
             }
         }
-        debug!(peers = targets.len(), "Phase B.9: epoch-key fan-out complete");
+        debug!(
+            peers = targets.len(),
+            "Phase B.9: epoch-key fan-out complete"
+        );
     }
 
     /// Apply an inbound sync response: merge into trust graph + DAG +
@@ -2440,10 +2452,7 @@ impl DdsNode {
                     crate::telemetry::record_pq_envelope_decrypt("aead_fail");
                     continue;
                 }
-                let epoch_key = match self
-                    .epoch_keys
-                    .peer_epoch_key(&env.responder, env.epoch_id)
-                {
+                let epoch_key = match self.epoch_keys.peer_epoch_key(&env.responder, env.epoch_id) {
                     Some(k) => k,
                     None => {
                         warn!(
