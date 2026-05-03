@@ -1367,23 +1367,22 @@ The API uses:
 
 This is a practical cross-language choice.
 
-### 16.7 Current Status Endpoint Limitation
+### 16.7 Status Endpoint — Live Peer and DAG Counters
 
-The HTTP status route reads the same `connected` snapshot the
-`dds_peers_connected` Prometheus gauge reads — refreshed by the swarm
-task on every connection lifecycle event via `NodePeerCounts` — and
-passes it as the `connected_peers` field in the JSON response. The
-remaining placeholder is the DAG operation count: the route still
-calls
+The HTTP status route reads two live snapshots from the shared
+`NodePeerCounts` atomic struct, refreshed by the swarm task on every
+connection lifecycle event and after every DAG mutation:
 
-- `svc.status(peer_id, connected_peers, 0)`
+- **`connected_peers`** — `NodePeerCounts.connected` (updated on every
+  libp2p connection lifecycle event).
+- **`dag_operations`** — `NodePeerCounts.dag_ops` (updated by
+  `DdsNode::refresh_peer_count_gauges` after every gossip/sync ingest).
 
-so `connected_peers` is a live view of the swarm but `dag_operations`
-is hard-coded to `0`. Wiring it requires a second shared snapshot
-(the current `CausalDag` lives behind the swarm task only) and is
-deferred until an operator explicitly asks for it — the audit
-chain length and trust-graph token count already give a more
-operationally useful "how much state is on this node" reading.
+Both values are passed directly to `svc.status(peer_id, connected_peers,
+dag_ops)` so the `/v1/status` JSON response reflects the current swarm
+and DAG state without polling. `dag_operations` resets to `0` on process
+restart because the in-memory `CausalDag` is rebuilt from gossip/sync
+rather than replayed from the `OperationStore` (see §14.8.2 and §19.2).
 
 ## 17. CLI, FFI, And Language Bindings
 

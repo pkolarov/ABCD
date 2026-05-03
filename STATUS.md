@@ -1,5 +1,46 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-03, updated 24th pass)
+
+- ✅ Whitepaper §16.7 stale "dag_operations hard-coded to 0" section corrected (2026-05-03):
+
+  **Gap:** §16.7 still described `dag_operations` as "hard-coded to `0`" and the
+  wiring as "deferred until an operator explicitly asks for it." This was accurate
+  before the 22nd-pass fix but the section was not updated when `dag_operations`
+  was wired in that same pass.
+
+  **Fix:** §16.7 heading changed from "Current Status Endpoint Limitation" to
+  "Status Endpoint — Live Peer and DAG Counters." Body updated to describe the
+  resolved implementation: both `connected_peers` (from `NodePeerCounts.connected`)
+  and `dag_operations` (from `NodePeerCounts.dag_ops`, refreshed by
+  `DdsNode::refresh_peer_count_gauges`) are passed as live values to
+  `svc.status(peer_id, connected_peers, dag_ops)`. The reset-on-restart
+  behaviour of `dag_operations` is noted with a cross-reference to §14.8.2
+  and §19.2.
+
+  **README.md updated (3 stale claims):**
+  1. "only `dds_sync_lag_seconds` and `dds_http_request_duration_seconds`
+     histograms remain deferred on the `metrics-exporter-prometheus` rollover"
+     → corrected to note both histograms shipped hand-rolled in follow-up #46
+     (2026-05-02).
+  2. "six active groups — `dds-audit`, `dds-process`, `dds-storage`, `dds-http`,
+     `dds-network`, `dds-fido2`" → corrected to "eight active groups" adding
+     `dds-pqc` and `dds-sync-lag` (both landed in Phase E / B.11, 2026-05-02),
+     matching `docs/observability/alerts/dds.rules.yml` which has exactly 8 rule
+     groups.
+  3. Missing `/v1/pq/rotate` (admin, POST) row added to the HTTP API endpoint
+     table (was in `http.rs:745` since B.10, 2026-05-01, but absent from the
+     README summary).
+
+  **win_service.rs formatting fixed:** `rustfmt` detected a line-break deviation
+  in the `use windows_service::service::{…}` import; reformatted to match the
+  rest of the file.
+
+  No logic/code changes. `cargo build --workspace` clean. `cargo clippy
+  --workspace --all-targets -- -D warnings` clean. `cargo fmt --all -- --check`
+  clean. All 725 library/unit tests pass (dds-core: 197, dds-node: 310,
+  dds-store/domain/net/cli: 38+78, dds-ffi: 13, dds-fido2-test: 89).
+
 ## Documentation-to-Code Verification Addendum (2026-05-03, updated 23rd pass)
 
 - ✅ Whitepaper §15.4 and §19.2 stale trust-graph-rehydration entry corrected (2026-05-03):

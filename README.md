@@ -260,19 +260,20 @@ this secret; locally, run
 | `GET` | `/v1/windows/policies` | Windows policy for this device |
 | `GET` | `/v1/macos/policies` | macOS policy for this device |
 | `GET` | `/v1/audit/entries` | Signed audit-log slice |
+| `POST` | `/v1/pq/rotate` | Rotate PQ epoch key (admin) |
 | `GET` | `/healthz`, `/readyz` | Orchestrator probes (Phase D) |
 
 Set `network.metrics_addr = "127.0.0.1:9495"` to expose Prometheus
 `/metrics` on a separate listener (observability-plan.md Phase C).
 Default is `None` so the second port is opt-in. The full catalog
 (28 `dds_*` families across network, trust-graph, FIDO2, sessions,
-audit, storage, HTTP, and process tiers; only `dds_sync_lag_seconds`
-and `dds_http_request_duration_seconds` histograms remain deferred
-on the `metrics-exporter-prometheus` rollover) is documented in the
+audit, storage, HTTP, and process tiers — all histograms including
+`dds_sync_lag_seconds` and `dds_http_request_duration_seconds` shipped
+hand-rolled in follow-up #46, 2026-05-02) is documented in the
 admin guide's [Monitoring and Diagnostics](docs/DDS-Admin-Guide.md#monitoring-and-diagnostics)
-section. Reference Alertmanager rules (six active groups —
+section. Reference Alertmanager rules (eight active groups —
 `dds-audit`, `dds-process`, `dds-storage`, `dds-http`,
-`dds-network`, `dds-fido2`) and two Grafana dashboards
+`dds-network`, `dds-fido2`, `dds-pqc`, `dds-sync-lag`) and two Grafana dashboards
 (`dds-overview`, `dds-trust-graph`) ship under
 [`docs/observability/`](docs/observability/) (Phase E). The
 `dds-http` group's `DdsLoopbackTcpAdminUsed` alert fires when
