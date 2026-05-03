@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     DDS Console — WPF wizard for domain bootstrap + service health view.
 
@@ -31,6 +31,32 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# Transcript so a crash before ShowDialog() leaves a forensic trail.
+$logPath = Join-Path $env:TEMP ("dds-console-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
+try { Start-Transcript -Path $logPath -Force | Out-Null } catch { }
+
+# Catch-all trap — pops a MessageBox so an instant-close window still
+# tells the operator what happened, then waits for an Enter so the
+# console window stays up too.
+trap {
+    $msg = "DdsConsole.ps1 crashed:`r`n`r`n$($_.Exception.Message)"
+    if ($_.InvocationInfo) {
+        $msg += "`r`n`r`nat $($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber)"
+        $msg += "`r`n  $($_.InvocationInfo.Line.Trim())"
+    }
+    $msg += "`r`n`r`nTranscript: $logPath"
+    try {
+        Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
+        [Windows.MessageBox]::Show($msg, "DDS Console - Error", 'OK', 'Error') | Out-Null
+    } catch {
+        Write-Host $msg -ForegroundColor Red
+    }
+    Write-Host $msg -ForegroundColor Red
+    try { Stop-Transcript | Out-Null } catch { }
+    Read-Host "Press Enter to close"
+    exit 1
+}
 
 # ── Self-elevate ─────────────────────────────────────────────────
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -280,7 +306,7 @@ function Refresh-Health {
             $el.TbLogTail.Text = $tail -join "`r`n"
             $el.TbLogTail.ScrollToEnd()
         } catch {
-            $el.TbLogTail.Text = "(unable to read $AuthBridgeLog: $($_.Exception.Message))"
+            $el.TbLogTail.Text = "(unable to read ${AuthBridgeLog}: $($_.Exception.Message))"
         }
     } else {
         $el.TbLogTail.Text = "(authbridge.log not present yet)"
@@ -298,7 +324,7 @@ $bootstrapProcess = $null
 function Run-Bootstrap {
     if (-not (Test-Path $BootstrapScript)) {
         Append-Log "ERROR: Bootstrap-DdsDomain.ps1 not found at $BootstrapScript"
-        Set-Status "Bootstrap script missing — reinstall the MSI." '#D13438'
+        Set-Status "Bootstrap script missing - reinstall the MSI." '#D13438'
         return
     }
     if ([string]::IsNullOrWhiteSpace($el.TbName.Text))    { Set-Status "Domain name is required."     '#D13438'; return }
@@ -307,7 +333,7 @@ function Run-Bootstrap {
     $el.BtnRun.IsEnabled = $false
     $el.TbLog.Clear()
     Reset-Steps
-    Set-Status "Bootstrap starting…" '#0078d4'
+    Set-Status "Bootstrap starting..." '#0078d4'
 
     $args = @(
         '-NoProfile','-ExecutionPolicy','Bypass',
@@ -331,7 +357,6 @@ function Run-Bootstrap {
     $script:bootstrapProcess.EnableRaisingEvents = $true
 
     $rxStep = [regex]'\[(\d)/9\]'
-    $rxFail = [regex](?i)'(error|exception|failed|throw)'
 
     $handler = {
         param($s, $e)

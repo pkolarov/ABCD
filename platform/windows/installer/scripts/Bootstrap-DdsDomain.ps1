@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Bootstrap a brand-new DDS domain on this Windows host.
 
