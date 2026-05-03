@@ -161,7 +161,12 @@ function Build-Rust([string]$target, [string]$stageDir) {
     # Ensure the target is installed (avoid 2>&1 — PS 5.1 turns native stderr into terminating ErrorRecords)
     & rustup target add $target | Out-Null
 
-    $cargoArgs = @("build", "--package", "dds-node", "--target", $target)
+    # MSI ships the bootstrap wizard + Bootstrap-DdsDomain.ps1, both of
+    # which call `dds-node init-domain --fido2`. The fido2 cargo feature
+    # is opt-in (gates the ctap-hid-fido2 dep), so it must be explicitly
+    # enabled here or the binary refuses --fido2 with
+    # "Error: --fido2 requires dds-node built with --features fido2".
+    $cargoArgs = @("build", "--package", "dds-node", "--target", $target, "--features", "fido2")
     if ($Configuration -eq "Release") { $cargoArgs += "--release" }
 
     Push-Location $RepoRoot
