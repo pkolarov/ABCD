@@ -58,4 +58,84 @@ public sealed class AppliedStateStoreTests
                 Directory.Delete(dir, recursive: true);
         }
     }
+
+    [Fact]
+    public void RemoveManagedUsername_RemovesFromSet()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "dds-linux-state-" + Guid.NewGuid());
+        try
+        {
+            var store = new AppliedStateStore(dir);
+            store.RecordManagedUsername("alice");
+            Assert.Contains("alice", store.Load().ManagedUsernames);
+
+            store.RemoveManagedUsername("alice");
+            Assert.DoesNotContain("alice", store.Load().ManagedUsernames);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+                Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RemoveManagedPath_RemovesFromSet()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "dds-linux-state-" + Guid.NewGuid());
+        try
+        {
+            var store = new AppliedStateStore(dir);
+            store.RecordManagedPath("/etc/dds/policy.conf");
+            Assert.Contains("/etc/dds/policy.conf", store.Load().ManagedPaths);
+
+            store.RemoveManagedPath("/etc/dds/policy.conf");
+            Assert.DoesNotContain("/etc/dds/policy.conf", store.Load().ManagedPaths);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+                Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RemoveManagedPackage_RemovesFromSet()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "dds-linux-state-" + Guid.NewGuid());
+        try
+        {
+            var store = new AppliedStateStore(dir);
+            store.RecordManagedPackage("curl");
+            Assert.Contains("curl", store.Load().ManagedPackages);
+
+            store.RemoveManagedPackage("curl");
+            Assert.DoesNotContain("curl", store.Load().ManagedPackages);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+                Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Remove_OnAbsentEntry_IsNoOp()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "dds-linux-state-" + Guid.NewGuid());
+        try
+        {
+            var store = new AppliedStateStore(dir);
+            // Remove on an entry that was never added must not throw.
+            store.RemoveManagedUsername("nobody");
+            store.RemoveManagedPath("/nonexistent");
+            store.RemoveManagedPackage("missing-pkg");
+            Assert.Empty(store.Load().ManagedUsernames);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+                Directory.Delete(dir, recursive: true);
+        }
+    }
 }

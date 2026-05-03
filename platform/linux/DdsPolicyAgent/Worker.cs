@@ -227,11 +227,20 @@ public sealed class Worker : BackgroundService
                 case "user" when action == "create":
                     _stateStore.RecordManagedUsername(id);
                     break;
+                case "user" when action == "delete":
+                    _stateStore.RemoveManagedUsername(id);
+                    break;
                 case "file" when action == "set" || action == "ensuredir":
                     _stateStore.RecordManagedPath(id);
                     break;
+                case "file" when action == "delete":
+                    _stateStore.RemoveManagedPath(id);
+                    break;
                 case "pkg" when action == "install":
                     _stateStore.RecordManagedPackage(id);
+                    break;
+                case "pkg" when action == "remove":
+                    _stateStore.RemoveManagedPackage(id);
                     break;
             }
         }

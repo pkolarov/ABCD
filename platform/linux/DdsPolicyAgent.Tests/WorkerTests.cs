@@ -48,6 +48,9 @@ sealed class TestAppliedStateStore : IAppliedStateStore
     public void RecordManagedUsername(string username) { }
     public void RecordManagedPath(string path) { }
     public void RecordManagedPackage(string packageName) { }
+    public void RemoveManagedUsername(string username) { }
+    public void RemoveManagedPath(string path) { }
+    public void RemoveManagedPackage(string packageName) { }
 }
 
 // ---- helpers ----

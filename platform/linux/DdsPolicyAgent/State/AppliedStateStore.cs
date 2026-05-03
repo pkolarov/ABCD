@@ -46,6 +46,9 @@ public interface IAppliedStateStore
     void RecordManagedUsername(string username);
     void RecordManagedPath(string path);
     void RecordManagedPackage(string packageName);
+    void RemoveManagedUsername(string username);
+    void RemoveManagedPath(string path);
+    void RemoveManagedPackage(string packageName);
 }
 
 public sealed class AppliedStateStore : IAppliedStateStore
@@ -122,6 +125,33 @@ public sealed class AppliedStateStore : IAppliedStateStore
         lock (_lock)
         {
             if (_state.ManagedPackages.Add(packageName))
+                WriteToDisk(_state);
+        }
+    }
+
+    public void RemoveManagedUsername(string username)
+    {
+        lock (_lock)
+        {
+            if (_state.ManagedUsernames.Remove(username))
+                WriteToDisk(_state);
+        }
+    }
+
+    public void RemoveManagedPath(string path)
+    {
+        lock (_lock)
+        {
+            if (_state.ManagedPaths.Remove(path))
+                WriteToDisk(_state);
+        }
+    }
+
+    public void RemoveManagedPackage(string packageName)
+    {
+        lock (_lock)
+        {
+            if (_state.ManagedPackages.Remove(packageName))
                 WriteToDisk(_state);
         }
     }
