@@ -285,12 +285,14 @@ foreach ($plat in $Targets) {
     }
 
     # Step 3.5: copy installer-side scripts into stage so WiX can reference them
-    $bootstrapSrc = Join-Path $InstallerDir "scripts\Bootstrap-DdsDomain.ps1"
-    if (Test-Path $bootstrapSrc) {
-        Copy-Item $bootstrapSrc -Destination $stageDir -Force
-        Write-Host "  -> Staged: $stageDir\Bootstrap-DdsDomain.ps1"
+    $scriptDir = Join-Path $InstallerDir "scripts"
+    if (Test-Path $scriptDir) {
+        foreach ($ps1 in Get-ChildItem -Path $scriptDir -Filter '*.ps1') {
+            Copy-Item $ps1.FullName -Destination $stageDir -Force
+            Write-Host "  -> Staged: $stageDir\$($ps1.Name)"
+        }
     } else {
-        Write-Warning "  Bootstrap-DdsDomain.ps1 not found at $bootstrapSrc"
+        Write-Warning "  Installer scripts dir not found: $scriptDir"
     }
 
     # Step 4: WiX MSI

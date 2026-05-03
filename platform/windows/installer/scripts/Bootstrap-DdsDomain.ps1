@@ -47,6 +47,7 @@ param(
     [string]$Name     = "",
     [string]$OrgHash  = "",
     [switch]$NoFido2,
+    [switch]$Force,
     [string]$InstallRoot = "C:\Program Files\DDS",
     [string]$DataRoot    = "C:\ProgramData\DDS"
 )
@@ -62,6 +63,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     if ($Name)    { $argList += @("-Name", "`"$Name`"") }
     if ($OrgHash) { $argList += @("-OrgHash", "`"$OrgHash`"") }
     if ($NoFido2) { $argList += "-NoFido2" }
+    if ($Force)   { $argList += "-Force" }
     Start-Process powershell.exe -Verb RunAs -ArgumentList $argList
     exit
 }
@@ -74,8 +76,34 @@ $AppSettings = Join-Path $ConfigDir  "appsettings.json"
 $NodeData   = Join-Path $DataRoot    "node-data"
 $ProvisionBundle = Join-Path $DataRoot "provision.dds"
 
+# Transcript log so even an instant-close window leaves an inspectable record.
+$logPath = Join-Path $env:TEMP ("dds-bootstrap-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
+try { Start-Transcript -Path $logPath -Force | Out-Null } catch { }
+
+# Always pause before exiting (success or failure), so a Start-menu-launched
+# PowerShell window stays open long enough for the operator to read the result.
+trap {
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Red
+    Write-Host "  Bootstrap FAILED" -ForegroundColor Red
+    Write-Host "============================================================" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+    if ($_.InvocationInfo) {
+        Write-Host "  at $($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor DarkGray
+        Write-Host "  $($_.InvocationInfo.Line.Trim())" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+    Write-Host "Full transcript: $logPath" -ForegroundColor Yellow
+    Write-Host ""
+    Read-Host "Press Enter to close"
+    try { Stop-Transcript | Out-Null } catch { }
+    exit 1
+}
+
 Write-Host ""
 Write-Host "=== DDS Domain Bootstrap ===" -ForegroundColor Cyan
+Write-Host "(transcript: $logPath)"
 Write-Host ""
 
 # ── Preflight ──────────────────────────────────────────────────────
@@ -111,11 +139,15 @@ if ($existing.Count -gt 0) {
     Write-Host "  - Any previously-enrolled users in this domain will be unreachable."
     Write-Host "  - The provision bundle for sibling nodes will be regenerated (old bundles invalid)."
     Write-Host ""
-    $resp = Read-Host "Wipe and re-bootstrap? Type 'WIPE' to confirm, anything else to cancel"
-    if ($resp -ne 'WIPE') {
-        Write-Host "Aborted. Existing state preserved." -ForegroundColor Cyan
-        Read-Host "Press Enter to exit"
-        exit 0
+    if ($Force) {
+        Write-Host "  -Force given, wiping without confirmation." -ForegroundColor Yellow
+    } else {
+        $resp = Read-Host "Wipe and re-bootstrap? Type 'WIPE' to confirm, anything else to cancel"
+        if ($resp -ne 'WIPE') {
+            Write-Host "Aborted. Existing state preserved." -ForegroundColor Cyan
+            Read-Host "Press Enter to exit"
+            exit 0
+        }
     }
 
     Write-Host ""
@@ -368,4 +400,5 @@ Write-Host "  Service status:"
 Get-Service Dds* | Format-Table Name, Status, StartType -AutoSize | Out-String | Write-Host
 Write-Host "  Next: launch DDS Tray Agent from Start menu to enroll users."
 Write-Host ""
+try { Stop-Transcript | Out-Null } catch { }
 Read-Host "Press Enter to close"
