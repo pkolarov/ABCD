@@ -53,6 +53,35 @@ sealed class TestAppliedStateStore : IAppliedStateStore
     public void RemoveManagedPackage(string packageName) { }
 }
 
+/// State store whose Load() returns a pre-populated managed set and records
+/// every add/remove call so tests can assert on resource lifecycle.
+sealed class TrackingAppliedStateStore : IAppliedStateStore
+{
+    private readonly AppliedState _state;
+
+    public List<string> AddedUsernames   { get; } = [];
+    public List<string> RemovedUsernames { get; } = [];
+    public List<string> AddedPaths       { get; } = [];
+    public List<string> RemovedPaths     { get; } = [];
+    public List<string> AddedPackages    { get; } = [];
+    public List<string> RemovedPackages  { get; } = [];
+
+    public TrackingAppliedStateStore(AppliedState initialState)
+        => _state = initialState;
+
+    public AppliedState Load() => _state;
+    public bool HasChanged(string _, string __) => true;
+    public void RecordApplied(string _, string __, string ___, string ____) { }
+
+    public void RecordManagedUsername(string u) => AddedUsernames.Add(u);
+    public void RecordManagedPath(string p)     => AddedPaths.Add(p);
+    public void RecordManagedPackage(string n)  => AddedPackages.Add(n);
+
+    public void RemoveManagedUsername(string u) => RemovedUsernames.Add(u);
+    public void RemoveManagedPath(string p)     => RemovedPaths.Add(p);
+    public void RemoveManagedPackage(string n)  => RemovedPackages.Add(n);
+}
+
 // ---- helpers ----
 
 file static class WorkerFactory
@@ -193,5 +222,72 @@ public sealed class WorkerTests
         Assert.Single(runner.Invocations);
         Assert.Equal("useradd", runner.Invocations[0].FileName);
         Assert.Equal("-m alice", runner.Invocations[0].Arguments);
+    }
+
+    [Fact]
+    public async Task DeleteUser_RemovesFromManagedSet()
+    {
+        // Pre-populate the managed set with "alice" so the delete guard passes.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedUsernames.Add("alice");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-delete-user",
+                    """{"policy_id":"policy-delete-user","version":1,"linux":{"local_users":[{"username":"alice","action":"Delete"}]}}"""),
+            ],
+        };
+        // AuditOnly: false so the enforcer runs the command path (NullCommandRunner captures it).
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client,
+            store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // The delete directive must trigger RemoveManagedUsername, not RecordManagedUsername.
+        Assert.Contains("alice", store.RemovedUsernames);
+        Assert.DoesNotContain("alice", store.AddedUsernames);
+    }
+
+    [Fact]
+    public async Task DeleteFile_RemovesFromManagedSet()
+    {
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedPaths.Add("/etc/dds/managed.conf");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-delete-file",
+                    """{"policy_id":"policy-delete-file","version":1,"linux":{"files":[{"path":"/etc/dds/managed.conf","action":"Delete"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client,
+            store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Contains("/etc/dds/managed.conf", store.RemovedPaths);
+        Assert.DoesNotContain("/etc/dds/managed.conf", store.AddedPaths);
     }
 }

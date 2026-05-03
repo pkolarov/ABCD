@@ -5524,6 +5524,64 @@ mod platform_applier_tests {
         );
     }
 
+    #[test]
+    fn linux_policy_without_publisher_capability_is_rejected() {
+        // A Linux policy signed by an identity that lacks the
+        // `dds:policy-publisher-linux` purpose vouch must be silently
+        // dropped by `list_applicable_linux_policies` (C-3 gate).
+        let (mut svc, _admin, _) = setup();
+        let dev = enroll_device(&mut svc, "linux-gated", vec![], None);
+
+        // Create a "bare" publisher: it has an attestation token in the
+        // graph but no publisher-capability vouch from any trusted root.
+        let bare = Identity::generate("bare-publisher", &mut OsRng);
+        let bare_attest = Token::sign(
+            TokenPayload {
+                iss: bare.id.to_urn(),
+                iss_key: bare.public_key.clone(),
+                jti: "bare-attest".into(),
+                sub: bare.id.to_urn(),
+                kind: TokenKind::Attest,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat: 1_700_000_000,
+                exp: Some(4_102_444_800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &bare.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(bare_attest)
+            .unwrap();
+
+        // Sign a Linux policy as the bare publisher (no capability vouch).
+        let policy = baseline_linux_policy(
+            "p:linux-gated",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&bare, "p-linux-bare", &policy))
+            .unwrap();
+
+        assert_eq!(
+            svc.list_applicable_linux_policies(&dev).unwrap().len(),
+            0,
+            "Linux policy from issuer lacking POLICY_PUBLISHER_LINUX must be rejected"
+        );
+    }
+
     // Silence the unused-import warning when only some helpers are
     // exercised in this module.
     #[allow(dead_code)]

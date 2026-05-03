@@ -1,5 +1,34 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-03, updated 20th pass)
+
+- ✅ Linux managed-set lifecycle bug fixed + capability gate test added (2026-05-03):
+  **Bug:** `Worker.RecordManagedResources` only added resources to the DDS-managed
+  sets (`ManagedUsernames`, `ManagedPaths`, `ManagedPackages`) on create/install
+  directives, but never removed them on delete/remove directives. After a user was
+  deleted or a file removed by DDS policy, the entry stayed in the managed set
+  permanently, causing: (a) stale entries accumulating across poll cycles, (b) the
+  delete guard remaining open for resources that DDS no longer manages.
+
+  **Fix:** Added `RemoveManagedUsername`, `RemoveManagedPath`, and
+  `RemoveManagedPackage` to the `IAppliedStateStore` interface and
+  `AppliedStateStore` implementation. Extended `RecordManagedResources` in
+  `Worker.cs` to call the remove methods when it sees `user:delete:*`,
+  `file:delete:*`, and `pkg:remove:*` directive tags. Added 4 new state-store
+  tests (`RemoveManagedUsername_RemovesFromSet`, `RemoveManagedPath_RemovesFromSet`,
+  `RemoveManagedPackage_RemovesFromSet`, `Remove_OnAbsentEntry_IsNoOp`) and 2 new
+  worker-level tests (`DeleteUser_RemovesFromManagedSet`,
+  `DeleteFile_RemovesFromManagedSet`) that exercise the end-to-end remove path.
+  **71 / 71** Linux C# tests passing (was 65).
+
+  **Rust gap closed:** Added `linux_policy_without_publisher_capability_is_rejected`
+  test to `platform_applier_tests` in `dds-node/src/service.rs`. This test verifies
+  that `list_applicable_linux_policies` rejects a Linux policy signed by an issuer
+  that has an attestation token but lacks the `dds:policy-publisher-linux` purpose
+  vouch (C-3 gate). The equivalent gate is exercised for Windows and macOS only
+  through the existing `setup()` precondition; this test proves the Linux gate
+  independently.
+
 ## Documentation-to-Code Verification Addendum (2026-05-03, updated 19th pass)
 
 - ✅ Linux L-2 typed enforcers landed (2026-05-03):
@@ -4717,7 +4746,7 @@ Global flags: `--data-dir <dir>` (local store), `--node-url <url>` (dds-node HTT
 |---|---|---|---|---|
 | **Windows** | `platform/windows/` | 🟢 **Login verified** | ✅ 298 Rust + 56 .NET + 47 C++ + 3 E2E | Native CP DLL + Auth Bridge + Tray Agent + Policy Agent all build + test on Win11 ARM64; **FIDO2 passwordless lock screen login re-verified after security hardening merge (2026-04-13)**; security fixes: credential_id-based vault lookup, RP-ID binding, removed unauth session endpoint; WebAuthn hmac-secret two-phase challenge/response verified with real authenticator |
 | **macOS** | `platform/macos/` | 🟢 **Smoke verified** | ✅ .NET build + 17 tests + smoke e2e | `DdsPolicyAgent.MacOS` worker with 5 host-backed enforcers, `.pkg` installer, single-command smoke test passing (6/6 checks), preference + launchd + account backends validated on real macOS ARM64 hardware; enterprise account/SSO coexistence is now modeled in `dds-domain`, while login-window/FileVault integration remains future `DdsLoginBridge` work |
-| **Linux** | `platform/linux/` | 🟡 **L-2 enforcers** | ✅ 65 C# tests | `DdsPolicyAgent.Linux` .NET 9 worker service — L-1 skeleton (signed envelope verification, applied-state reporting) promoted to **L-2**: five typed enforcers wired into `Worker.PollOnceAsync` dispatch all `linux.*` directive arrays in each policy document: `UserEnforcer` (create/delete/enable/disable/modify with UID-floor guard ≥1000 and DDS-managed-set delete guard), `SudoersEnforcer` (visudo-validated drop-in write/delete under `/etc/sudoers.d/`, SHA-256 content integrity), `FileEnforcer` (atomic temp+rename set, ensureDir, guarded delete, SHA-256 + path-traversal checks), `SystemdEnforcer` (enable/disable/start/stop/restart + drop-in write/remove with daemon-reload), `PackageEnforcer` (apt-get/dnf/rpm auto-detect, install/remove with managed-set guard); `AuditOnly: true` default suppresses all host mutations with audit-log lines; managed usernames/paths/packages persisted in `applied-state.json` for cross-cycle delete guards; `NullCommandRunner` test double; `ProcessCommandRunner` now executes real processes; typed L-2 directives (`LinuxSettings`, `LinuxUserDirective`, `LinuxSudoersDirective`, `LinuxFileDirective`, `LinuxSystemdDirective`, `LinuxPackageDirective`) landed in `dds-domain`; L-3 (privilege guard, real-device e2e) not started |
+| **Linux** | `platform/linux/` | 🟡 **L-2 enforcers** | ✅ 71 C# tests | `DdsPolicyAgent.Linux` .NET 9 worker service — L-1 skeleton (signed envelope verification, applied-state reporting) promoted to **L-2**: five typed enforcers wired into `Worker.PollOnceAsync` dispatch all `linux.*` directive arrays in each policy document: `UserEnforcer` (create/delete/enable/disable/modify with UID-floor guard ≥1000 and DDS-managed-set delete guard), `SudoersEnforcer` (visudo-validated drop-in write/delete under `/etc/sudoers.d/`, SHA-256 content integrity), `FileEnforcer` (atomic temp+rename set, ensureDir, guarded delete, SHA-256 + path-traversal checks), `SystemdEnforcer` (enable/disable/start/stop/restart + drop-in write/remove with daemon-reload), `PackageEnforcer` (apt-get/dnf/rpm auto-detect, install/remove with managed-set guard); `AuditOnly: true` default suppresses all host mutations with audit-log lines; managed usernames/paths/packages persisted in `applied-state.json` for cross-cycle delete guards; delete/remove directives correctly remove entries from the managed set (lifecycle bug fixed 2026-05-03); `NullCommandRunner` test double; `ProcessCommandRunner` now executes real processes; typed L-2 directives (`LinuxSettings`, `LinuxUserDirective`, `LinuxSudoersDirective`, `LinuxFileDirective`, `LinuxSystemdDirective`, `LinuxPackageDirective`) landed in `dds-domain`; L-3 (privilege guard, real-device e2e) not started |
 
 ## Cryptography
 
