@@ -352,6 +352,10 @@ bool RunEnrollmentFlow(HWND hwnd)
     } else {
         httpClient.SetPort(config.DdsNodePort());
     }
+    // A-3 fail-closed: load HMAC secret so response MAC verifies.
+    if (!config.HmacSecretPath().empty()) {
+        httpClient.LoadHmacSecret(config.HmacSecretPath());
+    }
 
     std::string credIdB64 = Base64UrlEncode(
         makeResult.credentialId.data(), makeResult.credentialId.size());

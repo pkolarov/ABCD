@@ -106,6 +106,13 @@ static void ShowStatus(HWND hwnd)
     } else {
         httpClient.SetPort(config.DdsNodePort());
     }
+    // A-3 fail-closed: load the per-install HMAC secret so the tray
+    // agent can verify response-body MACs the same way the Auth Bridge
+    // does. Without this, every reply is dropped with
+    // "MAC verification failed over pipe ... — dropping response".
+    if (!config.HmacSecretPath().empty()) {
+        httpClient.LoadHmacSecret(config.HmacSecretPath());
+    }
 
     DdsEnrolledUsersResult result = httpClient.GetEnrolledUsers(config.DeviceUrn());
 
