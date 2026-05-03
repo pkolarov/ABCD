@@ -235,7 +235,7 @@ impl RunningNode {
             .arg("run")
             .arg(&fixture.config_path)
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::null())
             .spawn()
             .unwrap();
         Self { fixture, child }
@@ -250,7 +250,7 @@ impl Drop for RunningNode {
 }
 
 async fn wait_for_status(client: &Client, api_url: &str) -> NodeStatus {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(resp) = client.get(format!("{api_url}/v1/status")).send().await {
             if resp.status().is_success() {

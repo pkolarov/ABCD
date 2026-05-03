@@ -982,6 +982,39 @@ enforcement. In the current tree, pre-logon first-account claim for
 native DDS Auth Bridge, while the policy agent remains the post-boot
 enforcer for the rest of Windows policy.
 
+The `WindowsSettings` bundle supports five directive types:
+
+| Field | Type | Enforcer | Description |
+|---|---|---|---|
+| `registry` | `[RegistryDirective]` | `RegistryEnforcer` | Set or delete registry values (allowlisted keys only) |
+| `local_accounts` | `[AccountDirective]` | `AccountEnforcer` | Create, disable, enable accounts; manage group membership |
+| `password_policy` | `PasswordPolicy` | `PasswordPolicyEnforcer` | Minimum length, max age, complexity, lockout |
+| `software` | (via `SoftwareAssignment` token) | `SoftwareInstaller` | Install/uninstall MSI packages |
+| `services` | `[ServiceDirective]` | `ServiceEnforcer` | Configure start type, start, or stop Windows services |
+
+**`services` directive example:**
+
+```json
+{
+  "windows": {
+    "services": [
+      {
+        "name": "RemoteRegistry",
+        "start_type": "Disabled",
+        "action": "Stop"
+      },
+      {
+        "name": "Spooler",
+        "start_type": "Automatic",
+        "action": "Start"
+      }
+    ]
+  }
+}
+```
+
+`action` values: `Configure` (set start type only), `Start` (set start type + ensure running), `Stop` (set start type + ensure stopped). Service names are validated against `^[A-Za-z0-9_\-]{1,256}$` before any SCM call. If the service does not exist on the endpoint, the directive is a no-op (logged at warn). All actions are idempotent.
+
 ### Windows First Account Claim
 
 For passwordless Windows logon, DDS can now bind a local account to a DDS
@@ -1076,6 +1109,7 @@ managed by DDS but is no longer desired. It then cleans up:
 | Local accounts | Disabled (not deleted, to preserve profiles) |
 | Group memberships | User removed from the group |
 | Software packages | Silently uninstalled via `msiexec /x` |
+| Services | No stale-item cleanup — service directives are applied on the forward enforcement pass only. Removing a `services` entry from policy stops future enforcement but does not revert prior start/stop actions, because reversing "Stop" or "Configure" is ambiguous. |
 
 **Drift correction.** If someone manually changes a DDS-managed registry value
 or re-enables a disabled account, the agent corrects the drift on the next poll

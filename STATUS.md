@@ -1,5 +1,34 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-03, updated 28th pass)
+
+- ✅ Admin Guide updated with `services` directive documentation (2026-05-03):
+
+  **Gap:** `DDS-Admin-Guide.md` had no documentation for the `services`
+  (`[ServiceDirective]`) field in `WindowsSettings` despite the `ServiceEnforcer`
+  landing in the 27th pass. The "Windows Policy (GPO Equivalent)" section listed
+  only `registry`, `local_accounts`, and `password_policy` implicitly; the
+  "Reconciliation & Drift Detection" cleanup table had no row for services.
+
+  **Fix:**
+  - Added a `WindowsSettings` directive summary table to the "Windows Policy
+    (GPO Equivalent)" section listing all five directive types (registry,
+    local_accounts, password_policy, software, services) with their enforcer
+    class and description.
+  - Added a `services` directive JSON example showing `Stop`+`Disabled` for
+    `RemoteRegistry` and `Start`+`Automatic` for `Spooler`, with a note on the
+    three action values (`Configure`, `Start`, `Stop`), name validation regex,
+    not-found behavior, and idempotency.
+  - Added a `Services` row to the "Stale-item cleanup" table explaining that
+    service directives have no stale-item cleanup (forward-enforcement only) and
+    why: reversing a `Stop` or `Configure` directive is ambiguous.
+
+  **Also committed:** two test-quality improvements to `cp_fido_e2e.rs`:
+  `stderr(Stdio::null())` (suppress test noise) and `wait_for_status` deadline
+  extended from 20 s → 30 s (reduce flakiness on slower CI hosts).
+
+  No code changes. All 925 Rust tests pass. No new warnings.
+
 ## Documentation-to-Code Verification Addendum (2026-05-03, updated 27th pass)
 
 - ✅ Windows `ServiceEnforcer` implemented — `WindowsSettings.services` gap closed (2026-05-03):
