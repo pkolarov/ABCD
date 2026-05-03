@@ -1,5 +1,33 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-03, updated 26th pass)
+
+- ✅ Two stale whitepaper claims corrected after 25th-pass DAG-persistence fix (2026-05-03):
+
+  **Gap 1 — §13.4 "Current Reality: What The Node Persists"** still said
+  "the current live node path mainly persists: tokens, revoked JTIs, burned
+  URNs, audit entries" and listed two open items: (1) the node does not
+  write DAG operations to `OperationStore`, (2) the node does not rebuild
+  the DAG from persistent storage on restart.  Both were resolved by the
+  25th-pass commit but the section was not updated.
+
+  **Fix:** §13.4 updated to describe the full persistence picture: DAG
+  operations via `store.put_operation` in `ingest_operation` /
+  `ingest_revocation` / `ingest_burn`, and startup rehydration via
+  `seed_dag_from_store`.  The two stale "less complete" bullets removed.
+
+  **Gap 2 — §14.8 intro** still said "There is one remaining
+  'design ahead of implementation' gap here (as of 2026-05-03). Two
+  previously-noted gaps have since been closed." — but after the
+  25th-pass commit all three subsections (14.8.1, 14.8.2, 14.8.3) are
+  marked Resolved.
+
+  **Fix:** §14.8 intro updated to "All three previously-noted
+  'design ahead of implementation' gaps have been resolved (as of
+  2026-05-03)."
+
+  No code changes.  `cargo test --workspace` — 925 / 925 passing.
+
 ## Documentation-to-Code Verification Addendum (2026-05-03, updated 25th pass)
 
 - ✅ Operation persistence gap closed (2026-05-03) — §14.8.2 / §15.4 / §19.2:

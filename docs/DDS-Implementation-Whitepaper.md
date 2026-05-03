@@ -983,20 +983,22 @@ This gives DDS a durable local store without bringing in an external service.
 
 ### 13.4 Current Reality: What The Node Persists
 
-The code architecture supports persistent operations and audit entries.
-However, the current live node path mainly persists:
+The code architecture supports persistent operations and audit entries,
+and the live node path now uses all of it:
 
 - tokens;
 - revoked JTIs;
 - burned URNs;
-- audit entries if audit is enabled and entries arrive.
+- DAG operations — `ingest_operation` calls `store.put_operation` in the
+  `Ok(true)` arm of `CausalDag::insert`; `ingest_revocation` and
+  `ingest_burn` persist their synthetic ops the same way (§14.8.2,
+  2026-05-03);
+- audit entries when audit is enabled (Z-3, 2026-04-26).
 
-Two things are less complete than the trait design suggests:
-
-1. The node does not currently write every ingested DAG operation into `OperationStore`.
-2. The node does not rebuild its in-memory DAG from persistent operation storage on restart.
-
-So the persistence design is ahead of the current node wiring.
+On restart, `DdsNode::seed_dag_from_store` reloads all stored operations
+into the in-memory `CausalDag` and rebuilds the sync-payload cache before
+the HTTP service starts, so the DAG is fully populated on the first peer
+connection rather than waiting for gossip re-delivery (§14.8.2, 2026-05-03).
 
 ## 14. Networking: What Travels Between Peers
 
@@ -1135,8 +1137,8 @@ That is a practical small-network bootstrapping pattern and matches libp2p's rol
 
 ### 14.8 Important Limitations In Live Networking
 
-There is one remaining "design ahead of implementation" gap here (as of 2026-05-03).
-Two previously-noted gaps have since been closed.
+All three previously-noted "design ahead of implementation" gaps have been resolved
+(as of 2026-05-03).
 
 #### 14.8.1 ~~Sync module not wired into live node~~ — **Resolved (2026-05-01)**
 
