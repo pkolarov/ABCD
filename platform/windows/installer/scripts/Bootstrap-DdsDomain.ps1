@@ -84,20 +84,59 @@ if (-not (Test-Path $NodeBin)) {
     exit 1
 }
 
-if (Test-Path (Join-Path $NodeData "domain.toml")) {
-    Write-Host "Domain already bootstrapped (domain.toml exists at $NodeData)." -ForegroundColor Yellow
-    Write-Host "To re-bootstrap, stop the services and delete $NodeData, then re-run."
-    Read-Host "Press Enter to exit"
-    exit 1
-}
-
+# ── Check service registration first ──────────────────────────────
 foreach ($svc in @("DdsNode","DdsAuthBridge","DdsPolicyAgent")) {
-    $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
-    if (-not $s) {
+    if (-not (Get-Service -Name $svc -ErrorAction SilentlyContinue)) {
         Write-Error "Service '$svc' is not registered. Reinstall the DDS MSI."
         exit 1
     }
-    if ($s.Status -ne 'Stopped') {
+}
+
+# ── Detect existing bootstrap state ──────────────────────────────
+$existing = @()
+if (Test-Path (Join-Path $NodeData "domain.toml"))      { $existing += "node-data\domain.toml" }
+if (Test-Path (Join-Path $NodeData "domain_key.bin"))   { $existing += "node-data\domain_key.bin (FIDO2-bound)" }
+if (Test-Path (Join-Path $NodeData "p2p_key.bin"))      { $existing += "node-data\p2p_key.bin" }
+if (Test-Path (Join-Path $NodeData "admission.cbor"))   { $existing += "node-data\admission.cbor" }
+if (Test-Path (Join-Path $DataRoot "node_key.bin"))     { $existing += "node_key.bin (Vouchsafe identity)" }
+if (Test-Path $NodeToml)                                { $existing += "config\node.toml" }
+
+if ($existing.Count -gt 0) {
+    Write-Host ""
+    Write-Host "Existing DDS state detected:" -ForegroundColor Yellow
+    foreach ($f in $existing) { Write-Host "  - $f" }
+    Write-Host ""
+    Write-Host "Bootstrapping a new domain will WIPE all of the above." -ForegroundColor Yellow
+    Write-Host "  - You'll need to touch your FIDO2 key again."
+    Write-Host "  - Any previously-enrolled users in this domain will be unreachable."
+    Write-Host "  - The provision bundle for sibling nodes will be regenerated (old bundles invalid)."
+    Write-Host ""
+    $resp = Read-Host "Wipe and re-bootstrap? Type 'WIPE' to confirm, anything else to cancel"
+    if ($resp -ne 'WIPE') {
+        Write-Host "Aborted. Existing state preserved." -ForegroundColor Cyan
+        Read-Host "Press Enter to exit"
+        exit 0
+    }
+
+    Write-Host ""
+    Write-Host "Stopping services and removing existing state..." -ForegroundColor Yellow
+    foreach ($svc in @("DdsPolicyAgent","DdsAuthBridge","DdsNode")) {
+        $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+        if ($s -and $s.Status -ne 'Stopped') {
+            Write-Host "  Stopping $svc..."
+            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (Test-Path $NodeData) { Remove-Item -Recurse -Force $NodeData }
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $DataRoot "node_key.bin")
+    Remove-Item -Force -ErrorAction SilentlyContinue $NodeToml
+    Write-Host "  Wiped." -ForegroundColor Green
+}
+
+# ── Stop services if running (clean state for first-time bootstrap) ──
+foreach ($svc in @("DdsPolicyAgent","DdsAuthBridge","DdsNode")) {
+    $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+    if ($s -and $s.Status -ne 'Stopped') {
         Write-Host "Stopping $svc (currently $($s.Status))..." -ForegroundColor Yellow
         Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
     }
