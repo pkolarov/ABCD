@@ -389,6 +389,22 @@ $json = $cfg | ConvertTo-Json -Depth 10
 [IO.File]::WriteAllText($AppSettings, $json, (New-Object Text.UTF8Encoding $false))
 Write-Host "  Updated: $AppSettings"
 
+# Also stamp HKLM\SOFTWARE\DDS\AuthBridge\DeviceUrn — the Auth Bridge
+# (and the Credential Provider via the bridge IPC) read the device URN
+# from the registry, NOT from appsettings.json. Without this, the
+# Auth Bridge filters /v1/enrolled-users with the MSI's placeholder
+# 'urn:dds:device:test-pc', the intersection with the real enrolled
+# user is empty, and the logon-screen CP shows
+# "DDS authenticator not connected" even with a key plugged in and an
+# enrolled user.
+$bridgeKey = 'HKLM:\SOFTWARE\DDS\AuthBridge'
+if (Test-Path $bridgeKey) {
+    Set-ItemProperty -Path $bridgeKey -Name DeviceUrn -Value $deviceUrn -Type String
+    Write-Host "  Updated: HKLM\SOFTWARE\DDS\AuthBridge\DeviceUrn = $deviceUrn"
+} else {
+    Write-Host "  WARN: $bridgeKey missing — Auth Bridge config not updated. Reinstall the MSI." -ForegroundColor Yellow
+}
+
 # ── 9. start auth bridge + policy agent ────────────────────────────
 Write-Host ""
 Write-Host "[9/9] Starting DdsAuthBridge and DdsPolicyAgent..." -ForegroundColor Green
