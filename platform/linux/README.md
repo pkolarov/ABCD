@@ -17,6 +17,7 @@ Initial supported distributions:
 - Ubuntu 24.04 LTS
 - Debian 12
 - Fedora 40 or newer
+- Alpine 3.20 or newer for L-1 anchor/runtime smoke only
 
 Initial host roles:
 
@@ -39,8 +40,9 @@ Use the same high-level shape as the Windows and macOS platform agents:
    - `GET /v1/linux/policies?device_urn=...`
    - `GET /v1/linux/software?device_urn=...`
    - `POST /v1/linux/applied`
-2. A Linux policy agent runs as a systemd service with least-privilege local
-   helpers for operations that require root.
+2. A Linux policy agent runs as an init-managed service (`systemd` on
+   Debian/Fedora-family distributions, OpenRC on Alpine) with least-privilege
+   local helpers for operations that require root.
 3. The agent verifies signed policy envelopes, computes intended state, applies
    idempotent enforcers, records local applied-state hashes, and reports drift.
 4. Production deployments use a Unix domain socket for the node API:
@@ -106,6 +108,7 @@ Initial packaging targets:
 
 - Debian package for Ubuntu and Debian
 - RPM package for Fedora-family systems
+- Alpine/OpenRC runtime scripts for L-1 VM smoke testing
 
 Installed paths:
 
@@ -117,10 +120,18 @@ Installed paths:
 - `/var/log/dds/` for file logs when journald forwarding is not enough
 - `/run/dds/api.sock` or `/var/run/dds/api.sock` for the node API socket
 
-systemd units:
+Service units/scripts:
 
 - `dds-node.service`
 - `dds-policy-agent.service`
+- `/etc/init.d/dds-node`
+- `/etc/init.d/dds-policy-agent`
+
+Packaging helpers:
+
+- `platform/linux/packaging/debian/build-deb.sh`
+- `platform/linux/packaging/debian/install-build-deps-ubuntu.sh`
+- `platform/linux/packaging/debian/README.Debian`
 
 ## Testing Plan
 
@@ -177,6 +188,10 @@ Split L-1 into two tracks:
 - Add Linux runtime packaging drafts:
   - `platform/linux/packaging/systemd/dds-node.service`
   - `platform/linux/packaging/systemd/dds-policy-agent.service`
+  - `platform/linux/packaging/openrc/dds-node`
+  - `platform/linux/packaging/openrc/dds-policy-agent`
+  - `platform/linux/packaging/debian/build-deb.sh`
+  - `platform/linux/packaging/debian/install-build-deps-ubuntu.sh`
   - `platform/linux/packaging/config/node.anchor.toml`
   - `platform/linux/packaging/config/node.member.toml`
   - `platform/linux/packaging/config/policy-agent.json`
@@ -205,9 +220,10 @@ bootstrap_peers = [
 ]
 ```
 
-- `dds-node.service` requirements:
+- service manager requirements:
   - run `dds-node run /etc/dds/node.toml`
-  - start after `network-online.target`
+  - start after network availability (`network-online.target` on systemd,
+    `need net` on OpenRC)
   - restart on failure
   - create or require `dds` runtime/state directories with restrictive
     permissions
@@ -230,10 +246,27 @@ bootstrap_peers = [
   - confirm `/readyz` is ready and `/v1/status` shows peer connectivity
   - restart the anchor and confirm the peer ID is unchanged
   - confirm the policy agent can reach the node through the Unix socket
+- Add an Alpine/UTM-specific runbook under `platform/linux/e2e/ALPINE-UTM.md`:
+  - use OpenRC scripts instead of systemd units
+  - publish the .NET agent for `linux-musl-arm64` or `linux-musl-x64`
+  - verify `/run/dds/api.sock`, `/v1/status`, `/v1/node/info`, and peer ID
+    stability across `rc-service dds-node restart`
+- Add a Debian package smoke runbook under `platform/linux/e2e/DEBIAN.md`:
+  - publish the .NET agent for `linux-arm64` or `linux-x64`
+  - build `dds-linux_<version>_<arch>.deb` from prebuilt artifacts
+  - install the package without auto-starting services
+  - configure `/etc/dds/node.toml`, preserve `/var/lib/dds/node/node_key.bin`,
+    and validate the UDS API plus policy-agent startup
+- Add an Ubuntu package smoke runbook under `platform/linux/e2e/UBUNTU.md`:
+  - install build prerequisites with apt
+  - map `dpkg --print-architecture` to the .NET runtime identifier
+  - build and install the Debian package on Ubuntu 24.04 LTS
+  - validate systemd startup, UDS API readiness, and peer ID stability
 
-L-1A exit gate: a Linux host can run `dds-node` as a stable systemd service,
-hold persistent node identity, expose the UDS admin API, advertise a usable
-libp2p multiaddr, and serve as the bootstrap peer for at least one second node.
+L-1A exit gate: a Linux host can run `dds-node` as a stable init-managed
+service, hold persistent node identity, expose the UDS admin API, advertise a
+usable libp2p multiaddr, and serve as the bootstrap peer for at least one second
+node.
 
 #### L-1B: No-Op Linux Policy Agent
 
@@ -320,6 +353,19 @@ Add development systemd units under `platform/linux/packaging/systemd/`:
 - `dds-node.service`
 - `dds-policy-agent.service`
 
+Add Alpine/OpenRC scripts under `platform/linux/packaging/openrc/`:
+
+- `dds-node`
+- `dds-policy-agent`
+- `conf.d/dds-node`
+- `conf.d/dds-policy-agent`
+
+Add Debian packaging under `platform/linux/packaging/debian/`:
+
+- `build-deb.sh`
+- `install-build-deps-ubuntu.sh`
+- `README.Debian`
+
 The policy-agent unit may run as root for L-1 only because later enforcers will
 need privileged host operations. Add a note in the unit comments that L-1 does
 not mutate host state, and that L-2 must revisit privilege separation before
@@ -377,12 +423,12 @@ L-1 implementation order:
 10. Run `dotnet test` for the Linux agent tests and targeted Rust tests for the
    new node/CLI route plumbing.
 
-Exit gate: on clean Linux VMs with systemd, one host runs as a DDS anchor node,
-a second node joins through its bootstrap multiaddr, both retain stable identity
-across restart, the anchor exposes its local API through `unix:/run/dds/api.sock`,
-and the no-op Linux policy agent fetches a signed Linux policy envelope, verifies
-it, writes applied state, posts an empty applied report, and repeats
-idempotently without mutating host state.
+Exit gate: on clean Linux VMs with systemd or OpenRC, one host runs as a DDS
+anchor node, a second node joins through its bootstrap multiaddr, both retain
+stable identity across restart, the anchor exposes its local API through
+`unix:/run/dds/api.sock`, and the no-op Linux policy agent fetches a signed Linux
+policy envelope, verifies it, writes applied state, posts an empty applied
+report, and repeats idempotently without mutating host state.
 
 ### L-2: Core Enforcers
 

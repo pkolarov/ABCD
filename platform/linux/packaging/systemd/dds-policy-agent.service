@@ -16,6 +16,7 @@ ExecStart=/usr/bin/dotnet /usr/local/lib/dds/DdsPolicyAgent.Linux/DdsPolicyAgent
 Restart=on-failure
 RestartSec=5s
 Environment=DOTNET_ENVIRONMENT=Production
+Environment=DDS_POLICY_AGENT_CONFIG=/etc/dds/policy-agent.json
 
 [Install]
 WantedBy=multi-user.target

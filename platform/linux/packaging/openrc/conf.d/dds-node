@@ -1,0 +1,7 @@
+# Optional OpenRC overrides for /etc/init.d/dds-node.
+
+DDS_NODE_COMMAND="/usr/local/bin/dds-node"
+DDS_NODE_ARGS="run /etc/dds/node.toml"
+DDS_NODE_PIDFILE="/run/dds/dds-node.pid"
+DDS_NODE_OUTPUT_LOG="/var/log/dds/dds-node.log"
+DDS_NODE_ERROR_LOG="/var/log/dds/dds-node.err"

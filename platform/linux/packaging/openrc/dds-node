@@ -1,0 +1,22 @@
+#!/sbin/openrc-run
+
+description="DDS Node"
+
+command="${DDS_NODE_COMMAND:-/usr/local/bin/dds-node}"
+command_args="${DDS_NODE_ARGS:-run /etc/dds/node.toml}"
+command_background=true
+pidfile="${DDS_NODE_PIDFILE:-/run/dds/dds-node.pid}"
+output_log="${DDS_NODE_OUTPUT_LOG:-/var/log/dds/dds-node.log}"
+error_log="${DDS_NODE_ERROR_LOG:-/var/log/dds/dds-node.err}"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath -d -m 0755 -o root:root /etc/dds
+    checkpath -d -m 0750 -o root:root /run/dds
+    checkpath -d -m 0700 -o root:root /var/lib/dds/node
+    checkpath -d -m 0750 -o root:root /var/log/dds
+}
