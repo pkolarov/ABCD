@@ -442,7 +442,7 @@
         <Shortcut Id="SH_TrayAgent"
                   Name="DDS Tray Agent"
                   Description="DDS user enrollment, vault refresh, and admin tray agent"
-                  Target="[#tray_agent_exe]"
+                  Target="[DIR_BIN]DdsTrayAgent.exe"
                   WorkingDirectory="DIR_BIN" />
         <RegistryValue Root="HKCU"
                        Key="Software\DDS\Shortcuts"

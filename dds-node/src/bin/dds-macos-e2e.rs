@@ -387,39 +387,29 @@ async fn publish_fixture(
         None => Identity::generate("macos-e2e-publisher", &mut OsRng),
     };
 
-    // C-3: publish self-attestation + self-vouches for the
-    // publisher-capability purposes the policy/software tokens
-    // require. Node-side `publisher_capability_ok` only admits
-    // those tokens once these vouches have been ingested — so we
-    // publish them first, pump a heartbeat for gossip to settle,
-    // and THEN fire the policy/software tokens.
-    {
-        let self_attest_token = self_attest_identity(&publisher)?;
-        let attest_hash = self_attest_token.payload_hash();
-        publish_operation(&mut node, &self_attest_token)?;
-
-        let policy_vouch = self_vouch_purpose(
-            &publisher,
-            &attest_hash,
-            dds_core::token::purpose::POLICY_PUBLISHER_MACOS,
-            "macos-e2e-vouch-policy-publisher-macos",
-        )?;
-        publish_operation(&mut node, &policy_vouch)?;
-
-        let software_vouch = self_vouch_purpose(
-            &publisher,
-            &attest_hash,
-            dds_core::token::purpose::SOFTWARE_PUBLISHER,
-            "macos-e2e-vouch-software-publisher",
-        )?;
-        publish_operation(&mut node, &software_vouch)?;
-
-        // Give node_a time to ingest the attest + vouches before we
-        // send policy/software tokens that reference them. Without
-        // this, the policy token can arrive before the vouch and
-        // `publisher_capability_ok` rejects it.
-        pump_for(&mut node, Duration::from_millis(spec.publish_interval_ms)).await;
-    }
+    // C-3: build self-attestation + self-vouches for the publisher-capability
+    // purposes. These are included in every publish iteration (see loop below)
+    // to guard against gossipsub InsufficientPeers races: wait_for_mesh returns
+    // as soon as admission completes, but gossipsub subscription exchange is a
+    // separate event that may arrive in the very next poll cycle. If the first
+    // iteration's publish_gossip_op returns InsufficientPeers the vouches are
+    // silently dropped; sending them again on iteration 2+ ensures they arrive
+    // before the policy token in the same gossip burst, satisfying
+    // `publisher_capability_ok` on node_a.
+    let self_attest_token = self_attest_identity(&publisher)?;
+    let attest_hash = self_attest_token.payload_hash();
+    let policy_vouch = self_vouch_purpose(
+        &publisher,
+        &attest_hash,
+        dds_core::token::purpose::POLICY_PUBLISHER_MACOS,
+        "macos-e2e-vouch-policy-publisher-macos",
+    )?;
+    let software_vouch = self_vouch_purpose(
+        &publisher,
+        &attest_hash,
+        dds_core::token::purpose::SOFTWARE_PUBLISHER,
+        "macos-e2e-vouch-software-publisher",
+    )?;
 
     let value_json: serde_json::Value = serde_json::from_str(&spec.preference_value_json)?;
     let policy = MacOsPolicyDocument {
@@ -496,6 +486,9 @@ async fn publish_fixture(
     )?;
 
     for _ in 0..spec.publish_count {
+        publish_operation(&mut node, &self_attest_token)?;
+        publish_operation(&mut node, &policy_vouch)?;
+        publish_operation(&mut node, &software_vouch)?;
         publish_operation(&mut node, &policy_token)?;
         publish_operation(&mut node, &software_token)?;
         pump_for(&mut node, Duration::from_millis(spec.publish_interval_ms)).await;
@@ -659,17 +652,15 @@ async fn pump_for(node: &mut DdsNode, duration: Duration) {
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(
+        // No event in this 250 ms window — keep looping until the deadline
+        // so gossip messages queued by publish_gossip_op get transmitted.
+        if let Ok(event) = tokio::time::timeout(
             remaining.min(Duration::from_millis(250)),
             node.swarm.select_next_some(),
         )
         .await
         {
-            Ok(event) => node.handle_swarm_event(event),
-            // No event in this 250 ms window — keep looping until the
-            // deadline so gossip messages queued by publish_gossip_op
-            // get a chance to be transmitted.
-            Err(_) => {}
+            node.handle_swarm_event(event);
         }
     }
 }

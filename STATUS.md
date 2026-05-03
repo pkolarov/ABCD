@@ -1,5 +1,38 @@
 # DDS Implementation Status
 
+## CI Fix Addendum (2026-05-04, 32nd pass)
+
+Three more CI failures surfaced after the 31st pass:
+
+**Fix A — CI clippy: `pump_for` match → if let**
+
+- Clippy (`-D warnings`) rejected the `match { Ok(e) => ..., Err(_) => {} }`
+  pattern in `pump_for` — use `if let Ok(event) = ... { }` instead.
+
+**Fix B — macOS smoke: vouches published before gossipsub subscription established**
+
+- Root cause: `wait_for_mesh` returns as soon as the DDS admission handshake
+  completes, but the gossipsub SUBSCRIBE event from the peer may arrive in the
+  very next poll cycle (a separate libp2p protocol message). If `publish_gossip_op`
+  is called while gossipsub has no subscribers, it silently returns `Ok(())` via
+  the `InsufficientPeers` branch — the message is dropped, never queued. The
+  self-attest + capability vouches were published once before the loop, so they
+  could be lost. Policy tokens published later (when gossipsub was ready) then
+  failed `publisher_capability_ok` because the vouches were not in node_a's
+  trust graph.
+- Fix: move self-attest + vouches publishing into the loop body, sent together
+  with the policy/software tokens on every iteration. Gossipsub deduplication
+  means node_a accepts them only on the first successful delivery; subsequent
+  iterations are harmless DuplicateJti returns.
+
+**Fix C — MSI WiX ICE69: SH_TrayAgent shortcut references file in a different feature**
+
+- `C_ShortcutTrayAgent` (in `F_Shortcuts`) had `Target="[#tray_agent_exe]"` which
+  references a file in `C_TrayAgent` (in `F_TrayAgent`). WiX ICE69 requires that a
+  shortcut and its target file belong to the same feature. Changed to the
+  path-based `Target="[DIR_BIN]DdsTrayAgent.exe"` which is functionally equivalent
+  but does not reference the file ID, avoiding the ICE69 error.
+
 ## CI Fix Addendum (2026-05-04, 31st pass)
 
 Three persistent CI workflow failures fixed:
