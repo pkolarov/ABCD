@@ -84,7 +84,12 @@ $DdsVersion = Get-DdsInstalledVersion
 # ── Paths ─────────────────────────────────────────────────────────
 $BootstrapScript = Join-Path $InstallRoot "bin\Bootstrap-DdsDomain.ps1"
 $TrayAgent       = Join-Path $InstallRoot "bin\DdsTrayAgent.exe"
+$NodeBin         = Join-Path $InstallRoot "bin\dds-node.exe"
 $AuthBridgeLog   = Join-Path $DataRoot    "authbridge.log"
+$ProvisionBundle = Join-Path $DataRoot    "provision.dds"
+$NodeData        = Join-Path $DataRoot    "node-data"
+$AdmissionCert   = Join-Path $NodeData    "admission.cbor"
+$NodeConfigFile  = Join-Path $InstallRoot "config\node.toml"
 
 # ── XAML ──────────────────────────────────────────────────────────
 [xml]$xaml = @'
@@ -166,6 +171,58 @@ $AuthBridgeLog   = Join-Path $DataRoot    "authbridge.log"
       </Grid>
     </TabItem>
 
+    <!-- ============== PROVISION TAB ============== -->
+    <TabItem Header="Provision">
+      <Grid Margin="10">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- Status block -->
+        <Border Grid.Row="0" BorderBrush="#cccccc" BorderThickness="1" Padding="8" Margin="0,0,0,8">
+          <StackPanel>
+            <TextBlock x:Name="TbProvJoinState" FontWeight="SemiBold" Text="Checking domain state..."/>
+            <TextBlock x:Name="TbProvJoinDetail" Foreground="#555555" Margin="0,2,0,0" TextWrapping="Wrap"/>
+          </StackPanel>
+        </Border>
+
+        <!-- Export -->
+        <GroupBox Grid.Row="1" Header="Export provision bundle (use to onboard new machines)" Margin="0,0,0,8">
+          <StackPanel Margin="6">
+            <TextBlock TextWrapping="Wrap" Margin="0,0,0,6">
+              The bundle is FIDO2-sealed at rest. The recipient machine still needs the admin's hardware key to unseal it during import. Keep it on encrypted media or a controlled share.
+            </TextBlock>
+            <StackPanel Orientation="Horizontal">
+              <Button x:Name="BtnProvExport" Content="Export provision.dds..." Padding="14,4" Margin="0,0,8,0"/>
+              <TextBlock x:Name="TbProvExportStatus" VerticalAlignment="Center" Foreground="#555555"/>
+            </StackPanel>
+          </StackPanel>
+        </GroupBox>
+
+        <!-- Import -->
+        <GroupBox Grid.Row="2" Header="Import provision bundle (join an existing domain)" Margin="0,0,0,8">
+          <StackPanel Margin="6">
+            <TextBlock x:Name="TbProvImportHint" TextWrapping="Wrap" Margin="0,0,0,6"
+                       Text="Pick a provision.dds copied from another machine in the domain. The admin's FIDO2 key must be present to unseal it."/>
+            <StackPanel Orientation="Horizontal">
+              <Button x:Name="BtnProvImport" Content="Import provision.dds..." Padding="14,4" Margin="0,0,8,0"/>
+              <TextBlock x:Name="TbProvImportStatus" VerticalAlignment="Center" Foreground="#555555"/>
+            </StackPanel>
+          </StackPanel>
+        </GroupBox>
+
+        <!-- Output -->
+        <GroupBox Grid.Row="3" Header="Output">
+          <TextBox x:Name="TbProvLog" IsReadOnly="True" FontFamily="Consolas" FontSize="11"
+                   VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                   TextWrapping="NoWrap" Background="#1e1e1e" Foreground="#dcdcdc"/>
+        </GroupBox>
+      </Grid>
+    </TabItem>
+
     <!-- ============== HEALTH TAB ============== -->
     <TabItem Header="Health">
       <Grid Margin="10">
@@ -220,6 +277,10 @@ $window.Title = "DDS Console  -  v$DdsVersion"
 $el = @{}
 foreach ($n in 'TbName','TbOrg','RbFido2','RbPass','CbForce','Steps','TbStatus','TbLog',
                 'BtnRun','BtnCopy','BtnOpenLog',
+                'TbProvJoinState','TbProvJoinDetail',
+                'BtnProvExport','TbProvExportStatus',
+                'BtnProvImport','TbProvImportStatus','TbProvImportHint',
+                'TbProvLog',
                 'DgServices','TbPipe','TbStateInv','TbLogTail',
                 'BtnRefresh','BtnTray','BtnStartAll','BtnStopAll') {
     $el[$n] = $window.FindName($n)
@@ -326,10 +387,68 @@ function Refresh-Health {
     }
 }
 
+# ── Provision tab ─────────────────────────────────────────────────
+#
+# Detection of "already part of a domain":
+#   - admission.cbor present in node-data  (this peer was admitted), OR
+#   - $InstallRoot\config\node.toml exists (running node config wired up)
+# Either signal means `dds-node provision` would refuse, so we hide
+# Import behind a disabled state.
+function Test-DomainJoined {
+    return (Test-Path $AdmissionCert) -or (Test-Path $NodeConfigFile)
+}
+
+function Append-ProvLog { param([string]$line)
+    $el.TbProvLog.AppendText($line + "`r`n")
+    $el.TbProvLog.ScrollToEnd()
+}
+
+function Refresh-Provision {
+    $joined = Test-DomainJoined
+    if ($joined) {
+        $el.TbProvJoinState.Text = "This machine: domain member"
+        $el.TbProvJoinState.Foreground = [Windows.Media.Brushes]::DarkGreen
+        $detail = @()
+        if (Test-Path $AdmissionCert)  { $detail += "admission.cbor present" }
+        if (Test-Path $NodeConfigFile) { $detail += "node.toml configured" }
+        $el.TbProvJoinDetail.Text = ($detail -join '; ')
+    } else {
+        $el.TbProvJoinState.Text = "This machine: not part of any domain"
+        $el.TbProvJoinState.Foreground = [Windows.Media.Brushes]::DarkOrange
+        $el.TbProvJoinDetail.Text = "Bootstrap a new domain or import a provision bundle from an existing one."
+    }
+
+    # Export: enabled iff the bundle file actually exists.
+    if (Test-Path $ProvisionBundle) {
+        $el.BtnProvExport.IsEnabled = $true
+        $el.TbProvExportStatus.Text = "Source: $ProvisionBundle"
+    } else {
+        $el.BtnProvExport.IsEnabled = $false
+        $el.TbProvExportStatus.Text = "No provision bundle on this machine ($ProvisionBundle missing)."
+    }
+
+    # Import: disabled if already joined (and explain why).
+    if ($joined) {
+        $el.BtnProvImport.IsEnabled = $false
+        $el.TbProvImportHint.Text =
+            "Import is disabled because this machine is already part of a domain. " +
+            "To re-provision, first wipe the existing state via the Bootstrap tab " +
+            "(check 'Wipe existing domain state') or remove " +
+            "$NodeData and $NodeConfigFile manually."
+        $el.TbProvImportStatus.Text = "(disabled — already joined)"
+    } else {
+        $el.BtnProvImport.IsEnabled = $true
+        $el.TbProvImportHint.Text =
+            "Pick a provision.dds copied from another machine in the domain. " +
+            "The admin's FIDO2 key must be present to unseal it."
+        $el.TbProvImportStatus.Text = ""
+    }
+}
+
 # Auto-refresh timer (every 2s)
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(2)
-$timer.Add_Tick({ Refresh-Health })
+$timer.Add_Tick({ Refresh-Health; Refresh-Provision })
 $timer.Start()
 
 # ── Bootstrap orchestration ───────────────────────────────────────
@@ -452,8 +571,145 @@ function Run-Bootstrap {
     $script:bootstrapTimer.Start()
 }
 
+# ── Provision: export + import handlers ───────────────────────────
+function Run-ProvisionExport {
+    if (-not (Test-Path $ProvisionBundle)) {
+        $el.TbProvExportStatus.Text = "Bundle missing — bootstrap a domain first."
+        return
+    }
+    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg.Title = "Export DDS provision bundle"
+    $dlg.FileName = "provision.dds"
+    $dlg.Filter = "DDS Provision Bundle (*.dds)|*.dds|All files (*.*)|*.*"
+    $dlg.OverwritePrompt = $true
+    if (-not $dlg.ShowDialog($window)) { return }
+    $dst = $dlg.FileName
+
+    # Stream copy via a temp file in the destination folder, then rename
+    # into place. Open the source with FileShare.ReadWrite so we don't
+    # collide with dds-node briefly reading the bundle during service
+    # start. Retry up to 3x on sharing violations (common cause: AV /
+    # OneDrive / Defender holding the destination just after creation).
+    $maxAttempts = 3
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        $tmp = "$dst.tmp-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        try {
+            $src = [System.IO.File]::Open($ProvisionBundle, 'Open', 'Read', 'ReadWrite')
+            try {
+                $out = [System.IO.File]::Open($tmp, 'Create', 'Write', 'None')
+                try { $src.CopyTo($out) } finally { $out.Close() }
+            } finally { $src.Close() }
+            if (Test-Path -LiteralPath $dst) { Remove-Item -LiteralPath $dst -Force }
+            Move-Item -LiteralPath $tmp -Destination $dst -Force
+            $el.TbProvExportStatus.Text = "Copied to $dst"
+            $el.TbProvExportStatus.Foreground = [Windows.Media.Brushes]::DarkGreen
+            Append-ProvLog "[Export] $ProvisionBundle -> $dst"
+            return
+        } catch [System.IO.IOException] {
+            if (Test-Path -LiteralPath $tmp) { try { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } catch { } }
+            # IOException covers sharing violations and "in use" errors.
+            # Retry only those; surface the rest immediately.
+            $hresult = $_.Exception.HResult
+            $isSharing = (($hresult -band 0xFFFF) -eq 32) -or (($hresult -band 0xFFFF) -eq 33)  # ERROR_SHARING_VIOLATION / LOCK_VIOLATION
+            if ($isSharing -and $attempt -lt $maxAttempts) {
+                Append-ProvLog "[Export] sharing violation on attempt $attempt; retrying..."
+                Start-Sleep -Milliseconds 400
+                continue
+            }
+            $msg = "$($_.Exception.Message) (source=$ProvisionBundle, dest=$dst)"
+            $el.TbProvExportStatus.Text = "Export failed: $msg"
+            $el.TbProvExportStatus.Foreground = [Windows.Media.Brushes]::DarkRed
+            Append-ProvLog "[Export] FAILED after $attempt attempt(s): $msg"
+            return
+        } catch {
+            if (Test-Path -LiteralPath $tmp) { try { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } catch { } }
+            $msg = "$($_.Exception.Message) (source=$ProvisionBundle, dest=$dst)"
+            $el.TbProvExportStatus.Text = "Export failed: $msg"
+            $el.TbProvExportStatus.Foreground = [Windows.Media.Brushes]::DarkRed
+            Append-ProvLog "[Export] FAILED: $msg"
+            return
+        }
+    }
+}
+
+function Run-ProvisionImport {
+    # Re-check at click time to avoid TOCTOU between the timer refresh
+    # and the user actually clicking.
+    if (Test-DomainJoined) {
+        $el.TbProvImportStatus.Text = "Already joined — import refused."
+        return
+    }
+    if (-not (Test-Path $NodeBin)) {
+        $el.TbProvImportStatus.Text = "dds-node.exe not found at $NodeBin."
+        $el.TbProvImportStatus.Foreground = [Windows.Media.Brushes]::DarkRed
+        return
+    }
+    $dlg = New-Object Microsoft.Win32.OpenFileDialog
+    $dlg.Title = "Import DDS provision bundle"
+    $dlg.Filter = "DDS Provision Bundle (*.dds)|*.dds|All files (*.*)|*.*"
+    $dlg.CheckFileExists = $true
+    if (-not $dlg.ShowDialog($window)) { return }
+    $bundle = $dlg.FileName
+
+    Append-ProvLog "[Import] Starting: $bundle"
+    Append-ProvLog "[Import] A new window will open. Touch the admin's FIDO2 key when prompted."
+
+    # Spawn a visible PowerShell window so dds-node provision has a real
+    # console for the FIDO2 PIN/touch prompt (libfido2 treats redirected
+    # children as non-interactive). Pause at the end so the operator can
+    # read the result before the window closes.
+    $cmd = @"
+& '$NodeBin' provision '$bundle'
+`$code = `$LASTEXITCODE
+Write-Host ''
+if (`$code -eq 0) {
+    Write-Host '=== Provision Complete ===' -ForegroundColor Green
+} else {
+    Write-Host "=== Provision FAILED (exit `$code) ===" -ForegroundColor Red
+}
+Read-Host 'Press Enter to close'
+exit `$code
+"@
+    $proc = Start-Process `
+        -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command', $cmd) `
+        -PassThru
+
+    $el.BtnProvImport.IsEnabled = $false
+    $el.TbProvImportStatus.Text = "Provisioning (PID $($proc.Id))..."
+    $el.TbProvImportStatus.Foreground = [Windows.Media.Brushes]::Blue
+
+    # Watch for exit and update UI; the timer-driven Refresh-Provision
+    # will then notice the new admission.cbor / node.toml and flip into
+    # the joined state.
+    $watcher = New-Object System.Windows.Threading.DispatcherTimer
+    $watcher.Interval = [TimeSpan]::FromMilliseconds(700)
+    $watcher.Add_Tick({
+        if ($proc.HasExited) {
+            $watcher.Stop()
+            $code = $proc.ExitCode
+            if ($code -eq 0) {
+                Append-ProvLog "[Import] Provision succeeded."
+                $el.TbProvImportStatus.Text = "Provision succeeded."
+                $el.TbProvImportStatus.Foreground = [Windows.Media.Brushes]::DarkGreen
+            } else {
+                Append-ProvLog "[Import] Provision failed (exit $code)."
+                $el.TbProvImportStatus.Text = "Provision failed (exit $code)."
+                $el.TbProvImportStatus.Foreground = [Windows.Media.Brushes]::DarkRed
+            }
+            Refresh-Provision
+            Refresh-Health
+        }
+    })
+    $watcher.Start()
+}
+
 # ── Wire up ───────────────────────────────────────────────────────
 $el.BtnRun.add_Click({ Run-Bootstrap })
+$el.BtnProvExport.add_Click({ Run-ProvisionExport })
+$el.BtnProvImport.add_Click({ Run-ProvisionImport })
 $el.BtnCopy.add_Click({
     [Windows.Clipboard]::SetText($el.TbLog.Text)
     Set-Status "Log copied to clipboard." '#107C10'
@@ -480,4 +736,5 @@ $el.BtnStopAll.add_Click({
 $window.add_Closed({ $timer.Stop() })
 
 Refresh-Health
+Refresh-Provision
 $window.ShowDialog() | Out-Null
