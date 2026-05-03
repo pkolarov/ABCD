@@ -761,7 +761,7 @@ dds/
     │   │   ├── Client/               HTTP client for dds-node /v1/windows/* API
     │   │   ├── Config/               Agent configuration model
     │   │   ├── State/                Applied-state persistence (idempotency)
-    │   │   └── Enforcers/            Registry, Account, PasswordPolicy, Software
+    │   │   └── Enforcers/            Registry, Account, PasswordPolicy, Software, Service
     │   ├── DdsPolicyAgent.Tests/     xUnit tests (cross-platform via InMemory* doubles)
     │   └── installer/                WiX v4 MSI bundle (Build-Msi.ps1 + DdsBundle.wxs)
     ├── linux/
@@ -1154,7 +1154,8 @@ Each enforcer is backed by a testable interface that abstracts the Win32 surface
 | `RegistryEnforcer` | `IRegistryOperations` | `Microsoft.Win32.Registry` | `InMemoryRegistryOperations` |
 | `AccountEnforcer` | `IAccountOperations` | `netapi32` P/Invoke / `DirectoryServices.AccountManagement` | `InMemoryAccountOperations` |
 | `PasswordPolicyEnforcer` | `IPasswordPolicyOperations` | `secedit` / `NetUserModalsSet` | `InMemoryPasswordPolicyOperations` |
-| `SoftwareInstaller` | (direct) | `msiexec` / `Add-AppxPackage` / process exec | (log-only stub) |
+| `SoftwareInstaller` | `ISoftwareOperations` | `WindowsSoftwareOperations` (`msiexec` / process exec) | `InMemorySoftwareOperations` |
+| `ServiceEnforcer` | `IServiceOperations` | `WindowsServiceOperations` (SCM P/Invoke) | `InMemoryServiceOperations` |
 
 All Win32 implementations carry `[SupportedOSPlatform("windows")]`. The DI
 container selects the real or in-memory implementation based on the platform,

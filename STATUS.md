@@ -1,5 +1,37 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-04, 33rd pass)
+
+- ✅ `DDS-Design-Document.md` enforcer table updated — two stale entries fixed:
+
+  **Gap 1 — `SoftwareInstaller` row showed `(direct)` / `(log-only stub)`.**
+  When the service-enforcer work landed in the 27th pass, the adjacent
+  `SoftwareInstaller` row still reflected its original stub state (before the
+  `ISoftwareOperations` interface and `InMemorySoftwareOperations` test double
+  were added). The "Test Double" cell said "(log-only stub)" and the
+  "Interface" cell said "(direct)" even though `ISoftwareOperations.cs`,
+  `WindowsSoftwareOperations.cs`, and `InMemorySoftwareOperations.cs` had been
+  in the codebase since the structured software enforcer work.
+
+  **Gap 2 — `ServiceEnforcer` missing from the enforcer table entirely.**
+  The `ServiceEnforcer` / `IServiceOperations` / `WindowsServiceOperations` /
+  `InMemoryServiceOperations` family landed in the 27th pass but was never
+  added to the "Each enforcer is backed by a testable interface" table in
+  §14.5.4, nor to the directory-tree listing in the repository-layout section.
+
+  **Fix:**
+  - `SoftwareInstaller` row: Interface → `ISoftwareOperations`,
+    Win32 impl → `WindowsSoftwareOperations` (`msiexec` / process exec),
+    Test Double → `InMemorySoftwareOperations`.
+  - Added new row: `ServiceEnforcer` | `IServiceOperations` |
+    `WindowsServiceOperations` (SCM P/Invoke) | `InMemoryServiceOperations`.
+  - Directory-tree listing (Windows Enforcers/) updated:
+    "Registry, Account, PasswordPolicy, Software" →
+    "Registry, Account, PasswordPolicy, Software, Service".
+
+  No Rust code changes. `cargo test --workspace` — 925 / 925 passing.
+  `cargo fmt --all -- --check` clean. .NET tests: 196 / 196 passing.
+
 ## CI Fix Addendum (2026-05-04, 32nd pass)
 
 Three more CI failures surfaced after the 31st pass:
