@@ -1,5 +1,22 @@
 # DDS Implementation Status
 
+## CI Fix Addendum (2026-05-03, 30th pass)
+
+- ✅ `cargo audit` CI failure resolved — created `.cargo/audit.toml` ignoring
+  RUSTSEC-2026-0119 and RUSTSEC-2026-0118 (both hickory-proto 0.25.x advisories
+  filed 2026-05-01). Root cause: libp2p-mdns pulls in `hickory-proto 0.25.0-alpha.5`;
+  RUSTSEC-2026-0119 requires ≥ 0.26.1 (unavailable), RUSTSEC-2026-0118 has no
+  fixed release. Upstream-blocked; advisories documented with removal condition
+  (drop ignores when libp2p-mdns ships hickory-proto ≥ 0.26.1).
+
+- ✅ `cargo vet` CI failure resolved — added `windows-service 0.7.0`
+  `safe-to-deploy` exemption to `supply-chain/config.toml`. The crate was
+  introduced in the 27th pass (ServiceEnforcer / Windows SCM) but its
+  supply-chain exemption was never recorded.
+
+  Verification: `cargo audit` exits 0 ("8 allowed warnings found");
+  `cargo vet` exits 0 ("Vetting Succeeded (14 fully audited, 496 exempted)").
+
 ## Documentation-to-Code Verification Addendum (2026-05-03, updated 29th pass)
 
 - ✅ Admin Guide updated with DDS Console and Tray Agent documentation (2026-05-03):
