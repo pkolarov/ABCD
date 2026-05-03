@@ -430,6 +430,55 @@ DdsEnrolledUsersResult CDdsNodeHttpClient::GetEnrolledUsers(const std::string& d
 }
 
 // ============================================================================
+// GET /v1/node/info
+// ============================================================================
+
+DdsNodeInfoResult CDdsNodeHttpClient::GetNodeInfo()
+{
+    DdsNodeInfoResult result = {};
+    result.success = false;
+    result.adminSetupAvailable = false;
+
+    FileLog::Write("DdsNodeHttpClient: GET /v1/node/info\n");
+
+    std::string responseBody;
+    DWORD httpStatus = SendRequest(L"GET", L"/v1/node/info", nullptr, responseBody);
+
+    if (httpStatus == 0)
+    {
+        result.errorMessage = "Connection to dds-node failed (is it running?)";
+        FileLog::Write("DdsNodeHttpClient: GET /v1/node/info -- connection failed\n");
+        return result;
+    }
+
+    FileLog::Writef("DdsNodeHttpClient: GET /v1/node/info -> HTTP %lu (bodyLen=%zu)\n",
+                    httpStatus, responseBody.size());
+
+    if (httpStatus == 200)
+    {
+        result.success = true;
+        result.nodeUrn       = JsonGetString(responseBody, "node_urn");
+        result.nodePubkeyB64 = JsonGetString(responseBody, "node_pubkey_b64");
+        result.peerId        = JsonGetString(responseBody, "peer_id");
+        // Mirrors the substring-match style used for `vouched` above.
+        result.adminSetupAvailable =
+            (responseBody.find("\"admin_setup_available\":true") != std::string::npos);
+    }
+    else
+    {
+        result.errorMessage = JsonGetString(responseBody, "error");
+        if (result.errorMessage.empty())
+        {
+            char buf[64];
+            sprintf_s(buf, "dds-node returned HTTP %lu", httpStatus);
+            result.errorMessage = buf;
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
 // POST /v1/enroll/user
 // ============================================================================
 

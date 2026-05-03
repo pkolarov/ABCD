@@ -130,6 +130,45 @@ bool RunAdminSetupFlow(HWND hwnd)
     config.Load();
     std::string rpId = config.RpId();
 
+    // Pre-flight: ask dds-node whether admin_setup is currently
+    // accepted (C-2 gate: trusted_roots empty AND .bootstrap sentinel
+    // present). Refuse here so we don't burn a FIDO2 credential slot
+    // on a request guaranteed to return HTTP 403. The pre-check needs
+    // the same transport + HMAC plumbing as the real POST.
+    {
+        CDdsNodeHttpClient preCheckClient;
+        if (!config.ApiAddr().empty()) {
+            preCheckClient.SetBaseUrl(config.ApiAddr());
+        } else {
+            preCheckClient.SetPort(config.DdsNodePort());
+        }
+        if (!config.HmacSecretPath().empty()) {
+            preCheckClient.LoadHmacSecret(config.HmacSecretPath());
+        }
+        auto info = preCheckClient.GetNodeInfo();
+        if (!info.success) {
+            FileLog::Writef("AdminSetup: pre-flight GET /v1/node/info failed: %s\n",
+                            info.errorMessage.c_str());
+            wchar_t msg[512];
+            swprintf_s(msg, L"Cannot reach dds-node:\n%hs", info.errorMessage.c_str());
+            MessageBoxW(hwnd, msg, L"DDS Admin Setup", MB_OK | MB_ICONERROR);
+            return false;
+        }
+        if (!info.adminSetupAvailable) {
+            FileLog::Write("AdminSetup: refused client-side -- admin already configured "
+                           "or .bootstrap sentinel absent\n");
+            MessageBoxW(hwnd,
+                L"Admin Setup is not available.\n\n"
+                L"Either an admin is already registered for this domain, or the "
+                L"\"\\ProgramData\\DDS\\node-data\\.bootstrap\" sentinel is absent.\n\n"
+                L"To add another admin, ask the existing admin to vouch for you "
+                L"via Approve Enrollments. To re-bootstrap, wipe node-data and "
+                L"re-run the bootstrap wizard.",
+                L"DDS Admin Setup", MB_OK | MB_ICONWARNING);
+            return false;
+        }
+    }
+
     // Build a userId for the admin (use "admin" as the label)
     std::string adminLabel = "admin";
     std::vector<uint8_t> userId(adminLabel.begin(), adminLabel.end());

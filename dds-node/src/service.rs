@@ -1263,6 +1263,21 @@ impl<
         self.node_identity.id.to_urn()
     }
 
+    /// True iff `admin_setup` would currently pass its C-2 gate:
+    /// `trusted_roots` is still empty AND the `<data_dir>/.bootstrap`
+    /// sentinel exists. Used by `/v1/node/info` so client tools can
+    /// pre-check before triggering a WebAuthn ceremony that would only
+    /// be rejected.
+    pub fn admin_setup_available(&self) -> bool {
+        if !self.trusted_roots.is_empty() {
+            return false;
+        }
+        match self.bootstrap_sentinel_path() {
+            Ok(p) => p.exists(),
+            Err(_) => false,
+        }
+    }
+
     /// observability-plan.md Phase D.2 — store smoke test for `/readyz`.
     ///
     /// Issues a single read against the audit chain. A successful

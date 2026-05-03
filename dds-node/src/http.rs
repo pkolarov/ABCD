@@ -1047,6 +1047,13 @@ pub struct NodeInfoResponse {
     pub node_urn: String,
     pub node_pubkey_b64: String,
     pub peer_id: String,
+    /// True iff `POST /v1/admin/setup` would currently be accepted by
+    /// the C-2 gate: `trusted_roots` empty AND the `<data_dir>\.bootstrap`
+    /// sentinel exists. Surfaced so client tools (e.g. the Windows tray
+    /// agent's "Admin Setup" flow) can refuse to invoke a doomed
+    /// WebAuthn ceremony — saving an authenticator credential slot and
+    /// avoiding a misleading "FIDO2 succeeded but admin denied" UX.
+    pub admin_setup_available: bool,
 }
 
 // ---------- error type ----------
@@ -1302,6 +1309,7 @@ where
         node_urn: svc.node_urn(),
         node_pubkey_b64: base64::engine::general_purpose::STANDARD.encode(svc.node_pubkey_bytes()),
         peer_id: state.info.peer_id.clone(),
+        admin_setup_available: svc.admin_setup_available(),
     }))
 }
 

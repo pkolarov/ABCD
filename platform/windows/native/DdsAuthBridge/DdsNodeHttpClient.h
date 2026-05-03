@@ -61,6 +61,22 @@ struct DdsAdminSetupResult
     std::string errorMessage;
 };
 
+// Result of GET /v1/node/info
+//
+// Pre-flight info for client tools: the tray agent calls this before
+// running an "Admin Setup" WebAuthn ceremony so it can refuse a
+// guaranteed-403 request and avoid wasting an authenticator credential
+// slot on an orphan credential.
+struct DdsNodeInfoResult
+{
+    bool        success;
+    std::string nodeUrn;
+    std::string nodePubkeyB64;
+    std::string peerId;
+    bool        adminSetupAvailable;   // C-2 gate open AND .bootstrap sentinel present
+    std::string errorMessage;
+};
+
 // Result of POST /v1/admin/vouch
 struct DdsAdminVouchResult
 {
@@ -139,6 +155,13 @@ public:
     //
     // Retrieves the list of users enrolled on this device from dds-node.
     DdsEnrolledUsersResult GetEnrolledUsers(const std::string& deviceUrn);
+
+    // GET /v1/node/info
+    //
+    // Discovery: returns node URN / pubkey / peer ID, plus whether
+    // POST /v1/admin/setup would currently succeed (admin_setup_available).
+    // Used by AdminSetup pre-flight in the tray agent.
+    DdsNodeInfoResult GetNodeInfo();
 
     // POST /v1/enroll/user
     //
