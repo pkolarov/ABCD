@@ -22,7 +22,11 @@
     Directory for final MSI files (default: .\out).
 
 .PARAMETER Version
-    MSI product version in Major.Minor.Patch.Build format (default: "1.0.0.0").
+    MSI product version in Major.Minor.Patch.Build format. When omitted, the
+    last component is auto-bumped from a counter persisted at
+    target\.msi_build_counter so each build produces a strictly-greater
+    version that MajorUpgrade will accept (msiexec /i works without
+    REINSTALL=ALL gymnastics). Pass an explicit -Version to override.
 
 .PARAMETER SkipRust
     Skip the Rust build step (use pre-built binaries).
@@ -93,6 +97,30 @@ if ($Platform -eq "both") {
     $Targets = @("x64", "arm64")
 } else {
     $Targets = @($Platform)
+}
+
+# ── Auto-bump build counter when no explicit -Version was supplied ────
+# Each invocation persists an incrementing counter at target\.msi_build_counter
+# and uses 1.0.0.<counter> as the MSI version. This keeps `msiexec /i` happy
+# without REINSTALL=ALL on dev iteration. The counter is uint16-bounded to fit
+# the MSI version field (Major.Minor.Build.Revision are each 0..65535).
+if (-not $PSBoundParameters.ContainsKey('Version')) {
+    $counterFile = Join-Path $RepoRoot "target\.msi_build_counter"
+    $counter = 0
+    if (Test-Path $counterFile) {
+        $raw = (Get-Content $counterFile -Raw -ErrorAction SilentlyContinue)
+        if ($null -ne $raw -and $raw.Trim() -match '^\d+$') {
+            $counter = [int]$raw.Trim()
+        }
+    }
+    $counter++
+    if ($counter -gt 65535) {
+        Write-Warning "Build counter exceeded 65535 -- wrapping to 1. Bump Major/Minor in Build-Msi.ps1 if you need to keep going."
+        $counter = 1
+    }
+    New-Item -ItemType Directory -Path (Split-Path $counterFile) -Force | Out-Null
+    Set-Content -Path $counterFile -Value $counter -Encoding ASCII -NoNewline
+    $Version = "1.0.0.$counter"
 }
 
 # ── Prerequisite checks ──────────────────────────────────────────
