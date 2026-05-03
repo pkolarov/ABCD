@@ -223,7 +223,8 @@ public class WorkerTests
         RegistryEnforcer? registryEnforcer = null,
         AccountEnforcer? accountEnforcer = null,
         PasswordPolicyEnforcer? passwordPolicyEnforcer = null,
-        SoftwareInstaller? softwareInstaller = null)
+        SoftwareInstaller? softwareInstaller = null,
+        ServiceEnforcer? serviceEnforcer = null)
     {
         return new Worker(
             client,
@@ -241,7 +242,10 @@ public class WorkerTests
                 NullLogger<PasswordPolicyEnforcer>.Instance),
             softwareInstaller ?? new SoftwareInstaller(
                 new InMemorySoftwareOperations(),
-                NullLogger<SoftwareInstaller>.Instance));
+                NullLogger<SoftwareInstaller>.Instance),
+            serviceEnforcer ?? new ServiceEnforcer(
+                new InMemoryServiceOperations(),
+                NullLogger<ServiceEnforcer>.Instance));
     }
 
     private static ApplicableWindowsPolicy BuildPolicy(string id, string version, string docJson)

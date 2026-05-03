@@ -42,6 +42,7 @@ public sealed class Worker : BackgroundService
     private readonly AccountEnforcer _accountEnforcer;
     private readonly PasswordPolicyEnforcer _passwordPolicyEnforcer;
     private readonly SoftwareInstaller _softwareInstaller;
+    private readonly ServiceEnforcer _serviceEnforcer;
 
     /// <summary>
     /// JoinState observed at the previous poll cycle. Used to detect
@@ -63,7 +64,8 @@ public sealed class Worker : BackgroundService
         RegistryEnforcer registryEnforcer,
         AccountEnforcer accountEnforcer,
         PasswordPolicyEnforcer passwordPolicyEnforcer,
-        SoftwareInstaller softwareInstaller)
+        SoftwareInstaller softwareInstaller,
+        ServiceEnforcer serviceEnforcer)
     {
         _client = client;
         _stateStore = stateStore;
@@ -74,6 +76,7 @@ public sealed class Worker : BackgroundService
         _accountEnforcer = accountEnforcer;
         _passwordPolicyEnforcer = passwordPolicyEnforcer;
         _softwareInstaller = softwareInstaller;
+        _serviceEnforcer = serviceEnforcer;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -492,16 +495,7 @@ public sealed class Worker : BackgroundService
         if (win.TryGetProperty("services", out var svc)
             && svc.ValueKind == JsonValueKind.Array)
         {
-            // Services use the same RegistryEnforcer stub for now;
-            // Phase D will split this to a ServiceEnforcer.
-            _log.LogInformation("[DRY-RUN] Services: {Count} directives", svc.GetArrayLength());
-            var serviceChanges = new List<string>();
-            foreach (var item in svc.EnumerateArray())
-            {
-                var name = item.TryGetProperty("name", out var n) ? n.GetString() : "?";
-                serviceChanges.Add($"service: {name}");
-            }
-            outcomes.Add(new EnforcementOutcome(EnforcementStatus.Ok, null, serviceChanges));
+            outcomes.Add(await _serviceEnforcer.ApplyAsync(svc, mode, ct).ConfigureAwait(false));
         }
 
         return ApplyBundleResult.Aggregate(outcomes);

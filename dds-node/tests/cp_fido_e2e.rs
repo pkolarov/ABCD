@@ -235,7 +235,7 @@ impl RunningNode {
             .arg("run")
             .arg(&fixture.config_path)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
         Self { fixture, child }

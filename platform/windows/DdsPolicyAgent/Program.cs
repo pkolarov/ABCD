@@ -131,6 +131,16 @@ else
     builder.Services.AddSingleton<ISoftwareOperations, InMemorySoftwareOperations>();
 }
 
+// Service operations: real SCM on Windows, in-memory elsewhere.
+if (OperatingSystem.IsWindows())
+{
+    builder.Services.AddSingleton<IServiceOperations, WindowsServiceOperations>();
+}
+else
+{
+    builder.Services.AddSingleton<IServiceOperations, InMemoryServiceOperations>();
+}
+
 // SC-5 Phase B.2: Authenticode verifier for the staged installer
 // signature gate. Real WinVerifyTrust on Windows; the stub on other
 // platforms fails any directive that requires a signature so dev/test
@@ -149,6 +159,7 @@ builder.Services.AddSingleton<RegistryEnforcer>();
 builder.Services.AddSingleton<AccountEnforcer>();
 builder.Services.AddSingleton<PasswordPolicyEnforcer>();
 builder.Services.AddSingleton<SoftwareInstaller>();
+builder.Services.AddSingleton<ServiceEnforcer>();
 
 // Register the background worker.
 builder.Services.AddHostedService<Worker>();

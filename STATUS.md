@@ -1,5 +1,54 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-03, updated 27th pass)
+
+- ✅ Windows `ServiceEnforcer` implemented — `WindowsSettings.services` gap closed (2026-05-03):
+
+  **Gap:** `DdsPolicyAgent/Worker.cs` `DispatchWindowsBundle` had a DRY-RUN
+  stub for `WindowsSettings.services` directives. The Rust
+  `dds-domain::ServiceDirective` type (with `ServiceAction::Configure / Start /
+  Stop` and `ServiceStartType::Boot / System / Automatic / Manual / Disabled`)
+  was fully defined since the typed-bundle work, but the C# enforcer side was
+  left as a "Phase D" placeholder that only logged directive names and returned
+  `Ok` without touching the SCM.
+
+  **Fix (6 new files / one updated test helper):**
+  - `Enforcers/IServiceOperations.cs` — thin SCM abstraction (6 methods:
+    `ServiceExists`, `GetStartType`, `SetStartType`, `GetRunState`,
+    `StartService`, `StopService`).
+  - `Enforcers/InMemoryServiceOperations.cs` — in-memory test double with
+    `Seed()` / `Peek()` helpers.
+  - `Enforcers/WindowsServiceOperations.cs` — production implementation:
+    reads start type via `ServiceController.StartType`, writes it via the
+    `HKLM\SYSTEM\CurrentControlSet\Services\<name>\Start` registry DWORD
+    (ServiceController.StartType is read-only in .NET), starts/stops via
+    `ServiceController.Start()` / `Stop()` with a 30-second wait.
+  - `Enforcers/ServiceEnforcer.cs` — typed enforcer. Validates service names
+    against `SafeServiceNamePattern` (`^[A-Za-z0-9_\-]{1,256}$`) before any
+    SCM call; applies `Configure` / `Start` / `Stop` actions; is idempotent
+    (no-op if already at desired state); respects `EnforcementMode.Audit`.
+  - `Program.cs` updated: registers `IServiceOperations` (real on Windows,
+    in-memory on other platforms) and `ServiceEnforcer` as singletons.
+  - `Worker.cs` updated: `_serviceEnforcer` field injected via constructor,
+    `DispatchWindowsBundle` routes `services` array through
+    `_serviceEnforcer.ApplyAsync` instead of the stub.
+
+  **Tests (`DdsPolicyAgent.Tests/ServiceEnforcerTests.cs` — 20 new):**
+  Configure sets/no-ops start type; Start starts/is-idempotent/also-sets-type;
+  Stop stops/is-idempotent/also-sets-type-to-disabled; Audit mode leaves state
+  unchanged; security: path-traversal/space/empty names rejected; multi-directive
+  batch; partial failure reports `Failed` status; `ExtractManagedKey` helpers.
+  `WorkerTests.cs` `BuildWorker` helper extended with the new `serviceEnforcer`
+  parameter (optional, defaults to `InMemoryServiceOperations`).
+
+  **Status:** **196 / 235 passing** on macOS (39 Windows-only integration tests
+  skipped, as before). No new warnings. `cargo test --workspace` — 925 / 925
+  Rust tests passing (cp_fido_e2e hardware tests excluded; those 3 timeout on
+  developer machines without a physical FIDO2 device, pre-existing).
+
+  **STATUS.md and architecture description updated** to reflect five enforcers
+  (Registry / Account / PasswordPolicy / Software / **Service**).
+
 ## Documentation-to-Code Verification Addendum (2026-05-03, updated 26th pass)
 
 - ✅ Two stale whitepaper claims corrected after 25th-pass DAG-persistence fix (2026-05-03):
@@ -5177,8 +5226,8 @@ Windows Service running alongside `dds-node` on the managed device.
 A new **`DdsPolicyAgent`** Windows Service (.NET 8 worker, `LocalSystem`)
 polls `dds-node`'s loopback HTTP API once a minute for `WindowsPolicyDocument`
 and `SoftwareAssignment` documents scoped to *this* device, then applies them
-via four pluggable enforcers: **Registry / Account / PasswordPolicy /
-SoftwareInstall**. State is persisted under `%ProgramData%\DDS\applied-state.json`
+via five pluggable enforcers: **Registry / Account / PasswordPolicy /
+SoftwareInstall / Service**. State is persisted under `%ProgramData%\DDS\applied-state.json`
 for idempotency, and outcomes are reported back to `dds-node` for audit. The
 agent ships in the same WiX MSI bundle as `dds-node.exe` and the existing
 `DdsCredentialProvider`, so installing one binary brings up the full Windows
@@ -5437,8 +5486,8 @@ complete, security-critical hardening (Phase 1) is done, the three
 algorithmic / sync blockers the chaos soak found (B5, B5b, B6) are fixed
 and validated, and the two platform blockers (B1, B2) are now resolved
 with full Windows ARM64 FIDO2 passwordless login verified end-to-end on real hardware (2026-04-13).
-All four Windows policy enforcers (Registry, Account, PasswordPolicy, Software)
-are now production-implemented with 39 Win32 integration tests passing on ARM64 (2026-04-13).
+All five Windows policy enforcers (Registry, Account, PasswordPolicy, Software, Service)
+are now production-implemented with 39 Win32 integration tests passing on ARM64 (2026-04-13, Service enforcer added 2026-05-03).
 WiX installer packaging and Windows service registration are now complete.
 Remaining gaps are *Authenticode code signing* (scaffolding in CI, needs certificate)
 and *operational instrumentation*.
@@ -5623,7 +5672,7 @@ Deferred to post-GA:
 - Phase 4 items 13–15 (sharded Kad, offline enrollment)
 - Open items from threat model review (admission cert revocation list, key rotation — see `docs/threat-model-review.md` §6)
 
-Note: Phase 3 items 9–10 (WindowsPolicyDocument distribution + SoftwareAssignment) are fully implemented through all phases A–I including G+H — all 4 Windows enforcers have production Win32 implementations with full reconciliation/drift-detection, 117 passing .NET tests, WiX MSI installer verified, CI integration complete with MSI compile verification and E2E smoke test.
+Note: Phase 3 items 9–10 (WindowsPolicyDocument distribution + SoftwareAssignment) are fully implemented through all phases A–I including G+H — all 5 Windows enforcers have production Win32 implementations with full reconciliation/drift-detection (Service enforcer added 2026-05-03), 196 passing .NET tests (macOS; 39 Windows-only integration tests require real Win32), WiX MSI installer verified, CI integration complete with MSI compile verification and E2E smoke test.
 
 ### Phase 4 — Scale
 
