@@ -717,3 +717,213 @@ fn test_no_body_returns_none() {
     assert!(SessionDocument::extract(&payload).unwrap().is_none());
     assert!(UserAuthAttestation::extract(&payload).unwrap().is_none());
 }
+
+// ============================================================
+// L-2 Linux typed directives
+// ============================================================
+
+#[test]
+fn test_linux_settings_default_is_empty() {
+    let s = LinuxSettings::default();
+    assert!(s.local_users.is_empty());
+    assert!(s.sudoers.is_empty());
+    assert!(s.files.is_empty());
+    assert!(s.systemd.is_empty());
+    assert!(s.packages.is_empty());
+}
+
+#[test]
+fn test_linux_user_directive_roundtrip() {
+    let directive = LinuxUserDirective {
+        username: "alice".into(),
+        action: LinuxUserAction::Create,
+        uid: Some(1001),
+        shell: Some("/bin/bash".into()),
+        groups: vec!["sudo".into(), "docker".into()],
+        full_name: Some("Alice Example".into()),
+    };
+    let mut buf = Vec::new();
+    ciborium::into_writer(&directive, &mut buf).unwrap();
+    let decoded: LinuxUserDirective = ciborium::from_reader(buf.as_slice()).unwrap();
+    assert_eq!(decoded, directive);
+}
+
+#[test]
+fn test_linux_user_action_variants_roundtrip() {
+    for action in [
+        LinuxUserAction::Create,
+        LinuxUserAction::Delete,
+        LinuxUserAction::Disable,
+        LinuxUserAction::Enable,
+        LinuxUserAction::Modify,
+    ] {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&action, &mut buf).unwrap();
+        let decoded: LinuxUserAction = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(decoded, action);
+    }
+}
+
+#[test]
+fn test_linux_sudoers_directive_roundtrip() {
+    let directive = LinuxSudoersDirective {
+        filename: "dds-ops".into(),
+        content: "%ops ALL=(ALL) NOPASSWD: /usr/bin/systemctl".into(),
+        content_sha256: "a".repeat(64),
+    };
+    let mut buf = Vec::new();
+    ciborium::into_writer(&directive, &mut buf).unwrap();
+    let decoded: LinuxSudoersDirective = ciborium::from_reader(buf.as_slice()).unwrap();
+    assert_eq!(decoded, directive);
+}
+
+#[test]
+fn test_linux_sudoers_delete_via_empty_content() {
+    let delete = LinuxSudoersDirective {
+        filename: "dds-ops".into(),
+        content: String::new(),
+        content_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+    };
+    let mut buf = Vec::new();
+    ciborium::into_writer(&delete, &mut buf).unwrap();
+    let decoded: LinuxSudoersDirective = ciborium::from_reader(buf.as_slice()).unwrap();
+    assert_eq!(decoded, delete);
+}
+
+#[test]
+fn test_linux_file_directive_roundtrip() {
+    let set = LinuxFileDirective {
+        path: "/etc/dds/motd".into(),
+        action: LinuxFileAction::Set,
+        content_b64: Some("aGVsbG8=".into()),
+        content_sha256: Some(
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into(),
+        ),
+        owner: Some("root:root".into()),
+        mode: Some("0644".into()),
+    };
+    let ensure_dir = LinuxFileDirective {
+        path: "/etc/dds/config.d".into(),
+        action: LinuxFileAction::EnsureDir,
+        content_b64: None,
+        content_sha256: None,
+        owner: Some("root:root".into()),
+        mode: Some("0750".into()),
+    };
+    for d in [set, ensure_dir] {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&d, &mut buf).unwrap();
+        let decoded: LinuxFileDirective = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(decoded, d);
+    }
+}
+
+#[test]
+fn test_linux_systemd_directive_roundtrip() {
+    let enable = LinuxSystemdDirective {
+        unit: "sshd.service".into(),
+        action: LinuxSystemdAction::Enable,
+        dropin_name: None,
+        dropin_content: None,
+    };
+    let dropin = LinuxSystemdDirective {
+        unit: "sshd.service".into(),
+        action: LinuxSystemdAction::ConfigureDropin,
+        dropin_name: Some("dds-limits".into()),
+        dropin_content: Some("[Service]\nLimitNOFILE=65535\n".into()),
+    };
+    for d in [enable, dropin] {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&d, &mut buf).unwrap();
+        let decoded: LinuxSystemdDirective = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(decoded, d);
+    }
+}
+
+#[test]
+fn test_linux_package_directive_roundtrip() {
+    let install = LinuxPackageDirective {
+        name: "ntp".into(),
+        action: LinuxPackageAction::Install,
+        version: Some("4.2.8".into()),
+    };
+    let remove = LinuxPackageDirective {
+        name: "telnet".into(),
+        action: LinuxPackageAction::Remove,
+        version: None,
+    };
+    for d in [install, remove] {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&d, &mut buf).unwrap();
+        let decoded: LinuxPackageDirective = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(decoded, d);
+    }
+}
+
+#[test]
+fn test_linux_policy_with_typed_bundle_roundtrip() {
+    let doc = LinuxPolicyDocument {
+        policy_id: "security/users".into(),
+        display_name: "User Management".into(),
+        version: 1,
+        enforcement: Enforcement::Enforce,
+        scope: PolicyScope {
+            device_tags: vec!["server".into()],
+            org_units: vec![],
+            identity_urns: vec![],
+        },
+        settings: vec![],
+        linux: Some(LinuxSettings {
+            local_users: vec![LinuxUserDirective {
+                username: "ops".into(),
+                action: LinuxUserAction::Create,
+                uid: None,
+                shell: Some("/bin/bash".into()),
+                groups: vec!["sudo".into()],
+                full_name: None,
+            }],
+            sudoers: vec![LinuxSudoersDirective {
+                filename: "dds-ops".into(),
+                content: "%ops ALL=(ALL) NOPASSWD: ALL".into(),
+                content_sha256: "b".repeat(64),
+            }],
+            files: vec![],
+            systemd: vec![LinuxSystemdDirective {
+                unit: "cron.service".into(),
+                action: LinuxSystemdAction::Enable,
+                dropin_name: None,
+                dropin_content: None,
+            }],
+            packages: vec![LinuxPackageDirective {
+                name: "htop".into(),
+                action: LinuxPackageAction::Install,
+                version: None,
+            }],
+        }),
+    };
+    let cbor = doc.to_cbor().unwrap();
+    assert_eq!(LinuxPolicyDocument::from_cbor(&cbor).unwrap(), doc);
+}
+
+#[test]
+fn test_linux_policy_backward_compat_decodes_old_shape() {
+    // An L-1 document (no `linux` field) must decode under the L-2 schema
+    // with `linux: None`.
+    let l1_doc = LinuxPolicyDocument {
+        policy_id: "legacy/empty".into(),
+        display_name: "Legacy".into(),
+        version: 1,
+        enforcement: Enforcement::Audit,
+        scope: PolicyScope {
+            device_tags: vec![],
+            org_units: vec![],
+            identity_urns: vec![],
+        },
+        settings: vec![],
+        linux: None,
+    };
+    let cbor = l1_doc.to_cbor().unwrap();
+    let decoded = LinuxPolicyDocument::from_cbor(&cbor).unwrap();
+    assert_eq!(decoded, l1_doc);
+    assert!(decoded.linux.is_none());
+}

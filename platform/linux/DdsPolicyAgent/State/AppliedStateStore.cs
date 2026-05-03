@@ -24,6 +24,18 @@ public sealed class AppliedState
 {
     [JsonPropertyName("policies")]
     public Dictionary<string, AppliedEntry> Policies { get; set; } = new();
+
+    /// Usernames that were created by the DDS agent. Delete is only allowed for these.
+    [JsonPropertyName("managed_usernames")]
+    public HashSet<string> ManagedUsernames { get; set; } = new(StringComparer.Ordinal);
+
+    /// Absolute file paths that were written by the DDS agent.
+    [JsonPropertyName("managed_paths")]
+    public HashSet<string> ManagedPaths { get; set; } = new(StringComparer.Ordinal);
+
+    /// Package names that were installed by the DDS agent.
+    [JsonPropertyName("managed_packages")]
+    public HashSet<string> ManagedPackages { get; set; } = new(StringComparer.Ordinal);
 }
 
 public interface IAppliedStateStore
@@ -31,6 +43,9 @@ public interface IAppliedStateStore
     AppliedState Load();
     bool HasChanged(string targetId, string contentHash);
     void RecordApplied(string targetId, string version, string contentHash, string status);
+    void RecordManagedUsername(string username);
+    void RecordManagedPath(string path);
+    void RecordManagedPackage(string packageName);
 }
 
 public sealed class AppliedStateStore : IAppliedStateStore
@@ -75,12 +90,39 @@ public sealed class AppliedStateStore : IAppliedStateStore
         {
             _state.Policies[targetId] = new AppliedEntry
             {
-                Version = version,
+                Version     = version,
                 ContentHash = contentHash,
-                AppliedAt = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                Status = status,
+                AppliedAt   = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                Status      = status,
             };
             WriteToDisk(_state);
+        }
+    }
+
+    public void RecordManagedUsername(string username)
+    {
+        lock (_lock)
+        {
+            if (_state.ManagedUsernames.Add(username))
+                WriteToDisk(_state);
+        }
+    }
+
+    public void RecordManagedPath(string path)
+    {
+        lock (_lock)
+        {
+            if (_state.ManagedPaths.Add(path))
+                WriteToDisk(_state);
+        }
+    }
+
+    public void RecordManagedPackage(string packageName)
+    {
+        lock (_lock)
+        {
+            if (_state.ManagedPackages.Add(packageName))
+                WriteToDisk(_state);
         }
     }
 
@@ -105,7 +147,7 @@ public sealed class AppliedStateStore : IAppliedStateStore
     private void WriteToDisk(AppliedState state)
     {
         var json = JsonSerializer.Serialize(state, JsonOpts);
-        var tmp = _path + ".tmp";
+        var tmp  = _path + ".tmp";
         File.WriteAllText(tmp, json);
         File.Move(tmp, _path, overwrite: true);
     }

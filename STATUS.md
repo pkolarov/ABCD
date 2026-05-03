@@ -1,5 +1,34 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-03, updated 19th pass)
+
+- ✅ Linux L-2 typed enforcers landed (2026-05-03):
+  Closed the `L-2 enforcers (users, sudoers, files, systemd, packages) not started`
+  gap from the platform status table.
+
+  **`dds-domain` type layer**: `LinuxSettings` promoted from empty struct to a
+  typed bundle containing `Vec<LinuxUserDirective>`, `Vec<LinuxSudoersDirective>`,
+  `Vec<LinuxFileDirective>`, `Vec<LinuxSystemdDirective>`, and
+  `Vec<LinuxPackageDirective>`. All five directive structs (with action enums and
+  optional fields) added to `dds-domain/src/types.rs`; 11 new CBOR round-trip +
+  backward-compat tests added to `dds-domain/tests/domain_tests.rs`.
+
+  **`platform/linux/DdsPolicyAgent` enforcer layer**: five new enforcer classes
+  (`UserEnforcer`, `SudoersEnforcer`, `FileEnforcer`, `SystemdEnforcer`,
+  `PackageEnforcer`) each implementing strict safety guards:
+  - **UserEnforcer**: UID floor ≥ 1000, safe-username chars, DDS-managed-set delete guard, additive group membership.
+  - **SudoersEnforcer**: single-component filename validation, `visudo -cf` pre-validation, SHA-256 content integrity, atomic temp+move write.
+  - **FileEnforcer**: absolute path + no-traversal check, SHA-256 content integrity, atomic temp+rename, DDS-managed-set delete guard.
+  - **SystemdEnforcer**: unit-suffix allowlist, drop-in stem validation, `daemon-reload` after any drop-in change.
+  - **PackageEnforcer**: package-name char validation, apt-get/dnf/rpm auto-detect, DDS-managed-set remove guard.
+
+  `Worker.PollOnceAsync` now dispatches all five enforcer arrays and records
+  managed usernames/paths/packages in `applied-state.json` for cross-cycle guards.
+  `ProcessCommandRunner` upgraded from `NotSupportedException` stub to a real
+  process runner; `NullCommandRunner` (with per-command exit-code overrides) added
+  for unit tests. `AuditOnly: true` (default) logs all actions without running any
+  host commands. **65 / 65** C# tests passing (was 16); 0 build warnings.
+
 ## Documentation-to-Code Verification Addendum (2026-05-03, updated 18th pass)
 
 - ✅ Telemetry catalog updated for EpochKeyRelease signature result codes (2026-05-03):
@@ -4688,7 +4717,7 @@ Global flags: `--data-dir <dir>` (local store), `--node-url <url>` (dds-node HTT
 |---|---|---|---|---|
 | **Windows** | `platform/windows/` | 🟢 **Login verified** | ✅ 298 Rust + 56 .NET + 47 C++ + 3 E2E | Native CP DLL + Auth Bridge + Tray Agent + Policy Agent all build + test on Win11 ARM64; **FIDO2 passwordless lock screen login re-verified after security hardening merge (2026-04-13)**; security fixes: credential_id-based vault lookup, RP-ID binding, removed unauth session endpoint; WebAuthn hmac-secret two-phase challenge/response verified with real authenticator |
 | **macOS** | `platform/macos/` | 🟢 **Smoke verified** | ✅ .NET build + 17 tests + smoke e2e | `DdsPolicyAgent.MacOS` worker with 5 host-backed enforcers, `.pkg` installer, single-command smoke test passing (6/6 checks), preference + launchd + account backends validated on real macOS ARM64 hardware; enterprise account/SSO coexistence is now modeled in `dds-domain`, while login-window/FileVault integration remains future `DdsLoginBridge` work |
-| **Linux** | `platform/linux/` | 🟡 **L-1 skeleton** | ✅ 16 C# tests | `DdsPolicyAgent.Linux` .NET 9 worker service — no-op skeleton proven: reads signed Linux policy envelopes through `unix:/run/dds/api.sock` (or loopback TCP for dev), verifies Ed25519 envelope signatures, records content-hash applied state, posts `POST /v1/linux/applied` reports; `dds-node` wired with `/v1/linux/policies`, `/v1/linux/software`, `/v1/linux/applied` routes + `LinuxPolicyDocument` schema + `dds platform linux ...` CLI surface; packaging systemd units + anchor/member config templates under `platform/linux/packaging/`; L-2 enforcers (users, sudoers, files, systemd, packages) not started |
+| **Linux** | `platform/linux/` | 🟡 **L-2 enforcers** | ✅ 65 C# tests | `DdsPolicyAgent.Linux` .NET 9 worker service — L-1 skeleton (signed envelope verification, applied-state reporting) promoted to **L-2**: five typed enforcers wired into `Worker.PollOnceAsync` dispatch all `linux.*` directive arrays in each policy document: `UserEnforcer` (create/delete/enable/disable/modify with UID-floor guard ≥1000 and DDS-managed-set delete guard), `SudoersEnforcer` (visudo-validated drop-in write/delete under `/etc/sudoers.d/`, SHA-256 content integrity), `FileEnforcer` (atomic temp+rename set, ensureDir, guarded delete, SHA-256 + path-traversal checks), `SystemdEnforcer` (enable/disable/start/stop/restart + drop-in write/remove with daemon-reload), `PackageEnforcer` (apt-get/dnf/rpm auto-detect, install/remove with managed-set guard); `AuditOnly: true` default suppresses all host mutations with audit-log lines; managed usernames/paths/packages persisted in `applied-state.json` for cross-cycle delete guards; `NullCommandRunner` test double; `ProcessCommandRunner` now executes real processes; typed L-2 directives (`LinuxSettings`, `LinuxUserDirective`, `LinuxSudoersDirective`, `LinuxFileDirective`, `LinuxSystemdDirective`, `LinuxPackageDirective`) landed in `dds-domain`; L-3 (privilege guard, real-device e2e) not started |
 
 ## Cryptography
 

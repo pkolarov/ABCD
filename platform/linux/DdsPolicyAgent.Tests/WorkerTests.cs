@@ -44,6 +44,10 @@ sealed class TestAppliedStateStore : IAppliedStateStore
 
     public void RecordApplied(string targetId, string version, string contentHash, string status)
         => _entries[targetId] = (version, contentHash, status);
+
+    public void RecordManagedUsername(string username) { }
+    public void RecordManagedPath(string path) { }
+    public void RecordManagedPackage(string packageName) { }
 }
 
 // ---- helpers ----
@@ -53,14 +57,17 @@ file static class WorkerFactory
     public static Worker Create(
         AgentConfig config,
         IDdsNodeClient? client = null,
-        IAppliedStateStore? store = null)
+        IAppliedStateStore? store = null,
+        ICommandRunner? runner = null)
     {
         client ??= new TestDdsNodeClient();
-        store ??= new TestAppliedStateStore();
+        store  ??= new TestAppliedStateStore();
+        runner ??= new NullCommandRunner();
         return new Worker(
             client,
             store,
             Options.Create(config),
+            runner,
             NullLogger<Worker>.Instance);
     }
 
@@ -167,10 +174,21 @@ public sealed class WorkerTests
     }
 
     [Fact]
-    public async Task ProcessCommandRunnerThrowsOnHostMutation()
+    public async Task ProcessCommandRunnerRunsCommand()
     {
         var runner = new ProcessCommandRunner();
-        await Assert.ThrowsAsync<NotSupportedException>(
-            () => runner.RunAsync("echo", "hello"));
+        var result = await runner.RunAsync("echo", "hello");
+        Assert.Equal(0, result.ExitCode);
+        Assert.Contains("hello", result.Stdout);
+    }
+
+    [Fact]
+    public void NullCommandRunnerRecordsInvocations()
+    {
+        var runner = new NullCommandRunner();
+        runner.RunAsync("useradd", "-m alice");
+        Assert.Single(runner.Invocations);
+        Assert.Equal("useradd", runner.Invocations[0].FileName);
+        Assert.Equal("-m alice", runner.Invocations[0].Arguments);
     }
 }

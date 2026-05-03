@@ -516,9 +516,164 @@ pub struct LinuxPolicyDocument {
     pub linux: Option<LinuxSettings>,
 }
 
-/// Strongly-typed Linux policy directives.
+/// Strongly-typed Linux policy directives (L-2).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct LinuxSettings {}
+pub struct LinuxSettings {
+    /// Local user and group directives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_users: Vec<LinuxUserDirective>,
+    /// Sudoers drop-in directives (files written under `/etc/sudoers.d/`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sudoers: Vec<LinuxSudoersDirective>,
+    /// Managed file and directory directives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<LinuxFileDirective>,
+    /// Systemd unit directives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub systemd: Vec<LinuxSystemdDirective>,
+    /// Package install / remove directives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<LinuxPackageDirective>,
+}
+
+/// What to do with a local Linux user account.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LinuxUserAction {
+    /// Create the account if it does not exist (idempotent).
+    Create,
+    /// Remove the account. The applier must refuse unless the account
+    /// is DDS-managed in local applied state.
+    Delete,
+    /// Lock the account (`passwd -l`) but preserve home and files.
+    Disable,
+    /// Unlock a previously locked account (`passwd -u`).
+    Enable,
+    /// Modify mutable fields (shell, groups) on an existing account.
+    Modify,
+}
+
+/// Local Linux user / group directive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinuxUserDirective {
+    /// Unix username. The applier enforces safe character rules and
+    /// refuses UIDs below a configured threshold (default 1000).
+    pub username: String,
+    pub action: LinuxUserAction,
+    /// Explicit UID. When `None`, the OS assigns one on create.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    /// Login shell, e.g. `/bin/bash`. `None` = OS default on create,
+    /// unchanged on modify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    /// Supplementary groups the user must be a member of. Applied as
+    /// additive — the applier does not remove groups not in this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    /// GECOS comment / full name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_name: Option<String>,
+}
+
+/// A DDS-managed sudoers drop-in file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinuxSudoersDirective {
+    /// File stem written under `/etc/sudoers.d/`, e.g. `dds-ops`.
+    /// The applier prefixes with a numeric priority if needed and
+    /// runs `visudo -cf` before activating.
+    pub filename: String,
+    /// Raw sudoers fragment (validated by `visudo -cf` before apply).
+    /// Set to empty string to delete the drop-in.
+    pub content: String,
+    /// SHA-256 hex of `content` for integrity verification by the
+    /// applier.
+    pub content_sha256: String,
+}
+
+/// What to do with a managed file or directory.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LinuxFileAction {
+    /// Create or overwrite the file with the provided content.
+    Set,
+    /// Delete the file. Refused if not DDS-managed.
+    Delete,
+    /// Ensure the directory exists with the given owner/mode.
+    EnsureDir,
+}
+
+/// A managed file or directory directive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinuxFileDirective {
+    /// Absolute path of the target file or directory.
+    pub path: String,
+    pub action: LinuxFileAction,
+    /// File content (base64-encoded). Required for `Set`, ignored
+    /// for `Delete`/`EnsureDir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_b64: Option<String>,
+    /// SHA-256 hex of the raw (pre-base64) content for integrity
+    /// verification by the applier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
+    /// Unix owner (user:group, e.g. `root:sudo`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Unix file mode in octal representation (e.g. `"0640"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+/// What to do with a systemd unit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LinuxSystemdAction {
+    Enable,
+    Disable,
+    Start,
+    Stop,
+    Restart,
+    /// Install a drop-in file under `/etc/systemd/system/<unit>.d/`
+    /// and reload the daemon.
+    ConfigureDropin,
+    /// Remove a previously installed drop-in file.
+    RemoveDropin,
+}
+
+/// A systemd unit directive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinuxSystemdDirective {
+    /// Unit name with suffix, e.g. `sshd.service` or `cron.timer`.
+    pub unit: String,
+    pub action: LinuxSystemdAction,
+    /// Drop-in filename stem, e.g. `dds-override`. Required for
+    /// `ConfigureDropin` / `RemoveDropin`, ignored for other actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropin_name: Option<String>,
+    /// Drop-in content (INI fragment). Required for `ConfigureDropin`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropin_content: Option<String>,
+}
+
+/// What to do with a managed package.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LinuxPackageAction {
+    /// Install the package via the host's native package manager
+    /// (apt, dnf, or rpm). Idempotent if already present.
+    Install,
+    /// Remove the package. Refused if not DDS-managed.
+    Remove,
+}
+
+/// A package directive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinuxPackageDirective {
+    /// Package name as known to the native package manager.
+    pub name: String,
+    pub action: LinuxPackageAction,
+    /// Specific version to pin, e.g. `"2.3.1"`. `None` = latest
+    /// available in configured repositories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
 
 impl DomainDocument for LinuxPolicyDocument {
     const BODY_TYPE: &'static str = body_types::LINUX_POLICY;
