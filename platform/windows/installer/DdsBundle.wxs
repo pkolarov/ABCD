@@ -192,6 +192,17 @@
                        Name="ApiAddr"
                        Value="pipe:dds-api"
                        Type="string" />
+
+        <!-- Product version stamp. Read by DdsConsole.ps1 and the tray
+             agent so they can show the installed MSI version without
+             querying the Windows Installer ARP table (which is slow and
+             can mismatch when a side-by-side runtime build is launched
+             from a dev tree). -->
+        <RegistryValue Root="HKLM"
+                       Key="SOFTWARE\DDS"
+                       Name="Version"
+                       Value="$(var.Version)"
+                       Type="string" />
       </Component>
     </ComponentGroup>
 

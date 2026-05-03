@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <commctrl.h>
+#include <strsafe.h>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -28,6 +29,30 @@ static HWND      g_hWnd = NULL;
 static NOTIFYICONDATAW g_nid = {};
 static const wchar_t* WINDOW_CLASS = L"DdsTrayAgentWndClass";
 static const wchar_t* WINDOW_TITLE = L"DDS Tray Agent";
+
+// ---------------------------------------------------------------------------
+// Installed product version — stamped by the MSI at HKLM\SOFTWARE\DDS\Version.
+// Falls back to "dev" when running out of a build tree before install.
+// ---------------------------------------------------------------------------
+static void GetInstalledVersion(wchar_t* buf, DWORD bufWchars)
+{
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\DDS", 0, KEY_READ, &hKey)
+            == ERROR_SUCCESS)
+    {
+        DWORD type = 0;
+        DWORD cb   = bufWchars * sizeof(wchar_t);
+        LONG  rc   = RegQueryValueExW(hKey, L"Version", NULL, &type,
+                                      reinterpret_cast<LPBYTE>(buf), &cb);
+        RegCloseKey(hKey);
+        if (rc == ERROR_SUCCESS && type == REG_SZ && bufWchars > 0)
+        {
+            buf[bufWchars - 1] = L'\0'; // defensive: registry strings may not be NUL-terminated
+            return;
+        }
+    }
+    wcscpy_s(buf, bufWchars, L"dev");
+}
 
 // ---------------------------------------------------------------------------
 // Tray icon management
@@ -46,7 +71,12 @@ static void AddTrayIcon(HWND hwnd)
         // Fall back to a standard application icon if custom icon not found
         g_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     }
-    wcscpy_s(g_nid.szTip, L"DDS Enrollment Agent");
+    wchar_t ver[64];
+    GetInstalledVersion(ver, ARRAYSIZE(ver));
+    // szTip is bounded to 128 wchars in NOTIFYICONDATAW; StringCchPrintf
+    // truncates safely if the version string is unexpectedly long.
+    StringCchPrintfW(g_nid.szTip, ARRAYSIZE(g_nid.szTip),
+                     L"DDS Enrollment Agent  v%s", ver);
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 
@@ -71,6 +101,7 @@ static void ShowTrayMenu(HWND hwnd)
     AppendMenuW(hMenu, MF_STRING, IDM_ADMIN_APPROVE,   L"Approve Enrollments...");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, IDM_STATUS,         L"Status");
+    AppendMenuW(hMenu, MF_STRING, IDM_ABOUT,           L"About DDS...");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, IDM_EXIT,            L"Exit");
 
@@ -116,15 +147,19 @@ static void ShowStatus(HWND hwnd)
 
     DdsEnrolledUsersResult result = httpClient.GetEnrolledUsers(config.DeviceUrn());
 
+    wchar_t ver[64];
+    GetInstalledVersion(ver, ARRAYSIZE(ver));
+
     wchar_t msg[512];
     if (result.success)
     {
         swprintf_s(msg,
-            L"DDS Tray Agent\n\n"
+            L"DDS Tray Agent  v%s\n\n"
             L"Node connection: OK\n"
             L"Enrolled users: %zu\n"
             L"Port: %lu\n"
             L"RP ID: %hs",
+            ver,
             result.users.size(),
             (unsigned long)config.DdsNodePort(),
             config.RpId().c_str());
@@ -132,10 +167,11 @@ static void ShowStatus(HWND hwnd)
     else
     {
         swprintf_s(msg,
-            L"DDS Tray Agent\n\n"
+            L"DDS Tray Agent  v%s\n\n"
             L"Node connection: FAILED\n"
             L"Error: %hs\n"
             L"Port: %lu",
+            ver,
             result.errorMessage.c_str(),
             (unsigned long)config.DdsNodePort());
     }
@@ -180,6 +216,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case IDM_STATUS:
             ShowStatus(hwnd);
             break;
+        case IDM_ABOUT: {
+            wchar_t ver[64];
+            GetInstalledVersion(ver, ARRAYSIZE(ver));
+            wchar_t aboutMsg[256];
+            StringCchPrintfW(aboutMsg, ARRAYSIZE(aboutMsg),
+                             L"DDS Windows Platform\n\n"
+                             L"Installed version: %s\n\n"
+                             L"Source of truth: HKLM\\SOFTWARE\\DDS\\Version",
+                             ver);
+            MessageBoxW(hwnd, aboutMsg, L"About DDS",
+                        MB_OK | MB_ICONINFORMATION);
+            break;
+        }
         case IDM_EXIT:
             RemoveTrayIcon();
             PostQuitMessage(0);

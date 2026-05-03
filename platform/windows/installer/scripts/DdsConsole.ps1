@@ -69,6 +69,18 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
+# ── Installed product version ─────────────────────────────────────
+# Stamped by the MSI at HKLM\SOFTWARE\DDS\Version. Falls back to a
+# development placeholder when run from a source tree before install.
+function Get-DdsInstalledVersion {
+    try {
+        $v = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\DDS' -Name 'Version' -ErrorAction Stop).Version
+        if ($v) { return $v }
+    } catch { }
+    return 'dev'
+}
+$DdsVersion = Get-DdsInstalledVersion
+
 # ── Paths ─────────────────────────────────────────────────────────
 $BootstrapScript = Join-Path $InstallRoot "bin\Bootstrap-DdsDomain.ps1"
 $TrayAgent       = Join-Path $InstallRoot "bin\DdsTrayAgent.exe"
@@ -202,6 +214,7 @@ $AuthBridgeLog   = Join-Path $DataRoot    "authbridge.log"
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
+$window.Title = "DDS Console  -  v$DdsVersion"
 
 # Resolve named elements
 $el = @{}
