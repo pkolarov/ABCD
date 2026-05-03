@@ -1762,6 +1762,9 @@ impl DdsNode {
             Ok(true) => {
                 info!(jti = %token.payload.jti, "ingested new operation");
                 self.cache_sync_payload(&op_id, &op_for_cache, token_bytes);
+                if let Err(e) = self.store.put_operation(&op_for_cache) {
+                    warn!("put_operation store error: {e}");
+                }
                 // Z-3 Phase A.1: stamp the chain only on novel ops; a
                 // duplicate token (DAG returned false) is not a state
                 // change so we don't log it as one.
@@ -1801,6 +1804,95 @@ impl DdsNode {
                 token_bytes: token_bytes.to_vec(),
             },
         );
+    }
+
+    /// Seed the in-memory [`CausalDag`] and sync-payload cache from
+    /// operations persisted to `self.store` in prior runs. Called once
+    /// on startup so a restarted node can answer sync requests immediately
+    /// rather than waiting for peers to push gossip.
+    ///
+    /// No-op when the store has no operations (first-time start).
+    /// Failures to load individual operations or their backing tokens are
+    /// logged and skipped; the trust graph is already populated via
+    /// `LocalService::rehydrate_from_store` so these are non-fatal.
+    pub fn seed_dag_from_store(&mut self) {
+        let ids = match self.store.operation_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!("seed_dag_from_store: operation_ids: {e}");
+                return;
+            }
+        };
+        if ids.is_empty() {
+            return;
+        }
+
+        // Load each operation and its backing token bytes.
+        let mut pending: Vec<Operation> = Vec::with_capacity(ids.len());
+        let mut cache_pairs: Vec<(Operation, Vec<u8>)> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let op = match self.store.get_operation(id) {
+                Ok(op) => op,
+                Err(e) => {
+                    warn!("seed_dag_from_store: get_operation {id}: {e}");
+                    continue;
+                }
+            };
+            // Op IDs follow the "op-{jti}" convention; extract jti for
+            // the token lookup.
+            let jti = op.id.strip_prefix("op-").unwrap_or(&op.id);
+            let token_bytes = match self.store.get_token(jti) {
+                Ok(t) => match t.to_cbor() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!("seed_dag_from_store: token to_cbor for {id}: {e}");
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    warn!("seed_dag_from_store: get_token for {id}: {e}");
+                    continue;
+                }
+            };
+            cache_pairs.push((op.clone(), token_bytes));
+            pending.push(op);
+        }
+
+        // Insert in topological order (iterative pass with progress
+        // tracking). Current protocol uses deps=[] for all ops so
+        // this converges in one pass; the loop handles any future
+        // ops that embed real dependency edges.
+        let mut progress = true;
+        while progress && !pending.is_empty() {
+            progress = false;
+            let mut remaining = Vec::new();
+            for op in pending {
+                let deps_satisfied = op.deps.iter().all(|d| self.dag.get(d).is_some());
+                if deps_satisfied {
+                    match self.dag.insert(op) {
+                        Ok(_) => progress = true,
+                        Err(e) => warn!("seed_dag_from_store: dag insert: {e}"),
+                    }
+                } else {
+                    remaining.push(op);
+                }
+            }
+            pending = remaining;
+        }
+        if !pending.is_empty() {
+            warn!(
+                skipped = pending.len(),
+                "seed_dag_from_store: ops with unresolvable deps skipped"
+            );
+        }
+
+        // Rebuild the sync-payload cache from the loaded (op, token) pairs.
+        for (op, token_bytes) in cache_pairs {
+            let id = op.id.clone();
+            self.cache_sync_payload(&id, &op, &token_bytes);
+        }
+
+        info!(seeded = self.dag.len(), "seeded DAG from operation store");
     }
 
     fn ingest_revocation(&mut self, token_bytes: &[u8]) {
@@ -1883,6 +1975,9 @@ impl DdsNode {
         // `ingest_operation`.
         let op = synthetic_op_for_token(&token);
         self.cache_sync_payload(&op.id, &op, token_bytes);
+        if let Err(e) = self.store.put_operation(&op) {
+            warn!("put_operation (revocation) store error: {e}");
+        }
 
         // **Z-1 Phase B.9** — revocation-triggered epoch rotation with
         // jitter (§4.6, §6.1). Set a deferred sleep so the `run()` loop
@@ -1971,6 +2066,9 @@ impl DdsNode {
         // original publisher.
         let op = synthetic_op_for_token(&token);
         self.cache_sync_payload(&op.id, &op, token_bytes);
+        if let Err(e) = self.store.put_operation(&op) {
+            warn!("put_operation (burn) store error: {e}");
+        }
     }
 
     fn ingest_audit(&mut self, entry_bytes: &[u8]) {

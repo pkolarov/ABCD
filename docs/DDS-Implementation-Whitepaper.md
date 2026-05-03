@@ -1150,14 +1150,25 @@ which calls `apply_sync_payloads_with_graph`).
 On `enc-v3` domains, `build_sync_response` AEAD-encrypts payloads and
 `handle_sync_response` decrypts them before the merge pipeline (Z-1 Phase B.8).
 
-#### 14.8.2 Operation persistence is incomplete
+#### 14.8.2 ~~Operation persistence is incomplete~~ — **Resolved (2026-05-03)**
 
-The node keeps an in-memory `CausalDag`, but does not persist each operation to `OperationStore` in the normal ingest path.
+`DdsNode::ingest_operation` now calls `self.store.put_operation(&op)` in
+the `Ok(true)` arm of `CausalDag::insert`, persisting every novel operation
+to `RedbBackend` alongside its backing token. The same pattern is applied in
+`ingest_revocation` and `ingest_burn` for their synthetic ops.
 
-That means:
+On startup, `DdsNode::seed_dag_from_store` (called from `main.rs` before the
+HTTP service starts) loads all stored operations, inserts them into the
+in-memory `CausalDag` in topological order, and rebuilds the sync-payload
+cache from the stored (op, token) pairs. This means a restarted node can
+serve sync responses to peers immediately rather than waiting for gossip to
+re-deliver all operations.
 
-- the trust-bearing tokens persist;
-- the exact causal operation history does not fully persist through node restarts.
+Four regression tests in `dds-node/tests/dag_persist.rs` cover:
+- empty store is a no-op;
+- two stored (op, token) pairs are seeded into the dag;
+- ops without a matching token entry are skipped without panic;
+- a second call to `seed_dag_from_store` is idempotent.
 
 #### 14.8.3 ~~Audit only partially wired~~ — **Resolved (2026-04-26, Z-3 Phase A)**
 
@@ -1228,23 +1239,24 @@ The expiry loop periodically:
 That is a pragmatic cleanup strategy.
 It keeps the graph bounded without requiring a full historical ledger forever.
 
-### 15.4 CausalDag Persistence Limitation
+### 15.4 ~~CausalDag Persistence Limitation~~ — **Resolved (2026-05-03)**
 
-The node's in-memory `dag` (`CausalDag`) starts empty on process start and is
-rebuilt from gossip and peer-sync on each boot. The operation history is not
-replayed from `OperationStore` on startup; the DAG is session-scoped.
+Both the `trust_graph` and the `CausalDag` are now fully rehydrated from the
+store before the swarm event loop starts.
 
-The `trust_graph` is **not** subject to the same limitation — it is rehydrated
-from the store before the swarm event loop starts polling for events.
-`DdsNode::init` creates a fresh `Arc<RwLock<TrustGraph>>`; `main.rs` clones
-that `Arc` into `LocalService::new`, which calls
-`LocalService::rehydrate_from_store` synchronously during construction. Because
-every inbound token is persisted to the store via `DdsNode::ingest_operation` →
-`store.put_token`, the trust graph reflects the complete prior-session state on
-restart (B5b fix, 2026-04-10).
+`DdsNode::seed_dag_from_store` — called from `main.rs` before `LocalService::new`
+— loads all persisted operations via `OperationStore::operation_ids` +
+`get_operation`, inserts them into the in-memory `dag` in topological order, and
+rebuilds the sync-payload cache from the stored (op, token) pairs. Both the
+`CausalDag` and the `sync_payloads` responder cache are therefore populated on
+the first peer connection rather than waiting for gossip re-delivery.
 
-The remaining open gap is the `CausalDag`: DAG persistence that survives restart
-is tracked in §19.2.
+The `trust_graph` path is unchanged: `DdsNode::init` creates a fresh
+`Arc<RwLock<TrustGraph>>`; `main.rs` clones that `Arc` into `LocalService::new`,
+which calls `LocalService::rehydrate_from_store` synchronously during construction.
+Because `DdsNode::ingest_operation` now calls both `store.put_token` (trust
+tokens) and `store.put_operation` (DAG entries), both views survive restart
+(B5b fix 2026-04-10 for trust graph; §14.8.2 fix 2026-05-03 for DAG).
 
 ## 16. Local Authority Service And HTTP API
 
@@ -1380,9 +1392,10 @@ connection lifecycle event and after every DAG mutation:
 
 Both values are passed directly to `svc.status(peer_id, connected_peers,
 dag_ops)` so the `/v1/status` JSON response reflects the current swarm
-and DAG state without polling. `dag_operations` resets to `0` on process
-restart because the in-memory `CausalDag` is rebuilt from gossip/sync
-rather than replayed from the `OperationStore` (see §14.8.2 and §19.2).
+and DAG state without polling. `dag_operations` now correctly reflects the persisted DAG size after restart:
+`DdsNode::seed_dag_from_store` (§14.8.2, §19.2) reloads all stored operations
+into the `CausalDag` before the event loop starts, so the first gauge refresh
+reports the pre-restart count rather than `0`.
 
 ## 17. CLI, FFI, And Language Bindings
 
@@ -1566,15 +1579,18 @@ These exist in code but are not yet end-to-end operational in the main node path
 - ~~delta-sync protocol module~~ — **Resolved (2026-05-01, §14.8.1)**: sync is
   live end-to-end; `DdsNode::try_sync_with` / `handle_sync_event` wire the
   `dds-net/src/sync.rs` module into the running node.
-- operation-store-backed restartable DAG — the `CausalDag` is rebuilt from
-  gossip/sync on each boot rather than replayed from `OperationStore`.
+- ~~operation-store-backed restartable DAG~~ — **Resolved (2026-05-03,
+  §14.8.2)**: `ingest_operation` now calls `store.put_operation` for every
+  novel op; `DdsNode::seed_dag_from_store` reloads and re-inserts them (plus
+  rebuilds the sync-payload cache) on startup before the event loop starts.
 - ~~full distributed audit publication~~ — **Resolved (2026-04-26, §14.8.3,
   Z-3 Phase A)**: `emit_local_audit` / `emit_audit_from_ingest` are wired to
   every state-mutating path in both `DdsNode` and `LocalService`.
 - ~~live status plumbing from swarm to HTTP API~~ — **Resolved**: peer counts
   (`connected_peers`, `dag_operations`) are now plumbed via the shared
   `NodePeerCounts` atomic snapshot refreshed by `refresh_peer_count_gauges`.
-  `dag_operations` reflects the in-memory `CausalDag` size (resets on restart).
+  `dag_operations` reflects the in-memory `CausalDag` size, now seeded from
+  `OperationStore` on startup (see §14.8.2 / §19.2 fix above).
 - ~~automatic node-side trust-graph rehydration from store on startup~~ —
   **Resolved (B5b, 2026-04-10)**: `DdsNode::trust_graph` and
   `LocalService::trust_graph` share the same `Arc<RwLock<TrustGraph>>`;
@@ -1607,17 +1623,16 @@ them; the remainder are genuine open work.
    dropped at the behaviour layer.
 2. Kademlia is used for discovery, not as the directory state store.
 3. ~~The node-side in-memory graph is not rebuilt from disk at startup.~~
-   **Resolved for the trust graph (B5b, 2026-04-10)**: the shared
-   `Arc<RwLock<TrustGraph>>` is rehydrated from the store by
-   `LocalService::rehydrate_from_store` before the swarm event loop runs.
-   The `CausalDag` is still session-scoped (rebuilt from gossip/sync on each
-   boot) — see §19.2.
+   **Resolved for both views**: the `TrustGraph` is rehydrated via
+   `LocalService::rehydrate_from_store` (B5b, 2026-04-10); the `CausalDag`
+   is now seeded via `DdsNode::seed_dag_from_store` (§14.8.2, 2026-05-03).
+   Both run before the swarm event loop polls its first event.
 4. ~~The HTTP status endpoint does not expose live peer and DAG counters.~~
    **Resolved**: `connected_peers` has been live since Phase C metrics #30
-   (shared `NodePeerCounts` atomic snapshot). `dag_operations` is now also
-   wired from `NodePeerCounts.dag_ops` (refreshed by `refresh_peer_count_gauges`);
-   it reports the current-session in-memory `CausalDag` size and resets to 0
-   on process restart.
+   (shared `NodePeerCounts` atomic snapshot). `dag_operations` is wired from
+   `NodePeerCounts.dag_ops` (refreshed by `refresh_peer_count_gauges`) and
+   now accurately reflects the pre-restart DAG size because
+   `seed_dag_from_store` runs before the first gauge refresh.
 5. Sessions are local artifacts, not replicated state.
 
 These are not fatal flaws for a prototype or research system.
@@ -2196,22 +2211,18 @@ Its strongest implemented ideas are:
 - good tests and meaningful load instrumentation.
 
 Its weakest or most transitional areas are not conceptual weakness so much as wiring gaps
-(state as of 2026-05-03 — several earlier items have since been resolved):
+(state as of 2026-05-03):
 
-- operation persistence: trust-bearing tokens persist across restarts,
-  but the causal DAG (`CausalDag`) is rebuilt from gossip / sync on each
-  boot rather than replayed from `OperationStore`;
-- the node's in-memory swarm-side `trust_graph` starts empty on each
-  boot and is re-populated via gossip and sync; the HTTP service can
-  reconstruct a snapshot from redb on demand, but these two views are
-  not automatically kept in sync at startup;
 - post-quantum: Phase B (encrypted gossip + sync) is complete; hardware
   binding for long-lived keys (Z-2) and full store-at-rest encryption
   (Z-4) remain open.
 
 Previously-noted gaps that are now resolved: sync is live (§4.5 / B.8);
 audit is full end-to-end (Z-3); domain admission is a live H-12
-peer-auth handshake; post-quantum is on by default for fresh deployments.
+peer-auth handshake; post-quantum is on by default for fresh deployments;
+both `TrustGraph` and `CausalDag` are seeded from `redb` on startup so a
+restarted node recovers full state without waiting for gossip (§14.8.2,
+§15.4, §19.2 — 2026-05-03).
 
 That is still a very respectable place for a project to be.
 

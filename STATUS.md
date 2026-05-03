@@ -1,5 +1,54 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-03, updated 25th pass)
+
+- ✅ Operation persistence gap closed (2026-05-03) — §14.8.2 / §15.4 / §19.2:
+
+  **Gap:** `DdsNode::ingest_operation` inserted each novel operation into the
+  in-memory `CausalDag` but never called `OperationStore::put_operation`, so
+  the causal DAG was session-scoped and rebuilt from gossip on every restart.
+  The sync-payload cache was similarly empty after restart, forcing peers to
+  re-push all operations rather than pulling them via anti-entropy. The
+  `dag_operations` counter reported `0` immediately after a restart even
+  though trust-graph tokens had already been rehydrated from redb.
+
+  **Fix (dds-node/src/node.rs):**
+  - `ingest_operation` now calls `self.store.put_operation(&op)` in the
+    `Ok(true)` arm of `CausalDag::insert` (best-effort; logged at warn on
+    failure, matching the existing `put_token` pattern).
+  - `ingest_revocation` and `ingest_burn` persist their synthetic ops via the
+    same `put_operation` call after `cache_sync_payload`.
+  - New `pub fn seed_dag_from_store(&mut self)` method: loads all stored
+    operations via `OperationStore::operation_ids` + `get_operation`, retrieves
+    each backing token via `get_token(jti)` (using the `"op-{jti}"` ID
+    convention), inserts ops into `self.dag` in topological order, and rebuilds
+    the `sync_payloads` responder cache from the loaded (op, token) pairs. Ops
+    whose backing token cannot be retrieved are skipped without panic (warning
+    logged). The second call is idempotent: `CausalDag::insert` returns
+    `Ok(false)` for duplicates.
+
+  **Fix (dds-node/src/main.rs):**
+  `node.seed_dag_from_store()` is called before `LocalService::new` so the
+  DAG and sync cache are fully populated before the HTTP service starts and
+  before the first peer admission handshake.
+
+  **Tests (dds-node/tests/dag_persist.rs — 4 new):**
+  1. `seed_dag_from_store_empty_is_noop` — fresh node, no stored ops → dag.len() == 0.
+  2. `seed_dag_from_store_populates_dag` — two (op, token) pairs seeded into
+     store → `seed_dag_from_store` produces dag.len() == 2.
+  3. `seed_dag_from_store_skips_op_without_token` — op without backing token is
+     skipped; op with valid token is seeded → dag.len() == 1.
+  4. `seed_dag_from_store_idempotent` — second call leaves dag.len() unchanged.
+
+  **Whitepaper updated:** §14.8.2 heading changed from "incomplete" to
+  "Resolved (2026-05-03)"; §15.4 "CausalDag Persistence Limitation" struck
+  through and replaced with a resolved note; §19.2 bullet updated;
+  §19.4 item 3 updated; weakest-areas summary (§19+) updated.
+
+  `cargo test --workspace` — 925 / 925 passing (was 921; 4 new dag_persist
+  integration tests). `cargo fmt --all --check` clean. `cargo clippy
+  -p dds-node --all-targets -- -D warnings` clean.
+
 ## Documentation-to-Code Verification Addendum (2026-05-03, updated 24th pass)
 
 - ✅ Whitepaper §16.7 stale "dag_operations hard-coded to 0" section corrected (2026-05-03):
