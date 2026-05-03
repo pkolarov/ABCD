@@ -666,7 +666,10 @@ async fn pump_for(node: &mut DdsNode, duration: Duration) {
         .await
         {
             Ok(event) => node.handle_swarm_event(event),
-            Err(_) => break,
+            // No event in this 250 ms window — keep looping until the
+            // deadline so gossip messages queued by publish_gossip_op
+            // get a chance to be transmitted.
+            Err(_) => {}
         }
     }
 }

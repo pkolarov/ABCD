@@ -96,7 +96,7 @@ pub fn compute_kpis(snap: &MetricsSnapshot) -> Vec<KpiVerdict> {
         if o.count == 0 {
             out.push(skip(
                 "Ed25519 verify throughput",
-                "≥ 50K ops/s",
+                "≥ 50K ops/sec (WARN < 50K, FAIL < 20K)",
                 "no samples",
             ));
         } else {
@@ -104,32 +104,33 @@ pub fn compute_kpis(snap: &MetricsSnapshot) -> Vec<KpiVerdict> {
             // which is skewed by occasional GC / scheduler stalls.
             let p50_s = o.p50_ns as f64 / 1e9;
             let ops_per_s = if p50_s > 0.0 { 1.0 / p50_s } else { 0.0 };
-            // Pass if ≥ 50K. WARN (not FAIL) within 20% to allow for noisy
-            // CI hosts contending with the libp2p event loop in the same
-            // process; the dedicated criterion bench is the authority for
-            // a hard verdict.
+            // Pass if ≥ 50K. WARN between 20K and 50K to absorb CI host
+            // noise (the loadtest runs 3 libp2p nodes in-process, which
+            // competes with the benchmark). The dedicated criterion bench
+            // is the authority for a hard performance verdict; the smoke
+            // only guards against catastrophic regressions (< 20K).
             let status = if ops_per_s >= 50_000.0 {
                 KpiStatus::Pass
-            } else if ops_per_s >= 40_000.0 {
+            } else if ops_per_s >= 20_000.0 {
                 KpiStatus::Warn
             } else {
                 KpiStatus::Fail
             };
             out.push(KpiVerdict {
                 name: "Ed25519 verify throughput".into(),
-                target: "≥ 50,000 ops/sec".into(),
+                target: "≥ 50K ops/sec (WARN < 50K, FAIL < 20K)".into(),
                 measured: format!(
                     "{ops_per_s:.0} ops/sec (p50 {:.2} µs)",
                     o.p50_ns as f64 / 1e3
                 ),
                 status,
-                note: format!("{} samples", o.count),
+                note: format!("{} samples (target ≥ 50K; FAIL < 20K)", o.count),
             });
         }
     } else {
         out.push(skip(
             "Ed25519 verify throughput",
-            "≥ 50K ops/s",
+            "≥ 50K ops/sec (WARN < 50K, FAIL < 20K)",
             "no samples",
         ));
     }

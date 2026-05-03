@@ -129,6 +129,11 @@ jobs:
           # .NET
           Copy-Item "stage\dotnet\DdsPolicyAgent.exe" $stage
 
+          # Installer-side PS1 scripts (mirrors Build-Msi.ps1 step 3.5)
+          Get-ChildItem "platform\windows\installer\scripts" -Filter "*.ps1" | ForEach-Object {
+            Copy-Item $_.FullName $stage -Force
+          }
+
           Write-Host "Staged binaries:"
           Get-ChildItem $stage | Format-Table Name, Length
 

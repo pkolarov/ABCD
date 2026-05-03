@@ -223,6 +223,9 @@ pub async fn run(
         roots.insert(root.id.to_urn());
         let graph = std::sync::Arc::new(std::sync::RwLock::new(TrustGraph::new()));
         let mut svc = LocalService::new(ident, graph, roots, MemoryBackend::new());
+        // The synthetic builder produces `fmt=none` attestations; allow them
+        // so enroll_user succeeds in the harness (A-1 flag defaults to false).
+        svc.set_allow_unattested_credentials(true);
         // FIDO2 verify is on (we want to measure it). The synthetic builder
         // produces valid `none` attestations.
         svc.add_policy_rule(PolicyRule {
