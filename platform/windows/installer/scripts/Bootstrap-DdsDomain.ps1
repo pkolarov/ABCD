@@ -77,7 +77,13 @@ $NodeData   = Join-Path $DataRoot    "node-data"
 $ProvisionBundle = Join-Path $DataRoot "provision.dds"
 
 # Transcript log so even an instant-close window leaves an inspectable record.
-$logPath = Join-Path $env:TEMP ("dds-bootstrap-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
+# DdsConsole.ps1 sets DDS_BOOTSTRAP_TRANSCRIPT before launching the bootstrap so
+# the GUI can tail this exact path; honour it when present.
+$logPath = if (-not [string]::IsNullOrEmpty($env:DDS_BOOTSTRAP_TRANSCRIPT)) {
+    $env:DDS_BOOTSTRAP_TRANSCRIPT
+} else {
+    Join-Path $env:TEMP ("dds-bootstrap-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
+}
 try { Start-Transcript -Path $logPath -Force | Out-Null } catch { }
 
 # Always pause before exiting (success or failure), so a Start-menu-launched

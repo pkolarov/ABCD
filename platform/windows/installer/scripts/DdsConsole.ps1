@@ -320,20 +320,96 @@ $timer.Add_Tick({ Refresh-Health })
 $timer.Start()
 
 # ── Bootstrap orchestration ───────────────────────────────────────
-$bootstrapProcess = $null
+#
+# Spawn the bootstrap script in its OWN visible PowerShell console
+# (not redirected) so:
+#   - dds-node init-domain --fido2 has a real stdin for FIDO2 PIN
+#     prompts (a redirected child is treated as non-interactive by
+#     libfido2 and times out with CTAP2_ERR_USER_ACTION_TIMEOUT).
+#   - The user can see the FIDO2 "touch your key" instruction.
+#
+# Console watches the bootstrap's transcript file (Start-Transcript in
+# Bootstrap-DdsDomain.ps1 already writes one) and tails it into the
+# log pane + step list. When the child process exits, refresh Health.
+$script:bootstrapProcess  = $null
+$script:bootstrapLogPath  = $null
+$script:bootstrapTailPos  = 0
+$script:bootstrapTimer    = $null
+$rxStepGlobal = [regex]'\[(\d)/9\]'
+
+function Stop-BootstrapTail {
+    if ($script:bootstrapTimer) { $script:bootstrapTimer.Stop(); $script:bootstrapTimer = $null }
+}
+
+function Tick-BootstrapTail {
+    if (-not $script:bootstrapLogPath -or -not (Test-Path $script:bootstrapLogPath)) { return }
+    try {
+        $fs = [IO.File]::Open($script:bootstrapLogPath, 'Open', 'Read', 'ReadWrite')
+        try {
+            if ($fs.Length -le $script:bootstrapTailPos) { return }
+            $fs.Seek($script:bootstrapTailPos, 'Begin') | Out-Null
+            $reader = New-Object IO.StreamReader $fs
+            while (-not $reader.EndOfStream) {
+                $line = $reader.ReadLine()
+                if ($null -eq $line) { break }
+                Append-Log $line
+                $m = $rxStepGlobal.Match($line)
+                if ($m.Success) {
+                    $idx = [int]$m.Groups[1].Value
+                    if ($idx -gt 1) { Mark-Step -Idx ($idx - 1) -State 'ok' }
+                    Mark-Step -Idx $idx -State 'running'
+                }
+                if ($line -like '*Bootstrap Complete*') { Mark-Step -Idx 9 -State 'ok' }
+                if ($line -like '*Bootstrap FAILED*' -or $line -like 'Error:*') {
+                    for ($i = $stepItems.Count - 1; $i -ge 0; $i--) {
+                        if ($stepItems[$i].Color -eq '#0078d4') {
+                            Mark-Step -Idx $stepItems[$i].Idx -State 'fail'
+                            break
+                        }
+                    }
+                }
+            }
+            $script:bootstrapTailPos = $fs.Position
+        } finally { $fs.Dispose() }
+    } catch { }
+    # If the process exited and we've drained the log, finalize.
+    if ($script:bootstrapProcess -and $script:bootstrapProcess.HasExited) {
+        Stop-BootstrapTail
+        $code = $script:bootstrapProcess.ExitCode
+        if ($code -eq 0) {
+            Set-Status "Bootstrap completed successfully." '#107C10'
+            for ($i = 0; $i -lt $stepItems.Count; $i++) {
+                if ($stepItems[$i].Color -eq '#0078d4') { Mark-Step -Idx $stepItems[$i].Idx -State 'ok' }
+            }
+        } else {
+            Set-Status "Bootstrap failed (exit $code). See log pane + transcript." '#D13438'
+        }
+        $el.BtnRun.IsEnabled = $true
+        Refresh-Health
+    }
+}
+
 function Run-Bootstrap {
     if (-not (Test-Path $BootstrapScript)) {
         Append-Log "ERROR: Bootstrap-DdsDomain.ps1 not found at $BootstrapScript"
         Set-Status "Bootstrap script missing - reinstall the MSI." '#D13438'
         return
     }
-    if ([string]::IsNullOrWhiteSpace($el.TbName.Text))    { Set-Status "Domain name is required."     '#D13438'; return }
-    if ([string]::IsNullOrWhiteSpace($el.TbOrg.Text))     { Set-Status "Org hash is required."        '#D13438'; return }
+    if ([string]::IsNullOrWhiteSpace($el.TbName.Text)) { Set-Status "Domain name is required." '#D13438'; return }
+    if ([string]::IsNullOrWhiteSpace($el.TbOrg.Text))  { Set-Status "Org hash is required."   '#D13438'; return }
 
     $el.BtnRun.IsEnabled = $false
     $el.TbLog.Clear()
     Reset-Steps
-    Set-Status "Bootstrap starting..." '#0078d4'
+    Set-Status "Bootstrap window launched - touch your FIDO2 key when prompted there." '#0078d4'
+
+    # Pre-compute the transcript path the bootstrap script will write,
+    # then pass it down so we know where to tail. Bootstrap-DdsDomain.ps1
+    # uses Get-Date inside Start-Transcript so we'd race against it; pin
+    # the path here with a unique tag and override via env var.
+    $script:bootstrapLogPath = Join-Path $env:TEMP ("dds-bootstrap-console-{0:yyyyMMdd-HHmmss-fff}.log" -f (Get-Date))
+    $script:bootstrapTailPos = 0
+    $env:DDS_BOOTSTRAP_TRANSCRIPT = $script:bootstrapLogPath
 
     $args = @(
         '-NoProfile','-ExecutionPolicy','Bypass',
@@ -341,71 +417,26 @@ function Run-Bootstrap {
         '-Name',     "`"$($el.TbName.Text.Trim())`"",
         '-OrgHash',  "`"$($el.TbOrg.Text.Trim())`""
     )
-    if ($el.RbPass.IsChecked) { $args += '-NoFido2' }
+    if ($el.RbPass.IsChecked)  { $args += '-NoFido2' }
     if ($el.CbForce.IsChecked) { $args += '-Force' }
 
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName  = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $psi.Arguments = ($args -join ' ')
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError  = $true
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow  = $true
+    # Visible window (no -WindowStyle Hidden, no CreateNoWindow). The
+    # bootstrap script's existing trap+pause keeps the window open on
+    # both success and failure so the user can read the result.
+    $script:bootstrapProcess = Start-Process `
+        -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -ArgumentList $args `
+        -PassThru
 
-    $script:bootstrapProcess = New-Object System.Diagnostics.Process
-    $script:bootstrapProcess.StartInfo = $psi
-    $script:bootstrapProcess.EnableRaisingEvents = $true
+    # Tail the transcript for live progress in the Console UI.
+    Append-Log "[Console] Bootstrap window launched (PID $($script:bootstrapProcess.Id))."
+    Append-Log "[Console] Transcript: $script:bootstrapLogPath"
+    Append-Log "[Console] Tailing for progress..."
 
-    $rxStep = [regex]'\[(\d)/9\]'
-
-    $handler = {
-        param($s, $e)
-        if ($null -eq $e.Data) { return }
-        $line = $e.Data
-        $window.Dispatcher.Invoke([action]{
-            Append-Log $line
-            $m = $rxStep.Match($line)
-            if ($m.Success) {
-                $idx = [int]$m.Groups[1].Value
-                # Mark previous step as ok, current as running
-                if ($idx -gt 1) { Mark-Step -Idx ($idx - 1) -State 'ok' }
-                Mark-Step -Idx $idx -State 'running'
-            }
-            if ($line -like '*Bootstrap Complete*') {
-                Mark-Step -Idx 9 -State 'ok'
-            }
-            if ($line -like 'Bootstrap FAILED*' -or $line -like 'Error*') {
-                # mark the running step (if any) as failed
-                for ($i = $stepItems.Count - 1; $i -ge 0; $i--) {
-                    if ($stepItems[$i].Color -eq '#0078d4') { Mark-Step -Idx $stepItems[$i].Idx -State 'fail'; break }
-                }
-            }
-        })
-    }
-    $script:bootstrapProcess.add_OutputDataReceived($handler)
-    $script:bootstrapProcess.add_ErrorDataReceived($handler)
-
-    $exitHandler = {
-        $window.Dispatcher.Invoke([action]{
-            $code = $script:bootstrapProcess.ExitCode
-            if ($code -eq 0) {
-                Set-Status "Bootstrap completed successfully." '#107C10'
-                # Mark any leftover running step as ok
-                for ($i = 0; $i -lt $stepItems.Count; $i++) {
-                    if ($stepItems[$i].Color -eq '#0078d4') { Mark-Step -Idx $stepItems[$i].Idx -State 'ok' }
-                }
-            } else {
-                Set-Status "Bootstrap failed (exit $code). See log + transcript." '#D13438'
-            }
-            $el.BtnRun.IsEnabled = $true
-            Refresh-Health
-        })
-    }
-    $script:bootstrapProcess.add_Exited($exitHandler)
-
-    $script:bootstrapProcess.Start() | Out-Null
-    $script:bootstrapProcess.BeginOutputReadLine()
-    $script:bootstrapProcess.BeginErrorReadLine()
+    $script:bootstrapTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:bootstrapTimer.Interval = [TimeSpan]::FromMilliseconds(700)
+    $script:bootstrapTimer.Add_Tick({ Tick-BootstrapTail })
+    $script:bootstrapTimer.Start()
 }
 
 # ── Wire up ───────────────────────────────────────────────────────
