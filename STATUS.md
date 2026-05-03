@@ -1,5 +1,37 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-03, updated 29th pass)
+
+- ✅ Admin Guide updated with DDS Console and Tray Agent documentation (2026-05-03):
+
+  **Gap 1 — DDS Console (`DdsConsole.ps1`) undocumented.**
+  Commits `2985806` (Provision tab) and earlier work added a full WPF GUI
+  management console (three tabs: Bootstrap, Provision, Health) installed by
+  the MSI and reachable from the Start menu. Neither the console's existence
+  nor any of its tabs were mentioned in `DDS-Admin-Guide.md`.
+
+  **Gap 2 — Tray Agent autostart and PasswordChangeMonitor undocumented.**
+  Commit `4e5cadf` added an `HKLM\Run` entry so `DdsTrayAgent.exe --minimized`
+  starts for every interactive logon, and a `PasswordChangeMonitor` that
+  detects Windows/AD password changes (via `WTSRegisterSessionNotification` +
+  60-second poll) and prompts the user to run `RefreshVaultFlow`. Neither
+  behavior was documented.
+
+  **Fix:**
+  - Updated the Windows Deployment **Components** table: Tray Agent row
+    now notes auto-start and vault-refresh; added a new row for **DDS Console**.
+  - Added `### DDS Console` section describing all three tabs (Bootstrap,
+    Provision, Health) — including the export/import bundle flow, the
+    TOCTOU-safe re-check at import click-time, and the 2-second auto-refresh.
+  - Added `### DDS Tray Agent — Autostart and Vault Refresh` section
+    documenting the `HKLM\Run` entry, the `PasswordChangeMonitor` dual-trigger
+    design (WTS session events + timer poll), detection algorithm
+    (`NetUserGetInfo` level 11 with `DsGetDcNameW` for AD users), the
+    300-second clock-jitter tolerance, and the `DDS_CLEAR_STALE` bridge
+    message sent after a successful vault refresh.
+
+  No code changes. Rust test suite unchanged at 925 passing.
+
 ## Documentation-to-Code Verification Addendum (2026-05-03, updated 28th pass)
 
 - ✅ Admin Guide updated with `services` directive documentation (2026-05-03):

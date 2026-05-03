@@ -1155,7 +1155,8 @@ desired, deletes it from the registry, and updates its managed-items tracking.
 | DDS Credential Provider | C++ COM DLL | Logon screen FIDO2 tile |
 | DDS Auth Bridge | C++ Windows Service | Mediates between CP and dds-node |
 | DDS Policy Agent | .NET Windows Service | Enforces GPO-equivalent policy |
-| DDS Tray Agent | C++ desktop app (optional) | Enrollment and notification UI |
+| DDS Tray Agent | C++ desktop app | Enrollment, vault-refresh, and notification UI; auto-starts on every interactive logon |
+| DDS Console | PowerShell WPF GUI | Bootstrap, Provision, and Health management (`DdsConsole.ps1`) |
 
 ### Architecture
 
@@ -1236,6 +1237,75 @@ dotnet test
 ```
 
 See [platform/windows/e2e/README.md](../platform/windows/e2e/README.md) for the full test matrix.
+
+### DDS Console
+
+The MSI installs a PowerShell WPF GUI (`DdsConsole.ps1`) reachable from the
+Start menu under **DDS → DDS Console**. It wraps the most common operator
+workflows in a graphical interface and requires no CLI familiarity.
+
+The console has three tabs:
+
+**Bootstrap tab** — Runs the domain genesis ceremony on the first node.
+Fill in a domain name, org hash, and authentication method (FIDO2 or
+passphrase), then click **Run Bootstrap**. Progress streams to the embedded
+log pane. The **Wipe existing domain state** checkbox is required when
+re-bootstrapping over an existing installation.
+
+**Provision tab** — Transfers an existing domain to a new machine without
+using the CLI.
+
+- **Export provision bundle**: copies `C:\ProgramData\DDS\provision.dds`
+  to an operator-chosen destination via a Save dialog. The bundle is
+  FIDO2-sealed at rest; the recipient still needs the admin's hardware key
+  at import time. The button is disabled when no bundle is present.
+- **Import provision bundle**: opens a File dialog to pick a `.dds` file,
+  then spawns a visible PowerShell console running
+  `dds-node provision <bundle>` — a real console is required so the
+  libfido2 PIN/touch prompts reach the user (a redirected child times out).
+  Import is disabled while the machine is already domain-joined; use the
+  Bootstrap tab's wipe option first.
+
+The Provision tab refreshes its domain-join status every 2 seconds so state
+changes (import succeeds → button disables, status turns green) propagate
+automatically.
+
+**Health tab** — Live service dashboard. Shows the Windows service status
+table (`DdsNode`, `DdsAuthBridge`, `DdsPolicyAgent`), the named-pipe
+connectivity indicator, the applied-state inventory, and a live tail of
+`authbridge.log`. Buttons allow starting or stopping all three services and
+opening the Tray Agent.
+
+### DDS Tray Agent — Autostart and Vault Refresh
+
+The MSI installs an `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`
+entry that launches `DdsTrayAgent.exe --minimized` for every interactive
+logon (all users on the machine). A single-instance mutex prevents duplicates
+if the user also opens the tray from the Start menu.
+
+The Tray Agent includes a **PasswordChangeMonitor** that detects Windows and
+AD password changes and prompts the user to refresh the DDS vault:
+
+| Trigger | Mechanism |
+|---|---|
+| Logon / session unlock | `WTSRegisterSessionNotification` |
+| Mid-session password change | 60-second `SetTimer` poll |
+
+Detection uses `NetUserGetInfo` level 11 (`password_age` field). The
+computed "password set time" (`now − password_age`) is persisted to
+`%LOCALAPPDATA%\DDS\pwd_state.txt` so the monitor does not re-prompt across
+reboots. `DsGetDcNameW` is used to target a domain controller for AD users;
+local SAM accounts fall back to a NULL server argument.
+
+The monitor only prompts when the user has a vault entry (no prompt for
+users who have never enrolled), applies a 300-second tolerance to absorb
+clock jitter, and suppresses overlapping prompts.
+
+When the user confirms the refresh, the Tray Agent runs `RefreshVaultFlow`,
+which re-derives the FIDO2 `hmac-secret`, re-encrypts the new password in
+the vault, and sends `DDS_CLEAR_STALE` to the Auth Bridge to clear any
+stale-vault cooldown immediately — so the next sign-in does not hit the
+15-minute lockout-prevention window.
 
 ---
 
