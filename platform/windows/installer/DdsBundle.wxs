@@ -120,6 +120,16 @@
     <ComponentGroup Id="CG_DdsNode" Directory="DIR_BIN">
       <Component Id="C_DdsNode" Guid="11111111-1111-1111-1111-111111111111">
         <File Id="dds_node_exe" Source="$(var.BuildDir)\dds-node.exe" KeyPath="yes" />
+        <!-- Stamp the installed version so the tray and Console can
+             display it (HKLM\Software\DDS\Version, REG_SZ). Co-located
+             on C_DdsNode (always installed via F_Core) rather than its
+             own component to keep the registry write tied to a feature
+             that is guaranteed present. -->
+        <RegistryValue Root="HKLM"
+                       Key="Software\DDS"
+                       Name="Version"
+                       Type="string"
+                       Value="$(var.Version)" />
         <ServiceInstall Id="SI_DdsNode"
                         Name="DdsNode"
                         DisplayName="DDS Node"
