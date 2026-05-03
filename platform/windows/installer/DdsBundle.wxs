@@ -102,7 +102,7 @@
     <!-- ============================================================ -->
     <!-- Feature: Tray Agent (optional, C++)                          -->
     <!-- ============================================================ -->
-    <Feature Id="F_TrayAgent" Title="DDS Tray Agent" Description="System tray notification agent" Level="2">
+    <Feature Id="F_TrayAgent" Title="DDS Tray Agent" Description="System tray notification agent" Level="1">
       <ComponentGroupRef Id="CG_TrayAgent" />
     </Feature>
 
