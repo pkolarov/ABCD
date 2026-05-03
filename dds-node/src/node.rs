@@ -301,12 +301,12 @@ pub struct DdsNode {
     p2p_signing_key: Option<ed25519_dalek::SigningKey>,
 }
 
-/// Shared peer-count snapshot for the Prometheus exposition. Two
-/// `Arc<AtomicU64>` so the swarm task and the metrics scrape task each
-/// own a cheap-to-clone handle without locking. Updated only by the
-/// swarm task in [`DdsNode::refresh_peer_count_gauges`]; reads by the
-/// scrape task are `Relaxed` since neither gauge has a happens-before
-/// dependency on any other state.
+/// Shared live-state snapshot for the Prometheus exposition and the
+/// HTTP `/v1/status` handler. Each field is an `Arc<AtomicU64>` so the
+/// swarm task and the reader tasks each own a cheap-to-clone handle
+/// without locking. Updated only by the swarm task in
+/// [`DdsNode::refresh_peer_count_gauges`]; reads are `Relaxed` since
+/// no field has a happens-before dependency on any other state.
 #[derive(Clone, Default)]
 pub struct NodePeerCounts {
     /// Backing store for `dds_peers_admitted`: count of peers
