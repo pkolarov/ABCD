@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <windows.h>
 #include "ipc_protocol.h"
 #include "ipc_messages.h"
 
@@ -143,6 +144,12 @@ public:
 private:
     HANDLE m_hPipe;
     UINT32 m_lastSeqId;
+    // Serialises all public pipe operations across threads. The CP DLL shares
+    // a single CIpcPipeClient between the BridgePoll thread (status / user
+    // listing) and the LogonUI thread (_EnumerateCredentials). Without this
+    // lock, concurrent WriteFile/ReadFile on the same handle can interleave
+    // message frames and let one thread consume the other's response.
+    CRITICAL_SECTION m_cs;
 
     BOOL WriteRaw(_In_reads_bytes_(len) const BYTE* pData, _In_ DWORD len);
     BOOL ReadRaw(_Out_writes_bytes_(bufferSize) BYTE* pBuffer, _In_ DWORD bufferSize, _Out_ DWORD* pBytesRead, _In_ DWORD timeoutMs);

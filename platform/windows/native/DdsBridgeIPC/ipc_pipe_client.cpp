@@ -6,19 +6,36 @@
 #include <stdio.h>
 #include <string.h>
 
+namespace {
+// RAII helper for CRITICAL_SECTION — keeps the per-method lock/unlock noise low
+// and guarantees release on every return path.
+struct CsLock
+{
+    CRITICAL_SECTION* cs;
+    explicit CsLock(CRITICAL_SECTION* c) : cs(c) { EnterCriticalSection(cs); }
+    ~CsLock() { LeaveCriticalSection(cs); }
+    CsLock(const CsLock&) = delete;
+    CsLock& operator=(const CsLock&) = delete;
+};
+} // namespace
+
 CIpcPipeClient::CIpcPipeClient()
     : m_hPipe(INVALID_HANDLE_VALUE)
     , m_lastSeqId(0)
 {
+    InitializeCriticalSection(&m_cs);
 }
 
 CIpcPipeClient::~CIpcPipeClient()
 {
     Disconnect();
+    DeleteCriticalSection(&m_cs);
 }
 
 BOOL CIpcPipeClient::Connect(_In_ DWORD timeoutMs)
 {
+    CsLock lock(&m_cs);
+
     if (m_hPipe != INVALID_HANDLE_VALUE)
     {
         return TRUE; // Already connected
@@ -54,14 +71,19 @@ BOOL CIpcPipeClient::Connect(_In_ DWORD timeoutMs)
         }
     }
 
+    // FILE_FLAG_OVERLAPPED is required for ReadRaw/WriteRaw to honour their
+    // timeoutMs argument. Without it, ReadFile/WriteFile ignore the OVERLAPPED
+    // parameter and block synchronously — which froze LogonUI indefinitely
+    // whenever the bridge accepted a connection but then stopped responding,
+    // forcing the user to reboot.
     m_hPipe = CreateFileW(
         IPC_PIPE::PIPE_NAME,
         GENERIC_READ | GENERIC_WRITE,
-        0,              // No sharing
-        NULL,           // Default security
+        0,                      // No sharing
+        NULL,                   // Default security
         OPEN_EXISTING,
-        0,              // Default attributes
-        NULL            // No template
+        FILE_FLAG_OVERLAPPED,   // Async I/O so timeouts actually work
+        NULL                    // No template
     );
 
     if (m_hPipe == INVALID_HANDLE_VALUE)
@@ -83,6 +105,7 @@ BOOL CIpcPipeClient::Connect(_In_ DWORD timeoutMs)
 
 void CIpcPipeClient::Disconnect()
 {
+    CsLock lock(&m_cs);
     if (m_hPipe != INVALID_HANDLE_VALUE)
     {
         CloseHandle(m_hPipe);
@@ -102,8 +125,45 @@ BOOL CIpcPipeClient::WriteRaw(_In_reads_bytes_(len) const BYTE* pData, _In_ DWOR
         return FALSE;
     }
 
+    // The pipe handle is opened with FILE_FLAG_OVERLAPPED, so WriteFile must
+    // be supplied an OVERLAPPED structure. Bound the wait so a hung bridge
+    // never blocks the LogonUI thread indefinitely.
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (ov.hEvent == NULL)
+    {
+        return FALSE;
+    }
+
+    BOOL  result       = FALSE;
     DWORD bytesWritten = 0;
-    return WriteFile(m_hPipe, pData, len, &bytesWritten, NULL) && (bytesWritten == len);
+    const DWORD kWriteTimeoutMs = 5000;
+
+    if (WriteFile(m_hPipe, pData, len, &bytesWritten, &ov))
+    {
+        result = (bytesWritten == len);
+    }
+    else if (GetLastError() == ERROR_IO_PENDING)
+    {
+        DWORD waitResult = WaitForSingleObject(ov.hEvent, kWriteTimeoutMs);
+        if (waitResult == WAIT_OBJECT_0)
+        {
+            if (GetOverlappedResult(m_hPipe, &ov, &bytesWritten, FALSE))
+            {
+                result = (bytesWritten == len);
+            }
+        }
+        else
+        {
+            // Timeout — cancel and drain the pending write so the OVERLAPPED
+            // is safe to free.
+            CancelIoEx(m_hPipe, &ov);
+            GetOverlappedResult(m_hPipe, &ov, &bytesWritten, TRUE);
+        }
+    }
+
+    CloseHandle(ov.hEvent);
+    return result;
 }
 
 BOOL CIpcPipeClient::ReadRaw(
@@ -173,6 +233,10 @@ BOOL CIpcPipeClient::SendRequest(
         return FALSE;
     }
 
+    // Lock around the full write+read so a concurrent caller from another
+    // thread cannot consume our response or write into the middle of ours.
+    CsLock lock(&m_cs);
+
     *pResponseBytesRead = 0;
 
     // Serialize and send request
@@ -214,6 +278,8 @@ BOOL CIpcPipeClient::SendRequestNoReply(
     _In_reads_bytes_opt_(requestPayloadLen) const BYTE* pRequestPayload,
     _In_ DWORD requestPayloadLen)
 {
+    CsLock lock(&m_cs);
+
     BYTE sendBuffer[IPC_PIPE::BUFFER_SIZE];
     UINT32 seqId = IpcNextSeqId();
 
@@ -237,6 +303,8 @@ BOOL CIpcPipeClient::SendMessageWithSeqId(
     _In_reads_bytes_opt_(payloadLen) const BYTE* pPayload,
     _In_ DWORD payloadLen)
 {
+    CsLock lock(&m_cs);
+
     BYTE sendBuffer[IPC_PIPE::BUFFER_SIZE];
 
     DWORD sendLen = IpcSerializeMessage(
@@ -264,6 +332,8 @@ BOOL CIpcPipeClient::ReadMessage(
     {
         return FALSE;
     }
+
+    CsLock lock(&m_cs);
 
     *pBytesRead = 0;
 
@@ -367,6 +437,8 @@ BOOL CIpcPipeClient::StartAuthFido(
         return FALSE;
     }
 
+    CsLock lock(&m_cs);
+
     IPC_REQ_START_AUTH_FIDO req = {};
     wcsncpy_s(req.sid, pszSid, _TRUNCATE);
     wcsncpy_s(req.rpId, pszRpId, _TRUNCATE);
@@ -399,6 +471,8 @@ BOOL CIpcPipeClient::StartAuthPiv(
     {
         return FALSE;
     }
+
+    CsLock lock(&m_cs);
 
     IPC_REQ_START_AUTH_PIV req = {};
     wcsncpy_s(req.sid, pszSid, _TRUNCATE);
@@ -492,6 +566,8 @@ BOOL CIpcPipeClient::StartEnrollUser(
     if (!pszSid || !pszDisplayName || !pszPassword || !pSeqId)
         return FALSE;
 
+    CsLock lock(&m_cs);
+
     IPC_REQ_ENROLL_USER req{};
     wcsncpy_s(req.sid,         pszSid,         _TRUNCATE);
     wcsncpy_s(req.displayName, pszDisplayName, _TRUNCATE);
@@ -562,6 +638,8 @@ BOOL CIpcPipeClient::StartAuthDds(
     {
         return FALSE;
     }
+
+    CsLock lock(&m_cs);
 
     IPC_REQ_DDS_START_AUTH req = {};
     wcsncpy_s(req.device_urn,    pszDeviceUrn,    _TRUNCATE);
