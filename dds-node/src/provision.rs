@@ -1265,7 +1265,14 @@ pub fn stamp_agent_appsettings(
 
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| ProvisionError::Io(format!("read {}: {e}", path.display())))?;
-    let mut root: serde_json::Value = serde_json::from_str(&raw)
+    // Tolerate a UTF-8 BOM at the start of appsettings.json. PowerShell
+    // 5.1's `Set-Content -Encoding UTF8` writes a BOM by default, and
+    // operator scripts (Bootstrap-DdsDomain.ps1, GUI tools) commonly
+    // re-stamp this file from PS — without this strip, the next
+    // CA_StampAgentPubkey on MSI re-install fails with
+    //   parse appsettings.json: expected value at line 1 column 1
+    let raw = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
+    let mut root: serde_json::Value = serde_json::from_str(raw)
         .map_err(|e| ProvisionError::Format(format!("parse {}: {e}", path.display())))?;
 
     let agent = root

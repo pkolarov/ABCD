@@ -284,7 +284,8 @@ pubkey = "$domainPubkey"
 admission_path = '$NodeData\admission.cbor'
 audit_log_enabled = false
 "@
-$tomlContent | Set-Content -Path $NodeToml -Encoding UTF8
+# BOM-less UTF-8 (see step 8 for rationale — applies equally here).
+[IO.File]::WriteAllText($NodeToml, $tomlContent, (New-Object Text.UTF8Encoding $false))
 Write-Host "  Written: $NodeToml"
 
 # ── 6. start dds-node + wait for pipe ──────────────────────────────
@@ -378,7 +379,14 @@ if (-not $cfg.PSObject.Properties.Match('DdsPolicyAgent').Count) {
 }
 $cfg.DdsPolicyAgent | Add-Member -NotePropertyName DeviceUrn -NotePropertyValue $deviceUrn -Force
 $cfg.DdsPolicyAgent | Add-Member -NotePropertyName PinnedNodePubkeyB64 -NotePropertyValue $nodePubkeyB64 -Force
-$cfg | ConvertTo-Json -Depth 10 | Set-Content -Path $AppSettings -Encoding UTF8
+# PS 5.1's Set-Content -Encoding UTF8 emits a BOM, but dds-node's JSON
+# parser (used by the MSI's CA_StampAgentPubkey custom action on every
+# upgrade) and .NET's appsettings.json reader both prefer BOM-less
+# UTF-8. Use [IO.File]::WriteAllText with UTF8Encoding($false) so a
+# subsequent MSI re-install doesn't fail with
+#   Format("parse appsettings.json: expected value at line 1 column 1")
+$json = $cfg | ConvertTo-Json -Depth 10
+[IO.File]::WriteAllText($AppSettings, $json, (New-Object Text.UTF8Encoding $false))
 Write-Host "  Updated: $AppSettings"
 
 # ── 9. start auth bridge + policy agent ────────────────────────────
