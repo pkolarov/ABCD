@@ -157,6 +157,7 @@ id = "${DOMAIN_ID}"
 pubkey = "${DOMAIN_PUBKEY}"
 admission_path = "${RUN_ROOT}/node-data/admission.cbor"
 audit_log_enabled = false
+capabilities = []
 EOF
 
 "${NODE_BIN}" run "${RUN_ROOT}/dds.toml" > "${RUN_ROOT}/logs/node.log" 2>&1 &

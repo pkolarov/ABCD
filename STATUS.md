@@ -1,5 +1,31 @@
 # DDS Implementation Status
 
+## CI Fix Addendum (2026-05-04, 34th pass) — macOS smoke: enc-v3 drops all plaintext gossip
+
+The macOS smoke test was still failing with "no policies visible after publish" after the
+33rd-pass two-phase publish fix. CI diagnostic logs for commit `bf20471` revealed:
+
+```
+WARN dds_node::node: received plaintext gossip on enc-v3 domain — dropping (×5)
+```
+
+**Root cause confirmed**: `dds_node::config::DomainConfig::capabilities` defaults to
+`["enc-v3"]` via `default_capabilities()` when not specified in `dds.toml` (config.rs:84,
+"PQ-by-default"). The smoke-test.sh dds.toml template omitted `capabilities`, so node_a
+silently enabled the enc-v3 gate and dropped every plaintext gossip message from the
+publisher (which has no epoch key).
+
+The two-phase publish fix in pass 33 did not fix this because enc-v3 drops messages
+regardless of ordering.
+
+**Fix**: Added `capabilities = []` to the `[domain]` section of the dds.toml template in
+`platform/macos/e2e/smoke-test.sh`. This disables the enc-v3 gate for the smoke-test
+node, matching the publisher's `capabilities: Vec::new()` already set in
+`dds-macos-e2e.rs:354`.
+
+The `dds-macos-e2e` publisher already had `capabilities: Vec::new()`, confirming it was
+always sending plaintext gossip; only node_a's receiver side needed the fix.
+
 ## CI Fix Addendum (2026-05-04, 33rd pass) — macOS smoke: gossipsub ordering race
 
 The macOS smoke test (`pkg.yml`) was still failing with "no policies visible after publish"
