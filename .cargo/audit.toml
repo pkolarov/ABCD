@@ -1,0 +1,21 @@
+# cargo-audit configuration
+# Advisories ignored here are upstream-blocked transitive dependencies that
+# cannot be fixed without upstream libp2p releasing a version that migrates
+# away from hickory-proto 0.25.x. Both advisories were filed 2026-05-01.
+# Track at: https://github.com/libp2p/rust-libp2p/issues (hickory-proto bump)
+# Remove these ignores once libp2p-mdns ships with hickory-proto >= 0.26.1.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0119: CPU exhaustion via O(n²) name compression in
+    # hickory-proto 0.25.x (via libp2p-mdns). Fix requires hickory-proto
+    # >= 0.26.1, but libp2p 0.56 still pins to 0.25.x upstream-blocked.
+    "RUSTSEC-2026-0119",
+
+    # RUSTSEC-2026-0118: NSEC3 closest-encloser proof unbounded loop in
+    # hickory-proto 0.25.x. Advisory reports no fixed upgrade available;
+    # this is DNSSEC validation code that is never exercised via our mDNS
+    # peer-discovery use case (no NSEC3 signed zones involved).
+    # Remove once upstream confirms a fix or libp2p drops hickory-mdns.
+    "RUSTSEC-2026-0118",
+]
