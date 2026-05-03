@@ -1,5 +1,32 @@
 # DDS Implementation Status
 
+## CI Fix Addendum (2026-05-04, 33rd pass) — macOS smoke: gossipsub ordering race
+
+The macOS smoke test (`pkg.yml`) was still failing with "no policies visible after publish"
+after the 32nd-pass fix. Root cause: gossipsub delivers messages to node_a without
+ordering guarantees. If `policy_token` arrives before `self_attest` / capability vouches
+(published in the same gossipsub burst), `publisher_capability_ok` calls `has_purpose`
+on an empty trust graph and the token is rejected. The previous "vouches-in-loop" fix
+still had all 5 tokens in a single gossipsub burst, so the race persisted.
+
+**Fix A — Two-phase publish in `dds-macos-e2e.rs`**
+
+- Changed `publish_fixture` to split each iteration into two phases:
+  - Phase A: publish self_attest + policy_vouch + software_vouch, then `pump_for(800 ms)`
+  - Phase B: publish policy_token + software_token, then `pump_for(publish_interval_ms)`
+- The 800 ms gap on localhost far exceeds a single gossip round trip, so by the time
+  Phase B runs, node_a has already ingested the vouches and `has_purpose` returns true.
+- Even if Phase A gets `InsufficientPeers` (gossipsub mesh not yet formed on iteration 1),
+  the 800 ms pump allows the SUBSCRIBE exchange to complete; iteration 2 then succeeds.
+
+**Fix B — Smoke test: replace `sleep 3` + single check with 15-second polling loop**
+
+- Replaced `sleep 3; curl ...` with a loop that polls `/v1/macos/policies` every second
+  for up to 15 seconds, breaking as soon as POLICY_COUNT ≥ 1. Handles slow CI runners.
+- On failure, prints the last 120 lines of `node.log` and the node `/v1/status` response
+  to CI output so root causes are visible without file access.
+- Also improved the `SMOKE TEST FAILED` section to print node.log and agent.log inline.
+
 ## Documentation-to-Code Verification Addendum (2026-05-04, 33rd pass)
 
 - ✅ `DDS-Design-Document.md` enforcer table updated — two stale entries fixed:

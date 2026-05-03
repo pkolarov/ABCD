@@ -485,16 +485,27 @@ async fn publish_fixture(
         &software,
     )?;
 
+    // Two-phase publish per iteration to eliminate the `publisher_capability_ok`
+    // ordering race: gossipsub delivers messages asynchronously, so a
+    // policy_token can arrive at node_a before the self_attest + vouches it
+    // depends on. Phase A publishes and pumps the vouches first; 800 ms on
+    // localhost is far more than a single gossip round trip, so by the time
+    // Phase B sends the body tokens, node_a has already ingested the vouches
+    // and `has_purpose` returns true.
     for _ in 0..spec.publish_count {
+        // Phase A: capability vouches.
         publish_operation(&mut node, &self_attest_token)?;
         publish_operation(&mut node, &policy_vouch)?;
         publish_operation(&mut node, &software_vouch)?;
+        pump_for(&mut node, Duration::from_millis(800)).await;
+
+        // Phase B: body tokens — by now node_a has the vouches.
         publish_operation(&mut node, &policy_token)?;
         publish_operation(&mut node, &software_token)?;
         pump_for(&mut node, Duration::from_millis(spec.publish_interval_ms)).await;
     }
 
-    pump_for(&mut node, Duration::from_secs(2)).await;
+    pump_for(&mut node, Duration::from_secs(3)).await;
 
     Ok(Manifest {
         generated_at: now_epoch(),

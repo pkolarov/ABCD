@@ -248,23 +248,28 @@ BOOTSTRAP_PEER="/ip4/127.0.0.1/tcp/${P2P_PORT}/p2p/${PEER_ID}"
   --connect-timeout-secs 30 2>&1 | tail -5
 echo "  fixture published"
 
-# Wait for gossip convergence
-sleep 3
-
-# Verify node received the policy. Since H-2/H-3 the response is a
-# `SignedPolicyEnvelope { version, kind, device_urn, issued_at,
-# payload_b64, signature_b64, ... }` with the actual
-# `{"policies": [...]}` body base64-encoded inside `payload_b64` — we
-# decode that here so the check matches the on-the-wire format.
-POLICY_COUNT=$(curl -sf "${NODE_URL}/v1/macos/policies?device_urn=${DEVICE_URN}" \
-  | python3 -c "
+# Wait for gossip convergence (poll up to 15 s in case the CI runner is slow)
+POLICY_COUNT=0
+for _pi in {1..15}; do
+  POLICY_COUNT=$(curl -sf "${NODE_URL}/v1/macos/policies?device_urn=${DEVICE_URN}" \
+    | python3 -c "
 import json, sys, base64
 env = json.load(sys.stdin)
 inner = json.loads(base64.b64decode(env['payload_b64'])) if 'payload_b64' in env else env
 print(len(inner.get('policies', [])))
 " 2>/dev/null || echo 0)
+  [[ "${POLICY_COUNT}" -ge 1 ]] && break
+  sleep 1
+done
 echo "  policies visible: ${POLICY_COUNT}"
-[[ "${POLICY_COUNT}" -ge 1 ]] || { echo "FAIL: no policies visible after publish" >&2; exit 1; }
+if [[ "${POLICY_COUNT}" -lt 1 ]]; then
+  echo "FAIL: no policies visible after publish" >&2
+  echo "=== Node log (last 120 lines) ===" >&2
+  tail -n 120 "${RUN_ROOT}/logs/node.log" >&2 || true
+  echo "=== Node status ===" >&2
+  curl -sf "${NODE_URL}/v1/status" 2>/dev/null >&2 || true
+  exit 1
+fi
 
 # ---- Step 8: Run agent for one poll cycle ----
 echo "=== Step 8: Run policy agent ==="
@@ -426,13 +431,11 @@ if ${FAILED}; then
   echo ""
   echo "SMOKE TEST FAILED"
   echo ""
-  echo "Diagnostic files:"
-  echo "  node log:  ${RUN_ROOT}/logs/node.log"
-  echo "  agent log: ${RUN_ROOT}/logs/agent.log"
-  echo "  state:     ${RUN_ROOT}/state/applied-state.json"
-  echo "  prefs:     ${RUN_ROOT}/ManagedPreferences/"
-  echo "  launchd:   ${RUN_ROOT}/state/launchd-state.json"
-  # Keep run_root for inspection
+  echo "=== Node log (last 150 lines) ==="
+  tail -n 150 "${RUN_ROOT}/logs/node.log" 2>/dev/null || echo "(no node log)"
+  echo "=== Agent log (last 80 lines) ==="
+  tail -n 80 "${RUN_ROOT}/logs/agent.log" 2>/dev/null || echo "(no agent log)"
+  # Keep run_root for local inspection
   trap - EXIT
   exit 1
 fi
