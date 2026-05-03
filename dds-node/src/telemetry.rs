@@ -38,7 +38,7 @@
 //! | `dds_fido2_assertions_total` | counter | `result=ok\|signature\|rp_id\|up\|sign_count\|other` | bumped by [`record_fido2_assertion`] |
 //! | `dds_sync_pulls_total` | counter | `result=ok\|fail` | bumped by [`record_sync_pull`] |
 //! | `dds_sync_payloads_rejected_total` | counter | `reason=legacy_v1\|publisher_capability\|publisher_identity\|replay_window\|signature\|duplicate_jti\|graph` | bumped by [`record_sync_payloads_rejected`] |
-//! | `dds_pq_releases_installed_total` | counter | `result=ok\|schema\|recipient_mismatch\|replay_window\|kem_ct\|decap\|aead` | bumped by [`record_pq_release_installed`] at every exit branch of [`crate::node::DdsNode::install_epoch_key_release`] |
+//! | `dds_pq_releases_installed_total` | counter | `result=ok\|schema\|recipient_mismatch\|replay_window\|bad_peer_id\|no_inline_pubkey\|bad_pubkey\|bad_sig\|kem_ct\|decap\|aead` | bumped by [`record_pq_release_installed`] at every exit branch of [`crate::node::DdsNode::install_epoch_key_release`] |
 //! | `dds_pq_releases_emitted_total` | counter | `result=ok\|no_kem_pk\|malformed_kem_pk\|not_for_self\|clock_error\|mint_fail\|cbor_fail` | bumped by [`record_pq_releases_emitted`] at every exit branch of [`crate::node::DdsNode::build_epoch_key_response`] |
 //! | `dds_pq_envelope_decrypt_total` | counter | `result=ok\|no_key\|aead_fail` | bumped by [`record_pq_envelope_decrypt`] at every exit branch of the gossip/sync envelope decrypt path in [`crate::node::DdsNode::handle_gossip_message`] and [`crate::node::DdsNode::handle_sync_response`] |
 //! | `dds_pq_rotation_total` | counter | `reason=time\|revocation\|manual` | bumped by [`record_pq_rotation`] at every epoch-key rotation trigger in [`crate::node::DdsNode::rotate_and_fan_out`] |
@@ -1631,6 +1631,20 @@ pub fn record_http_request(route: &str, method: &str, status: u16) {
 ///   rejected the ciphertext blob (wrong inner shape after the schema
 ///   length check passed — should be unreachable in practice but we
 ///   bump anyway so the budget stays accurate).
+/// - `bad_peer_id` — step 3a Ed25519 signature check: `release.publisher`
+///   could not be parsed as a libp2p `PeerId`.
+/// - `no_inline_pubkey` — step 3a: the publisher PeerId's multihash code
+///   is not `0x00` (identity), so the Ed25519 public key is not inline
+///   (SHA-256 PeerIds from older or non-Ed25519 nodes).
+/// - `bad_pubkey` — step 3a: the inline protobuf bytes could not be
+///   decoded as an Ed25519 key.
+/// - `bad_sig` — step 3a: the `signature` field does not verify against
+///   the publisher's embedded Ed25519 public key and the canonical
+///   signing bytes. Indicates a forged or corrupted release.
+/// - `kem_ct` — [`dds_core::crypto::kem::KemCiphertext::from_bytes`]
+///   rejected the ciphertext blob (wrong inner shape after the schema
+///   length check passed — should be unreachable in practice but we
+///   bump anyway so the budget stays accurate).
 /// - `decap` — [`dds_core::crypto::kem::decap`] failed (wrong KEM
 ///   secret, tampered ciphertext, or — critically — the publisher
 ///   bound the encapsulation to a different `(publisher, recipient,
@@ -2196,16 +2210,21 @@ fn render_exposition(
     out.push_str(
         "# HELP dds_pq_releases_installed_total Phase B EpochKeyRelease install outcomes since \
          process start, partitioned by result. ok = schema gate + recipient binding + replay-window \
-         guard + KEM decap + AEAD unwrap all succeeded (storage-side Inserted / Rotated / \
-         AlreadyCurrent / Stale collapsed into ok — those are not crypto outcomes); schema = \
-         EpochKeyRelease::validate rejected the shape (empty publisher / recipient, invalid expiry, \
-         wrong-length kem_ct / aead_ciphertext / signatures); recipient_mismatch = release.recipient \
-         != self.peer_id; replay_window = issued_at older than EPOCH_RELEASE_REPLAY_WINDOW_SECS \
-         (M-9-style replay defence); kem_ct = HybridKemCt::from_bytes rejected the inner shape; \
-         decap = ml-kem decap failed (wrong KEM secret, tampered ciphertext, or — critically — the \
-         publisher bound the encapsulation to a different (publisher, recipient, epoch_id) tuple \
-         than the release advertises); aead = ChaCha20-Poly1305 unwrap failed (wrong shared secret \
-         / tampered AEAD ciphertext or nonce / tag).\n",
+         guard + Ed25519 publisher-sig verify + KEM decap + AEAD unwrap all succeeded (storage-side \
+         Inserted / Rotated / AlreadyCurrent / Stale collapsed into ok — those are not crypto \
+         outcomes); schema = EpochKeyRelease::validate rejected the shape (empty publisher / \
+         recipient, invalid expiry, wrong-length kem_ct / aead_ciphertext / signatures); \
+         recipient_mismatch = release.recipient != self.peer_id; replay_window = issued_at older \
+         than EPOCH_RELEASE_REPLAY_WINDOW_SECS (M-9-style replay defence); bad_peer_id = \
+         release.publisher could not be parsed as a PeerId; no_inline_pubkey = publisher PeerId \
+         multihash is not identity-coded (SHA-256 PeerId — Ed25519 key not inline); bad_pubkey = \
+         inline protobuf could not be decoded as Ed25519; bad_sig = Ed25519 signature did not \
+         verify against the publisher's embedded public key (forged or corrupted release); kem_ct = \
+         HybridKemCt::from_bytes rejected the inner shape; decap = ml-kem decap failed (wrong KEM \
+         secret, tampered ciphertext, or publisher bound the encapsulation to a different \
+         (publisher, recipient, epoch_id) tuple than the release advertises); aead = \
+         ChaCha20-Poly1305 unwrap failed (wrong shared secret / tampered AEAD ciphertext or nonce / \
+         tag).\n",
     );
     out.push_str("# TYPE dds_pq_releases_installed_total counter\n");
     let pq_releases_snapshot = telemetry.pq_releases_installed_snapshot();

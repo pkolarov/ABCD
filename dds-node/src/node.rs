@@ -384,11 +384,8 @@ impl DdsNode {
         // PeerId identity multihash. Yields `None` only if the keypair is not
         // Ed25519 (shouldn't happen — `p2p_identity::load_or_create` always
         // generates Ed25519 keys).
-        let p2p_signing_key: Option<ed25519_dalek::SigningKey> = keypair
-            .clone()
-            .try_into_ed25519()
-            .ok()
-            .and_then(|kp| {
+        let p2p_signing_key: Option<ed25519_dalek::SigningKey> =
+            keypair.clone().try_into_ed25519().ok().and_then(|kp| {
                 // AsRef<[u8]> is the public surface for SecretKey bytes.
                 let binding = kp.secret();
                 let secret_slice = binding.as_ref();
@@ -3111,9 +3108,7 @@ impl DdsNode {
         // Step 3a — Ed25519 publisher-signature verification.
         // Skip for zero-signature releases (test helpers / pre-signing nodes).
         if release.signature.iter().any(|&b| b != 0) {
-            if let Err(reason) =
-                verify_epoch_key_release_signature(release, &release.publisher)
-            {
+            if let Err(reason) = verify_epoch_key_release_signature(release, &release.publisher) {
                 crate::telemetry::record_pq_release_installed(reason);
                 return Err(reason);
             }
@@ -3441,15 +3436,17 @@ pub fn mint_epoch_key_release_for_recipient<R: rand_core::CryptoRngCore>(
 /// `Err("no_inline_pubkey")` if the multihash is SHA-256 (i.e. the key was
 /// not Ed25519 or the encoding is not identity), and `Err("bad_pubkey")` if
 /// the embedded bytes cannot be decoded as an Ed25519 key.
-fn ed25519_vk_from_peer_id_str(peer_id_str: &str) -> Result<ed25519_dalek::VerifyingKey, &'static str> {
+fn ed25519_vk_from_peer_id_str(
+    peer_id_str: &str,
+) -> Result<ed25519_dalek::VerifyingKey, &'static str> {
     let peer_id: PeerId = peer_id_str.parse().map_err(|_| "bad_peer_id")?;
     // Identity multihash embeds the protobuf-encoded public key in its digest.
     let mh = peer_id.as_ref();
     if mh.code() != 0x00 {
         return Err("no_inline_pubkey");
     }
-    let pk = libp2p::identity::PublicKey::try_decode_protobuf(mh.digest())
-        .map_err(|_| "bad_pubkey")?;
+    let pk =
+        libp2p::identity::PublicKey::try_decode_protobuf(mh.digest()).map_err(|_| "bad_pubkey")?;
     let ed_pk = pk.try_into_ed25519().map_err(|_| "bad_pubkey")?;
     ed25519_dalek::VerifyingKey::from_bytes(&ed_pk.to_bytes()).map_err(|_| "bad_pubkey")
 }
@@ -3465,7 +3462,11 @@ fn verify_epoch_key_release_signature(
 ) -> Result<(), &'static str> {
     let vk = ed25519_vk_from_peer_id_str(publisher_peer_id_str)?;
     let msg = release.signing_bytes();
-    let sig_bytes: [u8; 64] = release.signature.as_slice().try_into().map_err(|_| "bad_sig")?;
+    let sig_bytes: [u8; 64] = release
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| "bad_sig")?;
     use ed25519_dalek::Verifier;
     vk.verify(&msg, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
         .map_err(|_| "bad_sig")

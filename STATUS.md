@@ -1,6 +1,18 @@
 # DDS Implementation Status
 
-## Documentation-to-Code Verification Addendum (2026-05-03, updated 17th pass)
+## Documentation-to-Code Verification Addendum (2026-05-03, updated 18th pass)
+
+- ✅ Telemetry catalog updated for EpochKeyRelease signature result codes (2026-05-03):
+  Follow-on to the B.6/B.9 signing commit: the four new `install_epoch_key_release`
+  step-3a exit paths (`bad_peer_id`, `no_inline_pubkey`, `bad_pubkey`, `bad_sig`)
+  were not listed in the `dds_pq_releases_installed_total` telemetry catalog.
+  Fixed in [`dds-node/src/telemetry.rs`](dds-node/src/telemetry.rs): module-doc
+  metric table, `record_pq_release_installed` function docstring, and the
+  Prometheus `# HELP` text all updated with per-code descriptions.
+  Also applied `cargo fmt` to fix formatting issues in the same commit that were
+  not caught before push. 838 / 838 `cargo test --workspace` passing (was 837 —
+  +1 for `signed_release_verifies_and_tampered_sig_rejects`); `cargo fmt` clean;
+  `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 - ✅ EpochKeyRelease Ed25519 publisher signature landed (2026-05-03):
   Closed the deferred PQ B.6/B.9 follow-on item from
@@ -32,7 +44,7 @@
   pins the sign+verify round-trip end-to-end and confirms a one-byte tamper is
   rejected with `bad_sig`.
 
-  `cargo test --workspace` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean.
+  837 / 837 `cargo test --workspace` passing (was 836); `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 16th pass)
 
