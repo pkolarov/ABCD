@@ -332,7 +332,7 @@
                         Start="auto"
                         Account="LocalSystem"
                         ErrorControl="normal"
-                        Arguments="--contentRoot &quot;[INSTALLFOLDER]&quot;">
+                        Arguments="--contentRoot &quot;[INSTALLFOLDER].&quot;">
           <ServiceDependency Id="DdsNode" />
         </ServiceInstall>
         <!-- See SC_DdsNode: deferred to first boot / post-provision. -->
