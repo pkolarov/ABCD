@@ -1556,13 +1556,24 @@ These areas are concrete in the code:
 
 ### 19.2 Implemented But Not Fully Wired Into The Live Node
 
-These exist in code but are not yet end-to-end operational in the main node path:
+These exist in code but are not yet end-to-end operational in the main node path
+(state as of 2026-05-03 — several earlier items have since been resolved):
 
-- delta-sync protocol module
-- operation-store-backed restartable DAG
-- full distributed audit publication
-- live status plumbing from swarm to HTTP API
-- automatic node-side trust-graph rehydration from store on startup
+- ~~delta-sync protocol module~~ — **Resolved (2026-05-01, §14.8.1)**: sync is
+  live end-to-end; `DdsNode::try_sync_with` / `handle_sync_event` wire the
+  `dds-net/src/sync.rs` module into the running node.
+- operation-store-backed restartable DAG — the `CausalDag` is rebuilt from
+  gossip/sync on each boot rather than replayed from `OperationStore`.
+- ~~full distributed audit publication~~ — **Resolved (2026-04-26, §14.8.3,
+  Z-3 Phase A)**: `emit_local_audit` / `emit_audit_from_ingest` are wired to
+  every state-mutating path in both `DdsNode` and `LocalService`.
+- ~~live status plumbing from swarm to HTTP API~~ — **Resolved**: peer counts
+  (`connected_peers`, `dag_operations`) are now plumbed via the shared
+  `NodePeerCounts` atomic snapshot refreshed by `refresh_peer_count_gauges`.
+  `dag_operations` reflects the in-memory `CausalDag` size (resets on restart).
+- automatic node-side trust-graph rehydration from store on startup — the
+  swarm-side `trust_graph` starts empty on each boot and is re-populated via
+  gossip and sync.
 
 ### 19.3 Present As Data Models More Than End-To-End Features
 
@@ -1588,7 +1599,12 @@ them; the remainder are genuine open work.
    dropped at the behaviour layer.
 2. Kademlia is used for discovery, not as the directory state store.
 3. The node-side in-memory graph is not rebuilt from disk at startup.
-4. The HTTP status endpoint does not expose live peer and DAG counters.
+4. ~~The HTTP status endpoint does not expose live peer and DAG counters.~~
+   **Resolved**: `connected_peers` has been live since Phase C metrics #30
+   (shared `NodePeerCounts` atomic snapshot). `dag_operations` is now also
+   wired from `NodePeerCounts.dag_ops` (refreshed by `refresh_peer_count_gauges`);
+   it reports the current-session in-memory `CausalDag` size and resets to 0
+   on process restart.
 5. Sessions are local artifacts, not replicated state.
 
 These are not fatal flaws for a prototype or research system.

@@ -1,5 +1,45 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-03, updated 22nd pass)
+
+- ✅ `dag_operations` wired into `/v1/status` + §19.2/§19.4 whitepaper stale entries fixed (2026-05-03):
+
+  **Code fix:** The HTTP `/v1/status` handler always returned `dag_operations: 0`
+  because it passed the literal `0` to `LocalService::status()`. The in-memory
+  `CausalDag` operation count (`self.dag.len()`) was available but not plumbed
+  to the status response.
+
+  **Fix:** Added `dag_ops: Arc<AtomicU64>` to `NodePeerCounts` (derives
+  `Default` → zero-initialised). `DdsNode::refresh_peer_count_gauges` now
+  stores `self.dag.len() as u64` alongside the existing admitted/connected
+  writes. The HTTP status handler reads `peer_counts.dag_ops.load(Relaxed)`
+  the same way it reads `peer_counts.connected` — falls back to `0` when
+  `peer_counts` is absent (test fixtures, bare routers). New unit test
+  `status_endpoint_reports_dag_ops_when_peer_counts_supplied` seeds
+  `dag_ops = 42` and asserts the JSON response reflects that value.
+  The count resets to 0 on process restart because the `CausalDag` is rebuilt
+  from gossip/sync rather than replayed from `OperationStore` — this is the
+  expected behaviour for the current session-scoped DAG.
+
+  **Doc fixes (§19.2 and §19.4):** The 21st pass updated §14.8.1, §14.8.3,
+  and §24 but missed §19.2 and §19.4, which still listed three resolved items
+  as open:
+
+  - §19.2 "delta-sync protocol module" — now struck through and marked
+    **Resolved (2026-05-01, §14.8.1)**.
+  - §19.2 "full distributed audit publication" — now struck through and marked
+    **Resolved (2026-04-26, §14.8.3, Z-3 Phase A)**.
+  - §19.2 "live status plumbing from swarm to HTTP API" — now struck through
+    and marked **Resolved** (peer counts wired since Phase C #30;
+    `dag_operations` wired by this commit).
+  - §19.4 bullet 4 "The HTTP status endpoint does not expose live peer and DAG
+    counters" — now struck through and marked **Resolved** with the same detail.
+
+  Remaining open items in §19.2: operation-store-backed restartable DAG;
+  automatic node-side trust-graph rehydration from store on startup.
+
+  No .NET or external code changes. `cargo build --workspace` clean.
+
 ## Documentation-to-Code Verification Addendum (2026-05-03, updated 21st pass)
 
 - ✅ Stale whitepaper implementation-status sections updated (2026-05-03):

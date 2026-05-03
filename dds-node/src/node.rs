@@ -319,6 +319,11 @@ pub struct NodePeerCounts {
     /// lifecycle event. Includes admitted *and* still-unadmitted peers
     /// — readers compute the unadmitted share as `connected - admitted`.
     pub connected: Arc<AtomicU64>,
+    /// In-memory [`CausalDag`] operation count at the last
+    /// `refresh_peer_count_gauges` call. Reset to 0 on process restart
+    /// (the DAG is rebuilt from gossip/sync, not replayed from the
+    /// operation store); reflects the running session's operation count.
+    pub dag_ops: Arc<AtomicU64>,
 }
 
 impl DdsNode {
@@ -624,10 +629,12 @@ impl DdsNode {
     fn refresh_peer_count_gauges(&self) {
         let admitted = self.admitted_peers.len() as u64;
         let connected = self.swarm.connected_peers().count() as u64;
+        let dag_ops = self.dag.len() as u64;
         self.peer_counts.admitted.store(admitted, Ordering::Relaxed);
         self.peer_counts
             .connected
             .store(connected, Ordering::Relaxed);
+        self.peer_counts.dag_ops.store(dag_ops, Ordering::Relaxed);
     }
 
     /// **Z-3 / Phase A.1**: install the Vouchsafe node identity used to

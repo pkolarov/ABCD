@@ -1246,7 +1246,16 @@ where
         .as_ref()
         .map(|pc| pc.connected.load(std::sync::atomic::Ordering::Relaxed) as usize)
         .unwrap_or(0);
-    let mut s = svc.status(&state.info.peer_id, connected_peers, 0)?;
+    // Read the in-memory CausalDag operation count from the same
+    // NodePeerCounts snapshot refreshed by refresh_peer_count_gauges.
+    // Resets to 0 on process restart (DAG rebuilt from gossip/sync).
+    let dag_ops = state
+        .info
+        .peer_counts
+        .as_ref()
+        .map(|pc| pc.dag_ops.load(std::sync::atomic::Ordering::Relaxed) as usize)
+        .unwrap_or(0);
+    let mut s = svc.status(&state.info.peer_id, connected_peers, dag_ops)?;
     // observability-plan.md Phase F closure for the deferred `dds-cli stats`
     // store-bytes row: read the same per-table snapshot the
     // `dds_store_bytes{table=...}` Prometheus gauge reads, owned-string
@@ -2883,6 +2892,28 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: NodeStatus = resp.json().await.unwrap();
         assert_eq!(body.connected_peers, 7);
+    }
+
+    /// `/v1/status.dag_operations` reports whatever the swarm task
+    /// has stored into the shared `NodePeerCounts.dag_ops` atomic —
+    /// refreshed by `refresh_peer_count_gauges` on every connection
+    /// lifecycle event. Closes the §19.4 whitepaper note that the
+    /// route reported a hard-coded 0 for DAG counters.
+    #[tokio::test]
+    async fn status_endpoint_reports_dag_ops_when_peer_counts_supplied() {
+        use crate::node::NodePeerCounts;
+        use std::sync::atomic::Ordering;
+
+        let mut state = make_state();
+        let counts = NodePeerCounts::default();
+        counts.dag_ops.store(42, Ordering::Relaxed);
+        state.info.peer_counts = Some(counts);
+
+        let base = spawn_server(state).await;
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: NodeStatus = resp.json().await.unwrap();
+        assert_eq!(body.dag_operations, 42);
     }
 
     /// observability-plan.md Phase F closure for the deferred
