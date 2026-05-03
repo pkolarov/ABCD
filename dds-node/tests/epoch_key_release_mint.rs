@@ -149,6 +149,7 @@ fn mint_helper_produces_release_decryptable_by_recipient() {
         &recipient_kem_pk,
         now,
         now + 86_400,
+        None,
     )
     .expect("mint ok");
 
@@ -196,6 +197,7 @@ fn mint_helper_rejects_invalid_inputs() {
         &recipient_kem_pk,
         now,
         now + 60,
+        None,
     )
     .unwrap_err();
     assert_eq!(err, "empty_publisher");
@@ -210,6 +212,7 @@ fn mint_helper_rejects_invalid_inputs() {
         &recipient_kem_pk,
         now,
         now + 60,
+        None,
     )
     .unwrap_err();
     assert_eq!(err, "empty_recipient");
@@ -224,6 +227,7 @@ fn mint_helper_rejects_invalid_inputs() {
         &recipient_kem_pk,
         now,
         now,
+        None,
     )
     .unwrap_err();
     assert_eq!(err, "invalid_expiry");
@@ -258,6 +262,7 @@ fn mint_two_releases_for_different_recipients_decap_independently() {
         &r1_kem,
         now,
         now + 86_400,
+        None,
     )
     .unwrap();
     let rel_for_r2 = mint_epoch_key_release_for_recipient(
@@ -269,6 +274,7 @@ fn mint_two_releases_for_different_recipients_decap_independently() {
         &r2_kem,
         now,
         now + 86_400,
+        None,
     )
     .unwrap();
 
@@ -434,4 +440,70 @@ fn build_response_is_empty_when_requester_cert_lacks_kem_pubkey() {
     };
     let response = publisher.build_epoch_key_response_for_tests(&request, &requester_id);
     assert!(response.releases.is_empty());
+}
+
+/// Ed25519 publisher signature: a release minted with a real signing key
+/// verifies on install; tampering with one signature byte is rejected.
+#[test]
+fn signed_release_verifies_and_tampered_sig_rejects() {
+    // Generate a real libp2p Ed25519 keypair so the publisher PeerId
+    // embeds the public key in its identity multihash (needed for
+    // the verify-side key recovery path).
+    let libp2p_keypair = libp2p::identity::Keypair::generate_ed25519();
+    let publisher_peer_id = libp2p::PeerId::from(libp2p_keypair.public());
+    let publisher_id = publisher_peer_id.to_string();
+
+    let ed_kp = libp2p_keypair.try_into_ed25519().unwrap();
+    let binding = ed_kp.secret();
+    let bytes: &[u8; 32] = binding.as_ref().try_into().unwrap();
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(bytes);
+
+    let domain_key = DomainKey::generate("test-domain-sig", &mut OsRng);
+    let (mut recipient_node, _dir) = spawn_node(&domain_key);
+    let recipient_id = recipient_node.peer_id.to_string();
+    let recipient_kem_pk = recipient_node.epoch_keys_for_tests().kem_public().clone();
+
+    let mut epoch_key = [0u8; 32];
+    use rand_core::RngCore;
+    OsRng.fill_bytes(&mut epoch_key);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let release = mint_epoch_key_release_for_recipient(
+        &mut OsRng,
+        &publisher_id,
+        42,
+        &epoch_key,
+        &recipient_id,
+        &recipient_kem_pk,
+        now,
+        now + 86_400,
+        Some(&signing_key),
+    )
+    .expect("mint with signing key");
+
+    assert!(
+        release.signature.iter().any(|&b| b != 0),
+        "expected non-zero signature"
+    );
+
+    // Valid signature — install must succeed.
+    let outcome = recipient_node
+        .install_epoch_key_release(&release, &recipient_id, now)
+        .expect("install signed release");
+    assert!(matches!(
+        outcome,
+        InstallOutcome::Inserted | InstallOutcome::Rotated
+    ));
+
+    // Tampered signature — install must be rejected.
+    let mut tampered = release.clone();
+    tampered.signature[0] ^= 0xff;
+    let err = recipient_node
+        .install_epoch_key_release(&tampered, &recipient_id, now)
+        .unwrap_err();
+    assert_eq!(err, "bad_sig");
 }

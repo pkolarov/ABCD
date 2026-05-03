@@ -291,6 +291,14 @@ pub struct DdsNode {
     /// strings on every tick. Empty when `config.network.bootstrap_peers`
     /// is empty (e.g. on the anchor itself or on mDNS-only members).
     bootstrap_addrs: Vec<Multiaddr>,
+    /// **Z-1 Phase B — EpochKeyRelease signing**: the Ed25519 signing key
+    /// extracted from the libp2p keypair at [`Self::init`]. Used by
+    /// [`mint_epoch_key_release_for_recipient`] to sign every minted
+    /// release so receivers can verify publisher authenticity using the
+    /// public key embedded in the publisher's `PeerId` (libp2p Ed25519
+    /// PeerIds carry the public key via the identity multihash).
+    /// `None` only in unit tests that bypass `init()`.
+    p2p_signing_key: Option<ed25519_dalek::SigningKey>,
 }
 
 /// Shared peer-count snapshot for the Prometheus exposition. Two
@@ -369,6 +377,24 @@ impl DdsNode {
 
         // Open storage
         let store = RedbBackend::open(config.db_path())?;
+
+        // Extract the Ed25519 signing key before the keypair is moved into
+        // build_swarm. Used to sign `EpochKeyRelease` blobs so receivers can
+        // verify publisher authenticity via the public key embedded in the
+        // PeerId identity multihash. Yields `None` only if the keypair is not
+        // Ed25519 (shouldn't happen — `p2p_identity::load_or_create` always
+        // generates Ed25519 keys).
+        let p2p_signing_key: Option<ed25519_dalek::SigningKey> = keypair
+            .clone()
+            .try_into_ed25519()
+            .ok()
+            .and_then(|kp| {
+                // AsRef<[u8]> is the public surface for SecretKey bytes.
+                let binding = kp.secret();
+                let secret_slice = binding.as_ref();
+                let bytes: &[u8; 32] = secret_slice.try_into().ok()?;
+                Some(ed25519_dalek::SigningKey::from_bytes(bytes))
+            });
 
         // Build swarm with the persistent libp2p identity.
         let swarm_config = SwarmConfig {
@@ -568,6 +594,7 @@ impl DdsNode {
             pending_revocation_rotation: None,
             manual_rotate: Arc::new(tokio::sync::Notify::new()),
             bootstrap_addrs,
+            p2p_signing_key,
         })
     }
 
@@ -1071,6 +1098,7 @@ impl DdsNode {
             &recipient_kem_pk,
             now_unix,
             expires_at,
+            self.p2p_signing_key.as_ref(),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -2374,6 +2402,7 @@ impl DdsNode {
                 &recipient_kem_pk,
                 now_unix,
                 expires_at,
+                self.p2p_signing_key.as_ref(),
             ) {
                 Ok(r) => r,
                 Err(reason) => {
@@ -2913,6 +2942,7 @@ impl DdsNode {
             &recipient_kem_pk,
             now_unix,
             expires_at,
+            self.p2p_signing_key.as_ref(),
         ) {
             Ok(r) => r,
             Err(reason) => {
@@ -3049,17 +3079,16 @@ impl DdsNode {
     ///    which classifies the install as Inserted / Rotated /
     ///    AlreadyCurrent / Stale.
     ///
-    /// Publisher-signature verification (Ed25519 + optional
-    /// ML-DSA-65) is intentionally **not** performed at this layer —
-    /// see the docstring on [`Self::epoch_keys`] for the threat-model
-    /// note. The release is delivered over an authenticated libp2p
-    /// channel (Noise + admitted-peer gating), and a forger that
-    /// neither has the publisher's epoch key nor the recipient's KEM
-    /// secret cannot construct `(kem_ct, aead_ciphertext)` pair that
-    /// decaps + unwraps to a usable epoch key. Step (4) + (5) are
-    /// the load-bearing forgery defence at this layer; the publisher
-    /// signature verify lands as a B.6 follow-on once the canonical
-    /// signing-bytes shape is finalised.
+    /// Publisher-signature verification (Ed25519) is performed at step 3a
+    /// below when the `signature` field is non-zero (i.e. when the release
+    /// was minted with a real signing key). The public key is recovered from
+    /// the publisher PeerId via the libp2p identity multihash — Ed25519
+    /// libp2p PeerIds embed the 32-byte public key in the PeerId bytes, so no
+    /// out-of-band pubkey distribution is required. A zero signature (64 zero
+    /// bytes) is accepted without verification for backward compat with test
+    /// helpers that bypass `mint_epoch_key_release_for_recipient`'s signing
+    /// path. The load-bearing forgery defence remains the KEM decap + AEAD
+    /// unwrap pipeline at steps 4–5; the publisher signature is defense in depth.
     pub fn install_epoch_key_release(
         &mut self,
         release: &EpochKeyRelease,
@@ -3078,6 +3107,18 @@ impl DdsNode {
             crate::telemetry::record_pq_release_installed("replay_window");
             return Err("replay_window");
         }
+
+        // Step 3a — Ed25519 publisher-signature verification.
+        // Skip for zero-signature releases (test helpers / pre-signing nodes).
+        if release.signature.iter().any(|&b| b != 0) {
+            if let Err(reason) =
+                verify_epoch_key_release_signature(release, &release.publisher)
+            {
+                crate::telemetry::record_pq_release_installed(reason);
+                return Err(reason);
+            }
+        }
+
         // Defensive re-check on the two length-bound slices. Schema
         // validate already covered these but we destructure into
         // fixed-length arrays before handing to the crypto layer.
@@ -3326,15 +3367,15 @@ pub fn epoch_key_binding(publisher: &str, recipient: &str, epoch_id: u64) -> Vec
 /// shared secret via [`dds_core::crypto::kem::decap`] and unwraps to
 /// recover `epoch_key`.
 ///
-/// `signature` is currently a 64-byte zero placeholder. The
-/// canonical signing-bytes shape (Ed25519 + optional ML-DSA-65 over
-/// the wire-encoded body) is intentionally deferred to a B.6 / B.9
-/// follow-on. See the docstring on [`DdsNode::epoch_keys`] for the
-/// threat-model note: at the install layer the load-bearing forgery
-/// defence is the per-recipient hybrid-KEM decap + AEAD unwrap
-/// pipeline; an attacker without `recipient_kem_pk`'s matching
-/// secret cannot construct a `(kem_ct, aead_ciphertext)` pair that
-/// recovers a usable epoch key.
+/// When `signing_key` is `Some`, the `signature` field is a real
+/// Ed25519 signature over [`dds_net::pq_envelope::EpochKeyRelease::signing_bytes`]
+/// using the publisher's libp2p Ed25519 key. The receiver verifies
+/// this signature via [`DdsNode::install_epoch_key_release`] by
+/// extracting the public key embedded in the publisher's PeerId
+/// (libp2p Ed25519 PeerIds embed the public key via the identity
+/// multihash). When `signing_key` is `None` (tests only), the
+/// signature field is a 64-byte zero placeholder — `install_epoch_key_release`
+/// skips verification for zero-signatures.
 ///
 /// Errors are short `&'static str` reasons suitable for log + metric
 /// labels at the call site, mirroring the receive-side
@@ -3349,6 +3390,7 @@ pub fn mint_epoch_key_release_for_recipient<R: rand_core::CryptoRngCore>(
     recipient_kem_pk: &dds_core::crypto::kem::HybridKemPublicKey,
     issued_at: u64,
     expires_at: u64,
+    signing_key: Option<&ed25519_dalek::SigningKey>,
 ) -> Result<EpochKeyRelease, &'static str> {
     if publisher_id.is_empty() {
         return Err("empty_publisher");
@@ -3366,7 +3408,7 @@ pub fn mint_epoch_key_release_for_recipient<R: rand_core::CryptoRngCore>(
     let (aead_nonce, aead_ciphertext) =
         dds_core::crypto::epoch_key::wrap(rng, &shared, epoch_key).map_err(|_| "wrap")?;
 
-    Ok(EpochKeyRelease {
+    let mut release = EpochKeyRelease {
         publisher: publisher_id.to_string(),
         epoch_id,
         issued_at,
@@ -3377,7 +3419,56 @@ pub fn mint_epoch_key_release_for_recipient<R: rand_core::CryptoRngCore>(
         aead_ciphertext,
         signature: vec![0u8; EPOCH_KEY_RELEASE_ED25519_SIG_LEN],
         pq_signature: None,
-    })
+    };
+
+    if let Some(sk) = signing_key {
+        use ed25519_dalek::Signer;
+        let msg = release.signing_bytes();
+        let sig = sk.sign(&msg);
+        release.signature = sig.to_bytes().to_vec();
+    }
+
+    Ok(release)
+}
+
+/// Extract an `ed25519_dalek::VerifyingKey` from a libp2p PeerId string.
+///
+/// libp2p Ed25519 PeerIds embed the protobuf-encoded 32-byte public key in
+/// the PeerId's identity multihash (multihash code 0x00), so the public key
+/// can be recovered without any out-of-band distribution.
+///
+/// Returns `Err("bad_peer_id")` if the string cannot be parsed as a PeerId,
+/// `Err("no_inline_pubkey")` if the multihash is SHA-256 (i.e. the key was
+/// not Ed25519 or the encoding is not identity), and `Err("bad_pubkey")` if
+/// the embedded bytes cannot be decoded as an Ed25519 key.
+fn ed25519_vk_from_peer_id_str(peer_id_str: &str) -> Result<ed25519_dalek::VerifyingKey, &'static str> {
+    let peer_id: PeerId = peer_id_str.parse().map_err(|_| "bad_peer_id")?;
+    // Identity multihash embeds the protobuf-encoded public key in its digest.
+    let mh = peer_id.as_ref();
+    if mh.code() != 0x00 {
+        return Err("no_inline_pubkey");
+    }
+    let pk = libp2p::identity::PublicKey::try_decode_protobuf(mh.digest())
+        .map_err(|_| "bad_pubkey")?;
+    let ed_pk = pk.try_into_ed25519().map_err(|_| "bad_pubkey")?;
+    ed25519_dalek::VerifyingKey::from_bytes(&ed_pk.to_bytes()).map_err(|_| "bad_pubkey")
+}
+
+/// Verify the Ed25519 signature on an `EpochKeyRelease` against the
+/// public key embedded in the publisher's PeerId identity multihash.
+///
+/// Returns `Ok(())` on success, `Err(reason)` where `reason` is one of
+/// `"bad_peer_id"`, `"no_inline_pubkey"`, `"bad_pubkey"`, or `"bad_sig"`.
+fn verify_epoch_key_release_signature(
+    release: &EpochKeyRelease,
+    publisher_peer_id_str: &str,
+) -> Result<(), &'static str> {
+    let vk = ed25519_vk_from_peer_id_str(publisher_peer_id_str)?;
+    let msg = release.signing_bytes();
+    let sig_bytes: [u8; 64] = release.signature.as_slice().try_into().map_err(|_| "bad_sig")?;
+    use ed25519_dalek::Verifier;
+    vk.verify(&msg, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
+        .map_err(|_| "bad_sig")
 }
 
 /// **M-9 (security review)**: return `true` if a revocation or burn

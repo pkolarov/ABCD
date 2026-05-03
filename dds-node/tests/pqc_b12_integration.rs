@@ -168,6 +168,7 @@ fn distribute_epoch_key(
         &recipient_kem_pk,
         now,
         now + 86_400,
+        None,
     )?;
     recipient.install_epoch_key_release(&release, &recipient_id, now)
 }
@@ -704,6 +705,7 @@ fn kem_pubkey_rotation_while_offline_receiver_updates_cert_and_decrypts() {
         &b_kem_pk,
         now,
         now + 86_400,
+        None,
     )
     .expect("mint with new KEM pubkey");
 
@@ -769,6 +771,7 @@ fn stale_kem_pubkey_release_cannot_be_decapped_by_recipient() {
         &old_a_kem_pk, // wrong: encapsulated to A's old KEM pubkey, not B's
         now,
         now + 86_400,
+        None,
     )
     .expect("mint");
 
@@ -796,6 +799,7 @@ fn stale_kem_pubkey_release_cannot_be_decapped_by_recipient() {
         &b_kem_pk, // correct: B's own KEM pubkey
         now,
         now + 86_400,
+        None,
     )
     .expect("mint good release");
     node_b

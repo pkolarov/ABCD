@@ -1,5 +1,39 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-03, updated 17th pass)
+
+- ✅ EpochKeyRelease Ed25519 publisher signature landed (2026-05-03):
+  Closed the deferred PQ B.6/B.9 follow-on item from
+  [`docs/pqc-phase-b-plan.md`](docs/pqc-phase-b-plan.md) B.9 — releases minted
+  by a node are now signed with its libp2p Ed25519 identity key and the signature
+  is verified by recipients before KEM decap.
+
+  **`dds-net/src/pq_envelope.rs`** — `EpochKeyRelease` gained a `signing_bytes()`
+  method that builds the canonical domain-separated signing input: `b"dds-ekr-v1\x00"`
+  tag prepended to a deterministic `ciborium` CBOR serialisation of the 8
+  pre-signature fields (matching the pattern of `dds-core::envelope::signing_bytes`).
+  New constant `EPOCH_KEY_RELEASE_SIGN_TAG`.
+
+  **`dds-node/src/node.rs`** — `DdsNode` gained `p2p_signing_key: Option<ed25519_dalek::SigningKey>`
+  extracted from the libp2p keypair in `init()` before the keypair is consumed by
+  `build_swarm`. `mint_epoch_key_release_for_recipient` accepts an optional
+  signing key and populates the signature field when `Some`. All three producer
+  call-sites (`epoch_key_releases_for_admission_response`,
+  `emit_epoch_key_releases_to_all_admitted_peers`, `build_epoch_key_response`)
+  pass `self.p2p_signing_key.as_ref()`. `install_epoch_key_release` gained step 3a:
+  signature verification via the two new private helpers
+  `ed25519_vk_from_peer_id_str` (recovers the verifying key from the libp2p PeerId
+  identity multihash — no schema changes to `AdmissionCert` needed) and
+  `verify_epoch_key_release_signature`. Zero-signature releases (all 64 bytes = 0)
+  skip verification for backward compat with test helpers and pre-signing nodes.
+
+  New test `signed_release_verifies_and_tampered_sig_rejects` in
+  [`dds-node/tests/epoch_key_release_mint.rs`](dds-node/tests/epoch_key_release_mint.rs)
+  pins the sign+verify round-trip end-to-end and confirms a one-byte tamper is
+  rejected with `bad_sig`.
+
+  `cargo test --workspace` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
 ## Documentation-to-Code Verification Addendum (2026-05-02, updated 16th pass)
 
 - ✅ AD-15 + AD-16 E2E test scripts landed (2026-05-02):

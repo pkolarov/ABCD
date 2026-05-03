@@ -27,6 +27,12 @@
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
+/// Domain-separation tag prepended to the CBOR body before Ed25519
+/// signing. Null-terminated so a longer tag can never be a prefix of
+/// a shorter one (mirrors the `ADMISSION_SIGN_PREFIX` convention in
+/// `dds-domain`).
+pub const EPOCH_KEY_RELEASE_SIGN_TAG: &[u8] = b"dds-ekr-v1\x00";
+
 /// **Z-1 Phase B (§4.5 piggy-back, §4.5.1 late-join)** — wire cap on
 /// the number of opaque CBOR-encoded `EpochKeyRelease` blobs an
 /// `AdmissionResponse` or `EpochKeyResponse` may carry.
@@ -430,6 +436,52 @@ impl EpochKeyRelease {
             }
         }
         Ok(())
+    }
+
+    /// Canonical bytes that both the signer and the verifier hash before
+    /// computing / checking the Ed25519 `signature` field.
+    ///
+    /// Format: [`EPOCH_KEY_RELEASE_SIGN_TAG`] (12 bytes) followed by the
+    /// CBOR encoding of a body struct containing the eight fields that
+    /// precede `signature` in declaration order:
+    /// `publisher`, `epoch_id`, `issued_at`, `expires_at`, `recipient`,
+    /// `kem_ct`, `aead_nonce`, `aead_ciphertext`.
+    ///
+    /// The tag provides domain separation so an Ed25519 signature over
+    /// an `EpochKeyRelease` body cannot be lifted to satisfy any other
+    /// signature scheme in the DDS protocol.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            publisher: &'a str,
+            epoch_id: u64,
+            issued_at: u64,
+            expires_at: u64,
+            recipient: &'a str,
+            #[serde(with = "serde_bytes")]
+            kem_ct: &'a [u8],
+            #[serde(with = "serde_bytes")]
+            aead_nonce: &'a [u8; 12],
+            #[serde(with = "serde_bytes")]
+            aead_ciphertext: &'a [u8],
+        }
+        let body = Body {
+            publisher: &self.publisher,
+            epoch_id: self.epoch_id,
+            issued_at: self.issued_at,
+            expires_at: self.expires_at,
+            recipient: &self.recipient,
+            kem_ct: &self.kem_ct,
+            aead_nonce: &self.aead_nonce,
+            aead_ciphertext: &self.aead_ciphertext,
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&body, &mut cbor)
+            .expect("EpochKeyRelease body serialization is infallible");
+        let mut out = Vec::with_capacity(EPOCH_KEY_RELEASE_SIGN_TAG.len() + cbor.len());
+        out.extend_from_slice(EPOCH_KEY_RELEASE_SIGN_TAG);
+        out.extend_from_slice(&cbor);
+        out
     }
 }
 
