@@ -1228,18 +1228,23 @@ The expiry loop periodically:
 That is a pragmatic cleanup strategy.
 It keeps the graph bounded without requiring a full historical ledger forever.
 
-### 15.4 Another Important Limitation
+### 15.4 CausalDag Persistence Limitation
 
-The node's in-memory `trust_graph` and `dag` start empty on process start.
-The current `DdsNode::init` path does not rebuild them from persistent store.
+The node's in-memory `dag` (`CausalDag`) starts empty on process start and is
+rebuilt from gossip and peer-sync on each boot. The operation history is not
+replayed from `OperationStore` on startup; the DAG is session-scoped.
 
-This means:
+The `trust_graph` is **not** subject to the same limitation — it is rehydrated
+from the store before the swarm event loop starts polling for events.
+`DdsNode::init` creates a fresh `Arc<RwLock<TrustGraph>>`; `main.rs` clones
+that `Arc` into `LocalService::new`, which calls
+`LocalService::rehydrate_from_store` synchronously during construction. Because
+every inbound token is persisted to the store via `DdsNode::ingest_operation` →
+`store.put_token`, the trust graph reflects the complete prior-session state on
+restart (B5b fix, 2026-04-10).
 
-- the persistent database may contain durable tokens;
-- the HTTP local service can reconstruct a fresh trust graph snapshot from the store when asked;
-- but the node's own in-memory swarm-side trust graph is not automatically rehydrated from disk at startup.
-
-This is a real implementation gap and worth calling out.
+The remaining open gap is the `CausalDag`: DAG persistence that survives restart
+is tracked in §19.2.
 
 ## 16. Local Authority Service And HTTP API
 
@@ -1571,9 +1576,13 @@ These exist in code but are not yet end-to-end operational in the main node path
   (`connected_peers`, `dag_operations`) are now plumbed via the shared
   `NodePeerCounts` atomic snapshot refreshed by `refresh_peer_count_gauges`.
   `dag_operations` reflects the in-memory `CausalDag` size (resets on restart).
-- automatic node-side trust-graph rehydration from store on startup — the
-  swarm-side `trust_graph` starts empty on each boot and is re-populated via
-  gossip and sync.
+- ~~automatic node-side trust-graph rehydration from store on startup~~ —
+  **Resolved (B5b, 2026-04-10)**: `DdsNode::trust_graph` and
+  `LocalService::trust_graph` share the same `Arc<RwLock<TrustGraph>>`;
+  `LocalService::rehydrate_from_store` is called during `LocalService::new`
+  before the swarm event loop polls its first event. Every inbound token is
+  persisted via `ingest_operation` → `store.put_token`, so the shared graph
+  reflects the full prior-session state on restart. See B5b entry in STATUS.md.
 
 ### 19.3 Present As Data Models More Than End-To-End Features
 
@@ -1598,7 +1607,12 @@ them; the remainder are genuine open work.
    admission cert, and gossip / sync from unadmitted peers is
    dropped at the behaviour layer.
 2. Kademlia is used for discovery, not as the directory state store.
-3. The node-side in-memory graph is not rebuilt from disk at startup.
+3. ~~The node-side in-memory graph is not rebuilt from disk at startup.~~
+   **Resolved for the trust graph (B5b, 2026-04-10)**: the shared
+   `Arc<RwLock<TrustGraph>>` is rehydrated from the store by
+   `LocalService::rehydrate_from_store` before the swarm event loop runs.
+   The `CausalDag` is still session-scoped (rebuilt from gossip/sync on each
+   boot) — see §19.2.
 4. ~~The HTTP status endpoint does not expose live peer and DAG counters.~~
    **Resolved**: `connected_peers` has been live since Phase C metrics #30
    (shared `NodePeerCounts` atomic snapshot). `dag_operations` is now also

@@ -1,5 +1,37 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-03, updated 23rd pass)
+
+- ✅ Whitepaper §15.4 and §19.2 stale trust-graph-rehydration entry corrected (2026-05-03):
+
+  **Gap:** The 22nd pass updated §19.2 to resolve three items (delta-sync,
+  distributed audit, live status plumbing) but incorrectly left
+  "automatic node-side trust-graph rehydration from store on startup" listed as
+  open. The B5b fix (2026-04-10, STATUS.md §P0.b2) had already resolved this:
+  `DdsNode::trust_graph` and `LocalService::trust_graph` share the same
+  `Arc<RwLock<TrustGraph>>`; `LocalService::new` calls
+  `rehydrate_from_store()` synchronously before the swarm event loop polls its
+  first event. Every inbound token (gossip or sync) is persisted by
+  `ingest_operation` → `store.put_token`, so the shared graph fully reflects
+  the prior-session state on restart.
+
+  **§15.4 updated:** Previously said "the node's in-memory trust_graph and dag
+  start empty on process start" and listed trust-graph rehydration as an
+  implementation gap. Corrected to note that only the `CausalDag` starts empty
+  (session-scoped by design); the `trust_graph` is rehydrated from store before
+  the event loop runs, per the B5b fix.
+
+  **§19.2 updated:** The trust-graph rehydration bullet is now struck through
+  and marked **Resolved (B5b, 2026-04-10)** with the mechanism noted.
+
+  Remaining open item in §19.2: operation-store-backed restartable DAG
+  (the `CausalDag` is rebuilt from gossip/sync on each boot, not replayed from
+  `OperationStore`).
+
+  No code changes. `cargo build --workspace` clean. All 558 library/unit
+  tests pass across workspace crates (dds-core: 197, dds-node: 310,
+  dds-store/domain/net/cli: 38, dds-ffi: 13).
+
 ## Documentation-to-Code Verification Addendum (2026-05-03, updated 22nd pass)
 
 - ✅ `dag_operations` wired into `/v1/status` + §19.2/§19.4 whitepaper stale entries fixed (2026-05-03):
@@ -35,8 +67,10 @@
   - §19.4 bullet 4 "The HTTP status endpoint does not expose live peer and DAG
     counters" — now struck through and marked **Resolved** with the same detail.
 
-  Remaining open items in §19.2: operation-store-backed restartable DAG;
-  automatic node-side trust-graph rehydration from store on startup.
+  Remaining open item in §19.2 at time of this pass: operation-store-backed
+  restartable DAG; automatic node-side trust-graph rehydration from store on
+  startup. **Note:** trust-graph rehydration was subsequently confirmed
+  resolved by B5b (see 23rd pass above) — only the DAG remains open.
 
   No .NET or external code changes. `cargo build --workspace` clean.
 
@@ -4928,9 +4962,11 @@ cargo run -p dds-loadtest --release -- --smoke --output-dir /tmp/dds-smoke
 cargo run --release -p dds-loadtest -- --duration 24h --output-dir results/$(date +%Y%m%d)
 ```
 
-The CI smoke job was originally planned as `.github/workflows/loadtest-smoke.yml`
-but that workflow does not exist yet; the loadtest must be run manually as shown
-above until a dedicated workflow is added.
+The CI smoke job runs as [`.github/workflows/loadtest-smoke.yml`](.github/workflows/loadtest-smoke.yml)
+on every push to `main` and on `workflow_dispatch`. The job builds the loadtest
+crate in release mode, runs `--smoke`, and uploads the summary artifacts.
+(This note was stale: the workflow was added in a 2026-05-02 pass — see the
+STATUS.md 14th-pass entry above for the closure entry.)
 
 ## What's Next
 
