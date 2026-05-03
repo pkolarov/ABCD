@@ -1,5 +1,75 @@
 # DDS Implementation Status
 
+## Documentation-to-Code Verification Addendum (2026-05-03, updated 21st pass)
+
+- ✅ Stale whitepaper implementation-status sections updated (2026-05-03):
+  Three sections in `docs/DDS-Implementation-Whitepaper.md` that described
+  "design ahead of implementation" gaps were stale and misleading post the
+  major Z-1 / Z-3 / B.8 implementation work.
+
+  **§14.8.1** — previously said "sync module exists but is not wired into the
+  live node." Sync IS now live: `DdsNode::try_sync_with` opens outbound
+  request-response sessions on each admitted peer and on a periodic backstop
+  timer; `DdsNode::handle_sync_event` processes inbound requests and responses
+  via `build_sync_response` / `handle_sync_response`; `apply_sync_payloads_with_graph`
+  runs after every `handle_sync_response`. On `enc-v3` domains, sync payloads
+  are AEAD-encrypted (Z-1 Phase B.8, 2026-05-01). Section updated to reflect
+  this resolution.
+
+  **§14.8.3** — previously said "audit publication is only partially present
+  (schema + receive path, no publication for local mutations)." Audit IS now
+  fully end-to-end: `emit_local_audit` / `emit_audit_from_ingest` are wired to
+  every state-mutating path in both `DdsNode` and `LocalService` (Z-3 Phase A,
+  2026-04-26). Section updated to reflect this resolution.
+
+  **§24 Final Assessment** — the "weakest areas" bullet list included three
+  stale items ("sync exists but is not live", "audit is schema-first, not
+  full lifecycle-first", "domain admission is not yet a live remote peer-auth
+  protocol"). All three are now resolved. Bullet list replaced with an
+  accurate set of remaining limitations (DAG persistence not live; swarm-side
+  trust graph starts empty on each boot; Z-2 hardware binding + Z-4
+  at-rest encryption still open).
+
+- ✅ Admin Guide histogram metrics section updated (2026-05-03):
+  `docs/DDS-Admin-Guide.md` incorrectly stated that `dds_sync_lag_seconds` and
+  `dds_http_request_duration_seconds` histograms were "deferred until
+  `metrics-exporter-prometheus` rollover." Both histograms shipped hand-rolled
+  in follow-up #46 (2026-05-02). Corrected the deferred note to "available in
+  the current build" and added both histogram rows to the metrics catalog table.
+  Also corrected the alert-group list from "three groups" to note the correct
+  eight active groups (including `dds-pqc` and `dds-sync-lag`).
+
+- ✅ Observability plan "seven groups" typo fixed (2026-05-03):
+  `docs/observability-plan.md` said "All seven alert groups are now active" but
+  then listed eight (`dds-audit`, `dds-process`, `dds-storage`, `dds-http`,
+  `dds-network`, `dds-fido2`, `dds-pqc`, `dds-sync-lag`). Changed "seven" to
+  "eight".
+
+- ✅ Design Document PQ gap note updated (2026-05-03):
+  `docs/DDS-Design-Document.md` §6.1 PQ warning noted the application-layer
+  Harvest-Now-Decrypt-Later gap as open. Updated to document that Z-1 Phase B
+  (complete 2026-05-01) closed the application-layer gap via ML-KEM-768 epoch
+  keys on gossip + sync on `enc-v3` domains; the remaining gap is transport-layer
+  (Noise XX still classical DH, awaiting hybrid-Noise upstream or Phase C).
+
+- ✅ Design Document directory tree updated (2026-05-03):
+  `platform/windows/installer/` and `platform/{linux,macos}/packaging/` were
+  marked "planned" in the directory tree but have been implemented. Updated
+  labels to reflect actual content (WiX MSI bundle, `.deb`/`.rpm`/systemd
+  assets, `pkgbuild`/`productbuild` assets).
+
+- ✅ README PQ scope note updated (2026-05-03):
+  The PQ scope disclaimer in `README.md` said "planned Phase B remediation"
+  and "Do not market DDS as end-to-end post-quantum until at least Phase B
+  closes." Phase B IS closed (2026-05-01). Updated to note Phase B resolved
+  the application-layer gap, with the remaining open scope being the
+  transport-layer handshake (awaiting Phase C / hybrid-Noise upstream).
+
+  No Rust or C# code changes — documentation corrections only.
+  `cargo build --workspace` clean; all .NET tests passing (Linux 71/71,
+  Windows 176/215 passing / 39 skipped-Windows-host-only, macOS 92/92).
+  Rust workspace tests running (838 expected — build verified clean).
+
 ## Documentation-to-Code Verification Addendum (2026-05-03, updated 20th pass)
 
 - ✅ Linux managed-set lifecycle bug fixed + capability gate test added (2026-05-03):

@@ -24,7 +24,7 @@ pin the exposition output. Phase E **PQC alert rules**
 2026-05-02 follow-up #45 — the two deferred B.11 alert rules are now
 active in `dds-pqc` group. Phase E **network + FIDO2 reference rules
 promoted to active** (`DdsAdmissionFailureSpike`, `DdsSyncRejectsSpike`,
-`DdsFido2AssertionFailureSpike`) landed follow-up #43. All seven alert
+`DdsFido2AssertionFailureSpike`) landed follow-up #43. All eight alert
 groups are now active: `dds-audit`, `dds-process`, `dds-storage`,
 `dds-http`, `dds-network`, `dds-fido2`, `dds-pqc`, and `dds-sync-lag`.
 Phase C **`dds_build_info` git_sha + rust_version

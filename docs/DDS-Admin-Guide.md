@@ -1654,11 +1654,8 @@ Catalog (full list with semantics is in
 | `dds_http_caller_identity_total` | counter | `kind=anonymous\|uds\|pipe\|admin` | Caller transport mix — H-7 cutover regression alarm |
 | `dds_memory_resident_bytes` | gauge | — | Process RSS |
 | `dds_thread_count` | gauge | — | OS thread count |
-
-Histograms (`dds_sync_lag_seconds`, `dds_http_request_duration_seconds`)
-are deferred until the hand-rolled exposition rolls over to
-`metrics-exporter-prometheus`; they will land alongside the Phase E
-`DdsSyncLagHigh` rule.
+| `dds_sync_lag_seconds` | histogram | — | Token `iat` → local apply latency (buckets: 1 s, 5 s, 15 s, 60 s, 300 s, 900 s, 3600 s, 86400 s) |
+| `dds_http_request_duration_seconds` | histogram | `route, method` | HTTP handler wall time (buckets: 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 250 ms, 500 ms, 1 s, 5 s) |
 
 ### Reference Dashboards & Alert Rules
 
@@ -1670,10 +1667,10 @@ load a working monitoring layer in minutes:
   rejection spike), `dds-process` (node down / flapping / build skew),
   `dds-storage` (write failures), `dds-http` (loopback-TCP H-7
   regression), `dds-network` (admission failure spike, sync rejects
-  spike), `dds-fido2` (assertion failure spike). Reference rules whose
-  source metric is still open (Phase C histograms) ship as commented
-  blocks — uncomment a tier only after confirming the metric ships in
-  the deployed `dds-node` build.
+  spike), `dds-fido2` (assertion failure spike), `dds-pqc` (decrypt
+  failure spike, key-request spike), `dds-sync-lag` (p99 sync lag > 60 s).
+  All eight groups are active — Phase C histograms shipped hand-rolled
+  (follow-up #46, 2026-05-02), so `DdsSyncLagHigh` is no longer deferred.
 - [`docs/observability/grafana/dds-overview.json`](observability/grafana/dds-overview.json)
   — Node count, build skew, audit chain head age, scrape health, audit
   emission rate by action, chain length / head age / uptime per

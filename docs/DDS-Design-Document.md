@@ -205,15 +205,16 @@ DDS uses **libp2p** as the networking substrate:
 > (Ed25519+ML-DSA-65), and as of **Z-1 Phase A (2026-04-28)** the
 > `AdmissionCert` and `AdmissionRevocation` are also hybrid PQ — a
 > v2-hybrid domain (`Domain.pq_pubkey` populated) rejects any cert or
-> revocation that lacks the ML-DSA-65 component. The transport
-> channel itself is **still not** post-quantum: a
-> Harvest-Now-Decrypt-Later adversary can record gossipsub / sync
-> traffic today and recover plaintext on a future quantum break.
+> revocation that lacks the ML-DSA-65 component.
+> **Z-1 Phase B (complete 2026-05-01)** closed the application-layer
+> Harvest-Now-Decrypt-Later gap: gossipsub messages and sync payloads
+> are now AEAD-encrypted under a per-publisher ML-KEM-768 epoch key on
+> `enc-v3` domains, so plaintext is not recoverable even from recorded
+> ciphertext. The transport channel itself is **still not** post-quantum
+> (Noise XX uses classical DH); full transport PQ awaits hybrid-Noise
+> upstream (rust-libp2p tracking issue rs/9595) or Phase C.
 > Tracked in [Claude_sec_review.md](../Claude_sec_review.md) Z-1 and
-> [docs/threat-model-review.md](threat-model-review.md) §4. Remaining
-> remediation waits on hybrid-Noise upstream (rust-libp2p tracking
-> issue rs/9595) or an interim per-message hybrid-KEM envelope on the
-> application layer.
+> [docs/threat-model-review.md](threat-model-review.md) §4.
 
 ### 6.2 Domain Isolation & Topic Structure
 
@@ -762,21 +763,21 @@ dds/
     │   │   ├── State/                Applied-state persistence (idempotency)
     │   │   └── Enforcers/            Registry, Account, PasswordPolicy, Software
     │   ├── DdsPolicyAgent.Tests/     xUnit tests (cross-platform via InMemory* doubles)
-    │   └── installer/                WiX v4 MSI bundle (planned)
+    │   └── installer/                WiX v4 MSI bundle (Build-Msi.ps1 + DdsBundle.wxs)
     ├── linux/
     │   ├── DdsPolicyAgent/           .NET 8 worker service — Linux policy enforcement
     │   │   ├── Client/               HTTP client for dds-node /v1/linux/* API
     │   │   ├── State/                Applied-state persistence in /var/lib/dds
-    │   │   └── Enforcers/            Sysctl, Files, Accounts, Systemd, SSH, Software
+    │   │   └── Enforcers/            Users, Sudoers, Files, Systemd, Packages
     │   ├── pam_dds/                  PAM module / helper bridge for local auth (planned)
-    │   └── packaging/                .deb / .rpm / systemd unit assets (planned)
+    │   └── packaging/                .deb / .rpm / systemd unit assets
     ├── macos/
     │   ├── DdsPolicyAgent/           .NET 8 launchd daemon — macOS policy enforcement
     │   │   ├── Client/               HTTP client for dds-node /v1/macos/* API
     │   │   ├── State/                Applied-state persistence in /Library/Application Support/DDS
     │   │   └── Enforcers/            Preferences, Accounts, launchd, Profiles, Software
     │   ├── DdsLoginBridge/           Authorization Services / session bootstrap bridge (planned)
-    │   └── packaging/                pkgbuild/productbuild/notarization assets (planned)
+    │   └── packaging/                pkgbuild/productbuild/notarization assets
     ├── android/                  Kotlin wrapper via UniFFI
     ├── ios/                      Swift wrapper via UniFFI
     └── embedded/                 no_std integration examples (Embassy)

@@ -5,15 +5,16 @@ A peer-to-peer identity and access management system built in Rust. DDS provides
 **Quantum-resistant token signatures** — hybrid Ed25519 + ML-DSA-65 (FIPS 204) on every token.
 
 > ⚠ **Scope of the PQ claim.** The hybrid signature applies to the
-> token / attestation layer **plus `AdmissionCert` and
-> `AdmissionRevocation`** as of Z-1 Phase A (2026-04-28). The libp2p
-> **transport handshake** (Noise XX over X25519, QUIC over
-> rustls/ECDHE) is still classical — see Z-1 in
-> [Claude_sec_review.md](Claude_sec_review.md) and
-> [docs/threat-model-review.md](docs/threat-model-review.md) §4 for the
-> remaining Harvest-Now-Decrypt-Later exposure on recorded
-> gossip / sync traffic and the planned Phase B remediation. Do not
-> market DDS as end-to-end post-quantum until at least Phase B closes.
+> token / attestation layer plus `AdmissionCert` / `AdmissionRevocation`
+> (Z-1 Phase A, 2026-04-28). **Z-1 Phase B (complete 2026-05-01)**
+> closed the application-layer Harvest-Now-Decrypt-Later gap: gossipsub
+> messages and sync payloads are AEAD-encrypted under ML-KEM-768 epoch
+> keys on `enc-v3` domains. The libp2p **transport handshake**
+> (Noise XX / QUIC) is still classical and remains the scope
+> boundary — see Z-1 in [Claude_sec_review.md](Claude_sec_review.md)
+> and [docs/threat-model-review.md](docs/threat-model-review.md) §4.
+> Do not market DDS as fully post-quantum until Phase C (hybrid-Noise
+> upstream) closes.
 
 **9 crates · 22,000 lines of Rust · 5 platform bindings**
 

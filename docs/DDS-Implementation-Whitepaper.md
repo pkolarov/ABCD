@@ -1135,26 +1135,20 @@ That is a practical small-network bootstrapping pattern and matches libp2p's rol
 
 ### 14.8 Important Limitations In Live Networking
 
-There are three major "design ahead of implementation" gaps here:
+There is one remaining "design ahead of implementation" gap here (as of 2026-05-03).
+Two previously-noted gaps have since been closed.
 
-#### 14.8.1 Sync module exists, but is not wired into the live node
+#### 14.8.1 ~~Sync module not wired into live node~~ — **Resolved (2026-05-01)**
 
-`dds-net/src/sync.rs` defines:
-
-- summaries;
-- operation ID exchange;
-- missing-op calculation;
-- payload application with topological retry.
-
-It is well tested.
-
-But the running `dds-node` event loop does **not** currently:
-
-- open sync streams;
-- negotiate sync sessions;
-- use `apply_sync_payloads` during real peer interaction.
-
-So this is a library-level capability and a tested prototype, not yet a live node protocol path.
+`dds-net/src/sync.rs` (summaries, missing-op calculation, encrypted payload transport)
+is now fully wired into the live node.
+`DdsNode::try_sync_with` opens an outbound request-response sync session
+with each newly-admitted peer and on the periodic backstop timer.
+`DdsNode::handle_sync_event` processes inbound requests (via
+`build_sync_response`) and inbound responses (via `handle_sync_response`,
+which calls `apply_sync_payloads_with_graph`).
+On `enc-v3` domains, `build_sync_response` AEAD-encrypts payloads and
+`handle_sync_response` decrypts them before the merge pipeline (Z-1 Phase B.8).
 
 #### 14.8.2 Operation persistence is incomplete
 
@@ -1165,15 +1159,16 @@ That means:
 - the trust-bearing tokens persist;
 - the exact causal operation history does not fully persist through node restarts.
 
-#### 14.8.3 Audit publication is only partially present
+#### 14.8.3 ~~Audit only partially wired~~ — **Resolved (2026-04-26, Z-3 Phase A)**
 
-The node can ingest audit log entries if they arrive and audit is enabled.
-What the code does not currently show is a matching publication path for local mutations.
-
-So audit is better described as:
-
-- schema plus storage plus receive path;
-- not yet full end-to-end distributed audit generation.
+`DdsNode::emit_local_audit` / `emit_audit_from_ingest` are now wired to
+every state-mutating path: all `ingest_operation` accept/reject branches,
+`ingest_revocation`, `ingest_burn`, admission-cert revocation, and all
+`LocalService` mutation entry points (`enroll_user`, `enroll_device`,
+`admin_setup`, `admin_vouch`, `record_applied`).
+Each entry writes a signed, hash-chained `AuditLogEntry` to redb.
+Audit is now full end-to-end: local mutations produce entries, the chain
+is verifiable, and the CLI can tail or export it.
 
 ## 15. The Node Process: What A Running DDS Node Actually Is
 
@@ -2171,13 +2166,23 @@ Its strongest implemented ideas are:
 - practical libp2p-based dissemination;
 - good tests and meaningful load instrumentation.
 
-Its weakest or most transitional areas are not conceptual weakness so much as wiring gaps:
+Its weakest or most transitional areas are not conceptual weakness so much as wiring gaps
+(state as of 2026-05-03 — several earlier items have since been resolved):
 
-- sync exists but is not live;
-- operation persistence exists but is not live in the main path;
-- audit is schema-first, not full lifecycle-first;
-- domain admission is not yet a live remote peer-auth protocol;
-- the node and HTTP service share persistence better than they share live in-memory state.
+- operation persistence: trust-bearing tokens persist across restarts,
+  but the causal DAG (`CausalDag`) is rebuilt from gossip / sync on each
+  boot rather than replayed from `OperationStore`;
+- the node's in-memory swarm-side `trust_graph` starts empty on each
+  boot and is re-populated via gossip and sync; the HTTP service can
+  reconstruct a snapshot from redb on demand, but these two views are
+  not automatically kept in sync at startup;
+- post-quantum: Phase B (encrypted gossip + sync) is complete; hardware
+  binding for long-lived keys (Z-2) and full store-at-rest encryption
+  (Z-4) remain open.
+
+Previously-noted gaps that are now resolved: sync is live (§4.5 / B.8);
+audit is full end-to-end (Z-3); domain admission is a live H-12
+peer-auth handshake; post-quantum is on by default for fresh deployments.
 
 That is still a very respectable place for a project to be.
 
