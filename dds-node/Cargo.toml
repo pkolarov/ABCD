@@ -72,6 +72,11 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
+# Windows Service Control Manager integration so dds-node can run as a
+# proper Windows service (StartServiceCtrlDispatcher, SERVICE_RUNNING /
+# SERVICE_STOPPED state transitions, Stop/Shutdown handler). Without
+# this, SCM times out and orphans the process.
+windows-service = "0.7"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

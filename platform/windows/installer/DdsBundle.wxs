@@ -128,7 +128,7 @@
                         Start="auto"
                         Account="LocalSystem"
                         ErrorControl="normal"
-                        Arguments="run --config &quot;[DIR_CONFIG]node.toml&quot;" />
+                        Arguments="service-run --config &quot;[DIR_CONFIG]node.toml&quot;" />
         <!-- Do NOT Start="install": the shipped node.toml is an unprovisioned
              template (no org_hash / domain) and dds-node refuses to load it
              with TOML parse error "missing field `org_hash`", causing MSI

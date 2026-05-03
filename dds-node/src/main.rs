@@ -101,15 +101,38 @@ use dds_node::p2p_identity;
 use dds_node::provision;
 use dds_node::service::LocalService;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[cfg(windows)]
+mod win_service;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Windows Service Control Manager dispatch path. Registered by the
+    // MSI as `dds-node.exe service-run --config <path>`. Must NOT be
+    // wrapped in a tokio runtime — `service_dispatcher::start` blocks
+    // synchronously waiting for SCM and spins up tokio inside the
+    // service handler. Using `#[tokio::main]` here would panic when the
+    // dispatcher tries to build its own runtime.
+    #[cfg(windows)]
+    if raw_args.first().map(String::as_str) == Some("service-run") {
+        return win_service::run();
+    }
+
+    // CLI / interactive path — build a tokio runtime ourselves so the
+    // service-mode early-return above can stay synchronous.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async_main(raw_args))
+}
+
+async fn async_main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("run");
 
     match sub {
