@@ -8,6 +8,7 @@
 #include "EnrollmentFlow.h"
 #include "AdminFlow.h"
 #include "RefreshVaultFlow.h"
+#include "PasswordChangeMonitor.h"
 #include "DdsNodeHttpClient.h"
 #include "Configuration.h"
 #include "FileLog.h"
@@ -15,6 +16,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <commctrl.h>
+#include <wtsapi32.h>
 #include <strsafe.h>
 
 #pragma comment(lib, "comctl32.lib")
@@ -236,7 +238,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
 
+    case WM_WTSSESSION_CHANGE:
+        PasswordChangeMonitor::HandleSessionChange(hwnd, wParam, lParam);
+        return 0;
+
+    case WM_TIMER:
+        if (PasswordChangeMonitor::HandleTimer(hwnd, wParam))
+            return 0;
+        break;
+
     case WM_DESTROY:
+        PasswordChangeMonitor::Stop(hwnd);
         RemoveTrayIcon();
         PostQuitMessage(0);
         return 0;
@@ -311,6 +323,11 @@ int APIENTRY wWinMain(
 
     // Add tray icon
     AddTrayIcon(g_hWnd);
+
+    // Start password-change monitor (WTS session events + 60s poll).
+    // The autostart Run-key launches us with --minimized at logon; either
+    // way the monitor is what we need running in the background.
+    PasswordChangeMonitor::Start(g_hWnd);
 
     FileLog::Write("DdsTrayAgent: tray icon added, entering message loop\n");
 

@@ -375,6 +375,18 @@
       <Component Id="C_TrayAgent" Guid="77777777-7777-7777-7777-777777777777">
         <File Id="tray_agent_exe" Source="$(var.BuildDir)\DdsTrayAgent.exe" KeyPath="yes" />
       </Component>
+      <!-- HKLM Run key: launch tray for every interactive logon (all users   -->
+      <!-- on the machine). The minimized flag suppresses any first-run UI;   -->
+      <!-- single-instance mutex prevents duplicates if the user also opens   -->
+      <!-- the Start-menu shortcut.                                           -->
+      <Component Id="C_TrayAgentAutostart" Guid="78787878-7878-7878-7878-787878787878">
+        <RegistryValue Root="HKLM"
+                       Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                       Name="DdsTrayAgent"
+                       Type="string"
+                       Value='"[#tray_agent_exe]" --minimized'
+                       KeyPath="yes" />
+      </Component>
     </ComponentGroup>
 
     <!-- ============================================================ -->
