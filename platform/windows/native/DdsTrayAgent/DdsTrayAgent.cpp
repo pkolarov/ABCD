@@ -97,7 +97,15 @@ static void ShowStatus(HWND hwnd)
     CDdsNodeHttpClient httpClient;
     CDdsConfiguration config;
     config.Load();
-    httpClient.SetPort(config.DdsNodePort());
+    // A-2: prefer ApiAddr (carries the pipe:<name> scheme for H-7
+    // step-2b's named-pipe transport). Bootstrap-DdsDomain.ps1
+    // generates node.toml with `api_addr = "pipe:dds-api"` only — no
+    // TCP listener — so SetPort alone gives WinHTTP error 12029.
+    if (!config.ApiAddr().empty()) {
+        httpClient.SetBaseUrl(config.ApiAddr());
+    } else {
+        httpClient.SetPort(config.DdsNodePort());
+    }
 
     DdsEnrolledUsersResult result = httpClient.GetEnrolledUsers(config.DeviceUrn());
 

@@ -154,8 +154,15 @@ bool RunAdminSetupFlow(HWND hwnd)
     }
 
     // POST /v1/admin/setup
+    // A-2: prefer ApiAddr over the legacy DdsNodePort path so the
+    // tray agent works against bootstrap-generated node.toml that
+    // ships with `api_addr = "pipe:dds-api"` only.
     CDdsNodeHttpClient httpClient;
-    httpClient.SetPort(config.DdsNodePort());
+    if (!config.ApiAddr().empty()) {
+        httpClient.SetBaseUrl(config.ApiAddr());
+    } else {
+        httpClient.SetPort(config.DdsNodePort());
+    }
 
     std::string credIdB64 = Base64UrlEncode(
         makeResult.credentialId.data(), makeResult.credentialId.size());
@@ -312,9 +319,13 @@ bool RunAdminApproveFlow(HWND hwnd)
         return false;
     }
 
-    // Fetch enrolled users from dds-node
+    // Fetch enrolled users from dds-node — prefer ApiAddr (A-2).
     CDdsNodeHttpClient httpClient;
-    httpClient.SetPort(config.DdsNodePort());
+    if (!config.ApiAddr().empty()) {
+        httpClient.SetBaseUrl(config.ApiAddr());
+    } else {
+        httpClient.SetPort(config.DdsNodePort());
+    }
 
     DdsEnrolledUsersResult usersResult = httpClient.GetEnrolledUsers(config.DeviceUrn());
 

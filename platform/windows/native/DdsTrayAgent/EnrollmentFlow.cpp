@@ -343,9 +343,15 @@ bool RunEnrollmentFlow(HWND hwnd)
 
     FileLog::Write("EnrollmentFlow: vault saved OK\n");
 
-    // Step 7: POST /v1/enroll/user to dds-node
+    // Step 7: POST /v1/enroll/user to dds-node — prefer ApiAddr (A-2)
+    // so we hit the named-pipe transport when the operator's node.toml
+    // disables loopback TCP.
     CDdsNodeHttpClient httpClient;
-    httpClient.SetPort(config.DdsNodePort());
+    if (!config.ApiAddr().empty()) {
+        httpClient.SetBaseUrl(config.ApiAddr());
+    } else {
+        httpClient.SetPort(config.DdsNodePort());
+    }
 
     std::string credIdB64 = Base64UrlEncode(
         makeResult.credentialId.data(), makeResult.credentialId.size());
