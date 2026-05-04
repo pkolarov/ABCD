@@ -1,5 +1,31 @@
 # DDS Implementation Status
 
+## Doc Fix (2026-05-04, 40th pass) — Linux reconciliation documented in Admin Guide
+
+### Gap
+
+The Admin Guide "Reconciliation & Drift Detection" section covered only the Windows
+policy agent. The Linux reconciliation pass (added in the 39th pass) was not documented.
+
+### Fix — `docs/DDS-Admin-Guide.md`
+
+- Split the "Reconciliation & Drift Detection" section into `#### Windows Reconciliation`
+  and `#### Linux Reconciliation` subsections.
+- Linux reconciliation table covers all seven enforcer categories, documenting which
+  resource types have stale-item cleanup and which do not (systemd is forward-pass only,
+  matching the Windows "Services" carve-out).
+- Clarifies the key behavioral difference: Windows has per-cycle drift correction
+  (via `HostStateChangedSinceApply`); Linux uses content-hash idempotency and only
+  re-applies when the policy hash changes.
+- Documents `/var/lib/dds/applied-state.json` as the Linux state-tracking file
+  (analogous to `%ProgramData%\DDS\applied-state.json` on Windows).
+
+**Test results**: all tests unchanged — 132 / 132 Linux .NET, 201 / 240 Windows .NET
+(39 skipped: Windows-only integration tests), 92 / 92 macOS .NET,
+Rust workspace tests clean.
+
+---
+
 ## Gap Fix (2026-05-04, 39th pass) — Linux reconciliation + doc corrections
 
 ### Linux reconciliation pass

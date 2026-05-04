@@ -1186,8 +1186,10 @@ dds platform windows claim-account \
 
 ### Reconciliation & Drift Detection
 
-The Windows policy agent automatically reconciles endpoint state with the
-current policy on every poll cycle (every 60 seconds). This means:
+Both the Windows and Linux policy agents automatically reconcile endpoint state
+with the current policy on every poll cycle (every 60 seconds).
+
+#### Windows Reconciliation
 
 **Stale-item cleanup.** When you remove a directive from a policy (e.g., delete
 a registry entry from the `registry` array, remove a user from `local_accounts`,
@@ -1233,6 +1235,42 @@ Before (policy has the entry):
 
 After (entry removed from policy): the agent detects `Enabled` is no longer
 desired, deletes it from the registry, and updates its managed-items tracking.
+
+#### Linux Reconciliation
+
+**Stale-item cleanup.** The Linux agent runs the same reconciliation algorithm.
+After applying all current policies, it computes the difference between the
+set of DDS-managed resources from the previous cycle and the resources declared
+in the current policy set. Items no longer desired are cleaned up:
+
+| Category | Cleanup action |
+|---|---|
+| Local users | Disabled via `passwd -l` (not deleted, to preserve home directories and logs) |
+| Managed files | Deleted from the filesystem |
+| Packages | Removed via the host package manager (`apt-get remove`, `dnf remove`, etc.) |
+| `sysctl` keys | Removed from `/etc/sysctl.d/60-dds-managed.conf` and `sysctl --system` re-run |
+| `ssh` drop-in | Removed from `/etc/ssh/sshd_config.d/60-dds.conf` if the `ssh` field is absent from all policies |
+| `systemd` units | No stale-item cleanup — enable/disable directives are applied on the forward pass only |
+| `sudoers` drop-ins | Deleted from `/etc/sudoers.d/` when the `content` field is empty or the directive is removed |
+
+**Drift correction.** The Linux agent uses a content-hash idempotency model: a
+policy is re-applied only when its content changes. Manual changes to DDS-managed
+files, kernel parameters, or sshd drop-ins are **not** automatically corrected
+until the policy is next updated. To force re-application, bump the policy
+version so the hash changes.
+
+**Audit mode.** Setting `AuditOnly: true` in the agent config suppresses all
+host mutations. The reconciliation pass will log what *would* be cleaned up but
+will not remove or disable anything.
+
+**Safety guarantees:**
+- Only items that DDS previously created/set are touched — pre-existing system
+  state (users, files, packages not managed by DDS) is never modified.
+- User deletion is refused for accounts not tracked in the DDS managed-set,
+  preventing accidental removal of pre-existing local accounts.
+- Package removal is refused for packages not previously installed by DDS.
+- The agent tracks managed items in `/var/lib/dds/applied-state.json`
+  under the `managed_usernames`, `managed_paths`, and `managed_packages` keys.
 
 ---
 
