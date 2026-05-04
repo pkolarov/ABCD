@@ -1186,8 +1186,8 @@ dds platform windows claim-account \
 
 ### Reconciliation & Drift Detection
 
-Both the Windows and Linux policy agents automatically reconcile endpoint state
-with the current policy on every poll cycle (every 60 seconds).
+The Windows, Linux, and macOS policy agents automatically reconcile endpoint
+state with the current policy on every poll cycle (every 60 seconds).
 
 #### Windows Reconciliation
 
@@ -1271,6 +1271,44 @@ will not remove or disable anything.
 - Package removal is refused for packages not previously installed by DDS.
 - The agent tracks managed items in `/var/lib/dds/applied-state.json`
   under the `managed_usernames`, `managed_paths`, and `managed_packages` keys.
+
+#### macOS Reconciliation
+
+**Stale-item cleanup.** The macOS agent runs the same reconciliation algorithm.
+After applying all current policies, it computes the difference between the
+set of DDS-managed resources from the previous cycle and the resources declared
+in the current policy set. Items no longer desired are cleaned up:
+
+| Category | Cleanup action |
+|---|---|
+| Managed preferences | Preference key deleted via `defaults delete` |
+| Local accounts | Disabled (not deleted, to preserve home directories) via `dscl` |
+| Group memberships | User removed from group via `dseditgroup` |
+| launchd jobs | Unloaded via `launchctl bootout` |
+| Configuration profiles | Removed via `profiles remove -identifier` |
+| Software packages | Audit-log only — macOS has no universal package-remove primitive; stale packages are flagged for manual uninstall |
+
+**Drift correction.** The macOS agent uses a content-hash idempotency model: a
+policy is re-applied only when its content changes. Manual changes to
+DDS-managed preference plists, launchd jobs, or profiles are **not**
+automatically corrected until the policy is next updated. To force
+re-application, bump the policy version so the hash changes.
+
+**Audit mode.** If any policy in the current cycle uses `enforcement: Audit`,
+the global mode is demoted to Audit for that cycle. The reconciliation pass logs
+what *would* be cleaned up but does not remove or disable anything.
+
+**Safety guarantees:**
+- Only items that DDS previously created/set are touched — pre-existing
+  system state (accounts, preference domains, launchd jobs, profiles not managed
+  by DDS) is never modified by reconciliation.
+- Account disablement is refused for accounts not tracked in the DDS managed-set,
+  preventing accidental disablement of pre-existing local accounts.
+- Software package uninstall is always skipped because generic `.pkg` uninstall
+  is not supported; stale packages require manual removal.
+- The agent tracks managed items in `/Library/Application Support/DDS/applied-state.json`
+  under the `managed_items` key, keyed by enforcer category (`preferences`,
+  `accounts`, `account_groups`, `launchd`, `profiles`, `software_managed`).
 
 ---
 

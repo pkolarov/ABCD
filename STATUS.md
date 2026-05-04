@@ -1,5 +1,39 @@
 # DDS Implementation Status
 
+## Doc Fix (2026-05-04, 41st pass) — macOS reconciliation documented in Admin Guide
+
+### Gap
+
+The Admin Guide "Reconciliation & Drift Detection" section stated "Both the Windows and Linux
+policy agents automatically reconcile endpoint state" — incorrectly omitting macOS. The macOS
+policy agent (`platform/macos/DdsPolicyAgent/Worker.cs`) has had a full reconciliation pass
+since before the 40th pass: after applying all current policies it computes the stale set
+and dispatches to per-enforcer reconcile methods for preferences, accounts, group memberships,
+launchd jobs, configuration profiles, and software packages.
+
+### Fix — `docs/DDS-Admin-Guide.md`
+
+- Updated the section intro from "Both the Windows and Linux policy agents..." to
+  "The Windows, Linux, and macOS policy agents...".
+- Added `#### macOS Reconciliation` subsection documenting:
+  - Stale-item cleanup table (6 categories: preferences, accounts, group memberships,
+    launchd jobs, profiles, software — software is audit-log-only because macOS has
+    no universal package-remove primitive).
+  - Content-hash idempotency model (same as Linux; manual drift not auto-corrected until
+    policy version bumps).
+  - Audit mode behaviour: global mode demoted to Audit if any policy uses `enforcement: Audit`.
+  - Safety guarantees: only DDS-managed items touched; account disablement guarded by
+    managed-set membership; software uninstall always skipped.
+  - State file: `/Library/Application Support/DDS/applied-state.json`, `managed_items` key,
+    categories `preferences`, `accounts`, `account_groups`, `launchd`, `profiles`,
+    `software_managed`.
+
+**Test results**: all tests unchanged — 92 / 92 macOS .NET, 132 / 132 Linux .NET,
+201 / 240 Windows .NET (39 skipped: Windows-only integration tests),
+Rust workspace tests clean.
+
+---
+
 ## Doc Fix (2026-05-04, 40th pass) — Linux reconciliation documented in Admin Guide
 
 ### Gap
