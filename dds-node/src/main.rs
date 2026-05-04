@@ -172,7 +172,7 @@ fn print_usage() {
   dds-node gen-node-key --data-dir <DIR>
   dds-node rotate-identity --data-dir <DIR> [--no-backup]
   dds-node gen-hmac-secret --out <FILE> [--force] [--keep-existing]
-  dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--out <FILE>] [--ttl-days <N>]
+  dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--kem-pubkey <HEX> | --kem-pubkey-path <FILE>] [--out <FILE>] [--ttl-days <N>]
   dds-node revoke-admission --domain-key <FILE> --domain <FILE> --peer-id <ID> [--reason <STR>] [--out <FILE>]
   dds-node import-revocation --data-dir <DIR> --in <FILE> [--config <PATH>]
   dds-node list-revocations --data-dir <DIR> [--json] [--config <PATH>]

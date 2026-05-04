@@ -146,14 +146,17 @@ dds-node gen-node-key --data-dir ~/.dds
 Output:
 ```
 Node libp2p identity:
-  data_dir: /home/admin/.dds
-  p2p_key:  /home/admin/.dds/p2p_key.bin
-  peer_id:  12D3KooWAbCdEf...
+  data_dir:       /home/admin/.dds
+  p2p_key:        /home/admin/.dds/p2p_key.bin
+  peer_id:        12D3KooWAbCdEf...
+  kem_pubkey_hex: aabbccdd1122...
 
-Send this peer id to the domain admin to obtain an admission cert.
+Send the peer_id and kem_pubkey_hex to the domain admin to obtain an
+admission cert.  The admin should pass --kem-pubkey <HEX> to `admit`
+so that enc-v3 encrypted gossip is enabled immediately on first connect.
 ```
 
-Record the `peer_id`. Send it to whoever holds the domain key.
+Record both `peer_id` **and** `kem_pubkey_hex`. Send both to whoever holds the domain key.
 
 ### Step 2: Issue an Admission Certificate
 
@@ -165,9 +168,19 @@ dds-node admit \
     --domain-key ./acme/domain_key.bin \
     --domain ./acme/domain.toml \
     --peer-id 12D3KooWAbCdEf... \
+    --kem-pubkey aabbccdd1122... \
     --out admission-newnode.cbor \
     --ttl-days 365
 ```
+
+The `--kem-pubkey` flag embeds the peer's ML-KEM-768 public key into the
+admission certificate so enc-v3 encrypted gossip activates immediately on
+first connect. Omitting it is allowed (the peer falls back to an
+`EpochKeyRequest` recovery path) but produces a warning and leaves enc-v3
+coverage at 0% until a new cert is re-issued with the key.
+
+Alternatively, `--kem-pubkey-path <FILE>` reads the hex from a file — useful
+when scripting admission for many nodes.
 
 The `--ttl-days` flag is optional. Without it, the certificate never expires.
 

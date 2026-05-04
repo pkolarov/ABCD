@@ -155,6 +155,28 @@ public sealed class ServiceEnforcer : IEnforcer
     public static string? ExtractManagedKey(JsonElement item) =>
         item.TryGetProperty("name", out var n) ? n.GetString() : null;
 
+    /// <summary>
+    /// Log stale services that are no longer in the policy.
+    /// Service configuration is not automatically reverted because
+    /// DDS does not record the pre-apply baseline; reverting blindly
+    /// could disrupt existing services. Operators are notified via
+    /// the audit log and should review manually.
+    /// </summary>
+    public List<string> ReconcileStaleServices(
+        IReadOnlySet<string> staleServiceNames, EnforcementMode mode)
+    {
+        var changes = new List<string>();
+        foreach (var name in staleServiceNames)
+        {
+            _log.LogWarning(
+                "Service reconcile: service '{Name}' is no longer in policy — " +
+                "DDS will not auto-revert service configuration; review manually",
+                name);
+            changes.Add($"[MANUAL] Reconcile-Review {name} (service configuration not auto-reverted)");
+        }
+        return changes;
+    }
+
     private static string DescribeDirective(JsonElement item)
     {
         var name = item.TryGetProperty("name", out var n) ? n.GetString() : "?";

@@ -1,5 +1,36 @@
 # DDS Implementation Status
 
+## Gap Fix Addendum (2026-05-04, 35th pass) — service reconciliation + design-doc corrections
+
+### Service reconciliation (Worker + ServiceEnforcer)
+
+`ServiceEnforcer` was added in the 27th pass with `ExtractManagedKey()` already present, but
+`Worker.cs` never called it and never tracked services in `managed_items["services"]`. This
+meant stale service directives (services removed from policy) were silently ignored instead of
+being flagged for manual review.
+
+**Fix**:
+- `Worker.ExtractDesiredItems()` now accepts a `HashSet<string> services` parameter and
+  populates it from `windows.services[*].name` via `ServiceEnforcer.ExtractManagedKey()`
+- `Worker.ReconcileAsync()` now accepts and stores `desiredServices`, computes the stale set,
+  calls `_serviceEnforcer.ReconcileStaleServices()`, and appends results to the reconciliation
+  report
+- `ServiceEnforcer.ReconcileStaleServices()` (new method) — audit-log only, no auto-revert
+  (DDS does not record a pre-apply service baseline), returns `[MANUAL] Reconcile-Review …`
+  entries so operators know to review manually
+
+**5 new tests** added (201 passed, 39 skipped, 240 total .NET):
+- `ServiceEnforcerTests`: `ReconcileStaleServices_returns_manual_review_change_for_each_stale_service`, `ReconcileStaleServices_in_audit_mode_still_returns_manual_review_change`, `ReconcileStaleServices_empty_set_returns_no_changes`
+- `WorkerTests`: `Service_directives_are_tracked_in_managed_items`, `Stale_service_is_noted_in_reconciliation_report`
+
+### Design document corrections (DDS-Design-Document.md)
+
+Five stale entries corrected:
+1. **§AD-join probe** — replaced stale `IAccountOperations.IsDomainJoined()` reference with correct `IJoinStateProbe.Detect()` and `Worker.EffectiveMode`
+2. **§MSI bundle table** — expanded from 3 rows to 10 rows (added `DdsAuthBridge.exe`, `DdsTrayAgent.exe`, `DdsConsole.ps1`, `Bootstrap-DdsDomain.ps1`, `node.toml`)
+3. **§B1/B2 resolution status** — updated "resolves B1 (stubbed) and partially resolves B2" → "resolved B1 and B2, both fully resolved"
+4. **§14.5.9 ManagedItemRecord** — updated JSON examples and description to match the real `ManagedItemRecord` object structure (all fields: `last_outcome`, `last_reason`, `host_state_at_apply`, `audit_frozen`, `updated_at`)
+
 ## CI Fix Addendum (2026-05-04, 34th pass) — macOS smoke: enc-v3 drops all plaintext gossip
 
 The macOS smoke test was still failing with "no policies visible after publish" after the
@@ -5922,7 +5953,7 @@ Deferred to post-GA:
 - Phase 4 items 13–15 (sharded Kad, offline enrollment)
 - Open items from threat model review (admission cert revocation list, key rotation — see `docs/threat-model-review.md` §6)
 
-Note: Phase 3 items 9–10 (WindowsPolicyDocument distribution + SoftwareAssignment) are fully implemented through all phases A–I including G+H — all 5 Windows enforcers have production Win32 implementations with full reconciliation/drift-detection (Service enforcer added 2026-05-03), 196 passing .NET tests (macOS; 39 Windows-only integration tests require real Win32), WiX MSI installer verified, CI integration complete with MSI compile verification and E2E smoke test.
+Note: Phase 3 items 9–10 (WindowsPolicyDocument distribution + SoftwareAssignment) are fully implemented through all phases A–I including G+H — all 5 Windows enforcers have production Win32 implementations with full reconciliation/drift-detection (Service enforcer added 2026-05-03, service reconciliation wired 2026-05-04), 201 passing .NET tests (macOS; 39 Windows-only integration tests require real Win32), WiX MSI installer verified, CI integration complete with MSI compile verification and E2E smoke test.
 
 ### Phase 4 — Scale
 

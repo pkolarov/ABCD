@@ -213,6 +213,104 @@ public class WorkerTests
         }
     }
 
+    // --- service reconciliation tracking --------------------------------
+
+    [Fact]
+    public async Task Service_directives_are_tracked_in_managed_items()
+    {
+        var client = Substitute.For<IDdsNodeClient>();
+        var probe = new InMemoryJoinStateProbe(JoinState.Workgroup);
+        var stateDir = Path.Combine(Path.GetTempPath(), $"dds-test-{Guid.NewGuid():N}");
+        try
+        {
+            var stateStore = new AppliedStateStore(stateDir);
+            var config = Options.Create(new AgentConfig
+            {
+                DeviceUrn = "dds:device:svc-host",
+                PollIntervalSeconds = 60,
+            });
+            client.GetPoliciesAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns(new List<ApplicableWindowsPolicy>
+                {
+                    BuildPolicy("p:svc:1", version: "1",
+                        """{"policy_id":"p:svc:1","version":1,"enforcement":"Enforce","windows":{"services":[{"name":"MySvc","action":"Configure","start_type":"Automatic"}]}}"""),
+                });
+            client.GetSoftwareAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns(new List<ApplicableSoftware>());
+
+            var ops = new InMemoryServiceOperations();
+            ops.Seed("MySvc", startType: "Manual", runState: "Stopped");
+            var worker = BuildWorker(
+                client, stateStore, probe, config,
+                serviceEnforcer: new ServiceEnforcer(ops, NullLogger<ServiceEnforcer>.Instance));
+
+            using var cts = new CancellationTokenSource();
+            var task = worker.StartAsync(cts.Token);
+            await Task.Delay(150);
+            cts.Cancel();
+            await task;
+            await worker.StopAsync(default);
+
+            var managed = stateStore.GetManagedItems("services");
+            Assert.Contains("MySvc", managed);
+        }
+        finally
+        {
+            try { Directory.Delete(stateDir, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
+    [Fact]
+    public async Task Stale_service_is_noted_in_reconciliation_report()
+    {
+        var client = Substitute.For<IDdsNodeClient>();
+        var probe = new InMemoryJoinStateProbe(JoinState.Workgroup);
+        var stateDir = Path.Combine(Path.GetTempPath(), $"dds-test-{Guid.NewGuid():N}");
+        try
+        {
+            var stateStore = new AppliedStateStore(stateDir);
+            stateStore.RecordManagedItems(
+                "services",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "StaleSvc" },
+                JoinState.Workgroup, auditMode: false, reason: null);
+
+            var config = Options.Create(new AgentConfig
+            {
+                DeviceUrn = "dds:device:svc-host",
+                PollIntervalSeconds = 60,
+            });
+            client.GetPoliciesAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns(new List<ApplicableWindowsPolicy>());
+            client.GetSoftwareAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns(new List<ApplicableSoftware>());
+
+            var worker = BuildWorker(client, stateStore, probe, config);
+
+            using var cts = new CancellationTokenSource();
+            var task = worker.StartAsync(cts.Token);
+            await Task.Delay(150);
+            cts.Cancel();
+            await task;
+            await worker.StopAsync(default);
+
+            // After reconciliation the stale service must NOT be in the current desired set.
+            var managed = stateStore.GetManagedItems("services");
+            Assert.DoesNotContain("StaleSvc", managed);
+
+            // A reconciliation report containing [MANUAL] must have been submitted.
+            await client.Received().ReportAppliedAsync(
+                Arg.Is<AppliedReport>(r =>
+                    r.TargetId == "_reconciliation" &&
+                    r.Directives != null &&
+                    r.Directives.Any(d => d.Contains("[MANUAL]") && d.Contains("StaleSvc"))),
+                Arg.Any<CancellationToken>());
+        }
+        finally
+        {
+            try { Directory.Delete(stateDir, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
     // --- helpers --------------------------------------------------------
 
     private static Worker BuildWorker(

@@ -1176,11 +1176,14 @@ Writes to any other path (including non-HKLM hives) are refused with
 `dds-node` pushes a malicious policy.
 
 **Domain-join guard:** The `AccountEnforcer` refuses all local-account
-operations when `IAccountOperations.IsDomainJoined()` returns true. This
-prevents conflicts with AD-managed accounts on domain-joined machines
-(v1 scope decision — AD-replacement is deferred to Phase 4). The native
-Windows Auth Bridge applies the same guard before allowing first-account
-claim at the logon screen.
+operations when `IJoinStateProbe.Detect()` returns `AdJoined`,
+`HybridJoined`, or `Unknown`. This prevents conflicts with AD-managed
+accounts on domain-joined machines (v1 scope decision — see
+`docs/windows-ad-coexistence-spec.md`). The other policy surfaces
+(registry, password policy, software, service) are forced to audit-only
+on AD/Hybrid hosts via the `Worker.EffectiveMode` helper (AD-04/05).
+The native Windows Auth Bridge applies the same guard before allowing
+first-account claim at the logon screen.
 
 **Password handling:** Passwords are never carried in `WindowsPolicyDocument`
 or `SoftwareAssignment`. Two Windows flows exist today:
@@ -1229,10 +1232,24 @@ The agent persists `%ProgramData%\DDS\applied-state.json`:
     }
   },
   "managed_items": {
-    "registry": ["LocalMachine\\SOFTWARE\\Policies\\DDS\\Feature\\Enabled"],
-    "accounts": ["dds-kiosk"],
-    "account_groups": ["dds-kiosk:Users"],
-    "software_managed": ["com.example.editor"]
+    "registry": {
+      "LocalMachine\\SOFTWARE\\Policies\\DDS\\Feature\\Enabled": {
+        "last_outcome": "applied", "host_state_at_apply": "Workgroup",
+        "audit_frozen": false, "updated_at": 1712640123
+      }
+    },
+    "accounts": {
+      "dds-kiosk": { "last_outcome": "applied", "host_state_at_apply": "Workgroup",
+        "audit_frozen": false, "updated_at": 1712640123 }
+    },
+    "account_groups": {
+      "dds-kiosk:Users": { "last_outcome": "applied", "host_state_at_apply": "Workgroup",
+        "audit_frozen": false, "updated_at": 1712640123 }
+    },
+    "software_managed": {
+      "com.example.editor": { "last_outcome": "applied", "host_state_at_apply": "Workgroup",
+        "audit_frozen": false, "updated_at": 1712640123 }
+    }
   }
 }
 ```
@@ -1253,20 +1270,25 @@ ACL: `LocalSystem` write, `Administrators` read, `Users` no access.
 
 #### 14.5.7 Packaging & Deployment
 
-A single **WiX v4 MSI bundle** ships all three Windows components:
+A single **WiX v4 MSI bundle** ships all Windows components:
 
 | Component | Install Path | Registered As |
 | --- | --- | --- |
 | `dds-node.exe` | `C:\Program Files\DDS\` | Windows Service `DdsNode` |
 | `DdsPolicyAgent.exe` | `C:\Program Files\DDS\` | Windows Service `DdsPolicyAgent` |
-| `DdsCredentialProvider.comhost.dll` | `C:\Program Files\DDS\` | COM CLSID `{8C0DBE9A-5E27-4DDA-9A4B-3B5C8A6E2A11}` |
-| `appsettings.json` | `C:\Program Files\DDS\` | Agent configuration |
+| `DdsAuthBridge.exe` | `C:\Program Files\DDS\` | Windows Service `DdsAuthBridge` |
+| `DdsTrayAgent.exe` | `C:\Program Files\DDS\` | Startup item (HKCU Run key) |
+| `DdsCredentialProvider.dll` | `C:\Program Files\DDS\` | COM CLSID `{8C0DBE9A-5E27-4DDA-9A4B-3B5C8A6E2A11}` |
+| `DdsConsole.ps1` | `C:\Program Files\DDS\` | Desktop / Start Menu shortcut |
+| `Bootstrap-DdsDomain.ps1` | `C:\Program Files\DDS\` | Provisioning helper script |
+| `appsettings.json` | `C:\Program Files\DDS\` | Policy Agent configuration |
+| `node.toml` | `C:\Program Files\DDS\config\` | DDS Node configuration |
 | State directory | `%ProgramData%\DDS\` | ACL: LocalSystem write, Admins read |
 
-The MSI bundle resolves production blocker **B1** (Windows Credential Provider
-stubbed) and partially resolves **B2** (cross-platform builds untested for
-Windows) by being the first artifact that builds and runs all three components
-together.
+The MSI bundle resolved production blockers **B1** (Windows Credential
+Provider) and **B2** (cross-platform builds / Windows CI). Both blockers are
+fully resolved: the Credential Provider ships code-complete in the MSI; a
+`windows-latest` CI job runs the full Windows integration suite end-to-end.
 
 #### 14.5.8 Enforcement Modes
 
@@ -1292,21 +1314,34 @@ applied, but it does not address two critical scenarios:
    reconciliation, the drift is not corrected until the policy document itself
    changes (triggering a hash difference).
 
-**Managed-items tracking.** The applied-state file is extended with a
-`managed_items` map, keyed by enforcer category:
+**Managed-items tracking.** The applied-state file includes a
+`managed_items` map, keyed by enforcer category. Each value is itself a map
+from managed-item key to a `ManagedItemRecord`:
 
 ```json
 {
   "policies": { ... },
   "software": { ... },
   "managed_items": {
-    "registry": ["LocalMachine\\SOFTWARE\\Policies\\DDS\\Feature\\Enabled", ...],
-    "accounts": ["dds-kiosk", "dds-audit"],
-    "account_groups": ["dds-kiosk:Users", "dds-audit:EventLogReaders"],
-    "software_managed": ["com.example.editor", "com.example.vpn"]
+    "registry": {
+      "LocalMachine\\SOFTWARE\\Policies\\DDS\\Feature\\Enabled": {
+        "last_outcome": "applied", "last_reason": null,
+        "host_state_at_apply": "Workgroup",
+        "audit_frozen": false, "updated_at": 1712640123
+      }
+    },
+    "accounts": { "dds-kiosk": { ... }, "dds-audit": { ... } },
+    "account_groups": { "dds-kiosk:Users": { ... } },
+    "software_managed": { "com.example.editor": { ... } },
+    "services": { "MySvc": { ... } }
   }
 }
 ```
+
+`host_state_at_apply` records the `JoinState` when the item was last written
+(enables audit-re-pass on transition). `audit_frozen` is set when
+reconciliation would remove an item on an AD/Hybrid/Unknown host; the freeze
+clears on the next workgroup-mode reconcile that lists the item.
 
 **Reconciliation algorithm.** On every poll cycle, after all policies and
 software assignments have been applied, the Worker executes a reconciliation

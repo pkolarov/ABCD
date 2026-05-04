@@ -236,4 +236,36 @@ public class ServiceEnforcerTests
         var item = JsonDocument.Parse("""{"action":"Start"}""").RootElement;
         Assert.Null(ServiceEnforcer.ExtractManagedKey(item));
     }
+
+    // --- ReconcileStaleServices ---
+
+    [Fact]
+    public void ReconcileStaleServices_returns_manual_review_change_for_each_stale_service()
+    {
+        var stale = new HashSet<string> { "MySvc", "OtherSvc" };
+        var changes = _enforcer.ReconcileStaleServices(stale, EnforcementMode.Enforce);
+
+        Assert.Equal(2, changes.Count);
+        Assert.All(changes, c => Assert.Contains("[MANUAL]", c));
+        Assert.Contains(changes, c => c.Contains("MySvc"));
+        Assert.Contains(changes, c => c.Contains("OtherSvc"));
+    }
+
+    [Fact]
+    public void ReconcileStaleServices_in_audit_mode_still_returns_manual_review_change()
+    {
+        var stale = new HashSet<string> { "spooler" };
+        var changes = _enforcer.ReconcileStaleServices(stale, EnforcementMode.Audit);
+
+        Assert.Single(changes);
+        Assert.Contains("[MANUAL]", changes[0]);
+        Assert.Contains("spooler", changes[0]);
+    }
+
+    [Fact]
+    public void ReconcileStaleServices_empty_set_returns_no_changes()
+    {
+        var changes = _enforcer.ReconcileStaleServices(new HashSet<string>(), EnforcementMode.Enforce);
+        Assert.Empty(changes);
+    }
 }

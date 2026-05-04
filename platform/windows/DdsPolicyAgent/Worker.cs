@@ -189,6 +189,7 @@ public sealed class Worker : BackgroundService
         var desiredAccounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var desiredGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var desiredSoftware = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var desiredServices = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // --- policies ---
         var policies = await _client
@@ -215,7 +216,7 @@ public sealed class Worker : BackgroundService
             if (p.Document.TryGetProperty("windows", out var win)
                 && win.ValueKind == JsonValueKind.Object)
             {
-                ExtractDesiredItems(win, desiredRegistryKeys, desiredAccounts, desiredGroups);
+                ExtractDesiredItems(win, desiredRegistryKeys, desiredAccounts, desiredGroups, desiredServices);
             }
 
             // AD-04: a transition since the last apply must force a one-shot
@@ -301,7 +302,7 @@ public sealed class Worker : BackgroundService
         // --- reconciliation pass ---
         await ReconcileAsync(
             desiredRegistryKeys, desiredAccounts, desiredGroups,
-            desiredSoftware, hostState, auditMode, modeReason, ct).ConfigureAwait(false);
+            desiredSoftware, desiredServices, hostState, auditMode, modeReason, ct).ConfigureAwait(false);
 
         _previousJoinState = hostState;
     }
@@ -336,7 +337,8 @@ public sealed class Worker : BackgroundService
         JsonElement win,
         HashSet<string> registryKeys,
         HashSet<string> accounts,
-        HashSet<string> groups)
+        HashSet<string> groups,
+        HashSet<string> services)
     {
         if (win.TryGetProperty("registry", out var reg) && reg.ValueKind == JsonValueKind.Array)
         {
@@ -362,6 +364,15 @@ public sealed class Worker : BackgroundService
                     groups.Add(g);
             }
         }
+
+        if (win.TryGetProperty("services", out var svc) && svc.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in svc.EnumerateArray())
+            {
+                var key = ServiceEnforcer.ExtractManagedKey(item);
+                if (key is not null) services.Add(key);
+            }
+        }
     }
 
     /// <summary>
@@ -376,6 +387,7 @@ public sealed class Worker : BackgroundService
         HashSet<string> desiredAccounts,
         HashSet<string> desiredGroups,
         HashSet<string> desiredSoftware,
+        HashSet<string> desiredServices,
         JoinState hostState,
         bool auditMode,
         string? modeReason,
@@ -458,6 +470,20 @@ public sealed class Worker : BackgroundService
                 staleSoftware.Count, modeReason);
         }
         _stateStore.RecordManagedItems("software_managed", desiredSoftware, hostState, auditMode, modeReason);
+
+        // Service reconciliation (audit-log only — no auto-revert of service configuration)
+        var prevServices = _stateStore.GetManagedItems("services");
+        var staleServices = new HashSet<string>(prevServices, StringComparer.OrdinalIgnoreCase);
+        staleServices.ExceptWith(desiredServices);
+        if (staleServices.Count > 0)
+        {
+            _log.LogInformation(
+                "Reconciliation: {Count} stale service directives noted (operators must review manually)",
+                staleServices.Count);
+            var changes = _serviceEnforcer.ReconcileStaleServices(staleServices, effectiveMode);
+            reconcileChanges.AddRange(changes);
+        }
+        _stateStore.RecordManagedItems("services", desiredServices, hostState, auditMode, modeReason);
 
         if (reconcileChanges.Count > 0)
         {
