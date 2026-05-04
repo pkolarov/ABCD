@@ -778,7 +778,7 @@ dds/
     │   │   ├── State/                Applied-state persistence in /Library/Application Support/DDS
     │   │   └── Enforcers/            Preferences, Accounts, launchd, Profiles, Software
     │   ├── DdsPolicyAgent.Tests/     xUnit tests (cross-platform via InMemory* doubles)
-    │   ├── DdsLoginBridge/           Authorization Services / session bootstrap bridge (planned)
+    │   ├── DdsLoginBridge/           Authorization Services / session bootstrap bridge (v2, planned)
     │   └── packaging/                pkgbuild/productbuild/notarization assets
     ├── android/                  Kotlin wrapper via UniFFI
     ├── ios/                      Swift wrapper via UniFFI

@@ -1,5 +1,50 @@
 # DDS Implementation Status
 
+## Doc Fix (2026-05-04, 47th pass) — Stale DdsAuthBridge comment + DdsLoginBridge annotation
+
+### Gaps
+
+**Gap 1 — `DDS_START_AUTH` handler comment was a stale single-phase stub description**
+
+`platform/windows/native/DdsAuthBridge/DdsAuthBridgeMain.cpp` had a section comment
+above `HandleDdsStartAuth` that described a single-phase flow where the bridge would
+"Call platform WebAuthn API for getAssertion (TODO: stub for now)". The actual
+implementation (completed earlier) uses a two-phase CP-driven flow:
+
+- **Phase 1**: Bridge fetches a server-issued FIDO2 challenge from `dds-node`, then
+  sends `DDS_AUTH_CHALLENGE` to the Credential Provider (CP) with credential ID,
+  RP ID, hmac-secret salt, and the server nonce.
+- **Phase 2**: CP calls `WebAuthNAuthenticatorGetAssertion`, sends `DDS_AUTH_RESPONSE`
+  back to the bridge; bridge POSTs the assertion to `dds-node /v1/session/assert`,
+  decrypts the vault password via hmac-secret output, and returns `DDS_AUTH_COMPLETE`.
+
+The `ExecuteDdsAuth` function already had a correct two-phase description at lines
+1047–1058, but the outer `HandleDdsStartAuth` comment had not been updated, leaving
+a misleading "TODO: stub for now" in the source for any developer reading the handler.
+
+**Gap 2 — `DdsLoginBridge/` marked "(planned)" without v2 context**
+
+`docs/DDS-Design-Document.md` directory tree at §A listed `DdsLoginBridge/` as
+"Authorization Services / session bootstrap bridge (planned)". §14.2.2 explicitly
+defers this component to v2, but the tree entry did not say "(v2, planned)", making it
+ambiguous whether the component was simply work-in-progress for v1 or intentionally
+scoped out.
+
+### Fix
+
+**`platform/windows/native/DdsAuthBridge/DdsAuthBridgeMain.cpp`**:
+- Replaced the stale single-phase TODO comment above `HandleDdsStartAuth` with an
+  accurate two-phase description matching the `ExecuteDdsAuth` implementation.
+
+**`docs/DDS-Design-Document.md`**:
+- Updated `DdsLoginBridge/` entry: "(planned)" → "(v2, planned)".
+
+**Test results**: 96 / 96 macOS .NET, 132 / 132 Linux .NET, 201 / 240 Windows .NET
+(39 skipped: Windows-host-only integration tests), Rust workspace check clean (no
+compiled Rust code changed; full test run confirmed clean on prior pass).
+
+---
+
 ## Doc + Test Fix (2026-05-04, 46th pass) — Design doc reconciliation gaps + macOS Worker test coverage
 
 ### Gaps

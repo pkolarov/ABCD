@@ -795,11 +795,19 @@ BOOL CALLBACK CDdsAuthBridgeMain::OnIpcRequest(
 // ============================================================================
 // DDS_START_AUTH handler
 //
-// DDS authentication flow:
-//   1. Call platform WebAuthn API for getAssertion (TODO: stub for now)
-//   2. POST assertion proof to dds-node /v1/session/assert
-//   3. Use hmac-secret to decrypt stored password from vault
-//   4. Return DDS_AUTH_COMPLETE with password + session token
+// Validates the request, selects the vault entry (or enters first-claim mode),
+// and spawns a worker thread that runs the two-phase flow in ExecuteDdsAuth:
+//
+//   Phase 1 (Bridge → CP):
+//     1. Fetch a server-issued FIDO2 challenge from dds-node.
+//     2. Send DDS_AUTH_CHALLENGE to the CP with credential ID, RP ID,
+//        hmac-secret salt, and the server challenge nonce.
+//
+//   Phase 2 (CP → Bridge, after CP calls WebAuthNAuthenticatorGetAssertion):
+//     3. Receive DDS_AUTH_RESPONSE with the WebAuthn assertion + hmac-secret.
+//     4. POST assertion proof to dds-node /v1/session/assert.
+//     5. Use hmac-secret output to decrypt the stored password from the vault.
+//     6. Return DDS_AUTH_COMPLETE with the password and session token.
 // ============================================================================
 
 BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
