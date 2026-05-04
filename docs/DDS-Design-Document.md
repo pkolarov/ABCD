@@ -1351,7 +1351,7 @@ pass:
 
 1. **Extract desired set** — scan all current policy documents and build the
    full set of managed-item keys per category (registry paths, usernames,
-   group memberships, package IDs).
+   group memberships, package IDs, service names).
 2. **Compute stale set** — `stale = previously_managed − desired`. Items in
    this set were managed by DDS in a prior cycle but are absent from the
    current policy.
@@ -1360,6 +1360,9 @@ pass:
    - **Accounts:** disable (not delete) stale users to avoid data loss.
    - **Group memberships:** remove the user from the stale group.
    - **Software:** silently uninstall stale packages via `msiexec /x`.
+   - **Services:** logged only — no auto-revert. Reversing a prior Stop or
+     Configure is ambiguous, so stale service directives are surfaced in the
+     reconciliation report for operators to review manually.
 4. **Update managed set** — replace the stored managed-items with the
    current desired set.
 
@@ -1384,11 +1387,13 @@ does not actually delete/disable anything.
 - Software uninstall uses the same `msiexec /x` path as explicit Uninstall
   directives, so it honours MSI rollback on failure.
 
-**Platform scope:** Reconciliation is implemented for Windows and Linux in v1.
-For Linux: stale users are disabled (not deleted, to preserve home directories),
-stale managed files are deleted, and stale packages are uninstalled via the host
-package manager. macOS reconciliation follows the same algorithm with
-platform-appropriate backends.
+**Platform scope:** Reconciliation is implemented for Windows, Linux, and macOS
+in v1. For Linux: stale users are disabled (not deleted, to preserve home
+directories), stale managed files are deleted, and stale packages are uninstalled
+via the host package manager. For macOS: the same algorithm runs with
+platform-appropriate backends (dscl, launchctl, profiles, etc.); generic package
+uninstall is not supported so stale software entries are flagged for manual
+removal.
 
 ### 14.6 Linux Platform — Managed Device Architecture
 

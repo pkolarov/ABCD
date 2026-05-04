@@ -88,7 +88,7 @@ public sealed class Worker : BackgroundService
         _log.LogInformation("DDS macOS Policy Agent stopping");
     }
 
-    private async Task PollAndApplyAsync(CancellationToken ct)
+    internal async Task PollAndApplyAsync(CancellationToken ct)
     {
         // Collect desired managed items across all policies for reconciliation.
         var desiredPreferences = new HashSet<string>(StringComparer.Ordinal);

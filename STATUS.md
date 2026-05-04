@@ -1,5 +1,85 @@
 # DDS Implementation Status
 
+## Doc + Test Fix (2026-05-04, 46th pass) — Design doc reconciliation gaps + macOS Worker test coverage
+
+### Gaps
+
+**Gap 1 — Design Document §14.5.9 reconciliation algorithm omitted Services**
+
+`docs/DDS-Design-Document.md` §14.5.9 described the reconciliation algorithm
+with four cleanup steps (Registry, Accounts, Group memberships, Software) but
+did not mention Services, even though:
+- The Windows Worker tracks service names in `managed_items["services"]`.
+- `ServiceEnforcer.ReconcileStaleServices` is implemented and tested (logs stale
+  services for operator review; no auto-revert because reversing Stop/Configure
+  is ambiguous).
+- The Admin Guide correctly documented the no-auto-revert behavior.
+- The reconciliation JSON example in §14.5.9 already showed a `"services"` key.
+
+The "Extract desired set" description also listed only "registry paths, usernames,
+group memberships, package IDs" — service names were missing.
+
+**Gap 2 — Design Document §14.5.9 "Platform scope" sentence was ambiguous**
+
+The sentence "Reconciliation is implemented for Windows and Linux in v1" did not
+explicitly include macOS, even though the 41st pass wired macOS reconciliation
+and documented it in the Admin Guide.
+
+**Gap 3 — macOS Worker reconciliation path not covered by Worker-level tests**
+
+`platform/macos/DdsPolicyAgent.Tests/WorkerTests.cs` had only 3 tests (two
+`ContentHash` unit tests and one "DeviceUrn empty" check). The macOS Worker's
+full `PollAndApplyAsync` → `ReconcileAsync` path was exercised only indirectly
+via enforcer-level tests; no Worker-level test verified that stale items were
+removed from the managed-item set and that a reconciliation report was posted
+back to `dds-node`.
+
+The Linux Worker exposes `PollOnceAsync` as `internal` for this purpose; the
+macOS Worker's equivalent method was `private`, making Worker-level testing
+impossible without a hosted-service harness.
+
+### Fix
+
+**`docs/DDS-Design-Document.md`** (§14.5.9):
+- Added "service names" to the "Extract desired set" category list.
+- Added a **Services** bullet to the "Clean up stale items" step: "logged only —
+  no auto-revert. Reversing a prior Stop or Configure is ambiguous, so stale
+  service directives are surfaced in the reconciliation report for operators to
+  review manually."
+- Clarified the "Platform scope" sentence to read "Reconciliation is implemented
+  for Windows, Linux, and macOS in v1" with explicit per-platform descriptions.
+
+**`platform/macos/DdsPolicyAgent/Worker.cs`**:
+- Changed `PollAndApplyAsync` from `private` to `internal` (matching the Linux
+  Worker's `PollOnceAsync` pattern). The project already has
+  `<InternalsVisibleTo Include="DdsPolicyAgent.MacOS.Tests"/>`.
+
+**`platform/macos/DdsPolicyAgent.Tests/TestDoubles.cs`**:
+- Added `TrackingAppliedStateStore` — a real `IAppliedStateStore` implementation
+  that can be pre-seeded with managed items from a prior cycle and tracks all
+  `SetManagedItems` calls for assertion.
+- Added `TestMacDdsNodeClient` — a controllable `IDdsNodeClient` that collects
+  all `ReportAppliedAsync` calls in `ReceivedReports`.
+
+**`platform/macos/DdsPolicyAgent.Tests/WorkerTests.cs`** — 4 new tests:
+- `Reconciliation_StaleLaunchdJob_IsUnloaded` — a launchd job absent from all
+  current policies is unloaded by the Worker's reconciliation pass, and the
+  managed set is updated to empty.
+- `Reconciliation_StaleAccount_IsDisabled` — a local account absent from all
+  current policies is disabled (not deleted), and the managed-accounts set is
+  cleared.
+- `Reconciliation_DesiredLaunchdJob_IsNotUnloaded` — a launchd job still present
+  in the current policy is not unloaded (desired set wins over stale detection).
+- `Reconciliation_ReconciliationReport_SentWhenChangesExist` — when stale items
+  are cleaned up, the Worker posts a `"_reconciliation"` report to `dds-node`
+  with directives referencing the stale item.
+
+**Test results**: 96 / 96 macOS .NET (up from 92), 132 / 132 Linux .NET,
+201 / 240 Windows .NET (39 skipped: Windows-only integration tests), Rust
+workspace tests clean.
+
+---
+
 ## CI Fix (2026-05-04, 45th pass) — macOS .NET policy agent missing from CI
 
 ### Gap
