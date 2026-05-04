@@ -1,5 +1,65 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-04, 42nd pass) — Linux PAM authentication module (`pam_dds`)
+
+### Gap
+
+The Design Document (§14.6.4–14.6.5) described `pam_dds.so` and `dds-pam-helper` as
+the Linux login / SSH integration layer, but neither binary existed in the codebase.
+The `platform/linux/pam_dds/` directory did not exist.
+
+### Fix — new Rust crate `platform/linux/pam_dds`
+
+Added to the Cargo workspace as `pam-dds`.  The crate builds two artifacts:
+
+**`pam_dds.so` (cdylib) — PAM module:**
+- Exports `pam_sm_authenticate`, `pam_sm_setcred`, `pam_sm_acct_mgmt` with the
+  Linux-PAM C ABI (`#[no_mangle] pub extern "C" fn`).
+- Reads the username from the PAM stack via `pam_get_item(PAM_USER)`.
+- Spawns `dds-pam-helper` as a subprocess, passing `--node-sock` and `--user`.
+- Returns `PAM_SUCCESS` (0) when the helper exits 0 with a valid `{"ok":true}` JSON
+  outcome; returns `PAM_AUTH_ERR` (7) otherwise.
+- Stays lightweight: no async runtime in the `.so` — all heavy I/O is in the helper.
+- PAM-specific code is guarded by `#[cfg(target_os = "linux")]` so the crate
+  compiles clean on macOS CI hosts.
+
+**`dds-pam-helper` (binary) — FIDO2 assertion helper:**
+- Calls `GET /v1/session/challenge` over the dds-node Unix socket.
+- Collects a FIDO2 assertion via tiered strategy:
+  1. `fido2-assert` tool (from `libfido2-tools`) when present on `PATH`.
+  2. Pre-computed assertion JSON from `--assertion-json FILE|-` for CI/scripted use.
+- Submits the assertion to `POST /v1/session/assert`.
+- Writes `{"ok":true,"session_id":"..."}` or `{"ok":false,"error":"..."}` to stdout
+  and exits 0 / 1 accordingly.
+- Uses the same hyper+UDS HTTP client pattern as `dds-cli`.
+
+**Module arguments:**
+```
+auth required pam_dds.so node_sock=/run/dds/api.sock [helper=PATH] [debug]
+```
+
+### Fix — `docs/DDS-Admin-Guide.md`
+
+Added a new `### Linux Login and SSH Integration` section documenting:
+- PAM stack authentication flow (6-step sequence diagram in prose).
+- Installation instructions (paths, ownership requirements).
+- PAM configuration snippet with `sufficient` vs `required` guidance.
+- Module argument reference table.
+- Pre-computed assertion JSON schema for CI/scripted environments.
+- SSH `AuthorizedKeysCommand` integration pointer.
+
+### Tests
+
+- 10 unit tests in `src/lib.rs` covering argument parsing, helper path resolution,
+  and `HelperOutcome` JSON serialisation/deserialisation.
+- 6 unit tests in `src/bin/dds_pam_helper.rs` covering CLI arg defaults, HTTP
+  request/response type round-trips, and assertion JSON parsing.
+
+**Test results**: all tests pass — 16 / 16 Rust `pam-dds` tests,
+132 / 132 Linux .NET tests, Rust workspace tests clean (no regressions).
+
+---
+
 ## Doc Fix (2026-05-04, 41st pass) — macOS reconciliation documented in Admin Guide
 
 ### Gap

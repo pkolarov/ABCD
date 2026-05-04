@@ -1,0 +1,37 @@
+[package]
+name = "pam-dds"
+description = "DDS PAM authentication module — pam_dds.so and dds-pam-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "pam_dds"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "dds-pam-helper"
+path = "src/bin/dds_pam_helper.rs"
+
+[features]
+default = []
+
+[dependencies]
+libc = "0.2"
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true }
+
+# Used only by the helper binary; the cdylib (pam_dds.so) stays lightweight.
+# These are declared unconditionally so `cargo test` on macOS can compile the
+# shared helper module; unix-socket I/O is still guarded by #[cfg(unix)].
+bytes = "1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+base64 = "0.22"
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

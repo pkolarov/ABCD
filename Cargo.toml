@@ -10,6 +10,7 @@ members = [
     "dds-cli",
     "dds-loadtest",
     "dds-fido2-test",
+    "platform/linux/pam_dds",
 ]
 
 [workspace.package]

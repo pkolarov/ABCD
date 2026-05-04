@@ -1154,6 +1154,104 @@ Only the fields present in the policy are written to the drop-in — absent fiel
 
 Package names are validated against a safe-character allowlist before any package manager call. `Remove` is refused for packages not previously installed by DDS (tracked in `/var/lib/dds/applied-state.json`).
 
+### Linux Login and SSH Integration
+
+DDS ships a PAM authentication module (`pam_dds.so`) and a companion helper
+binary (`dds-pam-helper`) that together extend FIDO2-backed authentication to:
+
+- **console / display-manager login** — via the PAM stack for `login`, `gdm`,
+  `sddm`, or any other display manager that supports PAM;
+- **`sudo` elevation** — via PAM's `auth` service;
+- **SSH** — via PAM when `UsePAM yes` is set in sshd (the default on most
+  distros); optionally combined with an `AuthorizedKeysCommand`.
+
+The v1 design is intentionally conservative: DDS authenticates and authorises
+**existing local accounts** only — it does not synthesise NSS users on the fly.
+A DDS policy document maps a DDS identity URN to one or more local POSIX
+accounts.
+
+#### How it works
+
+1. The PAM framework calls `pam_sm_authenticate` in `pam_dds.so`.
+2. The module reads the username from the PAM stack and spawns `dds-pam-helper`.
+3. The helper fetches a FIDO2 challenge from the local `dds-node` via
+   `GET /v1/session/challenge` (Unix socket at `/run/dds/api.sock`).
+4. The helper collects an authenticator assertion — either from a FIDO2
+   hardware key via `fido2-assert` (from `libfido2-tools`), or from a
+   pre-computed assertion JSON file for scripted / CI workflows.
+5. The assertion is submitted to `POST /v1/session/assert`; `dds-node`
+   evaluates trust and policy locally.
+6. On success the helper exits 0 and writes a JSON result to stdout;
+   the module returns `PAM_SUCCESS`.  On failure it returns `PAM_AUTH_ERR`.
+
+`pam_dds.so` is stateless and lightweight — it never parses trust-graph data
+itself.  All policy decisions remain inside `dds-node`.
+
+#### Installation
+
+```bash
+# Copy the module and helper (paths from the DEB/RPM package)
+install -m 0755 dds-pam-helper          /usr/lib/dds/dds-pam-helper
+install -m 0644 libpam_dds.so           /lib/x86_64-linux-gnu/security/pam_dds.so
+```
+
+The helper must be owned by `root` and not world-writable.
+
+#### PAM configuration
+
+Add `pam_dds` to the service's PAM stack.  For example, to protect `sudo`:
+
+```
+# /etc/pam.d/sudo
+auth   sufficient   pam_dds.so node_sock=/run/dds/api.sock
+auth   required     pam_unix.so
+```
+
+Using `sufficient` lets users fall back to password authentication if their
+FIDO2 key is unavailable.  Use `required` to mandate DDS authentication.
+
+**Supported module arguments:**
+
+| Argument | Default | Description |
+|---|---|---|
+| `node_sock=PATH` | `/run/dds/api.sock` | Unix socket path for `dds-node` |
+| `helper=PATH` | auto-detected | Explicit path to `dds-pam-helper` |
+| `debug` | off | Enable verbose syslog output |
+
+The helper is located automatically in `/usr/lib/dds/`, `/usr/local/lib/dds/`,
+`/usr/libexec/`, and `/usr/local/libexec/` when `helper=` is not specified.
+
+#### Using a pre-computed assertion (CI / scripted environments)
+
+For automated pipelines where a physical key is not available, supply a
+pre-computed assertion JSON file:
+
+```bash
+dds-pam-helper --node-sock /run/dds/api.sock \
+               --user alice \
+               --assertion-json ./assertion.json
+```
+
+The JSON schema:
+
+```json
+{
+  "credential_id":       "<base64url>",
+  "authenticator_data":  "<base64url>",
+  "client_data_hash":    "<base64url>",
+  "signature":           "<base64url>",
+  "client_data_json_b64": "<base64-standard, optional>",
+  "subject_urn":          "dds:user:alice (optional)"
+}
+```
+
+#### SSH `AuthorizedKeysCommand` integration
+
+To require DDS-authenticated SSH without relying purely on PAM, pair
+`pam_dds.so` with an `AuthorizedKeysCommand` in sshd that calls the
+`dds-pam-helper` for the challenge/assertion flow.  Full wiring instructions
+are provided in the [Developer Guide](DDS-Developer-Guide.md).
+
 ### Report Applied State
 
 After applying policy, agents report what they applied:
