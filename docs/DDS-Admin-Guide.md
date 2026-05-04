@@ -1348,7 +1348,8 @@ in the current policy set. Items no longer desired are cleaned up:
 | Packages | Removed via the host package manager (`apt-get remove`, `dnf remove`, etc.) |
 | `sysctl` keys | Removed from `/etc/sysctl.d/60-dds-managed.conf` and `sysctl --system` re-run |
 | `ssh` drop-in | Removed from `/etc/ssh/sshd_config.d/60-dds.conf` if the `ssh` field is absent from all policies |
-| `systemd` units | No stale-item cleanup — enable/disable directives are applied on the forward pass only |
+| `systemd` drop-ins | Deleted from `/etc/systemd/system/<unit>.d/` when the `ConfigureDropin` directive is removed; `daemon-reload` is triggered after each deletion |
+| `systemd` unit state | No stale-item cleanup — enable/disable/start/stop directives are applied on the forward pass only; reversing them is ambiguous |
 | `sudoers` drop-ins | Deleted from `/etc/sudoers.d/` when the `content` field is empty or the directive is removed |
 
 **Drift correction.** The Linux agent uses a content-hash idempotency model: a
@@ -1368,8 +1369,8 @@ will not remove or disable anything.
   preventing accidental removal of pre-existing local accounts.
 - Package removal is refused for packages not previously installed by DDS.
 - The agent tracks managed items in `/var/lib/dds/applied-state.json`
-  under the `managed_usernames`, `managed_paths`, `managed_packages`, and
-  `managed_sudoers_filenames` keys.
+  under the `managed_usernames`, `managed_paths`, `managed_packages`,
+  `managed_sudoers_filenames`, and `managed_systemd_dropins` keys.
 
 #### macOS Reconciliation
 

@@ -912,3 +912,68 @@ public sealed class ReconcileSudoersEnforcerTests
         Assert.Empty(runner.Invocations);
     }
 }
+
+// ============================================================
+// ReconcileSystemdDropinEnforcerTests
+// ============================================================
+
+public sealed class ReconcileSystemdDropinEnforcerTests
+{
+    [Fact]
+    public async Task ReconcileStaleDropins_ReturnsRemoveDirectivePerKey()
+    {
+        // The enforcer returns a removedropin directive for each stale key.
+        // /etc/systemd/system/ does not exist in CI so File.Delete is a no-op.
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleDropinsAsync(
+            new HashSet<string> { "sshd.service/hardening", "dds-agent.service/limits" },
+            CancellationToken.None);
+
+        Assert.Equal(2, applied.Count);
+        Assert.Contains("systemd:removedropin:sshd.service/hardening", applied);
+        Assert.Contains("systemd:removedropin:dds-agent.service/limits", applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleDropins_AuditOnly_ReturnDirectivesButNoFilesystemWrite()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleDropinsAsync(
+            new HashSet<string> { "sshd.service/hardening" }, CancellationToken.None);
+
+        Assert.Single(applied);
+        Assert.Equal("systemd:removedropin:sshd.service/hardening", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleDropins_UnsafeKey_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleDropinsAsync(
+            new HashSet<string> { "../../etc/passwd/evil" }, CancellationToken.None);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleDropins_EmptySet_ReturnsEmpty()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleDropinsAsync(
+            new HashSet<string>(), CancellationToken.None);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+}

@@ -93,12 +93,13 @@ public sealed class Worker : BackgroundService
 
         // Desired sets: populated from ALL current policies (including unchanged ones)
         // so the reconciliation pass at the end can detect items no longer in any policy.
-        var desiredUsernames         = new HashSet<string>(StringComparer.Ordinal);
-        var desiredPaths             = new HashSet<string>(StringComparer.Ordinal);
-        var desiredPackages          = new HashSet<string>(StringComparer.Ordinal);
-        var desiredSysctlKeys        = new HashSet<string>(StringComparer.Ordinal);
-        var desiredSudoersFilenames  = new HashSet<string>(StringComparer.Ordinal);
-        var hasSshPolicy             = false;
+        var desiredUsernames          = new HashSet<string>(StringComparer.Ordinal);
+        var desiredPaths              = new HashSet<string>(StringComparer.Ordinal);
+        var desiredPackages           = new HashSet<string>(StringComparer.Ordinal);
+        var desiredSysctlKeys         = new HashSet<string>(StringComparer.Ordinal);
+        var desiredSudoersFilenames   = new HashSet<string>(StringComparer.Ordinal);
+        var desiredSystemdDropinKeys  = new HashSet<string>(StringComparer.Ordinal);
+        var hasSshPolicy              = false;
 
         var userEnforcer    = new UserEnforcer   (_runner, _config.AuditOnly, _log);
         var sudoersEnforcer = new SudoersEnforcer(_runner, _config.AuditOnly, _log);
@@ -125,7 +126,8 @@ public sealed class Worker : BackgroundService
             if (hasLinuxObject)
             {
                 ExtractDesiredItems(linux, desiredUsernames, desiredPaths, desiredPackages,
-                                    desiredSysctlKeys, desiredSudoersFilenames);
+                                    desiredSysctlKeys, desiredSudoersFilenames,
+                                    desiredSystemdDropinKeys);
                 if (linux.TryGetProperty("ssh", out var sshProp)
                     && sshProp.ValueKind == JsonValueKind.Object)
                     hasSshPolicy = true;
@@ -192,12 +194,13 @@ public sealed class Worker : BackgroundService
         }
 
         // Reconciliation pass: disable stale users, delete stale files, remove stale packages,
-        // remove stale sysctl keys, remove stale sudoers drop-ins, and remove the sshd drop-in
-        // if no policy declares ssh.
+        // remove stale sysctl keys, remove stale sudoers drop-ins, remove stale systemd drop-ins,
+        // and remove the sshd drop-in if no policy declares ssh.
         await ReconcileLinuxAsync(
             desiredUsernames, desiredPaths, desiredPackages, desiredSysctlKeys,
-            desiredSudoersFilenames, hasSshPolicy,
-            userEnforcer, fileEnforcer, pkgEnforcer, sysctlEnforcer, sudoersEnforcer, sshdEnforcer,
+            desiredSudoersFilenames, desiredSystemdDropinKeys, hasSshPolicy,
+            userEnforcer, fileEnforcer, pkgEnforcer, sysctlEnforcer, sudoersEnforcer,
+            systemdEnforcer, sshdEnforcer,
             ct).ConfigureAwait(false);
     }
 
@@ -209,7 +212,8 @@ public sealed class Worker : BackgroundService
         HashSet<string> paths,
         HashSet<string> packages,
         HashSet<string> sysctlKeys,
-        HashSet<string> sudoersFilenames)
+        HashSet<string> sudoersFilenames,
+        HashSet<string> systemdDropinKeys)
     {
         if (linux.TryGetProperty("local_users", out var users) && users.ValueKind == JsonValueKind.Array)
         {
@@ -279,25 +283,42 @@ public sealed class Worker : BackgroundService
                     sudoersFilenames.Add(filename);
             }
         }
+
+        if (linux.TryGetProperty("systemd", out var systemd) && systemd.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var d in systemd.EnumerateArray())
+            {
+                var action = d.TryGetProperty("action", out var a) ? a.GetString() : null;
+                if (action != "ConfigureDropin") continue;
+                var unit = d.TryGetProperty("unit",        out var u)  ? u.GetString()  : null;
+                var stem = d.TryGetProperty("dropin_name", out var sn) ? sn.GetString() : null;
+                if (!string.IsNullOrWhiteSpace(unit) && !string.IsNullOrWhiteSpace(stem)
+                    && SystemdEnforcer.IsSafeUnitName(unit) && SystemdEnforcer.IsSafeDropinStem(stem))
+                    systemdDropinKeys.Add($"{unit}/{stem}");
+            }
+        }
     }
 
     /// Detects and handles items that were previously managed by DDS but are absent from
     /// the current policy set. Stale users are disabled (not deleted) to preserve home
     /// directories; stale files are deleted; stale packages are removed; stale sysctl
-    /// keys are removed from the managed drop-in; stale sudoers drop-ins are deleted; and
-    /// the sshd drop-in is removed when no current policy declares an ssh field.
+    /// keys are removed from the managed drop-in; stale sudoers drop-ins are deleted;
+    /// stale systemd drop-in files are deleted; and the sshd drop-in is removed when
+    /// no current policy declares an ssh field.
     private async Task ReconcileLinuxAsync(
         HashSet<string> desiredUsernames,
         HashSet<string> desiredPaths,
         HashSet<string> desiredPackages,
         HashSet<string> desiredSysctlKeys,
         HashSet<string> desiredSudoersFilenames,
+        HashSet<string> desiredSystemdDropinKeys,
         bool hasSshPolicy,
         UserEnforcer userEnforcer,
         FileEnforcer fileEnforcer,
         PackageEnforcer pkgEnforcer,
         SysctlEnforcer sysctlEnforcer,
         SudoersEnforcer sudoersEnforcer,
+        SystemdEnforcer systemdEnforcer,
         SshdEnforcer sshdEnforcer,
         CancellationToken ct)
     {
@@ -357,6 +378,21 @@ public sealed class Worker : BackgroundService
                 .ConfigureAwait(false);
             allChanges.AddRange(changes);
             foreach (var f in staleSudoers) _stateStore.RemoveManagedSudoersFilename(f);
+        }
+
+        // Systemd drop-ins: delete drop-in files no longer declared in any current policy.
+        var staleSystemdDropins = new HashSet<string>(
+            currentState.ManagedSystemdDropins, StringComparer.Ordinal);
+        staleSystemdDropins.ExceptWith(desiredSystemdDropinKeys);
+        if (staleSystemdDropins.Count > 0)
+        {
+            _log.LogInformation("Reconciliation: {Count} stale systemd drop-in(s) to delete",
+                staleSystemdDropins.Count);
+            var changes = await systemdEnforcer
+                .ReconcileStaleDropinsAsync(staleSystemdDropins, ct)
+                .ConfigureAwait(false);
+            allChanges.AddRange(changes);
+            foreach (var k in staleSystemdDropins) _stateStore.RemoveManagedSystemdDropin(k);
         }
 
         // Sshd: remove the drop-in when no current policy declares an ssh field.
@@ -469,6 +505,12 @@ public sealed class Worker : BackgroundService
                     break;
                 case "sudoers" when action == "delete":
                     _stateStore.RemoveManagedSudoersFilename(id);
+                    break;
+                case "systemd" when action == "configuredropin":
+                    _stateStore.RecordManagedSystemdDropin(id);
+                    break;
+                case "systemd" when action == "removedropin":
+                    _stateStore.RemoveManagedSystemdDropin(id);
                     break;
             }
         }

@@ -49,10 +49,12 @@ sealed class TestAppliedStateStore : IAppliedStateStore
     public void RecordManagedPath(string path) { }
     public void RecordManagedPackage(string packageName) { }
     public void RecordManagedSudoersFilename(string filename) { }
+    public void RecordManagedSystemdDropin(string dropinKey) { }
     public void RemoveManagedUsername(string username) { }
     public void RemoveManagedPath(string path) { }
     public void RemoveManagedPackage(string packageName) { }
     public void RemoveManagedSudoersFilename(string filename) { }
+    public void RemoveManagedSystemdDropin(string dropinKey) { }
 }
 
 /// State store whose Load() returns a pre-populated managed set and records
@@ -67,8 +69,10 @@ sealed class TrackingAppliedStateStore : IAppliedStateStore
     public List<string> RemovedPaths           { get; } = [];
     public List<string> AddedPackages          { get; } = [];
     public List<string> RemovedPackages        { get; } = [];
-    public List<string> AddedSudoersFilenames  { get; } = [];
-    public List<string> RemovedSudoersFilenames{ get; } = [];
+    public List<string> AddedSudoersFilenames   { get; } = [];
+    public List<string> RemovedSudoersFilenames { get; } = [];
+    public List<string> AddedSystemdDropinKeys  { get; } = [];
+    public List<string> RemovedSystemdDropinKeys{ get; } = [];
 
     public TrackingAppliedStateStore(AppliedState initialState)
         => _state = initialState;
@@ -77,15 +81,17 @@ sealed class TrackingAppliedStateStore : IAppliedStateStore
     public bool HasChanged(string _, string __) => true;
     public void RecordApplied(string _, string __, string ___, string ____) { }
 
-    public void RecordManagedUsername(string u)       => AddedUsernames.Add(u);
-    public void RecordManagedPath(string p)           => AddedPaths.Add(p);
-    public void RecordManagedPackage(string n)        => AddedPackages.Add(n);
-    public void RecordManagedSudoersFilename(string f)=> AddedSudoersFilenames.Add(f);
+    public void RecordManagedUsername(string u)        => AddedUsernames.Add(u);
+    public void RecordManagedPath(string p)            => AddedPaths.Add(p);
+    public void RecordManagedPackage(string n)         => AddedPackages.Add(n);
+    public void RecordManagedSudoersFilename(string f) => AddedSudoersFilenames.Add(f);
+    public void RecordManagedSystemdDropin(string k)   => AddedSystemdDropinKeys.Add(k);
 
-    public void RemoveManagedUsername(string u)       => RemovedUsernames.Add(u);
-    public void RemoveManagedPath(string p)           => RemovedPaths.Add(p);
-    public void RemoveManagedPackage(string n)        => RemovedPackages.Add(n);
-    public void RemoveManagedSudoersFilename(string f)=> RemovedSudoersFilenames.Add(f);
+    public void RemoveManagedUsername(string u)        => RemovedUsernames.Add(u);
+    public void RemoveManagedPath(string p)            => RemovedPaths.Add(p);
+    public void RemoveManagedPackage(string n)         => RemovedPackages.Add(n);
+    public void RemoveManagedSudoersFilename(string f) => RemovedSudoersFilenames.Add(f);
+    public void RemoveManagedSystemdDropin(string k)   => RemovedSystemdDropinKeys.Add(k);
 }
 
 // ---- helpers ----
@@ -624,5 +630,91 @@ public sealed class WorkerTests
         await worker.PollOnceAsync(CancellationToken.None);
 
         Assert.Contains("dds-ops", store.AddedSudoersFilenames);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleSystemdDropin_IsDeletedAndRemovedFromManagedSet()
+    {
+        // "sshd.service/hardening" was a managed systemd drop-in in a previous cycle but
+        // is absent from all current policies → reconciliation should delete it.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedSystemdDropins.Add("sshd.service/hardening");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Contains("sshd.service/hardening", store.RemovedSystemdDropinKeys);
+        Assert.DoesNotContain("sshd.service/hardening", store.AddedSystemdDropinKeys);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StillDesiredSystemdDropin_IsNotDeleted()
+    {
+        // "sshd.service/hardening" is managed AND still present in the current policy → not stale.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedSystemdDropins.Add("sshd.service/hardening");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-still-has-dropin",
+                    """{"policy_id":"policy-still-has-dropin","version":1,"linux":{"systemd":[{"unit":"sshd.service","action":"ConfigureDropin","dropin_name":"hardening","dropin_content":"[Service]\nLimitNOFILE=65535"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.DoesNotContain("sshd.service/hardening", store.RemovedSystemdDropinKeys);
+    }
+
+    [Fact]
+    public async Task SystemdConfigureDropin_RecordsManagedDropin()
+    {
+        // Applying a ConfigureDropin directive should record the "unit/stem" key.
+        var store  = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-dropin-set",
+                    """{"policy_id":"policy-dropin-set","version":1,"linux":{"systemd":[{"unit":"sshd.service","action":"ConfigureDropin","dropin_name":"hardening","dropin_content":"[Service]\nLimitNOFILE=65535"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Contains("sshd.service/hardening", store.AddedSystemdDropinKeys);
     }
 }

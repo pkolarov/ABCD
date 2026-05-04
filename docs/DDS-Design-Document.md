@@ -1351,7 +1351,8 @@ pass:
 
 1. **Extract desired set** — scan all current policy documents and build the
    full set of managed-item keys per category (registry paths, usernames,
-   group memberships, package IDs, service names).
+   group memberships, package IDs, service names, systemd drop-in keys,
+   sudoers filenames, sysctl keys).
 2. **Compute stale set** — `stale = previously_managed − desired`. Items in
    this set were managed by DDS in a prior cycle but are absent from the
    current policy.
@@ -1389,11 +1390,16 @@ does not actually delete/disable anything.
 
 **Platform scope:** Reconciliation is implemented for Windows, Linux, and macOS
 in v1. For Linux: stale users are disabled (not deleted, to preserve home
-directories), stale managed files are deleted, and stale packages are uninstalled
-via the host package manager. For macOS: the same algorithm runs with
-platform-appropriate backends (dscl, launchctl, profiles, etc.); generic package
-uninstall is not supported so stale software entries are flagged for manual
-removal.
+directories), stale managed files are deleted, stale packages are uninstalled
+via the host package manager, stale `sysctl` keys are removed from the managed
+drop-in, stale `sudoers` drop-ins are deleted from `/etc/sudoers.d/`, stale
+`systemd` drop-in files are deleted from `/etc/systemd/system/<unit>.d/` (with
+`daemon-reload`), and the `sshd` drop-in is removed when no current policy
+declares an `ssh` field. Unit-state directives (enable/disable/start/stop)
+are applied on the forward pass only — reversing them is ambiguous. For macOS:
+the same algorithm runs with platform-appropriate backends (dscl, launchctl,
+profiles, etc.); generic package uninstall is not supported so stale software
+entries are flagged for manual removal.
 
 ### 14.6 Linux Platform — Managed Device Architecture
 
@@ -1537,7 +1543,7 @@ Linux-specific enforcers:
 | `UserEnforcer` | `useradd`, `usermod`, `groupadd`, `passwd -l/-u` | Local accounts only |
 | `SudoersEnforcer` | drop-in files under `/etc/sudoers.d/` + `visudo -c` | Safe filename allowlist guards path traversal |
 | `FileEnforcer` | atomic temp-write + rename + `chmod`/`chown` | Only allowlisted paths |
-| `SystemdEnforcer` | `systemctl` / D-Bus | Service enable/disable/restart |
+| `SystemdEnforcer` | `systemctl` / D-Bus + drop-in files under `/etc/systemd/system/` | Service enable/disable/restart; `ConfigureDropin` drop-ins tracked in state store and reconciled |
 | `PackageEnforcer` | distro package manager abstraction | Backend chosen from host capability |
 | `SysctlEnforcer` | `/etc/sysctl.d/*.conf` + `sysctl --system` | Avoids ephemeral-only writes to `/proc/sys` |
 | `SshdEnforcer` | managed drop-in under `/etc/ssh/sshd_config.d/` + reload | No direct in-place edits to vendor file |

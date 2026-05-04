@@ -40,6 +40,10 @@ public sealed class AppliedState
     /// Sudoers drop-in filenames (stems under /etc/sudoers.d/) written by the DDS agent.
     [JsonPropertyName("managed_sudoers_filenames")]
     public HashSet<string> ManagedSudoersFilenames { get; set; } = new(StringComparer.Ordinal);
+
+    /// Systemd drop-in keys ("unit/stem") written by the DDS agent via ConfigureDropin.
+    [JsonPropertyName("managed_systemd_dropins")]
+    public HashSet<string> ManagedSystemdDropins { get; set; } = new(StringComparer.Ordinal);
 }
 
 public interface IAppliedStateStore
@@ -51,10 +55,12 @@ public interface IAppliedStateStore
     void RecordManagedPath(string path);
     void RecordManagedPackage(string packageName);
     void RecordManagedSudoersFilename(string filename);
+    void RecordManagedSystemdDropin(string dropinKey);
     void RemoveManagedUsername(string username);
     void RemoveManagedPath(string path);
     void RemoveManagedPackage(string packageName);
     void RemoveManagedSudoersFilename(string filename);
+    void RemoveManagedSystemdDropin(string dropinKey);
 }
 
 public sealed class AppliedStateStore : IAppliedStateStore
@@ -176,6 +182,24 @@ public sealed class AppliedStateStore : IAppliedStateStore
         lock (_lock)
         {
             if (_state.ManagedSudoersFilenames.Remove(filename))
+                WriteToDisk(_state);
+        }
+    }
+
+    public void RecordManagedSystemdDropin(string dropinKey)
+    {
+        lock (_lock)
+        {
+            if (_state.ManagedSystemdDropins.Add(dropinKey))
+                WriteToDisk(_state);
+        }
+    }
+
+    public void RemoveManagedSystemdDropin(string dropinKey)
+    {
+        lock (_lock)
+        {
+            if (_state.ManagedSystemdDropins.Remove(dropinKey))
                 WriteToDisk(_state);
         }
     }

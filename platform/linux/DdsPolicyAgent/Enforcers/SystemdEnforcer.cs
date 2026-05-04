@@ -59,46 +59,59 @@ public sealed class SystemdEnforcer
                 continue;
             }
 
-            var tag = $"systemd:{action.ToLowerInvariant()}:{unit}";
-
             switch (action)
             {
                 case "Enable":
                     await RunCtlOrLogAsync("enable", unit, ct).ConfigureAwait(false);
+                    applied.Add($"systemd:enable:{unit}");
                     break;
 
                 case "Disable":
                     await RunCtlOrLogAsync("disable", unit, ct).ConfigureAwait(false);
+                    applied.Add($"systemd:disable:{unit}");
                     break;
 
                 case "Start":
                     await RunCtlOrLogAsync("start", unit, ct).ConfigureAwait(false);
+                    applied.Add($"systemd:start:{unit}");
                     break;
 
                 case "Stop":
                     await RunCtlOrLogAsync("stop", unit, ct).ConfigureAwait(false);
+                    applied.Add($"systemd:stop:{unit}");
                     break;
 
                 case "Restart":
                     await RunCtlOrLogAsync("restart", unit, ct).ConfigureAwait(false);
+                    applied.Add($"systemd:restart:{unit}");
                     break;
 
                 case "ConfigureDropin":
-                    if (await WriteDropinAsync(unit, d, ct).ConfigureAwait(false))
+                {
+                    var stem = await WriteDropinAsync(unit, d, ct).ConfigureAwait(false);
+                    if (stem != null)
+                    {
                         needReload = true;
+                        applied.Add($"systemd:configuredropin:{unit}/{stem}");
+                    }
                     break;
+                }
 
                 case "RemoveDropin":
-                    if (await RemoveDropinAsync(unit, d, ct).ConfigureAwait(false))
+                {
+                    var stem = await RemoveDropinAsync(unit, d, ct).ConfigureAwait(false);
+                    if (stem != null)
+                    {
                         needReload = true;
+                        applied.Add($"systemd:removedropin:{unit}/{stem}");
+                    }
                     break;
+                }
 
                 default:
                     _log.LogWarning("SystemdEnforcer: unknown action {A} for {U}; skipping", action, unit);
-                    continue;
+                    break;
             }
-
-            applied.Add(tag);
         }
 
         if (needReload)
@@ -107,8 +120,54 @@ public sealed class SystemdEnforcer
         return applied;
     }
 
+    /// Deletes drop-in files that were written by DDS but are no longer declared in any
+    /// current policy. <paramref name="staleDropins"/> is a set of "unit/stem" keys
+    /// (managed set ∖ desired set). Returns a directive tag per processed entry.
+    public async Task<List<string>> ReconcileStaleDropinsAsync(
+        IReadOnlySet<string> staleDropins, CancellationToken ct)
+    {
+        var results = new List<string>();
+
+        foreach (var key in staleDropins)
+        {
+            var slash = key.IndexOf('/');
+            if (slash <= 0 || slash == key.Length - 1)
+            {
+                _log.LogWarning("SystemdEnforcer: invalid dropin key {K}; skipping", key);
+                continue;
+            }
+            var unit = key[..slash];
+            var stem = key[(slash + 1)..];
+
+            if (!IsSafeUnitName(unit) || !IsSafeDropinStem(stem))
+            {
+                _log.LogWarning("SystemdEnforcer: unsafe dropin key {K}; skipping", key);
+                continue;
+            }
+
+            var dropinPath = Path.Combine(DropinBase, $"{unit}.d", $"{stem}.conf");
+
+            if (_auditOnly)
+            {
+                _log.LogInformation("[audit] would remove stale dropin {P}", dropinPath);
+                results.Add($"systemd:removedropin:{key}");
+                continue;
+            }
+
+            if (File.Exists(dropinPath))
+            {
+                File.Delete(dropinPath);
+                _log.LogInformation("SystemdEnforcer: removed stale dropin {P}", dropinPath);
+                await RunCtlOrLogAsync("daemon-reload", string.Empty, ct).ConfigureAwait(false);
+            }
+            results.Add($"systemd:removedropin:{key}");
+        }
+
+        return results;
+    }
+
     [SupportedOSPlatform("linux")]
-    private async Task<bool> WriteDropinAsync(string unit, JsonElement d, CancellationToken ct)
+    private async Task<string?> WriteDropinAsync(string unit, JsonElement d, CancellationToken ct)
     {
         var stem    = d.TryGetProperty("dropin_name",    out var sn) ? sn.GetString() : null;
         var content = d.TryGetProperty("dropin_content", out var dc) ? dc.GetString() : null;
@@ -116,13 +175,13 @@ public sealed class SystemdEnforcer
         if (string.IsNullOrWhiteSpace(stem) || string.IsNullOrWhiteSpace(content))
         {
             _log.LogWarning("SystemdEnforcer: ConfigureDropin for {U} missing dropin_name or content", unit);
-            return false;
+            return null;
         }
 
         if (!IsSafeDropinStem(stem))
         {
             _log.LogWarning("SystemdEnforcer: unsafe dropin_name {S}; skipping", stem);
-            return false;
+            return null;
         }
 
         var dropinDir  = Path.Combine(DropinBase, $"{unit}.d");
@@ -131,7 +190,7 @@ public sealed class SystemdEnforcer
         if (_auditOnly)
         {
             _log.LogInformation("[audit] would write dropin {P}", dropinPath);
-            return true;
+            return stem;
         }
 
         Directory.CreateDirectory(dropinDir);
@@ -141,17 +200,17 @@ public sealed class SystemdEnforcer
                                   UnixFileMode.GroupRead | UnixFileMode.OtherRead);
         File.Move(tmp, dropinPath, overwrite: true);
         _log.LogInformation("SystemdEnforcer: wrote dropin {P}", dropinPath);
-        return true;
+        return stem;
     }
 
-    private Task<bool> RemoveDropinAsync(string unit, JsonElement d, CancellationToken ct)
+    private Task<string?> RemoveDropinAsync(string unit, JsonElement d, CancellationToken ct)
     {
         var stem = d.TryGetProperty("dropin_name", out var sn) ? sn.GetString() : null;
 
         if (string.IsNullOrWhiteSpace(stem) || !IsSafeDropinStem(stem))
         {
             _log.LogWarning("SystemdEnforcer: RemoveDropin for {U} has missing/unsafe dropin_name", unit);
-            return Task.FromResult(false);
+            return Task.FromResult<string?>(null);
         }
 
         var dropinPath = Path.Combine(DropinBase, $"{unit}.d", $"{stem}.conf");
@@ -159,7 +218,7 @@ public sealed class SystemdEnforcer
         if (_auditOnly)
         {
             _log.LogInformation("[audit] would remove dropin {P}", dropinPath);
-            return Task.FromResult(true);
+            return Task.FromResult<string?>(stem);
         }
 
         if (File.Exists(dropinPath))
@@ -168,7 +227,7 @@ public sealed class SystemdEnforcer
             _log.LogInformation("SystemdEnforcer: removed dropin {P}", dropinPath);
         }
 
-        return Task.FromResult(true);
+        return Task.FromResult<string?>(stem);
     }
 
     private async Task RunCtlOrLogAsync(string subcommand, string args, CancellationToken ct)
