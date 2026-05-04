@@ -1,5 +1,26 @@
 # DDS Implementation Status
 
+## Doc Fix Addendum (2026-05-04, 36th pass) — document --kem-pubkey in admit workflow
+
+`DDS-Admin-Guide.md` documented the `admit` command without `--kem-pubkey` / `--kem-pubkey-path`,
+and showed the `gen-node-key` output without the `kem_pubkey_hex` field that was added in the
+PQ-by-default work (Z-1 Phase B). Operators following the guide would issue admission certs
+without embedding the peer's ML-KEM-768 public key, triggering a warning and leaving enc-v3
+coverage at 0% until a cert re-issue.
+
+**Fixes**:
+1. `dds-node/src/main.rs` — `print_usage()` `admit` line now shows
+   `[--kem-pubkey <HEX> | --kem-pubkey-path <FILE>]`.
+2. `dds-node/src/main.rs` — `rotate-identity` printed instructions now include `--kem-pubkey`
+   in the suggested `admit` command and a note that `gen-node-key --data-dir <DIR>` retrieves
+   the (unchanged) `kem_pubkey_hex` after rotation.
+3. `docs/DDS-Admin-Guide.md` §Adding Nodes Step 1 — updated output block to show
+   `kem_pubkey_hex` and the instruction to send it with `peer_id`.
+4. `docs/DDS-Admin-Guide.md` §Adding Nodes Step 2 — `admit` example now includes
+   `--kem-pubkey`, with a note explaining the enc-v3 impact of omitting it.
+5. `docs/DDS-Admin-Guide.md` §Revoking/Rotation Step 2 — both the embedded sample output
+   and the standalone command block now include `--kem-pubkey`.
+
 ## Gap Fix Addendum (2026-05-04, 35th pass) — service reconciliation + design-doc corrections
 
 ### Service reconciliation (Worker + ServiceEnforcer)

@@ -460,7 +460,13 @@ fn cmd_rotate_identity(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     println!();
     println!("  1. Issue a fresh admission cert for the new peer id and ship it to this node:");
     println!(
-        "       dds-node admit --domain-key <FILE> --domain <FILE> \\\n         --peer-id {new_peer_id} --out admission.cbor"
+        "       # The epoch (KEM) key is unchanged by rotation — get kem_pubkey_hex by running:"
+    );
+    println!(
+        "       #   dds-node gen-node-key --data-dir {}", data_dir.display()
+    );
+    println!(
+        "       dds-node admit --domain-key <FILE> --domain <FILE> \\\n         --peer-id {new_peer_id} --kem-pubkey <HEX> --out admission.cbor"
     );
     println!(
         "     Then place admission.cbor at {}.",
