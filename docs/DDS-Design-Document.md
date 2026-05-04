@@ -769,13 +769,15 @@ dds/
     │   │   ├── Client/               HTTP client for dds-node /v1/linux/* API
     │   │   ├── State/                Applied-state persistence in /var/lib/dds
     │   │   └── Enforcers/            Users, Sudoers, Files, Systemd, Packages, Sysctl, Sshd
-    │   ├── pam_dds/                  PAM module / helper bridge for local auth (planned)
+    │   ├── DdsPolicyAgent.Tests/     xUnit tests (cross-platform via InMemory* doubles)
+    │   ├── pam_dds/                  Rust crate: pam_dds.so cdylib + dds-pam-helper binary
     │   └── packaging/                .deb / .rpm / systemd unit assets
     ├── macos/
     │   ├── DdsPolicyAgent/           .NET 8 launchd daemon — macOS policy enforcement
     │   │   ├── Client/               HTTP client for dds-node /v1/macos/* API
     │   │   ├── State/                Applied-state persistence in /Library/Application Support/DDS
     │   │   └── Enforcers/            Preferences, Accounts, launchd, Profiles, Software
+    │   ├── DdsPolicyAgent.Tests/     xUnit tests (cross-platform via InMemory* doubles)
     │   ├── DdsLoginBridge/           Authorization Services / session bootstrap bridge (planned)
     │   └── packaging/                pkgbuild/productbuild/notarization assets
     ├── android/                  Kotlin wrapper via UniFFI

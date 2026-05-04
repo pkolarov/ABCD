@@ -9,7 +9,7 @@
 use libc::{c_char, c_int, c_void};
 use std::ffi::CStr;
 
-use crate::{parse_module_args, HelperOutcome};
+use crate::{HelperOutcome, parse_module_args};
 
 // ─── PAM constants (Linux-PAM / POSIX) ───────────────────────────────────────
 
@@ -29,11 +29,7 @@ const PAM_USER: c_int = 2;
 // `libpam-dev`; the dynamic linker resolves them at load time.
 
 extern "C" {
-    fn pam_get_item(
-        pamh: *const PamHandle,
-        item_type: c_int,
-        item: *mut *const c_void,
-    ) -> c_int;
+    fn pam_get_item(pamh: *const PamHandle, item_type: c_int, item: *mut *const c_void) -> c_int;
 }
 
 /// Opaque PAM handle type — only ever used behind a raw pointer.
@@ -117,12 +113,10 @@ pub extern "C" fn pam_sm_authenticate(
         .output();
 
     match result {
-        Ok(out) if out.status.success() => {
-            match HelperOutcome::from_stdout(&out.stdout) {
-                Some(outcome) if outcome.ok => PAM_SUCCESS,
-                _ => PAM_AUTH_ERR,
-            }
-        }
+        Ok(out) if out.status.success() => match HelperOutcome::from_stdout(&out.stdout) {
+            Some(outcome) if outcome.ok => PAM_SUCCESS,
+            _ => PAM_AUTH_ERR,
+        },
         _ => PAM_AUTH_ERR,
     }
 }

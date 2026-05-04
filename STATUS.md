@@ -1,5 +1,52 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-04, 44th pass) — Windows .NET projects missing from solution + Design Document directory tree stale entries
+
+### Gaps
+
+**Gap 1 — `ABCD.sln` missing Windows DdsPolicyAgent projects**
+
+`ABCD.sln` did not include `DdsPolicyAgent.csproj` or `DdsPolicyAgent.Tests.csproj`
+from `platform/windows/`. The 43rd pass fixed the same gap for Linux; Windows was
+overlooked. The Windows test project is multi-targeting (net8.0 + net9.0) and
+fully cross-platform — 201 / 240 tests pass on macOS (39 Windows-host-only
+integration tests self-skip via `Xunit.SkippableFact`). A developer running
+`dotnet test ABCD.sln` would silently miss all 240 Windows unit tests.
+
+**Gap 2 — Design Document directory tree had stale "(planned)" label for `pam_dds/`**
+
+`DDS-Design-Document.md` directory tree (§A "Project Layout") showed:
+```
+│   ├── pam_dds/                  PAM module / helper bridge for local auth (planned)
+```
+but `pam_dds` was implemented and shipped in the 42nd pass. The "(planned)" annotation
+was not removed.
+
+**Gap 3 — Design Document directory tree missing `DdsPolicyAgent.Tests/` for Linux and macOS**
+
+The Linux and macOS `platform/` sections in the same directory tree did not list
+`DdsPolicyAgent.Tests/`, even though both directories have existed since the
+Linux tests were added (39th pass) and the macOS tests were added earlier.
+The Windows section correctly showed `DdsPolicyAgent.Tests/`.
+
+### Fix
+
+- Added `DdsPolicyAgent` solution folder under the existing `windows` solution
+  folder in `ABCD.sln`, with `DdsPolicyAgent.Windows` and
+  `DdsPolicyAgent.Windows.Tests` project entries, configuration platforms, and
+  `NestedProjects` bindings — mirroring the structure already present for
+  `linux` and `macos`.
+- Updated `docs/DDS-Design-Document.md` directory tree:
+  - Removed `(planned)` from the `pam_dds/` entry; updated description to
+    "Rust crate: pam_dds.so cdylib + dds-pam-helper binary".
+  - Added `DdsPolicyAgent.Tests/     xUnit tests (cross-platform via InMemory* doubles)`
+    after `DdsPolicyAgent/` in both the `linux/` and `macos/` sections.
+
+**Test results**: 201 / 240 Windows .NET (39 skipped: Windows-only integration tests),
+132 / 132 Linux .NET, 92 / 92 macOS .NET, Rust workspace tests clean.
+
+---
+
 ## Gap Fix (2026-05-04, 43rd pass) — Linux .NET projects missing from solution and CI
 
 ### Gap

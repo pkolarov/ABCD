@@ -183,7 +183,9 @@ async fn uds_get(sock_path: &str, path: &str) -> Result<Bytes, String> {
     let (mut sender, conn) = http1::handshake::<_, Empty<Bytes>>(io)
         .await
         .map_err(|e| format!("HTTP handshake: {e}"))?;
-    tokio::spawn(async move { let _ = conn.await; });
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
 
     let req = hyper::Request::builder()
         .method("GET")
@@ -230,7 +232,9 @@ async fn uds_post_json<T: Serialize>(
     let (mut sender, conn) = http1::handshake::<_, Full<Bytes>>(io)
         .await
         .map_err(|e| format!("HTTP handshake: {e}"))?;
-    tokio::spawn(async move { let _ = conn.await; });
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
 
     let req = hyper::Request::builder()
         .method("POST")
@@ -376,8 +380,7 @@ fn try_fido2_assert_tool(
 
     use sha2::Digest;
     let hash = sha2::Sha256::digest(client_data_json.as_bytes());
-    let client_data_hash =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash.as_slice());
+    let client_data_hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash.as_slice());
 
     Ok(PrecomputedAssertion {
         credential_id,
@@ -392,9 +395,8 @@ fn try_fido2_assert_tool(
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 fn emit_outcome(outcome: &HelperOutcome) -> ! {
-    let json = serde_json::to_string(outcome).unwrap_or_else(|_| {
-        r#"{"ok":false,"error":"internal serialization failure"}"#.to_owned()
-    });
+    let json = serde_json::to_string(outcome)
+        .unwrap_or_else(|_| r#"{"ok":false,"error":"internal serialization failure"}"#.to_owned());
     println!("{json}");
     if outcome.ok {
         process::exit(0);
@@ -421,10 +423,9 @@ async fn main() {
     });
 
     // 1. Fetch a server-issued challenge.
-    let challenge_bytes =
-        uds_get(&args.node_sock, "/v1/session/challenge")
-            .await
-            .unwrap_or_else(|e| emit_error(format!("fetch challenge: {e}")));
+    let challenge_bytes = uds_get(&args.node_sock, "/v1/session/challenge")
+        .await
+        .unwrap_or_else(|e| emit_error(format!("fetch challenge: {e}")));
 
     let challenge_resp: ChallengeResponse = serde_json::from_slice(&challenge_bytes)
         .unwrap_or_else(|e| emit_error(format!("parse challenge response: {e}")));
@@ -457,10 +458,9 @@ async fn main() {
         duration_secs: Some(args.duration_secs),
     };
 
-    let session_bytes =
-        uds_post_json(&args.node_sock, "/v1/session/assert", &request)
-            .await
-            .unwrap_or_else(|e| emit_error(format!("session assert: {e}")));
+    let session_bytes = uds_post_json(&args.node_sock, "/v1/session/assert", &request)
+        .await
+        .unwrap_or_else(|e| emit_error(format!("session assert: {e}")));
 
     let session: SessionResponse = serde_json::from_slice(&session_bytes)
         .unwrap_or_else(|e| emit_error(format!("parse session response: {e}")));
