@@ -1,5 +1,97 @@
 # DDS Implementation Status
 
+## Fix (2026-05-04, 50th pass) — Linux systemd drop-in reconciliation gap
+
+### Gap
+
+The Admin Guide and Design Document documented that `ConfigureDropin` directives
+write persistent files under `/etc/systemd/system/<unit>.d/<stem>.conf`. Unlike
+sudoers drop-ins (fixed in pass 49) and sysctl keys (fixed in pass 48), these
+files were:
+
+1. Not tracked in `AppliedStateStore` — there was no `managed_systemd_dropins`
+   field in the state JSON.
+2. Not cleaned up in the reconciliation pass — `ReconcileLinuxAsync` had no
+   block for systemd drop-ins.
+3. Emitting an incomplete tag — `SystemdEnforcer.ApplyAsync` built tags as
+   `systemd:configuredropin:<unit>` (missing the stem), so `RecordManagedResources`
+   could not key on the full `unit/stem` identity.
+
+**Scenario that exposed the gap:** If policy A wrote a drop-in via a
+`ConfigureDropin` directive (e.g., `sshd.service/hardening`), and later that
+policy was removed from the applicable set for a device, the drop-in file
+`/etc/systemd/system/sshd.service.d/hardening.conf` would persist indefinitely.
+
+The Admin Guide table row for `systemd` incorrectly said "No stale-item cleanup"
+for the entire enforcer, conflating unit-state directives (enable/disable/start/stop
+— no auto-revert is correct) with drop-in file directives (should be reconciled).
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/State/AppliedStateStore.cs`**:
+- Added `ManagedSystemdDropins: HashSet<string>` (`managed_systemd_dropins` JSON key).
+- Added `RecordManagedSystemdDropin` and `RemoveManagedSystemdDropin` to the
+  `IAppliedStateStore` interface and `AppliedStateStore` implementation.
+
+**`platform/linux/DdsPolicyAgent/Enforcers/SystemdEnforcer.cs`**:
+- Changed `WriteDropinAsync` and `RemoveDropinAsync` to return `string?` (the
+  stem name on success, `null` on failure/skip) instead of `bool`.
+- Restructured `ApplyAsync` to build per-case tags; `ConfigureDropin` now emits
+  `systemd:configuredropin:unit/stem` and `RemoveDropin` emits
+  `systemd:removedropin:unit/stem` so the state store can key on the full
+  `unit/stem` identity.
+- Added `ReconcileStaleDropinsAsync(IReadOnlySet<string> staleDropins, ct)`:
+  validates each `unit/stem` key, deletes the drop-in file if it exists,
+  triggers `daemon-reload`, and returns a directive tag per processed entry.
+  Audit mode logs intent without touching the filesystem.
+
+**`platform/linux/DdsPolicyAgent/Worker.cs`**:
+- Added `desiredSystemdDropinKeys: HashSet<string>` tracking across all current
+  policies.
+- Extended `ExtractDesiredItems` to collect `unit/stem` keys from `ConfigureDropin`
+  directives.
+- Extended `RecordManagedResources` to handle `systemd:configuredropin:unit/stem`
+  (calls `RecordManagedSystemdDropin`) and `systemd:removedropin:unit/stem`
+  (calls `RemoveManagedSystemdDropin`).
+- Extended `ReconcileLinuxAsync` with a systemd drop-ins block: computes stale
+  set (`ManagedSystemdDropins − desiredSystemdDropinKeys`), calls
+  `systemdEnforcer.ReconcileStaleDropinsAsync(staleDropins, ct)`, updates state
+  store. `SystemdEnforcer` is now threaded through to `ReconcileLinuxAsync`.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`**:
+- Added `ReconcileSystemdDropinEnforcerTests` with four tests:
+  `ReconcileStaleDropins_ReturnsRemoveDirectivePerKey`,
+  `ReconcileStaleDropins_AuditOnly_ReturnDirectivesButNoFilesystemWrite`,
+  `ReconcileStaleDropins_UnsafeKey_Skipped`,
+  `ReconcileStaleDropins_EmptySet_ReturnsEmpty`.
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `RecordManagedSystemdDropin` / `RemoveManagedSystemdDropin` to
+  `TestAppliedStateStore` and `TrackingAppliedStateStore` (interface compliance).
+- Added tracking lists `AddedSystemdDropinKeys` / `RemovedSystemdDropinKeys` to
+  `TrackingAppliedStateStore`.
+- Added three Worker-level tests:
+  `Reconciliation_StaleSystemdDropin_IsDeletedAndRemovedFromManagedSet`,
+  `Reconciliation_StillDesiredSystemdDropin_IsNotDeleted`,
+  `SystemdConfigureDropin_RecordsManagedDropin`.
+
+**`docs/DDS-Admin-Guide.md`**:
+- Split the `systemd` table row into two: drop-ins (reconciled, with
+  `daemon-reload`) and unit-state (forward-only, no auto-revert).
+- Added `managed_systemd_dropins` to the safety-guarantees managed-items list.
+
+**`docs/DDS-Design-Document.md`**:
+- Updated `SystemdEnforcer` row in the enforcer table to note drop-in tracking.
+- Expanded the §14.5.9 "Extract desired set" description to include systemd
+  drop-in keys.
+- Expanded the §14.5.9 platform-scope paragraph to list all Linux reconciliation
+  categories explicitly, clarifying that unit-state directives remain forward-only.
+
+**Test results**: 150 / 150 Linux .NET (7 new), 201 / 240 Windows .NET
+(39 skipped), 96 / 96 macOS .NET — all green. Rust workspace check clean.
+
+---
+
 ## Fix (2026-05-04, 49th pass) — Linux sudoers drop-in reconciliation gap
 
 ### Gap
