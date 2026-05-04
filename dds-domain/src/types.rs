@@ -534,6 +534,12 @@ pub struct LinuxSettings {
     /// Package install / remove directives.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packages: Vec<LinuxPackageDirective>,
+    /// Kernel parameter directives persisted to `/etc/sysctl.d/`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sysctl: Vec<SysctlDirective>,
+    /// SSH daemon configuration applied via drop-ins under `/etc/ssh/sshd_config.d/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshdPolicy>,
 }
 
 /// What to do with a local Linux user account.
@@ -673,6 +679,52 @@ pub struct LinuxPackageDirective {
     /// available in configured repositories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+}
+
+/// What to do with a kernel parameter.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SysctlAction {
+    /// Write the value to `/etc/sysctl.d/dds-managed.conf` and apply via
+    /// `sysctl --system`.
+    Set,
+    /// Remove the key from the DDS-managed drop-in and reload.
+    Delete,
+}
+
+/// A kernel parameter directive.  Values are persisted in a DDS-managed
+/// drop-in file (`/etc/sysctl.d/60-dds-managed.conf`) so they survive
+/// reboots, rather than written ephemerally to `/proc/sys`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SysctlDirective {
+    /// Dotted kernel parameter key, e.g. `"net.ipv4.ip_forward"`.
+    pub key: String,
+    /// String value to write (e.g. `"1"`, `"0"`, `"65536"`).
+    /// Ignored when `action` is `Delete`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    pub action: SysctlAction,
+}
+
+/// SSH daemon hardening policy applied via a DDS-managed drop-in under
+/// `/etc/ssh/sshd_config.d/60-dds.conf`.  Only the fields present in
+/// the policy are written; absent fields are not touched.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SshdPolicy {
+    /// Whether password authentication is permitted (`PasswordAuthentication yes/no`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_authentication: Option<bool>,
+    /// `PermitRootLogin` value, e.g. `"no"`, `"prohibit-password"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permit_root_login: Option<String>,
+    /// Whether public-key authentication is permitted (`PubkeyAuthentication yes/no`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pubkey_authentication: Option<bool>,
+    /// `AllowUsers` list.  Empty vec = directive omitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_users: Vec<String>,
+    /// `AllowGroups` list.  Empty vec = directive omitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_groups: Vec<String>,
 }
 
 impl DomainDocument for LinuxPolicyDocument {

@@ -1453,35 +1453,39 @@ LinuxPolicyDocument
 ├── settings: [PolicySetting]
 ├── enforcement: Enforcement
 └── linux: Option<LinuxSettings>
-    ├── sysctl: [SysctlDirective]
-    │   ├── key: String               # e.g. "net.ipv4.ip_forward"
-    │   ├── value: String
-    │   └── action: SysctlAction      # Set | Delete
-    ├── files: [ManagedFileDirective]
+    ├── local_users: [LinuxUserDirective]
+    │   ├── username: String
+    │   ├── uid: Option<u32>
+    │   ├── shell: Option<String>
+    │   ├── groups: [String]          # supplementary groups (additive)
+    │   ├── comment: Option<String>   # GECOS / full name
+    │   └── action: LinuxUserAction   # Create | Delete | Disable | Enable | Modify
+    ├── sudoers: [LinuxSudoersDirective]
+    │   ├── filename: String          # drop-in name under /etc/sudoers.d/ (no slashes)
+    │   ├── content: String           # sudoers rule text
+    │   └── content_sha256: Option<String>
+    ├── files: [LinuxFileDirective]
     │   ├── path: String              # allowlisted paths only
     │   ├── owner: Option<String>
     │   ├── group: Option<String>
     │   ├── mode: Option<String>      # e.g. "0644"
-    │   ├── content: Option<String>   # literal or rendered template
-    │   ├── sha256: Option<String>
-    │   └── action: FileAction        # Write | Delete
-    ├── local_accounts: [PosixAccountDirective]
-    │   ├── username: String
-    │   ├── uid: Option<u32>
-    │   ├── primary_group: Option<String>
-    │   ├── supplementary_groups: [String]
-    │   ├── shell: Option<String>
-    │   ├── home: Option<String>
-    │   ├── locked: Option<bool>
-    │   └── action: PosixAccountAction # Create | Delete | Lock | Unlock | Modify
-    ├── services: [SystemdDirective]
-    │   ├── name: String              # unit name, e.g. "sshd.service"
-    │   ├── enabled: Option<bool>
-    │   ├── state: Option<UnitState>  # Started | Stopped | Restarted
-    │   └── action: UnitAction        # Configure | Mask | Unmask
+    │   ├── content_b64: Option<String>
+    │   ├── content_sha256: Option<String>
+    │   └── action: LinuxFileAction   # Set | Delete
+    ├── systemd: [LinuxSystemdDirective]
+    │   ├── unit: String              # unit name, e.g. "sshd.service"
+    │   └── action: SystemdAction     # Enable | Disable | Start | Stop | Restart | Mask | Unmask
+    ├── packages: [LinuxPackageDirective]
+    │   ├── name: String              # package name
+    │   ├── action: PackageAction     # Install | Remove
+    │   └── version: Option<String>
+    ├── sysctl: [SysctlDirective]
+    │   ├── key: String               # e.g. "net.ipv4.ip_forward"
+    │   ├── value: Option<String>     # ignored for Delete
+    │   └── action: SysctlAction      # Set | Delete
     └── ssh: Option<SshdPolicy>
         ├── password_authentication: Option<bool>
-        ├── permit_root_login: Option<String>
+        ├── permit_root_login: Option<String>   # "yes"|"no"|"prohibit-password"|"forced-commands-only"
         ├── pubkey_authentication: Option<bool>
         ├── allow_users: [String]
         └── allow_groups: [String]

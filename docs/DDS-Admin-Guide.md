@@ -1081,6 +1081,79 @@ The macOS DDS Policy Agent enforces:
 - Configuration profiles
 - Software installation (signed `.pkg` with SHA-256 verification)
 
+### Linux Policy
+
+Query Linux policies for a device:
+
+```bash
+# HTTP
+curl "http://127.0.0.1:5551/v1/linux/policies?device_urn=urn:vouchsafe:linux-1.7k3mf9..."
+
+# CLI
+dds platform linux policies --device-urn urn:vouchsafe:linux-1.7k3mf9...
+dds platform linux software --device-urn urn:vouchsafe:linux-1.7k3mf9...
+```
+
+The `LinuxSettings` bundle supports seven directive types:
+
+| Field | Type | Enforcer | Description |
+|---|---|---|---|
+| `local_users` | `[LinuxUserDirective]` | `UserEnforcer` | Create, delete, lock, unlock, or modify local POSIX accounts |
+| `sudoers` | `[LinuxSudoersDirective]` | `SudoersEnforcer` | Write drop-in files under `/etc/sudoers.d/` |
+| `files` | `[LinuxFileDirective]` | `FileEnforcer` | Atomically write or delete files at allowlisted paths |
+| `systemd` | `[LinuxSystemdDirective]` | `SystemdEnforcer` | Enable, disable, start, stop, restart, or mask systemd units |
+| `packages` | `[LinuxPackageDirective]` | `PackageEnforcer` | Install or remove distro packages via `apt`/`dnf`/`zypper` |
+| `sysctl` | `[SysctlDirective]` | `SysctlEnforcer` | Persist kernel parameters to `/etc/sysctl.d/60-dds-managed.conf` |
+| `ssh` | `Option<SshdPolicy>` | `SshdEnforcer` | Write an SSH daemon drop-in at `/etc/ssh/sshd_config.d/60-dds.conf` |
+
+**`sysctl` directive example:**
+
+```json
+{
+  "linux": {
+    "sysctl": [
+      { "key": "net.ipv4.ip_forward",  "value": "1",  "action": "Set" },
+      { "key": "net.ipv6.conf.all.forwarding", "value": "0", "action": "Set" },
+      { "key": "vm.swappiness",        "action": "Delete" }
+    ]
+  }
+}
+```
+
+Keys must be dotted alphanumeric/underscore identifiers (e.g. `net.ipv4.ip_forward`). Values are validated to contain only printable ASCII with no shell metacharacters. `Delete` removes the key from the DDS-managed drop-in; it does not touch other drop-ins. Changes are applied via `sysctl --system` and survive reboots.
+
+**`ssh` policy example:**
+
+```json
+{
+  "linux": {
+    "ssh": {
+      "password_authentication": false,
+      "permit_root_login": "prohibit-password",
+      "pubkey_authentication": true,
+      "allow_groups": ["sshusers", "dds-ops"]
+    }
+  }
+}
+```
+
+Only the fields present in the policy are written to the drop-in — absent fields are not touched, so you can layer multiple policies. Valid `permit_root_login` values are `"yes"`, `"no"`, `"prohibit-password"`, and `"forced-commands-only"`. Setting `ssh` to `null` (or omitting it) removes the DDS-managed drop-in entirely. sshd is reloaded via `systemctl reload sshd` (falls back to `ssh` unit name for distros that use it).
+
+**`packages` directive example:**
+
+```json
+{
+  "linux": {
+    "packages": [
+      { "name": "ntp",   "action": "Install" },
+      { "name": "telnet","action": "Remove"  }
+    ]
+  }
+}
+```
+
+Package names are validated against a safe-character allowlist before any package manager call. `Remove` is refused for packages not previously installed by DDS (tracked in `/var/lib/dds/applied-state.json`).
+
 ### Report Applied State
 
 After applying policy, agents report what they applied:

@@ -96,6 +96,8 @@ public sealed class Worker : BackgroundService
         var fileEnforcer    = new FileEnforcer   (_runner, _config.AuditOnly, _log);
         var systemdEnforcer = new SystemdEnforcer(_runner, _config.AuditOnly, _log);
         var pkgEnforcer     = new PackageEnforcer(_runner, _config.AuditOnly, _log);
+        var sysctlEnforcer  = new SysctlEnforcer (_runner, _config.AuditOnly, _log);
+        var sshdEnforcer    = new SshdEnforcer   (_runner, _config.AuditOnly, _log);
 
         foreach (var p in policies)
         {
@@ -141,6 +143,7 @@ public sealed class Worker : BackgroundService
                 allDirectives.AddRange(await ApplyLinuxSectionAsync(
                     linux, policyId, version,
                     userEnforcer, sudoersEnforcer, fileEnforcer, systemdEnforcer, pkgEnforcer,
+                    sysctlEnforcer, sshdEnforcer,
                     managedUsernames, managedPaths, managedPackages,
                     ct).ConfigureAwait(false));
             }
@@ -179,6 +182,8 @@ public sealed class Worker : BackgroundService
         FileEnforcer fileEnforcer,
         SystemdEnforcer systemdEnforcer,
         PackageEnforcer pkgEnforcer,
+        SysctlEnforcer sysctlEnforcer,
+        SshdEnforcer sshdEnforcer,
         IReadOnlySet<string> managedUsernames,
         IReadOnlySet<string> managedPaths,
         IReadOnlySet<string> managedPackages,
@@ -200,6 +205,13 @@ public sealed class Worker : BackgroundService
 
         all.AddRange(await pkgEnforcer.ApplyAsync(
             GetArray(linux, "packages"), managedPackages, ct).ConfigureAwait(false));
+
+        all.AddRange(await sysctlEnforcer.ApplyAsync(
+            GetArray(linux, "sysctl"), ct).ConfigureAwait(false));
+
+        JsonElement? sshPolicy = linux.TryGetProperty("ssh", out var ssh)
+            && ssh.ValueKind == JsonValueKind.Object ? ssh : null;
+        all.AddRange(await sshdEnforcer.ApplyAsync(sshPolicy, ct).ConfigureAwait(false));
 
         return all;
     }

@@ -365,3 +365,315 @@ public sealed class PackageEnforcerTests
         Assert.Empty(runner.Invocations);
     }
 }
+
+// ============================================================
+// SysctlEnforcer
+// ============================================================
+
+public sealed class SysctlEnforcerTests
+{
+    private static JsonElement ParseElement(string json)
+        => JsonDocument.Parse(json).RootElement;
+
+    [Theory]
+    [InlineData("net.ipv4.ip_forward",   true)]
+    [InlineData("vm.swappiness",         true)]
+    [InlineData("kernel.sysrq",          true)]
+    [InlineData("a.b_c.d1",              true)]
+    [InlineData("",                      false)]
+    [InlineData("net..ipv4",             false)]  // empty segment
+    [InlineData(".leading",              false)]  // leading dot
+    [InlineData("trailing.",             false)]  // trailing dot
+    [InlineData("net.ipv4.ip forward",   false)]  // space
+    [InlineData("net.ipv4.ip-forward",   false)]  // hyphen not allowed
+    public void KeyValidation(string key, bool expected)
+        => Assert.Equal(expected, SysctlEnforcer.IsValidKey(key));
+
+    [Theory]
+    [InlineData("1",     true)]
+    [InlineData("0",     true)]
+    [InlineData("65536", true)]
+    [InlineData("",      true)]   // empty string is valid (some params accept it)
+    [InlineData("hello", true)]
+    [InlineData("val;rm -rf /", false)]  // shell metacharacter
+    [InlineData("val`cmd`",     false)]  // backtick
+    [InlineData("val$PATH",     false)]  // dollar
+    [InlineData("val|cmd",      false)]  // pipe
+    public void ValueValidation(string value, bool expected)
+        => Assert.Equal(expected, SysctlEnforcer.IsValidValue(value));
+
+    [Fact]
+    public async Task EmptyDirectivesReturnsEmpty()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SysctlEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync([], default);
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task SetDirective_AuditOnly_NoRunnerCall()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SysctlEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [ParseElement("""{"key":"net.ipv4.ip_forward","value":"1","action":"Set"}""")],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("sysctl:set:net.ipv4.ip_forward", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task SetDirective_AuditOnly_NoRunnerCall_MultipleKeys()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SysctlEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [
+                ParseElement("""{"key":"vm.swappiness","value":"10","action":"Set"}"""),
+                ParseElement("""{"key":"net.ipv4.ip_forward","value":"1","action":"Set"}"""),
+            ],
+            default);
+
+        Assert.Equal(2, applied.Count);
+        Assert.Contains("sysctl:set:vm.swappiness", applied);
+        Assert.Contains("sysctl:set:net.ipv4.ip_forward", applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task DeleteDirective_ReturnsEntry()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SysctlEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [ParseElement("""{"key":"net.ipv4.ip_forward","action":"Delete"}""")],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("sysctl:delete:net.ipv4.ip_forward", applied[0]);
+    }
+
+    [Fact]
+    public async Task UnsafeKeySkipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SysctlEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [ParseElement("""{"key":"net.ipv4.ip-forward","value":"1","action":"Set"}""")],
+            default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task UnsafeValueSkipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SysctlEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [ParseElement("""{"key":"net.ipv4.ip_forward","value":"1;rm -rf /","action":"Set"}""")],
+            default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task MissingValueOnSetSkipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SysctlEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [ParseElement("""{"key":"net.ipv4.ip_forward","action":"Set"}""")],
+            default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task UnknownActionSkipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SysctlEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [ParseElement("""{"key":"net.ipv4.ip_forward","value":"1","action":"Bogus"}""")],
+            default);
+
+        Assert.Empty(applied);
+    }
+}
+
+// ============================================================
+// SshdEnforcer
+// ============================================================
+
+public sealed class SshdEnforcerTests
+{
+    private static JsonElement ParseObject(string json)
+        => JsonDocument.Parse(json).RootElement;
+
+    [Theory]
+    [InlineData("alice",    true)]
+    [InlineData("dds-ops",  true)]
+    [InlineData("dds.ops",  true)]
+    [InlineData("",         false)]
+    [InlineData("1alice",   false)]  // starts with digit
+    [InlineData("alice!",   false)]  // illegal char
+    [InlineData("toolongusernamethatexceedslimit123456789012", false)]
+    public void NameValidation(string name, bool expected)
+        => Assert.Equal(expected, SshdEnforcer.IsValidName(name));
+
+    [Fact]
+    public async Task NullPolicy_NoDropinPresent_ReturnsEmpty()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SshdEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(null, default);
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task EmptyPolicyObject_NoDirectives_NoRunnerCall()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SshdEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var policy = ParseObject("{}");
+        var applied = await enforcer.ApplyAsync(policy, default);
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task PasswordAuth_False_AuditOnly_NoRunnerCall()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SshdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var policy = ParseObject("""{"password_authentication":false}""");
+        var applied = await enforcer.ApplyAsync(policy, default);
+
+        Assert.Single(applied);
+        Assert.Equal("sshd:set:PasswordAuthentication=False", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task PasswordAuth_True_RecordedCorrectly()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SshdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var policy = ParseObject("""{"password_authentication":true}""");
+        var applied = await enforcer.ApplyAsync(policy, default);
+
+        Assert.Single(applied);
+        Assert.Equal("sshd:set:PasswordAuthentication=True", applied[0]);
+    }
+
+    [Fact]
+    public async Task PubkeyAuth_AppliedWithSshd()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SshdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var policy = ParseObject("""{"pubkey_authentication":true}""");
+        var applied = await enforcer.ApplyAsync(policy, default);
+
+        Assert.Single(applied);
+        Assert.Equal("sshd:set:PubkeyAuthentication=True", applied[0]);
+    }
+
+    [Fact]
+    public async Task PermitRootLogin_ValidValue_Applied()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SshdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var policy = ParseObject("""{"permit_root_login":"prohibit-password"}""");
+        var applied = await enforcer.ApplyAsync(policy, default);
+
+        Assert.Single(applied);
+        Assert.Equal("sshd:set:PermitRootLogin=prohibit-password", applied[0]);
+    }
+
+    [Fact]
+    public async Task PermitRootLogin_InvalidValue_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SshdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var policy = ParseObject("""{"permit_root_login":"maybe"}""");
+        var applied = await enforcer.ApplyAsync(policy, default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task AllowUsers_ValidNames_Applied()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SshdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var policy = ParseObject("""{"allow_users":["alice","bob"]}""");
+        var applied = await enforcer.ApplyAsync(policy, default);
+
+        Assert.Single(applied);
+        Assert.Equal("sshd:set:AllowUsers=alice,bob", applied[0]);
+    }
+
+    [Fact]
+    public async Task AllowUsers_UnsafeNameFiltered()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SshdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        // "bad user" contains a space — should be filtered, leaving empty list → no directive
+        var policy = ParseObject("""{"allow_users":["bad user"]}""");
+        var applied = await enforcer.ApplyAsync(policy, default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task MultipleFields_AllPresentInResult()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SshdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var policy = ParseObject("""
+            {
+              "password_authentication": false,
+              "pubkey_authentication": true,
+              "permit_root_login": "prohibit-password",
+              "allow_groups": ["sshusers"]
+            }
+            """);
+        var applied = await enforcer.ApplyAsync(policy, default);
+
+        Assert.Equal(4, applied.Count);
+        Assert.Contains("sshd:set:PasswordAuthentication=False",     applied);
+        Assert.Contains("sshd:set:PubkeyAuthentication=True",        applied);
+        Assert.Contains("sshd:set:PermitRootLogin=prohibit-password", applied);
+        Assert.Contains("sshd:set:AllowGroups=sshusers",             applied);
+        Assert.Empty(runner.Invocations);
+    }
+}
