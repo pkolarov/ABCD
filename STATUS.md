@@ -1,5 +1,63 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 52nd pass) — SshdEnforcer empty-policy dropin cleanup bug + Admin Guide reload clarification
+
+### Gap
+
+`SshdEnforcer.ApplyAsync` had two related gaps around drop-in cleanup:
+
+1. **Empty/all-invalid policy object left dropin behind** — When an `ssh` policy object
+   existed but produced zero valid directives (e.g., all fields absent, all values
+   invalid such as an unrecognized `permit_root_login`), the function returned early
+   with an empty `result` list and left any previously-written
+   `/etc/ssh/sshd_config.d/60-dds.conf` dropin on disk.  The null-policy path (which
+   correctly removes the dropin) was never reached because `policy` was not `null`.
+
+   **Scenario that exposed the gap:** Policy A writes the sshd dropin with
+   `PermitRootLogin prohibit-password`. An operator then edits the policy to set
+   `permit_root_login` to an unrecognized value (typo, e.g. `"prohibit"`) and removes
+   all other fields. On the next poll cycle the policy now produces `lines.Count == 0`,
+   the early-return fires, and the dropin with the old setting persists indefinitely —
+   even though the policy no longer contains any effective sshd directive.
+
+2. **Admin Guide incorrectly implied sshd is reloaded on dropin removal** — The
+   paragraph following the `ssh` directive example ended with "sshd is reloaded via
+   `systemctl reload sshd`" immediately after describing the null-policy removal path,
+   making it appear that reload happens on removal. The code deliberately does NOT
+   reload on removal (safe default: old settings remain active until operator-triggered
+   reload or restart, so hardening settings are not automatically relaxed). The guide
+   needed to make this distinction explicit.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Enforcers/SshdEnforcer.cs`**:
+- In `ApplyAsync`, replaced the `lines.Count == 0` early-return path with the same
+  cleanup logic as the null-policy path: if the dropin exists at `DropinPath`,
+  call `RemoveDropinAsync` and return `["sshd:remove"]`; otherwise return `[]`.
+  This means an empty or all-invalid ssh policy object now behaves identically to a
+  null/absent ssh field for dropin lifecycle purposes.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`**:
+- Renamed `EmptyPolicyObject_NoDirectives_NoRunnerCall` →
+  `EmptyPolicyObject_NoDropinPresent_ReturnsEmpty` (more precise about precondition).
+- Added `AllFieldsInvalid_NoDropinPresent_ReturnsEmpty`: verifies that a policy object
+  whose only fields have invalid values (`permit_root_login: "maybe"`,
+  `allow_users: ["bad user"]`) is treated as no-op when no dropin exists, consistent
+  with empty policy and null policy when the file is absent.
+
+**`docs/DDS-Admin-Guide.md`**:
+- Updated the `ssh` directive description paragraph to explicitly state: sshd is
+  reloaded only when a new dropin is written; on removal the dropin file is deleted
+  but sshd is not automatically reloaded (intentional safe default so hardening
+  settings are not automatically relaxed).
+- Added note that an `ssh` object with no recognized fields (or all invalid) is
+  treated the same as `null` for dropin lifecycle purposes.
+
+**Test results**: 151 / 151 Linux .NET (1 new, 1 renamed), 201 / 240 Windows .NET
+(39 skipped), 96 / 96 macOS .NET — all green. Rust workspace check clean.
+
+---
+
 ## Fix (2026-05-04, 51st pass) — Linux path migration + PAM default + build packaging gaps
 
 ### Gap

@@ -548,12 +548,27 @@ public sealed class SshdEnforcerTests
     }
 
     [Fact]
-    public async Task EmptyPolicyObject_NoDirectives_NoRunnerCall()
+    public async Task EmptyPolicyObject_NoDropinPresent_ReturnsEmpty()
     {
+        // No recognized fields → no dropin present → no-op (same as null policy when dropin absent).
         var runner   = new NullCommandRunner();
         var enforcer = new SshdEnforcer(runner, auditOnly: false, NullLogger.Instance);
 
         var policy = ParseObject("{}");
+        var applied = await enforcer.ApplyAsync(policy, default);
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task AllFieldsInvalid_NoDropinPresent_ReturnsEmpty()
+    {
+        // All fields have invalid values → lines.Count == 0 → same cleanup path as empty object.
+        // When no dropin exists (common in CI), behaves as a no-op.
+        var runner   = new NullCommandRunner();
+        var enforcer = new SshdEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var policy = ParseObject("""{"permit_root_login":"maybe","allow_users":["bad user"]}""");
         var applied = await enforcer.ApplyAsync(policy, default);
         Assert.Empty(applied);
         Assert.Empty(runner.Invocations);

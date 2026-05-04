@@ -1137,7 +1137,7 @@ Keys must be dotted alphanumeric/underscore identifiers (e.g. `net.ipv4.ip_forwa
 }
 ```
 
-Only the fields present in the policy are written to the drop-in — absent fields are not touched, so you can layer multiple policies. Valid `permit_root_login` values are `"yes"`, `"no"`, `"prohibit-password"`, and `"forced-commands-only"`. Setting `ssh` to `null` (or omitting it) removes the DDS-managed drop-in entirely. sshd is reloaded via `systemctl reload sshd` (falls back to `ssh` unit name for distros that use it).
+Only the fields present in the policy are written to the drop-in — absent fields are not touched, so you can layer multiple policies. Valid `permit_root_login` values are `"yes"`, `"no"`, `"prohibit-password"`, and `"forced-commands-only"`. Setting `ssh` to `null` (or omitting it) removes the DDS-managed drop-in entirely; if an `ssh` object is present but contains no recognized fields (or all fields are invalid), it is treated the same way. **sshd is reloaded via `systemctl reload sshd` (falls back to `ssh` unit name) only when a new drop-in is written.** On removal, the drop-in file is deleted but sshd is not automatically reloaded — the old settings remain active in memory until the next operator-triggered reload or sshd restart. This is intentional: relaxing security settings is not done automatically.
 
 **`packages` directive example:**
 

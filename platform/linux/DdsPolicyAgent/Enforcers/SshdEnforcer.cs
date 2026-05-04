@@ -113,8 +113,15 @@ public sealed class SshdEnforcer
 
         if (lines.Count == 0)
         {
-            _log.LogDebug("SshdEnforcer: policy produced no directives; no-op");
-            return result;
+            // Policy object exists but produced no valid directives (all fields absent or invalid).
+            // Treat identically to null policy: remove any previously-written dropin so it
+            // doesn't linger after the operator removes all recognized ssh fields from the policy.
+            if (File.Exists(DropinPath))
+            {
+                await RemoveDropinAsync(ct).ConfigureAwait(false);
+                return ["sshd:remove"];
+            }
+            return [];
         }
 
         await WriteDropinAsync(lines, ct).ConfigureAwait(false);
