@@ -899,6 +899,8 @@ fn test_linux_policy_with_typed_bundle_roundtrip() {
                 action: LinuxPackageAction::Install,
                 version: None,
             }],
+            sysctl: vec![],
+            ssh: None,
         }),
     };
     let cbor = doc.to_cbor().unwrap();
