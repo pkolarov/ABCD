@@ -123,13 +123,16 @@ public sealed class Worker : BackgroundService
                 && linux.ValueKind == JsonValueKind.Object;
 
             // Always collect desired items for reconciliation, even on unchanged policies.
+            // NOTE: hasSshPolicy uses HasValidDirectives so an all-invalid ssh object is
+            // treated the same as absent — the reconciliation pass will clean up the dropin.
             if (hasLinuxObject)
             {
                 ExtractDesiredItems(linux, desiredUsernames, desiredPaths, desiredPackages,
                                     desiredSysctlKeys, desiredSudoersFilenames,
                                     desiredSystemdDropinKeys);
                 if (linux.TryGetProperty("ssh", out var sshProp)
-                    && sshProp.ValueKind == JsonValueKind.Object)
+                    && sshProp.ValueKind == JsonValueKind.Object
+                    && SshdEnforcer.HasValidDirectives(sshProp))
                     hasSshPolicy = true;
             }
 

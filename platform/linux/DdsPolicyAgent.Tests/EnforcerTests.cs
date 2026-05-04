@@ -690,6 +690,24 @@ public sealed class SshdEnforcerTests
         Assert.Contains("sshd:set:AllowGroups=sshusers",             applied);
         Assert.Empty(runner.Invocations);
     }
+
+    // ---- HasValidDirectives ----
+
+    [Theory]
+    [InlineData("""{"password_authentication":false}""",                     true)]
+    [InlineData("""{"pubkey_authentication":true}""",                        true)]
+    [InlineData("""{"permit_root_login":"no"}""",                            true)]
+    [InlineData("""{"allow_users":["alice"]}""",                             true)]
+    [InlineData("""{"allow_groups":["sshusers"]}""",                         true)]
+    [InlineData("""{}""",                                                    false)]
+    [InlineData("""{"permit_root_login":"invalid"}""",                       false)]
+    [InlineData("""{"allow_users":["bad user"]}""",                          false)]
+    [InlineData("""{"allow_users":[]}""",                                    false)]
+    [InlineData("""{"permit_root_login":"maybe","allow_users":["bad!"]}""",  false)]
+    public void HasValidDirectives_Returns_Expected(string json, bool expected)
+        => Assert.Equal(expected,
+               SshdEnforcer.HasValidDirectives(
+                   JsonDocument.Parse(json).RootElement));
 }
 
 // ============================================================

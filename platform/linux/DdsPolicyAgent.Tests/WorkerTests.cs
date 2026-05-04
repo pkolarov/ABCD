@@ -547,6 +547,40 @@ public sealed class WorkerTests
     }
 
     [Fact]
+    public async Task Reconciliation_AllInvalidSshFields_TreatedSameAsAbsentSshField()
+    {
+        // A policy with an ssh object whose every field is invalid (no recognized valid
+        // directive) must be treated the same as an absent ssh field for reconciliation
+        // purposes. hasSshPolicy must be false so the reconciliation pass runs
+        // sshdEnforcer.ApplyAsync(null) and can clean up any stale dropin.
+        // In CI the dropin does not exist, so it is a no-op and no reconciliation
+        // report is emitted. This test verifies the code path is reached without throwing.
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-all-invalid-ssh",
+                    """{"policy_id":"policy-all-invalid-ssh","version":1,"linux":{"ssh":{"permit_root_login":"typo-value"}}}"""),
+            ],
+        };
+
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client);
+
+        // Must not throw, and no reconciliation report since dropin does not exist in CI.
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.DoesNotContain(client.ReceivedReports, r => r.TargetId == "_reconciliation");
+    }
+
+    [Fact]
     public async Task Reconciliation_StaleSudoersDropin_IsDeletedAndRemovedFromManagedSet()
     {
         // "dds-ops" was a managed sudoers drop-in in a previous cycle but is absent

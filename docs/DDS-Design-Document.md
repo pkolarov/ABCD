@@ -1395,7 +1395,8 @@ via the host package manager, stale `sysctl` keys are removed from the managed
 drop-in, stale `sudoers` drop-ins are deleted from `/etc/sudoers.d/`, stale
 `systemd` drop-in files are deleted from `/etc/systemd/system/<unit>.d/` (with
 `daemon-reload`), and the `sshd` drop-in is removed when no current policy
-declares an `ssh` field. Unit-state directives (enable/disable/start/stop)
+declares an `ssh` field with at least one recognized valid directive (absent field,
+`null`, empty object, and all-invalid-value objects are all treated equivalently). Unit-state directives (enable/disable/start/stop)
 are applied on the forward pass only — reversing them is ambiguous. For macOS:
 the same algorithm runs with platform-appropriate backends (dscl, launchctl,
 profiles, etc.); generic package uninstall is not supported so stale software

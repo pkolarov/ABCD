@@ -1347,7 +1347,7 @@ in the current policy set. Items no longer desired are cleaned up:
 | Managed files | Deleted from the filesystem |
 | Packages | Removed via the host package manager (`apt-get remove`, `dnf remove`, etc.) |
 | `sysctl` keys | Removed from `/etc/sysctl.d/60-dds-managed.conf` and `sysctl --system` re-run |
-| `ssh` drop-in | Removed from `/etc/ssh/sshd_config.d/60-dds.conf` if the `ssh` field is absent from all policies |
+| `ssh` drop-in | Removed from `/etc/ssh/sshd_config.d/60-dds.conf` if no current policy declares an `ssh` field with at least one recognized valid directive (absent field, `null`, or all-invalid values are all treated the same) |
 | `systemd` drop-ins | Deleted from `/etc/systemd/system/<unit>.d/` when the `ConfigureDropin` directive is removed; `daemon-reload` is triggered after each deletion |
 | `systemd` unit state | No stale-item cleanup — enable/disable/start/stop directives are applied on the forward pass only; reversing them is ambiguous |
 | `sudoers` drop-ins | Deleted from `/etc/sudoers.d/` when the `content` field is empty or the directive is removed |

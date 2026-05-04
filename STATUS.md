@@ -1,5 +1,72 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 53rd pass) — sshd reconciliation bypass for all-invalid ssh objects
+
+### Gap
+
+`Worker.PollOnceAsync` set `hasSshPolicy = true` for any policy whose `linux.ssh`
+field was a JSON object — even when every field in that object was invalid (e.g.
+`{"permit_root_login":"typo"}`). `hasSshPolicy = true` suppresses the reconciliation
+call to `sshdEnforcer.ApplyAsync(null, ...)`, so:
+
+**Scenario:** Policy A previously wrote the sshd dropin with
+`PermitRootLogin prohibit-password`. An operator then changes every `ssh` field in
+that policy to an unrecognized value (or removes all known fields) without changing
+the rest of the policy document. From that point:
+
+1. On the first cycle after the edit: the content hash changed → the forward pass
+   runs → `SshdEnforcer.ApplyAsync` (pass 52 fix) removes the dropin. ✓
+2. On **every subsequent cycle** (hash unchanged): the forward pass is skipped.
+   Because `hasSshPolicy = true`, the reconciliation pass is also skipped. If an
+   operator force-re-applies or the dropin is recreated externally, it can persist
+   indefinitely. ✗
+
+The root cause: `hasSshPolicy` used `ssh.ValueKind == JsonValueKind.Object` rather
+than asking whether the object contains at least one valid directive. An all-invalid
+ssh object does not own the dropin and should not suppress reconciliation.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Enforcers/SshdEnforcer.cs`**:
+- Added `internal static bool HasValidDirectives(JsonElement policy)` — returns
+  `true` if the policy object contains at least one field that `ApplyAsync` would
+  accept as a valid directive (bool `password_authentication` / `pubkey_authentication`,
+  recognized `permit_root_login` string, or `allow_users` / `allow_groups` array with
+  at least one safe name). Returns `false` for an empty object, null, non-object, or
+  any object whose every field fails the enforcer's own validation.
+
+**`platform/linux/DdsPolicyAgent/Worker.cs`**:
+- Changed the `hasSshPolicy` detection block to add
+  `&& SshdEnforcer.HasValidDirectives(sshProp)`. An all-invalid ssh object now leaves
+  `hasSshPolicy = false`, allowing the reconciliation pass to call
+  `sshdEnforcer.ApplyAsync(null, ...)` and clean up the stale dropin on every cycle —
+  regardless of whether the policy content has changed since the dropin was last written.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`**:
+- Added `HasValidDirectives_Returns_Expected` theory (10 inline cases): validates the
+  new static method across valid single-field inputs, empty object, invalid-string
+  permit_root_login, invalid allow_users entries, empty array, and combined-invalid.
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `Reconciliation_AllInvalidSshFields_TreatedSameAsAbsentSshField`: a policy
+  whose `ssh` object has only unrecognized values must not prevent reconciliation from
+  running the null-ssh cleanup path. Verifies no reconciliation report is emitted when
+  the dropin does not exist (CI environment).
+
+**`docs/DDS-Admin-Guide.md`**:
+- Updated the reconciliation table `ssh drop-in` row: "if no current policy declares
+  an `ssh` field with at least one recognized valid directive (absent field, `null`, or
+  all-invalid values are all treated the same)."
+
+**`docs/DDS-Design-Document.md`** §14.5.9:
+- Updated the platform scope sentence to note that absent field, `null`, empty object,
+  and all-invalid-value objects are treated equivalently for dropin lifecycle.
+
+**Test results**: 162 / 162 Linux .NET (10 new in `HasValidDirectives_Returns_Expected`
++ 1 new `Reconciliation_AllInvalidSshFields…`), all others unchanged.
+
+---
+
 ## Fix (2026-05-05, 52nd pass) — SshdEnforcer empty-policy dropin cleanup bug + Admin Guide reload clarification
 
 ### Gap

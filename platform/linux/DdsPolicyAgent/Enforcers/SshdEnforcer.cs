@@ -211,6 +211,54 @@ public sealed class SshdEnforcer
         }
     }
 
+    /// Returns true if <paramref name="policy"/> is an object that would produce at
+    /// least one valid sshd directive. Used by the Worker to determine whether any
+    /// current policy "owns" the DDS sshd drop-in; if no policy returns true the
+    /// reconciliation pass removes the drop-in regardless of content-hash state.
+    internal static bool HasValidDirectives(JsonElement policy)
+    {
+        if (policy.ValueKind != JsonValueKind.Object)
+            return false;
+
+        if (policy.TryGetProperty("password_authentication", out var pa) &&
+            pa.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            return true;
+
+        if (policy.TryGetProperty("pubkey_authentication", out var pka) &&
+            pka.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            return true;
+
+        if (policy.TryGetProperty("permit_root_login", out var prl) &&
+            prl.ValueKind == JsonValueKind.String)
+        {
+            var val = prl.GetString() ?? string.Empty;
+            if (ValidPermitRootLogin.Contains(val))
+                return true;
+        }
+
+        if (policy.TryGetProperty("allow_users", out var au) && au.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var el in au.EnumerateArray())
+            {
+                var name = el.ValueKind == JsonValueKind.String ? el.GetString() : null;
+                if (!string.IsNullOrWhiteSpace(name) && IsValidName(name))
+                    return true;
+            }
+        }
+
+        if (policy.TryGetProperty("allow_groups", out var ag) && ag.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var el in ag.EnumerateArray())
+            {
+                var name = el.ValueKind == JsonValueKind.String ? el.GetString() : null;
+                if (!string.IsNullOrWhiteSpace(name) && IsValidName(name))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
     // Names (users/groups) must be safe POSIX identifiers.
     internal static bool IsValidName(string name)
     {
