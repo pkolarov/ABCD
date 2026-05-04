@@ -270,3 +270,16 @@ jobs:
             -CliBinary  "target\x86_64-pc-windows-msvc\debug\dds.exe" `
             -Target     "x86_64-pc-windows-msvc"
           if ($LASTEXITCODE -ne 0) { throw "Smoke test failed with exit code $LASTEXITCODE" }
+
+  linux-agent:
+    name: Linux .NET policy agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+      - name: Build Linux DdsPolicyAgent
+        run: dotnet build platform/linux/DdsPolicyAgent/DdsPolicyAgent.Linux.csproj -c Debug
+      - name: Test Linux DdsPolicyAgent
+        run: dotnet test platform/linux/DdsPolicyAgent.Tests/DdsPolicyAgent.Linux.Tests.csproj -c Debug --logger "console;verbosity=normal"

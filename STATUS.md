@@ -1,5 +1,23 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-04, 43rd pass) — Linux .NET projects missing from solution and CI
+
+### Gap
+
+`ABCD.sln` did not include `DdsPolicyAgent.Linux.csproj` or `DdsPolicyAgent.Linux.Tests.csproj`,
+so `dotnet test ABCD.sln` only ran 92 macOS tests and silently skipped the 132 Linux tests.
+The CI workflow `ci.yml` had no job building or testing the Linux .NET policy agent — any
+regression in the Linux agent would go undetected by CI.
+
+### Fix
+
+- Added Linux solution folder, `DdsPolicyAgent` sub-folder, and both Linux projects to `ABCD.sln`
+  so `dotnet test ABCD.sln --no-build` now runs 132 Linux + 92 macOS = 224 .NET tests.
+- Added `linux-agent` job to `.github/workflows/ci.yml` that builds and tests
+  `platform/linux/DdsPolicyAgent` and `platform/linux/DdsPolicyAgent.Tests` on `ubuntu-latest`.
+
+**Test results**: 132 / 132 Linux .NET, 92 / 92 macOS .NET, full Rust workspace 0 failures.
+
 ## Gap Fix (2026-05-04, 42nd pass) — Linux PAM authentication module (`pam_dds`)
 
 ### Gap
