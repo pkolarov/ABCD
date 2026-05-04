@@ -929,3 +929,131 @@ fn test_linux_policy_backward_compat_decodes_old_shape() {
     assert_eq!(decoded, l1_doc);
     assert!(decoded.linux.is_none());
 }
+
+// ============================================================
+// SysctlDirective roundtrip tests
+// ============================================================
+
+#[test]
+fn test_sysctl_directive_set_roundtrip() {
+    let d = SysctlDirective {
+        key: "net.ipv4.ip_forward".into(),
+        value: Some("1".into()),
+        action: SysctlAction::Set,
+    };
+    let mut buf = Vec::new();
+    ciborium::into_writer(&d, &mut buf).unwrap();
+    let decoded: SysctlDirective = ciborium::from_reader(buf.as_slice()).unwrap();
+    assert_eq!(decoded, d);
+}
+
+#[test]
+fn test_sysctl_directive_delete_roundtrip() {
+    let d = SysctlDirective {
+        key: "vm.swappiness".into(),
+        value: None,
+        action: SysctlAction::Delete,
+    };
+    let mut buf = Vec::new();
+    ciborium::into_writer(&d, &mut buf).unwrap();
+    let decoded: SysctlDirective = ciborium::from_reader(buf.as_slice()).unwrap();
+    assert_eq!(decoded, d);
+}
+
+#[test]
+fn test_sysctl_action_variants_roundtrip() {
+    for action in [SysctlAction::Set, SysctlAction::Delete] {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&action, &mut buf).unwrap();
+        let decoded: SysctlAction = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(decoded, action);
+    }
+}
+
+// ============================================================
+// SshdPolicy roundtrip tests
+// ============================================================
+
+#[test]
+fn test_sshd_policy_full_roundtrip() {
+    let p = SshdPolicy {
+        password_authentication: Some(false),
+        permit_root_login: Some("prohibit-password".into()),
+        pubkey_authentication: Some(true),
+        allow_users: vec!["alice".into(), "bob".into()],
+        allow_groups: vec!["sshusers".into()],
+    };
+    let mut buf = Vec::new();
+    ciborium::into_writer(&p, &mut buf).unwrap();
+    let decoded: SshdPolicy = ciborium::from_reader(buf.as_slice()).unwrap();
+    assert_eq!(decoded, p);
+}
+
+#[test]
+fn test_sshd_policy_minimal_roundtrip() {
+    let p = SshdPolicy {
+        password_authentication: Some(false),
+        permit_root_login: None,
+        pubkey_authentication: None,
+        allow_users: vec![],
+        allow_groups: vec![],
+    };
+    let mut buf = Vec::new();
+    ciborium::into_writer(&p, &mut buf).unwrap();
+    let decoded: SshdPolicy = ciborium::from_reader(buf.as_slice()).unwrap();
+    assert_eq!(decoded, p);
+}
+
+#[test]
+fn test_sshd_policy_default_is_empty() {
+    let p = SshdPolicy::default();
+    assert!(p.password_authentication.is_none());
+    assert!(p.permit_root_login.is_none());
+    assert!(p.pubkey_authentication.is_none());
+    assert!(p.allow_users.is_empty());
+    assert!(p.allow_groups.is_empty());
+}
+
+#[test]
+fn test_linux_policy_with_sysctl_and_ssh_roundtrip() {
+    let doc = LinuxPolicyDocument {
+        policy_id: "security/hardening".into(),
+        display_name: "Kernel and SSH Hardening".into(),
+        version: 2,
+        enforcement: Enforcement::Enforce,
+        scope: PolicyScope {
+            device_tags: vec!["server".into()],
+            org_units: vec![],
+            identity_urns: vec![],
+        },
+        settings: vec![],
+        linux: Some(LinuxSettings {
+            local_users: vec![],
+            sudoers: vec![],
+            files: vec![],
+            systemd: vec![],
+            packages: vec![],
+            sysctl: vec![
+                SysctlDirective {
+                    key: "net.ipv4.ip_forward".into(),
+                    value: Some("1".into()),
+                    action: SysctlAction::Set,
+                },
+                SysctlDirective {
+                    key: "kernel.sysrq".into(),
+                    value: Some("0".into()),
+                    action: SysctlAction::Set,
+                },
+            ],
+            ssh: Some(SshdPolicy {
+                password_authentication: Some(false),
+                permit_root_login: Some("no".into()),
+                pubkey_authentication: Some(true),
+                allow_users: vec!["alice".into()],
+                allow_groups: vec!["sshusers".into()],
+            }),
+        }),
+    };
+    let cbor = doc.to_cbor().unwrap();
+    assert_eq!(LinuxPolicyDocument::from_cbor(&cbor).unwrap(), doc);
+}

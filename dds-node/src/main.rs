@@ -463,7 +463,8 @@ fn cmd_rotate_identity(args: &[String]) -> Result<(), Box<dyn std::error::Error>
         "       # The epoch (KEM) key is unchanged by rotation — get kem_pubkey_hex by running:"
     );
     println!(
-        "       #   dds-node gen-node-key --data-dir {}", data_dir.display()
+        "       #   dds-node gen-node-key --data-dir {}",
+        data_dir.display()
     );
     println!(
         "       dds-node admit --domain-key <FILE> --domain <FILE> \\\n         --peer-id {new_peer_id} --kem-pubkey <HEX> --out admission.cbor"

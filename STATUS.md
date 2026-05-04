@@ -1,5 +1,29 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-04, 38th pass) — add SysctlDirective and SshdPolicy roundtrip tests
+
+`dds-domain/tests/domain_tests.rs` had roundtrip tests for every Linux directive type added before
+the 37th pass (`LinuxUserDirective`, `LinuxSudoersDirective`, `LinuxFileDirective`,
+`LinuxSystemdDirective`, `LinuxPackageDirective`) but was missing coverage for `SysctlDirective`
+and `SshdPolicy`, which were introduced in the 37th pass alongside the enforcer implementations.
+
+Also fixed a `cargo fmt` divergence in `dds-node/src/main.rs` (a println! argument that had not
+been reformatted after the 36th-pass `--kem-pubkey` doc fix).
+
+**Changes**:
+1. `dds-domain/tests/domain_tests.rs` — 7 new tests:
+   - `test_sysctl_directive_set_roundtrip` — Set action with key+value
+   - `test_sysctl_directive_delete_roundtrip` — Delete action with key only
+   - `test_sysctl_action_variants_roundtrip` — both enum variants serialize/deserialize
+   - `test_sshd_policy_full_roundtrip` — all five SshdPolicy fields populated
+   - `test_sshd_policy_minimal_roundtrip` — only password_authentication set
+   - `test_sshd_policy_default_is_empty` — Default impl yields all-None/empty
+   - `test_linux_policy_with_sysctl_and_ssh_roundtrip` — full LinuxPolicyDocument with
+     sysctl directives and ssh policy round-trips through to_cbor/from_cbor
+2. `dds-node/src/main.rs` — reformat one println! to satisfy `cargo fmt --check`.
+
+**Test results**: 42 / 42 dds-domain (was 35), 115 / 115 Linux .NET, full workspace 0 failures.
+
 ## Doc Fix Addendum (2026-05-04, 36th pass) — document --kem-pubkey in admit workflow
 
 `DDS-Admin-Guide.md` documented the `admit` command without `--kem-pubkey` / `--kem-pubkey-path`,
