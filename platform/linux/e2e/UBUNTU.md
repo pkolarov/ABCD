@@ -9,8 +9,8 @@ The L-1 goal is:
 - publish the no-op Linux policy agent
 - build a `.deb`
 - install the package
-- start `dds-node` with a provisioned `/etc/dds/node.toml`
-- confirm `/run/dds/api.sock`, `/readyz`, `/v1/status`, and peer ID stability
+- start `dds-node` with a provisioned `/var/lib/dds/dds.toml`
+- confirm `/var/lib/dds/dds.sock`, `/readyz`, `/v1/status`, and peer ID stability
 
 Policy enforcement is still out of scope.
 
@@ -104,12 +104,12 @@ start services until the node is provisioned.
 ## Configure Anchor
 
 ```sh
-sudo cp /usr/share/doc/dds-linux/examples/node.anchor.toml /etc/dds/node.toml
-sudo editor /etc/dds/node.toml
+sudo cp /usr/share/doc/dds-linux/examples/node.anchor.toml /var/lib/dds/dds.toml
+sudo editor /var/lib/dds/dds.toml
 sudo install -m 0600 admission.cbor /var/lib/dds/node/admission.cbor
 ```
 
-Replace all `__...__` placeholders in `/etc/dds/node.toml`.
+Replace all `__...__` placeholders in `/var/lib/dds/dds.toml`.
 
 ## Start Node
 
@@ -122,23 +122,23 @@ sudo systemctl status dds-node.service
 Check the local API:
 
 ```sh
-sudo ls -l /run/dds/api.sock
-curl --unix-socket /run/dds/api.sock http://localhost/readyz
-curl --unix-socket /run/dds/api.sock http://localhost/v1/status | jq
-curl --unix-socket /run/dds/api.sock http://localhost/v1/node/info | jq
+sudo ls -l /var/lib/dds/dds.sock
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/readyz
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/status | jq
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/node/info | jq
 ```
 
 Capture the peer ID:
 
 ```sh
-curl --unix-socket /run/dds/api.sock http://localhost/v1/status | jq '.peer_id'
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/status | jq '.peer_id'
 ```
 
 Restart and confirm it stays unchanged:
 
 ```sh
 sudo systemctl restart dds-node.service
-curl --unix-socket /run/dds/api.sock http://localhost/v1/status | jq '.peer_id'
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/status | jq '.peer_id'
 ```
 
 Do not delete `/var/lib/dds/node/node_key.bin` during routine repair. Removing

@@ -112,6 +112,7 @@ debian="$root/DEBIAN"
 
 install -d -m 0755 "$debian"
 install -d -m 0755 "$root/usr/bin"
+install -d -m 0755 "$root/usr/local/sbin"
 install -d -m 0755 "$root/usr/local/lib/dds/DdsPolicyAgent.Linux"
 install -d -m 0755 "$root/lib/systemd/system"
 install -d -m 0755 "$root/etc/dds"
@@ -119,6 +120,10 @@ install -d -m 0755 "$root/usr/share/doc/dds-linux/examples"
 
 install -m 0755 "$node_bin" "$root/usr/bin/dds-node"
 install -m 0755 "$cli_bin" "$root/usr/bin/dds-cli"
+install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-tpm-seal.sh" \
+  "$root/usr/local/sbin/dds-tpm-seal"
+install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-tpm-unseal.sh" \
+  "$root/usr/local/sbin/dds-tpm-unseal"
 cp -R "$agent_dir"/. "$root/usr/local/lib/dds/DdsPolicyAgent.Linux/"
 find "$root/usr/local/lib/dds/DdsPolicyAgent.Linux" -type d -exec chmod 0755 {} +
 find "$root/usr/local/lib/dds/DdsPolicyAgent.Linux" -type f -exec chmod 0644 {} +
@@ -130,7 +135,7 @@ install -m 0644 "$repo_root/platform/linux/packaging/systemd/dds-node.service" \
   "$root/lib/systemd/system/dds-node.service"
 install -m 0644 "$repo_root/platform/linux/packaging/systemd/dds-policy-agent.service" \
   "$root/lib/systemd/system/dds-policy-agent.service"
-sed -i 's#ExecStart=/usr/local/bin/dds-node run /etc/dds/node.toml#ExecStart=/usr/bin/dds-node run /etc/dds/node.toml#' \
+sed -i 's#ExecStart=/usr/local/bin/dds-node run /var/lib/dds/dds.toml#ExecStart=/usr/bin/dds-node run /var/lib/dds/dds.toml#' \
   "$root/lib/systemd/system/dds-node.service"
 if [[ "$framework_dependent" -eq 0 ]]; then
   sed -i 's#ExecStart=/usr/bin/dotnet /usr/local/lib/dds/DdsPolicyAgent.Linux/DdsPolicyAgent.Linux.dll#ExecStart=/usr/local/lib/dds/DdsPolicyAgent.Linux/DdsPolicyAgent.Linux#' \
@@ -186,7 +191,7 @@ dds-linux installed.
 
 Before starting services:
   1. Copy /usr/share/doc/dds-linux/examples/node.anchor.toml or node.member.toml
-     to /etc/dds/node.toml and replace placeholders.
+     to /var/lib/dds/dds.toml and replace placeholders.
   2. Place the admission certificate at /var/lib/dds/node/admission.cbor.
   3. Copy /usr/share/doc/dds-linux/examples/policy-agent.json to
      /etc/dds/policy-agent.json and replace placeholders.

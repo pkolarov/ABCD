@@ -194,8 +194,10 @@ pub fn save(path: &Path, kp: &Keypair) -> Result<(), P2pIdentityError> {
             ]
         }
         _ => {
-            tracing::warn!(
-                "{PASSPHRASE_ENV} not set; libp2p keypair will be stored unencrypted at {}",
+            tracing::info!(
+                "libp2p keypair stored unencrypted at {} ({PASSPHRASE_ENV} unset \
+                 — default for unattended service boot; FIDO2 protects the *domain* \
+                 key, not per-node identity. Relies on parent dir 0700 root:root)",
                 path.display()
             );
             let v = vec![

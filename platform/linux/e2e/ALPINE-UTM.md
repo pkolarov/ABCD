@@ -4,7 +4,7 @@ This runbook validates the current Linux L-1 target on an Alpine VM in UTM:
 
 - `dds-node` starts under OpenRC
 - node identity persists across restart
-- the local API socket appears at `/run/dds/api.sock`
+- the local API socket appears at `/var/lib/dds/dds.sock`
 - the VM can act as a DDS anchor peer
 - the no-op Linux policy agent can run under OpenRC
 
@@ -105,7 +105,7 @@ DDS_POLICY_AGENT_ARGS=""
 Copy the anchor template:
 
 ```sh
-cp platform/linux/packaging/config/node.anchor.toml /etc/dds/node.toml
+cp platform/linux/packaging/config/node.anchor.toml /var/lib/dds/dds.toml
 ```
 
 Replace the `__...__` placeholders with real bootstrap/domain values and place
@@ -129,7 +129,7 @@ rc-service dds-node status
 Check the socket and logs:
 
 ```sh
-ls -l /run/dds/api.sock
+ls -l /var/lib/dds/dds.sock
 tail -n 100 /var/log/dds/dds-node.log
 tail -n 100 /var/log/dds/dds-node.err
 ```
@@ -137,9 +137,9 @@ tail -n 100 /var/log/dds/dds-node.err
 Confirm readiness through the Unix socket:
 
 ```sh
-curl --unix-socket /run/dds/api.sock http://localhost/readyz
-curl --unix-socket /run/dds/api.sock http://localhost/v1/status | jq
-curl --unix-socket /run/dds/api.sock http://localhost/v1/node/info | jq
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/readyz
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/status | jq
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/node/info | jq
 ```
 
 Record the peer ID and advertised `/ip4/.../tcp/4001/p2p/...` multiaddr from the
@@ -167,21 +167,21 @@ Expected L-1 result:
 - no host mutation
 - `/var/lib/dds/policy-agent/applied-state.json` is created after a policy is
   available
-- logs show poll attempts against `unix:/run/dds/api.sock`
+- logs show poll attempts against `unix:/var/lib/dds/dds.sock`
 
 ## Restart Identity Check
 
 Capture the peer ID:
 
 ```sh
-curl --unix-socket /run/dds/api.sock http://localhost/v1/status | jq '.peer_id'
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/status | jq '.peer_id'
 ```
 
 Restart and compare:
 
 ```sh
 rc-service dds-node restart
-curl --unix-socket /run/dds/api.sock http://localhost/v1/status | jq '.peer_id'
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/status | jq '.peer_id'
 ```
 
 The value must remain unchanged.

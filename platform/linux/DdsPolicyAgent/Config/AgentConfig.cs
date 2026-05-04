@@ -7,7 +7,7 @@ public sealed class AgentConfig
     public const string SectionName = "DdsPolicyAgent";
 
     public string DeviceUrn { get; set; } = string.Empty;
-    public string NodeBaseUrl { get; set; } = "unix:/run/dds/api.sock";
+    public string NodeBaseUrl { get; set; } = "unix:/var/lib/dds/dds.sock";
     public int PollIntervalSeconds { get; set; } = 60;
     public string StateDir { get; set; } = OperatingSystem.IsLinux()
         ? "/var/lib/dds/policy-agent"

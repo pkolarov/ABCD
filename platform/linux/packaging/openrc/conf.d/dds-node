@@ -1,7 +1,21 @@
 # Optional OpenRC overrides for /etc/init.d/dds-node.
 
 DDS_NODE_COMMAND="/usr/local/bin/dds-node"
-DDS_NODE_ARGS="run /etc/dds/node.toml"
+DDS_NODE_ARGS="run /var/lib/dds/dds.toml"
 DDS_NODE_PIDFILE="/run/dds/dds-node.pid"
 DDS_NODE_OUTPUT_LOG="/var/log/dds/dds-node.log"
 DDS_NODE_ERROR_LOG="/var/log/dds/dds-node.err"
+
+# TPM-sealed passphrase unseal — runs at every service start (conf.d
+# is sourced before start_pre + start_stop_daemon, so the export
+# propagates into dds-node's environment). Falls through silently if
+# tpm2-tools or seal blobs are absent — node keys then stay plaintext
+# at rest, relying on /var/lib/dds/node 0700 perms. See
+# platform/linux/packaging/SEALED-PASSPHRASE.md.
+if [ -x /usr/local/sbin/dds-tpm-unseal ] && [ -f /var/lib/dds/node/seal.priv ]; then
+    if _dds_pass="$(/usr/local/sbin/dds-tpm-unseal /var/lib/dds/node 2>/dev/null)"; then
+        DDS_NODE_PASSPHRASE="$_dds_pass"
+        export DDS_NODE_PASSPHRASE
+    fi
+    unset _dds_pass
+fi

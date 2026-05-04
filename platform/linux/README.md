@@ -46,7 +46,7 @@ Use the same high-level shape as the Windows and macOS platform agents:
 3. The agent verifies signed policy envelopes, computes intended state, applies
    idempotent enforcers, records local applied-state hashes, and reports drift.
 4. Production deployments use a Unix domain socket for the node API:
-   `unix:/var/run/dds/api.sock`, guarded by `SO_PEERCRED` and filesystem
+   `unix:/var/lib/dds/dds.sock`, guarded by `SO_PEERCRED` and filesystem
    permissions.
 
 Preferred implementation language for the first agent is C#/.NET, matching the
@@ -114,11 +114,11 @@ Installed paths:
 
 - `/usr/local/bin/dds-node` or distribution package path for the node binary
 - `/usr/local/lib/dds/DdsPolicyAgent.Linux/` for the agent payload
-- `/etc/dds/node.toml` for node configuration
+- `/var/lib/dds/dds.toml` for node configuration (written by `dds-node provision`)
 - `/etc/dds/policy-agent.json` for agent configuration
 - `/var/lib/dds/` for node and agent state
 - `/var/log/dds/` for file logs when journald forwarding is not enough
-- `/run/dds/api.sock` or `/var/run/dds/api.sock` for the node API socket
+- `/var/lib/dds/dds.sock` for the node API Unix domain socket
 
 Service units/scripts:
 
@@ -196,18 +196,18 @@ Split L-1 into two tracks:
   - `platform/linux/packaging/config/node.member.toml`
   - `platform/linux/packaging/config/policy-agent.json`
 - Define production Linux node paths:
-  - node config: `/etc/dds/node.toml`
+  - node config: `/var/lib/dds/dds.toml` (written by `dds-node provision`)
   - node state: `/var/lib/dds/node`
   - node identity: `/var/lib/dds/node/node_key.bin`
   - admission certificate: `/var/lib/dds/node/admission.cbor`
-  - API socket: `unix:/run/dds/api.sock`
+  - API socket: `unix:/var/lib/dds/dds.sock`
   - logs: journald, with optional file forwarding under `/var/log/dds/`
 - The anchor node config must set:
   - `data_dir = "/var/lib/dds/node"`
   - `listen_addr = "/ip4/0.0.0.0/tcp/4001"`
   - `bootstrap_peers = []`
   - `mdns_enabled = true` for LAN labs, documented as optional for WAN anchors
-  - `api_addr = "unix:/run/dds/api.sock"`
+  - `api_addr = "unix:/var/lib/dds/dds.sock"`
   - `network.api_auth.trust_loopback_tcp_admin = false`
   - `network.api_auth.strict_device_binding = true`
   - optional `metrics_addr = "127.0.0.1:9495"`
@@ -221,13 +221,13 @@ bootstrap_peers = [
 ```
 
 - service manager requirements:
-  - run `dds-node run /etc/dds/node.toml`
+  - run `dds-node run /var/lib/dds/dds.toml`
   - start after network availability (`network-online.target` on systemd,
     `need net` on OpenRC)
   - restart on failure
   - create or require `dds` runtime/state directories with restrictive
     permissions
-  - expose the UDS at `/run/dds/api.sock`
+  - expose the UDS at `/var/lib/dds/dds.sock`
   - keep node identity stable across service restarts
 - Document the identity and admission lifecycle:
   - first anchor keeps its generated node identity in `/var/lib/dds/node`
@@ -249,13 +249,13 @@ bootstrap_peers = [
 - Add an Alpine/UTM-specific runbook under `platform/linux/e2e/ALPINE-UTM.md`:
   - use OpenRC scripts instead of systemd units
   - publish the .NET agent for `linux-musl-arm64` or `linux-musl-x64`
-  - verify `/run/dds/api.sock`, `/v1/status`, `/v1/node/info`, and peer ID
+  - verify `/var/lib/dds/dds.sock`, `/v1/status`, `/v1/node/info`, and peer ID
     stability across `rc-service dds-node restart`
 - Add a Debian package smoke runbook under `platform/linux/e2e/DEBIAN.md`:
   - publish the .NET agent for `linux-arm64` or `linux-x64`
   - build `dds-linux_<version>_<arch>.deb` from prebuilt artifacts
   - install the package without auto-starting services
-  - configure `/etc/dds/node.toml`, preserve `/var/lib/dds/node/node_key.bin`,
+  - configure `/var/lib/dds/dds.toml`, preserve `/var/lib/dds/node/node_key.bin`,
     and validate the UDS API plus policy-agent startup
 - Add an Ubuntu package smoke runbook under `platform/linux/e2e/UBUNTU.md`:
   - install build prerequisites with apt
@@ -331,7 +331,7 @@ The skeleton worker behavior:
 Initial `AgentConfig` fields:
 
 - `DeviceUrn`
-- `NodeBaseUrl`, defaulting to `unix:/run/dds/api.sock`
+- `NodeBaseUrl`, defaulting to `unix:/var/lib/dds/dds.sock`
 - `PollIntervalSeconds`, defaulting to `60`
 - `StateDir`, defaulting to `/var/lib/dds/policy-agent`
 - `PinnedNodePubkeyB64`
@@ -387,8 +387,8 @@ changing the public API shape.
 Tests for L-1:
 
 - `DdsNodeHttpFactoryTests`:
-  - resolves `unix:/run/dds/api.sock` to a placeholder HTTP base address
-  - extracts socket paths correctly
+  - resolves `unix:/var/lib/dds/dds.sock` to a placeholder HTTP base address
+  - extracts the socket path as `/var/lib/dds/dds.sock`
   - rejects empty `unix:` URLs
   - preserves loopback HTTP URLs
 - `EnvelopeVerifierTests`:
@@ -411,7 +411,7 @@ Tests for L-1:
 L-1 implementation order:
 
 1. Add Linux node service/config templates and the anchor smoke runbook.
-2. Validate `dds-node` builds and runs on Linux with `/etc/dds/node.toml`.
+2. Validate `dds-node` builds and runs on Linux with `/var/lib/dds/dds.toml`.
 3. Prove persistent node identity and anchor/member connectivity.
 4. Add Linux schemas and `/v1/linux/*` routes in `dds-node`.
 5. Add `dds platform linux ...` CLI commands.
@@ -426,7 +426,7 @@ L-1 implementation order:
 Exit gate: on clean Linux VMs with systemd or OpenRC, one host runs as a DDS
 anchor node, a second node joins through its bootstrap multiaddr, both retain
 stable identity across restart, the anchor exposes its local API through
-`unix:/run/dds/api.sock`, and the no-op Linux policy agent fetches a signed Linux
+`unix:/var/lib/dds/dds.sock`, and the no-op Linux policy agent fetches a signed Linux
 policy envelope, verifies it, writes applied state, posts an empty applied
 report, and repeats idempotently without mutating host state.
 

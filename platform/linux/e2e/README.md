@@ -24,7 +24,7 @@ dotnet build platform/linux/DdsPolicyAgent/DdsPolicyAgent.Linux.csproj -c Debug
 1. Install or stage `dds-node` at `/usr/local/bin/dds-node`.
 2. Install `platform/linux/packaging/systemd/dds-node.service` on systemd
    distributions, or `platform/linux/packaging/openrc/dds-node` on Alpine.
-3. Write `/etc/dds/node.toml` from
+3. Write `/var/lib/dds/dds.toml` from
    `platform/linux/packaging/config/node.anchor.toml`.
 4. Bootstrap the domain and place the admission certificate at
    `/var/lib/dds/node/admission.cbor`.
@@ -49,7 +49,7 @@ sudo rc-service dds-node status
 
 ## Member
 
-1. Write `/etc/dds/node.toml` from
+1. Write `/var/lib/dds/dds.toml` from
    `platform/linux/packaging/config/node.member.toml`.
 2. Replace `bootstrap_peers` with the anchor multiaddr.
 3. Install the member admission certificate at
@@ -61,6 +61,6 @@ sudo rc-service dds-node status
 - `GET /readyz` is ready on both nodes.
 - `GET /v1/status` shows at least one connected peer.
 - Restarting the anchor keeps the same peer ID.
-- `/run/dds/api.sock` exists while `dds-node.service` is running.
+- `/var/lib/dds/dds.sock` exists while `dds-node.service` is running.
 - The Linux policy agent can fetch `/v1/linux/policies` through
-  `unix:/run/dds/api.sock` and post an empty applied report.
+  `unix:/var/lib/dds/dds.sock` and post an empty applied report.

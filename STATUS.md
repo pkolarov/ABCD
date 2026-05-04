@@ -1,5 +1,99 @@
 # DDS Implementation Status
 
+## Fix (2026-05-04, 51st pass) — Linux path migration + PAM default + build packaging gaps
+
+### Gap
+
+Five documentation and build gaps left behind by the socket/config path
+migration (`/run/dds/api.sock` → `/var/lib/dds/dds.sock`,
+`/etc/dds/node.toml` → `/var/lib/dds/dds.toml`) and the TPM-sealed
+passphrase additions (systemd + OpenRC):
+
+1. **`build-deb.sh` missing TPM script installation** — the service unit
+   (`ExecStartPre=-/usr/local/sbin/dds-tpm-unseal`) and OpenRC conf.d block
+   reference `/usr/local/sbin/dds-tpm-{seal,unseal}`, but `build-deb.sh`
+   did not install the helpers from `platform/linux/packaging/scripts/`.
+   On a freshly installed package the paths would be dangling (the
+   leading `-` makes them no-ops, but they can't seal fresh identity files).
+
+2. **`build-deb.sh` postinst NOTE stale** — the `NOTE` block in the
+   generated `postinst` still told operators to copy the node template to
+   `/etc/dds/node.toml`; the service unit now reads `/var/lib/dds/dds.toml`.
+
+3. **`ALPINE-UTM.md` stale anchor config path** — the "Configure Anchor Node"
+   section still said to copy the template to `/etc/dds/node.toml`. The
+   OpenRC init script reads `DDS_NODE_ARGS="run /var/lib/dds/dds.toml"`, so
+   a node started after following that instruction would fail to find its
+   config.
+
+4. **`e2e/README.md` stale paths** — two `Write /etc/dds/node.toml` anchors
+   and two `unix:/run/dds/api.sock` Checks bullets.
+
+5. **`pam_dds` default socket path** — `DEFAULT_NODE_SOCK` and the doc
+   comment examples in `pam_dds/src/lib.rs` and `dds_pam_helper.rs` still
+   referenced `/run/dds/api.sock`; any operator who copies the example PAM
+   line would point the module at the wrong socket.
+
+6. **`DdsNodeHttpFactoryTests.cs` stale test input** — the two tests that
+   call `ResolveBaseAddress` and `ExtractSocketPath` used `/run/dds/api.sock`
+   as their test value, diverging from the production default now reflected
+   in `AgentConfig`.
+
+**Accompanying Rust changes** (also in this pass):
+- `main.rs`: `cmd_run` now receives `args.get(1..).unwrap_or(&[])` instead
+  of `&args[1..]` — the `unwrap_or("run")` fallback makes `sub == "run"`
+  reachable with an empty `args` slice (bare `dds-node` invocation), which
+  would have panicked on the direct index.
+- `identity_store.rs` / `p2p_identity.rs`: downgraded the no-passphrase
+  log from `warn!` to `info!` with an expanded message explaining the
+  security model (FIDO2 protects the domain key; per-node identity relies on
+  `0700 root:root`).
+
+**Also in this pass** (path migration, already on disk):
+- `AgentConfig.cs` `NodeBaseUrl` default, all four example/config TOML and
+  JSON files, all three E2E runbooks (UBUNTU, DEBIAN, ALPINE), `README.Debian`,
+  `build-deb.sh` sed substitution, OpenRC `conf.d/dds-node` and `dds-node`
+  init script, systemd `dds-node.service` — all migrated from old paths.
+- `platform/linux/packaging/scripts/` directory with `dds-tpm-seal.sh` and
+  `dds-tpm-unseal.sh` (the helpers referenced by the service units).
+- `platform/linux/README.md` design doc — all stale path references updated
+  to production values.
+
+### Fix
+
+**`platform/linux/packaging/debian/build-deb.sh`**:
+- Added `install -d -m 0755 "$root/usr/local/sbin"`.
+- Added `install -m 0755 .../dds-tpm-seal.sh "$root/usr/local/sbin/dds-tpm-seal"`.
+- Added `install -m 0755 .../dds-tpm-unseal.sh "$root/usr/local/sbin/dds-tpm-unseal"`.
+- Fixed postinst `NOTE` block: `/etc/dds/node.toml` → `/var/lib/dds/dds.toml`.
+
+**`platform/linux/e2e/ALPINE-UTM.md`**:
+- "Configure Anchor Node" section: `cp ... /etc/dds/node.toml` →
+  `cp ... /var/lib/dds/dds.toml`.
+
+**`platform/linux/e2e/README.md`**:
+- Both `Write /etc/dds/node.toml from ...` → `Write /var/lib/dds/dds.toml from ...`.
+- Both `/run/dds/api.sock` → `/var/lib/dds/dds.sock`.
+
+**`platform/linux/pam_dds/src/lib.rs`**:
+- `DEFAULT_NODE_SOCK` constant: `/run/dds/api.sock` → `/var/lib/dds/dds.sock`.
+- Module doc comment examples updated to match.
+
+**`platform/linux/pam_dds/src/bin/dds_pam_helper.rs`**:
+- Usage block comment default updated.
+
+**`platform/linux/DdsPolicyAgent.Tests/DdsNodeHttpFactoryTests.cs`**:
+- Both tests updated to use `unix:/var/lib/dds/dds.sock` as the test input;
+  `ExtractsUnixSocketPath` assertion updated to `"/var/lib/dds/dds.sock"`.
+
+**`platform/linux/README.md`**:
+- All stale path references updated: node config, API socket, `api_addr`
+  example, run command, ALPINE-UTM runbook note, `NodeBaseUrl` default,
+  `DdsNodeHttpFactoryTests` description, L-1A exit gate.
+
+150 / 150 `dotnet test` passing; `cargo test -p dds-node` and `cargo test -p
+pam_dds` clean.
+
 ## Fix (2026-05-04, 50th pass) — Linux systemd drop-in reconciliation gap
 
 ### Gap

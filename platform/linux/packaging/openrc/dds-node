@@ -3,7 +3,7 @@
 description="DDS Node"
 
 command="${DDS_NODE_COMMAND:-/usr/local/bin/dds-node}"
-command_args="${DDS_NODE_ARGS:-run /etc/dds/node.toml}"
+command_args="${DDS_NODE_ARGS:-run /var/lib/dds/dds.toml}"
 command_background=true
 pidfile="${DDS_NODE_PIDFILE:-/run/dds/dds-node.pid}"
 output_log="${DDS_NODE_OUTPUT_LOG:-/var/log/dds/dds-node.log}"

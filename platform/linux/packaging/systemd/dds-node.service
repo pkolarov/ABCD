@@ -13,7 +13,21 @@ StateDirectory=dds
 StateDirectoryMode=0700
 LogsDirectory=dds
 LogsDirectoryMode=0750
-ExecStart=/usr/local/bin/dds-node run /etc/dds/node.toml
+
+# TPM-sealed passphrase unseal. Helper writes
+# `DDS_NODE_PASSPHRASE=<base64>` into /run/dds/passphrase.env iff a TPM
+# and seal blobs are present; the leading `-` on EnvironmentFile= and
+# ExecStartPre= make both lines no-ops on hosts without a TPM (node
+# keys then stay plaintext at rest, relying on parent dir 0700 root).
+# See platform/linux/packaging/SEALED-PASSPHRASE.md.
+EnvironmentFile=-/run/dds/passphrase.env
+ExecStartPre=-/usr/local/sbin/dds-tpm-unseal --env-file /run/dds/passphrase.env /var/lib/dds/node
+
+ExecStart=/usr/local/bin/dds-node run /var/lib/dds/dds.toml
+
+# Best-effort scrub on stop.
+ExecStopPost=-/bin/sh -c 'shred -u /run/dds/passphrase.env 2>/dev/null || rm -f /run/dds/passphrase.env'
+
 Restart=on-failure
 RestartSec=5s
 Environment=RUST_LOG=info

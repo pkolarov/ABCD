@@ -18,14 +18,14 @@
 //! ## PAM configuration snippet
 //!
 //! ```text
-//! auth required pam_dds.so node_sock=/run/dds/api.sock helper=/usr/lib/dds/dds-pam-helper
+//! auth required pam_dds.so node_sock=/var/lib/dds/dds.sock helper=/usr/lib/dds/dds-pam-helper
 //! ```
 //!
 //! Supported module arguments:
 //!
 //! | Argument | Default | Description |
 //! |---|---|---|
-//! | `node_sock=PATH` | `/run/dds/api.sock` | Path to the dds-node Unix socket |
+//! | `node_sock=PATH` | `/var/lib/dds/dds.sock` | Path to the dds-node Unix socket |
 //! | `helper=PATH` | auto-detected | Path to `dds-pam-helper` binary |
 //! | `debug` | off | Log debug information via `syslog(3)` |
 
@@ -48,7 +48,7 @@ pub const HELPER_SEARCH_PATHS: &[&str] = &[
 ];
 
 /// Default dds-node Unix socket path.
-pub const DEFAULT_NODE_SOCK: &str = "/run/dds/api.sock";
+pub const DEFAULT_NODE_SOCK: &str = "/var/lib/dds/dds.sock";
 
 /// Parse module arguments (`argc`/`argv` pairs forwarded by the PAM
 /// framework) into a typed [`ModuleArgs`] struct.

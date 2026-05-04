@@ -8,14 +8,14 @@ public sealed class DdsNodeHttpFactoryTests
     public void ResolvesUnixSocketToPlaceholderHttpBase()
     {
         Assert.Equal(new Uri("http://localhost/"),
-            DdsNodeHttpFactory.ResolveBaseAddress("unix:/run/dds/api.sock"));
+            DdsNodeHttpFactory.ResolveBaseAddress("unix:/var/lib/dds/dds.sock"));
     }
 
     [Fact]
     public void ExtractsUnixSocketPath()
     {
-        Assert.Equal("/run/dds/api.sock",
-            DdsNodeHttpFactory.ExtractSocketPath("unix:/run/dds/api.sock"));
+        Assert.Equal("/var/lib/dds/dds.sock",
+            DdsNodeHttpFactory.ExtractSocketPath("unix:/var/lib/dds/dds.sock"));
     }
 
     [Fact]

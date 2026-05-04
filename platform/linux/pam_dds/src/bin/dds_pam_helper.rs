@@ -30,7 +30,7 @@
 //! dds-pam-helper [OPTIONS]
 //!
 //! Options:
-//!   --node-sock <PATH>       dds-node Unix socket [default: /run/dds/api.sock]
+//!   --node-sock <PATH>       dds-node Unix socket [default: /var/lib/dds/dds.sock]
 //!   --user <USERNAME>        Local POSIX username to authenticate
 //!   --assertion-json <PATH>  Read pre-computed assertion from file ('-' = stdin)
 //!   --credential-id <B64>    Credential ID (base64url) — required with --assertion-json

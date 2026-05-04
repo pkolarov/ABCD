@@ -269,8 +269,10 @@ pub fn save(path: &Path, ident: &Identity) -> Result<(), IdentityStoreError> {
             ]
         }
         _ => {
-            tracing::warn!(
-                "{PASSPHRASE_ENV} not set; node identity will be stored unencrypted at {}",
+            tracing::info!(
+                "node identity stored unencrypted at {} ({PASSPHRASE_ENV} unset \
+                 — default for unattended service boot; FIDO2 protects the *domain* \
+                 key, not per-node identity. Relies on parent dir 0700 root:root)",
                 path.display()
             );
             let v = vec![

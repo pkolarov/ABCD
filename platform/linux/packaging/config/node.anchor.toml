@@ -11,7 +11,7 @@ bootstrap_peers = []
 mdns_enabled = true
 heartbeat_secs = 5
 idle_timeout_secs = 60
-api_addr = "unix:/run/dds/api.sock"
+api_addr = "unix:/var/lib/dds/dds.sock"
 metrics_addr = "127.0.0.1:9495"
 
 [network.api_auth]

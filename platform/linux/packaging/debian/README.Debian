@@ -9,15 +9,18 @@ This package is an L-1 runtime package. It installs:
 - `dds-policy-agent.service`
 - example config under `/usr/share/doc/dds-linux/examples/`
 
-The package does not enable or start services automatically. A node cannot join
-or anchor a DDS network until `/etc/dds/node.toml` and
-`/var/lib/dds/node/admission.cbor` are provisioned.
+The package does not enable or start services automatically. A node cannot
+join or anchor a DDS network until it has been provisioned. `dds-node
+provision` writes its config at `<data_dir>/../dds.toml` (so
+`--data-dir /var/lib/dds/node` produces `/var/lib/dds/dds.toml`) and a
+local API UDS at `<data_dir>/../dds.sock`. The shipped service unit and
+OpenRC script point at `/var/lib/dds/dds.toml` to match.
 
 ## First Anchor
 
 ```sh
-sudo cp /usr/share/doc/dds-linux/examples/node.anchor.toml /etc/dds/node.toml
-sudo editor /etc/dds/node.toml
+sudo cp /usr/share/doc/dds-linux/examples/node.anchor.toml /var/lib/dds/dds.toml
+sudo editor /var/lib/dds/dds.toml
 sudo install -m 0600 admission.cbor /var/lib/dds/node/admission.cbor
 sudo systemctl enable --now dds-node.service
 ```
@@ -26,9 +29,9 @@ Then check:
 
 ```sh
 sudo systemctl status dds-node.service
-sudo ls -l /run/dds/api.sock
-curl --unix-socket /run/dds/api.sock http://localhost/readyz
-curl --unix-socket /run/dds/api.sock http://localhost/v1/status
+sudo ls -l /var/lib/dds/dds.sock
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/readyz
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/status
 ```
 
 ## Policy Agent
@@ -42,7 +45,7 @@ sudo systemctl enable --now dds-policy-agent.service
 `PinnedNodePubkeyB64` should come from:
 
 ```sh
-curl --unix-socket /run/dds/api.sock http://localhost/v1/node/info
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/node/info
 ```
 
 ## Identity Preservation

@@ -148,7 +148,11 @@ async fn async_main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
         "create-provision-bundle" => cmd_create_bundle(&args[1..]),
         "provision" => cmd_provision(&args[1..]),
         "stamp-agent-pubkey" => cmd_stamp_agent_pubkey(&args[1..]),
-        "run" => cmd_run(&args[1..]).await,
+        // `args.get(1..)` instead of `&args[1..]` because the
+        // `unwrap_or("run")` default at the top of this match means
+        // `sub == "run"` is reachable with an empty `args` (bare
+        // `dds-node`) — direct slicing would panic.
+        "run" => cmd_run(args.get(1..).unwrap_or(&[])).await,
         // Back-compat: if first arg looks like a config path (or there are no args)
         // treat it as `run <arg>`.
         s if s.ends_with(".toml") || s.ends_with(".dds") || !s.starts_with('-') => {

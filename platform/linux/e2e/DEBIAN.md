@@ -41,8 +41,8 @@ The package creates state directories but does not start services. Configure the
 node first:
 
 ```sh
-sudo cp /usr/share/doc/dds-linux/examples/node.anchor.toml /etc/dds/node.toml
-sudo editor /etc/dds/node.toml
+sudo cp /usr/share/doc/dds-linux/examples/node.anchor.toml /var/lib/dds/dds.toml
+sudo editor /var/lib/dds/dds.toml
 sudo install -m 0600 admission.cbor /var/lib/dds/node/admission.cbor
 ```
 
@@ -56,9 +56,9 @@ sudo systemctl status dds-node.service
 Check the local API:
 
 ```sh
-curl --unix-socket /run/dds/api.sock http://localhost/readyz
-curl --unix-socket /run/dds/api.sock http://localhost/v1/status
-curl --unix-socket /run/dds/api.sock http://localhost/v1/node/info
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/readyz
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/status
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/node/info
 ```
 
 Configure and start the no-op policy agent:
