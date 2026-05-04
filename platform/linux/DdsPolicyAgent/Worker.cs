@@ -93,9 +93,11 @@ public sealed class Worker : BackgroundService
 
         // Desired sets: populated from ALL current policies (including unchanged ones)
         // so the reconciliation pass at the end can detect items no longer in any policy.
-        var desiredUsernames = new HashSet<string>(StringComparer.Ordinal);
-        var desiredPaths     = new HashSet<string>(StringComparer.Ordinal);
-        var desiredPackages  = new HashSet<string>(StringComparer.Ordinal);
+        var desiredUsernames  = new HashSet<string>(StringComparer.Ordinal);
+        var desiredPaths      = new HashSet<string>(StringComparer.Ordinal);
+        var desiredPackages   = new HashSet<string>(StringComparer.Ordinal);
+        var desiredSysctlKeys = new HashSet<string>(StringComparer.Ordinal);
+        var hasSshPolicy      = false;
 
         var userEnforcer    = new UserEnforcer   (_runner, _config.AuditOnly, _log);
         var sudoersEnforcer = new SudoersEnforcer(_runner, _config.AuditOnly, _log);
@@ -120,7 +122,13 @@ public sealed class Worker : BackgroundService
 
             // Always collect desired items for reconciliation, even on unchanged policies.
             if (hasLinuxObject)
-                ExtractDesiredItems(linux, desiredUsernames, desiredPaths, desiredPackages);
+            {
+                ExtractDesiredItems(linux, desiredUsernames, desiredPaths, desiredPackages,
+                                    desiredSysctlKeys);
+                if (linux.TryGetProperty("ssh", out var sshProp)
+                    && sshProp.ValueKind == JsonValueKind.Object)
+                    hasSshPolicy = true;
+            }
 
             if (!_stateStore.HasChanged(policyId, hash))
             {
@@ -182,10 +190,12 @@ public sealed class Worker : BackgroundService
             _stateStore.RecordApplied(policyId, version, hash, status);
         }
 
-        // Reconciliation pass: disable stale users, delete stale files, remove stale packages.
+        // Reconciliation pass: disable stale users, delete stale files, remove stale packages,
+        // remove stale sysctl keys, and remove the sshd drop-in if no policy declares ssh.
         await ReconcileLinuxAsync(
-            desiredUsernames, desiredPaths, desiredPackages,
-            userEnforcer, fileEnforcer, pkgEnforcer, ct).ConfigureAwait(false);
+            desiredUsernames, desiredPaths, desiredPackages, desiredSysctlKeys, hasSshPolicy,
+            userEnforcer, fileEnforcer, pkgEnforcer, sysctlEnforcer, sshdEnforcer,
+            ct).ConfigureAwait(false);
     }
 
     /// Extracts the set of DDS-managed resource keys declared in a linux policy section.
@@ -194,7 +204,8 @@ public sealed class Worker : BackgroundService
         JsonElement linux,
         HashSet<string> usernames,
         HashSet<string> paths,
-        HashSet<string> packages)
+        HashSet<string> packages,
+        HashSet<string> sysctlKeys)
     {
         if (linux.TryGetProperty("local_users", out var users) && users.ValueKind == JsonValueKind.Array)
         {
@@ -237,18 +248,38 @@ public sealed class Worker : BackgroundService
                 }
             }
         }
+
+        if (linux.TryGetProperty("sysctl", out var sysctl) && sysctl.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var d in sysctl.EnumerateArray())
+            {
+                var action = d.TryGetProperty("action", out var a) ? a.GetString() : null;
+                if (action == "Set")
+                {
+                    var key = d.TryGetProperty("key", out var k) ? k.GetString() : null;
+                    if (!string.IsNullOrWhiteSpace(key))
+                        sysctlKeys.Add(key);
+                }
+            }
+        }
     }
 
     /// Detects and handles items that were previously managed by DDS but are absent from
     /// the current policy set. Stale users are disabled (not deleted) to preserve home
-    /// directories; stale files are deleted; stale packages are removed.
+    /// directories; stale files are deleted; stale packages are removed; stale sysctl
+    /// keys are removed from the managed drop-in; and the sshd drop-in is removed when
+    /// no current policy declares an ssh field.
     private async Task ReconcileLinuxAsync(
         HashSet<string> desiredUsernames,
         HashSet<string> desiredPaths,
         HashSet<string> desiredPackages,
+        HashSet<string> desiredSysctlKeys,
+        bool hasSshPolicy,
         UserEnforcer userEnforcer,
         FileEnforcer fileEnforcer,
         PackageEnforcer pkgEnforcer,
+        SysctlEnforcer sysctlEnforcer,
+        SshdEnforcer sshdEnforcer,
         CancellationToken ct)
     {
         var currentState = _stateStore.Load();
@@ -286,6 +317,19 @@ public sealed class Worker : BackgroundService
                 .ConfigureAwait(false);
             allChanges.AddRange(changes);
             foreach (var n in stalePackages) _stateStore.RemoveManagedPackage(n);
+        }
+
+        // Sysctl: remove keys no longer declared in any current policy.
+        var sysctlChanges = await sysctlEnforcer
+            .ReconcileStaleKeysAsync(desiredSysctlKeys, ct)
+            .ConfigureAwait(false);
+        allChanges.AddRange(sysctlChanges);
+
+        // Sshd: remove the drop-in when no current policy declares an ssh field.
+        if (!hasSshPolicy)
+        {
+            var sshdChanges = await sshdEnforcer.ApplyAsync(null, ct).ConfigureAwait(false);
+            allChanges.AddRange(sshdChanges);
         }
 
         if (allChanges.Count > 0)

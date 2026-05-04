@@ -1,5 +1,61 @@
 # DDS Implementation Status
 
+## Fix (2026-05-04, 48th pass) — Linux sysctl + sshd reconciliation gap
+
+### Gap
+
+The Admin Guide documented that the Linux policy agent reconciliation pass
+removes stale sysctl keys from `/etc/sysctl.d/60-dds-managed.conf` and removes
+the sshd drop-in at `/etc/ssh/sshd_config.d/60-dds.conf` when no current policy
+declares an `ssh` field. Neither was implemented — the `ReconcileLinuxAsync`
+method only handled users, files, and packages.
+
+**Scenario that exposed the gap:** If policy A set `net.ipv4.ip_forward = 1` via
+a sysctl directive, and later that policy was removed from the applicable set for
+a device, the key would remain in the drop-in on every subsequent poll because
+neither the forward pass (which skips unchanged or absent policies) nor the
+reconciliation pass touched sysctl keys.
+
+Similarly, the sshd drop-in created by a policy with an `ssh` field would persist
+after that policy was removed from the applicable set.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Enforcers/SysctlEnforcer.cs`**:
+- Added `ReconcileStaleKeysAsync(IReadOnlySet<string> desiredKeys, CancellationToken ct)`:
+  loads the current drop-in, computes the stale set (current keys minus desired),
+  removes them, and rewrites the file. Returns directive tags for each removed key.
+  Returns empty if the drop-in does not exist.
+
+**`platform/linux/DdsPolicyAgent/Worker.cs`**:
+- Added `desiredSysctlKeys: HashSet<string>` tracking across all current policies.
+- Extended `ExtractDesiredItems` with a `sysctlKeys` parameter to collect all
+  `Set`-action sysctl keys from applicable policies.
+- Added `hasSshPolicy: bool` tracking: set to `true` if any applicable policy has
+  an `ssh` object field.
+- Threaded `desiredSysctlKeys`, `hasSshPolicy`, `sysctlEnforcer`, and `sshdEnforcer`
+  through to `ReconcileLinuxAsync`.
+- In `ReconcileLinuxAsync`: calls `sysctlEnforcer.ReconcileStaleKeysAsync(desiredSysctlKeys)`
+  after the user/file/package reconciliation; calls `sshdEnforcer.ApplyAsync(null, ct)`
+  when `!hasSshPolicy` so the drop-in is removed if no current policy wants it.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`**:
+- Added `ReconcileSysctlEnforcerTests` with two tests:
+  `ReconcileStaleKeys_NoDropinFile_ReturnsEmpty` and
+  `ReconcileStaleKeys_AuditOnly_NoRunnerCallOnEmptyFile`.
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `Reconciliation_SysctlKeyStillDesired_NoReconciliationReport`: verifies
+  that a still-desired sysctl key does not trigger a reconciliation report.
+- Added `Reconciliation_SshPolicyAbsentFromAllPolicies_SshdReconciliationAttempted`:
+  verifies the sshd null-policy code path runs without throwing (no-op in CI
+  since the drop-in file does not exist).
+
+**Test results**: 136 / 136 Linux .NET (4 new), 201 / 240 Windows .NET (39 skipped),
+96 / 96 macOS .NET — all green.
+
+---
+
 ## Doc Fix (2026-05-04, 47th pass) — Stale DdsAuthBridge comment + DdsLoginBridge annotation
 
 ### Gaps

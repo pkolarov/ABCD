@@ -812,3 +812,39 @@ public sealed class ReconcilePackageEnforcerTests
         Assert.Empty(runner.Invocations);
     }
 }
+
+// ============================================================
+// SysctlEnforcer — reconciliation
+// ============================================================
+
+public sealed class ReconcileSysctlEnforcerTests
+{
+    [Fact]
+    public async Task ReconcileStaleKeys_NoDropinFile_ReturnsEmpty()
+    {
+        // If the drop-in file does not exist there is nothing to reconcile.
+        var runner   = new NullCommandRunner();
+        var enforcer = new SysctlEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        // /etc/sysctl.d/60-dds-managed.conf does not exist in CI → returns empty.
+        var applied = await enforcer.ReconcileStaleKeysAsync(
+            new HashSet<string>(), CancellationToken.None);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleKeys_AuditOnly_NoRunnerCallOnEmptyFile()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SysctlEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        // No drop-in file → still returns empty even in audit mode.
+        var applied = await enforcer.ReconcileStaleKeysAsync(
+            new HashSet<string> { "net.ipv4.ip_forward" }, CancellationToken.None);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+}

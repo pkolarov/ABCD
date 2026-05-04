@@ -175,6 +175,38 @@ public sealed class SysctlEnforcer
                 result.ExitCode, result.Stderr);
     }
 
+    /// Remove sysctl keys that are no longer declared in any applicable policy.
+    ///
+    /// Loads the current drop-in, computes the stale set (current keys minus
+    /// <paramref name="desiredKeys"/>), removes them, and rewrites the file.
+    /// Returns the directive tags for each removed key (e.g. "sysctl:delete:...").
+    /// Returns empty if the drop-in does not exist or no keys are stale.
+    public async Task<List<string>> ReconcileStaleKeysAsync(
+        IReadOnlySet<string> desiredKeys, CancellationToken ct)
+    {
+        var current = LoadDropin();
+        if (current.Count == 0)
+            return [];
+
+        var stale = current.Keys.Where(k => !desiredKeys.Contains(k)).ToList();
+        if (stale.Count == 0)
+            return [];
+
+        _log.LogInformation(
+            "SysctlEnforcer reconciliation: {Count} stale key(s) to remove", stale.Count);
+
+        var applied = new List<string>(stale.Count);
+        foreach (var k in stale)
+        {
+            current.Remove(k);
+            applied.Add($"sysctl:delete:{k}");
+        }
+
+        await WriteDropinAsync(current, ct).ConfigureAwait(false);
+        await ReloadAsync(ct).ConfigureAwait(false);
+        return applied;
+    }
+
     // Valid sysctl key: one or more dotted segments of [a-zA-Z0-9_], e.g. "net.ipv4.ip_forward".
     internal static bool IsValidKey(string key)
     {

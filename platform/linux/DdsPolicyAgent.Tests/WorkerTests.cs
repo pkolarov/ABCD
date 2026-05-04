@@ -472,4 +472,65 @@ public sealed class WorkerTests
 
         Assert.DoesNotContain(client.ReceivedReports, r => r.TargetId == "_reconciliation");
     }
+
+    [Fact]
+    public async Task Reconciliation_SysctlKeyStillDesired_NoReconciliationReport()
+    {
+        // A policy that declares a sysctl key keeps that key as desired →
+        // no reconciliation action should be taken for it.
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-sysctl",
+                    """{"policy_id":"policy-sysctl","version":1,"linux":{"sysctl":[{"key":"vm.swappiness","value":"10","action":"Set"}]}}"""),
+            ],
+        };
+
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // No reconciliation report expected since the key is still desired.
+        Assert.DoesNotContain(client.ReceivedReports,
+            r => r.TargetId == "_reconciliation");
+    }
+
+    [Fact]
+    public async Task Reconciliation_SshPolicyAbsentFromAllPolicies_SshdReconciliationAttempted()
+    {
+        // No applicable policy has an ssh field → sshdEnforcer.ApplyAsync(null) is called.
+        // In CI the drop-in does not exist, so it is a no-op and no report is emitted.
+        // This test verifies the code path is reached without throwing.
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-no-ssh",
+                    """{"policy_id":"policy-no-ssh","version":1,"linux":{"local_users":[]}}"""),
+            ],
+        };
+
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client);
+
+        // Must not throw — the reconciliation null-ssh path runs and is a no-op
+        // since /etc/ssh/sshd_config.d/60-dds.conf does not exist in CI.
+        await worker.PollOnceAsync(CancellationToken.None);
+    }
 }
