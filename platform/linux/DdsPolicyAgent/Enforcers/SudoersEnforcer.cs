@@ -136,6 +136,37 @@ public sealed class SudoersEnforcer
         return Task.CompletedTask;
     }
 
+    /// Deletes each sudoers drop-in whose filename is in <paramref name="staleFilenames"/>.
+    /// Only filenames that pass <see cref="IsSafeFilename"/> are removed; others are skipped
+    /// with a warning. Returns a directive tag for each deletion attempted.
+    public async Task<List<string>> ReconcileStaleSudoersAsync(
+        IReadOnlySet<string> staleFilenames, CancellationToken ct)
+    {
+        var applied = new List<string>();
+        foreach (var filename in staleFilenames)
+        {
+            if (!IsSafeFilename(filename))
+            {
+                _log.LogWarning(
+                    "SudoersEnforcer: stale filename {F} is unsafe; skipping reconciliation",
+                    filename);
+                continue;
+            }
+
+            var targetPath = Path.Combine(SudoersDir, filename);
+            if (_auditOnly)
+            {
+                _log.LogInformation("[audit] would delete stale sudoers drop-in {P}", targetPath);
+            }
+            else
+            {
+                await DeleteDropinAsync(targetPath, ct).ConfigureAwait(false);
+            }
+            applied.Add($"sudoers:delete:{filename}");
+        }
+        return applied;
+    }
+
     internal static bool IsSafeFilename(string name)
     {
         if (name.Length == 0 || name.Length > 64) return false;

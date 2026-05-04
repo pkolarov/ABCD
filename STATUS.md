@@ -1,5 +1,76 @@
 # DDS Implementation Status
 
+## Fix (2026-05-04, 49th pass) — Linux sudoers drop-in reconciliation gap
+
+### Gap
+
+The Admin Guide documented that the Linux policy agent reconciliation pass
+deletes stale sudoers drop-in files from `/etc/sudoers.d/` when the directive is
+removed from policy. The implementation did not honour this: `AppliedStateStore`
+had no `managed_sudoers_filenames` tracking field, `ExtractDesiredItems` never
+collected sudoers filenames from current policies, and `ReconcileLinuxAsync` had
+no block for stale sudoers drop-ins.
+
+**Scenario that exposed the gap:** If policy A placed `/etc/sudoers.d/dds-ops`
+via a `sudoers` directive, and later that policy was removed from the applicable
+set for a device, the drop-in would persist indefinitely because neither the
+forward pass (which skips unchanged / absent policies) nor the reconciliation
+pass touched sudoers files.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/State/AppliedStateStore.cs`**:
+- Added `ManagedSudoersFilenames: HashSet<string>` (`managed_sudoers_filenames`)
+  to `AppliedState`.
+- Added `RecordManagedSudoersFilename` and `RemoveManagedSudoersFilename` to
+  `IAppliedStateStore` and `AppliedStateStore`.
+
+**`platform/linux/DdsPolicyAgent/Enforcers/SudoersEnforcer.cs`**:
+- Added `ReconcileStaleSudoersAsync(IReadOnlySet<string> staleFilenames, CancellationToken ct)`:
+  iterates the stale set, skips unsafe filenames with a warning, calls
+  `DeleteDropinAsync` (or logs audit intent), returns a `sudoers:delete:<filename>`
+  tag for each entry processed.
+
+**`platform/linux/DdsPolicyAgent/Worker.cs`**:
+- Added `desiredSudoersFilenames: HashSet<string>` tracking across all current
+  policies.
+- Extended `ExtractDesiredItems` with a `sudoersFilenames` parameter that collects
+  filenames from directives with non-empty `content` (empty content signals deletion
+  and is already handled by the forward pass, not the reconciliation pass).
+- Extended `RecordManagedResources` to handle `sudoers:set:` (calls
+  `RecordManagedSudoersFilename`) and `sudoers:delete:` (calls
+  `RemoveManagedSudoersFilename`) directive tags.
+- Added sudoers block to `ReconcileLinuxAsync`: computes stale set
+  (`ManagedSudoersFilenames − desiredSudoersFilenames`), calls
+  `sudoersEnforcer.ReconcileStaleSudoersAsync(staleSudoers, ct)`, updates state
+  store. `SudoersEnforcer` is now threaded through to `ReconcileLinuxAsync`.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`**:
+- Added `ReconcileSudoersEnforcerTests` with four tests:
+  `ReconcileStaleSudoers_ReturnsDeleteDirectivePerFilename`,
+  `ReconcileStaleSudoers_AuditOnly_ReturnsdirectivesButNoFilesystemWrite`,
+  `ReconcileStaleSudoers_UnsafeFilename_Skipped`,
+  `ReconcileStaleSudoers_EmptySet_ReturnsEmpty`.
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `RecordManagedSudoersFilename` / `RemoveManagedSudoersFilename` to
+  `TestAppliedStateStore` and `TrackingAppliedStateStore` (interface compliance).
+- Added tracking lists `AddedSudoersFilenames` / `RemovedSudoersFilenames` to
+  `TrackingAppliedStateStore`.
+- Added three Worker-level tests:
+  `Reconciliation_StaleSudoersDropin_IsDeletedAndRemovedFromManagedSet`,
+  `Reconciliation_StillDesiredSudoersDropin_IsNotDeleted`,
+  `SudoersSet_RecordsManagedFilename`.
+
+**`docs/DDS-Admin-Guide.md`**:
+- Updated the Linux "Safety guarantees" paragraph to list
+  `managed_sudoers_filenames` alongside the other managed-item keys.
+
+**Test results**: 143 / 143 Linux .NET (7 new), 201 / 240 Windows .NET
+(39 skipped), 96 / 96 macOS .NET — all green.
+
+---
+
 ## Fix (2026-05-04, 48th pass) — Linux sysctl + sshd reconciliation gap
 
 ### Gap

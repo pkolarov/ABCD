@@ -48,9 +48,11 @@ sealed class TestAppliedStateStore : IAppliedStateStore
     public void RecordManagedUsername(string username) { }
     public void RecordManagedPath(string path) { }
     public void RecordManagedPackage(string packageName) { }
+    public void RecordManagedSudoersFilename(string filename) { }
     public void RemoveManagedUsername(string username) { }
     public void RemoveManagedPath(string path) { }
     public void RemoveManagedPackage(string packageName) { }
+    public void RemoveManagedSudoersFilename(string filename) { }
 }
 
 /// State store whose Load() returns a pre-populated managed set and records
@@ -59,12 +61,14 @@ sealed class TrackingAppliedStateStore : IAppliedStateStore
 {
     private readonly AppliedState _state;
 
-    public List<string> AddedUsernames   { get; } = [];
-    public List<string> RemovedUsernames { get; } = [];
-    public List<string> AddedPaths       { get; } = [];
-    public List<string> RemovedPaths     { get; } = [];
-    public List<string> AddedPackages    { get; } = [];
-    public List<string> RemovedPackages  { get; } = [];
+    public List<string> AddedUsernames         { get; } = [];
+    public List<string> RemovedUsernames       { get; } = [];
+    public List<string> AddedPaths             { get; } = [];
+    public List<string> RemovedPaths           { get; } = [];
+    public List<string> AddedPackages          { get; } = [];
+    public List<string> RemovedPackages        { get; } = [];
+    public List<string> AddedSudoersFilenames  { get; } = [];
+    public List<string> RemovedSudoersFilenames{ get; } = [];
 
     public TrackingAppliedStateStore(AppliedState initialState)
         => _state = initialState;
@@ -73,13 +77,15 @@ sealed class TrackingAppliedStateStore : IAppliedStateStore
     public bool HasChanged(string _, string __) => true;
     public void RecordApplied(string _, string __, string ___, string ____) { }
 
-    public void RecordManagedUsername(string u) => AddedUsernames.Add(u);
-    public void RecordManagedPath(string p)     => AddedPaths.Add(p);
-    public void RecordManagedPackage(string n)  => AddedPackages.Add(n);
+    public void RecordManagedUsername(string u)       => AddedUsernames.Add(u);
+    public void RecordManagedPath(string p)           => AddedPaths.Add(p);
+    public void RecordManagedPackage(string n)        => AddedPackages.Add(n);
+    public void RecordManagedSudoersFilename(string f)=> AddedSudoersFilenames.Add(f);
 
-    public void RemoveManagedUsername(string u) => RemovedUsernames.Add(u);
-    public void RemoveManagedPath(string p)     => RemovedPaths.Add(p);
-    public void RemoveManagedPackage(string n)  => RemovedPackages.Add(n);
+    public void RemoveManagedUsername(string u)       => RemovedUsernames.Add(u);
+    public void RemoveManagedPath(string p)           => RemovedPaths.Add(p);
+    public void RemoveManagedPackage(string n)        => RemovedPackages.Add(n);
+    public void RemoveManagedSudoersFilename(string f)=> RemovedSudoersFilenames.Add(f);
 }
 
 // ---- helpers ----
@@ -532,5 +538,91 @@ public sealed class WorkerTests
         // Must not throw — the reconciliation null-ssh path runs and is a no-op
         // since /etc/ssh/sshd_config.d/60-dds.conf does not exist in CI.
         await worker.PollOnceAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleSudoersDropin_IsDeletedAndRemovedFromManagedSet()
+    {
+        // "dds-ops" was a managed sudoers drop-in in a previous cycle but is absent
+        // from all current policies → the reconciliation pass should delete it.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedSudoersFilenames.Add("dds-ops");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Contains("dds-ops", store.RemovedSudoersFilenames);
+        Assert.DoesNotContain("dds-ops", store.AddedSudoersFilenames);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StillDesiredSudoersDropin_IsNotDeleted()
+    {
+        // "dds-ops" is managed AND still present in the current policy → not stale.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedSudoersFilenames.Add("dds-ops");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-still-has-sudoers",
+                    """{"policy_id":"policy-still-has-sudoers","version":1,"linux":{"sudoers":[{"filename":"dds-ops","content":"alice ALL=(ALL) NOPASSWD: /usr/bin/systemctl"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.DoesNotContain("dds-ops", store.RemovedSudoersFilenames);
+    }
+
+    [Fact]
+    public async Task SudoersSet_RecordsManagedFilename()
+    {
+        // Applying a sudoers directive with non-empty content should record the filename.
+        var store = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-sudoers-set",
+                    """{"policy_id":"policy-sudoers-set","version":1,"linux":{"sudoers":[{"filename":"dds-ops","content":"alice ALL=(ALL) NOPASSWD: /usr/bin/systemctl"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Contains("dds-ops", store.AddedSudoersFilenames);
     }
 }

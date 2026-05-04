@@ -1368,7 +1368,8 @@ will not remove or disable anything.
   preventing accidental removal of pre-existing local accounts.
 - Package removal is refused for packages not previously installed by DDS.
 - The agent tracks managed items in `/var/lib/dds/applied-state.json`
-  under the `managed_usernames`, `managed_paths`, and `managed_packages` keys.
+  under the `managed_usernames`, `managed_paths`, `managed_packages`, and
+  `managed_sudoers_filenames` keys.
 
 #### macOS Reconciliation
 

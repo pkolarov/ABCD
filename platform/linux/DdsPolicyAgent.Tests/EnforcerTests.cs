@@ -848,3 +848,67 @@ public sealed class ReconcileSysctlEnforcerTests
         Assert.Empty(runner.Invocations);
     }
 }
+
+// ============================================================
+// SudoersEnforcer — reconciliation
+// ============================================================
+
+public sealed class ReconcileSudoersEnforcerTests
+{
+    [Fact]
+    public async Task ReconcileStaleSudoers_ReturnsDeleteDirectivePerFilename()
+    {
+        // The enforcer returns a delete directive for each stale filename.
+        // /etc/sudoers.d/ does not exist in CI so DeleteDropinAsync is a no-op.
+        var runner   = new NullCommandRunner();
+        var enforcer = new SudoersEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleSudoersAsync(
+            new HashSet<string> { "dds-ops", "dds-readonly" }, CancellationToken.None);
+
+        Assert.Equal(2, applied.Count);
+        Assert.Contains("sudoers:delete:dds-ops", applied);
+        Assert.Contains("sudoers:delete:dds-readonly", applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleSudoers_AuditOnly_ReturnsdirectivesButNoFilesystemWrite()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SudoersEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleSudoersAsync(
+            new HashSet<string> { "dds-ops" }, CancellationToken.None);
+
+        Assert.Single(applied);
+        Assert.Equal("sudoers:delete:dds-ops", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleSudoers_UnsafeFilename_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SudoersEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleSudoersAsync(
+            new HashSet<string> { "bad/name" }, CancellationToken.None);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleSudoers_EmptySet_ReturnsEmpty()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SudoersEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleSudoersAsync(
+            new HashSet<string>(), CancellationToken.None);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+}

@@ -36,6 +36,10 @@ public sealed class AppliedState
     /// Package names that were installed by the DDS agent.
     [JsonPropertyName("managed_packages")]
     public HashSet<string> ManagedPackages { get; set; } = new(StringComparer.Ordinal);
+
+    /// Sudoers drop-in filenames (stems under /etc/sudoers.d/) written by the DDS agent.
+    [JsonPropertyName("managed_sudoers_filenames")]
+    public HashSet<string> ManagedSudoersFilenames { get; set; } = new(StringComparer.Ordinal);
 }
 
 public interface IAppliedStateStore
@@ -46,9 +50,11 @@ public interface IAppliedStateStore
     void RecordManagedUsername(string username);
     void RecordManagedPath(string path);
     void RecordManagedPackage(string packageName);
+    void RecordManagedSudoersFilename(string filename);
     void RemoveManagedUsername(string username);
     void RemoveManagedPath(string path);
     void RemoveManagedPackage(string packageName);
+    void RemoveManagedSudoersFilename(string filename);
 }
 
 public sealed class AppliedStateStore : IAppliedStateStore
@@ -152,6 +158,24 @@ public sealed class AppliedStateStore : IAppliedStateStore
         lock (_lock)
         {
             if (_state.ManagedPackages.Remove(packageName))
+                WriteToDisk(_state);
+        }
+    }
+
+    public void RecordManagedSudoersFilename(string filename)
+    {
+        lock (_lock)
+        {
+            if (_state.ManagedSudoersFilenames.Add(filename))
+                WriteToDisk(_state);
+        }
+    }
+
+    public void RemoveManagedSudoersFilename(string filename)
+    {
+        lock (_lock)
+        {
+            if (_state.ManagedSudoersFilenames.Remove(filename))
                 WriteToDisk(_state);
         }
     }

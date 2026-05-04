@@ -93,11 +93,12 @@ public sealed class Worker : BackgroundService
 
         // Desired sets: populated from ALL current policies (including unchanged ones)
         // so the reconciliation pass at the end can detect items no longer in any policy.
-        var desiredUsernames  = new HashSet<string>(StringComparer.Ordinal);
-        var desiredPaths      = new HashSet<string>(StringComparer.Ordinal);
-        var desiredPackages   = new HashSet<string>(StringComparer.Ordinal);
-        var desiredSysctlKeys = new HashSet<string>(StringComparer.Ordinal);
-        var hasSshPolicy      = false;
+        var desiredUsernames         = new HashSet<string>(StringComparer.Ordinal);
+        var desiredPaths             = new HashSet<string>(StringComparer.Ordinal);
+        var desiredPackages          = new HashSet<string>(StringComparer.Ordinal);
+        var desiredSysctlKeys        = new HashSet<string>(StringComparer.Ordinal);
+        var desiredSudoersFilenames  = new HashSet<string>(StringComparer.Ordinal);
+        var hasSshPolicy             = false;
 
         var userEnforcer    = new UserEnforcer   (_runner, _config.AuditOnly, _log);
         var sudoersEnforcer = new SudoersEnforcer(_runner, _config.AuditOnly, _log);
@@ -124,7 +125,7 @@ public sealed class Worker : BackgroundService
             if (hasLinuxObject)
             {
                 ExtractDesiredItems(linux, desiredUsernames, desiredPaths, desiredPackages,
-                                    desiredSysctlKeys);
+                                    desiredSysctlKeys, desiredSudoersFilenames);
                 if (linux.TryGetProperty("ssh", out var sshProp)
                     && sshProp.ValueKind == JsonValueKind.Object)
                     hasSshPolicy = true;
@@ -191,10 +192,12 @@ public sealed class Worker : BackgroundService
         }
 
         // Reconciliation pass: disable stale users, delete stale files, remove stale packages,
-        // remove stale sysctl keys, and remove the sshd drop-in if no policy declares ssh.
+        // remove stale sysctl keys, remove stale sudoers drop-ins, and remove the sshd drop-in
+        // if no policy declares ssh.
         await ReconcileLinuxAsync(
-            desiredUsernames, desiredPaths, desiredPackages, desiredSysctlKeys, hasSshPolicy,
-            userEnforcer, fileEnforcer, pkgEnforcer, sysctlEnforcer, sshdEnforcer,
+            desiredUsernames, desiredPaths, desiredPackages, desiredSysctlKeys,
+            desiredSudoersFilenames, hasSshPolicy,
+            userEnforcer, fileEnforcer, pkgEnforcer, sysctlEnforcer, sudoersEnforcer, sshdEnforcer,
             ct).ConfigureAwait(false);
     }
 
@@ -205,7 +208,8 @@ public sealed class Worker : BackgroundService
         HashSet<string> usernames,
         HashSet<string> paths,
         HashSet<string> packages,
-        HashSet<string> sysctlKeys)
+        HashSet<string> sysctlKeys,
+        HashSet<string> sudoersFilenames)
     {
         if (linux.TryGetProperty("local_users", out var users) && users.ValueKind == JsonValueKind.Array)
         {
@@ -262,23 +266,38 @@ public sealed class Worker : BackgroundService
                 }
             }
         }
+
+        if (linux.TryGetProperty("sudoers", out var sudoers) && sudoers.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var d in sudoers.EnumerateArray())
+            {
+                // A directive with non-empty content declares ownership of that drop-in filename.
+                var filename = d.TryGetProperty("filename", out var fn) ? fn.GetString() : null;
+                var content  = d.TryGetProperty("content",  out var co) ? co.GetString() : null;
+                if (!string.IsNullOrWhiteSpace(filename) && !string.IsNullOrEmpty(content)
+                    && SudoersEnforcer.IsSafeFilename(filename))
+                    sudoersFilenames.Add(filename);
+            }
+        }
     }
 
     /// Detects and handles items that were previously managed by DDS but are absent from
     /// the current policy set. Stale users are disabled (not deleted) to preserve home
     /// directories; stale files are deleted; stale packages are removed; stale sysctl
-    /// keys are removed from the managed drop-in; and the sshd drop-in is removed when
-    /// no current policy declares an ssh field.
+    /// keys are removed from the managed drop-in; stale sudoers drop-ins are deleted; and
+    /// the sshd drop-in is removed when no current policy declares an ssh field.
     private async Task ReconcileLinuxAsync(
         HashSet<string> desiredUsernames,
         HashSet<string> desiredPaths,
         HashSet<string> desiredPackages,
         HashSet<string> desiredSysctlKeys,
+        HashSet<string> desiredSudoersFilenames,
         bool hasSshPolicy,
         UserEnforcer userEnforcer,
         FileEnforcer fileEnforcer,
         PackageEnforcer pkgEnforcer,
         SysctlEnforcer sysctlEnforcer,
+        SudoersEnforcer sudoersEnforcer,
         SshdEnforcer sshdEnforcer,
         CancellationToken ct)
     {
@@ -324,6 +343,21 @@ public sealed class Worker : BackgroundService
             .ReconcileStaleKeysAsync(desiredSysctlKeys, ct)
             .ConfigureAwait(false);
         allChanges.AddRange(sysctlChanges);
+
+        // Sudoers: delete drop-in files no longer declared in any current policy.
+        var staleSudoers = new HashSet<string>(
+            currentState.ManagedSudoersFilenames, StringComparer.Ordinal);
+        staleSudoers.ExceptWith(desiredSudoersFilenames);
+        if (staleSudoers.Count > 0)
+        {
+            _log.LogInformation("Reconciliation: {Count} stale sudoers drop-in(s) to delete",
+                staleSudoers.Count);
+            var changes = await sudoersEnforcer
+                .ReconcileStaleSudoersAsync(staleSudoers, ct)
+                .ConfigureAwait(false);
+            allChanges.AddRange(changes);
+            foreach (var f in staleSudoers) _stateStore.RemoveManagedSudoersFilename(f);
+        }
 
         // Sshd: remove the drop-in when no current policy declares an ssh field.
         if (!hasSshPolicy)
@@ -429,6 +463,12 @@ public sealed class Worker : BackgroundService
                     break;
                 case "pkg" when action == "remove":
                     _stateStore.RemoveManagedPackage(id);
+                    break;
+                case "sudoers" when action == "set":
+                    _stateStore.RecordManagedSudoersFilename(id);
+                    break;
+                case "sudoers" when action == "delete":
+                    _stateStore.RemoveManagedSudoersFilename(id);
                     break;
             }
         }
