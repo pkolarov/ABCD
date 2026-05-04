@@ -64,8 +64,7 @@ public sealed class UserEnforcerTests
 
         await enforcer.ApplyAsync(directives, new HashSet<string>(), default);
 
-        Assert.True(runner.Invocations.Any(i => i.FileName == "useradd"),
-            "Expected useradd to be invoked");
+        Assert.Contains(runner.Invocations, i => i.FileName == "useradd");
         var addArgs = runner.Invocations.First(i => i.FileName == "useradd").Arguments;
         Assert.Contains("bob", addArgs);
         Assert.Contains("1500", addArgs);
@@ -674,6 +673,142 @@ public sealed class SshdEnforcerTests
         Assert.Contains("sshd:set:PubkeyAuthentication=True",        applied);
         Assert.Contains("sshd:set:PermitRootLogin=prohibit-password", applied);
         Assert.Contains("sshd:set:AllowGroups=sshusers",             applied);
+        Assert.Empty(runner.Invocations);
+    }
+}
+
+// ============================================================
+// Reconciliation methods on enforcers
+// ============================================================
+
+public sealed class ReconcileUserEnforcerTests
+{
+    [Fact]
+    public async Task ReconcileStaleUsers_DisablesEachUser()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleUsersAsync(["alice", "bob"], default);
+
+        Assert.Equal(2, applied.Count);
+        Assert.Contains("user:disable:alice", applied);
+        Assert.Contains("user:disable:bob", applied);
+        Assert.Contains(runner.Invocations, i => i.FileName == "passwd" && i.Arguments.Contains("alice"));
+        Assert.Contains(runner.Invocations, i => i.FileName == "passwd" && i.Arguments.Contains("bob"));
+    }
+
+    [Fact]
+    public async Task ReconcileStaleUsers_AuditOnly_NoRunnerCall()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new UserEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleUsersAsync(["alice"], default);
+
+        Assert.Single(applied);
+        Assert.Equal("user:disable:alice", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleUsers_UnsafeUsername_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleUsersAsync(["bad name!"], default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleUsers_EmptyList_ReturnsEmpty()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleUsersAsync([], default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+}
+
+public sealed class ReconcileFileEnforcerTests
+{
+    [Fact]
+    public void ReconcileStaleFiles_ReturnsDeleteEntries()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = enforcer.ReconcileStaleFiles(["/etc/dds/old.conf"]);
+
+        Assert.Single(applied);
+        Assert.Equal("file:delete:/etc/dds/old.conf", applied[0]);
+    }
+
+    [Fact]
+    public void ReconcileStaleFiles_UnsafePath_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = enforcer.ReconcileStaleFiles(["relative/path"]);
+
+        Assert.Empty(applied);
+    }
+
+    [Fact]
+    public void ReconcileStaleFiles_EmptyList_ReturnsEmpty()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = enforcer.ReconcileStaleFiles([]);
+
+        Assert.Empty(applied);
+    }
+}
+
+public sealed class ReconcilePackageEnforcerTests
+{
+    [Fact]
+    public async Task ReconcileStalePackages_AuditOnly_NoRunnerCall()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new PackageEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStalePackagesAsync(["ntp"], default);
+
+        Assert.Single(applied);
+        Assert.Equal("pkg:remove:ntp", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStalePackages_UnsafeName_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new PackageEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStalePackagesAsync(["bad pkg"], default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStalePackages_EmptyList_ReturnsEmpty()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new PackageEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStalePackagesAsync([], default);
+
+        Assert.Empty(applied);
         Assert.Empty(runner.Invocations);
     }
 }

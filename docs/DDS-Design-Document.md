@@ -768,7 +768,7 @@ dds/
     │   ├── DdsPolicyAgent/           .NET 8 worker service — Linux policy enforcement
     │   │   ├── Client/               HTTP client for dds-node /v1/linux/* API
     │   │   ├── State/                Applied-state persistence in /var/lib/dds
-    │   │   └── Enforcers/            Users, Sudoers, Files, Systemd, Packages
+    │   │   └── Enforcers/            Users, Sudoers, Files, Systemd, Packages, Sysctl, Sshd
     │   ├── pam_dds/                  PAM module / helper bridge for local auth (planned)
     │   └── packaging/                .deb / .rpm / systemd unit assets
     ├── macos/
@@ -1382,9 +1382,11 @@ does not actually delete/disable anything.
 - Software uninstall uses the same `msiexec /x` path as explicit Uninstall
   directives, so it honours MSI rollback on failure.
 
-**Platform scope:** Reconciliation is implemented for Windows in v1. macOS and
-Linux reconciliation follow the same algorithm with platform-appropriate
-backends.
+**Platform scope:** Reconciliation is implemented for Windows and Linux in v1.
+For Linux: stale users are disabled (not deleted, to preserve home directories),
+stale managed files are deleted, and stale packages are uninstalled via the host
+package manager. macOS reconciliation follows the same algorithm with
+platform-appropriate backends.
 
 ### 14.6 Linux Platform — Managed Device Architecture
 
@@ -1525,12 +1527,13 @@ Linux-specific enforcers:
 
 | Enforcer | Backend | Notes |
 | --- | --- | --- |
-| `SysctlEnforcer` | `/etc/sysctl.d/*.conf` + `sysctl --system` | Avoids ephemeral-only writes to `/proc/sys` |
-| `ManagedFileEnforcer` | atomic temp-write + rename + `chmod`/`chown` | Only allowlisted paths |
-| `PosixAccountEnforcer` | `useradd`, `usermod`, `groupadd`, `passwd -l/-u` | Local accounts only |
+| `UserEnforcer` | `useradd`, `usermod`, `groupadd`, `passwd -l/-u` | Local accounts only |
+| `SudoersEnforcer` | drop-in files under `/etc/sudoers.d/` + `visudo -c` | Safe filename allowlist guards path traversal |
+| `FileEnforcer` | atomic temp-write + rename + `chmod`/`chown` | Only allowlisted paths |
 | `SystemdEnforcer` | `systemctl` / D-Bus | Service enable/disable/restart |
+| `PackageEnforcer` | distro package manager abstraction | Backend chosen from host capability |
+| `SysctlEnforcer` | `/etc/sysctl.d/*.conf` + `sysctl --system` | Avoids ephemeral-only writes to `/proc/sys` |
 | `SshdEnforcer` | managed drop-in under `/etc/ssh/sshd_config.d/` + reload | No direct in-place edits to vendor file |
-| `SoftwareInstaller` | distro package manager abstraction | Backend chosen from host capability |
 
 Persisted state lives at `/var/lib/dds/applied-state.json`.
 Config lives under `/etc/dds/`.
@@ -1538,7 +1541,7 @@ Logs go to `journald`.
 
 #### 14.6.4 Linux Security Controls
 
-**Filesystem allowlist:** `ManagedFileEnforcer` only writes under:
+**Filesystem allowlist:** `FileEnforcer` only writes under:
 
 - `/etc/dds/`
 - `/etc/ssh/sshd_config.d/`

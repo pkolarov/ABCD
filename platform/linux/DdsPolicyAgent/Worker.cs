@@ -91,6 +91,12 @@ public sealed class Worker : BackgroundService
         var managedPackages = new HashSet<string>(
             state.ManagedPackages, StringComparer.Ordinal);
 
+        // Desired sets: populated from ALL current policies (including unchanged ones)
+        // so the reconciliation pass at the end can detect items no longer in any policy.
+        var desiredUsernames = new HashSet<string>(StringComparer.Ordinal);
+        var desiredPaths     = new HashSet<string>(StringComparer.Ordinal);
+        var desiredPackages  = new HashSet<string>(StringComparer.Ordinal);
+
         var userEnforcer    = new UserEnforcer   (_runner, _config.AuditOnly, _log);
         var sudoersEnforcer = new SudoersEnforcer(_runner, _config.AuditOnly, _log);
         var fileEnforcer    = new FileEnforcer   (_runner, _config.AuditOnly, _log);
@@ -109,14 +115,18 @@ public sealed class Worker : BackgroundService
                 ? v.ToString()
                 : "0";
 
+            var hasLinuxObject = p.Document.TryGetProperty("linux", out var linux)
+                && linux.ValueKind == JsonValueKind.Object;
+
+            // Always collect desired items for reconciliation, even on unchanged policies.
+            if (hasLinuxObject)
+                ExtractDesiredItems(linux, desiredUsernames, desiredPaths, desiredPackages);
+
             if (!_stateStore.HasChanged(policyId, hash))
             {
                 _log.LogDebug("Policy {Id} v{Version} unchanged; skip", policyId, version);
                 continue;
             }
-
-            var hasLinuxObject = p.Document.TryGetProperty("linux", out var linux)
-                && linux.ValueKind == JsonValueKind.Object;
 
             if (!hasLinuxObject)
             {
@@ -170,6 +180,128 @@ public sealed class Worker : BackgroundService
             };
             await _client.ReportAppliedAsync(report, ct).ConfigureAwait(false);
             _stateStore.RecordApplied(policyId, version, hash, status);
+        }
+
+        // Reconciliation pass: disable stale users, delete stale files, remove stale packages.
+        await ReconcileLinuxAsync(
+            desiredUsernames, desiredPaths, desiredPackages,
+            userEnforcer, fileEnforcer, pkgEnforcer, ct).ConfigureAwait(false);
+    }
+
+    /// Extracts the set of DDS-managed resource keys declared in a linux policy section.
+    /// Used to build the desired-state sets for reconciliation.
+    private static void ExtractDesiredItems(
+        JsonElement linux,
+        HashSet<string> usernames,
+        HashSet<string> paths,
+        HashSet<string> packages)
+    {
+        if (linux.TryGetProperty("local_users", out var users) && users.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var d in users.EnumerateArray())
+            {
+                var action = d.TryGetProperty("action", out var a) ? a.GetString() : null;
+                if (action == "Create" || action == "Modify" || action == "Enable" || action == "Disable")
+                {
+                    var username = d.TryGetProperty("username", out var u) ? u.GetString() : null;
+                    if (!string.IsNullOrWhiteSpace(username))
+                        usernames.Add(username);
+                }
+            }
+        }
+
+        if (linux.TryGetProperty("files", out var files) && files.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var d in files.EnumerateArray())
+            {
+                var action = d.TryGetProperty("action", out var a) ? a.GetString() : null;
+                if (action == "Set" || action == "EnsureDir")
+                {
+                    var path = d.TryGetProperty("path", out var p) ? p.GetString() : null;
+                    if (!string.IsNullOrWhiteSpace(path))
+                        paths.Add(path);
+                }
+            }
+        }
+
+        if (linux.TryGetProperty("packages", out var pkgs) && pkgs.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var d in pkgs.EnumerateArray())
+            {
+                var action = d.TryGetProperty("action", out var a) ? a.GetString() : null;
+                if (action == "Install")
+                {
+                    var name = d.TryGetProperty("name", out var n) ? n.GetString() : null;
+                    if (!string.IsNullOrWhiteSpace(name))
+                        packages.Add(name);
+                }
+            }
+        }
+    }
+
+    /// Detects and handles items that were previously managed by DDS but are absent from
+    /// the current policy set. Stale users are disabled (not deleted) to preserve home
+    /// directories; stale files are deleted; stale packages are removed.
+    private async Task ReconcileLinuxAsync(
+        HashSet<string> desiredUsernames,
+        HashSet<string> desiredPaths,
+        HashSet<string> desiredPackages,
+        UserEnforcer userEnforcer,
+        FileEnforcer fileEnforcer,
+        PackageEnforcer pkgEnforcer,
+        CancellationToken ct)
+    {
+        var currentState = _stateStore.Load();
+        var allChanges = new List<string>();
+
+        var staleUsers = new HashSet<string>(currentState.ManagedUsernames, StringComparer.Ordinal);
+        staleUsers.ExceptWith(desiredUsernames);
+        if (staleUsers.Count > 0)
+        {
+            _log.LogInformation("Reconciliation: {Count} stale user(s) to disable", staleUsers.Count);
+            var changes = await userEnforcer
+                .ReconcileStaleUsersAsync(staleUsers, ct)
+                .ConfigureAwait(false);
+            allChanges.AddRange(changes);
+            foreach (var u in staleUsers) _stateStore.RemoveManagedUsername(u);
+        }
+
+        var stalePaths = new HashSet<string>(currentState.ManagedPaths, StringComparer.Ordinal);
+        stalePaths.ExceptWith(desiredPaths);
+        if (stalePaths.Count > 0)
+        {
+            _log.LogInformation("Reconciliation: {Count} stale file(s) to delete", stalePaths.Count);
+            var changes = fileEnforcer.ReconcileStaleFiles(stalePaths);
+            allChanges.AddRange(changes);
+            foreach (var p in stalePaths) _stateStore.RemoveManagedPath(p);
+        }
+
+        var stalePackages = new HashSet<string>(currentState.ManagedPackages, StringComparer.Ordinal);
+        stalePackages.ExceptWith(desiredPackages);
+        if (stalePackages.Count > 0)
+        {
+            _log.LogInformation("Reconciliation: {Count} stale package(s) to remove", stalePackages.Count);
+            var changes = await pkgEnforcer
+                .ReconcileStalePackagesAsync(stalePackages, ct)
+                .ConfigureAwait(false);
+            allChanges.AddRange(changes);
+            foreach (var n in stalePackages) _stateStore.RemoveManagedPackage(n);
+        }
+
+        if (allChanges.Count > 0)
+        {
+            _log.LogInformation("Reconciliation complete: {Count} action(s)", allChanges.Count);
+            var report = new AppliedReport
+            {
+                DeviceUrn  = _config.DeviceUrn,
+                TargetId   = "_reconciliation",
+                Version    = "1",
+                Status     = "ok",
+                Kind       = AppliedKind.Reconciliation,
+                Directives = allChanges,
+                AppliedAt  = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            };
+            await _client.ReportAppliedAsync(report, ct).ConfigureAwait(false);
         }
     }
 

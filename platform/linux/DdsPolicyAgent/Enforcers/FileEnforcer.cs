@@ -179,6 +179,24 @@ public sealed class FileEnforcer
         }
     }
 
+    /// Deletes each stale DDS-managed file. Only safe, allowlisted paths are processed.
+    public List<string> ReconcileStaleFiles(IEnumerable<string> stalePaths)
+    {
+        var applied = new List<string>();
+        foreach (var path in stalePaths)
+        {
+            if (!IsSafePath(path))
+            {
+                _log.LogWarning("FileEnforcer: reconcile skip unsafe path {P}", path);
+                continue;
+            }
+            _log.LogInformation("Reconciliation: deleting stale DDS-managed file {P}", path);
+            ApplyDelete(path);
+            applied.Add($"file:delete:{path}");
+        }
+        return applied;
+    }
+
     internal static bool IsSafePath(string path)
     {
         if (!Path.IsPathRooted(path)) return false;

@@ -57,6 +57,7 @@ public sealed class AppliedReport
 public static class AppliedKind
 {
     public const string Policy = "policy";
+    public const string Reconciliation = "reconciliation";
 }
 
 public interface IDdsNodeClient

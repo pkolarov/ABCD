@@ -136,6 +136,25 @@ public sealed class PackageEnforcer
         return PackageManager.Unknown;
     }
 
+    /// Removes each stale DDS-managed package via the host package manager.
+    public async Task<List<string>> ReconcileStalePackagesAsync(
+        IEnumerable<string> stalePackages, CancellationToken ct)
+    {
+        var applied = new List<string>();
+        foreach (var name in stalePackages)
+        {
+            if (!IsValidPackageName(name))
+            {
+                _log.LogWarning("PackageEnforcer: reconcile skip unsafe package {N}", name);
+                continue;
+            }
+            _log.LogInformation("Reconciliation: removing stale DDS-managed package {N}", name);
+            await RemoveAsync(name, ct).ConfigureAwait(false);
+            applied.Add($"pkg:remove:{name}");
+        }
+        return applied;
+    }
+
     internal static bool IsValidPackageName(string name)
     {
         if (name.Length == 0 || name.Length > 128) return false;

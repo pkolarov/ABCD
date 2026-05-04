@@ -290,4 +290,186 @@ public sealed class WorkerTests
         Assert.Contains("/etc/dds/managed.conf", store.RemovedPaths);
         Assert.DoesNotContain("/etc/dds/managed.conf", store.AddedPaths);
     }
+
+    // =========================================================
+    // Reconciliation tests
+    // =========================================================
+
+    [Fact]
+    public async Task Reconciliation_StaleUser_IsDisabledAndRemovedFromManagedSet()
+    {
+        // "alice" was managed in a previous cycle but is absent from current policies.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedUsernames.Add("alice");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Contains("alice", store.RemovedUsernames);
+        Assert.Contains(runner.Invocations,
+            i => i.FileName == "passwd" && i.Arguments.Contains("alice"));
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleUser_AuditOnly_NoRunnerCall()
+    {
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedUsernames.Add("bob");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // Audit mode: no commands, but state must still be updated so the
+        // stale item is not re-reported on every cycle.
+        Assert.Contains("bob", store.RemovedUsernames);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleFile_IsDeletedAndRemovedFromManagedSet()
+    {
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedPaths.Add("/etc/dds/stale.conf");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Contains("/etc/dds/stale.conf", store.RemovedPaths);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StalePackage_IsRemovedAndRemovedFromManagedSet()
+    {
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedPackages.Add("ntp");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Contains("ntp", store.RemovedPackages);
+        // Package removal invokes the package manager — any call with "ntp" qualifies.
+        Assert.Contains(runner.Invocations, i => i.Arguments.Contains("ntp"));
+    }
+
+    [Fact]
+    public async Task Reconciliation_StillDesiredUser_IsNotDisabled()
+    {
+        // "alice" is managed AND still present in the current policy → not stale.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedUsernames.Add("alice");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-still-has-alice",
+                    """{"policy_id":"policy-still-has-alice","version":1,"linux":{"local_users":[{"username":"alice","action":"Create"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.DoesNotContain("alice", store.RemovedUsernames);
+        Assert.DoesNotContain(runner.Invocations,
+            i => i.FileName == "passwd" && i.Arguments.Contains("alice"));
+    }
+
+    [Fact]
+    public async Task Reconciliation_ReconciliationReport_SentWhenChangesExist()
+    {
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedPackages.Add("curl");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        var reconcileReport = client.ReceivedReports.FirstOrDefault(
+            r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconcileReport);
+        Assert.Equal("ok", reconcileReport.Status);
+        Assert.Equal("reconciliation", reconcileReport.Kind);
+        Assert.Contains(reconcileReport.Directives, d => d.Contains("curl"));
+    }
+
+    [Fact]
+    public async Task Reconciliation_NoStaleItems_NoReportSent()
+    {
+        // Empty managed sets → nothing stale → no reconciliation report.
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+            },
+            client);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.DoesNotContain(client.ReceivedReports, r => r.TargetId == "_reconciliation");
+    }
 }

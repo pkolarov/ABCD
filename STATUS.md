@@ -1,5 +1,58 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-04, 39th pass) — Linux reconciliation + doc corrections
+
+### Linux reconciliation pass
+
+`DdsPolicyAgent.Linux` had no reconciliation pass. Items created by DDS in a prior cycle
+(users, managed files, packages) that were subsequently removed from policy would persist
+indefinitely on the endpoint.
+
+**Fix — Worker.cs**:
+- `PollOnceAsync` now collects desired usernames, file paths, and package names from ALL
+  current policies during the poll loop (even unchanged ones) before the `HasChanged` skip.
+- After all policies are applied, `ReconcileLinuxAsync` computes the stale set
+  (`managed − desired`) and dispatches to enforcer reconcile methods.
+- A `_reconciliation` `AppliedReport` is posted to dds-node when any stale items are found.
+
+**Fix — Enforcers**:
+- `UserEnforcer.ReconcileStaleUsersAsync` — disables (does not delete) stale accounts with
+  `passwd -l <username>` to preserve home directories and files.
+- `FileEnforcer.ReconcileStaleFiles` — deletes each stale managed file; path-safety check
+  still applied.
+- `PackageEnforcer.ReconcileStalePackagesAsync` — removes each stale package via the
+  detected host package manager (apt-get / dnf / rpm).
+
+**Fix — Client**:
+- Added `AppliedKind.Reconciliation = "reconciliation"` constant alongside `Policy`.
+
+**Tests** — 17 new tests (132 total Linux, was 115):
+- `ReconcileUserEnforcerTests` (4): DisablesEachUser, AuditOnly_NoRunnerCall, UnsafeUsername_Skipped, EmptyList_ReturnsEmpty
+- `ReconcileFileEnforcerTests` (3): ReturnsDeleteEntries, UnsafePath_Skipped, EmptyList_ReturnsEmpty
+- `ReconcilePackageEnforcerTests` (3): AuditOnly_NoRunnerCall, UnsafeName_Skipped, EmptyList_ReturnsEmpty
+- `WorkerTests` reconciliation (6): StaleUser_IsDisabledAndRemovedFromManagedSet, StaleUser_AuditOnly_NoRunnerCall, StaleFile_IsDeletedAndRemovedFromManagedSet, StalePackage_IsRemovedAndRemovedFromManagedSet, StillDesiredUser_IsNotDisabled, ReconciliationReport_SentWhenChangesExist, NoStaleItems_NoReportSent
+- Fixed pre-existing xUnit2012 `Assert.True(…Any(…))` warning in `CreateUser_EnforceMode_CallsUseradd`
+
+### Documentation corrections (DDS-Design-Document.md)
+
+Three stale entries fixed in §14.6:
+
+1. **Linux enforcer table** — table used original design names that never matched the
+   shipped code. Updated all rows to actual class names:
+   `PosixAccountEnforcer` → `UserEnforcer`; `ManagedFileEnforcer` → `FileEnforcer`;
+   `SoftwareInstaller` → `PackageEnforcer`. Added missing `SudoersEnforcer` row.
+
+2. **Directory tree listing** — `Enforcers/` comment for `linux/DdsPolicyAgent` listed
+   "Users, Sudoers, Files, Systemd, Packages" but was missing `Sysctl, Sshd` (added in
+   the 37th pass). Updated to include all seven enforcers.
+
+3. **§14.6.4 / §14.5.9** — `ManagedFileEnforcer` reference in the filesystem-allowlist
+   bullet corrected to `FileEnforcer`. Platform-scope note updated: Linux reconciliation
+   is now implemented in v1 (not "planned").
+
+**Test results**: 132 / 132 Linux .NET (was 115), 240 / 240 Windows .NET, 92 / 92 macOS .NET.
+Rust workspace unchanged; cargo fmt clean.
+
 ## Test Gap Fix (2026-05-04, 38th pass) — add SysctlDirective and SshdPolicy roundtrip tests
 
 `dds-domain/tests/domain_tests.rs` had roundtrip tests for every Linux directive type added before

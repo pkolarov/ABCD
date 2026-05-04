@@ -184,6 +184,26 @@ public sealed class UserEnforcer
             _log.LogWarning("{Cmd} {Args} exited {Code}: {Err}", cmd, args, result.ExitCode, result.Stderr);
     }
 
+    /// Locks each stale DDS-managed user account with `passwd -l` (disable, not delete,
+    /// to preserve home directory and files). Items not passing validation are skipped.
+    public async Task<List<string>> ReconcileStaleUsersAsync(
+        IEnumerable<string> staleUsernames, CancellationToken ct)
+    {
+        var applied = new List<string>();
+        foreach (var username in staleUsernames)
+        {
+            if (!IsValidUsername(username))
+            {
+                _log.LogWarning("UserEnforcer: reconcile skip unsafe username {U}", username);
+                continue;
+            }
+            _log.LogInformation("Reconciliation: disabling stale DDS-managed user {U}", username);
+            await RunOrLogAsync("passwd", $"-l {username}", ct).ConfigureAwait(false);
+            applied.Add($"user:disable:{username}");
+        }
+        return applied;
+    }
+
     internal static bool IsValidUsername(string name)
     {
         if (name.Length == 0 || name.Length > 32) return false;
