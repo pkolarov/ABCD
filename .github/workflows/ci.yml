@@ -283,3 +283,16 @@ jobs:
         run: dotnet build platform/linux/DdsPolicyAgent/DdsPolicyAgent.Linux.csproj -c Debug
       - name: Test Linux DdsPolicyAgent
         run: dotnet test platform/linux/DdsPolicyAgent.Tests/DdsPolicyAgent.Linux.Tests.csproj -c Debug --logger "console;verbosity=normal"
+
+  macos-agent:
+    name: macOS .NET policy agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+      - name: Build macOS DdsPolicyAgent
+        run: dotnet build platform/macos/DdsPolicyAgent/DdsPolicyAgent.MacOS.csproj -c Debug
+      - name: Test macOS DdsPolicyAgent
+        run: dotnet test platform/macos/DdsPolicyAgent.Tests/DdsPolicyAgent.MacOS.Tests.csproj -c Debug --logger "console;verbosity=normal"

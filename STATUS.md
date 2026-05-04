@@ -1,5 +1,46 @@
 # DDS Implementation Status
 
+## CI Fix (2026-05-04, 45th pass) — macOS .NET policy agent missing from CI
+
+### Gap
+
+`.github/workflows/ci.yml` had a `linux-agent` job (added in the 43rd pass) that
+builds and tests `DdsPolicyAgent.Linux` on every PR. No equivalent job existed for
+the macOS .NET policy agent, even though 92 unit tests are defined in
+`platform/macos/DdsPolicyAgent.Tests/` and both macOS projects are already in
+`ABCD.sln`. A regression in `DdsPolicyAgent.MacOS` would go undetected by CI.
+
+The macOS tests use the same InMemory doubles pattern as the Linux and Windows tests
+and carry no macOS-host requirement — `PrivilegeGuard.DemandRoot` is bypassed via
+the `DDS_POLICYAGENT_ASSUME_ROOT=1` env var in the test fixtures, and the one Unix
+Domain Socket E2E test self-skips when UDS is unavailable. All 92 tests pass on a
+Linux CI host.
+
+### Fix
+
+Added `macos-agent` job to `.github/workflows/ci.yml` immediately after `linux-agent`,
+mirroring its structure exactly:
+
+```yaml
+macos-agent:
+  name: macOS .NET policy agent
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '9.0.x'
+    - name: Build macOS DdsPolicyAgent
+      run: dotnet build platform/macos/DdsPolicyAgent/DdsPolicyAgent.MacOS.csproj -c Debug
+    - name: Test macOS DdsPolicyAgent
+      run: dotnet test platform/macos/DdsPolicyAgent.Tests/DdsPolicyAgent.MacOS.Tests.csproj -c Debug --logger "console;verbosity=normal"
+```
+
+**Test results**: 92 / 92 macOS .NET, 132 / 132 Linux .NET, 201 / 240 Windows .NET
+(39 skipped: Windows-only integration tests), Rust workspace tests clean.
+
+---
+
 ## Gap Fix (2026-05-04, 44th pass) — Windows .NET projects missing from solution + Design Document directory tree stale entries
 
 ### Gaps
