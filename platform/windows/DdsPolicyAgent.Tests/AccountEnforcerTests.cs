@@ -184,6 +184,95 @@ public class AccountEnforcerTests
         Assert.True(_ops.UserExists("b"));
     }
 
+    // --- Username validation ---
+
+    [Theory]
+    [InlineData("alice")]
+    [InlineData("svc-account")]
+    [InlineData("node_1")]
+    [InlineData("a")]
+    [InlineData("ABCDEFGHIJ1234567890")]  // exactly 20 chars
+    public void IsValidUsername_accepts_valid_names(string name)
+    {
+        Assert.True(AccountEnforcer.IsValidUsername(name));
+    }
+
+    [Theory]
+    [InlineData("")]                          // empty
+    [InlineData("ABCDEFGHIJ12345678901")]     // 21 chars
+    [InlineData("alice/bob")]                 // slash
+    [InlineData("alice\\bob")]                // backslash
+    [InlineData("alice[0]")]                  // brackets
+    [InlineData("alice:1")]                   // colon
+    [InlineData("alice;1")]                   // semicolon
+    [InlineData("alice|pipe")]               // pipe
+    [InlineData("a=b")]                       // equals
+    [InlineData("a,b")]                       // comma
+    [InlineData("a+b")]                       // plus
+    [InlineData("a*b")]                       // asterisk
+    [InlineData("a?b")]                       // question mark
+    [InlineData("a<b")]                       // less-than
+    [InlineData("a>b")]                       // greater-than
+    [InlineData("alice@domain")]              // at-sign
+    [InlineData("ends.")]                     // trailing dot
+    [InlineData("ends ")]                     // trailing space
+    public void IsValidUsername_rejects_invalid_names(string name)
+    {
+        Assert.False(AccountEnforcer.IsValidUsername(name));
+    }
+
+    [Fact]
+    public async Task Invalid_username_returns_failed_status()
+    {
+        var dir = Parse("""[{"username":"alice/admin","action":"Create"}]""");
+        var r = await _enforcer.ApplyAsync(dir, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Failed, r.Status);
+        Assert.Contains("FAILED", r.Changes![0]);
+        Assert.False(_ops.UserExists("alice/admin"));
+    }
+
+    [Fact]
+    public async Task Username_too_long_returns_failed_status()
+    {
+        var dir = Parse("""[{"username":"ABCDEFGHIJ12345678901","action":"Create"}]""");
+        var r = await _enforcer.ApplyAsync(dir, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Failed, r.Status);
+    }
+
+    // --- Group name validation ---
+
+    [Theory]
+    [InlineData("Administrators")]
+    [InlineData("Remote Desktop Users")]
+    [InlineData("my-group_1")]
+    public void IsValidGroupName_accepts_valid_names(string name)
+    {
+        Assert.True(AccountEnforcer.IsValidGroupName(name));
+    }
+
+    [Theory]
+    [InlineData("")]                   // empty
+    [InlineData("group/evil")]         // slash
+    [InlineData("group:name")]         // colon
+    [InlineData("group|pipe")]         // pipe
+    [InlineData("ends.")]              // trailing dot
+    public void IsValidGroupName_rejects_invalid_names(string name)
+    {
+        Assert.False(AccountEnforcer.IsValidGroupName(name));
+    }
+
+    [Fact]
+    public async Task Invalid_group_name_in_Create_returns_failed_status()
+    {
+        var dir = Parse("""[{"username":"alice","action":"Create","groups":["bad/group"]}]""");
+        var r = await _enforcer.ApplyAsync(dir, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Failed, r.Status);
+        Assert.Contains("FAILED", r.Changes![0]);
+        // alice was created before group validation ran; group was NOT added
+        Assert.True(_ops.UserExists("alice"));
+        Assert.DoesNotContain("bad/group", _ops.GetGroups("alice"));
+    }
+
     private static JsonElement Parse(string json)
         => JsonDocument.Parse(json).RootElement;
 }

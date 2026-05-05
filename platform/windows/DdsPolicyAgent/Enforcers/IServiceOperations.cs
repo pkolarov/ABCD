@@ -46,4 +46,16 @@ public interface IServiceOperations
     /// service does not exist or cannot be stopped.
     /// </summary>
     void StopService(string name);
+
+    /// <summary>
+    /// Returns the display name for the service as shown in the
+    /// Services UI. Returns <c>null</c> if the service does not exist.
+    /// </summary>
+    string? GetDisplayName(string name);
+
+    /// <summary>
+    /// Sets the display name for the service. Throws if the service
+    /// does not exist.
+    /// </summary>
+    void SetDisplayName(string name, string displayName);
 }

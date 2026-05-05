@@ -1187,6 +1187,18 @@ on AD/Hybrid hosts via the `Worker.EffectiveMode` helper (AD-04/05).
 The native Windows Auth Bridge applies the same guard before allowing
 first-account claim at the logon screen.
 
+**Account name validation:** The `AccountEnforcer` validates both
+`username` and group names before any Win32 call. Usernames must
+satisfy Windows SAM Account Name constraints: 1–20 characters, no
+`" / \ [ ] : ; | = , + * ? < > @`, and must not end with `.` or a
+space. Group names allow the same forbidden characters with a 256-
+character limit. Strings outside these constraints are rejected with
+`EnforcementStatus.Failed` without touching the Win32 layer.
+
+**Service display name length:** The `ServiceEnforcer` caps `display_name`
+at 256 characters (Windows SCM registry limit). Names exceeding this
+are rejected with `EnforcementStatus.Failed` before the registry write.
+
 **Password handling:** Passwords are never carried in `WindowsPolicyDocument`
 or `SoftwareAssignment`. Two Windows flows exist today:
 

@@ -1,5 +1,89 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 69th pass) — Windows: AccountEnforcer name validation + ServiceEnforcer display_name
+
+### Gaps
+
+**Gap 1 — `AccountEnforcer` accepted any string for `username` and group names without validation**
+
+The Linux `UserEnforcer` added `IsValidUsername()` in an earlier pass, but the Windows
+`AccountEnforcer` passed `username` and group names directly to Win32 without validation.
+A crafted policy could supply a username or group name that contains forbidden SAM
+characters (`" / \ [ ] : ; | = , + * ? < > @`) or exceeds the 20-character SAM limit,
+leading to ungraceful Win32 API failures instead of a controlled `EnforcementStatus.Failed`.
+
+**Gap 2 — `ServiceDirective.display_name` was in the spec but not implemented**
+
+The Design Document (§14.5.1) listed `display_name: Option<String>` in `ServiceDirective`
+but `ServiceEnforcer.ApplyOne` only read `name`, `action`, and `start_type` — the
+`display_name` field was silently ignored. An operator publishing a services policy with a
+`display_name` entry would see no effect and no error.
+
+### Fix
+
+**`platform/windows/DdsPolicyAgent/Enforcers/AccountEnforcer.cs`**:
+- Added `internal static bool IsValidUsername(string name)` — Windows SAM Account Name
+  constraints: 1–20 characters, no `" / \ [ ] : ; | = , + * ? < > @`, must not end with
+  `.` or space.
+- Added `internal static bool IsValidGroupName(string name)` — same forbidden character
+  set, max 256 characters.
+- `ApplyOne` validates `username` before any action; throws `InvalidOperationException`
+  (→ `EnforcementStatus.Failed`) on invalid input.
+- `ApplyCreate` validates each group name before calling `AddToGroup`.
+- Class-level doc comment updated to reference the new security control.
+
+**`platform/windows/DdsPolicyAgent/Enforcers/IServiceOperations.cs`**:
+- Added `string? GetDisplayName(string name)` and `void SetDisplayName(string name, string displayName)`.
+
+**`platform/windows/DdsPolicyAgent/Enforcers/InMemoryServiceOperations.cs`**:
+- Added `DisplayName` property to `ServiceState`.
+- Implemented `GetDisplayName` / `SetDisplayName`.
+- `Seed()` now accepts an optional `displayName` parameter.
+
+**`platform/windows/DdsPolicyAgent/Enforcers/WindowsServiceOperations.cs`**:
+- `GetDisplayName`: reads `ServiceController.DisplayName`.
+- `SetDisplayName`: writes `HKLM\SYSTEM\CurrentControlSet\Services\<name>\DisplayName`
+  registry value (same pattern as `SetStartType`).
+
+**`platform/windows/DdsPolicyAgent/Enforcers/ServiceEnforcer.cs`**:
+- Added `MaxDisplayNameLength = 256` constant.
+- `ApplyOne` reads `display_name` from JSON; rejects values > 256 chars with
+  `EnforcementStatus.Failed`.
+- `ApplyConfigure` signature updated to accept `displayName`; calls `SetDisplayName`
+  when the current value differs (idempotent).
+- Class-level doc comment updated.
+
+**`platform/windows/DdsPolicyAgent.Tests/AccountEnforcerTests.cs`** (34 new tests):
+- `IsValidUsername_accepts_valid_names` Theory (5 cases)
+- `IsValidUsername_rejects_invalid_names` Theory (18 cases)
+- `Invalid_username_returns_failed_status`, `Username_too_long_returns_failed_status`
+- `IsValidGroupName_accepts_valid_names` Theory (3 cases)
+- `IsValidGroupName_rejects_invalid_names` Theory (5 cases)
+- `Invalid_group_name_in_Create_returns_failed_status`
+
+**`platform/windows/DdsPolicyAgent.Tests/ServiceEnforcerTests.cs`** (5 new tests):
+- `Configure_sets_display_name`
+- `Configure_display_name_is_noop_when_unchanged`
+- `Configure_sets_start_type_and_display_name_together`
+- `Rejects_display_name_exceeding_max_length`
+- `Display_name_at_max_length_is_accepted`
+
+**`docs/DDS-Admin-Guide.md`**:
+- `services` directive example: added `display_name` field; updated prose to document
+  the field, its registry backing, and the 256-character limit.
+- Added `local_accounts` directive example with `Create` / `Disable` entries; prose
+  documents SAM validation constraints for `username` and group names.
+- Updated capability table: `local_accounts` description now says "workgroup machines only".
+
+**`docs/DDS-Design-Document.md`** §14.5.5:
+- Added "Account name validation" paragraph documenting `AccountEnforcer` SAM constraints.
+- Added "Service display name length" paragraph documenting the 256-character cap.
+
+**Test results**: Windows .NET **240/240** (was 201/201; 39 new tests). macOS .NET 96/96.
+`cargo check --workspace` clean. `cargo test -p dds-node --lib` **312/312**.
+
+---
+
 ## Fix (2026-05-05, 68th pass) — docs: fix stale `--hybrid` flag refs; add genesis ceremony and `self-admit` section to Admin Guide
 
 ### Gaps

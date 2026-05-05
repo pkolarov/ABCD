@@ -14,6 +14,14 @@ namespace DDS.PolicyAgent.Enforcers;
 /// machines (classic AD or hybrid AD+Entra). The AD-coexistence
 /// audit-only override for the other surfaces is Phase 2; account
 /// mutation stays refused on AD/Hybrid even after that.
+///
+/// <para>
+/// <b>Security:</b> <c>username</c> and group names are validated
+/// against Windows SAM constraints before any Win32 call. Strings
+/// outside the allowed character set are rejected with
+/// <see cref="EnforcementStatus.Failed"/> to prevent a compromised
+/// dds-node from injecting invalid user or group names into Win32 APIs.
+/// </para>
 /// </summary>
 public sealed class AccountEnforcer : IEnforcer
 {
@@ -81,6 +89,10 @@ public sealed class AccountEnforcer : IEnforcer
         var username = item.GetProperty("username").GetString()!;
         var action = item.GetProperty("action").GetString()!;
 
+        if (!IsValidUsername(username))
+            throw new InvalidOperationException(
+                $"Refused: username '{username}' contains invalid characters");
+
         var desc = $"{action} '{username}'";
 
         if (mode == EnforcementMode.Audit)
@@ -131,7 +143,12 @@ public sealed class AccountEnforcer : IEnforcer
             {
                 var groupName = g.GetString();
                 if (groupName is not null)
+                {
+                    if (!IsValidGroupName(groupName))
+                        throw new InvalidOperationException(
+                            $"Refused: group name '{groupName}' contains invalid characters");
                     _ops.AddToGroup(username, groupName);
+                }
             }
         }
 
@@ -299,6 +316,45 @@ public sealed class AccountEnforcer : IEnforcer
             }
         }
         return changes;
+    }
+
+    /// <summary>
+    /// Validates a Windows SAM Account Name. Windows forbids these
+    /// characters: <c>" / \ [ ] : ; | = , + * ? &lt; &gt; @</c>.
+    /// Names must be 1–20 characters and must not end with a period
+    /// or space.
+    /// </summary>
+    internal static bool IsValidUsername(string name)
+    {
+        if (string.IsNullOrEmpty(name) || name.Length > 20) return false;
+        if (name[^1] is '.' or ' ') return false;
+        foreach (var c in name)
+        {
+            if (c is '"' or '/' or '\\' or '[' or ']' or ':' or ';'
+                  or '|' or '=' or ',' or '+' or '*' or '?' or '<'
+                  or '>' or '@')
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Validates a Windows local group name. Group names follow the
+    /// same forbidden character set as SAM Account Names but may be
+    /// up to 256 characters long.
+    /// </summary>
+    internal static bool IsValidGroupName(string name)
+    {
+        if (string.IsNullOrEmpty(name) || name.Length > 256) return false;
+        if (name[^1] is '.' or ' ') return false;
+        foreach (var c in name)
+        {
+            if (c is '"' or '/' or '\\' or '[' or ']' or ':' or ';'
+                  or '|' or '=' or ',' or '+' or '*' or '?' or '<'
+                  or '>' or '@')
+                return false;
+        }
+        return true;
     }
 
     private static string DescribeDirective(JsonElement item)

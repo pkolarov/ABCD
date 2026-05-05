@@ -118,4 +118,28 @@ public sealed class WindowsServiceOperations : IServiceOperations
             sc.WaitForStatus(ServiceControllerStatus.Stopped, WaitTimeout);
         }
     }
+
+    public string? GetDisplayName(string name)
+    {
+        try
+        {
+            using var sc = new ServiceController(name);
+            return sc.DisplayName;
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    public void SetDisplayName(string name, string displayName)
+    {
+        // ServiceController.DisplayName is read-only; write via the
+        // registry key HKLM\SYSTEM\CurrentControlSet\Services\<name>\DisplayName.
+        using var key = Registry.LocalMachine.OpenSubKey(
+            $@"SYSTEM\CurrentControlSet\Services\{name}", writable: true)
+            ?? throw new InvalidOperationException($"Service '{name}' not found in registry");
+
+        key.SetValue("DisplayName", displayName, RegistryValueKind.String);
+    }
 }

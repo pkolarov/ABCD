@@ -13,6 +13,7 @@ public sealed class InMemoryServiceOperations : IServiceOperations
         public string Name { get; set; } = string.Empty;
         public string StartType { get; set; } = "Automatic";
         public string RunState { get; set; } = "Stopped";
+        public string? DisplayName { get; set; }
     }
 
     private readonly Dictionary<string, ServiceState> _services =
@@ -20,7 +21,8 @@ public sealed class InMemoryServiceOperations : IServiceOperations
     private readonly object _lock = new();
 
     /// <summary>Pre-seed a service for test setup.</summary>
-    public void Seed(string name, string startType = "Automatic", string runState = "Stopped")
+    public void Seed(string name, string startType = "Automatic", string runState = "Stopped",
+        string? displayName = null)
     {
         lock (_lock)
         {
@@ -29,6 +31,7 @@ public sealed class InMemoryServiceOperations : IServiceOperations
                 Name = name,
                 StartType = startType,
                 RunState = runState,
+                DisplayName = displayName,
             };
         }
     }
@@ -81,6 +84,24 @@ public sealed class InMemoryServiceOperations : IServiceOperations
             if (!_services.TryGetValue(name, out var s))
                 throw new InvalidOperationException($"Service '{name}' does not exist");
             s.RunState = "Stopped";
+        }
+    }
+
+    public string? GetDisplayName(string name)
+    {
+        lock (_lock)
+        {
+            return _services.TryGetValue(name, out var s) ? s.DisplayName : null;
+        }
+    }
+
+    public void SetDisplayName(string name, string displayName)
+    {
+        lock (_lock)
+        {
+            if (!_services.TryGetValue(name, out var s))
+                throw new InvalidOperationException($"Service '{name}' does not exist");
+            s.DisplayName = displayName;
         }
     }
 

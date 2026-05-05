@@ -16,9 +16,10 @@ namespace DDS.PolicyAgent.Enforcers;
 /// <para>
 /// <b>Security:</b> service names are validated against
 /// <see cref="SafeServiceNamePattern"/> before any SCM call.
-/// Names outside the pattern are rejected with
-/// <see cref="EnforcementStatus.Failed"/> to prevent a compromised
-/// dds-node from injecting arbitrary service paths.
+/// Display names are validated against
+/// <see cref="MaxDisplayNameLength"/> to prevent oversized strings
+/// from reaching registry writes. Names outside the allowed pattern
+/// are rejected with <see cref="EnforcementStatus.Failed"/>.
 /// </para>
 /// </summary>
 public sealed class ServiceEnforcer : IEnforcer
@@ -34,6 +35,13 @@ public sealed class ServiceEnforcer : IEnforcer
     /// </summary>
     public static readonly Regex SafeServiceNamePattern =
         new(@"^[A-Za-z0-9_\-]{1,256}$", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Maximum length for a service display name. Windows SCM
+    /// display names are stored in the registry and must not exceed
+    /// 256 characters.
+    /// </summary>
+    public const int MaxDisplayNameLength = 256;
 
     public ServiceEnforcer(IServiceOperations ops, ILogger<ServiceEnforcer> log)
     {
@@ -84,6 +92,14 @@ public sealed class ServiceEnforcer : IEnforcer
             && st.ValueKind != JsonValueKind.Null
             ? st.GetString() : null;
 
+        var displayName = item.TryGetProperty("display_name", out var dn)
+            && dn.ValueKind != JsonValueKind.Null
+            ? dn.GetString() : null;
+
+        if (displayName is not null && displayName.Length > MaxDisplayNameLength)
+            throw new InvalidOperationException(
+                $"Refused: display_name for '{name}' exceeds {MaxDisplayNameLength} characters");
+
         var desc = startType is not null
             ? $"{action} '{name}' (start_type={startType})"
             : $"{action} '{name}'";
@@ -97,10 +113,10 @@ public sealed class ServiceEnforcer : IEnforcer
         switch (action)
         {
             case "Configure":
-                return ApplyConfigure(name, startType, desc);
+                return ApplyConfigure(name, startType, displayName, desc);
 
             case "Start":
-                ApplyConfigure(name, startType, desc);
+                ApplyConfigure(name, startType, displayName, desc);
                 if (_ops.ServiceExists(name) && _ops.GetRunState(name) != "Running")
                 {
                     _ops.StartService(name);
@@ -110,7 +126,7 @@ public sealed class ServiceEnforcer : IEnforcer
                 return $"[NO-OP] Start '{name}' (already running or not found)";
 
             case "Stop":
-                ApplyConfigure(name, startType, desc);
+                ApplyConfigure(name, startType, displayName, desc);
                 if (_ops.ServiceExists(name) && _ops.GetRunState(name) != "Stopped")
                 {
                     _ops.StopService(name);
@@ -124,13 +140,15 @@ public sealed class ServiceEnforcer : IEnforcer
         }
     }
 
-    private string ApplyConfigure(string name, string? startType, string desc)
+    private string ApplyConfigure(string name, string? startType, string? displayName, string desc)
     {
         if (!_ops.ServiceExists(name))
         {
             _log.LogWarning("Service: '{Name}' not found — skipping", name);
             return $"[NO-OP] {desc} (service not found)";
         }
+
+        var changed = false;
 
         if (startType is not null)
         {
@@ -139,10 +157,23 @@ public sealed class ServiceEnforcer : IEnforcer
             {
                 _ops.SetStartType(name, startType);
                 _log.LogInformation("Service: set start type for '{Name}' to {Type}", name, startType);
-                return $"Configure '{name}' start_type={startType}";
+                changed = true;
             }
-            return $"[NO-OP] Configure '{name}' (start_type already {startType})";
         }
+
+        if (displayName is not null)
+        {
+            var current = _ops.GetDisplayName(name);
+            if (current != displayName)
+            {
+                _ops.SetDisplayName(name, displayName);
+                _log.LogInformation("Service: set display name for '{Name}' to '{Display}'", name, displayName);
+                changed = true;
+            }
+        }
+
+        if (changed)
+            return $"Configure '{name}'";
 
         return $"[NO-OP] Configure '{name}' (nothing to change)";
     }

@@ -1122,7 +1122,7 @@ The `WindowsSettings` bundle supports five directive types:
 | Field | Type | Enforcer | Description |
 |---|---|---|---|
 | `registry` | `[RegistryDirective]` | `RegistryEnforcer` | Set or delete registry values (allowlisted keys only) |
-| `local_accounts` | `[AccountDirective]` | `AccountEnforcer` | Create, disable, enable accounts; manage group membership |
+| `local_accounts` | `[AccountDirective]` | `AccountEnforcer` | Create, disable, enable accounts; manage group membership (workgroup machines only) |
 | `password_policy` | `PasswordPolicy` | `PasswordPolicyEnforcer` | Minimum length, max age, complexity, lockout |
 | `software` | (via `SoftwareAssignment` token) | `SoftwareInstaller` | Install/uninstall MSI packages |
 | `services` | `[ServiceDirective]` | `ServiceEnforcer` | Configure start type, start, or stop Windows services |
@@ -1135,6 +1135,7 @@ The `WindowsSettings` bundle supports five directive types:
     "services": [
       {
         "name": "RemoteRegistry",
+        "display_name": "Remote Registry (DDS-managed)",
         "start_type": "Disabled",
         "action": "Stop"
       },
@@ -1148,7 +1149,32 @@ The `WindowsSettings` bundle supports five directive types:
 }
 ```
 
-`action` values: `Configure` (set start type only), `Start` (set start type + ensure running), `Stop` (set start type + ensure stopped). Service names are validated against `^[A-Za-z0-9_\-]{1,256}$` before any SCM call. If the service does not exist on the endpoint, the directive is a no-op (logged at warn). All actions are idempotent.
+`action` values: `Configure` (set start type / display name only), `Start` (configure + ensure running), `Stop` (configure + ensure stopped). The optional `display_name` field sets the human-readable name shown in the Services snap-in; it is written to `HKLM\SYSTEM\CurrentControlSet\Services\<name>\DisplayName` and is capped at 256 characters. Service names are validated against `^[A-Za-z0-9_\-]{1,256}$` before any SCM call. If the service does not exist on the endpoint, the directive is a no-op (logged at warn). All actions are idempotent.
+
+**`local_accounts` directive example:**
+
+```json
+{
+  "windows": {
+    "local_accounts": [
+      {
+        "username": "svc-backup",
+        "action": "Create",
+        "full_name": "Backup Service Account",
+        "description": "DDS-managed service account",
+        "groups": ["Backup Operators"],
+        "password_never_expires": true
+      },
+      {
+        "username": "old-svc",
+        "action": "Disable"
+      }
+    ]
+  }
+}
+```
+
+`action` values: `Create` (idempotent — creates if missing, applies groups on every cycle), `Delete`, `Disable`, `Enable`. `Create` and `Delete` are only applied on workgroup machines (the `AccountEnforcer` refuses all operations on AD-joined or Entra hybrid-joined machines). Usernames are validated against Windows SAM Account Name constraints: 1–20 characters, no `" / \ [ ] : ; | = , + * ? < > @`, may not end with `.` or space. Group names in the `groups` array are validated against the same forbidden character set (max 256 characters). Invalid names are rejected with `EnforcementStatus.Failed` before any Win32 call.
 
 ### Windows First Account Claim
 

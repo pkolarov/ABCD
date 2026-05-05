@@ -221,6 +221,64 @@ public class ServiceEnforcerTests
         Assert.Equal("Running", _ops.Peek("goodsvc")!.RunState);
     }
 
+    // --- display_name ---
+
+    [Fact]
+    public async Task Configure_sets_display_name()
+    {
+        _ops.Seed("spooler", displayName: "Print Spooler");
+        var dir = Parse("""[{"name":"spooler","display_name":"DDS Print Spooler","action":"Configure"}]""");
+        var r = await _enforcer.ApplyAsync(dir, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Ok, r.Status);
+        Assert.Equal("DDS Print Spooler", _ops.Peek("spooler")!.DisplayName);
+        Assert.DoesNotContain("NO-OP", r.Changes![0]);
+    }
+
+    [Fact]
+    public async Task Configure_display_name_is_noop_when_unchanged()
+    {
+        _ops.Seed("spooler", displayName: "Print Spooler");
+        var dir = Parse("""[{"name":"spooler","display_name":"Print Spooler","action":"Configure"}]""");
+        var r = await _enforcer.ApplyAsync(dir, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Ok, r.Status);
+        Assert.Contains("NO-OP", r.Changes![0]);
+    }
+
+    [Fact]
+    public async Task Configure_sets_start_type_and_display_name_together()
+    {
+        _ops.Seed("spooler", startType: "Manual", displayName: "Old Name");
+        var dir = Parse("""[{"name":"spooler","start_type":"Automatic","display_name":"New Name","action":"Configure"}]""");
+        var r = await _enforcer.ApplyAsync(dir, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Ok, r.Status);
+        Assert.Equal("Automatic", _ops.Peek("spooler")!.StartType);
+        Assert.Equal("New Name", _ops.Peek("spooler")!.DisplayName);
+    }
+
+    [Fact]
+    public async Task Rejects_display_name_exceeding_max_length()
+    {
+        _ops.Seed("spooler");
+        var longName = new string('A', ServiceEnforcer.MaxDisplayNameLength + 1);
+        var json = "[{\"name\":\"spooler\",\"display_name\":\"" + longName + "\",\"action\":\"Configure\"}]";
+        var dir = Parse(json);
+        var r = await _enforcer.ApplyAsync(dir, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Failed, r.Status);
+        Assert.Contains("FAILED", r.Changes![0]);
+    }
+
+    [Fact]
+    public async Task Display_name_at_max_length_is_accepted()
+    {
+        _ops.Seed("spooler");
+        var maxName = new string('A', ServiceEnforcer.MaxDisplayNameLength);
+        var json = "[{\"name\":\"spooler\",\"display_name\":\"" + maxName + "\",\"action\":\"Configure\"}]";
+        var dir = Parse(json);
+        var r = await _enforcer.ApplyAsync(dir, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Ok, r.Status);
+        Assert.Equal(maxName, _ops.Peek("spooler")!.DisplayName);
+    }
+
     // --- ExtractManagedKey ---
 
     [Fact]
