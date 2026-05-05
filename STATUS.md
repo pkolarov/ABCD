@@ -1,5 +1,61 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 59th pass) — SystemdEnforcer: Mask/Unmask + doc/struct alignment
+
+### Gap
+
+`LinuxSystemdAction` in `dds-domain/src/types.rs` and the `SystemdEnforcer` were missing
+the `Mask` and `Unmask` actions, even though both the Design Document (§14.6.1) and the
+Admin Guide listed them. At the same time, `ConfigureDropin` and `RemoveDropin` —
+implemented since pass 50 — were absent from the Design Document struct definition,
+and `dropin_name` / `dropin_content` fields were not shown.
+
+The architecture diagram in §14.6 (Design Document) additionally showed six enforcer
+slots with stale display names ("Account Enforcer", "SSH Enforcer", "Software Install")
+and omitted `SudoersEnforcer` entirely.
+
+**`Mask`** links a unit file to `/dev/null` via `systemctl mask`, preventing it from
+being started by any means (including by other unit dependencies). **`Unmask`** reverses
+this. Both actions are important for hardening policies (e.g. disabling dangerous
+legacy services like `telnet.service` irrevocably).
+
+### Fix
+
+**`dds-domain/src/types.rs`**:
+- Added `Mask` and `Unmask` variants to `LinuxSystemdAction` enum with doc comments.
+
+**`platform/linux/DdsPolicyAgent/Enforcers/SystemdEnforcer.cs`**:
+- Added `"Mask"` and `"Unmask"` cases to `ApplyAsync` switch: call `systemctl mask`
+  / `systemctl unmask` via `RunCtlOrLogAsync` and emit `systemd:mask:<unit>` /
+  `systemd:unmask:<unit>` tags.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`**:
+- Added `MaskUnit_AuditOnly_NoRunner` Fact: audit mode emits tag without runner call.
+- Added `MaskUnit_EnforceMode_CallsSystemctl` Fact: enforce mode calls `systemctl mask`.
+- Added `UnmaskUnit_EnforceMode_CallsSystemctl` Fact: enforce mode calls `systemctl unmask`.
+
+**`docs/DDS-Design-Document.md`** §14.6.1:
+- Replaced `action: SystemdAction # Enable | Disable | Start | Stop | Restart | Mask | Unmask`
+  with the full accurate action list including `ConfigureDropin` and `RemoveDropin`.
+- Added `dropin_name` and `dropin_content` optional fields to the `LinuxSystemdDirective`
+  struct tree.
+- Fixed the §14.6 architecture diagram to show all seven enforcers with their correct
+  class names (`UserEnforcer`, `SudoersEnforcer`, `FileEnforcer`, `SystemdEnforcer`,
+  `SshdEnforcer`, `PackageEnforcer`, `SysctlEnforcer`).
+
+**`docs/DDS-Admin-Guide.md`**:
+- Updated `systemd` row in the directive table to mention `mask`, `unmask`,
+  `ConfigureDropin`, and `RemoveDropin`.
+- Added a **`systemd` directive example** (Enable, Start, Mask, ConfigureDropin) with
+  full field documentation for all nine valid `action` values.
+- Updated Security Reference enforcement capabilities table row for systemd to list all
+  supported subcommands and explain drop-in lifecycle.
+
+**Test results**: Linux .NET **197/197** (was 194/194; 3 new tests). macOS .NET 96/96.
+Rust dds-domain 131 passing. `cargo check --workspace` clean.
+
+---
+
 ## Fix (2026-05-05, 58th pass) — FileEnforcer / UserEnforcer: argument-injection hardening
 
 ### Gap

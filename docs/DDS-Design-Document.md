@@ -1436,12 +1436,13 @@ All distro-specific behavior stays in the Linux agent and its enforcers.
 │  │  every 60s               │                               │
 │  │                          │                               │
 │  │  ┌──────────────────┐    │                               │
-│  │  │ Sysctl Enforcer  │    │                               │
-│  │  │ File Enforcer    │    │                               │
-│  │  │ Account Enforcer │    │                               │
-│  │  │ Systemd Enforcer │    │                               │
-│  │  │ SSH Enforcer     │    │                               │
-│  │  │ Software Install │    │                               │
+│  │  │ SysctlEnforcer   │    │                               │
+│  │  │ FileEnforcer     │    │                               │
+│  │  │ UserEnforcer     │    │                               │
+│  │  │ SudoersEnforcer  │    │                               │
+│  │  │ SystemdEnforcer  │    │                               │
+│  │  │ SshdEnforcer     │    │                               │
+│  │  │ PackageEnforcer  │    │                               │
 │  │  └──────────────────┘    │                               │
 │  │                          │                               │
 │  │  State: /var/lib/dds     │                               │
@@ -1490,7 +1491,9 @@ LinuxPolicyDocument
     │   └── action: LinuxFileAction   # Set | Delete
     ├── systemd: [LinuxSystemdDirective]
     │   ├── unit: String              # unit name, e.g. "sshd.service"
-    │   └── action: SystemdAction     # Enable | Disable | Start | Stop | Restart | Mask | Unmask
+    │   ├── action: SystemdAction     # Enable | Disable | Start | Stop | Restart | Mask | Unmask | ConfigureDropin | RemoveDropin
+    │   ├── dropin_name: Option<String>   # stem for ConfigureDropin / RemoveDropin (no slashes or dots)
+    │   └── dropin_content: Option<String> # INI fragment; required for ConfigureDropin
     ├── packages: [LinuxPackageDirective]
     │   ├── name: String              # package name
     │   ├── action: PackageAction     # Install | Remove

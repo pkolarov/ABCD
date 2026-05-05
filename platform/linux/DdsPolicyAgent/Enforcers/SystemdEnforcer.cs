@@ -86,6 +86,16 @@ public sealed class SystemdEnforcer
                     applied.Add($"systemd:restart:{unit}");
                     break;
 
+                case "Mask":
+                    await RunCtlOrLogAsync("mask", unit, ct).ConfigureAwait(false);
+                    applied.Add($"systemd:mask:{unit}");
+                    break;
+
+                case "Unmask":
+                    await RunCtlOrLogAsync("unmask", unit, ct).ConfigureAwait(false);
+                    applied.Add($"systemd:unmask:{unit}");
+                    break;
+
                 case "ConfigureDropin":
                 {
                     var stem = await WriteDropinAsync(unit, d, ct).ConfigureAwait(false);

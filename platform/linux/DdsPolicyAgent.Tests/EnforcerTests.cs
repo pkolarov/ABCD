@@ -416,6 +416,54 @@ public sealed class SystemdEnforcerTests
         Assert.Empty(applied);
         Assert.Empty(runner.Invocations);
     }
+
+    [Fact]
+    public async Task MaskUnit_AuditOnly_NoRunner()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"telnet.service","action":"Mask"}""").RootElement],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("systemd:mask:telnet.service", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task MaskUnit_EnforceMode_CallsSystemctl()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"telnet.service","action":"Mask"}""").RootElement],
+            default);
+
+        Assert.Single(runner.Invocations);
+        Assert.Equal("systemctl", runner.Invocations[0].FileName);
+        Assert.Contains("mask", runner.Invocations[0].Arguments);
+        Assert.Contains("telnet.service", runner.Invocations[0].Arguments);
+    }
+
+    [Fact]
+    public async Task UnmaskUnit_EnforceMode_CallsSystemctl()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"telnet.service","action":"Unmask"}""").RootElement],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("systemd:unmask:telnet.service", applied[0]);
+        Assert.Single(runner.Invocations);
+        Assert.Equal("systemctl", runner.Invocations[0].FileName);
+        Assert.Contains("unmask", runner.Invocations[0].Arguments);
+    }
 }
 
 // ============================================================

@@ -637,6 +637,10 @@ pub enum LinuxSystemdAction {
     Start,
     Stop,
     Restart,
+    /// Mask the unit so it cannot be started (links to `/dev/null`).
+    Mask,
+    /// Unmask a previously masked unit.
+    Unmask,
     /// Install a drop-in file under `/etc/systemd/system/<unit>.d/`
     /// and reload the daemon.
     ConfigureDropin,

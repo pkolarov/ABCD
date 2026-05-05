@@ -1102,7 +1102,7 @@ The `LinuxSettings` bundle supports seven directive types:
 | `local_users` | `[LinuxUserDirective]` | `UserEnforcer` | Create, delete, lock, unlock, or modify local POSIX accounts |
 | `sudoers` | `[LinuxSudoersDirective]` | `SudoersEnforcer` | Write drop-in files under `/etc/sudoers.d/` |
 | `files` | `[LinuxFileDirective]` | `FileEnforcer` | Atomically write or delete files at allowlisted paths |
-| `systemd` | `[LinuxSystemdDirective]` | `SystemdEnforcer` | Enable, disable, start, stop, restart, or mask systemd units |
+| `systemd` | `[LinuxSystemdDirective]` | `SystemdEnforcer` | Enable, disable, start, stop, restart, mask, or unmask systemd units; write or remove override drop-in files |
 | `packages` | `[LinuxPackageDirective]` | `PackageEnforcer` | Install or remove distro packages via `apt`/`dnf`/`zypper` |
 | `sysctl` | `[SysctlDirective]` | `SysctlEnforcer` | Persist kernel parameters to `/etc/sysctl.d/60-dds-managed.conf` |
 | `ssh` | `Option<SshdPolicy>` | `SshdEnforcer` | Write an SSH daemon drop-in at `/etc/ssh/sshd_config.d/60-dds.conf` |
@@ -1139,6 +1139,28 @@ Keys must be dotted alphanumeric/underscore identifiers (e.g. `net.ipv4.ip_forwa
 ```
 
 Only the fields present in the policy are written to the drop-in — absent fields are not touched, so you can layer multiple policies. Valid `permit_root_login` values are `"yes"`, `"no"`, `"prohibit-password"`, and `"forced-commands-only"`. Setting `ssh` to `null` (or omitting it) removes the DDS-managed drop-in entirely; if an `ssh` object is present but contains no recognized fields (or all fields are invalid), it is treated the same way. **sshd is reloaded via `systemctl reload sshd` (falls back to `ssh` unit name) only when a new drop-in is written.** On removal, the drop-in file is deleted but sshd is not automatically reloaded — the old settings remain active in memory until the next operator-triggered reload or sshd restart. This is intentional: relaxing security settings is not done automatically.
+
+**`systemd` directive example:**
+
+```json
+{
+  "linux": {
+    "systemd": [
+      { "unit": "ntp.service",     "action": "Enable"  },
+      { "unit": "ntp.service",     "action": "Start"   },
+      { "unit": "telnet.service",  "action": "Mask"    },
+      {
+        "unit":           "sshd.service",
+        "action":         "ConfigureDropin",
+        "dropin_name":    "dds-hardening",
+        "dropin_content": "[Service]\nLimitNOFILE=1024\n"
+      }
+    ]
+  }
+}
+```
+
+Valid `action` values: `Enable`, `Disable`, `Start`, `Stop`, `Restart`, `Mask`, `Unmask`, `ConfigureDropin`, `RemoveDropin`. `Mask` links the unit file to `/dev/null` so it cannot be started by any means; `Unmask` reverses this. `ConfigureDropin` writes an override file under `/etc/systemd/system/<unit>.d/<dropin_name>.conf` and triggers `daemon-reload`; both `dropin_name` (alphanumeric, hyphens, underscores only — no dots) and `dropin_content` are required. `RemoveDropin` removes that file and triggers `daemon-reload`. Drop-in files written by DDS are tracked in `/var/lib/dds/applied-state.json` and removed during reconciliation when the corresponding directive is no longer present. Unit-state directives (`Enable`, `Disable`, `Start`, `Stop`, `Restart`, `Mask`, `Unmask`) are applied on the forward pass only — reversing them is not done automatically.
 
 **`packages` directive example:**
 
@@ -2101,7 +2123,7 @@ Settings can also be overridden via environment variables with the prefix
 | Sudoers drop-ins | `visudo -cf` + `/etc/sudoers.d/` | Validates each drop-in with `visudo` before writing; safe-delete on reconciliation. |
 | Kernel parameters | `sysctl --system` + `/etc/sysctl.d/60-dds-managed.conf` | Atomic drop-in write; keys not in any policy are pruned from the drop-in on reconciliation. |
 | SSH daemon config | `systemctl reload sshd` + `/etc/ssh/sshd_config.d/60-dds.conf` | Drop-in is removed when no policy declares an `ssh` field. Attempts `sshd` then `ssh` service name. |
-| systemd units | `systemctl enable/disable/start/stop/reload` + override drop-ins | Enable, disable, and manage unit state; drop-ins created under `/etc/systemd/system/<unit>.d/`. |
+| systemd units | `systemctl enable/disable/start/stop/restart/mask/unmask` + override drop-ins | Full unit lifecycle (Enable, Disable, Start, Stop, Restart, Mask, Unmask); `ConfigureDropin` / `RemoveDropin` write override files under `/etc/systemd/system/<unit>.d/` and trigger `daemon-reload`. |
 
 ### Service Management
 
