@@ -29,5 +29,20 @@ if [[ ! -f "${DDS_ROOT}/appsettings.json" ]]; then
   cp /usr/local/lib/dds/appsettings.json "${DDS_ROOT}/appsettings.json" 2>/dev/null || true
 fi
 
-echo "DDS Platform installed. Run: sudo dds-bootstrap-domain"
+cat <<'EOF'
+
+DDS Platform installed.
+
+Next step depends on this Mac's role:
+
+  * To create a NEW domain (anchor node):
+      sudo dds-bootstrap-domain
+
+  * To JOIN an existing domain (sibling node) — the common case:
+      sudo dds-node provision /path/to/provision.dds
+    On first run, this auto-seals a DDS_NODE_PASSPHRASE in the
+    System Keychain so node identity lands encrypted at rest.
+    The LaunchDaemon unseals it at every boot — no further action.
+
+EOF
 exit 0

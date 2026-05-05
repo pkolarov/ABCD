@@ -66,31 +66,42 @@ seal.pub seal.priv   # TPM2-sealed object holding the passphrase
 
 ## Existing already-provisioned host
 
-There's no `rewrap-identity` helper today — `rotate-identity` rotates
-the node's libp2p PeerId, which **invalidates the admission cert** and
-makes the node a different peer. That's not what you want for a wrap
-migration.
+Use `dds-node rewrap-identity` to re-encrypt the existing keys under
+the sealed passphrase **without** rotating the PeerId or invalidating
+the admission cert.
 
-Two options for now:
+```sh
+# 1. Seal a fresh passphrase into the TPM.
+pass="$(sudo /usr/local/sbin/dds-tpm-seal /var/lib/dds/node)"
 
-1. **Re-provision the node** (destructive, simplest). Stop the
-   service, archive `/var/lib/dds/node/`, then:
-   ```sh
-   sudo rm -rf /var/lib/dds/node
-   pass="$(sudo /usr/local/sbin/dds-tpm-seal /var/lib/dds/node)"
-   sudo env DDS_NODE_PASSPHRASE="$pass" \
-       /usr/local/bin/dds-node provision /path/to/provision.dds \
-       --data-dir /var/lib/dds/node --no-start
-   unset pass
-   sudo rc-service dds-node start
-   ```
-   This generates a new PeerId and a fresh admission cert, so the
-   node looks like a new peer to the rest of the network.
+# 2. Stop the service so the node isn't holding the key files open.
+sudo rc-service dds-node stop     # OpenRC
+# or: sudo systemctl stop dds-node
 
-2. **Defer until a `dds-node rewrap-identity` helper lands.** It
-   would load with the empty passphrase and save with the new
-   one, leaving PeerId / admission cert intact. Tracked alongside
-   M-22.
+# 3. Rewrap the keys in place (PeerId unchanged).
+sudo env DDS_NODE_PASSPHRASE="$pass" \
+    /usr/local/bin/dds-node rewrap-identity \
+    --data-dir /var/lib/dds/node
+unset pass
+
+# 4. Start the service — the TPM unseal hook supplies DDS_NODE_PASSPHRASE.
+sudo rc-service dds-node start
+```
+
+Backups (`node_key.bin.bak`, `p2p_key.bin.bak`) are written
+automatically before the overwrite unless `--no-backup` is passed.
+
+If the keys are already encrypted under a **different** old passphrase
+(e.g., rotating to a new TPM-bound secret after a PCR policy change),
+supply the old one via `DDS_NODE_PASSPHRASE_OLD`:
+
+```sh
+export DDS_NODE_PASSPHRASE_OLD=<old_passphrase>
+export DDS_NODE_PASSPHRASE=<new_passphrase>
+sudo -E /usr/local/bin/dds-node rewrap-identity \
+    --data-dir /var/lib/dds/node
+unset DDS_NODE_PASSPHRASE_OLD DDS_NODE_PASSPHRASE
+```
 
 For brand-new hosts, do the seal step **before** `dds-node provision`
 so this isn't an issue.

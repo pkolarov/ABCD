@@ -609,14 +609,110 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
+/// **macOS auto-seal**: when `DDS_NODE_PASSPHRASE` is unset and the
+/// keychain helpers from the .pkg installer are present at
+/// `/usr/local/sbin/dds-keychain-{seal,unseal}`, fetch (or create) a
+/// sealed passphrase from the System Keychain so node identity lands
+/// encrypted at rest *without* the operator running a separate seal
+/// command. The LaunchDaemon wrapper unseals at every boot, so the
+/// only command an end-user runs after `installer -pkg` is
+/// `sudo dds-node provision <bundle>`.
+///
+/// Falls through quietly if the helpers aren't installed (dev builds,
+/// hand-built dds-node) so this never breaks the provision flow.
+/// Linux is intentionally manual (operator runs `dds-tpm-seal` first)
+/// because PCR-policy choice is host-specific and shouldn't be picked
+/// silently. Windows is deferred until the
+/// `service-run --unseal-passphrase-from` flag lands in win_service.
+#[cfg(target_os = "macos")]
+fn try_auto_seal_passphrase() {
+    use std::path::Path;
+    use std::process::Command;
+
+    if std::env::var(crate::identity_store::PASSPHRASE_ENV)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    let unseal = Path::new("/usr/local/sbin/dds-keychain-unseal");
+    let seal = Path::new("/usr/local/sbin/dds-keychain-seal");
+    if !unseal.exists() {
+        return;
+    }
+
+    // 1. Try existing sealed item first — common on a re-provision.
+    if let Ok(out) = Command::new(unseal).output() {
+        if out.status.success() {
+            let pass = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !pass.is_empty() {
+                println!();
+                println!("  System Keychain holds a sealed DDS_NODE_PASSPHRASE for this host —");
+                println!("  reusing it so node identity lands encrypted at rest.");
+                println!();
+                // SAFETY: provision runs single-threaded before the tokio
+                // runtime starts; no other thread observes the env var.
+                unsafe {
+                    std::env::set_var(crate::identity_store::PASSPHRASE_ENV, &pass);
+                }
+                return;
+            }
+        }
+    }
+
+    // 2. No sealed passphrase yet — create one.
+    if !seal.exists() {
+        return;
+    }
+    match Command::new(seal).output() {
+        Ok(out) if out.status.success() => {
+            let pass = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !pass.is_empty() {
+                println!();
+                println!("  Sealed a fresh DDS_NODE_PASSPHRASE in the System Keychain so");
+                println!("  node identity lands encrypted at rest. The LaunchDaemon");
+                println!("  wrapper unseals it at every boot — no further action needed.");
+                println!();
+                unsafe {
+                    std::env::set_var(crate::identity_store::PASSPHRASE_ENV, &pass);
+                }
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.trim().is_empty() {
+                eprintln!();
+                eprintln!("  Note: dds-keychain-seal failed: {}", stderr.trim());
+                eprintln!("  Continuing without sealed passphrase.");
+                eprintln!();
+            }
+        }
+        Err(e) => {
+            eprintln!();
+            eprintln!("  Note: could not exec dds-keychain-seal: {e}");
+            eprintln!("  Continuing without sealed passphrase.");
+            eprintln!();
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn try_auto_seal_passphrase() {
+    // Linux: operator runs `dds-tpm-seal` manually so PCR-policy
+    // choice is explicit. Windows: deferred until the
+    // service-run --unseal-passphrase-from flag lands.
+}
+
 /// At-rest-storage advisory. Printed at the top of every provision run
 /// so the operator knows whether `node_key.bin` / `p2p_key.bin` are
 /// going to land encrypted (DDS_NODE_PASSPHRASE set) or plaintext (env
 /// unset) before any keys are written. On Linux without a TPM the
 /// message is loud — sealed-passphrase wrappers are the recommended
-/// path and a missing TPM is a real production gap. On macOS/Windows
-/// the message is softer because OS-bound storage (Keychain, DPAPI)
-/// is always available; only the install-time wiring is not yet done.
+/// path and a missing TPM is a real production gap. On macOS the
+/// message only fires when the .pkg helpers are absent (dev builds);
+/// the install path runs `try_auto_seal_passphrase` first which sets
+/// the env and silences this advisory.
 fn warn_at_rest_storage() {
     // Operator already supplied a wrap key — no advisory needed.
     let passphrase_set = std::env::var(crate::identity_store::PASSPHRASE_ENV)
@@ -660,10 +756,11 @@ fn warn_at_rest_storage() {
     #[cfg(target_os = "macos")]
     {
         println!();
-        println!("  Note: DDS_NODE_PASSPHRASE is unset. Node identity will be stored");
-        println!("  plaintext at rest, relying on file permissions. macOS System");
-        println!("  Keychain (SEP-backed) integration is documented in");
-        println!("  docs/sealed-passphrase-design.md but not yet wired into install.");
+        println!("  Note: DDS_NODE_PASSPHRASE is unset and the keychain helpers at");
+        println!("  /usr/local/sbin/dds-keychain-{{seal,unseal}} are absent — this is a");
+        println!("  dev/hand-built dds-node, not a .pkg install. Node identity will be");
+        println!("  stored plaintext at rest. Install the .pkg (or copy the helpers from");
+        println!("  platform/macos/packaging/helpers/) to enable auto-seal.");
         println!();
     }
 
@@ -722,6 +819,10 @@ pub fn run_provision(
     data_dir: Option<&Path>,
     start_node: bool,
 ) -> Result<ProvisionSummary, ProvisionError> {
+    // Try to set DDS_NODE_PASSPHRASE from OS-bound storage BEFORE
+    // emitting the warn — if the auto-seal succeeds, the warn becomes
+    // a no-op (it gates on PASSPHRASE_ENV being non-empty).
+    try_auto_seal_passphrase();
     warn_at_rest_storage();
 
     // 1. Load bundle
@@ -2250,11 +2351,6 @@ mod tests {
         use base64::Engine as _;
 
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Make sure the fail-closed gate from security-gaps #4 is off
-        // for this test — load_or_create on a missing file would
-        // otherwise refuse to write a plain v1 identity.
-        // SAFETY: TEST_ENV_LOCK serializes env mutation across the test
-        // binary, so this `remove_var` cannot race with another test.
         unsafe { std::env::remove_var("DDS_REQUIRE_ENCRYPTED_KEYS") };
         unsafe { std::env::remove_var("DDS_NODE_PASSPHRASE") };
 

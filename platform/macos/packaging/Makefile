@@ -81,6 +81,7 @@ pkg-payload: rust-binaries dotnet-agent
 	@echo "[3/4] Assembling package payload..."
 	rm -rf "$(PAYLOAD_DIR)"
 	mkdir -p "$(PAYLOAD_DIR)/usr/local/bin"
+	mkdir -p "$(PAYLOAD_DIR)/usr/local/sbin"
 	mkdir -p "$(PAYLOAD_DIR)/usr/local/lib/dds"
 	mkdir -p "$(PAYLOAD_DIR)/Library/LaunchDaemons"
 	mkdir -p "$(PAYLOAD_DIR)/Library/Application Support/DDS"
@@ -97,6 +98,18 @@ pkg-payload: rust-binaries dotnet-agent
 	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-bootstrap-domain"
 	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-enroll-admin"
 	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-admit-node"
+
+	# Sealed-passphrase helpers (System Keychain integration).
+	# `dds-node provision` auto-detects /usr/local/sbin/dds-keychain-{seal,unseal}
+	# and seals on first run when DDS_NODE_PASSPHRASE isn't already set.
+	# `dds-launchd-wrapper` is the LaunchDaemon entrypoint that unseals at
+	# every service start. See platform/macos/packaging/SEALED-PASSPHRASE.md.
+	cp "$(PKG_DIR)/helpers/dds-keychain-seal.sh"   "$(PAYLOAD_DIR)/usr/local/sbin/dds-keychain-seal"
+	cp "$(PKG_DIR)/helpers/dds-keychain-unseal.sh" "$(PAYLOAD_DIR)/usr/local/sbin/dds-keychain-unseal"
+	cp "$(PKG_DIR)/helpers/dds-launchd-wrapper.sh" "$(PAYLOAD_DIR)/usr/local/sbin/dds-launchd-wrapper"
+	chmod +x "$(PAYLOAD_DIR)/usr/local/sbin/dds-keychain-seal"
+	chmod +x "$(PAYLOAD_DIR)/usr/local/sbin/dds-keychain-unseal"
+	chmod +x "$(PAYLOAD_DIR)/usr/local/sbin/dds-launchd-wrapper"
 
 	# .NET agent (self-contained single binary)
 	cp "$(BUILD_DIR)/agent/DdsPolicyAgent.MacOS" "$(PAYLOAD_DIR)/usr/local/lib/dds/"

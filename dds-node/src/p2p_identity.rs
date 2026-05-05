@@ -372,6 +372,88 @@ pub fn load(path: &Path) -> Result<Keypair, P2pIdentityError> {
     Ok(kp)
 }
 
+/// Like [`load`] but decrypts with `pass` instead of reading
+/// `DDS_NODE_PASSPHRASE` from the environment.  Used by
+/// `rewrap-identity` to load a key encrypted under an *old* passphrase
+/// before re-saving it under a new one.  M-10 lazy-rewrap is skipped
+/// intentionally — the caller will call [`save`] immediately after.
+pub fn load_with_passphrase(
+    path: &Path,
+    pass: Option<&str>,
+) -> Result<Keypair, P2pIdentityError> {
+    let bytes = read_no_follow(path).map_err(|e| P2pIdentityError::Io(e.to_string()))?;
+    let value: CborValue =
+        ciborium::from_reader(&bytes[..]).map_err(|e| P2pIdentityError::Cbor(e.to_string()))?;
+    let map = value
+        .as_map()
+        .ok_or_else(|| P2pIdentityError::Format("not a map".into()))?;
+
+    let mut version: Option<i64> = None;
+    let mut salt: Option<Vec<u8>> = None;
+    let mut nonce: Option<Vec<u8>> = None;
+    let mut key_field: Option<Vec<u8>> = None;
+    let mut m_cost: Option<u32> = None;
+    let mut t_cost: Option<u32> = None;
+    let mut p_cost: Option<u32> = None;
+    for (k, v) in map.iter() {
+        if let Some(name) = k.as_text() {
+            match name {
+                "v" => version = v.as_integer().and_then(|i| i64::try_from(i).ok()),
+                "salt" => salt = v.as_bytes().cloned(),
+                "nonce" => nonce = v.as_bytes().cloned(),
+                "key" => key_field = v.as_bytes().cloned(),
+                "m_cost" => m_cost = v.as_integer().and_then(|i| u32::try_from(i).ok()),
+                "t_cost" => t_cost = v.as_integer().and_then(|i| u32::try_from(i).ok()),
+                "p_cost" => p_cost = v.as_integer().and_then(|i| u32::try_from(i).ok()),
+                _ => {}
+            }
+        }
+    }
+    let key_field = key_field.ok_or_else(|| P2pIdentityError::Format("missing key".into()))?;
+
+    let mut proto = match version {
+        Some(v) if v == VERSION_PLAIN as i64 => key_field,
+        Some(v) if v == VERSION_ENCRYPTED as i64 || v == VERSION_ENCRYPTED_V3 as i64 => {
+            let pass = Zeroizing::new(pass.ok_or_else(|| {
+                P2pIdentityError::Crypto(format!(
+                    "p2p key is encrypted but no passphrase was supplied \
+                     (set {PASSPHRASE_ENV} or use DDS_NODE_PASSPHRASE_OLD)"
+                ))
+            })?.to_owned());
+            let salt = salt.ok_or_else(|| P2pIdentityError::Format("missing salt".into()))?;
+            let nonce = nonce.ok_or_else(|| P2pIdentityError::Format("missing nonce".into()))?;
+            let params = if v == VERSION_ENCRYPTED as i64 {
+                KdfParams::V2
+            } else {
+                let m = m_cost
+                    .ok_or_else(|| P2pIdentityError::Format("v=3 missing m_cost".into()))?;
+                let t = t_cost
+                    .ok_or_else(|| P2pIdentityError::Format("v=3 missing t_cost".into()))?;
+                let p = p_cost
+                    .ok_or_else(|| P2pIdentityError::Format("v=3 missing p_cost".into()))?;
+                KdfParams { m_cost_kib: m, t_cost: t, p_cost: p }
+            };
+            let mut key = derive_key(pass.as_bytes(), &salt, params)?;
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+            let pt = cipher
+                .decrypt(Nonce::from_slice(&nonce), key_field.as_ref())
+                .map_err(|e| P2pIdentityError::Crypto(format!("decrypt: {e}")))?;
+            key.zeroize();
+            pt
+        }
+        other => {
+            return Err(P2pIdentityError::Format(format!(
+                "unknown version {other:?}"
+            )));
+        }
+    };
+
+    let kp = Keypair::from_protobuf_encoding(&proto)
+        .map_err(|e| P2pIdentityError::Libp2p(e.to_string()))?;
+    proto.zeroize();
+    Ok(kp)
+}
+
 fn derive_key(passphrase: &[u8], salt: &[u8], p: KdfParams) -> Result<[u8; 32], P2pIdentityError> {
     let params = Params::new(p.m_cost_kib, p.t_cost, p.p_cost, Some(32))
         .map_err(|e| P2pIdentityError::Crypto(e.to_string()))?;

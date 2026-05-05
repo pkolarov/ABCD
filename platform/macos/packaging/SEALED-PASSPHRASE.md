@@ -18,72 +18,100 @@ boot using `/var/db/SystemKey` — well before any LaunchDaemon starts.
 By the time the dds-node LaunchDaemon launches, the System Keychain is
 already accessible. **No service-ordering work needed.**
 
-## Prereqs
+## End-user flow (typical: joining an existing domain)
 
-The helper scripts ship in the macOS .pkg installer (or copy them
-manually):
+After `installer -pkg DDS-Platform-macOS-X.Y.Z-arm64.pkg -target /`:
 
 ```sh
-sudo install -m 0755 platform/macos/packaging/scripts/dds-keychain-seal.sh \
-    /usr/local/sbin/dds-keychain-seal
-sudo install -m 0755 platform/macos/packaging/scripts/dds-keychain-unseal.sh \
-    /usr/local/sbin/dds-keychain-unseal
-sudo install -m 0755 platform/macos/packaging/scripts/dds-launchd-wrapper.sh \
-    /usr/local/sbin/dds-launchd-wrapper
+sudo dds-node provision /path/to/provision.dds
 ```
+
+That's it. On first run, `dds-node provision` detects the .pkg helpers
+at `/usr/local/sbin/dds-keychain-{seal,unseal}` and:
+
+1. Seals a fresh random passphrase into the System Keychain
+   (service `"DDS Node Passphrase"`, account `<hostname-short>`).
+2. Stamps `DDS_NODE_PASSPHRASE` into its own process env.
+3. Continues provision — `node_key.bin` and `p2p_key.bin` land
+   encrypted (CBOR `v=3`, Argon2id+ChaCha20-Poly1305).
 
 The LaunchDaemon plist
-([`com.dds.node.plist`](com.dds.node.plist)) already invokes the
-wrapper instead of dds-node directly.
+([`com.dds.node.plist`](com.dds.node.plist)) invokes
+`/usr/local/sbin/dds-launchd-wrapper`, which unseals the passphrase
+from the keychain at every service start. The operator never types or
+touches anything after `provision` returns.
 
-## One-time setup
+## Re-provision behaviour
+
+`dds-node provision` first tries to *reuse* an existing sealed
+passphrase before creating a new one. So a re-provision (after a
+`rm -rf "/Library/Application Support/DDS/node-data"`) keeps the same
+keychain entry. To force-rotate the passphrase, delete the keychain
+item first:
 
 ```sh
-# 1. Seal a fresh random passphrase. Outputs the base64 plaintext on
-#    stdout — capture it, don't echo.
-pass="$(sudo /usr/local/sbin/dds-keychain-seal)"
-
-# 2. Provision (or first-time gen-node-key) with that passphrase set
-#    so node_key.bin and p2p_key.bin land encrypted.
-sudo env DDS_NODE_PASSPHRASE="$pass" \
-    dds-node provision /path/to/provision.dds
-
-# 3. Drop the plaintext from the shell.
-unset pass
-
-# 4. The LaunchDaemon's wrapper unseals at every start. Bring up the
-#    service the usual way:
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.dds.node.plist
+sudo security delete-generic-password \
+    -s "DDS Node Passphrase" -a "$(hostname -s)" \
+    /Library/Keychains/System.keychain
 ```
 
-After this, `/Library/Application Support/DDS/node-data/` holds
-encrypted `node_key.bin` / `p2p_key.bin` and the System Keychain holds
-the sealed wrap key (service `"DDS Node Passphrase"`, account
-`<hostname-short>`).
+The next `dds-node provision` will seal a new one.
 
 ## Existing already-provisioned host
 
-Same caveat as Linux: there's no `rewrap-identity` helper today, and
-`rotate-identity` rotates the libp2p PeerId which invalidates the
-admission cert. Two options:
+For a host that was provisioned **before** the auto-seal landed (or
+manually with `DDS_NODE_PASSPHRASE=""`), use `dds-node rewrap-identity`
+to re-encrypt the existing keys under the sealed passphrase **without**
+rotating the PeerId or invalidating the admission cert.
 
-1. **Re-provision** (destructive, simplest). Stop the LaunchDaemon,
-   archive `/Library/Application Support/DDS/node-data`, then:
-   ```sh
-   sudo launchctl unload /Library/LaunchDaemons/com.dds.node.plist
-   sudo rm -rf "/Library/Application Support/DDS/node-data"
-   pass="$(sudo /usr/local/sbin/dds-keychain-seal)"
-   sudo env DDS_NODE_PASSPHRASE="$pass" \
-       dds-node provision /path/to/provision.dds
-   unset pass
-   sudo launchctl bootstrap system /Library/LaunchDaemons/com.dds.node.plist
-   ```
-   This generates a new PeerId and a fresh admission cert.
+```sh
+# 1. Seal a fresh passphrase into the System Keychain.
+pass="$(sudo /usr/local/sbin/dds-keychain-seal)"
 
-2. **Defer** until a `dds-node rewrap-identity` helper lands.
+# 2. Stop the LaunchDaemon.
+sudo launchctl unload /Library/LaunchDaemons/com.dds.node.plist
 
-Brand-new hosts: do the seal step **before** `dds-node provision` so
-this isn't an issue.
+# 3. Rewrap the keys in place (PeerId unchanged).
+sudo env DDS_NODE_PASSPHRASE="$pass" \
+    /usr/local/bin/dds-node rewrap-identity \
+    --data-dir "/Library/Application Support/DDS/node-data"
+unset pass
+
+# 4. Reload — the wrapper unseals from the keychain at every start.
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.dds.node.plist
+```
+
+Backups (`node_key.bin.bak`, `p2p_key.bin.bak`) are written
+automatically before the overwrite unless `--no-backup` is passed.
+
+If the keys are already encrypted under a **different** old passphrase,
+supply the old one via `DDS_NODE_PASSPHRASE_OLD`:
+
+```sh
+export DDS_NODE_PASSPHRASE_OLD=<old_passphrase>
+export DDS_NODE_PASSPHRASE=<new_passphrase>
+sudo -E /usr/local/bin/dds-node rewrap-identity \
+    --data-dir "/Library/Application Support/DDS/node-data"
+unset DDS_NODE_PASSPHRASE_OLD DDS_NODE_PASSPHRASE
+```
+
+## Manual install (no .pkg)
+
+If you're working from a hand-built dds-node and not the .pkg, the
+helpers don't ship to `/usr/local/sbin/`. Auto-seal silently
+falls through and `provision` writes plaintext keys. To opt in:
+
+```sh
+sudo install -m 0755 platform/macos/packaging/helpers/dds-keychain-seal.sh \
+    /usr/local/sbin/dds-keychain-seal
+sudo install -m 0755 platform/macos/packaging/helpers/dds-keychain-unseal.sh \
+    /usr/local/sbin/dds-keychain-unseal
+sudo install -m 0755 platform/macos/packaging/helpers/dds-launchd-wrapper.sh \
+    /usr/local/sbin/dds-launchd-wrapper
+```
+
+Then re-run `dds-node provision` (or `rewrap-identity` for an
+already-provisioned node) — auto-seal kicks in.
 
 ## Verifying
 
@@ -105,28 +133,17 @@ inherited dds-node process — never on disk.
 **`security: SecKeychainSearchCopyNext: The specified item could not be
 found in the keychain.`** — sealed passphrase doesn't exist for this
 host. The LaunchDaemon wrapper falls through; node keys stay
-plaintext. Run `dds-keychain-seal` if you want to fix it.
+plaintext. Run `dds-keychain-seal` (or re-provision) if you want to fix it.
 
 **`Error: Crypto("decrypt: aead::Error")` at startup** — keychain item
 present but its value doesn't decrypt the existing node keys. Common
 cause: passphrase was rotated under the keys (e.g., `delete-generic-password`
 + `dds-keychain-seal` while keys were already encrypted). Recovery:
-either restore the old passphrase from a backup, or accept loss of the
-encrypted keys and re-provision.
+either restore the old passphrase from a backup, or
+`dds-node rewrap-identity` with `DDS_NODE_PASSPHRASE_OLD` set to the
+old passphrase, or accept loss of the encrypted keys and re-provision.
 
 **Restoring on a different Mac.** The System Keychain master key is
 host-bound. Sealed items don't move between Macs. For DR, keep an
 off-keychain backup of the *plaintext* node keys under separate
 controls (or rely on re-provisioning from the bundle).
-
-## Removing the sealed passphrase
-
-```sh
-sudo security delete-generic-password \
-    -s "DDS Node Passphrase" -a "$(hostname -s)" \
-    /Library/Keychains/System.keychain
-```
-
-The wrapper will fall through on next start and dds-node will load
-keys plaintext (which fails if the keys were saved encrypted — see
-the second troubleshooting entry).

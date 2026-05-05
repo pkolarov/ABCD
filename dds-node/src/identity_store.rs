@@ -494,6 +494,105 @@ pub fn load(path: &Path) -> Result<Identity, IdentityStoreError> {
     Ok(ident)
 }
 
+/// Like [`load`] but decrypts with `pass` instead of reading
+/// `DDS_NODE_PASSPHRASE` from the environment.  Used by
+/// `rewrap-identity` to load a key encrypted under an *old* passphrase
+/// before re-saving it under a new one.  M-10 lazy-rewrap is skipped
+/// intentionally — the caller will call [`save`] immediately after,
+/// which handles the re-encryption.
+pub fn load_with_passphrase(
+    path: &Path,
+    pass: Option<&str>,
+) -> Result<Identity, IdentityStoreError> {
+    let bytes = read_no_follow(path).map_err(|e| IdentityStoreError::Io(e.to_string()))?;
+    let value: CborValue =
+        ciborium::from_reader(&bytes[..]).map_err(|e| IdentityStoreError::Cbor(e.to_string()))?;
+    let map = value
+        .as_map()
+        .ok_or_else(|| IdentityStoreError::Format("not a map".into()))?;
+
+    let mut version: Option<i64> = None;
+    let mut label: Option<String> = None;
+    let mut salt: Option<Vec<u8>> = None;
+    let mut nonce: Option<Vec<u8>> = None;
+    let mut key_field: Option<Vec<u8>> = None;
+    let mut m_cost: Option<u32> = None;
+    let mut t_cost: Option<u32> = None;
+    let mut p_cost: Option<u32> = None;
+    for (k, v) in map.iter() {
+        if let Some(name) = k.as_text() {
+            match name {
+                "v" => version = v.as_integer().and_then(|i| i64::try_from(i).ok()),
+                "label" => label = v.as_text().map(|s| s.to_string()),
+                "salt" => salt = v.as_bytes().cloned(),
+                "nonce" => nonce = v.as_bytes().cloned(),
+                "key" => key_field = v.as_bytes().cloned(),
+                "m_cost" => m_cost = v.as_integer().and_then(|i| u32::try_from(i).ok()),
+                "t_cost" => t_cost = v.as_integer().and_then(|i| u32::try_from(i).ok()),
+                "p_cost" => p_cost = v.as_integer().and_then(|i| u32::try_from(i).ok()),
+                _ => {}
+            }
+        }
+    }
+    let label = label.ok_or_else(|| IdentityStoreError::Format("missing label".into()))?;
+    let key_field = key_field.ok_or_else(|| IdentityStoreError::Format("missing key".into()))?;
+
+    let mut raw = match version {
+        Some(v) if v == VERSION_PLAIN as i64 => {
+            if key_field.len() != 32 {
+                return Err(IdentityStoreError::Format("plain key wrong length".into()));
+            }
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&key_field);
+            k
+        }
+        Some(v) if v == VERSION_ENCRYPTED as i64 || v == VERSION_ENCRYPTED_V3 as i64 => {
+            let pass = Zeroizing::new(pass.ok_or_else(|| {
+                IdentityStoreError::Crypto(format!(
+                    "identity is encrypted but no passphrase was supplied \
+                     (set {PASSPHRASE_ENV} or use DDS_NODE_PASSPHRASE_OLD)"
+                ))
+            })?.to_owned());
+            let salt = salt.ok_or_else(|| IdentityStoreError::Format("missing salt".into()))?;
+            let nonce = nonce.ok_or_else(|| IdentityStoreError::Format("missing nonce".into()))?;
+            let params = if v == VERSION_ENCRYPTED as i64 {
+                KdfParams::V2
+            } else {
+                let m = m_cost
+                    .ok_or_else(|| IdentityStoreError::Format("v=3 missing m_cost".into()))?;
+                let t = t_cost
+                    .ok_or_else(|| IdentityStoreError::Format("v=3 missing t_cost".into()))?;
+                let p = p_cost
+                    .ok_or_else(|| IdentityStoreError::Format("v=3 missing p_cost".into()))?;
+                KdfParams { m_cost_kib: m, t_cost: t, p_cost: p }
+            };
+            let mut key = derive_key(pass.as_bytes(), &salt, params)?;
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+            let mut pt = cipher
+                .decrypt(Nonce::from_slice(&nonce), key_field.as_ref())
+                .map_err(|e| IdentityStoreError::Crypto(format!("decrypt: {e}")))?;
+            key.zeroize();
+            if pt.len() != 32 {
+                pt.zeroize();
+                return Err(IdentityStoreError::Format("decrypted key wrong length".into()));
+            }
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&pt);
+            pt.zeroize();
+            k
+        }
+        other => {
+            return Err(IdentityStoreError::Format(format!(
+                "unknown version {other:?}"
+            )));
+        }
+    };
+
+    let signing_key = SigningKey::from_bytes(&raw);
+    raw.zeroize();
+    Ok(Identity::from_signing_key(&label, signing_key))
+}
+
 fn derive_key(
     passphrase: &[u8],
     salt: &[u8],
@@ -784,4 +883,5 @@ mod tests {
         unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
         assert!(!require_encrypted_keys(), "unset must be falsy");
     }
+
 }

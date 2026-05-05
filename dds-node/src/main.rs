@@ -22,6 +22,24 @@
 //!   `PeerId`. Run this on a sibling machine to discover the peer id
 //!   that the admin needs in order to issue an admission cert.
 //!
+//! - `dds-node rewrap-identity --data-dir <DIR> [--no-backup]`
+//!   Re-encrypts `<DIR>/node_key.bin` and `<DIR>/p2p_key.bin` with the
+//!   passphrase in `DDS_NODE_PASSPHRASE` without changing the Ed25519
+//!   signing key or the libp2p PeerId.  This is the safe path for
+//!   sealing a node that was provisioned with plaintext keys: seal the
+//!   passphrase first (`dds-tpm-seal` / `dds-keychain-seal`), then run
+//!   `DDS_NODE_PASSPHRASE=<sealed_value> dds-node rewrap-identity`.
+//!
+//!   If the keys are already encrypted under a *different* old
+//!   passphrase, put that old value in `DDS_NODE_PASSPHRASE_OLD` and the
+//!   desired new value in `DDS_NODE_PASSPHRASE` — the command will load
+//!   with the old one and save with the new one.
+//!
+//!   The admission cert and PeerId are unchanged — no admin involvement
+//!   is required after this command.  Optionally backs up the original
+//!   files as `node_key.bin.bak` / `p2p_key.bin.bak` (--no-backup to
+//!   skip).
+//!
 //! - `dds-node rotate-identity --data-dir <DIR> [--no-backup]`
 //!   Threat-model §2 recommendation #3 / §8 open item #9. Generates a
 //!   fresh libp2p Ed25519 keypair, atomically replaces
@@ -138,6 +156,7 @@ async fn async_main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
     match sub {
         "init-domain" => cmd_init_domain(&args[1..]),
         "gen-node-key" => cmd_gen_node_key(&args[1..]),
+        "rewrap-identity" => cmd_rewrap_identity(&args[1..]),
         "rotate-identity" => cmd_rotate_identity(&args[1..]),
         "gen-hmac-secret" => cmd_gen_hmac_secret(&args[1..]),
         "admit" => cmd_admit(&args[1..]),
@@ -174,6 +193,7 @@ fn print_usage() {
         "Usage:
   dds-node init-domain --name <NAME> --dir <DIR> [--fido2 | --legacy]
   dds-node gen-node-key --data-dir <DIR>
+  dds-node rewrap-identity --data-dir <DIR> [--no-backup]
   dds-node rotate-identity --data-dir <DIR> [--no-backup]
   dds-node gen-hmac-secret --out <FILE> [--force] [--keep-existing]
   dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--kem-pubkey <HEX> | --kem-pubkey-path <FILE>] [--out <FILE>] [--ttl-days <N>]
@@ -325,6 +345,127 @@ fn cmd_gen_node_key(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("Send the peer_id and kem_pubkey_hex to the domain admin to obtain an");
     println!("admission cert.  The admin should pass --kem-pubkey <HEX> to `admit`");
     println!("so that enc-v3 encrypted gossip is enabled immediately on first connect.");
+    Ok(())
+}
+
+/// Re-encrypt the node's identity files under a new passphrase without
+/// changing the Ed25519 signing key or libp2p PeerId.
+///
+/// Typical workflow (sealing a plaintext-provisioned node):
+/// ```sh
+/// pass="$(dds-keychain-seal)"        # or dds-tpm-seal <data_dir>
+/// DDS_NODE_PASSPHRASE="$pass" \
+///   dds-node rewrap-identity --data-dir <DIR>
+/// unset pass
+/// ```
+///
+/// To rotate an already-encrypted passphrase:
+/// ```sh
+/// export DDS_NODE_PASSPHRASE_OLD=<old_passphrase>
+/// export DDS_NODE_PASSPHRASE=<new_passphrase>
+/// dds-node rewrap-identity --data-dir <DIR>
+/// unset DDS_NODE_PASSPHRASE_OLD DDS_NODE_PASSPHRASE
+/// ```
+///
+/// The PeerId and admission cert are unchanged; no admin involvement
+/// is required after running this command.
+fn cmd_rewrap_identity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = PathBuf::from(require_flag(args, "--data-dir")?);
+    let no_backup = args.iter().any(|a| a == "--no-backup");
+
+    if !data_dir.exists() {
+        return Err(format!(
+            "data_dir {} does not exist",
+            data_dir.display()
+        )
+        .into());
+    }
+
+    let node_path = data_dir.join("node_key.bin");
+    let p2p_path = data_dir.join("p2p_key.bin");
+    for p in [&node_path, &p2p_path] {
+        if !p.exists() {
+            return Err(format!(
+                "key file not found: {} — use `provision` or `gen-node-key` first",
+                p.display()
+            )
+            .into());
+        }
+    }
+
+    // New passphrase (target): from DDS_NODE_PASSPHRASE.
+    let new_pass = std::env::var(identity_store::PASSPHRASE_ENV).ok();
+    if new_pass.as_deref().unwrap_or("").is_empty() {
+        eprintln!(
+            "WARNING: DDS_NODE_PASSPHRASE is not set — rewrap will write PLAINTEXT keys. \
+             Set DDS_NODE_PASSPHRASE to the sealed passphrase before running this command."
+        );
+    }
+
+    // Old passphrase (current on-disk encryption): from DDS_NODE_PASSPHRASE_OLD
+    // if set, otherwise assume the keys are plaintext or use DDS_NODE_PASSPHRASE
+    // (handles the case where old == new, i.e., a no-op re-save for format upgrade).
+    let old_pass_owned;
+    let old_pass: Option<&str> = if let Ok(old) = std::env::var("DDS_NODE_PASSPHRASE_OLD") {
+        if !old.is_empty() {
+            old_pass_owned = old;
+            Some(old_pass_owned.as_str())
+        } else {
+            new_pass.as_deref()
+        }
+    } else {
+        // No separate old passphrase — either plaintext (v=1) or same passphrase.
+        // For v=1, identity_store/p2p_identity ignore the passphrase on load.
+        new_pass.as_deref()
+    };
+
+    // Load both keys with the old passphrase (or plaintext for v=1).
+    let ident = identity_store::load_with_passphrase(&node_path, old_pass).map_err(|e| {
+        format!(
+            "failed to load node_key.bin: {e}\n\
+             If the key is encrypted, set DDS_NODE_PASSPHRASE_OLD to the current passphrase."
+        )
+    })?;
+    let p2p_kp = p2p_identity::load_with_passphrase(&p2p_path, old_pass).map_err(|e| {
+        format!(
+            "failed to load p2p_key.bin: {e}\n\
+             If the key is encrypted, set DDS_NODE_PASSPHRASE_OLD to the current passphrase."
+        )
+    })?;
+    let peer_id = libp2p::PeerId::from(p2p_kp.public());
+
+    // Optionally back up the originals before overwriting.
+    if !no_backup {
+        for (src, dst_name) in [(&node_path, "node_key.bin.bak"), (&p2p_path, "p2p_key.bin.bak")] {
+            let dst = data_dir.join(dst_name);
+            std::fs::copy(src, &dst).map_err(|e| {
+                format!("failed to back up {} to {}: {e}", src.display(), dst.display())
+            })?;
+        }
+    }
+
+    // Save both keys. DDS_NODE_PASSPHRASE is the new target — save() reads it.
+    identity_store::save(&node_path, &ident).map_err(|e| {
+        format!("failed to save node_key.bin: {e}")
+    })?;
+    p2p_identity::save(&p2p_path, &p2p_kp).map_err(|e| {
+        format!("failed to save p2p_key.bin: {e}")
+    })?;
+
+    let enc = new_pass.as_deref().unwrap_or("").is_empty();
+    println!("rewrap-identity complete:");
+    println!("  data_dir:     {}", data_dir.display());
+    println!("  peer_id:      {peer_id}  (unchanged)");
+    println!(
+        "  encryption:   {}",
+        if enc { "PLAINTEXT (DDS_NODE_PASSPHRASE not set)" } else { "encrypted (v=3 Argon2id)" }
+    );
+    if !no_backup {
+        println!("  backups:      node_key.bin.bak, p2p_key.bin.bak");
+    }
+    println!();
+    println!("The node's PeerId and admission cert are unchanged.");
+    println!("Restart dds-node for the service to pick up the new key wrapping.");
     Ok(())
 }
 
