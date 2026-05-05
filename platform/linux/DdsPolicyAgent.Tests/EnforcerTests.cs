@@ -682,6 +682,65 @@ public sealed class PackageEnforcerTests
         Assert.Equal("pkg:install:ntp", applied[0]);
         Assert.Empty(runner.Invocations);
     }
+
+    [Fact]
+    public async Task InstallPackage_ZypperBackend_CallsZypperInstall()
+    {
+        var runner = new NullCommandRunner();
+        // Make apt-get and dnf absent; zypper present.
+        runner.InvocationExitCodeOverrides[("which", "apt-get")] = 1;
+        runner.InvocationExitCodeOverrides[("which", "dnf")]     = 1;
+        runner.InvocationExitCodeOverrides[("which", "zypper")]  = 0;
+        var enforcer = new PackageEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"name":"vim","action":"Install"}""").RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("pkg:install:vim", applied[0]);
+        Assert.Contains(runner.Invocations, i => i.FileName == "zypper" && i.Arguments == "install -y vim");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "apt-get");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "dnf");
+    }
+
+    [Fact]
+    public async Task InstallPackage_ZypperBackend_WithVersion_UsesEqualsSeparator()
+    {
+        var runner = new NullCommandRunner();
+        runner.InvocationExitCodeOverrides[("which", "apt-get")] = 1;
+        runner.InvocationExitCodeOverrides[("which", "dnf")]     = 1;
+        runner.InvocationExitCodeOverrides[("which", "zypper")]  = 0;
+        var enforcer = new PackageEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"name":"vim","action":"Install","version":"9.0.1-1"}""").RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Single(applied);
+        Assert.Contains(runner.Invocations, i => i.FileName == "zypper" && i.Arguments == "install -y vim=9.0.1-1");
+    }
+
+    [Fact]
+    public async Task RemovePackage_ZypperBackend_CallsZypperRemove()
+    {
+        var runner = new NullCommandRunner();
+        runner.InvocationExitCodeOverrides[("which", "apt-get")] = 1;
+        runner.InvocationExitCodeOverrides[("which", "dnf")]     = 1;
+        runner.InvocationExitCodeOverrides[("which", "zypper")]  = 0;
+        var enforcer = new PackageEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"name":"vim","action":"Remove"}""").RootElement],
+            new HashSet<string>(["vim"]),
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("pkg:remove:vim", applied[0]);
+        Assert.Contains(runner.Invocations, i => i.FileName == "zypper" && i.Arguments == "remove -y vim");
+    }
 }
 
 // ============================================================

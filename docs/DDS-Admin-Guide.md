@@ -1954,7 +1954,7 @@ systemd (Ubuntu/Debian/Fedora) or OpenRC (Alpine)
   └── dds-policy-agent.service
         └── DdsPolicyAgent.Linux
               └── polls GET /v1/linux/policies, /v1/linux/software
-              └── enforces via useradd/userdel, apt-get/dnf, visudo,
+              └── enforces via useradd/userdel, apt-get/dnf/zypper, visudo,
                   sysctl --system, systemctl, sshd_config.d drop-ins
               └── reports POST /v1/linux/applied
 ```
@@ -2150,7 +2150,7 @@ Settings can also be overridden via environment variables with the prefix
 |---|---|---|
 | Local users | `useradd`, `usermod`, `userdel`, `passwd` | Create, modify, disable, delete accounts. Stale DDS-managed accounts are locked (`passwd -l`) rather than deleted during reconciliation. |
 | Files and directories | `File.WriteAllBytes` / `File.Delete` | Managed file and directory state with SHA-256 idempotency. Only files previously written by the agent are eligible for deletion. |
-| Package installation | `apt-get` / `dnf` (auto-detected) | Install and remove packages. Detection order: `apt-get` → `dnf`. |
+| Package installation | `apt-get` / `dnf` / `zypper` (auto-detected) | Install and remove packages. Detection order: `apt-get` → `dnf` → `zypper` → `rpm`. |
 | Sudoers drop-ins | `visudo -cf` + `/etc/sudoers.d/` | Validates each drop-in with `visudo` before writing; safe-delete on reconciliation. |
 | Kernel parameters | `sysctl --system` + `/etc/sysctl.d/60-dds-managed.conf` | Atomic drop-in write; keys not in any policy are pruned from the drop-in on reconciliation. |
 | SSH daemon config | `systemctl reload sshd` + `/etc/ssh/sshd_config.d/60-dds.conf` | Drop-in is removed when no policy declares an `ssh` field. Attempts `sshd` then `ssh` service name. |

@@ -1,5 +1,59 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 64th pass) — PackageEnforcer: add zypper backend + stale Admin Guide detection-order entries
+
+### Gap
+
+Both the Design Document (§14.5 / §14.6.1 struct tree, line "distro package repo operation
+(`apt`, `dnf`, `zypper`)") and the Admin Guide package-installation capability table listed
+`zypper` as a supported package manager, but `PackageEnforcer.cs` only detected and dispatched
+to `apt-get`, `dnf`, and `rpm`. The `zypper` case was silently unreachable: on openSUSE/SUSE
+hosts both `zypper` and `rpm` are present; the code would fall through to the `rpm` backend,
+which lacks dependency resolution and uses a different invocation syntax.
+
+The Admin Guide also had two stale entries that omitted `zypper`:
+- Capability table (§Linux Deployment): "Detection order: `apt-get` → `dnf`." missing
+  `zypper` and `rpm`.
+- Architecture ASCII diagram: `apt-get/dnf` in the agent enforce line.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Enforcers/PackageEnforcer.cs`**:
+- Added `Zypper` to the `PackageManager` enum.
+- `DetectPackageManagerAsync` now checks `zypper` between `dnf` and `rpm` (before `rpm`
+  because openSUSE hosts have both; zypper is the correct high-level frontend with dependency
+  resolution). A comment records the ordering rationale.
+- `InstallAsync` dispatch: added `PackageManager.Zypper => ("zypper", $"install -y {spec}")`.
+  zypper uses the same `name=version` pin syntax as apt-get.
+- `RemoveAsync` dispatch: added `PackageManager.Zypper => ("zypper", $"remove -y {name}")`.
+- Class-level doc comment updated: detection order now reads `dpkg (apt-get) → dnf → zypper → rpm`.
+
+**`platform/linux/DdsPolicyAgent/Runtime/CommandRunner.cs`**:
+- Added `InvocationExitCodeOverrides` dictionary to `NullCommandRunner`, keyed by
+  `(FileName, Arguments)` tuple. This takes precedence over the existing per-executable
+  `ExitCodeOverrides` when both match.  Allows tests to selectively make `which apt-get`
+  fail while `which zypper` succeeds — previously impossible since all `which` calls
+  share the same executable key.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`**:
+- `InstallPackage_ZypperBackend_CallsZypperInstall` — enforce mode, no version: confirms
+  `zypper install -y vim` is invoked and `apt-get`/`dnf` are not.
+- `InstallPackage_ZypperBackend_WithVersion_UsesEqualsSeparator` — enforce mode, with version:
+  confirms `zypper install -y vim=9.0.1-1` (zypper uses `=` for version pinning, same as apt).
+- `RemovePackage_ZypperBackend_CallsZypperRemove` — enforce mode: confirms
+  `zypper remove -y vim` when the package is DDS-managed.
+
+**`docs/DDS-Admin-Guide.md`**:
+- Capability table (§Linux Deployment): updated backend column to
+  `apt-get` / `dnf` / `zypper` (auto-detected)" and detection order to
+  "`apt-get` → `dnf` → `zypper` → `rpm`".
+- Architecture ASCII diagram: `apt-get/dnf` → `apt-get/dnf/zypper`.
+
+**Test results**: Linux .NET **227/227** (was 224/224; 3 new tests). macOS .NET 96/96.
+`cargo check --workspace` clean.
+
+---
+
 ## Fix (2026-05-05, 63rd pass) — PackageEnforcer: version-string argument injection + Design Document stale SystemdEnforcer notes
 
 ### Gaps

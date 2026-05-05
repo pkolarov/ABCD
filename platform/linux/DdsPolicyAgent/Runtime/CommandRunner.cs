@@ -51,11 +51,17 @@ public sealed class NullCommandRunner : ICommandRunner
     /// Per-command exit-code overrides keyed by executable name.
     public Dictionary<string, int> ExitCodeOverrides { get; } = new(StringComparer.Ordinal);
 
+    /// Per-invocation exit-code overrides keyed by (executable, arguments). Takes precedence
+    /// over <see cref="ExitCodeOverrides"/> when both match the same call.
+    public Dictionary<(string FileName, string Arguments), int> InvocationExitCodeOverrides { get; } = new();
+
     public Task<CommandResult> RunAsync(
         string fileName, string arguments, CancellationToken ct = default)
     {
         Invocations.Add((fileName, arguments));
-        var code = ExitCodeOverrides.TryGetValue(fileName, out var ov) ? ov : 0;
+        var code = InvocationExitCodeOverrides.TryGetValue((fileName, arguments), out var ov2) ? ov2
+                 : ExitCodeOverrides.TryGetValue(fileName, out var ov) ? ov
+                 : 0;
         return Task.FromResult(new CommandResult(code, string.Empty, string.Empty));
     }
 }

@@ -7,7 +7,7 @@ namespace DDS.PolicyAgent.Linux.Enforcers;
 
 /// Applies LinuxPackageDirective entries (install / remove) via the host package manager.
 ///
-/// Package manager detection order: dpkg (apt-get) → dnf → rpm.
+/// Package manager detection order: dpkg (apt-get) → dnf → zypper → rpm.
 /// Remove is refused for packages not in the `managedPackages` set (caller-supplied).
 public sealed class PackageEnforcer
 {
@@ -96,10 +96,11 @@ public sealed class PackageEnforcer
         var pm = await DetectPackageManagerAsync(ct).ConfigureAwait(false);
         var (cmd, args) = pm switch
         {
-            PackageManager.Apt => ("apt-get", $"install -y {spec}"),
-            PackageManager.Dnf => ("dnf", $"install -y {spec}"),
-            PackageManager.Rpm => ("rpm", $"-i {spec}"),
-            _                  => throw new InvalidOperationException("no supported package manager found"),
+            PackageManager.Apt    => ("apt-get", $"install -y {spec}"),
+            PackageManager.Dnf    => ("dnf",     $"install -y {spec}"),
+            PackageManager.Zypper => ("zypper",  $"install -y {spec}"),
+            PackageManager.Rpm    => ("rpm",     $"-i {spec}"),
+            _                     => throw new InvalidOperationException("no supported package manager found"),
         };
 
         var result = await _runner.RunAsync(cmd, args, ct).ConfigureAwait(false);
@@ -118,10 +119,11 @@ public sealed class PackageEnforcer
         var pm = await DetectPackageManagerAsync(ct).ConfigureAwait(false);
         var (cmd, args) = pm switch
         {
-            PackageManager.Apt => ("apt-get", $"remove -y {name}"),
-            PackageManager.Dnf => ("dnf", $"remove -y {name}"),
-            PackageManager.Rpm => ("rpm", $"-e {name}"),
-            _                  => throw new InvalidOperationException("no supported package manager found"),
+            PackageManager.Apt    => ("apt-get", $"remove -y {name}"),
+            PackageManager.Dnf    => ("dnf",     $"remove -y {name}"),
+            PackageManager.Zypper => ("zypper",  $"remove -y {name}"),
+            PackageManager.Rpm    => ("rpm",     $"-e {name}"),
+            _                     => throw new InvalidOperationException("no supported package manager found"),
         };
 
         var result = await _runner.RunAsync(cmd, args, ct).ConfigureAwait(false);
@@ -129,7 +131,7 @@ public sealed class PackageEnforcer
             _log.LogWarning("{Cmd} {Args} exited {Code}: {Err}", cmd, args, result.ExitCode, result.Stderr);
     }
 
-    private enum PackageManager { Apt, Dnf, Rpm, Unknown }
+    private enum PackageManager { Apt, Dnf, Zypper, Rpm, Unknown }
 
     private async Task<PackageManager> DetectPackageManagerAsync(CancellationToken ct)
     {
@@ -137,6 +139,10 @@ public sealed class PackageEnforcer
             return PackageManager.Apt;
         if ((await _runner.RunAsync("which", "dnf", ct).ConfigureAwait(false)).Success)
             return PackageManager.Dnf;
+        // zypper is detected before rpm because openSUSE hosts have both; zypper is the
+        // correct high-level frontend and handles dependency resolution correctly.
+        if ((await _runner.RunAsync("which", "zypper", ct).ConfigureAwait(false)).Success)
+            return PackageManager.Zypper;
         if ((await _runner.RunAsync("which", "rpm", ct).ConfigureAwait(false)).Success)
             return PackageManager.Rpm;
         return PackageManager.Unknown;
