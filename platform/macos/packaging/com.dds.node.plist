@@ -4,11 +4,17 @@
 <dict>
   <key>Label</key>
   <string>com.dds.node</string>
+  <!--
+    ProgramArguments points at a wrapper that:
+      1. tries to unseal DDS_NODE_PASSPHRASE from the System Keychain
+         (silent fall-through if no sealed passphrase is configured),
+      2. exports it,
+      3. exec's `dds-node run <config>`.
+    See platform/macos/packaging/SEALED-PASSPHRASE.md.
+  -->
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/dds-node</string>
-    <string>run</string>
-    <string>/Library/Application Support/DDS/dds.toml</string>
+    <string>/usr/local/sbin/dds-launchd-wrapper</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/Library/Application Support/DDS</string>

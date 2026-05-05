@@ -78,24 +78,22 @@ hosts without a TPM still boot, just with plaintext node keys.
   in boot using `/var/db/SystemKey` — well before any LaunchDaemon
   runs. So when the dds-node LaunchDaemon starts, the System Keychain
   is already unlocked. No `Wants=`/`After=`-equivalent ordering work.
-- **Service hook**: replace the LaunchDaemon's
-  `ProgramArguments` with a tiny shell wrapper:
-  ```sh
-  #!/bin/sh
-  pass="$(security find-generic-password -w -s 'DDS Node Passphrase' \
-            /Library/Keychains/System.keychain 2>/dev/null || true)"
-  [ -n "$pass" ] && export DDS_NODE_PASSPHRASE="$pass"
-  exec /usr/local/bin/dds-node run /Library/Application\ Support/DDS/dds.toml
-  ```
-  Seal helper:
-  ```sh
-  pass="$(openssl rand -base64 32 | tr -d '\n')"
-  security add-generic-password -A \
-      -s 'DDS Node Passphrase' -a "$(hostname)" -w "$pass" \
-      /Library/Keychains/System.keychain
-  printf '%s' "$pass"
-  ```
-  *Status: not yet implemented in this repo. Sketch only.*
+- **Service hook**: the LaunchDaemon's `ProgramArguments` invokes a
+  wrapper at `/usr/local/sbin/dds-launchd-wrapper` that calls the
+  unseal helper, exports `DDS_NODE_PASSPHRASE`, and `exec`s
+  `dds-node run`. Falls through cleanly when no sealed passphrase
+  exists.
+- **Helpers** (in
+  [`platform/macos/packaging/scripts/`](../platform/macos/packaging/scripts/)):
+  - `dds-keychain-seal.sh` — generates random passphrase, stores in
+    keychain, prints to stdout (refuses to overwrite an existing item)
+  - `dds-keychain-unseal.sh` — reads from keychain, prints to stdout
+  - `dds-launchd-wrapper.sh` — LaunchDaemon entrypoint; calls unseal
+    then `exec`s dds-node
+- **Runbook**:
+  [`platform/macos/packaging/SEALED-PASSPHRASE.md`](../platform/macos/packaging/SEALED-PASSPHRASE.md).
+  *Status: implemented; round-trip verified end-to-end (seal →
+  encrypted gen-node-key → reload → wrong-passphrase rejection).*
 
 ### Windows — DPAPI machine scope (TPM-backed transparently)
 
