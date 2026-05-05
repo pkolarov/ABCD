@@ -2166,10 +2166,13 @@ issues a self-signed admission cert, writes `/var/lib/dds/dds.toml`, and starts
 **Option B — Genesis (first node in a new domain):**
 
 ```bash
-sudo dds-node init-domain --name "example.org" --org-hash <hash> \
-  --passphrase-env DDS_DOMAIN_PASSPHRASE
+# Set DDS_DOMAIN_PASSPHRASE in the environment before running these commands
+# (omit it to store the domain key unencrypted — not recommended for production).
+sudo DDS_DOMAIN_PASSPHRASE="$DDS_DOMAIN_PASSPHRASE" \
+  dds-node init-domain --name "example.org" --dir /var/lib/dds/node
 sudo dds-node gen-node-key --data-dir /var/lib/dds/node
-sudo dds-node self-admit --data-dir /var/lib/dds/node
+sudo DDS_DOMAIN_PASSPHRASE="$DDS_DOMAIN_PASSPHRASE" \
+  dds-node self-admit --data-dir /var/lib/dds/node
 sudo cp platform/linux/packaging/config/node.anchor.toml /var/lib/dds/dds.toml
 # edit /var/lib/dds/dds.toml to fill in domain.name, domain.id, domain.pubkey
 sudo systemctl daemon-reload
@@ -2186,7 +2189,8 @@ dds-node gen-node-key --data-dir /var/lib/dds/node
 curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/node/info | jq '.peer_id'
 
 # On the admin machine (with admin key):
-dds node admit <peer_id> --cert-out admission.cbor
+dds-node admit --domain-key <DIR>/domain_key.bin --domain <DIR>/domain.toml \
+  --peer-id <peer_id> --kem-pubkey <kem_pubkey_hex> --out admission.cbor
 
 # Copy domain.toml + admission.cbor to the new node:
 sudo install -m 0600 admission.cbor /var/lib/dds/node/admission.cbor

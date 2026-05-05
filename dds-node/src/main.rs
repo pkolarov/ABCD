@@ -99,6 +99,14 @@
 //!   No-op on non-Windows: Unix path security is enforced via per-file
 //!   `0o600` / per-dir `0o700` modes set elsewhere (L-2/L-3/L-4/M-20).
 //!
+//! - `dds-node self-admit --data-dir <DIR> [--domain-key <FILE>] [--domain <FILE>] [--ttl-days <N>] [--force]`
+//!   Genesis convenience command. Issues a domain-signed admission cert for
+//!   *this* node without requiring a separate admin machine. The domain key
+//!   must be present in `<DIR>/domain_key.bin` (or the path given by
+//!   `--domain-key`). Run after `init-domain` and `gen-node-key` on the
+//!   anchor node. Refuses to overwrite an existing `admission.cbor` unless
+//!   `--force` is passed.
+//!
 //! - `dds-node run [config.toml]`
 //!   Default action. Loads config, verifies admission cert, runs the
 //!   P2P node.
@@ -156,6 +164,7 @@ async fn async_main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
     match sub {
         "init-domain" => cmd_init_domain(&args[1..]),
         "gen-node-key" => cmd_gen_node_key(&args[1..]),
+        "self-admit" => cmd_self_admit(&args[1..]),
         "rewrap-identity" => cmd_rewrap_identity(&args[1..]),
         "rotate-identity" => cmd_rotate_identity(&args[1..]),
         "gen-hmac-secret" => cmd_gen_hmac_secret(&args[1..]),
@@ -193,6 +202,7 @@ fn print_usage() {
         "Usage:
   dds-node init-domain --name <NAME> --dir <DIR> [--fido2 | --legacy]
   dds-node gen-node-key --data-dir <DIR>
+  dds-node self-admit --data-dir <DIR> [--domain-key <FILE>] [--domain <FILE>] [--ttl-days <N>] [--force]
   dds-node rewrap-identity --data-dir <DIR> [--no-backup]
   dds-node rotate-identity --data-dir <DIR> [--no-backup]
   dds-node gen-hmac-secret --out <FILE> [--force] [--keep-existing]
@@ -345,6 +355,110 @@ fn cmd_gen_node_key(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("Send the peer_id and kem_pubkey_hex to the domain admin to obtain an");
     println!("admission cert.  The admin should pass --kem-pubkey <HEX> to `admit`");
     println!("so that enc-v3 encrypted gossip is enabled immediately on first connect.");
+    Ok(())
+}
+
+/// Genesis convenience: issue a domain-signed admission cert for *this* node
+/// without a separate admin machine.  Designed for Option B (anchor genesis)
+/// where `init-domain` and `gen-node-key` have already been run in the same
+/// `--data-dir`.
+///
+/// The domain key is loaded from `<data_dir>/domain_key.bin` by default
+/// (override with `--domain-key`); the domain file from
+/// `<data_dir>/domain.toml` (override with `--domain`). The p2p keypair and
+/// epoch KEM keys must already exist (created by `gen-node-key`).
+///
+/// Refuses to overwrite an existing `admission.cbor` unless `--force` is
+/// passed, so accidental re-issuance on a running node is not destructive.
+fn cmd_self_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = PathBuf::from(require_flag(args, "--data-dir")?);
+    let domain_key_path = PathBuf::from(
+        flag(args, "--domain-key")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| data_dir.join("domain_key.bin").to_string_lossy().into_owned()),
+    );
+    let domain_path = PathBuf::from(
+        flag(args, "--domain")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| data_dir.join("domain.toml").to_string_lossy().into_owned()),
+    );
+    let ttl_days: Option<u64> = flag(args, "--ttl-days").map(|s| s.parse()).transpose()?;
+    let force = args.iter().any(|a| a == "--force");
+
+    // p2p keypair must already exist (created by gen-node-key).
+    let p2p_path = data_dir.join("p2p_key.bin");
+    if !p2p_path.exists() {
+        return Err(format!(
+            "p2p key not found: {} — run `gen-node-key --data-dir {}` first",
+            p2p_path.display(),
+            data_dir.display()
+        )
+        .into());
+    }
+    let p2p_kp = p2p_identity::load_or_create(&p2p_path)?;
+    let peer_id = libp2p::PeerId::from(p2p_kp.public());
+
+    // Hybrid KEM pubkey — present when gen-node-key ran on a hybrid domain.
+    let epoch_keys_path = data_dir.join("epoch_keys.cbor");
+    let kem_pubkey_bytes: Option<Vec<u8>> = if epoch_keys_path.exists() {
+        let mut rng = rand::thread_rng();
+        let epoch_keys =
+            dds_node::epoch_key_store::EpochKeyStore::load_or_create(&epoch_keys_path, &mut rng)
+                .map_err(|e| format!("epoch_keys: {e}"))?;
+        Some(epoch_keys.kem_public().to_bytes())
+    } else {
+        None
+    };
+
+    // Refuse to silently clobber an existing cert (the node may be live).
+    let out = data_dir.join("admission.cbor");
+    if out.exists() && !force {
+        return Err(format!(
+            "admission cert already exists at {} — pass --force to overwrite",
+            out.display()
+        )
+        .into());
+    }
+
+    let key = domain_store::load_domain_key(&domain_key_path)?;
+    let domain = domain_store::load_domain_file(&domain_path)?;
+    if key.id() != domain.id {
+        return Err("domain key does not match domain.toml id".into());
+    }
+
+    if kem_pubkey_bytes.is_none() && domain.pq_pubkey.is_some() {
+        eprintln!("WARNING: domain is hybrid but epoch_keys.cbor is missing.");
+        eprintln!(
+            "  Run `gen-node-key --data-dir {}` first to generate the KEM keypair.",
+            data_dir.display()
+        );
+        eprintln!("  Proceeding without kem_pubkey — enc-v3 encrypted gossip will be");
+        eprintln!("  unavailable until the admission cert is re-issued with a KEM pubkey.");
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let expires_at = ttl_days.map(|d| now + d * 86_400);
+    let cert =
+        key.issue_admission_with_kem(peer_id.to_string(), now, expires_at, kem_pubkey_bytes);
+    domain_store::save_admission_cert(&out, &cert)?;
+
+    println!("Self-admission cert issued:");
+    println!("  domain:     {} ({})", domain.name, domain.id);
+    println!("  peer_id:    {peer_id}");
+    println!("  issued_at:  {now}");
+    if let Some(exp) = expires_at {
+        println!("  expires:    {exp}");
+    } else {
+        println!("  expires:    never");
+    }
+    if cert.pq_kem_pubkey.is_some() {
+        println!("  kem_pubkey: set");
+    } else {
+        println!("  kem_pubkey: not set");
+    }
+    println!("  out:        {}", out.display());
     Ok(())
 }
 
