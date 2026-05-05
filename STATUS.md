@@ -1,5 +1,47 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 57th pass) — Admin Guide: add Linux Deployment section
+
+### Gap
+
+`docs/DDS-Admin-Guide.md` had deployment sections for Windows (`## Windows Deployment`,
+§1416) and macOS (`## macOS Deployment`, §1580), but **no Linux Deployment section**.
+The guide documented Linux policy management (§1084 "Linux Policy") and login/SSH
+integration (§1157 "Linux Login and SSH Integration"), but an operator landing on the
+guide had no equivalent of the Windows or macOS sections covering:
+
+- Component table (what processes run)
+- Architecture diagram (systemd → dds-node Unix socket → policy agent)
+- Installation (`.deb` package + manual build steps)
+- Node setup (provision, genesis, manual admission)
+- Policy agent setup (config fields, pinned pubkey, AuditOnly flag)
+- Data paths (`/var/lib/dds/`, `/etc/dds/`, `/var/log/dds/`, drop-in paths)
+- Policy enforcement capabilities table (7 enforcers, backends, notes)
+- Service management commands (systemctl, OpenRC)
+- Validating (dotnet test + distribution-specific runbooks)
+
+### Fix
+
+**`docs/DDS-Admin-Guide.md`** — inserted `## Linux Deployment` between
+`## macOS Deployment` and `## Monitoring and Diagnostics`, and updated the Table of
+Contents (item 16). The new section mirrors the structure of the Windows and macOS
+sections and references the existing distribution-specific runbooks
+(`platform/linux/e2e/UBUNTU.md`, `DEBIAN.md`, `ALPINE-UTM.md`) for smoke-test steps.
+
+All data (paths, config keys, enforcer backends, service names) verified against the
+live source files:
+- `platform/linux/packaging/systemd/dds-node.service`
+- `platform/linux/packaging/systemd/dds-policy-agent.service`
+- `platform/linux/packaging/config/node.anchor.toml`
+- `platform/linux/packaging/config/policy-agent.json`
+- `platform/linux/DdsPolicyAgent/Enforcers/*.cs`
+- `platform/linux/DdsPolicyAgent/Config/AgentConfig.cs`
+
+**Test results**: no code changes; all tests unchanged. Linux .NET 162/162, macOS .NET
+96/96, Rust 774 unit + 83 integration.
+
+---
+
 ## Fix (2026-05-05, 56th pass) — Feature matrix and metrics table corrections
 
 ### Gaps

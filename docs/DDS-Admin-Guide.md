@@ -23,12 +23,13 @@ For background on how DDS works internally, see the [Developer Guide](DDS-Develo
 13. [Policy Management](#policy-management)
 14. [Windows Deployment](#windows-deployment)
 15. [macOS Deployment](#macos-deployment)
-16. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
-17. [Audit Log](#audit-log)
-18. [Debugging](#debugging)
-19. [Air-Gapped Sync (USB Stick / Courier)](#air-gapped-sync-usb-stick--courier)
-20. [Security Reference](#security-reference)
-21. [Troubleshooting](#troubleshooting)
+16. [Linux Deployment](#linux-deployment)
+17. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
+18. [Audit Log](#audit-log)
+19. [Debugging](#debugging)
+20. [Air-Gapped Sync (USB Stick / Courier)](#air-gapped-sync-usb-stick--courier)
+21. [Security Reference](#security-reference)
+22. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -1875,6 +1876,284 @@ Run the .NET unit tests:
 ```bash
 dotnet test platform/macos/DdsPolicyAgent.Tests/DdsPolicyAgent.MacOS.Tests.csproj
 ```
+
+---
+
+## Linux Deployment
+
+### Components
+
+| Component | Type | Purpose |
+|---|---|---|
+| `dds-node` | Rust binary (systemd / OpenRC service) | P2P node + HTTP API + Unix domain socket |
+| DDS Linux Policy Agent | .NET self-contained binary (systemd service) | Enforces Linux policy (accounts, files, packages, sudoers, sysctl, sshd, systemd units) |
+| `dds` | Rust binary (CLI) | Admin and operator commands |
+| `dds-fido2-test` | Rust binary | Interactive FIDO2 enrollment + auth testing |
+
+### Architecture
+
+```
+systemd (Ubuntu/Debian/Fedora) or OpenRC (Alpine)
+  ├── dds-node.service
+  │     └── dds-node run /var/lib/dds/dds.toml
+  │           ├── HTTP 127.0.0.1:5551
+  │           └── Unix socket: /var/lib/dds/dds.sock (SO_PEERCRED gated)
+  └── dds-policy-agent.service
+        └── DdsPolicyAgent.Linux
+              └── polls GET /v1/linux/policies, /v1/linux/software
+              └── enforces via useradd/userdel, apt-get/dnf, visudo,
+                  sysctl --system, systemctl, sshd_config.d drop-ins
+              └── reports POST /v1/linux/applied
+```
+
+The API socket is a Unix domain socket at `/var/lib/dds/dds.sock` with mode `0750`
+(owner `root`, group `root`). Only processes running as root (or in the `dds` supplementary
+group if added) can connect. TCP `127.0.0.1:5551` is also available but disabled by
+default on production deployments (`trust_loopback_tcp_admin = false` in the anchor
+config).
+
+### Installation
+
+**Option A — Debian/Ubuntu `.deb` package (recommended):**
+
+Install build dependencies on the build machine:
+
+```bash
+sudo platform/linux/packaging/debian/install-build-deps-ubuntu.sh
+```
+
+Build artifacts and package:
+
+```bash
+export DDS_DEB_ARCH="$(dpkg --print-architecture)"
+case "$DDS_DEB_ARCH" in
+  arm64) export DDS_DOTNET_RID=linux-arm64 ;;
+  amd64) export DDS_DOTNET_RID=linux-x64 ;;
+esac
+
+cargo build -p dds-node -p dds-cli -p dds-fido2-test --release
+
+dotnet publish platform/linux/DdsPolicyAgent/DdsPolicyAgent.Linux.csproj \
+  -c Release -r "$DDS_DOTNET_RID" --self-contained true \
+  /p:UseAppHost=true \
+  -o "artifacts/linux-$DDS_DEB_ARCH/DdsPolicyAgent.Linux"
+
+platform/linux/packaging/debian/build-deb.sh \
+  --version 0.1.0 \
+  --arch "$DDS_DEB_ARCH" \
+  --node target/release/dds-node \
+  --cli target/release/dds \
+  --agent-dir "artifacts/linux-$DDS_DEB_ARCH/DdsPolicyAgent.Linux"
+```
+
+Install the package on the target host:
+
+```bash
+sudo apt install "./platform/linux/packaging/debian/dist/dds-linux_0.1.0_${DDS_DEB_ARCH}.deb"
+```
+
+The package installs all files and creates state directories but does **not** enable or
+start services until the node is provisioned.
+
+**Option B — Manual build from source:**
+
+```bash
+cargo build --release -p dds-node -p dds-cli -p dds-fido2-test
+dotnet publish platform/linux/DdsPolicyAgent/DdsPolicyAgent.Linux.csproj \
+  -c Release -r linux-arm64 --self-contained true -p:UseAppHost=true
+```
+
+Copy binaries to the target host:
+
+```bash
+install -m 0755 target/release/dds-node  /usr/local/bin/dds-node
+install -m 0755 target/release/dds       /usr/local/bin/dds
+install -p platform/linux/packaging/systemd/dds-node.service \
+          /etc/systemd/system/dds-node.service
+install -p platform/linux/packaging/systemd/dds-policy-agent.service \
+          /etc/systemd/system/dds-policy-agent.service
+```
+
+On **Alpine / OpenRC**:
+
+```sh
+install -p platform/linux/packaging/openrc/dds-node /etc/init.d/dds-node
+chmod +x /etc/init.d/dds-node
+```
+
+### Node Setup
+
+After installing, provision or bootstrap the node:
+
+**Option A — Single-file provisioning (recommended for member nodes):**
+
+Copy `provision.dds` from an existing node (macOS, Windows, or another Linux node), then:
+
+```bash
+sudo dds-node provision /path/to/provision.dds
+```
+
+This command decrypts the domain key (FIDO2 touch required), generates a node key,
+issues a self-signed admission cert, writes `/var/lib/dds/dds.toml`, and starts
+`dds-node.service` via `systemctl`.
+
+**Option B — Genesis (first node in a new domain):**
+
+```bash
+sudo dds-node init-domain --name "example.org" --org-hash <hash> \
+  --passphrase-env DDS_DOMAIN_PASSPHRASE
+sudo dds-node gen-node-key --data-dir /var/lib/dds/node
+sudo dds-node self-admit --data-dir /var/lib/dds/node
+sudo cp platform/linux/packaging/config/node.anchor.toml /var/lib/dds/dds.toml
+# edit /var/lib/dds/dds.toml to fill in domain.name, domain.id, domain.pubkey
+sudo systemctl daemon-reload
+sudo systemctl enable --now dds-node.service
+```
+
+**Option C — Manual admission cert for a member node:**
+
+```bash
+# On the member node:
+sudo mkdir -p /var/lib/dds/node
+dds-node gen-node-key --data-dir /var/lib/dds/node
+# Print peer_id:
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/node/info | jq '.peer_id'
+
+# On the admin machine (with admin key):
+dds node admit <peer_id> --cert-out admission.cbor
+
+# Copy domain.toml + admission.cbor to the new node:
+sudo install -m 0600 admission.cbor /var/lib/dds/node/admission.cbor
+sudo cp platform/linux/packaging/config/node.member.toml /var/lib/dds/dds.toml
+# edit /var/lib/dds/dds.toml: set bootstrap_peers to the anchor multiaddr
+sudo systemctl daemon-reload
+sudo systemctl enable --now dds-node.service
+```
+
+### Policy Agent Setup
+
+After `dds-node.service` is running and a device URN has been enrolled:
+
+```bash
+sudo cp platform/linux/packaging/config/policy-agent.json /etc/dds/policy-agent.json
+```
+
+Edit `/etc/dds/policy-agent.json` and fill in the two required fields:
+
+```json
+{
+  "DdsPolicyAgent": {
+    "DeviceUrn": "urn:vouchsafe:device:...",
+    "PinnedNodePubkeyB64": "<base64 ed25519 public key from /v1/node/info>",
+    "NodeBaseUrl": "unix:/var/lib/dds/dds.sock",
+    "PollIntervalSeconds": 60,
+    "StateDir": "/var/lib/dds/policy-agent",
+    "EnvelopeMaxClockSkewSeconds": 300,
+    "AuditOnly": true
+  }
+}
+```
+
+`PinnedNodePubkeyB64` can be read from the running node:
+
+```bash
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/node/info | jq -r '.node_pubkey_b64'
+```
+
+Set `AuditOnly: false` when you are ready for the agent to make real host changes.
+While `true`, the agent logs what it *would* do without touching any system state.
+
+Start the agent:
+
+```bash
+sudo systemctl enable --now dds-policy-agent.service
+```
+
+Settings can also be overridden via environment variables with the prefix
+`DdsPolicyAgent__` (e.g. `DdsPolicyAgent__AuditOnly=false`).
+
+### Data Paths (Linux)
+
+| Path | Purpose |
+|---|---|
+| `/usr/local/bin/dds-node` | Node binary |
+| `/usr/local/bin/dds` | CLI binary |
+| `/usr/local/lib/dds/DdsPolicyAgent.Linux/` | Policy agent binaries |
+| `/var/lib/dds/dds.toml` | Node configuration |
+| `/var/lib/dds/node/` | Node database, keys, admission cert (`node_key.bin`, `domain_key.bin`, `admission.cbor`) |
+| `/var/lib/dds/dds.sock` | Unix domain socket (API) |
+| `/var/lib/dds/policy-agent/` | Policy agent applied-state store |
+| `/etc/dds/policy-agent.json` | Policy agent configuration |
+| `/var/log/dds/` | dds-node logs (OpenRC) |
+| `journalctl -u dds-node.service` | dds-node logs (systemd) |
+| `journalctl -u dds-policy-agent.service` | Policy agent logs (systemd) |
+| `/etc/sysctl.d/60-dds-managed.conf` | DDS-managed kernel parameter drop-in |
+| `/etc/ssh/sshd_config.d/60-dds.conf` | DDS-managed sshd drop-in |
+| `/etc/sudoers.d/` | DDS-managed sudoers drop-ins |
+
+### Policy Enforcement Capabilities
+
+| Capability | Backend | Notes |
+|---|---|---|
+| Local users | `useradd`, `usermod`, `userdel`, `passwd` | Create, modify, disable, delete accounts. Stale DDS-managed accounts are locked (`passwd -l`) rather than deleted during reconciliation. |
+| Files and directories | `File.WriteAllBytes` / `File.Delete` | Managed file and directory state with SHA-256 idempotency. Only files previously written by the agent are eligible for deletion. |
+| Package installation | `apt-get` / `dnf` (auto-detected) | Install and remove packages. Detection order: `apt-get` → `dnf`. |
+| Sudoers drop-ins | `visudo -cf` + `/etc/sudoers.d/` | Validates each drop-in with `visudo` before writing; safe-delete on reconciliation. |
+| Kernel parameters | `sysctl --system` + `/etc/sysctl.d/60-dds-managed.conf` | Atomic drop-in write; keys not in any policy are pruned from the drop-in on reconciliation. |
+| SSH daemon config | `systemctl reload sshd` + `/etc/ssh/sshd_config.d/60-dds.conf` | Drop-in is removed when no policy declares an `ssh` field. Attempts `sshd` then `ssh` service name. |
+| systemd units | `systemctl enable/disable/start/stop/reload` + override drop-ins | Enable, disable, and manage unit state; drop-ins created under `/etc/systemd/system/<unit>.d/`. |
+
+### Service Management
+
+```bash
+# Check service status
+sudo systemctl status dds-node.service dds-policy-agent.service
+
+# Restart dds-node
+sudo systemctl restart dds-node.service
+
+# Restart policy agent
+sudo systemctl restart dds-policy-agent.service
+
+# Stop services
+sudo systemctl stop dds-node.service dds-policy-agent.service
+
+# View logs (systemd)
+journalctl -u dds-node.service -n 100 --no-pager
+journalctl -u dds-policy-agent.service -n 100 --no-pager
+
+# Check node API via Unix socket
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/readyz
+curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/status | jq
+```
+
+On **Alpine / OpenRC**:
+
+```sh
+sudo rc-service dds-node status
+sudo rc-service dds-node restart
+tail -f /var/log/dds/dds-node.err
+```
+
+### Validating
+
+Run the .NET unit tests:
+
+```bash
+dotnet test platform/linux/DdsPolicyAgent.Tests/DdsPolicyAgent.Linux.Tests.csproj
+```
+
+For a single-host smoke test, follow the steps in
+[platform/linux/e2e/README.md](../platform/linux/e2e/README.md). The test covers:
+node start, Unix socket availability, `/readyz` and `/v1/status` health, peer-ID
+stability across restarts, and policy agent `GET /v1/linux/policies` + `POST /v1/linux/applied`
+round-trip.
+
+Distribution-specific runbooks:
+
+- Ubuntu 24.04 LTS: [platform/linux/e2e/UBUNTU.md](../platform/linux/e2e/UBUNTU.md)
+- Debian 12: [platform/linux/e2e/DEBIAN.md](../platform/linux/e2e/DEBIAN.md)
+- Alpine 3.20 (UTM): [platform/linux/e2e/ALPINE-UTM.md](../platform/linux/e2e/ALPINE-UTM.md)
 
 ---
 
