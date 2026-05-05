@@ -1,5 +1,36 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 54th pass) — gossip convergence test flakiness + Developer Guide LinuxPolicyDocument gap
+
+### Changes
+
+**`dds-node/tests/http_binary_e2e.rs`** — `binary_nodes_converge_on_gossip_and_revocation`:
+- Removed the single up-front `publish_operation` call before the convergence loop.
+  `publish_gossip_op` silently returns `Ok(())` on `InsufficientPeers`, so a single
+  publish before the gossipsub mesh is fully established (admission complete but
+  SUBSCRIBE exchange not yet landed) was silently dropped, causing the test to time out
+  waiting for node B to converge. This is the same race fixed in commit 73475e2 for the
+  macOS e2e `publish_fixture`.
+- Moved `publish_operation(alice_attest)` + `publish_operation(alice_vouch)` inside
+  the gossip-convergence wait loop — republishing on every 250 ms iteration until node B
+  reports `trust_graph_tokens >= 2`. Nodes deduplicate by JTI so re-publishing is safe.
+- Applied the same pattern to the revocation-convergence loop: `publish_revocation(revoke)`
+  is now called at the top of each iteration rather than once before the loop.
+
+**`docs/DDS-Developer-Guide.md`** — Chapter 7 (Domain Documents):
+- Added a `LinuxPolicyDocument` section after `MacOsPolicyDocument`. The guide
+  documented `WindowsPolicyDocument` and `MacOsPolicyDocument` with struct layouts but
+  omitted Linux entirely. Added struct definitions for `LinuxPolicyDocument` and
+  `LinuxSettings` (showing all seven `LinuxSettings` sub-fields: `local_users`,
+  `sudoers`, `files`, `systemd`, `packages`, `sysctl`, `ssh`), a note on the `DdsPolicyAgent`
+  enforcer model, and the "all-invalid == absent" sshd drop-in lifecycle behavior
+  from the 53rd pass.
+
+**Test results**: all `cargo test --workspace` green (2/2 `http_binary_e2e`, all others
+unchanged). Linux .NET 162/162, macOS .NET 96/96.
+
+---
+
 ## Fix (2026-05-05, 53rd pass) — sshd reconciliation bypass for all-invalid ssh objects
 
 ### Gap

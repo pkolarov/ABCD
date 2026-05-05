@@ -738,14 +738,15 @@ async fn binary_nodes_converge_on_gossip_and_revocation() {
 
     // Publish alice's attestation + vouch via gossip from node A.
     let publisher = Publisher::spawn(&domain_key, &node_a.fixture);
-    sleep(Duration::from_secs(3)).await;
-    publisher.publish_operation(alice_attest);
-    publisher.publish_operation(alice_vouch.clone());
 
-    // Verify convergence: both nodes should see 2 trust graph tokens
-    // once gossip propagates.
+    // Verify convergence: republish on every iteration to guard against
+    // gossipsub InsufficientPeers races — publish_gossip_op returns Ok(())
+    // silently on InsufficientPeers, so a single publish before the mesh
+    // forms is lost. Nodes deduplicate by JTI so re-publishing is safe.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
+        publisher.publish_operation(alice_attest.clone());
+        publisher.publish_operation(alice_vouch.clone());
         let status_b = wait_for_status(&client, &node_b.fixture.api_url).await;
         if status_b.trust_graph_tokens >= 2 {
             break;
@@ -764,12 +765,13 @@ async fn binary_nodes_converge_on_gossip_and_revocation() {
     assert!(status_b.trust_graph_tokens >= 2);
 
     // Revoke alice's vouch and verify convergence — both nodes should
-    // process the revocation.
+    // process the revocation. Republish on every iteration for the same
+    // InsufficientPeers reason; revocations are idempotent by JTI.
     let revoke = make_revoke(&root, &alice_vouch.payload.jti, "revoke-alice-cluster-e2e");
-    publisher.publish_revocation(revoke);
 
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
+        publisher.publish_revocation(revoke.clone());
         let status_a = wait_for_status(&client, &node_a.fixture.api_url).await;
         let status_b = wait_for_status(&client, &node_b.fixture.api_url).await;
         if status_a.store_revoked >= 1 && status_b.store_revoked >= 1 {

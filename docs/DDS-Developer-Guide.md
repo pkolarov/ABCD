@@ -677,6 +677,40 @@ pub struct SoftwareAssignment {
 local-account directives for standalone Macs, launchd jobs, and configuration
 profiles.
 
+**`LinuxPolicyDocument`** — carries managed Linux device policy. The
+`linux` field (added in L-2) holds strongly-typed directives; the
+`settings` escape-hatch remains available for directives not yet
+promoted to first-class fields:
+
+```rust
+pub struct LinuxPolicyDocument {
+    pub policy_id: String,
+    pub display_name: String,
+    pub version: u64,                      // monotonically increasing
+    pub scope: PolicyScope,                // device tags, org units, or URNs
+    pub settings: Vec<PolicySetting>,      // free-form escape hatch
+    pub enforcement: Enforcement,
+    pub linux: Option<LinuxSettings>,      // strongly-typed directives (L-2)
+}
+
+pub struct LinuxSettings {
+    pub local_users: Vec<LinuxUserDirective>,   // create/delete/modify accounts
+    pub sudoers: Vec<LinuxSudoersDirective>,    // drop-ins under /etc/sudoers.d/
+    pub files: Vec<LinuxFileDirective>,         // managed file/directory state
+    pub systemd: Vec<LinuxSystemdDirective>,    // unit enable/disable/dropin
+    pub packages: Vec<LinuxPackageDirective>,   // install/remove packages
+    pub sysctl: Vec<SysctlDirective>,           // /etc/sysctl.d/60-dds-managed.conf
+    pub ssh: Option<SshdPolicy>,                // /etc/ssh/sshd_config.d/60-dds.conf
+}
+```
+
+The `DdsPolicyAgent` on each managed Linux host polls for new
+`LinuxPolicyDocument` tokens and applies them via per-subsystem
+enforcers (`SshdEnforcer`, `SysctlEnforcer`, `SudoersEnforcer`,
+`SystemdEnforcer`). An `ssh` object with no recognized or valid fields
+is treated identically to an absent `ssh` field — the DDS-managed drop-in
+is removed rather than left in a stale state.
+
 **`MacAccountBindingDocument`** — binds a DDS subject on a specific device to
 the macOS local account that hosts their home folder and session.
 
