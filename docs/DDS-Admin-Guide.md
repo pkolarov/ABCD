@@ -1101,11 +1101,42 @@ The `LinuxSettings` bundle supports seven directive types:
 |---|---|---|---|
 | `local_users` | `[LinuxUserDirective]` | `UserEnforcer` | Create, delete, lock, unlock, or modify local POSIX accounts |
 | `sudoers` | `[LinuxSudoersDirective]` | `SudoersEnforcer` | Write drop-in files under `/etc/sudoers.d/` |
-| `files` | `[LinuxFileDirective]` | `FileEnforcer` | Atomically write or delete files at allowlisted paths |
+| `files` | `[LinuxFileDirective]` | `FileEnforcer` | Atomically write or delete files, or ensure directories exist, at allowlisted paths |
 | `systemd` | `[LinuxSystemdDirective]` | `SystemdEnforcer` | Enable, disable, start, stop, restart, mask, or unmask systemd units; write or remove override drop-in files |
 | `packages` | `[LinuxPackageDirective]` | `PackageEnforcer` | Install or remove distro packages via `apt`/`dnf`/`zypper` |
 | `sysctl` | `[SysctlDirective]` | `SysctlEnforcer` | Persist kernel parameters to `/etc/sysctl.d/60-dds-managed.conf` |
 | `ssh` | `Option<SshdPolicy>` | `SshdEnforcer` | Write an SSH daemon drop-in at `/etc/ssh/sshd_config.d/60-dds.conf` |
+
+**`files` directive example:**
+
+```json
+{
+  "linux": {
+    "files": [
+      {
+        "path":           "/etc/dds/motd.txt",
+        "action":         "Set",
+        "content_b64":    "<base64-encoded file content>",
+        "content_sha256": "<lowercase hex SHA-256 of the raw bytes>",
+        "owner":          "root:root",
+        "mode":           "0644"
+      },
+      {
+        "path":   "/etc/dds/banner.txt",
+        "action": "Delete"
+      },
+      {
+        "path":  "/etc/dds/conf.d",
+        "action": "EnsureDir",
+        "owner": "root:dds",
+        "mode":  "0750"
+      }
+    ]
+  }
+}
+```
+
+Valid `action` values: `Set`, `Delete`, `EnsureDir`. `Set` atomically writes the file (temp-file + rename); `Delete` removes a file — only files previously written by DDS are eligible (tracked in the applied-state store); `EnsureDir` creates the directory if it does not exist and applies `owner`/`mode`. The `owner` field accepts `"user"` or `"user:group"` in POSIX name characters (`[a-zA-Z0-9_.-]`, ≤ 32 chars each). The `mode` field accepts 3–4 octal digits (`"644"` or `"0644"`). Content integrity is verified via `content_sha256` (lowercase hex SHA-256 of the raw decoded bytes) before any write is attempted.
 
 **`sysctl` directive example:**
 

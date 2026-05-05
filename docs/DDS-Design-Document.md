@@ -1483,12 +1483,11 @@ LinuxPolicyDocument
     │   └── content_sha256: Option<String>
     ├── files: [LinuxFileDirective]
     │   ├── path: String              # allowlisted paths only
-    │   ├── owner: Option<String>
-    │   ├── group: Option<String>
-    │   ├── mode: Option<String>      # e.g. "0644"
+    │   ├── owner: Option<String>     # "user" or "user:group" (POSIX names only, ≤32 chars each)
+    │   ├── mode: Option<String>      # 3–4 octal digits, e.g. "0644" or "644"
     │   ├── content_b64: Option<String>
     │   ├── content_sha256: Option<String>
-    │   └── action: LinuxFileAction   # Set | Delete
+    │   └── action: LinuxFileAction   # Set | Delete | EnsureDir
     ├── systemd: [LinuxSystemdDirective]
     │   ├── unit: String              # unit name, e.g. "sshd.service"
     │   ├── action: SystemdAction     # Enable | Disable | Start | Stop | Restart | Mask | Unmask | ConfigureDropin | RemoveDropin

@@ -1,5 +1,61 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 60th pass) — FileEnforcer: EnsureDir test coverage + doc alignment
+
+### Gap
+
+`LinuxFileAction` in `dds-domain/src/types.rs` and `FileEnforcer.cs` support
+three actions — `Set`, `Delete`, and `EnsureDir` — but the Design Document
+struct tree for `LinuxFileDirective` listed only `Set | Delete` in the
+`LinuxFileAction` comment. At the same time, the struct tree showed a
+separate `group: Option<String>` field that does not exist in the Rust
+struct (ownership is expressed as a single `owner` field accepting
+`"user"` or `"user:group"` format).
+
+The Admin Guide's `files` directive table entry described the enforcer as
+"write or delete files" without mentioning `EnsureDir`, and there was no
+worked example for the `files` directive (unlike `sysctl`, `ssh`, and
+`systemd` which all had examples).
+
+The `EnsureDir` code path in `FileEnforcer.cs` — added in pass 39 — had
+no unit test coverage at all: the four owner/mode validation paths and the
+audit-mode path were untested.
+
+### Fix
+
+**`docs/DDS-Design-Document.md`** §14.6.1:
+- Removed the spurious `group: Option<String>` field from the
+  `LinuxFileDirective` struct tree.
+- Added a comment to `owner` clarifying it accepts `"user"` or `"user:group"`
+  format (POSIX names only, ≤ 32 chars each).
+- Updated the `LinuxFileAction` comment from `# Set | Delete` to
+  `# Set | Delete | EnsureDir`.
+- Updated the `mode` comment to accurately describe the constraint:
+  3–4 octal digits.
+
+**`docs/DDS-Admin-Guide.md`**:
+- Updated the `files` row in the Linux directive table to mention
+  `EnsureDir` alongside write and delete.
+- Added a **`files` directive example** with `Set`, `Delete`, and
+  `EnsureDir` actions, showing all supported fields (`owner`, `mode`,
+  `content_b64`, `content_sha256`) with inline documentation for each.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`**:
+- Added `EnsureDir_AuditOnly_NoRunnerCall` Fact: audit mode emits tag
+  without touching the filesystem.
+- Added `EnsureDir_EnforceMode_CallsChownAndChmod` Fact: enforce mode
+  invokes `chown` and `chmod` when valid owner and mode are provided.
+- Added `EnsureDir_EnforceMode_UnsafeOwner_SkipsChown` Fact: an unsafe
+  `owner` value (containing a space) causes `chown` to be skipped while
+  `chmod` still runs.
+- Added `EnsureDir_EnforceMode_UnsafeMode_SkipsChmod` Fact: an unsafe
+  `mode` value causes `chmod` to be skipped while `chown` still runs.
+
+**Test results**: Linux .NET **201/201** (was 197/197; 4 new tests).
+macOS .NET 96/96. Rust dds-domain 131 passing. `cargo check --workspace` clean.
+
+---
+
 ## Fix (2026-05-05, 59th pass) — SystemdEnforcer: Mask/Unmask + doc/struct alignment
 
 ### Gap

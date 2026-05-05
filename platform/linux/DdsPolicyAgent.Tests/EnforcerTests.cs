@@ -346,6 +346,78 @@ public sealed class FileEnforcerTests
         Assert.Single(applied);  // file:set was recorded
         Assert.DoesNotContain(runner.Invocations, i => i.FileName == "chmod");
     }
+
+    [Fact]
+    public async Task EnsureDir_AuditOnly_NoRunnerCall()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"path":"/etc/dds/conf.d","action":"EnsureDir","owner":"root","mode":"0750"}""")
+                .RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("file:ensuredir:/etc/dds/conf.d", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task EnsureDir_EnforceMode_CallsChownAndChmod()
+    {
+        // Use /tmp which is guaranteed to exist so Directory.CreateDirectory is a no-op.
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"path":"/tmp","action":"EnsureDir","owner":"root:root","mode":"0755"}""")
+                .RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("file:ensuredir:/tmp", applied[0]);
+        Assert.Contains(runner.Invocations, i => i.FileName == "chown");
+        Assert.Contains(runner.Invocations, i => i.FileName == "chmod");
+    }
+
+    [Fact]
+    public async Task EnsureDir_EnforceMode_UnsafeOwner_SkipsChown()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"path":"/tmp","action":"EnsureDir","owner":"nobody /etc/shadow","mode":"0750"}""")
+                .RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Single(applied);
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "chown");
+        // chmod still runs because mode is safe
+        Assert.Contains(runner.Invocations, i => i.FileName == "chmod");
+    }
+
+    [Fact]
+    public async Task EnsureDir_EnforceMode_UnsafeMode_SkipsChmod()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"path":"/tmp","action":"EnsureDir","owner":"root","mode":"777 /etc/shadow"}""")
+                .RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Single(applied);
+        // chown still runs because owner is safe
+        Assert.Contains(runner.Invocations, i => i.FileName == "chown");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "chmod");
+    }
 }
 
 // ============================================================
