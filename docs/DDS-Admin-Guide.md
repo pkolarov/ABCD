@@ -96,35 +96,91 @@ With FIDO2 protection, every admission signing operation requires a physical tou
 
 ### Hybrid (Post-Quantum) Genesis
 
-For protection against the Harvest-Now-Decrypt-Later threat on the H-12 admission handshake, opt the new domain into the Z-1 Phase A hybrid (Ed25519 + ML-DSA-65 / FIPS 204) signing scheme:
+Hybrid (Ed25519 + ML-DSA-65 / FIPS 204) is the **default** for all new domains. No extra flag is needed — the basic `init-domain` command already produces a hybrid domain:
 
 ```bash
 export DDS_DOMAIN_PASSPHRASE="strong-passphrase-here"
-dds-node init-domain --name acme.com --dir ./acme --hybrid
+dds-node init-domain --name acme.com --dir ./acme
 ```
 
-A `--hybrid` domain advertises a `pq_pubkey` (1,952 B ML-DSA-65 public) in `domain.toml` and every `AdmissionCert` / `AdmissionRevocation` minted under it carries a 3,309 B `pq_signature` alongside the Ed25519 one. Sibling nodes refuse any cert or revocation that lacks the PQ component once the domain is hybrid, and the on-disk `domain_key.bin` switches to format **v4** (plain hybrid) or **v5** (encrypted hybrid — `DDS_DOMAIN_PASSPHRASE` set) so the PQ secret survives a save/load round-trip.
+The output confirms the hybrid scheme:
 
-> **Mutually exclusive with `--fido2`** — v3 (FIDO2-protected) is Ed25519-only today; v6 hybrid+FIDO2 is a future Phase A-3 follow-up.
+```
+Domain created:
+  name:        acme.com
+  id:          dds-dom:XXXXX
+  pubkey:      aabb...
+  pq_pubkey:   ccdd... (1952 bytes ML-DSA-65)
+  domain.toml: acme/domain.toml (share with siblings)
+  domain_key:  acme/domain_key.bin (keep secret)
+  scheme:      v2 hybrid (Ed25519 + ML-DSA-65) — Z-1 Phase A admission cert path (default)
+```
+
+A hybrid domain advertises a `pq_pubkey` (1,952 B ML-DSA-65 public) in `domain.toml` and every `AdmissionCert` / `AdmissionRevocation` minted under it carries a 3,309 B `pq_signature` alongside the Ed25519 one. Sibling nodes refuse any cert or revocation that lacks the PQ component once the domain is hybrid, and the on-disk `domain_key.bin` uses format **v4** (plain) or **v5** (encrypted — `DDS_DOMAIN_PASSPHRASE` set) so the PQ secret survives a save/load round-trip.
+
+> **Legacy (Ed25519-only) mode** — pass `--legacy` only for benchmark or regression-test fixtures that explicitly need the old v1/v2 path. Production deployments should never use `--legacy`.
+
+> **`--fido2` is mutually exclusive with `--legacy`** — v3 (FIDO2-protected) is Ed25519-only today; v6 hybrid+FIDO2 is a future Phase A-3 follow-up.
 
 ### What Happens at Genesis
 
-1. An Ed25519 keypair is generated for the domain (`--hybrid` also generates an ML-DSA-65 keypair alongside)
-2. A `DomainId` is derived: `dds-dom:<base32-sha256-of-public-key>` (the Ed25519 component still defines `DomainId`, so a fleet rotating from v1 to v2 keeps the same ID)
-3. The public half is written to `domain.toml` (with `pq_pubkey` populated under `--hybrid`)
+1. An Ed25519 keypair is generated for the domain (and an ML-DSA-65 keypair is generated alongside it by default)
+2. A `DomainId` is derived: `dds-dom:<base32-sha256-of-public-key>` (the Ed25519 component defines `DomainId`, so a fleet upgrading from legacy to hybrid keeps the same ID)
+3. The public half is written to `domain.toml` (with `pq_pubkey` populated in the default hybrid mode)
 4. The secret half is encrypted and written to `domain_key.bin`
 
-The on-disk format depends on the protection mode:
+The on-disk format depends on the protection mode and passphrase:
 
 | Format | Mode | Notes |
 |---|---|---|
-| **v1** | plain Ed25519 | `DDS_DOMAIN_PASSPHRASE` unset, no flags |
-| **v2** | encrypted Ed25519 | `DDS_DOMAIN_PASSPHRASE` set, no flags |
+| **v1** | plain Ed25519 | `--legacy`, `DDS_DOMAIN_PASSPHRASE` unset — tests/benchmarks only |
+| **v2** | encrypted Ed25519 | `--legacy`, `DDS_DOMAIN_PASSPHRASE` set — tests/benchmarks only |
 | **v3** | FIDO2-encrypted Ed25519 | `--fido2` |
-| **v4** | plain hybrid (Ed25519 + ML-DSA-65) | `--hybrid`, `DDS_DOMAIN_PASSPHRASE` unset |
-| **v5** | encrypted hybrid | `--hybrid`, `DDS_DOMAIN_PASSPHRASE` set |
+| **v4** | plain hybrid (Ed25519 + ML-DSA-65) | default, `DDS_DOMAIN_PASSPHRASE` unset |
+| **v5** | encrypted hybrid | default, `DDS_DOMAIN_PASSPHRASE` set |
 
 The domain ID is baked into all libp2p protocol strings, so every node in the domain must share this identity.
+
+### Completing Genesis on the Anchor Node
+
+After `init-domain` creates the domain key files, the anchor node needs its own libp2p keypair and an admission certificate signed by that domain key. Run these two commands on the same machine where you ran `init-domain`:
+
+```bash
+# Generate the node's persistent libp2p keypair.
+# Prints the PeerId and kem_pubkey_hex (used for enc-v3 gossip).
+dds-node gen-node-key --data-dir ./acme
+
+# Issue a domain-signed admission cert for this node.
+# Uses the domain key and p2p keypair already in ./acme.
+export DDS_DOMAIN_PASSPHRASE="strong-passphrase-here"
+dds-node self-admit --data-dir ./acme
+```
+
+`self-admit` options:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--data-dir <DIR>` | required | Directory containing `p2p_key.bin`, `domain_key.bin`, `domain.toml`, and where `admission.cbor` will be written |
+| `--domain-key <FILE>` | `<data-dir>/domain_key.bin` | Override path to the domain secret key |
+| `--domain <FILE>` | `<data-dir>/domain.toml` | Override path to the domain public identity |
+| `--ttl-days <N>` | never expires | Embed an expiry timestamp (`now + N * 86400` seconds) in the cert |
+| `--force` | false | Overwrite an existing `admission.cbor`; fails without this flag if the file is present |
+
+Sample output:
+
+```
+Self-admission cert issued:
+  domain:     acme.com (dds-dom:XXXXX)
+  peer_id:    12D3KooWAbCdEf...
+  issued_at:  1714086000
+  expires:    never
+  kem_pubkey: set
+  out:        acme/admission.cbor
+```
+
+The resulting `admission.cbor` proves to every peer that this node's `PeerId` was admitted to the domain by the domain key — the same trust anchor used for all other nodes. Unlike `admit` (which requires the admin to be on a separate machine), `self-admit` is only appropriate for the anchor node during genesis, when the domain key and the node key legitimately share one machine.
+
+> **If you regenerate the domain key after `self-admit`**, the existing `admission.cbor` will no longer verify — run `self-admit --force` again with the new domain key. If you rotate the node's libp2p keypair later (`rotate-identity`), you must use `admit` from the admin machine to issue a new cert for the new PeerId; `self-admit` is a genesis-only convenience.
 
 ---
 
@@ -2860,7 +2916,7 @@ optimisation.
 
 DDS is **quantum-resistant by default** for application-layer signatures. All non-FIDO2 identities use hybrid Ed25519 + ML-DSA-65 (FIPS 204) signatures, and both the classical and post-quantum component must verify for a token to be valid.
 
-Domain trust roots inherit the same hybrid scheme **opt-in** via `init-domain --hybrid` (Z-1 Phase A): a `--hybrid` domain mints `AdmissionCert` and `AdmissionRevocation` records that carry a PQ signature alongside the Ed25519 one, and sibling nodes reject any cert or revocation lacking the PQ component once the domain advertises a `pq_pubkey`. A v1 (Ed25519-only) domain keeps verifying as before. The libp2p Noise XX handshake and QUIC TLS keyshare remain classical pending Phase B (per-message hybrid-KEM envelope on gossip + sync) and Phase C (upstream hybrid Noise via `rust-libp2p` `rs/9595`).
+Domain trust roots use the same hybrid scheme **by default** (Z-1 Phase A): `init-domain` without flags produces a hybrid domain that mints `AdmissionCert` and `AdmissionRevocation` records carrying a PQ signature alongside the Ed25519 one. Sibling nodes reject any cert or revocation lacking the PQ component once the domain advertises a `pq_pubkey`. A legacy (`--legacy`) domain keeps verifying with Ed25519 only. The libp2p Noise XX handshake and QUIC TLS keyshare remain classical pending Phase B (per-message hybrid-KEM envelope on gossip + sync) and Phase C (upstream hybrid Noise via `rust-libp2p` `rs/9595`).
 
 FIDO2 leaf identities use classical Ed25519 or ECDSA-P256 due to hardware limitations. Quantum resistance flows through the vouch chain from hybrid trust roots.
 

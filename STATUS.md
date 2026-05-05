@@ -1,5 +1,63 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 68th pass) — docs: fix stale `--hybrid` flag refs; add genesis ceremony and `self-admit` section to Admin Guide
+
+### Gaps
+
+**Gap 1 — `docs/DDS-Admin-Guide.md` "Hybrid (Post-Quantum) Genesis" showed `--hybrid` as a CLI flag**
+
+The section contained:
+```bash
+dds-node init-domain --name acme.com --dir ./acme --hybrid
+```
+The code (`cmd_init_domain`) does not accept `--hybrid` — hybrid (Ed25519 + ML-DSA-65) is the
+**default** since the 67th pass. The correct flags are `--fido2` (opt into FIDO2-protected Ed25519)
+and `--legacy` (opt into legacy Ed25519-only mode, tests/benchmarks only). An operator following the
+guide and passing `--hybrid` would get an `Unknown flag: --hybrid` error.
+
+**Gap 2 — Format table listed `--hybrid` as the trigger for v4/v5 on-disk formats**
+
+The table rows for v1/v2 said `DDS_DOMAIN_PASSPHRASE` unset/set, "no flags" — implying they are
+the default. The rows for v4/v5 said `--hybrid`, `DDS_DOMAIN_PASSPHRASE` unset/set — implying
+hybrid is opt-in. This was the reverse of reality.
+
+**Gap 3 — Security Reference section still said `init-domain --hybrid` (opt-in framing)**
+
+`docs/DDS-Admin-Guide.md` §Cryptography: "Domain trust roots inherit the same hybrid scheme
+**opt-in** via `init-domain --hybrid` (Z-1 Phase A)…" — stale framing from before hybrid became
+the default.
+
+**Gap 4 — No documentation for the `self-admit` subcommand and completing genesis on the anchor node**
+
+The "Creating a Domain" section documented `init-domain` but stopped there. A reader following the
+guide had no single-source reference for the two commands needed to set up the anchor node's own
+identity after creating the domain:
+1. `dds-node gen-node-key --data-dir <dir>` — generate the p2p keypair
+2. `dds-node self-admit --data-dir <dir>` — issue the admission cert signed by the domain key
+
+The command was only mentioned in two deeply-nested platform-specific contexts (macOS bootstrap
+script step description, Linux Option B snippet). The flags (`--domain-key`, `--domain`,
+`--ttl-days`, `--force`) had no reference anywhere in the guide.
+
+### Fix
+
+**`docs/DDS-Admin-Guide.md`**:
+- **"Hybrid (Post-Quantum) Genesis"**: removed `--hybrid` from the example command; rewrote the
+  intro to say hybrid is the default; changed `A --hybrid domain advertises…` to neutral phrasing;
+  updated the note to document `--legacy` as the opt-out instead of `--hybrid` as the opt-in.
+- **"What Happens at Genesis" format table**: v1/v2 rows now show `--legacy`, `DDS_DOMAIN_PASSPHRASE`
+  unset/set — tests/benchmarks only; v4/v5 rows now show `default` instead of `--hybrid`.
+- **"What Happens at Genesis" step 1**: `(--hybrid also generates…)` → `(…by default)`.
+- **New section "Completing Genesis on the Anchor Node"** (after "What Happens at Genesis"): shows
+  `gen-node-key` + `self-admit`, full flag reference table for `self-admit`, sample output, and an
+  explanatory note on when `self-admit` is appropriate vs `admit`.
+- **§Cryptography**: replaced `opt-in via init-domain --hybrid` with `by default` phrasing.
+
+**Test results**: no code changes; all tests unchanged.
+`self-admit` CLI integration tests (6/6) pass. `cargo check --workspace` clean.
+
+---
+
 ## Fix (2026-05-05, 67th pass) — docs: fix stale `rotate-identity` / `scripts/` references; add `rewrap-identity` to Admin Guide
 
 ### Gaps
