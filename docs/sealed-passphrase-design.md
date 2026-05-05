@@ -84,7 +84,7 @@ hosts without a TPM still boot, just with plaintext node keys.
   `dds-node run`. Falls through cleanly when no sealed passphrase
   exists.
 - **Helpers** (in
-  [`platform/macos/packaging/scripts/`](../platform/macos/packaging/scripts/)):
+  [`platform/macos/packaging/helpers/`](../platform/macos/packaging/helpers/)):
   - `dds-keychain-seal.sh` — generates random passphrase, stores in
     keychain, prints to stdout (refuses to overwrite an existing item)
   - `dds-keychain-unseal.sh` — reads from keychain, prints to stdout
@@ -141,8 +141,10 @@ hosts without a TPM still boot, just with plaintext node keys.
 
 For an **already-provisioned** node (keys already plaintext on disk),
 seal first, then re-encrypt by setting `DDS_NODE_PASSPHRASE` and
-running `dds-node rotate-identity --data-dir <dir>` — that triggers a
-re-save with the new wrap. Document this in the runbook.
+running `dds-node rewrap-identity --data-dir <dir>` — that re-saves
+the existing keys under the new wrap **without** changing the Ed25519
+signing key or libp2p PeerId (the admission cert remains valid). See
+the per-platform runbooks for the full procedure.
 
 ## Boot-ordering summary
 

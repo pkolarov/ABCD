@@ -35,8 +35,9 @@ The helper scripts (`/usr/local/sbin/dds-tpm-seal` and
 #    passphrase on stdout — capture it, don't echo it.
 pass="$(sudo /usr/local/sbin/dds-tpm-seal /var/lib/dds/node)"
 
-# 2. Provision (or rotate-identity) with that passphrase set, so
-#    node_key.bin and p2p_key.bin are written encrypted.
+# 2. Provision with that passphrase set, so node_key.bin and
+#    p2p_key.bin are written encrypted from the start. (For existing
+#    already-provisioned hosts use rewrap-identity instead — see below.)
 sudo env DDS_NODE_PASSPHRASE="$pass" \
     /usr/local/bin/dds-node provision /path/to/provision.dds \
     --data-dir /var/lib/dds/node --no-start

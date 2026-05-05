@@ -1,5 +1,67 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 67th pass) — docs: fix stale `rotate-identity` / `scripts/` references; add `rewrap-identity` to Admin Guide
+
+### Gaps
+
+**Gap 1 — `docs/sealed-passphrase-design.md` referenced `rotate-identity` for re-encryption**
+
+The "Operational lifecycle" section said: "For an already-provisioned node … running
+`dds-node rotate-identity --data-dir <dir>` — that triggers a re-save with the new wrap."
+The 66th pass added `rewrap-identity` specifically for this use case (`rotate-identity`
+generates a new Ed25519 key and invalidates the admission cert). The design doc pointed
+operators at the wrong command.
+
+**Gap 2 — `docs/sealed-passphrase-design.md` listed stale macOS helpers path**
+
+The macOS helpers section linked to `platform/macos/packaging/scripts/` but the 66th pass
+moved the three scripts to `platform/macos/packaging/helpers/`. The link was broken.
+
+**Gap 3 — `rewrap-identity` not documented in DDS-Admin-Guide.md**
+
+The Admin Guide had a complete "Rotating a Node's Identity" section for `rotate-identity`
+but no section for `rewrap-identity`. The only documentation was in the per-platform
+SEALED-PASSPHRASE.md runbooks, leaving no single-page reference in the main guide.
+The `rotate-identity` use-case list also incorrectly included "passphrase change paired
+with re-wrapping" — that's `rewrap-identity`'s job.
+
+**Gap 4 — `platform/linux/packaging/SEALED-PASSPHRASE.md` comment said `(or rotate-identity)`**
+
+The "One-time setup" code comment `# 2. Provision (or rotate-identity)` confused the
+two commands in the same step; a reader could infer `rotate-identity` was valid for
+first-time provisioning.
+
+### Fix
+
+**`docs/sealed-passphrase-design.md`**:
+- "Operational lifecycle" paragraph: `rotate-identity` → `rewrap-identity`; clarified
+  that the PeerId and admission cert are unchanged.
+- macOS helpers link: `packaging/scripts/` → `packaging/helpers/`.
+
+**`docs/DDS-Admin-Guide.md`**:
+- Removed "A passphrase change for `DDS_NODE_PASSPHRASE` paired with re-wrapping" from
+  the `rotate-identity` use-case list (that belongs under `rewrap-identity`).
+- Added new top-level section **"Re-encrypting Node Keys Under a New Passphrase"**
+  immediately after "Rotating a Node's Identity": explains when to use `rewrap-identity`,
+  shows the full bash flow for first-time encryption and for passphrase rotation, shows
+  sample output, and links to the Linux/macOS SEALED-PASSPHRASE.md runbooks.
+
+**`platform/linux/packaging/SEALED-PASSPHRASE.md`**:
+- Step 2 comment: `Provision (or rotate-identity)` → `Provision` with a parenthetical
+  pointing to the "Existing already-provisioned host" section for the `rewrap-identity` flow.
+
+**Test results**: no code changes; all tests unchanged. Linux .NET **227/227**,
+macOS .NET 96/96. `cargo check --workspace` clean. `cargo test -p dds-node --lib`
+**312/312**.
+
+---
+
+## Fix (2026-05-05, 66th pass) — dds-node: add rewrap-identity subcommand; macOS Keychain helpers → helpers/
+
+See git log for the 66th pass details.
+
+---
+
 ## Fix (2026-05-05, 65th pass) — Admin Guide: add `sudoers` + `local_users` directive examples; Design Document: fix `comment` → `full_name` field name
 
 ### Gaps

@@ -305,7 +305,6 @@ identity is its libp2p Ed25519 keypair stored at
 `<data_dir>/p2p_key.bin`. Rotation is the right response to:
 
 - A suspected compromise of the on-disk key file.
-- A passphrase change for `DDS_NODE_PASSPHRASE` paired with re-wrapping.
 - Routine hygiene on a published rotation cadence.
 
 The flow is two-touch: the operator runs `rotate-identity` locally,
@@ -411,6 +410,67 @@ The node will verify the new admission cert against the freshly-
 rotated PeerId at startup and refuse to start if the cert was
 issued for the wrong PeerId — which is the safety property that
 makes the manual admin signature load-bearing.
+
+---
+
+## Re-encrypting Node Keys Under a New Passphrase
+
+Use `dds-node rewrap-identity` to re-encrypt `node_key.bin` and
+`p2p_key.bin` under a new (or first-time) `DDS_NODE_PASSPHRASE`
+**without** generating a new Ed25519 keypair. The PeerId and admission
+cert are unchanged, so **no admin involvement is required**.
+
+This is the right tool for:
+
+- Enabling at-rest encryption on a node that was provisioned without
+  `DDS_NODE_PASSPHRASE` set (e.g., migrating to the sealed-passphrase
+  setup on Linux, macOS, or Windows).
+- Rotating the passphrase itself (e.g., after a TPM PCR policy change
+  or a keychain entry recreation).
+
+```bash
+# Stop the node so the running process isn't holding the key files.
+sudo systemctl stop dds-node          # systemd
+# or: sudo rc-service dds-node stop  # OpenRC
+# or: sudo launchctl unload ...       # macOS LaunchDaemon
+
+# Set the new target passphrase (for TPM-sealed setup, capture from
+# the seal helper; for macOS keychain, dds-keychain-seal prints it).
+export DDS_NODE_PASSPHRASE='<new_passphrase>'
+
+# If the keys are ALREADY encrypted under a DIFFERENT old passphrase,
+# also set DDS_NODE_PASSPHRASE_OLD. If they are currently plaintext
+# (v=1), omit DDS_NODE_PASSPHRASE_OLD.
+# export DDS_NODE_PASSPHRASE_OLD='<old_passphrase>'
+
+sudo -E dds-node rewrap-identity --data-dir /opt/dds/data
+
+unset DDS_NODE_PASSPHRASE DDS_NODE_PASSPHRASE_OLD
+
+# Restart. The service's unseal hook (TPM / Keychain) will supply
+# DDS_NODE_PASSPHRASE automatically on every subsequent start.
+sudo systemctl start dds-node
+```
+
+Sample output:
+
+```
+rewrap-identity complete:
+  data_dir:     /opt/dds/data
+  peer_id:      12D3KooWXxx…  (unchanged)
+  encryption:   encrypted (v=3 Argon2id)
+  backups:      node_key.bin.bak, p2p_key.bin.bak
+
+The node's PeerId and admission cert are unchanged.
+Restart dds-node for the service to pick up the new key wrapping.
+```
+
+Backups (`node_key.bin.bak`, `p2p_key.bin.bak`) are written before
+the overwrite unless `--no-backup` is passed. The per-platform
+sealed-passphrase runbooks
+([Linux](../platform/linux/packaging/SEALED-PASSPHRASE.md),
+[macOS](../platform/macos/packaging/SEALED-PASSPHRASE.md)) contain
+the complete seal-then-rewrap procedure for each OS.
 
 ---
 
