@@ -1,5 +1,67 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 58th pass) — FileEnforcer / UserEnforcer: argument-injection hardening
+
+### Gap
+
+Two Linux policy agent enforcers passed externally-sourced values directly to system
+commands without validating that the values were single safe tokens:
+
+**`FileEnforcer`** — `ApplyOwnerAndModeAsync` passed the `owner` and `mode` fields
+straight to `chown` / `chmod` via `ProcessStartInfo.Arguments`.  .NET's argument
+tokeniser on Unix splits on whitespace, so an `owner` value such as
+`"nobody /etc/shadow"` would cause `chown nobody /etc/shadow <target-path>` — affecting
+an unintended file.  Likewise a `mode` value of `"777 /etc/shadow"` would chmod both
+the shadow file and the intended target.
+
+**`UserEnforcer`** — The `shell` field was passed directly into the `useradd` / `usermod`
+argument string without validation.  A value containing a space (e.g.
+`"/bin/bash -g root"`) would be split by the runtime into extra flags, enabling the
+caller to inject arbitrary `useradd` / `usermod` options such as `-g root` to assign a
+privileged primary group.
+
+Both issues require that an attacker (or misconfigured operator) can write a policy into
+the DDS trust graph — a privileged operation — but they represent a defense-in-depth
+failure: the enforcer layer should never allow crafted policy fields to affect resources
+outside the intended target path or add unauthorized flags to privileged system commands.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Enforcers/FileEnforcer.cs`**:
+- Added `internal static bool IsSafeOwner(string owner)` — accepts only `user` or
+  `user:group` where each part matches POSIX name characters (`[a-zA-Z0-9_.-]`,
+  ≤ 32 chars each, no spaces, at most one colon).
+- Added `internal static bool IsSafeMode(string mode)` — accepts only 3–4 octal digit
+  strings (`[0-7]{3,4}`); rejects symbolic notation to eliminate the space vector.
+- `ApplyOwnerAndModeAsync` now validates both values before calling the runner.  An
+  unsafe value is logged at Warning and the `chown` / `chmod` call is skipped.
+
+**`platform/linux/DdsPolicyAgent/Enforcers/UserEnforcer.cs`**:
+- Added `internal static bool IsSafeShellPath(string shell)` — requires an absolute
+  path (starts with `/`), no whitespace, and no shell metacharacters
+  (`` ` $;|&><"' ``).
+- `BuildUseraddArgs` now validates the `shell` field and returns `null` (signalling
+  "skip this Create") when the value is unsafe.  The return type changed from `string`
+  to `string?`.
+- `ApplyCreateAsync` return type changed from `Task` to `Task<bool>` — returns `false`
+  when `BuildUseraddArgs` returns null; `ApplyAsync` uses `continue` so the
+  directive tag is not recorded for a rejected Create.
+- `ApplyModifyAsync` validates the `shell` field with `IsSafeShellPath` before adding
+  `-s …` to the `usermod` argument list; an unsafe shell logs Warning and the `-s`
+  flag is omitted (the rest of the Modify — groups, full_name — still applies).
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`**:
+- `UserEnforcerTests`: added `ShellPathValidation` Theory (10 inline cases),
+  `Create_UnsafeShell_Skipped` Fact, and `Modify_UnsafeShell_Skipped` Fact.
+- `FileEnforcerTests`: added `OwnerValidation` Theory (8 inline cases),
+  `ModeValidation` Theory (10 inline cases), `UnsafeOwner_SkipsChown` Fact, and
+  `UnsafeMode_SkipsChmod` Fact.
+
+**Test results**: Linux .NET **194/194** (was 162/162; 32 new tests). macOS .NET
+96/96. Rust 774 unit + 83 integration, all passing.
+
+---
+
 ## Fix (2026-05-05, 57th pass) — Admin Guide: add Linux Deployment section
 
 ### Gap

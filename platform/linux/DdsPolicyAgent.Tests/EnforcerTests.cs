@@ -104,6 +104,52 @@ public sealed class UserEnforcerTests
         Assert.Empty(applied);
         Assert.Empty(runner.Invocations);
     }
+
+    [Theory]
+    [InlineData("/bin/bash",       true)]
+    [InlineData("/usr/bin/zsh",    true)]
+    [InlineData("/bin/sh",         true)]
+    [InlineData("/sbin/nologin",   true)]
+    [InlineData("bash",            false)]  // not absolute
+    [InlineData("/bin/bash -x",    false)]  // space — would inject a flag
+    [InlineData("/bin/bash\t",     false)]  // tab
+    [InlineData("/bin/ba$h",       false)]  // $ metacharacter
+    [InlineData("/bin/ba;sh",      false)]  // ; metacharacter
+    [InlineData("",                false)]
+    public void ShellPathValidation(string shell, bool expected)
+        => Assert.Equal(expected, UserEnforcer.IsSafeShellPath(shell));
+
+    [Fact]
+    public async Task Create_UnsafeShell_Skipped()
+    {
+        var runner = new NullCommandRunner();
+        runner.ExitCodeOverrides["id"] = 1;
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        // Shell with a space would allow injecting "-g root" as an extra useradd flag.
+        var applied = await enforcer.ApplyAsync(
+            [ParseElement("""{"username":"alice","action":"Create","shell":"/bin/bash -g root"}""")],
+            new HashSet<string>(), default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task Modify_UnsafeShell_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [ParseElement("""{"username":"alice","action":"Modify","shell":"/bin/bash -g root"}""")],
+            new HashSet<string>(), default);
+
+        // The Modify action itself still succeeds (groups may be applied), but usermod
+        // is not called with the unsafe shell flag.
+        Assert.DoesNotContain(runner.Invocations, i =>
+            i.FileName == "usermod" && i.Arguments.Contains("-s"));
+    }
 }
 
 // ============================================================
@@ -231,6 +277,74 @@ public sealed class FileEnforcerTests
 
         Assert.Empty(applied);
         Assert.Empty(runner.Invocations);
+    }
+
+    [Theory]
+    [InlineData("root",            true)]
+    [InlineData("www-data",        true)]
+    [InlineData("root:root",       true)]
+    [InlineData("nobody:nogroup",  true)]
+    [InlineData("nobody /etc/shadow", false)]  // space — would inject extra chown target
+    [InlineData("root /etc/passwd",   false)]  // space injection
+    [InlineData("",                false)]
+    [InlineData("root:root:extra", false)]      // too many colons
+    public void OwnerValidation(string owner, bool expected)
+        => Assert.Equal(expected, FileEnforcer.IsSafeOwner(owner));
+
+    [Theory]
+    [InlineData("644",         true)]
+    [InlineData("0644",        true)]
+    [InlineData("1777",        true)]
+    [InlineData("777",         true)]
+    [InlineData("u+x",         false)]   // symbolic — could contain spaces
+    [InlineData("644 /etc/shadow", false)]  // space injection
+    [InlineData("",            false)]
+    [InlineData("99",          false)]   // too short
+    [InlineData("08644",       false)]   // too long
+    [InlineData("888",         false)]   // non-octal digit
+    public void ModeValidation(string mode, bool expected)
+        => Assert.Equal(expected, FileEnforcer.IsSafeMode(mode));
+
+    [Fact]
+    public async Task UnsafeOwner_SkipsChown()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        // Even in audit mode the runner should not be called with a chown for an unsafe owner.
+        // (audit mode returns true for ApplySetAsync but never invokes the runner.)
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""
+                {"path":"/etc/dds/motd","action":"Set",
+                 "content_b64":"aGVsbG8=",
+                 "content_sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                 "owner":"nobody /etc/shadow","mode":"644"}
+                """).RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Single(applied);  // file:set was recorded
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "chown");
+    }
+
+    [Fact]
+    public async Task UnsafeMode_SkipsChmod()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""
+                {"path":"/etc/dds/motd","action":"Set",
+                 "content_b64":"aGVsbG8=",
+                 "content_sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                 "mode":"777 /etc/shadow"}
+                """).RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Single(applied);  // file:set was recorded
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "chmod");
     }
 }
 

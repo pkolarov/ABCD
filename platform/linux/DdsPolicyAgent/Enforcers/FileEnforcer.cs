@@ -162,20 +162,36 @@ public sealed class FileEnforcer
     {
         if (d.TryGetProperty("owner", out var owner) && owner.ValueKind == JsonValueKind.String)
         {
-            var result = await _runner
-                .RunAsync("chown", $"{owner.GetString()} {path}", ct)
-                .ConfigureAwait(false);
-            if (!result.Success)
-                _log.LogWarning("chown failed for {P}: {Err}", path, result.Stderr);
+            var ownerVal = owner.GetString()!;
+            if (!IsSafeOwner(ownerVal))
+            {
+                _log.LogWarning("FileEnforcer: unsafe owner value {O} for {P}; skipping chown", ownerVal, path);
+            }
+            else
+            {
+                var result = await _runner
+                    .RunAsync("chown", $"{ownerVal} {path}", ct)
+                    .ConfigureAwait(false);
+                if (!result.Success)
+                    _log.LogWarning("chown failed for {P}: {Err}", path, result.Stderr);
+            }
         }
 
         if (d.TryGetProperty("mode", out var mode) && mode.ValueKind == JsonValueKind.String)
         {
-            var result = await _runner
-                .RunAsync("chmod", $"{mode.GetString()} {path}", ct)
-                .ConfigureAwait(false);
-            if (!result.Success)
-                _log.LogWarning("chmod failed for {P}: {Err}", path, result.Stderr);
+            var modeVal = mode.GetString()!;
+            if (!IsSafeMode(modeVal))
+            {
+                _log.LogWarning("FileEnforcer: unsafe mode value {M} for {P}; skipping chmod", modeVal, path);
+            }
+            else
+            {
+                var result = await _runner
+                    .RunAsync("chmod", $"{modeVal} {path}", ct)
+                    .ConfigureAwait(false);
+                if (!result.Success)
+                    _log.LogWarning("chmod failed for {P}: {Err}", path, result.Stderr);
+            }
         }
     }
 
@@ -202,5 +218,31 @@ public sealed class FileEnforcer
         if (!Path.IsPathRooted(path)) return false;
         var normalized = Path.GetFullPath(path);
         return normalized == path.TrimEnd('/');
+    }
+
+    // Valid owner: "user" or "user:group" where each part is a POSIX name ([a-zA-Z0-9_.-]+, ≤32 chars).
+    // No spaces — prevents injecting extra arguments to chown (e.g. "nobody /etc/shadow").
+    internal static bool IsSafeOwner(string owner)
+    {
+        if (string.IsNullOrEmpty(owner) || owner.Length > 65) return false;
+        var parts = owner.Split(':', 2);
+        foreach (var part in parts)
+        {
+            if (part.Length == 0 || part.Length > 32) return false;
+            foreach (var c in part)
+                if (!char.IsAsciiLetterOrDigit(c) && c != '_' && c != '-' && c != '.')
+                    return false;
+        }
+        return true;
+    }
+
+    // Valid mode: 3 or 4 octal digits only (e.g. "644", "0644", "1777").
+    // Rejects symbolic notation to prevent spaces and argument injection.
+    internal static bool IsSafeMode(string mode)
+    {
+        if (mode.Length is < 3 or > 4) return false;
+        foreach (var c in mode)
+            if (c < '0' || c > '7') return false;
+        return true;
     }
 }

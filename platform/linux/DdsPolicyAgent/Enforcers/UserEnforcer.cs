@@ -66,7 +66,8 @@ public sealed class UserEnforcer
             switch (action)
             {
                 case "Create":
-                    await ApplyCreateAsync(username, d, uid, ct).ConfigureAwait(false);
+                    if (!await ApplyCreateAsync(username, d, uid, ct).ConfigureAwait(false))
+                        continue;
                     break;
 
                 case "Delete":
@@ -101,10 +102,13 @@ public sealed class UserEnforcer
         return applied;
     }
 
-    private async Task ApplyCreateAsync(
+    private async Task<bool> ApplyCreateAsync(
         string username, JsonElement d, uint? uid, CancellationToken ct)
     {
         var args = BuildUseraddArgs(username, d, uid);
+        if (args is null)
+            return false;
+
         if (!await UserExistsAsync(username, ct).ConfigureAwait(false))
         {
             await RunOrLogAsync("useradd", args, ct).ConfigureAwait(false);
@@ -115,6 +119,7 @@ public sealed class UserEnforcer
         }
 
         await ApplyGroupsAsync(username, d, ct).ConfigureAwait(false);
+        return true;
     }
 
     private async Task ApplyModifyAsync(string username, JsonElement d, CancellationToken ct)
@@ -122,7 +127,13 @@ public sealed class UserEnforcer
         var parts = new List<string>();
 
         if (d.TryGetProperty("shell", out var shell) && shell.ValueKind == JsonValueKind.String)
-            parts.Add($"-s {shell.GetString()}");
+        {
+            var shellVal = shell.GetString()!;
+            if (!IsSafeShellPath(shellVal))
+                _log.LogWarning("UserEnforcer: unsafe shell value {S} for {U}; skipping -s", shellVal, username);
+            else
+                parts.Add($"-s {shellVal}");
+        }
 
         if (d.TryGetProperty("full_name", out var fn) && fn.ValueKind == JsonValueKind.String)
             parts.Add($"-c {ShellEscape(fn.GetString()!)}");
@@ -147,7 +158,7 @@ public sealed class UserEnforcer
         }
     }
 
-    private static string BuildUseraddArgs(string username, JsonElement d, uint? uid)
+    private string? BuildUseraddArgs(string username, JsonElement d, uint? uid)
     {
         var parts = new List<string> { "-m" };
 
@@ -155,7 +166,15 @@ public sealed class UserEnforcer
             parts.Add($"-u {uid.Value}");
 
         if (d.TryGetProperty("shell", out var shell) && shell.ValueKind == JsonValueKind.String)
-            parts.Add($"-s {shell.GetString()}");
+        {
+            var shellVal = shell.GetString()!;
+            if (!IsSafeShellPath(shellVal))
+            {
+                _log.LogWarning("UserEnforcer: unsafe shell value {S} for {U}; skipping Create", shellVal, username);
+                return null;
+            }
+            parts.Add($"-s {shellVal}");
+        }
 
         if (d.TryGetProperty("full_name", out var fn) && fn.ValueKind == JsonValueKind.String)
             parts.Add($"-c {ShellEscape(fn.GetString()!)}");
@@ -211,6 +230,21 @@ public sealed class UserEnforcer
             if (!char.IsAsciiLetterOrDigit(c) && c != '_' && c != '-' && c != '.')
                 return false;
         if (name[0] == '-') return false;
+        return true;
+    }
+
+    // Valid shell: absolute path, no spaces, no shell metacharacters.
+    // Spaces would allow injecting extra flags into useradd/usermod (e.g. "/bin/sh -g root").
+    internal static bool IsSafeShellPath(string shell)
+    {
+        if (string.IsNullOrEmpty(shell) || shell.Length > 256) return false;
+        if (!shell.StartsWith('/')) return false;
+        foreach (var c in shell)
+        {
+            if (c <= 0x20 || c > 0x7E) return false;  // non-printable or non-ASCII
+            if (c is ' ' or '\t' or ';' or '&' or '|' or '`' or '$' or '>' or '<' or '"' or '\'')
+                return false;
+        }
         return true;
     }
 
