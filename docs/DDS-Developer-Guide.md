@@ -54,6 +54,7 @@ Let's dive in.
 10. [Chapter 10: The Road to Active Directory](#chapter-10-the-road-to-active-directory) — Expanding DDS to cover AD and LDAP concepts
 11. [Chapter 11: Your First Day](#chapter-11-your-first-day) — Getting started with the code
 12. [Chapter 12: How We Know It's Fast Enough](#chapter-12-how-we-know-its-fast-enough) — KPIs, the chaos soak, and what each number means
+13. [Chapter 13: Linux Login Integration](#chapter-13-linux-login-integration--pam_dds-and-dds-pam-helper) — `pam_dds.so`, `dds-pam-helper`, and SSH `AuthorizedKeysCommand` wiring
 
 ---
 
@@ -1374,3 +1375,225 @@ For pilot deployments these proxies are good enough — we know the *trend* is f
 - Two KPIs (heap, bandwidth) are currently RSS-proxy measurements with documented caveats — fine for pilot, will be hardened pre-GA
 
 If you remember nothing else from this chapter: **soaks are how we find the bugs that stress tests miss, and KPIs are how we keep ourselves honest about whether the fix actually worked.**
+
+---
+
+## Chapter 13: Linux Login Integration — `pam_dds` and `dds-pam-helper`
+
+### Overview
+
+DDS ships two Linux-specific authentication artefacts:
+
+| Artefact | What it is |
+|---|---|
+| `pam_dds.so` | A PAM module (`cdylib`) loaded by the Linux-PAM framework |
+| `dds-pam-helper` | A standalone binary invoked by `pam_dds.so` that runs the FIDO2 assertion flow |
+
+Together they let you replace (or layer on top of) password authentication for:
+
+- console and display-manager login (`login`, `gdm`, `sddm`, …)
+- `sudo` elevation
+- SSH when `UsePAM yes` is set in sshd
+- SSH without PAM via the `AuthorizedKeysCommand` hook
+
+Both artefacts live in `platform/linux/pam_dds/` and are compiled as part of the normal Cargo workspace:
+
+```bash
+cargo build -p pam-dds          # builds pam_dds.so + dds-pam-helper
+cargo test  -p pam-dds          # unit tests (cross-platform)
+```
+
+The `pam_dds.so` cdylib entry points (`pam_sm_authenticate`, `pam_sm_setcred`, `pam_sm_acct_mgmt`) are in `src/linux.rs` and are only compiled for `target_os = "linux"`.  All shared parsing helpers live in `src/lib.rs` and compile on every platform so the unit tests run on macOS in CI without a PAM framework installed.
+
+### How authentication flows
+
+```
+User logs in (console, sudo, SSH)
+         │
+         ▼
+PAM framework calls pam_sm_authenticate() in pam_dds.so
+         │
+         ▼ reads username from PAM stack
+         ▼ resolves dds-pam-helper binary (helper= arg or search paths)
+         │
+         ▼ spawns dds-pam-helper --node-sock PATH --user USERNAME
+         │
+     dds-pam-helper
+         │
+         ├── GET /v1/session/challenge  ──► dds-node (Unix socket)
+         │         ◄── { challenge_id, challenge_b64url }
+         │
+         ├── Collect FIDO2 assertion
+         │     • If fido2-assert(1) is on PATH: delegates to it
+         │     • If --assertion-json FILE supplied: reads from file (CI mode)
+         │
+         ├── POST /v1/session/assert  ──► dds-node (Unix socket)
+         │         ◄── { session_id, expires_at, token_cbor_b64 }
+         │
+         └── writes {"ok":true,"session_id":"…"} to stdout, exits 0
+         │
+         ▼
+pam_dds.so parses stdout → PAM_SUCCESS (ok == true) or PAM_AUTH_ERR
+```
+
+`pam_dds.so` is intentionally stateless.  It never parses trust-graph data, reads policy documents, or calls `dds-node` directly.  All authorization decisions stay inside `dds-node`.
+
+### Building and installing
+
+```bash
+# 1. Cross-compile for the target Linux host (example: x86_64-unknown-linux-musl)
+cargo build -p pam-dds --release --target x86_64-unknown-linux-gnu
+
+# 2. Install
+install -m 0755 target/x86_64-unknown-linux-gnu/release/dds-pam-helper \
+    /usr/lib/dds/dds-pam-helper
+install -m 0644 target/x86_64-unknown-linux-gnu/release/libpam_dds.so \
+    /lib/x86_64-linux-gnu/security/pam_dds.so
+```
+
+The helper must be owned by root and not world-writable; the PAM module directory (`/lib/…/security/`) is root-owned on all major distros.
+
+### PAM stack configuration
+
+Add `pam_dds` to the relevant service file under `/etc/pam.d/`.  The recommended pattern uses `sufficient` so users can fall back to their UNIX password if the FIDO2 key is unavailable:
+
+```
+# /etc/pam.d/sudo  (or login, sshd, gdm-password, …)
+auth   sufficient   pam_dds.so node_sock=/run/dds/api.sock
+auth   required     pam_unix.so
+```
+
+Use `required` instead of `sufficient` to mandate DDS authentication (no password fallback).
+
+**Supported module arguments:**
+
+| Argument | Default | Description |
+|---|---|---|
+| `node_sock=PATH` | `/var/lib/dds/dds.sock` | Unix socket path for `dds-node` |
+| `helper=PATH` | auto-detected | Explicit path to `dds-pam-helper` |
+| `debug` | off | Enable verbose syslog output |
+
+When `helper=` is not specified, the module searches these paths in order:
+
+1. `/usr/lib/dds/dds-pam-helper`
+2. `/usr/local/lib/dds/dds-pam-helper`
+3. `/usr/libexec/dds-pam-helper`
+4. `/usr/local/libexec/dds-pam-helper`
+
+### SSH `AuthorizedKeysCommand` wiring
+
+For SSH deployments where you want DDS authentication **without** relying on PAM (for example, when sshd is built without PAM support, or when you need the assertion flow to happen before the session is established), pair `pam_dds.so` with an `AuthorizedKeysCommand` script.
+
+The `AuthorizedKeysCommand` hook in sshd is normally used to look up authorised public keys dynamically.  DDS repurposes it to run the FIDO2 challenge/response flow inline: if the assertion succeeds, the command emits a dummy placeholder key that sshd accepts.
+
+#### Step 1 — Create the wrapper script
+
+```bash
+cat > /usr/lib/dds/dds-ssh-auth <<'EOF'
+#!/bin/sh
+# DDS SSH AuthorizedKeysCommand wrapper.
+# Arguments forwarded by sshd: %u (username) %f (fingerprint) %k (key)
+# We ignore fingerprint and key; the assertion flow is the authority.
+
+USERNAME="$1"
+SOCK="${DDS_NODE_SOCK:-/run/dds/api.sock}"
+
+# Run the assertion flow.
+RESULT="$(/usr/lib/dds/dds-pam-helper \
+    --node-sock "$SOCK" \
+    --user      "$USERNAME" 2>/dev/null)"
+
+OK="$(printf '%s' "$RESULT" | /usr/bin/python3 -c \
+    'import sys,json; d=json.load(sys.stdin); print(d.get("ok","false"))' \
+    2>/dev/null)"
+
+if [ "$OK" = "True" ]; then
+    # Emit a placeholder key so sshd grants access.
+    # The key type and value are irrelevant; sshd checks that the client
+    # presents *a* key matching this line during key exchange.  Because DDS
+    # gates the assertion before this line is emitted, only a successfully
+    # authenticated DDS user ever sees it.
+    echo "no-pty,no-port-forwarding ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDS-placeholder dds-auth"
+fi
+# Exit 0 in all cases; sshd treats an empty response as "no keys found".
+EOF
+chmod 0755 /usr/lib/dds/dds-ssh-auth
+chown root:root /usr/lib/dds/dds-ssh-auth
+```
+
+#### Step 2 — Configure sshd
+
+Add the following to `/etc/ssh/sshd_config` (or a drop-in under `/etc/ssh/sshd_config.d/`):
+
+```
+# DDS FIDO2 authentication via AuthorizedKeysCommand
+AuthorizedKeysCommand     /usr/lib/dds/dds-ssh-auth %u
+AuthorizedKeysCommandUser dds-auth
+
+# Disable password authentication when DDS is the only auth method.
+# Remove these lines if you want password fallback.
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+```
+
+Create the unprivileged service account sshd uses to run the command:
+
+```bash
+useradd --system --no-create-home --shell /sbin/nologin dds-auth
+```
+
+#### Step 3 — Reload sshd
+
+```bash
+systemctl reload sshd
+```
+
+#### How the placeholder key works
+
+sshd evaluates `AuthorizedKeysCommand` after the client has completed the key-exchange handshake but before granting a shell.  When the wrapper emits the placeholder line, sshd checks that the connecting client has the matching private key.  Because the placeholder is a dummy value the client never possesses, it will never match — **that is intentional**.  The DDS assertion already proved identity; the placeholder is just the vehicle that tells sshd "a key was found" so it does not fall through to password authentication.
+
+> **Note:** If you want clients to complete a second proof-of-possession via an actual Ed25519 key *in addition* to the DDS assertion, replace the placeholder with a real per-user public key retrieved from the DDS trust graph.  That more advanced pattern is out of scope for this chapter.
+
+### Testing without a FIDO2 key
+
+The `--assertion-json` flag lets you inject a pre-computed assertion for CI and development:
+
+```bash
+# 1. Generate a test assertion (using the dds-cli test-assertion command or
+#    by replaying a captured assertion from a dev FIDO2 key).
+cat > /tmp/test-assertion.json <<'EOF'
+{
+  "credential_id":      "<base64url credential ID>",
+  "authenticator_data": "<base64url authenticator data>",
+  "client_data_hash":   "<base64url SHA-256 of clientDataJSON>",
+  "signature":          "<base64url assertion signature>"
+}
+EOF
+
+# 2. Run the helper directly.
+dds-pam-helper \
+    --node-sock  /run/dds/api.sock \
+    --user       alice \
+    --assertion-json /tmp/test-assertion.json
+# Expected stdout: {"ok":true,"session_id":"…"}
+```
+
+The end-to-end flow is covered by `platform/linux/pam_dds/src/bin/dds_pam_helper.rs` unit tests and the `pam_dds` lib tests in `src/lib.rs`.
+
+### Security properties
+
+| Property | Mechanism |
+|---|---|
+| No plaintext password on the wire | FIDO2 assertion only — `dds-pam-helper` never reads or transmits a password |
+| Helper fails closed | If `dds-pam-helper` is not found, `pam_sm_authenticate` returns `PAM_SYSTEM_ERR` (not `PAM_SUCCESS`) |
+| No dds-node dependency for `setcred` / `acct_mgmt` | Both stubs return `PAM_SUCCESS` unconditionally — policy is evaluated inside `dds-node` at assertion time |
+| Atomic drop-in writes | `WriteDropinAsync` writes to a `.dds-tmp` file then renames — sshd never reads a partially-written config |
+| Privilege separation | `pam_dds.so` runs in the caller's process; `dds-pam-helper` runs as the PAM user; `dds-node` owns all trust decisions |
+
+### Relevant source files
+
+| File | Purpose |
+|---|---|
+| `platform/linux/pam_dds/src/lib.rs` | Shared types (`ModuleArgs`, `HelperOutcome`), arg parser, search path logic |
+| `platform/linux/pam_dds/src/linux.rs` | PAM C entry points (`pam_sm_authenticate`, `pam_sm_setcred`, `pam_sm_acct_mgmt`) |
+| `platform/linux/pam_dds/src/bin/dds_pam_helper.rs` | Helper binary: challenge fetch, `fido2-assert` delegation, assertion submission |

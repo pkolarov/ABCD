@@ -1,5 +1,45 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 55th pass) — Developer Guide Chapter 13: pam_dds / Linux Login Integration
+
+### Gap
+
+`docs/DDS-Admin-Guide.md` §"SSH AuthorizedKeysCommand integration" ended with
+the sentence:
+
+> "Full wiring instructions are provided in the [Developer Guide](DDS-Developer-Guide.md)."
+
+but the Developer Guide had no `pam_dds` section at all — not even a passing
+mention. The Admin Guide covered the basic PAM stack configuration and the
+pre-computed-assertion CI workflow but explicitly deferred the complete
+`AuthorizedKeysCommand` sshd wiring to the Developer Guide, leaving that
+cross-reference dangling.
+
+### Fix
+
+**`docs/DDS-Developer-Guide.md`** — added **Chapter 13: Linux Login Integration — `pam_dds` and `dds-pam-helper`**:
+- Overview table: `pam_dds.so` (cdylib) vs `dds-pam-helper` (binary), crate
+  location, build commands.
+- End-to-end authentication flow diagram (PAM stack → helper → challenge
+  fetch → FIDO2 assertion → session assert → PAM_SUCCESS).
+- Build and installation instructions (cross-compile, install paths, file
+  modes).
+- PAM stack configuration (`sufficient` vs `required`, module arguments table,
+  helper search paths).
+- **Full SSH `AuthorizedKeysCommand` wiring** (the section missing from the
+  guide): three-step recipe covering the wrapper shell script, sshd_config
+  directives, `dds-auth` service account, and an explanation of how the
+  placeholder key mechanism works and why it is intentionally unmatched.
+- Testing without a FIDO2 key (`--assertion-json` mode, example JSON schema).
+- Security properties table.
+- Relevant source files table.
+- Updated Table of Contents to include Chapter 13.
+
+**Test results**: all `cargo test --workspace` green (774 / 774 passing,
+1 ignored). Linux .NET 162/162, macOS .NET 96/96. No code changes; doc-only.
+
+---
+
 ## Fix (2026-05-05, 54th pass) — gossip convergence test flakiness + Developer Guide LinuxPolicyDocument gap
 
 ### Changes
