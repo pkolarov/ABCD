@@ -1208,6 +1208,59 @@ Valid `action` values: `Enable`, `Disable`, `Start`, `Stop`, `Restart`, `Mask`, 
 
 Package names are validated against a safe-character allowlist before any package manager call. `Remove` is refused for packages not previously installed by DDS (tracked in `/var/lib/dds/applied-state.json`).
 
+**`sudoers` directive example:**
+
+```json
+{
+  "linux": {
+    "sudoers": [
+      {
+        "filename":       "dds-ops",
+        "content":        "%dds-ops ALL=(ALL) NOPASSWD: /usr/bin/systemctl",
+        "content_sha256": "<lowercase hex SHA-256 of the content string>"
+      },
+      {
+        "filename": "dds-readonly",
+        "content":  ""
+      }
+    ]
+  }
+}
+```
+
+`filename` must be a safe alphanumeric stem (letters, digits, hyphens, underscores; 1–64 chars; no path separators or dots). `content` is the raw sudoers fragment written to `/etc/sudoers.d/<filename>`. The enforcer runs `visudo -cf` to validate the content before moving the file into place — a syntactically invalid rule is logged and skipped. Setting `content` to an empty string deletes the drop-in. `content_sha256` (optional) is the lowercase hex SHA-256 of the `content` string; when present the enforcer verifies integrity before writing.
+
+**`local_users` directive example:**
+
+```json
+{
+  "linux": {
+    "local_users": [
+      {
+        "username": "svc-dds",
+        "action":   "Create",
+        "uid":      1500,
+        "shell":    "/usr/sbin/nologin",
+        "groups":   ["dds-ops"],
+        "full_name": "DDS service account"
+      },
+      {
+        "username": "bob",
+        "action":   "Modify",
+        "shell":    "/bin/bash",
+        "groups":   ["dds-ops", "docker"]
+      },
+      {
+        "username": "alice",
+        "action":   "Disable"
+      }
+    ]
+  }
+}
+```
+
+Valid `action` values: `Create`, `Delete`, `Disable`, `Enable`, `Modify`. `Create` is idempotent — the account is created if it does not already exist; supplementary `groups` are applied on every cycle. `Delete` is refused for accounts not previously created by DDS (tracked in the applied-state store). `Disable` locks the account via `passwd -l`; `Enable` unlocks it via `passwd -u` — both preserve the home directory and files. `Modify` updates the `shell`, `full_name`, and `groups` fields on an existing account. `uid` must be ≥ 1000 (the enforcer refuses UIDs below this threshold to prevent tampering with system accounts). The `shell` field must be an absolute path with no whitespace or shell metacharacters. `full_name` maps to the GECOS field (`-c` on `useradd`/`usermod`).
+
 ### Linux Login and SSH Integration
 
 DDS ships a PAM authentication module (`pam_dds.so`) and a companion helper

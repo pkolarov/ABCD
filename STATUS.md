@@ -1,5 +1,48 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 65th pass) — Admin Guide: add `sudoers` + `local_users` directive examples; Design Document: fix `comment` → `full_name` field name
+
+### Gaps
+
+**Gap 1 — Admin Guide missing `sudoers` and `local_users` directive examples**
+
+The Admin Guide's Linux Policy section listed seven directive types in the capability
+table (`local_users`, `sudoers`, `files`, `systemd`, `packages`, `sysctl`, `ssh`) and
+provided worked JSON examples for five of them (`files`, `sysctl`, `ssh`, `systemd`,
+`packages`). The `sudoers` and `local_users` directives had no examples at all — an
+operator reading the guide could not determine the correct JSON shape, field names, or
+safety constraints without reading the source code.
+
+**Gap 2 — Design Document `LinuxUserDirective` struct tree used wrong field name**
+
+The `LinuxUserDirective` struct tree in `docs/DDS-Design-Document.md` §14.6.1 listed
+`comment: Option<String>   # GECOS / full name`, but the actual Rust struct field
+(`dds-domain/src/types.rs:581`) and the C# enforcer
+(`platform/linux/DdsPolicyAgent/Enforcers/UserEnforcer.cs:138,179`) both use
+`full_name`. An operator or integration author following the design document would
+have used the wrong key name in policy JSON.
+
+### Fix
+
+**`docs/DDS-Admin-Guide.md`**:
+- Added **`sudoers` directive example** (after `packages` example): two-entry array
+  showing a write with `content_sha256` and a delete via empty `content`. Prose explains
+  the safe-filename constraint, `visudo -cf` validation, and empty-string delete
+  semantics.
+- Added **`local_users` directive example** (after `sudoers` example): three-entry
+  array demonstrating `Create` with full field set (`uid`, `shell`, `groups`,
+  `full_name`), `Modify` (shell + groups change), and `Disable`. Prose explains all
+  five actions, the UID ≥ 1000 guard, shell-path validation, and GECOS mapping.
+
+**`docs/DDS-Design-Document.md`** §14.6.1:
+- Corrected `comment: Option<String>` → `full_name: Option<String>` in the
+  `LinuxUserDirective` struct tree to match the live Rust field name.
+
+**Test results**: no code changes; all tests unchanged. Linux .NET **227/227**,
+macOS .NET 96/96. `cargo check --workspace` clean.
+
+---
+
 ## Fix (2026-05-05, 64th pass) — PackageEnforcer: add zypper backend + stale Admin Guide detection-order entries
 
 ### Gap

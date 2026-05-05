@@ -1475,7 +1475,7 @@ LinuxPolicyDocument
     │   ├── uid: Option<u32>
     │   ├── shell: Option<String>
     │   ├── groups: [String]          # supplementary groups (additive)
-    │   ├── comment: Option<String>   # GECOS / full name
+    │   ├── full_name: Option<String> # GECOS / full name
     │   └── action: LinuxUserAction   # Create | Delete | Disable | Enable | Modify
     ├── sudoers: [LinuxSudoersDirective]
     │   ├── filename: String          # drop-in name under /etc/sudoers.d/ (no slashes)
