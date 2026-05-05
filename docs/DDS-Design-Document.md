@@ -1565,6 +1565,10 @@ Logs go to `journald`.
 - `/etc/systemd/system/`
 - `/usr/local/lib/dds/`
 
+This allowlist is enforced inside `FileEnforcer.IsSafePath` (`AllowedPrefixes`), which
+is checked before every `Set`, `Delete`, and `EnsureDir` operation — including the
+reconciliation stale-delete path.
+
 Writes to `/etc/passwd`, `/etc/shadow`, `/boot`, `/usr/bin`, or arbitrary user
 home directories are forbidden.
 

@@ -222,9 +222,19 @@ public sealed class SudoersEnforcerTests
 public sealed class FileEnforcerTests
 {
     [Theory]
-    [InlineData("/etc/dds/motd", true)]
-    [InlineData("relative/path", false)]
-    [InlineData("/etc/../etc/passwd", false)]
+    [InlineData("/etc/dds/motd",                  true)]
+    [InlineData("/etc/dds/conf.d/custom.conf",    true)]
+    [InlineData("/etc/ssh/sshd_config.d/60-dds.conf", true)]
+    [InlineData("/etc/sysctl.d/60-dds.conf",      true)]
+    [InlineData("/etc/systemd/system/foo.service", true)]
+    [InlineData("/usr/local/lib/dds/helper",      true)]
+    [InlineData("relative/path",                  false)]
+    [InlineData("/etc/../etc/passwd",             false)]
+    [InlineData("/etc/passwd",                    false)]  // outside allowlist
+    [InlineData("/etc/shadow",                    false)]  // outside allowlist
+    [InlineData("/boot/grub.cfg",                 false)]  // outside allowlist
+    [InlineData("/home/alice/file",               false)]  // outside allowlist
+    [InlineData("/tmp/evil",                      false)]  // outside allowlist
     public void PathValidation(string path, bool expected)
         => Assert.Equal(expected, FileEnforcer.IsSafePath(path));
 
@@ -367,18 +377,22 @@ public sealed class FileEnforcerTests
     [Fact]
     public async Task EnsureDir_EnforceMode_CallsChownAndChmod()
     {
-        // Use /tmp which is guaranteed to exist so Directory.CreateDirectory is a no-op.
+        // Use a temp directory that actually exists so Directory.CreateDirectory is a no-op.
+        // Inject the temp prefix into the enforcer's allowlist so the path passes IsSafePath.
+        var tmpBase = Path.GetTempPath().TrimEnd('/') + "/";
+        var path    = Path.Combine(Path.GetTempPath(), "dds-test-ensuredir");
         var runner   = new NullCommandRunner();
-        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance);
+        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance,
+            allowedPrefixes: [tmpBase]);
 
         var applied = await enforcer.ApplyAsync(
-            [JsonDocument.Parse("""{"path":"/tmp","action":"EnsureDir","owner":"root:root","mode":"0755"}""")
+            [JsonDocument.Parse($$$"""{"path":"{{{path}}}","action":"EnsureDir","owner":"root:root","mode":"0755"}""")
                 .RootElement],
             new HashSet<string>(),
             default);
 
         Assert.Single(applied);
-        Assert.Equal("file:ensuredir:/tmp", applied[0]);
+        Assert.Equal($"file:ensuredir:{path}", applied[0]);
         Assert.Contains(runner.Invocations, i => i.FileName == "chown");
         Assert.Contains(runner.Invocations, i => i.FileName == "chmod");
     }
@@ -386,11 +400,14 @@ public sealed class FileEnforcerTests
     [Fact]
     public async Task EnsureDir_EnforceMode_UnsafeOwner_SkipsChown()
     {
+        var tmpBase = Path.GetTempPath().TrimEnd('/') + "/";
+        var path    = Path.Combine(Path.GetTempPath(), "dds-test-ensuredir");
         var runner   = new NullCommandRunner();
-        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance);
+        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance,
+            allowedPrefixes: [tmpBase]);
 
         var applied = await enforcer.ApplyAsync(
-            [JsonDocument.Parse("""{"path":"/tmp","action":"EnsureDir","owner":"nobody /etc/shadow","mode":"0750"}""")
+            [JsonDocument.Parse($$$"""{"path":"{{{path}}}","action":"EnsureDir","owner":"nobody /etc/shadow","mode":"0750"}""")
                 .RootElement],
             new HashSet<string>(),
             default);
@@ -404,11 +421,14 @@ public sealed class FileEnforcerTests
     [Fact]
     public async Task EnsureDir_EnforceMode_UnsafeMode_SkipsChmod()
     {
+        var tmpBase = Path.GetTempPath().TrimEnd('/') + "/";
+        var path    = Path.Combine(Path.GetTempPath(), "dds-test-ensuredir");
         var runner   = new NullCommandRunner();
-        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance);
+        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance,
+            allowedPrefixes: [tmpBase]);
 
         var applied = await enforcer.ApplyAsync(
-            [JsonDocument.Parse("""{"path":"/tmp","action":"EnsureDir","owner":"root","mode":"777 /etc/shadow"}""")
+            [JsonDocument.Parse($$$"""{"path":"{{{path}}}","action":"EnsureDir","owner":"root","mode":"777 /etc/shadow"}""")
                 .RootElement],
             new HashSet<string>(),
             default);
@@ -417,6 +437,24 @@ public sealed class FileEnforcerTests
         // chown still runs because owner is safe
         Assert.Contains(runner.Invocations, i => i.FileName == "chown");
         Assert.DoesNotContain(runner.Invocations, i => i.FileName == "chmod");
+    }
+
+    [Fact]
+    public async Task SetFile_OutsideAllowlist_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""
+                {"path":"/etc/passwd","action":"Set",
+                 "content_b64":"aGVsbG8=","content_sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"}
+                """).RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
     }
 }
 

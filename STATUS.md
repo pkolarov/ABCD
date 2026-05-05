@@ -1,5 +1,59 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 61st pass) — FileEnforcer: enforce filesystem allowlist in IsSafePath
+
+### Gap
+
+`FileEnforcer.IsSafePath` validated only that a path was absolute and normalized
+(no `..` traversal). The filesystem allowlist required by §14.6.4 of the Design
+Document — limiting writes to `/etc/dds/`, `/etc/ssh/sshd_config.d/`,
+`/etc/sysctl.d/`, `/etc/systemd/system/`, and `/usr/local/lib/dds/` — was
+**documented but not enforced in code**. An operator-authorized-but-crafted policy
+document could therefore direct `FileEnforcer` to write or delete files at any
+absolute path, including `/etc/passwd`, `/etc/shadow`, `/boot`, or user home
+directories.
+
+The class-level comment and the `ReconcileStaleFiles` doc comment both mentioned
+"allowlisted paths" without the allowlist actually being checked. The three
+`EnsureDir_EnforceMode_*` tests from pass 60 used `/tmp` as the test path
+(outside any real allowlist), masking the gap.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Enforcers/FileEnforcer.cs`**:
+- Added `internal static readonly string[] AllowedPrefixes` with the five
+  production-safe roots from §14.6.4.
+- Added `_allowedPrefixes` instance field populated from the new constructor
+  parameter `string[]? allowedPrefixes = null` (defaults to `AllowedPrefixes`
+  so all production callers in `Worker.cs` require no change).
+- `IsSafePath` now has two overloads: the static `IsSafePath(string path)` that
+  uses `AllowedPrefixes` (used by static `PathValidation` tests), and
+  `IsSafePath(string path, string[] allowedPrefixes)` that checks against the
+  supplied set. The instance `ApplyAsync` and `ReconcileStaleFiles` both call
+  the two-argument form with `_allowedPrefixes`.
+- Updated class-level and `ReconcileStaleFiles` doc comments.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`**:
+- Expanded `PathValidation` Theory from 3 to 13 inline cases — added 5 allowed
+  paths (one per prefix) and 5 rejected paths (`/etc/passwd`, `/etc/shadow`,
+  `/boot/grub.cfg`, `/home/alice/file`, `/tmp/evil`).
+- Fixed three `EnsureDir_EnforceMode_*` tests that used `/tmp` (outside the real
+  allowlist): each now injects `Path.GetTempPath()` as the `allowedPrefixes` so
+  `Directory.CreateDirectory` succeeds on all CI platforms while the chown/chmod
+  validation logic is still exercised.
+- Added `SetFile_OutsideAllowlist_Skipped` Fact: passing `/etc/passwd` with a
+  `Set` action on a production-prefixed enforcer returns an empty applied list.
+
+**`docs/DDS-Design-Document.md`** §14.6.4:
+- Added one sentence noting that the allowlist is enforced inside `IsSafePath`
+  (`AllowedPrefixes`), covering both `Set`/`Delete`/`EnsureDir` and the
+  reconciliation stale-delete path.
+
+**Test results**: Linux .NET **212/212** (was 201/201; 11 new tests).
+macOS .NET 96/96. `cargo check --workspace` clean.
+
+---
+
 ## Fix (2026-05-05, 60th pass) — FileEnforcer: EnsureDir test coverage + doc alignment
 
 ### Gap

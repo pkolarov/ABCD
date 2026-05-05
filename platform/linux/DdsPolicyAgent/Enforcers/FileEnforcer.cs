@@ -9,21 +9,37 @@ namespace DDS.PolicyAgent.Linux.Enforcers;
 /// Applies LinuxFileDirective entries (set / delete / ensure-dir).
 ///
 /// Safety invariants:
-///   - Path must be absolute and must not contain `..` components.
+///   - Path must be absolute, normalised (no `..`), and under an allowlisted root.
 ///   - Delete is only applied to paths in the DDS-managed set.
 ///   - SHA-256 of decoded content is verified before writing.
 ///   - Files are written atomically via a temp file + rename in the same directory.
 public sealed class FileEnforcer
 {
+    /// Filesystem roots the agent is permitted to write under (§14.6.4).
+    /// Paths outside these prefixes are rejected at the IsSafePath gate regardless
+    /// of DDS-managed status, preventing even an attacker-controlled-but-valid policy
+    /// from touching /etc/passwd, /boot, user home directories, etc.
+    internal static readonly string[] AllowedPrefixes =
+    [
+        "/etc/dds/",
+        "/etc/ssh/sshd_config.d/",
+        "/etc/sysctl.d/",
+        "/etc/systemd/system/",
+        "/usr/local/lib/dds/",
+    ];
+
     private readonly ICommandRunner _runner;
     private readonly bool _auditOnly;
     private readonly ILogger _log;
+    private readonly string[] _allowedPrefixes;
 
-    public FileEnforcer(ICommandRunner runner, bool auditOnly, ILogger log)
+    public FileEnforcer(ICommandRunner runner, bool auditOnly, ILogger log,
+        string[]? allowedPrefixes = null)
     {
         _runner = runner;
         _auditOnly = auditOnly;
         _log = log;
+        _allowedPrefixes = allowedPrefixes ?? AllowedPrefixes;
     }
 
     public async Task<List<string>> ApplyAsync(
@@ -44,7 +60,7 @@ public sealed class FileEnforcer
                 continue;
             }
 
-            if (!IsSafePath(path))
+            if (!IsSafePath(path, _allowedPrefixes))
             {
                 _log.LogWarning("FileEnforcer: unsafe path {P}; skipping", path);
                 continue;
@@ -201,7 +217,7 @@ public sealed class FileEnforcer
         var applied = new List<string>();
         foreach (var path in stalePaths)
         {
-            if (!IsSafePath(path))
+            if (!IsSafePath(path, _allowedPrefixes))
             {
                 _log.LogWarning("FileEnforcer: reconcile skip unsafe path {P}", path);
                 continue;
@@ -213,11 +229,18 @@ public sealed class FileEnforcer
         return applied;
     }
 
+    /// Validates a path against the production allowlist. Used by tests and by the static
+    /// reconcile caller path that always uses production prefixes.
     internal static bool IsSafePath(string path)
+        => IsSafePath(path, AllowedPrefixes);
+
+    internal static bool IsSafePath(string path, string[] allowedPrefixes)
     {
         if (!Path.IsPathRooted(path)) return false;
         var normalized = Path.GetFullPath(path);
-        return normalized == path.TrimEnd('/');
+        if (normalized != path.TrimEnd('/')) return false;
+        return allowedPrefixes.Any(prefix =>
+            normalized.StartsWith(prefix, StringComparison.Ordinal));
     }
 
     // Valid owner: "user" or "user:group" where each part is a POSIX name ([a-zA-Z0-9_.-]+, ≤32 chars).
