@@ -1,5 +1,64 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 70th pass) — Windows: AccountEnforcer username allowlist + group name control-char hardening
+
+### Gap
+
+**`AccountEnforcer.IsValidUsername` used a denylist inconsistent with the operations layer.**
+
+`AccountEnforcer.IsValidUsername` validated usernames against the Windows SAM Account Name
+forbidden-character list (`" / \ [ ] : ; | = , + * ? < > @`) but did not reject characters
+that the underlying `WindowsAccountOperations.IsValidSamUsername` allowlist
+(`^[A-Za-z0-9._\-]+$`) would reject — specifically spaces in the middle of a name,
+exclamation marks, hash characters, and control characters (tab, null byte, newline).
+
+The consequence: a crafted policy with a username like `"alice bob"` or `"alice!"` would
+pass the enforcer's denylist check, be forwarded to `_ops.CreateUser(...)`, and fail at the
+Win32 `NetUserAdd` level with an opaque `ArgumentException: 'alice bob' is not a valid SAM
+account name`, rather than being rejected early with the clearer
+`EnforcementStatus.Failed: Refused: username … contains invalid characters`.
+
+**`AccountEnforcer.IsValidGroupName` did not reject control characters.**
+
+The group name validator used the same SAM denylist but did not check for control characters
+(chars < 0x20). A group name containing a tab or newline would pass the enforcer, reach
+`NetLocalGroupAddMembers`, and fail opaquely. Additionally, trailing-space rejection was
+documented but not explicitly tested.
+
+### Fix
+
+**`platform/windows/DdsPolicyAgent/Enforcers/AccountEnforcer.cs`**:
+- `IsValidUsername`: replaced the SAM-forbidden denylist with an **allowlist** — only ASCII
+  letters, digits, `.`, `_`, and `-` are accepted; trailing `.` is still explicitly rejected.
+  This aligns the enforcer with `WindowsAccountOperations.IsValidSamUsername` and prevents
+  characters such as space, `!`, `#`, or control characters from reaching Win32.
+- `IsValidGroupName`: added control-character guard (`c < 0x20` → reject); the existing
+  SAM-forbidden denylist and trailing-dot/space checks are preserved. Spaces within the
+  group name continue to be allowed (e.g. "Remote Desktop Users").
+- Updated XML doc-comments on both methods to describe the new logic precisely.
+
+**`platform/windows/DdsPolicyAgent.Tests/AccountEnforcerTests.cs`** (+7 tests):
+- `IsValidUsername_rejects_invalid_names` Theory: added `"alice bob"` (space in middle),
+  `"alice!"` (exclamation), `"alice#1"` (hash), `"alice\tname"` (tab/control character).
+  Comments updated to distinguish SAM-forbidden chars from allowlist rejections.
+- `IsValidGroupName_rejects_invalid_names` Theory: added `"ends "` (trailing space),
+  `"group\tname"` (tab), `"group\nname"` (newline).
+
+**`docs/DDS-Admin-Guide.md`**:
+- Updated the `local_accounts` directive description: username validation now described as
+  an allowlist ("only ASCII letters, digits, `.`, `_`, `-`; must not end with `.`") rather
+  than a forbidden-character list. Added note that `full_name` and `description` are set at
+  creation only (not updated on subsequent `Create` cycles for existing users).
+
+**`docs/DDS-Design-Document.md`** §14.5.5:
+- Rewrote "Account name validation" paragraph to describe the allowlist for usernames and
+  the denylist-plus-control-char check for group names.
+
+**Test results**: Windows .NET **247/247** (was 240/240; +7 new tests). macOS .NET 96/96.
+Linux .NET 227/227. `cargo test --workspace --lib` **737/737** (all crates, 0 failures).
+
+---
+
 ## Fix (2026-05-05, 69th pass) — Windows: AccountEnforcer name validation + ServiceEnforcer display_name
 
 ### Gaps

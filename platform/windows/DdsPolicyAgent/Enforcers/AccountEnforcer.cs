@@ -319,29 +319,29 @@ public sealed class AccountEnforcer : IEnforcer
     }
 
     /// <summary>
-    /// Validates a Windows SAM Account Name. Windows forbids these
-    /// characters: <c>" / \ [ ] : ; | = , + * ? &lt; &gt; @</c>.
-    /// Names must be 1–20 characters and must not end with a period
-    /// or space.
+    /// Validates a Windows SAM Account Name using an allowlist.
+    /// Only ASCII letters, digits, dot, underscore, and hyphen are
+    /// permitted. Names must be 1–20 characters and must not end with
+    /// a dot (Windows API rejects trailing dots). This is intentionally
+    /// stricter than the raw SAM spec to align with
+    /// <see cref="WindowsAccountOperations.IsValidSamUsername"/> and
+    /// prevent unexpected Win32 errors for unusual characters.
     /// </summary>
     internal static bool IsValidUsername(string name)
     {
         if (string.IsNullOrEmpty(name) || name.Length > 20) return false;
-        if (name[^1] is '.' or ' ') return false;
+        if (name[^1] == '.') return false;
         foreach (var c in name)
-        {
-            if (c is '"' or '/' or '\\' or '[' or ']' or ':' or ';'
-                  or '|' or '=' or ',' or '+' or '*' or '?' or '<'
-                  or '>' or '@')
-                return false;
-        }
+            if (!char.IsAsciiLetterOrDigit(c) && c != '.' && c != '_' && c != '-') return false;
         return true;
     }
 
     /// <summary>
-    /// Validates a Windows local group name. Group names follow the
-    /// same forbidden character set as SAM Account Names but may be
-    /// up to 256 characters long.
+    /// Validates a Windows local group name. Group names may contain
+    /// spaces (e.g. "Remote Desktop Users") but must not include control
+    /// characters or the SAM-forbidden set
+    /// <c>" / \ [ ] : ; | = , + * ? &lt; &gt; @</c>.
+    /// Names must be 1–256 characters and must not end with a dot or space.
     /// </summary>
     internal static bool IsValidGroupName(string name)
     {
@@ -349,6 +349,7 @@ public sealed class AccountEnforcer : IEnforcer
         if (name[^1] is '.' or ' ') return false;
         foreach (var c in name)
         {
+            if (c < 0x20) return false;  // reject control characters (incl. null, tab, newline)
             if (c is '"' or '/' or '\\' or '[' or ']' or ':' or ';'
                   or '|' or '=' or ',' or '+' or '*' or '?' or '<'
                   or '>' or '@')

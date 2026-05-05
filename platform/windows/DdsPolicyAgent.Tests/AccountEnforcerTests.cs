@@ -200,22 +200,26 @@ public class AccountEnforcerTests
     [Theory]
     [InlineData("")]                          // empty
     [InlineData("ABCDEFGHIJ12345678901")]     // 21 chars
-    [InlineData("alice/bob")]                 // slash
-    [InlineData("alice\\bob")]                // backslash
-    [InlineData("alice[0]")]                  // brackets
-    [InlineData("alice:1")]                   // colon
-    [InlineData("alice;1")]                   // semicolon
-    [InlineData("alice|pipe")]               // pipe
-    [InlineData("a=b")]                       // equals
-    [InlineData("a,b")]                       // comma
-    [InlineData("a+b")]                       // plus
-    [InlineData("a*b")]                       // asterisk
-    [InlineData("a?b")]                       // question mark
-    [InlineData("a<b")]                       // less-than
-    [InlineData("a>b")]                       // greater-than
-    [InlineData("alice@domain")]              // at-sign
+    [InlineData("alice/bob")]                 // slash (SAM forbidden)
+    [InlineData("alice\\bob")]                // backslash (SAM forbidden)
+    [InlineData("alice[0]")]                  // brackets (SAM forbidden)
+    [InlineData("alice:1")]                   // colon (SAM forbidden)
+    [InlineData("alice;1")]                   // semicolon (SAM forbidden)
+    [InlineData("alice|pipe")]                // pipe (SAM forbidden)
+    [InlineData("a=b")]                       // equals (SAM forbidden)
+    [InlineData("a,b")]                       // comma (SAM forbidden)
+    [InlineData("a+b")]                       // plus (SAM forbidden)
+    [InlineData("a*b")]                       // asterisk (SAM forbidden)
+    [InlineData("a?b")]                       // question mark (SAM forbidden)
+    [InlineData("a<b")]                       // less-than (SAM forbidden)
+    [InlineData("a>b")]                       // greater-than (SAM forbidden)
+    [InlineData("alice@domain")]              // at-sign (SAM forbidden)
     [InlineData("ends.")]                     // trailing dot
-    [InlineData("ends ")]                     // trailing space
+    [InlineData("ends ")]                     // space (not in allowlist)
+    [InlineData("alice bob")]                 // space in middle (not in allowlist)
+    [InlineData("alice!")]                    // exclamation (not in allowlist)
+    [InlineData("alice#1")]                   // hash (not in allowlist)
+    [InlineData("alice\tname")]               // tab — control character
     public void IsValidUsername_rejects_invalid_names(string name)
     {
         Assert.False(AccountEnforcer.IsValidUsername(name));
@@ -256,6 +260,9 @@ public class AccountEnforcerTests
     [InlineData("group:name")]         // colon
     [InlineData("group|pipe")]         // pipe
     [InlineData("ends.")]              // trailing dot
+    [InlineData("ends ")]              // trailing space
+    [InlineData("group\tname")]        // tab — control character
+    [InlineData("group\nname")]        // newline — control character
     public void IsValidGroupName_rejects_invalid_names(string name)
     {
         Assert.False(AccountEnforcer.IsValidGroupName(name));

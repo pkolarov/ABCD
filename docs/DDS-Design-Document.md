@@ -1188,12 +1188,16 @@ The native Windows Auth Bridge applies the same guard before allowing
 first-account claim at the logon screen.
 
 **Account name validation:** The `AccountEnforcer` validates both
-`username` and group names before any Win32 call. Usernames must
-satisfy Windows SAM Account Name constraints: 1–20 characters, no
-`" / \ [ ] : ; | = , + * ? < > @`, and must not end with `.` or a
-space. Group names allow the same forbidden characters with a 256-
-character limit. Strings outside these constraints are rejected with
-`EnforcementStatus.Failed` without touching the Win32 layer.
+`username` and group names before any Win32 call. Usernames use an
+allowlist: 1–20 characters, only ASCII letters, digits, `.`, `_`,
+and `-`; must not end with `.`. This is intentionally stricter than
+the raw SAM spec to align with the operations layer and prevent
+control-character injection into Win32 APIs. Group names are validated
+with the SAM-forbidden character denylist (`" / \ [ ] : ; | = , + *
+? < > @`) plus control characters (< 0x20), max 256 characters; spaces
+within the name are permitted (e.g. "Remote Desktop Users"), but names
+may not end with `.` or space. Strings outside these constraints are
+rejected with `EnforcementStatus.Failed` without touching the Win32 layer.
 
 **Service display name length:** The `ServiceEnforcer` caps `display_name`
 at 256 characters (Windows SCM registry limit). Names exceeding this

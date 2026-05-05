@@ -1174,7 +1174,7 @@ The `WindowsSettings` bundle supports five directive types:
 }
 ```
 
-`action` values: `Create` (idempotent — creates if missing, applies groups on every cycle), `Delete`, `Disable`, `Enable`. `Create` and `Delete` are only applied on workgroup machines (the `AccountEnforcer` refuses all operations on AD-joined or Entra hybrid-joined machines). Usernames are validated against Windows SAM Account Name constraints: 1–20 characters, no `" / \ [ ] : ; | = , + * ? < > @`, may not end with `.` or space. Group names in the `groups` array are validated against the same forbidden character set (max 256 characters). Invalid names are rejected with `EnforcementStatus.Failed` before any Win32 call.
+`action` values: `Create` (idempotent — creates if missing, applies groups and `password_never_expires` on every cycle; `full_name` and `description` are only set at creation), `Delete`, `Disable`, `Enable`. `Create` and `Delete` are only applied on workgroup machines (the `AccountEnforcer` refuses all operations on AD-joined or Entra hybrid-joined machines). Usernames are validated with an allowlist: 1–20 characters, only ASCII letters, digits, `.`, `_`, and `-`; must not end with `.`. Group names in the `groups` array are validated against the SAM-forbidden character set (`" / \ [ ] : ; | = , + * ? < > @`) plus control characters, and may not end with `.` or space (max 256 characters; spaces within the name are allowed, e.g. "Remote Desktop Users"). Invalid names are rejected with `EnforcementStatus.Failed` before any Win32 call.
 
 ### Windows First Account Claim
 
