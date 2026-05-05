@@ -1396,7 +1396,7 @@ drop-in, stale `sudoers` drop-ins are deleted from `/etc/sudoers.d/`, stale
 `systemd` drop-in files are deleted from `/etc/systemd/system/<unit>.d/` (with
 `daemon-reload`), and the `sshd` drop-in is removed when no current policy
 declares an `ssh` field with at least one recognized valid directive (absent field,
-`null`, empty object, and all-invalid-value objects are all treated equivalently). Unit-state directives (enable/disable/start/stop)
+`null`, empty object, and all-invalid-value objects are all treated equivalently). Unit-state directives (Enable/Disable/Start/Stop/Restart/Mask/Unmask)
 are applied on the forward pass only — reversing them is ambiguous. For macOS:
 the same algorithm runs with platform-appropriate backends (dscl, launchctl,
 profiles, etc.); generic package uninstall is not supported so stale software
@@ -1546,7 +1546,7 @@ Linux-specific enforcers:
 | `UserEnforcer` | `useradd`, `usermod`, `groupadd`, `passwd -l/-u` | Local accounts only |
 | `SudoersEnforcer` | drop-in files under `/etc/sudoers.d/` + `visudo -c` | Safe filename allowlist guards path traversal |
 | `FileEnforcer` | atomic temp-write + rename + `chmod`/`chown` | Only allowlisted paths |
-| `SystemdEnforcer` | `systemctl` / D-Bus + drop-in files under `/etc/systemd/system/` | Service enable/disable/restart; `ConfigureDropin` drop-ins tracked in state store and reconciled |
+| `SystemdEnforcer` | `systemctl` + drop-in files under `/etc/systemd/system/` | Enable/Disable/Start/Stop/Restart/Mask/Unmask units; `ConfigureDropin` drop-ins tracked in state store and reconciled; `RemoveDropin` removes them |
 | `PackageEnforcer` | distro package manager abstraction | Backend chosen from host capability |
 | `SysctlEnforcer` | `/etc/sysctl.d/*.conf` + `sysctl --system` | Avoids ephemeral-only writes to `/proc/sys` |
 | `SshdEnforcer` | managed drop-in under `/etc/ssh/sshd_config.d/` + reload | No direct in-place edits to vendor file |

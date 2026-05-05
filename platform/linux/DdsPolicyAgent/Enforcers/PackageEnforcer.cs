@@ -49,6 +49,12 @@ public sealed class PackageEnforcer
                 continue;
             }
 
+            if (version != null && !IsValidVersion(version))
+            {
+                _log.LogWarning("PackageEnforcer: unsafe version string {V} for {N}; skipping", version, name);
+                continue;
+            }
+
             var tag = $"pkg:{action.ToLowerInvariant()}:{name}";
 
             switch (action)
@@ -160,6 +166,19 @@ public sealed class PackageEnforcer
         if (name.Length == 0 || name.Length > 128) return false;
         foreach (var c in name)
             if (!char.IsAsciiLetterOrDigit(c) && c != '-' && c != '_' && c != '.' && c != '+')
+                return false;
+        return true;
+    }
+
+    /// Validates a package version string against the union of Debian and RPM version character sets.
+    /// Rejects any value that contains whitespace or shell-special characters that could be
+    /// split into extra arguments by ProcessStartInfo's argument tokeniser.
+    internal static bool IsValidVersion(string version)
+    {
+        if (version.Length == 0 || version.Length > 64) return false;
+        foreach (var c in version)
+            if (!char.IsAsciiLetterOrDigit(c) && c != '.' && c != '-' && c != '_'
+                && c != '+' && c != '~' && c != ':')
                 return false;
         return true;
     }

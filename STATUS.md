@@ -1,5 +1,73 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 63rd pass) — PackageEnforcer: version-string argument injection + Design Document stale SystemdEnforcer notes
+
+### Gaps
+
+**Gap 1 — `PackageEnforcer.InstallAsync` passed unvalidated `version` field into package-manager arguments**
+
+`PackageEnforcer.ApplyAsync` validated the `name` field via `IsValidPackageName` but passed the
+optional `version` field straight into the argument string without any validation:
+
+```csharp
+var spec = string.IsNullOrEmpty(version) ? name : $"{name}={version}";
+// args = $"install -y {spec}"  ← version participates with no guards
+```
+
+`ProcessStartInfo` on .NET splits the `arguments` string on whitespace before handing the tokens
+to the OS. A `version` containing a space (e.g. `"1.0 --no-verify-gpg"`) would be split into
+extra flags, allowing the caller to inject arbitrary `apt-get` / `dnf` / `rpm` options such as
+`--no-verify-gpg` or `--allow-unauthenticated`, bypassing GPG signature verification.
+
+This is the same argument-injection class as the 58th pass fixed for `FileEnforcer` (owner/mode)
+and `UserEnforcer` (shell). Exploiting it requires writing an `Install` directive into the DDS
+trust graph — a privileged operation — but the enforcer layer must never allow crafted policy
+fields to inject flags into privileged system commands.
+
+**Gap 2 — Design Document §14.5.9 and §14.6.3 stale `SystemdEnforcer` descriptions**
+
+The 59th pass added `Mask` and `Unmask` actions to `SystemdEnforcer` and updated the Admin Guide
+and the Design Document §14.6.1 struct definition. Two sentences in the Design Document were not
+updated:
+
+- §14.5.9 reconciliation section: "Unit-state directives (enable/disable/start/stop) are applied
+  on the forward pass only" — missing `Restart`, `Mask`, and `Unmask`.
+- §14.6.3 enforcer table: `SystemdEnforcer` notes said "Service enable/disable/restart;
+  `ConfigureDropin` drop-ins tracked in state store and reconciled" — missing `Mask`/`Unmask`
+  and `RemoveDropin`.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Enforcers/PackageEnforcer.cs`**:
+- Added `internal static bool IsValidVersion(string version)` — accepts only the union of
+  Debian (`[A-Za-z0-9._+~:-]`) and RPM (`[A-Za-z0-9._-]`) version character sets, max 64 chars.
+  Rejects empty strings, strings longer than 64 chars, and any character that could introduce
+  whitespace-split argument injection (spaces, `$`, `;`, `|`, `&`, etc.).
+- Added version validation gate in `ApplyAsync` (before the switch): when `version != null` and
+  `!IsValidVersion(version)`, logs a Warning and `continue`s — directive tag is not emitted and
+  no runner call is made.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`**:
+- Added `VersionValidation` Theory (10 inline cases): valid forms `"1.2.3"`, `"1:2.3.4-5"`,
+  `"2.3.1-1.fc38"`, `"1.0+dfsg"`, `"1.0~rc1"` all pass; empty string, space-injection
+  (`"1.0 --force"`), semicolon, dollar, and 67-char-overlong all fail.
+- Added `Install_UnsafeVersion_SkippedNoRunner` Fact: a directive with `version:"1.0 --no-verify-gpg"`
+  produces an empty `applied` list and zero runner invocations.
+- Added `Install_ValidVersion_AuditOnlyNoRunner` Fact: a directive with a valid Debian version
+  including epoch and dfsg suffix (`"1:4.2.8p15+dfsg-1"`) emits the expected tag in audit mode
+  with no runner call.
+
+**`docs/DDS-Design-Document.md`**:
+- §14.5.9: Updated "Unit-state directives (enable/disable/start/stop)" →
+  "Unit-state directives (Enable/Disable/Start/Stop/Restart/Mask/Unmask)".
+- §14.6.3 table `SystemdEnforcer` notes: Updated to list all supported subcommand categories
+  and mention `RemoveDropin` alongside `ConfigureDropin`.
+
+**Test results**: Linux .NET **224/224** (was 212/212; 12 new tests). macOS .NET 96/96.
+`cargo check --workspace` clean.
+
+---
+
 ## Fix (2026-05-05, 62nd pass) — provision: at-rest-storage advisory on every provision run
 
 ### Gap

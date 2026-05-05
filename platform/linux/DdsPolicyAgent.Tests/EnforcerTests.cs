@@ -635,6 +635,53 @@ public sealed class PackageEnforcerTests
         Assert.Empty(applied);
         Assert.Empty(runner.Invocations);
     }
+
+    [Theory]
+    [InlineData("1.2.3",                                                                   true)]
+    [InlineData("1:2.3.4-5",                                                               true)]
+    [InlineData("2.3.1-1.fc38",                                                            true)]
+    [InlineData("1.0+dfsg",                                                                true)]
+    [InlineData("1.0~rc1",                                                                 true)]
+    [InlineData("",                                                                        false)]  // empty
+    [InlineData("1.0 --force",                                                             false)]  // space
+    [InlineData("1.0;rm -rf /",                                                            false)]  // semicolon
+    [InlineData("$(evil)",                                                                 false)]  // dollar
+    [InlineData("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",     false)]  // 67 chars > 64
+    public void VersionValidation(string version, bool expected)
+        => Assert.Equal(expected, PackageEnforcer.IsValidVersion(version));
+
+    [Fact]
+    public async Task Install_UnsafeVersion_SkippedNoRunner()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new PackageEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        // Version with a space would split into extra arguments; must be rejected.
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"name":"ntp","action":"Install","version":"1.0 --no-verify-gpg"}""").RootElement],
+            new HashSet<string>(),
+            default);
+
+        // The directive tag is not emitted and no runner call is made.
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task Install_ValidVersion_AuditOnlyNoRunner()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new PackageEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"name":"ntp","action":"Install","version":"1:4.2.8p15+dfsg-1"}""").RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("pkg:install:ntp", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
 }
 
 // ============================================================
