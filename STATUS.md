@@ -1,5 +1,47 @@
 # DDS Implementation Status
 
+## Fix (2026-05-05, 62nd pass) — provision: at-rest-storage advisory on every provision run
+
+### Gap
+
+`run_provision` wrote node identity keys (`node_key.bin`, `p2p_key.bin`) without
+first advising the operator about their encryption posture. The sealed-passphrase
+design (`docs/sealed-passphrase-design.md`) documents per-platform at-rest
+protection (Linux TPM2, macOS System Keychain, Windows DPAPI) but nothing in the
+provisioning flow surfaced whether `DDS_NODE_PASSPHRASE` was set before keys
+landed on disk. Operators without the sealed-passphrase helper wired up would
+silently receive plaintext key files — a gap especially sharp on Linux hosts
+without a TPM (no hardware-bound protection at all).
+
+### Fix
+
+**`dds-node/src/provision.rs`**:
+- Added `warn_at_rest_storage()`, called at the very top of `run_provision`
+  before any keys are written.
+- When `DDS_NODE_PASSPHRASE` is already set the function returns immediately
+  (no output — the operator has done the right thing).
+- When it is unset:
+  - **Linux + TPM present** (`/dev/tpm0` or `/dev/tpmrm0` exists): advisory
+    note showing the exact seal-and-provision command sequence, then continues.
+  - **Linux, no TPM**: loud `=====` box warning that keys will land plaintext,
+    names the affected files and their fallback protection (filesystem mode
+    0700/0600), points at `docs/sealed-passphrase-design.md`, and offers a
+    Ctrl-C escape hatch.
+  - **macOS / Windows**: softer one-paragraph note pointing at the design doc
+    and flagging that OS-bound Keychain/DPAPI wiring is not yet in the install
+    scripts.
+- Added two regression tests:
+  - `warn_at_rest_storage_silent_when_passphrase_set` — verifies the early-exit
+    path; holds `ENV_LOCK` to prevent interference with sibling env-var tests.
+  - `warn_at_rest_storage_no_panic_when_passphrase_unset` — exercises the
+    platform-specific output path; asserts no panic regardless of whether a
+    TPM is present on the test host.
+
+**Test results**: `cargo test -p dds-node --lib` — **312/312** (was 310/310;
+2 new tests). `cargo check --workspace` clean.
+
+---
+
 ## Fix (2026-05-05, 61st pass) — FileEnforcer: enforce filesystem allowlist in IsSafePath
 
 ### Gap

@@ -609,6 +609,76 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
+/// At-rest-storage advisory. Printed at the top of every provision run
+/// so the operator knows whether `node_key.bin` / `p2p_key.bin` are
+/// going to land encrypted (DDS_NODE_PASSPHRASE set) or plaintext (env
+/// unset) before any keys are written. On Linux without a TPM the
+/// message is loud — sealed-passphrase wrappers are the recommended
+/// path and a missing TPM is a real production gap. On macOS/Windows
+/// the message is softer because OS-bound storage (Keychain, DPAPI)
+/// is always available; only the install-time wiring is not yet done.
+fn warn_at_rest_storage() {
+    // Operator already supplied a wrap key — no advisory needed.
+    let passphrase_set = std::env::var(crate::identity_store::PASSPHRASE_ENV)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if passphrase_set {
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let has_tpm = std::path::Path::new("/dev/tpm0").exists()
+            || std::path::Path::new("/dev/tpmrm0").exists();
+        if has_tpm {
+            println!();
+            println!("  TPM detected (/dev/tpm0). To encrypt node identity at rest, run");
+            println!("  the seal helper BEFORE provision and set DDS_NODE_PASSPHRASE:");
+            println!("    pass=\"$(/usr/local/sbin/dds-tpm-seal /var/lib/dds/node)\"");
+            println!("    DDS_NODE_PASSPHRASE=\"$pass\" dds-node provision <bundle> ...");
+            println!("  Continuing without seal — node keys will land plaintext at rest.");
+            println!();
+        } else {
+            println!();
+            println!("  ============================================================");
+            println!("  WARNING: no TPM detected on this host");
+            println!("  ============================================================");
+            println!("  /dev/tpm0 and /dev/tpmrm0 are absent. Node identity");
+            println!("  (node_key.bin, p2p_key.bin) will be stored UNENCRYPTED at");
+            println!("  rest, protected only by filesystem permissions");
+            println!("  (/var/lib/dds/node mode 0700 root:root, files 0600).");
+            println!();
+            println!("  Production hosts should provision with a TPM and the sealed-");
+            println!("  passphrase wrapper. See docs/sealed-passphrase-design.md.");
+            println!();
+            println!("  Continuing — Ctrl-C now if you want to abort and add a TPM.");
+            println!("  ============================================================");
+            println!();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        println!();
+        println!("  Note: DDS_NODE_PASSPHRASE is unset. Node identity will be stored");
+        println!("  plaintext at rest, relying on file permissions. macOS System");
+        println!("  Keychain (SEP-backed) integration is documented in");
+        println!("  docs/sealed-passphrase-design.md but not yet wired into install.");
+        println!();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        println!();
+        println!("  Note: DDS_NODE_PASSPHRASE is unset. Node identity will be stored");
+        println!("  plaintext at rest, relying on file permissions. Windows DPAPI");
+        println!("  machine-scope (TPM-backed transparently when present) integration");
+        println!("  is documented in docs/sealed-passphrase-design.md but not yet");
+        println!("  wired into install.");
+        println!();
+    }
+}
+
 /// Default data directory for the current platform.
 fn default_data_dir() -> PathBuf {
     match std::env::consts::OS {
@@ -652,6 +722,8 @@ pub fn run_provision(
     data_dir: Option<&Path>,
     start_node: bool,
 ) -> Result<ProvisionSummary, ProvisionError> {
+    warn_at_rest_storage();
+
     // 1. Load bundle
     println!("[1/6] Loading provision bundle...");
     let bundle = load_bundle(bundle_path)?;
@@ -2389,5 +2461,26 @@ mod tests {
             cert.pq_kem_pubkey.is_none(),
             "legacy domain admission cert must not carry pq_kem_pubkey"
         );
+    }
+
+    /// `warn_at_rest_storage` must be a no-op (no panic, no output side
+    /// effects that could affect other tests) when `DDS_NODE_PASSPHRASE`
+    /// is already set to a non-empty value.
+    #[test]
+    fn warn_at_rest_storage_silent_when_passphrase_set() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::set_var(crate::identity_store::PASSPHRASE_ENV, "s3cr3t") };
+        warn_at_rest_storage(); // must return immediately without panic
+        unsafe { std::env::remove_var(crate::identity_store::PASSPHRASE_ENV) };
+    }
+
+    /// `warn_at_rest_storage` must complete without panicking when
+    /// `DDS_NODE_PASSPHRASE` is unset, regardless of whether a TPM is
+    /// present on the host running the test.
+    #[test]
+    fn warn_at_rest_storage_no_panic_when_passphrase_unset() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(crate::identity_store::PASSPHRASE_ENV) };
+        warn_at_rest_storage(); // must not panic on any supported platform
     }
 }
