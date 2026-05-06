@@ -1,5 +1,44 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-07, 84th pass) — Linux: SystemdEnforcer ConfigureDropin missing enforce-mode test coverage
+
+### Gap
+
+**`SystemdEnforcerTests.ConfigureDropin` had no enforce-mode test.**
+
+Every other `SystemdEnforcer` action has a matching pair:
+`{Action}_AuditOnly_NoRunner` + `{Action}_EnforceMode_CallsSystemctl`.  `ConfigureDropin`
+had the audit-mode test (`ConfigureDropin_AuditOnly_ReturnsDirectiveTagWithoutWrite`) and
+two validation tests, but the enforce-mode path — where `WriteDropinAsync` creates the drop-in
+file and `daemon-reload` is subsequently called via the runner — had zero coverage.
+
+The root cause was the hardcoded `DropinBase = "/etc/systemd/system"` constant: enforce-mode
+tests couldn't write to a system directory in CI.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Enforcers/SystemdEnforcer.cs`**:
+- Renamed the constant to `DefaultDropinBase`.
+- Added an optional `string? dropinBase = null` constructor parameter; field
+  `_dropinBase` is initialised to `dropinBase ?? DefaultDropinBase`.
+- Replaced the three `DropinBase` usages in `WriteDropinAsync`, `RemoveDropinAsync`,
+  and `ReconcileStaleDropinsAsync` with `_dropinBase`.
+- Production callers pass no argument and retain the existing system path.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`** (+1 test):
+
+`SystemdEnforcerTests` (+1):
+- `ConfigureDropin_EnforceMode_WritesFileAndCallsDaemonReload` — enforcer instantiated
+  with a temp directory as the dropin base; `ApplyAsync` with a valid `ConfigureDropin`
+  directive writes `sshd.service.d/dds-limits.conf` under the temp dir (content verified),
+  returns `"systemd:configuredropin:sshd.service/dds-limits"`, and triggers exactly one
+  runner call of `systemctl daemon-reload`. Temp dir cleaned up in `finally`.
+
+**Test results**: Linux .NET **294/294** (was 293/293; +1 new test). All other suites
+unchanged.
+
+---
+
 ## Gap Fix (2026-05-06, 83rd pass) — Linux: PackageEnforcer RPM backend and Dnf+version test coverage
 
 ### Gap

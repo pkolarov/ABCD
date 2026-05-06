@@ -835,6 +835,44 @@ public sealed class SystemdEnforcerTests
     }
 
     [Fact]
+    public async Task ConfigureDropin_EnforceMode_WritesFileAndCallsDaemonReload()
+    {
+        var tmpBase  = Path.Combine(Path.GetTempPath(), "dds-systemd-" + Guid.NewGuid());
+        try
+        {
+            var runner   = new NullCommandRunner();
+            var enforcer = new SystemdEnforcer(runner, auditOnly: false, NullLogger.Instance,
+                dropinBase: tmpBase);
+
+            var applied = await enforcer.ApplyAsync(
+                [JsonDocument.Parse("""
+                    {"unit":"sshd.service","action":"ConfigureDropin",
+                     "dropin_name":"dds-limits","dropin_content":"[Service]\nLimitNOFILE=1024\n"}
+                    """).RootElement],
+                default);
+
+            Assert.Single(applied);
+            Assert.Equal("systemd:configuredropin:sshd.service/dds-limits", applied[0]);
+
+            // Enforce mode: daemon-reload must be called after writing the drop-in.
+            Assert.Single(runner.Invocations);
+            Assert.Equal("systemctl", runner.Invocations[0].FileName);
+            Assert.Contains("daemon-reload", runner.Invocations[0].Arguments);
+
+            // The drop-in file must be written at the injected base path.
+            var dropinPath = Path.Combine(tmpBase, "sshd.service.d", "dds-limits.conf");
+            Assert.True(File.Exists(dropinPath));
+            var content = await File.ReadAllTextAsync(dropinPath);
+            Assert.Contains("LimitNOFILE=1024", content);
+        }
+        finally
+        {
+            if (Directory.Exists(tmpBase))
+                Directory.Delete(tmpBase, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task RemoveDropin_AuditOnly_ReturnsDirectiveTag()
     {
         var runner   = new NullCommandRunner();

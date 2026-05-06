@@ -23,17 +23,20 @@ public sealed class SystemdEnforcer
             ".automount", ".swap", ".path", ".slice", ".scope"
         };
 
-    private const string DropinBase = "/etc/systemd/system";
+    private const string DefaultDropinBase = "/etc/systemd/system";
 
     private readonly ICommandRunner _runner;
     private readonly bool _auditOnly;
     private readonly ILogger _log;
+    private readonly string _dropinBase;
 
-    public SystemdEnforcer(ICommandRunner runner, bool auditOnly, ILogger log)
+    public SystemdEnforcer(ICommandRunner runner, bool auditOnly, ILogger log,
+        string? dropinBase = null)
     {
         _runner = runner;
         _auditOnly = auditOnly;
         _log = log;
+        _dropinBase = dropinBase ?? DefaultDropinBase;
     }
 
     public async Task<List<string>> ApplyAsync(
@@ -155,7 +158,7 @@ public sealed class SystemdEnforcer
                 continue;
             }
 
-            var dropinPath = Path.Combine(DropinBase, $"{unit}.d", $"{stem}.conf");
+            var dropinPath = Path.Combine(_dropinBase, $"{unit}.d", $"{stem}.conf");
 
             if (_auditOnly)
             {
@@ -194,7 +197,7 @@ public sealed class SystemdEnforcer
             return null;
         }
 
-        var dropinDir  = Path.Combine(DropinBase, $"{unit}.d");
+        var dropinDir  = Path.Combine(_dropinBase, $"{unit}.d");
         var dropinPath = Path.Combine(dropinDir, $"{stem}.conf");
 
         if (_auditOnly)
@@ -223,7 +226,7 @@ public sealed class SystemdEnforcer
             return Task.FromResult<string?>(null);
         }
 
-        var dropinPath = Path.Combine(DropinBase, $"{unit}.d", $"{stem}.conf");
+        var dropinPath = Path.Combine(_dropinBase, $"{unit}.d", $"{stem}.conf");
 
         if (_auditOnly)
         {
