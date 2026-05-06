@@ -83,6 +83,14 @@ hosts without a TPM still boot, just with plaintext node keys.
   unseal helper, exports `DDS_NODE_PASSPHRASE`, and `exec`s
   `dds-node run`. Falls through cleanly when no sealed passphrase
   exists.
+- **Provision-time auto-seal**: `dds-node provision` itself looks for
+  `/usr/local/sbin/dds-keychain-{seal,unseal}` (installed by the
+  .pkg) and, when `DDS_NODE_PASSPHRASE` is unset, either reuses an
+  existing keychain entry or seals a fresh one before writing
+  `node_key.bin` / `p2p_key.bin`. End-user flow after `installer
+  -pkg ...` is therefore exactly one command:
+  `sudo dds-node provision /path/to/provision.dds`. See
+  [`provision.rs::try_auto_seal_passphrase`](../dds-node/src/provision.rs).
 - **Helpers** (in
   [`platform/macos/packaging/helpers/`](../platform/macos/packaging/helpers/)):
   - `dds-keychain-seal.sh` — generates random passphrase, stores in
@@ -92,8 +100,9 @@ hosts without a TPM still boot, just with plaintext node keys.
     then `exec`s dds-node
 - **Runbook**:
   [`platform/macos/packaging/SEALED-PASSPHRASE.md`](../platform/macos/packaging/SEALED-PASSPHRASE.md).
-  *Status: implemented; round-trip verified end-to-end (seal →
-  encrypted gen-node-key → reload → wrong-passphrase rejection).*
+  *Status: implemented end-to-end. Provision-time auto-seal makes the
+  install a single command; round-trip (seal → encrypted save →
+  reload → wrong-passphrase rejection) verified locally.*
 
 ### Windows — DPAPI machine scope (TPM-backed transparently)
 
@@ -122,29 +131,57 @@ hosts without a TPM still boot, just with plaintext node keys.
 
 ## Operational lifecycle
 
-1. **One-time seal** (post-install, before `dds-node provision`):
-   ```sh
-   pass="$(dds-tpm-seal)"             # Linux
-   # pass="$(dds-keychain-seal)"      # macOS (when implemented)
-   # pass="$(.\Seal-DdsPassphrase.ps1)"  # Windows (when implemented)
-   ```
-2. **Provision with the passphrase set** so `node_key.bin` /
-   `p2p_key.bin` land encrypted from the start:
-   ```sh
-   DDS_NODE_PASSPHRASE="$pass" dds-node provision <bundle.dds> \
-     --data-dir /var/lib/dds/node --no-start
-   unset pass
-   ```
-3. **Start the service.** The unit's `ExecStartPre=` (systemd) or
-   conf.d block (OpenRC) unseals at every start. The operator never
-   re-enters the passphrase.
+The flow differs by platform because PCR-policy choice on Linux is
+host-specific (and shouldn't be picked silently), while macOS keychain
+storage has no such knob — so macOS auto-seals at provision time.
 
-For an **already-provisioned** node (keys already plaintext on disk),
-seal first, then re-encrypt by setting `DDS_NODE_PASSPHRASE` and
-running `dds-node rewrap-identity --data-dir <dir>` — that re-saves
-the existing keys under the new wrap **without** changing the Ed25519
-signing key or libp2p PeerId (the admission cert remains valid). See
-the per-platform runbooks for the full procedure.
+### macOS — single command
+
+```sh
+sudo installer -pkg DDS-Platform-macOS-X.Y.Z-arm64.pkg -target /
+sudo dds-node provision /path/to/provision.dds
+```
+
+`dds-node provision` detects the .pkg helpers, seals a fresh
+passphrase in the System Keychain (or reuses an existing one), and
+writes `node_key.bin` / `p2p_key.bin` encrypted. The LaunchDaemon
+wrapper unseals at every boot. No environment variables. No manual
+seal step.
+
+### Linux — explicit seal first
+
+```sh
+# 1. Seal a passphrase under the TPM (PCR-policy choices belong to
+#    the operator — see SEALED-PASSPHRASE.md).
+pass="$(sudo /usr/local/sbin/dds-tpm-seal /var/lib/dds/node)"
+
+# 2. Provision with the passphrase set.
+sudo env DDS_NODE_PASSPHRASE="$pass" \
+    dds-node provision <bundle.dds> --data-dir /var/lib/dds/node --no-start
+unset pass
+
+# 3. Start the service. OpenRC conf.d / systemd ExecStartPre= unseals
+#    at every start.
+sudo rc-service dds-node start          # OpenRC
+# or:
+sudo systemctl enable --now dds-node    # systemd
+```
+
+### Windows — pending
+
+`service-run --unseal-passphrase-from <path>` flag is sketched but not
+yet implemented. Until it lands, Windows nodes provision plaintext
+(filesystem perms only).
+
+### Already-provisioned node (any platform)
+
+If keys are already on disk plaintext (or under an old passphrase) and
+you want to start using a sealed passphrase, run
+`dds-node rewrap-identity --data-dir <dir>` with `DDS_NODE_PASSPHRASE`
+set to the new (sealed) value — that re-saves the existing keys under
+the new wrap **without** changing the Ed25519 signing key or libp2p
+PeerId, so the admission cert remains valid. See the per-platform
+runbooks for the full procedure.
 
 ## Boot-ordering summary
 
