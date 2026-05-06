@@ -1,5 +1,41 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-06, 83rd pass) — Linux: PackageEnforcer RPM backend and Dnf+version test coverage
+
+### Gap
+
+**`PackageEnforcerTests` had zero test coverage for the RPM backend, and no test for
+the Dnf backend with a version string.**
+
+The 82nd pass added enforce-mode tests for the `apt-get` and `dnf` backends (install and
+remove, no version). Three remaining gaps existed:
+
+- **RPM backend (all cases untested)** — the `PackageManager.Rpm` detection branch
+  (`which rpm` succeeds after apt-get / dnf / zypper all absent) and both its
+  commands (`rpm -i {spec}` for install, `rpm -e {name}` for remove) had no coverage.
+- **Dnf backend + version** — the `{name}={version}` spec format was tested for
+  apt-get (82nd pass) and zypper (earlier pass) but not for the dnf backend.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`** (+4 tests):
+
+`PackageEnforcerTests` (+4):
+- `InstallPackage_DnfBackend_WithVersion_UsesEqualsSeparator` — dnf backend with a
+  version string uses `dnf install -y httpd=2.4.54-1` (completing the version-format
+  matrix for all three high-level backends).
+- `InstallPackage_RpmBackend_CallsRpm` — all high-level backends absent, `which rpm`
+  succeeds; `rpm -i bash` is invoked and no apt-get/dnf/zypper calls are made.
+- `InstallPackage_RpmBackend_WithVersion_UsesEqualsSeparator` — rpm backend with a
+  version string uses `rpm -i bash=5.1.8-6.el9`.
+- `RemovePackage_RpmBackend_CallsRpm` — rpm backend calls `rpm -e bash` for a
+  DDS-managed package; no apt-get/dnf/zypper calls made.
+
+**Test results**: Linux .NET **293/293** (was 289/289; +4 new tests). All other suites
+unchanged.
+
+---
+
 ## Gap Fix (2026-05-06, 82nd pass) — Linux: SystemdEnforcer and PackageEnforcer missing audit-mode and backend-specific test coverage
 
 ### Gap

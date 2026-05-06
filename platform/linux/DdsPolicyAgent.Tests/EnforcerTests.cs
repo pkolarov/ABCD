@@ -1215,6 +1215,92 @@ public sealed class PackageEnforcerTests
         Assert.Contains(runner.Invocations, i => i.FileName == "dnf" && i.Arguments == "remove -y httpd");
         Assert.DoesNotContain(runner.Invocations, i => i.FileName == "apt-get");
     }
+
+    [Fact]
+    public async Task InstallPackage_DnfBackend_WithVersion_UsesEqualsSeparator()
+    {
+        var runner = new NullCommandRunner();
+        runner.InvocationExitCodeOverrides[("which", "apt-get")] = 1;
+        runner.InvocationExitCodeOverrides[("which", "dnf")]     = 0;
+        var enforcer = new PackageEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"name":"httpd","action":"Install","version":"2.4.54-1"}""").RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("pkg:install:httpd", applied[0]);
+        Assert.Contains(runner.Invocations, i => i.FileName == "dnf" && i.Arguments == "install -y httpd=2.4.54-1");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "apt-get");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "zypper");
+    }
+
+    [Fact]
+    public async Task InstallPackage_RpmBackend_CallsRpm()
+    {
+        var runner = new NullCommandRunner();
+        runner.InvocationExitCodeOverrides[("which", "apt-get")] = 1;
+        runner.InvocationExitCodeOverrides[("which", "dnf")]     = 1;
+        runner.InvocationExitCodeOverrides[("which", "zypper")]  = 1;
+        runner.InvocationExitCodeOverrides[("which", "rpm")]     = 0;
+        var enforcer = new PackageEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"name":"bash","action":"Install"}""").RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("pkg:install:bash", applied[0]);
+        Assert.Contains(runner.Invocations, i => i.FileName == "rpm" && i.Arguments == "-i bash");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "apt-get");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "dnf");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "zypper");
+    }
+
+    [Fact]
+    public async Task InstallPackage_RpmBackend_WithVersion_UsesEqualsSeparator()
+    {
+        var runner = new NullCommandRunner();
+        runner.InvocationExitCodeOverrides[("which", "apt-get")] = 1;
+        runner.InvocationExitCodeOverrides[("which", "dnf")]     = 1;
+        runner.InvocationExitCodeOverrides[("which", "zypper")]  = 1;
+        runner.InvocationExitCodeOverrides[("which", "rpm")]     = 0;
+        var enforcer = new PackageEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"name":"bash","action":"Install","version":"5.1.8-6.el9"}""").RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("pkg:install:bash", applied[0]);
+        Assert.Contains(runner.Invocations, i => i.FileName == "rpm" && i.Arguments == "-i bash=5.1.8-6.el9");
+    }
+
+    [Fact]
+    public async Task RemovePackage_RpmBackend_CallsRpm()
+    {
+        var runner = new NullCommandRunner();
+        runner.InvocationExitCodeOverrides[("which", "apt-get")] = 1;
+        runner.InvocationExitCodeOverrides[("which", "dnf")]     = 1;
+        runner.InvocationExitCodeOverrides[("which", "zypper")]  = 1;
+        runner.InvocationExitCodeOverrides[("which", "rpm")]     = 0;
+        var enforcer = new PackageEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"name":"bash","action":"Remove"}""").RootElement],
+            new HashSet<string>(["bash"]),
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("pkg:remove:bash", applied[0]);
+        Assert.Contains(runner.Invocations, i => i.FileName == "rpm" && i.Arguments == "-e bash");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "apt-get");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "dnf");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "zypper");
+    }
 }
 
 // ============================================================
