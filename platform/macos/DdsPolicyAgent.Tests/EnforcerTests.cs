@@ -507,6 +507,41 @@ public class EnforcerTests
         Assert.True(ops.IsInGroup("alice", "-evil")); // NOT removed — invalid key was skipped
     }
 
+    [Fact]
+    public void MacAccountEnforcer_ReconcileStaleAccounts_skips_invalid_username()
+    {
+        // A stale account key with an invalid username must be skipped before
+        // any dscl call — symmetric with the group-name validation added for
+        // ReconcileStaleGroups in the 75th pass.
+        var ops = new InMemoryMacAccountOperations();
+        var enforcer = new MacAccountEnforcer(ops, NullLogger<MacAccountEnforcer>.Instance);
+
+        var changes = enforcer.ReconcileStaleAccounts(
+            new HashSet<string>(["-evil"], StringComparer.OrdinalIgnoreCase),
+            EnforcementMode.Enforce);
+
+        Assert.Empty(changes);
+    }
+
+    [Fact]
+    public void MacAccountEnforcer_ReconcileStaleGroups_skips_invalid_username_in_key()
+    {
+        // A stale group key whose username part is invalid must be skipped
+        // before any dseditgroup call — symmetric with the group-name check
+        // added in the 75th pass.
+        var ops = new InMemoryMacAccountOperations();
+        ops.CreateUser("alice", null, null, false, false);
+        ops.Peek("alice")!.Groups.Add("staff");
+        var enforcer = new MacAccountEnforcer(ops, NullLogger<MacAccountEnforcer>.Instance);
+
+        var changes = enforcer.ReconcileStaleGroups(
+            new HashSet<string>(["-evil:staff"], StringComparer.OrdinalIgnoreCase),
+            EnforcementMode.Enforce);
+
+        Assert.Empty(changes);
+        Assert.True(ops.IsInGroup("alice", "staff")); // untouched
+    }
+
     // --- MacAccountEnforcer: username and shell validation ---
 
     [Theory]

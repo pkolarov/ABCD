@@ -240,6 +240,12 @@ public sealed class AccountEnforcer : IEnforcer
         var changes = new List<string>();
         foreach (var username in staleUsernames)
         {
+            if (!IsValidUsername(username))
+            {
+                _log.LogWarning("Reconcile: username '{User}' from stale key is invalid, skipping", username);
+                continue;
+            }
+
             try
             {
                 if (!_ops.UserExists(username))
@@ -286,6 +292,12 @@ public sealed class AccountEnforcer : IEnforcer
             if (sep < 0) continue;
             var username = key[..sep];
             var group = key[(sep + 1)..];
+
+            if (!IsValidUsername(username))
+            {
+                _log.LogWarning("Reconcile: username '{User}' from key '{Key}' is invalid, skipping", username, key);
+                continue;
+            }
 
             if (!IsValidGroupName(group))
             {

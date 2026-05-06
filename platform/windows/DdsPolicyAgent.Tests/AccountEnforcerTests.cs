@@ -326,6 +326,36 @@ public class AccountEnforcerTests
         Assert.Contains("bad/group", _ops.GetGroups("alice")); // NOT removed — invalid key was skipped
     }
 
+    [Fact]
+    public void ReconcileStaleAccounts_skips_invalid_username()
+    {
+        // A stale key with an invalid username (e.g. containing a slash) must
+        // be skipped without calling into Win32 — symmetric with the group-name
+        // validation added for ReconcileStaleGroups.
+        var changes = _enforcer.ReconcileStaleAccounts(
+            new HashSet<string>(["bad/user"], StringComparer.OrdinalIgnoreCase),
+            EnforcementMode.Enforce);
+
+        Assert.Empty(changes);
+    }
+
+    [Fact]
+    public void ReconcileStaleGroups_skips_invalid_username_in_key()
+    {
+        // A stale group key whose username part is invalid must be skipped
+        // before any Win32 group-removal call — symmetric with the group-name
+        // check added in the 75th pass.
+        _ops.CreateUser("alice", null, null);
+        _ops.AddToGroup("alice", "Administrators");
+
+        var changes = _enforcer.ReconcileStaleGroups(
+            new HashSet<string>(["bad/user:Administrators"], StringComparer.OrdinalIgnoreCase),
+            EnforcementMode.Enforce);
+
+        Assert.Empty(changes);
+        Assert.Contains("Administrators", _ops.GetGroups("alice")); // untouched
+    }
+
     private static JsonElement Parse(string json)
         => JsonDocument.Parse(json).RootElement;
 }

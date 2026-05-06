@@ -613,6 +613,12 @@ public sealed class MacAccountEnforcer : IEnforcer
         var changes = new List<string>();
         foreach (var username in staleKeys)
         {
+            if (!IsValidUsername(username))
+            {
+                _log.LogWarning("Reconcile: username '{User}' from stale key is invalid, skipping", username);
+                continue;
+            }
+
             try
             {
                 var desc = $"Reconcile-Disable '{username}'";
@@ -663,6 +669,12 @@ public sealed class MacAccountEnforcer : IEnforcer
 
                 var username = managedKey[..sep];
                 var group = managedKey[(sep + 1)..];
+
+                if (!IsValidUsername(username))
+                {
+                    _log.LogWarning("Reconcile: username '{User}' from key '{Key}' is invalid, skipping", username, managedKey);
+                    continue;
+                }
 
                 if (!IsValidGroupName(group))
                 {

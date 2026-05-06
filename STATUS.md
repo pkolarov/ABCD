@@ -1,5 +1,57 @@
 # DDS Implementation Status
 
+## Fix (2026-05-06, 76th pass) — macOS + Windows: validate usernames in ReconcileStaleAccounts and ReconcileStaleGroups before OS API calls
+
+### Gap
+
+**`ReconcileStaleAccounts` on both macOS and Windows passed usernames directly to OS account APIs
+without any prior validation, and `ReconcileStaleGroups` (fixed for group names in the 75th pass)
+still passed the username half of the `username:group` key to OS APIs without validation.**
+
+The 75th pass added `IsValidGroupName(group)` to the stale-group reconciler, closing the
+group-name injection vector. The symmetric username gap remained: a tampered or malformed
+stale-account key could pass an attacker-controlled string to `dscl` (macOS) or Win32
+`NetUserGetInfo` / `NetUserSetInfo` (Windows) without any character-class check.
+
+The same defensive-depth argument applies: the forward-pass enforcement paths gate every
+`DisableUser` call behind `IsValidUsername`, but the symmetric reconciliation path had no
+such check.
+
+### Fix
+
+**`platform/windows/DdsPolicyAgent/Enforcers/AccountEnforcer.cs`** (`ReconcileStaleAccounts`):
+- Added `IsValidUsername(username)` check before entering the try-block; logs `LogWarning`
+  and skips the key if invalid — symmetric with `ApplyAsync`.
+
+**`platform/windows/DdsPolicyAgent/Enforcers/AccountEnforcer.cs`** (`ReconcileStaleGroups`):
+- Added `IsValidUsername(username)` check immediately after parsing `username` from the stale
+  key and before the existing `IsValidGroupName(group)` check.
+
+**`platform/macos/DdsPolicyAgent/Enforcers/MacAccountEnforcer.cs`** (`ReconcileStaleAccounts`):
+- Same fix: `IsValidUsername(username)` check with `LogWarning` and skip before the try-block.
+
+**`platform/macos/DdsPolicyAgent/Enforcers/MacAccountEnforcer.cs`** (`ReconcileStaleGroups`):
+- Same fix: `IsValidUsername(username)` check before the existing `IsValidGroupName(group)` check.
+
+**`platform/windows/DdsPolicyAgent.Tests/AccountEnforcerTests.cs`** (+2 tests):
+- `ReconcileStaleAccounts_skips_invalid_username` — verifies a stale key with an invalid
+  username (e.g. `bad/user`) produces no changes and makes no Win32 calls.
+- `ReconcileStaleGroups_skips_invalid_username_in_key` — verifies a stale group key whose
+  username part is invalid (e.g. `bad/user:Administrators`) is skipped, leaving the valid
+  user's group membership intact.
+
+**`platform/macos/DdsPolicyAgent.Tests/EnforcerTests.cs`** (+2 tests):
+- `MacAccountEnforcer_ReconcileStaleAccounts_skips_invalid_username` — verifies a stale key
+  with an invalid username (e.g. `-evil`) produces no changes.
+- `MacAccountEnforcer_ReconcileStaleGroups_skips_invalid_username_in_key` — verifies a stale
+  group key whose username part is invalid (e.g. `-evil:staff`) is skipped, leaving the valid
+  user's group membership intact.
+
+**Test results**: macOS .NET **139/139** (was 137/137; +2 new tests). Windows .NET **293/293**,
+39 skipped (was 291/291; +2 new tests). Rust **737/737** (unchanged).
+
+---
+
 ## Fix (2026-05-06, 75th pass) — macOS + Windows: validate group names in ReconcileStaleGroups before removal
 
 ### Gap
