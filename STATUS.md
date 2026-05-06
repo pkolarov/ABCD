@@ -1,5 +1,43 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-06, 81st pass) — Linux: AppliedStateStore missing Record/Remove/Persist tests for ManagedSudoersFilenames and ManagedSystemdDropins
+
+### Gap
+
+**`AppliedStateStoreTests` had zero test coverage for `RecordManagedSudoersFilename`,
+`RemoveManagedSudoersFilename`, `RecordManagedSystemdDropin`, and
+`RemoveManagedSystemdDropin`.**
+
+The 78th pass added `SetManagedGroups` tests following the standard Record/Remove/Persist
+pattern used for `ManagedUsernames`, `ManagedPaths`, and `ManagedPackages`. However the
+same pattern was never applied to `ManagedSudoersFilenames` and `ManagedSystemdDropins`,
+which were added in earlier passes. The `Remove_OnAbsentEntry_IsNoOp` test also did not
+cover these two resource types, meaning no-op removes were untested for them.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent.Tests/AppliedStateStoreTests.cs`** (+4 tests, 1 updated):
+
+- `RemoveManagedSudoersFilename_RemovesFromSet` — `RecordManagedSudoersFilename("dds-ops")`
+  then `RemoveManagedSudoersFilename("dds-ops")` confirms the entry is gone from
+  `ManagedSudoersFilenames`.
+- `RemoveManagedSystemdDropin_RemovesFromSet` — same pattern for
+  `"sshd.service/dds-limits"` in `ManagedSystemdDropins`.
+- `RecordManagedSudoersFilename_PersistedToDiskAndReloadedCorrectly` — records two
+  filenames via a first store instance, reloads via a second instance pointing at the same
+  directory, and asserts both are present with count 2.
+- `RecordManagedSystemdDropin_PersistedToDiskAndReloadedCorrectly` — same round-trip check
+  for `"sshd.service/dds-limits"` and `"dds-agent.service/hardening"`.
+- `Remove_OnAbsentEntry_IsNoOp` (updated) — now also calls
+  `RemoveManagedSudoersFilename("missing-drop")` and
+  `RemoveManagedSystemdDropin("sshd.service/missing")` to confirm no exception is thrown
+  for never-added entries.
+
+**Test results**: Linux .NET **277/277** (was 273/273; +4 new tests). macOS .NET **137/137**
+(unchanged). Windows .NET **252/252**, 39 skipped (unchanged). Rust **838/838** (unchanged).
+
+---
+
 ## Gap Fix (2026-05-06, 80th pass) — Linux: SystemdEnforcer and UserEnforcer missing forward-path test coverage
 
 ### Gap

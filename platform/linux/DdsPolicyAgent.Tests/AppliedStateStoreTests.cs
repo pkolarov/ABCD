@@ -130,7 +130,95 @@ public sealed class AppliedStateStoreTests
             store.RemoveManagedUsername("nobody");
             store.RemoveManagedPath("/nonexistent");
             store.RemoveManagedPackage("missing-pkg");
+            store.RemoveManagedSudoersFilename("missing-drop");
+            store.RemoveManagedSystemdDropin("sshd.service/missing");
             Assert.Empty(store.Load().ManagedUsernames);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+                Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RemoveManagedSudoersFilename_RemovesFromSet()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "dds-linux-state-" + Guid.NewGuid());
+        try
+        {
+            var store = new AppliedStateStore(dir);
+            store.RecordManagedSudoersFilename("dds-ops");
+            Assert.Contains("dds-ops", store.Load().ManagedSudoersFilenames);
+
+            store.RemoveManagedSudoersFilename("dds-ops");
+            Assert.DoesNotContain("dds-ops", store.Load().ManagedSudoersFilenames);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+                Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RemoveManagedSystemdDropin_RemovesFromSet()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "dds-linux-state-" + Guid.NewGuid());
+        try
+        {
+            var store = new AppliedStateStore(dir);
+            store.RecordManagedSystemdDropin("sshd.service/dds-limits");
+            Assert.Contains("sshd.service/dds-limits", store.Load().ManagedSystemdDropins);
+
+            store.RemoveManagedSystemdDropin("sshd.service/dds-limits");
+            Assert.DoesNotContain("sshd.service/dds-limits", store.Load().ManagedSystemdDropins);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+                Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RecordManagedSudoersFilename_PersistedToDiskAndReloadedCorrectly()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "dds-linux-state-" + Guid.NewGuid());
+        try
+        {
+            var store = new AppliedStateStore(dir);
+            store.RecordManagedSudoersFilename("dds-ops");
+            store.RecordManagedSudoersFilename("dds-readonly");
+
+            var store2 = new AppliedStateStore(dir);
+            var reloaded = store2.Load();
+            Assert.Contains("dds-ops", reloaded.ManagedSudoersFilenames);
+            Assert.Contains("dds-readonly", reloaded.ManagedSudoersFilenames);
+            Assert.Equal(2, reloaded.ManagedSudoersFilenames.Count);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+                Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RecordManagedSystemdDropin_PersistedToDiskAndReloadedCorrectly()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "dds-linux-state-" + Guid.NewGuid());
+        try
+        {
+            var store = new AppliedStateStore(dir);
+            store.RecordManagedSystemdDropin("sshd.service/dds-limits");
+            store.RecordManagedSystemdDropin("dds-agent.service/hardening");
+
+            var store2 = new AppliedStateStore(dir);
+            var reloaded = store2.Load();
+            Assert.Contains("sshd.service/dds-limits", reloaded.ManagedSystemdDropins);
+            Assert.Contains("dds-agent.service/hardening", reloaded.ManagedSystemdDropins);
+            Assert.Equal(2, reloaded.ManagedSystemdDropins.Count);
         }
         finally
         {
