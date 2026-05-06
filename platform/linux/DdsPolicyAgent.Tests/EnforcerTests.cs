@@ -1099,6 +1099,33 @@ public sealed class SshdEnforcerTests
     }
 
     [Fact]
+    public async Task AllowGroups_ValidNames_Applied()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SshdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var policy = ParseObject("""{"allow_groups":["sshusers","ops-team"]}""");
+        var applied = await enforcer.ApplyAsync(policy, default);
+
+        Assert.Single(applied);
+        Assert.Equal("sshd:set:AllowGroups=sshusers,ops-team", applied[0]);
+    }
+
+    [Fact]
+    public async Task AllowGroups_UnsafeNameFiltered()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SshdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        // "bad group!" contains '!' — should be filtered, leaving empty list → no directive
+        var policy = ParseObject("""{"allow_groups":["bad group!"]}""");
+        var applied = await enforcer.ApplyAsync(policy, default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
     public async Task MultipleFields_AllPresentInResult()
     {
         var runner   = new NullCommandRunner();
@@ -1135,6 +1162,8 @@ public sealed class SshdEnforcerTests
     [InlineData("""{"allow_users":["bad user"]}""",                          false)]
     [InlineData("""{"allow_users":[]}""",                                    false)]
     [InlineData("""{"permit_root_login":"maybe","allow_users":["bad!"]}""",  false)]
+    [InlineData("""{"allow_groups":["bad group!"]}""",                       false)]
+    [InlineData("""{"allow_groups":[]}""",                                   false)]
     public void HasValidDirectives_Returns_Expected(string json, bool expected)
         => Assert.Equal(expected,
                SshdEnforcer.HasValidDirectives(

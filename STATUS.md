@@ -1,5 +1,43 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-06, 79th pass) — Linux: SshdEnforcer missing AllowGroups validation tests
+
+### Gap
+
+**`SshdEnforcerTests` had no dedicated tests for `allow_groups` name validation in
+`ApplyAsync`, and `HasValidDirectives` lacked cases for invalid / empty `allow_groups`.**
+
+The `AllowUsers` directive had symmetric test coverage:
+- `AllowUsers_ValidNames_Applied` — verifies valid names produce an `AllowUsers` directive.
+- `AllowUsers_UnsafeNameFiltered` — verifies names containing illegal characters are dropped.
+- `HasValidDirectives` inline data for `{"allow_users":["bad user"]}` → false.
+- `HasValidDirectives` inline data for `{"allow_users":[]}` → false.
+
+`AllowGroups` — which uses the same `ParseNameList` / `IsValidName` validation path —
+only appeared in the multi-field test `MultipleFields_AllPresentInResult` (valid group,
+no coverage of filtering) and in one `HasValidDirectives` inline case for a valid group.
+The filtering behaviour for `allow_groups` (empty list, invalid name) was entirely untested.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`** (+4 test coverage additions):
+- `AllowGroups_ValidNames_Applied` — two valid group names produce a single
+  `sshd:set:AllowGroups=sshusers,ops-team` directive (parallel to
+  `AllowUsers_ValidNames_Applied`).
+- `AllowGroups_UnsafeNameFiltered` — a group name containing `!` is rejected by
+  `IsValidName`, leaving an empty list → no directive emitted (parallel to
+  `AllowUsers_UnsafeNameFiltered`).
+- `HasValidDirectives` `[InlineData("""{"allow_groups":["bad group!"]}""", false)]` —
+  group name with illegal characters → HasValidDirectives returns false.
+- `HasValidDirectives` `[InlineData("""{"allow_groups":[]}""", false)]` — empty
+  `allow_groups` array → HasValidDirectives returns false (parallel to the existing
+  `allow_users:[]` false case).
+
+**Test results**: Linux .NET **260/260** (was 256/256; +4 new tests). macOS .NET **137/137**
+(unchanged). Windows .NET **252/252**, 39 skipped (unchanged). Rust **838/838** (unchanged).
+
+---
+
 ## Gap Fix (2026-05-06, 78th pass) — Linux: AppliedStateStore missing SetManagedGroups tests
 
 ### Gap
