@@ -1,5 +1,62 @@
 # DDS Implementation Status
 
+## Fix (2026-05-06, 73rd pass) — macOS: MacAccountEnforcer group membership enforcement
+
+### Gap
+
+**`MacAccountEnforcer` tracked `groups` for reconciliation but never applied group memberships.**
+
+The macOS `MacAccountEnforcer` had `ExtractManagedGroups` (which extracts `username:group` pairs
+from policy directives for reconciliation tracking) and `ReconcileStaleGroups` (which removes
+group memberships that dropped out of policy via `_ops.RemoveFromGroup`). However:
+
+- `IMacAccountOperations` had no `AddToGroup` method — only `IsInGroup` and `RemoveFromGroup`.
+- `ApplyCreate` created the user but never added supplementary group memberships from the `groups` array.
+- `ApplyModify` updated shell/admin/hidden but also never applied the `groups` array.
+
+The consequence: a `MacOsPolicyDocument` containing `"groups": ["staff","wheel"]` in a
+`local_accounts` directive would be tracked in the applied-state store (so stale groups could be
+removed on reconciliation), but the groups were never actually added during any enforcement cycle.
+The `admin` group is handled separately via the `admin: bool` field and `SetAdmin`; arbitrary
+supplementary groups listed in `groups` were silently dropped.
+
+### Fix
+
+**`platform/macos/DdsPolicyAgent/Enforcers/MacAccountEnforcer.cs`**:
+- Added `void AddToGroup(string username, string group)` to `IMacAccountOperations`.
+- Implemented `AddToGroup` in `InMemoryMacAccountOperations` (adds to `AccountState.Groups`).
+- Implemented `AddToGroup` in `HostMacAccountOperations` via
+  `dseditgroup -o edit -n . -a <user> -t user <group>` (symmetric with the existing `RemoveFromGroup`
+  which uses `-d`).
+- Added `internal static bool IsValidGroupName(string name)`: max 255 chars, must not start with
+  `-` (flag injection guard), no control characters (chars < 0x20). Spaces within the name are
+  allowed (e.g. hypothetical multi-word macOS groups), matching the Windows group name policy.
+- Added private `ApplyGroupsInternal(username, item, changes)` helper that reads the `groups`
+  JSON array, validates each entry with `IsValidGroupName`, skips already-member entries
+  (idempotent), and calls `_ops.AddToGroup` for new memberships.
+- `ApplyCreate`: after `_ops.CreateUser(...)`, calls `ApplyGroupsInternal`; when the user
+  already exists, delegates to `ApplyModify` which also calls `ApplyGroupsInternal`.
+- `ApplyModify`: calls `ApplyGroupsInternal` in addition to existing shell/admin/hidden handling.
+
+**`platform/macos/DdsPolicyAgent.Tests/EnforcerTests.cs`** (16 new tests):
+- `IsValidGroupName_accepts_valid_names` Theory (6 cases)
+- `IsValidGroupName_rejects_invalid_names` Theory (5 cases: empty, leading `-`, tab, newline,
+  null byte)
+- `Create_applies_groups_to_new_user` — verifies groups are applied on initial creation.
+- `Create_existing_user_applies_groups_via_Modify` — verifies group enforcement on
+  idempotent Create (user already exists → falls through to Modify).
+- `Modify_applies_new_groups` — verifies group enforcement on explicit Modify action.
+- `Create_skips_unsafe_group_applies_safe_group` — unsafe group name (`-G root`) is skipped;
+  the safe group in the same directive is applied.
+- `Create_group_already_member_is_noop` — second enforcement cycle does not duplicate the
+  `AddToGroup` call for an already-member user (idempotent).
+
+**Test results**: macOS .NET **134/134** (was 118/118; 16 new tests). Linux .NET **240/240**.
+Windows .NET **247/247** (39 Win32-only integration tests skipped on macOS). No Rust changes.
+`cargo test --workspace --lib` **737/737** (all crates, 0 failures).
+
+---
+
 ## Fix (2026-05-06, 72nd pass) — Linux: UserEnforcer group name validation
 
 ### Gap

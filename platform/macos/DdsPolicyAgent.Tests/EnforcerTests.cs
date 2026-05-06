@@ -588,6 +588,129 @@ public class EnforcerTests
         Assert.True(ops.IsAdmin("alice"));                  // admin change still applied
     }
 
+    // --- MacAccountEnforcer: group name validation ---
+
+    [Theory]
+    [InlineData("staff")]
+    [InlineData("wheel")]
+    [InlineData("admin")]
+    [InlineData("Remote Desktop Users")]  // spaces allowed within name
+    [InlineData("dds-ops")]
+    [InlineData("dds_team")]
+    public void MacAccountEnforcer_IsValidGroupName_accepts_valid_names(string name)
+        => Assert.True(MacAccountEnforcer.IsValidGroupName(name));
+
+    [Theory]
+    [InlineData("")]                  // empty
+    [InlineData("-admin")]            // starts with dash (flag injection)
+    [InlineData("group\tname")]       // tab (control character)
+    [InlineData("group\nname")]       // newline
+    [InlineData("group\0name")]       // null byte
+    public void MacAccountEnforcer_IsValidGroupName_rejects_invalid_names(string name)
+        => Assert.False(MacAccountEnforcer.IsValidGroupName(name));
+
+    // --- MacAccountEnforcer: group enforcement ---
+
+    [Fact]
+    public async Task MacAccountEnforcer_Create_applies_groups_to_new_user()
+    {
+        var ops = new InMemoryMacAccountOperations();
+        var enforcer = new MacAccountEnforcer(ops, NullLogger<MacAccountEnforcer>.Instance);
+
+        var directive = JsonDocument.Parse("""
+        [
+          {"username":"alice","action":"Create","groups":["staff","wheel"]}
+        ]
+        """).RootElement;
+
+        var outcome = await enforcer.ApplyAsync(directive, EnforcementMode.Enforce);
+
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
+        Assert.True(ops.UserExists("alice"));
+        Assert.True(ops.IsInGroup("alice", "staff"));
+        Assert.True(ops.IsInGroup("alice", "wheel"));
+    }
+
+    [Fact]
+    public async Task MacAccountEnforcer_Create_existing_user_applies_groups_via_Modify()
+    {
+        var ops = new InMemoryMacAccountOperations();
+        ops.CreateUser("alice", null, null, false, false);
+        var enforcer = new MacAccountEnforcer(ops, NullLogger<MacAccountEnforcer>.Instance);
+
+        var directive = JsonDocument.Parse("""
+        [
+          {"username":"alice","action":"Create","groups":["staff"]}
+        ]
+        """).RootElement;
+
+        var outcome = await enforcer.ApplyAsync(directive, EnforcementMode.Enforce);
+
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
+        Assert.True(ops.IsInGroup("alice", "staff"));
+    }
+
+    [Fact]
+    public async Task MacAccountEnforcer_Modify_applies_new_groups()
+    {
+        var ops = new InMemoryMacAccountOperations();
+        ops.CreateUser("alice", null, null, false, false);
+        var enforcer = new MacAccountEnforcer(ops, NullLogger<MacAccountEnforcer>.Instance);
+
+        var directive = JsonDocument.Parse("""
+        [
+          {"username":"alice","action":"Modify","groups":["wheel"]}
+        ]
+        """).RootElement;
+
+        var outcome = await enforcer.ApplyAsync(directive, EnforcementMode.Enforce);
+
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
+        Assert.True(ops.IsInGroup("alice", "wheel"));
+    }
+
+    [Fact]
+    public async Task MacAccountEnforcer_Create_skips_unsafe_group_applies_safe_group()
+    {
+        var ops = new InMemoryMacAccountOperations();
+        var enforcer = new MacAccountEnforcer(ops, NullLogger<MacAccountEnforcer>.Instance);
+
+        var directive = JsonDocument.Parse("""
+        [
+          {"username":"alice","action":"Create","groups":["-G root","staff"]}
+        ]
+        """).RootElement;
+
+        var outcome = await enforcer.ApplyAsync(directive, EnforcementMode.Enforce);
+
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
+        Assert.True(ops.UserExists("alice"));
+        Assert.True(ops.IsInGroup("alice", "staff"));
+        Assert.False(ops.IsInGroup("alice", "-G root"));
+    }
+
+    [Fact]
+    public async Task MacAccountEnforcer_Create_group_already_member_is_noop()
+    {
+        var ops = new InMemoryMacAccountOperations();
+        ops.CreateUser("alice", null, null, false, false);
+        ops.AddToGroup("alice", "staff");
+        var enforcer = new MacAccountEnforcer(ops, NullLogger<MacAccountEnforcer>.Instance);
+
+        var directive = JsonDocument.Parse("""
+        [
+          {"username":"alice","action":"Create","groups":["staff"]}
+        ]
+        """).RootElement;
+
+        var outcome = await enforcer.ApplyAsync(directive, EnforcementMode.Enforce);
+
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
+        Assert.True(ops.IsInGroup("alice", "staff"));
+        // Changes should NOT mention group+= since it was already a member
+        Assert.DoesNotContain(outcome.Changes!, c => c.Contains("group+=staff"));
+    }
+
     [Fact]
     public void ProfileEnforcer_ReconcileStaleProfiles_enforce_mode_removes_profiles()
     {

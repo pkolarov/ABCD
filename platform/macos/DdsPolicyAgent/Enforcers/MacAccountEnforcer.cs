@@ -22,6 +22,7 @@ public interface IMacAccountOperations
     void SetHidden(string username, bool hidden);
     void SetShell(string username, string? shell);
     bool IsInGroup(string username, string group);
+    void AddToGroup(string username, string group);
     void RemoveFromGroup(string username, string group);
     bool IsDirectoryBound();
 }
@@ -70,6 +71,11 @@ public sealed class InMemoryMacAccountOperations : IMacAccountOperations
     public void SetShell(string username, string? shell) { if (_accounts.TryGetValue(username, out var a)) a.Shell = shell; }
     public bool IsInGroup(string username, string group)
         => _accounts.TryGetValue(username, out var a) && a.Groups.Contains(group);
+    public void AddToGroup(string username, string group)
+    {
+        if (_accounts.TryGetValue(username, out var a))
+            a.Groups.Add(group);
+    }
     public void RemoveFromGroup(string username, string group)
     {
         if (_accounts.TryGetValue(username, out var a))
@@ -215,6 +221,14 @@ public sealed class HostMacAccountOperations : IMacAccountOperations
         return result.StandardOutput
             .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Contains(username, StringComparer.OrdinalIgnoreCase);
+    }
+
+    public void AddToGroup(string username, string group)
+    {
+        PrivilegeGuard.DemandRoot("local macOS group membership mutation");
+        _runner.RunChecked(
+            "/usr/sbin/dseditgroup",
+            ["-o", "edit", "-n", ".", "-a", username, "-t", "user", group]);
     }
 
     public void RemoveFromGroup(string username, string group)
@@ -395,8 +409,12 @@ public sealed class MacAccountEnforcer : IEnforcer
             return ApplyModify(item, username);
 
         _ops.CreateUser(username, fullName, shell, admin, hidden);
+        var changes = new List<string>();
+        ApplyGroupsInternal(username, item, changes);
         _log.LogInformation("Account: created '{User}'", username);
-        return $"Create '{username}'";
+        return changes.Count > 0
+            ? $"Create '{username}' ({string.Join(", ", changes)})"
+            : $"Create '{username}'";
     }
 
     private string ApplyDelete(string username)
@@ -465,11 +483,36 @@ public sealed class MacAccountEnforcer : IEnforcer
             changes.Add($"hidden={hidden.Value}");
         }
 
+        ApplyGroupsInternal(username, item, changes);
+
         if (changes.Count == 0)
             return $"[NO-OP] Modify '{username}'";
 
         _log.LogInformation("Account: modified '{User}' ({Changes})", username, string.Join(", ", changes));
         return $"Modify '{username}' ({string.Join(", ", changes)})";
+    }
+
+    private void ApplyGroupsInternal(string username, JsonElement item, List<string> changes)
+    {
+        if (!item.TryGetProperty("groups", out var groups) || groups.ValueKind != JsonValueKind.Array)
+            return;
+
+        foreach (var g in groups.EnumerateArray())
+        {
+            var group = g.GetString();
+            if (string.IsNullOrWhiteSpace(group))
+                continue;
+            if (!IsValidGroupName(group))
+            {
+                _log.LogWarning("Account enforcer: unsafe group name '{G}' for '{U}'; skipping", group, username);
+                continue;
+            }
+            if (!_ops.IsInGroup(username, group))
+            {
+                _ops.AddToGroup(username, group);
+                changes.Add($"group+={group}");
+            }
+        }
     }
 
     private static string? GetOptionalString(JsonElement item, string name)
@@ -512,6 +555,20 @@ public sealed class MacAccountEnforcer : IEnforcer
             if (c is ' ' or '\t' or ';' or '&' or '|' or '`' or '$' or '>' or '<' or '"' or '\'')
                 return false;
         }
+        return true;
+    }
+
+    /// <summary>
+    /// Validates a macOS local group name passed to <c>dseditgroup</c>.
+    /// Rejects names that could be interpreted as flags (leading <c>-</c>),
+    /// are empty, or contain control characters. Max 255 chars.
+    /// </summary>
+    internal static bool IsValidGroupName(string name)
+    {
+        if (string.IsNullOrEmpty(name) || name.Length > 255) return false;
+        if (name[0] == '-') return false;
+        foreach (var c in name)
+            if (c < 0x20) return false;
         return true;
     }
 
