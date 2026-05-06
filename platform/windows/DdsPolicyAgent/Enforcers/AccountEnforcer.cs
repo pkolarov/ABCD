@@ -287,6 +287,12 @@ public sealed class AccountEnforcer : IEnforcer
             var username = key[..sep];
             var group = key[(sep + 1)..];
 
+            if (!IsValidGroupName(group))
+            {
+                _log.LogWarning("Reconcile: group name '{Group}' from key '{Key}' is invalid, skipping", group, key);
+                continue;
+            }
+
             try
             {
                 if (!_ops.UserExists(username))

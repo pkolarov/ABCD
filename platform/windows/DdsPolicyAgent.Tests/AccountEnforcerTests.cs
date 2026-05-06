@@ -280,6 +280,52 @@ public class AccountEnforcerTests
         Assert.DoesNotContain("bad/group", _ops.GetGroups("alice"));
     }
 
+    // --- ReconcileStaleGroups ---
+
+    [Fact]
+    public void ReconcileStaleGroups_removes_valid_stale_group()
+    {
+        _ops.CreateUser("alice", null, null);
+        _ops.AddToGroup("alice", "Administrators");
+
+        var changes = _enforcer.ReconcileStaleGroups(
+            new HashSet<string>(["alice:Administrators"], StringComparer.OrdinalIgnoreCase),
+            EnforcementMode.Enforce);
+
+        Assert.Single(changes);
+        Assert.Contains("Reconcile-RemoveFromGroup", changes[0]);
+        Assert.DoesNotContain("Administrators", _ops.GetGroups("alice"));
+    }
+
+    [Fact]
+    public void ReconcileStaleGroups_audit_mode_does_not_remove()
+    {
+        _ops.CreateUser("alice", null, null);
+        _ops.AddToGroup("alice", "Administrators");
+
+        var changes = _enforcer.ReconcileStaleGroups(
+            new HashSet<string>(["alice:Administrators"], StringComparer.OrdinalIgnoreCase),
+            EnforcementMode.Audit);
+
+        Assert.Single(changes);
+        Assert.Contains("[AUDIT]", changes[0]);
+        Assert.Contains("Administrators", _ops.GetGroups("alice"));
+    }
+
+    [Fact]
+    public void ReconcileStaleGroups_skips_invalid_group_name()
+    {
+        _ops.CreateUser("alice", null, null);
+        _ops.AddToGroup("alice", "bad/group");
+
+        var changes = _enforcer.ReconcileStaleGroups(
+            new HashSet<string>(["alice:bad/group"], StringComparer.OrdinalIgnoreCase),
+            EnforcementMode.Enforce);
+
+        Assert.Empty(changes);
+        Assert.Contains("bad/group", _ops.GetGroups("alice")); // NOT removed — invalid key was skipped
+    }
+
     private static JsonElement Parse(string json)
         => JsonDocument.Parse(json).RootElement;
 }

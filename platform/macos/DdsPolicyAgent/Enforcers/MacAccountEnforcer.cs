@@ -663,6 +663,13 @@ public sealed class MacAccountEnforcer : IEnforcer
 
                 var username = managedKey[..sep];
                 var group = managedKey[(sep + 1)..];
+
+                if (!IsValidGroupName(group))
+                {
+                    _log.LogWarning("Reconcile: group name '{Group}' from key '{Key}' is invalid, skipping", group, managedKey);
+                    continue;
+                }
+
                 var desc = $"Reconcile-RemoveGroup '{username}' from '{group}'";
 
                 if (mode == EnforcementMode.Audit)

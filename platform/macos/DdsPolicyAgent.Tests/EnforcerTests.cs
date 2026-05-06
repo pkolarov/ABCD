@@ -491,6 +491,22 @@ public class EnforcerTests
         Assert.True(ops.IsInGroup("alice", "staff"));
     }
 
+    [Fact]
+    public void MacAccountEnforcer_ReconcileStaleGroups_skips_invalid_group_name()
+    {
+        var ops = new InMemoryMacAccountOperations();
+        ops.CreateUser("alice", null, null, false, false);
+        ops.Peek("alice")!.Groups.Add("-evil");
+        var enforcer = new MacAccountEnforcer(ops, NullLogger<MacAccountEnforcer>.Instance);
+
+        var changes = enforcer.ReconcileStaleGroups(
+            new HashSet<string>(["alice:-evil"], StringComparer.OrdinalIgnoreCase),
+            EnforcementMode.Enforce);
+
+        Assert.Empty(changes);
+        Assert.True(ops.IsInGroup("alice", "-evil")); // NOT removed — invalid key was skipped
+    }
+
     // --- MacAccountEnforcer: username and shell validation ---
 
     [Theory]

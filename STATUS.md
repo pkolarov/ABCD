@@ -1,5 +1,56 @@
 # DDS Implementation Status
 
+## Fix (2026-05-06, 75th pass) — macOS + Windows: validate group names in ReconcileStaleGroups before removal
+
+### Gap
+
+**`ReconcileStaleGroups` on both macOS and Windows called `RemoveFromGroup` without validating the group name parsed from the stored key.**
+
+`MacAccountEnforcer.ReconcileStaleGroups` and `AccountEnforcer.ReconcileStaleGroups` both
+parse stale managed keys of the form `username:group` and immediately call the platform
+removal command (`dseditgroup -o edit -d …` / `RemoveFromGroup`) after only a colon-separator
+check.  The forward-pass enforcement paths (added 69th–73rd passes) gate every `AddToGroup`
+call behind `IsValidGroupName`, but the symmetric removal path had no such check.
+
+If the stored managed state is tampered with — or if a malformed key was somehow persisted
+before validation was added — the reconciler could pass an attacker-controlled string directly
+to the OS command without sanitisation.  The pattern is inconsistent with the defensive-depth
+applied uniformly in the apply paths.
+
+STATUS.md was also missing the 71st pass entry (added as part of this pass).
+
+### Fix
+
+**`platform/macos/DdsPolicyAgent/Enforcers/MacAccountEnforcer.cs`** (`ReconcileStaleGroups`):
+- Added `IsValidGroupName(group)` check immediately after parsing `username` and `group` from
+  the stale key; logs `LogWarning` and skips the key if invalid — symmetric with
+  `ApplyGroupsInternal`.
+
+**`platform/windows/DdsPolicyAgent/Enforcers/AccountEnforcer.cs`** (`ReconcileStaleGroups`):
+- Same fix: `IsValidGroupName(group)` check with `LogWarning` and skip before entering the
+  try-block that calls `_ops.RemoveFromGroup`.
+
+**`platform/macos/DdsPolicyAgent.Tests/EnforcerTests.cs`** (+1 test):
+- `MacAccountEnforcer_ReconcileStaleGroups_skips_invalid_group_name` — verifies that a stale
+  key containing an invalid group name (e.g. `alice:-evil`) produces no changes and does not
+  remove the user from the group.
+
+**`platform/windows/DdsPolicyAgent.Tests/AccountEnforcerTests.cs`** (+3 tests):
+- `ReconcileStaleGroups_removes_valid_stale_group` — baseline: valid stale key removes group
+  membership in Enforce mode.
+- `ReconcileStaleGroups_audit_mode_does_not_remove` — Audit mode emits `[AUDIT]` log entry
+  without removing the group.
+- `ReconcileStaleGroups_skips_invalid_group_name` — invalid group name in stale key produces
+  no changes and leaves the group membership intact.
+
+**`STATUS.md`**: Added the missing 71st pass entry (macOS username + shell path validation).
+
+**Test results**: macOS .NET **135/135** (was 134/134; +1 new test). Windows .NET **250/250**,
+39 skipped (was 247/247; +3 new tests). Linux .NET **240/240** (unchanged). Rust **737/737**
+(unchanged).
+
+---
+
 ## Doc (2026-05-06, 74th pass) — macOS: document `groups` field in MacAccountDirective schema
 
 ### Gap
@@ -136,6 +187,54 @@ pass); the Linux counterpart was missing the same defence.
 
 **Test results**: Linux .NET **240/240** (was 227/227; 13 new tests). macOS .NET **118/118**.
 Windows .NET **247/247** (39 Win32-only integration tests skipped on macOS). No Rust changes.
+
+---
+
+## Fix (2026-05-06, 71st pass) — macOS: MacAccountEnforcer username + shell path input validation
+
+### Gap
+
+**`MacAccountEnforcer.ApplyOne` passed `username` directly to `dscl`/`sysadminctl` without validation, and `ApplyCreate`/`ApplyModify` passed `shell` the same way.**
+
+The macOS `MacAccountEnforcer` forwarded `username` and `shell` from the policy document to
+OS-level commands (`dscl`, `sysadminctl`) without any sanitisation. A crafted policy
+containing:
+- A username with spaces, control characters, or other metacharacters would fail with an
+  opaque OS error rather than a controlled `[SKIPPED]` log line.
+- A shell path containing spaces could inject extra flags into `dscl -create … UserShell`.
+
+This is the same argument-injection class fixed for Windows `AccountEnforcer` (passes 69–70)
+and Linux `UserEnforcer` (earlier passes).
+
+### Fix
+
+**`platform/macos/DdsPolicyAgent/Enforcers/MacAccountEnforcer.cs`**:
+- Added `internal static bool IsValidUsername(string name)` — POSIX short-name allowlist:
+  ASCII letters, digits, `.`, `_`, `-`; max 255 characters; must not start with `-`.
+- Added `internal static bool IsSafeShellPath(string path)` — must be absolute, no
+  whitespace or metacharacters, max 256 characters.
+- `ApplyOne` now skips directives with invalid usernames and logs at `LogWarning`.
+- `ApplyCreate` skips the entire directive if the shell path is unsafe.
+- `ApplyModify` ignores only the shell change when the path is unsafe, and still applies
+  any other fields (admin, hidden) from the same directive.
+
+**`platform/macos/DdsPolicyAgent.Tests/EnforcerTests.cs`** (+22 tests):
+- `IsValidUsername` and `IsSafeShellPath` Theory cases covering valid and invalid inputs.
+- Integration-style tests verifying that unsafe usernames cause the directive to be skipped
+  entirely, and that an unsafe shell path causes only the shell update to be skipped.
+
+**`docs/DDS-Admin-Guide.md`**:
+- Updated the macOS enforcer capability table row for "Local accounts" to document the
+  username constraints (1–255 chars, ASCII letters/digits/`.`/`_`/`-`, not starting with `-`)
+  and the shell path constraint (absolute, no spaces or metacharacters).
+
+**`docs/DDS-Design-Document.md`** §14.7.4:
+- Added "Account name validation" paragraph describing the POSIX short-name allowlist for
+  `username` and the shell path validation, with the skip-and-log behaviour on rejection.
+
+**Test results**: macOS .NET **118/118** (was 96/96; +22 new tests). Linux .NET **227/227**.
+Windows .NET **247/247** (39 Win32-only integration tests skipped on macOS). No Rust changes.
+`cargo check --workspace` clean.
 
 ---
 
