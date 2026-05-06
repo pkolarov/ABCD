@@ -138,4 +138,75 @@ public sealed class AppliedStateStoreTests
                 Directory.Delete(dir, recursive: true);
         }
     }
+
+    [Fact]
+    public void SetManagedGroups_StoresAndReplacesGroupSet()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "dds-linux-state-" + Guid.NewGuid());
+        try
+        {
+            var store = new AppliedStateStore(dir);
+
+            store.SetManagedGroups(["alice:sudo", "bob:docker"]);
+            var state = store.Load();
+            Assert.Contains("alice:sudo", state.ManagedGroups);
+            Assert.Contains("bob:docker", state.ManagedGroups);
+            Assert.Equal(2, state.ManagedGroups.Count);
+
+            // Replace with a smaller set — bob:docker must be dropped.
+            store.SetManagedGroups(["alice:sudo"]);
+            state = store.Load();
+            Assert.Contains("alice:sudo", state.ManagedGroups);
+            Assert.DoesNotContain("bob:docker", state.ManagedGroups);
+            Assert.Single(state.ManagedGroups);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+                Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SetManagedGroups_EmptySet_ClearsAllGroups()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "dds-linux-state-" + Guid.NewGuid());
+        try
+        {
+            var store = new AppliedStateStore(dir);
+            store.SetManagedGroups(["alice:sudo"]);
+            Assert.NotEmpty(store.Load().ManagedGroups);
+
+            store.SetManagedGroups([]);
+            Assert.Empty(store.Load().ManagedGroups);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+                Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SetManagedGroups_PersistedToDiskAndReloadedCorrectly()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "dds-linux-state-" + Guid.NewGuid());
+        try
+        {
+            var store = new AppliedStateStore(dir);
+            store.SetManagedGroups(["alice:sudo", "alice:adm"]);
+
+            // Reload from disk via a second store instance pointing at the same directory.
+            var store2 = new AppliedStateStore(dir);
+            var reloaded = store2.Load();
+            Assert.Contains("alice:sudo", reloaded.ManagedGroups);
+            Assert.Contains("alice:adm", reloaded.ManagedGroups);
+            Assert.Equal(2, reloaded.ManagedGroups.Count);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+                Directory.Delete(dir, recursive: true);
+        }
+    }
 }

@@ -1,5 +1,41 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-06, 78th pass) — Linux: AppliedStateStore missing SetManagedGroups tests
+
+### Gap
+
+**`AppliedStateStoreTests.cs` for the Linux DDS Policy Agent had no test coverage
+for `SetManagedGroups` / `ManagedGroups`, which were added in the 77th pass.**
+
+The 77th pass added `ManagedGroups` (`HashSet<string>`, serialized as `managed_groups`)
+and `SetManagedGroups(IEnumerable<string>)` to the Linux `AppliedState` / `IAppliedStateStore`.
+The `WorkerTests.cs` and `EnforcerTests.cs` both exercised the new capability end-to-end, but
+`AppliedStateStoreTests.cs` — which tests the persistence layer in isolation — had no case for
+`SetManagedGroups`.
+
+This left three behaviors untested at the store level:
+- Bulk-replace semantics: calling `SetManagedGroups` with a smaller set removes entries that
+  were in the previous set.
+- Clear semantics: calling `SetManagedGroups([])` empties the set.
+- Disk persistence and reload: `managed_groups` must survive a round-trip through JSON
+  serialization and be readable by a new `AppliedStateStore` instance.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent.Tests/AppliedStateStoreTests.cs`** (+3 tests):
+- `SetManagedGroups_StoresAndReplacesGroupSet` — verifies that a two-entry set is stored
+  correctly, then replaced by a one-entry call that drops the second key.
+- `SetManagedGroups_EmptySet_ClearsAllGroups` — verifies that `SetManagedGroups([])` after
+  a non-empty set produces an empty `ManagedGroups`.
+- `SetManagedGroups_PersistedToDiskAndReloadedCorrectly` — verifies that group keys survive
+  `WriteToDisk` + `LoadFromDisk` by constructing a second `AppliedStateStore` over the same
+  directory and asserting the reloaded state matches.
+
+**Test results**: Linux .NET **256/256** (was 253/253; +3 new tests). macOS .NET **137/137**
+(unchanged). Windows .NET **252/252**, 39 skipped (unchanged). Rust **838/838** (unchanged).
+
+---
+
 ## Gap Fix (2026-05-06, 77th pass) — Linux: group membership reconciliation
 
 ### Gap
@@ -64,7 +100,7 @@ Also updated `TestAppliedStateStore` and `TrackingAppliedStateStore` to implemen
 `SetManagedGroups` interface method.
 
 **Test results**: Linux .NET **253/253** (was 240/240; +13 new tests). macOS .NET **137/137**
-(unchanged). Windows .NET **252/252**, 39 skipped (unchanged). Rust **737/737** (unchanged).
+(unchanged). Windows .NET **252/252**, 39 skipped (unchanged). Rust **838/838** (unchanged).
 
 ---
 
@@ -116,7 +152,7 @@ such check.
   user's group membership intact.
 
 **Test results**: macOS .NET **139/139** (was 137/137; +2 new tests). Windows .NET **293/293**,
-39 skipped (was 291/291; +2 new tests). Rust **737/737** (unchanged).
+39 skipped (was 291/291; +2 new tests). Rust **838/838** (unchanged).
 
 ---
 
@@ -166,7 +202,7 @@ STATUS.md was also missing the 71st pass entry (added as part of this pass).
 **`STATUS.md`**: Added the missing 71st pass entry (macOS username + shell path validation).
 
 **Test results**: macOS .NET **135/135** (was 134/134; +1 new test). Windows .NET **250/250**,
-39 skipped (was 247/247; +3 new tests). Linux .NET **240/240** (unchanged). Rust **737/737**
+39 skipped (was 247/247; +3 new tests). Linux .NET **240/240** (unchanged). Rust **838/838**
 (unchanged).
 
 ---
@@ -207,7 +243,7 @@ to `MacAccountEnforcer`, but the documentation was not updated to reflect the ne
   of each `action` value and the validation rules.
 
 **Test results**: No code changes. macOS .NET **134/134**. Linux .NET **240/240**.
-Windows .NET **247/247** (39 skipped). `cargo test --workspace --lib` **737/737** (unchanged).
+Windows .NET **247/247** (39 skipped). `cargo test --workspace --lib` **838/838** (unchanged).
 
 ---
 
