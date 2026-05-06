@@ -849,6 +849,115 @@ public sealed class SystemdEnforcerTests
         Assert.Equal("systemd:removedropin:sshd.service/dds-limits", applied[0]);
         Assert.Empty(runner.Invocations);
     }
+
+    [Fact]
+    public async Task UnmaskUnit_AuditOnly_NoRunner()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"telnet.service","action":"Unmask"}""").RootElement],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("systemd:unmask:telnet.service", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task StartUnit_AuditOnly_NoRunner()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"ntp.service","action":"Start"}""").RootElement],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("systemd:start:ntp.service", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task StopUnit_AuditOnly_NoRunner()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"ntp.service","action":"Stop"}""").RootElement],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("systemd:stop:ntp.service", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task RestartUnit_AuditOnly_NoRunner()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"sshd.service","action":"Restart"}""").RootElement],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("systemd:restart:sshd.service", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task RemoveDropin_EnforceMode_CallsDaemonReload()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"sshd.service","action":"RemoveDropin","dropin_name":"dds-limits"}""")
+                .RootElement],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("systemd:removedropin:sshd.service/dds-limits", applied[0]);
+        // Enforce mode: needReload=true triggers daemon-reload even when file does not exist.
+        Assert.Single(runner.Invocations);
+        Assert.Equal("systemctl", runner.Invocations[0].FileName);
+        Assert.Contains("daemon-reload", runner.Invocations[0].Arguments);
+    }
+
+    [Fact]
+    public async Task RemoveDropin_MissingDropinName_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"sshd.service","action":"RemoveDropin"}""").RootElement],
+            default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task RemoveDropin_UnsafeDropinStem_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        // dropin_name with a dot is rejected by IsSafeDropinStem
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"sshd.service","action":"RemoveDropin","dropin_name":"dds.conf"}""")
+                .RootElement],
+            default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
 }
 
 // ============================================================
@@ -1015,6 +1124,96 @@ public sealed class PackageEnforcerTests
         Assert.Single(applied);
         Assert.Equal("pkg:remove:vim", applied[0]);
         Assert.Contains(runner.Invocations, i => i.FileName == "zypper" && i.Arguments == "remove -y vim");
+    }
+
+    [Fact]
+    public async Task InstallPackage_AptBackend_CallsAptGet()
+    {
+        // Default NullCommandRunner returns exit 0 for "which apt-get", selecting the Apt backend.
+        var runner   = new NullCommandRunner();
+        var enforcer = new PackageEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"name":"ntp","action":"Install"}""").RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("pkg:install:ntp", applied[0]);
+        Assert.Contains(runner.Invocations, i => i.FileName == "apt-get" && i.Arguments == "install -y ntp");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "dnf");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "zypper");
+    }
+
+    [Fact]
+    public async Task RemovePackage_AptBackend_CallsAptGet()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new PackageEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"name":"ntp","action":"Remove"}""").RootElement],
+            new HashSet<string>(["ntp"]),
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("pkg:remove:ntp", applied[0]);
+        Assert.Contains(runner.Invocations, i => i.FileName == "apt-get" && i.Arguments == "remove -y ntp");
+    }
+
+    [Fact]
+    public async Task InstallPackage_AptBackend_WithVersion_UsesEqualsSeparator()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new PackageEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"name":"ntp","action":"Install","version":"1:4.2.8p15-1"}""").RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("pkg:install:ntp", applied[0]);
+        Assert.Contains(runner.Invocations, i => i.FileName == "apt-get" && i.Arguments == "install -y ntp=1:4.2.8p15-1");
+    }
+
+    [Fact]
+    public async Task InstallPackage_DnfBackend_CallsDnf()
+    {
+        var runner = new NullCommandRunner();
+        runner.InvocationExitCodeOverrides[("which", "apt-get")] = 1;
+        runner.InvocationExitCodeOverrides[("which", "dnf")]     = 0;
+        var enforcer = new PackageEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"name":"httpd","action":"Install"}""").RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("pkg:install:httpd", applied[0]);
+        Assert.Contains(runner.Invocations, i => i.FileName == "dnf" && i.Arguments == "install -y httpd");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "apt-get");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "zypper");
+    }
+
+    [Fact]
+    public async Task RemovePackage_DnfBackend_CallsDnf()
+    {
+        var runner = new NullCommandRunner();
+        runner.InvocationExitCodeOverrides[("which", "apt-get")] = 1;
+        runner.InvocationExitCodeOverrides[("which", "dnf")]     = 0;
+        var enforcer = new PackageEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"name":"httpd","action":"Remove"}""").RootElement],
+            new HashSet<string>(["httpd"]),
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("pkg:remove:httpd", applied[0]);
+        Assert.Contains(runner.Invocations, i => i.FileName == "dnf" && i.Arguments == "remove -y httpd");
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "apt-get");
     }
 }
 

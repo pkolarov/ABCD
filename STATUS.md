@@ -1,5 +1,74 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-06, 82nd pass) — Linux: SystemdEnforcer and PackageEnforcer missing audit-mode and backend-specific test coverage
+
+### Gap
+
+**`SystemdEnforcerTests` had no audit-mode test coverage for four implemented actions
+(`Unmask`, `Start`, `Stop`, `Restart`), and no enforce-mode or validation coverage for
+the `RemoveDropin` action.**
+
+The 80th pass added `Disable` (audit + enforce), `Start` / `Stop` / `Restart` (enforce
+only), `ConfigureDropin` (audit only), and `RemoveDropin` (audit only). Five symmetry
+gaps remained after that pass:
+
+- `Unmask` — enforce mode was tested, but no audit-mode test existed (contrast with
+  `Mask`, which has both `MaskUnit_AuditOnly_NoRunner` and `MaskUnit_EnforceMode_CallsSystemctl`).
+- `Start`, `Stop`, `Restart` — enforce mode was tested, but no audit-mode test existed
+  (contrast with `Enable` and `Disable`, which each have both modes).
+- `RemoveDropin` — audit mode was tested, but no enforce-mode test, no
+  missing-`dropin_name` test, and no unsafe-`dropin_name` test existed (contrast with
+  `ConfigureDropin`, which has all three validation cases).
+
+**`PackageEnforcerTests` had no enforce-mode test for the `apt-get` backend (the
+default, detected first) and no enforce-mode test for the `dnf` backend.**
+
+The existing enforce-mode tests covered only Zypper (`InstallPackage_ZypperBackend_*`,
+`RemovePackage_ZypperBackend_*`). The three prior backend detection paths —
+`apt-get` (priority 1), `dnf` (priority 2) — were exercised only through audit-mode
+tests where the package-manager detection branch is never reached. This left the most
+commonly deployed backend (`apt-get`, used on Debian/Ubuntu) without any enforce-path
+coverage.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`** (+12 tests):
+
+`SystemdEnforcerTests` (+7):
+- `UnmaskUnit_AuditOnly_NoRunner` — audit mode returns `systemd:unmask:telnet.service`
+  and makes no runner calls (parallel to `MaskUnit_AuditOnly_NoRunner`).
+- `StartUnit_AuditOnly_NoRunner` — audit mode returns `systemd:start:ntp.service` and
+  makes no runner calls (parallel to `DisableUnit_AuditOnly_NoRunner`).
+- `StopUnit_AuditOnly_NoRunner` — audit mode returns `systemd:stop:ntp.service` and
+  makes no runner calls.
+- `RestartUnit_AuditOnly_NoRunner` — audit mode returns `systemd:restart:sshd.service`
+  and makes no runner calls.
+- `RemoveDropin_EnforceMode_CallsDaemonReload` — enforce mode with a valid `dropin_name`
+  returns the directive tag, and `needReload = true` causes a `systemctl daemon-reload`
+  invocation even when the target file does not exist on disk.
+- `RemoveDropin_MissingDropinName_Skipped` — a `RemoveDropin` directive without
+  `dropin_name` produces no applied entry and no runner call.
+- `RemoveDropin_UnsafeDropinStem_Skipped` — a `dropin_name` containing a dot (rejected
+  by `IsSafeDropinStem`) produces no applied entry and no runner call.
+
+`PackageEnforcerTests` (+5):
+- `InstallPackage_AptBackend_CallsAptGet` — default `NullCommandRunner` (all `which`
+  calls succeed) selects the `apt-get` backend; `install -y ntp` is invoked and no
+  `dnf` or `zypper` call is made.
+- `RemovePackage_AptBackend_CallsAptGet` — apt-get backend calls `remove -y ntp` for a
+  DDS-managed package.
+- `InstallPackage_AptBackend_WithVersion_UsesEqualsSeparator` — apt-get install with
+  a version string uses `ntp=1:4.2.8p15-1` (the `name=version` spec format).
+- `InstallPackage_DnfBackend_CallsDnf` — with `which apt-get` failing and `which dnf`
+  succeeding, `dnf install -y httpd` is invoked.
+- `RemovePackage_DnfBackend_CallsDnf` — dnf backend calls `remove -y httpd` for a
+  DDS-managed package.
+
+**Test results**: Linux .NET **289/289** (was 277/277; +12 new tests). macOS .NET **137/137**
+(unchanged). Windows .NET **252/252**, 39 skipped (unchanged). Rust **838/838** (unchanged).
+
+---
+
 ## Gap Fix (2026-05-06, 81st pass) — Linux: AppliedStateStore missing Record/Remove/Persist tests for ManagedSudoersFilenames and ManagedSystemdDropins
 
 ### Gap
