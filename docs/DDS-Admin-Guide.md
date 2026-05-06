@@ -2081,7 +2081,7 @@ returns the canonical `node_pubkey_b64` to copy in.
 | Capability | Backend | Notes |
 |---|---|---|
 | Managed preferences | `plutil` (binary plist) | Writes to `/Library/Managed Preferences/` |
-| Local accounts | `dscl`, `pwpolicy`, `sysadminctl`, `dseditgroup` | Create/delete/disable users, admin group, hidden flag. Use only on standalone Macs; refuses on directory-bound machines today. |
+| Local accounts | `dscl`, `pwpolicy`, `sysadminctl`, `dseditgroup` | Create/delete/disable users, admin group, hidden flag. `username` must be 1–255 chars, ASCII letters/digits/`.`/`_`/`-`, not starting with `-`. Shell must be an absolute path with no spaces or metacharacters. Use only on standalone Macs; refuses on directory-bound machines today. |
 | launchd services | `launchctl` bootstrap/bootout/kickstart | Configure, load, unload managed LaunchDaemons/Agents |
 | Configuration profiles | `profiles -I` / `profiles -R` | SHA-256 idempotency, payload stamp state |
 | Software install | `/usr/sbin/installer` + `pkgutil` | HTTP download, SHA-256 verify, optional signature check. Uninstall intentionally not supported. |

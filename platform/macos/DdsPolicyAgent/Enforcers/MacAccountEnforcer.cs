@@ -287,6 +287,12 @@ public sealed class HostMacAccountOperations : IMacAccountOperations
 /// Applies <c>MacOsSettings.local_accounts</c> directives against
 /// local macOS account operations. Directory-bound hosts are refused
 /// in v1 to avoid conflicting with external identity sources.
+///
+/// Input safety: <c>username</c> is validated against the macOS short-name
+/// allowlist before any operation is attempted (ASCII letters, digits, <c>.</c>,
+/// <c>_</c>, <c>-</c>; max 255 chars; must not start with <c>-</c>). Shell paths are
+/// validated for absolute paths free of whitespace and metacharacters.
+/// Directives that fail either check are logged and skipped.
 /// </summary>
 public sealed class MacAccountEnforcer : IEnforcer
 {
@@ -346,6 +352,13 @@ public sealed class MacAccountEnforcer : IEnforcer
     {
         var username = item.GetProperty("username").GetString() ?? throw new InvalidOperationException("missing username");
         var action = item.GetProperty("action").GetString() ?? throw new InvalidOperationException("missing action");
+
+        if (!IsValidUsername(username))
+        {
+            _log.LogWarning("Account enforcer: unsafe username '{U}'; skipping", username);
+            return $"[SKIPPED] {action} '{username}' — invalid username";
+        }
+
         var desc = $"{action} '{username}'";
 
         if (mode == EnforcementMode.Audit)
@@ -371,6 +384,12 @@ public sealed class MacAccountEnforcer : IEnforcer
         var shell = GetOptionalString(item, "shell");
         var admin = GetOptionalBool(item, "admin") ?? false;
         var hidden = GetOptionalBool(item, "hidden") ?? false;
+
+        if (shell is not null && !IsSafeShellPath(shell))
+        {
+            _log.LogWarning("Account enforcer: unsafe shell '{S}' for '{U}'; skipping", shell, username);
+            return $"[SKIPPED] Create '{username}' — unsafe shell path";
+        }
 
         if (_ops.UserExists(username))
             return ApplyModify(item, username);
@@ -419,10 +438,17 @@ public sealed class MacAccountEnforcer : IEnforcer
         var changes = new List<string>();
 
         var shell = GetOptionalString(item, "shell");
-        if (shell is not null && _ops.GetShell(username) != shell)
+        if (shell is not null)
         {
-            _ops.SetShell(username, shell);
-            changes.Add($"shell={shell}");
+            if (!IsSafeShellPath(shell))
+            {
+                _log.LogWarning("Account enforcer: unsafe shell '{S}' for '{U}'; ignoring shell change", shell, username);
+            }
+            else if (_ops.GetShell(username) != shell)
+            {
+                _ops.SetShell(username, shell);
+                changes.Add($"shell={shell}");
+            }
         }
 
         var admin = GetOptionalBool(item, "admin");
@@ -455,6 +481,39 @@ public sealed class MacAccountEnforcer : IEnforcer
         => item.TryGetProperty(name, out var value) && value.ValueKind != JsonValueKind.Null
             ? value.GetBoolean()
             : null;
+
+    /// <summary>
+    /// Validates a macOS local account short name (POSIX username).
+    /// Allowed: ASCII letters, digits, <c>.</c>, <c>_</c>, <c>-</c>;
+    /// max 255 characters; must not start with <c>-</c>.
+    /// </summary>
+    internal static bool IsValidUsername(string name)
+    {
+        if (name.Length == 0 || name.Length > 255) return false;
+        foreach (var c in name)
+            if (!char.IsAsciiLetterOrDigit(c) && c != '_' && c != '-' && c != '.')
+                return false;
+        if (name[0] == '-') return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Validates a shell path to prevent argument injection into
+    /// <c>dscl -create … UserShell</c> calls. Requires an absolute
+    /// path with no whitespace or shell metacharacters.
+    /// </summary>
+    internal static bool IsSafeShellPath(string shell)
+    {
+        if (string.IsNullOrEmpty(shell) || shell.Length > 256) return false;
+        if (!shell.StartsWith('/')) return false;
+        foreach (var c in shell)
+        {
+            if (c <= 0x20 || c > 0x7E) return false;
+            if (c is ' ' or '\t' or ';' or '&' or '|' or '`' or '$' or '>' or '<' or '"' or '\'')
+                return false;
+        }
+        return true;
+    }
 
     /// <summary>
     /// Extract the managed-item key (username) for a Create directive.

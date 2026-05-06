@@ -491,6 +491,103 @@ public class EnforcerTests
         Assert.True(ops.IsInGroup("alice", "staff"));
     }
 
+    // --- MacAccountEnforcer: username and shell validation ---
+
+    [Theory]
+    [InlineData("alice")]
+    [InlineData("alice.smith")]
+    [InlineData("alice_smith")]
+    [InlineData("alice-smith")]
+    [InlineData("alice123")]
+    public void MacAccountEnforcer_IsValidUsername_accepts_valid_names(string name)
+        => Assert.True(MacAccountEnforcer.IsValidUsername(name));
+
+    [Theory]
+    [InlineData("")]                     // empty
+    [InlineData("alice smith")]          // space in middle
+    [InlineData("alice!")]               // exclamation mark
+    [InlineData("alice\tname")]          // tab (control character)
+    [InlineData("-alice")]               // starts with dash
+    [InlineData("alice\0null")]          // null byte
+    public void MacAccountEnforcer_IsValidUsername_rejects_invalid_names(string name)
+        => Assert.False(MacAccountEnforcer.IsValidUsername(name));
+
+    [Theory]
+    [InlineData("/bin/zsh")]
+    [InlineData("/bin/bash")]
+    [InlineData("/usr/local/bin/fish")]
+    public void MacAccountEnforcer_IsSafeShellPath_accepts_valid_paths(string shell)
+        => Assert.True(MacAccountEnforcer.IsSafeShellPath(shell));
+
+    [Theory]
+    [InlineData("bin/zsh")]             // not absolute
+    [InlineData("/bin/zsh arg")]        // space — argument injection
+    [InlineData("/bin/zsh;id")]         // semicolon injection
+    [InlineData("/bin/$SHELL")]         // dollar sign
+    [InlineData("")]                    // empty
+    public void MacAccountEnforcer_IsSafeShellPath_rejects_unsafe_paths(string shell)
+        => Assert.False(MacAccountEnforcer.IsSafeShellPath(shell));
+
+    [Fact]
+    public async Task MacAccountEnforcer_invalid_username_returns_skipped_tag()
+    {
+        var ops = new InMemoryMacAccountOperations();
+        var enforcer = new MacAccountEnforcer(ops, NullLogger<MacAccountEnforcer>.Instance);
+
+        var directive = JsonDocument.Parse("""
+        [
+          {"username":"alice smith","action":"Create","shell":"/bin/zsh"}
+        ]
+        """).RootElement;
+
+        var outcome = await enforcer.ApplyAsync(directive, EnforcementMode.Enforce);
+
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
+        Assert.Single(outcome.Changes!);
+        Assert.Contains("[SKIPPED]", outcome.Changes![0]);
+        Assert.False(ops.UserExists("alice smith"));
+    }
+
+    [Fact]
+    public async Task MacAccountEnforcer_unsafe_shell_on_create_returns_skipped_tag()
+    {
+        var ops = new InMemoryMacAccountOperations();
+        var enforcer = new MacAccountEnforcer(ops, NullLogger<MacAccountEnforcer>.Instance);
+
+        var directive = JsonDocument.Parse("""
+        [
+          {"username":"alice","action":"Create","shell":"/bin/zsh --login"}
+        ]
+        """).RootElement;
+
+        var outcome = await enforcer.ApplyAsync(directive, EnforcementMode.Enforce);
+
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
+        Assert.Single(outcome.Changes!);
+        Assert.Contains("[SKIPPED]", outcome.Changes![0]);
+        Assert.False(ops.UserExists("alice"));
+    }
+
+    [Fact]
+    public async Task MacAccountEnforcer_unsafe_shell_on_modify_ignored_other_changes_applied()
+    {
+        var ops = new InMemoryMacAccountOperations();
+        ops.CreateUser("alice", null, "/bin/bash", false, false);
+        var enforcer = new MacAccountEnforcer(ops, NullLogger<MacAccountEnforcer>.Instance);
+
+        var directive = JsonDocument.Parse("""
+        [
+          {"username":"alice","action":"Modify","shell":"/bin/zsh;id","admin":true}
+        ]
+        """).RootElement;
+
+        var outcome = await enforcer.ApplyAsync(directive, EnforcementMode.Enforce);
+
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
+        Assert.Equal("/bin/bash", ops.GetShell("alice"));  // shell unchanged
+        Assert.True(ops.IsAdmin("alice"));                  // admin change still applied
+    }
+
     [Fact]
     public void ProfileEnforcer_ReconcileStaleProfiles_enforce_mode_removes_profiles()
     {
