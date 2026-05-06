@@ -1,5 +1,47 @@
 # DDS Implementation Status
 
+## Fix (2026-05-06, 72nd pass) — Linux: UserEnforcer group name validation
+
+### Gap
+
+**`UserEnforcer.ApplyGroupsAsync` passed group names to `usermod -aG` without validation.**
+
+The Linux `UserEnforcer` already validated usernames (`IsValidUsername`) and shell paths
+(`IsSafeShellPath`) against argument-injection vectors, but the `groups` array in each directive
+was passed directly to `usermod -aG {gname} {username}` with only a null/whitespace check.
+
+A crafted policy document could supply a group name containing:
+- A space (e.g., `"-G root"`) — .NET splits the argument string on whitespace when launching the
+  child process with `UseShellExecute = false`, so `usermod` would receive `-G root` as extra
+  positional arguments (argument injection, not shell injection).
+- A leading `-` — the token would be interpreted as a flag by `usermod`.
+- Other metacharacters (`; $ | > < &`) — less dangerous with `UseShellExecute = false` but still
+  structurally unsound.
+
+The Windows `AccountEnforcer` already had an equivalent `IsValidGroupName` guard (added 69th
+pass); the Linux counterpart was missing the same defence.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Enforcers/UserEnforcer.cs`**:
+- Added `internal static bool IsValidGroupName(string name)` — 1–32 characters, ASCII
+  letters/digits/underscore/hyphen only, must not start with `-`.
+- `ApplyGroupsAsync` now calls `IsValidGroupName` before invoking `usermod`; invalid group names
+  are logged as `LogWarning` and skipped (same pattern as the existing username and shell-path
+  guards).
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`** (13 new tests):
+- `GroupNameValidation` Theory (11 inline cases)
+- `Create_UnsafeGroupName_Skipped` — verifies `useradd` still runs but `usermod` is not called
+  with the injected flag string.
+- `Create_MixedGroups_SafeGroupApplied_UnsafeSkipped` — verifies the safe group in a mixed
+  array is applied while the two unsafe entries are dropped.
+
+**Test results**: Linux .NET **240/240** (was 227/227; 13 new tests). macOS .NET **118/118**.
+Windows .NET **247/247** (39 Win32-only integration tests skipped on macOS). No Rust changes.
+
+---
+
 ## Fix (2026-05-05, 70th pass) — Windows: AccountEnforcer username allowlist + group name control-char hardening
 
 ### Gap

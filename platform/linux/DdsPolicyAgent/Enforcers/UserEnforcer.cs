@@ -154,6 +154,11 @@ public sealed class UserEnforcer
         {
             var gname = g.GetString();
             if (string.IsNullOrWhiteSpace(gname)) continue;
+            if (!IsValidGroupName(gname))
+            {
+                _log.LogWarning("UserEnforcer: unsafe group name {G} for {U}; skipping", gname, username);
+                continue;
+            }
             await RunOrLogAsync("usermod", $"-aG {gname} {username}", ct).ConfigureAwait(false);
         }
     }
@@ -230,6 +235,18 @@ public sealed class UserEnforcer
             if (!char.IsAsciiLetterOrDigit(c) && c != '_' && c != '-' && c != '.')
                 return false;
         if (name[0] == '-') return false;
+        return true;
+    }
+
+    // Valid Linux group name: 1–32 chars, ASCII letters/digits/underscore/hyphen, must not
+    // start with '-' (which would be parsed as a flag by usermod).
+    internal static bool IsValidGroupName(string name)
+    {
+        if (string.IsNullOrEmpty(name) || name.Length > 32) return false;
+        if (name[0] == '-') return false;
+        foreach (var c in name)
+            if (!char.IsAsciiLetterOrDigit(c) && c != '_' && c != '-')
+                return false;
         return true;
     }
 

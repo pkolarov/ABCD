@@ -150,6 +150,59 @@ public sealed class UserEnforcerTests
         Assert.DoesNotContain(runner.Invocations, i =>
             i.FileName == "usermod" && i.Arguments.Contains("-s"));
     }
+
+    [Theory]
+    [InlineData("sudo",       true)]
+    [InlineData("wheel",      true)]
+    [InlineData("dds-ops",    true)]
+    [InlineData("dds_ops",    true)]
+    [InlineData("",           false)]
+    [InlineData("-wheel",     false)]  // starts with '-' — would be parsed as a usermod flag
+    [InlineData("wh eel",     false)]  // space — causes argument split
+    [InlineData("wh\teel",    false)]  // tab
+    [InlineData("wh;eel",     false)]  // semicolon
+    [InlineData("wh$eel",     false)]  // dollar
+    [InlineData("toolonggroupnamethatexceedslimit123456789012", false)]
+    public void GroupNameValidation(string name, bool expected)
+        => Assert.Equal(expected, UserEnforcer.IsValidGroupName(name));
+
+    [Fact]
+    public async Task Create_UnsafeGroupName_Skipped()
+    {
+        var runner = new NullCommandRunner();
+        runner.ExitCodeOverrides["id"] = 1;
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        // Group name with a leading '-' would inject a flag into "usermod -aG".
+        var applied = await enforcer.ApplyAsync(
+            [ParseElement("""{"username":"alice","action":"Create","groups":["-G root"]}""")],
+            new HashSet<string>(), default);
+
+        // useradd still runs (create is valid), but the unsafe group is never passed to usermod.
+        Assert.Contains(runner.Invocations, i => i.FileName == "useradd");
+        Assert.DoesNotContain(runner.Invocations, i =>
+            i.FileName == "usermod" && i.Arguments.Contains("-G root"));
+    }
+
+    [Fact]
+    public async Task Create_MixedGroups_SafeGroupApplied_UnsafeSkipped()
+    {
+        var runner = new NullCommandRunner();
+        runner.ExitCodeOverrides["id"] = 1;
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [ParseElement("""{"username":"alice","action":"Create","groups":["sudo","-bad","wh eel"]}""")],
+            new HashSet<string>(), default);
+
+        // Only "sudo" is valid; the other two are skipped.
+        Assert.Contains(runner.Invocations, i =>
+            i.FileName == "usermod" && i.Arguments.Contains("sudo") && i.Arguments.Contains("alice"));
+        Assert.DoesNotContain(runner.Invocations, i =>
+            i.FileName == "usermod" && i.Arguments.Contains("-bad"));
+        Assert.DoesNotContain(runner.Invocations, i =>
+            i.FileName == "usermod" && i.Arguments.Contains("wh eel"));
+    }
 }
 
 // ============================================================
