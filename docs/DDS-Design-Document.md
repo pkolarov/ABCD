@@ -1490,7 +1490,7 @@ LinuxPolicyDocument
     │   ├── username: String
     │   ├── uid: Option<u32>
     │   ├── shell: Option<String>
-    │   ├── groups: [String]          # supplementary groups (additive)
+    │   ├── groups: [String]          # supplementary groups (applied via usermod -aG; tracked and reconciled)
     │   ├── full_name: Option<String> # GECOS / full name
     │   └── action: LinuxUserAction   # Create | Delete | Disable | Enable | Modify
     ├── sudoers: [LinuxSudoersDirective]

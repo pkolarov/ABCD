@@ -1200,6 +1200,119 @@ public sealed class ReconcileUserEnforcerTests
     }
 }
 
+public sealed class ReconcileGroupEnforcerTests
+{
+    private static JsonElement ParseElement(string json)
+        => JsonDocument.Parse(json).RootElement;
+
+    [Theory]
+    [InlineData("""{"username":"alice","action":"Create","groups":["sudo","staff"]}""", new[] { "alice:sudo", "alice:staff" })]
+    [InlineData("""{"username":"bob","action":"Modify","groups":["docker"]}""",         new[] { "bob:docker" })]
+    [InlineData("""{"username":"carol","action":"Create"}""",                           new string[0])]
+    [InlineData("""{"username":"dave","action":"Create","groups":[]}""",                new string[0])]
+    public void ExtractManagedGroups_ReturnsExpectedKeys(string json, string[] expected)
+    {
+        var d = ParseElement(json);
+        var actual = UserEnforcer.ExtractManagedGroups(d).ToList();
+        Assert.Equal(expected.OrderBy(x => x), actual.OrderBy(x => x));
+    }
+
+    [Fact]
+    public async Task ReconcileStaleGroups_CallsGpasswdForValidKey()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleGroupsAsync(
+            new HashSet<string> { "alice:sudo" }, default);
+
+        Assert.Single(applied);
+        Assert.Equal("user:leave-group:alice:sudo", applied[0]);
+        Assert.Contains(runner.Invocations, i => i.FileName == "gpasswd" && i.Arguments.Contains("alice") && i.Arguments.Contains("sudo"));
+    }
+
+    [Fact]
+    public async Task ReconcileStaleGroups_AuditOnly_LogsDoesNotRunGpasswd()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new UserEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleGroupsAsync(
+            new HashSet<string> { "alice:sudo" }, default);
+
+        Assert.Single(applied);
+        Assert.Equal("user:leave-group:alice:sudo", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleGroups_InvalidUsername_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleGroupsAsync(
+            new HashSet<string> { "bad name!:sudo" }, default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleGroups_InvalidGroupName_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleGroupsAsync(
+            new HashSet<string> { "alice:-badgroup" }, default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleGroups_UnparseableKey_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleGroupsAsync(
+            new HashSet<string> { "nodecollonseparator" }, default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleGroups_GpasswdFailure_NotRecordedAsChange()
+    {
+        var runner = new NullCommandRunner();
+        runner.ExitCodeOverrides["gpasswd"] = 3;
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleGroupsAsync(
+            new HashSet<string> { "alice:sudo" }, default);
+
+        // gpasswd returned non-zero (user already not a member) — not counted as a change.
+        Assert.Empty(applied);
+        Assert.Single(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleGroups_EmptySet_ReturnsEmpty()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ReconcileStaleGroupsAsync(
+            new HashSet<string>(), default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+}
+
 public sealed class ReconcileFileEnforcerTests
 {
     [Fact]

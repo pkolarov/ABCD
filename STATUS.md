@@ -1,5 +1,73 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-06, 77th pass) — Linux: group membership reconciliation
+
+### Gap
+
+**The Linux DDS Policy Agent applied group memberships but never reconciled them when groups were removed from policy.**
+
+`UserEnforcer.ApplyGroupsAsync` adds users to supplementary groups via `usermod -aG` whenever a
+`local_users` directive contains a `groups` array. However:
+
+- `AppliedState` had no `ManagedGroups` field — group memberships were never persisted.
+- There was no `ExtractManagedGroups` method to collect desired `username:group` pairs.
+- `UserEnforcer` had no `ReconcileStaleGroupsAsync` method.
+- `Worker.ReconcileLinuxAsync` never attempted group membership cleanup.
+
+The consequence: if a `groups: ["sudo"]` directive was applied to user `alice`, and the `sudo` entry
+was later removed from the policy, `alice` would remain in the `sudo` group indefinitely — the Linux
+version of the same bug that was fixed for macOS in the 73rd pass.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/State/AppliedStateStore.cs`**:
+- Added `ManagedGroups` (`HashSet<string>`, serialized as `managed_groups`) to `AppliedState`.
+- Added `SetManagedGroups(IEnumerable<string>)` to `IAppliedStateStore` and `AppliedStateStore`.
+  This bulk-replaces the full desired set at the end of every poll cycle (cheaper than tracking
+  individual add/remove events for group memberships, which change as a set each cycle).
+
+**`platform/linux/DdsPolicyAgent/Enforcers/UserEnforcer.cs`**:
+- Added `ExtractManagedGroups(JsonElement directive)` static helper: yields `username:group` string
+  keys for every entry in the directive's `groups` array. Used in `ExtractDesiredItems`.
+- Added `ReconcileStaleGroupsAsync(IReadOnlySet<string> staleKeys, CancellationToken ct)`:
+  parses each `username:group` key, validates both parts with `IsValidUsername` and `IsValidGroupName`,
+  then calls `gpasswd -d <username> <group>` (symmetric with `usermod -aG` in `ApplyGroupsAsync`).
+  In audit mode, logs and records the change without running any command. A non-zero exit from
+  `gpasswd` (user already not a member) is logged at debug and not counted as a change.
+
+**`platform/linux/DdsPolicyAgent/Worker.cs`**:
+- Added `desiredGroups` (`HashSet<string>`) to `PollOnceAsync`, populated by the updated
+  `ExtractDesiredItems` (which now calls `UserEnforcer.ExtractManagedGroups` on every `local_users`
+  directive).
+- `ReconcileLinuxAsync` signature extended with `desiredGroups`; body now computes stale group
+  memberships (`currentState.ManagedGroups` − `desiredGroups`), calls
+  `ReconcileStaleGroupsAsync` for the stale set, and then calls `_stateStore.SetManagedGroups(desiredGroups)`
+  to persist the full desired set for the next cycle.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`** (+11 tests, new class `ReconcileGroupEnforcerTests`):
+- `ExtractManagedGroups_ReturnsExpectedKeys` Theory (4 cases: groups applied, single group, no groups field, empty groups array)
+- `ReconcileStaleGroups_CallsGpasswdForValidKey` — valid key runs `gpasswd -d`, records change
+- `ReconcileStaleGroups_AuditOnly_LogsDoesNotRunGpasswd` — audit mode: change recorded, no runner call
+- `ReconcileStaleGroups_InvalidUsername_Skipped` — invalid username in key is skipped
+- `ReconcileStaleGroups_InvalidGroupName_Skipped` — leading `-` in group name is skipped
+- `ReconcileStaleGroups_UnparseableKey_Skipped` — key without `:` separator is skipped
+- `ReconcileStaleGroups_GpasswdFailure_NotRecordedAsChange` — non-zero `gpasswd` exit not counted
+- `ReconcileStaleGroups_EmptySet_ReturnsEmpty` — empty stale set returns no changes
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`** (+2 tests):
+- `GroupMembership_ReconcileRemovesStaleKey` — stale `alice:sudo` in prior state, policy with
+  no groups: verifies `gpasswd -d alice sudo` is called and `SetManagedGroups` is called with empty set.
+- `GroupMembership_DesiredGroupPersisted` — policy containing `groups: ["sudo"]` for alice:
+  verifies `SetManagedGroups` is called with `alice:sudo`.
+
+Also updated `TestAppliedStateStore` and `TrackingAppliedStateStore` to implement the new
+`SetManagedGroups` interface method.
+
+**Test results**: Linux .NET **253/253** (was 240/240; +13 new tests). macOS .NET **137/137**
+(unchanged). Windows .NET **252/252**, 39 skipped (unchanged). Rust **737/737** (unchanged).
+
+---
+
 ## Fix (2026-05-06, 76th pass) — macOS + Windows: validate usernames in ReconcileStaleAccounts and ReconcileStaleGroups before OS API calls
 
 ### Gap

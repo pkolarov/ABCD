@@ -1427,7 +1427,7 @@ Package names are validated against a safe-character allowlist before any packag
 }
 ```
 
-Valid `action` values: `Create`, `Delete`, `Disable`, `Enable`, `Modify`. `Create` is idempotent — the account is created if it does not already exist; supplementary `groups` are applied on every cycle. `Delete` is refused for accounts not previously created by DDS (tracked in the applied-state store). `Disable` locks the account via `passwd -l`; `Enable` unlocks it via `passwd -u` — both preserve the home directory and files. `Modify` updates the `shell`, `full_name`, and `groups` fields on an existing account. `uid` must be ≥ 1000 (the enforcer refuses UIDs below this threshold to prevent tampering with system accounts). The `shell` field must be an absolute path with no whitespace or shell metacharacters. `full_name` maps to the GECOS field (`-c` on `useradd`/`usermod`).
+Valid `action` values: `Create`, `Delete`, `Disable`, `Enable`, `Modify`. `Create` is idempotent — the account is created if it does not already exist; supplementary `groups` are applied on every cycle via `usermod -aG`. `Delete` is refused for accounts not previously created by DDS (tracked in the applied-state store). `Disable` locks the account via `passwd -l`; `Enable` unlocks it via `passwd -u` — both preserve the home directory and files. `Modify` updates the `shell`, `full_name`, and `groups` fields on an existing account. `uid` must be ≥ 1000 (the enforcer refuses UIDs below this threshold to prevent tampering with system accounts). The `shell` field must be an absolute path with no whitespace or shell metacharacters. `full_name` maps to the GECOS field (`-c` on `useradd`/`usermod`). Group names in `groups` must not start with `-` (flag-injection guard), must contain only ASCII letters, digits, underscores, and hyphens, and are capped at 32 chars; invalid group names are skipped with a warning. Supplementary group memberships added by DDS are tracked in `applied-state.json` and removed via `gpasswd -d` during reconciliation when the group is no longer listed in any current policy for that user.
 
 ### Linux Login and SSH Integration
 
@@ -1619,6 +1619,7 @@ in the current policy set. Items no longer desired are cleaned up:
 | Category | Cleanup action |
 |---|---|
 | Local users | Disabled via `passwd -l` (not deleted, to preserve home directories and logs) |
+| Supplementary group memberships | Removed via `gpasswd -d <user> <group>` for each `username:group` pair that was previously managed but is no longer declared in any current policy |
 | Managed files | Deleted from the filesystem |
 | Packages | Removed via the host package manager (`apt-get remove`, `dnf remove`, etc.) |
 | `sysctl` keys | Removed from `/etc/sysctl.d/60-dds-managed.conf` and `sysctl --system` re-run |
@@ -1645,7 +1646,7 @@ will not remove or disable anything.
 - Package removal is refused for packages not previously installed by DDS.
 - The agent tracks managed items in `/var/lib/dds/applied-state.json`
   under the `managed_usernames`, `managed_paths`, `managed_packages`,
-  `managed_sudoers_filenames`, and `managed_systemd_dropins` keys.
+  `managed_sudoers_filenames`, `managed_systemd_dropins`, and `managed_groups` keys.
 
 #### macOS Reconciliation
 
@@ -2373,7 +2374,7 @@ Settings can also be overridden via environment variables with the prefix
 
 | Capability | Backend | Notes |
 |---|---|---|
-| Local users | `useradd`, `usermod`, `userdel`, `passwd` | Create, modify, disable, delete accounts. Stale DDS-managed accounts are locked (`passwd -l`) rather than deleted during reconciliation. |
+| Local users | `useradd`, `usermod`, `userdel`, `passwd`, `gpasswd` | Create, modify, disable, delete accounts. Supplementary group memberships (via `usermod -aG`) are tracked and removed via `gpasswd -d` when dropped from policy. Stale DDS-managed accounts are locked (`passwd -l`) rather than deleted during reconciliation. |
 | Files and directories | `File.WriteAllBytes` / `File.Delete` | Managed file and directory state with SHA-256 idempotency. Only files previously written by the agent are eligible for deletion. |
 | Package installation | `apt-get` / `dnf` / `zypper` (auto-detected) | Install and remove packages. Detection order: `apt-get` → `dnf` → `zypper` → `rpm`. |
 | Sudoers drop-ins | `visudo -cf` + `/etc/sudoers.d/` | Validates each drop-in with `visudo` before writing; safe-delete on reconciliation. |

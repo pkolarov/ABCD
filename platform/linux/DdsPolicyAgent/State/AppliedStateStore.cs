@@ -44,6 +44,10 @@ public sealed class AppliedState
     /// Systemd drop-in keys ("unit/stem") written by the DDS agent via ConfigureDropin.
     [JsonPropertyName("managed_systemd_dropins")]
     public HashSet<string> ManagedSystemdDropins { get; set; } = new(StringComparer.Ordinal);
+
+    /// Group memberships ("username:group") added by the DDS agent via usermod -aG.
+    [JsonPropertyName("managed_groups")]
+    public HashSet<string> ManagedGroups { get; set; } = new(StringComparer.Ordinal);
 }
 
 public interface IAppliedStateStore
@@ -61,6 +65,7 @@ public interface IAppliedStateStore
     void RemoveManagedPackage(string packageName);
     void RemoveManagedSudoersFilename(string filename);
     void RemoveManagedSystemdDropin(string dropinKey);
+    void SetManagedGroups(IEnumerable<string> groups);
 }
 
 public sealed class AppliedStateStore : IAppliedStateStore
@@ -201,6 +206,15 @@ public sealed class AppliedStateStore : IAppliedStateStore
         {
             if (_state.ManagedSystemdDropins.Remove(dropinKey))
                 WriteToDisk(_state);
+        }
+    }
+
+    public void SetManagedGroups(IEnumerable<string> groups)
+    {
+        lock (_lock)
+        {
+            _state.ManagedGroups = new HashSet<string>(groups, StringComparer.Ordinal);
+            WriteToDisk(_state);
         }
     }
 

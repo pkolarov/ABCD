@@ -55,6 +55,7 @@ sealed class TestAppliedStateStore : IAppliedStateStore
     public void RemoveManagedPackage(string packageName) { }
     public void RemoveManagedSudoersFilename(string filename) { }
     public void RemoveManagedSystemdDropin(string dropinKey) { }
+    public void SetManagedGroups(IEnumerable<string> groups) { }
 }
 
 /// State store whose Load() returns a pre-populated managed set and records
@@ -81,6 +82,8 @@ sealed class TrackingAppliedStateStore : IAppliedStateStore
     public bool HasChanged(string _, string __) => true;
     public void RecordApplied(string _, string __, string ___, string ____) { }
 
+    public List<IEnumerable<string>> SetGroupsCalls { get; } = [];
+
     public void RecordManagedUsername(string u)        => AddedUsernames.Add(u);
     public void RecordManagedPath(string p)            => AddedPaths.Add(p);
     public void RecordManagedPackage(string n)         => AddedPackages.Add(n);
@@ -92,6 +95,7 @@ sealed class TrackingAppliedStateStore : IAppliedStateStore
     public void RemoveManagedPackage(string n)         => RemovedPackages.Add(n);
     public void RemoveManagedSudoersFilename(string f) => RemovedSudoersFilenames.Add(f);
     public void RemoveManagedSystemdDropin(string k)   => RemovedSystemdDropinKeys.Add(k);
+    public void SetManagedGroups(IEnumerable<string> groups) => SetGroupsCalls.Add(groups.ToList());
 }
 
 // ---- helpers ----
@@ -750,5 +754,70 @@ public sealed class WorkerTests
         await worker.PollOnceAsync(CancellationToken.None);
 
         Assert.Contains("sshd.service/hardening", store.AddedSystemdDropinKeys);
+    }
+
+    [Fact]
+    public async Task GroupMembership_ReconcileRemovesStaleKey()
+    {
+        // Pre-state: "alice:sudo" was previously managed. Current policy has no groups.
+        // Expected: gpasswd -d alice sudo is called; SetManagedGroups called with empty set.
+        var staleState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        staleState.ManagedGroups.Add("alice:sudo");
+
+        var store  = new TrackingAppliedStateStore(staleState);
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-no-groups",
+                    """{"policy_id":"policy-no-groups","version":1,"linux":{"local_users":[{"username":"alice","action":"Create","shell":"/bin/bash"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Contains(runner.Invocations,
+            i => i.FileName == "gpasswd" && i.Arguments.Contains("alice") && i.Arguments.Contains("sudo"));
+        Assert.Single(store.SetGroupsCalls);
+        Assert.Empty(store.SetGroupsCalls[0]);
+    }
+
+    [Fact]
+    public async Task GroupMembership_DesiredGroupPersisted()
+    {
+        // Policy declares alice in group sudo — SetManagedGroups should be called with "alice:sudo".
+        var store  = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-with-group",
+                    """{"policy_id":"policy-with-group","version":1,"linux":{"local_users":[{"username":"alice","action":"Create","shell":"/bin/bash","groups":["sudo"]}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Single(store.SetGroupsCalls);
+        Assert.Contains("alice:sudo", store.SetGroupsCalls[0]);
     }
 }

@@ -228,6 +228,78 @@ public sealed class UserEnforcer
         return applied;
     }
 
+    /// Returns "username:group" keys for every valid group listed in a directive's `groups`
+    /// array. Used to build the desired-group set for reconciliation tracking.
+    public static IEnumerable<string> ExtractManagedGroups(JsonElement directive)
+    {
+        var username = directive.TryGetProperty("username", out var u) ? u.GetString() : null;
+        if (username is null) yield break;
+
+        if (!directive.TryGetProperty("groups", out var groups) || groups.ValueKind != JsonValueKind.Array)
+            yield break;
+
+        foreach (var g in groups.EnumerateArray())
+        {
+            var group = g.GetString();
+            if (!string.IsNullOrWhiteSpace(group))
+                yield return $"{username}:{group}";
+        }
+    }
+
+    /// Removes stale DDS-managed group memberships. Each key is "username:group".
+    /// Skips keys with invalid username or group name. In audit mode, logs but does
+    /// not run commands. Attempts `gpasswd -d <user> <group>`; a non-zero exit means
+    /// the user is already not a member, which is logged at debug.
+    public async Task<List<string>> ReconcileStaleGroupsAsync(
+        IReadOnlySet<string> staleKeys, CancellationToken ct)
+    {
+        var applied = new List<string>();
+        foreach (var key in staleKeys)
+        {
+            var sep = key.IndexOf(':');
+            if (sep < 0)
+            {
+                _log.LogWarning("UserEnforcer: reconcile skip unparseable group key {Key}", key);
+                continue;
+            }
+
+            var username = key[..sep];
+            var group    = key[(sep + 1)..];
+
+            if (!IsValidUsername(username))
+            {
+                _log.LogWarning("UserEnforcer: reconcile skip invalid username in group key {Key}", key);
+                continue;
+            }
+
+            if (!IsValidGroupName(group))
+            {
+                _log.LogWarning("UserEnforcer: reconcile skip invalid group name in group key {Key}", key);
+                continue;
+            }
+
+            if (_auditOnly)
+            {
+                _log.LogInformation("[audit] would run: gpasswd -d {User} {Group}", username, group);
+                applied.Add($"user:leave-group:{key}");
+                continue;
+            }
+
+            var result = await _runner.RunAsync("gpasswd", $"-d {username} {group}", ct).ConfigureAwait(false);
+            if (result.Success)
+            {
+                _log.LogInformation("Reconciliation: removed {User} from group {Group}", username, group);
+                applied.Add($"user:leave-group:{key}");
+            }
+            else
+            {
+                _log.LogDebug("gpasswd -d {User} {Group}: exit {Code} (already not a member?): {Err}",
+                    username, group, result.ExitCode, result.Stderr);
+            }
+        }
+        return applied;
+    }
+
     internal static bool IsValidUsername(string name)
     {
         if (name.Length == 0 || name.Length > 32) return false;

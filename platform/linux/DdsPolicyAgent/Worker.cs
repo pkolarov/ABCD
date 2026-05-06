@@ -99,6 +99,7 @@ public sealed class Worker : BackgroundService
         var desiredSysctlKeys         = new HashSet<string>(StringComparer.Ordinal);
         var desiredSudoersFilenames   = new HashSet<string>(StringComparer.Ordinal);
         var desiredSystemdDropinKeys  = new HashSet<string>(StringComparer.Ordinal);
+        var desiredGroups             = new HashSet<string>(StringComparer.Ordinal);
         var hasSshPolicy              = false;
 
         var userEnforcer    = new UserEnforcer   (_runner, _config.AuditOnly, _log);
@@ -129,7 +130,7 @@ public sealed class Worker : BackgroundService
             {
                 ExtractDesiredItems(linux, desiredUsernames, desiredPaths, desiredPackages,
                                     desiredSysctlKeys, desiredSudoersFilenames,
-                                    desiredSystemdDropinKeys);
+                                    desiredSystemdDropinKeys, desiredGroups);
                 if (linux.TryGetProperty("ssh", out var sshProp)
                     && sshProp.ValueKind == JsonValueKind.Object
                     && SshdEnforcer.HasValidDirectives(sshProp))
@@ -198,10 +199,10 @@ public sealed class Worker : BackgroundService
 
         // Reconciliation pass: disable stale users, delete stale files, remove stale packages,
         // remove stale sysctl keys, remove stale sudoers drop-ins, remove stale systemd drop-ins,
-        // and remove the sshd drop-in if no policy declares ssh.
+        // remove stale group memberships, and remove the sshd drop-in if no policy declares ssh.
         await ReconcileLinuxAsync(
             desiredUsernames, desiredPaths, desiredPackages, desiredSysctlKeys,
-            desiredSudoersFilenames, desiredSystemdDropinKeys, hasSshPolicy,
+            desiredSudoersFilenames, desiredSystemdDropinKeys, desiredGroups, hasSshPolicy,
             userEnforcer, fileEnforcer, pkgEnforcer, sysctlEnforcer, sudoersEnforcer,
             systemdEnforcer, sshdEnforcer,
             ct).ConfigureAwait(false);
@@ -216,7 +217,8 @@ public sealed class Worker : BackgroundService
         HashSet<string> packages,
         HashSet<string> sysctlKeys,
         HashSet<string> sudoersFilenames,
-        HashSet<string> systemdDropinKeys)
+        HashSet<string> systemdDropinKeys,
+        HashSet<string> groups)
     {
         if (linux.TryGetProperty("local_users", out var users) && users.ValueKind == JsonValueKind.Array)
         {
@@ -229,6 +231,9 @@ public sealed class Worker : BackgroundService
                     if (!string.IsNullOrWhiteSpace(username))
                         usernames.Add(username);
                 }
+
+                foreach (var groupKey in UserEnforcer.ExtractManagedGroups(d))
+                    groups.Add(groupKey);
             }
         }
 
@@ -315,6 +320,7 @@ public sealed class Worker : BackgroundService
         HashSet<string> desiredSysctlKeys,
         HashSet<string> desiredSudoersFilenames,
         HashSet<string> desiredSystemdDropinKeys,
+        HashSet<string> desiredGroups,
         bool hasSshPolicy,
         UserEnforcer userEnforcer,
         FileEnforcer fileEnforcer,
@@ -397,6 +403,20 @@ public sealed class Worker : BackgroundService
             allChanges.AddRange(changes);
             foreach (var k in staleSystemdDropins) _stateStore.RemoveManagedSystemdDropin(k);
         }
+
+        // Group memberships: remove memberships no longer declared in any current policy.
+        var staleGroups = new HashSet<string>(currentState.ManagedGroups, StringComparer.Ordinal);
+        staleGroups.ExceptWith(desiredGroups);
+        if (staleGroups.Count > 0)
+        {
+            _log.LogInformation("Reconciliation: {Count} stale group membership(s) to remove", staleGroups.Count);
+            var changes = await userEnforcer
+                .ReconcileStaleGroupsAsync(staleGroups, ct)
+                .ConfigureAwait(false);
+            allChanges.AddRange(changes);
+        }
+        // Always persist the full desired group set so removals from policy are detected next cycle.
+        _stateStore.SetManagedGroups(desiredGroups);
 
         // Sshd: remove the drop-in when no current policy declares an ssh field.
         if (!hasSshPolicy)
