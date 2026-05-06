@@ -1219,10 +1219,36 @@ dds platform macos software --device-urn urn:vouchsafe:mac-1.7k3mf9...
 
 The macOS DDS Policy Agent enforces:
 - Managed preferences (plist-backed)
-- Local accounts (`dscl`, `pwpolicy`, `dseditgroup`)
+- Local accounts (`dscl`, `pwpolicy`, `sysadminctl`, `dseditgroup`) — including supplementary group memberships via the `groups` array
 - launchd services
 - Configuration profiles
 - Software installation (signed `.pkg` with SHA-256 verification)
+
+**`local_accounts` directive example:**
+
+```json
+{
+  "macos": {
+    "local_accounts": [
+      {
+        "username": "svc-dds",
+        "action": "Create",
+        "full_name": "DDS Service Account",
+        "shell": "/usr/bin/false",
+        "admin": false,
+        "hidden": true,
+        "groups": ["staff", "com.apple.access_ssh"]
+      },
+      {
+        "username": "old-admin",
+        "action": "Disable"
+      }
+    ]
+  }
+}
+```
+
+`action` values: `Create` (idempotent — creates if missing; `full_name` and `shell` set at creation; supplementary `groups` applied on every cycle), `Delete`, `Disable`, `Enable`, `Modify`. `Create` and `Delete` are only applied on standalone Macs — the enforcer refuses mutation on directory-bound or Platform SSO managed machines. `username` must be 1–255 chars, ASCII letters/digits/`.`/`_`/`-`, not starting with `-`. Shell must be an absolute path with no spaces or metacharacters. Group names in `groups` must not start with `-`, must contain no control characters, and are capped at 255 chars; invalid group names are skipped with a warning and the rest of the directive continues.
 
 ### Linux Policy
 
@@ -2081,7 +2107,7 @@ returns the canonical `node_pubkey_b64` to copy in.
 | Capability | Backend | Notes |
 |---|---|---|
 | Managed preferences | `plutil` (binary plist) | Writes to `/Library/Managed Preferences/` |
-| Local accounts | `dscl`, `pwpolicy`, `sysadminctl`, `dseditgroup` | Create/delete/disable users, admin group, hidden flag. `username` must be 1–255 chars, ASCII letters/digits/`.`/`_`/`-`, not starting with `-`. Shell must be an absolute path with no spaces or metacharacters. Use only on standalone Macs; refuses on directory-bound machines today. |
+| Local accounts | `dscl`, `pwpolicy`, `sysadminctl`, `dseditgroup` | Create/delete/disable users, admin group, hidden flag, and supplementary group memberships. `username` must be 1–255 chars, ASCII letters/digits/`.`/`_`/`-`, not starting with `-`. Shell must be an absolute path with no spaces or metacharacters. Group names in the `groups` array are validated (max 255 chars; must not start with `-`; no control characters) before each `dseditgroup` call; supplementary groups are applied on every `Create`/`Modify` cycle. Use only on standalone Macs; refuses on directory-bound machines today. |
 | launchd services | `launchctl` bootstrap/bootout/kickstart | Configure, load, unload managed LaunchDaemons/Agents |
 | Configuration profiles | `profiles -I` / `profiles -R` | SHA-256 idempotency, payload stamp state |
 | Software install | `/usr/sbin/installer` + `pkgutil` | HTTP download, SHA-256 verify, optional signature check. Uninstall intentionally not supported. |

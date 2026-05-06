@@ -1,5 +1,45 @@
 # DDS Implementation Status
 
+## Doc (2026-05-06, 74th pass) — macOS: document `groups` field in MacAccountDirective schema
+
+### Gap
+
+**`MacAccountDirective` schema was missing the `groups` field in both design and admin docs.**
+
+The 73rd pass added `AddToGroup` support and full supplementary group membership enforcement
+to `MacAccountEnforcer`, but the documentation was not updated to reflect the new field:
+
+- `DDS-Design-Document.md` §14.7.3 listed `MacAccountDirective` without the `groups` field.
+  The account name validation paragraph described only `username` and `shell` validation, not
+  group name validation.
+- `DDS-Admin-Guide.md` §macOS policy section's bullet list mentioned
+  `dseditgroup` but not the `groups` array or what values are valid.
+  The capability table row also omitted supplementary group membership.
+  There was no JSON example showing `groups` for macOS (Windows had one).
+
+### Fix
+
+**`docs/DDS-Design-Document.md`**:
+- Added `groups: Option<Vec<String>>  # supplementary group memberships (via dseditgroup)` to the
+  `MacAccountDirective` schema tree (§14.7.3, alongside `username`, `shell`, `admin`, `hidden`).
+- Extended the "Account name validation" paragraph to describe group name validation: max 255
+  chars; must not start with `-` (flag-injection guard); must not contain control characters
+  (< 0x20); spaces within the name are allowed (e.g. hypothetical multi-word macOS groups).
+
+**`docs/DDS-Admin-Guide.md`**:
+- Updated the macOS enforcer capability table row for "Local accounts" to include
+  "supplementary group memberships" and to describe the group name validation rules.
+- Updated the macOS policy section bullet list to mention `sysadminctl` (was missing) and
+  "including supplementary group memberships via the `groups` array".
+- Added a new `local_accounts` JSON example for macOS (mirroring the existing Windows example)
+  that shows `groups`, `admin`, `hidden`, and `shell` fields, followed by a prose description
+  of each `action` value and the validation rules.
+
+**Test results**: No code changes. macOS .NET **134/134**. Linux .NET **240/240**.
+Windows .NET **247/247** (39 skipped). `cargo test --workspace --lib` **737/737** (unchanged).
+
+---
+
 ## Fix (2026-05-06, 73rd pass) — macOS: MacAccountEnforcer group membership enforcement
 
 ### Gap

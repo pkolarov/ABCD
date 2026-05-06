@@ -1724,6 +1724,7 @@ MacOsPolicyDocument
     │   ├── shell: Option<String>
     │   ├── admin: Option<bool>
     │   ├── hidden: Option<bool>
+    │   ├── groups: Option<Vec<String>>  # supplementary group memberships (via dseditgroup)
     │   └── action: MacAccountAction  # Create | Delete | Disable | Enable | Modify
     ├── launchd: [LaunchdDirective]
     │   ├── label: String
@@ -1846,8 +1847,11 @@ It does not rewrite arbitrary application bundles or protected system locations.
 a POSIX short-name allowlist (ASCII letters, digits, `.`, `_`, `-`; max 255
 characters; must not start with `-`) before any `dscl`/`sysadminctl` call.
 Shell paths are validated for absolute form with no whitespace or metacharacters.
-Directives that fail either check are logged and skipped — they never reach the
-OS-level commands.
+Group names in the `groups` array are validated before each `dseditgroup` call:
+max 255 characters; must not start with `-` (flag-injection guard); must not
+contain control characters (< 0x20). Spaces within the group name are allowed
+(e.g. hypothetical multi-word macOS groups). Directives that fail any of these
+checks are logged and skipped — they never reach the OS-level commands.
 
 **External account-source guard:** If the host is bound to Active Directory,
 Open Directory, LDAP, or another external account source, local account mutation
