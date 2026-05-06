@@ -1,5 +1,75 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-06, 80th pass) — Linux: SystemdEnforcer and UserEnforcer missing forward-path test coverage
+
+### Gap
+
+**`SystemdEnforcerTests` and `UserEnforcerTests` had no test coverage for several
+implemented actions in the forward enforcement path.**
+
+`SystemdEnforcer.ApplyAsync` handles nine actions: `Enable`, `Disable`, `Start`, `Stop`,
+`Restart`, `Mask`, `Unmask`, `ConfigureDropin`, and `RemoveDropin`. The existing tests
+covered `Enable` (audit + enforce), `Mask` (audit + enforce), and `Unmask` (enforce), plus
+the unsafe-unit-name guard (exercised via `Start`). Six actions were entirely untested:
+
+- `Disable` — no audit-mode or enforce-mode test.
+- `Start` — no success-path test (only the unsafe-name-skip path was exercised indirectly).
+- `Stop` — no test.
+- `Restart` — no test.
+- `ConfigureDropin` — no audit-mode test (audit path returns the directive tag without any
+  filesystem write; this was the most important missing case because the dropin state is
+  tracked in `applied-state.json` and reconciled).
+- `RemoveDropin` — no audit-mode test.
+
+`UserEnforcer.ApplyAsync` handles five actions: `Create`, `Delete`, `Disable`, `Enable`,
+and `Modify`. The existing tests covered `Create` (audit + enforce), `Delete` (refused path),
+UID-below-minimum rejection, and `Modify` (only the unsafe-shell skip path). Three forward
+paths were untested:
+
+- `Disable` — no audit-mode or enforce-mode test. The reconcile path
+  (`ReconcileStaleUsersAsync`) was tested separately but exercises a different code path
+  (`passwd -l` via `RunOrLogAsync`); the forward `Disable` case is the same command but
+  reached through `ApplyAsync`.
+- `Enable` — no test.
+- `Modify` happy path — only the rejection of an unsafe shell was tested; the normal
+  `usermod -s <shell> <username>` invocation was never exercised.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`** (+13 test coverage additions):
+
+`SystemdEnforcerTests`:
+- `DisableUnit_AuditOnly_NoRunner` — audit mode returns `systemd:disable:telnet.service`
+  and makes no runner calls (parallel to `EnableUnit_AuditOnlyNoRunner`).
+- `DisableUnit_EnforceMode_CallsSystemctl` — enforce mode invokes `systemctl disable
+  telnet.service` (parallel to `EnableUnit_EnforceMode_CallsSystemctl`).
+- `StartUnit_EnforceMode_CallsSystemctl` — enforce mode invokes `systemctl start ntp.service`.
+- `StopUnit_EnforceMode_CallsSystemctl` — enforce mode invokes `systemctl stop ntp.service`.
+- `RestartUnit_EnforceMode_CallsSystemctl` — enforce mode invokes `systemctl restart
+  sshd.service`.
+- `ConfigureDropin_AuditOnly_ReturnsDirectiveTagWithoutWrite` — audit mode returns
+  `systemd:configuredropin:sshd.service/dds-limits` and makes no runner calls (no
+  `daemon-reload`).
+- `ConfigureDropin_MissingDropinName_Skipped` — a `ConfigureDropin` directive without
+  `dropin_name` produces no applied entries and no runner calls.
+- `ConfigureDropin_UnsafeDropinStemSkipped` — a `dropin_name` containing a dot (rejected
+  by `IsSafeDropinStem`) produces no applied entries and no runner calls.
+- `RemoveDropin_AuditOnly_ReturnsDirectiveTag` — audit mode returns
+  `systemd:removedropin:sshd.service/dds-limits` and makes no runner calls.
+
+`UserEnforcerTests`:
+- `Disable_AuditOnly_NoRunnerCall` — audit mode returns `user:disable:alice` and makes no
+  runner calls.
+- `Disable_EnforceMode_CallsPasswdLock` — enforce mode invokes `passwd -l alice`.
+- `Enable_EnforceMode_CallsPasswdUnlock` — enforce mode invokes `passwd -u alice`.
+- `Modify_HappyPath_UpdatesShell` — enforce mode with a safe shell invokes `usermod -s
+  /usr/sbin/nologin alice`.
+
+**Test results**: Linux .NET **273/273** (was 260/260; +13 new tests). macOS .NET **137/137**
+(unchanged). Windows .NET **252/252**, 39 skipped (unchanged). Rust **838/838** (unchanged).
+
+---
+
 ## Gap Fix (2026-05-06, 79th pass) — Linux: SshdEnforcer missing AllowGroups validation tests
 
 ### Gap

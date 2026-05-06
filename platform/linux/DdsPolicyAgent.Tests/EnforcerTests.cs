@@ -203,6 +203,73 @@ public sealed class UserEnforcerTests
         Assert.DoesNotContain(runner.Invocations, i =>
             i.FileName == "usermod" && i.Arguments.Contains("wh eel"));
     }
+
+    [Fact]
+    public async Task Disable_AuditOnly_NoRunnerCall()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new UserEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [ParseElement("""{"username":"alice","action":"Disable"}""")],
+            new HashSet<string>(), default);
+
+        Assert.Single(applied);
+        Assert.Equal("user:disable:alice", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task Disable_EnforceMode_CallsPasswdLock()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [ParseElement("""{"username":"alice","action":"Disable"}""")],
+            new HashSet<string>(), default);
+
+        Assert.Single(applied);
+        Assert.Equal("user:disable:alice", applied[0]);
+        Assert.Single(runner.Invocations);
+        Assert.Equal("passwd", runner.Invocations[0].FileName);
+        Assert.Contains("-l", runner.Invocations[0].Arguments);
+        Assert.Contains("alice", runner.Invocations[0].Arguments);
+    }
+
+    [Fact]
+    public async Task Enable_EnforceMode_CallsPasswdUnlock()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [ParseElement("""{"username":"alice","action":"Enable"}""")],
+            new HashSet<string>(), default);
+
+        Assert.Single(applied);
+        Assert.Equal("user:enable:alice", applied[0]);
+        Assert.Single(runner.Invocations);
+        Assert.Equal("passwd", runner.Invocations[0].FileName);
+        Assert.Contains("-u", runner.Invocations[0].Arguments);
+        Assert.Contains("alice", runner.Invocations[0].Arguments);
+    }
+
+    [Fact]
+    public async Task Modify_HappyPath_UpdatesShell()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [ParseElement("""{"username":"alice","action":"Modify","shell":"/usr/sbin/nologin"}""")],
+            new HashSet<string>(), default);
+
+        Assert.Single(applied);
+        Assert.Equal("user:modify:alice", applied[0]);
+        Assert.Contains(runner.Invocations, i =>
+            i.FileName == "usermod" && i.Arguments.Contains("-s") && i.Arguments.Contains("alice"));
+    }
 }
 
 // ============================================================
@@ -626,6 +693,161 @@ public sealed class SystemdEnforcerTests
         Assert.Single(runner.Invocations);
         Assert.Equal("systemctl", runner.Invocations[0].FileName);
         Assert.Contains("unmask", runner.Invocations[0].Arguments);
+    }
+
+    [Fact]
+    public async Task DisableUnit_AuditOnly_NoRunner()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"telnet.service","action":"Disable"}""").RootElement],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("systemd:disable:telnet.service", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task DisableUnit_EnforceMode_CallsSystemctl()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"telnet.service","action":"Disable"}""").RootElement],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("systemd:disable:telnet.service", applied[0]);
+        Assert.Single(runner.Invocations);
+        Assert.Equal("systemctl", runner.Invocations[0].FileName);
+        Assert.Contains("disable", runner.Invocations[0].Arguments);
+        Assert.Contains("telnet.service", runner.Invocations[0].Arguments);
+    }
+
+    [Fact]
+    public async Task StartUnit_EnforceMode_CallsSystemctl()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"ntp.service","action":"Start"}""").RootElement],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("systemd:start:ntp.service", applied[0]);
+        Assert.Single(runner.Invocations);
+        Assert.Equal("systemctl", runner.Invocations[0].FileName);
+        Assert.Contains("start", runner.Invocations[0].Arguments);
+        Assert.Contains("ntp.service", runner.Invocations[0].Arguments);
+    }
+
+    [Fact]
+    public async Task StopUnit_EnforceMode_CallsSystemctl()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"ntp.service","action":"Stop"}""").RootElement],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("systemd:stop:ntp.service", applied[0]);
+        Assert.Single(runner.Invocations);
+        Assert.Equal("systemctl", runner.Invocations[0].FileName);
+        Assert.Contains("stop", runner.Invocations[0].Arguments);
+        Assert.Contains("ntp.service", runner.Invocations[0].Arguments);
+    }
+
+    [Fact]
+    public async Task RestartUnit_EnforceMode_CallsSystemctl()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"sshd.service","action":"Restart"}""").RootElement],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("systemd:restart:sshd.service", applied[0]);
+        Assert.Single(runner.Invocations);
+        Assert.Equal("systemctl", runner.Invocations[0].FileName);
+        Assert.Contains("restart", runner.Invocations[0].Arguments);
+        Assert.Contains("sshd.service", runner.Invocations[0].Arguments);
+    }
+
+    [Fact]
+    public async Task ConfigureDropin_AuditOnly_ReturnsDirectiveTagWithoutWrite()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""
+                {"unit":"sshd.service","action":"ConfigureDropin",
+                 "dropin_name":"dds-limits","dropin_content":"[Service]\nLimitNOFILE=1024\n"}
+                """).RootElement],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("systemd:configuredropin:sshd.service/dds-limits", applied[0]);
+        // Audit mode: no systemctl daemon-reload should be called
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ConfigureDropin_MissingDropinName_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"sshd.service","action":"ConfigureDropin","dropin_content":"[Service]\nX=1\n"}""")
+                .RootElement],
+            default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ConfigureDropin_UnsafeDropinStemSkipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        // dropin_name with a dot is rejected by IsSafeDropinStem
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""
+                {"unit":"sshd.service","action":"ConfigureDropin",
+                 "dropin_name":"dds.conf","dropin_content":"[Service]\nX=1\n"}
+                """).RootElement],
+            default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task RemoveDropin_AuditOnly_ReturnsDirectiveTag()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SystemdEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"unit":"sshd.service","action":"RemoveDropin","dropin_name":"dds-limits"}""")
+                .RootElement],
+            default);
+
+        Assert.Single(applied);
+        Assert.Equal("systemd:removedropin:sshd.service/dds-limits", applied[0]);
+        Assert.Empty(runner.Invocations);
     }
 }
 
