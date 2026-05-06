@@ -1490,6 +1490,99 @@ public sealed class SysctlEnforcerTests
 
         Assert.Empty(applied);
     }
+
+    [Fact]
+    public async Task SetDirective_EnforceMode_WritesDropinAndCallsSysctlSystem()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "dds-sysctl-" + Guid.NewGuid() + ".conf");
+        try
+        {
+            var runner   = new NullCommandRunner();
+            var enforcer = new SysctlEnforcer(runner, auditOnly: false, NullLogger.Instance,
+                dropinPath: tmp);
+
+            var applied = await enforcer.ApplyAsync(
+                [ParseElement("""{"key":"net.ipv4.ip_forward","value":"1","action":"Set"}""")],
+                default);
+
+            Assert.Single(applied);
+            Assert.Equal("sysctl:set:net.ipv4.ip_forward", applied[0]);
+
+            Assert.True(File.Exists(tmp));
+            var content = await File.ReadAllTextAsync(tmp);
+            Assert.Contains("net.ipv4.ip_forward = 1", content);
+
+            Assert.Single(runner.Invocations);
+            Assert.Equal("sysctl", runner.Invocations[0].FileName);
+            Assert.Equal("--system", runner.Invocations[0].Arguments);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
+
+    [Fact]
+    public async Task SetDirective_EnforceMode_UnchangedValue_NoSysctlCall()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "dds-sysctl-" + Guid.NewGuid() + ".conf");
+        try
+        {
+            // Pre-seed the dropin file with the value we are about to "set".
+            await File.WriteAllTextAsync(tmp, "net.ipv4.ip_forward = 1\n");
+
+            var runner   = new NullCommandRunner();
+            var enforcer = new SysctlEnforcer(runner, auditOnly: false, NullLogger.Instance,
+                dropinPath: tmp);
+
+            var applied = await enforcer.ApplyAsync(
+                [ParseElement("""{"key":"net.ipv4.ip_forward","value":"1","action":"Set"}""")],
+                default);
+
+            // Directive tag is still emitted (idempotent success), but no file write or runner call.
+            Assert.Single(applied);
+            Assert.Equal("sysctl:set:net.ipv4.ip_forward", applied[0]);
+            Assert.Empty(runner.Invocations);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteDirective_EnforceMode_RemovesPreviouslyManagedKey()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "dds-sysctl-" + Guid.NewGuid() + ".conf");
+        try
+        {
+            await File.WriteAllTextAsync(tmp,
+                "# Managed by DDS\nnet.ipv4.ip_forward = 1\nvm.swappiness = 10\n");
+
+            var runner   = new NullCommandRunner();
+            var enforcer = new SysctlEnforcer(runner, auditOnly: false, NullLogger.Instance,
+                dropinPath: tmp);
+
+            var applied = await enforcer.ApplyAsync(
+                [ParseElement("""{"key":"vm.swappiness","action":"Delete"}""")],
+                default);
+
+            Assert.Single(applied);
+            Assert.Equal("sysctl:delete:vm.swappiness", applied[0]);
+
+            var content = await File.ReadAllTextAsync(tmp);
+            Assert.DoesNotContain("vm.swappiness", content);
+            Assert.Contains("net.ipv4.ip_forward", content);
+
+            Assert.Single(runner.Invocations);
+            Assert.Equal("sysctl", runner.Invocations[0].FileName);
+            Assert.Equal("--system", runner.Invocations[0].Arguments);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
 }
 
 // ============================================================
@@ -1713,6 +1806,94 @@ public sealed class SshdEnforcerTests
         => Assert.Equal(expected,
                SshdEnforcer.HasValidDirectives(
                    JsonDocument.Parse(json).RootElement));
+
+    [Fact]
+    public async Task ValidPolicy_EnforceMode_WritesDropinAndCallsSystemctlReload()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "dds-sshd-" + Guid.NewGuid() + ".conf");
+        try
+        {
+            var runner   = new NullCommandRunner();
+            var enforcer = new SshdEnforcer(runner, auditOnly: false, NullLogger.Instance,
+                dropinPath: tmp);
+
+            var applied = await enforcer.ApplyAsync(
+                ParseObject("""{"password_authentication":false,"permit_root_login":"no"}"""),
+                default);
+
+            Assert.Equal(2, applied.Count);
+            Assert.Contains("sshd:set:PasswordAuthentication=False", applied);
+            Assert.Contains("sshd:set:PermitRootLogin=no",           applied);
+
+            Assert.True(File.Exists(tmp));
+            var content = await File.ReadAllTextAsync(tmp);
+            Assert.Contains("PasswordAuthentication no", content);
+            Assert.Contains("PermitRootLogin no",        content);
+
+            // systemctl reload sshd must be called; NullCommandRunner returns success so
+            // the ssh-unit fallback is not triggered.
+            Assert.Single(runner.Invocations);
+            Assert.Equal("systemctl",    runner.Invocations[0].FileName);
+            Assert.Equal("reload sshd",  runner.Invocations[0].Arguments);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
+
+    [Fact]
+    public async Task NullPolicy_EnforceMode_RemovesExistingDropin()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "dds-sshd-" + Guid.NewGuid() + ".conf");
+        try
+        {
+            await File.WriteAllTextAsync(tmp, "# Managed by DDS\nPasswordAuthentication no\n");
+
+            var runner   = new NullCommandRunner();
+            var enforcer = new SshdEnforcer(runner, auditOnly: false, NullLogger.Instance,
+                dropinPath: tmp);
+
+            var applied = await enforcer.ApplyAsync(null, default);
+
+            Assert.Single(applied);
+            Assert.Equal("sshd:remove", applied[0]);
+            Assert.False(File.Exists(tmp));
+            Assert.Empty(runner.Invocations);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
+
+    [Fact]
+    public async Task AllFieldsInvalid_EnforceMode_RemovesExistingDropin()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "dds-sshd-" + Guid.NewGuid() + ".conf");
+        try
+        {
+            await File.WriteAllTextAsync(tmp, "# Managed by DDS\nPasswordAuthentication no\n");
+
+            var runner   = new NullCommandRunner();
+            var enforcer = new SshdEnforcer(runner, auditOnly: false, NullLogger.Instance,
+                dropinPath: tmp);
+
+            // All fields invalid → zero lines → remove existing dropin.
+            var applied = await enforcer.ApplyAsync(
+                ParseObject("""{"permit_root_login":"maybe","allow_users":["bad user"]}"""),
+                default);
+
+            Assert.Single(applied);
+            Assert.Equal("sshd:remove", applied[0]);
+            Assert.False(File.Exists(tmp));
+            Assert.Empty(runner.Invocations);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
 }
 
 // ============================================================
@@ -1997,6 +2178,64 @@ public sealed class ReconcileSysctlEnforcerTests
 
         Assert.Empty(applied);
         Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleKeys_EnforceMode_RemovesStaleKey()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "dds-sysctl-" + Guid.NewGuid() + ".conf");
+        try
+        {
+            await File.WriteAllTextAsync(tmp,
+                "# Managed by DDS\nnet.ipv4.ip_forward = 1\nvm.swappiness = 10\n");
+
+            var runner   = new NullCommandRunner();
+            var enforcer = new SysctlEnforcer(runner, auditOnly: false, NullLogger.Instance,
+                dropinPath: tmp);
+
+            // Desired set only contains ip_forward; swappiness is stale.
+            var applied = await enforcer.ReconcileStaleKeysAsync(
+                new HashSet<string> { "net.ipv4.ip_forward" }, CancellationToken.None);
+
+            Assert.Single(applied);
+            Assert.Equal("sysctl:delete:vm.swappiness", applied[0]);
+
+            var content = await File.ReadAllTextAsync(tmp);
+            Assert.DoesNotContain("vm.swappiness", content);
+            Assert.Contains("net.ipv4.ip_forward", content);
+
+            Assert.Single(runner.Invocations);
+            Assert.Equal("sysctl",   runner.Invocations[0].FileName);
+            Assert.Equal("--system", runner.Invocations[0].Arguments);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
+
+    [Fact]
+    public async Task ReconcileStaleKeys_EnforceMode_AllKeysDesired_NoWrite()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "dds-sysctl-" + Guid.NewGuid() + ".conf");
+        try
+        {
+            await File.WriteAllTextAsync(tmp, "net.ipv4.ip_forward = 1\n");
+
+            var runner   = new NullCommandRunner();
+            var enforcer = new SysctlEnforcer(runner, auditOnly: false, NullLogger.Instance,
+                dropinPath: tmp);
+
+            var applied = await enforcer.ReconcileStaleKeysAsync(
+                new HashSet<string> { "net.ipv4.ip_forward" }, CancellationToken.None);
+
+            Assert.Empty(applied);
+            Assert.Empty(runner.Invocations);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
     }
 }
 

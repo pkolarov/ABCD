@@ -18,17 +18,20 @@ namespace DDS.PolicyAgent.Linux.Enforcers;
 [SupportedOSPlatform("linux")]
 public sealed class SysctlEnforcer
 {
-    private const string DropinPath = "/etc/sysctl.d/60-dds-managed.conf";
+    private const string DefaultDropinPath = "/etc/sysctl.d/60-dds-managed.conf";
 
     private readonly ICommandRunner _runner;
     private readonly bool _auditOnly;
     private readonly ILogger _log;
+    private readonly string _dropinPath;
 
-    public SysctlEnforcer(ICommandRunner runner, bool auditOnly, ILogger log)
+    public SysctlEnforcer(ICommandRunner runner, bool auditOnly, ILogger log,
+        string? dropinPath = null)
     {
         _runner = runner;
         _auditOnly = auditOnly;
         _log = log;
+        _dropinPath = dropinPath ?? DefaultDropinPath;
     }
 
     public async Task<List<string>> ApplyAsync(
@@ -104,14 +107,14 @@ public sealed class SysctlEnforcer
         return applied;
     }
 
-    private static Dictionary<string, string> LoadDropin()
+    private Dictionary<string, string> LoadDropin()
     {
         var result = new Dictionary<string, string>(StringComparer.Ordinal);
 
-        if (!File.Exists(DropinPath))
+        if (!File.Exists(_dropinPath))
             return result;
 
-        foreach (var raw in File.ReadAllLines(DropinPath))
+        foreach (var raw in File.ReadAllLines(_dropinPath))
         {
             var line = raw.Trim();
             if (line.StartsWith('#') || line.Length == 0)
@@ -145,20 +148,20 @@ public sealed class SysctlEnforcer
         if (_auditOnly)
         {
             _log.LogInformation(
-                "[audit] would write {Path} ({N} entries)", DropinPath, entries.Count);
+                "[audit] would write {Path} ({N} entries)", _dropinPath, entries.Count);
             return;
         }
 
-        var dir = Path.GetDirectoryName(DropinPath)!;
+        var dir = Path.GetDirectoryName(_dropinPath)!;
         Directory.CreateDirectory(dir);
 
-        var tmp = DropinPath + ".dds-tmp";
+        var tmp = _dropinPath + ".dds-tmp";
         await File.WriteAllTextAsync(tmp, content, Encoding.UTF8, ct).ConfigureAwait(false);
         File.SetUnixFileMode(tmp,
             UnixFileMode.UserRead | UnixFileMode.UserWrite |
             UnixFileMode.GroupRead | UnixFileMode.OtherRead);
-        File.Move(tmp, DropinPath, overwrite: true);
-        _log.LogInformation("SysctlEnforcer: wrote {Path} ({N} entries)", DropinPath, entries.Count);
+        File.Move(tmp, _dropinPath, overwrite: true);
+        _log.LogInformation("SysctlEnforcer: wrote {Path} ({N} entries)", _dropinPath, entries.Count);
     }
 
     private async Task ReloadAsync(CancellationToken ct)

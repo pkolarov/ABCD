@@ -22,7 +22,7 @@ namespace DDS.PolicyAgent.Linux.Enforcers;
 [SupportedOSPlatform("linux")]
 public sealed class SshdEnforcer
 {
-    private const string DropinPath = "/etc/ssh/sshd_config.d/60-dds.conf";
+    private const string DefaultDropinPath = "/etc/ssh/sshd_config.d/60-dds.conf";
 
     private static readonly HashSet<string> ValidPermitRootLogin =
         new(StringComparer.OrdinalIgnoreCase)
@@ -33,12 +33,15 @@ public sealed class SshdEnforcer
     private readonly ICommandRunner _runner;
     private readonly bool _auditOnly;
     private readonly ILogger _log;
+    private readonly string _dropinPath;
 
-    public SshdEnforcer(ICommandRunner runner, bool auditOnly, ILogger log)
+    public SshdEnforcer(ICommandRunner runner, bool auditOnly, ILogger log,
+        string? dropinPath = null)
     {
         _runner = runner;
         _auditOnly = auditOnly;
         _log = log;
+        _dropinPath = dropinPath ?? DefaultDropinPath;
     }
 
     /// Apply the given policy object (deserialized from the `ssh` field of
@@ -48,7 +51,7 @@ public sealed class SshdEnforcer
         // Null / absent ssh field → remove our drop-in if present.
         if (policy is null || policy.Value.ValueKind != JsonValueKind.Object)
         {
-            if (File.Exists(DropinPath))
+            if (File.Exists(_dropinPath))
             {
                 await RemoveDropinAsync(ct).ConfigureAwait(false);
                 return ["sshd:remove"];
@@ -116,7 +119,7 @@ public sealed class SshdEnforcer
             // Policy object exists but produced no valid directives (all fields absent or invalid).
             // Treat identically to null policy: remove any previously-written dropin so it
             // doesn't linger after the operator removes all recognized ssh fields from the policy.
-            if (File.Exists(DropinPath))
+            if (File.Exists(_dropinPath))
             {
                 await RemoveDropinAsync(ct).ConfigureAwait(false);
                 return ["sshd:remove"];
@@ -159,34 +162,34 @@ public sealed class SshdEnforcer
 
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would write {Path} ({N} directives)", DropinPath, lines.Count);
+            _log.LogInformation("[audit] would write {Path} ({N} directives)", _dropinPath, lines.Count);
             return;
         }
 
-        var dir = Path.GetDirectoryName(DropinPath)!;
+        var dir = Path.GetDirectoryName(_dropinPath)!;
         Directory.CreateDirectory(dir);
 
-        var tmp = DropinPath + ".dds-tmp";
+        var tmp = _dropinPath + ".dds-tmp";
         await File.WriteAllTextAsync(tmp, content, Encoding.UTF8, ct).ConfigureAwait(false);
         File.SetUnixFileMode(tmp,
             UnixFileMode.UserRead | UnixFileMode.UserWrite |
             UnixFileMode.GroupRead);
-        File.Move(tmp, DropinPath, overwrite: true);
-        _log.LogInformation("SshdEnforcer: wrote {Path}", DropinPath);
+        File.Move(tmp, _dropinPath, overwrite: true);
+        _log.LogInformation("SshdEnforcer: wrote {Path}", _dropinPath);
     }
 
     private Task RemoveDropinAsync(CancellationToken ct)
     {
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would remove {Path}", DropinPath);
+            _log.LogInformation("[audit] would remove {Path}", _dropinPath);
             return Task.CompletedTask;
         }
 
-        if (File.Exists(DropinPath))
+        if (File.Exists(_dropinPath))
         {
-            File.Delete(DropinPath);
-            _log.LogInformation("SshdEnforcer: removed {Path}", DropinPath);
+            File.Delete(_dropinPath);
+            _log.LogInformation("SshdEnforcer: removed {Path}", _dropinPath);
         }
         return Task.CompletedTask;
     }

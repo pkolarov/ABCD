@@ -1,5 +1,69 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-07, 85th pass) — Linux: SysctlEnforcer and SshdEnforcer missing enforce-mode test coverage
+
+### Gap
+
+**`SysctlEnforcerTests` and `SshdEnforcerTests` had no enforce-mode file-writing tests.**
+
+Both `SysctlEnforcer` and `SshdEnforcer` write files to well-known system paths
+(`/etc/sysctl.d/60-dds-managed.conf` and `/etc/ssh/sshd_config.d/60-dds.conf` respectively).
+Like `SystemdEnforcer` before the 84th pass, these paths were hardcoded constants — making it
+impossible to write enforce-mode tests that actually exercise `WriteDropinAsync`,
+`RemoveDropinAsync`, and `ReconcileStaleKeysAsync` without root access and a real Linux
+filesystem.
+
+Uncovered enforce-mode paths:
+- `SysctlEnforcer`: `ApplyAsync` with `Set`/`Delete` in enforce mode, and `ReconcileStaleKeysAsync`
+  with real dropin content.
+- `SshdEnforcer`: `ApplyAsync` in enforce mode (file write + `systemctl reload sshd`),
+  dropin removal on null policy, and dropin removal when all directives are invalid.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Enforcers/SysctlEnforcer.cs`**:
+- Renamed `DropinPath` const to `DefaultDropinPath`.
+- Added optional `string? dropinPath = null` constructor parameter; field `_dropinPath`
+  initialised to `dropinPath ?? DefaultDropinPath`.
+- Changed `LoadDropin()` from `static` to instance method, replacing `DropinPath` → `_dropinPath`.
+- Replaced all `DropinPath` usages in `WriteDropinAsync` with `_dropinPath`.
+
+**`platform/linux/DdsPolicyAgent/Enforcers/SshdEnforcer.cs`**:
+- Renamed `DropinPath` const to `DefaultDropinPath`.
+- Added optional `string? dropinPath = null` constructor parameter; field `_dropinPath`
+  initialised to `dropinPath ?? DefaultDropinPath`.
+- Replaced all `DropinPath` usages in `ApplyAsync`, `WriteDropinAsync`, and `RemoveDropinAsync`
+  with `_dropinPath`.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`** (+8 tests):
+
+`SysctlEnforcerTests` (+3):
+- `SetDirective_EnforceMode_WritesDropinAndCallsSysctlSystem` — injects temp path; verifies
+  file written with correct `key = value` content and `sysctl --system` called.
+- `SetDirective_EnforceMode_UnchangedValue_NoSysctlCall` — pre-seeds dropin with same value;
+  verifies no file write and no runner call (idempotent optimisation).
+- `DeleteDirective_EnforceMode_RemovesPreviouslyManagedKey` — pre-seeds dropin with two keys;
+  deletes one; verifies remaining key intact and `sysctl --system` called.
+
+`SshdEnforcerTests` (+3):
+- `ValidPolicy_EnforceMode_WritesDropinAndCallsSystemctlReload` — injects temp path; verifies
+  file written with correct directives and `systemctl reload sshd` called.
+- `NullPolicy_EnforceMode_RemovesExistingDropin` — pre-seeds dropin; passes null policy;
+  verifies file deleted and no runner call.
+- `AllFieldsInvalid_EnforceMode_RemovesExistingDropin` — pre-seeds dropin; passes policy where
+  all fields are invalid; verifies file deleted and no runner call.
+
+`ReconcileSysctlEnforcerTests` (+2):
+- `ReconcileStaleKeys_EnforceMode_RemovesStaleKey` — pre-seeds dropin with 2 keys; desired set
+  contains only 1; verifies stale key removed from file and `sysctl --system` called.
+- `ReconcileStaleKeys_EnforceMode_AllKeysDesired_NoWrite` — pre-seeds dropin; all keys desired;
+  verifies no write and no runner call.
+
+**Test results**: Linux .NET **302/302** (was 294/294; +8 new tests). All other suites
+unchanged.
+
+---
+
 ## Gap Fix (2026-05-07, 84th pass) — Linux: SystemdEnforcer ConfigureDropin missing enforce-mode test coverage
 
 ### Gap
