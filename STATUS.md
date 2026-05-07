@@ -1,5 +1,57 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-07, 87th pass) — Linux: WorkerTests missing remove-from-managed-set coverage for RemovePackage, DeleteSudoers, RemoveDropin
+
+### Gap
+
+**`WorkerTests` had no test verifying that the apply path removes resources from the managed
+set when a policy directive explicitly removes them.**
+
+`RecordManagedResources` in `Worker.cs` has three remove-side switch cases that were never
+exercised by any Worker-level test:
+
+- `pkg:remove:<name>` → `RemoveManagedPackage` — only produced when `PackageEnforcer.ApplyAsync`
+  processes a directive with `action: "Remove"` for a package that is already in the managed set.
+  No positive test verified that the managed-set removal was triggered.
+- `sudoers:delete:<filename>` → `RemoveManagedSudoersFilename` — produced when
+  `SudoersEnforcer.ApplyAsync` receives a directive with empty `content` (deletion signal). No
+  apply-path test verified the managed-set removal.
+- `systemd:removedropin:<unit>/<stem>` → `RemoveManagedSystemdDropin` — produced when
+  `SystemdEnforcer.ApplyAsync` processes a `RemoveDropin` directive. No apply-path test verified
+  the managed-set removal.
+
+In contrast, the reconcile path for each of these resources IS tested (via
+`Reconciliation_StalePackage_IsRemovedAndRemovedFromManagedSet`,
+`Reconciliation_StaleSudoersDropin_IsDeletedAndRemovedFromManagedSet`, and
+`Reconciliation_StaleSystemdDropin_IsDeletedAndRemovedFromManagedSet`), but those tests exercise
+direct `_stateStore.RemoveManaged*` calls in `ReconcileLinuxAsync`, not the
+`RecordManagedResources` switch path. A regression breaking the switch (e.g. typo in case label)
+would have been invisible.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`** (+3 tests):
+
+- `RemovePackage_RemovesFromManagedSet` — pre-populates `ManagedPackages` with "curl" (required
+  for the PackageEnforcer guard); policy has `action: "Remove"` for "curl"; `AuditOnly: true` to
+  skip package-manager detection; asserts `store.RemovedPackages` contains "curl" and
+  `store.AddedPackages` does not.
+- `DeleteSudoers_RemovesFromManagedSet` — pre-populates `ManagedSudoersFilenames` with "dds-ops";
+  policy has a sudoers directive with empty `content` (deletion signal); `AuditOnly: true` to skip
+  filesystem writes; asserts `store.RemovedSudoersFilenames` contains "dds-ops" and
+  `store.AddedSudoersFilenames` does not.
+- `RemoveDropin_RemovesFromManagedSet` — pre-populates `ManagedSystemdDropins` with
+  "sshd.service/dds-limits"; policy has `action: "RemoveDropin"` for the same key; `AuditOnly:
+  true` to skip filesystem writes; asserts `store.RemovedSystemdDropinKeys` contains
+  "sshd.service/dds-limits" and `store.AddedSystemdDropinKeys` does not.
+
+All three follow the same audit-mode pattern as `DeleteUser_RemovesFromManagedSet` and
+`DeleteFile_RemovesFromManagedSet`.
+
+**Test results**: Linux .NET **309/309** (was 306/306; +3 new tests). All other suites unchanged.
+
+---
+
 ## Gap Fix (2026-05-07, 86th pass) — Linux: WorkerTests missing managed-set recording coverage for CreateUser, SetFile, EnsureDir, InstallPackage
 
 ### Gap

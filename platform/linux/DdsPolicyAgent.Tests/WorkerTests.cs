@@ -933,4 +933,104 @@ public sealed class WorkerTests
 
         Assert.Contains("curl", store.AddedPackages);
     }
+
+    [Fact]
+    public async Task RemovePackage_RemovesFromManagedSet()
+    {
+        // Pre-populate the managed set with "curl" so the PackageEnforcer Remove guard passes.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedPackages.Add("curl");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-remove-pkg",
+                    """{"policy_id":"policy-remove-pkg","version":1,"linux":{"packages":[{"name":"curl","action":"Remove"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // The remove directive must trigger RemoveManagedPackage, not RecordManagedPackage.
+        Assert.Contains("curl", store.RemovedPackages);
+        Assert.DoesNotContain("curl", store.AddedPackages);
+    }
+
+    [Fact]
+    public async Task DeleteSudoers_RemovesFromManagedSet()
+    {
+        // Pre-populate the managed set with "dds-ops" to reflect a realistic prior cycle.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedSudoersFilenames.Add("dds-ops");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                // Empty content signals deletion in SudoersEnforcer.
+                WorkerFactory.MakePolicy(
+                    "policy-delete-sudoers",
+                    """{"policy_id":"policy-delete-sudoers","version":1,"linux":{"sudoers":[{"filename":"dds-ops","content":""}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // The delete directive must trigger RemoveManagedSudoersFilename, not RecordManagedSudoersFilename.
+        Assert.Contains("dds-ops", store.RemovedSudoersFilenames);
+        Assert.DoesNotContain("dds-ops", store.AddedSudoersFilenames);
+    }
+
+    [Fact]
+    public async Task RemoveDropin_RemovesFromManagedSet()
+    {
+        // Pre-populate the managed set with the dropin key to reflect a realistic prior cycle.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedSystemdDropins.Add("sshd.service/dds-limits");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-remove-dropin",
+                    """{"policy_id":"policy-remove-dropin","version":1,"linux":{"systemd":[{"unit":"sshd.service","action":"RemoveDropin","dropin_name":"dds-limits"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // The RemoveDropin directive must trigger RemoveManagedSystemdDropin, not RecordManagedSystemdDropin.
+        Assert.Contains("sshd.service/dds-limits", store.RemovedSystemdDropinKeys);
+        Assert.DoesNotContain("sshd.service/dds-limits", store.AddedSystemdDropinKeys);
+    }
 }
