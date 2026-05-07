@@ -1,5 +1,83 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-07, 91st pass) — Windows: WorkerTests missing reconciliation coverage for registry, accounts, group membership, software, and no-stale-no-report
+
+### Gap
+
+**`WorkerTests` for the Windows policy agent had only 10 tests, covering AD coexistence and
+service reconciliation but missing Worker-level integration tests for the other four
+reconciliation categories:**
+
+- **Stale registry entry** — Worker calls `RegistryEnforcer.ReconcileStaleItems` when a
+  registry value is in the managed set but absent from all current policies. The value should
+  be deleted from `InMemoryRegistryOperations` and `RecordCalls["registry"]` should become empty.
+- **Desired registry entry not deleted** — When a registry value is both managed AND present
+  in the current policy, reconciliation must not touch it. The value must survive in
+  `InMemoryRegistryOperations` and the managed-registry set must still contain the entry.
+- **Stale account** — Worker calls `AccountEnforcer.ReconcileStaleAccounts` when an account
+  is in the managed set but absent from all current policies. `IsEnabled` must flip to `false`
+  and the managed-accounts set must become empty.
+- **Desired account not disabled** — When an account is both managed AND present in the
+  current policy, reconciliation must not disable it. `IsEnabled` must remain `true` and the
+  managed-accounts set must still contain the username.
+- **Stale group membership** — Worker calls `AccountEnforcer.ReconcileStaleGroups` when a
+  `username:group` pair is in the managed set but absent from all current policies. The user
+  must be removed from that group and the managed-groups set must become empty.
+- **Stale software** — Worker calls `SoftwareInstaller.ReconcileStalePackages` when a package
+  is in the managed set but absent from all current software assignments. The package must be
+  uninstalled and the managed-software set must become empty.
+- **No stale items → no reconciliation report** — When all managed sets are empty and no
+  current policy produces stale items, no `_reconciliation` report should be posted.
+
+Additionally, `Worker.PollAndApplyAsync` was `private`, preventing direct test invocation
+and forcing existing reconciliation tests to use the slower StartAsync/150ms-delay/Cancel
+pattern instead of the direct-call pattern used by macOS tests. The new tests require
+direct invocation for reliable, non-timing-sensitive assertions.
+
+### Fix
+
+**`platform/windows/DdsPolicyAgent/Worker.cs`**:
+- Changed `private async Task PollAndApplyAsync` to `internal async Task PollAndApplyAsync`
+  so the test assembly (linked via `InternalsVisibleTo`) can call it directly.
+
+**`platform/windows/DdsPolicyAgent.Tests/TestDoubles.cs`** (new file):
+- Added `TrackingAppliedStateStore` — implements `IAppliedStateStore` with an in-memory
+  managed-item dictionary; `RecordCalls` tracks what `RecordManagedItems` was called with
+  so tests can assert the updated managed sets without a temp directory.
+- Added `TestWindowsDdsNodeClient` — implements `IDdsNodeClient` and accumulates
+  `ReportAppliedAsync` calls in `ReceivedReports` for assertion.
+
+**`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `MakeWorker` factory helper that uses `TrackingAppliedStateStore` and
+  `TestWindowsDdsNodeClient`, parallel to the `MakeWorker` helpers on macOS and Linux.
+- Added `Reconciliation_StaleRegistryEntry_IsDeleted` — seeds a value at
+  `LocalMachine\SOFTWARE\Policies\DDS\OldSetting`, pre-seeds it in the managed set, runs a
+  cycle with no policies, verifies the value was deleted and the set is now empty.
+- Added `Reconciliation_DesiredRegistryEntry_IsKept` — seeds the same value, pre-seeds it
+  in the managed set, presents a policy that still claims the key
+  (`hive: "LocalMachine"`, `key: "SOFTWARE\\Policies\\DDS"`, `name: "Setting"`), verifies
+  the value survives and the managed set still contains the entry.
+- Added `Reconciliation_StaleAccount_IsDisabled` — creates user `dds-ops`, pre-seeds it in
+  accounts, runs a cycle with no policies, verifies `IsEnabled` flipped to `false`.
+- Added `Reconciliation_DesiredAccount_IsNotDisabled` — creates `dds-ops`, pre-seeds it,
+  presents a policy with `local_accounts` claiming `dds-ops`, verifies `IsEnabled` stays
+  `true`.
+- Added `Reconciliation_StaleGroupMembership_IsRemoved` — adds `alice` to `Administrators`
+  and `Users`, pre-seeds `alice:Administrators` in managed groups, runs a cycle with no
+  policies, verifies alice was removed from `Administrators` but not `Users`.
+- Added `Reconciliation_StaleSoftware_IsUninstalled` — seeds `com.example.editor` as
+  installed, pre-seeds it in managed software, runs a cycle with no software assignments,
+  verifies the package is uninstalled.
+- Added `Reconciliation_NoStaleItems_NoReportSent` — empty managed sets, empty client
+  responses, verifies no `_reconciliation` report was posted.
+
+### Result
+
+Windows test count: **252 → 259** (7 new passing tests; 0 failures).
+Linux and macOS counts unchanged (334 and 143 respectively).
+
+---
+
 ## Gap Fix (2026-05-07, 90th pass) — Linux: EnvelopeVerifierTests and DdsNodeHttpFactoryTests missing security and transport coverage
 
 ### Gap

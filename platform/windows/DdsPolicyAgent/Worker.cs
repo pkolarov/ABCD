@@ -171,7 +171,7 @@ public sealed class Worker : BackgroundService
             "Host is Entra-only joined — DDS policy enforcement is unsupported. Skipping poll.");
     }
 
-    private async Task PollAndApplyAsync(JoinState hostState, CancellationToken ct)
+    internal async Task PollAndApplyAsync(JoinState hostState, CancellationToken ct)
     {
         var auditMode = EffectiveMode(EnforcementMode.Enforce, hostState) == EnforcementMode.Audit;
         var modeReason = EffectiveModeReason(hostState);

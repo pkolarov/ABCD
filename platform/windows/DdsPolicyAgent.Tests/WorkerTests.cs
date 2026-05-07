@@ -311,6 +311,227 @@ public class WorkerTests
         }
     }
 
+    // ─── Reconciliation tests (Worker-level) ─────────────────────────────────
+    // These tests drive Worker.PollAndApplyAsync directly on a workgroup host
+    // with an empty policy list so the reconciliation pass runs in isolation.
+
+    private static Worker MakeWorker(
+        TestWindowsDdsNodeClient client,
+        TrackingAppliedStateStore store,
+        InMemoryRegistryOperations? registryOps = null,
+        InMemoryAccountOperations? accountOps = null,
+        InMemorySoftwareOperations? softwareOps = null,
+        InMemoryServiceOperations? serviceOps = null)
+    {
+        var config = Options.Create(new AgentConfig { DeviceUrn = "urn:dds:device:test" });
+        return new Worker(
+            client, store, new InMemoryJoinStateProbe(JoinState.Workgroup), config,
+            NullLogger<Worker>.Instance,
+            new RegistryEnforcer(registryOps ?? new InMemoryRegistryOperations(), NullLogger<RegistryEnforcer>.Instance),
+            new AccountEnforcer(accountOps ?? new InMemoryAccountOperations(), new InMemoryJoinStateProbe(), NullLogger<AccountEnforcer>.Instance),
+            new PasswordPolicyEnforcer(new InMemoryPasswordPolicyOperations(), NullLogger<PasswordPolicyEnforcer>.Instance),
+            new SoftwareInstaller(softwareOps ?? new InMemorySoftwareOperations(), NullLogger<SoftwareInstaller>.Instance),
+            new ServiceEnforcer(serviceOps ?? new InMemoryServiceOperations(), NullLogger<ServiceEnforcer>.Instance));
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleRegistryEntry_IsDeleted()
+    {
+        // A registry value was managed in the prior cycle but no current
+        // policy claims it → reconciliation must delete it.
+        var registryOps = new InMemoryRegistryOperations();
+        registryOps.SetValue("LocalMachine", @"SOFTWARE\Policies\DDS", "OldSetting", (uint)1, RegValueKind.Dword);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["registry"] = [@"LocalMachine\SOFTWARE\Policies\DDS\OldSetting"],
+        });
+        var client = new TestWindowsDdsNodeClient(); // no policies
+
+        var worker = MakeWorker(client, store, registryOps: registryOps);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // Value must have been deleted by the enforcer.
+        Assert.Null(registryOps.Peek("LocalMachine", @"SOFTWARE\Policies\DDS", "OldSetting"));
+
+        // The managed-registry set must now be empty.
+        Assert.True(store.RecordCalls.ContainsKey("registry"));
+        Assert.Empty(store.RecordCalls["registry"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_DesiredRegistryEntry_IsKept()
+    {
+        // A registry value is both managed AND present in the current policy
+        // → reconciliation must not touch it.
+        var registryOps = new InMemoryRegistryOperations();
+        registryOps.SetValue("LocalMachine", @"SOFTWARE\Policies\DDS", "Setting", (uint)1, RegValueKind.Dword);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["registry"] = [@"LocalMachine\SOFTWARE\Policies\DDS\Setting"],
+        });
+
+        var policyDoc = JsonDocument.Parse(
+            """{"policy_id":"p1","version":1,"enforcement":"Enforce","windows":{"registry":[{"action":"Set","hive":"LocalMachine","key":"SOFTWARE\\Policies\\DDS","name":"Setting","value":{"Dword":1}}]}}""");
+        var client = new TestWindowsDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableWindowsPolicy
+                {
+                    Jti = "jti-1",
+                    Issuer = "dds:test",
+                    Iat = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    Document = policyDoc.RootElement,
+                },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, registryOps: registryOps);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // Value must still be present — reconciliation must not have deleted it.
+        Assert.NotNull(registryOps.Peek("LocalMachine", @"SOFTWARE\Policies\DDS", "Setting"));
+
+        // The managed set must still contain the entry.
+        Assert.True(store.RecordCalls.ContainsKey("registry"));
+        Assert.Contains(@"LocalMachine\SOFTWARE\Policies\DDS\Setting",
+            store.RecordCalls["registry"], StringComparer.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleAccount_IsDisabled()
+    {
+        // "dds-ops" was managed in the prior cycle but no current policy
+        // claims it → reconciliation must disable the account.
+        var accountOps = new InMemoryAccountOperations();
+        accountOps.CreateUser("dds-ops", null, null);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["accounts"] = ["dds-ops"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // Account must be disabled (not deleted).
+        Assert.False(accountOps.IsEnabled("dds-ops"));
+
+        // The managed-accounts set must now be empty.
+        Assert.True(store.RecordCalls.ContainsKey("accounts"));
+        Assert.Empty(store.RecordCalls["accounts"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_DesiredAccount_IsNotDisabled()
+    {
+        // "dds-ops" is both managed AND present in the current policy
+        // → reconciliation must not disable it.
+        var accountOps = new InMemoryAccountOperations();
+        accountOps.CreateUser("dds-ops", null, null);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["accounts"] = ["dds-ops"],
+        });
+
+        var policyDoc = JsonDocument.Parse(
+            """{"policy_id":"p1","version":1,"enforcement":"Enforce","windows":{"local_accounts":[{"action":"Create","username":"dds-ops"}]}}""");
+        var client = new TestWindowsDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableWindowsPolicy
+                {
+                    Jti = "jti-1",
+                    Issuer = "dds:test",
+                    Iat = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    Document = policyDoc.RootElement,
+                },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // Account must still be enabled.
+        Assert.True(accountOps.IsEnabled("dds-ops"));
+
+        // The managed set must still contain the account.
+        Assert.True(store.RecordCalls.ContainsKey("accounts"));
+        Assert.Contains("dds-ops", store.RecordCalls["accounts"], StringComparer.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleGroupMembership_IsRemoved()
+    {
+        // "alice:Administrators" was managed in the prior cycle but no
+        // current policy claims it → reconciliation must remove alice from Administrators.
+        var accountOps = new InMemoryAccountOperations();
+        accountOps.CreateUser("alice", null, null);
+        accountOps.AddToGroup("alice", "Administrators");
+        accountOps.AddToGroup("alice", "Users");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["account_groups"] = ["alice:Administrators"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // alice must have been removed from Administrators.
+        Assert.DoesNotContain("Administrators", accountOps.GetGroups("alice"));
+        // alice must still be in Users (unmanaged membership is not touched).
+        Assert.Contains("Users", accountOps.GetGroups("alice"));
+
+        // The managed-groups set must now be empty.
+        Assert.True(store.RecordCalls.ContainsKey("account_groups"));
+        Assert.Empty(store.RecordCalls["account_groups"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleSoftware_IsUninstalled()
+    {
+        // "com.example.editor" was managed in the prior cycle but no
+        // current software assignment claims it → reconciliation must uninstall it.
+        var softwareOps = new InMemorySoftwareOperations();
+        softwareOps.SeedInstalled("com.example.editor");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["software_managed"] = ["com.example.editor"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store, softwareOps: softwareOps);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // Package must have been uninstalled.
+        Assert.False(softwareOps.IsInstalled("com.example.editor"));
+
+        // The managed-software set must now be empty.
+        Assert.True(store.RecordCalls.ContainsKey("software_managed"));
+        Assert.Empty(store.RecordCalls["software_managed"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_NoStaleItems_NoReportSent()
+    {
+        // Empty managed sets → nothing stale → no _reconciliation report.
+        var store = new TrackingAppliedStateStore();
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        Assert.DoesNotContain(client.ReceivedReports, r => r.TargetId == "_reconciliation");
+    }
+
     // --- helpers --------------------------------------------------------
 
     private static Worker BuildWorker(
