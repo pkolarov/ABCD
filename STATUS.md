@@ -1,5 +1,50 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-07, 86th pass) — Linux: WorkerTests missing managed-set recording coverage for CreateUser, SetFile, EnsureDir, InstallPackage
+
+### Gap
+
+**`WorkerTests` had no positive assertion that applying a `Create` user, `Set` file,
+`EnsureDir` file, or `Install` package directive records the resource in the managed set.**
+
+The pattern of "apply directive → verify resource recorded in managed set" was already
+established by `SudoersSet_RecordsManagedFilename` and
+`SystemdConfigureDropin_RecordsManagedDropin` (both added in earlier passes). Those two
+resources had full lifecycle coverage; the remaining four did not.
+
+**Missing coverage:**
+- `user:create:<username>` → `RecordManagedUsername` — only tested negatively (via
+  `DeleteUser_RemovesFromManagedSet` which asserts `AddedUsernames` is *not* populated
+  on a Delete action). No test verified the positive path where Create records the username.
+- `file:set:<path>` → `RecordManagedPath` — no positive recording test existed.
+- `file:ensuredir:<path>` → `RecordManagedPath` — no positive recording test existed.
+- `pkg:install:<name>` → `RecordManagedPackage` — no positive recording test existed.
+
+These paths are exercised by `RecordManagedResources` in `Worker.cs` but were not unit-tested,
+leaving silent regressions possible if the `switch` tag matching were broken.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`** (+4 tests):
+
+`WorkerTests` (+4):
+- `CreateUser_RecordsManagedUsername` — policy with `Create` action for user "bob";
+  `AuditOnly=true` so no real commands run; asserts `store.AddedUsernames` contains "bob".
+- `SetFile_RecordsManagedPath` — policy with `Set` action for `/etc/dds/test.conf` with
+  valid base64 content; asserts `store.AddedPaths` contains the path.
+- `EnsureDir_RecordsManagedPath` — policy with `EnsureDir` action for `/etc/dds/conf.d`;
+  asserts `store.AddedPaths` contains the path.
+- `InstallPackage_RecordsManagedPackage` — policy with `Install` action for package "curl";
+  `AuditOnly=true` to skip package-manager detection; asserts `store.AddedPackages` contains "curl".
+
+All four tests follow the same audit-mode pattern as `SudoersSet_RecordsManagedFilename`
+and `SystemdConfigureDropin_RecordsManagedDropin`.
+
+**Test results**: Linux .NET **306/306** (was 302/302; +4 new tests). All other suites
+unchanged.
+
+---
+
 ## Gap Fix (2026-05-07, 85th pass) — Linux: SysctlEnforcer and SshdEnforcer missing enforce-mode test coverage
 
 ### Gap

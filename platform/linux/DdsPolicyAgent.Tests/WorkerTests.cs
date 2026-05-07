@@ -820,4 +820,117 @@ public sealed class WorkerTests
         Assert.Single(store.SetGroupsCalls);
         Assert.Contains("alice:sudo", store.SetGroupsCalls[0]);
     }
+
+    [Fact]
+    public async Task CreateUser_RecordsManagedUsername()
+    {
+        // A Create directive that succeeds should register the username in the managed set.
+        var store = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-create-user",
+                    """{"policy_id":"policy-create-user","version":1,"linux":{"local_users":[{"username":"bob","action":"Create","shell":"/bin/bash"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Contains("bob", store.AddedUsernames);
+    }
+
+    [Fact]
+    public async Task SetFile_RecordsManagedPath()
+    {
+        // A Set file directive that succeeds should register the path in the managed set.
+        var store = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
+        var contentB64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("# managed by dds"));
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-set-file",
+                    "{\"policy_id\":\"policy-set-file\",\"version\":1,\"linux\":{\"files\":[{\"path\":\"/etc/dds/test.conf\",\"action\":\"Set\",\"content_b64\":\"" + contentB64 + "\"}]}}"),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Contains("/etc/dds/test.conf", store.AddedPaths);
+    }
+
+    [Fact]
+    public async Task EnsureDir_RecordsManagedPath()
+    {
+        // An EnsureDir file directive should register the path in the managed set.
+        var store = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-ensuredir",
+                    """{"policy_id":"policy-ensuredir","version":1,"linux":{"files":[{"path":"/etc/dds/conf.d","action":"EnsureDir"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Contains("/etc/dds/conf.d", store.AddedPaths);
+    }
+
+    [Fact]
+    public async Task InstallPackage_RecordsManagedPackage()
+    {
+        // An Install package directive that succeeds should register the package in the managed set.
+        var store = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-install-pkg",
+                    """{"policy_id":"policy-install-pkg","version":1,"linux":{"packages":[{"name":"curl","action":"Install"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Contains("curl", store.AddedPackages);
+    }
 }
