@@ -357,4 +357,142 @@ public class WorkerTests
         Assert.True(store.SetCalls.ContainsKey("account_groups"));
         Assert.Empty(store.SetCalls["account_groups"]);
     }
+
+    [Fact]
+    public async Task Reconciliation_DesiredGroupMembership_IsKept()
+    {
+        // "alice:sudo" is both managed AND still declared in the current policy
+        // — reconciliation must NOT remove alice from sudo.
+        var accountOps = new InMemoryMacAccountOperations();
+        accountOps.CreateUser("alice", null, null, false, false);
+        accountOps.AddToGroup("alice", "sudo");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["account_groups"] = ["alice:sudo"],
+        });
+
+        var policyDoc = JsonDocument.Parse(
+            """{"policy_id":"p1","version":1,"macos":{"local_accounts":[{"action":"Create","username":"alice","groups":["sudo"]}]}}""");
+
+        var client = new TestMacDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableMacOsPolicy { Jti = "jti-1", Document = policyDoc.RootElement },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // alice must still be in sudo — reconciliation must not have touched it.
+        Assert.True(accountOps.IsInGroup("alice", "sudo"));
+
+        // The managed-groups set must still contain the membership.
+        Assert.True(store.SetCalls.ContainsKey("account_groups"));
+        Assert.Contains("alice:sudo", store.SetCalls["account_groups"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_DesiredPreference_IsKept()
+    {
+        // "System:com.apple.dock:autohide" is both managed AND still declared
+        // in the current policy — reconciliation must NOT delete the value.
+        var prefOps = new InMemoryMacPreferenceOperations();
+        prefOps.SetValueJson("com.apple.dock", "autohide", PreferenceScope.System, "true");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["preferences"] = ["System:com.apple.dock:autohide"],
+        });
+
+        var policyDoc = JsonDocument.Parse(
+            """{"policy_id":"p1","version":1,"macos":{"preferences":[{"domain":"com.apple.dock","key":"autohide","value":true,"scope":"System","action":"Set"}]}}""");
+
+        var client = new TestMacDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableMacOsPolicy { Jti = "jti-1", Document = policyDoc.RootElement },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, prefOps: prefOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // The preference value must still be present.
+        Assert.NotNull(prefOps.GetValueJson("com.apple.dock", "autohide", PreferenceScope.System));
+
+        // The managed-preferences set must still contain the key.
+        Assert.True(store.SetCalls.ContainsKey("preferences"));
+        Assert.Contains("System:com.apple.dock:autohide", store.SetCalls["preferences"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_DesiredProfile_IsKept()
+    {
+        // "com.dds.active-profile" is both managed AND still declared in the
+        // current policy — reconciliation must NOT remove the profile.
+        var profileOps = new InMemoryProfileOperations();
+        profileOps.Install("com.dds.active-profile", "Active Profile", "sha256abc", [0x01]);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["profiles"] = ["com.dds.active-profile"],
+        });
+
+        var policyDoc = JsonDocument.Parse(
+            """{"policy_id":"p1","version":1,"macos":{"profiles":[{"action":"Install","identifier":"com.dds.active-profile","display_name":"Active Profile","payload_sha256":"sha256abc","payload_b64":"AQ=="}]}}""");
+
+        var client = new TestMacDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableMacOsPolicy { Jti = "jti-1", Document = policyDoc.RootElement },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, profileOps: profileOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Profile must still be installed — reconciliation must not have touched it.
+        Assert.True(profileOps.IsInstalled("com.dds.active-profile", "sha256abc"));
+
+        // The managed-profiles set must still contain the profile.
+        Assert.True(store.SetCalls.ContainsKey("profiles"));
+        Assert.Contains("com.dds.active-profile", store.SetCalls["profiles"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_DesiredSoftware_IsKept()
+    {
+        // "com.example.app" is both managed AND still present in current
+        // software assignments — reconciliation must NOT emit a MANUAL uninstall.
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["software_managed"] = ["com.example.app"],
+        });
+
+        var softwareDoc = JsonDocument.Parse(
+            """{"package_id":"com.example.app","action":"Install","version":"1.0","source":"https://example.com/app.pkg","sha256":"abc"}""");
+
+        var client = new TestMacDdsNodeClient
+        {
+            NextSoftware =
+            [
+                new ApplicableSoftware { Jti = "jti-sw-1", Document = softwareDoc.RootElement },
+            ],
+        };
+
+        var worker = MakeWorker(client, store);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // No reconciliation report must be sent.
+        Assert.DoesNotContain(client.ReceivedReports, r => r.TargetId == "_reconciliation");
+
+        // The managed-software set must still contain the package.
+        Assert.True(store.SetCalls.ContainsKey("software_managed"));
+        Assert.Contains("com.example.app", store.SetCalls["software_managed"]);
+    }
 }

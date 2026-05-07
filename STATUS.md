@@ -1,5 +1,84 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-07, 93rd pass) — macOS + Windows: missing desired-counterpart reconciliation tests
+
+### Gap
+
+**macOS `WorkerTests` covered all six reconciliation categories (preferences, accounts, group
+memberships, launchd jobs, profiles, software) with "stale → cleaned up" tests, but was
+missing the symmetric "desired → kept" counterpart tests for four of them:**
+
+- **`Reconciliation_DesiredGroupMembership_IsKept`** — When `alice:sudo` is in the managed set
+  AND still declared in the current policy `local_accounts`, reconciliation must NOT call
+  `MacAccountEnforcer.ReconcileStaleGroups` for that key. Only `launchd` and `local_accounts`
+  had "desired stays" tests; group membership, preferences, profiles, and software did not.
+- **`Reconciliation_DesiredPreference_IsKept`** — When `System:com.apple.dock:autohide` is in
+  the managed set AND the current policy's `preferences` array still declares that key with
+  `action: "Set"`, reconciliation must NOT delete the value.
+- **`Reconciliation_DesiredProfile_IsKept`** — When `com.dds.active-profile` is in the managed
+  set AND the current policy's `profiles` array still declares `action: "Install"` for it,
+  reconciliation must NOT remove the profile.
+- **`Reconciliation_DesiredSoftware_IsKept`** — When `com.example.app` is in the managed set
+  AND current software assignments still include it, reconciliation must NOT emit a `[MANUAL]`
+  uninstall entry.
+
+**Windows `WorkerTests` covered all five reconciliation categories (registry, accounts, group
+memberships, software, services) with "stale → cleaned up" tests, but was missing the
+symmetric "desired → kept" counterpart for three of them:**
+
+- **`Reconciliation_DesiredGroupMembership_IsKept`** — When `alice:Administrators` is in the
+  managed set AND the current policy `local_accounts` still claims that membership,
+  reconciliation must NOT remove alice from Administrators.
+- **`Reconciliation_DesiredSoftware_IsKept`** — When `com.example.editor` is in the managed set
+  AND current software assignments still include it, reconciliation must NOT call
+  `SoftwareInstaller.ReconcileStalePackages` for it.
+- **`Reconciliation_DesiredService_IsKept`** — When `MySvc` is in the managed set AND the
+  current policy `services` array still declares it, reconciliation must NOT emit a `[MANUAL]`
+  review directive and must not send a `_reconciliation` report.
+
+The "desired stays" tests verify the `ExceptWith` set subtraction in each reconciliation
+path is correct — that items present in both the managed set and the desired set are not
+accidentally treated as stale. These tests exist for launchd/accounts (macOS) and
+registry/accounts (Windows) but were missing for the remaining categories.
+
+### Fix
+
+**`platform/macos/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `Reconciliation_DesiredGroupMembership_IsKept` — pre-seeds `alice:sudo` in managed
+  groups, provides a policy with `local_accounts: [{action:"Create", username:"alice",
+  groups:["sudo"]}]`, asserts alice is still in sudo and the managed-groups set still
+  contains the key after the cycle.
+- Added `Reconciliation_DesiredPreference_IsKept` — pre-seeds `System:com.apple.dock:autohide`
+  in managed preferences, provides a policy with that key in `preferences`, asserts the value
+  still exists and the managed-preferences set still contains the key.
+- Added `Reconciliation_DesiredProfile_IsKept` — pre-seeds `com.dds.active-profile` in managed
+  profiles, provides a policy with that identifier in `profiles`, asserts the profile is still
+  installed and the managed-profiles set still contains the identifier.
+- Added `Reconciliation_DesiredSoftware_IsKept` — pre-seeds `com.example.app` in managed
+  software, provides a software assignment for it via `client.NextSoftware`, asserts no
+  `_reconciliation` report is sent and the managed-software set still contains the package.
+
+**`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `Reconciliation_DesiredGroupMembership_IsKept` — pre-seeds `alice:Administrators` in
+  managed groups, provides a policy with `local_accounts: [{action:"Create", username:"alice",
+  groups:["Administrators"]}]`, asserts alice is still in Administrators and the managed-groups
+  set still contains the key.
+- Added `Reconciliation_DesiredSoftware_IsKept` — pre-seeds `com.example.editor` in managed
+  software, provides a software assignment via `client.NextSoftware`, asserts the package is
+  still installed and the managed-software set still contains it.
+- Added `Reconciliation_DesiredService_IsKept` — pre-seeds `MySvc` in managed services,
+  provides a policy with `services: [{name:"MySvc", action:"Configure", ...}]`, asserts no
+  `_reconciliation` report is sent and the managed-services set still contains `MySvc`.
+
+### Result
+
+macOS test count: **143 → 147** (4 new passing tests; 0 failures).
+Windows test count: **260 → 263** (3 new passing tests; 0 failures).
+Linux count unchanged (335).
+Rust workspace: all tests continue to pass.
+
+---
+
 ## Bug Fix + Test Gap (2026-05-07, 92nd pass) — Linux: group-membership `Delete`-directive bug + Windows: missing service reconciliation test
 
 ### Bug

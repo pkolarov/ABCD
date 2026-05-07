@@ -560,6 +560,115 @@ public class WorkerTests
         Assert.DoesNotContain(client.ReceivedReports, r => r.TargetId == "_reconciliation");
     }
 
+    [Fact]
+    public async Task Reconciliation_DesiredGroupMembership_IsKept()
+    {
+        // "alice:Administrators" is both managed AND still declared in the current
+        // policy — reconciliation must NOT remove alice from Administrators.
+        var accountOps = new InMemoryAccountOperations();
+        accountOps.CreateUser("alice", null, null);
+        accountOps.AddToGroup("alice", "Administrators");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["account_groups"] = ["alice:Administrators"],
+        });
+
+        var client = new TestWindowsDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableWindowsPolicy
+                {
+                    Jti = "jti-1",
+                    Document = JsonDocument.Parse(
+                        """{"policy_id":"p1","version":1,"windows":{"local_accounts":[{"action":"Create","username":"alice","groups":["Administrators"]}]}}""").RootElement,
+                },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // alice must still be in Administrators — reconciliation must not have touched it.
+        Assert.Contains("Administrators", accountOps.GetGroups("alice"));
+
+        // The managed-groups set must still contain the membership.
+        Assert.True(store.RecordCalls.ContainsKey("account_groups"));
+        Assert.Contains("alice:Administrators", store.RecordCalls["account_groups"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_DesiredSoftware_IsKept()
+    {
+        // "com.example.editor" is both managed AND still present in current
+        // software assignments — reconciliation must NOT uninstall it.
+        var softwareOps = new InMemorySoftwareOperations();
+        softwareOps.SeedInstalled("com.example.editor");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["software_managed"] = ["com.example.editor"],
+        });
+
+        var client = new TestWindowsDdsNodeClient
+        {
+            NextSoftware =
+            [
+                new ApplicableSoftware
+                {
+                    Jti = "jti-sw-1",
+                    Document = JsonDocument.Parse(
+                        """{"package_id":"com.example.editor","action":"Install","version":"1.0","source_url":"https://example.com/editor.msi","sha256":"abc","installer_type":"msi"}""").RootElement,
+                },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, softwareOps: softwareOps);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // Package must still be marked installed — reconciliation must not have uninstalled it.
+        Assert.True(softwareOps.IsInstalled("com.example.editor"));
+
+        // The managed-software set must still contain the package.
+        Assert.True(store.RecordCalls.ContainsKey("software_managed"));
+        Assert.Contains("com.example.editor", store.RecordCalls["software_managed"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_DesiredService_IsKept()
+    {
+        // "MySvc" is both managed AND still declared in the current policy —
+        // reconciliation must NOT emit a [MANUAL] directive for it.
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["services"] = ["MySvc"],
+        });
+
+        var client = new TestWindowsDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableWindowsPolicy
+                {
+                    Jti = "jti-1",
+                    Document = JsonDocument.Parse(
+                        """{"policy_id":"p1","version":1,"windows":{"services":[{"name":"MySvc","action":"Configure","binary_path":"C:\\MySvc\\mysvc.exe","display_name":"My Service","start_type":"Automatic"}]}}""").RootElement,
+                },
+            ],
+        };
+
+        var worker = MakeWorker(client, store);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // No reconciliation report must be sent.
+        Assert.DoesNotContain(client.ReceivedReports, r => r.TargetId == "_reconciliation");
+
+        // The managed-services set must still contain the service.
+        Assert.True(store.RecordCalls.ContainsKey("services"));
+        Assert.Contains("MySvc", store.RecordCalls["services"]);
+    }
+
     // --- helpers --------------------------------------------------------
 
     private static Worker BuildWorker(
