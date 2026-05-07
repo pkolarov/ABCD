@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 using DDS.PolicyAgent.Linux.State;
 
 namespace DDS.PolicyAgent.Linux.Tests;

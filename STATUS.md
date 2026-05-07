@@ -1,5 +1,86 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-07, 90th pass) — Linux: EnvelopeVerifierTests and DdsNodeHttpFactoryTests missing security and transport coverage
+
+### Gap
+
+**`EnvelopeVerifierTests` for the Linux policy agent had only 4 tests (vs 8 on macOS and 11 on
+Windows), missing critical security property tests:**
+
+- **`ServerClaimedPubkeyMismatchRejected`** — the `node_pubkey_b64` in the envelope is checked
+  against the configured pinned key. When they differ, `VerifyAndUnwrap` must throw even if the
+  signature itself is valid. This check is present in the Linux `EnvelopeVerifier` code but was
+  untested.
+- **`TamperedPayloadRejected`** — a modified `payload_b64` (while keeping the original
+  signature) must cause the Ed25519 signature check to fail. Zero test coverage for this
+  fundamental tamper-resistance property.
+- **`StaleIssuedAtRejected`** — envelopes whose `issued_at` timestamp is outside the configured
+  clock-skew window must be rejected. The `maxClockSkew` parameter and the skew check were
+  exercised by neither unit tests nor integration tests on Linux.
+- **`SigningBytesLayoutPinned`** — the byte layout of `BuildSigningBytes` (domain tag, length-
+  prefixed fields, little-endian timestamp) must remain stable for cross-language interop with
+  the Rust node. No test pinned this layout on the Linux agent.
+- **`InteropVectorAcceptsRustSignature`** — the pre-computed Rust interop vector (pinned in
+  `dds-core::envelope::tests::interop_vector_is_stable`) must verify against the C# Ed25519
+  implementation. This cross-language test existed on macOS and Windows but was absent from
+  Linux.
+
+**`DdsNodeHttpFactoryTests` for the Linux policy agent had only 4 tests (vs 10 on macOS),
+missing:**
+
+- **`IsUnixSocket_RecognisesScheme`** — case-insensitive dispatch (`unix:`, `Unix:`, `UNIX:`)
+  and negative cases (`http://`, `https://`, empty string).
+- **`IsUnixSocket_NullIsFalse`** — null input must return `false`.
+- **`ExtractSocketPath_RejectsNonUnixUrl`** — passing a TCP URL to `ExtractSocketPath` must
+  throw `ArgumentException`.
+- **`BuildHandler_TcpReturnsSocketsHttpHandler`** — TCP path must return a
+  `SocketsHttpHandler` with `ConnectCallback == null`.
+- **`BuildHandler_UnixInstallsConnectCallback`** — UDS path must install a non-null
+  `ConnectCallback`.
+- **`UnixHandler_E2E_ConnectsToLocalSocket`** — end-to-end test that spins a minimal HTTP/1
+  echo server on a temp Unix domain socket and asserts the `HttpClient` built by the factory
+  actually reaches it. Without this test a broken `ConnectCallback` wiring would be invisible
+  until runtime on a real machine.
+
+Additionally, `DdsNodeHttpFactoryTests.cs` and `AppliedStateStoreTests.cs` were missing
+`// SPDX-License-Identifier: MIT OR Apache-2.0` headers.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent.Tests/EnvelopeVerifierTests.cs`**:
+- Added `ServerClaimedPubkeyMismatchRejected` — generates two keypairs, signs with key A,
+  stuffs key B into `NodePubkeyB64`, verifies the check `CryptographicEquals(serverPubkey, _pinnedPubkey)` fires.
+- Added `TamperedPayloadRejected` — signs `{}`, then replaces `PayloadB64` with `{"evil":1}`,
+  verifies signature verification fails.
+- Added `StaleIssuedAtRejected` — signs with `issued_at` = one hour ago, constructs verifier
+  with `maxClockSkew = 30s`, verifies the skew gate fires.
+- Added `SigningBytesLayoutPinned` — calls `BuildSigningBytes("d","k",0x0102030405060708UL,"p")`
+  and asserts length 45 + domain tag prefix + device-length LE prefix.
+- Added `InteropVectorAcceptsRustSignature` — uses the same hard-coded Rust vector already in
+  the macOS/Windows tests.
+- Added `HexDecode` private helper.
+
+**`platform/linux/DdsPolicyAgent.Tests/DdsNodeHttpFactoryTests.cs`**:
+- Added `System.Net`, `System.Net.Sockets`, `System.Text` using directives.
+- Added `IsUnixSocket_RecognisesScheme` (Theory with 6 inline cases).
+- Added `IsUnixSocket_NullIsFalse`.
+- Added `ExtractSocketPath_RejectsNonUnixUrl`.
+- Added `BuildHandler_TcpReturnsSocketsHttpHandler`.
+- Added `BuildHandler_UnixInstallsConnectCallback`.
+- Added `UnixHandler_E2E_ConnectsToLocalSocket` with full `EchoResponder` helper class
+  (identical to the macOS test).
+- Added `// SPDX-License-Identifier: MIT OR Apache-2.0` header.
+
+**`platform/linux/DdsPolicyAgent.Tests/AppliedStateStoreTests.cs`**:
+- Added `// SPDX-License-Identifier: MIT OR Apache-2.0` header.
+
+### Result
+
+Linux test count: **318 → 334** (16 new passing tests; 0 failures).
+macOS and Windows counts unchanged (143 and 252 respectively).
+
+---
+
 ## Gap Fix (2026-05-07, 89th pass) — macOS: WorkerTests missing reconciliation coverage for preferences, profiles, software, group membership, desired account, and no-stale-no-report
 
 ### Gap
