@@ -18,17 +18,19 @@ namespace DDS.PolicyAgent.Linux.Enforcers;
 [SupportedOSPlatform("linux")]
 public sealed class SudoersEnforcer
 {
-    private const string SudoersDir = "/etc/sudoers.d";
+    internal const string DefaultSudoersDir = "/etc/sudoers.d";
 
     private readonly ICommandRunner _runner;
     private readonly bool _auditOnly;
     private readonly ILogger _log;
+    private readonly string _sudoersDir;
 
-    public SudoersEnforcer(ICommandRunner runner, bool auditOnly, ILogger log)
+    public SudoersEnforcer(ICommandRunner runner, bool auditOnly, ILogger log, string? sudoersDir = null)
     {
         _runner = runner;
         _auditOnly = auditOnly;
         _log = log;
+        _sudoersDir = sudoersDir ?? DefaultSudoersDir;
     }
 
     public async Task<List<string>> ApplyAsync(
@@ -60,7 +62,7 @@ public sealed class SudoersEnforcer
                 continue;
             }
 
-            var targetPath = Path.Combine(SudoersDir, filename);
+            var targetPath = Path.Combine(_sudoersDir, filename);
 
             // Empty content signals deletion.
             if (content.Length == 0)
@@ -153,7 +155,7 @@ public sealed class SudoersEnforcer
                 continue;
             }
 
-            var targetPath = Path.Combine(SudoersDir, filename);
+            var targetPath = Path.Combine(_sudoersDir, filename);
             if (_auditOnly)
             {
                 _log.LogInformation("[audit] would delete stale sudoers drop-in {P}", targetPath);

@@ -1,5 +1,76 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-07, 88th pass) — Linux: FileEnforcer missing enforce-mode and validation tests; SudoersEnforcer missing enforce-mode and input-validation tests
+
+### Gap
+
+**`FileEnforcerTests` had no enforce-mode test for the `Set` action, no audit-mode test for the
+`Delete` action, no input-validation tests for the `ApplySetAsync` guard branches, and no test
+for the `default:` (unknown-action) branch in `ApplyAsync`.**
+
+The `Set` action is the most common file-management operation: it writes bytes to a temp file,
+applies owner/mode, and atomically renames to the target path. The entire enforce-mode path
+— `File.WriteAllBytesAsync`, `ApplyOwnerAndModeAsync`, and `File.Move` — had **zero test
+coverage**. A regression in any of those three steps would have been invisible.
+
+The `Delete` action had one test (`DeleteFile_RefusedWhenNotManaged`) that used a non-managed
+path so `ApplyDelete` was never reached; the `_auditOnly` branch of `ApplyDelete` (log and
+return without deleting) was therefore also untested.
+
+Two early-exit guards in `ApplySetAsync` had no dedicated tests:
+- Missing `content_b64` field → logs warning and returns `false`.
+- Malformed base64 in `content_b64` → catches `FormatException` and returns `false`.
+
+The `default:` branch in `ApplyAsync` (unrecognised `action` value) had no test in
+`FileEnforcerTests`.
+
+**`SudoersEnforcerTests` had no enforce-mode tests for the `Set` action because `SudoersDir`
+was a hardcoded constant, making it impossible to write enforce-mode tests in CI. The SHA-256
+mismatch guard and the missing-`content`-field guard also had no test coverage.**
+
+The enforce-mode path — `File.WriteAllTextAsync`, `File.SetUnixFileMode`, `visudo -cf`, and
+`File.Move` — had zero test coverage. A regression breaking the visudo-failure guard (allowing
+an invalid sudoers file to be moved into place) would have been invisible.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Enforcers/SudoersEnforcer.cs`**:
+- Renamed `SudoersDir` const to `DefaultSudoersDir` (now `internal` for test use).
+- Added optional `string? sudoersDir = null` constructor parameter; field `_sudoersDir`
+  initialized to `sudoersDir ?? DefaultSudoersDir`.
+- Replaced both `SudoersDir` usages in `ApplyAsync` and `ReconcileStaleSudoersAsync` with
+  `_sudoersDir`. Production callers pass no argument and retain the existing system path.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`** (+9 tests):
+
+`FileEnforcerTests` (+5):
+- `SetFile_EnforceMode_WritesFileAndCallsChownAndChmod` — injects temp prefix; `ApplyAsync`
+  with a valid `Set` directive writes the file atomically (content verified via `File.Exists`),
+  returns `"file:set:…"`, and triggers exactly one `chown` and one `chmod` invocation.
+- `SetFile_MissingContentB64_Skipped` — directive with no `content_b64` field → empty result,
+  no runner calls.
+- `SetFile_InvalidBase64_Skipped` — `content_b64: "!not-base64!"` triggers the `FormatException`
+  catch branch → empty result, no runner calls.
+- `DeleteFile_AuditOnly_ReturnsTagWithoutDeleting` — audit mode, path in managed set; injects
+  temp prefix with a pre-created file; asserts tag is returned and the file still exists.
+- `SetFile_UnknownAction_Skipped` — `action: "Wipe"` falls into the `default:` branch →
+  empty result, no runner calls.
+
+`SudoersEnforcerTests` (+4):
+- `SetDropin_Sha256Mismatch_Skipped` — `content_sha256` does not match content → empty result.
+- `MissingContent_Skipped` — directive missing the `content` field → empty result.
+- `SetDropin_EnforceMode_VisudoSucceeds_WritesFile` — injects temp sudoers dir; `NullCommandRunner`
+  returns exit 0 for `visudo`; asserts the target file exists after `File.Move` and the runner
+  recorded a `visudo` invocation.
+- `SetDropin_EnforceMode_VisudoFails_DoesNotMoveFile` — `runner.ExitCodeOverrides["visudo"] = 1`;
+  asserts the target file does NOT exist (temp file cleaned up by `finally`) and the runner
+  still recorded the `visudo` invocation.
+
+**Test results**: Linux .NET **318/318** (was 309/309; +9 new tests). macOS .NET **137/137**
+(unchanged). Windows .NET **252/252**, 39 skipped (unchanged). Rust **838/838** (unchanged).
+
+---
+
 ## Gap Fix (2026-05-07, 87th pass) — Linux: WorkerTests missing remove-from-managed-set coverage for RemovePackage, DeleteSudoers, RemoveDropin
 
 ### Gap

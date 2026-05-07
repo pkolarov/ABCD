@@ -333,6 +333,90 @@ public sealed class SudoersEnforcerTests
 
         Assert.Empty(applied);
     }
+
+    [Fact]
+    public async Task SetDropin_Sha256Mismatch_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SudoersEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse(
+                """{"filename":"dds-ops","content":"%ops ALL=(ALL) NOPASSWD: ALL","content_sha256":"0000000000000000000000000000000000000000000000000000000000000000"}""")
+                .RootElement],
+            default);
+
+        Assert.Empty(applied);
+    }
+
+    [Fact]
+    public async Task MissingContent_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new SudoersEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"filename":"dds-ops"}""").RootElement],
+            default);
+
+        Assert.Empty(applied);
+    }
+
+    [Fact]
+    public async Task SetDropin_EnforceMode_VisudoSucceeds_WritesFile()
+    {
+        var tmpDir   = Path.Combine(Path.GetTempPath(), "dds-sudoers-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tmpDir);
+        var runner   = new NullCommandRunner();
+        var enforcer = new SudoersEnforcer(runner, auditOnly: false, NullLogger.Instance,
+            sudoersDir: tmpDir);
+
+        try
+        {
+            var applied = await enforcer.ApplyAsync(
+                [JsonDocument.Parse(
+                    """{"filename":"dds-ops","content":"%ops ALL=(ALL) NOPASSWD: ALL"}""").RootElement],
+                default);
+
+            Assert.Single(applied);
+            Assert.Equal("sudoers:set:dds-ops", applied[0]);
+            Assert.True(File.Exists(Path.Combine(tmpDir, "dds-ops")));
+            Assert.Contains(runner.Invocations, i => i.FileName == "visudo");
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SetDropin_EnforceMode_VisudoFails_DoesNotMoveFile()
+    {
+        var tmpDir   = Path.Combine(Path.GetTempPath(), "dds-sudoers-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tmpDir);
+        var runner   = new NullCommandRunner();
+        runner.ExitCodeOverrides["visudo"] = 1;
+        var enforcer = new SudoersEnforcer(runner, auditOnly: false, NullLogger.Instance,
+            sudoersDir: tmpDir);
+
+        try
+        {
+            var applied = await enforcer.ApplyAsync(
+                [JsonDocument.Parse(
+                    """{"filename":"dds-ops","content":"%ops ALL=(ALL) NOPASSWD: ALL"}""").RootElement],
+                default);
+
+            // Tag is still recorded (attempt was made) but the file must not exist since visudo rejected it.
+            Assert.Single(applied);
+            Assert.Equal("sudoers:set:dds-ops", applied[0]);
+            Assert.False(File.Exists(Path.Combine(tmpDir, "dds-ops")));
+            Assert.Contains(runner.Invocations, i => i.FileName == "visudo");
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
 }
 
 // ============================================================
@@ -570,6 +654,112 @@ public sealed class FileEnforcerTests
                 {"path":"/etc/passwd","action":"Set",
                  "content_b64":"aGVsbG8=","content_sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"}
                 """).RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task SetFile_EnforceMode_WritesFileAndCallsChownAndChmod()
+    {
+        var tmpBase = Path.GetTempPath().TrimEnd('/') + "/";
+        var path    = Path.Combine(Path.GetTempPath(), "dds-test-setfile-enforce");
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance,
+            allowedPrefixes: [tmpBase]);
+
+        try
+        {
+            var applied = await enforcer.ApplyAsync(
+                [JsonDocument.Parse($$$"""
+                    {"path":"{{{path}}}","action":"Set",
+                     "content_b64":"aGVsbG8=",
+                     "content_sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                     "owner":"root","mode":"0644"}
+                    """).RootElement],
+                new HashSet<string>(),
+                default);
+
+            Assert.Single(applied);
+            Assert.Equal($"file:set:{path}", applied[0]);
+            Assert.True(File.Exists(path));
+            Assert.Contains(runner.Invocations, i => i.FileName == "chown");
+            Assert.Contains(runner.Invocations, i => i.FileName == "chmod");
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+            if (File.Exists(path + ".dds-tmp")) File.Delete(path + ".dds-tmp");
+        }
+    }
+
+    [Fact]
+    public async Task SetFile_MissingContentB64_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"path":"/etc/dds/motd","action":"Set"}""").RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task SetFile_InvalidBase64_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"path":"/etc/dds/motd","action":"Set","content_b64":"!not-base64!"}""").RootElement],
+            new HashSet<string>(),
+            default);
+
+        Assert.Empty(applied);
+        Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task DeleteFile_AuditOnly_ReturnsTagWithoutDeleting()
+    {
+        var tmpBase = Path.GetTempPath().TrimEnd('/') + "/";
+        var path    = Path.Combine(Path.GetTempPath(), "dds-test-deletefile-audit");
+        await File.WriteAllTextAsync(path, "test content");
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: true, NullLogger.Instance,
+            allowedPrefixes: [tmpBase]);
+
+        try
+        {
+            var applied = await enforcer.ApplyAsync(
+                [JsonDocument.Parse($$$"""{"path":"{{{path}}}","action":"Delete"}""").RootElement],
+                new HashSet<string>([path]),
+                default);
+
+            Assert.Single(applied);
+            Assert.Equal($"file:delete:{path}", applied[0]);
+            Assert.True(File.Exists(path));  // audit mode: file not deleted
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task SetFile_UnknownAction_Skipped()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        var applied = await enforcer.ApplyAsync(
+            [JsonDocument.Parse("""{"path":"/etc/dds/motd","action":"Wipe","content_b64":"aGVsbG8="}""").RootElement],
             new HashSet<string>(),
             default);
 
