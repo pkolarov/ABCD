@@ -70,11 +70,13 @@ public class WorkerTests
         TrackingAppliedStateStore store,
         InMemoryLaunchdOperations? launchdOps = null,
         InMemoryMacAccountOperations? accountOps = null,
-        InMemoryMacPreferenceOperations? prefOps = null)
+        InMemoryMacPreferenceOperations? prefOps = null,
+        InMemoryProfileOperations? profileOps = null)
     {
         launchdOps ??= new InMemoryLaunchdOperations();
         accountOps ??= new InMemoryMacAccountOperations();
         prefOps ??= new InMemoryMacPreferenceOperations();
+        profileOps ??= new InMemoryProfileOperations();
 
         var config = Options.Create(new AgentConfig { DeviceUrn = "urn:dds:device:test" });
         return new Worker(
@@ -83,7 +85,7 @@ public class WorkerTests
             new PreferenceEnforcer(prefOps, NullLogger<PreferenceEnforcer>.Instance),
             new MacAccountEnforcer(accountOps, NullLogger<MacAccountEnforcer>.Instance),
             new LaunchdEnforcer(launchdOps, NullLogger<LaunchdEnforcer>.Instance),
-            new ProfileEnforcer(new InMemoryProfileOperations(), NullLogger<ProfileEnforcer>.Instance),
+            new ProfileEnforcer(profileOps, NullLogger<ProfileEnforcer>.Instance),
             new SoftwareInstaller(
                 NullLogger<SoftwareInstaller>.Instance,
                 Substitute.For<ICommandRunner>(),
@@ -203,5 +205,156 @@ public class WorkerTests
         Assert.NotNull(reconcileReport);
         Assert.Equal("ok", reconcileReport.Status);
         Assert.Contains(reconcileReport.Directives, d => d.Contains("com.dds.stale"));
+    }
+
+    [Fact]
+    public async Task Reconciliation_NoStaleItems_NoReportSent()
+    {
+        // Empty managed sets → nothing stale → no reconciliation report.
+        var store = new TrackingAppliedStateStore();
+        var client = new TestMacDdsNodeClient();
+
+        var worker = MakeWorker(client, store);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        Assert.DoesNotContain(client.ReceivedReports, r => r.TargetId == "_reconciliation");
+    }
+
+    [Fact]
+    public async Task Reconciliation_StalePreference_IsRemovedAndSetUpdated()
+    {
+        // "System:com.apple.dock:autohide" was managed in the previous cycle but is
+        // absent from all current policies → reconciliation must delete the value.
+        var prefOps = new InMemoryMacPreferenceOperations();
+        prefOps.SetValueJson("com.apple.dock", "autohide", PreferenceScope.System, "true");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["preferences"] = ["System:com.apple.dock:autohide"],
+        });
+        var client = new TestMacDdsNodeClient();
+
+        var worker = MakeWorker(client, store, prefOps: prefOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // The preference value must have been deleted by the enforcer.
+        Assert.Null(prefOps.GetValueJson("com.apple.dock", "autohide", PreferenceScope.System));
+
+        // The managed-preferences set must now be empty.
+        Assert.True(store.SetCalls.ContainsKey("preferences"));
+        Assert.Empty(store.SetCalls["preferences"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_DesiredAccount_IsNotDisabled()
+    {
+        // "dds-kiosk" is both managed AND still present in the current
+        // policy — it must survive reconciliation with IsEnabled == true.
+        var accountOps = new InMemoryMacAccountOperations();
+        accountOps.CreateUser("dds-kiosk", null, null, false, false);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["accounts"] = ["dds-kiosk"],
+        });
+
+        var policyDoc = JsonDocument.Parse(
+            """{"policy_id":"p1","version":1,"macos":{"local_accounts":[{"action":"Create","username":"dds-kiosk"}]}}""");
+
+        var client = new TestMacDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableMacOsPolicy { Jti = "jti-1", Document = policyDoc.RootElement },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Account must still be enabled — reconciliation must not have touched it.
+        Assert.True(accountOps.IsEnabled("dds-kiosk"));
+
+        // The managed set must still contain the account.
+        Assert.True(store.SetCalls.ContainsKey("accounts"));
+        Assert.Contains("dds-kiosk", store.SetCalls["accounts"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleProfile_IsRemovedAndSetUpdated()
+    {
+        // "com.dds.old-profile" was managed in the previous cycle but is absent
+        // from all current policies → reconciliation must remove it.
+        var profileOps = new InMemoryProfileOperations();
+        profileOps.Install("com.dds.old-profile", "Old Profile", "sha256abc", [0x00]);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["profiles"] = ["com.dds.old-profile"],
+        });
+        var client = new TestMacDdsNodeClient();
+
+        var worker = MakeWorker(client, store, profileOps: profileOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Profile must have been removed by the enforcer.
+        Assert.False(profileOps.IsInstalled("com.dds.old-profile", "sha256abc"));
+
+        // The managed-profiles set must now be empty.
+        Assert.True(store.SetCalls.ContainsKey("profiles"));
+        Assert.Empty(store.SetCalls["profiles"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleSoftware_ReportsManualUninstall()
+    {
+        // "com.example.app" was managed in the previous cycle but is absent from
+        // current software assignments → reconciliation logs a MANUAL uninstall
+        // entry (generic pkg removal is not supported on macOS).
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["software_managed"] = ["com.example.app"],
+        });
+        var client = new TestMacDdsNodeClient(); // no software directives
+
+        var worker = MakeWorker(client, store);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Reconciliation report must contain a MANUAL entry for the stale package.
+        var reconcileReport = client.ReceivedReports.FirstOrDefault(
+            r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconcileReport);
+        Assert.Contains(reconcileReport.Directives,
+            d => d.Contains("MANUAL") && d.Contains("com.example.app"));
+
+        // The managed-software set must now be empty.
+        Assert.True(store.SetCalls.ContainsKey("software_managed"));
+        Assert.Empty(store.SetCalls["software_managed"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleGroupMembership_IsRemovedAndSetUpdated()
+    {
+        // "alice:sudo" was managed in the previous cycle but is absent from
+        // all current policies → reconciliation must remove alice from sudo.
+        var accountOps = new InMemoryMacAccountOperations();
+        accountOps.CreateUser("alice", null, null, false, false);
+        accountOps.AddToGroup("alice", "sudo");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["account_groups"] = ["alice:sudo"],
+        });
+        var client = new TestMacDdsNodeClient();
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // alice must have been removed from sudo by the enforcer.
+        Assert.False(accountOps.IsInGroup("alice", "sudo"));
+
+        // The managed-groups set must now be empty.
+        Assert.True(store.SetCalls.ContainsKey("account_groups"));
+        Assert.Empty(store.SetCalls["account_groups"]);
     }
 }

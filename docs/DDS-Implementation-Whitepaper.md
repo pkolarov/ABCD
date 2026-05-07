@@ -1646,8 +1646,9 @@ The full per-finding ledger lives in
 [`Claude_sec_review.md`](../Claude_sec_review.md). Summary:
 
 - **All Critical (3/3) and High (12/12) findings** are Fixed
-  (pending verify — the Windows CI run still needs to confirm the
-  C++ Auth Bridge / WiX-MSI pieces of H-6 and H-7 step-2b).
+  (H-6 step-2 and H-7 step-2b verified on Windows x64 host
+  2026-04-24 — see [`Claude_sec_review.md`](../Claude_sec_review.md)
+  for details).
 - **19 of 22 Medium** and **17 of 18 Low** findings are closed.
 - Remaining deferred items and the rationale for each: M-13 (FIDO
   MDS integration — external design), M-15 (node-bound FIDO2

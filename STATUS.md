@@ -1,5 +1,74 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-07, 89th pass) — macOS: WorkerTests missing reconciliation coverage for preferences, profiles, software, group membership, desired account, and no-stale-no-report
+
+### Gap
+
+**`WorkerTests` for the macOS policy agent had only 7 tests in total, covering 2 of the 6
+reconciliation categories (launchd and accounts). The following scenarios had no test coverage
+at the Worker integration level:**
+
+- **Stale preference value** — Worker calls `PreferenceEnforcer.ReconcileStaleItems` when a
+  preference key is in the managed set but absent from all current policies. The preference
+  value should be deleted from `InMemoryMacPreferenceOperations` and
+  `SetCalls["preferences"]` should become empty.
+- **Desired account not disabled** — When an account appears in both the managed set AND the
+  current policy, reconciliation must not disable it. `IsEnabled` must remain `true` and the
+  managed-accounts set must still contain the username.
+- **Stale profile** — Worker calls `ProfileEnforcer.ReconcileStaleProfiles` when a profile is
+  managed but no current policy declares it. The profile must be removed from
+  `InMemoryProfileOperations` and `SetCalls["profiles"]` must be empty.
+- **Stale software (manual uninstall)** — Worker calls
+  `SoftwareInstaller.ReconcileStalePackages` when a software package is managed but absent
+  from current software assignments. macOS pkg uninstall is unsupported, so the reconciliation
+  report must contain a `[MANUAL]` entry for the stale package and
+  `SetCalls["software_managed"]` must be empty.
+- **Stale group membership** — Worker calls `MacAccountEnforcer.ReconcileStaleGroups` when a
+  `username:group` key is in the managed set but absent from current policies. The user must be
+  removed from the group via `InMemoryMacAccountOperations` and `SetCalls["account_groups"]`
+  must be empty.
+- **No stale items → no reconciliation report** — When all managed sets are empty and no
+  policies are active, the Worker must not post a `_reconciliation` report to dds-node.
+
+Additionally, `MakeWorker` hardcoded `new InMemoryProfileOperations()` instead of accepting
+it as an optional parameter, making it impossible to pre-seed profile state for reconciliation
+tests.
+
+### Fix
+
+**`platform/macos/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+
+- Extended `MakeWorker` to accept `InMemoryProfileOperations? profileOps = null` (defaulting
+  to a fresh instance), mirroring the existing optional parameters for `launchdOps`,
+  `accountOps`, and `prefOps`. `ProfileEnforcer` is now constructed with the caller-supplied
+  instance rather than a hardcoded `new InMemoryProfileOperations()`.
+- Added 6 new `[Fact]` tests:
+  - `Reconciliation_NoStaleItems_NoReportSent` — empty managed sets produce no `_reconciliation`
+    report in `ReceivedReports`.
+  - `Reconciliation_StalePreference_IsRemovedAndSetUpdated` — pre-seeds `prefOps` with
+    `System:com.apple.dock:autohide`, pre-seeds store with the same key, runs poll with no
+    policies, asserts `GetValueJson` returns null and `SetCalls["preferences"]` is empty.
+  - `Reconciliation_DesiredAccount_IsNotDisabled` — pre-seeds `accountOps` and store with
+    `dds-kiosk`, provides a policy that still declares it, asserts `IsEnabled` remains true
+    and the account survives in `SetCalls["accounts"]`.
+  - `Reconciliation_StaleProfile_IsRemovedAndSetUpdated` — pre-seeds `profileOps` with
+    `com.dds.old-profile` (sha `sha256abc`), pre-seeds store with the identifier, runs poll
+    with no policies, asserts `IsInstalled("com.dds.old-profile", "sha256abc")` returns false
+    and `SetCalls["profiles"]` is empty.
+  - `Reconciliation_StaleSoftware_ReportsManualUninstall` — pre-seeds store with
+    `com.example.app`, runs poll with no software directives, asserts the reconciliation
+    report contains a `[MANUAL]` directive for the package and `SetCalls["software_managed"]`
+    is empty.
+  - `Reconciliation_StaleGroupMembership_IsRemovedAndSetUpdated` — pre-seeds `accountOps`
+    with alice in sudo, pre-seeds store with `alice:sudo`, runs poll with no policies, asserts
+    `IsInGroup("alice", "sudo")` returns false and `SetCalls["account_groups"]` is empty.
+
+### Result
+
+macOS test count: **137 → 143** (6 new passing tests; 0 failures).
+
+---
+
 ## Gap Fix (2026-05-07, 88th pass) — Linux: FileEnforcer missing enforce-mode and validation tests; SudoersEnforcer missing enforce-mode and input-validation tests
 
 ### Gap
