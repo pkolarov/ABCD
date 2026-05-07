@@ -230,10 +230,14 @@ public sealed class Worker : BackgroundService
                     var username = d.TryGetProperty("username", out var u) ? u.GetString() : null;
                     if (!string.IsNullOrWhiteSpace(username))
                         usernames.Add(username);
-                }
 
-                foreach (var groupKey in UserEnforcer.ExtractManagedGroups(d))
-                    groups.Add(groupKey);
+                    // Only count group memberships for directives that keep the user alive.
+                    // Delete directives must not populate desiredGroups — otherwise the
+                    // stale-group reconciliation pass would skip removing the membership even
+                    // though the user is being deleted by the same cycle.
+                    foreach (var groupKey in UserEnforcer.ExtractManagedGroups(d))
+                        groups.Add(groupKey);
+                }
             }
         }
 

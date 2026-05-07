@@ -520,6 +520,34 @@ public class WorkerTests
     }
 
     [Fact]
+    public async Task Reconciliation_StaleService_IsNotedInReport()
+    {
+        // "LegacySvc" was managed in the prior cycle but no current policy
+        // declares it → reconciliation must emit a [MANUAL] directive for it
+        // (services are not auto-reverted) and update the managed-services set.
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["services"] = ["LegacySvc"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // A reconciliation report must have been submitted.
+        var reconcileReport = client.ReceivedReports.FirstOrDefault(
+            r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconcileReport);
+        Assert.Equal("ok", reconcileReport.Status);
+        Assert.Contains(reconcileReport.Directives,
+            d => d.Contains("[MANUAL]") && d.Contains("LegacySvc"));
+
+        // The managed-services set must now be empty.
+        Assert.True(store.RecordCalls.ContainsKey("services"));
+        Assert.Empty(store.RecordCalls["services"]);
+    }
+
+    [Fact]
     public async Task Reconciliation_NoStaleItems_NoReportSent()
     {
         // Empty managed sets → nothing stale → no _reconciliation report.

@@ -1,5 +1,49 @@
 # DDS Implementation Status
 
+## Bug Fix + Test Gap (2026-05-07, 92nd pass) — Linux: group-membership `Delete`-directive bug + Windows: missing service reconciliation test
+
+### Bug
+
+**`ExtractDesiredItems` in `platform/linux/DdsPolicyAgent/Worker.cs` called
+`UserEnforcer.ExtractManagedGroups(d)` for every user directive, including `Delete`
+actions.** This meant that if a policy declared a user with `action: "Delete"` and
+still listed `groups: ["sudo"]`, the key `alice:sudo` was added to `desiredGroups`.
+As a result the stale-group reconciliation pass treated the group membership as still
+desired and never ran `gpasswd -d alice sudo`, leaving a stale OS group membership
+that should have been cleaned up.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Worker.cs`**:
+- Moved the `ExtractManagedGroups` call inside the `if (action == "Create" || "Modify" || "Enable" || "Disable")` branch so group memberships are only counted as desired when the directive keeps the user alive. Delete directives no longer populate `desiredGroups`, allowing the stale-group reconciliation pass to run `gpasswd -d` as intended.
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `GroupMembership_DeleteDirective_DoesNotKeepGroupDesired` — regression test that verifies a `Delete` user directive with `groups: ["sudo"]` does NOT block stale-group reconciliation: `SetManagedGroups` is called with an empty set and `gpasswd -d alice sudo` is invoked.
+
+### Gap
+
+**Windows `WorkerTests` had `Reconciliation_Stale*` tests for registry, accounts, groups, and software
+(from the 91st pass) but no corresponding test for service reconciliation in the new
+`MakeWorker` + `PollAndApplyAsync` pattern.** Service reconciliation was only covered by the older
+`StartAsync`-delay-based `Stale_service_is_noted_in_reconciliation_report` test.
+
+### Fix
+
+**`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `Reconciliation_StaleService_IsNotedInReport` — pre-seeds `"LegacySvc"` in managed
+  services, runs a cycle with no policies, verifies a `_reconciliation` report containing a
+  `[MANUAL] Reconcile-Review LegacySvc` directive was posted and the managed-services set
+  is now empty. Uses the `MakeWorker` + `PollAndApplyAsync` pattern for consistency.
+
+### Result
+
+Linux test count: **334 → 335** (1 new passing test; 0 failures).
+Windows test count: **259 → 260** (1 new passing test; 0 failures).
+macOS count unchanged (143).
+Rust workspace: all tests continue to pass.
+
+---
+
 ## Gap Fix (2026-05-07, 91st pass) — Windows: WorkerTests missing reconciliation coverage for registry, accounts, group membership, software, and no-stale-no-report
 
 ### Gap

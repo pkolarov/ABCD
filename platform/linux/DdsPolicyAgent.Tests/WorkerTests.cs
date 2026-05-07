@@ -822,6 +822,49 @@ public sealed class WorkerTests
     }
 
     [Fact]
+    public async Task GroupMembership_DeleteDirective_DoesNotKeepGroupDesired()
+    {
+        // A Delete user directive must NOT add the user's groups to desiredGroups.
+        // If it did, the stale-group reconciliation pass would skip removing the
+        // membership ("alice:sudo" would appear desired even though alice is being
+        // deleted). This is a regression test for the ExtractDesiredItems bug fix.
+        var staleState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        staleState.ManagedGroups.Add("alice:sudo");
+
+        var store  = new TrackingAppliedStateStore(staleState);
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                // Policy now says Delete alice (but mistakenly still lists groups).
+                WorkerFactory.MakePolicy(
+                    "policy-delete-user",
+                    """{"policy_id":"policy-delete-user","version":1,"linux":{"local_users":[{"username":"alice","action":"Delete","groups":["sudo"]}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // SetManagedGroups must be called with an empty set: the Delete directive
+        // must not contribute "alice:sudo" to the desired set.
+        Assert.Single(store.SetGroupsCalls);
+        Assert.Empty(store.SetGroupsCalls[0]);
+
+        // The stale group reconciliation must have attempted gpasswd -d alice sudo.
+        Assert.Contains(runner.Invocations,
+            i => i.FileName == "gpasswd" && i.Arguments.Contains("alice") && i.Arguments.Contains("sudo"));
+    }
+
+    [Fact]
     public async Task CreateUser_RecordsManagedUsername()
     {
         // A Create directive that succeeds should register the username in the managed set.
