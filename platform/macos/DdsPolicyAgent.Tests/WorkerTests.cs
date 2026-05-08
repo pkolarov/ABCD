@@ -174,6 +174,44 @@ public class WorkerTests
     }
 
     [Fact]
+    public async Task Reconciliation_StaleAccount_AuditMode_DoesNotDisable()
+    {
+        // When the active policy enforces Audit mode, stale accounts must NOT be
+        // disabled — only an [AUDIT] log entry is emitted.  State must still be
+        // updated so the stale item is not re-reported on every cycle.
+        var accountOps = new InMemoryMacAccountOperations();
+        accountOps.CreateUser("dds-kiosk", null, null, false, false);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["accounts"] = ["dds-kiosk"],
+        });
+
+        // Policy declares Audit enforcement but no local_accounts →
+        // desiredAccounts is empty → "dds-kiosk" is stale.
+        var policyDoc = JsonDocument.Parse(
+            """{"policy_id":"p1","version":1,"enforcement":"Audit","macos":{}}""");
+
+        var client = new TestMacDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableMacOsPolicy { Jti = "jti-1", Document = policyDoc.RootElement },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Audit mode: DisableUser must NOT have been called.
+        Assert.True(accountOps.IsEnabled("dds-kiosk"));
+
+        // State must still be cleared so the item is not re-reported next cycle.
+        Assert.True(store.SetCalls.ContainsKey("accounts"));
+        Assert.Empty(store.SetCalls["accounts"]);
+    }
+
+    [Fact]
     public async Task Reconciliation_DesiredLaunchdJob_IsNotUnloaded()
     {
         // "com.dds.active-job" is both managed AND still present in the

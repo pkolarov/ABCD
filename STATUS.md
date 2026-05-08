@@ -1,5 +1,50 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-08, 100th pass) — macOS: missing `Reconciliation_StaleAccount_AuditMode_DoesNotDisable` worker-level parity test
+
+### Gap
+
+**`platform/macos/DdsPolicyAgent.Tests/WorkerTests.cs` was missing an audit-mode
+reconciliation test**, while the Linux suite has had
+`Reconciliation_StaleUser_AuditOnly_NoRunnerCall` since its initial implementation.
+
+The macOS `Worker.cs` derives its effective `EnforcementMode` from the policy's
+`enforcement` field (not a config-level flag): if any active policy carries
+`enforcement: "Audit"`, the `globalMode` local variable is set to
+`EnforcementMode.Audit` and the reconciliation pass is called with that mode.  All
+six macOS reconciliation paths (`ReconcileStaleAccounts`, `ReconcileStaleGroups`,
+`ReconcileStaleItems` in Launchd/Preference/Profile, and `ReconcileStalePackages`)
+already honour the mode and emit `[AUDIT]` entries without executing system changes.
+However no Worker-level test verified this end-to-end path through
+`PollAndApplyAsync`.
+
+The specific uncovered scenario: "dds-kiosk" is a tracked managed account from a
+previous cycle; the current poll returns a policy with `enforcement: "Audit"` but no
+`local_accounts` section — so "dds-kiosk" is stale and reconciliation is triggered
+in Audit mode.  Without the test, a future regression (e.g. accidentally passing
+`EnforcementMode.Enforce` to `ReconcileStaleAccounts`) would go undetected.
+
+### Fix
+
+**`platform/macos/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `Reconciliation_StaleAccount_AuditMode_DoesNotDisable` — pre-seeds
+  "dds-kiosk" in managed accounts and in `InMemoryMacAccountOperations`; passes a
+  policy with `enforcement: "Audit"` and no `local_accounts` (so "dds-kiosk" is
+  stale); calls `PollAndApplyAsync`; asserts that `IsEnabled("dds-kiosk")` is still
+  `true` (no `DisableUser` call) and that the managed-accounts set is cleared to `{}`
+  (so the stale item is not re-reported on the next cycle).
+
+Inserted adjacent to `Reconciliation_StaleAccount_IsDisabled` as the direct
+audit-mode counterpart.
+
+### Result
+
+macOS test count: **154 → 155** (1 new passing test; 0 failures).
+Linux count unchanged (341). Windows count unchanged (265).
+Rust workspace: no changes.
+
+---
+
 ## Feature (2026-05-08, 98th pass) — Windows: DPAPI sealed-passphrase for encrypted node identity at rest
 
 ### Gap
