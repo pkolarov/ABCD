@@ -1,5 +1,46 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-08, 95th pass) — Linux + macOS: EnvelopeVerifier test parity with Windows
+
+### Gap
+
+**`platform/linux/DdsPolicyAgent.Tests/EnvelopeVerifierTests.cs` and
+`platform/macos/DdsPolicyAgent.Tests/EnvelopeVerifierTests.cs` were missing three
+security-relevant test cases that already existed in the Windows suite:**
+
+- **`VersionMismatchRejected`** — Verifies that `VerifyAndUnwrap` throws
+  `EnvelopeVerificationException` when `env.Version != 1`. The production
+  implementations already reject unknown versions; the tests were simply absent
+  from the Linux and macOS suites.
+- **`SignatureWrongLengthRejected`** — Verifies that a 32-byte (truncated) signature
+  is rejected before the Ed25519 verify step. Without this test the early-exit
+  `signature.Length != 64` guard could be silently removed in a refactor.
+- **`CtorRejectsBadPubkey`** — Verifies that constructing `EnvelopeVerifier` with a
+  31-byte key or an empty `deviceUrn` throws `ArgumentException`. This guards the
+  constructor validation that prevents a zero-length or wrong-size key from reaching
+  the crypto layer.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent.Tests/EnvelopeVerifierTests.cs`**:
+- Added `VersionMismatchRejected`, `SignatureWrongLengthRejected`, `CtorRejectsBadPubkey`.
+  All three map directly to existing checks in `platform/linux/DdsPolicyAgent/Client/SignedPolicyEnvelope.cs`.
+
+**`platform/macos/DdsPolicyAgent.Tests/EnvelopeVerifierTests.cs`**:
+- Added `VersionMismatchRejected`, `SignatureWrongLengthRejected`, `CtorRejectsBadPubkey`.
+  All three map directly to existing checks in `platform/macos/DdsPolicyAgent/Client/SignedPolicyEnvelope.cs`.
+
+No production code changes — the implementations already had all three guards.
+
+### Result
+
+Linux test count: **335 → 338** (3 new passing tests; 0 failures).
+macOS test count: **148 → 151** (3 new passing tests; 0 failures).
+Windows count unchanged (264).
+Rust workspace: no changes (all tests continue to pass from 94th pass).
+
+---
+
 ## Bug Fix (2026-05-08, 94th pass) — macOS + Windows: `Delete`-directive group-membership bug
 
 ### Bug

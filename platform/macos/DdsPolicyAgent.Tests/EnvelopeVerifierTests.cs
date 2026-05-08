@@ -64,6 +64,20 @@ public class EnvelopeVerifierTests
     }
 
     [Fact]
+    public void VersionMismatchRejected()
+    {
+        var (pub, priv) = GenerateKey();
+        var payload = System.Text.Encoding.UTF8.GetBytes("{}");
+        var now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var env = BuildEnvelope(pub, priv, DeviceUrn, Kind, now, payload);
+        env.Version = 2;
+
+        var verifier = new EnvelopeVerifier(pub, DeviceUrn);
+        Assert.Throws<EnvelopeVerificationException>(
+            () => verifier.VerifyAndUnwrap(env, Kind));
+    }
+
+    [Fact]
     public void KindSpliceRejected()
     {
         var (pub, priv) = GenerateKey();
@@ -130,6 +144,29 @@ public class EnvelopeVerifierTests
         var verifier = new EnvelopeVerifier(pub, DeviceUrn, TimeSpan.FromSeconds(30));
         Assert.Throws<EnvelopeVerificationException>(
             () => verifier.VerifyAndUnwrap(env, Kind));
+    }
+
+    [Fact]
+    public void SignatureWrongLengthRejected()
+    {
+        var (pub, priv) = GenerateKey();
+        var payload = System.Text.Encoding.UTF8.GetBytes("{}");
+        var now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var env = BuildEnvelope(pub, priv, DeviceUrn, Kind, now, payload);
+        env.SignatureB64 = Convert.ToBase64String(new byte[32]);
+
+        var verifier = new EnvelopeVerifier(pub, DeviceUrn);
+        Assert.Throws<EnvelopeVerificationException>(
+            () => verifier.VerifyAndUnwrap(env, Kind));
+    }
+
+    [Fact]
+    public void CtorRejectsBadPubkey()
+    {
+        Assert.Throws<ArgumentException>(
+            () => new EnvelopeVerifier(new byte[31], DeviceUrn));
+        Assert.Throws<ArgumentException>(
+            () => new EnvelopeVerifier(new byte[32], ""));
     }
 
     [Fact]

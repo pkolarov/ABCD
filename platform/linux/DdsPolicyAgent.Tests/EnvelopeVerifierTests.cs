@@ -59,6 +59,31 @@ public sealed class EnvelopeVerifierTests
     }
 
     [Fact]
+    public void VersionMismatchRejected()
+    {
+        var (pub, priv) = GenerateEd25519KeyPair();
+        const string deviceUrn = "urn:dds:device:linux-test";
+        var payload = "{}"u8.ToArray();
+        var issuedAt = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var sig = SignEnvelope(priv, deviceUrn, EnvelopeKind.LinuxPolicies, issuedAt, payload);
+
+        var env = new SignedPolicyEnvelope
+        {
+            Version = 2,
+            Kind = EnvelopeKind.LinuxPolicies,
+            DeviceUrn = deviceUrn,
+            IssuedAt = issuedAt,
+            PayloadB64 = Convert.ToBase64String(payload),
+            SignatureB64 = Convert.ToBase64String(sig),
+            NodePubkeyB64 = Convert.ToBase64String(pub),
+        };
+
+        var verifier = new EnvelopeVerifier(pub, deviceUrn);
+        Assert.Throws<EnvelopeVerificationException>(
+            () => verifier.VerifyAndUnwrap(env, EnvelopeKind.LinuxPolicies));
+    }
+
+    [Fact]
     public void RejectsMalformedBase64Signature()
     {
         var (pub, _) = GenerateEd25519KeyPair();
@@ -186,6 +211,40 @@ public sealed class EnvelopeVerifierTests
         var verifier = new EnvelopeVerifier(pub, deviceUrn, TimeSpan.FromSeconds(30));
         Assert.Throws<EnvelopeVerificationException>(
             () => verifier.VerifyAndUnwrap(env, EnvelopeKind.LinuxPolicies));
+    }
+
+    [Fact]
+    public void SignatureWrongLengthRejected()
+    {
+        var (pub, priv) = GenerateEd25519KeyPair();
+        const string deviceUrn = "urn:dds:device:linux-test";
+        var payload = "{}"u8.ToArray();
+        var issuedAt = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var sig = SignEnvelope(priv, deviceUrn, EnvelopeKind.LinuxPolicies, issuedAt, payload);
+
+        var env = new SignedPolicyEnvelope
+        {
+            Version = 1,
+            Kind = EnvelopeKind.LinuxPolicies,
+            DeviceUrn = deviceUrn,
+            IssuedAt = issuedAt,
+            PayloadB64 = Convert.ToBase64String(payload),
+            SignatureB64 = Convert.ToBase64String(new byte[32]),
+            NodePubkeyB64 = Convert.ToBase64String(pub),
+        };
+
+        var verifier = new EnvelopeVerifier(pub, deviceUrn);
+        Assert.Throws<EnvelopeVerificationException>(
+            () => verifier.VerifyAndUnwrap(env, EnvelopeKind.LinuxPolicies));
+    }
+
+    [Fact]
+    public void CtorRejectsBadPubkey()
+    {
+        Assert.Throws<ArgumentException>(
+            () => new EnvelopeVerifier(new byte[31], "urn:dds:device:linux-test"));
+        Assert.Throws<ArgumentException>(
+            () => new EnvelopeVerifier(new byte[32], ""));
     }
 
     [Fact]
