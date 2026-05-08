@@ -40,6 +40,13 @@ public class AppliedStateStoreTests : IDisposable
         Assert.False(_store.HasChanged("p:test", "sha256:abc"));
     }
 
+    [Fact]
+    public void HasChanged_returns_true_when_hash_differs()
+    {
+        _store.RecordApplied("p:test", "1", "sha256:old", "ok", isSoftware: false);
+        Assert.True(_store.HasChanged("p:test", "sha256:new"));
+    }
+
     // B-3 (security review): a previously failed apply must remain
     // re-eligible on the next poll, even when the content hash matches.
     // Without this, a transient enforcer failure latches forever and

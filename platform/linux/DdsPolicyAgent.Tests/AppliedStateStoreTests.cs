@@ -62,6 +62,23 @@ public sealed class AppliedStateStoreTests
     }
 
     [Fact]
+    public void HasChanged_returns_true_when_hash_differs()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "dds-linux-state-" + Guid.NewGuid());
+        try
+        {
+            var store = new AppliedStateStore(dir);
+            store.RecordApplied("policy-a", "1", "sha256:old", "ok");
+            Assert.True(store.HasChanged("policy-a", "sha256:new"));
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+                Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
     public void RemoveManagedUsername_RemovesFromSet()
     {
         var dir = Path.Combine(Path.GetTempPath(), "dds-linux-state-" + Guid.NewGuid());

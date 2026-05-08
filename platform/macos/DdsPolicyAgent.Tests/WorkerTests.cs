@@ -60,6 +60,36 @@ public class WorkerTests
         await worker.StopAsync(default);
     }
 
+    [Fact]
+    public async Task Worker_stops_immediately_when_PinnedNodePubkeyB64_is_empty()
+    {
+        var client = Substitute.For<IDdsNodeClient>();
+        var stateStore = Substitute.For<IAppliedStateStore>();
+        var config = Options.Create(new AgentConfig
+        {
+            DeviceUrn = "urn:dds:device:test",
+            PinnedNodePubkeyB64 = "",
+        });
+
+        var worker = new Worker(
+            client, stateStore, config,
+            NullLogger<Worker>.Instance,
+            new PreferenceEnforcer(new InMemoryMacPreferenceOperations(), NullLogger<PreferenceEnforcer>.Instance),
+            new MacAccountEnforcer(new InMemoryMacAccountOperations(), NullLogger<MacAccountEnforcer>.Instance),
+            new LaunchdEnforcer(new InMemoryLaunchdOperations(), NullLogger<LaunchdEnforcer>.Instance),
+            new ProfileEnforcer(new InMemoryProfileOperations(), NullLogger<ProfileEnforcer>.Instance),
+            new SoftwareInstaller(
+                NullLogger<SoftwareInstaller>.Instance,
+                Substitute.For<ICommandRunner>(),
+                Options.Create(new AgentConfig()),
+                new StaticHttpClientFactory(new HttpClient())));
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        await worker.StartAsync(cts.Token);
+        await client.DidNotReceive().GetPoliciesAsync(Arg.Any<string>(), Arg.Any<CancellationToken>());
+        await worker.StopAsync(default);
+    }
+
     // ─── Reconciliation tests ─────────────────────────────────────────────────
     // These tests drive Worker.PollAndApplyAsync (exposed as internal) directly
     // rather than through ExecuteAsync so they can check reconciliation outcomes

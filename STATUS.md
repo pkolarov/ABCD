@@ -1,5 +1,58 @@
 # DDS Implementation Status
 
+## Bug + Test Gap Fix (2026-05-08, 97th pass) — macOS: missing `PinnedNodePubkeyB64` fail-closed guard + `HasChanged_returns_true_when_hash_differs` parity tests on macOS and Linux
+
+### Gap
+
+**`platform/macos/DdsPolicyAgent/Worker.cs` did not check for an empty
+`PinnedNodePubkeyB64` in `ExecuteAsync`**, unlike the Linux agent which has had
+this fail-closed guard since its initial implementation.
+
+Both the Linux and macOS `Program.cs` already validate `PinnedNodePubkeyB64` at
+DI startup (throwing `InvalidOperationException` if blank), but the Worker-level
+check matters for unit-test correctness and defense-in-depth: tests that
+construct `Worker` directly (bypassing DI) could start the polling loop with an
+unconfigured key, and a misconfigured deployment without the DI guard would spin
+endlessly rather than stopping cleanly.
+
+**`platform/macos/DdsPolicyAgent.Tests/AppliedStateStoreTests.cs` and
+`platform/linux/DdsPolicyAgent.Tests/AppliedStateStoreTests.cs` were missing
+`HasChanged_returns_true_when_hash_differs`**, a test that existed in the Windows
+suite. The case being tested — recording a target with hash A, then calling
+`HasChanged` with hash B — is handled correctly by both implementations (the
+`ContentHash ==` guard short-circuits to `true` when hashes differ), but the
+branch had no dedicated test on either macOS or Linux.
+
+### Fix
+
+**`platform/macos/DdsPolicyAgent/Worker.cs`**:
+- Added early-return guard for empty `PinnedNodePubkeyB64` in `ExecuteAsync`,
+  matching the Linux agent's `FailsClosedWithoutPinnedNodeKey` behavior.
+  Logs a clear error and returns before entering the polling loop.
+
+**`platform/macos/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `Worker_stops_immediately_when_PinnedNodePubkeyB64_is_empty` — constructs
+  `Worker` with a valid `DeviceUrn` but empty `PinnedNodePubkeyB64`, calls
+  `StartAsync`, and asserts that `GetPoliciesAsync` is never invoked. Directly
+  mirrors the existing `Worker_stops_immediately_when_DeviceUrn_is_empty` test.
+
+**`platform/macos/DdsPolicyAgent.Tests/AppliedStateStoreTests.cs`**:
+- Added `HasChanged_returns_true_when_hash_differs` — records `"sha256:old"` for
+  a target and asserts that `HasChanged` with `"sha256:new"` returns `true`.
+
+**`platform/linux/DdsPolicyAgent.Tests/AppliedStateStoreTests.cs`**:
+- Added `HasChanged_returns_true_when_hash_differs` — same scenario, using the
+  Linux store's 4-arg `RecordApplied` signature (no `isSoftware` parameter).
+
+### Result
+
+macOS test count: **152 → 154** (2 new passing tests; 0 failures).
+Linux test count: **338 → 339** (1 new passing test; 0 failures).
+Windows count unchanged (265).
+Rust workspace: no changes (all tests continue to pass).
+
+---
+
 ## Test Gap Fix (2026-05-08, 96th pass) — Windows + macOS: `MalformedBase64SignatureRejected` envelope-verifier test parity with Linux
 
 ### Gap

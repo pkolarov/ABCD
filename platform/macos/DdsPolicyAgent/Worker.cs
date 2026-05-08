@@ -61,6 +61,12 @@ public sealed class Worker : BackgroundService
             return;
         }
 
+        if (string.IsNullOrWhiteSpace(_config.PinnedNodePubkeyB64))
+        {
+            _log.LogError("PinnedNodePubkeyB64 is not configured — cannot start macOS policy agent");
+            return;
+        }
+
         _log.LogInformation(
             "DDS macOS Policy Agent started. device={DeviceUrn} poll={Interval}s node={NodeUrl}",
             _config.DeviceUrn, _config.PollIntervalSeconds, _config.NodeBaseUrl);
