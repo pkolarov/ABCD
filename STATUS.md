@@ -1,5 +1,107 @@
 # DDS Implementation Status
 
+## Feature (2026-05-08, 98th pass) — Windows: DPAPI sealed-passphrase for encrypted node identity at rest
+
+### Gap
+
+**Windows node identity files were provisioned plaintext** (filesystem permissions
+only, no passphrase encryption) because the `dds-node service-run` path had no
+mechanism to supply `DDS_NODE_PASSPHRASE`. The sealed-passphrase design document
+([`docs/sealed-passphrase-design.md`](docs/sealed-passphrase-design.md)) had
+described the required implementation as "sketch only — not yet implemented".
+
+### Fix
+
+**`dds-node/src/win_dpapi.rs`** (new file):
+- `seal(plaintext)` — wraps `CryptProtectData(CRYPTPROTECT_LOCAL_MACHINE)` to produce
+  a machine-scoped DPAPI ciphertext blob.
+- `unseal(ciphertext)` — wraps `CryptUnprotectData`, returns plaintext in `Zeroizing<Vec<u8>>`.
+
+**`dds-node/src/win_service.rs`**:
+- `run()` now parses `--unseal-passphrase-from <path>` from service args, reads the
+  DPAPI blob, decrypts it, and sets `DDS_NODE_PASSPHRASE` in-process before
+  `service_dispatcher::start`. If the blob is absent (pre-provision) the service
+  starts without a passphrase (keys plaintext) and logs a warning.
+
+**`dds-node/src/main.rs`**:
+- Added `seal-passphrase [--out <PATH>] [--force]` subcommand: generates a random
+  32-byte passphrase, seals it with DPAPI machine scope, writes to
+  `%ProgramData%\DDS\node-passphrase.dpapi` (or `--out`), prints the plaintext
+  passphrase so the caller can set `DDS_NODE_PASSPHRASE` before provisioning.
+  Guards against accidental overwrite of an existing blob (requires `--force`).
+
+**`dds-node/Cargo.toml`**:
+- Added `Win32_Security_Cryptography` feature to `windows-sys`.
+
+**`platform/windows/installer/DdsBundle.wxs`**:
+- Updated `ServiceInstall` `Arguments` to include
+  `--unseal-passphrase-from "[CommonAppDataFolder]DDS\node-passphrase.dpapi"`.
+
+**`platform/windows/installer/scripts/Bootstrap-DdsDomain.ps1`**:
+- Added step 2b: calls `dds-node.exe seal-passphrase` to produce the DPAPI blob,
+  sets `DDS_NODE_PASSPHRASE` so subsequent `gen-node-key` / `provision` steps write
+  identity files encrypted at rest. Clears the env var at the end of the script.
+
+**`docs/sealed-passphrase-design.md`**:
+- Updated Windows section from "pending / sketch only" to "implemented (2026-05-08)"
+  with the actual file references and updated operational docs.
+
+### Security posture
+
+On hosts with a TPM (all modern Windows 11 devices), DPAPI machine master keys are
+transparently TPM-backed (`Silent-Backup / TPM-Bind`), so the node passphrase blob
+is TPM-bound without any extra configuration. On hosts without a TPM, DPAPI still
+provides off-host binding (the blob cannot be decrypted on another machine).
+Combined with the data-dir DACL applied by the MSI custom action `CA_RestrictDataDirAcl`,
+node identity files are now encrypted at rest on Windows pilot deployments.
+
+### Result
+
+No test count change (Windows-only, `#[cfg(windows)]` code paths). Rust workspace
+cross-compiles clean on macOS host. Windows build + integration tests on ARM64
+are verified as part of the next Windows CI run.
+
+---
+
+## Fix + Test Gap (2026-05-08, 99th pass) — Linux: `ContentHash` accessibility and format parity with macOS/Windows
+
+### Gap
+
+**`platform/linux/DdsPolicyAgent/Worker.cs` had `ContentHash` declared as `private static`**,
+while the macOS and Windows agents both declare it as `public static`. This meant
+`ContentHash` could not be called from the test assembly, so Linux was missing
+`ContentHash_is_deterministic` and `ContentHash_differs_for_different_documents` —
+two tests that exist on both macOS and Windows.
+
+A second inconsistency: the Linux implementation returned a bare lowercase hex string
+(e.g. `"a1b2c3..."`), while macOS and Windows both return a `"sha256:{hex}"` prefixed
+string. Additionally, Linux used `JsonSerializer.Serialize(element)` to canonicalise
+the JSON before hashing, while macOS and Windows use `element.GetRawText()`.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Worker.cs`**:
+- Changed `private static string ContentHash(JsonElement element)` →
+  `internal static string ContentHash(JsonElement doc)` so the test assembly
+  (linked via `InternalsVisibleTo`) can call it directly.
+- Changed implementation to use `doc.GetRawText()` (matching macOS/Windows).
+- Added `"sha256:"` prefix to the returned string (matching macOS/Windows format
+  and the convention already used in `AppliedStateStoreTests` for test hash values).
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `ContentHashTests` class with two tests:
+  - `ContentHash_is_deterministic` — verifies the same `JsonElement` produces the
+    same hash twice and that the result starts with `"sha256:"`.
+  - `ContentHash_differs_for_different_documents` — verifies two logically different
+    JSON documents produce different hashes.
+
+### Result
+
+Linux test count: **339 → 341** (2 new passing tests; 0 failures).
+macOS count unchanged (154). Rust workspace unchanged.
+
+---
+
 ## Bug + Test Gap Fix (2026-05-08, 97th pass) — macOS: missing `PinnedNodePubkeyB64` fail-closed guard + `HasChanged_returns_true_when_hash_differs` parity tests on macOS and Linux
 
 ### Gap

@@ -543,11 +543,11 @@ public sealed class Worker : BackgroundService
         }
     }
 
-    private static string ContentHash(JsonElement element)
+    internal static string ContentHash(JsonElement doc)
     {
-        var json = JsonSerializer.Serialize(element);
-        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(json));
-        return Convert.ToHexString(bytes).ToLowerInvariant();
+        var raw = doc.GetRawText();
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(raw));
+        return $"sha256:{Convert.ToHexString(bytes).ToLowerInvariant()}";
     }
 
 }

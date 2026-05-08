@@ -132,6 +132,31 @@ file static class WorkerFactory
     }
 }
 
+// ---- ContentHash tests ----
+
+public sealed class ContentHashTests
+{
+    [Fact]
+    public void ContentHash_is_deterministic()
+    {
+        var doc = JsonDocument.Parse("""{"policy_id":"p1","version":1}""");
+        var h1 = Worker.ContentHash(doc.RootElement);
+        var h2 = Worker.ContentHash(doc.RootElement);
+        Assert.Equal(h1, h2);
+        Assert.StartsWith("sha256:", h1);
+    }
+
+    [Fact]
+    public void ContentHash_differs_for_different_documents()
+    {
+        var d1 = JsonDocument.Parse("""{"policy_id":"p1"}""");
+        var d2 = JsonDocument.Parse("""{"policy_id":"p2"}""");
+        Assert.NotEqual(
+            Worker.ContentHash(d1.RootElement),
+            Worker.ContentHash(d2.RootElement));
+    }
+}
+
 // ---- tests ----
 
 public sealed class WorkerTests
