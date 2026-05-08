@@ -599,6 +599,45 @@ public class WorkerTests
     }
 
     [Fact]
+    public async Task GroupMembership_DeleteDirective_DoesNotKeepGroupDesired()
+    {
+        // A Delete account directive must NOT add the account's groups to desiredGroups.
+        // If it did, stale-group reconciliation would skip removing "alice:Administrators"
+        // even though alice is being deleted. Regression test for the ExtractDesiredItems fix.
+        var accountOps = new InMemoryAccountOperations();
+        accountOps.CreateUser("alice", null, null);
+        accountOps.AddToGroup("alice", "Administrators");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["account_groups"] = ["alice:Administrators"],
+        });
+
+        var client = new TestWindowsDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableWindowsPolicy
+                {
+                    Jti = "jti-1",
+                    Document = JsonDocument.Parse(
+                        """{"policy_id":"p1","version":1,"windows":{"local_accounts":[{"action":"Delete","username":"alice","groups":["Administrators"]}]}}""").RootElement,
+                },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // Stale-group reconciliation must have removed alice from Administrators.
+        Assert.DoesNotContain("Administrators", accountOps.GetGroups("alice"));
+
+        // The managed-groups set must now be empty.
+        Assert.True(store.RecordCalls.ContainsKey("account_groups"));
+        Assert.Empty(store.RecordCalls["account_groups"]);
+    }
+
+    [Fact]
     public async Task Reconciliation_DesiredSoftware_IsKept()
     {
         // "com.example.editor" is both managed AND still present in current

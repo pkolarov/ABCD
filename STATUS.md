@@ -1,5 +1,63 @@
 # DDS Implementation Status
 
+## Bug Fix (2026-05-08, 94th pass) — macOS + Windows: `Delete`-directive group-membership bug
+
+### Bug
+
+**`ExtractDesiredItems` in both `platform/macos/DdsPolicyAgent/Worker.cs` and
+`platform/windows/DdsPolicyAgent/Worker.cs` called `ExtractManagedGroups` for every
+item in the `local_accounts` array, including `Delete` directives.** This is the same
+class of bug that was fixed for Linux in the 92nd pass.
+
+Concretely, if a policy declared:
+
+```json
+{ "action": "Delete", "username": "alice", "groups": ["sudo"] }    // macOS
+{ "action": "Delete", "username": "alice", "groups": ["Administrators"] }  // Windows
+```
+
+the key `alice:sudo` (or `alice:Administrators`) was added to `desiredGroups`.
+The stale-group reconciliation pass then treated that membership as still desired
+and skipped removing alice from the group — even though the same cycle was deleting
+the user. The OS was left with a stale group membership that should have been
+cleaned up.
+
+### Fix
+
+**`platform/macos/DdsPolicyAgent/Worker.cs`**:
+- In `ExtractDesiredItems`, read the `action` field for each `local_accounts` item.
+  Only call `MacAccountEnforcer.ExtractManagedGroups` when `action != "Delete"`.
+  `Delete` directives no longer add group memberships to `desiredGroups`, allowing
+  stale-group reconciliation to run `dscl . -delete /Groups/<group> GroupMembership`
+  as intended.
+
+**`platform/windows/DdsPolicyAgent/Worker.cs`**:
+- Same fix: in `ExtractDesiredItems`, read the `action` field and skip
+  `AccountEnforcer.ExtractManagedGroups` for `Delete` directives.
+
+**`platform/macos/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `GroupMembership_DeleteDirective_DoesNotKeepGroupDesired` — pre-seeds
+  `alice:sudo` in managed groups, provides a policy with
+  `local_accounts: [{action:"Delete", username:"alice", groups:["sudo"]}]`,
+  asserts alice is removed from sudo and the managed-groups set is empty after
+  the cycle.
+
+**`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `GroupMembership_DeleteDirective_DoesNotKeepGroupDesired` — pre-seeds
+  `alice:Administrators` in managed groups, provides a policy with
+  `local_accounts: [{action:"Delete", username:"alice", groups:["Administrators"]}]`,
+  asserts alice is removed from Administrators and the managed-groups set is empty
+  after the cycle.
+
+### Result
+
+macOS test count: **147 → 148** (1 new passing test; 0 failures).
+Windows test count: **263 → 264** (1 new passing test; 0 failures).
+Linux count unchanged (335).
+Rust workspace: all tests continue to pass.
+
+---
+
 ## Gap Fix (2026-05-07, 93rd pass) — macOS + Windows: missing desired-counterpart reconciliation tests
 
 ### Gap

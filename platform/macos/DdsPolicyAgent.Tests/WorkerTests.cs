@@ -395,6 +395,43 @@ public class WorkerTests
     }
 
     [Fact]
+    public async Task GroupMembership_DeleteDirective_DoesNotKeepGroupDesired()
+    {
+        // A Delete account directive must NOT add the account's groups to desiredGroups.
+        // If it did, stale-group reconciliation would skip removing "alice:sudo" even
+        // though alice is being deleted. Regression test for the ExtractDesiredItems fix.
+        var accountOps = new InMemoryMacAccountOperations();
+        accountOps.CreateUser("alice", null, null, false, false);
+        accountOps.AddToGroup("alice", "sudo");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["account_groups"] = ["alice:sudo"],
+        });
+
+        var policyDoc = JsonDocument.Parse(
+            """{"policy_id":"p1","version":1,"macos":{"local_accounts":[{"action":"Delete","username":"alice","groups":["sudo"]}]}}""");
+
+        var client = new TestMacDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableMacOsPolicy { Jti = "jti-1", Document = policyDoc.RootElement },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Stale-group reconciliation must have removed alice from sudo.
+        Assert.False(accountOps.IsInGroup("alice", "sudo"));
+
+        // The managed-groups set must now be empty.
+        Assert.True(store.SetCalls.ContainsKey("account_groups"));
+        Assert.Empty(store.SetCalls["account_groups"]);
+    }
+
+    [Fact]
     public async Task Reconciliation_DesiredPreference_IsKept()
     {
         // "System:com.apple.dock:autohide" is both managed AND still declared

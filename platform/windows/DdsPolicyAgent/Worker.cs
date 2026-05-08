@@ -357,11 +357,17 @@ public sealed class Worker : BackgroundService
         {
             foreach (var item in acct.EnumerateArray())
             {
+                var action = item.TryGetProperty("action", out var a) ? a.GetString() : null;
                 var key = AccountEnforcer.ExtractManagedKey(item);
                 if (key is not null) accounts.Add(key);
 
-                foreach (var g in AccountEnforcer.ExtractManagedGroups(item))
-                    groups.Add(g);
+                // Delete directives must not contribute to desiredGroups — the user is being
+                // removed, so its group memberships are stale and must be cleaned up.
+                if (action != "Delete")
+                {
+                    foreach (var g in AccountEnforcer.ExtractManagedGroups(item))
+                        groups.Add(g);
+                }
             }
         }
 
