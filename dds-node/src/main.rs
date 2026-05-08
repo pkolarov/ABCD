@@ -129,6 +129,8 @@ use dds_node::service::LocalService;
 
 #[cfg(windows)]
 mod win_service;
+#[cfg(windows)]
+mod win_dpapi;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -176,6 +178,8 @@ async fn async_main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
         "create-provision-bundle" => cmd_create_bundle(&args[1..]),
         "provision" => cmd_provision(&args[1..]),
         "stamp-agent-pubkey" => cmd_stamp_agent_pubkey(&args[1..]),
+        #[cfg(windows)]
+        "seal-passphrase" => cmd_seal_passphrase(&args[1..]),
         // `args.get(1..)` instead of `&args[1..]` because the
         // `unwrap_or("run")` default at the top of this match means
         // `sub == "run"` is reachable with an empty `args` (bare
@@ -214,7 +218,8 @@ fn print_usage() {
   dds-node create-provision-bundle --dir <DIR> --org <ORG> [--out <FILE>]
   dds-node provision <BUNDLE.dds> [--data-dir <DIR>] [--no-start]
   dds-node stamp-agent-pubkey --data-dir <DIR> --config-dir <DIR>
-  dds-node run [config.toml]"
+  dds-node run [config.toml]
+  dds-node seal-passphrase [--out <PATH>]  (Windows only)"
     );
 }
 
@@ -1524,3 +1529,87 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 // Suppress dead-code warnings for the helper used only in cmd_run path
 #[allow(dead_code)]
 fn _silence_unused(_p: &Path) {}
+
+/// Seal a random `DDS_NODE_PASSPHRASE` with DPAPI machine scope and write
+/// the blob to `%ProgramData%\DDS\node-passphrase.dpapi` (or `--out <PATH>`).
+///
+/// **Windows only.** Used during provisioning so node identity lands
+/// encrypted at rest. The MSI registers the service with
+/// `--unseal-passphrase-from <PATH>` pointing at the same file, so the
+/// passphrase is automatically unsealed at every service start.
+///
+/// Typical workflow (run as admin):
+/// ```powershell
+/// # 1. Seal the passphrase.
+/// $pass = & dds-node.exe seal-passphrase
+/// # 2. Set it so provisioning writes encrypted keys.
+/// $env:DDS_NODE_PASSPHRASE = $pass
+/// # 3. Provision.
+/// & dds-node.exe provision C:\path\to\bundle.dds --data-dir C:\ProgramData\DDS\node
+/// Remove-Item Env:\DDS_NODE_PASSPHRASE
+/// ```
+///
+/// If a blob already exists at the target path the command refuses to
+/// overwrite it (use `--force` to overwrite). This prevents accidental
+/// re-sealing that would make the stored encrypted keys unreadable.
+#[cfg(windows)]
+fn cmd_seal_passphrase(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use rand::RngCore;
+
+    let default_out = {
+        let mut p = std::path::PathBuf::from(
+            std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string()),
+        );
+        p.push("DDS");
+        p.push("node-passphrase.dpapi");
+        p
+    };
+
+    let out_path = match arg_value(args, "--out") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => default_out,
+    };
+    let force = args.iter().any(|a| a == "--force");
+
+    if out_path.exists() && !force {
+        return Err(format!(
+            "sealed passphrase blob already exists at {}.\n\
+             Use --force to overwrite (this will make previously encrypted \
+             node keys unreadable unless you also run rewrap-identity).",
+            out_path.display()
+        )
+        .into());
+    }
+
+    // Generate 32 random bytes and hex-encode as the passphrase.
+    let mut raw = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut raw);
+    let passphrase = hex::encode(raw);
+
+    // DPAPI-seal the passphrase bytes.
+    let blob = win_dpapi::seal(passphrase.as_bytes())
+        .map_err(|e| format!("DPAPI seal failed: {e}"))?;
+
+    // Create the directory if needed (e.g. %ProgramData%\DDS may not exist).
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&out_path, &blob)?;
+
+    // Print the plaintext passphrase so the caller can set DDS_NODE_PASSPHRASE.
+    println!("{passphrase}");
+    eprintln!(
+        "Sealed passphrase written to {}. \
+         Set DDS_NODE_PASSPHRASE to the value above before provisioning.",
+        out_path.display()
+    );
+    Ok(())
+}
+
+/// Return the value of `--flag <value>` from `args`, or `None`.
+/// Used by `cmd_seal_passphrase`; distinct from `require_flag`.
+#[cfg(windows)]
+fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let pos = args.iter().position(|a| a == flag)?;
+    args.get(pos + 1).map(String::as_str)
+}

@@ -119,15 +119,22 @@ hosts without a TPM still boot, just with plaintext node keys.
   `auto-start` (the dds-node service is) already starts after `RPCSS`
   which depends on `LSASS`. So DPAPI is always available by the time
   SCM launches the service.
-- **Service hook**: extend
-  [`win_service.rs`](../dds-node/src/win_service.rs) with a
-  `--unseal-passphrase-from <path>` flag on `service-run` (small Rust
-  change — call `CryptUnprotectData` via `windows-sys`, set
-  `DDS_NODE_PASSPHRASE` in-process before
-  `service_dispatcher::start`). MSI install passes the flag in the
-  registered service args.
+- **Service hook**: [`win_service.rs`](../dds-node/src/win_service.rs)
+  parses `--unseal-passphrase-from <path>` before
+  `service_dispatcher::start`, calls `CryptUnprotectData` via
+  [`win_dpapi.rs`](../dds-node/src/win_dpapi.rs), and sets
+  `DDS_NODE_PASSPHRASE` in-process. If the blob is absent (pre-provision),
+  the service starts without a passphrase (keys plaintext). The MSI
+  registers the service with
+  `--unseal-passphrase-from %ProgramData%\DDS\node-passphrase.dpapi`.
+  The `dds-node seal-passphrase [--out <PATH>]` subcommand seals a random
+  passphrase at provisioning time; `Bootstrap-DdsDomain.ps1` calls it
+  automatically before `gen-node-key` so keys land encrypted on first
+  provision.
 
-  *Status: not yet implemented in this repo. Sketch only.*
+  *Status: **implemented** (2026-05-08). [`win_dpapi.rs`](../dds-node/src/win_dpapi.rs),
+  [`win_service.rs`](../dds-node/src/win_service.rs), `main.rs::cmd_seal_passphrase`,
+  WiX service args, and `Bootstrap-DdsDomain.ps1` step 2b.*
 
 ## Operational lifecycle
 
@@ -167,11 +174,30 @@ sudo rc-service dds-node start          # OpenRC
 sudo systemctl enable --now dds-node    # systemd
 ```
 
-### Windows — pending
+### Windows — automatic (as of 2026-05-08)
 
-`service-run --unseal-passphrase-from <path>` flag is sketched but not
-yet implemented. Until it lands, Windows nodes provision plaintext
-(filesystem perms only).
+`Bootstrap-DdsDomain.ps1` seals the passphrase automatically in step 2b
+before generating any node keys. The MSI service registration always
+passes `--unseal-passphrase-from %ProgramData%\DDS\node-passphrase.dpapi`.
+
+```powershell
+sudo installer C:\path\to\DDS-Platform-Windows-X.Y.Z.msi
+# Then run Bootstrap-DdsDomain.ps1 — sealed passphrase and encrypted
+# node identity are set up automatically as part of the script.
+```
+
+If you need to seal a passphrase manually (e.g. on a sibling node
+provisioned from a bundle rather than bootstrapped):
+
+```powershell
+# 1. Seal a passphrase.
+$env:DDS_NODE_PASSPHRASE = & dds-node.exe seal-passphrase
+# 2. Provision (keys land encrypted).
+& dds-node.exe provision C:\path\to\bundle.dds --data-dir C:\ProgramData\DDS\node
+# 3. Clear the env var.
+Remove-Item Env:\DDS_NODE_PASSPHRASE
+# Service unseals from %ProgramData%\DDS\node-passphrase.dpapi at each start.
+```
 
 ### Already-provisioned node (any platform)
 

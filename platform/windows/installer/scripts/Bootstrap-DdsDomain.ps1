@@ -222,6 +222,21 @@ Write-Host "[2/9] Creating provision bundle for sibling nodes..." -ForegroundCol
 if ($LASTEXITCODE -ne 0) { throw "create-provision-bundle failed" }
 Write-Host "  Bundle: $ProvisionBundle"
 
+# ── 2b. Seal node passphrase (DPAPI machine scope) ─────────────────
+# Generate a random passphrase, seal it under DPAPI machine scope, and set
+# DDS_NODE_PASSPHRASE so subsequent key-generation steps (gen-node-key,
+# self-admit, provision) write identity files encrypted at rest.  The
+# DdsNode service is registered with --unseal-passphrase-from pointing at
+# this blob, so the passphrase is automatically unsealed at every service
+# start without any operator action.
+Write-Host ""
+Write-Host "[2b/9] Sealing node passphrase..." -ForegroundColor Green
+$SealedBlobPath = Join-Path $DataRoot "node-passphrase.dpapi"
+$env:DDS_NODE_PASSPHRASE = & $NodeBin seal-passphrase --out $SealedBlobPath
+if ($LASTEXITCODE -ne 0) { throw "seal-passphrase failed" }
+Write-Host "  Sealed blob: $SealedBlobPath"
+Write-Host "  Node identity will be encrypted at rest."
+
 # ── 3. node identity ───────────────────────────────────────────────
 Write-Host ""
 Write-Host "[3/9] Generating node libp2p identity..." -ForegroundColor Green
@@ -421,6 +436,11 @@ DEVICE_URN=$deviceUrn
 PEER_ID=$peerId
 "@ | Set-Content -Path (Join-Path $DataRoot "bootstrap.env") -Encoding UTF8
 
+# Clear the in-process passphrase env var now that provisioning is done.
+# The service reads it from the DPAPI blob at start; it must not remain in
+# the interactive shell environment.
+Remove-Item Env:\DDS_NODE_PASSPHRASE -ErrorAction SilentlyContinue
+
 # ── Summary ────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
@@ -433,6 +453,8 @@ Write-Host "  Device URN: $deviceUrn"
 Write-Host "  Peer ID:    $peerId"
 Write-Host ""
 Write-Host "  Domain key: $NodeData\domain_key.bin (KEEP SAFE)"
+Write-Host "  Sealed passphrase: $SealedBlobPath"
+Write-Host "  Node identity: encrypted at rest (DPAPI machine scope)"
 Write-Host "  Config:     $NodeToml"
 Write-Host ""
 Write-Host "  Provision bundle: $ProvisionBundle"
