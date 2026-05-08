@@ -165,6 +165,20 @@ public class EnvelopeVerifierTests
     }
 
     [Fact]
+    public void MalformedBase64SignatureRejected()
+    {
+        var (pub, priv) = GenerateKey();
+        var payload = System.Text.Encoding.UTF8.GetBytes("{}");
+        var now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var env = BuildEnvelope(pub, priv, DeviceUrn, Kind, now, payload);
+        env.SignatureB64 = "!!NOT_VALID_BASE64!!";
+
+        var verifier = new EnvelopeVerifier(pub, DeviceUrn);
+        Assert.Throws<EnvelopeVerificationException>(
+            () => verifier.VerifyAndUnwrap(env, Kind));
+    }
+
+    [Fact]
     public void CtorRejectsBadPubkey()
     {
         Assert.Throws<ArgumentException>(

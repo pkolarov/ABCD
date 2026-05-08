@@ -1,5 +1,54 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-08, 96th pass) — Windows + macOS: `MalformedBase64SignatureRejected` envelope-verifier test parity with Linux
+
+### Gap
+
+**`platform/windows/DdsPolicyAgent.Tests/EnvelopeVerifierTests.cs` and
+`platform/macos/DdsPolicyAgent.Tests/EnvelopeVerifierTests.cs` were missing
+`MalformedBase64SignatureRejected`**, a test that already existed in the Linux
+suite as `RejectsMalformedBase64Signature`.
+
+All three platforms' `EnvelopeVerifier.VerifyAndUnwrap` implementations contain
+the identical guard:
+
+```csharp
+byte[] signature;
+try { signature = Convert.FromBase64String(env.SignatureB64); }
+catch (FormatException) { throw new EnvelopeVerificationException("signature_b64 malformed"); }
+```
+
+The `catch (FormatException)` path — triggered when `SignatureB64` contains
+characters outside the base64 alphabet (e.g. `"!!NOT_VALID_BASE64!!"`) — was
+exercised on Linux but had no test coverage on Windows or macOS. Without this
+test, a refactor that silently swallows the `FormatException` (or removes the
+try/catch entirely) would go undetected on those platforms.
+
+### Fix
+
+**`platform/windows/DdsPolicyAgent.Tests/EnvelopeVerifierTests.cs`**:
+- Added `MalformedBase64SignatureRejected` — sets `SignatureB64` to
+  `"!!NOT_VALID_BASE64!!"` on an otherwise-valid envelope and asserts that
+  `VerifyAndUnwrap` throws `EnvelopeVerificationException`. Inserted adjacent to
+  the existing `SignatureWrongLengthRejected` test to keep the signature-validation
+  cluster together.
+
+**`platform/macos/DdsPolicyAgent.Tests/EnvelopeVerifierTests.cs`**:
+- Same fix, using `EnvelopeKind.MacOsPolicies` as the expected kind to match the
+  macOS test fixture.
+
+No production code changes — the `catch (FormatException)` guard was already
+correct on both platforms; only the test coverage was absent.
+
+### Result
+
+Windows test count: **264 → 265** (1 new passing test; 0 failures).
+macOS test count: **151 → 152** (1 new passing test; 0 failures).
+Linux count unchanged (338).
+Rust workspace: no changes (all tests continue to pass).
+
+---
+
 ## Test Gap Fix (2026-05-08, 95th pass) — Linux + macOS: EnvelopeVerifier test parity with Windows
 
 ### Gap
