@@ -32,6 +32,23 @@ use tokio::time::{Instant, timeout};
 
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Run `test` on a multi-thread tokio runtime and force shutdown after
+/// 5 seconds. This avoids the libp2p QUIC background-task hang that
+/// occurs when `#[tokio::test]` calls `Runtime::drop()` →
+/// `shutdown_timeout(Duration::MAX)`.
+fn run_in_bounded_rt<F>(test: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    rt.block_on(test);
+    rt.shutdown_timeout(std::time::Duration::from_secs(5));
+}
+
 /// Spin up a node, optionally pre-seeding its on-disk
 /// `admission_revocations.cbor` with `seed`. The seeded file is
 /// loaded and verified by `DdsNode::init` before the swarm is built,
@@ -175,8 +192,14 @@ fn connect_one_sided(
 /// disk; B starts empty. After the H-12 handshake completes, B's
 /// in-memory store contains both entries AND its on-disk file
 /// reflects them (so a restart re-loads them at `init`).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn revocations_propagate_via_h12_handshake_and_persist() {
+#[test]
+fn revocations_propagate_via_h12_handshake_and_persist() {
+    run_in_bounded_rt(async {
+        revocations_propagate_via_h12_handshake_and_persist_inner().await;
+    });
+}
+
+async fn revocations_propagate_via_h12_handshake_and_persist_inner() {
     let _ = tracing_subscriber::fmt::try_init();
     let dkey = dds_domain::DomainKey::from_secret_bytes("piggyback.local", [7u8; 32]);
     let domain = dkey.domain();
