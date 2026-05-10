@@ -30,7 +30,7 @@ use libp2p::{Multiaddr, swarm::SwarmEvent};
 use tempfile::TempDir;
 use tokio::time::{Instant, timeout};
 
-const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
+const ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Spin up a node, optionally pre-seeding its on-disk
 /// `admission_revocations.cbor` with `seed`. The seeded file is

@@ -50,6 +50,26 @@ public class WorkerTests
         await worker.StopAsync(default);
     }
 
+    [Fact]
+    public async Task Worker_stops_immediately_when_PinnedNodePubkeyB64_is_empty()
+    {
+        var client = Substitute.For<IDdsNodeClient>();
+        var stateStore = Substitute.For<IAppliedStateStore>();
+        var config = Options.Create(new AgentConfig
+        {
+            DeviceUrn = "urn:dds:device:test",
+            PinnedNodePubkeyB64 = "",
+        });
+
+        var worker = BuildWorker(client, stateStore, new InMemoryJoinStateProbe(), config);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        await worker.StartAsync(cts.Token);
+        // Should have returned immediately without calling the client.
+        await client.DidNotReceive().GetPoliciesAsync(Arg.Any<string>(), Arg.Any<CancellationToken>());
+        await worker.StopAsync(default);
+    }
+
     // --- AD-04: EffectiveMode wrapper -----------------------------------
 
     [Theory]
@@ -86,6 +106,7 @@ public class WorkerTests
         var config = Options.Create(new AgentConfig
         {
             DeviceUrn = "dds:device:entra-host",
+            PinnedNodePubkeyB64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             PollIntervalSeconds = 60,
         });
 
@@ -421,6 +442,34 @@ public class WorkerTests
         Assert.False(accountOps.IsEnabled("dds-ops"));
 
         // The managed-accounts set must now be empty.
+        Assert.True(store.RecordCalls.ContainsKey("accounts"));
+        Assert.Empty(store.RecordCalls["accounts"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleAccount_AuditMode_DoesNotDisable()
+    {
+        // On an AD-joined host the effective mode is forced to Audit; stale
+        // accounts must NOT be disabled — the reconciler skips the disable
+        // and the managed-accounts set is still cleared so the item is not
+        // re-reported on the next cycle.
+        var accountOps = new InMemoryAccountOperations();
+        accountOps.CreateUser("dds-ops", null, null);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["accounts"] = ["dds-ops"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(JoinState.AdJoined, CancellationToken.None);
+
+        // Audit mode: DisableUser must NOT have been called.
+        Assert.True(accountOps.IsEnabled("dds-ops"));
+
+        // The managed-accounts set must still be cleared so the item is
+        // not re-reported on every subsequent cycle.
         Assert.True(store.RecordCalls.ContainsKey("accounts"));
         Assert.Empty(store.RecordCalls["accounts"]);
     }

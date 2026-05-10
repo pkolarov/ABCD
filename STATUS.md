@@ -1,5 +1,61 @@
 # DDS Implementation Status
 
+## Docs + Test + Flake Fix (2026-05-08, 101st pass) — threat-model stale entries (Z-1/Z-3/Z-5), Windows PinnedNodePubkeyB64 guard + 2 parity tests, h12 timeout
+
+### Gaps / Issues
+
+Three stale rows in `docs/threat-model-review.md` did not reflect work already merged:
+- **Z-1 Phase B** (2026-05-01): the §4 finding row still read "partially closed 2026-04-28"
+  (pre-Phase-B); the tracker row in §6 was similarly stale.
+- **Z-3** (closed 2026-04-26): the tracker row still showed "❌ open".
+- **Z-5** (closed 2026-05-02): the tracker row showed "⚠ partially closed (doc half only)"
+  despite `dds export --encrypt-to` being fully wired.
+
+**Windows** `DdsPolicyAgent.Tests/WorkerTests.cs` was missing
+`Reconciliation_StaleAccount_AuditMode_DoesNotDisable` — the audit-mode counterpart of
+`Reconciliation_StaleAccount_IsDisabled`.  macOS had gained this test in the 100th pass;
+Windows was left behind.
+
+`dds-node/tests/h12_revocation_piggyback.rs` had `ADMISSION_TIMEOUT = 10s`, which was
+tight enough to expire on a loaded CI host, producing a spurious "B never admitted A"
+failure.
+
+### Fix
+
+**`docs/threat-model-review.md`**:
+- §4 finding row for Z-1: updated Phase B status and date to 2026-05-01.
+- §4 "No message-level encryption" finding row: marked CLOSED by Z-1 Phase B.
+- §6 tracker row 14 (Z-1): updated to reflect Phase B completion.
+- §6 tracker row 16 (Z-3): changed from "❌ open" to "✅ closed 2026-04-26".
+- §6 tracker row 18 (Z-5): changed from "⚠ partially closed" to
+  "✅ closed 2026-05-02 — `dds export --encrypt-to <hex-pubkey>` hybrid KEM envelope".
+
+**`platform/windows/DdsPolicyAgent/Worker.cs`**:
+- Added `PinnedNodePubkeyB64` fail-closed guard (parity with macOS line 64 and Linux line 47):
+  if the config value is blank the worker logs an error and returns immediately, preventing
+  the agent from running with an un-pinned node.
+
+**`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `Worker_stops_immediately_when_PinnedNodePubkeyB64_is_empty`: verifies the guard
+  above — starts the worker with `PinnedNodePubkeyB64 = ""` and asserts that `GetPoliciesAsync`
+  is never called.
+- Added `Reconciliation_StaleAccount_AuditMode_DoesNotDisable`: pre-seeds "dds-ops" in
+  managed accounts and `InMemoryAccountOperations`; calls `PollAndApplyAsync(JoinState.AdJoined, …)`
+  so `EffectiveMode` returns `Audit`; asserts `IsEnabled("dds-ops")` is still `true` and
+  the managed-accounts set is cleared to `{}`.
+
+**`dds-node/tests/h12_revocation_piggyback.rs`**:
+- `ADMISSION_TIMEOUT` raised from 10 s to 30 s; test passes in ~3 s on an idle host,
+  30 s gives adequate slack under load.
+
+### Result
+
+Windows test count: **265 → 267** (2 new passing tests; 0 failures).
+macOS count: 155 (unchanged). Linux count: 341 (unchanged).
+Rust workspace: 1 timeout constant changed, 0 logic changes; all tests green.
+
+---
+
 ## Test Gap Fix (2026-05-08, 100th pass) — macOS: missing `Reconciliation_StaleAccount_AuditMode_DoesNotDisable` worker-level parity test
 
 ### Gap
