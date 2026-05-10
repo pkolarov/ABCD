@@ -45,8 +45,14 @@ where
         .enable_all()
         .build()
         .expect("build tokio runtime");
-    rt.block_on(test);
+    // Catch panics so shutdown_timeout(5s) always runs, not Runtime::drop(MAX).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(test);
+    }));
     rt.shutdown_timeout(std::time::Duration::from_secs(5));
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 /// Spin up a node, optionally pre-seeding its on-disk

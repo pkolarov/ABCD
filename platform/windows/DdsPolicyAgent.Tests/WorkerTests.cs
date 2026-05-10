@@ -142,6 +142,7 @@ public class WorkerTests
         var config = Options.Create(new AgentConfig
         {
             DeviceUrn = "dds:device:ad-host",
+            PinnedNodePubkeyB64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             PollIntervalSeconds = 60,
         });
 
@@ -199,6 +200,7 @@ public class WorkerTests
             var config = Options.Create(new AgentConfig
             {
                 DeviceUrn = "dds:device:ad-host",
+                PinnedNodePubkeyB64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
                 PollIntervalSeconds = 60,
             });
             client.GetPoliciesAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
@@ -248,6 +250,7 @@ public class WorkerTests
             var config = Options.Create(new AgentConfig
             {
                 DeviceUrn = "dds:device:svc-host",
+                PinnedNodePubkeyB64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
                 PollIntervalSeconds = 60,
             });
             client.GetPoliciesAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
@@ -298,6 +301,7 @@ public class WorkerTests
             var config = Options.Create(new AgentConfig
             {
                 DeviceUrn = "dds:device:svc-host",
+                PinnedNodePubkeyB64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
                 PollIntervalSeconds = 60,
             });
             client.GetPoliciesAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())

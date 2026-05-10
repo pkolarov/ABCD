@@ -30,6 +30,29 @@ use tokio::time::{Instant, sleep, timeout};
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Run `test` on a multi-thread tokio runtime and force shutdown after
+/// 5 seconds. This avoids the libp2p QUIC background-task hang that
+/// occurs when `#[tokio::test]` calls `Runtime::drop()` →
+/// `shutdown_timeout(Duration::MAX)`.
+fn run_in_bounded_rt<F>(test: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    // Catch panics so shutdown_timeout(5s) always runs, not Runtime::drop(MAX).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(test);
+    }));
+    rt.shutdown_timeout(std::time::Duration::from_secs(5));
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 /// Spin up a node belonging to `domain_key`, with an admission cert
 /// that the test can choose to leave valid or deliberately break.
 ///
@@ -236,8 +259,14 @@ fn connect_one_sided(
 
 /// **Positive case**: two nodes with valid certs admit each other
 /// and gossip flows through the production ingest path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn admitted_peers_populated_and_gossip_flows() {
+#[test]
+fn admitted_peers_populated_and_gossip_flows() {
+    run_in_bounded_rt(async {
+        admitted_peers_populated_and_gossip_flows_inner().await;
+    });
+}
+
+async fn admitted_peers_populated_and_gossip_flows_inner() {
     let _ = tracing_subscriber::fmt::try_init();
     let dkey = dds_domain::DomainKey::from_secret_bytes("test.local", [42u8; 32]);
 
@@ -346,8 +375,14 @@ async fn admitted_peers_populated_and_gossip_flows() {
 /// **Negative case**: B presents a cert that doesn't verify (issued
 /// for the wrong peer id). A must NOT admit B, and gossip from B
 /// must NOT land in A's trust graph.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unadmitted_peer_gossip_dropped() {
+#[test]
+fn unadmitted_peer_gossip_dropped() {
+    run_in_bounded_rt(async {
+        unadmitted_peer_gossip_dropped_inner().await;
+    });
+}
+
+async fn unadmitted_peer_gossip_dropped_inner() {
     let _ = tracing_subscriber::fmt::try_init();
     let dkey = dds_domain::DomainKey::from_secret_bytes("test.local", [42u8; 32]);
 

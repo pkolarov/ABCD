@@ -1,5 +1,43 @@
 # DDS Implementation Status
 
+## Fix (2026-05-10, 102nd pass) — Windows StartAsync test configs + h12_admission run_in_bounded_rt
+
+### Gaps / Issues
+
+**101st pass left 4 `StartAsync`-based Windows tests broken**: the new `PinnedNodePubkeyB64`
+fail-closed guard in `Worker.ExecuteAsync` caused `AdJoined_host_dispatches_in_audit_mode_and_reports_reason`,
+`AdJoined_host_freezes_stale_items_instead_of_unwinding`, `Service_directives_are_tracked_in_managed_items`,
+and `Stale_service_is_noted_in_reconciliation_report` to exit before their polling cycles.
+The `Entra_only` test was fixed in the commit; these four were not.
+
+**`dds-node/tests/h12_admission.rs`** had the same libp2p QUIC background-task hang that was
+fixed in `h12_revocation_piggyback.rs` (commit `663adf1`) — both tests used
+`#[tokio::test(flavor = "multi_thread")]` which calls `Runtime::drop()` →
+`shutdown_timeout(Duration::MAX)`, hanging indefinitely after the test body completes.
+
+### Fix
+
+**`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added `PinnedNodePubkeyB64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="` to the
+  `AgentConfig` in the four tests that use `StartAsync` and lacked the key, matching the
+  pattern already applied to `Entra_only_host_emits_unsupported_heartbeat_and_skips_polling`
+  in the 101st pass commit.
+
+**`dds-node/tests/h12_admission.rs`**:
+- Added `run_in_bounded_rt` helper (identical to the one in `h12_revocation_piggyback.rs`):
+  builds a multi-thread runtime with 4 workers, runs the test future to completion, then
+  calls `rt.shutdown_timeout(5 s)` to ensure QUIC background tasks are killed promptly.
+- Changed `admitted_peers_populated_and_gossip_flows` and `unadmitted_peer_gossip_dropped`
+  from `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` to `#[test]` +
+  `run_in_bounded_rt`, matching the fix pattern from commit `663adf1`.
+
+### Result
+
+Windows test count: **267 → 267** (4 previously-broken tests now pass; 2 were already passing).
+Rust workspace: 2 test functions refactored to use bounded runtime; all tests green.
+
+---
+
 ## Docs + Test + Flake Fix (2026-05-08, 101st pass) — threat-model stale entries (Z-1/Z-3/Z-5), Windows PinnedNodePubkeyB64 guard + 2 parity tests, h12 timeout
 
 ### Gaps / Issues
