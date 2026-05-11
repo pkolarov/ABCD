@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// This binary is Linux-only; suppress dead-code warnings on cross-compile targets.
-#![cfg(target_os = "linux")]
+// Suppress dead-code / unused-import warnings when cross-compiled for non-Linux
+// targets (e.g. x86_64-pc-windows-gnu in CI).  The binary is only *run* on
+// Linux, but the crate must compile everywhere so `main` remains reachable.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 //! `dds-pam-helper` — FIDO2 assertion helper for `pam_dds.so`.
 //!
 //! ## Responsibilities
