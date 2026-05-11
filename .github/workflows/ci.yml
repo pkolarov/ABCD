@@ -230,10 +230,10 @@ jobs:
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
           Copy-Item "target\x86_64-pc-windows-msvc\release\dds-node.exe" $stage -ErrorAction Stop
           $nativeBuild = "platform\windows\native\build\Release"
-          @("DdsAuthBridge.exe", "DdsCredentialProvider.dll", "DdsTrayAgent.exe") | ForEach-Object {
+          @("DdsAuthBridge.exe", "DdsCredentialProvider.dll", "DdsTrayAgent.exe", "dds-enroll-user.exe") | ForEach-Object {
             $src = Join-Path $nativeBuild $_
             if (Test-Path $src) { Copy-Item $src $stage }
-            else { Write-Warning "Not found: $src" }
+            else { throw "Native binary not found (did MSBuild run?): $src" }
           }
           Copy-Item "stage\dotnet\DdsPolicyAgent.exe" $stage
           # Copy installer-side PS1 scripts (mirroring Build-Msi.ps1 step 3.5)
