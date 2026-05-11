@@ -544,7 +544,7 @@
                        Type="string" />
         <RegistryValue Root="HKLM"
                        Key="Software\Classes\DDS.ProvisionBundle\DefaultIcon"
-                       Value='[#dds_console_ps1]'
+                       Value='[DIR_BIN]DdsConsole.ps1'
                        Type="expandable" />
 
         <!-- Open verb: launch the wizard pre-pointed at Branch B with the
@@ -552,7 +552,7 @@
              outer double-quotes around the script path. -->
         <RegistryValue Root="HKLM"
                        Key="Software\Classes\DDS.ProvisionBundle\shell\open\command"
-                       Value='"[System64Folder]WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "[#dds_console_ps1]" -Mode JoinDomain -BundlePath "%1"'
+                       Value='"[System64Folder]WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "[DIR_BIN]DdsConsole.ps1" -Mode JoinDomain -BundlePath "%1"'
                        Type="expandable" />
       </Component>
     </ComponentGroup>
@@ -581,7 +581,7 @@
         <RegistryValue Root="HKLM"
                        Key="Software\Microsoft\Active Setup\Installed Components\{F1A2B3C4-DDS0-0000-0000-DDSONBOARD01}"
                        Name="StubPath"
-                       Value='"[System64Folder]WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "[#dds_console_ps1]" -Mode Auto'
+                       Value='"[System64Folder]WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "[DIR_BIN]DdsConsole.ps1" -Mode Auto'
                        Type="expandable" />
         <RegistryValue Root="HKLM"
                        Key="Software\Microsoft\Active Setup\Installed Components\{F1A2B3C4-DDS0-0000-0000-DDSONBOARD01}"
