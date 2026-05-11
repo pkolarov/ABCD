@@ -120,10 +120,10 @@ jobs:
 
           # C++ native
           $nativeBuild = "platform\windows\native\build\Release"
-          @("DdsAuthBridge.exe", "DdsCredentialProvider.dll", "DdsTrayAgent.exe") | ForEach-Object {
+          @("DdsAuthBridge.exe", "DdsCredentialProvider.dll", "DdsTrayAgent.exe", "dds-enroll-user.exe") | ForEach-Object {
             $src = Join-Path $nativeBuild $_
             if (Test-Path $src) { Copy-Item $src $stage }
-            else { Write-Warning "Not found: $src" }
+            else { throw "Native binary not found (did MSBuild run?): $src" }
           }
 
           # .NET
@@ -175,7 +175,8 @@ jobs:
             "stage\x64\DdsAuthBridge.exe",
             "stage\x64\DdsCredentialProvider.dll",
             "stage\x64\DdsPolicyAgent.exe",
-            "stage\x64\DdsTrayAgent.exe"
+            "stage\x64\DdsTrayAgent.exe",
+            "stage\x64\dds-enroll-user.exe"
           ) + @(Get-ChildItem "out\*.msi" | ForEach-Object { $_.FullName })
 
           foreach ($file in $filesToSign) {
