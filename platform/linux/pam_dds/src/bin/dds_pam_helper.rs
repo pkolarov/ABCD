@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+// This binary is Linux-only; suppress dead-code warnings on cross-compile targets.
+#![cfg(target_os = "linux")]
 //! `dds-pam-helper` — FIDO2 assertion helper for `pam_dds.so`.
 //!
 //! ## Responsibilities

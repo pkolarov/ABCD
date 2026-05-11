@@ -43,6 +43,7 @@ public sealed class BackendOperationTests : IDisposable
     [Fact]
     public void HostMacPreferenceOperations_round_trips_managed_plist_values()
     {
+        if (!OperatingSystem.IsMacOS()) return; // requires /usr/bin/plutil
         var cfg = Options.Create(new AgentConfig
         {
             ManagedPreferencesDir = Path.Combine(_tmpDir, "prefs"),
@@ -63,6 +64,7 @@ public sealed class BackendOperationTests : IDisposable
     [Fact]
     public void HostLaunchdOperations_issues_launchctl_commands_and_persists_binding()
     {
+        if (!OperatingSystem.IsMacOS()) return; // RecordingCommandRunner delegates plutil to real runner
         var launchdDir = Path.Combine(_tmpDir, "LaunchDaemons");
         Directory.CreateDirectory(launchdDir);
         var plistPath = Path.Combine(launchdDir, "com.dds.test.plist");
@@ -115,6 +117,7 @@ public sealed class BackendOperationTests : IDisposable
     [Fact]
     public void HostProfileOperations_installs_and_removes_profile_with_stamp_state()
     {
+        if (!OperatingSystem.IsMacOS()) return; // RecordingCommandRunner delegates plutil to real runner
         var installed = new HashSet<string>(StringComparer.Ordinal);
         var realRunner = new ProcessCommandRunner(NullLogger<ProcessCommandRunner>.Instance);
         var runner = new RecordingCommandRunner((file, args, stdin) =>

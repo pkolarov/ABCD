@@ -82,6 +82,7 @@ unsafe fn collect_pam_args(argc: c_int, argv: *const *const c_char) -> Vec<Strin
 /// 4. Parse the helper's stdout as [`HelperOutcome`] JSON.
 /// 5. Return `PAM_SUCCESS` when `ok == true`, `PAM_AUTH_ERR` otherwise.
 #[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // PAM ABI: extern "C" entry points cannot be unsafe fn
 pub extern "C" fn pam_sm_authenticate(
     pamh: *mut PamHandle,
     _flags: c_int,
