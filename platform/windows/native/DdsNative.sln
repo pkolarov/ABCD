@@ -15,6 +15,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DdsCommon", "DdsCommon\DdsC
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DdsTrayAgent", "DdsTrayAgent\DdsTrayAgent.vcxproj", "{D4E5F6A7-B8C9-0123-DEF4-56789ABCDEF0}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DdsEnrollUser", "DdsEnrollUser\DdsEnrollUser.vcxproj", "{E5F60718-C9DA-4123-EFAB-6789ABCDEF01}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|ARM64 = Debug|ARM64
@@ -71,6 +73,14 @@ Global
 		{D4E5F6A7-B8C9-0123-DEF4-56789ABCDEF0}.Release|ARM64.Build.0 = Release|ARM64
 		{D4E5F6A7-B8C9-0123-DEF4-56789ABCDEF0}.Release|x64.ActiveCfg = Release|x64
 		{D4E5F6A7-B8C9-0123-DEF4-56789ABCDEF0}.Release|x64.Build.0 = Release|x64
+		{E5F60718-C9DA-4123-EFAB-6789ABCDEF01}.Debug|ARM64.ActiveCfg = Debug|ARM64
+		{E5F60718-C9DA-4123-EFAB-6789ABCDEF01}.Debug|ARM64.Build.0 = Debug|ARM64
+		{E5F60718-C9DA-4123-EFAB-6789ABCDEF01}.Debug|x64.ActiveCfg = Debug|x64
+		{E5F60718-C9DA-4123-EFAB-6789ABCDEF01}.Debug|x64.Build.0 = Debug|x64
+		{E5F60718-C9DA-4123-EFAB-6789ABCDEF01}.Release|ARM64.ActiveCfg = Release|ARM64
+		{E5F60718-C9DA-4123-EFAB-6789ABCDEF01}.Release|ARM64.Build.0 = Release|ARM64
+		{E5F60718-C9DA-4123-EFAB-6789ABCDEF01}.Release|x64.ActiveCfg = Release|x64
+		{E5F60718-C9DA-4123-EFAB-6789ABCDEF01}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

@@ -124,17 +124,21 @@ unsigned __stdcall BridgePollThreadFunction(void* param)
         if (g_BridgePollKill) break;
         if (!g_BridgePollActive) continue;
 
-        // ---- Poll bridge status ----
-        IPC_RESP_STATUS status{};
-        bool connected = (g_provider_bridge.GetStatusShort(200, &status) &&
-                          status.deviceConnected);
+        // ---- Poll FIDO HID device presence directly ----
+        // The original Crayonic-forked code asked the bridge for
+        // deviceConnected, but the bridge hardcodes that to FALSE
+        // (no BLE device manager in the DDS fork). For the USB FIDO2
+        // path we look at HID device presence ourselves — we already
+        // run inside LogonUI with SetupAPI access. This is what wakes
+        // the "key just got plugged in → auto-logon" nudge.
+        bool connected = (CDdsBridgeClient::AnyFidoHidDevicePresent() == TRUE);
 
         if (connected != g_DeviceConnectedLast)
         {
             g_DeviceConnectedLast = connected;
             if (connected)
             {
-                CPLog("BridgePoll: device connected — calling TryLoadDdsUsers");
+                CPLog("BridgePoll: FIDO HID device connected — calling TryLoadDdsUsers");
                 bool ok = TryLoadDdsUsers();
                 for (int attempt = 1; !ok && attempt <= 3 && !g_BridgePollKill; ++attempt)
                 {
@@ -147,7 +151,7 @@ unsigned __stdcall BridgePollThreadFunction(void* param)
             }
             else
             {
-                CPLog("BridgePoll: device disconnected — clearing g_ddsUsers");
+                CPLog("BridgePoll: FIDO HID device disconnected — clearing g_ddsUsers");
                 memset(&g_ddsUsers, 0, sizeof(g_ddsUsers));
             }
 

@@ -84,6 +84,22 @@ public:
         _In_ INT32  ntStatus
     );
 
+    // Cross-thread cancel for an in-flight WebAuthNAuthenticatorGetAssertion.
+    // Safe to call from any thread (e.g. CDdsCredential::SetDeselected,
+    // ::UnAdvise) — looks up the cancellation GUID we registered with the
+    // platform, calls WebAuthNCancelCurrentOperation, and unblocks the CP
+    // thread that's spinning inside the WebAuthn API. No-op if no call is
+    // in flight.
+    void CancelCurrentWebAuthn();
+
+    // Pre-flight check: returns TRUE if at least one USB-HID FIDO2
+    // authenticator (HID usage page 0xF1D0) is currently enumerated.
+    // Used to fail fast before entering the blocking WebAuthn API when
+    // no security key is plugged in — Windows' WebAuthn UI otherwise
+    // stalls on "Insert your security key" for up to 60s with no way
+    // for our CP thread to break out.
+    static BOOL AnyFidoHidDevicePresent();
+
 private:
     DdsBridgeAuthResult WaitForDdsAuthComplete(UINT32 seqId, DWORD timeoutMs,
         std::function<void(UINT32, PCWSTR)> progressCallback);
@@ -100,4 +116,12 @@ private:
 
     CIpcPipeClient m_client;
     BOOL EnsureConnected();
+
+    // Cancellation state guarded by m_csWebAuthn. Set when we enter the
+    // WebAuthn API, cleared on return. CancelCurrentWebAuthn() inspects
+    // this from another thread to decide whether a cancel is meaningful.
+    CRITICAL_SECTION m_csWebAuthn;
+    GUID  m_currentCancelId{};
+    BOOL  m_webauthnInProgress{ FALSE };
+    UINT32 m_currentWebauthnSeqId{ 0 };
 };

@@ -45,7 +45,18 @@
            Compressed="yes"
            InstallerVersion="500">
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of DDS is already installed." />
+    <!-- Schedule="afterInstallExecute": the new product installs FIRST,
+         then the old product is removed. This is the standard MSI
+         pattern for preserving operator-customized config files across
+         upgrades. Combined with NeverOverwrite+Permanent on the two
+         config components below, it means:
+           1. New product installs. NeverOverwrite skips replacing the
+              existing node.toml + appsettings.json.
+           2. Old product uninstalls. Permanent="yes" tells MSI not to
+              remove those two components.
+           3. Result: operator-customized configs survive every upgrade. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of DDS is already installed."
+                  Schedule="afterInstallExecute" />
     <MediaTemplate EmbedCab="yes" />
 
     <!-- ============================================================ -->
@@ -107,6 +118,16 @@
     </Feature>
 
     <!-- ============================================================ -->
+    <!-- Feature: Onboarding Wizard helper (file association +        -->
+    <!-- per-user auto-launch via Active Setup, plus dds-enroll-user) -->
+    <!-- ============================================================ -->
+    <Feature Id="F_OnboardingWizard" Title="DDS Onboarding Wizard" Description="Guided setup + per-user auto-launch + .dds file association" Level="1">
+      <ComponentGroupRef Id="CG_EnrollUser" />
+      <ComponentGroupRef Id="CG_DdsFileAssoc" />
+      <ComponentGroupRef Id="CG_ActiveSetup" />
+    </Feature>
+
+    <!-- ============================================================ -->
     <!-- Feature: Start menu shortcuts + bootstrap script             -->
     <!-- ============================================================ -->
     <Feature Id="F_Shortcuts" Title="Start Menu Shortcuts" Description="DDS folder in Start menu (Bootstrap, Tray Agent)" Level="1">
@@ -139,20 +160,34 @@
                         Account="LocalSystem"
                         ErrorControl="normal"
                         Arguments="service-run --config &quot;[DIR_CONFIG]node.toml&quot; --unseal-passphrase-from &quot;[CommonAppDataFolder]DDS\node-passphrase.dpapi&quot;" />
-        <!-- Do NOT Start="install": the shipped node.toml is an unprovisioned
-             template (no org_hash / domain) and dds-node refuses to load it
-             with TOML parse error "missing field `org_hash`", causing MSI
-             error 1920 + rollback. The service is registered with Start="auto"
-             above so it comes up on next boot; the documented post-install
-             workflow is `dds-node provision <bundle.dds>` which writes a real
-             config and starts the service. -->
+        <!-- Start="install" Wait="no": auto-start on every install AND
+             upgrade so the operator doesn't have to manually Start-Service
+             after each MSI. Wait="no" is critical for the fresh-install
+             case: the shipped node.toml is an unprovisioned template
+             without a [domain] section, dds-node refuses to load it with a
+             TOML parse error, and the service exits — but because we
+             don't wait, MSI ignores it and the install still succeeds.
+             The user then runs the onboarding wizard (auto-launched via
+             Active Setup) which writes a real config and the service
+             comes up cleanly. On an UPGRADE the existing operator
+             node.toml is preserved by NeverOverwrite+Permanent on
+             C_DdsNodeConfig, so the start succeeds immediately. -->
         <ServiceControl Id="SC_DdsNode"
                         Name="DdsNode"
                         Stop="both"
+                        Start="install"
                         Remove="uninstall"
-                        Wait="yes" />
+                        Wait="no" />
       </Component>
-      <Component Id="C_DdsNodeConfig" Guid="22222222-2222-2222-2222-222222222222" Directory="DIR_CONFIG">
+      <!-- node.toml is install-once / preserve-forever:
+           * NeverOverwrite="yes" — install only if file doesn't exist.
+           * Permanent="yes"      — never removed by uninstall or by
+                                    MajorUpgrade's RemoveExistingProducts.
+           Combined with MajorUpgrade Schedule="afterInstallExecute"
+           above, the operator's customized node.toml survives every
+           upgrade. (If you really need to ship a new template, change
+           the path or rename so it lands as a new file.) -->
+      <Component Id="C_DdsNodeConfig" Guid="22222222-2222-2222-2222-222222222222" Directory="DIR_CONFIG" NeverOverwrite="yes" Permanent="yes">
         <File Id="node_config_toml" Source="$(var.ConfigDir)\node.toml" KeyPath="yes" />
       </Component>
     </ComponentGroup>
@@ -172,13 +207,31 @@
                         Account="LocalSystem"
                         ErrorControl="normal">
           <ServiceDependency Id="DdsNode" />
+          <!-- NgcSvc (Microsoft Passport) hosts the WebAuthn UI broker that
+               WebAuthNAuthenticatorGetAssertion DCOM-activates from the
+               secure desktop. NgcSvc ships as StartType=Manual on Win10/11
+               and is otherwise only started on demand once a user session
+               uses Windows Hello — never from LogonUI's pre-login context.
+               Without it running, the broker activation fails with
+               CO_E_RUNAS_LOGON_FAILURE (0x8000401A) and the FIDO2 tile
+               dies before the security key is ever contacted.
+               Declaring NgcSvc as a SCM dependency makes the SCM start it
+               before DdsAuthBridge during boot, so by the time LogonUI
+               loads our credential provider the broker can activate. -->
+          <ServiceDependency Id="NgcSvc" />
         </ServiceInstall>
-        <!-- See SC_DdsNode: deferred to first boot / post-provision. -->
+        <!-- Start="install" Wait="no": see SC_DdsNode. Windows SCM honors
+             the ServiceDependency above and waits for DdsNode to enter
+             Running before kicking off DdsAuthBridge, so we don't need
+             ordering logic here. If DdsNode isn't actually serving on a
+             fresh install, DdsAuthBridge will fail too — but Wait="no"
+             keeps the MSI quiet. -->
         <ServiceControl Id="SC_AuthBridge"
                         Name="DdsAuthBridge"
                         Stop="both"
+                        Start="install"
                         Remove="uninstall"
-                        Wait="yes" />
+                        Wait="no" />
 
         <!-- **H-6 step-2 (security review)**: tell the Auth Bridge
              where to find the per-install HMAC secret generated below
@@ -285,6 +338,14 @@
                   Impersonate="no"
                   Return="check" />
 
+    <!-- Note: auto-launch of the onboarding wizard for the installing user
+         is handled by Active Setup (CG_ActiveSetup below): on the next
+         interactive logon Windows replays the StubPath into HKCU and
+         fires the wizard once per user. This avoids the cross-WiX-version
+         fragility of UtilExtension's WixShellExec custom action; the only
+         downside is the installing user has to log off/on once after a
+         fresh install. Subsequent users are caught automatically. -->
+
     <InstallExecuteSequence>
       <!-- Run after the files are laid down (so dds-node.exe exists)
            and the data dir is created (so we have something to ACL),
@@ -313,7 +374,17 @@
     <!-- ICE09 warns about non-permanent System32 component; this is intentional
          for credential providers — they must live in System32 for logonui.exe -->
     <ComponentGroup Id="CG_CredProv" Directory="System64Folder">
-      <Component Id="C_CredProvDll" Guid="44444444-4444-4444-4444-444444444444" Permanent="yes">
+      <!-- 1.1.7 fix: bumped Guid from ...44 to ...45 so the credential
+           provider DLL is treated as a NEW component by MSI on upgrade,
+           forcing the new build to land on disk. With the original fixed
+           GUID + Permanent="yes", MSI treated the component as "already
+           installed permanently" and silently skipped replacing the
+           DLL — leaving every operator on the May 4 build for weeks of
+           1.1.x upgrades. The DLL has no VERSIONINFO resource, so MSI
+           had no way to detect that the source differed from the target.
+           Keeping Permanent="yes" preserves the original ICE09 intent
+           (logonui.exe never sees the file vanish on uninstall). -->
+      <Component Id="C_CredProvDll" Guid="44444444-4444-4444-4444-444444444445" Permanent="yes">
         <File Id="credprov_dll" Source="$(var.BuildDir)\DdsCredentialProvider.dll" KeyPath="yes" />
 
         <!-- COM registration: HKCR\CLSID\{...}\InprocServer32 -->
@@ -356,14 +427,19 @@
                         Arguments="--contentRoot &quot;[INSTALLFOLDER].&quot;">
           <ServiceDependency Id="DdsNode" />
         </ServiceInstall>
-        <!-- See SC_DdsNode: deferred to first boot / post-provision. -->
+        <!-- Start="install" Wait="no": same pattern as SC_DdsNode/SC_AuthBridge. -->
         <ServiceControl Id="SC_PolicyAgent"
                         Name="DdsPolicyAgent"
                         Stop="both"
+                        Start="install"
                         Remove="uninstall"
-                        Wait="yes" />
+                        Wait="no" />
       </Component>
-      <Component Id="C_PolicyAgentConfig" Guid="88888888-8888-8888-8888-888888888888" Directory="DIR_CONFIG">
+      <!-- appsettings.json: same NeverOverwrite + Permanent pattern as
+           C_DdsNodeConfig. Carries DeviceUrn (only known after
+           enroll-device) and PinnedNodePubkeyB64 (re-stamped by
+           CA_StampAgentPubkey post-install). -->
+      <Component Id="C_PolicyAgentConfig" Guid="88888888-8888-8888-8888-888888888888" Directory="DIR_CONFIG" NeverOverwrite="yes" Permanent="yes">
         <File Id="policy_agent_appsettings" Source="$(var.ConfigDir)\appsettings.json" KeyPath="yes" />
       </Component>
     </ComponentGroup>
@@ -399,7 +475,7 @@
     </ComponentGroup>
 
     <!-- ============================================================ -->
-    <!-- Component: Bootstrap-DdsDomain.ps1 in DIR_BIN                -->
+    <!-- Component: Bootstrap-DdsDomain.ps1 + wizard helpers in DIR_BIN -->
     <!-- ============================================================ -->
     <ComponentGroup Id="CG_BootstrapScript" Directory="DIR_BIN">
       <Component Id="C_BootstrapScript" Guid="99999999-9999-9999-9999-999999999999">
@@ -411,6 +487,107 @@
         <File Id="dds_console_ps1"
               Source="$(var.BuildDir)\DdsConsole.ps1"
               KeyPath="yes" />
+      </Component>
+      <Component Id="C_GetOnboardingState" Guid="D1D1D1D1-D1D1-D1D1-D1D1-D1D1D1D1D1D1">
+        <File Id="state_probe_ps1"
+              Source="$(var.BuildDir)\Get-DdsOnboardingState.ps1"
+              KeyPath="yes" />
+      </Component>
+      <Component Id="C_EnrollDeviceScript" Guid="D2D2D2D2-D2D2-D2D2-D2D2-D2D2D2D2D2D2">
+        <File Id="enroll_device_ps1"
+              Source="$(var.BuildDir)\Enroll-DdsDevice.ps1"
+              KeyPath="yes" />
+      </Component>
+      <Component Id="C_ResetBootstrapScript" Guid="D3D3D3D3-D3D3-D3D3-D3D3-D3D3D3D3D3D3">
+        <File Id="reset_bootstrap_ps1"
+              Source="$(var.BuildDir)\Reset-DdsBootstrap.ps1"
+              KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- ============================================================ -->
+    <!-- Component: dds-enroll-user.exe (CLI helper for Branch C of   -->
+    <!-- the wizard — non-interactive FIDO2 enrollment with NDJSON    -->
+    <!-- status piped back to DdsConsole.ps1).                         -->
+    <!-- ============================================================ -->
+    <ComponentGroup Id="CG_EnrollUser" Directory="DIR_BIN">
+      <Component Id="C_EnrollUser" Guid="E1E1E1E1-E1E1-E1E1-E1E1-E1E1E1E1E1E1">
+        <File Id="dds_enroll_user_exe"
+              Source="$(var.BuildDir)\dds-enroll-user.exe"
+              KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- ============================================================ -->
+    <!-- Component: .dds file association                             -->
+    <!-- Double-click a *.dds provision bundle → wizard opens in      -->
+    <!-- Branch B (Join Domain) with the bundle pre-loaded.           -->
+    <!-- ============================================================ -->
+    <ComponentGroup Id="CG_DdsFileAssoc" Directory="INSTALLFOLDER">
+      <Component Id="C_DdsFileAssoc" Guid="E2E2E2E2-E2E2-E2E2-E2E2-E2E2E2E2E2E2">
+        <!-- Extension → ProgId -->
+        <RegistryValue Root="HKLM"
+                       Key="Software\Classes\.dds"
+                       Value="DDS.ProvisionBundle"
+                       Type="string"
+                       KeyPath="yes" />
+        <RegistryValue Root="HKLM"
+                       Key="Software\Classes\.dds"
+                       Name="Content Type"
+                       Value="application/x-dds-bundle"
+                       Type="string" />
+
+        <!-- ProgId metadata -->
+        <RegistryValue Root="HKLM"
+                       Key="Software\Classes\DDS.ProvisionBundle"
+                       Value="DDS Provision Bundle"
+                       Type="string" />
+        <RegistryValue Root="HKLM"
+                       Key="Software\Classes\DDS.ProvisionBundle\DefaultIcon"
+                       Value='[#dds_console_ps1]'
+                       Type="expandable" />
+
+        <!-- Open verb: launch the wizard pre-pointed at Branch B with the
+             dropped bundle path. PowerShell quoting on %1 is handled by the
+             outer double-quotes around the script path. -->
+        <RegistryValue Root="HKLM"
+                       Key="Software\Classes\DDS.ProvisionBundle\shell\open\command"
+                       Value='"[System64Folder]WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "[#dds_console_ps1]" -Mode JoinDomain -BundlePath "%1"'
+                       Type="expandable" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- ============================================================ -->
+    <!-- Component: Active Setup — runs DdsConsole.ps1 once per user  -->
+    <!-- on first interactive logon after install. The Active Setup   -->
+    <!-- mechanism replays HKLM commands into HKCU for each user the  -->
+    <!-- first time they log on, so we get a single auto-launch       -->
+    <!-- without needing per-user RunOnce keys at install time.       -->
+    <!--                                                                -->
+    <!-- Bumping `Version` re-fires the StubPath for every user.       -->
+    <!-- ============================================================ -->
+    <ComponentGroup Id="CG_ActiveSetup" Directory="INSTALLFOLDER">
+      <Component Id="C_ActiveSetupOnboard" Guid="E3E3E3E3-E3E3-E3E3-E3E3-E3E3E3E3E3E3">
+        <RegistryValue Root="HKLM"
+                       Key="Software\Microsoft\Active Setup\Installed Components\{F1A2B3C4-DDS0-0000-0000-DDSONBOARD01}"
+                       Value="DDS Onboarding Wizard"
+                       Type="string"
+                       KeyPath="yes" />
+        <RegistryValue Root="HKLM"
+                       Key="Software\Microsoft\Active Setup\Installed Components\{F1A2B3C4-DDS0-0000-0000-DDSONBOARD01}"
+                       Name="Version"
+                       Value="1,0,0,0"
+                       Type="string" />
+        <RegistryValue Root="HKLM"
+                       Key="Software\Microsoft\Active Setup\Installed Components\{F1A2B3C4-DDS0-0000-0000-DDSONBOARD01}"
+                       Name="StubPath"
+                       Value='"[System64Folder]WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "[#dds_console_ps1]" -Mode Auto'
+                       Type="expandable" />
+        <RegistryValue Root="HKLM"
+                       Key="Software\Microsoft\Active Setup\Installed Components\{F1A2B3C4-DDS0-0000-0000-DDSONBOARD01}"
+                       Name="IsInstalled"
+                       Value="1"
+                       Type="integer" />
       </Component>
     </ComponentGroup>
 

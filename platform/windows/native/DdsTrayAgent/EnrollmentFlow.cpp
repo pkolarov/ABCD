@@ -1,6 +1,16 @@
 // EnrollmentFlow.cpp
 // User enrollment: password prompt -> MakeCredential -> GetAssertion (hmac-secret)
 // -> encrypt password -> vault -> POST /v1/enroll/user.
+//
+// The flow has two skins:
+//   * RunEnrollmentFlow(HWND)      — legacy interactive MessageBox skin used
+//                                    by DdsTrayAgent.
+//   * RunEnrollmentFlowEx(opts)    — generalized: caller can preset the
+//                                    password and supply a phase callback so
+//                                    the UI lives outside the C++ code (used
+//                                    by DdsEnrollUser.exe / the wizard).
+//
+// Internally both call RunEnrollmentFlowImpl().
 
 #include "EnrollmentFlow.h"
 #include "WebAuthnHelper.h"
@@ -91,7 +101,43 @@ static std::wstring GetCurrentDisplayName()
 }
 
 // ---------------------------------------------------------------------------
-// Simple password prompt dialog (modal)
+// JSON string escaping (minimal — for status callback payloads)
+// ---------------------------------------------------------------------------
+
+static std::string JsonEscape(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    sprintf_s(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+// Emit a phase line to the callback, if set.
+static void EmitPhase(const EnrollmentFlowOptions& opts, const std::string& json)
+{
+    if (opts.onPhase) opts.onPhase(json);
+}
+
+// ---------------------------------------------------------------------------
+// Simple password prompt dialog (modal) — used only in interactive mode
 // ---------------------------------------------------------------------------
 
 static bool PromptForPassword(HWND hwnd, std::wstring& outPassword)
@@ -203,12 +249,18 @@ static bool PromptForPassword(HWND hwnd, std::wstring& outPassword)
 }
 
 // ---------------------------------------------------------------------------
-// Enrollment flow
+// Core enrollment implementation
 // ---------------------------------------------------------------------------
 
-bool RunEnrollmentFlow(HWND hwnd)
+static EnrollmentFlowResult RunEnrollmentFlowImpl(const EnrollmentFlowOptions& opts)
 {
-    FileLog::Write("EnrollmentFlow: begin\n");
+    EnrollmentFlowResult result = {};
+    HWND hwnd = opts.hwnd;
+
+    FileLog::Writef("EnrollmentFlow: begin (interactive=%d, preset=%d)\n",
+                    opts.interactive ? 1 : 0,
+                    opts.presetPassword.empty() ? 0 : 1);
+    EmitPhase(opts, "{\"phase\":\"start\"}");
 
     // Load config
     CDdsConfiguration config;
@@ -218,22 +270,47 @@ bool RunEnrollmentFlow(HWND hwnd)
     std::wstring userSid;
     if (!GetCurrentUserSid(userSid))
     {
-        MessageBoxW(hwnd, L"Failed to determine current user SID.",
-                    L"Enrollment Error", MB_OK | MB_ICONERROR);
-        return false;
+        result.errorPhase   = "user_sid";
+        result.errorMessage = "Failed to determine current user SID.";
+        if (opts.interactive)
+            MessageBoxW(hwnd, L"Failed to determine current user SID.",
+                        L"Enrollment Error", MB_OK | MB_ICONERROR);
+        EmitPhase(opts,
+            "{\"phase\":\"error\",\"at\":\"user_sid\",\"message\":\""
+            + JsonEscape(result.errorMessage) + "\"}");
+        return result;
     }
     std::wstring displayName = GetCurrentDisplayName();
-    std::string rpId = config.RpId();
+    std::string  rpId        = config.RpId();
 
     FileLog::Writef("EnrollmentFlow: user='%ls' rpId='%s'\n",
                     displayName.c_str(), rpId.c_str());
 
-    // Step 1: Prompt for Windows password
+    // Step 1: obtain Windows password
     std::wstring password;
-    if (!PromptForPassword(hwnd, password))
+    if (!opts.presetPassword.empty())
     {
-        FileLog::Write("EnrollmentFlow: user cancelled password prompt\n");
-        return false;
+        password = opts.presetPassword;
+    }
+    else if (opts.interactive)
+    {
+        if (!PromptForPassword(hwnd, password))
+        {
+            FileLog::Write("EnrollmentFlow: user cancelled password prompt\n");
+            result.errorPhase   = "password";
+            result.errorMessage = "User cancelled.";
+            EmitPhase(opts, "{\"phase\":\"cancelled\"}");
+            return result;
+        }
+    }
+    else
+    {
+        result.errorPhase   = "password";
+        result.errorMessage = "Non-interactive mode requires presetPassword.";
+        EmitPhase(opts,
+            "{\"phase\":\"error\",\"at\":\"password\",\"message\":\""
+            + JsonEscape(result.errorMessage) + "\"}");
+        return result;
     }
 
     // Step 2: MakeCredential (Touch 1)
@@ -246,10 +323,14 @@ bool RunEnrollmentFlow(HWND hwnd)
     std::string sidStr(sidUtf8);
     std::vector<uint8_t> userId(sidStr.begin(), sidStr.end());
 
-    MessageBoxW(hwnd,
-        L"Touch your security key to register it.\n\n"
-        L"This is touch 1 of 2.",
-        L"DDS Enrollment", MB_OK | MB_ICONINFORMATION);
+    if (opts.interactive)
+    {
+        MessageBoxW(hwnd,
+            L"Touch your security key to register it.\n\n"
+            L"This is touch 1 of 2.",
+            L"DDS Enrollment", MB_OK | MB_ICONINFORMATION);
+    }
+    EmitPhase(opts, "{\"phase\":\"touch1_prompt\"}");
 
     auto makeResult = CWebAuthnHelper::MakeCredential(
         hwnd, rpId, userId, displayName, true /*hmacSecret - must be enabled at create time*/);
@@ -258,13 +339,22 @@ bool RunEnrollmentFlow(HWND hwnd)
     {
         FileLog::Writef("EnrollmentFlow: MakeCredential failed: %s\n",
                         makeResult.errorMessage.c_str());
-        wchar_t msg[512];
-        swprintf_s(msg, L"FIDO2 key registration failed:\n%hs",
-                   makeResult.errorMessage.c_str());
-        MessageBoxW(hwnd, msg, L"Enrollment Error", MB_OK | MB_ICONERROR);
+        result.errorPhase   = "make_credential";
+        result.errorMessage = makeResult.errorMessage;
+        if (opts.interactive)
+        {
+            wchar_t msg[512];
+            swprintf_s(msg, L"FIDO2 key registration failed:\n%hs",
+                       makeResult.errorMessage.c_str());
+            MessageBoxW(hwnd, msg, L"Enrollment Error", MB_OK | MB_ICONERROR);
+        }
         SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
-        return false;
+        EmitPhase(opts,
+            "{\"phase\":\"error\",\"at\":\"make_credential\",\"message\":\""
+            + JsonEscape(makeResult.errorMessage) + "\"}");
+        return result;
     }
+    EmitPhase(opts, "{\"phase\":\"key_made\"}");
 
     // Step 3: Generate random 32-byte salt for hmac-secret
     std::vector<uint8_t> salt(32);
@@ -272,10 +362,14 @@ bool RunEnrollmentFlow(HWND hwnd)
                     BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 
     // Step 4: GetAssertion with hmac-secret (Touch 2)
-    MessageBoxW(hwnd,
-        L"Touch your security key again to complete enrollment.\n\n"
-        L"This is touch 2 of 2.",
-        L"DDS Enrollment", MB_OK | MB_ICONINFORMATION);
+    if (opts.interactive)
+    {
+        MessageBoxW(hwnd,
+            L"Touch your security key again to complete enrollment.\n\n"
+            L"This is touch 2 of 2.",
+            L"DDS Enrollment", MB_OK | MB_ICONINFORMATION);
+    }
+    EmitPhase(opts, "{\"phase\":\"touch2_prompt\"}");
 
     auto assertResult = CWebAuthnHelper::GetAssertionHmacSecret(
         hwnd, rpId, makeResult.credentialId, salt);
@@ -284,22 +378,33 @@ bool RunEnrollmentFlow(HWND hwnd)
     {
         FileLog::Writef("EnrollmentFlow: GetAssertion hmac failed: %s\n",
                         assertResult.errorMessage.c_str());
-        MessageBoxW(hwnd,
-            L"Failed to get hmac-secret from authenticator.\n"
-            L"Enrollment cannot proceed.",
-            L"Enrollment Error", MB_OK | MB_ICONERROR);
+        result.errorPhase   = "get_assertion";
+        result.errorMessage = assertResult.errorMessage.empty()
+            ? std::string("hmac-secret output unavailable")
+            : assertResult.errorMessage;
+        if (opts.interactive)
+        {
+            MessageBoxW(hwnd,
+                L"Failed to get hmac-secret from authenticator.\n"
+                L"Enrollment cannot proceed.",
+                L"Enrollment Error", MB_OK | MB_ICONERROR);
+        }
         SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
-        return false;
+        EmitPhase(opts,
+            "{\"phase\":\"error\",\"at\":\"get_assertion\",\"message\":\""
+            + JsonEscape(result.errorMessage) + "\"}");
+        return result;
     }
+    EmitPhase(opts, "{\"phase\":\"hmac_done\"}");
 
     // Step 5: Encrypt password using hmac-secret output
     VaultEntry entry = {};
-    entry.userSid = userSid;
+    entry.userSid     = userSid;
     entry.displayName = displayName;
     entry.credentialId = makeResult.credentialId;
-    entry.rpId = rpId;
-    entry.salt = salt;
-    entry.authMethod = 1; // FIDO2
+    entry.rpId        = rpId;
+    entry.salt        = salt;
+    entry.authMethod  = 1; // FIDO2
 
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
@@ -312,11 +417,17 @@ bool RunEnrollmentFlow(HWND hwnd)
             entry))
     {
         FileLog::Write("EnrollmentFlow: password encryption failed\n");
-        MessageBoxW(hwnd, L"Failed to encrypt password.",
-                    L"Enrollment Error", MB_OK | MB_ICONERROR);
+        result.errorPhase   = "encrypt";
+        result.errorMessage = "Failed to encrypt password with hmac-secret output.";
+        if (opts.interactive)
+            MessageBoxW(hwnd, L"Failed to encrypt password.",
+                        L"Enrollment Error", MB_OK | MB_ICONERROR);
         SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
         SecureZeroMemory(assertResult.hmacSecretOutput.data(), 32);
-        return false;
+        EmitPhase(opts,
+            "{\"phase\":\"error\",\"at\":\"encrypt\",\"message\":\""
+            + JsonEscape(result.errorMessage) + "\"}");
+        return result;
     }
 
     // Secure cleanup of sensitive material
@@ -329,19 +440,35 @@ bool RunEnrollmentFlow(HWND hwnd)
     if (!vault.EnrollUser(entry))
     {
         FileLog::Write("EnrollmentFlow: vault EnrollUser failed\n");
-        MessageBoxW(hwnd, L"Failed to save credential to vault.",
-                    L"Enrollment Error", MB_OK | MB_ICONERROR);
-        return false;
+        result.errorPhase   = "vault_save";
+        result.errorMessage = "Vault EnrollUser() failed.";
+        if (opts.interactive)
+            MessageBoxW(hwnd, L"Failed to save credential to vault.",
+                        L"Enrollment Error", MB_OK | MB_ICONERROR);
+        EmitPhase(opts,
+            "{\"phase\":\"error\",\"at\":\"vault_save\",\"message\":\""
+            + JsonEscape(result.errorMessage) + "\"}");
+        return result;
     }
     if (!vault.Save())
     {
         FileLog::Write("EnrollmentFlow: vault Save failed\n");
-        MessageBoxW(hwnd, L"Failed to write vault file to disk.",
-                    L"Enrollment Error", MB_OK | MB_ICONERROR);
-        return false;
+        result.errorPhase   = "vault_save";
+        result.errorMessage = "Vault file write to disk failed.";
+        if (opts.interactive)
+            MessageBoxW(hwnd, L"Failed to write vault file to disk.",
+                        L"Enrollment Error", MB_OK | MB_ICONERROR);
+        EmitPhase(opts,
+            "{\"phase\":\"error\",\"at\":\"vault_save\",\"message\":\""
+            + JsonEscape(result.errorMessage) + "\"}");
+        return result;
     }
-
+    EmitPhase(opts, "{\"phase\":\"vault_written\"}");
     FileLog::Write("EnrollmentFlow: vault saved OK\n");
+
+    // Local vault is in place — set provisional success. Server POST is
+    // best-effort; if it fails, the user can still sign in locally.
+    result.success = true;
 
     // Step 7: POST /v1/enroll/user to dds-node — prefer ApiAddr (A-2)
     // so we hit the named-pipe transport when the operator's node.toml
@@ -389,27 +516,67 @@ bool RunEnrollmentFlow(HWND hwnd)
     {
         FileLog::Writef("EnrollmentFlow: dds-node enroll failed: %s\n",
                         enrollResult.errorMessage.c_str());
-        wchar_t msg[512];
-        swprintf_s(msg,
-            L"Credential saved locally, but DDS node enrollment failed:\n%hs\n\n"
-            L"You can retry enrollment later. The local vault entry is preserved.",
-            enrollResult.errorMessage.c_str());
-        MessageBoxW(hwnd, msg, L"Enrollment Warning", MB_OK | MB_ICONWARNING);
-        // Return true because the local vault was saved successfully
-        return true;
+        result.serverPosted = false;
+        result.errorPhase   = "post_enroll";
+        result.errorMessage = enrollResult.errorMessage;
+        if (opts.interactive)
+        {
+            wchar_t msg[512];
+            swprintf_s(msg,
+                L"Credential saved locally, but DDS node enrollment failed:\n%hs\n\n"
+                L"You can retry enrollment later. The local vault entry is preserved.",
+                enrollResult.errorMessage.c_str());
+            MessageBoxW(hwnd, msg, L"Enrollment Warning", MB_OK | MB_ICONWARNING);
+        }
+        EmitPhase(opts,
+            "{\"phase\":\"enroll_failed_local_only\",\"message\":\""
+            + JsonEscape(enrollResult.errorMessage) + "\"}");
+        // result.success stays true — local vault is in place.
+        return result;
     }
+
+    result.serverPosted = true;
+    result.urn = enrollResult.urn;
+    result.jti = enrollResult.jti;
 
     FileLog::Writef("EnrollmentFlow: dds-node enroll OK urn='%s' jti='%s'\n",
                     enrollResult.urn.c_str(), enrollResult.jti.c_str());
 
-    // Success!
-    wchar_t successMsg[512];
-    swprintf_s(successMsg,
-        L"FIDO2 key enrolled successfully!\n\n"
-        L"URN: %hs\n\n"
-        L"Ask your administrator to approve this enrollment.",
-        enrollResult.urn.c_str());
-    MessageBoxW(hwnd, successMsg, L"Enrollment Complete", MB_OK | MB_ICONINFORMATION);
+    EmitPhase(opts,
+        "{\"phase\":\"enroll_posted\",\"urn\":\""
+        + JsonEscape(enrollResult.urn) + "\",\"jti\":\""
+        + JsonEscape(enrollResult.jti) + "\"}");
 
-    return true;
+    if (opts.interactive)
+    {
+        wchar_t successMsg[512];
+        swprintf_s(successMsg,
+            L"FIDO2 key enrolled successfully!\n\n"
+            L"URN: %hs\n\n"
+            L"Ask your administrator to approve this enrollment.",
+            enrollResult.urn.c_str());
+        MessageBoxW(hwnd, successMsg, L"Enrollment Complete", MB_OK | MB_ICONINFORMATION);
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+bool RunEnrollmentFlow(HWND hwnd)
+{
+    EnrollmentFlowOptions opts;
+    opts.hwnd        = hwnd;
+    opts.interactive = true;
+    auto r = RunEnrollmentFlowImpl(opts);
+    // Legacy semantics: success means the local vault was saved (server
+    // POST may have failed — RunEnrollmentFlowImpl already showed a warning).
+    return r.success;
+}
+
+EnrollmentFlowResult RunEnrollmentFlowEx(const EnrollmentFlowOptions& opts)
+{
+    return RunEnrollmentFlowImpl(opts);
 }

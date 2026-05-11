@@ -53,7 +53,7 @@ param(
     [string]$OutputDir = "",
 
     [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
-    [string]$Version = "1.0.0.0",
+    [string]$Version = "1.1.7.0",
 
     [switch]$SkipRust,
     [switch]$SkipNative,
@@ -120,7 +120,7 @@ if (-not $PSBoundParameters.ContainsKey('Version')) {
     }
     New-Item -ItemType Directory -Path (Split-Path $counterFile) -Force | Out-Null
     Set-Content -Path $counterFile -Value $counter -Encoding ASCII -NoNewline
-    $Version = "1.0.0.$counter"
+    $Version = "1.1.7.$counter"
 }
 
 # ── Prerequisite checks ──────────────────────────────────────────
@@ -228,7 +228,8 @@ function Build-Native([string]$msbuildPlatform, [string]$stageDir, [string]$nati
     $nativeBinaries = @(
         "DdsAuthBridge.exe",
         "DdsCredentialProvider.dll",
-        "DdsTrayAgent.exe"
+        "DdsTrayAgent.exe",
+        "dds-enroll-user.exe"   # Wizard-driven non-interactive FIDO enrollment helper
     )
     foreach ($bin in $nativeBinaries) {
         $src = Join-Path $nativeBuildDir $bin
@@ -317,12 +318,29 @@ foreach ($plat in $Targets) {
         Build-Dotnet -rid $info.DotnetRid -stageDir $stageDir
     }
 
-    # Step 3.5: copy installer-side scripts into stage so WiX can reference them
+    # Step 3.5: copy installer-side scripts into stage so WiX can reference them.
+    # While copying, force UTF-8-with-BOM on every *.ps1 — Windows PowerShell 5.1
+    # reads no-BOM files as Windows-1252, which corrupts any non-ASCII characters
+    # (em-dashes, accents, etc.) and breaks parsing with cryptic "Unexpected
+    # token" errors. Authoring tools (incl. the Anthropic Write tool) often emit
+    # UTF-8 without BOM, so we self-heal at build time instead of relying on
+    # every contributor to remember.
     $scriptDir = Join-Path $InstallerDir "scripts"
     if (Test-Path $scriptDir) {
+        $utf8Bom = New-Object Text.UTF8Encoding $true
+        $utf8    = New-Object Text.UTF8Encoding $false
         foreach ($ps1 in Get-ChildItem -Path $scriptDir -Filter '*.ps1') {
-            Copy-Item $ps1.FullName -Destination $stageDir -Force
-            Write-Host "  -> Staged: $stageDir\$($ps1.Name)"
+            $dst = Join-Path $stageDir $ps1.Name
+            $bytes = [IO.File]::ReadAllBytes($ps1.FullName)
+            $hasBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+            if (-not $hasBom) {
+                # Decode strictly as UTF-8 (correct for files we author) then re-emit with BOM.
+                [IO.File]::WriteAllText($dst, $utf8.GetString($bytes), $utf8Bom)
+                Write-Host "  -> Staged (+UTF-8 BOM): $dst"
+            } else {
+                Copy-Item $ps1.FullName -Destination $dst -Force
+                Write-Host "  -> Staged: $dst"
+            }
         }
     } else {
         Write-Warning "  Installer scripts dir not found: $scriptDir"

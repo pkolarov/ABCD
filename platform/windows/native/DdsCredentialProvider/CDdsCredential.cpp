@@ -190,6 +190,11 @@ HRESULT CDdsCredential::Advise(
 HRESULT CDdsCredential::UnAdvise()
 {
     OutputDebugString(L"UnAdvise()\n");
+    // If a WebAuthn call is blocked inside Windows (e.g. user unplugged the
+    // security key and is now navigating away), cancel it so the CP thread
+    // doesn't sit pinned in the platform API for up to 60s.
+    g_ddsBridgeClient.CancelCurrentWebAuthn();
+
     if (_pCredProvCredentialEvents)
     {
         _pCredProvCredentialEvents->Release();
@@ -221,9 +226,13 @@ HRESULT CDdsCredential::SetSelected(BOOL* pbAutoLogon)
 HRESULT CDdsCredential::SetDeselected()
 {
     OutputDebugString(L"SetDeselected()\n");
-    HRESULT hr = S_OK;
+    // User pressed ESC, switched to a different tile, or LogonUI tore the
+    // tile down for some other reason. If our WebAuthn call is blocked
+    // inside Windows (typical when the user unplugged the security key
+    // mid-prompt), cross-thread cancel it now so the CP thread is freed.
+    g_ddsBridgeClient.CancelCurrentWebAuthn();
 
-    return hr;
+    return S_OK;
 }
 
 // Gets info for a particular field of a tile.
@@ -468,7 +477,13 @@ HRESULT CDdsCredential::GetSerializationDds(
         _pszSubjectUrn,
         _pszCredentialId ? _pszCredentialId : L"",
         L"dds.local",      // rpId
-        20000,             // 20 second timeout — keep short to avoid freezing LogonUI
+        60000,             // 60 seconds — matches the bridge's AUTH_TIMEOUT_MS
+                           //   (ipc_protocol.h). When CP timed out at 20s but
+                           //   the bridge waited 60s, every retry within those
+                           //   40s got "Another authentication is in progress".
+                           //   Now the timeouts align; the bridge's
+                           //   cancel-and-supersede in HandleDdsStartAuth
+                           //   handles fast retries cleanly.
         progressCb
     );
 
@@ -477,6 +492,17 @@ HRESULT CDdsCredential::GetSerializationDds(
         OutputDebugString(L"GetSerializationDds: auth failed — ");
         OutputDebugString(authResult.errorMessage.c_str());
         OutputDebugString(L"\n");
+
+        // Mirror the failure into the file log so post-mortems don't need a
+        // live debugger attached.  The HRESULT itself comes from
+        // HandleWebAuthnChallenge (see DdsBridgeClient.cpp) — here we record
+        // the *post-classification* errorCode + the message the user will see.
+        char errMsgA[512]{};
+        WideCharToMultiByte(CP_UTF8, 0, authResult.errorMessage.c_str(), -1,
+                            errMsgA, sizeof(errMsgA), NULL, NULL);
+        CPLog("GetSerializationDds: AUTH FAILED errorCode=%d msg='%s' cpus=%d",
+              (int)authResult.errorCode, errMsgA, (int)_cpus);
+
         // Don't auto-trigger again on next tile select — let user click Submit manually
         auto_tries = 0;
 

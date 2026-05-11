@@ -44,6 +44,9 @@ platform/windows/installer/out/
 *.msi
 *.wixpdb
 
+# Claude Code per-repo state
+.claude/
+
 # macOS metadata
 .DS_Store
 ._*

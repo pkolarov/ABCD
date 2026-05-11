@@ -41,10 +41,50 @@ BOOL CIpcPipeClient::Connect(_In_ DWORD timeoutMs)
         return TRUE; // Already connected
     }
 
-    // Wait for the pipe to become available
-    if (!WaitNamedPipeW(IPC_PIPE::PIPE_NAME, timeoutMs))
+    // Wait for the pipe to become available.
+    //
+    // WaitNamedPipeW honours its timeout only when the pipe object exists but
+    // every instance is busy. If the pipe does not exist yet, it returns
+    // immediately with ERROR_FILE_NOT_FOUND — which is exactly the boot-time
+    // race where LogonUI loads the credential provider before the SCM has
+    // finished starting DdsAuthBridge. Poll WaitNamedPipeW until either it
+    // succeeds or the caller's timeout elapses.
+    DWORD err = ERROR_SUCCESS;
+    BOOL  available = FALSE;
     {
-        DWORD err = GetLastError();
+        const ULONGLONG startTick = GetTickCount64();
+        for (;;)
+        {
+            const ULONGLONG elapsed = GetTickCount64() - startTick;
+            if (elapsed >= timeoutMs) { err = ERROR_SEM_TIMEOUT; break; }
+
+            DWORD remaining = (DWORD)(timeoutMs - elapsed);
+            DWORD slice = remaining < 100 ? remaining : 100;
+
+            if (WaitNamedPipeW(IPC_PIPE::PIPE_NAME, slice))
+            {
+                available = TRUE;
+                break;
+            }
+            err = GetLastError();
+            if (err == ERROR_FILE_NOT_FOUND)
+            {
+                // Pipe not yet created — back off and retry within the budget.
+                Sleep(50);
+                continue;
+            }
+            if (err == ERROR_SEM_TIMEOUT)
+            {
+                // Slice expired; loop checks overall deadline.
+                continue;
+            }
+            // Anything else: unrecoverable.
+            break;
+        }
+    }
+
+    if (!available)
+    {
         // Log to C:\Temp for diagnostics (visible after reboot)
         {
             CreateDirectoryA("C:\\Temp", nullptr);

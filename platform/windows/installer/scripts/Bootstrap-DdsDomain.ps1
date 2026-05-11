@@ -75,6 +75,43 @@ $NodeToml   = Join-Path $ConfigDir   "node.toml"
 $AppSettings = Join-Path $ConfigDir  "appsettings.json"
 $NodeData   = Join-Path $DataRoot    "node-data"
 $ProvisionBundle = Join-Path $DataRoot "provision.dds"
+$BootstrapMarkerDir  = Join-Path $DataRoot    "bootstrap"
+$BootstrapMarkerFile = Join-Path $BootstrapMarkerDir ".in-progress.json"
+
+# Emit a machine-parseable step marker the wizard tails for progress.
+# Mirrors the "[N/9] ..." human line so existing eyes still see it.
+function Write-DdsStep {
+    param([int]$Idx, [string]$Slug)
+    Write-Host ("##DDS-STEP## {0}/9 {1}" -f $Idx, $Slug)
+}
+
+# Persist resume state. The wizard offers Resume/Restart on relaunch when
+# this file exists.
+function Write-BootstrapMarker {
+    param([int]$Step, [string]$Slug)
+    try {
+        if (-not (Test-Path $BootstrapMarkerDir)) {
+            New-Item -ItemType Directory -Force -Path $BootstrapMarkerDir | Out-Null
+        }
+        $obj = @{
+            domain_name = $Name
+            org_hash    = $OrgHash
+            step        = $Step
+            slug        = $Slug
+            timestamp   = (Get-Date).ToString('o')
+        }
+        ($obj | ConvertTo-Json -Compress) |
+            Set-Content -Path $BootstrapMarkerFile -Encoding UTF8 -Force
+    } catch { }
+}
+
+function Clear-BootstrapMarker {
+    try {
+        if (Test-Path $BootstrapMarkerFile) {
+            Remove-Item -Force -ErrorAction SilentlyContinue $BootstrapMarkerFile
+        }
+    } catch { }
+}
 
 # Transcript log so even an instant-close window leaves an inspectable record.
 # DdsConsole.ps1 sets DDS_BOOTSTRAP_TRANSCRIPT before launching the bootstrap so
@@ -202,6 +239,8 @@ if ($useFido2) {
 # ── 1. init-domain ─────────────────────────────────────────────────
 Write-Host ""
 Write-Host "[1/9] Creating domain '$Name'..." -ForegroundColor Green
+Write-DdsStep 1 "init-domain"
+Write-BootstrapMarker 1 "init-domain"
 New-Item -ItemType Directory -Force -Path $NodeData | Out-Null
 & $NodeBin init-domain --name $Name --dir $NodeData @fido2Args
 if ($LASTEXITCODE -ne 0) { throw "init-domain failed" }
@@ -218,6 +257,8 @@ Write-Host "  domain_id: $domainId"
 # ── 2. provision bundle ────────────────────────────────────────────
 Write-Host ""
 Write-Host "[2/9] Creating provision bundle for sibling nodes..." -ForegroundColor Green
+Write-DdsStep 2 "create-provision-bundle"
+Write-BootstrapMarker 2 "create-provision-bundle"
 & $NodeBin create-provision-bundle --dir $NodeData --org $OrgHash --out $ProvisionBundle
 if ($LASTEXITCODE -ne 0) { throw "create-provision-bundle failed" }
 Write-Host "  Bundle: $ProvisionBundle"
@@ -240,6 +281,8 @@ Write-Host "  Node identity will be encrypted at rest."
 # ── 3. node identity ───────────────────────────────────────────────
 Write-Host ""
 Write-Host "[3/9] Generating node libp2p identity..." -ForegroundColor Green
+Write-DdsStep 3 "gen-node-key"
+Write-BootstrapMarker 3 "gen-node-key"
 $genOut = & $NodeBin gen-node-key --data-dir $NodeData 2>&1
 $genOut | Tee-Object -FilePath (Join-Path $NodeData "gen-node-key.out")
 $peerId = ($genOut | Select-String -Pattern 'peer_id:\s*(\S+)' | Select-Object -Last 1).Matches.Groups[1].Value
@@ -249,6 +292,8 @@ Write-Host "  peer_id: $peerId"
 # ── 4. self-admit ──────────────────────────────────────────────────
 Write-Host ""
 Write-Host "[4/9] Self-admitting this node..." -ForegroundColor Green
+Write-DdsStep 4 "self-admit"
+Write-BootstrapMarker 4 "self-admit"
 & $NodeBin admit `
     --domain-key (Join-Path $NodeData "domain_key.bin") `
     --domain     (Join-Path $NodeData "domain.toml") `
@@ -260,6 +305,8 @@ if ($LASTEXITCODE -ne 0) { throw "admit failed" }
 # ── 5. node.toml ───────────────────────────────────────────────────
 Write-Host ""
 Write-Host "[5/9] Writing node configuration..." -ForegroundColor Green
+Write-DdsStep 5 "write-node-toml"
+Write-BootstrapMarker 5 "write-node-toml"
 # A-2: dds-node's named-pipe admin gate accepts S-1-5-18 (LocalSystem)
 # automatically and any SID listed in windows_admin_sids. The bootstrap
 # script itself runs as the operator's elevated user (e.g.
@@ -306,6 +353,8 @@ Write-Host "  Written: $NodeToml"
 # ── 6. start dds-node + wait for pipe ──────────────────────────────
 Write-Host ""
 Write-Host "[6/9] Starting DdsNode service..." -ForegroundColor Green
+Write-DdsStep 6 "start-node"
+Write-BootstrapMarker 6 "start-node"
 Start-Service -Name DdsNode
 
 $pipePath = "\\.\pipe\dds-api"
@@ -360,6 +409,8 @@ function Invoke-DdsNodePipe {
 
 Write-Host ""
 Write-Host "[7/9] Enrolling this device via /v1/enroll/device..." -ForegroundColor Green
+Write-DdsStep 7 "enroll-device"
+Write-BootstrapMarker 7 "enroll-device"
 $hostName = $env:COMPUTERNAME
 $deviceId = "DDS-WIN-$($hostName.ToUpper())"
 $osVersion = (Get-CimInstance Win32_OperatingSystem).Version
@@ -385,6 +436,8 @@ if (-not $nodePubkeyB64) { throw "Failed to extract node_pubkey_b64 from /v1/nod
 # ── 8. stamp appsettings.json ──────────────────────────────────────
 Write-Host ""
 Write-Host "[8/9] Stamping appsettings.json with DeviceUrn + PinnedNodePubkeyB64..." -ForegroundColor Green
+Write-DdsStep 8 "stamp-appsettings"
+Write-BootstrapMarker 8 "stamp-appsettings"
 if (-not (Test-Path $AppSettings)) {
     throw "appsettings.json not found at $AppSettings (MSI install incomplete?)"
 }
@@ -423,6 +476,8 @@ if (Test-Path $bridgeKey) {
 # ── 9. start auth bridge + policy agent ────────────────────────────
 Write-Host ""
 Write-Host "[9/9] Starting DdsAuthBridge and DdsPolicyAgent..." -ForegroundColor Green
+Write-DdsStep 9 "start-bridge-policyagent"
+Write-BootstrapMarker 9 "start-bridge-policyagent"
 Start-Service -Name DdsAuthBridge
 Start-Service -Name DdsPolicyAgent
 
@@ -442,6 +497,8 @@ PEER_ID=$peerId
 Remove-Item Env:\DDS_NODE_PASSPHRASE -ErrorAction SilentlyContinue
 
 # ── Summary ────────────────────────────────────────────────────────
+Clear-BootstrapMarker
+
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "  DDS Domain Bootstrap Complete" -ForegroundColor Green

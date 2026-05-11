@@ -16,7 +16,8 @@
 
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{GetLastError, LocalFree, BOOL};
+use windows_sys::core::BOOL;
+use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
 use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE,
 };

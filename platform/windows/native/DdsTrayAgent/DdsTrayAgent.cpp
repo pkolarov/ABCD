@@ -9,6 +9,7 @@
 #include "AdminFlow.h"
 #include "RefreshVaultFlow.h"
 #include "PasswordChangeMonitor.h"
+#include "CredentialVault.h"
 #include "DdsNodeHttpClient.h"
 #include "Configuration.h"
 #include "FileLog.h"
@@ -18,6 +19,8 @@
 #include <commctrl.h>
 #include <wtsapi32.h>
 #include <strsafe.h>
+#include <sddl.h>       // ConvertSidToStringSidW
+#include <vector>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -182,6 +185,136 @@ static void ShowStatus(HWND hwnd)
 }
 
 // ---------------------------------------------------------------------------
+// Onboarding nudge — if this machine is provisioned but the current user
+// has no vault entry, show a balloon notification at most once per day so
+// the user discovers the FIDO2 enrollment wizard. Click → launches
+// DdsConsole.ps1 -Mode EnrollUser.
+//
+// Triggered once shortly after tray startup. The PasswordChangeMonitor's
+// existing 60s poll loop is *not* re-used here — we only want to fire
+// the nudge once per session, not every 60s.
+// ---------------------------------------------------------------------------
+
+static UINT_PTR g_nudgeTimerId = 0;
+static const UINT NUDGE_TIMER_ID = 0x4444;
+
+static bool GetCurrentUserSidW(std::wstring& outSid)
+{
+    HANDLE hToken = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) return false;
+    DWORD len = 0;
+    GetTokenInformation(hToken, TokenUser, NULL, 0, &len);
+    std::vector<BYTE> buf(len);
+    BOOL ok = GetTokenInformation(hToken, TokenUser, buf.data(), len, &len);
+    CloseHandle(hToken);
+    if (!ok) return false;
+    LPWSTR sidStr = NULL;
+    if (!ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid, &sidStr))
+        return false;
+    outSid = sidStr;
+    LocalFree(sidStr);
+    return true;
+}
+
+static bool IsMachineProvisioned()
+{
+    // Cheap check: %ProgramData%\DDS\node-data\domain.toml present.
+    wchar_t pd[MAX_PATH] = {};
+    if (!GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH)) return false;
+    std::wstring p = pd;
+    p += L"\\DDS\\node-data\\domain.toml";
+    return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+static bool ShouldShowNudgeToday()
+{
+    // Persist a yyyymmdd stamp under HKCU\Software\DDS\LastEnrollNudge.
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t today[16];
+    StringCchPrintfW(today, ARRAYSIZE(today), L"%04u%02u%02u",
+                     st.wYear, st.wMonth, st.wDay);
+
+    HKEY hKey = NULL;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\DDS", 0, NULL,
+                        REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE,
+                        NULL, &hKey, NULL) != ERROR_SUCCESS)
+    {
+        return true; // can't read — fail open to nudging once
+    }
+    wchar_t buf[16] = {};
+    DWORD type = 0, cb = sizeof(buf);
+    LONG rc = RegQueryValueExW(hKey, L"LastEnrollNudge", NULL, &type,
+                               reinterpret_cast<LPBYTE>(buf), &cb);
+    bool show = true;
+    if (rc == ERROR_SUCCESS && type == REG_SZ && wcscmp(buf, today) == 0)
+    {
+        show = false;
+    }
+    if (show)
+    {
+        RegSetValueExW(hKey, L"LastEnrollNudge", 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(today),
+                       static_cast<DWORD>((wcslen(today) + 1) * sizeof(wchar_t)));
+    }
+    RegCloseKey(hKey);
+    return show;
+}
+
+static void ShowEnrollNudgeBalloon(HWND hwnd)
+{
+    NOTIFYICONDATAW nid = g_nid;
+    nid.uFlags |= NIF_INFO;
+    StringCchCopyW(nid.szInfoTitle, ARRAYSIZE(nid.szInfoTitle),
+                   L"Set up passwordless sign-in");
+    StringCchCopyW(nid.szInfo, ARRAYSIZE(nid.szInfo),
+                   L"Click here to register a security key for your account.");
+    nid.dwInfoFlags = NIIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    FileLog::Write("DdsTrayAgent: nudge balloon shown\n");
+}
+
+static void LaunchOnboardingWizardEnrollUser()
+{
+    // Locate DdsConsole.ps1 next to ourselves (\Program Files\DDS\bin\).
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    std::wstring binDir(exePath);
+    size_t slash = binDir.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) binDir.resize(slash);
+    std::wstring scriptPath = binDir + L"\\DdsConsole.ps1";
+
+    std::wstring args = L"-NoProfile -ExecutionPolicy Bypass -File \"";
+    args += scriptPath;
+    args += L"\" -Mode EnrollUser";
+
+    SHELLEXECUTEINFOW sei = {};
+    sei.cbSize = sizeof(sei);
+    sei.fMask  = SEE_MASK_NOASYNC;
+    sei.lpVerb = L"open";
+    sei.lpFile = L"powershell.exe";
+    sei.lpParameters = args.c_str();
+    sei.nShow = SW_SHOWNORMAL;
+    ShellExecuteExW(&sei);
+}
+
+static void CheckAndShowEnrollNudge(HWND hwnd)
+{
+    if (!IsMachineProvisioned()) return;
+
+    std::wstring sid;
+    if (!GetCurrentUserSidW(sid)) return;
+
+    CCredentialVault vault;
+    vault.Load();
+    auto entries = vault.FindByUserSid(sid);
+    if (!entries.empty()) return;  // already enrolled
+
+    if (!ShouldShowNudgeToday()) return;
+
+    ShowEnrollNudgeBalloon(hwnd);
+}
+
+// ---------------------------------------------------------------------------
 // Window procedure
 // ---------------------------------------------------------------------------
 
@@ -197,6 +330,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         else if (LOWORD(lParam) == WM_LBUTTONDBLCLK)
         {
             ShowStatus(hwnd);
+        }
+        else if (LOWORD(lParam) == /*NIN_BALLOONUSERCLICK*/ (WM_USER + 5))
+        {
+            // Click on the "Set up passwordless sign-in" balloon → wizard.
+            LaunchOnboardingWizardEnrollUser();
         }
         return 0;
 
@@ -243,6 +381,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_TIMER:
+        if (wParam == NUDGE_TIMER_ID)
+        {
+            // One-shot: kill the timer immediately, then probe.
+            KillTimer(hwnd, NUDGE_TIMER_ID);
+            g_nudgeTimerId = 0;
+            CheckAndShowEnrollNudge(hwnd);
+            return 0;
+        }
         if (PasswordChangeMonitor::HandleTimer(hwnd, wParam))
             return 0;
         break;
@@ -328,6 +474,12 @@ int APIENTRY wWinMain(
     // The autostart Run-key launches us with --minimized at logon; either
     // way the monitor is what we need running in the background.
     PasswordChangeMonitor::Start(g_hWnd);
+
+    // Arm the one-shot onboarding-nudge probe ~30s after startup. The delay
+    // is intentional: at logon the dds-node service may still be coming up
+    // and the user is likely focused on something else — we wait until the
+    // session has settled before showing the balloon.
+    g_nudgeTimerId = SetTimer(g_hWnd, NUDGE_TIMER_ID, 30 * 1000, NULL);
 
     FileLog::Write("DdsTrayAgent: tray icon added, entering message loop\n");
 

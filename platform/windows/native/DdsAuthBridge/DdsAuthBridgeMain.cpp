@@ -18,9 +18,108 @@
 #include <lm.h>          // NetGetJoinInformation
 #include <sddl.h>        // ConvertStringSidToSidW
 #include <bcrypt.h>       // BCryptGenRandom for challenge
+#include <winsvc.h>       // OpenSCManager / StartService for NgcSvc kick
 #pragma comment(lib, "netapi32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "bcrypt.lib")
+
+// Make sure NgcSvc (Microsoft Passport) is running. WebAuthn on the secure
+// desktop DCOM-activates a UI broker that depends on this service; with
+// NgcSvc stopped, WebAuthNAuthenticatorGetAssertion fails immediately with
+// CO_E_RUNAS_LOGON_FAILURE (0x8000401A) and the FIDO2 tile never reaches
+// the security key. NgcSvc ships StartType=Manual and is otherwise only
+// started on demand once a user session uses Hello — never from LogonUI.
+//
+// The WiX install also declares NgcSvc as a SCM dependency of this service,
+// which handles new installs; this runtime call covers already-installed
+// machines and the "service was stopped manually" recovery path.
+static void EnsureNgcSvcRunning()
+{
+    SC_HANDLE hScm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!hScm)
+    {
+        FileLog::Writef("DdsAuthBridge: EnsureNgcSvcRunning: OpenSCManager "
+                        "failed gle=%lu\n", GetLastError());
+        return;
+    }
+
+    SC_HANDLE hSvc = OpenServiceW(hScm, L"NgcSvc",
+                                  SERVICE_QUERY_STATUS | SERVICE_START);
+    if (!hSvc)
+    {
+        FileLog::Writef("DdsAuthBridge: EnsureNgcSvcRunning: OpenService "
+                        "NgcSvc failed gle=%lu (service not present?)\n",
+                        GetLastError());
+        CloseServiceHandle(hScm);
+        return;
+    }
+
+    SERVICE_STATUS_PROCESS ssp{};
+    DWORD cbNeeded = 0;
+    if (QueryServiceStatusEx(hSvc, SC_STATUS_PROCESS_INFO,
+                             reinterpret_cast<BYTE*>(&ssp), sizeof(ssp),
+                             &cbNeeded))
+    {
+        if (ssp.dwCurrentState == SERVICE_RUNNING)
+        {
+            FileLog::Write("DdsAuthBridge: EnsureNgcSvcRunning: NgcSvc "
+                           "already running\n");
+            CloseServiceHandle(hSvc);
+            CloseServiceHandle(hScm);
+            return;
+        }
+        FileLog::Writef("DdsAuthBridge: EnsureNgcSvcRunning: NgcSvc state=%lu "
+                        "— starting\n", (unsigned long)ssp.dwCurrentState);
+    }
+
+    if (!StartServiceW(hSvc, 0, nullptr))
+    {
+        DWORD gle = GetLastError();
+        // Treat already-running as success — race with another caller.
+        if (gle == ERROR_SERVICE_ALREADY_RUNNING)
+        {
+            FileLog::Write("DdsAuthBridge: EnsureNgcSvcRunning: NgcSvc "
+                           "already running (race)\n");
+        }
+        else
+        {
+            FileLog::Writef("DdsAuthBridge: EnsureNgcSvcRunning: StartService "
+                            "NgcSvc failed gle=%lu\n", gle);
+        }
+        CloseServiceHandle(hSvc);
+        CloseServiceHandle(hScm);
+        return;
+    }
+
+    // Poll until SERVICE_RUNNING or a short deadline. We don't block the
+    // bridge's own startup on this — if NgcSvc takes too long, the WebAuthn
+    // call will surface its own error on the next tile click.
+    const DWORD start = GetTickCount();
+    const DWORD deadline = start + 5000;
+    while (GetTickCount() < deadline)
+    {
+        if (QueryServiceStatusEx(hSvc, SC_STATUS_PROCESS_INFO,
+                                 reinterpret_cast<BYTE*>(&ssp), sizeof(ssp),
+                                 &cbNeeded) &&
+            ssp.dwCurrentState == SERVICE_RUNNING)
+        {
+            FileLog::Writef("DdsAuthBridge: EnsureNgcSvcRunning: NgcSvc "
+                            "RUNNING after %lu ms\n",
+                            (unsigned long)(GetTickCount() - start));
+            break;
+        }
+        Sleep(100);
+    }
+    if (ssp.dwCurrentState != SERVICE_RUNNING)
+    {
+        FileLog::Writef("DdsAuthBridge: EnsureNgcSvcRunning: NgcSvc did not "
+                        "reach RUNNING within 5s (state=%lu) — proceeding\n",
+                        (unsigned long)ssp.dwCurrentState);
+    }
+
+    CloseServiceHandle(hSvc);
+    CloseServiceHandle(hScm);
+}
 
 // Base64url encode (no padding) for dds-node JSON
 static std::string Base64UrlEncode(const uint8_t* data, size_t len)
@@ -357,6 +456,12 @@ BOOL CDdsAuthBridgeMain::Initialize(_In_ HANDLE hStopEvent)
     // subsystem routes its diagnostics through it.
     FileLog::Init();
     FileLog::Write("DdsAuthBridge: Initialize() begin\n");
+
+    // Kick NgcSvc before anything else — see EnsureNgcSvcRunning() for the
+    // full rationale. The WiX install declares NgcSvc as a SCM dependency
+    // so this is a no-op on clean install boots, but the runtime call
+    // covers already-installed machines and operator-stopped recovery.
+    EnsureNgcSvcRunning();
 
     // Load configuration from registry
     m_config.Load();
@@ -818,14 +923,28 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
 {
     FileLog::Writef("DdsStartAuth: seqId=%u payloadLen=%lu\n", seqId, payloadLen);
 
-    // Check for existing auth operation
+    // Stale-auth supersede: if a previous auth is still in flight (the
+    // CP gave up on its short timeout while our worker is still waiting
+    // for AUTH_RESPONSE), cancel the old worker so the new request can
+    // proceed instead of returning DEVICE_BUSY. Without this, every
+    // retry within the bridge's AUTH_TIMEOUT_MS window failed with
+    // "Another authentication is in progress" — see DDS-#cp-stuck-auth.
+    //
+    // Old client context is already gone (its pipe call timed out and
+    // disconnected), so we don't need to send an error back to it.
     EnterCriticalSection(&m_csAuth);
     if (m_activeAuth.hThread != NULL)
     {
+        FileLog::Write("DdsStartAuth: cancelling stuck previous auth so new request can run\n");
+        m_activeAuth.cancelled = TRUE;
+        SetEvent(m_activeAuth.hResponseEvent); // wake the worker so it observes cancelled=TRUE
+        HANDLE oldThread = m_activeAuth.hThread;
+        m_activeAuth.hThread = NULL; // claim the slot; worker will not double-close
+
         LeaveCriticalSection(&m_csAuth);
-        SendAuthError(pClientCtx, seqId, IPC_ERROR::DEVICE_BUSY,
-            L"Another authentication is in progress");
-        return TRUE;
+        WaitForSingleObject(oldThread, 5000);
+        CloseHandle(oldThread);
+        EnterCriticalSection(&m_csAuth);
     }
 
     // Extract DDS-specific fields from the IPC_REQ_DDS_START_AUTH payload.
@@ -1183,6 +1302,12 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     if (pOp->cancelled)
     {
         FileLog::Write("DdsAuth.worker: cancelled by client\n");
+        // Tell the original client (CP) so its blocking AuthenticateDds()
+        // call returns immediately. Without this the CP would still wait
+        // for DDS_AUTH_COMPLETE for its own timeout, freezing the LogonUI
+        // even though the bridge has already given up.
+        SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::USER_CANCELLED,
+            L"Authentication cancelled");
         return;
     }
 
@@ -1252,6 +1377,12 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     if (pOp->cancelled)
     {
         FileLog::Write("DdsAuth.worker: cancelled by client\n");
+        // Tell the original client (CP) so its blocking AuthenticateDds()
+        // call returns immediately. Without this the CP would still wait
+        // for DDS_AUTH_COMPLETE for its own timeout, freezing the LogonUI
+        // even though the bridge has already given up.
+        SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::USER_CANCELLED,
+            L"Authentication cancelled");
         return;
     }
 
@@ -1691,7 +1822,13 @@ BOOL CDdsAuthBridgeMain::HandleCancelAuth(
     if (m_activeAuth.hThread != NULL)
     {
         m_activeAuth.cancelled = TRUE;
-        FileLog::Write("CancelAuth: cancellation flag set\n");
+        // Wake the worker immediately — without this, the worker stays
+        // blocked in WaitForSingleObject(hResponseEvent, AUTH_TIMEOUT_MS)
+        // until the full 60s timeout fires, which freezes the LogonUI
+        // when the user presses Esc in the WebAuthn dialog.
+        if (m_activeAuth.hResponseEvent != NULL)
+            SetEvent(m_activeAuth.hResponseEvent);
+        FileLog::Write("CancelAuth: cancellation flag set, worker signalled\n");
     }
     else
     {
