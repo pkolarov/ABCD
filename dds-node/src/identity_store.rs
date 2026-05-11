@@ -547,12 +547,15 @@ pub fn load_with_passphrase(
             k
         }
         Some(v) if v == VERSION_ENCRYPTED as i64 || v == VERSION_ENCRYPTED_V3 as i64 => {
-            let pass = Zeroizing::new(pass.ok_or_else(|| {
-                IdentityStoreError::Crypto(format!(
-                    "identity is encrypted but no passphrase was supplied \
+            let pass = Zeroizing::new(
+                pass.ok_or_else(|| {
+                    IdentityStoreError::Crypto(format!(
+                        "identity is encrypted but no passphrase was supplied \
                      (set {PASSPHRASE_ENV} or use DDS_NODE_PASSPHRASE_OLD)"
-                ))
-            })?.to_owned());
+                    ))
+                })?
+                .to_owned(),
+            );
             let salt = salt.ok_or_else(|| IdentityStoreError::Format("missing salt".into()))?;
             let nonce = nonce.ok_or_else(|| IdentityStoreError::Format("missing nonce".into()))?;
             let params = if v == VERSION_ENCRYPTED as i64 {
@@ -564,7 +567,11 @@ pub fn load_with_passphrase(
                     .ok_or_else(|| IdentityStoreError::Format("v=3 missing t_cost".into()))?;
                 let p = p_cost
                     .ok_or_else(|| IdentityStoreError::Format("v=3 missing p_cost".into()))?;
-                KdfParams { m_cost_kib: m, t_cost: t, p_cost: p }
+                KdfParams {
+                    m_cost_kib: m,
+                    t_cost: t,
+                    p_cost: p,
+                }
             };
             let mut key = derive_key(pass.as_bytes(), &salt, params)?;
             let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
@@ -574,7 +581,9 @@ pub fn load_with_passphrase(
             key.zeroize();
             if pt.len() != 32 {
                 pt.zeroize();
-                return Err(IdentityStoreError::Format("decrypted key wrong length".into()));
+                return Err(IdentityStoreError::Format(
+                    "decrypted key wrong length".into(),
+                ));
             }
             let mut k = [0u8; 32];
             k.copy_from_slice(&pt);
@@ -883,5 +892,4 @@ mod tests {
         unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
         assert!(!require_encrypted_keys(), "unset must be falsy");
     }
-
 }

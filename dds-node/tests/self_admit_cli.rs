@@ -23,7 +23,13 @@ fn run_capture(cmd: &mut Command) -> (bool, String, String) {
 
 fn init_hybrid_domain(dir: &std::path::Path) {
     let status = dds_node_bin()
-        .args(["init-domain", "--name", "test.local", "--dir", dir.to_str().unwrap()])
+        .args([
+            "init-domain",
+            "--name",
+            "test.local",
+            "--dir",
+            dir.to_str().unwrap(),
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -68,12 +74,12 @@ fn self_admit_hybrid_domain_success() {
     init_hybrid_domain(dir);
     gen_node_key(dir);
 
-    let (ok, stdout, stderr) = run_capture(dds_node_bin().args([
-        "self-admit",
-        "--data-dir",
-        dir.to_str().unwrap(),
-    ]));
-    assert!(ok, "self-admit should succeed on hybrid domain; stderr={stderr}");
+    let (ok, stdout, stderr) =
+        run_capture(dds_node_bin().args(["self-admit", "--data-dir", dir.to_str().unwrap()]));
+    assert!(
+        ok,
+        "self-admit should succeed on hybrid domain; stderr={stderr}"
+    );
 
     assert!(
         dir.join("admission.cbor").exists(),
@@ -100,12 +106,12 @@ fn self_admit_legacy_domain_success() {
     init_legacy_domain(dir);
     gen_node_key(dir);
 
-    let (ok, stdout, stderr) = run_capture(dds_node_bin().args([
-        "self-admit",
-        "--data-dir",
-        dir.to_str().unwrap(),
-    ]));
-    assert!(ok, "self-admit should succeed on legacy domain; stderr={stderr}");
+    let (ok, stdout, stderr) =
+        run_capture(dds_node_bin().args(["self-admit", "--data-dir", dir.to_str().unwrap()]));
+    assert!(
+        ok,
+        "self-admit should succeed on legacy domain; stderr={stderr}"
+    );
     assert!(
         dir.join("admission.cbor").exists(),
         "admission.cbor must be written"
@@ -126,19 +132,13 @@ fn self_admit_refuses_to_overwrite_without_force() {
     gen_node_key(dir);
 
     // First run — succeeds.
-    let (ok, _, stderr) = run_capture(dds_node_bin().args([
-        "self-admit",
-        "--data-dir",
-        dir.to_str().unwrap(),
-    ]));
+    let (ok, _, stderr) =
+        run_capture(dds_node_bin().args(["self-admit", "--data-dir", dir.to_str().unwrap()]));
     assert!(ok, "first self-admit should succeed; stderr={stderr}");
 
     // Second run without --force — must fail.
-    let (ok, _, stderr) = run_capture(dds_node_bin().args([
-        "self-admit",
-        "--data-dir",
-        dir.to_str().unwrap(),
-    ]));
+    let (ok, _, stderr) =
+        run_capture(dds_node_bin().args(["self-admit", "--data-dir", dir.to_str().unwrap()]));
     assert!(!ok, "second self-admit without --force must fail");
     assert!(
         stderr.contains("--force"),
@@ -156,11 +156,8 @@ fn self_admit_force_overwrites_existing_cert() {
     gen_node_key(dir);
 
     // First run.
-    let (ok, _, _) = run_capture(dds_node_bin().args([
-        "self-admit",
-        "--data-dir",
-        dir.to_str().unwrap(),
-    ]));
+    let (ok, _, _) =
+        run_capture(dds_node_bin().args(["self-admit", "--data-dir", dir.to_str().unwrap()]));
     assert!(ok);
 
     // Second run with --force.
@@ -186,11 +183,8 @@ fn self_admit_fails_without_p2p_key() {
     init_hybrid_domain(dir);
     // Deliberately skip gen-node-key.
 
-    let (ok, _, stderr) = run_capture(dds_node_bin().args([
-        "self-admit",
-        "--data-dir",
-        dir.to_str().unwrap(),
-    ]));
+    let (ok, _, stderr) =
+        run_capture(dds_node_bin().args(["self-admit", "--data-dir", dir.to_str().unwrap()]));
     assert!(!ok, "self-admit without p2p key must fail");
     assert!(
         stderr.contains("gen-node-key"),
@@ -211,12 +205,12 @@ fn self_admit_warns_on_hybrid_domain_without_epoch_keys() {
     // Remove epoch_keys.cbor to simulate the missing-KEM scenario.
     std::fs::remove_file(dir.join("epoch_keys.cbor")).unwrap();
 
-    let (ok, stdout, stderr) = run_capture(dds_node_bin().args([
-        "self-admit",
-        "--data-dir",
-        dir.to_str().unwrap(),
-    ]));
-    assert!(ok, "self-admit should still succeed without epoch_keys; stderr={stderr}");
+    let (ok, stdout, stderr) =
+        run_capture(dds_node_bin().args(["self-admit", "--data-dir", dir.to_str().unwrap()]));
+    assert!(
+        ok,
+        "self-admit should still succeed without epoch_keys; stderr={stderr}"
+    );
     assert!(
         stderr.contains("WARNING"),
         "should print a warning to stderr; got:\n{stderr}"

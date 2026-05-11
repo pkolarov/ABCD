@@ -16,11 +16,11 @@
 
 use std::ptr;
 
-use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
 use windows_sys::Win32::Security::Cryptography::{
-    CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE,
+    CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CryptProtectData, CryptUnprotectData,
 };
+use windows_sys::core::BOOL;
 use zeroize::Zeroizing;
 
 /// Seal `plaintext` with DPAPI machine scope. Returns the opaque ciphertext
@@ -37,10 +37,10 @@ pub fn seal(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let ok: BOOL = unsafe {
         CryptProtectData(
             &mut input as *mut _,
-            ptr::null(),      // description — optional
-            ptr::null_mut(),  // optional entropy
-            ptr::null_mut(),  // reserved
-            ptr::null_mut(),  // prompt struct
+            ptr::null(),     // description — optional
+            ptr::null_mut(), // optional entropy
+            ptr::null_mut(), // reserved
+            ptr::null_mut(), // prompt struct
             CRYPTPROTECT_LOCAL_MACHINE,
             &mut output as *mut _,
         )
@@ -72,10 +72,10 @@ pub fn unseal(ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     let ok: BOOL = unsafe {
         CryptUnprotectData(
             &mut input as *mut _,
-            ptr::null_mut(),  // description out — not needed
-            ptr::null_mut(),  // optional entropy
-            ptr::null_mut(),  // reserved
-            ptr::null_mut(),  // prompt struct
+            ptr::null_mut(), // description out — not needed
+            ptr::null_mut(), // optional entropy
+            ptr::null_mut(), // reserved
+            ptr::null_mut(), // prompt struct
             CRYPTPROTECT_LOCAL_MACHINE,
             &mut output as *mut _,
         )

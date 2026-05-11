@@ -104,9 +104,7 @@ fn try_unseal_passphrase_from_args(args: &[String]) -> Result<(), Box<dyn std::e
             );
         }
         Err(e) => {
-            return Err(
-                format!("failed to read sealed passphrase from {blob_path:?}: {e}").into(),
-            );
+            return Err(format!("failed to read sealed passphrase from {blob_path:?}: {e}").into());
         }
     }
     Ok(())
@@ -260,7 +258,10 @@ mod tests {
     fn strip_unseal_flag_handles_flag_at_end_with_no_value() {
         // Malformed invocation: flag present but no following value.
         // Should remove only the flag itself and not panic.
-        let args = vec!["--config".to_string(), "--unseal-passphrase-from".to_string()];
+        let args = vec![
+            "--config".to_string(),
+            "--unseal-passphrase-from".to_string(),
+        ];
         let stripped = strip_unseal_flag(args);
         assert_eq!(stripped, vec!["--config"]);
     }
@@ -273,7 +274,10 @@ mod tests {
             "--unseal-passphrase-from".to_string(),
             "blob.dpapi".to_string(),
         ];
-        assert_eq!(flag_value(&args, "--unseal-passphrase-from"), Some("blob.dpapi"));
+        assert_eq!(
+            flag_value(&args, "--unseal-passphrase-from"),
+            Some("blob.dpapi")
+        );
     }
 
     #[test]

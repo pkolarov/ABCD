@@ -28,7 +28,7 @@ const PAM_USER: c_int = 2;
 // so that the build succeeds without a compile-time dependency on
 // `libpam-dev`; the dynamic linker resolves them at load time.
 
-extern "C" {
+unsafe extern "C" {
     fn pam_get_item(pamh: *const PamHandle, item_type: c_int, item: *mut *const c_void) -> c_int;
 }
 
@@ -81,7 +81,7 @@ unsafe fn collect_pam_args(argc: c_int, argv: *const *const c_char) -> Vec<Strin
 /// 3. Invoke the helper with `--node-sock` and `--user` arguments.
 /// 4. Parse the helper's stdout as [`HelperOutcome`] JSON.
 /// 5. Return `PAM_SUCCESS` when `ok == true`, `PAM_AUTH_ERR` otherwise.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pam_sm_authenticate(
     pamh: *mut PamHandle,
     _flags: c_int,
@@ -125,7 +125,7 @@ pub extern "C" fn pam_sm_authenticate(
 ///
 /// DDS sessions are managed by `dds-node`; no additional credential
 /// material needs to be placed in the PAM environment by this module.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pam_sm_setcred(
     _pamh: *mut PamHandle,
     _flags: c_int,
@@ -141,7 +141,7 @@ pub extern "C" fn pam_sm_setcred(
 /// The DDS policy is evaluated at session-assertion time inside `dds-node`.
 /// Account-management checks are therefore deferred to that evaluation; this
 /// stub returns `PAM_SUCCESS` so the PAM stack continues normally.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pam_sm_acct_mgmt(
     _pamh: *mut PamHandle,
     _flags: c_int,

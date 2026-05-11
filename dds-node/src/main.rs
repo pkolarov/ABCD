@@ -128,9 +128,9 @@ use dds_node::provision;
 use dds_node::service::LocalService;
 
 #[cfg(windows)]
-mod win_service;
-#[cfg(windows)]
 mod win_dpapi;
+#[cfg(windows)]
+mod win_service;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -380,7 +380,12 @@ fn cmd_self_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let domain_key_path = PathBuf::from(
         flag(args, "--domain-key")
             .map(|s| s.to_string())
-            .unwrap_or_else(|| data_dir.join("domain_key.bin").to_string_lossy().into_owned()),
+            .unwrap_or_else(|| {
+                data_dir
+                    .join("domain_key.bin")
+                    .to_string_lossy()
+                    .into_owned()
+            }),
     );
     let domain_path = PathBuf::from(
         flag(args, "--domain")
@@ -445,8 +450,7 @@ fn cmd_self_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
     let expires_at = ttl_days.map(|d| now + d * 86_400);
-    let cert =
-        key.issue_admission_with_kem(peer_id.to_string(), now, expires_at, kem_pubkey_bytes);
+    let cert = key.issue_admission_with_kem(peer_id.to_string(), now, expires_at, kem_pubkey_bytes);
     domain_store::save_admission_cert(&out, &cert)?;
 
     println!("Self-admission cert issued:");
@@ -493,11 +497,7 @@ fn cmd_rewrap_identity(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     let no_backup = args.iter().any(|a| a == "--no-backup");
 
     if !data_dir.exists() {
-        return Err(format!(
-            "data_dir {} does not exist",
-            data_dir.display()
-        )
-        .into());
+        return Err(format!("data_dir {} does not exist", data_dir.display()).into());
     }
 
     let node_path = data_dir.join("node_key.bin");
@@ -555,21 +555,26 @@ fn cmd_rewrap_identity(args: &[String]) -> Result<(), Box<dyn std::error::Error>
 
     // Optionally back up the originals before overwriting.
     if !no_backup {
-        for (src, dst_name) in [(&node_path, "node_key.bin.bak"), (&p2p_path, "p2p_key.bin.bak")] {
+        for (src, dst_name) in [
+            (&node_path, "node_key.bin.bak"),
+            (&p2p_path, "p2p_key.bin.bak"),
+        ] {
             let dst = data_dir.join(dst_name);
             std::fs::copy(src, &dst).map_err(|e| {
-                format!("failed to back up {} to {}: {e}", src.display(), dst.display())
+                format!(
+                    "failed to back up {} to {}: {e}",
+                    src.display(),
+                    dst.display()
+                )
             })?;
         }
     }
 
     // Save both keys. DDS_NODE_PASSPHRASE is the new target — save() reads it.
-    identity_store::save(&node_path, &ident).map_err(|e| {
-        format!("failed to save node_key.bin: {e}")
-    })?;
-    p2p_identity::save(&p2p_path, &p2p_kp).map_err(|e| {
-        format!("failed to save p2p_key.bin: {e}")
-    })?;
+    identity_store::save(&node_path, &ident)
+        .map_err(|e| format!("failed to save node_key.bin: {e}"))?;
+    p2p_identity::save(&p2p_path, &p2p_kp)
+        .map_err(|e| format!("failed to save p2p_key.bin: {e}"))?;
 
     let enc = new_pass.as_deref().unwrap_or("").is_empty();
     println!("rewrap-identity complete:");
@@ -577,7 +582,11 @@ fn cmd_rewrap_identity(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     println!("  peer_id:      {peer_id}  (unchanged)");
     println!(
         "  encryption:   {}",
-        if enc { "PLAINTEXT (DDS_NODE_PASSPHRASE not set)" } else { "encrypted (v=3 Argon2id)" }
+        if enc {
+            "PLAINTEXT (DDS_NODE_PASSPHRASE not set)"
+        } else {
+            "encrypted (v=3 Argon2id)"
+        }
     );
     if !no_backup {
         println!("  backups:      node_key.bin.bak, p2p_key.bin.bak");
@@ -1587,8 +1596,8 @@ fn cmd_seal_passphrase(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     let passphrase = hex::encode(raw);
 
     // DPAPI-seal the passphrase bytes.
-    let blob = win_dpapi::seal(passphrase.as_bytes())
-        .map_err(|e| format!("DPAPI seal failed: {e}"))?;
+    let blob =
+        win_dpapi::seal(passphrase.as_bytes()).map_err(|e| format!("DPAPI seal failed: {e}"))?;
 
     // Create the directory if needed (e.g. %ProgramData%\DDS may not exist).
     if let Some(parent) = out_path.parent() {

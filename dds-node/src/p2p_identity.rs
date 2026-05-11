@@ -377,10 +377,7 @@ pub fn load(path: &Path) -> Result<Keypair, P2pIdentityError> {
 /// `rewrap-identity` to load a key encrypted under an *old* passphrase
 /// before re-saving it under a new one.  M-10 lazy-rewrap is skipped
 /// intentionally — the caller will call [`save`] immediately after.
-pub fn load_with_passphrase(
-    path: &Path,
-    pass: Option<&str>,
-) -> Result<Keypair, P2pIdentityError> {
+pub fn load_with_passphrase(path: &Path, pass: Option<&str>) -> Result<Keypair, P2pIdentityError> {
     let bytes = read_no_follow(path).map_err(|e| P2pIdentityError::Io(e.to_string()))?;
     let value: CborValue =
         ciborium::from_reader(&bytes[..]).map_err(|e| P2pIdentityError::Cbor(e.to_string()))?;
@@ -414,24 +411,31 @@ pub fn load_with_passphrase(
     let mut proto = match version {
         Some(v) if v == VERSION_PLAIN as i64 => key_field,
         Some(v) if v == VERSION_ENCRYPTED as i64 || v == VERSION_ENCRYPTED_V3 as i64 => {
-            let pass = Zeroizing::new(pass.ok_or_else(|| {
-                P2pIdentityError::Crypto(format!(
-                    "p2p key is encrypted but no passphrase was supplied \
+            let pass = Zeroizing::new(
+                pass.ok_or_else(|| {
+                    P2pIdentityError::Crypto(format!(
+                        "p2p key is encrypted but no passphrase was supplied \
                      (set {PASSPHRASE_ENV} or use DDS_NODE_PASSPHRASE_OLD)"
-                ))
-            })?.to_owned());
+                    ))
+                })?
+                .to_owned(),
+            );
             let salt = salt.ok_or_else(|| P2pIdentityError::Format("missing salt".into()))?;
             let nonce = nonce.ok_or_else(|| P2pIdentityError::Format("missing nonce".into()))?;
             let params = if v == VERSION_ENCRYPTED as i64 {
                 KdfParams::V2
             } else {
-                let m = m_cost
-                    .ok_or_else(|| P2pIdentityError::Format("v=3 missing m_cost".into()))?;
-                let t = t_cost
-                    .ok_or_else(|| P2pIdentityError::Format("v=3 missing t_cost".into()))?;
-                let p = p_cost
-                    .ok_or_else(|| P2pIdentityError::Format("v=3 missing p_cost".into()))?;
-                KdfParams { m_cost_kib: m, t_cost: t, p_cost: p }
+                let m =
+                    m_cost.ok_or_else(|| P2pIdentityError::Format("v=3 missing m_cost".into()))?;
+                let t =
+                    t_cost.ok_or_else(|| P2pIdentityError::Format("v=3 missing t_cost".into()))?;
+                let p =
+                    p_cost.ok_or_else(|| P2pIdentityError::Format("v=3 missing p_cost".into()))?;
+                KdfParams {
+                    m_cost_kib: m,
+                    t_cost: t,
+                    p_cost: p,
+                }
             };
             let mut key = derive_key(pass.as_bytes(), &salt, params)?;
             let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
