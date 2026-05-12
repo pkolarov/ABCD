@@ -39,9 +39,13 @@ jobs:
   build-msi:
     name: MSI (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    # ARM64 runs natively on GitHub's hosted windows-11-arm runner (GA 2025).
-    # Native build avoids the ring-crate cross-compile pain that previously
-    # forced local-only ARM64 MSI production via Build-Msi.ps1 -Platform arm64.
+    # ARM64 is intentionally NOT in the auto matrix: the windows-11-arm
+    # hosted runner was unreliable in practice (failures there blocked
+    # downstream jobs and prevented x64 artifacts from reaching the
+    # GitHub Release). ARM64 MSIs continue to be produced locally via
+    # `Build-Msi.ps1 -Platform arm64`. To re-enable when the runner is
+    # stable, re-add the arch: arm64 / runner: windows-11-arm entry to
+    # the matrix below — every step is already parameterized for it.
     strategy:
       fail-fast: false
       matrix:
@@ -52,12 +56,6 @@ jobs:
             msbuild_platform: x64
             dotnet_rid: win-x64
             native_build_dir: platform\windows\native\build\Release
-          - arch: arm64
-            runner: windows-11-arm
-            rust_target: aarch64-pc-windows-msvc
-            msbuild_platform: ARM64
-            dotnet_rid: win-arm64
-            native_build_dir: platform\windows\native\build\Release-ARM64
     steps:
       - uses: actions/checkout@v4
 
