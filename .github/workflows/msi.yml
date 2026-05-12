@@ -28,24 +28,36 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'MSI version (e.g. 1.0.0.0)'
+        description: 'MSI version (e.g. 1.1.8.0)'
         required: false
-        default: '1.0.0.0'
+        default: '1.1.8.0'
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build-msi:
-    name: MSI (x64)
-    runs-on: windows-latest
-    # NOTE: ARM64 MSI is built locally via Build-Msi.ps1 -Platform arm64
-    # GitHub does not offer hosted Windows ARM64 runners; cross-compiling
-    # the ring crate from x64→ARM64 is unreliable. Add an ARM64 matrix
-    # entry here once a self-hosted ARM64 runner is available.
-    outputs:
-      hashes: ${{ steps.hash.outputs.hashes }}
-
+    name: MSI (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    # ARM64 runs natively on GitHub's hosted windows-11-arm runner (GA 2025).
+    # Native build avoids the ring-crate cross-compile pain that previously
+    # forced local-only ARM64 MSI production via Build-Msi.ps1 -Platform arm64.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            msbuild_platform: x64
+            dotnet_rid: win-x64
+            native_build_dir: platform\windows\native\build\Release
+          - arch: arm64
+            runner: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+            msbuild_platform: ARM64
+            dotnet_rid: win-arm64
+            native_build_dir: platform\windows\native\build\Release-ARM64
     steps:
       - uses: actions/checkout@v4
 
@@ -57,7 +69,7 @@ jobs:
           if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.version }}" -ne "") {
             $v = "${{ inputs.version }}"
           } elseif ("${{ github.ref_type }}" -eq "tag") {
-            # Strip leading 'v' from tag: v1.2.3 -> 1.2.3.0
+            # Strip leading 'v' from tag and pad to 4 parts: v1.1.8 -> 1.1.8.0, v1.1.8.5 -> 1.1.8.5
             $tag = "${{ github.ref_name }}" -replace '^v', ''
             $parts = $tag -split '\.'
             while ($parts.Count -lt 4) { $parts += '0' }
@@ -71,24 +83,24 @@ jobs:
       # ── Rust ─────────────────────────────────────────────────────
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.rust_target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: msi-x64
+          key: msi-${{ matrix.arch }}
 
-      - name: Build dds-node (x86_64-pc-windows-msvc)
-        run: cargo build --package dds-node --target x86_64-pc-windows-msvc --release
+      - name: Build dds-node (${{ matrix.rust_target }})
+        run: cargo build --package dds-node --target ${{ matrix.rust_target }} --release
 
       # ── C++ native ──────────────────────────────────────────────
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
-      - name: Build C++ native (x64)
+      - name: Build C++ native (${{ matrix.msbuild_platform }})
         run: >
           msbuild platform\windows\native\DdsNative.sln
           /p:Configuration=Release
-          /p:Platform=x64
+          /p:Platform=${{ matrix.msbuild_platform }}
           /m
           /verbosity:minimal
 
@@ -97,11 +109,11 @@ jobs:
         with:
           dotnet-version: '9.0.x'
 
-      - name: Publish DdsPolicyAgent (win-x64)
+      - name: Publish DdsPolicyAgent (${{ matrix.dotnet_rid }})
         run: >
           dotnet publish platform\windows\DdsPolicyAgent\DdsPolicyAgent.csproj
           --configuration Release
-          --runtime win-x64
+          --runtime ${{ matrix.dotnet_rid }}
           --self-contained true
           --framework net9.0
           -p:PublishSingleFile=true
@@ -112,14 +124,14 @@ jobs:
       - name: Stage binaries
         shell: pwsh
         run: |
-          $stage = "stage\x64"
+          $stage = "stage\${{ matrix.arch }}"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
           # Rust
-          Copy-Item "target\x86_64-pc-windows-msvc\release\dds-node.exe" $stage
+          Copy-Item "target\${{ matrix.rust_target }}\release\dds-node.exe" $stage
 
           # C++ native
-          $nativeBuild = "platform\windows\native\build\Release"
+          $nativeBuild = "${{ matrix.native_build_dir }}"
           @("DdsAuthBridge.exe", "DdsCredentialProvider.dll", "DdsTrayAgent.exe", "dds-enroll-user.exe") | ForEach-Object {
             $src = Join-Path $nativeBuild $_
             if (Test-Path $src) { Copy-Item $src $stage }
@@ -141,18 +153,18 @@ jobs:
       - name: Install WiX
         run: dotnet tool install --global wix --version 5.0.2
 
-      - name: Build MSI (x64)
+      - name: Build MSI (${{ matrix.arch }})
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path out -Force | Out-Null
-          $msiName = "DDS-${{ steps.version.outputs.version }}-x64.msi"
+          $msiName = "DDS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.msi"
           wix build platform\windows\installer\DdsBundle.wxs `
             -o "out\$msiName" `
-            -d BuildDir="stage\x64" `
+            -d BuildDir="stage\${{ matrix.arch }}" `
             -d ConfigDir="platform\windows\installer\config" `
-            -d Platform="x64" `
+            -d Platform="${{ matrix.arch }}" `
             -d Version="${{ steps.version.outputs.version }}" `
-            -arch x64
+            -arch ${{ matrix.arch }}
           Write-Host "Built: out\$msiName"
           Get-ChildItem out\*.msi | Format-Table Name, @{N='Size (MB)';E={[math]::Round($_.Length/1MB,1)}}
 
@@ -171,12 +183,12 @@ jobs:
 
           # Sign each binary and the MSI
           $filesToSign = @(
-            "stage\x64\dds-node.exe",
-            "stage\x64\DdsAuthBridge.exe",
-            "stage\x64\DdsCredentialProvider.dll",
-            "stage\x64\DdsPolicyAgent.exe",
-            "stage\x64\DdsTrayAgent.exe",
-            "stage\x64\dds-enroll-user.exe"
+            "stage\${{ matrix.arch }}\dds-node.exe",
+            "stage\${{ matrix.arch }}\DdsAuthBridge.exe",
+            "stage\${{ matrix.arch }}\DdsCredentialProvider.dll",
+            "stage\${{ matrix.arch }}\DdsPolicyAgent.exe",
+            "stage\${{ matrix.arch }}\DdsTrayAgent.exe",
+            "stage\${{ matrix.arch }}\dds-enroll-user.exe"
           ) + @(Get-ChildItem "out\*.msi" | ForEach-Object { $_.FullName })
 
           foreach ($file in $filesToSign) {
@@ -211,7 +223,7 @@ jobs:
       - name: Generate SHA-256 checksums
         shell: pwsh
         run: |
-          $checksumFile = "out\SHA256SUMS.txt"
+          $checksumFile = "out\SHA256SUMS-${{ matrix.arch }}.txt"
           Get-ChildItem "out\*.msi" | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
             "$hash  $($_.Name)" | Tee-Object -Append -FilePath $checksumFile
@@ -219,31 +231,42 @@ jobs:
           Write-Host "Checksums:"
           Get-Content $checksumFile
 
-      # ── SLSA subject hashes ─────────────────────────────────────
-      # supply-chain-plan.md Phase C.1 — compute SHA-256 over each MSI
-      # and base64-encode the subjects so the provenance job can sign them.
-      - name: Compute artifact hashes
-        id: hash
-        shell: pwsh
-        run: |
-          $lines = Get-ChildItem "out\*.msi" | ForEach-Object {
-            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
-            "$hash  $($_.Name)"
-          }
-          $raw = $lines -join "`n"
-          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($raw))
-          "hashes=$encoded" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
-          Write-Host "SLSA subjects: $raw"
-
       # ── Upload artifact ──────────────────────────────────────────
       - name: Upload MSI
         uses: actions/upload-artifact@v4
         with:
-          name: DDS-MSI-x64
+          name: DDS-MSI-${{ matrix.arch }}
           path: |
             out/*.msi
-            out/SHA256SUMS.txt
+            out/SHA256SUMS-${{ matrix.arch }}.txt
           if-no-files-found: error
+
+  # ── Collect SLSA hashes (both arches) ────────────────────────────
+  # supply-chain-plan.md Phase C.1 — download every MSI artifact from
+  # both matrix legs, compute their SHA-256 digests, and emit the
+  # base64-encoded subjects consumed by the provenance job below.
+  # Uses the artifact-download pattern (mirrors pkg.yml) rather than
+  # matrix job outputs, which historically misbehave across legs.
+  collect-hashes:
+    name: Collect MSI hashes
+    needs: [build-msi]
+    runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - name: Download all MSI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: DDS-MSI-*
+          merge-multiple: true
+
+      - name: Compute SHA-256 hashes
+        id: hash
+        run: |
+          echo "hashes=$(sha256sum artifacts/*.msi | base64 -w0)" >> "$GITHUB_OUTPUT"
+          echo "SLSA subjects:"
+          sha256sum artifacts/*.msi
 
   # ── SLSA Level 3 provenance ─────────────────────────────────────
   # supply-chain-plan.md Phase C.1 — generate an in-toto SLSA Level 3
@@ -255,14 +278,14 @@ jobs:
   # Pin by commit SHA rather than semver tag for supply-chain safety;
   # update the SHA when bumping the generator version.
   provenance:
-    needs: [build-msi]
+    needs: [collect-hashes]
     permissions:
       actions: read
       id-token: write
       contents: write
     uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
     with:
-      base64-subjects: "${{ needs.build-msi.outputs.hashes }}"
+      base64-subjects: "${{ needs.collect-hashes.outputs.hashes }}"
       upload-assets: ${{ startsWith(github.ref, 'refs/tags/v') }}
 
   # ── Sigstore cosign signing (tags only) ──────────────────────────
@@ -350,7 +373,7 @@ jobs:
         with:
           files: |
             artifacts/*.msi
-            artifacts/SHA256SUMS.txt
+            artifacts/SHA256SUMS-*.txt
             artifacts/*.intoto.jsonl
             artifacts/*.bundle
           generate_release_notes: true

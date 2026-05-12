@@ -53,7 +53,7 @@ param(
     [string]$OutputDir = "",
 
     [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
-    [string]$Version = "1.1.7.0",
+    [string]$Version = "1.1.8.0",
 
     [switch]$SkipRust,
     [switch]$SkipNative,
@@ -120,7 +120,7 @@ if (-not $PSBoundParameters.ContainsKey('Version')) {
     }
     New-Item -ItemType Directory -Path (Split-Path $counterFile) -Force | Out-Null
     Set-Content -Path $counterFile -Value $counter -Encoding ASCII -NoNewline
-    $Version = "1.1.7.$counter"
+    $Version = "1.1.8.$counter"
 }
 
 # ── Prerequisite checks ──────────────────────────────────────────

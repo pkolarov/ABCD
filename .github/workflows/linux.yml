@@ -1,0 +1,272 @@
+name: Linux Tarball
+
+# Builds versioned Linux tarballs containing the dds CLI + dds-node binaries
+# for x86_64 and aarch64. Tarballs are SLSA Level 3 attested and cosign-signed
+# on tag pushes, mirroring the MSI and macOS .pkg pipelines so a single
+# v1.1.8.<n> tag produces a complete cross-platform release.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'dds-cli/**'
+      - 'dds-node/**'
+      - 'dds-core/**'
+      - 'dds-domain/**'
+      - 'dds-store/**'
+      - 'dds-net/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/linux.yml'
+  pull_request:
+    paths:
+      - 'dds-cli/**'
+      - 'dds-node/**'
+      - 'dds-core/**'
+      - 'dds-domain/**'
+      - 'dds-store/**'
+      - 'dds-net/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/linux.yml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Tarball version (e.g. 1.1.8.0)'
+        required: false
+        default: '1.1.8.0'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-tarball:
+    name: Linux tarball (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            # GitHub hosted ARM64 Linux runner (GA 2025). Native build avoids
+            # cross-compile overhead and toolchain headaches with ring/openssl.
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Compute version ──────────────────────────────────────────
+      - name: Compute version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.version }}" ]]; then
+            v="${{ inputs.version }}"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            v="${{ github.ref_name }}"
+            v="${v#v}"
+          else
+            v="0.0.0-build.${{ github.run_number }}"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Tarball version: $v"
+
+      - name: Install libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-${{ matrix.arch }}
+
+      - name: Build dds + dds-node (release)
+        run: |
+          cargo build --release --target ${{ matrix.rust_target }} \
+            -p dds-cli \
+            -p dds-node
+
+      # ── Assemble tarball ─────────────────────────────────────────
+      - name: Stage tarball payload
+        id: tarball
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          name="dds-platform-linux-${{ matrix.arch }}-${v}"
+          stage="stage/${name}"
+          mkdir -p "${stage}/bin"
+
+          cp "target/${{ matrix.rust_target }}/release/dds" "${stage}/bin/dds"
+          cp "target/${{ matrix.rust_target }}/release/dds-node" "${stage}/bin/dds-node"
+          chmod +x "${stage}/bin/dds" "${stage}/bin/dds-node"
+
+          cat > "${stage}/VERSION" <<EOF
+          ${v}
+          EOF
+
+          # Lightweight README pointing at install steps; full docs ship in repo.
+          cat > "${stage}/README" <<'EOF'
+          DDS Platform — Linux tarball
+          ============================
+
+          Contents:
+            bin/dds        — DDS CLI
+            bin/dds-node   — DDS node daemon
+            VERSION        — release version
+
+          Install:
+            sudo install -m 0755 bin/dds      /usr/local/bin/dds
+            sudo install -m 0755 bin/dds-node /usr/local/bin/dds-node
+
+          Verify (with cosign + the .bundle from the release):
+            cosign verify-blob \
+              --bundle dds-platform-linux-<arch>-<ver>.tar.gz.bundle \
+              --certificate-identity-regexp \
+                "https://github.com/.*/\.github/workflows/linux\.yml@.*" \
+              --certificate-oidc-issuer \
+                "https://token.actions.githubusercontent.com" \
+              dds-platform-linux-<arch>-<ver>.tar.gz
+          EOF
+
+          mkdir -p out
+          tarball="out/${name}.tar.gz"
+          tar -czf "${tarball}" -C stage "${name}"
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          ls -lh out/
+
+      # ── SHA-256 ──────────────────────────────────────────────────
+      - name: Generate SHA-256 checksum
+        run: |
+          cd out
+          sha256sum *.tar.gz > "SHA256SUMS-${{ matrix.arch }}.txt"
+          cat "SHA256SUMS-${{ matrix.arch }}.txt"
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: dds-linux-${{ matrix.arch }}
+          path: |
+            out/*.tar.gz
+            out/SHA256SUMS-${{ matrix.arch }}.txt
+          if-no-files-found: error
+
+  # ── Collect SLSA hashes ──────────────────────────────────────────
+  # Mirrors pkg.yml: download every tarball from both matrix legs and
+  # produce a single base64 subjects blob for the provenance generator.
+  collect-hashes:
+    name: Collect tarball hashes
+    needs: [build-tarball]
+    runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - name: Download all tarball artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: dds-linux-*
+          merge-multiple: true
+
+      - name: Compute SHA-256 hashes
+        id: hash
+        run: |
+          echo "hashes=$(sha256sum artifacts/*.tar.gz | base64 -w0)" >> "$GITHUB_OUTPUT"
+          echo "SLSA subjects:"
+          sha256sum artifacts/*.tar.gz
+
+  # ── SLSA Level 3 provenance ──────────────────────────────────────
+  provenance:
+    needs: [collect-hashes]
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: "${{ needs.collect-hashes.outputs.hashes }}"
+      upload-assets: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+  # ── Sigstore cosign signing (tags only) ──────────────────────────
+  sign:
+    name: Sign with cosign
+    needs: [build-tarball]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Download tarball artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: dds-linux-*
+          merge-multiple: true
+
+      - name: Sign tarballs
+        working-directory: artifacts
+        run: |
+          for f in *.tar.gz; do
+            cosign sign-blob --bundle "${f}.bundle" "$f"
+            echo "Signed: $f  →  ${f}.bundle"
+          done
+
+      - name: Upload signature bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosign-bundles-linux
+          path: artifacts/*.bundle
+          if-no-files-found: error
+
+  # ── Release job (tags only) ──────────────────────────────────────
+  release:
+    name: Create Release
+    needs: [build-tarball, provenance, sign]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download tarball artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: dds-linux-*
+          merge-multiple: true
+
+      - name: Download provenance attestations
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: "*.intoto.jsonl"
+          merge-multiple: true
+
+      - name: Download cosign bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: cosign-bundles-linux
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS-*.txt
+            artifacts/*.intoto.jsonl
+            artifacts/*.bundle
+          generate_release_notes: true
+          draft: true
