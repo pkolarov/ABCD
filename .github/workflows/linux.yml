@@ -216,7 +216,7 @@ jobs:
         working-directory: artifacts
         run: |
           for f in *.tar.gz; do
-            cosign sign-blob --bundle "${f}.bundle" "$f"
+            cosign sign-blob --yes --bundle "${f}.bundle" "$f"
             echo "Signed: $f  →  ${f}.bundle"
           done
 
