@@ -193,7 +193,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pass targets: explicitly so dtolnay performs the full rustup
+      # toolchain install + `rustup target add`. Without it, on macos-latest
+      # the action's quick-check path leaves the runner-image's bootstrap
+      # cargo→rustup-init shim in PATH, and every cargo call dies with
+      # "unexpected argument 'build' / Usage: rustup-init". The build-pkg
+      # job above passes targets and works; mirror that here.
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -206,6 +214,8 @@ jobs:
       - name: Build binaries (debug, for speed)
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
+          which cargo
+          cargo --version
           cargo build -p dds-node --bin dds-node --bin dds-macos-e2e
           dotnet build platform/macos/DdsPolicyAgent/DdsPolicyAgent.MacOS.csproj -c Debug
 
