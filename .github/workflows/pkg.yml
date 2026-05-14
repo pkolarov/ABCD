@@ -72,9 +72,21 @@ jobs:
           echo "Package version: $v"
 
       # ── Rust ─────────────────────────────────────────────────────
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_target }}
+      # macos-latest pre-stages rustup-init at ~/.cargo/bin/cargo (the
+      # binary literally identifies itself as `rustup-init 1.29.0`),
+      # and dtolnay/rust-toolchain@stable does not always replace it
+      # — so plain `cargo build` dies with
+      #   "error: unexpected argument 'build' / Usage: rustup-init".
+      # Force a clean rustup install before rust-cache restores
+      # ~/.cargo/registry on top.
+      - name: Bootstrap rust toolchain (clean rustup install)
+        run: |
+          rm -rf "$HOME/.cargo" "$HOME/.rustup"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
+            -y --default-toolchain stable --profile minimal \
+            --target ${{ matrix.rust_target }}
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo" --version
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -82,13 +94,6 @@ jobs:
 
       - name: Build Rust binaries (release)
         run: |
-          # macos-latest now ships a /usr/local/bin/cargo shim that lazily
-          # forwards to rustup-init; without forcing ~/.cargo/bin to the
-          # front, `cargo build` runs the shim and dies with
-          #   "error: unexpected argument 'build' found / Usage: rustup-init".
-          # dtolnay/rust-toolchain@stable installs the real toolchain into
-          # ~/.cargo/bin, so prepending it makes that proxy win.
-          export PATH="$HOME/.cargo/bin:$PATH"
           which cargo
           cargo --version
           cargo build --release \
@@ -193,15 +198,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pass targets: explicitly so dtolnay performs the full rustup
-      # toolchain install + `rustup target add`. Without it, on macos-latest
-      # the action's quick-check path leaves the runner-image's bootstrap
-      # cargo→rustup-init shim in PATH, and every cargo call dies with
-      # "unexpected argument 'build' / Usage: rustup-init". The build-pkg
-      # job above passes targets and works; mirror that here.
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
+      # See build-pkg for the macos-latest rustup-init shim rationale.
+      - name: Bootstrap rust toolchain (clean rustup install)
+        run: |
+          rm -rf "$HOME/.cargo" "$HOME/.rustup"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
+            -y --default-toolchain stable --profile minimal \
+            --target aarch64-apple-darwin
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo" --version
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -213,7 +218,6 @@ jobs:
 
       - name: Build binaries (debug, for speed)
         run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
           which cargo
           cargo --version
           cargo build -p dds-node --bin dds-node --bin dds-macos-e2e
