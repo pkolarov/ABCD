@@ -82,6 +82,15 @@ jobs:
 
       - name: Build Rust binaries (release)
         run: |
+          # macos-latest now ships a /usr/local/bin/cargo shim that lazily
+          # forwards to rustup-init; without forcing ~/.cargo/bin to the
+          # front, `cargo build` runs the shim and dies with
+          #   "error: unexpected argument 'build' found / Usage: rustup-init".
+          # dtolnay/rust-toolchain@stable installs the real toolchain into
+          # ~/.cargo/bin, so prepending it makes that proxy win.
+          export PATH="$HOME/.cargo/bin:$PATH"
+          which cargo
+          cargo --version
           cargo build --release \
             -p dds-node --features fido2 \
             -p dds-cli \
@@ -196,6 +205,7 @@ jobs:
 
       - name: Build binaries (debug, for speed)
         run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
           cargo build -p dds-node --bin dds-node --bin dds-macos-e2e
           dotnet build platform/macos/DdsPolicyAgent/DdsPolicyAgent.MacOS.csproj -c Debug
 
