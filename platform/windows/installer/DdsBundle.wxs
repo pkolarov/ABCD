@@ -338,6 +338,33 @@
                   Impersonate="no"
                   Return="check" />
 
+    <!-- ============================================================ -->
+    <!-- Flip NgcSvc (Microsoft Passport Container) StartType=Manual  -->
+    <!-- → Automatic so it survives idle timeouts and reboots. The    -->
+    <!-- ServiceDependency in CG_AuthBridge only gates *bridge start*;-->
+    <!-- once both are running the SCM is free to stop NgcSvc when    -->
+    <!-- nothing else is using it (Hello-less Home SKUs idle it out   -->
+    <!-- within hours), and every subsequent secure-desktop WebAuthn  -->
+    <!-- call then fails immediately with CO_E_RUNAS_LOGON_FAILURE   -->
+    <!-- (0x8000401A) until something restarts it. Auto start type    -->
+    <!-- keeps the broker available for LogonUI across the full       -->
+    <!-- machine lifecycle.                                            -->
+    <!--                                                                -->
+    <!-- The bridge also re-kicks NgcSvc per challenge (DdsAuth-      -->
+    <!-- BridgeMain.cpp::HandleDdsStartAuth) as the runtime safety    -->
+    <!-- net for legacy installs and operator/policy overrides.       -->
+    <!--                                                                -->
+    <!-- Return="ignore": skip silently on Windows SKUs that lack    -->
+    <!-- NgcSvc (Server Core, LTSC variants) — install must not       -->
+    <!-- fail just because the service is missing.                    -->
+    <!-- ============================================================ -->
+    <CustomAction Id="CA_SetNgcSvcAuto"
+                  Directory="DIR_BIN"
+                  ExeCommand='"[SystemFolder]sc.exe" config NgcSvc start= auto'
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
     <!-- Note: auto-launch of the onboarding wizard for the installing user
          is handled by Active Setup (CG_ActiveSetup below): on the next
          interactive logon Windows replays the StubPath into HKCU and
@@ -366,6 +393,11 @@
            so a single re-entrant deferred phase covers all three
            helpers. -->
       <Custom Action="CA_StampAgentPubkey" After="CA_GenHmacSecret" Condition="NOT REMOVE" />
+      <!-- Set NgcSvc StartType=Automatic before the bridge service starts
+           so the WebAuthn UI broker is reliably available the first time
+           LogonUI invokes our credential provider. Sequenced last among
+           the deferred CAs so it shares the same elevated phase. -->
+      <Custom Action="CA_SetNgcSvcAuto" After="CA_StampAgentPubkey" Condition="NOT REMOVE" />
     </InstallExecuteSequence>
 
     <!-- ============================================================ -->

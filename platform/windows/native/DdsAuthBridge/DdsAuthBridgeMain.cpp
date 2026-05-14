@@ -923,6 +923,17 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
 {
     FileLog::Writef("DdsStartAuth: seqId=%u payloadLen=%lu\n", seqId, payloadLen);
 
+    // Per-challenge NgcSvc revive: the boot-time call in Initialize() only
+    // covers the moment the bridge first starts. NgcSvc ships StartType=Manual
+    // and on machines that never use Windows Hello it idle-times-out within
+    // hours, after which every WebAuthn assertion from LogonUI fails instantly
+    // with 0x8000401A. Re-checking here is ~1ms when running and self-heals
+    // the operator-stopped/idle-timed-out case the commit log already calls
+    // out — done outside m_csAuth so a slow start (≤5s) doesn't block other
+    // CP requests. The WiX install also flips NgcSvc to Automatic as belt-
+    // and-suspenders, but legacy installs and policy overrides reach here.
+    EnsureNgcSvcRunning();
+
     // Stale-auth supersede: if a previous auth is still in flight (the
     // CP gave up on its short timeout while our worker is still waiting
     // for AUTH_RESPONSE), cancel the old worker so the new request can
