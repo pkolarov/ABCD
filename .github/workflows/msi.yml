@@ -39,13 +39,17 @@ jobs:
   build-msi:
     name: MSI (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    # ARM64 is intentionally NOT in the auto matrix: the windows-11-arm
-    # hosted runner was unreliable in practice (failures there blocked
-    # downstream jobs and prevented x64 artifacts from reaching the
-    # GitHub Release). ARM64 MSIs continue to be produced locally via
-    # `Build-Msi.ps1 -Platform arm64`. To re-enable when the runner is
-    # stable, re-add the arch: arm64 / runner: windows-11-arm entry to
-    # the matrix below — every step is already parameterized for it.
+    # ARM64 runs on the windows-11-arm hosted runner (GA 2025). That
+    # runner has been flaky enough in the past to block the downstream
+    # collect-hashes/provenance/sign/release pipeline — the previous
+    # mitigation was to drop ARM64 from the matrix entirely (011dbe6).
+    # Instead, continue-on-error is driven by matrix.optional so the
+    # ARM64 leg can fail without failing the parent job: downstream
+    # `needs: [build-msi]` then treats the parent as success and ships
+    # whatever artifacts the x64 leg produced. ARM64 ships when its
+    # runner is healthy, no-ops when it isn't. The x64 leg stays
+    # required (optional: false).
+    continue-on-error: ${{ matrix.optional }}
     strategy:
       fail-fast: false
       matrix:
@@ -56,6 +60,14 @@ jobs:
             msbuild_platform: x64
             dotnet_rid: win-x64
             native_build_dir: platform\windows\native\build\Release
+            optional: false
+          - arch: arm64
+            runner: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+            msbuild_platform: ARM64
+            dotnet_rid: win-arm64
+            native_build_dir: platform\windows\native\build\Release-ARM64
+            optional: true
     steps:
       - uses: actions/checkout@v4
 
