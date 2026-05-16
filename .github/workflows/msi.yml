@@ -112,8 +112,15 @@ jobs:
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $installPath = & $vswhere -latest -products '*' -property installationPath
-          if (-not $installPath) { throw "vswhere returned no installPath" }
+          # The runner image has *two* VS products installed: Enterprise
+          # (`C:\Program Files\…\Enterprise`) and BuildTools (`…(x86)\…\
+          # BuildTools`). `vswhere -latest` picks Enterprise; rustc/cc-rs
+          # picks BuildTools (see error path in run 25962091028). Target
+          # BuildTools explicitly so the install lands where rustc looks.
+          $installPath = & $vswhere `
+            -products Microsoft.VisualStudio.Product.BuildTools `
+            -property installationPath | Select-Object -First 1
+          if (-not $installPath) { throw "vswhere found no BuildTools install" }
           Write-Host "VS install path: $installPath"
 
           $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
