@@ -209,6 +209,14 @@ public class WorkerTests
         // State must still be cleared so the item is not re-reported next cycle.
         Assert.True(store.SetCalls.ContainsKey("accounts"));
         Assert.Empty(store.SetCalls["accounts"]);
+
+        // Reconciliation report must carry the [AUDIT] prefix so operators
+        // can distinguish dry-run entries from actual changes.
+        var reconciliation = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconciliation);
+        Assert.Contains(reconciliation.Directives,
+            d => d.Contains("[AUDIT]") && d.Contains("dds-kiosk"));
     }
 
     [Fact]
