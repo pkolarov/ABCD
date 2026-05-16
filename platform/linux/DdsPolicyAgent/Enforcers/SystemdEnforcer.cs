@@ -163,7 +163,7 @@ public sealed class SystemdEnforcer
             if (_auditOnly)
             {
                 _log.LogInformation("[audit] would remove stale dropin {P}", dropinPath);
-                results.Add($"systemd:removedropin:{key}");
+                results.Add($"[AUDIT] systemd:removedropin:{key}");
                 continue;
             }
 

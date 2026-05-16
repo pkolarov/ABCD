@@ -201,8 +201,8 @@ public sealed class SysctlEnforcer
         var applied = new List<string>(stale.Count);
         foreach (var k in stale)
         {
+            applied.Add(_auditOnly ? $"[AUDIT] sysctl:delete:{k}" : $"sysctl:delete:{k}");
             current.Remove(k);
-            applied.Add($"sysctl:delete:{k}");
         }
 
         await WriteDropinAsync(current, ct).ConfigureAwait(false);

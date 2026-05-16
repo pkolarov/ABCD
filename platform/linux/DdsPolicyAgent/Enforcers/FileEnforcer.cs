@@ -222,6 +222,12 @@ public sealed class FileEnforcer
                 _log.LogWarning("FileEnforcer: reconcile skip unsafe path {P}", path);
                 continue;
             }
+            if (_auditOnly)
+            {
+                _log.LogInformation("[audit] would delete stale DDS-managed file {P}", path);
+                applied.Add($"[AUDIT] file:delete:{path}");
+                continue;
+            }
             _log.LogInformation("Reconciliation: deleting stale DDS-managed file {P}", path);
             ApplyDelete(path);
             applied.Add($"file:delete:{path}");

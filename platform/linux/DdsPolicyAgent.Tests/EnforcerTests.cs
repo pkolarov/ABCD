@@ -2293,6 +2293,19 @@ public sealed class ReconcileFileEnforcerTests
 
         Assert.Empty(applied);
     }
+
+    [Fact]
+    public void ReconcileStaleFiles_AuditOnly_ReturnsAuditPrefixedTag()
+    {
+        var runner   = new NullCommandRunner();
+        var enforcer = new FileEnforcer(runner, auditOnly: true, NullLogger.Instance);
+
+        var applied = enforcer.ReconcileStaleFiles(["/etc/dds/old.conf"]);
+
+        Assert.Single(applied);
+        Assert.Equal("[AUDIT] file:delete:/etc/dds/old.conf", applied[0]);
+        Assert.Empty(runner.Invocations);
+    }
 }
 
 public sealed class ReconcilePackageEnforcerTests
@@ -2306,7 +2319,7 @@ public sealed class ReconcilePackageEnforcerTests
         var applied = await enforcer.ReconcileStalePackagesAsync(["ntp"], default);
 
         Assert.Single(applied);
-        Assert.Equal("pkg:remove:ntp", applied[0]);
+        Assert.Equal("[AUDIT] pkg:remove:ntp", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -2368,6 +2381,37 @@ public sealed class ReconcileSysctlEnforcerTests
 
         Assert.Empty(applied);
         Assert.Empty(runner.Invocations);
+    }
+
+    [Fact]
+    public async Task ReconcileStaleKeys_AuditOnly_WithStaleKey_ReturnsAuditPrefixedTag()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "dds-sysctl-audit-" + Guid.NewGuid() + ".conf");
+        try
+        {
+            await File.WriteAllTextAsync(tmp,
+                "# Managed by DDS\nnet.ipv4.ip_forward = 1\nvm.swappiness = 10\n");
+
+            var runner   = new NullCommandRunner();
+            var enforcer = new SysctlEnforcer(runner, auditOnly: true, NullLogger.Instance,
+                dropinPath: tmp);
+
+            // Desired set only contains ip_forward; swappiness is stale.
+            var applied = await enforcer.ReconcileStaleKeysAsync(
+                new HashSet<string> { "net.ipv4.ip_forward" }, CancellationToken.None);
+
+            Assert.Single(applied);
+            Assert.Equal("[AUDIT] sysctl:delete:vm.swappiness", applied[0]);
+            // Audit mode: runner must not be called (WriteDropin skips the real write).
+            Assert.Empty(runner.Invocations);
+            // Audit mode: file must not be modified.
+            var content = await File.ReadAllTextAsync(tmp);
+            Assert.Contains("vm.swappiness", content);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
     }
 
     [Fact]
@@ -2462,7 +2506,7 @@ public sealed class ReconcileSudoersEnforcerTests
             new HashSet<string> { "dds-ops" }, CancellationToken.None);
 
         Assert.Single(applied);
-        Assert.Equal("sudoers:delete:dds-ops", applied[0]);
+        Assert.Equal("[AUDIT] sudoers:delete:dds-ops", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -2527,7 +2571,7 @@ public sealed class ReconcileSystemdDropinEnforcerTests
             new HashSet<string> { "sshd.service/hardening" }, CancellationToken.None);
 
         Assert.Single(applied);
-        Assert.Equal("systemd:removedropin:sshd.service/hardening", applied[0]);
+        Assert.Equal("[AUDIT] systemd:removedropin:sshd.service/hardening", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 

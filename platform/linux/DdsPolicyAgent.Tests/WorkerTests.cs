@@ -443,6 +443,65 @@ public sealed class WorkerTests
     }
 
     [Fact]
+    public async Task Reconciliation_StaleFile_AuditOnly_ReturnsAuditPrefixedEntry()
+    {
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedPaths.Add("/etc/dds/stale.conf");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // State is updated so the item is not re-reported every cycle.
+        Assert.Contains("/etc/dds/stale.conf", store.RemovedPaths);
+        // Reconciliation report must carry the [AUDIT] prefix.
+        var reconciliation = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconciliation);
+        Assert.Contains("[AUDIT] file:delete:/etc/dds/stale.conf", reconciliation.Directives);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StalePackage_AuditOnly_ReturnsAuditPrefixedEntry()
+    {
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedPackages.Add("ntp");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // State is updated so the item is not re-reported every cycle.
+        Assert.Contains("ntp", store.RemovedPackages);
+        // Audit mode: package manager must NOT be invoked.
+        Assert.Empty(runner.Invocations);
+        // Reconciliation report must carry the [AUDIT] prefix.
+        var reconciliation = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconciliation);
+        Assert.Contains("[AUDIT] pkg:remove:ntp", reconciliation.Directives);
+    }
+
+    [Fact]
     public async Task Reconciliation_StillDesiredUser_IsNotDisabled()
     {
         // "alice" is managed AND still present in the current policy → not stale.

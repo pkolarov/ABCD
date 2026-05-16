@@ -160,6 +160,12 @@ public sealed class PackageEnforcer
                 _log.LogWarning("PackageEnforcer: reconcile skip unsafe package {N}", name);
                 continue;
             }
+            if (_auditOnly)
+            {
+                _log.LogInformation("[audit] would remove stale DDS-managed package {N}", name);
+                applied.Add($"[AUDIT] pkg:remove:{name}");
+                continue;
+            }
             _log.LogInformation("Reconciliation: removing stale DDS-managed package {N}", name);
             await RemoveAsync(name, ct).ConfigureAwait(false);
             applied.Add($"pkg:remove:{name}");

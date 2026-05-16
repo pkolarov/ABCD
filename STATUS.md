@@ -1,5 +1,95 @@
 # DDS Implementation Status
 
+## Fix (2026-05-17, 109th pass) — Linux: [AUDIT] prefix missing from reconciliation reports for FileEnforcer, PackageEnforcer, SudoersEnforcer, SystemdEnforcer, SysctlEnforcer
+
+### Gap
+
+The 106th pass fixed `UserEnforcer.ReconcileStaleUsersAsync` and
+`UserEnforcer.ReconcileStaleGroupsAsync` to add the `[AUDIT]` prefix on
+their returned change strings in audit mode, so operators can distinguish
+a dry-run reconciliation report from a real enforcement report. The same
+prefix was already used by macOS `MacAccountEnforcer` and all Windows
+reconcilers. However, **five other Linux reconcile methods were left
+unfixed** and continued to return unprefixed tags even when
+`_auditOnly` was true:
+
+| Enforcer | Method | Pre-fix tag | Fix |
+|---|---|---|---|
+| `FileEnforcer` | `ReconcileStaleFiles` | `"file:delete:{path}"` | added explicit `_auditOnly` branch |
+| `PackageEnforcer` | `ReconcileStalePackagesAsync` | `"pkg:remove:{name}"` | added explicit `_auditOnly` branch |
+| `SudoersEnforcer` | `ReconcileStaleSudoersAsync` | `"sudoers:delete:{filename}"` | added `[AUDIT]` prefix to existing audit branch |
+| `SystemdEnforcer` | `ReconcileStaleDropinsAsync` | `"systemd:removedropin:{key}"` | added `[AUDIT]` prefix to existing audit branch |
+| `SysctlEnforcer` | `ReconcileStaleKeysAsync` | `"sysctl:delete:{key}"` | added `[AUDIT]` prefix via ternary in key loop |
+
+In each case the underlying OS mutation was already skipped in audit mode
+(via `_auditOnly` guards inside `ApplyDelete`, `RemoveAsync`,
+`DeleteDropinAsync`, `WriteDropinAsync`, etc.), but the returned
+`Directives` list still contained non-prefixed strings that made the
+`_reconciliation` report indistinguishable from an enforce-mode report.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Enforcers/FileEnforcer.cs`**:
+- `ReconcileStaleFiles`: added explicit `if (_auditOnly)` branch before
+  `ApplyDelete` — logs `[audit] would delete stale DDS-managed file {P}`,
+  adds `"[AUDIT] file:delete:{path}"`, and `continue`s. The non-audit
+  path is unchanged.
+
+**`platform/linux/DdsPolicyAgent/Enforcers/PackageEnforcer.cs`**:
+- `ReconcileStalePackagesAsync`: added explicit `if (_auditOnly)` branch
+  before `RemoveAsync` — logs `[audit] would remove stale DDS-managed
+  package {N}`, adds `"[AUDIT] pkg:remove:{name}"`, and `continue`s. The
+  non-audit path is unchanged.
+
+**`platform/linux/DdsPolicyAgent/Enforcers/SudoersEnforcer.cs`**:
+- `ReconcileStaleSudoersAsync`: the existing `if (_auditOnly)` branch
+  now adds `"[AUDIT] sudoers:delete:{filename}"` and `continue`s instead
+  of falling through to the shared `applied.Add` call.
+
+**`platform/linux/DdsPolicyAgent/Enforcers/SystemdEnforcer.cs`**:
+- `ReconcileStaleDropinsAsync`: the existing `if (_auditOnly)` branch
+  now adds `"[AUDIT] systemd:removedropin:{key}"` instead of
+  `"systemd:removedropin:{key}"`.
+
+**`platform/linux/DdsPolicyAgent/Enforcers/SysctlEnforcer.cs`**:
+- `ReconcileStaleKeysAsync`: key-loop now adds
+  `$"[AUDIT] sysctl:delete:{k}"` or `$"sysctl:delete:{k}"` based on
+  `_auditOnly` via a single ternary. The `WriteDropinAsync` and
+  `ReloadAsync` calls both guard on `_auditOnly` internally, so no file
+  write or sysctl reload happens in audit mode.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`** (3 tests updated + 2 added):
+- `ReconcileStalePackages_AuditOnly_NoRunnerCall`: updated expected tag to
+  `"[AUDIT] pkg:remove:ntp"`.
+- `ReconcileStaleSudoers_AuditOnly_ReturnsdirectivesButNoFilesystemWrite`: updated expected tag to
+  `"[AUDIT] sudoers:delete:dds-ops"`.
+- `ReconcileStaleDropins_AuditOnly_ReturnDirectivesButNoFilesystemWrite`: updated expected tag to
+  `"[AUDIT] systemd:removedropin:sshd.service/hardening"`.
+- `ReconcileStaleFiles_AuditOnly_ReturnsAuditPrefixedTag` (new): audits
+  only mode + enforcer with `auditOnly: true` → no runner calls,
+  `"[AUDIT] file:delete:/etc/dds/old.conf"` returned.
+- `ReconcileStaleKeys_AuditOnly_WithStaleKey_ReturnsAuditPrefixedTag` (new):
+  creates a real dropin file with two keys, passes one as desired; asserts
+  `"[AUDIT] sysctl:delete:vm.swappiness"` is returned, no runner calls,
+  and the file is not modified.
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`** (2 tests added):
+- `Reconciliation_StaleFile_AuditOnly_ReturnsAuditPrefixedEntry`: Worker
+  with `AuditOnly=true` + one stale file → `_reconciliation` report
+  contains `"[AUDIT] file:delete:/etc/dds/stale.conf"`, state is pruned.
+- `Reconciliation_StalePackage_AuditOnly_ReturnsAuditPrefixedEntry`:
+  Worker with `AuditOnly=true` + one stale package → `_reconciliation`
+  report contains `"[AUDIT] pkg:remove:ntp"`, package manager not called,
+  state is pruned.
+
+### Result
+
+Linux test count: **341 → 345** (7 tests updated/added, 0 failures).
+macOS count: 159 (unchanged). Windows count: 267 (unchanged).
+Rust workspace: no changes.
+
+---
+
 ## Fix (2026-05-16, 108th pass) — macOS: implement Uninstall via uninstall_script
 
 ### Gap

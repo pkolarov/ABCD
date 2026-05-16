@@ -159,11 +159,10 @@ public sealed class SudoersEnforcer
             if (_auditOnly)
             {
                 _log.LogInformation("[audit] would delete stale sudoers drop-in {P}", targetPath);
+                applied.Add($"[AUDIT] sudoers:delete:{filename}");
+                continue;
             }
-            else
-            {
-                await DeleteDropinAsync(targetPath, ct).ConfigureAwait(false);
-            }
+            await DeleteDropinAsync(targetPath, ct).ConfigureAwait(false);
             applied.Add($"sudoers:delete:{filename}");
         }
         return applied;
