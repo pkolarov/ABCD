@@ -111,16 +111,17 @@ jobs:
         if: matrix.arch == 'arm64'
         shell: pwsh
         run: |
+          # Runner image has multiple VS installs (Enterprise + a
+          # BuildTools dir that vswhere can't always see). cc-rs and
+          # rustc each run their own vswhere queries and may disagree
+          # on which install is "latest" — see runs 25962091028 and
+          # 25962147843. Strategy: install Hostarm64 into whichever
+          # install vswhere -latest returns (we know that works), then
+          # tell rustc the exact linker path via GITHUB_ENV so it
+          # doesn't fall back to its own (broken) lookup.
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          # The runner image has *two* VS products installed: Enterprise
-          # (`C:\Program Files\…\Enterprise`) and BuildTools (`…(x86)\…\
-          # BuildTools`). `vswhere -latest` picks Enterprise; rustc/cc-rs
-          # picks BuildTools (see error path in run 25962091028). Target
-          # BuildTools explicitly so the install lands where rustc looks.
-          $installPath = & $vswhere `
-            -products Microsoft.VisualStudio.Product.BuildTools `
-            -property installationPath | Select-Object -First 1
-          if (-not $installPath) { throw "vswhere found no BuildTools install" }
+          $installPath = & $vswhere -latest -products '*' -property installationPath
+          if (-not $installPath) { throw "vswhere returned no installPath" }
           Write-Host "VS install path: $installPath"
 
           $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
@@ -142,6 +143,14 @@ jobs:
             throw "Hostarm64 linker still missing after install: $linker"
           }
           Write-Host "OK: $linker"
+
+          # Override rustc's linker discovery for the ARM64 target. Without
+          # this, rustc constructs a Hostarm64 path under a BuildTools dir
+          # that vswhere-installed components never reach, and the build
+          # dies with "linker not found" inside the first build script.
+          "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$linker" | `
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Exported CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$linker"
 
       - name: Build dds-node (${{ matrix.rust_target }})
         run: cargo build --package dds-node --target ${{ matrix.rust_target }} --release
