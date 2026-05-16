@@ -1,5 +1,200 @@
 # DDS Implementation Status
 
+## Fix (2026-05-16, 106th pass) — Linux: [AUDIT] prefix missing from reconciliation report in audit mode
+
+### Gap
+
+**`UserEnforcer.ReconcileStaleUsersAsync`** (Linux) had no `_auditOnly` branch: it called
+`RunOrLogAsync` (which correctly skips the `passwd -l` command in audit mode) but
+unconditionally added `"user:disable:{username}"` to the returned `Directives` list.
+In audit mode the reconciliation report sent to the node therefore contained non-prefixed
+entries that looked identical to live enforcement, making it impossible for an operator to
+distinguish a dry-run report from an enforcement report.
+
+**`UserEnforcer.ReconcileStaleGroupsAsync`** had the same problem in its explicit audit
+branch: it logged `[audit] would run: gpasswd -d …` and skipped the shell call, but added
+`"user:leave-group:{key}"` without an `[AUDIT]` prefix.
+
+macOS `MacAccountEnforcer.ReconcileStaleAccounts` and the Windows reconcilers have always
+used the `[AUDIT]` prefix convention; Linux was the only platform that did not.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Enforcers/UserEnforcer.cs`**:
+- `ReconcileStaleUsersAsync`: added explicit `if (_auditOnly)` branch before `RunOrLogAsync`
+  that logs `[audit] would run: passwd -l {U}` and adds `"[AUDIT] user:disable:{username}"`
+  to the result, then `continue`s. The non-audit path is unchanged.
+- `ReconcileStaleGroupsAsync`: changed `applied.Add($"user:leave-group:{key}")` in the
+  existing `_auditOnly` branch to `applied.Add($"[AUDIT] user:leave-group:{key}")`.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`**:
+- `ReconcileStaleUsers_AuditOnly_NoRunnerCall`: updated `Assert.Equal` to expect
+  `"[AUDIT] user:disable:alice"`.
+- `ReconcileStaleGroups_AuditOnly_LogsDoesNotRunGpasswd`: updated `Assert.Equal` to expect
+  `"[AUDIT] user:leave-group:alice:sudo"`.
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- `Reconciliation_StaleUser_AuditOnly_NoRunnerCall`: added assertion that the
+  `_reconciliation` report sent to the client contains `"[AUDIT] user:disable:bob"`.
+
+### Result
+
+Linux test count: **341 → 341** (3 tests updated; 0 failures).
+macOS count: 155 (unchanged). Windows count: 267 (unchanged).
+Rust workspace: no changes.
+
+---
+
+## CI / Installer Fixes (2026-05-14 to 2026-05-16) — ARM64 MSI + macOS pkg + release tags v1.2.0.0 / v1.2.1.0
+
+### Issues
+
+After the 105th-pass CI fixes, a series of further CI and installer regressions were found
+and resolved across the ARM64 MSI build, macOS pkg workflow, and Sigstore signing:
+
+- **Cosign sign-blob interactive prompt** (260b298): `cosign sign-blob` opens a
+  Rekor-transparency-log confirmation prompt when called without `--yes`; this hung the
+  MSI CI job. Fix: add `--yes` to all MSI Installer workflow `cosign sign-blob` calls.
+  Same fix later applied to cli/linux/pkg workflows in 70dcbbc.
+- **ARM64 auto matrix entry** (011dbe6, tag `v1.1.9.0`): the auto-generated ARM64 runner
+  entry in `msi.yml` was causing false failure gating; removed the auto entry and kept x64
+  as the mandatory leg; ARM64 re-enabled as `continue-on-error: true` in 8460f59.
+- **NgcSvc per-challenge revive** (6a947f2): the 103rd-pass change added
+  `EnsureNgcSvcRunning()` only at bridge `Initialize()`. On a long-running process
+  (observed at 36 h) NgcSvc idles out and every subsequent WebAuthn call returns
+  `CO_E_RUNAS_LOGON_FAILURE (0x8000401A)`. Two fixes: call `EnsureNgcSvcRunning()` at
+  the top of `HandleDdsStartAuth` (per-challenge revive, ~1 ms when already running); and
+  installer CA `CA_SetNgcSvcAuto` sets NgcSvc `StartType=Automatic` during install so it
+  persists across reboots and idle periods.
+- **macOS PATH / cargo issues** (c9a79f7, b1ccb27, 9697d66): `~/.cargo/bin` was not at
+  front of PATH on `macos-latest` pkg builds; `dtolnay/rust-toolchain` needed explicit
+  `targets:` for the smoke-test job; rustup install needed `--force-reinstall` to avoid
+  stale caches.
+- **ARM64 MSVC toolset** (41d8e43, a26f3f9, 04dec76, tag `v1.2.1.0`): `windows-11-arm`
+  runner lacked the ARM64-host MSVC toolset; then VS BuildTools needed to be targeted
+  specifically; then `rustc` needed its linker overridden via env var rather than by
+  chasing `vswhere` output.
+
+### Release tags
+
+| Tag | Commit | Date | Notes |
+|-----|--------|------|-------|
+| `v1.1.9.0` | `011dbe6` | 2026-05-13 | First x64-only MSI cut after cosign fix |
+| `v1.2.0.0` | `70dcbbc` | 2026-05-14 | NgcSvc per-challenge revive + cross-workflow cosign fix |
+| `v1.2.1.0` | `04dec76` | 2026-05-16 | ARM64 MSI build fully green (HEAD) |
+
+### Result
+
+x64 MSI: green. ARM64 MSI: green (optional matrix leg). macOS pkg: green. Linux tarballs:
+green. All SLSA Level 3 provenance + cosign signatures produced without interactive prompts.
+
+---
+
+## Fix (2026-05-11, 105th pass) — pam-dds clippy + cross-compile dead code + macOS plutil CI guard
+
+### Issues
+
+Three CI failures remained after the 104th pass:
+
+1. **clippy `not_unsafe_ptr_arg_deref`** on `pam_sm_authenticate` (`linux.rs:91`): PAM
+   `extern "C"` entry points cannot be marked `unsafe fn` (C ABI requirement), so the
+   lint cannot be resolved by adding `unsafe`; suppressed with
+   `#[allow(clippy::not_unsafe_ptr_arg_deref)]`.
+2. **Dead-code warnings in `dds_pam_helper.rs`** on cross-compile targets
+   (`x86_64-pc-windows-gnu`, `x86_64-pc-windows-msvc`): the binary is Linux-only but
+   structs/functions were visible to all targets. Fix: added `#![cfg(target_os = "linux")]`
+   at file level so the whole module compiles to nothing on non-Linux targets.
+3. **macOS `BackendOperationTests` failing on `ubuntu-latest` CI runner**: three tests
+   (`HostMacPreferenceOperations_round_trips_managed_plist_values` and two
+   Launchd/Profile tests) call real `ProcessCommandRunner` → `/usr/bin/plutil`, which
+   doesn't exist on Ubuntu. Fix: added `if (!OperatingSystem.IsMacOS()) return;` guards
+   so they pass silently on Linux CI and still execute on macOS.
+
+### Fix
+
+- `platform/linux/pam_dds/src/linux.rs`: `#[allow(clippy::not_unsafe_ptr_arg_deref)]` on the three entry points.
+- `platform/linux/pam_dds/src/dds_pam_helper.rs`: `#![cfg(target_os = "linux")]` at crate level.
+- `platform/macos/DdsPolicyAgent.Tests/BackendOperationTests.cs`: `IsMacOS()` guards on three plutil-dependent tests.
+
+### Result
+
+All CI checks green. Test counts unchanged (267 / 155 / 341).
+
+---
+
+## Fix (2026-05-11, 104th pass) — pam-dds Rust 2024 unsafe syntax + cargo fmt
+
+### Issues
+
+Two CI failures after the 103rd pass:
+
+1. **`pam-dds` compile error** (`platform/linux/pam_dds/src/linux.rs`): Rust 2024 edition
+   requires `unsafe extern "C"` blocks and `#[unsafe(no_mangle)]` attributes. All three
+   PAM entry points (`pam_sm_authenticate`, `pam_sm_setcred`, `pam_sm_acct_mgmt`) and the
+   `extern` block for `pam_get_item` needed updating.
+2. **`cargo fmt` diff**: `dds-node/src/identity_store.rs` and other `dds-node` source files
+   had formatting drift introduced by the 103rd pass. Ran `cargo fmt --all`; no logic
+   changes.
+
+### Fix
+
+- `platform/linux/pam_dds/src/linux.rs`: all PAM extern entry points updated to Rust 2024
+  `unsafe extern "C"` / `#[unsafe(no_mangle)]` syntax.
+- Ran `cargo fmt --all` across the workspace.
+
+### Result
+
+Rust workspace builds and tests green. `pam-dds` cross-compiles without errors.
+Test counts unchanged (267 / 155 / 341).
+
+---
+
+## Fix + Feat (2026-05-11, 103rd pass) — Windows WebAuthn lock-screen reliability + onboarding work
+
+### WebAuthn Lock-Screen Fixes
+
+**NgcSvc startup dependency**: without NgcSvc running, `WebAuthNAuthenticatorGetAssertion`
+on the secure desktop fails with `CO_E_RUNAS_LOGON_FAILURE (0x8000401A)` because the UI
+broker can't be DCOM-activated from LogonUI's pre-login context. Fix: declared NgcSvc as
+an SCM dependency of DdsAuthBridge in WiX, and called `StartService("NgcSvc")` at bridge
+`Initialize()`.
+
+**Cross-thread WebAuthn cancel**: the cancellation GUID was local to each call, so ESC
+during a "please insert your security key" prompt could not unblock the CP thread for up
+to 60 s. Fix: promoted the cancellation GUID to a mutex-guarded member of
+`CDdsBridgeClient`, exposed `CancelCurrentWebAuthn()`, and called it from
+`CDdsCredential::SetDeselected` / `UnAdvise`.
+
+**Pre-flight FIDO HID check** via SetupAPI + `HIDP_GetCaps` (usage page `0xF1D0`): fail
+fast with "insert your security key" instead of entering the blocking WebAuthn API when no
+authenticator is enumerated.
+
+**Auto-logon nudge**: `BridgePoll` now uses `AnyFidoHidDevicePresent()` for
+connect/disconnect detection (the previous `bridge.deviceConnected` was always `false`, a
+Crayonic-fork leftover), so plugging the key in at the lock screen wakes
+`CredentialsChanged` → auto-select tile → WebAuthn prompt.
+
+**Logging**: comprehensive WebAuthn-call logging in `CDdsBridgeClient` (HRESULT,
+`WebAuthNGetErrorName`, elapsed ms, UVPA probe, hWnd state, classifier flags). Logs written
+to `C:\Temp\dds_cp.log` instead of `OutputDebugString`-only.
+
+### Other Work (Bundled)
+
+- `DdsConsole.ps1` / `Bootstrap-DdsDomain.ps1` expansion.
+- New `dds-enroll-user` native helper + `Enroll-DdsDevice.ps1`, `Get-DdsOnboardingState.ps1`,
+  `Reset-DdsBootstrap.ps1` install scripts.
+- `DdsTrayAgent` + `EnrollmentFlow` updates; `ipc_pipe_client.cpp` adjustments.
+- `Build-Msi.ps1` + `DdsBundle.wxs` installer updates; `win_dpapi.rs` minor change.
+- `platform/windows/e2e` onboarding branch scripts (`onboarding_branch_a/b/c.ps1`).
+- `.gitignore`: excluded per-repo `.claude/` Claude Code state.
+
+### Result
+
+Windows test count: **267** (unchanged; all tests green).
+macOS count: 155 (unchanged). Linux count: 341 (unchanged).
+
+---
+
 ## Fix (2026-05-10, 102nd pass) — Windows StartAsync test configs + h12_admission run_in_bounded_rt
 
 ### Gaps / Issues

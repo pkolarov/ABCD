@@ -386,6 +386,13 @@ public sealed class WorkerTests
         // stale item is not re-reported on every cycle.
         Assert.Contains("bob", store.RemovedUsernames);
         Assert.Empty(runner.Invocations);
+
+        // Reconciliation report must carry the [AUDIT] prefix so operators
+        // can distinguish dry-run entries from actual changes.
+        var reconciliation = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconciliation);
+        Assert.Contains("[AUDIT] user:disable:bob", reconciliation.Directives);
     }
 
     [Fact]

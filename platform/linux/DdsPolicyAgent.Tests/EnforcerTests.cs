@@ -2116,7 +2116,7 @@ public sealed class ReconcileUserEnforcerTests
         var applied = await enforcer.ReconcileStaleUsersAsync(["alice"], default);
 
         Assert.Single(applied);
-        Assert.Equal("user:disable:alice", applied[0]);
+        Assert.Equal("[AUDIT] user:disable:alice", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -2186,7 +2186,7 @@ public sealed class ReconcileGroupEnforcerTests
             new HashSet<string> { "alice:sudo" }, default);
 
         Assert.Single(applied);
-        Assert.Equal("user:leave-group:alice:sudo", applied[0]);
+        Assert.Equal("[AUDIT] user:leave-group:alice:sudo", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
