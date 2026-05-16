@@ -1,5 +1,30 @@
 # DDS Implementation Status
 
+## Fix (2026-05-16, 107th pass) — macOS: add [AUDIT] assertion to audit-mode reconciliation test
+
+### Gap
+
+`WorkerTests.Reconciliation_StaleAccount_AuditMode_DoesNotDisable` verified that
+`DisableUser` was not called in audit mode and that state was cleared, but did not
+assert that the `_reconciliation` report sent to the node carries the `[AUDIT]` prefix.
+The assertion gap meant a regression in `MacAccountEnforcer.ReconcileStaleAccounts`
+(dropping the prefix) would go undetected by CI.
+
+### Fix
+
+**`platform/macos/DdsPolicyAgent.Tests/WorkerTests.cs`**:
+- Added assertions after the existing state-cleared checks: retrieves the `_reconciliation`
+  report from `client.ReceivedReports` and asserts it contains a directive with both
+  `[AUDIT]` and `dds-kiosk` — mirroring the Linux assertion added in b6933a0.
+
+### Result
+
+macOS test count: **155 → 155** (assertions added to existing test; 0 failures).
+Linux count: 341 (unchanged). Windows count: 267 (unchanged).
+Rust workspace: no changes.
+
+---
+
 ## Fix (2026-05-16, 106th pass) — Linux: [AUDIT] prefix missing from reconciliation report in audit mode
 
 ### Gap
