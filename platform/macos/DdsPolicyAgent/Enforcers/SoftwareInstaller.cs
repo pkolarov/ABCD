@@ -11,11 +11,15 @@ namespace DDS.PolicyAgent.MacOS.Enforcers;
 
 /// <summary>
 /// macOS software installer backed by `/usr/sbin/installer` and
-/// `/usr/sbin/pkgutil`. This first host-backed slice supports local or
-/// HTTPS `.pkg` install/update flows with SHA-256 verification and
-/// optional signature checks. Generic uninstall is still intentionally
-/// refused because macOS packages do not have a universal safe remove
-/// primitive.
+/// `/usr/sbin/pkgutil`. Supports local or HTTPS `.pkg` install/update
+/// flows with SHA-256 verification and optional signature checks.
+///
+/// For <c>Uninstall</c> actions, there is no universal macOS package-
+/// removal primitive, so the caller must supply an <c>uninstall_script</c>
+/// inline shell command in the directive. The agent runs it via
+/// <c>/bin/zsh -lc</c> (same as <c>pre_install_script</c> /
+/// <c>post_install_script</c>) when
+/// <see cref="AgentConfig.AllowInlinePackageScripts"/> is enabled.
 /// </summary>
 public sealed class SoftwareInstaller : IEnforcer
 {
@@ -86,6 +90,10 @@ public sealed class SoftwareInstaller : IEnforcer
         string action,
         CancellationToken ct)
     {
+        // Uninstall is handled separately: no source/sha256/download needed.
+        if (string.Equals(action, "Uninstall", StringComparison.OrdinalIgnoreCase))
+            return ApplyUninstall(directive, packageId, version);
+
         if (!directive.TryGetProperty("source", out var sourceValue) ||
             string.IsNullOrWhiteSpace(sourceValue.GetString()))
         {
@@ -105,12 +113,6 @@ public sealed class SoftwareInstaller : IEnforcer
                 throw new InvalidOperationException(
                     "inline pre/post install scripts are disabled for macOS package assignments");
             }
-        }
-
-        if (string.Equals(action, "Uninstall", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidOperationException(
-                "generic macOS pkg uninstall is not supported yet; package-native removal recipes are still TODO");
         }
 
         var currentVersion = TryGetInstalledVersion(packageId);
@@ -208,6 +210,40 @@ public sealed class SoftwareInstaller : IEnforcer
                     $"expected '{expected.TeamId}', got '{teamId}'");
             }
         }
+    }
+
+    /// <summary>
+    /// Handle an <c>Uninstall</c> action using the caller-supplied
+    /// <c>uninstall_script</c> field. Because macOS has no universal
+    /// package-removal primitive, the admin must embed a shell removal
+    /// recipe. The script is run via <c>/bin/zsh -lc</c> (same path as
+    /// <c>pre_install_script</c> / <c>post_install_script</c>).
+    /// Requires <see cref="AgentConfig.AllowInlinePackageScripts"/>.
+    /// </summary>
+    private string ApplyUninstall(JsonElement directive, string packageId, string version)
+    {
+        if (!directive.TryGetProperty("uninstall_script", out var scriptEl) ||
+            string.IsNullOrWhiteSpace(scriptEl.GetString()))
+        {
+            throw new InvalidOperationException(
+                $"cannot uninstall '{packageId}': macOS has no universal package-removal primitive. " +
+                "Set 'uninstall_script' in the software assignment with a package-native removal recipe.");
+        }
+
+        if (!_config.AllowInlinePackageScripts)
+        {
+            throw new InvalidOperationException(
+                $"cannot uninstall '{packageId}': uninstall_script requires " +
+                "AllowInlinePackageScripts to be enabled in agent configuration");
+        }
+
+        PrivilegeGuard.DemandRoot("macOS package uninstall");
+
+        var script = scriptEl.GetString()!;
+        _log.LogWarning("Executing uninstall script for {PackageId} v{Version}", packageId, version);
+        _runner.RunChecked("/bin/zsh", ["-lc", script]);
+
+        return $"Uninstall {packageId} v{version}";
     }
 
     private static string Trim(string stderr, string stdout)
@@ -397,8 +433,11 @@ public sealed class SoftwareInstaller : IEnforcer
 
     /// <summary>
     /// Log stale software packages that are no longer in the policy.
-    /// Generic macOS pkg uninstall is intentionally not supported, so
-    /// this is audit-log only regardless of mode.
+    /// Auto-uninstall during reconciliation is not supported because the
+    /// removed directive (and its <c>uninstall_script</c>) is no longer
+    /// available once the package leaves the policy; operators must
+    /// either add an explicit <c>Uninstall</c> directive or remove the
+    /// package manually.
     /// </summary>
     public List<string> ReconcileStalePackages(IReadOnlySet<string> staleKeys, EnforcementMode mode)
     {
@@ -406,9 +445,11 @@ public sealed class SoftwareInstaller : IEnforcer
         foreach (var packageId in staleKeys)
         {
             _log.LogWarning(
-                "Software reconcile: package '{PackageId}' is no longer in policy but cannot be auto-uninstalled on macOS",
+                "Software reconcile: package '{PackageId}' is no longer in policy; " +
+                "add an Uninstall directive with uninstall_script to remove automatically, " +
+                "or remove the package manually",
                 packageId);
-            changes.Add($"[MANUAL] Reconcile-Uninstall {packageId} (macOS pkg uninstall not supported — remove manually)");
+            changes.Add($"[MANUAL] Reconcile-Uninstall {packageId} (add Uninstall directive with uninstall_script, or remove manually)");
         }
         return changes;
     }

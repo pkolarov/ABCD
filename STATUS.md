@@ -1,5 +1,47 @@
 # DDS Implementation Status
 
+## Fix (2026-05-16, 108th pass) — macOS: implement Uninstall via uninstall_script
+
+### Gap
+
+macOS `.pkg` packages have no universal removal primitive (`pkgutil` exposes no
+uninstall command), so `SoftwareInstaller.ApplyAsync` previously threw an
+`InvalidOperationException` for any `action: Uninstall` directive, making it
+impossible for admins to remove managed software on macOS via DDS policy.
+
+### Fix
+
+**`dds-domain/src/types.rs`** (`SoftwareAssignment`):
+- Added `uninstall_script: Option<String>` field with `#[serde(default, …)]`
+  (backward-compatible: missing in old CBOR decodes as `None`).
+- Added `software_assignment_round_trip_with_uninstall_script` unit test.
+
+**`platform/macos/DdsPolicyAgent/Enforcers/SoftwareInstaller.cs`**:
+- Added `ApplyUninstall` private method: validates `uninstall_script` is set,
+  checks `AllowInlinePackageScripts`, demands root, runs `/bin/zsh -lc <script>`.
+- Moved Uninstall dispatch before the source/sha256 checks (no download needed
+  for removal).
+- Updated `ReconcileStalePackages` log/change message to explain the Uninstall
+  directive path.
+
+**`platform/macos/DdsPolicyAgent.Tests/EnforcerTests.cs`** (4 new tests):
+- `SoftwareInstaller_Uninstall_with_script_executes_zsh_and_succeeds`
+- `SoftwareInstaller_Uninstall_without_script_throws_helpful_error`
+- `SoftwareInstaller_Uninstall_with_script_but_scripts_disabled_throws`
+- `SoftwareInstaller_Uninstall_audit_mode_reports_intent_without_running_script`
+
+**`dds-node` tests** (`service.rs`, `http.rs`, `node.rs`, `dds-macos-e2e.rs`):
+- Updated all existing `SoftwareAssignment` test fixtures with `uninstall_script: None`
+  to compile after the new required field.
+
+### Result
+
+macOS test count: **155 → 159** (4 new tests, 0 failures).
+Linux count: 341 (unchanged). Windows count: 267 (unchanged).
+Rust workspace: compiles and all existing tests pass.
+
+---
+
 ## Fix (2026-05-16, 107th pass) — macOS: add [AUDIT] assertion to audit-mode reconciliation test
 
 ### Gap

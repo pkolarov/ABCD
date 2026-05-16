@@ -866,6 +866,14 @@ pub struct SoftwareAssignment {
     /// Pre/post install scripts (optional).
     pub pre_install_script: Option<String>,
     pub post_install_script: Option<String>,
+    /// Platform-specific removal recipe for macOS. Because macOS does not
+    /// have a universal package-removal primitive, admins supply an inline
+    /// shell script that the macOS agent runs (via `/bin/zsh -lc`) when
+    /// the directive `action` is `Uninstall`. Required on macOS for any
+    /// `Uninstall` assignment; ignored by the Windows agent (which uses
+    /// MSI product-code uninstall instead).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uninstall_script: Option<String>,
     /// Required OS-vendor-rooted signer identity on the package blob, in
     /// addition to the SHA-256 hash. When set, the agent must verify the
     /// platform signature on the downloaded artifact and refuse the
@@ -1213,6 +1221,65 @@ mod tests {
 
         let extracted = SsoIdentityLinkDocument::extract(&payload).unwrap().unwrap();
         assert_eq!(extracted, doc);
+    }
+
+    #[test]
+    fn software_assignment_round_trip_with_uninstall_script() {
+        let doc = SoftwareAssignment {
+            package_id: "com.example.app".into(),
+            display_name: "Example App".into(),
+            version: "2.0".into(),
+            source: "https://example.com/app-2.0.pkg".into(),
+            sha256: "abc123".into(),
+            action: InstallAction::Uninstall,
+            scope: PolicyScope {
+                device_tags: vec!["mac".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            silent: true,
+            pre_install_script: None,
+            post_install_script: None,
+            uninstall_script: Some("rm -rf /Applications/Example.app".into()),
+            publisher_identity: None,
+        };
+
+        let mut payload = empty_payload();
+        doc.embed(&mut payload).unwrap();
+
+        let extracted = SoftwareAssignment::extract(&payload).unwrap().unwrap();
+        assert_eq!(extracted, doc);
+    }
+
+    #[test]
+    fn software_assignment_uninstall_script_absent_on_legacy_wire() {
+        // A SoftwareAssignment serialised without uninstall_script (legacy
+        // publishers) must deserialise with uninstall_script = None so
+        // the field is backward-compatible.
+        let doc_no_script = SoftwareAssignment {
+            package_id: "com.example.legacy".into(),
+            display_name: "Legacy App".into(),
+            version: "1.0".into(),
+            source: "https://example.com/app-1.0.pkg".into(),
+            sha256: "def456".into(),
+            action: InstallAction::Install,
+            scope: PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            silent: false,
+            pre_install_script: None,
+            post_install_script: None,
+            uninstall_script: None,
+            publisher_identity: None,
+        };
+
+        let mut payload = empty_payload();
+        doc_no_script.embed(&mut payload).unwrap();
+
+        let extracted = SoftwareAssignment::extract(&payload).unwrap().unwrap();
+        assert_eq!(extracted.uninstall_script, None);
     }
 
     #[test]

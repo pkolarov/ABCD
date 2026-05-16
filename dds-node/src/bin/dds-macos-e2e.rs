@@ -471,6 +471,7 @@ async fn publish_fixture(
         silent: true,
         pre_install_script: None,
         post_install_script: None,
+        uninstall_script: None,
         publisher_identity: None,
     };
 

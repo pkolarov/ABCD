@@ -3759,6 +3759,7 @@ mod tests {
             silent: true,
             pre_install_script: None,
             post_install_script: None,
+            uninstall_script: None,
             publisher_identity: None,
         };
         pkg.embed(&mut sw_payload).unwrap();
@@ -3947,6 +3948,7 @@ mod tests {
             silent: true,
             pre_install_script: None,
             post_install_script: None,
+            uninstall_script: None,
             publisher_identity: None,
         };
         pkg.embed(&mut sw_payload).unwrap();

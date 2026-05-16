@@ -431,6 +431,7 @@ fn test_software_assignment_roundtrip() {
         silent: true,
         pre_install_script: None,
         post_install_script: Some("cleanup.ps1".into()),
+        uninstall_script: None,
         publisher_identity: None,
     };
     let cbor = doc.to_cbor().unwrap();
@@ -454,6 +455,7 @@ fn test_software_assignment_with_authenticode_publisher_roundtrip() {
         silent: true,
         pre_install_script: None,
         post_install_script: None,
+        uninstall_script: None,
         publisher_identity: Some(PublisherIdentity::Authenticode {
             subject: "Example Software, Inc.".into(),
             root_thumbprint: Some("a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4".into()),
@@ -480,6 +482,7 @@ fn test_software_assignment_with_apple_publisher_roundtrip() {
         silent: true,
         pre_install_script: None,
         post_install_script: None,
+        uninstall_script: None,
         publisher_identity: Some(PublisherIdentity::AppleDeveloperId {
             team_id: "ABCDE12345".into(),
         }),
@@ -510,11 +513,13 @@ fn test_software_assignment_legacy_cbor_decodes_as_none() {
         silent: false,
         pre_install_script: None,
         post_install_script: None,
+        uninstall_script: None,
         publisher_identity: None,
     };
     let cbor = v1.to_cbor().unwrap();
     let decoded = SoftwareAssignment::from_cbor(&cbor).unwrap();
     assert_eq!(decoded.publisher_identity, None);
+    assert_eq!(decoded.uninstall_script, None);
     assert_eq!(decoded, v1);
 }
 

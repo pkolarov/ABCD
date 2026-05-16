@@ -3791,6 +3791,7 @@ mod platform_applier_tests {
             silent: true,
             pre_install_script: None,
             post_install_script: None,
+            uninstall_script: None,
             publisher_identity: None,
         };
         svc.trust_graph
@@ -5299,6 +5300,7 @@ mod platform_applier_tests {
             silent: true,
             pre_install_script: None,
             post_install_script: None,
+            uninstall_script: None,
             publisher_identity: None,
         };
         let pkg_v2 = SoftwareAssignment {
@@ -5395,6 +5397,7 @@ mod platform_applier_tests {
             silent: true,
             pre_install_script: None,
             post_install_script: None,
+            uninstall_script: None,
             // Invalid: empty Authenticode subject. `validate()`
             // returns `EmptyAuthenticodeSubject`.
             publisher_identity: Some(PublisherIdentity::Authenticode {

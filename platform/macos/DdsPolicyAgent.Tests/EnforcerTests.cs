@@ -812,6 +812,104 @@ public class EnforcerTests
         Assert.Contains("com.example.app", changes[0]);
     }
 
+    // --- macOS Uninstall via uninstall_script -----------------------------------
+
+    [Fact]
+    public async Task SoftwareInstaller_Uninstall_with_script_executes_zsh_and_succeeds()
+    {
+        using var _ = AssumeRootScope.Enter();
+        var invocations = new List<string>();
+        var runner = new RecordingCommandRunner((file, args, _) =>
+        {
+            invocations.Add($"{file} {string.Join(' ', args)}");
+            return new CommandResult(0, string.Empty, string.Empty);
+        });
+        var installer = new SoftwareInstaller(
+            NullLogger<SoftwareInstaller>.Instance,
+            runner,
+            Options.Create(new AgentConfig { AllowInlinePackageScripts = true }),
+            new StaticHttpClientFactory(new HttpClient()));
+
+        var directive = JsonDocument.Parse("""
+        {"package_id":"com.example.app","version":"1.0","action":"Uninstall",
+         "uninstall_script":"rm -rf /Applications/Example.app"}
+        """).RootElement;
+
+        var outcome = await installer.ApplyAsync(directive, EnforcementMode.Enforce);
+
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
+        Assert.NotNull(outcome.Changes);
+        Assert.Single(outcome.Changes);
+        Assert.Contains("Uninstall", outcome.Changes[0]);
+        Assert.Contains("com.example.app", outcome.Changes[0]);
+        // Must have invoked /bin/zsh with -lc and the script.
+        Assert.Contains(invocations, s => s.Contains("/bin/zsh") && s.Contains("-lc"));
+    }
+
+    [Fact]
+    public async Task SoftwareInstaller_Uninstall_without_script_throws_helpful_error()
+    {
+        var installer = new SoftwareInstaller(
+            NullLogger<SoftwareInstaller>.Instance,
+            new RecordingCommandRunner((_, _, _) => new CommandResult(0, string.Empty, string.Empty)),
+            Options.Create(new AgentConfig { AllowInlinePackageScripts = true }),
+            new StaticHttpClientFactory(new HttpClient()));
+
+        var directive = JsonDocument.Parse("""
+        {"package_id":"com.example.app","version":"1.0","action":"Uninstall"}
+        """).RootElement;
+
+        var outcome = await installer.ApplyAsync(directive, EnforcementMode.Enforce);
+
+        Assert.Equal(EnforcementStatus.Failed, outcome.Status);
+        Assert.NotNull(outcome.Error);
+        Assert.Contains("uninstall_script", outcome.Error);
+    }
+
+    [Fact]
+    public async Task SoftwareInstaller_Uninstall_with_script_but_scripts_disabled_throws()
+    {
+        var installer = new SoftwareInstaller(
+            NullLogger<SoftwareInstaller>.Instance,
+            new RecordingCommandRunner((_, _, _) => new CommandResult(0, string.Empty, string.Empty)),
+            Options.Create(new AgentConfig { AllowInlinePackageScripts = false }),
+            new StaticHttpClientFactory(new HttpClient()));
+
+        var directive = JsonDocument.Parse("""
+        {"package_id":"com.example.app","version":"1.0","action":"Uninstall",
+         "uninstall_script":"rm -rf /Applications/Example.app"}
+        """).RootElement;
+
+        var outcome = await installer.ApplyAsync(directive, EnforcementMode.Enforce);
+
+        Assert.Equal(EnforcementStatus.Failed, outcome.Status);
+        Assert.NotNull(outcome.Error);
+        Assert.Contains("AllowInlinePackageScripts", outcome.Error);
+    }
+
+    [Fact]
+    public async Task SoftwareInstaller_Uninstall_audit_mode_reports_intent_without_running_script()
+    {
+        var runner = new RecordingCommandRunner((_, _, _) => new CommandResult(0, string.Empty, string.Empty));
+        var installer = new SoftwareInstaller(
+            NullLogger<SoftwareInstaller>.Instance,
+            runner,
+            Options.Create(new AgentConfig { AllowInlinePackageScripts = true }),
+            new StaticHttpClientFactory(new HttpClient()));
+
+        var directive = JsonDocument.Parse("""
+        {"package_id":"com.example.app","version":"1.0","action":"Uninstall",
+         "uninstall_script":"rm -rf /Applications/Example.app"}
+        """).RootElement;
+
+        var outcome = await installer.ApplyAsync(directive, EnforcementMode.Audit);
+
+        Assert.Equal(EnforcementStatus.Ok, outcome.Status);
+        Assert.Contains("[AUDIT]", outcome.Changes![0]);
+        // Must not have executed any shell command in audit mode.
+        Assert.Empty(runner.Invocations);
+    }
+
     // --- SC-5 Phase B.3: macOS Apple Developer Team ID gate ------------------
     //
     // The Rust-side schema (`dds-domain::PublisherIdentity`) and the

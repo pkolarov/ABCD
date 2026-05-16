@@ -3766,6 +3766,7 @@ mod publisher_identity_gate_tests {
             silent: true,
             pre_install_script: None,
             post_install_script: None,
+            uninstall_script: None,
             publisher_identity,
         };
         let mut payload = TokenPayload {
