@@ -99,6 +99,43 @@ jobs:
         with:
           key: msi-${{ matrix.arch }}
 
+      # The windows-11-arm hosted runner image ships only the x64-host
+      # cross toolchain (Hostx64\arm64\link.exe). rustc detects an ARM64
+      # host triple and asks for Hostarm64\arm64\link.exe, which isn't
+      # present — every cargo build fails with "linker not found" inside
+      # a build script (proc-macro2, quote, …) before any project code
+      # compiles. Install the native ARM64 toolset so rustc gets its
+      # expected linker. Scoped to the arm64 leg so the x64 leg's
+      # `windows-latest` doesn't pay the 3-5 min install for nothing.
+      - name: Install ARM64 MSVC toolset (windows-11-arm)
+        if: matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -latest -products '*' -property installationPath
+          if (-not $installPath) { throw "vswhere returned no installPath" }
+          Write-Host "VS install path: $installPath"
+
+          $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          & $vsInstaller modify `
+            --installPath $installPath `
+            --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+            --quiet --norestart --wait --nocache
+          # 0 = success, 3010 = success-reboot-required; treat both as OK
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
+            throw "vs_installer modify failed (exit $LASTEXITCODE)"
+          }
+
+          # Sanity-check the Hostarm64 linker now exists. MSVC version
+          # dir name floats (e.g. 14.44.35207) so resolve the latest.
+          $msvcRoot = Join-Path $installPath 'VC\Tools\MSVC'
+          $latest = (Get-ChildItem $msvcRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          $linker = Join-Path $latest 'bin\Hostarm64\arm64\link.exe'
+          if (-not (Test-Path $linker)) {
+            throw "Hostarm64 linker still missing after install: $linker"
+          }
+          Write-Host "OK: $linker"
+
       - name: Build dds-node (${{ matrix.rust_target }})
         run: cargo build --package dds-node --target ${{ matrix.rust_target }} --release
 
