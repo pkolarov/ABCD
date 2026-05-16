@@ -54,7 +54,7 @@ public sealed class SshdEnforcer
             if (File.Exists(_dropinPath))
             {
                 await RemoveDropinAsync(ct).ConfigureAwait(false);
-                return ["sshd:remove"];
+                return [_auditOnly ? "[AUDIT] sshd:remove" : "sshd:remove"];
             }
             return [];
         }
@@ -122,7 +122,7 @@ public sealed class SshdEnforcer
             if (File.Exists(_dropinPath))
             {
                 await RemoveDropinAsync(ct).ConfigureAwait(false);
-                return ["sshd:remove"];
+                return [_auditOnly ? "[AUDIT] sshd:remove" : "sshd:remove"];
             }
             return [];
         }

@@ -2084,6 +2084,60 @@ public sealed class SshdEnforcerTests
             if (File.Exists(tmp)) File.Delete(tmp);
         }
     }
+
+    [Fact]
+    public async Task NullPolicy_AuditOnly_DropinPresent_ReturnsAuditPrefixedTagWithoutRemovingFile()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "dds-sshd-" + Guid.NewGuid() + ".conf");
+        try
+        {
+            await File.WriteAllTextAsync(tmp, "# Managed by DDS\nPasswordAuthentication no\n");
+
+            var runner   = new NullCommandRunner();
+            var enforcer = new SshdEnforcer(runner, auditOnly: true, NullLogger.Instance,
+                dropinPath: tmp);
+
+            var applied = await enforcer.ApplyAsync(null, default);
+
+            Assert.Single(applied);
+            Assert.Equal("[AUDIT] sshd:remove", applied[0]);
+            // Audit mode: file must NOT have been deleted.
+            Assert.True(File.Exists(tmp));
+            Assert.Empty(runner.Invocations);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
+
+    [Fact]
+    public async Task AllFieldsInvalid_AuditOnly_DropinPresent_ReturnsAuditPrefixedTagWithoutRemovingFile()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "dds-sshd-" + Guid.NewGuid() + ".conf");
+        try
+        {
+            await File.WriteAllTextAsync(tmp, "# Managed by DDS\nPasswordAuthentication no\n");
+
+            var runner   = new NullCommandRunner();
+            var enforcer = new SshdEnforcer(runner, auditOnly: true, NullLogger.Instance,
+                dropinPath: tmp);
+
+            // All fields invalid → zero lines → audit mode: log intent, do not delete.
+            var applied = await enforcer.ApplyAsync(
+                ParseObject("""{"permit_root_login":"maybe","allow_users":["bad user"]}"""),
+                default);
+
+            Assert.Single(applied);
+            Assert.Equal("[AUDIT] sshd:remove", applied[0]);
+            Assert.True(File.Exists(tmp));
+            Assert.Empty(runner.Invocations);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
 }
 
 // ============================================================

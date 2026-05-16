@@ -1,5 +1,51 @@
 # DDS Implementation Status
 
+## Fix (2026-05-17, 110th pass) — Linux: [AUDIT] prefix missing from SshdEnforcer dropin-remove tags in audit mode
+
+### Gap
+
+`SshdEnforcer.ApplyAsync` contains two code paths that remove the DDS-managed
+sshd drop-in (`/etc/ssh/sshd_config.d/60-dds.conf`) and return `"sshd:remove"`:
+
+1. When called with `null` (or a non-object) policy — used by
+   `Worker.ReconcileLinuxAsync` when no current policy declares an `ssh`
+   section.
+2. When called with a policy object whose every field is invalid or absent —
+   the `lines.Count == 0` fallback that treats an all-invalid `ssh` object
+   identically to a missing `ssh` key.
+
+In both cases the returned tag was `"sshd:remove"` regardless of audit mode,
+so an audit-mode reconciliation report would contain the unprefixed tag and
+appear identical to an enforce-mode report. This is inconsistent with the
+109th-pass fix that added `[AUDIT]` prefix to every other Linux reconcile path.
+
+`RemoveDropinAsync` already guards correctly (`_auditOnly` returns without
+deleting the file), so the file was never actually deleted in audit mode — only
+the returned directive tag was wrong.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Enforcers/SshdEnforcer.cs`**:
+- Both `return ["sshd:remove"]` sites in `ApplyAsync` changed to
+  `return [_auditOnly ? "[AUDIT] sshd:remove" : "sshd:remove"]`.
+
+**`platform/linux/DdsPolicyAgent.Tests/EnforcerTests.cs`** (2 new tests):
+- `NullPolicy_AuditOnly_DropinPresent_ReturnsAuditPrefixedTagWithoutRemovingFile`:
+  creates a real temp drop-in, calls `ApplyAsync(null, default)` with
+  `auditOnly: true`, asserts `"[AUDIT] sshd:remove"`, and verifies the file
+  still exists on disk.
+- `AllFieldsInvalid_AuditOnly_DropinPresent_ReturnsAuditPrefixedTagWithoutRemovingFile`:
+  same setup with an all-invalid `ssh` policy object (the `lines.Count == 0`
+  fallback path), asserts `"[AUDIT] sshd:remove"` and file not deleted.
+
+### Result
+
+Linux test count: **345 → 347** (2 new, 0 failures).
+macOS count: 159 (unchanged). Windows count: 267 (unchanged).
+Rust workspace: no changes.
+
+---
+
 ## Fix (2026-05-17, 109th pass) — Linux: [AUDIT] prefix missing from reconciliation reports for FileEnforcer, PackageEnforcer, SudoersEnforcer, SystemdEnforcer, SysctlEnforcer
 
 ### Gap
