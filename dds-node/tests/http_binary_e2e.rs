@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use base64::Engine;
@@ -27,6 +28,13 @@ use reqwest::Client;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep};
+
+// Binary-spawning tests must not run concurrently: on macOS, dyld security
+// verification of a newly-compiled binary is not cached across simultaneous
+// instances, so startup latency under parallel load can exceed the
+// wait_for_status deadline.  Hold this lock for the full duration of each
+// binary test to serialize them.
+static BIN_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 fn dds_node_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_dds-node"))
@@ -556,6 +564,10 @@ async fn wait_for_session_failure(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn binary_http_api_end_to_end() {
+    let _lock = BIN_TEST_LOCK
+        .get_or_init(tokio::sync::Mutex::default)
+        .lock()
+        .await;
     let client = Client::new();
     let domain_key = dds_domain::DomainKey::from_secret_bytes("binary-http.local", [19u8; 32]);
     let root = Identity::generate("root", &mut OsRng);
@@ -699,6 +711,10 @@ async fn binary_http_api_end_to_end() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn binary_nodes_converge_on_gossip_and_revocation() {
+    let _lock = BIN_TEST_LOCK
+        .get_or_init(tokio::sync::Mutex::default)
+        .lock()
+        .await;
     let client = Client::new();
     let domain_key = dds_domain::DomainKey::from_secret_bytes("binary-cluster.local", [23u8; 32]);
     let root = Identity::generate("root", &mut OsRng);
