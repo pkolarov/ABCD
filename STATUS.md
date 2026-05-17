@@ -1,5 +1,40 @@
 # DDS Implementation Status
 
+## Fix (2026-05-17, 118th pass) — Windows: Worker ignores enforcement field on software assignment documents
+
+### Gap
+
+`Worker.PollAndApplyAsync` (Windows) read the `enforcement` field from policy
+documents and applied `EffectiveMode(EnforcementMode.Enforce, hostState)` for
+software assignments — hardcoding `EnforcementMode.Enforce` as the requested
+mode and ignoring any `enforcement: "Audit"` field in a software assignment
+document. A software assignment with `"enforcement":"Audit"` on a Workgroup host
+was therefore silently escalated to Enforce mode, causing the installer to
+actually install the package rather than short-circuiting with an `[AUDIT]` tag.
+
+This is the same class of bug fixed for macOS in pass 116.
+
+### Fix
+
+**`platform/windows/DdsPolicyAgent/Worker.cs`** (software dispatch loop):
+- Replaced `var effectiveSoftware = EffectiveMode(EnforcementMode.Enforce, hostState)` with a two-step pattern:
+  1. `requestedSoftware` — read from the document's `enforcement` field (defaults to `Enforce` when absent, same as policy documents).
+  2. `effectiveSoftware = EffectiveMode(requestedSoftware, hostState)` — layers the AD/Hybrid/Unknown host-state override on top.
+
+**`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs`** (+1 test):
+- `Apply_Software_AuditOnly_ReportDirectiveHasAuditPrefix`: software assignment
+  with `"enforcement":"Audit"` on a Workgroup host → report directive contains
+  `[AUDIT]`, package is not installed. Uses a NSubstitute state-store stub with
+  `HasChanged.Returns(true)` so the Worker reaches the enforcement-mode dispatch
+  rather than skipping the unchanged item.
+
+### Result
+
+Windows test count: **271 → 272** (1 new test; 0 failures).
+macOS count: 161 (unchanged). Linux count: 354 (unchanged). Rust workspace: no changes.
+
+---
+
 ## Fix (2026-05-17, 117th pass) — Linux: [audit] log prefix casing + Windows: PasswordPolicy reconcile gap
 
 ### Gaps

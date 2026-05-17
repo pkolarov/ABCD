@@ -287,10 +287,13 @@ public sealed class Worker : BackgroundService
                 continue;
             }
 
-            // AD-05: software dispatch was previously hardcoded to
-            // EnforcementMode.Enforce — wrap it through EffectiveMode so
-            // AD/Hybrid/Unknown hosts also short-circuit to audit.
-            var effectiveSoftware = EffectiveMode(EnforcementMode.Enforce, hostState);
+            // Read the per-document enforcement field (mirrors the macOS fix in pass 116).
+            // Then layer host-state on top via EffectiveMode so AD/Hybrid/Unknown always
+            // short-circuit to audit regardless of the document-level field.
+            var requestedSoftware = s.Document.TryGetProperty("enforcement", out var swE)
+                ? ParseMode(swE.GetString())
+                : EnforcementMode.Enforce;
+            var effectiveSoftware = EffectiveMode(requestedSoftware, hostState);
             var outcome = await _softwareInstaller
                 .ApplyAsync(s.Document, effectiveSoftware, ct)
                 .ConfigureAwait(false);

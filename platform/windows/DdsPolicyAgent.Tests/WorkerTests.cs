@@ -823,6 +823,48 @@ public class WorkerTests
         Assert.Contains("_applied", store.RecordCalls["password_policy"]);
     }
 
+    [Fact]
+    public async Task Apply_Software_AuditOnly_ReportDirectiveHasAuditPrefix()
+    {
+        // A software assignment with enforcement:"Audit" on a Workgroup host must
+        // be processed in audit mode: the installer short-circuits with an [AUDIT]
+        // tag and does NOT invoke any install operation (mirrors macOS pass 116 fix).
+        var softwareOps = new InMemorySoftwareOperations();
+        // Use a mocked state store so HasChanged returns true — otherwise the Worker
+        // skips unchanged items before reaching the enforcement-mode dispatch.
+        var stateStore = Substitute.For<IAppliedStateStore>();
+        stateStore.HasChanged(Arg.Any<string>(), Arg.Any<string>()).Returns(true);
+        stateStore.GetManagedItems(Arg.Any<string>())
+            .Returns(_ => (IReadOnlySet<string>)new HashSet<string>());
+
+        var client = new TestWindowsDdsNodeClient
+        {
+            NextSoftware =
+            [
+                new ApplicableSoftware
+                {
+                    Jti = "jti-sw-audit",
+                    Document = JsonDocument.Parse(
+                        """{"package_id":"com.example.audit-pkg","action":"Install","version":"2.0","source_url":"https://example.com/pkg.msi","sha256":"abc","installer_type":"msi","enforcement":"Audit"}""").RootElement,
+                },
+            ],
+        };
+
+        var probe = new InMemoryJoinStateProbe(JoinState.Workgroup);
+        var config = Options.Create(new AgentConfig { DeviceUrn = "urn:dds:device:test" });
+        var worker = BuildWorker(client, stateStore, probe, config,
+            softwareInstaller: new SoftwareInstaller(softwareOps, NullLogger<SoftwareInstaller>.Instance));
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // The software apply report must contain [AUDIT] and the package id.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "com.example.audit-pkg");
+        Assert.NotNull(report);
+        Assert.Contains(report.Directives, d => d.Contains("[AUDIT]") && d.Contains("com.example.audit-pkg"));
+
+        // Nothing must have been installed — audit mode short-circuits before any op.
+        Assert.False(softwareOps.IsInstalled("com.example.audit-pkg"));
+    }
+
     // --- helpers --------------------------------------------------------
 
     private static Worker BuildWorker(
