@@ -129,7 +129,7 @@ public sealed class SshdEnforcer
 
         await WriteDropinAsync(lines, ct).ConfigureAwait(false);
         await ReloadSshdAsync(ct).ConfigureAwait(false);
-        return result;
+        return _auditOnly ? result.ConvertAll(t => $"[AUDIT] {t}") : result;
     }
 
     private List<string> ParseNameList(JsonElement array, string fieldName)

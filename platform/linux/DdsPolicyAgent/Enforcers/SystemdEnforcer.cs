@@ -62,41 +62,42 @@ public sealed class SystemdEnforcer
                 continue;
             }
 
+            var pfx = _auditOnly ? "[AUDIT] " : "";
             switch (action)
             {
                 case "Enable":
                     await RunCtlOrLogAsync("enable", unit, ct).ConfigureAwait(false);
-                    applied.Add($"systemd:enable:{unit}");
+                    applied.Add($"{pfx}systemd:enable:{unit}");
                     break;
 
                 case "Disable":
                     await RunCtlOrLogAsync("disable", unit, ct).ConfigureAwait(false);
-                    applied.Add($"systemd:disable:{unit}");
+                    applied.Add($"{pfx}systemd:disable:{unit}");
                     break;
 
                 case "Start":
                     await RunCtlOrLogAsync("start", unit, ct).ConfigureAwait(false);
-                    applied.Add($"systemd:start:{unit}");
+                    applied.Add($"{pfx}systemd:start:{unit}");
                     break;
 
                 case "Stop":
                     await RunCtlOrLogAsync("stop", unit, ct).ConfigureAwait(false);
-                    applied.Add($"systemd:stop:{unit}");
+                    applied.Add($"{pfx}systemd:stop:{unit}");
                     break;
 
                 case "Restart":
                     await RunCtlOrLogAsync("restart", unit, ct).ConfigureAwait(false);
-                    applied.Add($"systemd:restart:{unit}");
+                    applied.Add($"{pfx}systemd:restart:{unit}");
                     break;
 
                 case "Mask":
                     await RunCtlOrLogAsync("mask", unit, ct).ConfigureAwait(false);
-                    applied.Add($"systemd:mask:{unit}");
+                    applied.Add($"{pfx}systemd:mask:{unit}");
                     break;
 
                 case "Unmask":
                     await RunCtlOrLogAsync("unmask", unit, ct).ConfigureAwait(false);
-                    applied.Add($"systemd:unmask:{unit}");
+                    applied.Add($"{pfx}systemd:unmask:{unit}");
                     break;
 
                 case "ConfigureDropin":
@@ -105,7 +106,7 @@ public sealed class SystemdEnforcer
                     if (stem != null)
                     {
                         needReload = true;
-                        applied.Add($"systemd:configuredropin:{unit}/{stem}");
+                        applied.Add($"{pfx}systemd:configuredropin:{unit}/{stem}");
                     }
                     break;
                 }
@@ -116,7 +117,7 @@ public sealed class SystemdEnforcer
                     if (stem != null)
                     {
                         needReload = true;
-                        applied.Add($"systemd:removedropin:{unit}/{stem}");
+                        applied.Add($"{pfx}systemd:removedropin:{unit}/{stem}");
                     }
                     break;
                 }

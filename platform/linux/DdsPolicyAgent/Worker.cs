@@ -496,13 +496,18 @@ public sealed class Worker : BackgroundService
         return [];
     }
 
-    // Parse directive tags emitted by enforcers (e.g. "user:create:alice") and
-    // register the affected resource in the applied state store so that future
-    // Delete / Remove operations pass the DDS-managed safety check.
+    // Parse directive tags emitted by enforcers (e.g. "user:create:alice" or
+    // "[AUDIT] user:create:alice") and register the affected resource in the
+    // applied state store so that future Delete / Remove operations pass the
+    // DDS-managed safety check.
     private void RecordManagedResources(IEnumerable<string> directives)
     {
-        foreach (var tag in directives)
+        const string AuditPrefix = "[AUDIT] ";
+        foreach (var raw in directives)
         {
+            var tag = raw.StartsWith(AuditPrefix, StringComparison.Ordinal)
+                ? raw[AuditPrefix.Length..]
+                : raw;
             var parts = tag.Split(':', 3);
             if (parts.Length != 3) continue;
             var (category, action, id) = (parts[0], parts[1], parts[2]);

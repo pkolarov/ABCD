@@ -84,13 +84,13 @@ public sealed class SysctlEnforcer
                         changed = true;
                     }
 
-                    applied.Add($"sysctl:set:{key}");
+                    applied.Add(_auditOnly ? $"[AUDIT] sysctl:set:{key}" : $"sysctl:set:{key}");
                     break;
 
                 case "Delete":
                     if (current.Remove(key))
                         changed = true;
-                    applied.Add($"sysctl:delete:{key}");
+                    applied.Add(_auditOnly ? $"[AUDIT] sysctl:delete:{key}" : $"sysctl:delete:{key}");
                     break;
 
                 default:

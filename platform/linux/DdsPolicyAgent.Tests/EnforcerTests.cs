@@ -44,7 +44,7 @@ public sealed class UserEnforcerTests
         var applied = await enforcer.ApplyAsync(directives, new HashSet<string>(), default);
 
         Assert.Single(applied);
-        Assert.Equal("user:create:alice", applied[0]);
+        Assert.Equal("[AUDIT] user:create:alice", applied[0]);
         // Audit mode: runner must NOT have been called with useradd
         Assert.Empty(runner.Invocations);
     }
@@ -215,7 +215,7 @@ public sealed class UserEnforcerTests
             new HashSet<string>(), default);
 
         Assert.Single(applied);
-        Assert.Equal("user:disable:alice", applied[0]);
+        Assert.Equal("[AUDIT] user:disable:alice", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -301,7 +301,7 @@ public sealed class SudoersEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("sudoers:set:dds-ops", applied[0]);
+        Assert.Equal("[AUDIT] sudoers:set:dds-ops", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -317,7 +317,7 @@ public sealed class SudoersEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("sudoers:delete:dds-ops", applied[0]);
+        Assert.Equal("[AUDIT] sudoers:delete:dds-ops", applied[0]);
     }
 
     [Fact]
@@ -457,7 +457,7 @@ public sealed class FileEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("file:set:/etc/dds/motd", applied[0]);
+        Assert.Equal("[AUDIT] file:set:/etc/dds/motd", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -574,7 +574,7 @@ public sealed class FileEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("file:ensuredir:/etc/dds/conf.d", applied[0]);
+        Assert.Equal("[AUDIT] file:ensuredir:/etc/dds/conf.d", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -743,7 +743,7 @@ public sealed class FileEnforcerTests
                 default);
 
             Assert.Single(applied);
-            Assert.Equal($"file:delete:{path}", applied[0]);
+            Assert.Equal($"[AUDIT] file:delete:{path}", applied[0]);
             Assert.True(File.Exists(path));  // audit mode: file not deleted
         }
         finally
@@ -803,7 +803,7 @@ public sealed class SystemdEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("systemd:enable:sshd.service", applied[0]);
+        Assert.Equal("[AUDIT] systemd:enable:sshd.service", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -848,7 +848,7 @@ public sealed class SystemdEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("systemd:mask:telnet.service", applied[0]);
+        Assert.Equal("[AUDIT] systemd:mask:telnet.service", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -896,7 +896,7 @@ public sealed class SystemdEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("systemd:disable:telnet.service", applied[0]);
+        Assert.Equal("[AUDIT] systemd:disable:telnet.service", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -986,7 +986,7 @@ public sealed class SystemdEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("systemd:configuredropin:sshd.service/dds-limits", applied[0]);
+        Assert.Equal("[AUDIT] systemd:configuredropin:sshd.service/dds-limits", applied[0]);
         // Audit mode: no systemctl daemon-reload should be called
         Assert.Empty(runner.Invocations);
     }
@@ -1074,7 +1074,7 @@ public sealed class SystemdEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("systemd:removedropin:sshd.service/dds-limits", applied[0]);
+        Assert.Equal("[AUDIT] systemd:removedropin:sshd.service/dds-limits", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -1089,7 +1089,7 @@ public sealed class SystemdEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("systemd:unmask:telnet.service", applied[0]);
+        Assert.Equal("[AUDIT] systemd:unmask:telnet.service", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -1104,7 +1104,7 @@ public sealed class SystemdEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("systemd:start:ntp.service", applied[0]);
+        Assert.Equal("[AUDIT] systemd:start:ntp.service", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -1119,7 +1119,7 @@ public sealed class SystemdEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("systemd:stop:ntp.service", applied[0]);
+        Assert.Equal("[AUDIT] systemd:stop:ntp.service", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -1134,7 +1134,7 @@ public sealed class SystemdEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("systemd:restart:sshd.service", applied[0]);
+        Assert.Equal("[AUDIT] systemd:restart:sshd.service", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -1215,7 +1215,7 @@ public sealed class PackageEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("pkg:install:ntp", applied[0]);
+        Assert.Equal("[AUDIT] pkg:install:ntp", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -1291,7 +1291,7 @@ public sealed class PackageEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("pkg:install:ntp", applied[0]);
+        Assert.Equal("[AUDIT] pkg:install:ntp", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -1589,7 +1589,7 @@ public sealed class SysctlEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("sysctl:set:net.ipv4.ip_forward", applied[0]);
+        Assert.Equal("[AUDIT] sysctl:set:net.ipv4.ip_forward", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -1607,8 +1607,8 @@ public sealed class SysctlEnforcerTests
             default);
 
         Assert.Equal(2, applied.Count);
-        Assert.Contains("sysctl:set:vm.swappiness", applied);
-        Assert.Contains("sysctl:set:net.ipv4.ip_forward", applied);
+        Assert.Contains("[AUDIT] sysctl:set:vm.swappiness", applied);
+        Assert.Contains("[AUDIT] sysctl:set:net.ipv4.ip_forward", applied);
         Assert.Empty(runner.Invocations);
     }
 
@@ -1623,7 +1623,7 @@ public sealed class SysctlEnforcerTests
             default);
 
         Assert.Single(applied);
-        Assert.Equal("sysctl:delete:net.ipv4.ip_forward", applied[0]);
+        Assert.Equal("[AUDIT] sysctl:delete:net.ipv4.ip_forward", applied[0]);
     }
 
     [Fact]
@@ -1843,7 +1843,7 @@ public sealed class SshdEnforcerTests
         var applied = await enforcer.ApplyAsync(policy, default);
 
         Assert.Single(applied);
-        Assert.Equal("sshd:set:PasswordAuthentication=False", applied[0]);
+        Assert.Equal("[AUDIT] sshd:set:PasswordAuthentication=False", applied[0]);
         Assert.Empty(runner.Invocations);
     }
 
@@ -1857,7 +1857,7 @@ public sealed class SshdEnforcerTests
         var applied = await enforcer.ApplyAsync(policy, default);
 
         Assert.Single(applied);
-        Assert.Equal("sshd:set:PasswordAuthentication=True", applied[0]);
+        Assert.Equal("[AUDIT] sshd:set:PasswordAuthentication=True", applied[0]);
     }
 
     [Fact]
@@ -1870,7 +1870,7 @@ public sealed class SshdEnforcerTests
         var applied = await enforcer.ApplyAsync(policy, default);
 
         Assert.Single(applied);
-        Assert.Equal("sshd:set:PubkeyAuthentication=True", applied[0]);
+        Assert.Equal("[AUDIT] sshd:set:PubkeyAuthentication=True", applied[0]);
     }
 
     [Fact]
@@ -1883,7 +1883,7 @@ public sealed class SshdEnforcerTests
         var applied = await enforcer.ApplyAsync(policy, default);
 
         Assert.Single(applied);
-        Assert.Equal("sshd:set:PermitRootLogin=prohibit-password", applied[0]);
+        Assert.Equal("[AUDIT] sshd:set:PermitRootLogin=prohibit-password", applied[0]);
     }
 
     [Fact]
@@ -1909,7 +1909,7 @@ public sealed class SshdEnforcerTests
         var applied = await enforcer.ApplyAsync(policy, default);
 
         Assert.Single(applied);
-        Assert.Equal("sshd:set:AllowUsers=alice,bob", applied[0]);
+        Assert.Equal("[AUDIT] sshd:set:AllowUsers=alice,bob", applied[0]);
     }
 
     [Fact]
@@ -1936,7 +1936,7 @@ public sealed class SshdEnforcerTests
         var applied = await enforcer.ApplyAsync(policy, default);
 
         Assert.Single(applied);
-        Assert.Equal("sshd:set:AllowGroups=sshusers,ops-team", applied[0]);
+        Assert.Equal("[AUDIT] sshd:set:AllowGroups=sshusers,ops-team", applied[0]);
     }
 
     [Fact]
@@ -1970,10 +1970,10 @@ public sealed class SshdEnforcerTests
         var applied = await enforcer.ApplyAsync(policy, default);
 
         Assert.Equal(4, applied.Count);
-        Assert.Contains("sshd:set:PasswordAuthentication=False",     applied);
-        Assert.Contains("sshd:set:PubkeyAuthentication=True",        applied);
-        Assert.Contains("sshd:set:PermitRootLogin=prohibit-password", applied);
-        Assert.Contains("sshd:set:AllowGroups=sshusers",             applied);
+        Assert.Contains("[AUDIT] sshd:set:PasswordAuthentication=False",     applied);
+        Assert.Contains("[AUDIT] sshd:set:PubkeyAuthentication=True",        applied);
+        Assert.Contains("[AUDIT] sshd:set:PermitRootLogin=prohibit-password", applied);
+        Assert.Contains("[AUDIT] sshd:set:AllowGroups=sshusers",             applied);
         Assert.Empty(runner.Invocations);
     }
 

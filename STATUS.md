@@ -1,5 +1,56 @@
 # DDS Implementation Status
 
+## Fix (2026-05-17, 112th pass) — Linux: [AUDIT] prefix missing from all enforcer ApplyAsync tag paths
+
+### Bug
+
+The 110th-pass fix added the `[AUDIT]` prefix to `SshdEnforcer`'s `sshd:remove`
+paths, but the same bug existed in the `ApplyAsync` methods of six other Linux
+enforcers. Each enforcer builds a tag string without an `[AUDIT]` prefix and then
+calls a helper that returns early in audit mode; the resulting tag is added to the
+`applied` list without the prefix, making audit-mode reports indistinguishable from
+enforce-mode reports. Affected enforcers:
+
+- `UserEnforcer.ApplyAsync` — `user:{action}:{username}` tags
+- `PackageEnforcer.ApplyAsync` — `pkg:{action}:{name}` tags
+- `FileEnforcer.ApplyAsync` — `file:{action}:{path}` tags
+- `SudoersEnforcer.ApplyAsync` — `sudoers:set/{delete}:{filename}` tags
+- `SystemdEnforcer.ApplyAsync` — all nine `systemd:{action}:{unit}` / dropin tags
+- `SysctlEnforcer.ApplyAsync` — `sysctl:set/{delete}:{key}` tags
+
+Additionally, `SshdEnforcer.ApplyAsync`'s `sshd:set:*` paths (the happy path
+that builds and returns the `result` list) also lacked the prefix — only
+`sshd:remove` was fixed in the 110th pass.
+
+The tests for these paths were also wrong in the same way, passing because both
+code and assertion agreed on the incorrect behavior.
+
+Finally, `Worker.RecordManagedResources` parsed tags by splitting on `:`. With the
+`[AUDIT]` prefix, the split produced `"[AUDIT] user"` as the category and nothing
+matched, so managed-resource state was silently not recorded in audit mode.
+
+### Fix
+
+- `UserEnforcer`, `PackageEnforcer`, `FileEnforcer`: changed `applied.Add(tag)` →
+  `applied.Add(_auditOnly ? $"[AUDIT] {tag}" : tag)`.
+- `SudoersEnforcer`: changed both direct `applied.Add(...)` calls to conditional
+  `[AUDIT]` prefix forms.
+- `SystemdEnforcer`: added `var pfx = _auditOnly ? "[AUDIT] " : "";` before the
+  action switch and used `$"{pfx}systemd:..."` for all nine `applied.Add` calls.
+- `SysctlEnforcer`: changed both `applied.Add($"sysctl:...")` to conditional forms.
+- `SshdEnforcer`: changed `return result` → `return _auditOnly ? result.ConvertAll(t => $"[AUDIT] {t}") : result`.
+- `Worker.RecordManagedResources`: strips the `"[AUDIT] "` prefix before parsing,
+  so managed-resource state is correctly recorded in both modes.
+- `EnforcerTests.cs`: updated all audit-mode tag assertions to expect the
+  `[AUDIT]` prefix.
+
+### Result
+
+Linux: 347 tests (unchanged count; all pass with corrected assertions). macOS: 159
+tests (unchanged). Rust: 347 tests (unchanged). All pass.
+
+---
+
 ## Doc fix (2026-05-17, 111th pass) — Update DDS-Admin-Guide.md and DDS-Design-Document.md for macOS Uninstall via uninstall_script
 
 ### Gap

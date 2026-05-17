@@ -68,7 +68,7 @@ public sealed class SudoersEnforcer
             if (content.Length == 0)
             {
                 await DeleteDropinAsync(targetPath, ct).ConfigureAwait(false);
-                applied.Add($"sudoers:delete:{filename}");
+                applied.Add(_auditOnly ? $"[AUDIT] sudoers:delete:{filename}" : $"sudoers:delete:{filename}");
                 continue;
             }
 
@@ -79,7 +79,7 @@ public sealed class SudoersEnforcer
             }
 
             await WriteDropinAsync(filename, targetPath, content, ct).ConfigureAwait(false);
-            applied.Add($"sudoers:set:{filename}");
+            applied.Add(_auditOnly ? $"[AUDIT] sudoers:set:{filename}" : $"sudoers:set:{filename}");
         }
 
         return applied;

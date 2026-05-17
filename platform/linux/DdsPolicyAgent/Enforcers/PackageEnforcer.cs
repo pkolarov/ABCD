@@ -77,7 +77,7 @@ public sealed class PackageEnforcer
                     continue;
             }
 
-            applied.Add(tag);
+            applied.Add(_auditOnly ? $"[AUDIT] {tag}" : tag);
         }
 
         return applied;

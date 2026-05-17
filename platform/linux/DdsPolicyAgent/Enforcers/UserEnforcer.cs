@@ -96,7 +96,7 @@ public sealed class UserEnforcer
                     continue;
             }
 
-            applied.Add(tag);
+            applied.Add(_auditOnly ? $"[AUDIT] {tag}" : tag);
         }
 
         return applied;

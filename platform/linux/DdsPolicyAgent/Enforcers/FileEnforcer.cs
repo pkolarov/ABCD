@@ -93,7 +93,7 @@ public sealed class FileEnforcer
                     continue;
             }
 
-            applied.Add(tag);
+            applied.Add(_auditOnly ? $"[AUDIT] {tag}" : tag);
         }
 
         return applied;
