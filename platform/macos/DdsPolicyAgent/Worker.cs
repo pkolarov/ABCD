@@ -167,6 +167,12 @@ public sealed class Worker : BackgroundService
             if (managedKey is not null)
                 desiredSoftware.Add(managedKey);
 
+            var swEnforcement = s.Document.TryGetProperty("enforcement", out var swE)
+                ? ParseMode(swE.GetString())
+                : EnforcementMode.Enforce;
+            if (swEnforcement == EnforcementMode.Audit)
+                globalMode = EnforcementMode.Audit;
+
             if (!_stateStore.HasChanged(pkgId, hash))
             {
                 _log.LogDebug("Software {Id} v{V} unchanged — skip", pkgId, version);
@@ -174,7 +180,7 @@ public sealed class Worker : BackgroundService
             }
 
             var outcome = await _softwareInstaller
-                .ApplyAsync(s.Document, EnforcementMode.Enforce, ct)
+                .ApplyAsync(s.Document, swEnforcement, ct)
                 .ConfigureAwait(false);
             var apply = ApplyBundleResult.FromOutcome(outcome);
 

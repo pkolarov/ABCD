@@ -121,6 +121,26 @@ public class PasswordPolicyEnforcerTests
         Assert.Equal((uint)15, _ops.GetCurrent().LockoutDurationMinutes);
     }
 
+    [Fact]
+    public void ReconcileStalePolicy_EmitsManualDirective()
+    {
+        // ReconcileStalePolicy must return a [MANUAL] entry regardless of enforcement
+        // mode — password policy cannot be auto-reverted since DDS does not record the
+        // pre-apply baseline.
+        var result = _enforcer.ReconcileStalePolicy(EnforcementMode.Enforce);
+        Assert.Single(result);
+        Assert.Contains("[MANUAL]", result[0]);
+        Assert.Contains("password_policy", result[0]);
+    }
+
+    [Fact]
+    public void ReconcileStalePolicy_AuditMode_StillEmitsManualDirective()
+    {
+        var result = _enforcer.ReconcileStalePolicy(EnforcementMode.Audit);
+        Assert.Single(result);
+        Assert.Contains("[MANUAL]", result[0]);
+    }
+
     private static JsonElement Parse(string json)
         => JsonDocument.Parse(json).RootElement;
 }

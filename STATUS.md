@@ -1,5 +1,109 @@
 # DDS Implementation Status
 
+## Fix (2026-05-17, 117th pass) — Linux: [audit] log prefix casing + Windows: PasswordPolicy reconcile gap
+
+### Gaps
+
+**Gap 1 — Linux: `[audit]` log prefix casing inconsistency**
+
+All seven Linux enforcers emitted `[audit]` (lowercase) in `LogInformation` calls
+while directive strings and all macOS/Windows log messages used `[AUDIT]` (uppercase).
+An operator grepping structured logs for `[AUDIT]` would miss Linux audit-mode
+activity. 22 `LogInformation` calls across `FileEnforcer`, `UserEnforcer`,
+`SshdEnforcer`, `SystemdEnforcer`, `PackageEnforcer`, `SysctlEnforcer`, and
+`SudoersEnforcer` used the lowercase prefix.
+
+**Gap 2 — Windows: `PasswordPolicyEnforcer` had no reconcile method**
+
+`ReconcileAsync` in the Windows Worker tracked registry keys, accounts, group
+memberships, software packages, and services — but not `password_policy`.
+When a policy with a `password_policy` section was removed, the Worker took no
+action: no report was emitted, no state transition was noted, and operators had
+no automated signal that previously DDS-managed password policy knobs were now
+orphaned. All other resource types with a similar "can't auto-revert" constraint
+(`ServiceEnforcer`) emit a `[MANUAL]` reconciliation entry.
+
+### Fix
+
+**Gap 1 — `platform/linux/DdsPolicyAgent/Enforcers/*.cs`**:
+- Replaced all 22 occurrences of `"[audit]"` in `LogInformation` calls with
+  `"[AUDIT]"` across all 7 Linux enforcer files. Directive strings were already
+  correct (`[AUDIT]` uppercase) from prior passes; only log messages needed updating.
+- No test changes required — existing tests assert on directive strings, not logs.
+
+**Gap 2 — `platform/windows/DdsPolicyAgent/Enforcers/PasswordPolicyEnforcer.cs`**:
+- Added `ReconcileStalePolicy(EnforcementMode mode)` — logs a warning and returns
+  `["[MANUAL] password_policy:orphaned (policy removed — review knobs manually)"]`.
+  Follows the same `[MANUAL]`-entry pattern as `ServiceEnforcer.ReconcileStaleServices`.
+
+**`platform/windows/DdsPolicyAgent/Worker.cs`**:
+- Added `desiredPasswordPolicy` (`HashSet<string>`) to `PollAndApplyAsync`.
+- Updated `ExtractDesiredItems` signature (+`HashSet<string> passwordPolicy`) and body:
+  adds sentinel key `"_applied"` when a policy contains a `password_policy` object.
+- Updated `ReconcileAsync` signature (+`desiredPasswordPolicy`) and added a
+  `password_policy` reconcile block after services: calls
+  `_passwordPolicyEnforcer.ReconcileStalePolicy` when the stale set is non-empty,
+  then persists the updated desired set via `_stateStore.RecordManagedItems`.
+
+**`platform/windows/DdsPolicyAgent.Tests/PasswordPolicyEnforcerTests.cs`** (+2 tests):
+- `ReconcileStalePolicy_EmitsManualDirective`: enforce mode → single `[MANUAL]` entry.
+- `ReconcileStalePolicy_AuditMode_StillEmitsManualDirective`: audit mode → same.
+
+**`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs`** (+2 tests):
+- `Reconciliation_StalePasswordPolicy_EmitsManualDirective`: pre-seeded
+  `password_policy=["_applied"]`, no current policy has it → `_reconciliation`
+  report contains `[MANUAL]…password_policy`, managed set cleared.
+- `Reconciliation_DesiredPasswordPolicy_IsKept`: pre-seeded with `"_applied"`,
+  current policy still has `password_policy` → no reconciliation report sent,
+  sentinel preserved in managed set.
+
+### Result
+
+Linux test count: **354 → 354** (log message changes only; 0 test changes).
+Windows test count: **267 → 271** (4 new tests; 0 failures).
+macOS count: 161 (unchanged). Rust workspace: no changes.
+
+---
+
+## Fix (2026-05-17, 116th pass) — macOS: Worker ignores enforcement field on software assignment documents
+
+### Gap
+
+`Worker.PollAndApplyAsync` read the `enforcement` field from macOS policy
+documents and passed the resulting `EnforcementMode` to `DispatchMacOsBundle`.
+For software assignment documents, however, the Worker hardcoded
+`EnforcementMode.Enforce` in the `_softwareInstaller.ApplyAsync(...)` call,
+ignoring any `enforcement: "Audit"` field in the assignment. Additionally, an
+audit-mode software assignment did not contribute to `globalMode`, so the
+reconciliation pass could remain in Enforce mode even when all active software
+assignments were in Audit mode.
+
+`SoftwareInstaller.ApplyAsync` already handled `EnforcementMode.Audit`
+correctly (short-circuit with `[AUDIT]` tag, no command runner invocation) and
+had an enforcer-level unit test for that path. The gap was only at the Worker
+dispatch level.
+
+### Fix
+
+In `Worker.PollAndApplyAsync`'s software loop:
+- Read `enforcement` from the software document (defaulting to `Enforce` when
+  absent, matching the policy-document pattern).
+- Set `globalMode = EnforcementMode.Audit` when the software document is in
+  audit mode, so reconciliation also runs in audit mode.
+- Pass the derived `swEnforcement` to `_softwareInstaller.ApplyAsync()`
+  instead of the hardcoded `EnforcementMode.Enforce`.
+
+Added `Apply_Software_AuditOnly_ReportDirectiveHasAuditPrefix` to
+`WorkerTests.cs`: a software assignment with `enforcement:"Audit"` must produce
+a report whose `Directives` list contains `[AUDIT]` and the package ID.
+
+### Result
+
+macOS: 161 tests (was 160; 1 new). Linux: 354 (unchanged). All Rust workspace
+tests pass. All pass.
+
+---
+
 ## Fix (2026-05-17, 115th pass) — macOS: add [AUDIT] prefix to SoftwareInstaller.ReconcileStalePackages in audit mode
 
 ### Gap

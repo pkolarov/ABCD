@@ -91,7 +91,7 @@ public sealed class SudoersEnforcer
     {
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would write sudoers drop-in {P} ({N} bytes)",
+            _log.LogInformation("[AUDIT] would write sudoers drop-in {P} ({N} bytes)",
                 targetPath, content.Length);
             return;
         }
@@ -125,7 +125,7 @@ public sealed class SudoersEnforcer
     {
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would delete sudoers drop-in {P}", targetPath);
+            _log.LogInformation("[AUDIT] would delete sudoers drop-in {P}", targetPath);
             return Task.CompletedTask;
         }
 
@@ -158,7 +158,7 @@ public sealed class SudoersEnforcer
             var targetPath = Path.Combine(_sudoersDir, filename);
             if (_auditOnly)
             {
-                _log.LogInformation("[audit] would delete stale sudoers drop-in {P}", targetPath);
+                _log.LogInformation("[AUDIT] would delete stale sudoers drop-in {P}", targetPath);
                 applied.Add($"[AUDIT] sudoers:delete:{filename}");
                 continue;
             }

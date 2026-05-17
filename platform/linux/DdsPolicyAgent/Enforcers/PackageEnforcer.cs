@@ -89,7 +89,7 @@ public sealed class PackageEnforcer
 
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would install package {Spec}", spec);
+            _log.LogInformation("[AUDIT] would install package {Spec}", spec);
             return;
         }
 
@@ -112,7 +112,7 @@ public sealed class PackageEnforcer
     {
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would remove package {Name}", name);
+            _log.LogInformation("[AUDIT] would remove package {Name}", name);
             return;
         }
 
@@ -162,7 +162,7 @@ public sealed class PackageEnforcer
             }
             if (_auditOnly)
             {
-                _log.LogInformation("[audit] would remove stale DDS-managed package {N}", name);
+                _log.LogInformation("[AUDIT] would remove stale DDS-managed package {N}", name);
                 applied.Add($"[AUDIT] pkg:remove:{name}");
                 continue;
             }

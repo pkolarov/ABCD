@@ -196,6 +196,7 @@ public sealed class Worker : BackgroundService
         var desiredGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var desiredSoftware = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var desiredServices = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var desiredPasswordPolicy = new HashSet<string>(StringComparer.Ordinal);
 
         // --- policies ---
         var policies = await _client
@@ -222,7 +223,7 @@ public sealed class Worker : BackgroundService
             if (p.Document.TryGetProperty("windows", out var win)
                 && win.ValueKind == JsonValueKind.Object)
             {
-                ExtractDesiredItems(win, desiredRegistryKeys, desiredAccounts, desiredGroups, desiredServices);
+                ExtractDesiredItems(win, desiredRegistryKeys, desiredAccounts, desiredGroups, desiredServices, desiredPasswordPolicy);
             }
 
             // AD-04: a transition since the last apply must force a one-shot
@@ -308,7 +309,8 @@ public sealed class Worker : BackgroundService
         // --- reconciliation pass ---
         await ReconcileAsync(
             desiredRegistryKeys, desiredAccounts, desiredGroups,
-            desiredSoftware, desiredServices, hostState, auditMode, modeReason, ct).ConfigureAwait(false);
+            desiredSoftware, desiredServices, desiredPasswordPolicy,
+            hostState, auditMode, modeReason, ct).ConfigureAwait(false);
 
         _previousJoinState = hostState;
     }
@@ -344,7 +346,8 @@ public sealed class Worker : BackgroundService
         HashSet<string> registryKeys,
         HashSet<string> accounts,
         HashSet<string> groups,
-        HashSet<string> services)
+        HashSet<string> services,
+        HashSet<string> passwordPolicy)
     {
         if (win.TryGetProperty("registry", out var reg) && reg.ValueKind == JsonValueKind.Array)
         {
@@ -385,6 +388,9 @@ public sealed class Worker : BackgroundService
                 if (key is not null) services.Add(key);
             }
         }
+
+        if (win.TryGetProperty("password_policy", out var pp) && pp.ValueKind == JsonValueKind.Object)
+            passwordPolicy.Add("_applied");
     }
 
     /// <summary>
@@ -400,6 +406,7 @@ public sealed class Worker : BackgroundService
         HashSet<string> desiredGroups,
         HashSet<string> desiredSoftware,
         HashSet<string> desiredServices,
+        HashSet<string> desiredPasswordPolicy,
         JoinState hostState,
         bool auditMode,
         string? modeReason,
@@ -496,6 +503,20 @@ public sealed class Worker : BackgroundService
             reconcileChanges.AddRange(changes);
         }
         _stateStore.RecordManagedItems("services", desiredServices, hostState, auditMode, modeReason);
+
+        // Password policy reconciliation (manual-review only — DDS cannot auto-revert knobs
+        // because the pre-apply baseline is not recorded).
+        var prevPasswordPolicy = _stateStore.GetManagedItems("password_policy");
+        var stalePasswordPolicy = new HashSet<string>(prevPasswordPolicy, StringComparer.Ordinal);
+        stalePasswordPolicy.ExceptWith(desiredPasswordPolicy);
+        if (stalePasswordPolicy.Count > 0)
+        {
+            _log.LogInformation(
+                "Reconciliation: password_policy removed from all policies — knobs may be orphaned");
+            var changes = _passwordPolicyEnforcer.ReconcileStalePolicy(effectiveMode);
+            reconcileChanges.AddRange(changes);
+        }
+        _stateStore.RecordManagedItems("password_policy", desiredPasswordPolicy, hostState, auditMode, modeReason);
 
         if (reconcileChanges.Count > 0)
         {

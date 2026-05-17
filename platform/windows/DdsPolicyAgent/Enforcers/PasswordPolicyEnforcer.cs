@@ -140,4 +140,19 @@ public sealed class PasswordPolicyEnforcer : IEnforcer
             _log.LogError(ex, "PasswordPolicy: failed to set {Name}", name);
         }
     }
+
+    /// <summary>
+    /// Called during reconciliation when no current policy contains a
+    /// <c>password_policy</c> section but DDS previously applied one.
+    /// Password policy knobs cannot be auto-reverted because DDS does not
+    /// record the pre-apply baseline. Emits a <c>[MANUAL]</c> entry so
+    /// operators know to review the current settings manually.
+    /// </summary>
+    public List<string> ReconcileStalePolicy(EnforcementMode mode)
+    {
+        _log.LogWarning(
+            "PasswordPolicy reconcile: password_policy removed from all policies — " +
+            "DDS cannot auto-revert knobs; review current password policy manually");
+        return [$"[MANUAL] password_policy:orphaned (policy removed — review knobs manually)"];
+    }
 }

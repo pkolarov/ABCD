@@ -163,7 +163,7 @@ public sealed class SystemdEnforcer
 
             if (_auditOnly)
             {
-                _log.LogInformation("[audit] would remove stale dropin {P}", dropinPath);
+                _log.LogInformation("[AUDIT] would remove stale dropin {P}", dropinPath);
                 results.Add($"[AUDIT] systemd:removedropin:{key}");
                 continue;
             }
@@ -203,7 +203,7 @@ public sealed class SystemdEnforcer
 
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would write dropin {P}", dropinPath);
+            _log.LogInformation("[AUDIT] would write dropin {P}", dropinPath);
             return stem;
         }
 
@@ -231,7 +231,7 @@ public sealed class SystemdEnforcer
 
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would remove dropin {P}", dropinPath);
+            _log.LogInformation("[AUDIT] would remove dropin {P}", dropinPath);
             return Task.FromResult<string?>(stem);
         }
 
@@ -250,7 +250,7 @@ public sealed class SystemdEnforcer
 
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would run: systemctl {Args}", fullArgs);
+            _log.LogInformation("[AUDIT] would run: systemctl {Args}", fullArgs);
             return;
         }
 

@@ -162,7 +162,7 @@ public sealed class SshdEnforcer
 
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would write {Path} ({N} directives)", _dropinPath, lines.Count);
+            _log.LogInformation("[AUDIT] would write {Path} ({N} directives)", _dropinPath, lines.Count);
             return;
         }
 
@@ -182,7 +182,7 @@ public sealed class SshdEnforcer
     {
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would remove {Path}", _dropinPath);
+            _log.LogInformation("[AUDIT] would remove {Path}", _dropinPath);
             return Task.CompletedTask;
         }
 
@@ -198,7 +198,7 @@ public sealed class SshdEnforcer
     {
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would run: systemctl reload sshd");
+            _log.LogInformation("[AUDIT] would run: systemctl reload sshd");
             return;
         }
 

@@ -148,7 +148,7 @@ public sealed class SysctlEnforcer
         if (_auditOnly)
         {
             _log.LogInformation(
-                "[audit] would write {Path} ({N} entries)", _dropinPath, entries.Count);
+                "[AUDIT] would write {Path} ({N} entries)", _dropinPath, entries.Count);
             return;
         }
 
@@ -168,7 +168,7 @@ public sealed class SysctlEnforcer
     {
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would run: sysctl --system");
+            _log.LogInformation("[AUDIT] would run: sysctl --system");
             return;
         }
 

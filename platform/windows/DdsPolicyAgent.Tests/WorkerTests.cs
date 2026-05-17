@@ -761,6 +761,68 @@ public class WorkerTests
         Assert.Contains("MySvc", store.RecordCalls["services"]);
     }
 
+    [Fact]
+    public async Task Reconciliation_StalePasswordPolicy_EmitsManualDirective()
+    {
+        // "password_policy" was applied in a prior cycle but no current policy
+        // has it → reconciliation must emit a [MANUAL] directive (knobs cannot
+        // be auto-reverted) and clear the managed-password_policy set.
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["password_policy"] = ["_applied"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // A reconciliation report must have been submitted.
+        var reconcileReport = client.ReceivedReports.FirstOrDefault(
+            r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconcileReport);
+        Assert.Equal("ok", reconcileReport.Status);
+        Assert.Contains(reconcileReport.Directives,
+            d => d.Contains("[MANUAL]") && d.Contains("password_policy"));
+
+        // The managed-password_policy set must now be empty.
+        Assert.True(store.RecordCalls.ContainsKey("password_policy"));
+        Assert.Empty(store.RecordCalls["password_policy"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_DesiredPasswordPolicy_IsKept()
+    {
+        // password_policy is managed AND still declared in the current policy
+        // → reconciliation must NOT emit a [MANUAL] directive.
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["password_policy"] = ["_applied"],
+        });
+
+        var client = new TestWindowsDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableWindowsPolicy
+                {
+                    Jti = "jti-1",
+                    Document = JsonDocument.Parse(
+                        """{"policy_id":"p1","version":1,"windows":{"password_policy":{"min_length":12}}}""").RootElement,
+                },
+            ],
+        };
+
+        var worker = MakeWorker(client, store);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // No reconciliation report must be sent.
+        Assert.DoesNotContain(client.ReceivedReports, r => r.TargetId == "_reconciliation");
+
+        // The managed-password_policy set must still contain the sentinel.
+        Assert.True(store.RecordCalls.ContainsKey("password_policy"));
+        Assert.Contains("_applied", store.RecordCalls["password_policy"]);
+    }
+
     // --- helpers --------------------------------------------------------
 
     private static Worker BuildWorker(

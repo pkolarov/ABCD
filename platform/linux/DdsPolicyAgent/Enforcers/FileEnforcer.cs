@@ -130,7 +130,7 @@ public sealed class FileEnforcer
 
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would write {P} ({N} bytes)", path, bytes.Length);
+            _log.LogInformation("[AUDIT] would write {P} ({N} bytes)", path, bytes.Length);
             return true;
         }
 
@@ -150,7 +150,7 @@ public sealed class FileEnforcer
     {
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would delete {P}", path);
+            _log.LogInformation("[AUDIT] would delete {P}", path);
             return;
         }
 
@@ -165,7 +165,7 @@ public sealed class FileEnforcer
     {
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would ensure dir {P}", path);
+            _log.LogInformation("[AUDIT] would ensure dir {P}", path);
             return;
         }
 
@@ -224,7 +224,7 @@ public sealed class FileEnforcer
             }
             if (_auditOnly)
             {
-                _log.LogInformation("[audit] would delete stale DDS-managed file {P}", path);
+                _log.LogInformation("[AUDIT] would delete stale DDS-managed file {P}", path);
                 applied.Add($"[AUDIT] file:delete:{path}");
                 continue;
             }

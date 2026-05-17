@@ -578,6 +578,33 @@ public class WorkerTests
     }
 
     [Fact]
+    public async Task Apply_Software_AuditOnly_ReportDirectiveHasAuditPrefix()
+    {
+        // A software assignment with enforcement:"Audit" must be processed in
+        // audit mode: the installer returns an [AUDIT] tag and does NOT invoke
+        // any command runner (no real install attempt).
+        var store = new TrackingAppliedStateStore();
+        var softwareDoc = JsonDocument.Parse(
+            """{"package_id":"com.example.audit-pkg","action":"Install","version":"2.0","source":"https://example.com/pkg.pkg","sha256":"abc","enforcement":"Audit"}""");
+
+        var client = new TestMacDdsNodeClient
+        {
+            NextSoftware =
+            [
+                new ApplicableSoftware { Jti = "jti-sw-audit", Document = softwareDoc.RootElement },
+            ],
+        };
+
+        var worker = MakeWorker(client, store);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // The software apply report must contain [AUDIT] and the package id.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "com.example.audit-pkg");
+        Assert.NotNull(report);
+        Assert.Contains(report.Directives, d => d.Contains("[AUDIT]") && d.Contains("com.example.audit-pkg"));
+    }
+
+    [Fact]
     public async Task Reconciliation_DesiredSoftware_IsKept()
     {
         // "com.example.app" is both managed AND still present in current

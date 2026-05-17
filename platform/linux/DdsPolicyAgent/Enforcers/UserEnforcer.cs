@@ -199,7 +199,7 @@ public sealed class UserEnforcer
     {
         if (_auditOnly)
         {
-            _log.LogInformation("[audit] would run: {Cmd} {Args}", cmd, args);
+            _log.LogInformation("[AUDIT] would run: {Cmd} {Args}", cmd, args);
             return;
         }
 
@@ -223,7 +223,7 @@ public sealed class UserEnforcer
             }
             if (_auditOnly)
             {
-                _log.LogInformation("[audit] would run: passwd -l {U}", username);
+                _log.LogInformation("[AUDIT] would run: passwd -l {U}", username);
                 applied.Add($"[AUDIT] user:disable:{username}");
                 continue;
             }
@@ -286,7 +286,7 @@ public sealed class UserEnforcer
 
             if (_auditOnly)
             {
-                _log.LogInformation("[audit] would run: gpasswd -d {User} {Group}", username, group);
+                _log.LogInformation("[AUDIT] would run: gpasswd -d {User} {Group}", username, group);
                 applied.Add($"[AUDIT] user:leave-group:{key}");
                 continue;
             }
