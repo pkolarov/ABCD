@@ -1,5 +1,39 @@
 # DDS Implementation Status
 
+## Test (2026-05-17, 114th pass) — Linux: add Worker-level audit-prefix tests for remaining 4 enforcers
+
+### Gap
+
+The 113th pass added Worker-level `[AUDIT]` prefix tests for the apply phase but only
+covered three of the seven enforcers (UserEnforcer, PackageEnforcer, FileEnforcer).
+The remaining four enforcers — SudoersEnforcer, SysctlEnforcer, SystemdEnforcer, and
+SshdEnforcer — had enforcer-level unit tests asserting the `[AUDIT]` prefix but no
+Worker-level tests verifying that the prefix survives the full
+Worker → enforcer → `ReportApplied` → `ReceivedReports` pipeline.
+
+### Fix
+
+Added four new `[Fact]` tests to `WorkerTests.cs`:
+
+- `Apply_SetSudoers_AuditOnly_ReportDirectiveHasAuditPrefix` — Sudoers set directive
+  in audit mode: verifies `[AUDIT] sudoers:set:dds-ops` in the policy report directives
+  AND that `store.AddedSudoersFilenames` contains "dds-ops".
+- `Apply_SetSysctl_AuditOnly_ReportDirectiveHasAuditPrefix` — Sysctl set directive in
+  audit mode: verifies `[AUDIT] sysctl:set:vm.swappiness` in the policy report directives.
+- `Apply_ConfigureSystemdDropin_AuditOnly_ReportDirectiveHasAuditPrefix` — Systemd
+  ConfigureDropin directive in audit mode: verifies
+  `[AUDIT] systemd:configuredropin:sshd.service/hardening` in the policy report directives
+  AND that `store.AddedSystemdDropinKeys` contains the drop-in key.
+- `Apply_SshdPolicy_AuditOnly_ReportDirectiveHasAuditPrefix` — Sshd policy directive
+  in audit mode: verifies `[AUDIT] sshd:set:PasswordAuthentication=False` in the policy
+  report directives.
+
+### Result
+
+Linux: 354 tests (was 350; 4 new). macOS: 159 tests (unchanged). All pass.
+
+---
+
 ## Test (2026-05-17, 113th pass) — Linux: add Worker-level audit-prefix tests for apply phase
 
 ### Gap

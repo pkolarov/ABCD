@@ -1273,4 +1273,127 @@ public sealed class WorkerTests
         Assert.NotNull(report);
         Assert.Contains("[AUDIT] file:set:/etc/dds/audit.conf", report.Directives);
     }
+
+    [Fact]
+    public async Task Apply_SetSudoers_AuditOnly_ReportDirectiveHasAuditPrefix()
+    {
+        var store = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-audit-sudoers",
+                    """{"policy_id":"policy-audit-sudoers","version":1,"linux":{"sudoers":[{"filename":"dds-ops","content":"alice ALL=(ALL) NOPASSWD: /usr/bin/systemctl"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // Managed state must be updated so stale-sudoers reconciliation detects the drop-in.
+        Assert.Contains("dds-ops", store.AddedSudoersFilenames);
+
+        // The policy report directive must carry [AUDIT] so operators can
+        // distinguish dry-run entries from actual mutations.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "policy-audit-sudoers");
+        Assert.NotNull(report);
+        Assert.Contains("[AUDIT] sudoers:set:dds-ops", report.Directives);
+    }
+
+    [Fact]
+    public async Task Apply_SetSysctl_AuditOnly_ReportDirectiveHasAuditPrefix()
+    {
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-audit-sysctl",
+                    """{"policy_id":"policy-audit-sysctl","version":1,"linux":{"sysctl":[{"key":"vm.swappiness","value":"10","action":"Set"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "policy-audit-sysctl");
+        Assert.NotNull(report);
+        Assert.Contains("[AUDIT] sysctl:set:vm.swappiness", report.Directives);
+    }
+
+    [Fact]
+    public async Task Apply_ConfigureSystemdDropin_AuditOnly_ReportDirectiveHasAuditPrefix()
+    {
+        var store = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-audit-systemd",
+                    """{"policy_id":"policy-audit-systemd","version":1,"linux":{"systemd":[{"unit":"sshd.service","action":"ConfigureDropin","dropin_name":"hardening","dropin_content":"[Service]\nLimitNOFILE=65535"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // Managed state must be updated so stale-dropin reconciliation detects the drop-in.
+        Assert.Contains("sshd.service/hardening", store.AddedSystemdDropinKeys);
+
+        // The policy report directive must carry [AUDIT].
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "policy-audit-systemd");
+        Assert.NotNull(report);
+        Assert.Contains("[AUDIT] systemd:configuredropin:sshd.service/hardening", report.Directives);
+    }
+
+    [Fact]
+    public async Task Apply_SshdPolicy_AuditOnly_ReportDirectiveHasAuditPrefix()
+    {
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-audit-sshd",
+                    """{"policy_id":"policy-audit-sshd","version":1,"linux":{"ssh":{"password_authentication":false}}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "policy-audit-sshd");
+        Assert.NotNull(report);
+        Assert.Contains("[AUDIT] sshd:set:PasswordAuthentication=False", report.Directives);
+    }
 }
