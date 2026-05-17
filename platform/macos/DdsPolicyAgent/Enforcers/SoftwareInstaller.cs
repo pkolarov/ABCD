@@ -444,12 +444,21 @@ public sealed class SoftwareInstaller : IEnforcer
         var changes = new List<string>();
         foreach (var packageId in staleKeys)
         {
-            _log.LogWarning(
-                "Software reconcile: package '{PackageId}' is no longer in policy; " +
-                "add an Uninstall directive with uninstall_script to remove automatically, " +
-                "or remove the package manually",
-                packageId);
-            changes.Add($"[MANUAL] Reconcile-Uninstall {packageId} (add Uninstall directive with uninstall_script, or remove manually)");
+            var desc = $"[MANUAL] Reconcile-Uninstall {packageId} (add Uninstall directive with uninstall_script, or remove manually)";
+            if (mode == EnforcementMode.Audit)
+            {
+                _log.LogInformation("[AUDIT] Software reconcile: package '{PackageId}' is no longer in policy", packageId);
+                changes.Add($"[AUDIT] {desc}");
+            }
+            else
+            {
+                _log.LogWarning(
+                    "Software reconcile: package '{PackageId}' is no longer in policy; " +
+                    "add an Uninstall directive with uninstall_script to remove automatically, " +
+                    "or remove the package manually",
+                    packageId);
+                changes.Add(desc);
+            }
         }
         return changes;
     }

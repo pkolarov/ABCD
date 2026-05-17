@@ -1,5 +1,36 @@
 # DDS Implementation Status
 
+## Fix (2026-05-17, 115th pass) — macOS: add [AUDIT] prefix to SoftwareInstaller.ReconcileStalePackages in audit mode
+
+### Gap
+
+`SoftwareInstaller.ReconcileStalePackages` accepted an `EnforcementMode mode` parameter
+(matching the interface) but never checked it. In audit mode the method unconditionally
+emitted a `[MANUAL] Reconcile-Uninstall ...` string and logged at `LogWarning` — the same
+output as enforce mode. All other macOS reconciliation methods (MacAccountEnforcer,
+LaunchdEnforcer, PreferenceEnforcer, ProfileEnforcer) and the Windows
+`SoftwareInstaller.ReconcileStalePackages` already gate on `mode == EnforcementMode.Audit`
+and prepend `[AUDIT]`.
+
+The existing test `SoftwareInstaller_ReconcileStalePackages_always_logs_manual_action`
+only tested `EnforcementMode.Enforce` and was named as if audit mode didn't matter.
+
+### Fix
+
+- In `ReconcileStalePackages`: when `mode == EnforcementMode.Audit`, log at
+  `LogInformation` with `[AUDIT] Software reconcile: package '{PackageId}' is no longer
+  in policy` and return `$"[AUDIT] {desc}"` instead of falling through to the warning path.
+- Added `SoftwareInstaller_ReconcileStalePackages_audit_mode_returns_audit_prefix` to
+  `EnforcerTests.cs` — asserts a single change whose string contains `[AUDIT]` and
+  the package ID when called with `EnforcementMode.Audit`.
+
+### Result
+
+macOS: 160 tests (was 159; 1 new). Linux: 354 (unchanged). Windows .NET: 267 pass / 39
+skipped (unchanged). All Rust workspace tests pass. All pass.
+
+---
+
 ## Test (2026-05-17, 114th pass) — Linux: add Worker-level audit-prefix tests for remaining 4 enforcers
 
 ### Gap

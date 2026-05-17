@@ -812,6 +812,24 @@ public class EnforcerTests
         Assert.Contains("com.example.app", changes[0]);
     }
 
+    [Fact]
+    public void SoftwareInstaller_ReconcileStalePackages_audit_mode_returns_audit_prefix()
+    {
+        var installer = new SoftwareInstaller(
+            NullLogger<SoftwareInstaller>.Instance,
+            new RecordingCommandRunner((_, _, _) => new CommandResult(0, string.Empty, string.Empty)),
+            Options.Create(new AgentConfig()),
+            new StaticHttpClientFactory(new HttpClient()));
+
+        var changes = installer.ReconcileStalePackages(
+            new HashSet<string>(["com.example.app"]),
+            EnforcementMode.Audit);
+
+        Assert.Single(changes);
+        Assert.Contains("[AUDIT]", changes[0]);
+        Assert.Contains("com.example.app", changes[0]);
+    }
+
     // --- macOS Uninstall via uninstall_script -----------------------------------
 
     [Fact]
