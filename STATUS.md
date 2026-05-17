@@ -1,5 +1,39 @@
 # DDS Implementation Status
 
+## Test (2026-05-17, 113th pass) — Linux: add Worker-level audit-prefix tests for apply phase
+
+### Gap
+
+The 112th pass fixed the missing `[AUDIT]` prefix in enforcer `ApplyAsync` tag paths
+and updated enforcer-level unit tests to assert the corrected behavior. However, the
+`WorkerTests.cs` apply-phase tests only verified that managed-resource state was
+correctly updated in audit mode (via `TrackingAppliedStateStore`); they did not check
+that the policy report's `Directives` list contained the `[AUDIT]` prefix. The
+reconciliation tests (`Reconciliation_StaleUser_AuditOnly_NoRunnerCall`, etc.) already
+checked `[AUDIT]` in reconciliation reports, but the corresponding apply-phase coverage
+was missing.
+
+### Fix
+
+Added three new `[Fact]` tests to `WorkerTests.cs` that cover the full
+Worker → enforcer → report pipeline in audit mode:
+
+- `Apply_CreateUser_AuditOnly_ReportDirectiveHasAuditPrefix` — Create user directive
+  in audit mode: verifies `[AUDIT] user:create:alice` in the policy report directives
+  AND that `store.AddedUsernames` contains "alice".
+- `Apply_InstallPackage_AuditOnly_ReportDirectiveHasAuditPrefix` — Install package
+  directive in audit mode: verifies `[AUDIT] pkg:install:ntp` in the policy report
+  directives AND that `store.AddedPackages` contains "ntp".
+- `Apply_SetFile_AuditOnly_ReportDirectiveHasAuditPrefix` — Set file directive in
+  audit mode: verifies `[AUDIT] file:set:/etc/dds/audit.conf` in the policy report
+  directives AND that `store.AddedPaths` contains the path.
+
+### Result
+
+Linux: 350 tests (was 347; 3 new). macOS: 159 tests (unchanged). All pass.
+
+---
+
 ## Fix (2026-05-17, 112th pass) — Linux: [AUDIT] prefix missing from all enforcer ApplyAsync tag paths
 
 ### Bug
@@ -47,7 +81,8 @@ matched, so managed-resource state was silently not recorded in audit mode.
 ### Result
 
 Linux: 347 tests (unchanged count; all pass with corrected assertions). macOS: 159
-tests (unchanged). Rust: 347 tests (unchanged). All pass.
+tests (unchanged). Rust: 347 tests (unchanged). All pass. (Note: Linux test count
+raised to 350 in the 113th pass with three new apply-phase audit-prefix tests.)
 
 ---
 

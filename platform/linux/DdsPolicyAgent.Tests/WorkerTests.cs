@@ -1167,4 +1167,110 @@ public sealed class WorkerTests
         Assert.Contains("sshd.service/dds-limits", store.RemovedSystemdDropinKeys);
         Assert.DoesNotContain("sshd.service/dds-limits", store.AddedSystemdDropinKeys);
     }
+
+    // =========================================================
+    // Apply-phase [AUDIT] prefix tests (113th pass)
+    //
+    // The 112th pass fixed missing [AUDIT] prefixes in six enforcer
+    // ApplyAsync paths. These tests verify the prefix survives the
+    // full Worker → enforcer → report pipeline (not just the
+    // enforcer unit in isolation).
+    // =========================================================
+
+    [Fact]
+    public async Task Apply_CreateUser_AuditOnly_ReportDirectiveHasAuditPrefix()
+    {
+        var store = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-audit-create-user",
+                    """{"policy_id":"policy-audit-create-user","version":1,"linux":{"local_users":[{"username":"alice","action":"Create","shell":"/bin/bash"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // Managed state must be updated so future Remove directives pass the guard.
+        Assert.Contains("alice", store.AddedUsernames);
+
+        // The policy report directive must carry [AUDIT] so operators can
+        // distinguish dry-run entries from actual mutations.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "policy-audit-create-user");
+        Assert.NotNull(report);
+        Assert.Contains("[AUDIT] user:create:alice", report.Directives);
+    }
+
+    [Fact]
+    public async Task Apply_InstallPackage_AuditOnly_ReportDirectiveHasAuditPrefix()
+    {
+        var store = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-audit-install-pkg",
+                    """{"policy_id":"policy-audit-install-pkg","version":1,"linux":{"packages":[{"name":"ntp","action":"Install"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Contains("ntp", store.AddedPackages);
+
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "policy-audit-install-pkg");
+        Assert.NotNull(report);
+        Assert.Contains("[AUDIT] pkg:install:ntp", report.Directives);
+    }
+
+    [Fact]
+    public async Task Apply_SetFile_AuditOnly_ReportDirectiveHasAuditPrefix()
+    {
+        var store = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
+        var contentB64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("# managed by dds"));
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-audit-set-file",
+                    "{\"policy_id\":\"policy-audit-set-file\",\"version\":1,\"linux\":{\"files\":[{\"path\":\"/etc/dds/audit.conf\",\"action\":\"Set\",\"content_b64\":\"" + contentB64 + "\"}]}}"),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.Contains("/etc/dds/audit.conf", store.AddedPaths);
+
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "policy-audit-set-file");
+        Assert.NotNull(report);
+        Assert.Contains("[AUDIT] file:set:/etc/dds/audit.conf", report.Directives);
+    }
 }
