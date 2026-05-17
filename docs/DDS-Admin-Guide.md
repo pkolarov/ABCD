@@ -1680,8 +1680,7 @@ what *would* be cleaned up but does not remove or disable anything.
   by DDS) is never modified by reconciliation.
 - Account disablement is refused for accounts not tracked in the DDS managed-set,
   preventing accidental disablement of pre-existing local accounts.
-- Software package uninstall is always skipped because generic `.pkg` uninstall
-  is not supported; stale packages require manual removal.
+- Explicit `Uninstall` directives are now supported via the `uninstall_script` field (requires `AllowInlinePackageScripts: true`). Stale packages (previously installed but no longer in any applicable policy) still require manual removal — there is no automatic reconciliation-driven uninstall.
 - The agent tracks managed items in `/Library/Application Support/DDS/applied-state.json`
   under the `managed_items` key, keyed by enforcer category (`preferences`,
   `accounts`, `account_groups`, `launchd`, `profiles`, `software_managed`).
@@ -2085,10 +2084,13 @@ The policy agent reads from `/Library/Application Support/DDS/appsettings.json`:
     "ManagedPreferencesDir": "/Library/Managed Preferences",
     "LaunchDaemonPlistDir": "/Library/LaunchDaemons",
     "LaunchAgentPlistDir": "/Library/LaunchAgents",
-    "RequirePackageSignature": true
+    "RequirePackageSignature": true,
+    "AllowInlinePackageScripts": false
   }
 }
 ```
+
+`AllowInlinePackageScripts` (default `false`): must be set to `true` to run `pre_install_script`, `post_install_script`, or `uninstall_script` fields from `SoftwareAssignment` tokens. Leave disabled unless your policy model requires it.
 
 Settings can also be overridden via environment variables (prefix `DdsPolicyAgent__`).
 
@@ -2111,7 +2113,7 @@ returns the canonical `node_pubkey_b64` to copy in.
 | Local accounts | `dscl`, `pwpolicy`, `sysadminctl`, `dseditgroup` | Create/delete/disable users, admin group, hidden flag, and supplementary group memberships. `username` must be 1–255 chars, ASCII letters/digits/`.`/`_`/`-`, not starting with `-`. Shell must be an absolute path with no spaces or metacharacters. Group names in the `groups` array are validated (max 255 chars; must not start with `-`; no control characters) before each `dseditgroup` call; supplementary groups are applied on every `Create`/`Modify` cycle. Use only on standalone Macs; refuses on directory-bound machines today. |
 | launchd services | `launchctl` bootstrap/bootout/kickstart | Configure, load, unload managed LaunchDaemons/Agents |
 | Configuration profiles | `profiles -I` / `profiles -R` | SHA-256 idempotency, payload stamp state |
-| Software install | `/usr/sbin/installer` + `pkgutil` | HTTP download, SHA-256 verify, optional signature check. Uninstall intentionally not supported. |
+| Software install/uninstall | `/usr/sbin/installer` + `pkgutil` + `/bin/zsh` | HTTP download, SHA-256 verify, optional signature check. `Uninstall` action supported via `uninstall_script` field in the `SoftwareAssignment` token (requires `AllowInlinePackageScripts: true` in agent config); macOS has no universal package-removal primitive so the admin supplies an inline shell removal recipe. |
 
 ### Service Management
 

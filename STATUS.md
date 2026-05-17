@@ -1,5 +1,50 @@
 # DDS Implementation Status
 
+## Doc fix (2026-05-17, 111th pass) — Update DDS-Admin-Guide.md and DDS-Design-Document.md for macOS Uninstall via uninstall_script
+
+### Gap
+
+The 108th-pass commit (`4fdbeb8`) added macOS `Uninstall` action support via an
+`uninstall_script` field in `SoftwareAssignment`, but three documentation sites
+still said "Uninstall intentionally not supported":
+
+1. `docs/DDS-Admin-Guide.md` — Policy Enforcement Capabilities table row for
+   "Software install" claimed uninstall was not supported.
+2. `docs/DDS-Admin-Guide.md` — Safety Guarantees section stated "Software
+   package uninstall is always skipped".
+3. `docs/DDS-Admin-Guide.md` — Policy Agent Configuration section example JSON
+   was missing the `AllowInlinePackageScripts` config key (required for the
+   new `uninstall_script` feature).
+4. `docs/DDS-Design-Document.md` — `SoftwareAssignment` schema block was missing
+   the `uninstall_script` field.
+5. `docs/DDS-Design-Document.md` — Reconciliation description still said
+   "generic package uninstall is not supported".
+
+### Fix
+
+**`docs/DDS-Admin-Guide.md`**:
+- Updated "Software install" capability row to mention `Uninstall` action support
+  via `uninstall_script` and `AllowInlinePackageScripts: true` requirement.
+- Updated Safety Guarantees to clarify: explicit `Uninstall` now works via
+  `uninstall_script`; stale packages (no longer in any policy) still require
+  manual removal.
+- Added `AllowInlinePackageScripts: false` to the configuration example JSON
+  with a note explaining it must be enabled for `uninstall_script` / pre/post
+  install scripts.
+
+**`docs/DDS-Design-Document.md`**:
+- Added `uninstall_script: Option<String>` to the `SoftwareAssignment` schema block.
+- Updated reconciliation description to say explicit `Uninstall` is supported
+  via `uninstall_script`, while stale-package reconciliation still requires
+  manual removal.
+
+### Result
+
+Linux: 347 tests (unchanged). macOS: 159 tests (unchanged). Rust: no code changes.
+All existing tests still pass. Documentation now accurately reflects the 108th-pass implementation.
+
+---
+
 ## Fix (2026-05-17, 110th pass) — Linux: [AUDIT] prefix missing from SshdEnforcer dropin-remove tags in audit mode
 
 ### Gap

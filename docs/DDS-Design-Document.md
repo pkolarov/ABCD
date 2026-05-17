@@ -1069,7 +1069,8 @@ SoftwareAssignment
 ├── scope: PolicyScope         # same scope model as WindowsPolicyDocument
 ├── silent: bool
 ├── pre_install_script: Option<String>
-└── post_install_script: Option<String>
+├── post_install_script: Option<String>
+└── uninstall_script: Option<String>  # macOS only; shell recipe run by /bin/zsh -lc when action=Uninstall
 ```
 
 Both types are signed Vouchsafe attestation tokens. The trust graph validates
@@ -1415,8 +1416,7 @@ declares an `ssh` field with at least one recognized valid directive (absent fie
 `null`, empty object, and all-invalid-value objects are all treated equivalently). Unit-state directives (Enable/Disable/Start/Stop/Restart/Mask/Unmask)
 are applied on the forward pass only — reversing them is ambiguous. For macOS:
 the same algorithm runs with platform-appropriate backends (dscl, launchctl,
-profiles, etc.); generic package uninstall is not supported so stale software
-entries are flagged for manual removal.
+profiles, etc.); explicit `Uninstall` directives are supported via `uninstall_script` (requires `AllowInlinePackageScripts: true`), but stale software entries (packages no longer in any policy) are still flagged for manual removal.
 
 ### 14.6 Linux Platform — Managed Device Architecture
 
