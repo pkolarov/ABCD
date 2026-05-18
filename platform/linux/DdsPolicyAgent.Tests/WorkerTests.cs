@@ -1762,4 +1762,41 @@ public sealed class WorkerTests
         Assert.NotNull(reconciliation);
         Assert.Contains("[AUDIT] user:leave-group:alice:sudo", reconciliation.Directives);
     }
+
+    [Fact]
+    public async Task Reconciliation_StaleGroupMembership_EnforceMode_EmitsLeaveGroupDirective()
+    {
+        // "alice:sudo" was managed in a prior cycle but is absent from all current policies.
+        // In enforce mode gpasswd must be called and the reconciliation report must carry
+        // user:leave-group:alice:sudo without the [AUDIT] prefix.
+        var staleState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        staleState.ManagedGroups.Add("alice:sudo");
+
+        var store  = new TrackingAppliedStateStore(staleState);
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // gpasswd must be invoked in enforce mode.
+        Assert.Contains(runner.Invocations,
+            i => i.FileName == "gpasswd" && i.Arguments.Contains("alice") && i.Arguments.Contains("sudo"));
+        // SetManagedGroups is called with the empty desired set.
+        Assert.Single(store.SetGroupsCalls);
+        Assert.Empty(store.SetGroupsCalls[0]);
+
+        var reconciliation = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconciliation);
+        Assert.Contains("user:leave-group:alice:sudo", reconciliation.Directives);
+        Assert.DoesNotContain("[AUDIT]", string.Join(",", reconciliation.Directives));
+    }
 }

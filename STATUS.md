@@ -1,5 +1,51 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-18, 127th pass) — Linux: Worker-level enforce-mode reconciliation test missing for group memberships
+
+### Gap
+
+`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs` was missing the enforce-mode
+counterpart for the group-membership reconciliation test added in the 121st pass.
+
+The 121st pass added:
+- `Reconciliation_StaleGroupMembership_AuditOnly_EmitsAuditPrefixedLeaveGroupDirective`:
+  verifies that in audit mode `gpasswd` is NOT called and the `_reconciliation` report
+  carries `[AUDIT] user:leave-group:alice:sudo`.
+
+The older `GroupMembership_ReconcileRemovesStaleKey` test (added earlier) verifies that
+`gpasswd -d alice sudo` is called in enforce mode and `SetManagedGroups` is called with
+the empty set — but it never asserts that the `_reconciliation` report is sent or that
+the directive string is `user:leave-group:alice:sudo` (without the `[AUDIT]` prefix).
+
+This is the exact same gap pattern that was fixed for sysctl and sshd in the 125th pass
+and for sudoers and systemd in the 126th pass. Every other reconciliation category now
+has both an audit-mode test (checking the `[AUDIT]`-prefixed directive) and an
+enforce-mode test (checking the non-prefixed directive and the real side effect); group
+membership was the sole remaining category with only the audit-mode half covered at the
+`Reconciliation_` naming level.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`** (+1 test):
+
+- Added `Reconciliation_StaleGroupMembership_EnforceMode_EmitsLeaveGroupDirective`:
+  seeds `ManagedGroups` with `"alice:sudo"`, runs `PollOnceAsync` with `AuditOnly = false`
+  and empty `NextPolicies`, asserts:
+  - `gpasswd` IS invoked with `alice` and `sudo` arguments
+  - `SetManagedGroups` is called with the empty desired set
+  - `_reconciliation` report contains `user:leave-group:alice:sudo`
+  - report directives do NOT contain `[AUDIT]`
+
+No production code changes were required — `UserEnforcer.ReconcileStaleGroupsAsync`
+already emits the correct non-prefixed directive in enforce mode.
+
+### Result
+
+Linux test count: **363 → 364** (1 new test; 0 failures). macOS: 166 (unchanged).
+Windows: 275 (unchanged). Rust workspace: no changes.
+
+---
+
 ## Fix + Test Gap Fix (2026-05-18, 126th pass) — Linux: Worker missing sudoersDir/systemdDropinBase path injection + enforce-mode reconciliation tests for sudoers and systemd drop-ins + sshd enforce-mode test bug fix
 
 ### Gaps
