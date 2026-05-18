@@ -385,6 +385,36 @@ public class WorkerTests
     }
 
     [Fact]
+    public async Task Reconciliation_StaleRegistryEntry_AuditMode_DoesNotDelete()
+    {
+        // On an AD-joined host the effective mode is forced to Audit; stale
+        // registry entries must NOT be deleted — the reconciler is skipped
+        // and the value remains intact.
+        var registryOps = new InMemoryRegistryOperations();
+        registryOps.SetValue("LocalMachine", @"SOFTWARE\Policies\DDS", "OldSetting", (uint)1, RegValueKind.Dword);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["registry"] = [@"LocalMachine\SOFTWARE\Policies\DDS\OldSetting"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store, registryOps: registryOps);
+        await worker.PollAndApplyAsync(JoinState.AdJoined, CancellationToken.None);
+
+        // Audit mode: DeleteValue must NOT have been called.
+        Assert.NotNull(registryOps.Peek("LocalMachine", @"SOFTWARE\Policies\DDS", "OldSetting"));
+
+        // No reconciliation report must be sent (reconciler was skipped entirely).
+        Assert.DoesNotContain(client.ReceivedReports, r => r.TargetId == "_reconciliation");
+
+        // The managed-registry set must still be cleared so the item is
+        // not re-reported on every subsequent cycle.
+        Assert.True(store.RecordCalls.ContainsKey("registry"));
+        Assert.Empty(store.RecordCalls["registry"]);
+    }
+
+    [Fact]
     public async Task Reconciliation_DesiredRegistryEntry_IsKept()
     {
         // A registry value is both managed AND present in the current policy
@@ -548,6 +578,36 @@ public class WorkerTests
     }
 
     [Fact]
+    public async Task Reconciliation_StaleGroupMembership_AuditMode_DoesNotRemove()
+    {
+        // On an AD-joined host stale group memberships must NOT be removed —
+        // the reconciler is skipped and alice must remain in Administrators.
+        var accountOps = new InMemoryAccountOperations();
+        accountOps.CreateUser("alice", null, null);
+        accountOps.AddToGroup("alice", "Administrators");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["account_groups"] = ["alice:Administrators"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(JoinState.AdJoined, CancellationToken.None);
+
+        // Audit mode: RemoveFromGroup must NOT have been called.
+        Assert.Contains("Administrators", accountOps.GetGroups("alice"));
+
+        // No reconciliation report must be sent (reconciler was skipped entirely).
+        Assert.DoesNotContain(client.ReceivedReports, r => r.TargetId == "_reconciliation");
+
+        // The managed-groups set must still be cleared so the item is
+        // not re-reported on every subsequent cycle.
+        Assert.True(store.RecordCalls.ContainsKey("account_groups"));
+        Assert.Empty(store.RecordCalls["account_groups"]);
+    }
+
+    [Fact]
     public async Task Reconciliation_StaleSoftware_IsUninstalled()
     {
         // "com.example.editor" was managed in the prior cycle but no
@@ -568,6 +628,35 @@ public class WorkerTests
         Assert.False(softwareOps.IsInstalled("com.example.editor"));
 
         // The managed-software set must now be empty.
+        Assert.True(store.RecordCalls.ContainsKey("software_managed"));
+        Assert.Empty(store.RecordCalls["software_managed"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleSoftware_AuditMode_DoesNotUninstall()
+    {
+        // On an AD-joined host stale software must NOT be uninstalled —
+        // the reconciler is skipped and the package must remain installed.
+        var softwareOps = new InMemorySoftwareOperations();
+        softwareOps.SeedInstalled("com.example.editor");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["software_managed"] = ["com.example.editor"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store, softwareOps: softwareOps);
+        await worker.PollAndApplyAsync(JoinState.AdJoined, CancellationToken.None);
+
+        // Audit mode: UninstallMsi must NOT have been called.
+        Assert.True(softwareOps.IsInstalled("com.example.editor"));
+
+        // No reconciliation report must be sent (reconciler was skipped entirely).
+        Assert.DoesNotContain(client.ReceivedReports, r => r.TargetId == "_reconciliation");
+
+        // The managed-software set must still be cleared so the item is
+        // not re-reported on every subsequent cycle.
         Assert.True(store.RecordCalls.ContainsKey("software_managed"));
         Assert.Empty(store.RecordCalls["software_managed"]);
     }

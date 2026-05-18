@@ -1,5 +1,70 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-18, 124th pass) — Windows: Worker-level audit-mode reconciliation tests missing for registry entries, group memberships, and software
+
+### Gap
+
+`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs` was missing Worker-level
+tests verifying that audit-mode reconciliation (triggered by `JoinState.AdJoined`)
+correctly skips stale-item cleanup for three enforcer categories without
+emitting any reconciliation report:
+
+1. **Stale registry entries** — In audit mode the Worker skips the
+   `RegistryEnforcer.ReconcileStaleItems` call entirely; the stale value must
+   remain intact and no `_reconciliation` report sent. The existing
+   `Reconciliation_StaleRegistryEntry_IsDeleted` covered only the enforce path.
+
+2. **Stale group memberships** — In audit mode the Worker skips the
+   `AccountEnforcer.ReconcileStaleGroups` call; alice must remain in
+   Administrators and no report sent. The existing
+   `Reconciliation_StaleGroupMembership_IsRemoved` covered only enforce.
+
+3. **Stale software** — In audit mode the Worker skips the
+   `SoftwareInstaller.ReconcileStalePackages` call; the package must remain
+   installed and no report sent. The existing `Reconciliation_StaleSoftware_IsUninstalled`
+   covered only enforce.
+
+The existing `Reconciliation_StaleAccount_AuditMode_DoesNotDisable` covered
+accounts (one of five reconciliation paths). The pattern fixed here is identical
+to the macOS gaps resolved in passes 120–123.
+
+Note: `Service` and `PasswordPolicy` reconciliation always runs regardless of audit
+mode (no auto-revert possible — manual-review-only), so no additional audit-mode
+tests are needed for those two categories.
+
+### Fix
+
+**`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs`** (+3 tests):
+
+- `Reconciliation_StaleRegistryEntry_AuditMode_DoesNotDelete`:
+  pre-loads a `LocalMachine\SOFTWARE\Policies\DDS\OldSetting` value, seeds the
+  managed-registry set, runs `PollAndApplyAsync` with `JoinState.AdJoined` and
+  no policy directives, asserts:
+  - value still exists (DeleteValue not called)
+  - no `_reconciliation` report sent to client
+  - managed-registry set cleared (not re-reported next cycle)
+
+- `Reconciliation_StaleGroupMembership_AuditMode_DoesNotRemove`:
+  pre-adds `alice` to `Administrators`, seeds `alice:Administrators` in managed
+  groups, runs with `JoinState.AdJoined`, asserts:
+  - alice still in Administrators (RemoveFromGroup not called)
+  - no `_reconciliation` report sent
+  - managed-groups set cleared
+
+- `Reconciliation_StaleSoftware_AuditMode_DoesNotUninstall`:
+  pre-seeds `com.example.editor` in managed software and marks it installed, runs
+  with `JoinState.AdJoined`, asserts:
+  - software still installed (UninstallMsi not called)
+  - no `_reconciliation` report sent
+  - managed-software set cleared
+
+### Result
+
+Windows test count: **272 → 275** (3 new tests; 0 failures). macOS: 166 (unchanged).
+Linux: 359 (unchanged). Rust workspace: no changes.
+
+---
+
 ## Test Gap Fix (2026-05-18, 123rd pass) — macOS: Worker-level audit-mode reconciliation tests missing for launchd, preferences, profiles, software, and group memberships
 
 ### Gap
