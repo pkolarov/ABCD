@@ -1445,4 +1445,107 @@ public sealed class WorkerTests
         Assert.NotNull(report);
         Assert.Contains("[AUDIT] sshd:set:PasswordAuthentication=False", report.Directives);
     }
+
+    [Fact]
+    public async Task Reconciliation_StaleSudoersDropin_AuditOnly_EmitsAuditPrefixedDeleteDirective()
+    {
+        // "dds-ops" was managed in a prior cycle but is absent from all current policies.
+        // In audit mode the drop-in must NOT be deleted, but the reconciliation report
+        // must carry the [AUDIT] prefix so operators can distinguish dry-run from real action.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedSudoersFilenames.Add("dds-ops");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // State tracking must still remove the filename so the item is not re-reported every cycle.
+        Assert.Contains("dds-ops", store.RemovedSudoersFilenames);
+        // No filesystem calls — visudo/delete must not be invoked.
+        Assert.Empty(runner.Invocations);
+
+        var reconciliation = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconciliation);
+        Assert.Contains("[AUDIT] sudoers:delete:dds-ops", reconciliation.Directives);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleSystemdDropin_AuditOnly_EmitsAuditPrefixedRemoveDropinDirective()
+    {
+        // "sshd.service/hardening" was managed in a prior cycle but is absent from all current
+        // policies. In audit mode the drop-in file must NOT be removed, but the reconciliation
+        // report must carry the [AUDIT] prefix.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedSystemdDropins.Add("sshd.service/hardening");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // State tracking must still remove the key so the item is not re-reported every cycle.
+        Assert.Contains("sshd.service/hardening", store.RemovedSystemdDropinKeys);
+        // daemon-reload and file-delete must not be invoked.
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "systemctl");
+
+        var reconciliation = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconciliation);
+        Assert.Contains("[AUDIT] systemd:removedropin:sshd.service/hardening", reconciliation.Directives);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleGroupMembership_AuditOnly_EmitsAuditPrefixedLeaveGroupDirective()
+    {
+        // "alice:sudo" was managed in a prior cycle but is absent from all current policies.
+        // In audit mode gpasswd must NOT be called, but the reconciliation report must carry
+        // the [AUDIT] prefix so operators can distinguish dry-run from real action.
+        var staleState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        staleState.ManagedGroups.Add("alice:sudo");
+
+        var store  = new TrackingAppliedStateStore(staleState);
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // gpasswd must not be invoked in audit mode.
+        Assert.DoesNotContain(runner.Invocations, i => i.FileName == "gpasswd");
+        // SetManagedGroups is always called with the empty desired set.
+        Assert.Single(store.SetGroupsCalls);
+        Assert.Empty(store.SetGroupsCalls[0]);
+
+        var reconciliation = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconciliation);
+        Assert.Contains("[AUDIT] user:leave-group:alice:sudo", reconciliation.Directives);
+    }
 }

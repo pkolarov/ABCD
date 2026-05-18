@@ -1,5 +1,57 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-18, 121st pass) — Linux: Worker-level audit-mode reconciliation tests missing for sudoers, systemd drop-ins, and group memberships
+
+### Gap
+
+`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs` was missing Worker-level
+tests verifying that audit-mode reconciliation correctly emits `[AUDIT]`-prefixed
+directives in the reconciliation report for three enforcer categories:
+
+1. **Stale sudoers drop-ins** — `SudoersEnforcer.ReconcileStaleSudoersAsync` returns
+   `[AUDIT] sudoers:delete:{filename}` when `_auditOnly` is true, but there was no
+   Worker-level test confirming this string reached the `_reconciliation` report.
+2. **Stale systemd drop-ins** — `SystemdEnforcer.ReconcileStaleDropinsAsync` returns
+   `[AUDIT] systemd:removedropin:{key}` when `_auditOnly` is true; same gap.
+3. **Stale group memberships** — `UserEnforcer.ReconcileStaleGroupsAsync` returns
+   `[AUDIT] user:leave-group:{key}` when `_auditOnly` is true; same gap.
+
+The 120th pass added the corresponding test for `SshdEnforcer` (sshd drop-in removal
+in audit mode), revealing these three sibling paths were uncovered at the Worker level.
+All three enforcer methods had correct audit-mode logic; the gap was test coverage only.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`** (+3 tests):
+
+- `Reconciliation_StaleSudoersDropin_AuditOnly_EmitsAuditPrefixedDeleteDirective`:
+  pre-seeds `ManagedSudoersFilenames` with `"dds-ops"`, runs `PollOnceAsync` with
+  `AuditOnly = true` and no current policies, asserts:
+  - `store.RemovedSudoersFilenames` contains `"dds-ops"` (state tracking still runs)
+  - `runner.Invocations` is empty (no filesystem mutation)
+  - reconciliation report contains `[AUDIT] sudoers:delete:dds-ops`
+
+- `Reconciliation_StaleSystemdDropin_AuditOnly_EmitsAuditPrefixedRemoveDropinDirective`:
+  pre-seeds `ManagedSystemdDropins` with `"sshd.service/hardening"`, runs `PollOnceAsync`
+  with `AuditOnly = true` and no current policies, asserts:
+  - `store.RemovedSystemdDropinKeys` contains `"sshd.service/hardening"`
+  - no `systemctl` invocation
+  - reconciliation report contains `[AUDIT] systemd:removedropin:sshd.service/hardening`
+
+- `Reconciliation_StaleGroupMembership_AuditOnly_EmitsAuditPrefixedLeaveGroupDirective`:
+  pre-seeds `ManagedGroups` with `"alice:sudo"`, runs `PollOnceAsync` with `AuditOnly = true`
+  and no current policies, asserts:
+  - no `gpasswd` invocation
+  - `SetManagedGroups` called with empty set (desired group set is always persisted)
+  - reconciliation report contains `[AUDIT] user:leave-group:alice:sudo`
+
+### Result
+
+Linux test count: **355 → 358** (3 new tests; 0 failures).
+macOS count: 161 (unchanged). Windows count: 272 (unchanged). Rust workspace: no changes.
+
+---
+
 ## Test Gap Fix (2026-05-18, 120th pass) — Linux: Worker sshd reconciliation audit-mode test missing
 
 ### Gap
