@@ -21,19 +21,22 @@ public sealed class Worker : BackgroundService
     private readonly AgentConfig _config;
     private readonly ICommandRunner _runner;
     private readonly ILogger<Worker> _log;
+    private readonly string? _sshdDropinPath;
 
     public Worker(
         IDdsNodeClient client,
         IAppliedStateStore stateStore,
         IOptions<AgentConfig> config,
         ICommandRunner runner,
-        ILogger<Worker> log)
+        ILogger<Worker> log,
+        string? sshdDropinPath = null)
     {
         _client = client;
         _stateStore = stateStore;
         _config = config.Value;
         _runner = runner;
         _log = log;
+        _sshdDropinPath = sshdDropinPath;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -108,7 +111,7 @@ public sealed class Worker : BackgroundService
         var systemdEnforcer = new SystemdEnforcer(_runner, _config.AuditOnly, _log);
         var pkgEnforcer     = new PackageEnforcer(_runner, _config.AuditOnly, _log);
         var sysctlEnforcer  = new SysctlEnforcer (_runner, _config.AuditOnly, _log);
-        var sshdEnforcer    = new SshdEnforcer   (_runner, _config.AuditOnly, _log);
+        var sshdEnforcer    = new SshdEnforcer   (_runner, _config.AuditOnly, _log, _sshdDropinPath);
 
         foreach (var p in policies)
         {

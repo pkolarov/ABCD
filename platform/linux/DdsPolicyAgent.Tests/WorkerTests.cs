@@ -106,7 +106,8 @@ file static class WorkerFactory
         AgentConfig config,
         IDdsNodeClient? client = null,
         IAppliedStateStore? store = null,
-        ICommandRunner? runner = null)
+        ICommandRunner? runner = null,
+        string? sshdDropinPath = null)
     {
         client ??= new TestDdsNodeClient();
         store  ??= new TestAppliedStateStore();
@@ -116,7 +117,8 @@ file static class WorkerFactory
             store,
             Options.Create(config),
             runner,
-            NullLogger<Worker>.Instance);
+            NullLogger<Worker>.Instance,
+            sshdDropinPath);
     }
 
     public static ApplicableLinuxPolicy MakePolicy(string policyId, string documentJson)
@@ -673,6 +675,53 @@ public sealed class WorkerTests
         await worker.PollOnceAsync(CancellationToken.None);
 
         Assert.DoesNotContain(client.ReceivedReports, r => r.TargetId == "_reconciliation");
+    }
+
+    [Fact]
+    public async Task Reconciliation_SshPolicyAbsent_AuditOnly_EmitsAuditPrefixedRemoveDirective()
+    {
+        // No policy has an ssh field and the sshd drop-in exists on disk → the
+        // reconciliation pass calls sshdEnforcer.ApplyAsync(null) which returns
+        // "[AUDIT] sshd:remove" in audit mode without deleting the file.
+        // This test pre-seeds the drop-in via a temp file so the File.Exists
+        // check in SshdEnforcer passes, proving the directive reaches the report.
+        var tmp = Path.Combine(Path.GetTempPath(), "dds-sshd-wkr-" + Guid.NewGuid() + ".conf");
+        try
+        {
+            await File.WriteAllTextAsync(tmp, "# Managed by DDS\nPasswordAuthentication no\n");
+
+            var client = new TestDdsNodeClient
+            {
+                NextPolicies =
+                [
+                    WorkerFactory.MakePolicy(
+                        "policy-no-ssh",
+                        """{"policy_id":"policy-no-ssh","version":1,"linux":{"local_users":[]}}"""),
+                ],
+            };
+
+            var worker = WorkerFactory.Create(
+                new AgentConfig
+                {
+                    DeviceUrn           = "urn:dds:device:test",
+                    PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                    AuditOnly           = true,
+                },
+                client,
+                sshdDropinPath: tmp);
+
+            await worker.PollOnceAsync(CancellationToken.None);
+
+            var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+            Assert.NotNull(report);
+            Assert.Contains("[AUDIT] sshd:remove", report.Directives);
+            // Audit mode: drop-in must not be deleted.
+            Assert.True(File.Exists(tmp));
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
     }
 
     [Fact]

@@ -1,5 +1,45 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-18, 120th pass) — Linux: Worker sshd reconciliation audit-mode test missing
+
+### Gap
+
+`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs` was missing a Worker-level
+test for the sshd drop-in removal path in audit mode. When no policy has an `ssh`
+field but a DDS-managed sshd drop-in exists on disk, the Worker calls
+`SshdEnforcer.ApplyAsync(null)` during the reconciliation pass. In audit mode
+this should return `"[AUDIT] sshd:remove"` without deleting the file — but this
+path had no Worker-level coverage, only the lower-level `SshdEnforcerTests`.
+
+Additionally `Worker.cs` did not thread the `SshdEnforcer` constructor's optional
+`dropinPath` parameter through from the `Worker` constructor, so tests could not
+provide a controllable temp-file path and were forced to use the production
+`/etc/ssh/sshd.conf.d/dds-sshd.conf` path, which does not exist in a test
+environment and silently made the audit-mode remove directive unreachable.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Worker.cs`**:
+- Added `string? sshdDropinPath = null` optional parameter to the `Worker`
+  constructor.
+- Stored it as `private readonly string? _sshdDropinPath` and threaded it
+  through to `new SshdEnforcer(_runner, _config.AuditOnly, _log, _sshdDropinPath)`.
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`** (+1 test):
+- Added `string? sshdDropinPath = null` to `WorkerFactory.Create` helper and
+  forwarded it to the `Worker` constructor.
+- Added `Reconciliation_SshPolicyAbsent_AuditOnly_EmitsAuditPrefixedRemoveDirective`:
+  writes a real temp file, runs `PollOnceAsync` with `AuditOnly = true` and no
+  `ssh` policy, asserts the `_reconciliation` report contains `[AUDIT] sshd:remove`,
+  and verifies the temp file was **not** deleted (audit mode).
+
+### Result
+
+Linux test count: **354 → 355** (1 new test; 0 failures).
+macOS count: 161 (unchanged). Windows count: 272 (unchanged). Rust workspace: no changes.
+
+---
+
 ## Fix (2026-05-17, 119th pass) — Rust/docs: SoftwareAssignment missing enforcement field + Admin Guide reconciliation gap
 
 ### Gaps
