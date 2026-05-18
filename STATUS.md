@@ -1,5 +1,56 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-18, 125th pass) — Linux: Worker-level enforce-mode reconciliation tests missing for sysctl key and sshd dropin
+
+### Gap
+
+`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs` was missing Worker-level
+tests verifying that enforce-mode reconciliation correctly removes stale items
+for two file-based enforcer paths:
+
+1. **Stale sysctl keys (enforce mode)** — `SysctlEnforcer.ReconcileStaleKeysAsync`
+   removes the key from the drop-in file and rewrites it in enforce mode, emitting
+   `sysctl:delete:{key}` (no `[AUDIT]` prefix). The existing
+   `Reconciliation_StaleSysctlKey_AuditOnly_EmitsAuditPrefixedDeleteDirective`
+   (added in the 122nd pass) covered audit mode; the enforce-mode counterpart was
+   missing. Both paths write/don't-write a real temp file, so the tests are
+   symmetric.
+
+2. **Stale sshd drop-in (enforce mode)** — `SshdEnforcer.ApplyAsync(null)` deletes
+   the drop-in file in enforce mode, emitting `sshd:remove` (no `[AUDIT]` prefix).
+   The existing `Reconciliation_SshPolicyAbsent_AuditOnly_EmitsAuditPrefixedRemoveDirective`
+   (added in the 120th pass) covered audit mode; the enforce-mode counterpart was
+   missing.
+
+Both gaps follow the same pattern: audit test existed (temp-file-seeded) but the
+enforce-mode twin that verifies the file mutation actually occurred was absent.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`** (+2 tests):
+
+- `Reconciliation_StaleSysctlKey_EnforceMode_DeletesKeyFromDropin`:
+  writes a temp drop-in containing `vm.swappiness = 10`, runs `PollOnceAsync`
+  with `AuditOnly = false` and no current policies (so `desiredSysctlKeys` is
+  empty), asserts:
+  - `_reconciliation` report contains `sysctl:delete:vm.swappiness`
+  - report directives do NOT contain `[AUDIT]`
+  - drop-in file content no longer contains `vm.swappiness` (key was removed)
+
+- `Reconciliation_SshPolicyAbsent_EnforceMode_DeletesDropinFile`:
+  writes a temp sshd drop-in, runs `PollOnceAsync` with `AuditOnly = false` and
+  a policy that has no `ssh` field (so `hasSshPolicy = false`), asserts:
+  - `_reconciliation` report contains `sshd:remove`
+  - report directives do NOT contain `[AUDIT]`
+  - drop-in file has been deleted (`File.Exists` returns false)
+
+### Result
+
+Linux test count: **359 → 361** (2 new tests; 0 failures). macOS: 166 (unchanged).
+Windows: 275 (unchanged). Rust workspace: no changes.
+
+---
+
 ## Test Gap Fix (2026-05-18, 124th pass) — Windows: Worker-level audit-mode reconciliation tests missing for registry entries, group memberships, and software
 
 ### Gap

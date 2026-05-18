@@ -616,6 +616,45 @@ public sealed class WorkerTests
     }
 
     [Fact]
+    public async Task Reconciliation_StaleSysctlKey_EnforceMode_DeletesKeyFromDropin()
+    {
+        // A sysctl key is present in the managed drop-in but absent from all current
+        // policies → ReconcileStaleKeysAsync removes the key and rewrites the file in
+        // enforce mode, emitting "sysctl:delete:{key}" (no [AUDIT] prefix).
+        var tmp = Path.Combine(Path.GetTempPath(), "dds-sysctl-wkr-enf-" + Guid.NewGuid() + ".conf");
+        try
+        {
+            await File.WriteAllTextAsync(tmp, "# Managed by DDS\nvm.swappiness = 10\n");
+
+            var client = new TestDdsNodeClient();   // no policies → desiredSysctlKeys is empty
+
+            var worker = WorkerFactory.Create(
+                new AgentConfig
+                {
+                    DeviceUrn           = "urn:dds:device:test",
+                    PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                    AuditOnly           = false,
+                },
+                client,
+                sysctlDropinPath: tmp);
+
+            await worker.PollOnceAsync(CancellationToken.None);
+
+            var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+            Assert.NotNull(report);
+            Assert.Contains("sysctl:delete:vm.swappiness", report.Directives);
+            Assert.DoesNotContain("[AUDIT]", string.Concat(report.Directives));
+            // Enforce mode: the key must have been removed from the drop-in file.
+            var content = await File.ReadAllTextAsync(tmp);
+            Assert.DoesNotContain("vm.swappiness", content);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
+
+    [Fact]
     public async Task Reconciliation_StaleSysctlKey_AuditOnly_EmitsAuditPrefixedDeleteDirective()
     {
         // A sysctl key is present in the managed drop-in but absent from all current
@@ -716,6 +755,52 @@ public sealed class WorkerTests
         await worker.PollOnceAsync(CancellationToken.None);
 
         Assert.DoesNotContain(client.ReceivedReports, r => r.TargetId == "_reconciliation");
+    }
+
+    [Fact]
+    public async Task Reconciliation_SshPolicyAbsent_EnforceMode_DeletesDropinFile()
+    {
+        // No policy has an ssh field and the sshd drop-in exists on disk → the
+        // reconciliation pass calls sshdEnforcer.ApplyAsync(null) which deletes the file
+        // in enforce mode, emitting "sshd:remove" (no [AUDIT] prefix).
+        var tmp = Path.Combine(Path.GetTempPath(), "dds-sshd-wkr-enf-" + Guid.NewGuid() + ".conf");
+        try
+        {
+            await File.WriteAllTextAsync(tmp, "# Managed by DDS\nPasswordAuthentication no\n");
+
+            var client = new TestDdsNodeClient
+            {
+                NextPolicies =
+                [
+                    WorkerFactory.MakePolicy(
+                        "policy-no-ssh",
+                        """{"policy_id":"policy-no-ssh","version":1,"linux":{"local_users":[]}}"""),
+                ],
+            };
+
+            var worker = WorkerFactory.Create(
+                new AgentConfig
+                {
+                    DeviceUrn           = "urn:dds:device:test",
+                    PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                    AuditOnly           = false,
+                },
+                client,
+                sshdDropinPath: tmp);
+
+            await worker.PollOnceAsync(CancellationToken.None);
+
+            var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+            Assert.NotNull(report);
+            Assert.Contains("sshd:remove", report.Directives);
+            Assert.DoesNotContain("[AUDIT]", string.Concat(report.Directives));
+            // Enforce mode: the drop-in must have been deleted.
+            Assert.False(File.Exists(tmp));
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
     }
 
     [Fact]
