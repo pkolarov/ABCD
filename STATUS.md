@@ -1,5 +1,45 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-18, 122nd pass) — Linux: Worker-level audit-mode sysctl key reconciliation test missing + dropin path injection
+
+### Gap
+
+`platform/linux/DdsPolicyAgent/Worker.cs` created `SysctlEnforcer` without threading
+the optional `dropinPath` parameter through from the `Worker` constructor, so tests
+could not control the drop-in file path. This meant there was no Worker-level test
+verifying that stale sysctl key reconciliation in audit mode correctly emits
+`[AUDIT] sysctl:delete:{key}` in the `_reconciliation` report without rewriting the
+file — despite that path existing in `SysctlEnforcer.ReconcileStaleKeysAsync` and
+being covered by lower-level `EnforcerTests`.
+
+The pattern is identical to the sshd dropin path injection gap fixed in pass 120.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Worker.cs`**:
+- Added `string? sysctlDropinPath = null` optional parameter to the `Worker` constructor.
+- Stored it as `private readonly string? _sysctlDropinPath` and threaded it through to
+  `new SysctlEnforcer(_runner, _config.AuditOnly, _log, _sysctlDropinPath)` in
+  `PollOnceAsync`.
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`** (+1 test):
+- Added `string? sysctlDropinPath = null` to `WorkerFactory.Create` helper and
+  forwarded it to the `Worker` constructor.
+- Added `Reconciliation_StaleSysctlKey_AuditOnly_EmitsAuditPrefixedDeleteDirective`:
+  writes a real temp file (`# Managed by DDS\nvm.swappiness = 10\n`), runs
+  `PollOnceAsync` with `AuditOnly = true` and no current policies (so
+  `desiredSysctlKeys` is empty), asserts:
+  - `_reconciliation` report contains `[AUDIT] sysctl:delete:vm.swappiness`
+  - drop-in file still exists and still contains `vm.swappiness = 10` (audit mode:
+    no write occurred)
+
+### Result
+
+Linux test count: **358 → 359** (1 new test; 0 failures).
+macOS count: 161 (unchanged). Windows count: 272 (unchanged). Rust workspace: no changes.
+
+---
+
 ## Test Gap Fix (2026-05-18, 121st pass) — Linux: Worker-level audit-mode reconciliation tests missing for sudoers, systemd drop-ins, and group memberships
 
 ### Gap

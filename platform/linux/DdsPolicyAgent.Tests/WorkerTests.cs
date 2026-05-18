@@ -107,7 +107,8 @@ file static class WorkerFactory
         IDdsNodeClient? client = null,
         IAppliedStateStore? store = null,
         ICommandRunner? runner = null,
-        string? sshdDropinPath = null)
+        string? sshdDropinPath = null,
+        string? sysctlDropinPath = null)
     {
         client ??= new TestDdsNodeClient();
         store  ??= new TestAppliedStateStore();
@@ -118,7 +119,8 @@ file static class WorkerFactory
             Options.Create(config),
             runner,
             NullLogger<Worker>.Instance,
-            sshdDropinPath);
+            sshdDropinPath,
+            sysctlDropinPath);
     }
 
     public static ApplicableLinuxPolicy MakePolicy(string policyId, string documentJson)
@@ -611,6 +613,45 @@ public sealed class WorkerTests
         // No reconciliation report expected since the key is still desired.
         Assert.DoesNotContain(client.ReceivedReports,
             r => r.TargetId == "_reconciliation");
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleSysctlKey_AuditOnly_EmitsAuditPrefixedDeleteDirective()
+    {
+        // A sysctl key is present in the managed drop-in but absent from all current
+        // policies → ReconcileStaleKeysAsync returns "[AUDIT] sysctl:delete:{key}" in
+        // audit mode without rewriting the file.
+        // Pre-seed a real temp drop-in with the key so SysctlEnforcer.LoadDropin finds it.
+        var tmp = Path.Combine(Path.GetTempPath(), "dds-sysctl-wkr-" + Guid.NewGuid() + ".conf");
+        try
+        {
+            await File.WriteAllTextAsync(tmp, "# Managed by DDS\nvm.swappiness = 10\n");
+
+            var client = new TestDdsNodeClient();   // no policies → desiredSysctlKeys is empty
+
+            var worker = WorkerFactory.Create(
+                new AgentConfig
+                {
+                    DeviceUrn           = "urn:dds:device:test",
+                    PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                    AuditOnly           = true,
+                },
+                client,
+                sysctlDropinPath: tmp);
+
+            await worker.PollOnceAsync(CancellationToken.None);
+
+            var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+            Assert.NotNull(report);
+            Assert.Contains("[AUDIT] sysctl:delete:vm.swappiness", report.Directives);
+            // Audit mode: drop-in must not be modified or deleted.
+            Assert.True(File.Exists(tmp));
+            Assert.Contains("vm.swappiness = 10", await File.ReadAllTextAsync(tmp));
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
     }
 
     [Fact]
