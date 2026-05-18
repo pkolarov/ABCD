@@ -3761,6 +3761,7 @@ mod tests {
             post_install_script: None,
             uninstall_script: None,
             publisher_identity: None,
+            enforcement: Enforcement::Enforce,
         };
         pkg.embed(&mut sw_payload).unwrap();
         let sw_token = Token::sign(sw_payload, &admin.signing_key).unwrap();
@@ -3950,6 +3951,7 @@ mod tests {
             post_install_script: None,
             uninstall_script: None,
             publisher_identity: None,
+            enforcement: Enforcement::Enforce,
         };
         pkg.embed(&mut sw_payload).unwrap();
         let sw_token = Token::sign(sw_payload, &admin.signing_key).unwrap();

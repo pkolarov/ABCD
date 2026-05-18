@@ -8,9 +8,9 @@ use dds_core::identity::Identity;
 use dds_core::token::{Token, TokenKind, TokenPayload};
 use dds_domain::domain::to_hex;
 use dds_domain::{
-    DomainDocument, DomainKey, LaunchdAction, LaunchdDirective, MacOsPolicyDocument, MacOsSettings,
-    PolicyScope, PreferenceAction, PreferenceDirective, PreferenceScope as DomainPreferenceScope,
-    SoftwareAssignment,
+    DomainDocument, DomainKey, Enforcement, LaunchdAction, LaunchdDirective, MacOsPolicyDocument,
+    MacOsSettings, PolicyScope, PreferenceAction, PreferenceDirective,
+    PreferenceScope as DomainPreferenceScope, SoftwareAssignment,
 };
 use dds_net::gossip::GossipMessage;
 use dds_node::config::{DomainConfig, NetworkConfig, NodeConfig};
@@ -473,6 +473,7 @@ async fn publish_fixture(
         post_install_script: None,
         uninstall_script: None,
         publisher_identity: None,
+        enforcement: Enforcement::Enforce,
     };
 
     let policy_token = attest_with_body(

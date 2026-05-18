@@ -885,6 +885,16 @@ pub struct SoftwareAssignment {
     /// Phase B.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publisher_identity: Option<PublisherIdentity>,
+    /// Per-assignment enforcement mode. Defaults to `Enforce` when absent
+    /// so legacy tokens without this field continue to behave as before.
+    /// Set to `Audit` to make the agent log what it *would* install/uninstall
+    /// without performing any actual package operations.
+    #[serde(default = "default_software_enforcement")]
+    pub enforcement: Enforcement,
+}
+
+fn default_software_enforcement() -> Enforcement {
+    Enforcement::Enforce
 }
 
 /// Software install action.
@@ -1242,6 +1252,7 @@ mod tests {
             post_install_script: None,
             uninstall_script: Some("rm -rf /Applications/Example.app".into()),
             publisher_identity: None,
+            enforcement: Enforcement::Enforce,
         };
 
         let mut payload = empty_payload();
@@ -1273,6 +1284,7 @@ mod tests {
             post_install_script: None,
             uninstall_script: None,
             publisher_identity: None,
+            enforcement: Enforcement::Enforce,
         };
 
         let mut payload = empty_payload();

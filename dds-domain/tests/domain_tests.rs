@@ -433,6 +433,7 @@ fn test_software_assignment_roundtrip() {
         post_install_script: Some("cleanup.ps1".into()),
         uninstall_script: None,
         publisher_identity: None,
+        enforcement: Enforcement::Enforce,
     };
     let cbor = doc.to_cbor().unwrap();
     assert_eq!(SoftwareAssignment::from_cbor(&cbor).unwrap(), doc);
@@ -460,6 +461,7 @@ fn test_software_assignment_with_authenticode_publisher_roundtrip() {
             subject: "Example Software, Inc.".into(),
             root_thumbprint: Some("a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4".into()),
         }),
+        enforcement: Enforcement::Enforce,
     };
     let cbor = doc.to_cbor().unwrap();
     assert_eq!(SoftwareAssignment::from_cbor(&cbor).unwrap(), doc);
@@ -486,6 +488,7 @@ fn test_software_assignment_with_apple_publisher_roundtrip() {
         publisher_identity: Some(PublisherIdentity::AppleDeveloperId {
             team_id: "ABCDE12345".into(),
         }),
+        enforcement: Enforcement::Enforce,
     };
     let cbor = doc.to_cbor().unwrap();
     assert_eq!(SoftwareAssignment::from_cbor(&cbor).unwrap(), doc);
@@ -515,12 +518,67 @@ fn test_software_assignment_legacy_cbor_decodes_as_none() {
         post_install_script: None,
         uninstall_script: None,
         publisher_identity: None,
+        enforcement: Enforcement::Enforce,
     };
     let cbor = v1.to_cbor().unwrap();
     let decoded = SoftwareAssignment::from_cbor(&cbor).unwrap();
     assert_eq!(decoded.publisher_identity, None);
     assert_eq!(decoded.uninstall_script, None);
     assert_eq!(decoded, v1);
+}
+
+/// Backward-compat: a CBOR blob without an `enforcement` field (produced
+/// by a pre-119th-pass publisher) must deserialise as `Enforce` — the
+/// safe default so existing software assignments remain operational.
+#[test]
+fn test_software_assignment_legacy_enforcement_defaults_to_enforce() {
+    // Produce a wire representation that predates the enforcement field by
+    // stripping it: serialise normally, decode the CBOR map, remove the
+    // "enforcement" key, re-encode, and verify the round-trip.
+    use ciborium::value::Value;
+    let doc = SoftwareAssignment {
+        package_id: "com.legacy.pkg".into(),
+        display_name: "Legacy Pkg".into(),
+        version: "1.0.0".into(),
+        source: "https://example.com/pkg.msi".into(),
+        sha256: "aabbcc".into(),
+        action: InstallAction::Install,
+        scope: PolicyScope {
+            device_tags: vec![],
+            org_units: vec![],
+            identity_urns: vec![],
+        },
+        silent: false,
+        pre_install_script: None,
+        post_install_script: None,
+        uninstall_script: None,
+        publisher_identity: None,
+        enforcement: Enforcement::Enforce,
+    };
+
+    // Serialise to CBOR map, then strip the enforcement key to simulate
+    // a legacy wire blob.
+    let full_cbor = doc.to_cbor().unwrap();
+    let map: Value = ciborium::from_reader(full_cbor.as_slice()).unwrap();
+    let stripped: Value = match map {
+        Value::Map(pairs) => Value::Map(
+            pairs
+                .into_iter()
+                .filter(|(k, _)| k != &Value::Text("enforcement".into()))
+                .collect(),
+        ),
+        other => other,
+    };
+    let mut stripped_bytes = Vec::new();
+    ciborium::into_writer(&stripped, &mut stripped_bytes).unwrap();
+
+    let legacy = SoftwareAssignment::from_cbor(&stripped_bytes).unwrap();
+    assert_eq!(
+        legacy.enforcement,
+        Enforcement::Enforce,
+        "missing enforcement field must default to Enforce"
+    );
+    assert_eq!(legacy.publisher_identity, None);
 }
 
 #[test]

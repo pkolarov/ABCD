@@ -3768,6 +3768,7 @@ mod publisher_identity_gate_tests {
             post_install_script: None,
             uninstall_script: None,
             publisher_identity,
+            enforcement: dds_domain::types::Enforcement::Enforce,
         };
         let mut payload = TokenPayload {
             iss: ident.id.to_urn(),

@@ -1068,6 +1068,7 @@ SoftwareAssignment
 ├── action: InstallAction      # Install | Uninstall | Update
 ├── scope: PolicyScope         # same scope model as WindowsPolicyDocument
 ├── silent: bool
+├── enforcement: Enforcement   # Audit | Enforce (default Enforce); per-assignment mode
 ├── pre_install_script: Option<String>
 ├── post_install_script: Option<String>
 └── uninstall_script: Option<String>  # macOS only; shell recipe run by /bin/zsh -lc when action=Uninstall

@@ -1,5 +1,78 @@
 # DDS Implementation Status
 
+## Fix (2026-05-17, 119th pass) — Rust/docs: SoftwareAssignment missing enforcement field + Admin Guide reconciliation gap
+
+### Gaps
+
+**Gap 1 — `SoftwareAssignment` Rust struct missing `enforcement` field**
+
+The 116th and 118th passes fixed the Windows and macOS Workers to honour the
+per-document `enforcement` field on `SoftwareAssignment` JSON tokens. However,
+the underlying Rust domain type (`dds-domain/src/types.rs: SoftwareAssignment`)
+never had this field: the C# Workers read it directly from a raw `JsonElement`,
+but when `dds-node` serialises an applicable software assignment over HTTP (via
+`ApplicableSoftware.document: SoftwareAssignment`), the field was silently
+dropped. An admin publishing a software-assignment token via the Rust domain API
+could therefore not set `enforcement: Audit`; any policy that arrived through
+the gossip/sync path with `enforcement` present would also lose it when the
+node re-serialised the `ApplicableSoftware` response.
+
+**Gap 2 — `DDS-Design-Document.md`: `SoftwareAssignment` schema missing `enforcement`**
+
+The design document schema block for `SoftwareAssignment` listed `package_id`,
+`display_name`, `version`, `source`, `sha256`, `action`, `scope`, `silent`,
+`pre/post_install_script`, and `uninstall_script` — but omitted `enforcement`.
+`WindowsPolicyDocument`, `LinuxPolicyDocument`, and `MacOsPolicyDocument` all
+show `enforcement: Enforcement` in their schema blocks.
+
+**Gap 3 — `DDS-Admin-Guide.md`: Windows Reconciliation table missing `password_policy`**
+
+The 117th pass added `PasswordPolicyEnforcer.ReconcileStalePolicy` which emits
+a `[MANUAL]` reconciliation report when the `password_policy` section is removed
+from all active policies. The Windows Reconciliation stale-item cleanup table in
+the Admin Guide had rows for registry, accounts, group memberships, software, and
+services — but no row for `password_policy`.
+
+### Fix
+
+**`dds-domain/src/types.rs`**:
+- Added `pub enforcement: Enforcement` field to `SoftwareAssignment` with
+  `#[serde(default = "default_software_enforcement")]` so legacy tokens without
+  the field deserialise as `Enforce` (preserving prior behaviour).
+- Added `fn default_software_enforcement() -> Enforcement { Enforcement::Enforce }`.
+- Updated all 2 in-file `SoftwareAssignment { … }` struct literals to include
+  `enforcement: Enforcement::Enforce`.
+
+**`dds-domain/tests/domain_tests.rs`**:
+- Updated all 4 existing `SoftwareAssignment { … }` literals to add the field.
+- Added new test `test_software_assignment_legacy_enforcement_defaults_to_enforce`:
+  strips the `enforcement` key from a serialised CBOR blob (simulating a
+  pre-119th-pass publisher) and asserts the decoded value is `Enforcement::Enforce`.
+
+**`dds-node/src/node.rs`**, **`dds-node/src/service.rs`**, **`dds-node/src/http.rs`**,
+**`dds-node/src/bin/dds-macos-e2e.rs`**:
+- Updated all remaining `SoftwareAssignment { … }` struct literal construction
+  sites (9 total) to include `enforcement: Enforcement::Enforce`. Sites using
+  struct update syntax (`..base.clone()`) inherit the field automatically.
+
+**`docs/DDS-Design-Document.md`**:
+- Added `├── enforcement: Enforcement   # Audit | Enforce (default Enforce); per-assignment mode`
+  to the `SoftwareAssignment` schema block.
+
+**`docs/DDS-Admin-Guide.md`**:
+- Added `password_policy` row to the Windows Reconciliation stale-item cleanup
+  table explaining the `[MANUAL]` report behaviour and why automatic revert is
+  not supported.
+
+### Result
+
+Rust workspace: **+1 new test** (`test_software_assignment_legacy_enforcement_defaults_to_enforce`);
+all existing tests pass (0 failures). dds-domain tests: 42 → 43 passed.
+Linux test count: 354 (unchanged). macOS count: 161 (unchanged).
+Windows count: 272 (unchanged). Documentation updated.
+
+---
+
 ## Fix (2026-05-17, 118th pass) — Windows: Worker ignores enforcement field on software assignment documents
 
 ### Gap

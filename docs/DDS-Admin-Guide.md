@@ -1576,6 +1576,7 @@ managed by DDS but is no longer desired. It then cleans up:
 | Group memberships | User removed from the group |
 | Software packages | Silently uninstalled via `msiexec /x` |
 | Services | No stale-item cleanup — service directives are applied on the forward enforcement pass only. Removing a `services` entry from policy stops future enforcement but does not revert prior start/stop actions, because reversing "Stop" or "Configure" is ambiguous. |
+| Password policy | No automatic stale-item cleanup — when the `password_policy` section is removed from all active policies, the agent emits a `[MANUAL]` reconciliation report reminding the operator to review the OS password-policy knobs manually. DDS cannot automatically revert OS-level password settings because the prior state is not tracked; this mirrors the same `[MANUAL]` pattern used by `services`. |
 
 **Drift correction.** If someone manually changes a DDS-managed registry value
 or re-enables a disabled account, the agent corrects the drift on the next poll

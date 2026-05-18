@@ -3793,6 +3793,7 @@ mod platform_applier_tests {
             post_install_script: None,
             uninstall_script: None,
             publisher_identity: None,
+            enforcement: dds_domain::types::Enforcement::Enforce,
         };
         svc.trust_graph
             .write()
@@ -5302,6 +5303,7 @@ mod platform_applier_tests {
             post_install_script: None,
             uninstall_script: None,
             publisher_identity: None,
+            enforcement: dds_domain::types::Enforcement::Enforce,
         };
         let pkg_v2 = SoftwareAssignment {
             version: "2.0.0".into(),
@@ -5404,6 +5406,7 @@ mod platform_applier_tests {
                 subject: String::new(),
                 root_thumbprint: None,
             }),
+            enforcement: dds_domain::types::Enforcement::Enforce,
         };
         let good = SoftwareAssignment {
             package_id: "com.example.viewer".into(),
