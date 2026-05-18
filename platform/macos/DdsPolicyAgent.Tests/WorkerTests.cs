@@ -635,4 +635,189 @@ public class WorkerTests
         Assert.True(store.SetCalls.ContainsKey("software_managed"));
         Assert.Contains("com.example.app", store.SetCalls["software_managed"]);
     }
+
+    [Fact]
+    public async Task Reconciliation_StaleLaunchdJob_AuditMode_DoesNotUnload()
+    {
+        // In audit mode, a stale launchd job must NOT be unloaded — only an
+        // [AUDIT] reconciliation report entry is emitted.
+        var launchdOps = new InMemoryLaunchdOperations();
+        launchdOps.Load("com.dds.old-job");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["launchd"] = ["com.dds.old-job"],
+        });
+
+        var policyDoc = JsonDocument.Parse(
+            """{"policy_id":"p1","version":1,"enforcement":"Audit","macos":{}}""");
+
+        var client = new TestMacDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableMacOsPolicy { Jti = "jti-1", Document = policyDoc.RootElement },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, launchdOps: launchdOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Audit mode: the job must still be loaded (Unload not called).
+        Assert.True(launchdOps.Peek("com.dds.old-job")?.Loaded ?? false);
+
+        // Reconciliation report must carry [AUDIT] and the job label.
+        var reconciliation = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconciliation);
+        Assert.Contains(reconciliation.Directives,
+            d => d.Contains("[AUDIT]") && d.Contains("com.dds.old-job"));
+    }
+
+    [Fact]
+    public async Task Reconciliation_StalePreference_AuditMode_EmitsAuditPrefixedDeleteDirective()
+    {
+        // In audit mode, a stale preference must NOT be deleted — only an
+        // [AUDIT] reconciliation report entry is emitted.
+        var prefOps = new InMemoryMacPreferenceOperations();
+        prefOps.SetValueJson("com.apple.dock", "autohide", PreferenceScope.System, "true");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["preferences"] = ["System:com.apple.dock:autohide"],
+        });
+
+        var policyDoc = JsonDocument.Parse(
+            """{"policy_id":"p1","version":1,"enforcement":"Audit","macos":{}}""");
+
+        var client = new TestMacDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableMacOsPolicy { Jti = "jti-1", Document = policyDoc.RootElement },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, prefOps: prefOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Audit mode: the preference value must still be present (not deleted).
+        Assert.NotNull(prefOps.GetValueJson("com.apple.dock", "autohide", PreferenceScope.System));
+
+        // Reconciliation report must carry [AUDIT] and the managed key.
+        var reconciliation = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconciliation);
+        Assert.Contains(reconciliation.Directives,
+            d => d.Contains("[AUDIT]") && d.Contains("System:com.apple.dock:autohide"));
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleProfile_AuditMode_EmitsAuditPrefixedRemoveDirective()
+    {
+        // In audit mode, a stale profile must NOT be removed — only an
+        // [AUDIT] reconciliation report entry is emitted.
+        var profileOps = new InMemoryProfileOperations();
+        profileOps.Install("com.dds.old-profile", "Old Profile", "sha256abc", [0x00]);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["profiles"] = ["com.dds.old-profile"],
+        });
+
+        var policyDoc = JsonDocument.Parse(
+            """{"policy_id":"p1","version":1,"enforcement":"Audit","macos":{}}""");
+
+        var client = new TestMacDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableMacOsPolicy { Jti = "jti-1", Document = policyDoc.RootElement },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, profileOps: profileOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Audit mode: the profile must still be installed (Remove not called).
+        Assert.True(profileOps.IsInstalled("com.dds.old-profile", "sha256abc"));
+
+        // Reconciliation report must carry [AUDIT] and the profile identifier.
+        var reconciliation = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconciliation);
+        Assert.Contains(reconciliation.Directives,
+            d => d.Contains("[AUDIT]") && d.Contains("com.dds.old-profile"));
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleSoftware_AuditMode_EmitsAuditPrefixedManualEntry()
+    {
+        // In audit mode, a stale software package must NOT trigger a MANUAL
+        // uninstall command — only an [AUDIT] reconciliation report entry is emitted.
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["software_managed"] = ["com.example.app"],
+        });
+
+        var policyDoc = JsonDocument.Parse(
+            """{"policy_id":"p1","version":1,"enforcement":"Audit","macos":{}}""");
+
+        var client = new TestMacDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableMacOsPolicy { Jti = "jti-1", Document = policyDoc.RootElement },
+            ],
+        };
+
+        var worker = MakeWorker(client, store);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Reconciliation report must carry [AUDIT] and the package id.
+        var reconciliation = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconciliation);
+        Assert.Contains(reconciliation.Directives,
+            d => d.Contains("[AUDIT]") && d.Contains("com.example.app"));
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleGroupMembership_AuditMode_DoesNotRemove()
+    {
+        // In audit mode, a stale group membership must NOT be removed — only an
+        // [AUDIT] reconciliation report entry is emitted.
+        var accountOps = new InMemoryMacAccountOperations();
+        accountOps.CreateUser("alice", null, null, false, false);
+        accountOps.AddToGroup("alice", "sudo");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["account_groups"] = ["alice:sudo"],
+        });
+
+        var policyDoc = JsonDocument.Parse(
+            """{"policy_id":"p1","version":1,"enforcement":"Audit","macos":{}}""");
+
+        var client = new TestMacDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableMacOsPolicy { Jti = "jti-1", Document = policyDoc.RootElement },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Audit mode: alice must still be in sudo (RemoveFromGroup not called).
+        Assert.True(accountOps.IsInGroup("alice", "sudo"));
+
+        // Reconciliation report must carry [AUDIT] and the group membership key.
+        var reconciliation = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(reconciliation);
+        Assert.Contains(reconciliation.Directives,
+            d => d.Contains("[AUDIT]") && d.Contains("alice"));
+    }
 }
