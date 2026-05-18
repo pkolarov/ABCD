@@ -23,6 +23,8 @@ public sealed class Worker : BackgroundService
     private readonly ILogger<Worker> _log;
     private readonly string? _sshdDropinPath;
     private readonly string? _sysctlDropinPath;
+    private readonly string? _sudoersDir;
+    private readonly string? _systemdDropinBase;
 
     public Worker(
         IDdsNodeClient client,
@@ -31,7 +33,9 @@ public sealed class Worker : BackgroundService
         ICommandRunner runner,
         ILogger<Worker> log,
         string? sshdDropinPath = null,
-        string? sysctlDropinPath = null)
+        string? sysctlDropinPath = null,
+        string? sudoersDir = null,
+        string? systemdDropinBase = null)
     {
         _client = client;
         _stateStore = stateStore;
@@ -40,6 +44,8 @@ public sealed class Worker : BackgroundService
         _log = log;
         _sshdDropinPath = sshdDropinPath;
         _sysctlDropinPath = sysctlDropinPath;
+        _sudoersDir = sudoersDir;
+        _systemdDropinBase = systemdDropinBase;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -109,9 +115,9 @@ public sealed class Worker : BackgroundService
         var hasSshPolicy              = false;
 
         var userEnforcer    = new UserEnforcer   (_runner, _config.AuditOnly, _log);
-        var sudoersEnforcer = new SudoersEnforcer(_runner, _config.AuditOnly, _log);
+        var sudoersEnforcer = new SudoersEnforcer(_runner, _config.AuditOnly, _log, _sudoersDir);
         var fileEnforcer    = new FileEnforcer   (_runner, _config.AuditOnly, _log);
-        var systemdEnforcer = new SystemdEnforcer(_runner, _config.AuditOnly, _log);
+        var systemdEnforcer = new SystemdEnforcer(_runner, _config.AuditOnly, _log, _systemdDropinBase);
         var pkgEnforcer     = new PackageEnforcer(_runner, _config.AuditOnly, _log);
         var sysctlEnforcer  = new SysctlEnforcer (_runner, _config.AuditOnly, _log, _sysctlDropinPath);
         var sshdEnforcer    = new SshdEnforcer   (_runner, _config.AuditOnly, _log, _sshdDropinPath);

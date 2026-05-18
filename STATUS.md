@@ -1,5 +1,87 @@
 # DDS Implementation Status
 
+## Fix + Test Gap Fix (2026-05-18, 126th pass) — Linux: Worker missing sudoersDir/systemdDropinBase path injection + enforce-mode reconciliation tests for sudoers and systemd drop-ins + sshd enforce-mode test bug fix
+
+### Gaps
+
+**Gap 1 — `Worker` constructor missing `sudoersDir` and `systemdDropinBase` parameters**
+
+`platform/linux/DdsPolicyAgent/Worker.cs` instantiated `SudoersEnforcer` and
+`SystemdEnforcer` without threading optional path parameters from the `Worker`
+constructor. Both enforcers already accept optional paths in their constructors:
+- `SudoersEnforcer(runner, auditOnly, log, sudoersDir?)` — defaults to `/etc/sudoers.d`
+- `SystemdEnforcer(runner, auditOnly, log, dropinBase?)` — defaults to `/etc/systemd/system`
+
+Without injection the enforcer always writes to the production paths, so tests could
+not create temp directories to verify that reconciliation actually deletes drop-in files
+in enforce mode. This is the same class of gap that was fixed for `SshdEnforcer` in
+the 120th pass and `SysctlEnforcer` in the 122nd pass.
+
+**Gap 2 — Enforce-mode reconciliation tests missing for sudoers and systemd drop-ins**
+
+The 121st pass added audit-mode Worker tests for sudoers
+(`Reconciliation_StaleSudoersDropin_AuditOnly_EmitsAuditPrefixedDeleteDirective`) and
+systemd (`Reconciliation_StaleSystemdDropin_AuditOnly_EmitsAuditPrefixedRemoveDropinDirective`)
+that verified no file mutation occurs and the reconciliation report carries the `[AUDIT]`
+prefix. The enforce-mode twins — verifying that the file is actually deleted and the
+reconciliation report carries the non-prefixed directive — were absent. Both gaps follow
+the same pattern as the sysctl and sshd gaps fixed in the 125th pass.
+
+**Gap 3 — Pre-existing bug in `Reconciliation_SshPolicyAbsent_EnforceMode_DeletesDropinFile` (125th pass)**
+
+The enforce-mode sshd test seeded a temp drop-in and provided a policy with
+`"linux":{"local_users":[]}` (no `ssh` field). Because `TestAppliedStateStore.HasChanged`
+always returns `true`, the apply phase ran, called `sshdEnforcer.ApplyAsync(null)`, and
+deleted the temp file — before the reconciliation phase could act on it. The reconciliation
+phase then found no file to delete and emitted no directive, so no `_reconciliation` report
+was sent and `Assert.NotNull(report)` failed on every run.
+
+The correct approach (matching the sysctl enforce-mode test) is to use empty
+`NextPolicies = []`, which skips the apply loop entirely and lets only the reconciliation
+pass handle the sshd drop-in removal.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent/Worker.cs`**:
+- Added `string? sudoersDir = null` and `string? systemdDropinBase = null` optional
+  parameters to the `Worker` constructor.
+- Stored as `_sudoersDir` and `_systemdDropinBase`.
+- Threaded to `new SudoersEnforcer(_runner, _config.AuditOnly, _log, _sudoersDir)` and
+  `new SystemdEnforcer(_runner, _config.AuditOnly, _log, _systemdDropinBase)` in
+  `PollOnceAsync`.
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`** (+2 tests, 1 bug fix):
+- Added `string? sudoersDir = null` and `string? systemdDropinBase = null` to
+  `WorkerFactory.Create` and forwarded to the `Worker` constructor.
+
+- Added `Reconciliation_StaleSudoersDropin_EnforceMode_DeletesDropinFile`:
+  creates a temp sudoers dir containing `dds-ops`, runs `PollOnceAsync` with
+  `AuditOnly = false` and no current policies (so `staleSudoers = {"dds-ops"}`),
+  asserts:
+  - `_reconciliation` report contains `sudoers:delete:dds-ops`
+  - report directives do NOT contain `[AUDIT]`
+  - drop-in file has been deleted (`File.Exists` returns false)
+
+- Added `Reconciliation_StaleSystemdDropin_EnforceMode_DeletesDropinFile`:
+  creates a temp systemd base dir with `sshd.service.d/hardening.conf`, runs
+  `PollOnceAsync` with `AuditOnly = false` and no current policies (so
+  `staleSystemdDropins = {"sshd.service/hardening"}`), asserts:
+  - `_reconciliation` report contains `systemd:removedropin:sshd.service/hardening`
+  - report directives do NOT contain `[AUDIT]`
+  - drop-in file has been deleted (`File.Exists` returns false)
+
+- Fixed `Reconciliation_SshPolicyAbsent_EnforceMode_DeletesDropinFile`:
+  replaced the `NextPolicies` block containing `"policy-no-ssh"` with
+  `new TestDdsNodeClient()` (empty policies), so the apply loop does not run and
+  only the reconciliation pass calls `sshdEnforcer.ApplyAsync(null)`.
+
+### Result
+
+Linux test count: **361 → 363** (2 new tests; 0 failures; pre-existing sshd enforce-mode
+failure corrected). macOS: 166 (unchanged). Windows: 275 (unchanged). Rust workspace: no changes.
+
+---
+
 ## Test Gap Fix (2026-05-18, 125th pass) — Linux: Worker-level enforce-mode reconciliation tests missing for sysctl key and sshd dropin
 
 ### Gap

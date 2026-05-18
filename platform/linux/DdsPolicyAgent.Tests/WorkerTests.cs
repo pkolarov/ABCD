@@ -108,7 +108,9 @@ file static class WorkerFactory
         IAppliedStateStore? store = null,
         ICommandRunner? runner = null,
         string? sshdDropinPath = null,
-        string? sysctlDropinPath = null)
+        string? sysctlDropinPath = null,
+        string? sudoersDir = null,
+        string? systemdDropinBase = null)
     {
         client ??= new TestDdsNodeClient();
         store  ??= new TestAppliedStateStore();
@@ -120,7 +122,9 @@ file static class WorkerFactory
             runner,
             NullLogger<Worker>.Instance,
             sshdDropinPath,
-            sysctlDropinPath);
+            sysctlDropinPath,
+            sudoersDir,
+            systemdDropinBase);
     }
 
     public static ApplicableLinuxPolicy MakePolicy(string policyId, string documentJson)
@@ -760,23 +764,18 @@ public sealed class WorkerTests
     [Fact]
     public async Task Reconciliation_SshPolicyAbsent_EnforceMode_DeletesDropinFile()
     {
-        // No policy has an ssh field and the sshd drop-in exists on disk → the
-        // reconciliation pass calls sshdEnforcer.ApplyAsync(null) which deletes the file
-        // in enforce mode, emitting "sshd:remove" (no [AUDIT] prefix).
+        // No applicable policy has an ssh field and the sshd drop-in exists on disk →
+        // the reconciliation pass calls sshdEnforcer.ApplyAsync(null) which deletes the
+        // file in enforce mode, emitting "sshd:remove" (no [AUDIT] prefix).
+        // Use empty NextPolicies so only the reconciliation phase runs; a policy with a
+        // linux section but no ssh field would cause the apply phase to call ApplyAsync(null)
+        // first, deleting the file before the reconciliation pass acts on it.
         var tmp = Path.Combine(Path.GetTempPath(), "dds-sshd-wkr-enf-" + Guid.NewGuid() + ".conf");
         try
         {
             await File.WriteAllTextAsync(tmp, "# Managed by DDS\nPasswordAuthentication no\n");
 
-            var client = new TestDdsNodeClient
-            {
-                NextPolicies =
-                [
-                    WorkerFactory.MakePolicy(
-                        "policy-no-ssh",
-                        """{"policy_id":"policy-no-ssh","version":1,"linux":{"local_users":[]}}"""),
-                ],
-            };
+            var client = new TestDdsNodeClient();   // no policies → hasSshPolicy stays false
 
             var worker = WorkerFactory.Create(
                 new AgentConfig
@@ -874,6 +873,50 @@ public sealed class WorkerTests
 
         Assert.Contains("dds-ops", store.RemovedSudoersFilenames);
         Assert.DoesNotContain("dds-ops", store.AddedSudoersFilenames);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleSudoersDropin_EnforceMode_DeletesDropinFile()
+    {
+        // A sudoers drop-in is present on disk but absent from all current policies →
+        // ReconcileStaleSudoersAsync deletes the file in enforce mode, emitting
+        // "sudoers:delete:{filename}" (no [AUDIT] prefix).
+        var tmpDir = Path.Combine(Path.GetTempPath(), "dds-sudoers-wkr-enf-" + Guid.NewGuid());
+        Directory.CreateDirectory(tmpDir);
+        var dropinPath = Path.Combine(tmpDir, "dds-ops");
+        try
+        {
+            await File.WriteAllTextAsync(dropinPath, "alice ALL=(ALL) NOPASSWD: /usr/bin/systemctl\n");
+
+            var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+            initialState.ManagedSudoersFilenames.Add("dds-ops");
+            var store  = new TrackingAppliedStateStore(initialState);
+            var client = new TestDdsNodeClient();   // no policies → staleSudoers = {"dds-ops"}
+
+            var worker = WorkerFactory.Create(
+                new AgentConfig
+                {
+                    DeviceUrn           = "urn:dds:device:test",
+                    PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                    AuditOnly           = false,
+                },
+                client,
+                store,
+                sudoersDir: tmpDir);
+
+            await worker.PollOnceAsync(CancellationToken.None);
+
+            var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+            Assert.NotNull(report);
+            Assert.Contains("sudoers:delete:dds-ops", report.Directives);
+            Assert.DoesNotContain("[AUDIT]", string.Concat(report.Directives));
+            // Enforce mode: the drop-in file must have been deleted.
+            Assert.False(File.Exists(dropinPath));
+        }
+        finally
+        {
+            if (Directory.Exists(tmpDir)) Directory.Delete(tmpDir, recursive: true);
+        }
     }
 
     [Fact]
@@ -992,6 +1035,51 @@ public sealed class WorkerTests
         await worker.PollOnceAsync(CancellationToken.None);
 
         Assert.DoesNotContain("sshd.service/hardening", store.RemovedSystemdDropinKeys);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleSystemdDropin_EnforceMode_DeletesDropinFile()
+    {
+        // A systemd drop-in is present on disk but absent from all current policies →
+        // ReconcileStaleDropinsAsync deletes the file in enforce mode, emitting
+        // "systemd:removedropin:{key}" (no [AUDIT] prefix).
+        var tmpBase = Path.Combine(Path.GetTempPath(), "dds-systemd-wkr-enf-" + Guid.NewGuid());
+        var dropinDir  = Path.Combine(tmpBase, "sshd.service.d");
+        var dropinPath = Path.Combine(dropinDir, "hardening.conf");
+        Directory.CreateDirectory(dropinDir);
+        try
+        {
+            await File.WriteAllTextAsync(dropinPath, "[Service]\nLimitNOFILE=65535\n");
+
+            var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+            initialState.ManagedSystemdDropins.Add("sshd.service/hardening");
+            var store  = new TrackingAppliedStateStore(initialState);
+            var client = new TestDdsNodeClient();   // no policies → staleSystemdDropins = {"sshd.service/hardening"}
+
+            var worker = WorkerFactory.Create(
+                new AgentConfig
+                {
+                    DeviceUrn           = "urn:dds:device:test",
+                    PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                    AuditOnly           = false,
+                },
+                client,
+                store,
+                systemdDropinBase: tmpBase);
+
+            await worker.PollOnceAsync(CancellationToken.None);
+
+            var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+            Assert.NotNull(report);
+            Assert.Contains("systemd:removedropin:sshd.service/hardening", report.Directives);
+            Assert.DoesNotContain("[AUDIT]", string.Concat(report.Directives));
+            // Enforce mode: the drop-in file must have been deleted.
+            Assert.False(File.Exists(dropinPath));
+        }
+        finally
+        {
+            if (Directory.Exists(tmpBase)) Directory.Delete(tmpBase, recursive: true);
+        }
     }
 
     [Fact]
