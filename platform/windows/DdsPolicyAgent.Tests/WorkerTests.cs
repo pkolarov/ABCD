@@ -1127,6 +1127,60 @@ public class WorkerTests
         Assert.Empty(store.RecordCalls["password_policy"]);
     }
 
+    [Fact]
+    public async Task Reconciliation_StaleService_EnforceMode_EmitsManualDirective()
+    {
+        // "LegacySvc" was managed in the prior cycle but no current policy claims it.
+        // Service configuration is not auto-reverted in any mode — in enforce mode
+        // the reconciler must still emit a [MANUAL] directive (no [AUDIT] prefix).
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["services"] = ["LegacySvc"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // A reconciliation report must be submitted.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        Assert.Contains(report.Directives,
+            d => d.Contains("[MANUAL]") && d.Contains("LegacySvc"));
+        Assert.DoesNotContain("[AUDIT]", string.Join(",", report.Directives));
+
+        // The managed-services set must now be empty.
+        Assert.True(store.RecordCalls.ContainsKey("services"));
+        Assert.Empty(store.RecordCalls["services"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StalePasswordPolicy_EnforceMode_EmitsManualDirective()
+    {
+        // "password_policy" was applied in a prior cycle but no current policy claims it.
+        // Password policy knobs cannot be auto-reverted in any mode — in enforce mode
+        // the reconciler must still emit a [MANUAL] directive (no [AUDIT] prefix).
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["password_policy"] = ["_applied"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // A reconciliation report must be submitted.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        Assert.Contains(report.Directives,
+            d => d.Contains("[MANUAL]") && d.Contains("password_policy"));
+        Assert.DoesNotContain("[AUDIT]", string.Join(",", report.Directives));
+
+        // The managed-password_policy set must now be empty.
+        Assert.True(store.RecordCalls.ContainsKey("password_policy"));
+        Assert.Empty(store.RecordCalls["password_policy"]);
+    }
+
     // --- helpers --------------------------------------------------------
 
     private static Worker BuildWorker(

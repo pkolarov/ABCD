@@ -1,5 +1,61 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-19, 133rd pass) — Windows: service and password_policy missing EnforceMode reconciliation tests
+
+### Gap
+
+`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs` was missing enforce-mode
+reconciliation tests for the `service` and `password_policy` categories, following
+the same pattern gap that passes 128–132 closed for other categories across all
+three platforms.
+
+The pre-existing tests for these two categories:
+
+- `Reconciliation_StaleService_IsNotedInReport` — uses `JoinState.Workgroup`,
+  asserts `_reconciliation` report with `[MANUAL]` directive is sent.
+- `Reconciliation_StalePasswordPolicy_EmitsManualDirective` — uses
+  `JoinState.Workgroup`, asserts `_reconciliation` report with `[MANUAL]`
+  directive is sent.
+
+Unlike the four auto-revertible Windows categories (registry, account, group
+membership, software), service and password_policy cannot be auto-reverted in
+any mode — they always emit a `[MANUAL]` directive. Pass 131 added AD-joined
+variants to confirm this "always emits" behaviour on AD-joined hosts. The
+missing enforce-mode variants pin the complementary Workgroup invariant:
+`[MANUAL]` is emitted **and** no `[AUDIT]` prefix appears in any directive
+— the same `DoesNotContain("[AUDIT]", ...)` assertion added by pass 128 for
+the four auto-revertible categories.
+
+### Fix
+
+**`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs`** (+2 tests):
+
+- Added `Reconciliation_StaleService_EnforceMode_EmitsManualDirective`:
+  seeds `["services"]` with `"LegacySvc"`, runs `PollAndApplyAsync` with
+  `JoinState.Workgroup` and no policies, asserts:
+  - `_reconciliation` report IS sent
+  - Directive contains `[MANUAL]` and `"LegacySvc"`
+  - `Assert.DoesNotContain("[AUDIT]", ...)` — no audit prefix in enforce mode
+  - Managed-services set is cleared to empty
+
+- Added `Reconciliation_StalePasswordPolicy_EnforceMode_EmitsManualDirective`:
+  seeds `["password_policy"]` with `"_applied"`, runs `PollAndApplyAsync` with
+  `JoinState.Workgroup` and no policies, asserts:
+  - `_reconciliation` report IS sent
+  - Directive contains `[MANUAL]` and `"password_policy"`
+  - `Assert.DoesNotContain("[AUDIT]", ...)` — no audit prefix in enforce mode
+  - Managed-password_policy set is cleared to empty
+
+No production code changed — both categories already emitted `[MANUAL]`
+directives unconditionally in all modes; the tests pin the existing behaviour.
+
+### Result
+
+Linux test count: **367** (unchanged). macOS: **172** (unchanged). Windows:
+**281 → 283** (+2 new tests; 0 failures). Rust workspace: no changes.
+
+---
+
 ## Test Gap Fix + Bug Fix (2026-05-19, 132nd pass) — macOS: missing software enforce-mode directive test; Rust: flaky identity_store test from concurrent env-var mutation
 
 ### Gap 1 — macOS software enforce-mode test
