@@ -75,8 +75,13 @@ pub(crate) fn require_encrypted_keys() -> bool {
     }
 }
 
+// All test modules that mutate process env vars (passphrase + require-encrypted)
+// must hold this shared lock.  Using `TEST_ENV_LOCK` from the crate root so
+// `identity_store`, `p2p_identity`, and `domain_store` tests all serialise on the
+// same mutex — a separate `Mutex<()>` here caused cross-module races when
+// `domain_store` tests set `DDS_REQUIRE_ENCRYPTED_KEYS` concurrently.
 #[cfg(test)]
-pub(crate) static PASSPHRASE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) use crate::TEST_ENV_LOCK as PASSPHRASE_ENV_LOCK;
 
 const VERSION_PLAIN: u8 = 1;
 const VERSION_ENCRYPTED: u8 = 2;
@@ -628,6 +633,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::remove_var(PASSPHRASE_ENV) };
+        unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("node_key.bin");
         let ident = load_or_create(&path, "node-a").unwrap();
@@ -665,7 +671,10 @@ mod tests {
         let _g = PASSPHRASE_ENV_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        // Clear both env vars so a prior test that panicked mid-set can't
+        // leave DDS_REQUIRE_ENCRYPTED_KEYS active and cause a spurious failure.
         unsafe { std::env::remove_var(PASSPHRASE_ENV) };
+        unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("node_key.bin");
         let a = load_or_create(&path, "node").unwrap();

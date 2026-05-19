@@ -970,4 +970,32 @@ public class WorkerTests
             d => d.Contains("Reconcile-RemoveGroup") && d.Contains("alice") && d.Contains("sudo"));
         Assert.DoesNotContain("[AUDIT]", string.Join(",", report.Directives));
     }
+
+    [Fact]
+    public async Task Reconciliation_StaleSoftware_EnforceMode_EmitsManualDirective()
+    {
+        // "com.example.app" was managed in the prior cycle but no current policy
+        // claims it — enforce-mode reconciliation cannot auto-uninstall on macOS
+        // (no generic uninstall path) so it must emit a [MANUAL] directive and the
+        // _reconciliation report must NOT carry an [AUDIT] prefix.
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["software_managed"] = ["com.example.app"],
+        });
+        var client = new TestMacDdsNodeClient(); // no policies or software → com.example.app is stale
+
+        var worker = MakeWorker(client, store);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // A reconciliation report must have been submitted with the [MANUAL] directive.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        Assert.Contains(report.Directives,
+            d => d.Contains("[MANUAL]") && d.Contains("com.example.app"));
+        Assert.DoesNotContain("[AUDIT]", string.Join(",", report.Directives));
+
+        // The managed-software set must now be empty.
+        Assert.True(store.SetCalls.ContainsKey("software_managed"));
+        Assert.Empty(store.SetCalls["software_managed"]);
+    }
 }

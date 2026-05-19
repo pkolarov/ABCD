@@ -1,5 +1,83 @@
 # DDS Implementation Status
 
+## Test Gap Fix + Bug Fix (2026-05-19, 132nd pass) — macOS: missing software enforce-mode directive test; Rust: flaky identity_store test from concurrent env-var mutation
+
+### Gap 1 — macOS software enforce-mode test
+
+`platform/macos/DdsPolicyAgent.Tests/WorkerTests.cs` was missing a
+`Reconciliation_StaleSoftware_EnforceMode_EmitsManualDirective` test, following
+the same pattern gap that passes 123–131 closed for all other reconciliation
+categories across Linux, macOS, and Windows.
+
+The existing `Reconciliation_StaleSoftware_ReportsManualUninstall` test verified
+the reconciliation report is sent and the directive contains `[MANUAL]`, but:
+- Did not use the standard `*_EnforceMode_*` naming convention.
+- Did not assert `DoesNotContain("[AUDIT]")` to pin the "no audit prefix in
+  enforce mode" invariant (unlike every other enforce-mode test added in pass 129).
+
+Unlike the other four macOS auto-revertible categories (launchd, account,
+preference, profile, group), `SoftwareInstaller.ReconcileStalePackages` DOES have
+an audit-mode branch (emits `[AUDIT] [MANUAL] Reconcile-Uninstall ...`) and an
+enforce-mode branch (emits `[MANUAL] Reconcile-Uninstall ...` with no audit prefix).
+The missing test pins the enforce-mode branch explicitly.
+
+### Fix 1
+
+**`platform/macos/DdsPolicyAgent.Tests/WorkerTests.cs`** (+1 test):
+
+- Added `Reconciliation_StaleSoftware_EnforceMode_EmitsManualDirective`:
+  seeds `["software_managed"]` with `"com.example.app"`, runs `PollAndApplyAsync`
+  with default enforce-mode worker and no policies (so the package is stale), asserts:
+  - `_reconciliation` report IS sent
+  - Directive contains `[MANUAL]` and `"com.example.app"`
+  - `Assert.DoesNotContain("[AUDIT]", ...)` — no audit prefix in enforce mode
+  - Managed-software set is cleared to empty
+
+---
+
+### Gap 2 — Flaky Rust unit test from concurrent env-var mutation
+
+`dds-node::identity_store::tests::test_load_or_create_persists_across_calls`
+intermittently failed with:
+
+```
+Crypto("refusing to write plaintext node identity ... DDS_REQUIRE_ENCRYPTED_KEYS
+is set but DDS_NODE_PASSPHRASE is empty.")
+```
+
+**Root cause:** `identity_store.rs` defined its own `PASSPHRASE_ENV_LOCK` mutex
+(separate from `crate::TEST_ENV_LOCK` defined in `lib.rs` and used by
+`domain_store.rs` tests). Because tests in `identity_store` and `domain_store`
+acquired *different* locks, they ran concurrently. When a `domain_store` test
+set `DDS_REQUIRE_ENCRYPTED_KEYS=1` and `test_load_or_create_persists_across_calls`
+ran at the same time (holding only `PASSPHRASE_ENV_LOCK`), the latter saw the env var
+as set even though it had cleared `DDS_NODE_PASSPHRASE`, causing `save` to fail.
+
+### Fix 2
+
+**`dds-node/src/identity_store.rs`** (3 changes):
+
+- Replaced the separate `PASSPHRASE_ENV_LOCK: Mutex<()>` static with
+  `pub(crate) use crate::TEST_ENV_LOCK as PASSPHRASE_ENV_LOCK;` so all
+  env-mutating tests in the crate (`identity_store`, `p2p_identity`,
+  `domain_store`) serialize on the same mutex.
+
+- Added `remove_var(REQUIRE_ENCRYPTED_KEYS_ENV)` to
+  `test_load_or_create_persists_across_calls` and `test_plain_roundtrip` so
+  each test enters a clean state even if a prior test in the same lock
+  group panicked mid-`set_var`.
+
+No production code changed — all fixes are `#[cfg(test)]` paths.
+
+### Result
+
+Linux test count: **367** (unchanged). macOS: **171 → 172** (+1 new test; 0
+failures). Windows: **281** (unchanged). Rust workspace (unit tests): **312**
+(unchanged, 0 failures). Integration tests require no production node on port
+5551 (not run on dev machine with live service — unchanged from prior passes).
+
+---
+
 ## Test Gap Fix (2026-05-19, 131st pass) — Windows: Worker-level reconciliation tests missing AD-joined coverage for service and password-policy [MANUAL] directives
 
 ### Gap
