@@ -954,6 +954,125 @@ public class WorkerTests
         Assert.False(softwareOps.IsInstalled("com.example.audit-pkg"));
     }
 
+    [Fact]
+    public async Task Reconciliation_StaleRegistryEntry_EnforceMode_EmitsDeleteDirective()
+    {
+        // "LocalMachine\SOFTWARE\Policies\DDS\OldSetting" was managed in the prior cycle
+        // but no current policy claims it — enforce-mode reconciliation must delete the value
+        // and the _reconciliation report must carry the Reconcile-Delete directive without
+        // an [AUDIT] prefix.
+        var registryOps = new InMemoryRegistryOperations();
+        registryOps.SetValue("LocalMachine", @"SOFTWARE\Policies\DDS", "OldSetting", (uint)1, RegValueKind.Dword);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["registry"] = [@"LocalMachine\SOFTWARE\Policies\DDS\OldSetting"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store, registryOps: registryOps);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // Value must have been deleted.
+        Assert.Null(registryOps.Peek("LocalMachine", @"SOFTWARE\Policies\DDS", "OldSetting"));
+
+        // A reconciliation report must have been submitted with the correct directive.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        Assert.Contains(report.Directives,
+            d => d.Contains("Reconcile-Delete") && d.Contains(@"SOFTWARE\Policies\DDS\OldSetting"));
+        Assert.DoesNotContain("[AUDIT]", string.Join(",", report.Directives));
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleAccount_EnforceMode_EmitsDisableDirective()
+    {
+        // "dds-ops" was managed in the prior cycle but no current policy claims it —
+        // enforce-mode reconciliation must disable the account and the _reconciliation
+        // report must carry the Reconcile-Disable directive without an [AUDIT] prefix.
+        var accountOps = new InMemoryAccountOperations();
+        accountOps.CreateUser("dds-ops", null, null);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["accounts"] = ["dds-ops"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // Account must be disabled.
+        Assert.False(accountOps.IsEnabled("dds-ops"));
+
+        // A reconciliation report must have been submitted with the correct directive.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        Assert.Contains(report.Directives,
+            d => d.Contains("Reconcile-Disable") && d.Contains("dds-ops"));
+        Assert.DoesNotContain("[AUDIT]", string.Join(",", report.Directives));
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleGroupMembership_EnforceMode_EmitsRemoveDirective()
+    {
+        // "alice:Administrators" was managed in the prior cycle but no current policy
+        // claims it — enforce-mode reconciliation must remove alice from Administrators and
+        // the _reconciliation report must carry the Reconcile-RemoveFromGroup directive
+        // without an [AUDIT] prefix.
+        var accountOps = new InMemoryAccountOperations();
+        accountOps.CreateUser("alice", null, null);
+        accountOps.AddToGroup("alice", "Administrators");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["account_groups"] = ["alice:Administrators"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // alice must have been removed from Administrators.
+        Assert.DoesNotContain("Administrators", accountOps.GetGroups("alice"));
+
+        // A reconciliation report must have been submitted with the correct directive.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        Assert.Contains(report.Directives,
+            d => d.Contains("Reconcile-RemoveFromGroup") && d.Contains("alice") && d.Contains("Administrators"));
+        Assert.DoesNotContain("[AUDIT]", string.Join(",", report.Directives));
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleSoftware_EnforceMode_EmitsUninstallDirective()
+    {
+        // "com.example.editor" was managed in the prior cycle but no current policy claims
+        // it — enforce-mode reconciliation must uninstall it and the _reconciliation report
+        // must carry the Reconcile-Uninstall directive without an [AUDIT] prefix.
+        var softwareOps = new InMemorySoftwareOperations();
+        softwareOps.SeedInstalled("com.example.editor");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["software_managed"] = ["com.example.editor"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store, softwareOps: softwareOps);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // Package must have been uninstalled.
+        Assert.False(softwareOps.IsInstalled("com.example.editor"));
+
+        // A reconciliation report must have been submitted with the correct directive.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        Assert.Contains(report.Directives,
+            d => d.Contains("Reconcile-Uninstall") && d.Contains("com.example.editor"));
+        Assert.DoesNotContain("[AUDIT]", string.Join(",", report.Directives));
+    }
+
     // --- helpers --------------------------------------------------------
 
     private static Worker BuildWorker(

@@ -1,5 +1,85 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-19, 128th pass) — Windows: Worker-level enforce-mode reconciliation tests missing report directive assertions for registry, account, group, and software
+
+### Gap
+
+`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs` had enforce-mode reconciliation tests
+for all four auto-revertible categories (registry entries, accounts, group memberships, and
+software packages), but none of them asserted that a `_reconciliation` report was actually
+sent or that its `Directives` list contained the expected non-`[AUDIT]`-prefixed directive
+string.
+
+The existing tests verified only side effects and managed-set clearance:
+
+- `Reconciliation_StaleRegistryEntry_IsDeleted` — checked value deleted and managed set
+  empty, but not the `_reconciliation` report.
+- `Reconciliation_StaleAccount_IsDisabled` — checked account disabled, but not the report.
+- `Reconciliation_StaleGroupMembership_IsRemoved` — checked group removed, but not the
+  report.
+- `Reconciliation_StaleSoftware_IsUninstalled` — checked package uninstalled, but not the
+  report.
+
+Pass 124 added the audit-mode counterparts (`*_AuditMode_DoesNotDelete/Remove/Disable/
+Uninstall`) which assert that NO `_reconciliation` report is sent (the Windows reconciler
+is skipped entirely in audit/AD-joined mode). The enforce-mode twins — which assert that the
+report IS sent and carries the correct non-prefixed directive — were absent. This is the same
+gap pattern fixed for Linux (passes 125–127) and follows the same naming convention.
+
+In enforce mode (`JoinState.Workgroup`), the Windows `ReconcileAsync` calls the relevant
+enforcer method and collects directives in `reconcileChanges`; if the list is non-empty a
+`_reconciliation` report is sent via `ReportAsync`. The directive strings emitted are:
+- `"Reconcile-Delete {managedKey}"` for registry
+- `"Reconcile-Disable '{username}'"` for accounts
+- `"Reconcile-RemoveFromGroup '{username}' from '{group}'"` for group memberships
+- `"Reconcile-Uninstall {pkgId}"` for software packages
+
+None of the pre-existing enforce-mode tests verified any of these.
+
+### Fix
+
+**`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs`** (+4 tests):
+
+- Added `Reconciliation_StaleRegistryEntry_EnforceMode_EmitsDeleteDirective`:
+  seeds a registry value at `SOFTWARE\Policies\DDS\OldSetting`, runs `PollAndApplyAsync`
+  with `JoinState.Workgroup` and empty policies, asserts:
+  - Value is deleted (`registryOps.Peek` returns null)
+  - `_reconciliation` report is sent
+  - Directives contain a string with `"Reconcile-Delete"` and `"SOFTWARE\Policies\DDS\OldSetting"`
+  - No `[AUDIT]` prefix in any directive
+
+- Added `Reconciliation_StaleAccount_EnforceMode_EmitsDisableDirective`:
+  creates `"dds-ops"` (enabled), runs `PollAndApplyAsync`, asserts:
+  - Account is disabled (`IsEnabled` returns false)
+  - `_reconciliation` report is sent
+  - Directives contain `"Reconcile-Disable"` and `"dds-ops"`
+  - No `[AUDIT]` prefix
+
+- Added `Reconciliation_StaleGroupMembership_EnforceMode_EmitsRemoveDirective`:
+  creates `"alice"` in `"Administrators"`, runs `PollAndApplyAsync`, asserts:
+  - `"alice"` is removed from `"Administrators"`
+  - `_reconciliation` report is sent
+  - Directives contain `"Reconcile-RemoveFromGroup"`, `"alice"`, and `"Administrators"`
+  - No `[AUDIT]` prefix
+
+- Added `Reconciliation_StaleSoftware_EnforceMode_EmitsUninstallDirective`:
+  seeds `"com.example.editor"` as installed, runs `PollAndApplyAsync`, asserts:
+  - Package is uninstalled (`IsInstalled` returns false)
+  - `_reconciliation` report is sent
+  - Directives contain `"Reconcile-Uninstall"` and `"com.example.editor"`
+  - No `[AUDIT]` prefix
+
+No production code changes were required — the `ReconcileAsync` method already collects
+changes from each enforcer and sends the `_reconciliation` report whenever `reconcileChanges`
+is non-empty.
+
+### Result
+
+Linux test count: **364** (unchanged). macOS: **166** (unchanged). Windows: **275 → 279**
+(4 new tests; 0 failures). Rust workspace: no changes.
+
+---
+
 ## Test Gap Fix (2026-05-18, 127th pass) — Linux: Worker-level enforce-mode reconciliation test missing for group memberships
 
 ### Gap
