@@ -1073,6 +1073,60 @@ public class WorkerTests
         Assert.DoesNotContain("[AUDIT]", string.Join(",", report.Directives));
     }
 
+    [Fact]
+    public async Task Reconciliation_StaleService_AdJoined_StillEmitsManualDirective()
+    {
+        // On an AD-joined host the effective mode is forced to Audit, but service
+        // configuration is NOT auto-reverted in any mode — the reconciler always
+        // emits a [MANUAL] directive to prompt operator review regardless of join state.
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["services"] = ["LegacySvc"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store);
+        await worker.PollAndApplyAsync(JoinState.AdJoined, CancellationToken.None);
+
+        // A reconciliation report must still be submitted even on an AD-joined host.
+        var report = client.ReceivedReports.FirstOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        Assert.Equal("ok", report.Status);
+        Assert.Contains(report.Directives,
+            d => d.Contains("[MANUAL]") && d.Contains("LegacySvc"));
+
+        // The managed-services set must now be empty.
+        Assert.True(store.RecordCalls.ContainsKey("services"));
+        Assert.Empty(store.RecordCalls["services"]);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StalePasswordPolicy_AdJoined_StillEmitsManualDirective()
+    {
+        // On an AD-joined host the effective mode is forced to Audit, but password
+        // policy knobs cannot be auto-reverted in any mode — the reconciler always
+        // emits a [MANUAL] directive to prompt operator review regardless of join state.
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["password_policy"] = ["_applied"],
+        });
+        var client = new TestWindowsDdsNodeClient();
+
+        var worker = MakeWorker(client, store);
+        await worker.PollAndApplyAsync(JoinState.AdJoined, CancellationToken.None);
+
+        // A reconciliation report must still be submitted even on an AD-joined host.
+        var report = client.ReceivedReports.FirstOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        Assert.Equal("ok", report.Status);
+        Assert.Contains(report.Directives,
+            d => d.Contains("[MANUAL]") && d.Contains("password_policy"));
+
+        // The managed-password_policy set must now be empty.
+        Assert.True(store.RecordCalls.ContainsKey("password_policy"));
+        Assert.Empty(store.RecordCalls["password_policy"]);
+    }
+
     // --- helpers --------------------------------------------------------
 
     private static Worker BuildWorker(

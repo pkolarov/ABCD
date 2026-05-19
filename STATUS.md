@@ -1,5 +1,77 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-19, 131st pass) — Windows: Worker-level reconciliation tests missing AD-joined coverage for service and password-policy [MANUAL] directives
+
+### Gap
+
+`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs` had no tests verifying that
+service and password-policy reconciliation emits `[MANUAL]` directives when the host
+is AD-joined (audit mode).
+
+The existing tests for these two categories:
+
+- `Reconciliation_StaleService_IsNotedInReport` — uses `JoinState.Workgroup`, asserts
+  `_reconciliation` report with `[MANUAL]` directive is sent.
+- `Reconciliation_StalePasswordPolicy_EmitsManualDirective` — uses `JoinState.Workgroup`,
+  asserts `_reconciliation` report with `[MANUAL]` directive is sent.
+
+Unlike registry, account, group, and software reconciliation, services and password_policy
+have no `!auditMode` guard in `Worker.ReconcileAsync`:
+
+```csharp
+// Service reconciliation (lines 500–507): no !auditMode check
+if (staleServices.Count > 0)
+{
+    var changes = _serviceEnforcer.ReconcileStaleServices(staleServices, effectiveMode);
+    reconcileChanges.AddRange(changes);
+}
+
+// Password policy reconciliation (lines 515–521): no !auditMode check
+if (stalePasswordPolicy.Count > 0)
+{
+    var changes = _passwordPolicyEnforcer.ReconcileStalePolicy(effectiveMode);
+    reconcileChanges.AddRange(changes);
+}
+```
+
+This is intentional: services and password_policy cannot be auto-reverted in any mode
+(the `[MANUAL]` directive is the only output), so the operator-notification behaviour
+is correct on both workgroup and AD-joined hosts. The pre-existing `AuditMode_DoesNotX`
+tests for the other four categories verify those reconcilers are completely skipped on
+AD-joined hosts (reconcileChanges stays empty → no report sent). For services and
+password_policy the invariant is the opposite: the `_reconciliation` report IS sent
+even on AD-joined hosts.
+
+No tests verified this "always emits, regardless of join state" contract.
+
+### Fix
+
+**`platform/windows/DdsPolicyAgent.Tests/WorkerTests.cs`** (+2 tests):
+
+- Added `Reconciliation_StaleService_AdJoined_StillEmitsManualDirective`:
+  seeds `ManagedItems["services"]` with `"LegacySvc"`, runs `PollAndApplyAsync`
+  with `JoinState.AdJoined` and empty policies, asserts:
+  - `_reconciliation` report IS sent
+  - Directives contain `[MANUAL]` and `"LegacySvc"`
+  - Managed-services set is cleared
+
+- Added `Reconciliation_StalePasswordPolicy_AdJoined_StillEmitsManualDirective`:
+  seeds `ManagedItems["password_policy"]` with `"_applied"`, runs `PollAndApplyAsync`
+  with `JoinState.AdJoined` and empty policies, asserts:
+  - `_reconciliation` report IS sent
+  - Directives contain `[MANUAL]` and `"password_policy"`
+  - Managed-password_policy set is cleared
+
+No production code changes were required — `ReconcileAsync` already emits the `[MANUAL]`
+directives unconditionally for these two categories.
+
+### Result
+
+Linux test count: **367** (unchanged). macOS: **171** (unchanged). Windows: **279 → 281**
+(2 new tests; 0 failures). Rust workspace: no changes.
+
+---
+
 ## Test Gap Fix (2026-05-19, 130th pass) — Linux: Worker-level enforce-mode reconciliation tests missing report directive assertions for user, file, and package
 
 ### Gap
