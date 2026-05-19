@@ -1,5 +1,98 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-19, 129th pass) — macOS: Worker-level enforce-mode reconciliation tests missing report directive assertions for launchd, account, preference, profile, and group membership
+
+### Gap
+
+`platform/macos/DdsPolicyAgent.Tests/WorkerTests.cs` had enforce-mode reconciliation tests
+for all five auto-revertible categories (launchd jobs, accounts, preferences, profiles, and
+group memberships), but none of them asserted that a `_reconciliation` report was actually
+sent or that its `Directives` list contained the expected non-`[AUDIT]`-prefixed directive
+string.
+
+The existing tests verified only side effects and managed-set clearance:
+
+- `Reconciliation_StaleLaunchdJob_IsUnloaded` — checked job unloaded and managed set empty,
+  but not the `_reconciliation` report.
+- `Reconciliation_StaleAccount_IsDisabled` — checked account disabled, but not the report.
+- `Reconciliation_StalePreference_IsRemovedAndSetUpdated` — checked value deleted, but not
+  the report.
+- `Reconciliation_StaleProfile_IsRemovedAndSetUpdated` — checked profile removed, but not
+  the report.
+- `Reconciliation_StaleGroupMembership_IsRemovedAndSetUpdated` — checked group removed, but
+  not the report.
+
+Pass 123 added the audit-mode counterparts (`*_AuditMode_*`) for all five categories, which
+assert that the `_reconciliation` report IS sent carrying `[AUDIT]`-prefixed directives. The
+enforce-mode twins — which assert that the report IS sent and carries the correct
+non-prefixed directive — were absent. This is the same gap pattern fixed for Linux
+(passes 125–127) and Windows (pass 128) and follows the same naming convention.
+
+In enforce mode (no `"enforcement":"Audit"` in any active policy), `ReconcileAsync` calls
+each enforcer and collects directives in `reconcileChanges`; if the list is non-empty a
+`_reconciliation` report is sent via `ReportAsync`. The directive strings emitted are:
+- `"Reconcile-Unload {label}"` for launchd jobs
+- `"Reconcile-Disable '{username}'"` for accounts
+- `"Reconcile-Delete {managedKey}"` for preferences
+- `"Reconcile-Remove profile {identifier}"` for profiles
+- `"Reconcile-RemoveGroup '{username}' from '{group}'"` for group memberships
+
+None of the pre-existing enforce-mode tests verified any of these.
+
+Note: Software reconciliation on macOS already asserts the `[MANUAL]` directive in
+`Reconciliation_StaleSoftware_ReportsManualUninstall` (since software removal is always
+manual on macOS, the directive is always emitted — there was no gap there).
+
+### Fix
+
+**`platform/macos/DdsPolicyAgent.Tests/WorkerTests.cs`** (+5 tests):
+
+- Added `Reconciliation_StaleLaunchdJob_EnforceMode_EmitsUnloadDirective`:
+  seeds `"com.dds.old-job"` as loaded, runs `PollAndApplyAsync` with no active policies,
+  asserts:
+  - Job is unloaded (`Peek` returns Loaded=false)
+  - `_reconciliation` report is sent
+  - Directives contain `"Reconcile-Unload"` and `"com.dds.old-job"`
+  - No `[AUDIT]` prefix in any directive
+
+- Added `Reconciliation_StaleAccount_EnforceMode_EmitsDisableDirective`:
+  creates `"dds-kiosk"` (enabled), runs `PollAndApplyAsync`, asserts:
+  - Account is disabled (`IsEnabled` returns false)
+  - `_reconciliation` report is sent
+  - Directives contain `"Reconcile-Disable"` and `"dds-kiosk"`
+  - No `[AUDIT]` prefix
+
+- Added `Reconciliation_StalePreference_EnforceMode_EmitsDeleteDirective`:
+  seeds `"System:com.apple.dock:autohide"`, runs `PollAndApplyAsync`, asserts:
+  - Preference is deleted (`GetValueJson` returns null)
+  - `_reconciliation` report is sent
+  - Directives contain `"Reconcile-Delete"` and `"com.apple.dock:autohide"`
+  - No `[AUDIT]` prefix
+
+- Added `Reconciliation_StaleProfile_EnforceMode_EmitsRemoveDirective`:
+  seeds `"com.dds.old-profile"` as installed, runs `PollAndApplyAsync`, asserts:
+  - Profile is removed (`IsInstalled` returns false)
+  - `_reconciliation` report is sent
+  - Directives contain `"Reconcile-Remove"` and `"com.dds.old-profile"`
+  - No `[AUDIT]` prefix
+
+- Added `Reconciliation_StaleGroupMembership_EnforceMode_EmitsRemoveGroupDirective`:
+  creates `"alice"` in `"sudo"`, runs `PollAndApplyAsync`, asserts:
+  - `"alice"` is removed from `"sudo"` (`IsInGroup` returns false)
+  - `_reconciliation` report is sent
+  - Directives contain `"Reconcile-RemoveGroup"`, `"alice"`, and `"sudo"`
+  - No `[AUDIT]` prefix
+
+No production code changes were required — `ReconcileAsync` already collects changes from
+each enforcer and sends the `_reconciliation` report whenever `reconcileChanges` is non-empty.
+
+### Result
+
+Linux test count: **364** (unchanged). macOS: **166 → 171** (5 new tests; 0 failures).
+Windows: **279** (unchanged). Rust workspace: no changes.
+
+---
+
 ## Test Gap Fix (2026-05-19, 128th pass) — Windows: Worker-level enforce-mode reconciliation tests missing report directive assertions for registry, account, group, and software
 
 ### Gap

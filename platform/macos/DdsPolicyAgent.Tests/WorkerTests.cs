@@ -820,4 +820,154 @@ public class WorkerTests
         Assert.Contains(reconciliation.Directives,
             d => d.Contains("[AUDIT]") && d.Contains("alice"));
     }
+
+    [Fact]
+    public async Task Reconciliation_StaleLaunchdJob_EnforceMode_EmitsUnloadDirective()
+    {
+        // "com.dds.old-job" was managed in the prior cycle but no current policy
+        // claims it — enforce-mode reconciliation must unload it and the
+        // _reconciliation report must carry the Reconcile-Unload directive without
+        // an [AUDIT] prefix.
+        var launchdOps = new InMemoryLaunchdOperations();
+        launchdOps.Load("com.dds.old-job");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["launchd"] = ["com.dds.old-job"],
+        });
+        var client = new TestMacDdsNodeClient();
+
+        var worker = MakeWorker(client, store, launchdOps: launchdOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Job must have been unloaded.
+        Assert.False(launchdOps.Peek("com.dds.old-job")?.Loaded ?? false);
+
+        // A reconciliation report must have been submitted with the correct directive.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        Assert.Contains(report.Directives,
+            d => d.Contains("Reconcile-Unload") && d.Contains("com.dds.old-job"));
+        Assert.DoesNotContain("[AUDIT]", string.Join(",", report.Directives));
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleAccount_EnforceMode_EmitsDisableDirective()
+    {
+        // "dds-kiosk" was managed in the prior cycle but no current policy claims it —
+        // enforce-mode reconciliation must disable the account and the _reconciliation
+        // report must carry the Reconcile-Disable directive without an [AUDIT] prefix.
+        var accountOps = new InMemoryMacAccountOperations();
+        accountOps.CreateUser("dds-kiosk", null, null, false, false);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["accounts"] = ["dds-kiosk"],
+        });
+        var client = new TestMacDdsNodeClient();
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Account must be disabled.
+        Assert.False(accountOps.IsEnabled("dds-kiosk"));
+
+        // A reconciliation report must have been submitted with the correct directive.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        Assert.Contains(report.Directives,
+            d => d.Contains("Reconcile-Disable") && d.Contains("dds-kiosk"));
+        Assert.DoesNotContain("[AUDIT]", string.Join(",", report.Directives));
+    }
+
+    [Fact]
+    public async Task Reconciliation_StalePreference_EnforceMode_EmitsDeleteDirective()
+    {
+        // "System:com.apple.dock:autohide" was managed in the prior cycle but no
+        // current policy claims it — enforce-mode reconciliation must delete the value
+        // and the _reconciliation report must carry the Reconcile-Delete directive
+        // without an [AUDIT] prefix.
+        var prefOps = new InMemoryMacPreferenceOperations();
+        prefOps.SetValueJson("com.apple.dock", "autohide", PreferenceScope.System, "true");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["preferences"] = ["System:com.apple.dock:autohide"],
+        });
+        var client = new TestMacDdsNodeClient();
+
+        var worker = MakeWorker(client, store, prefOps: prefOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Preference value must have been deleted.
+        Assert.Null(prefOps.GetValueJson("com.apple.dock", "autohide", PreferenceScope.System));
+
+        // A reconciliation report must have been submitted with the correct directive.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        Assert.Contains(report.Directives,
+            d => d.Contains("Reconcile-Delete") && d.Contains("com.apple.dock:autohide"));
+        Assert.DoesNotContain("[AUDIT]", string.Join(",", report.Directives));
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleProfile_EnforceMode_EmitsRemoveDirective()
+    {
+        // "com.dds.old-profile" was managed in the prior cycle but no current policy
+        // claims it — enforce-mode reconciliation must remove it and the
+        // _reconciliation report must carry the Reconcile-Remove directive without
+        // an [AUDIT] prefix.
+        var profileOps = new InMemoryProfileOperations();
+        profileOps.Install("com.dds.old-profile", "Old Profile", "sha256abc", [0x00]);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["profiles"] = ["com.dds.old-profile"],
+        });
+        var client = new TestMacDdsNodeClient();
+
+        var worker = MakeWorker(client, store, profileOps: profileOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Profile must have been removed.
+        Assert.False(profileOps.IsInstalled("com.dds.old-profile", "sha256abc"));
+
+        // A reconciliation report must have been submitted with the correct directive.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        Assert.Contains(report.Directives,
+            d => d.Contains("Reconcile-Remove") && d.Contains("com.dds.old-profile"));
+        Assert.DoesNotContain("[AUDIT]", string.Join(",", report.Directives));
+    }
+
+    [Fact]
+    public async Task Reconciliation_StaleGroupMembership_EnforceMode_EmitsRemoveGroupDirective()
+    {
+        // "alice:sudo" was managed in the prior cycle but no current policy claims it —
+        // enforce-mode reconciliation must remove alice from sudo and the
+        // _reconciliation report must carry the Reconcile-RemoveGroup directive without
+        // an [AUDIT] prefix.
+        var accountOps = new InMemoryMacAccountOperations();
+        accountOps.CreateUser("alice", null, null, false, false);
+        accountOps.AddToGroup("alice", "sudo");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["account_groups"] = ["alice:sudo"],
+        });
+        var client = new TestMacDdsNodeClient();
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // alice must have been removed from sudo.
+        Assert.False(accountOps.IsInGroup("alice", "sudo"));
+
+        // A reconciliation report must have been submitted with the correct directive.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        Assert.Contains(report.Directives,
+            d => d.Contains("Reconcile-RemoveGroup") && d.Contains("alice") && d.Contains("sudo"));
+        Assert.DoesNotContain("[AUDIT]", string.Join(",", report.Directives));
+    }
 }
