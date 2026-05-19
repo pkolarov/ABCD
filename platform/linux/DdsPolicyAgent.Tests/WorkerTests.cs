@@ -404,6 +404,43 @@ public sealed class WorkerTests
     }
 
     [Fact]
+    public async Task Reconciliation_StaleUser_EnforceMode_EmitsDisableDirective()
+    {
+        // "alice" was managed in a previous cycle but absent from current policies.
+        // In enforce mode (AuditOnly = false), ReconcileStaleUsersAsync must disable
+        // the account, send the _reconciliation report, and emit a non-[AUDIT]-prefixed
+        // user:disable directive.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedUsernames.Add("alice");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // Account must be disabled (passwd -l called).
+        Assert.Contains(runner.Invocations,
+            i => i.FileName == "passwd" && i.Arguments.Contains("alice"));
+        // Reconciliation report must be sent.
+        var report = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        // Directive must contain the action and username without an [AUDIT] prefix.
+        Assert.Contains(report.Directives,
+            d => d.Contains("user:disable") && d.Contains("alice"));
+        Assert.DoesNotContain(report.Directives, d => d.Contains("[AUDIT]"));
+    }
+
+    [Fact]
     public async Task Reconciliation_StaleFile_IsDeletedAndRemovedFromManagedSet()
     {
         var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
@@ -479,6 +516,41 @@ public sealed class WorkerTests
     }
 
     [Fact]
+    public async Task Reconciliation_StaleFile_EnforceMode_EmitsDeleteDirective()
+    {
+        // "/etc/dds/stale.conf" was managed in a previous cycle but absent from current
+        // policies. In enforce mode (AuditOnly = false), ReconcileStaleFiles must delete
+        // the file, send the _reconciliation report, and emit a non-[AUDIT]-prefixed
+        // file:delete directive.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedPaths.Add("/etc/dds/stale.conf");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // File must be removed from managed set.
+        Assert.Contains("/etc/dds/stale.conf", store.RemovedPaths);
+        // Reconciliation report must be sent.
+        var report = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        // Directive must contain the action and path without an [AUDIT] prefix.
+        Assert.Contains(report.Directives,
+            d => d.Contains("file:delete") && d.Contains("/etc/dds/stale.conf"));
+        Assert.DoesNotContain(report.Directives, d => d.Contains("[AUDIT]"));
+    }
+
+    [Fact]
     public async Task Reconciliation_StalePackage_AuditOnly_ReturnsAuditPrefixedEntry()
     {
         var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
@@ -507,6 +579,42 @@ public sealed class WorkerTests
             .SingleOrDefault(r => r.TargetId == "_reconciliation");
         Assert.NotNull(reconciliation);
         Assert.Contains("[AUDIT] pkg:remove:ntp", reconciliation.Directives);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StalePackage_EnforceMode_EmitsRemoveDirective()
+    {
+        // "ntp" was managed in a previous cycle but absent from current policies.
+        // In enforce mode (AuditOnly = false), ReconcileStalePackagesAsync must remove
+        // the package, send the _reconciliation report, and emit a non-[AUDIT]-prefixed
+        // pkg:remove directive.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedPackages.Add("ntp");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient { NextPolicies = [] };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // Package manager must be invoked (any call containing "ntp").
+        Assert.Contains(runner.Invocations, i => i.Arguments.Contains("ntp"));
+        // Reconciliation report must be sent.
+        var report = client.ReceivedReports
+            .SingleOrDefault(r => r.TargetId == "_reconciliation");
+        Assert.NotNull(report);
+        // Directive must contain the action and package name without an [AUDIT] prefix.
+        Assert.Contains(report.Directives,
+            d => d.Contains("pkg:remove") && d.Contains("ntp"));
+        Assert.DoesNotContain(report.Directives, d => d.Contains("[AUDIT]"));
     }
 
     [Fact]

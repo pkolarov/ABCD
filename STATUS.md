@@ -1,5 +1,75 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-19, 130th pass) — Linux: Worker-level enforce-mode reconciliation tests missing report directive assertions for user, file, and package
+
+### Gap
+
+`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs` had enforce-mode reconciliation tests
+for three categories (users, files, and packages), but none of them asserted that a
+`_reconciliation` report was actually sent or that its `Directives` list contained the
+expected non-`[AUDIT]`-prefixed directive string.
+
+The existing tests verified only side effects and managed-set clearance:
+
+- `Reconciliation_StaleUser_IsDisabledAndRemovedFromManagedSet` — checked `passwd -l`
+  was called and managed-usernames set cleared, but not the `_reconciliation` report.
+- `Reconciliation_StaleFile_IsDeletedAndRemovedFromManagedSet` — checked path removed
+  from managed set, but not the report.
+- `Reconciliation_StalePackage_IsRemovedAndRemovedFromManagedSet` — checked package
+  manager was invoked, but not the report.
+
+Passes 123–129 fixed the same gap pattern for all other reconciliation categories across
+Linux (sysctl, sshd, sudoers, systemd, groups), Windows (registry, account, group,
+software), and macOS (launchd, account, preference, profile, group). User, file, and
+package were the three remaining Linux categories with audit-mode counterparts that assert
+the `[AUDIT]`-prefixed directive, while the enforce-mode twins — which assert the report
+IS sent and carries the correct non-prefixed directive — were absent.
+
+In enforce mode (`AuditOnly = false`), `PollOnceAsync` calls each enforcer's reconcile
+method and collects directives; if the list is non-empty a `_reconciliation` report is
+sent via `ReportAsync`. The directive strings emitted are:
+- `"user:disable:{username}"` for users
+- `"file:delete:{path}"` for files
+- `"pkg:remove:{name}"` for packages
+
+None of the pre-existing enforce-mode tests verified any of these.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`** (+3 tests):
+
+- Added `Reconciliation_StaleUser_EnforceMode_EmitsDisableDirective`:
+  seeds `ManagedUsernames` with `"alice"`, runs `PollOnceAsync` with `AuditOnly = false`
+  and empty `NextPolicies`, asserts:
+  - `passwd -l alice` IS invoked
+  - `_reconciliation` report is sent
+  - Directives contain `"user:disable"` and `"alice"`
+  - No `[AUDIT]` prefix in any directive
+
+- Added `Reconciliation_StaleFile_EnforceMode_EmitsDeleteDirective`:
+  seeds `ManagedPaths` with `"/etc/dds/stale.conf"`, runs `PollOnceAsync`, asserts:
+  - Path is removed from managed set (`store.RemovedPaths` contains it)
+  - `_reconciliation` report is sent
+  - Directives contain `"file:delete"` and `"/etc/dds/stale.conf"`
+  - No `[AUDIT]` prefix in any directive
+
+- Added `Reconciliation_StalePackage_EnforceMode_EmitsRemoveDirective`:
+  seeds `ManagedPackages` with `"ntp"`, runs `PollOnceAsync`, asserts:
+  - Package manager IS invoked with `"ntp"`
+  - `_reconciliation` report is sent
+  - Directives contain `"pkg:remove"` and `"ntp"`
+  - No `[AUDIT]` prefix in any directive
+
+No production code changes were required — `PollOnceAsync` already collects directives
+from each enforcer and sends the `_reconciliation` report whenever the list is non-empty.
+
+### Result
+
+Linux test count: **364 → 367** (3 new tests; 0 failures). macOS: **171** (unchanged).
+Windows: **279** (unchanged). Rust workspace: no changes.
+
+---
+
 ## Test Gap Fix (2026-05-19, 129th pass) — macOS: Worker-level enforce-mode reconciliation tests missing report directive assertions for launchd, account, preference, profile, and group membership
 
 ### Gap
