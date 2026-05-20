@@ -1,5 +1,49 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-20, 135th pass) — Linux: missing positive-retention tests for file and package reconciliation
+
+### Gap
+
+`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs` had tests for the
+negative-reconciliation path — "stale managed item is removed when no longer
+in policy" — but no tests for the complementary positive-retention path:
+"managed item that is still declared by current policy is NOT removed."
+
+The existing stale-file/package tests:
+- `Reconciliation_StaleFile_IsRemovedFromState` — file in managed set, absent
+  from current policy → `RemoveManagedPath` is called.
+- `Reconciliation_StalePackage_IsRemovedFromState` — package in managed set,
+  absent from current policy → `RemoveManagedPackage` is called.
+
+The missing tests pin that `RemoveManagedPath` / `RemoveManagedPackage` are
+NOT called when the item is still present in the current policy — a guard
+against false-positive deletions caused by policy-fetch errors or filter bugs.
+
+### Fix
+
+**`platform/linux/DdsPolicyAgent.Tests/WorkerTests.cs`** (+2 tests):
+
+- Added `Reconciliation_StillDesiredFile_IsNotDeleted`:
+  seeds `ManagedPaths` with `"/etc/dds/keep.conf"`, runs `PollOnceAsync` with
+  a policy that still contains that path (action `EnsureDir`), asserts
+  `Assert.DoesNotContain("/etc/dds/keep.conf", store.RemovedPaths)`.
+
+- Added `Reconciliation_StillDesiredPackage_IsNotRemoved`:
+  seeds `ManagedPackages` with `"curl"`, runs `PollOnceAsync` with a policy
+  that still contains `curl` (action `Install`), asserts
+  `Assert.DoesNotContain("curl", store.RemovedPackages)`.
+
+Both tests use the pre-existing `TrackingAppliedStateStore` helper and enforce
+mode (AuditOnly: false). No production code changed.
+
+### Result
+
+Linux test count: **367 → 369** (+2 new tests; 0 failures). macOS: **172**
+(unchanged). Windows: **283** (unchanged). Rust workspace (unit tests): **315**
+(unchanged).
+
+---
+
 ## Test Gap Fix (2026-05-20, 134th pass) — dds-node: Linux HTTP endpoint integration tests missing
 
 ### Gap

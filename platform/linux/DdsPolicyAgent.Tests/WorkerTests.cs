@@ -652,6 +652,69 @@ public sealed class WorkerTests
     }
 
     [Fact]
+    public async Task Reconciliation_StillDesiredFile_IsNotDeleted()
+    {
+        // "/etc/dds/keep.conf" is managed AND still declared by current policy → not stale.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedPaths.Add("/etc/dds/keep.conf");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-still-has-file",
+                    """{"policy_id":"policy-still-has-file","version":1,"linux":{"files":[{"path":"/etc/dds/keep.conf","action":"EnsureDir"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.DoesNotContain("/etc/dds/keep.conf", store.RemovedPaths);
+    }
+
+    [Fact]
+    public async Task Reconciliation_StillDesiredPackage_IsNotRemoved()
+    {
+        // "curl" is managed AND still declared by current policy → not stale.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedPackages.Add("curl");
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-still-has-pkg",
+                    """{"policy_id":"policy-still-has-pkg","version":1,"linux":{"packages":[{"name":"curl","action":"Install"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        Assert.DoesNotContain("curl", store.RemovedPackages);
+    }
+
+    [Fact]
     public async Task Reconciliation_ReconciliationReport_SentWhenChangesExist()
     {
         var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
