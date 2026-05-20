@@ -1,5 +1,35 @@
 # DDS Implementation Status
 
+## Fix + Test Gap (2026-05-20, 138th pass) — dds-node: B-4 iat tie-breaker tests for macOS/Linux; drop-path tracing in macOS/Linux supersede functions
+
+### Gap
+
+`dds-node/src/service.rs` had two gaps after the 137th pass:
+
+1. **Missing iat tie-breaker tests for macOS and Linux.** The B-4 supersession rule (highest `version` wins; ties broken by latest `iat`; final tie by lex-smallest `jti`) was tested for the `version` dimension on all three platforms, and for the `iat` dimension only on Windows (`b4_windows_policies_supersede_by_iat_on_version_tie`). The macOS and Linux analogs were absent, leaving the equal-version tie-breaker path uncovered for those platforms.
+
+2. **Missing drop-path tracing in `supersede_macos_policies` and `supersede_linux_policies`.** The Windows supersede function logs both directions — "B-4: superseding duplicate windows policy" (new item wins) and "B-4: dropping duplicate windows policy" (existing item retained). The macOS and Linux functions only logged the win path. When the existing policy was kept (e.g. during re-gossip of the same attestation), no log was emitted, making production debugging of unexplained policy absences harder.
+
+### Fix
+
+**`dds-node/src/service.rs`** (+2 tests, +2 `else` log branches):
+
+Tests:
+- `b4_macos_policies_supersede_by_iat_on_version_tie`: two `MacOsPolicyDocument` attestations with the same `policy_id` and equal `version` but `iat` of 1_700_000_000 vs 1_700_001_000 must collapse to the one with the later `iat`. Mirrors the Windows test.
+- `b4_linux_policies_supersede_by_iat_on_version_tie`: same as above for `LinuxPolicyDocument`.
+
+Production fix:
+- Added `else` branch with `tracing::warn!` to `supersede_macos_policies` — logs `policy_id`, `winning_jti` (the retained item), and `loser_jti` (the dropped item) when the incoming duplicate is not kept.
+- Same fix applied to `supersede_linux_policies`.
+
+Also updated `docs/AD-drop-in-replacement-roadmap.md` to reflect all closed security findings (A-2, A-3, A-4, B-1 through B-4, Z-3) and the Phase 0 exit gate status.
+
+### Result
+
+Rust workspace (unit tests): **326 → 328** (+2 new tests; 0 failures). `cargo fmt --check` clean. macOS: **172** (unchanged). Linux: **369** (unchanged). Windows: **283** (unchanged).
+
+---
+
 ## Test Gap Fix (2026-05-20, 137th pass) — dds-node: missing disabled/audit/publisher-cap/supersession tests for macOS; audit + publisher-cap tests for Linux and Windows
 
 ### Gap

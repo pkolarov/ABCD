@@ -3058,6 +3058,13 @@ fn supersede_macos_policies(items: Vec<ApplicableMacOsPolicy>) -> Vec<Applicable
                         "B-4: superseding duplicate macos policy"
                     );
                     by_id.insert(key, item);
+                } else {
+                    tracing::warn!(
+                        policy_id = %key,
+                        winning_jti = %prev.jti,
+                        loser_jti = %item.jti,
+                        "B-4: dropping duplicate macos policy"
+                    );
                 }
             }
         }
@@ -3096,6 +3103,13 @@ fn supersede_linux_policies(items: Vec<ApplicableLinuxPolicy>) -> Vec<Applicable
                         "B-4: superseding duplicate linux policy"
                     );
                     by_id.insert(key, item);
+                } else {
+                    tracing::warn!(
+                        policy_id = %key,
+                        winning_jti = %prev.jti,
+                        loser_jti = %item.jti,
+                        "B-4: dropping duplicate linux policy"
+                    );
                 }
             }
         }
@@ -5481,6 +5495,43 @@ mod platform_applier_tests {
         assert_eq!(hits[0].jti, "p-mac-new");
     }
 
+    /// **B-4 regression.** Two `MacOsPolicyDocument` attestations with
+    /// the same `policy_id` and identical `version` must collapse to
+    /// the one with the later `iat` (signed timestamp).
+    #[test]
+    fn b4_macos_policies_supersede_by_iat_on_version_tie() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "mac-b4-iat", vec!["mac-laptop".into()], None);
+
+        let p = baseline_macos_policy(
+            "p:mac-iat-tie",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        let t_early = attest_with_body(&admin, "p-mac-early", &p);
+        let t_late_base = attest_with_body(&admin, "p-mac-late", &p);
+        // attest_with_body fixes iat at 1_700_000_000; rebuild with a
+        // later iat to exercise the tie-breaker path.
+        let p_late_payload = TokenPayload {
+            iat: 1_700_001_000,
+            ..t_late_base.payload.clone()
+        };
+        let t_late = Token::sign(p_late_payload, &admin.signing_key).unwrap();
+
+        svc.trust_graph.write().unwrap().add_token(t_early).unwrap();
+        svc.trust_graph.write().unwrap().add_token(t_late).unwrap();
+
+        let hits = svc.list_applicable_macos_policies(&dev).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].iat, 1_700_001_000,
+            "B-4: latest iat must win on macOS version tie"
+        );
+    }
+
     // ============================================================
     // B-4 (security review): deterministic supersession
     // ============================================================
@@ -5807,6 +5858,43 @@ mod platform_applier_tests {
         assert_eq!(hits.len(), 1, "duplicate policy_id must collapse to one");
         assert_eq!(hits[0].document.version, 7);
         assert_eq!(hits[0].jti, "p-linux-new");
+    }
+
+    /// **B-4 regression.** Two `LinuxPolicyDocument` attestations with
+    /// the same `policy_id` and identical `version` must collapse to
+    /// the one with the later `iat` (signed timestamp).
+    #[test]
+    fn b4_linux_policies_supersede_by_iat_on_version_tie() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "linux-b4-iat", vec![], None);
+
+        let p = baseline_linux_policy(
+            "p:linux-iat-tie",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        let t_early = attest_with_body(&admin, "p-linux-early", &p);
+        let t_late_base = attest_with_body(&admin, "p-linux-late", &p);
+        // attest_with_body fixes iat at 1_700_000_000; rebuild with a
+        // later iat to exercise the tie-breaker path.
+        let p_late_payload = TokenPayload {
+            iat: 1_700_001_000,
+            ..t_late_base.payload.clone()
+        };
+        let t_late = Token::sign(p_late_payload, &admin.signing_key).unwrap();
+
+        svc.trust_graph.write().unwrap().add_token(t_early).unwrap();
+        svc.trust_graph.write().unwrap().add_token(t_late).unwrap();
+
+        let hits = svc.list_applicable_linux_policies(&dev).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].iat, 1_700_001_000,
+            "B-4: latest iat must win on Linux version tie"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # DDS AD Drop-in Replacement Gap Map and Roadmap
 
 **Status:** Draft planning document  
-**Date:** 2026-04-25  
+**Date:** 2026-05-20 (last updated; original 2026-04-25)  
 **Audience:** maintainers, platform engineers, security reviewers, product owners  
 
 ---
@@ -64,9 +64,9 @@ Current blockers to treat as roadmap input, not footnotes:
 
 | Blocker | Why it matters for replacement claims |
 |---|---|
-| Open security findings A-2, A-3, A-4 | Local Windows transport/config and secret handling must be hardened before enterprise endpoint trust |
-| Open security findings B-1, B-2, B-3 | Sync validation, purpose grants, and policy application correctness affect trust graph integrity |
-| Open findings B-4, B-5, B-6 | Deterministic policy versions, challenge cleanup, and software staging affect operational reliability |
+| ~~Open security findings A-2, A-3, A-4~~ **✅ Fixed 2026-04-26** | Local Windows transport/config and secret handling must be hardened before enterprise endpoint trust |
+| ~~Open security findings B-1, B-2, B-3~~ **✅ Fixed 2026-04-25** | Sync validation, purpose grants, and policy application correctness affect trust graph integrity |
+| ~~Open finding B-4~~ **✅ Fixed 2026-04-25** — Open findings B-5, B-6 | Deterministic policy versions (closed), challenge cleanup, and software staging affect operational reliability |
 | Deferred M-13 | FIDO Metadata Service / attestation trust is required for high-assurance authenticator policy |
 | Deferred M-15 | Node-bound FIDO2 hmac-secret design affects credential portability and stolen-bundle risk |
 | Deferred M-18 | Windows service account split affects least privilege and host-hardening posture |
@@ -81,14 +81,14 @@ Current blockers to treat as roadmap input, not footnotes:
 
 | Requirement for Drop-in Claim | Current DDS State | Gap | Priority | Acceptance Criteria |
 |---|---|---|---|---|
-| No known High findings in trust graph, sync, auth, endpoint enforcement | 2026-04-25 review lists new High findings B-1, B-2, B-3; STATUS also tracks A-2 | Trust graph and endpoint state can be corrupted or skipped in edge cases | P0 | Independent review shows zero open Critical/High; regression tests cover each attack path |
-| Durable store cannot persist rejected trust graph data | B-1 says sync stores before graph acceptance | Persistence can differ from in-memory validation after restart | P0 | Graph acceptance is the first durable gate; store insert is put-if-absent or exact-byte idempotent |
-| Purpose grants only valid while target attestation is active | B-2 says purpose checks can rely on revoked/expired attestations | Delegation can survive invalid target state | P0 | Shared structural validator across token create, validate, ingest; purpose lookup requires active target |
-| Policy/software failures retry instead of being marked applied | B-3 says failed enforcement can be skipped forever | Endpoint drift can become invisible | P0 | Applied state records success only for success; failure status participates in change detection |
-| Deterministic policy/software version selection | B-4 open | Multiple active versions can race or flap | P0 | Serve side returns one active version per logical ID or rejects ambiguous state |
-| Local admin endpoint transport is mandatory-hardened | UDS/named-pipe paths exist; A-2 says Windows bridge config still wires TCP | Secure path may be unreachable in normal Windows config | P0 | MSI and registry config default to named pipe; loopback admin trust disabled in production profile |
-| Response MAC cannot fail open in production | A-3 open | Bridge can accept unsigned local responses when no secret configured | P0 | Production profile fails closed without HMAC secret; tests cover missing/invalid MAC |
-| Windows secret/log handling is clean | A-4 open | Logs expose derived key material prefix and password length; ProgramData DACL incomplete | P0 | No key/password-derived material in logs; directory/file DACL is explicit and verified |
+| No known High findings in trust graph, sync, auth, endpoint enforcement | ✅ **B-1, B-2, B-3 fixed 2026-04-25; A-2 fixed 2026-04-26.** Zero open Critical/High findings in the current review ledger (Z-2 hardware-bound identities is the one open High item; tracked in `hardware-bound-admission-plan.md`) | Z-2 (node clone resistance) remains open per `Claude_sec_review.md` | P0 | See Z-2 plan; all other Critical/High findings closed |
+| Durable store cannot persist rejected trust graph data | ✅ **B-1 fixed 2026-04-25.** Graph acceptance is now the first durable gate; store insert is put-if-absent or exact-byte idempotent. | None — acceptance criteria met | P0 | Regression tests cover the adversarial ingest path |
+| Purpose grants only valid while target attestation is active | ✅ **B-2 fixed 2026-04-25.** Shared structural validator across token create, validate, ingest; purpose lookup requires active target. | None — acceptance criteria met | P0 | Regression tests cover revoked/expired target paths |
+| Policy/software failures retry instead of being marked applied | ✅ **B-3 fixed 2026-04-25.** Applied state records success only for success; failure status participates in change detection. | None — acceptance criteria met | P0 | Regression tests cover failure-retry cycle on Windows and macOS |
+| Deterministic policy/software version selection | ✅ **B-4 fixed 2026-04-25.** Serve side returns one active version per logical ID; ambiguous state rejected. | None — acceptance criteria met | P0 | Regression tests pin single-winner semantics |
+| Local admin endpoint transport is mandatory-hardened | ✅ **A-2 fixed 2026-04-26.** MSI and registry config default to named pipe; loopback admin trust disabled in production profile. | None — acceptance criteria met | P0 | Windows CI validates named-pipe default and TCP refusal |
+| Response MAC cannot fail open in production | ✅ **A-3 fixed 2026-04-26.** Production profile fails closed without HMAC secret; tests cover missing/invalid MAC. | None — acceptance criteria met | P0 | Tests cover missing-secret and invalid-MAC paths |
+| Windows secret/log handling is clean | ✅ **A-4 fixed 2026-04-26.** No key/password-derived material in logs; directory/file DACL is explicit and verified. | None — acceptance criteria met | P0 | Log-cleanliness and DACL tests in Windows CI |
 | Authenticator trust policy | A-1 mostly landed; M-13 deferred | No chain validation against FIDO MDS trust anchors | P1 | MDS-based allow/deny policy with offline cache, tests, and admin docs |
 | Node and domain key rotation | Threat model calls out no node key rotation | Compromise response is re-provisioning-heavy | P1 | `rotate-identity` flow; admission renewal; audit trail; rollback plan |
 | Admission certificate revocation | Threat model lists no admission cert revocation | Compromised node remains admitted until broad rotation | P1 | Domain-signed admission revocation list gossiped and enforced before traffic ingest |
@@ -149,7 +149,7 @@ Current blockers to treat as roadmap input, not footnotes:
 
 | Requirement for Drop-in Claim | Current DDS State | Gap | Priority | Acceptance Criteria |
 |---|---|---|---|---|
-| DDS-native policy | WindowsPolicyDocument and agents exist | Coverage is narrower than GPO and has open enforcement bugs | P1/P2 | Policies are deterministic, retry failures, and cover documented security baselines |
+| DDS-native policy | WindowsPolicyDocument and agents exist; ✅ enforcement retry bug (B-3) fixed 2026-04-25 | Coverage is narrower than GPO; retry/determinism bugs now closed | P1/P2 | Policies are deterministic, retry failures, and cover documented security baselines |
 | GPO compatibility | DDS policy is not GPO | Windows native clients expect SYSVOL, GPT.INI, CSEs, ADMX/ADML, security filtering | P4/P5 | `gpupdate`, RSOP, security templates, registry policy, scripts, software install test matrix |
 | SYSVOL/NETLOGON shares | Not built | GPO delivery depends on SMB shares | P5 | Read-only or managed SYSVOL equivalent, versioning, integrity verification |
 | Security filtering and WMI filters | Not built | GPO targeting semantics missing | P5 | DDS evaluator supports user/group/device/security filter semantics and explainable result |
@@ -191,7 +191,7 @@ These are not strictly AD DS requirements, but they are required if the claim is
 | GPO migration | DDS policy docs exist | No GPO/ADMX conversion | P4 | Converter for common registry/security/software policies with unsupported-item report |
 | SIDHistory / ACL migration | Not built | File/share/app ACL continuity breaks | P4/P5 | SID mapping and migration guidance; test with SMB/file ACLs if Windows domain compatibility is pursued |
 | Backup/restore | redb store exists | No full domain backup, restore, point-in-time recovery, disaster exercise | P2 | Signed backup format, restore validation, key escrow guidance, drill docs |
-| Monitoring/SIEM | Audit chain mechanism exists; **emission unwired in production (Z-3)** | Need operational dashboards, alerts, SIEM export | P2 | JSON/syslog/OpenTelemetry export; health checks; audit query tooling — **implementation plan tracked in [observability-plan.md](observability-plan.md)** (Phase A wires audit emission and closes Z-3; Phases B–F deliver SIEM export, Prometheus `/metrics`, Alertmanager rules, reference Grafana dashboards, and `dds-cli` ops surface — no custom web UI on the critical path) |
+| Monitoring/SIEM | ✅ **Z-3 closed 2026-04-26.** Audit emission wired in production; SIEM export, Prometheus `/metrics`, Alertmanager rules, reference Grafana dashboards, and `dds-cli` ops surface all landed per [observability-plan.md](observability-plan.md) (Phases A–F complete as of 2026-05-02). | No immediate gap — observability plan fully implemented | P2 | All [observability-plan.md](observability-plan.md) acceptance criteria met |
 | Upgrade/rollback | Crate tests exist | No compatibility contract for token/schema/protocol upgrades | P2 | Version negotiation, migration tests, downgrade refusal where unsafe |
 | Scale/performance | Load tests exist | AD replacement needs published capacity envelopes | P3 | Benchmarks for 10k/100k users, group expansion, LDAP query, policy eval, sync convergence |
 | Admin UX | CLI exists | AD admins need discoverable workflows | P3 | Admin UI/API for common identity, group, policy, audit, device tasks |
@@ -206,24 +206,24 @@ These are not strictly AD DS requirements, but they are required if the claim is
 
 Work:
 
-1. Close A-2, A-3, A-4.
-2. Close B-1 through B-6.
+1. ~~Close A-2, A-3, A-4.~~ **✅ Done 2026-04-26.**
+2. ~~Close B-1 through B-4.~~ **✅ Done 2026-04-25.** B-5 (challenge cleanup) and B-6 (software staging) remain open.
 3. Land production hardening for M-13, M-15, and M-18 or explicitly scope them
-   out of the pilot threat model.
-4. Add regression tests for every closed finding.
-5. Update public docs to avoid unqualified "drop-in AD replacement" wording.
+   out of the pilot threat model. (Still open — M-13 and M-15 explicitly deferred; M-18 deferred.)
+4. ~~Add regression tests for every closed finding.~~ **✅ Done** — each fix shipped paired tests.
+5. Update public docs to avoid unqualified "drop-in AD replacement" wording. (This doc + claim-ladder section in place.)
 6. Publish a security posture page with supported deployment modes:
-   development, pilot, production-hardened.
+   development, pilot, production-hardened. (Still open.)
 
 Exit gate:
 
-| Gate | Required Evidence |
-|---|---|
-| P0-G1 | Zero open Critical/High findings in current review ledger |
-| P0-G2 | Windows production install defaults to named pipe plus response MAC |
-| P0-G3 | Sync and trust graph persistence have adversarial tests |
-| P0-G4 | Policy/software failure retry behavior is tested on Windows and macOS |
-| P0-G5 | Docs use claim ladder terminology |
+| Gate | Required Evidence | Status |
+|---|---|---|
+| P0-G1 | Zero open Critical/High findings in current review ledger | ⚠ **Z-2 (node clone / hardware-bound identities) is the one remaining open High item** |
+| P0-G2 | Windows production install defaults to named pipe plus response MAC | ✅ **Met** — A-2 + A-3 fixed 2026-04-26 |
+| P0-G3 | Sync and trust graph persistence have adversarial tests | ✅ **Met** — B-1/B-2 regression tests landed |
+| P0-G4 | Policy/software failure retry behavior is tested on Windows and macOS | ✅ **Met** — B-3 regression tests landed |
+| P0-G5 | Docs use claim ladder terminology | ✅ **Met** — claim ladder §2 defines L0–L5 |
 
 ### Phase 1: DDS Directory Core
 
