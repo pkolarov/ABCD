@@ -1,5 +1,38 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-20, 136th pass) — dds-node: Linux scope tests + macOS global/OU scope tests missing
+
+### Gap
+
+`dds-node/src/service.rs` had asymmetric scope-matching test coverage across platforms:
+
+- **Windows** (`list_applicable_windows_policies`): global-scope, tag-scope, OU+identity-scope, typed-settings — 4 tests.
+- **macOS** (`list_applicable_macos_policies`): tag-scope, typed-settings — 2 tests. **Missing**: global-scope and OU+identity-scope.
+- **Linux** (`list_applicable_linux_policies`): tag-scope, supersession, disabled-enforcement, no-publisher-capability — 4 tests. **Missing**: global-scope, OU+identity-scope, and typed-settings round-trip.
+
+The missing tests leave uncovered the code paths that match an empty-scope policy against every device and that route OU/identity-URN scoped policies to the correct subset — exactly the logic that a policy filter bug would break silently.
+
+### Fix
+
+**`dds-node/src/service.rs`** (+5 tests):
+
+Linux additions (mirrors Windows):
+- `linux_policy_global_scope_matches_every_device`: empty scope (`device_tags: []`, `org_units: []`, `identity_urns: []`) must match a tagged device and an OU-assigned device.
+- `linux_policy_org_unit_and_identity_scope`: OU-scoped policy matches only the engineering device; identity-URN-scoped policy matches only the ops device.
+- `typed_linux_settings_survive_listing_round_trip`: full `LinuxSettings` payload (user directive + file directive + package directive) survives the attest→list→decode cycle intact.
+
+macOS additions (mirrors Windows):
+- `macos_policy_global_scope_matches_every_device`: mirrors the Linux/Windows global-scope test for `list_applicable_macos_policies`.
+- `macos_policy_org_unit_and_identity_scope`: OU-scoped policy matches only the design OU; identity-URN-scoped policy matches only the engineering device.
+
+No production code changed.
+
+### Result
+
+Linux test count: **369** (unchanged). macOS: **172** (unchanged). Windows: **283** (unchanged). Rust workspace (unit tests): **315 → 320** (+5 new tests; 0 failures).
+
+---
+
 ## Test Gap Fix (2026-05-20, 135th pass) — Linux: missing positive-retention tests for file and package reconciliation
 
 ### Gap

@@ -3428,11 +3428,12 @@ mod platform_applier_tests {
     use dds_core::token::TokenPayload;
     use dds_domain::{
         AccountAction, AccountDirective, DeviceJoinDocument, LaunchdAction, LaunchdDirective,
-        LinuxPolicyDocument, MacAccountAction, MacAccountDirective, MacOsPolicyDocument,
-        MacOsSettings, PasswordPolicy, PolicyScope, PreferenceAction, PreferenceDirective,
-        PreferenceScope, ProfileAction, ProfileDirective, PublisherIdentity, RegistryAction,
-        RegistryDirective, RegistryHive, RegistryValue, SoftwareAssignment, WindowsPolicyDocument,
-        WindowsSettings,
+        LinuxFileAction, LinuxFileDirective, LinuxPackageAction, LinuxPackageDirective,
+        LinuxPolicyDocument, LinuxSettings, LinuxUserAction, LinuxUserDirective, MacAccountAction,
+        MacAccountDirective, MacOsPolicyDocument, MacOsSettings, PasswordPolicy, PolicyScope,
+        PreferenceAction, PreferenceDirective, PreferenceScope, ProfileAction, ProfileDirective,
+        PublisherIdentity, RegistryAction, RegistryDirective, RegistryHive, RegistryValue,
+        SoftwareAssignment, WindowsPolicyDocument, WindowsSettings,
     };
     use dds_store::MemoryBackend;
     use rand::rngs::OsRng;
@@ -5135,6 +5136,86 @@ mod platform_applier_tests {
     }
 
     #[test]
+    fn macos_policy_global_scope_matches_every_device() {
+        // An empty scope (no tags, no OUs, no identity URNs) must match
+        // every enrolled device, mirroring the Windows global-scope test.
+        let (mut svc, admin, _) = setup();
+        let dev_a = enroll_device(&mut svc, "mac-global-a", vec!["mac-laptop".into()], None);
+        let dev_b = enroll_device(&mut svc, "mac-global-b", vec![], Some("engineering".into()));
+
+        let policy = baseline_macos_policy(
+            "p:mac-global",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-mac-global", &policy))
+            .unwrap();
+
+        assert_eq!(
+            svc.list_applicable_macos_policies(&dev_a).unwrap().len(),
+            1,
+            "global-scope policy must match a device with tags"
+        );
+        assert_eq!(
+            svc.list_applicable_macos_policies(&dev_b).unwrap().len(),
+            1,
+            "global-scope policy must match a device with an org unit"
+        );
+    }
+
+    #[test]
+    fn macos_policy_org_unit_and_identity_scope() {
+        // OU-scoped policies must match only devices in that OU;
+        // identity-URN-scoped policies must match only the exact device.
+        // Mirrors the Windows org_unit_and_identity_scope test.
+        let (mut svc, admin, _) = setup();
+        let dev_design = enroll_device(&mut svc, "mac-ou-design", vec![], Some("design".into()));
+        let dev_eng = enroll_device(&mut svc, "mac-ou-eng", vec![], Some("engineering".into()));
+
+        let by_ou = baseline_macos_policy(
+            "p:mac-design",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec!["design".into()],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-mac-ou", &by_ou))
+            .unwrap();
+
+        let by_id = baseline_macos_policy(
+            "p:mac-eng-direct",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![dev_eng.clone()],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-mac-id", &by_id))
+            .unwrap();
+
+        let design_hits = svc.list_applicable_macos_policies(&dev_design).unwrap();
+        let eng_hits = svc.list_applicable_macos_policies(&dev_eng).unwrap();
+
+        assert_eq!(design_hits.len(), 1);
+        assert_eq!(design_hits[0].document.policy_id, "p:mac-design");
+        assert_eq!(eng_hits.len(), 1);
+        assert_eq!(eng_hits[0].document.policy_id, "p:mac-eng-direct");
+    }
+
+    #[test]
     fn typed_macos_settings_survive_listing_round_trip() {
         let (mut svc, admin, _) = setup();
         let dev = enroll_device(&mut svc, "mac-typed", vec!["mac-laptop".into()], None);
@@ -5601,6 +5682,161 @@ mod platform_applier_tests {
             0,
             "Linux policy from issuer lacking POLICY_PUBLISHER_LINUX must be rejected"
         );
+    }
+
+    #[test]
+    fn linux_policy_global_scope_matches_every_device() {
+        // An empty scope (no tags, no OUs, no identity URNs) must match
+        // every enrolled device, mirroring the Windows global-scope test.
+        let (mut svc, admin, _) = setup();
+        let dev_a = enroll_device(&mut svc, "linux-global-a", vec!["server".into()], None);
+        let dev_b = enroll_device(&mut svc, "linux-global-b", vec![], Some("engineering".into()));
+
+        let policy = baseline_linux_policy(
+            "p:linux-global",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-linux-global", &policy))
+            .unwrap();
+
+        assert_eq!(
+            svc.list_applicable_linux_policies(&dev_a).unwrap().len(),
+            1,
+            "global-scope policy must match a device with tags"
+        );
+        assert_eq!(
+            svc.list_applicable_linux_policies(&dev_b).unwrap().len(),
+            1,
+            "global-scope policy must match a device with an org unit"
+        );
+    }
+
+    #[test]
+    fn linux_policy_org_unit_and_identity_scope() {
+        // OU-scoped policies must match only devices in that OU;
+        // identity-URN-scoped policies must match only the exact device.
+        // Mirrors the Windows org_unit_and_identity_scope test.
+        let (mut svc, admin, _) = setup();
+        let dev_eng =
+            enroll_device(&mut svc, "linux-ou-eng", vec![], Some("engineering".into()));
+        let dev_ops = enroll_device(&mut svc, "linux-ou-ops", vec![], Some("ops".into()));
+
+        let by_ou = baseline_linux_policy(
+            "p:linux-eng",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec!["engineering".into()],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-linux-ou", &by_ou))
+            .unwrap();
+
+        let by_id = baseline_linux_policy(
+            "p:linux-ops-direct",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![dev_ops.clone()],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-linux-id", &by_id))
+            .unwrap();
+
+        let eng_hits = svc.list_applicable_linux_policies(&dev_eng).unwrap();
+        let ops_hits = svc.list_applicable_linux_policies(&dev_ops).unwrap();
+
+        assert_eq!(eng_hits.len(), 1);
+        assert_eq!(eng_hits[0].document.policy_id, "p:linux-eng");
+        assert_eq!(ops_hits.len(), 1);
+        assert_eq!(ops_hits[0].document.policy_id, "p:linux-ops-direct");
+    }
+
+    #[test]
+    fn typed_linux_settings_survive_listing_round_trip() {
+        // A `LinuxPolicyDocument` with fully-typed directives must arrive
+        // at the agent exactly as the admin signed it.  Mirrors the
+        // `typed_macos_settings_survive_listing_round_trip` test.
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "linux-typed", vec!["linux-server".into()], None);
+
+        let policy = LinuxPolicyDocument {
+            policy_id: "p:linux-typed".into(),
+            display_name: "Typed Linux".into(),
+            version: 3,
+            enforcement: dds_domain::types::Enforcement::Audit,
+            scope: PolicyScope {
+                device_tags: vec!["linux-server".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            settings: vec![],
+            linux: Some(LinuxSettings {
+                local_users: vec![LinuxUserDirective {
+                    username: "dds-svc".into(),
+                    action: LinuxUserAction::Create,
+                    uid: Some(1500),
+                    shell: Some("/bin/bash".into()),
+                    groups: vec!["sudo".into()],
+                    full_name: Some("DDS Service Account".into()),
+                }],
+                files: vec![LinuxFileDirective {
+                    path: "/etc/dds/agent.conf".into(),
+                    action: LinuxFileAction::Set,
+                    content_b64: Some("Y29uZg==".into()),
+                    content_sha256: Some("abc123".into()),
+                    owner: Some("root:root".into()),
+                    mode: Some("0640".into()),
+                }],
+                packages: vec![LinuxPackageDirective {
+                    name: "curl".into(),
+                    action: LinuxPackageAction::Install,
+                    version: Some("7.68.0".into()),
+                }],
+                ..Default::default()
+            }),
+        };
+
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-linux-typed", &policy))
+            .unwrap();
+
+        let hits = svc.list_applicable_linux_policies(&dev).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(matches!(
+            hits[0].document.enforcement,
+            dds_domain::types::Enforcement::Audit
+        ));
+        assert_eq!(hits[0].document.version, 3);
+
+        let bundle = hits[0].document.linux.as_ref().unwrap();
+        assert_eq!(bundle.local_users.len(), 1);
+        assert_eq!(bundle.local_users[0].username, "dds-svc");
+        assert_eq!(bundle.local_users[0].uid, Some(1500));
+        assert_eq!(bundle.local_users[0].groups, vec!["sudo"]);
+
+        assert_eq!(bundle.files.len(), 1);
+        assert_eq!(bundle.files[0].path, "/etc/dds/agent.conf");
+        assert_eq!(bundle.files[0].owner.as_deref(), Some("root:root"));
+
+        assert_eq!(bundle.packages.len(), 1);
+        assert_eq!(bundle.packages[0].name, "curl");
+        assert_eq!(bundle.packages[0].version.as_deref(), Some("7.68.0"));
     }
 
     // Silence the unused-import warning when only some helpers are
