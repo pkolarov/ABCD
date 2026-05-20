@@ -66,7 +66,7 @@ Current blockers to treat as roadmap input, not footnotes:
 |---|---|
 | ~~Open security findings A-2, A-3, A-4~~ **✅ Fixed 2026-04-26** | Local Windows transport/config and secret handling must be hardened before enterprise endpoint trust |
 | ~~Open security findings B-1, B-2, B-3~~ **✅ Fixed 2026-04-25** | Sync validation, purpose grants, and policy application correctness affect trust graph integrity |
-| ~~Open finding B-4~~ **✅ Fixed 2026-04-25** — Open findings B-5, B-6 | Deterministic policy versions (closed), challenge cleanup, and software staging affect operational reliability |
+| ~~Open findings B-4, B-5, B-6~~ **✅ All fixed 2026-04-25** | Deterministic policy versions, challenge cleanup, and software staging — all closed |
 | Deferred M-13 | FIDO Metadata Service / attestation trust is required for high-assurance authenticator policy |
 | Deferred M-15 | Node-bound FIDO2 hmac-secret design affects credential portability and stolen-bundle risk |
 | Deferred M-18 | Windows service account split affects least privilege and host-hardening posture |
@@ -207,7 +207,7 @@ These are not strictly AD DS requirements, but they are required if the claim is
 Work:
 
 1. ~~Close A-2, A-3, A-4.~~ **✅ Done 2026-04-26.**
-2. ~~Close B-1 through B-4.~~ **✅ Done 2026-04-25.** B-5 (challenge cleanup) and B-6 (software staging) remain open.
+2. ~~Close B-1 through B-6.~~ **✅ Done 2026-04-25.** B-5 (challenge cleanup) and B-6 (software staging) both closed in the same 2026-04-25 pass.
 3. Land production hardening for M-13, M-15, and M-18 or explicitly scope them
    out of the pilot threat model. (Still open — M-13 and M-15 explicitly deferred; M-18 deferred.)
 4. ~~Add regression tests for every closed finding.~~ **✅ Done** — each fix shipped paired tests.

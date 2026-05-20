@@ -5532,6 +5532,45 @@ mod platform_applier_tests {
         );
     }
 
+    /// **B-4 regression.** When two `MacOsPolicyDocument` attestations
+    /// share `policy_id`, `version`, *and* `iat`, the lex-smallest `jti`
+    /// wins (final tiebreaker).
+    #[test]
+    fn b4_macos_policies_supersede_by_jti_on_iat_tie() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "mac-b4-jti", vec!["mac-laptop".into()], None);
+
+        let p = baseline_macos_policy(
+            "p:mac-jti-tie",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        // Both tokens share the same iat. Lex-smaller jti "p-mac-aaa" must win.
+        let t_lex_larger = attest_with_body(&admin, "p-mac-zzz", &p);
+        let t_lex_smaller = attest_with_body(&admin, "p-mac-aaa", &p);
+
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(t_lex_larger)
+            .unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(t_lex_smaller)
+            .unwrap();
+
+        let hits = svc.list_applicable_macos_policies(&dev).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].jti, "p-mac-aaa",
+            "B-4: lex-smallest jti must win on macOS iat tie"
+        );
+    }
+
     // ============================================================
     // B-4 (security review): deterministic supersession
     // ============================================================
@@ -5621,6 +5660,46 @@ mod platform_applier_tests {
         );
     }
 
+    /// **B-4 regression.** When two `WindowsPolicyDocument` attestations
+    /// share `policy_id`, `version`, *and* `iat`, the lex-smallest `jti`
+    /// wins (final tiebreaker).
+    #[test]
+    fn b4_windows_policies_supersede_by_jti_on_iat_tie() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "ws-b4-jti", vec!["workstation".into()], None);
+
+        let p = baseline_policy(
+            "p:jti-tie",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        // Both tokens get the same iat (1_700_000_000 from attest_with_body)
+        // and same version. Lex-smaller jti "p-aaa" must beat "p-zzz".
+        let t_lex_larger = attest_with_body(&admin, "p-zzz", &p);
+        let t_lex_smaller = attest_with_body(&admin, "p-aaa", &p);
+
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(t_lex_larger)
+            .unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(t_lex_smaller)
+            .unwrap();
+
+        let hits = svc.list_applicable_windows_policies(&dev).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].jti, "p-aaa",
+            "B-4: lex-smallest jti must win on Windows iat tie"
+        );
+    }
+
     /// **B-4 regression.** Two `SoftwareAssignment` attestations with
     /// the same `package_id` collapse to the latest `iat`.
     #[test]
@@ -5669,6 +5748,56 @@ mod platform_applier_tests {
         assert_eq!(hits.len(), 1, "duplicate package_id must collapse to one");
         assert_eq!(hits[0].document.version, "2.0.0");
         assert_eq!(hits[0].iat, 1_700_002_000);
+    }
+
+    /// **B-4 regression.** When two `SoftwareAssignment` attestations
+    /// share `package_id` *and* `iat`, the lex-smallest `jti` wins.
+    #[test]
+    fn b4_software_supersedes_by_jti_on_iat_tie() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "ws-b4-sw-jti", vec!["developer".into()], None);
+
+        let pkg = SoftwareAssignment {
+            package_id: "com.example.jti-tie".into(),
+            display_name: "JtiTie".into(),
+            version: "1.0.0".into(),
+            source: "https://cdn.example.com/jtitie-1.0.0.msi".into(),
+            sha256: "deadbeef".into(),
+            action: dds_domain::InstallAction::Install,
+            scope: PolicyScope {
+                device_tags: vec!["developer".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            silent: true,
+            pre_install_script: None,
+            post_install_script: None,
+            uninstall_script: None,
+            publisher_identity: None,
+            enforcement: dds_domain::types::Enforcement::Enforce,
+        };
+        // Both tokens share the same iat (1_700_000_000 from attest_with_body).
+        // Lex-smaller jti "sw-aaa" must beat "sw-zzz".
+        let t_lex_larger = attest_with_body(&admin, "sw-zzz", &pkg);
+        let t_lex_smaller = attest_with_body(&admin, "sw-aaa", &pkg);
+
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(t_lex_larger)
+            .unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(t_lex_smaller)
+            .unwrap();
+
+        let hits = svc.list_applicable_software(&dev).unwrap();
+        assert_eq!(hits.len(), 1, "duplicate package_id must collapse to one");
+        assert_eq!(
+            hits[0].jti, "sw-aaa",
+            "B-4: lex-smallest jti must win on software iat tie"
+        );
     }
 
     /// **B-4 regression.** Documents with *different* logical IDs are
@@ -5894,6 +6023,45 @@ mod platform_applier_tests {
         assert_eq!(
             hits[0].iat, 1_700_001_000,
             "B-4: latest iat must win on Linux version tie"
+        );
+    }
+
+    /// **B-4 regression.** When two `LinuxPolicyDocument` attestations
+    /// share `policy_id`, `version`, *and* `iat`, the lex-smallest `jti`
+    /// wins (final tiebreaker).
+    #[test]
+    fn b4_linux_policies_supersede_by_jti_on_iat_tie() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "linux-b4-jti", vec![], None);
+
+        let p = baseline_linux_policy(
+            "p:linux-jti-tie",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        // Both tokens share the same iat. Lex-smaller jti "p-linux-aaa" must win.
+        let t_lex_larger = attest_with_body(&admin, "p-linux-zzz", &p);
+        let t_lex_smaller = attest_with_body(&admin, "p-linux-aaa", &p);
+
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(t_lex_larger)
+            .unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(t_lex_smaller)
+            .unwrap();
+
+        let hits = svc.list_applicable_linux_policies(&dev).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].jti, "p-linux-aaa",
+            "B-4: lex-smallest jti must win on Linux iat tie"
         );
     }
 

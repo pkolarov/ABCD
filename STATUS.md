@@ -1,5 +1,34 @@
 # DDS Implementation Status
 
+## Test Gap (2026-05-21, 139th pass) — dds-node: B-4 jti final-tiebreaker tests for Windows, macOS, Linux, and software; stale B-5/B-6 status fixed in AD roadmap
+
+### Gap
+
+`dds-node/src/service.rs` had four coverage gaps after the 138th pass:
+
+The B-4 supersession rule has three tiebreakers: highest `version` wins; equal-version ties broken by latest `iat`; final tie (same version AND same iat) broken by lex-smallest `jti`. Tests existed for the `version` and `iat` tiebreaker paths on all platforms, but the final `jti` tiebreaker path was untested on Windows, macOS, Linux, and software supersession.
+
+`docs/AD-drop-in-replacement-roadmap.md` contained two stale references claiming B-5 (challenge cleanup) and B-6 (software staging) were still open, when both were closed on 2026-04-25 (commits `0980e67` and `cc2e9a8` respectively).
+
+### Fix
+
+**`dds-node/src/service.rs`** (+4 tests):
+
+- `b4_windows_policies_supersede_by_jti_on_iat_tie`: two `WindowsPolicyDocument` attestations with the same `policy_id`, `version`, and `iat` — lex-smaller jti `p-aaa` must beat `p-zzz`.
+- `b4_macos_policies_supersede_by_jti_on_iat_tie`: same for `MacOsPolicyDocument`.
+- `b4_linux_policies_supersede_by_jti_on_iat_tie`: same for `LinuxPolicyDocument`.
+- `b4_software_supersedes_by_jti_on_iat_tie`: same for `SoftwareAssignment` — lex-smaller jti `sw-aaa` must beat `sw-zzz`.
+
+**`docs/AD-drop-in-replacement-roadmap.md`**:
+- Table row line 69: updated to show B-4, B-5, B-6 all fixed 2026-04-25.
+- Phase 0 work item 2 (line 210): updated to show B-1 through B-6 all closed in the same pass.
+
+### Result
+
+Rust workspace unit tests: **328 → 332** (+4 new tests; 0 failures). All 332 `dds-node` lib tests pass; full workspace 759/759. `cargo fmt` clean.
+
+---
+
 ## Fix + Test Gap (2026-05-20, 138th pass) — dds-node: B-4 iat tie-breaker tests for macOS/Linux; drop-path tracing in macOS/Linux supersede functions
 
 ### Gap
