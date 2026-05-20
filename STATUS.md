@@ -1,5 +1,61 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-20, 134th pass) — dds-node: Linux HTTP endpoint integration tests missing
+
+### Gap
+
+`dds-node/src/http.rs` had HTTP-level integration tests for Windows and macOS endpoints
+(`/v1/windows/policies`, `/v1/windows/software`, `/v1/windows/applied`,
+`/v1/macos/policies`, `/v1/macos/software`, `/v1/macos/applied`) but no corresponding
+tests for the Linux endpoints (`/v1/linux/policies`, `/v1/linux/software`,
+`/v1/linux/applied`).
+
+The root cause was twofold:
+1. The test-only `spawn_server` helper only registered Windows and macOS routes; Linux
+   routes were absent, so any test hitting `/v1/linux/*` would have received 404.
+2. No `seed_linux_state` helper existed (unlike `seed_windows_state` and
+   `seed_macos_state`), so there was no way to populate the in-memory backend with
+   Linux-specific domain/policy/software documents for tests.
+
+`dds-node/src/service.rs` had unit tests for `list_applicable_linux_policies` logic,
+but the HTTP transport layer — envelope wrapping (`LINUX_POLICIES`, `LINUX_SOFTWARE`
+kind constants), scope filtering, and the 202 applied-report path — had no coverage.
+
+### Fix
+
+**`dds-node/src/http.rs`** (+3 routes to `spawn_server`, +1 helper, +3 tests):
+
+- Added Linux routes to the test `spawn_server` helper:
+  `GET /v1/linux/policies`, `GET /v1/linux/software`, `POST /v1/linux/applied`
+  (mirroring the existing Windows and macOS route registrations).
+
+- Added `seed_linux_state` async helper: enrolls a device with tag
+  `"linux-workstation"`, creates a `LinuxPolicyDocument` `"security/users"` with a
+  `LinuxUserDirective` for user `"dds-svc"`, creates a `SoftwareAssignment`
+  `"com.example.linuxagent"`, and seeds `POLICY_PUBLISHER_LINUX` +
+  `SOFTWARE_PUBLISHER` capabilities via `seed_publisher_capabilities`.
+
+- Added `test_linux_policies_endpoint_returns_typed_bundle`: GETs `/v1/linux/policies`,
+  asserts envelope kind is `LINUX_POLICIES`, verifies 1 policy document with
+  `policy_id="security/users"` containing a user directive for `"dds-svc"`.
+
+- Added `test_linux_software_endpoint_filters_by_scope`: GETs `/v1/linux/software`
+  with matching `device_urn` (expects 1 result, `LINUX_SOFTWARE` kind) and with a
+  non-matching URN (expects 0 results).
+
+- Added `test_linux_applied_endpoint_accepts_report`: POSTs an `AppliedReport` with
+  one `AppliedStatus::Ok` entry to `/v1/linux/applied`, asserts HTTP 202.
+
+No production code changed — all changes are within `#[cfg(test)]` paths.
+
+### Result
+
+Linux test count: **367** (unchanged). macOS: **172** (unchanged). Windows:
+**283** (unchanged). Rust workspace (unit tests): **312 → 315** (+3 new tests;
+0 failures).
+
+---
+
 ## Test Gap Fix (2026-05-19, 133rd pass) — Windows: service and password_policy missing EnforceMode reconciliation tests
 
 ### Gap

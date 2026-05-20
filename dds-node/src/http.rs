@@ -2811,6 +2811,18 @@ mod tests {
                 "/v1/macos/applied",
                 post(record_macos_applied::<MemoryBackend>),
             )
+            .route(
+                "/v1/linux/policies",
+                get(list_linux_policies::<MemoryBackend>),
+            )
+            .route(
+                "/v1/linux/software",
+                get(list_linux_software::<MemoryBackend>),
+            )
+            .route(
+                "/v1/linux/applied",
+                post(record_linux_applied::<MemoryBackend>),
+            )
             .route("/healthz", get(healthz))
             .route("/readyz", get(readyz::<MemoryBackend>))
             .with_state(state);
@@ -4148,6 +4160,214 @@ mod tests {
         };
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/macos/applied"))
+            .json(&report)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202);
+    }
+
+    // ----------------------------------------------------------------
+    // Linux applier HTTP endpoint tests
+    // ----------------------------------------------------------------
+
+    async fn seed_linux_state(state: &AppState<MemoryBackend>) -> String {
+        use crate::service::EnrollDeviceRequest;
+        use dds_core::token::{Token, TokenKind, TokenPayload};
+        use dds_domain::{
+            DomainDocument, Enforcement, InstallAction, LinuxPolicyDocument, LinuxSettings,
+            LinuxUserAction, LinuxUserDirective, PolicyScope, SoftwareAssignment,
+        };
+
+        let device_urn = {
+            let mut svc = state.svc.lock().await;
+            svc.set_verify_fido2(false);
+            svc.enroll_device(EnrollDeviceRequest {
+                label: "linux-ws".into(),
+                device_id: "hw-linux-1".into(),
+                hostname: "ubuntu-1".into(),
+                os: "Linux".into(),
+                os_version: "22.04".into(),
+                tpm_ek_hash: None,
+                org_unit: Some("engineering".into()),
+                tags: vec!["linux-workstation".into()],
+            })
+            .unwrap()
+            .urn
+        };
+
+        let admin = Identity::generate("admin-linux", &mut OsRng);
+        let mut payload = TokenPayload {
+            iss: admin.id.to_urn(),
+            iss_key: admin.public_key.clone(),
+            jti: "linux-policy-baseline".into(),
+            sub: admin.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1_700_000_000,
+            exp: Some(4_102_444_800),
+            body_type: None,
+            body_cbor: None,
+        };
+        let policy = LinuxPolicyDocument {
+            policy_id: "security/users".into(),
+            display_name: "Managed Users".into(),
+            version: 1,
+            enforcement: Enforcement::Enforce,
+            scope: PolicyScope {
+                device_tags: vec!["linux-workstation".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            settings: vec![],
+            linux: Some(LinuxSettings {
+                local_users: vec![LinuxUserDirective {
+                    username: "dds-svc".into(),
+                    action: LinuxUserAction::Create,
+                    uid: None,
+                    shell: Some("/bin/bash".into()),
+                    groups: vec![],
+                    full_name: None,
+                }],
+                ..Default::default()
+            }),
+        };
+        policy.embed(&mut payload).unwrap();
+        let policy_token = Token::sign(payload, &admin.signing_key).unwrap();
+
+        let mut sw_payload = TokenPayload {
+            iss: admin.id.to_urn(),
+            iss_key: admin.public_key.clone(),
+            jti: "linux-sw-agent".into(),
+            sub: admin.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1_700_000_000,
+            exp: Some(4_102_444_800),
+            body_type: None,
+            body_cbor: None,
+        };
+        let pkg = SoftwareAssignment {
+            package_id: "com.example.linuxagent".into(),
+            display_name: "Linux Agent".into(),
+            version: "1.0.0".into(),
+            source: "https://cdn.example.com/agent-1.0.0.deb".into(),
+            sha256: "aabbccdd".into(),
+            action: InstallAction::Install,
+            scope: PolicyScope {
+                device_tags: vec!["linux-workstation".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            silent: true,
+            pre_install_script: None,
+            post_install_script: None,
+            uninstall_script: None,
+            publisher_identity: None,
+            enforcement: Enforcement::Enforce,
+        };
+        pkg.embed(&mut sw_payload).unwrap();
+        let sw_token = Token::sign(sw_payload, &admin.signing_key).unwrap();
+
+        seed_publisher_capabilities(
+            state,
+            &admin,
+            &[
+                dds_core::token::purpose::POLICY_PUBLISHER_LINUX,
+                dds_core::token::purpose::SOFTWARE_PUBLISHER,
+            ],
+        )
+        .await;
+
+        let svc = state.svc.lock().await;
+        let mut g = svc.trust_graph.write().unwrap();
+        g.add_token(policy_token).unwrap();
+        g.add_token(sw_token).unwrap();
+        device_urn
+    }
+
+    #[tokio::test]
+    async fn test_linux_policies_endpoint_returns_typed_bundle() {
+        let state = make_state();
+        let device_urn = seed_linux_state(&state).await;
+        let base = spawn_server(state).await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/v1/linux/policies"))
+            .query(&[("device_urn", &device_urn)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let env: dds_core::envelope::SignedPolicyEnvelope = resp.json().await.unwrap();
+        assert_eq!(env.kind, dds_core::envelope::kind::LINUX_POLICIES);
+        let bytes = unwrap_envelope_payload(env);
+        let body: LinuxPoliciesResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.policies.len(), 1);
+        assert_eq!(body.policies[0].document.policy_id, "security/users");
+        let settings = body.policies[0].document.linux.as_ref().unwrap();
+        assert_eq!(settings.local_users.len(), 1);
+        assert_eq!(settings.local_users[0].username, "dds-svc");
+    }
+
+    #[tokio::test]
+    async fn test_linux_software_endpoint_filters_by_scope() {
+        let state = make_state();
+        let device_urn = seed_linux_state(&state).await;
+        let base = spawn_server(state).await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/v1/linux/software"))
+            .query(&[("device_urn", &device_urn)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let env: dds_core::envelope::SignedPolicyEnvelope = resp.json().await.unwrap();
+        assert_eq!(env.kind, dds_core::envelope::kind::LINUX_SOFTWARE);
+        let bytes = unwrap_envelope_payload(env);
+        let body: LinuxSoftwareResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.software.len(), 1);
+        assert_eq!(
+            body.software[0].document.package_id,
+            "com.example.linuxagent"
+        );
+
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/v1/linux/software"))
+            .query(&[("device_urn", "urn:vouchsafe:nobody.zzz")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let env: dds_core::envelope::SignedPolicyEnvelope = resp.json().await.unwrap();
+        let bytes = unwrap_envelope_payload(env);
+        let body: LinuxSoftwareResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.software.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_linux_applied_endpoint_accepts_report() {
+        let state = make_state();
+        let base = spawn_server(state).await;
+        let report = AppliedReport {
+            device_urn: "urn:vouchsafe:ubuntu.xxx".into(),
+            target_id: "security/users".into(),
+            version: "1".into(),
+            status: crate::service::AppliedStatus::Ok,
+            kind: None,
+            directives: vec!["user: dds-svc create".into()],
+            error: None,
+            applied_at: 1_700_000_000,
+        };
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/linux/applied"))
             .json(&report)
             .send()
             .await
