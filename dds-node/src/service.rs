@@ -3772,6 +3772,61 @@ mod platform_applier_tests {
     }
 
     #[test]
+    fn windows_policy_without_publisher_capability_is_rejected() {
+        // A Windows policy signed by an identity that lacks the
+        // `dds:policy-publisher-windows` purpose vouch must be silently
+        // dropped by `list_applicable_windows_policies` (C-3 gate).
+        let (mut svc, _admin, _) = setup();
+        let dev = enroll_device(&mut svc, "ws-gated", vec![], None);
+
+        let bare = Identity::generate("bare-win-publisher", &mut OsRng);
+        let bare_attest = Token::sign(
+            TokenPayload {
+                iss: bare.id.to_urn(),
+                iss_key: bare.public_key.clone(),
+                jti: "bare-attest-win".into(),
+                sub: bare.id.to_urn(),
+                kind: TokenKind::Attest,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat: 1_700_000_000,
+                exp: Some(4_102_444_800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &bare.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(bare_attest)
+            .unwrap();
+
+        let policy = baseline_policy(
+            "p:win-gated",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&bare, "p-win-bare", &policy))
+            .unwrap();
+
+        assert_eq!(
+            svc.list_applicable_windows_policies(&dev).unwrap().len(),
+            0,
+            "Windows policy from issuer lacking POLICY_PUBLISHER_WINDOWS must be rejected"
+        );
+    }
+
+    #[test]
     fn software_assignment_scope_matching() {
         let (mut svc, admin, _) = setup();
         let dev_dev = enroll_device(&mut svc, "dev-1", vec!["developer".into()], None);
@@ -5271,6 +5326,161 @@ mod platform_applier_tests {
         assert_eq!(bundle.profiles[0].identifier, "com.dds.test");
     }
 
+    #[test]
+    fn macos_policy_disabled_documents_are_skipped() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "mac-disabled", vec![], None);
+        let mut policy = baseline_macos_policy(
+            "p:mac-disabled",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        policy.enforcement = Enforcement::Disabled;
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-mac-dis", &policy))
+            .unwrap();
+
+        assert_eq!(
+            svc.list_applicable_macos_policies(&dev).unwrap().len(),
+            0,
+            "disabled macOS policies must not be returned"
+        );
+    }
+
+    #[test]
+    fn macos_policy_audit_documents_are_returned() {
+        // Audit-mode docs must reach the agent — the agent decides whether
+        // to enforce or log. The directory layer must not pre-filter them.
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "mac-audit", vec![], None);
+        let mut policy = baseline_macos_policy(
+            "p:mac-audit",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        policy.enforcement = Enforcement::Audit;
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-mac-audit", &policy))
+            .unwrap();
+
+        let hits = svc.list_applicable_macos_policies(&dev).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(matches!(hits[0].document.enforcement, Enforcement::Audit));
+    }
+
+    #[test]
+    fn macos_policy_without_publisher_capability_is_rejected() {
+        // A macOS policy signed by an identity that lacks the
+        // `dds:policy-publisher-macos` purpose vouch must be silently
+        // dropped by `list_applicable_macos_policies` (C-3 gate).
+        let (mut svc, _admin, _) = setup();
+        let dev = enroll_device(&mut svc, "mac-gated", vec![], None);
+
+        let bare = Identity::generate("bare-mac-publisher", &mut OsRng);
+        let bare_attest = Token::sign(
+            TokenPayload {
+                iss: bare.id.to_urn(),
+                iss_key: bare.public_key.clone(),
+                jti: "bare-attest-mac".into(),
+                sub: bare.id.to_urn(),
+                kind: TokenKind::Attest,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat: 1_700_000_000,
+                exp: Some(4_102_444_800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &bare.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(bare_attest)
+            .unwrap();
+
+        let policy = baseline_macos_policy(
+            "p:mac-gated",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&bare, "p-mac-bare", &policy))
+            .unwrap();
+
+        assert_eq!(
+            svc.list_applicable_macos_policies(&dev).unwrap().len(),
+            0,
+            "macOS policy from issuer lacking POLICY_PUBLISHER_MACOS must be rejected"
+        );
+    }
+
+    /// **B-4 regression.** Two `MacOsPolicyDocument` attestations with
+    /// the same `policy_id` but different `version`s must collapse to
+    /// the highest version.
+    #[test]
+    fn b4_macos_policies_supersede_by_version() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "mac-b4", vec!["mac-laptop".into()], None);
+
+        let mut p_old = baseline_macos_policy(
+            "p:mac-supersede",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        p_old.version = 2;
+        let mut p_new = baseline_macos_policy(
+            "p:mac-supersede",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        p_new.version = 5;
+
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-mac-new", &p_new))
+            .unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-mac-old", &p_old))
+            .unwrap();
+
+        let hits = svc.list_applicable_macos_policies(&dev).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "duplicate macOS policy_id must collapse to one"
+        );
+        assert_eq!(hits[0].document.version, 5);
+        assert_eq!(hits[0].jti, "p-mac-new");
+    }
+
     // ============================================================
     // B-4 (security review): deterministic supersession
     // ============================================================
@@ -5690,7 +5900,12 @@ mod platform_applier_tests {
         // every enrolled device, mirroring the Windows global-scope test.
         let (mut svc, admin, _) = setup();
         let dev_a = enroll_device(&mut svc, "linux-global-a", vec!["server".into()], None);
-        let dev_b = enroll_device(&mut svc, "linux-global-b", vec![], Some("engineering".into()));
+        let dev_b = enroll_device(
+            &mut svc,
+            "linux-global-b",
+            vec![],
+            Some("engineering".into()),
+        );
 
         let policy = baseline_linux_policy(
             "p:linux-global",
@@ -5724,8 +5939,7 @@ mod platform_applier_tests {
         // identity-URN-scoped policies must match only the exact device.
         // Mirrors the Windows org_unit_and_identity_scope test.
         let (mut svc, admin, _) = setup();
-        let dev_eng =
-            enroll_device(&mut svc, "linux-ou-eng", vec![], Some("engineering".into()));
+        let dev_eng = enroll_device(&mut svc, "linux-ou-eng", vec![], Some("engineering".into()));
         let dev_ops = enroll_device(&mut svc, "linux-ou-ops", vec![], Some("ops".into()));
 
         let by_ou = baseline_linux_policy(
@@ -5837,6 +6051,35 @@ mod platform_applier_tests {
         assert_eq!(bundle.packages.len(), 1);
         assert_eq!(bundle.packages[0].name, "curl");
         assert_eq!(bundle.packages[0].version.as_deref(), Some("7.68.0"));
+    }
+
+    #[test]
+    fn linux_policy_audit_documents_are_returned() {
+        // Audit-mode docs must reach the agent — the agent decides whether
+        // to enforce or log. The directory layer must not pre-filter them.
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "linux-audit", vec![], None);
+        let mut policy = baseline_linux_policy(
+            "p:linux-audit",
+            PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        policy.enforcement = Enforcement::Audit;
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-linux-audit", &policy))
+            .unwrap();
+
+        let hits = svc.list_applicable_linux_policies(&dev).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(matches!(
+            hits[0].document.enforcement,
+            dds_domain::types::Enforcement::Audit
+        ));
     }
 
     // Silence the unused-import warning when only some helpers are

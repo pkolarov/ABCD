@@ -1,5 +1,45 @@
 # DDS Implementation Status
 
+## Test Gap Fix (2026-05-20, 137th pass) — dds-node: missing disabled/audit/publisher-cap/supersession tests for macOS; audit + publisher-cap tests for Linux and Windows
+
+### Gap
+
+`dds-node/src/service.rs` had asymmetric enforcement-mode and C-3 gate test coverage across the three platform policy-listing functions:
+
+- **Windows** (`list_applicable_windows_policies`): disabled-skipped, audit-returned — covered. `without_publisher_capability_is_rejected` — **missing**.
+- **macOS** (`list_applicable_macos_policies`): `disabled_documents_are_skipped`, `audit_documents_are_returned`, `without_publisher_capability_is_rejected`, `b4_macos_policies_supersede_by_version` — all **missing**.
+- **Linux** (`list_applicable_linux_policies`): disabled-skipped, without_publisher_cap — covered. `audit_documents_are_returned` — **missing**.
+
+The missing tests leave uncovered:
+- The C-3 publisher-capability gate in `list_applicable_windows_policies` and `list_applicable_macos_policies` — a policy signed by an unpermissioned identity could silently be delivered to agents if that guard regressed.
+- The audit pass-through contract for macOS and Linux — a mistaken filter that drops `Enforcement::Audit` docs would fail silently.
+- The macOS `Enforcement::Disabled` filter — a regression could deliver disabled policies to macOS agents.
+- The macOS B-4 supersession rule — duplicate `policy_id` collapse is tested for Windows and Linux but not macOS.
+
+### Fix
+
+**`dds-node/src/service.rs`** (+6 tests):
+
+Windows addition:
+- `windows_policy_without_publisher_capability_is_rejected`: a bare publisher (no `dds:policy-publisher-windows` vouch) signs a global-scope Windows policy; `list_applicable_windows_policies` must return 0 results.
+
+macOS additions (mirrors Windows and Linux):
+- `macos_policy_disabled_documents_are_skipped`: `Enforcement::Disabled` policy must return 0 results.
+- `macos_policy_audit_documents_are_returned`: `Enforcement::Audit` policy must reach the agent (agent decides; directory must not pre-filter).
+- `macos_policy_without_publisher_capability_is_rejected`: bare publisher lacking `dds:policy-publisher-macos` vouch must be dropped (C-3 gate).
+- `b4_macos_policies_supersede_by_version`: two macOS attestations with the same `policy_id` but different versions collapse to the higher version.
+
+Linux addition:
+- `linux_policy_audit_documents_are_returned`: `Enforcement::Audit` policy must reach the Linux agent unchanged.
+
+No production code changed. Also applied `cargo fmt` to two pre-existing long-line wraps in lines from the 136th pass.
+
+### Result
+
+Rust workspace (unit tests): **320 → 326** (+6 new tests; 0 failures). `cargo fmt --check` clean. macOS: **172** (unchanged). Linux: **369** (unchanged). Windows: **283** (unchanged).
+
+---
+
 ## Test Gap Fix (2026-05-20, 136th pass) — dds-node: Linux scope tests + macOS global/OU scope tests missing
 
 ### Gap
