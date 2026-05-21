@@ -10477,11 +10477,11 @@ M-1…M-22 ledger; the addendum table below is the per-finding view.
 | **Edition** | 2024 |
 | **Workspace crates** | 10 (dds-core, dds-domain, dds-store, dds-net, dds-node, dds-ffi, dds-cli, dds-loadtest, dds-fido2-test, pam-dds) |
 | **Rust LOC** | 8,400+ |
-| **Rust tests** | 959 total (macOS dev host 2026-05-18; up from 857 at 2026-05-05 snapshot) |
+| **Rust tests** | 963 total (macOS dev host 2026-05-21; +4 `dds-node::key_provider` tests from Phase A1; up from 959 at 2026-05-18 snapshot) |
 | **.NET tests** | 805 passing on macOS dev host: Linux 364 + macOS 166 + Windows 275 (39 Windows-host-only integration tests skipped on macOS; 314 Windows total) |
 | **C++ native tests** | 47 (Windows) |
 | **Python tests** | 13 (requires `pip install pytest`; `bindings/python/test_dds.py`) |
-| **Total tests** | 1764 passing on macOS dev host (Rust 959 + .NET 805); add Windows-only .NET 39 + C++ 47 = 1850 across all hosts |
+| **Total tests** | 1768 passing on macOS dev host (Rust 963 + .NET 805); add Windows-only .NET 39 + C++ 47 = 1854 across all hosts |
 | **Shared library** | libdds\_ffi.dylib (739 KB) |
 
 Verification note (2026-04-13, Windows 11 ARM64):
@@ -10742,7 +10742,7 @@ Classical-only available for embedded/`no_std` targets.
 
 | Target | Status | Notes |
 |---|---|---|
-| macOS ARM64 (aarch64-apple-darwin) | ✅ Builds + tests | Dev host, 959 Rust tests + 166 macOS .NET + 364 Linux .NET + 275 Windows .NET (on macOS) |
+| macOS ARM64 (aarch64-apple-darwin) | ✅ Builds + tests | Dev host, 963 Rust tests + 166 macOS .NET + 364 Linux .NET + 275 Windows .NET (on macOS) |
 | Linux x86\_64 | ✅ Expected to build | Standard Rust target |
 | **Windows ARM64 (aarch64-pc-windows-msvc)** | ✅ **298 Rust + 56 .NET + 47 C++ tests pass** | **Win11 ARM64, MSVC 14.44 + LLVM 22.1.3, full workspace verified 2026-04-13 (post security merge)** |
 | Windows x86\_64 | ✅ Expected to build (cross) | CI cross-compile gate |
