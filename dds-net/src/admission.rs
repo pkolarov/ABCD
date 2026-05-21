@@ -42,6 +42,25 @@
 
 use serde::{Deserialize, Serialize};
 
+/// `serde` helper — serialize `Option<Vec<u8>>` as a CBOR byte string when
+/// present, compatible with `#[serde(with = "serde_bytes")]` on `Vec<u8>`.
+///
+/// Only called when `skip_serializing_if = "Option::is_none"` is satisfied
+/// (i.e. the value is `Some`). Deserialization always returns `Some(_)`.
+mod opt_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(b) => s.serialize_bytes(b.as_slice()),
+            None => unreachable!("skip_serializing_if guards None"),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let b: serde_bytes::ByteBuf = Deserialize::deserialize(d)?;
+        Ok(Some(b.into_vec()))
+    }
+}
+
 /// Per-response wire cap on the number of opaque CBOR-encoded
 /// admission-revocation blobs an `AdmissionResponse` may carry.
 ///
@@ -57,10 +76,21 @@ use serde::{Deserialize, Serialize};
 /// hostile peer cannot wedge the handshake by oversending.
 pub const MAX_REVOCATIONS_PER_RESPONSE: usize = 1024;
 
-/// Asks the remote peer for its admission cert. Carries no state —
-/// the request is the entire handshake on the requester side.
+/// Asks the remote peer for its admission cert.
+///
+/// **Phase A2** — gains an optional `challenge` field: 32 random bytes the
+/// requester wants the responder to sign with its admission key. The responder
+/// returns the signature in [`AdmissionResponse::challenge_signature`]. Absent
+/// on pre-Phase-A2 peers; responders MUST ignore a missing challenge (and omit
+/// `challenge_signature` in their response). `#[serde(default)]` +
+/// `skip_serializing_if` keeps v1 wire encodings byte-identical.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AdmissionRequest;
+pub struct AdmissionRequest {
+    /// Fresh 32-byte nonce the requester wants the responder to sign.
+    /// `None` on pre-Phase-A2 peers; responders skip challenge-response if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_bytes")]
+    pub challenge: Option<Vec<u8>>,
+}
 
 /// Response carrying the peer's admission cert and (optionally) a
 /// piggy-backed snapshot of the peer's known admission revocations.
@@ -93,6 +123,15 @@ pub struct AdmissionResponse {
     /// at the receive site.
     #[serde(default)]
     pub epoch_key_releases: Vec<Vec<u8>>,
+    /// **Phase A2** — signature of the responder's admission key over the
+    /// requester's [`AdmissionRequest::challenge`] (64 bytes for Ed25519,
+    /// variable for ECDSA-P256 DER). `None` when the request carried no
+    /// challenge or when the responder has no `admission_pubkey` in its cert.
+    /// The requester verifies this against `cert.body.admission_pubkey`.
+    /// `#[serde(default)]` + `skip_serializing_if` keeps v1/v2/v3 wire
+    /// encodings byte-identical for peers that predate Phase A2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_signature: Option<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -101,7 +140,7 @@ mod tests {
 
     #[test]
     fn admission_request_roundtrip() {
-        let req = AdmissionRequest;
+        let req = AdmissionRequest { challenge: None };
         let mut buf = Vec::new();
         ciborium::into_writer(&req, &mut buf).unwrap();
         let _: AdmissionRequest = ciborium::from_reader(&buf[..]).unwrap();
@@ -224,6 +263,7 @@ mod tests {
                 b"opaque-release-1".to_vec(),
                 b"opaque-release-2-longer".to_vec(),
             ],
+            challenge_signature: None,
         };
         let mut buf = Vec::new();
         ciborium::into_writer(&resp, &mut buf).unwrap();
@@ -275,6 +315,7 @@ mod tests {
             cert_cbor: Some(b"v3-cert".to_vec()),
             revocations: vec![b"rev-1".to_vec()],
             epoch_key_releases: vec![b"release-1".to_vec(), b"release-2".to_vec()],
+            challenge_signature: None,
         };
         let mut buf = Vec::new();
         ciborium::into_writer(&v3, &mut buf).unwrap();
@@ -282,5 +323,94 @@ mod tests {
         let round: V2Wire = ciborium::from_reader(&buf[..]).unwrap();
         assert_eq!(round.cert_cbor.as_deref(), Some(b"v3-cert".as_ref()));
         assert_eq!(round.revocations.len(), 1);
+    }
+
+    /// **Phase A2** — `AdmissionRequest` with a challenge field round-trips
+    /// correctly through CBOR.
+    #[test]
+    fn admission_request_roundtrip_with_challenge() {
+        let challenge = vec![0x01u8; 32];
+        let req = AdmissionRequest {
+            challenge: Some(challenge.clone()),
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&req, &mut buf).unwrap();
+        let round: AdmissionRequest = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(round.challenge.as_deref(), Some(challenge.as_slice()));
+    }
+
+    /// **Phase A2** — `AdmissionRequest` with no challenge (`None`) still encodes
+    /// and decodes cleanly (pre-Phase-A2 wire format).
+    #[test]
+    fn admission_request_no_challenge_roundtrip() {
+        let req = AdmissionRequest { challenge: None };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&req, &mut buf).unwrap();
+        let round: AdmissionRequest = ciborium::from_reader(&buf[..]).unwrap();
+        assert!(round.challenge.is_none());
+    }
+
+    /// **Phase A2** — a pre-Phase-A2 sender (no challenge field) must still
+    /// decode cleanly under the Phase-A2 schema, with `challenge` defaulting
+    /// to `None`. Pins the backwards-compat wire invariant.
+    #[test]
+    fn admission_request_decodes_pre_a2_wire_without_challenge_field() {
+        // Pre-Phase-A2 `AdmissionRequest` was a unit struct — CBOR encodes
+        // as an empty map.
+        #[derive(Serialize)]
+        struct PreA2Wire;
+        let pre_a2 = PreA2Wire;
+        let mut buf = Vec::new();
+        ciborium::into_writer(&pre_a2, &mut buf).unwrap();
+        let round: AdmissionRequest = ciborium::from_reader(&buf[..]).unwrap();
+        assert!(
+            round.challenge.is_none(),
+            "missing Phase-A2 challenge field must default to None"
+        );
+    }
+
+    /// **Phase A2** — `AdmissionResponse` with `challenge_signature` round-trips.
+    #[test]
+    fn admission_response_roundtrip_with_challenge_signature() {
+        let resp = AdmissionResponse {
+            cert_cbor: Some(b"opaque-cert".to_vec()),
+            challenge_signature: Some(vec![0xABu8; 64]),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&resp, &mut buf).unwrap();
+        let round: AdmissionResponse = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(round.cert_cbor, resp.cert_cbor);
+        assert_eq!(
+            round.challenge_signature.as_deref(),
+            Some([0xABu8; 64].as_ref())
+        );
+    }
+
+    /// **Phase A2** — a pre-Phase-A2 response (no `challenge_signature` field)
+    /// must still decode cleanly with `challenge_signature` defaulting to `None`.
+    #[test]
+    fn admission_response_decodes_pre_a2_wire_without_challenge_signature() {
+        #[derive(Serialize)]
+        struct PreA2Response<'a> {
+            cert_cbor: Option<&'a [u8]>,
+            #[serde(default)]
+            revocations: Vec<Vec<u8>>,
+            #[serde(default)]
+            epoch_key_releases: Vec<Vec<u8>>,
+        }
+        let pre_a2 = PreA2Response {
+            cert_cbor: Some(b"v3-cert"),
+            revocations: vec![],
+            epoch_key_releases: vec![],
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&pre_a2, &mut buf).unwrap();
+        let round: AdmissionResponse = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(round.cert_cbor.as_deref(), Some(b"v3-cert".as_ref()));
+        assert!(
+            round.challenge_signature.is_none(),
+            "missing Phase-A2 challenge_signature field must default to None"
+        );
     }
 }

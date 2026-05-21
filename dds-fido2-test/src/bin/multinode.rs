@@ -299,6 +299,7 @@ async fn spawn_node(
             api_auth: Default::default(),
             allow_legacy_v1_tokens: false,
             metrics_addr: None,
+            allow_v1_certs: true,
         },
         // Same org_hash on every node — gossipsub topics are derived
         // from (domain_tag, org_hash), so giving each node a different

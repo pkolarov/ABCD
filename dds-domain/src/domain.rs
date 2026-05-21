@@ -461,11 +461,32 @@ impl DomainKey {
         expires_at: Option<u64>,
         pq_kem_pubkey: Option<Vec<u8>>,
     ) -> AdmissionCert {
+        self.issue_admission_v2(peer_id, issued_at, expires_at, pq_kem_pubkey, None)
+    }
+
+    /// **Phase A2** — issue an admission cert with an optional hardware-bound
+    /// admission public key. When `admission_pubkey` is `Some`, the resulting
+    /// cert body carries the key so H-12 can enforce challenge-response proof
+    /// of possession. `pq_kem_pubkey` continues to carry the enc-v3 KEM pubkey
+    /// independently.
+    ///
+    /// This is the canonical issuance entry point from Phase A2 onward.
+    /// [`Self::issue_admission`] and [`Self::issue_admission_with_kem`] both
+    /// delegate here with `admission_pubkey = None` for backwards compatibility.
+    pub fn issue_admission_v2(
+        &self,
+        peer_id: String,
+        issued_at: u64,
+        expires_at: Option<u64>,
+        pq_kem_pubkey: Option<Vec<u8>>,
+        admission_pubkey: Option<dds_core::key_provider::AdmissionPublicKey>,
+    ) -> AdmissionCert {
         let body = AdmissionBody {
             domain_id: self.id(),
             peer_id,
             issued_at,
             expires_at,
+            admission_pubkey,
         };
         let payload = body.to_signing_bytes();
         let sig = self.signing_key.sign(&payload);
@@ -539,12 +560,26 @@ impl DomainSigner for DomainKey {
 
 /// The signed body of an admission certificate. Field order is fixed; the
 /// CBOR encoding of this struct is what gets signed.
+///
+/// **Phase A2** — `admission_pubkey` is the new optional field. When present
+/// (v2 cert), the H-12 receiver verifies a fresh challenge-response signature
+/// over a locally-supplied nonce before admitting the peer. When absent (v1
+/// cert) the receiver falls back to cert-only verification. Field is
+/// `#[serde(default)]` + `skip_serializing_if` so v1 wire encodings are
+/// byte-identical; v2 bodies sign the field as part of the CBOR body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdmissionBody {
     pub domain_id: DomainId,
     pub peer_id: String,
     pub issued_at: u64,
     pub expires_at: Option<u64>,
+    /// **Phase A2** — public half of the node's admission key (hardware-bound
+    /// or `SoftwareKeyfile`). Present on v2 certs only; absent on v1 certs
+    /// issued before Phase A2. When present, H-12 also verifies a
+    /// challenge-response signature proving the peer holds the matching
+    /// private key (see `docs/hardware-bound-admission-plan.md §6`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_pubkey: Option<dds_core::key_provider::AdmissionPublicKey>,
 }
 
 impl AdmissionBody {
@@ -1585,5 +1620,82 @@ mod tests {
         assert!(decoded.pq_signature.is_none());
         let domain = key.domain();
         decoded.verify_with_domain(&domain, "peer", 0).unwrap();
+    }
+
+    // ── Phase A2 tests ───────────────────────────────────────────────────────
+
+    /// **Phase A2** — `issue_admission_v2` embeds an `admission_pubkey` in the
+    /// cert body. The body is signed over the full body (including the new
+    /// field), and `verify_with_domain` must succeed.
+    #[test]
+    fn admission_cert_v2_carries_admission_pubkey() {
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let admission_pubkey =
+            dds_core::key_provider::AdmissionPublicKey::Ed25519(vec![0x42u8; 32]);
+        let cert = key.issue_admission_v2(
+            "peer-x".into(),
+            100,
+            Some(9999),
+            None,
+            Some(admission_pubkey.clone()),
+        );
+        assert!(cert.body.admission_pubkey.is_some());
+        assert_eq!(
+            cert.body.admission_pubkey.as_ref().unwrap(),
+            &admission_pubkey
+        );
+        let domain = key.domain();
+        cert.verify_with_domain(&domain, "peer-x", 100).unwrap();
+    }
+
+    /// **Phase A2** — v1 certs (no `admission_pubkey`) still verify
+    /// normally; the field is absent from the CBOR and the signature
+    /// is still valid under the v1 signing bytes.
+    #[test]
+    fn admission_cert_v1_no_admission_pubkey_still_verifies() {
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let cert = key.issue_admission("peer-y".into(), 0, None);
+        assert!(cert.body.admission_pubkey.is_none());
+        let domain = key.domain();
+        cert.verify_with_domain(&domain, "peer-y", 0).unwrap();
+    }
+
+    /// **Phase A2** — a v2 cert round-trips through CBOR with the
+    /// `admission_pubkey` field intact.
+    #[test]
+    fn admission_cert_v2_cbor_roundtrip() {
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let admission_pubkey =
+            dds_core::key_provider::AdmissionPublicKey::EcdsaP256(vec![0x03u8; 33]);
+        let cert = key.issue_admission_v2("peer-z".into(), 500, None, None, Some(admission_pubkey));
+        let bytes = cert.to_cbor().unwrap();
+        let decoded = AdmissionCert::from_cbor(&bytes).unwrap();
+        assert!(decoded.body.admission_pubkey.is_some());
+        match decoded.body.admission_pubkey.as_ref().unwrap() {
+            dds_core::key_provider::AdmissionPublicKey::EcdsaP256(k) => {
+                assert_eq!(k, &vec![0x03u8; 33]);
+            }
+            _ => panic!("expected EcdsaP256"),
+        }
+        let domain = key.domain();
+        decoded.verify_with_domain(&domain, "peer-z", 500).unwrap();
+    }
+
+    /// **Phase A2** — signing bytes for v1 body (no `admission_pubkey`) and v2
+    /// body (with `admission_pubkey`) are different. This ensures the
+    /// `admission_pubkey` field is part of the signed content and cannot be
+    /// stripped by an attacker to downgrade a v2 cert to v1.
+    #[test]
+    fn admission_cert_v2_signing_bytes_differ_from_v1() {
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let admission_pubkey =
+            dds_core::key_provider::AdmissionPublicKey::Ed25519(vec![0x11u8; 32]);
+        let v1_cert = key.issue_admission("peer".into(), 0, None);
+        let v2_cert = key.issue_admission_v2("peer".into(), 0, None, None, Some(admission_pubkey));
+        // Signatures must differ because the signed bodies differ.
+        assert_ne!(
+            v1_cert.signature, v2_cert.signature,
+            "v1 and v2 certs must have different signatures (different body bytes)"
+        );
     }
 }

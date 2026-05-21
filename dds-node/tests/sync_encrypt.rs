@@ -74,6 +74,7 @@ fn make_node(
             api_auth: Default::default(),
             allow_legacy_v1_tokens: false,
             metrics_addr: None,
+            allow_v1_certs: true,
         },
         org_hash: "test-org".to_string(),
         domain: DomainConfig {

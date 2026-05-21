@@ -2012,37 +2012,65 @@ cover all five lifecycle scenarios from `docs/pqc-phase-b-plan.md §7`.
 [STATUS.md](STATUS.md) and [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md)
 for the complete ledger.
 
-### Z-2 (High) ⚠ Phase A1 shipped — Hardware-bound identities (A2–A6 pending)
+### Z-2 (High) ⚠ Phase A2 shipped — Hardware-bound identities (A3–A6 pending)
 
 [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md)
-(committed 2026-04-26 as `d5c2da5`) has moved from design-only to
-first production code. **Phase A1 landed 2026-05-21:** the
-`dds-core::key_provider::KeyProvider` trait and the `SoftwareKeyfile`
-backend are in-tree. `DdsNode` now loads / creates `admission_key.bin`
-on every startup via `SoftwareKeyfile::load_or_create`, logs a WARN
-when the software fallback is in use, and holds the provider as
-`DdsNode::admission_key_provider: Box<dyn KeyProvider>` ready for
-Phase A2 wiring.
+(committed 2026-04-26 as `d5c2da5`). **Phase A1 landed 2026-05-21**
+(141st pass); **Phase A2 landed 2026-05-21** (141st pass).
 
-**What Phase A1 ships:**
+**What Phase A1 shipped (2026-05-21):**
 
 - `dds-core/src/key_provider.rs` — `KeyProvider` trait (sign-only, no
   export; `Send + Sync`), `AdmissionPublicKey` enum (Ed25519 / ECDSA-P256),
   `ProviderKind` enum (SoftwareKeyfile / Tpm2 / AppleSecureEnclave).
 - `dds-node/src/key_provider.rs` — `SoftwareKeyfile` backend wrapping
   `p2p_identity::load_or_create` against `<data_dir>/admission_key.bin`.
-  Stable `identity_handle` is SHA-256 of the key path (not a secret).
-  4 unit tests: stable-across-loads, sign/verify round-trip, provider_kind,
-  handle deterministic.
+  Stable `identity_handle` is SHA-256 of the key path. 4 unit tests.
 - `dds-node/src/config.rs` — `NodeConfig::admission_key_path()`.
 - `dds-node/src/node.rs` — `DdsNode::admission_key_provider` field;
   load-or-create in `DdsNode::init()`.
 
-**What Phase A1 does NOT yet change (attack surface unchanged):**
+**What Phase A2 ships (2026-05-21):**
 
-- `AdmissionBody` (`dds-domain/src/domain.rs`) still has no
-  `admission_pubkey` field; H-12 still has no challenge-response step
-  (Phase A2).
+- `dds-domain/src/domain.rs` — `AdmissionBody.admission_pubkey:
+  Option<AdmissionPublicKey>` (CBOR-optional; v1 wire byte-identical).
+  New `DomainKey::issue_admission_v2` method takes the optional pubkey.
+- `dds-net/src/admission.rs` — `AdmissionRequest.challenge:
+  Option<Vec<u8>>` (32-byte nonce, CBOR-optional) and
+  `AdmissionResponse.challenge_signature: Option<Vec<u8>>` (raw sig
+  bytes, CBOR-optional). Wire backward-compat: pre-A2 peers parse
+  cleanly with fields defaulting to `None`.
+- `dds-node/src/node.rs` — `DdsNode::pending_challenges:
+  BTreeMap<PeerId, Vec<u8>>` tracks per-peer nonces. `send_admission_request`
+  fills a 32-byte OsRng nonce. `handle_admission_event` signs the
+  requester's challenge with `admission_key_provider.sign()`. `verify_peer_admission`
+  enforces: if cert has `admission_pubkey`, both challenge and
+  `challenge_signature` must be present and the sig must verify;
+  if cert has no `admission_pubkey` (v1), the peer is admitted only
+  when `allow_v1_certs = true`. New `verify_admission_challenge` helper
+  verifies Ed25519 (64-byte sig) and ECDSA-P256 (DER or fixed-length).
+- `dds-node/src/main.rs` — `issue-self-admission` and `issue-admission`
+  CLI subcommands now load `admission_key.bin` and embed the pubkey in
+  the cert via `issue_admission_v2`.
+- `dds-node/src/config.rs` — `NetworkConfig.allow_v1_certs: bool`
+  (default `true` for soft migration window).
+- **8 new unit tests** in `dds-node::node::admission_challenge_tests`:
+  Ed25519 valid/wrong-sig/wrong-key/bad-pubkey-len/bad-sig-len,
+  ECDSA-P256 valid/wrong-sig/bad-pubkey.
+
+**Attack status after Phase A2:** A peer presenting a v2 cert
+(admission_pubkey set) must prove possession of the matching private key
+via a fresh per-handshake challenge. Exfiltrating `p2p_key.bin +
+admission.cbor` is no longer sufficient to clone a v2-cert node — the
+attacker must also exfiltrate `admission_key.bin`. Hardware binding
+(TPM 2.0 / Secure Enclave, A3/A4) makes `admission_key.bin` non-exportable,
+closing the attack completely. During the `allow_v1_certs = true` migration
+window, a node that was admitted with a v1 cert (no admission_pubkey)
+remains unprotected — the window closes when operators re-issue certs
+with `issue-self-admission` and flip `allow_v1_certs = false`.
+
+**Remaining work (admin-key binding and other non-A2 gaps unchanged):**
+
 - Admin-key OS-keystore binding is an explicit TODO in
   `dds-node/src/service.rs` (deferred as M-22 in this review).
 - User FIDO2 attestation: `none` and `packed` self-attestation accepted
@@ -2051,16 +2079,10 @@ Phase A2 wiring.
 - Domain root key is software Ed25519 by default; FIDO2 only with
   `--fido2` at `init-domain`.
 
-**Attack still applies until Phase A2 lands:** Exfiltrating
-`p2p_key.bin + admission.cbor` from any domain node clones the node.
-Phase A1 is infrastructure only — it creates the key and holds the
-provider but does not gate admission on it. The structural fix (H-12
-challenge-response) lands in Phase A2.
-
-**Remediation track:** A2 (AdmissionCert v2 + H-12 challenge-response)
-→ A3 (TPM 2.0 Linux/Windows) → A4 (Apple Secure Enclave) → A5
-(Ed25519 on capable dTPMs) → A6 (migration tooling + `allow_v1_certs
-= false` flip) → A7 (threat-model close-out). See
+**Remediation track:** ~~A1 ✅~~ → ~~A2 ✅~~ → A3 (TPM 2.0 Linux/Windows)
+→ A4 (Apple Secure Enclave) → A5 (Ed25519 on capable dTPMs) → A6
+(migration tooling + `allow_v1_certs = false` flip) → A7
+(threat-model close-out). See
 [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md)
 §10 for the full phasing table.
 

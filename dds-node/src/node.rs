@@ -308,6 +308,20 @@ pub struct DdsNode {
     ///
     /// See `docs/hardware-bound-admission-plan.md` §5 and §7.
     pub admission_key_provider: Box<dyn dds_core::key_provider::KeyProvider>,
+    /// **Phase A2** — per-peer challenge nonces we generated when sending an
+    /// `AdmissionRequest`. On response receipt the nonce is consumed and the
+    /// `challenge_signature` in the response is verified against the peer's
+    /// `cert.body.admission_pubkey`. Entries are inserted in
+    /// `send_admission_request` and removed (with verification) in
+    /// `verify_peer_admission`. A stale entry (peer disconnected before
+    /// responding) is evicted on `ConnectionClosed`.
+    pending_challenges: BTreeMap<PeerId, Vec<u8>>,
+    /// **Phase A2** — when `false`, peers presenting a v1 cert (no
+    /// `admission_pubkey`) are rejected outright. Default `true` during the
+    /// migration window; operators flip to `false` after every node has been
+    /// re-admitted with a v2 cert. Sourced from
+    /// `config.network.allow_v1_certs`.
+    allow_v1_certs: bool,
 }
 
 /// Shared live-state snapshot for the Prometheus exposition and the
@@ -544,11 +558,12 @@ impl DdsNode {
         // non-zero from the first Prometheus scrape after init.
         crate::telemetry::record_pq_epoch_id(epoch_keys.my_current_epoch().0);
 
-        // **Z-2 / Phase A1** — load or create the admission key.
-        // Phase A1: always the SoftwareKeyfile backend (admission_key.bin).
-        // Phase A3/A4 will select TPM 2.0 or Secure Enclave based on config
-        // and platform availability. Zero behavioral change in Phase A1 —
-        // the key is loaded and held but not yet wired into H-12 (Phase A2).
+        // **Z-2 / Phase A2** — load or create the admission key.
+        // Phase A2: SoftwareKeyfile backend (admission_key.bin); the key is
+        // now wired into H-12 challenge-response (challenge generation in
+        // `send_admission_request`, signing in `handle_admission_event`,
+        // verification in `verify_peer_admission`). Phase A3/A4 will swap in
+        // TPM 2.0 or Secure Enclave without changing the H-12 protocol.
         let admission_key_path = config.admission_key_path();
         let admission_key_provider: Box<dyn dds_core::key_provider::KeyProvider> = Box::new(
             crate::key_provider::SoftwareKeyfile::load_or_create(&admission_key_path).map_err(
@@ -594,6 +609,9 @@ impl DdsNode {
 
         info!(%peer_id, domain = %config.domain.name, org = %config.org_hash, "DDS node initialized");
 
+        // Extract before `config` is moved into the struct.
+        let allow_v1_certs = config.network.allow_v1_certs;
+
         Ok(Self {
             swarm,
             peer_id,
@@ -629,6 +647,8 @@ impl DdsNode {
             bootstrap_addrs,
             p2p_signing_key,
             admission_key_provider,
+            pending_challenges: BTreeMap::new(),
+            allow_v1_certs,
         })
     }
 
@@ -968,6 +988,10 @@ impl DdsNode {
                 // afresh — we don't trust a stale admission across
                 // connection lifecycles.
                 self.admitted_peers.remove(&peer_id);
+                // Phase A2: evict any pending challenge so we don't
+                // accumulate stale entries for peers that disconnected
+                // before answering.
+                self.pending_challenges.remove(&peer_id);
                 self.refresh_peer_count_gauges();
             }
             _ => {}
@@ -980,13 +1004,24 @@ impl DdsNode {
     /// `handle_admission_event`. Between `ConnectionEstablished` and
     /// receipt of a valid cert, the peer stays out of
     /// `admitted_peers` and therefore its gossip / sync is dropped.
+    ///
+    /// **Phase A2** — includes a fresh 32-byte challenge nonce. The
+    /// responder signs it with its admission key and returns the
+    /// signature in `AdmissionResponse::challenge_signature`. We
+    /// stash the nonce in `pending_challenges` so `verify_peer_admission`
+    /// can check the signature when the response arrives.
     fn request_peer_admission(&mut self, peer_id: PeerId) {
-        let _id = self
-            .swarm
-            .behaviour_mut()
-            .admission
-            .send_request(&peer_id, AdmissionRequest);
-        debug!(%peer_id, "H-12: sent admission request");
+        use rand::RngCore;
+        let mut challenge = vec![0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut challenge);
+        self.pending_challenges.insert(peer_id, challenge.clone());
+        let _id = self.swarm.behaviour_mut().admission.send_request(
+            &peer_id,
+            AdmissionRequest {
+                challenge: Some(challenge),
+            },
+        );
+        debug!(%peer_id, "H-12: sent admission request with challenge");
     }
 
     /// Handle admission-protocol events (H-12). Serves our own cert
@@ -995,7 +1030,9 @@ impl DdsNode {
     fn handle_admission_event(&mut self, event: RrEvent<AdmissionRequest, AdmissionResponse>) {
         match event {
             RrEvent::Message { peer, message, .. } => match message {
-                RrMessage::Request { channel, .. } => {
+                RrMessage::Request {
+                    request, channel, ..
+                } => {
                     // Serve our own admission cert. Serialising on
                     // every request is cheap (one CBOR encode of a
                     // ~100-byte struct) and keeps us from caching a
@@ -1023,6 +1060,21 @@ impl DdsNode {
                     // list — the requester will use `EpochKeyRequest` via
                     // PQ-B7-RECOVERY-1 once they start receiving gossip.
                     let epoch_key_releases = self.epoch_key_releases_for_admission_response(&peer);
+                    // **Phase A2** — if the request carries a challenge,
+                    // sign it with our admission key so the requester can
+                    // verify we hold the private key matching
+                    // `cert.body.admission_pubkey`. Skip silently when
+                    // the request has no challenge (pre-A2 peer).
+                    let challenge_signature = request.challenge.as_deref().and_then(|challenge| {
+                        match self.admission_key_provider.sign(challenge) {
+                            Ok(sig) => Some(sig),
+                            Err(e) => {
+                                warn!(%peer, error = %e,
+                                        "H-12: failed to sign challenge with admission key");
+                                None
+                            }
+                        }
+                    });
                     if self
                         .swarm
                         .behaviour_mut()
@@ -1033,6 +1085,7 @@ impl DdsNode {
                                 cert_cbor,
                                 revocations,
                                 epoch_key_releases,
+                                challenge_signature,
                             },
                         )
                         .is_err()
@@ -1183,6 +1236,10 @@ impl DdsNode {
     /// merged entries are persisted atomically so the next start-up
     /// applies them at `init`.
     fn verify_peer_admission(&mut self, peer_id: PeerId, response: AdmissionResponse) {
+        // Consume the pending challenge for this peer (if any). Used below
+        // for Phase A2 challenge-response verification.
+        let our_challenge = self.pending_challenges.remove(&peer_id);
+
         // Process piggy-backed revocations first. We do this even if
         // the cert later fails to verify — the revocations carry
         // their own domain-signed authority and `add` rejects any
@@ -1222,6 +1279,51 @@ impl DdsNode {
         };
         match cert.verify_with_domain(&self.domain, &peer_str, now) {
             Ok(()) => {
+                // **Phase A2** — enforce challenge-response proof of possession.
+                //
+                // Cases:
+                // (a) cert.body.admission_pubkey is Some → verify challenge sig.
+                //     If sig is missing or invalid → refuse admission.
+                // (b) cert.body.admission_pubkey is None (v1 cert) →
+                //     honour if allow_v1_certs=true, refuse if false.
+                if let Some(admission_pubkey) = &cert.body.admission_pubkey {
+                    // v2 cert — challenge signature is mandatory.
+                    let challenge = match our_challenge.as_deref() {
+                        Some(c) => c,
+                        None => {
+                            warn!(%peer_id,
+                                "H-12: v2 cert but no challenge was sent — \
+                                 cannot verify proof of possession; refusing");
+                            crate::telemetry::record_admission_handshake("fail");
+                            return;
+                        }
+                    };
+                    let sig = match response.challenge_signature.as_deref() {
+                        Some(s) => s,
+                        None => {
+                            warn!(%peer_id,
+                                "H-12: v2 cert but peer returned no challenge_signature");
+                            crate::telemetry::record_admission_handshake("fail");
+                            return;
+                        }
+                    };
+                    if let Err(reason) =
+                        verify_admission_challenge(admission_pubkey, challenge, sig)
+                    {
+                        warn!(%peer_id, reason,
+                            "H-12: challenge-response verification failed — refusing");
+                        crate::telemetry::record_admission_handshake("fail");
+                        return;
+                    }
+                } else if !self.allow_v1_certs {
+                    // v1 cert and operator has disabled the migration window.
+                    warn!(%peer_id,
+                        "H-12: peer presented a v1 cert (no admission_pubkey) but \
+                         allow_v1_certs=false — refusing");
+                    crate::telemetry::record_admission_handshake("fail");
+                    return;
+                }
+
                 info!(%peer_id, "H-12: peer admitted to domain");
                 self.admitted_peers.insert(peer_id);
                 crate::telemetry::record_admission_handshake("ok");
@@ -3759,6 +3861,153 @@ fn software_publisher_identity_ok(token: &Token) -> bool {
     match doc.publisher_identity.as_ref() {
         Some(pi) => pi.validate().is_ok(),
         None => true,
+    }
+}
+
+/// **Phase A2** — verify a challenge-response signature from a peer's
+/// `AdmissionResponse::challenge_signature` against the public key in the
+/// peer's cert body (`AdmissionBody::admission_pubkey`).
+///
+/// Returns `Ok(())` on success; `Err(reason)` with a short human-readable
+/// description on failure. Callers log the reason at `warn!` level.
+fn verify_admission_challenge(
+    pubkey: &dds_core::key_provider::AdmissionPublicKey,
+    challenge: &[u8],
+    signature: &[u8],
+) -> Result<(), &'static str> {
+    use dds_core::key_provider::AdmissionPublicKey;
+    match pubkey {
+        AdmissionPublicKey::Ed25519(key_bytes) => {
+            use ed25519_dalek::Verifier as _;
+            let arr: [u8; 32] = key_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| "ed25519 pubkey is not 32 bytes")?;
+            let vk = ed25519_dalek::VerifyingKey::from_bytes(&arr)
+                .map_err(|_| "ed25519 pubkey is invalid")?;
+            let sig_arr: [u8; 64] = signature
+                .try_into()
+                .map_err(|_| "ed25519 signature is not 64 bytes")?;
+            let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+            vk.verify(challenge, &sig)
+                .map_err(|_| "ed25519 challenge signature invalid")
+        }
+        AdmissionPublicKey::EcdsaP256(key_bytes) => {
+            use p256::ecdsa::{
+                Signature as P256Signature, VerifyingKey as P256VerifyingKey,
+                signature::Verifier as _,
+            };
+            let vk = P256VerifyingKey::from_sec1_bytes(key_bytes)
+                .map_err(|_| "ecdsa-p256 pubkey is invalid")?;
+            let sig = P256Signature::from_der(signature)
+                .or_else(|_| P256Signature::from_slice(signature))
+                .map_err(|_| "ecdsa-p256 signature is invalid")?;
+            vk.verify(challenge, &sig)
+                .map_err(|_| "ecdsa-p256 challenge signature invalid")
+        }
+    }
+}
+
+#[cfg(test)]
+mod admission_challenge_tests {
+    //! Phase A2 — unit coverage for [`verify_admission_challenge`].
+    //!
+    //! Each test constructs a real key, signs a challenge, and exercises
+    //! one branch of the verifier. The negative paths confirm the function
+    //! returns `Err` (not `Ok`) and does not panic.
+
+    use super::*;
+    use dds_core::key_provider::AdmissionPublicKey;
+
+    fn ed25519_keypair() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
+    }
+
+    #[test]
+    fn ed25519_valid_signature_accepted() {
+        let sk = ed25519_keypair();
+        let vk = sk.verifying_key();
+        let pubkey = AdmissionPublicKey::Ed25519(vk.to_bytes().to_vec());
+        let challenge = b"h12-challenge-nonce-abcdefghij12";
+        use ed25519_dalek::Signer as _;
+        let sig = sk.sign(challenge).to_bytes().to_vec();
+        assert!(verify_admission_challenge(&pubkey, challenge, &sig).is_ok());
+    }
+
+    #[test]
+    fn ed25519_wrong_signature_rejected() {
+        let sk = ed25519_keypair();
+        let vk = sk.verifying_key();
+        let pubkey = AdmissionPublicKey::Ed25519(vk.to_bytes().to_vec());
+        let challenge = b"h12-challenge-nonce-abcdefghij12";
+        // Sign a different message — signature will not verify against challenge.
+        use ed25519_dalek::Signer as _;
+        let sig = sk
+            .sign(b"wrong-message-entirely-different")
+            .to_bytes()
+            .to_vec();
+        assert!(verify_admission_challenge(&pubkey, challenge, &sig).is_err());
+    }
+
+    #[test]
+    fn ed25519_wrong_key_rejected() {
+        // Sign with one key, verify against a different key's public bytes.
+        let sk_signer = ed25519_keypair();
+        let sk_other = ed25519_keypair();
+        let pubkey = AdmissionPublicKey::Ed25519(sk_other.verifying_key().to_bytes().to_vec());
+        let challenge = b"h12-challenge-nonce-abcdefghij12";
+        use ed25519_dalek::Signer as _;
+        let sig = sk_signer.sign(challenge).to_bytes().to_vec();
+        assert!(verify_admission_challenge(&pubkey, challenge, &sig).is_err());
+    }
+
+    #[test]
+    fn ed25519_bad_pubkey_length_rejected() {
+        let pubkey = AdmissionPublicKey::Ed25519(vec![0u8; 16]); // wrong length
+        let sig = vec![0u8; 64];
+        assert!(verify_admission_challenge(&pubkey, b"challenge", &sig).is_err());
+    }
+
+    #[test]
+    fn ed25519_bad_signature_length_rejected() {
+        let sk = ed25519_keypair();
+        let pubkey = AdmissionPublicKey::Ed25519(sk.verifying_key().to_bytes().to_vec());
+        let sig = vec![0u8; 32]; // Ed25519 sigs must be 64 bytes
+        assert!(verify_admission_challenge(&pubkey, b"challenge", &sig).is_err());
+    }
+
+    #[test]
+    fn ecdsa_p256_valid_signature_accepted() {
+        use p256::ecdsa::{SigningKey as P256SigningKey, signature::Signer as _};
+        let sk = P256SigningKey::random(&mut rand::rngs::OsRng);
+        let vk = sk.verifying_key();
+        let pubkey_bytes = vk.to_encoded_point(true).as_bytes().to_vec(); // SEC1 compressed
+        let pubkey = AdmissionPublicKey::EcdsaP256(pubkey_bytes);
+        let challenge = b"h12-challenge-nonce-abcdefghij12";
+        let sig: p256::ecdsa::Signature = sk.sign(challenge);
+        // Use fixed-size r||s encoding; verify_admission_challenge accepts
+        // both DER and fixed-size via from_der || from_slice.
+        let sig_bytes = sig.to_bytes().to_vec();
+        assert!(verify_admission_challenge(&pubkey, challenge, &sig_bytes).is_ok());
+    }
+
+    #[test]
+    fn ecdsa_p256_wrong_signature_rejected() {
+        use p256::ecdsa::{SigningKey as P256SigningKey, signature::Signer as _};
+        let sk = P256SigningKey::random(&mut rand::rngs::OsRng);
+        let vk = sk.verifying_key();
+        let pubkey_bytes = vk.to_encoded_point(true).as_bytes().to_vec();
+        let pubkey = AdmissionPublicKey::EcdsaP256(pubkey_bytes);
+        let sig: p256::ecdsa::Signature = sk.sign(b"wrong-message");
+        let sig_bytes = sig.to_bytes().to_vec();
+        assert!(verify_admission_challenge(&pubkey, b"correct-challenge", &sig_bytes).is_err());
+    }
+
+    #[test]
+    fn ecdsa_p256_bad_pubkey_rejected() {
+        let pubkey = AdmissionPublicKey::EcdsaP256(vec![0u8; 33]); // all-zero is invalid
+        let sig = vec![0u8; 64];
+        assert!(verify_admission_challenge(&pubkey, b"challenge", &sig).is_err());
     }
 }
 

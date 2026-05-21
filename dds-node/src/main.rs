@@ -239,6 +239,33 @@ fn require_flag<'a>(args: &'a [String], name: &str) -> Result<&'a str, Box<dyn s
     flag(args, name).ok_or_else(|| format!("missing required flag {name}").into())
 }
 
+/// **Phase A2** — parse the optional `--admission-pubkey <HEX>` flag.
+///
+/// The value is a hex-encoded Ed25519 public key (32 bytes / 64 hex chars)
+/// produced by `dds-node provision-admission-key` on the target node.
+/// Returns `None` when the flag is absent (v1 cert will be issued).
+fn parse_admission_pubkey_flag(
+    args: &[String],
+) -> Result<Option<dds_core::key_provider::AdmissionPublicKey>, Box<dyn std::error::Error>> {
+    let Some(hex) = flag(args, "--admission-pubkey") else {
+        return Ok(None);
+    };
+    let bytes =
+        dds_domain::domain::from_hex(hex).map_err(|e| format!("--admission-pubkey: {e}"))?;
+    match bytes.len() {
+        32 => Ok(Some(dds_core::key_provider::AdmissionPublicKey::Ed25519(
+            bytes,
+        ))),
+        33 => Ok(Some(dds_core::key_provider::AdmissionPublicKey::EcdsaP256(
+            bytes,
+        ))),
+        n => Err(format!(
+            "--admission-pubkey: expected 32 (Ed25519) or 33 (ECDSA-P256) bytes, got {n}"
+        )
+        .into()),
+    }
+}
+
 fn cmd_init_domain(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let name = require_flag(args, "--name")?;
     let dir = PathBuf::from(require_flag(args, "--dir")?);
@@ -446,11 +473,39 @@ fn cmd_self_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  unavailable until the admission cert is re-issued with a KEM pubkey.");
     }
 
+    // **Phase A2** — include the node's own admission public key in the cert so
+    // peers can verify challenge-response proof of possession. Load it from
+    // `admission_key.bin` in the data dir (created by `gen-node-key` or the
+    // first node start). Falls back to None (v1 cert) if not present.
+    let admission_pubkey: Option<dds_core::key_provider::AdmissionPublicKey> = {
+        let admission_key_path = data_dir.join("admission_key.bin");
+        if admission_key_path.exists() {
+            match dds_node::key_provider::SoftwareKeyfile::load_or_create(&admission_key_path) {
+                Ok(kp) => {
+                    use dds_core::key_provider::KeyProvider;
+                    Some(kp.public_key())
+                }
+                Err(e) => {
+                    eprintln!("WARNING: could not load admission key: {e}; issuing v1 cert");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
     let expires_at = ttl_days.map(|d| now + d * 86_400);
-    let cert = key.issue_admission_with_kem(peer_id.to_string(), now, expires_at, kem_pubkey_bytes);
+    let cert = key.issue_admission_v2(
+        peer_id.to_string(),
+        now,
+        expires_at,
+        kem_pubkey_bytes,
+        admission_pubkey,
+    );
     domain_store::save_admission_cert(&out, &cert)?;
 
     println!("Self-admission cert issued:");
@@ -869,6 +924,13 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
+    // **Phase A2** — accept the peer's admission public key (hex) so the
+    // issued cert binds the hardware-key public half. The peer obtains this
+    // from `dds-node provision-admission-key` output. When absent the cert is
+    // issued as a v1 cert (no `admission_pubkey`); the peer will still be
+    // admitted during the migration window (allow_v1_certs=true).
+    let admission_pubkey = parse_admission_pubkey_flag(args)?;
+
     let key = domain_store::load_domain_key(&domain_key_path)?;
     let domain = domain_store::load_domain_file(&domain_path)?;
     if key.id() != domain.id {
@@ -889,7 +951,13 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
     let expires_at = ttl_days.map(|d| now + d * 86_400);
-    let cert = key.issue_admission_with_kem(peer_id.to_string(), now, expires_at, kem_pubkey_bytes);
+    let cert = key.issue_admission_v2(
+        peer_id.to_string(),
+        now,
+        expires_at,
+        kem_pubkey_bytes,
+        admission_pubkey,
+    );
     domain_store::save_admission_cert(&out, &cert)?;
 
     println!("Admission cert issued:");

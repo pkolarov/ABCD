@@ -71,7 +71,7 @@ impl KeyProvider for SoftwareKeyfile {
     }
 
     fn public_key(&self) -> AdmissionPublicKey {
-        AdmissionPublicKey::Ed25519(self.signing_key.verifying_key().to_bytes())
+        AdmissionPublicKey::Ed25519(self.signing_key.verifying_key().to_bytes().to_vec())
     }
 
     fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, SignError> {
@@ -139,7 +139,8 @@ mod tests {
             AdmissionPublicKey::Ed25519(b) => b,
             _ => panic!("expected Ed25519"),
         };
-        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes).unwrap();
+        let arr: [u8; 32] = pubkey_bytes.as_slice().try_into().unwrap();
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&arr).unwrap();
         let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().unwrap();
         let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
         verifying_key.verify(msg, &sig).unwrap();

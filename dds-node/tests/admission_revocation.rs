@@ -46,6 +46,7 @@ fn build_node_dir(secret: [u8; 32]) -> (TempDir, NodeConfig, libp2p::identity::K
             api_auth: Default::default(),
             allow_legacy_v1_tokens: false,
             metrics_addr: None,
+            allow_v1_certs: true,
         },
         org_hash: "org.test".to_string(),
         domain: DomainConfig {

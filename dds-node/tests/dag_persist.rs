@@ -41,6 +41,7 @@ fn make_node(domain_key: &DomainKey) -> (dds_node::node::DdsNode, tempfile::Temp
             api_auth: Default::default(),
             allow_legacy_v1_tokens: false,
             metrics_addr: None,
+            allow_v1_certs: true,
         },
         org_hash: "test-org".to_string(),
         domain: DomainConfig {

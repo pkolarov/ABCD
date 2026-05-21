@@ -6,17 +6,27 @@
 //!
 //! See `docs/hardware-bound-admission-plan.md` §5 for the full design.
 //! Phase A1 delivers this trait + the `SoftwareKeyfile` backend only;
+//! Phase A2 adds serde to `AdmissionPublicKey` so it embeds in `AdmissionBody`.
 //! TPM 2.0 (Phase A3) and Apple Secure Enclave (Phase A4) follow.
 
 use alloc::{string::String, vec::Vec};
+use serde::{Deserialize, Serialize};
 
 /// Algorithm and public-key bytes for the admission key.
-#[derive(Debug, Clone)]
+///
+/// **Phase A2** — derives `Serialize`/`Deserialize` so it can be embedded in
+/// `dds_domain::AdmissionBody` and carried in the signed cert body.
+/// Serialised as a CBOR map `{"ed25519": <32-byte blob>}` or
+/// `{"ecdsa-p256": <33-byte blob>}` via `serde_bytes` for compact wire
+/// encoding; the variant tag is the map key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdmissionPublicKey {
     /// Ed25519 compressed public key (32 bytes).
-    Ed25519([u8; 32]),
+    #[serde(rename = "ed25519")]
+    Ed25519(#[serde(with = "serde_bytes")] Vec<u8>),
     /// ECDSA-P256 SEC1 compressed public key (33 bytes).
-    EcdsaP256([u8; 33]),
+    #[serde(rename = "ecdsa-p256")]
+    EcdsaP256(#[serde(with = "serde_bytes")] Vec<u8>),
 }
 
 /// Which hardware (or software) backend backs this provider.

@@ -205,6 +205,7 @@ fn write_node_fixture(
             api_auth: Default::default(),
             allow_legacy_v1_tokens: false,
             metrics_addr: None,
+            allow_v1_certs: true,
         },
         org_hash: "e2e-org".to_string(),
         domain: DomainConfig {
@@ -306,6 +307,7 @@ impl Publisher {
                 api_auth: Default::default(),
                 allow_legacy_v1_tokens: false,
                 metrics_addr: None,
+                allow_v1_certs: true,
             },
             org_hash: "e2e-org".to_string(),
             domain: DomainConfig {

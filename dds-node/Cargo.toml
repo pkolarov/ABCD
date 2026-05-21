@@ -52,6 +52,11 @@ base64 = "0.22"
 ed25519-dalek = { workspace = true, features = ["std"] }
 hex = "0.4"
 sha2.workspace = true
+# ECDSA-P256 signature verification in the H-12 admission challenge-response
+# path (`verify_admission_challenge` in `node.rs`). The workspace pin carries
+# `default-features = false, features = ["ecdsa"]` which is all that is needed
+# at runtime. Dev-dependencies add `["pkcs8"]` for test key synthesis.
+p256 = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 toml_edit = "0.22"
 tempfile = "3"

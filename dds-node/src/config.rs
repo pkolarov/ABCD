@@ -235,6 +235,16 @@ pub struct NetworkConfig {
     /// operator to supply their own ACL / mTLS posture.
     #[serde(default)]
     pub metrics_addr: Option<String>,
+
+    /// **Phase A2** — when `true` (default), inbound H-12 admission
+    /// requests from peers carrying a v1 cert (no `admission_pubkey`) are
+    /// still honoured without challenge-response verification. Set to `false`
+    /// once every node in the domain has been re-admitted with a v2 cert to
+    /// enforce hardware-bound identity on all peers. Default `true` for the
+    /// migration window; operators flip to `false` after full rollout (see
+    /// `docs/hardware-bound-admission-plan.md §9`).
+    #[serde(default = "default_true")]
+    pub allow_v1_certs: bool,
 }
 
 impl Default for NetworkConfig {
@@ -249,6 +259,7 @@ impl Default for NetworkConfig {
             api_auth: ApiAuthConfig::default(),
             allow_legacy_v1_tokens: false,
             metrics_addr: None,
+            allow_v1_certs: true,
         }
     }
 }
