@@ -355,11 +355,14 @@ mod tests {
     /// to `None`. Pins the backwards-compat wire invariant.
     #[test]
     fn admission_request_decodes_pre_a2_wire_without_challenge_field() {
-        // Pre-Phase-A2 `AdmissionRequest` was a unit struct — CBOR encodes
-        // as an empty map.
+        // Pre-Phase-A2 `AdmissionRequest` was a unit struct. ciborium
+        // serializes unit structs (`struct Foo;`) as CBOR null (0xf6), not
+        // as an empty map — so we reproduce the actual pre-A2 on-wire shape
+        // using a zero-named-field struct `{}` which ciborium encodes as an
+        // empty map (0xa0), exactly what the old `AdmissionRequest { }` emits.
         #[derive(Serialize)]
-        struct PreA2Wire;
-        let pre_a2 = PreA2Wire;
+        struct PreA2Wire {}
+        let pre_a2 = PreA2Wire {};
         let mut buf = Vec::new();
         ciborium::into_writer(&pre_a2, &mut buf).unwrap();
         let round: AdmissionRequest = ciborium::from_reader(&buf[..]).unwrap();
