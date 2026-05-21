@@ -55,6 +55,10 @@ mod opt_bytes {
             None => unreachable!("skip_serializing_if guards None"),
         }
     }
+    // Used by the derived Serialize for AdmissionResponse.challenge_signature
+    // and similar opt-bytes fields. Not called by the custom AdmissionRequest
+    // Deserialize impl (which handles the challenge field directly).
+    #[allow(dead_code)]
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
         let b: serde_bytes::ByteBuf = Deserialize::deserialize(d)?;
         Ok(Some(b.into_vec()))
@@ -84,12 +88,56 @@ pub const MAX_REVOCATIONS_PER_RESPONSE: usize = 1024;
 /// on pre-Phase-A2 peers; responders MUST ignore a missing challenge (and omit
 /// `challenge_signature` in their response). `#[serde(default)]` +
 /// `skip_serializing_if` keeps v1 wire encodings byte-identical.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// **Backward compat (Phase A2):** pre-Phase-A2 peers sent `AdmissionRequest`
+/// as a unit struct (`struct AdmissionRequest;`). ciborium serializes unit
+/// structs as CBOR null (`0xf6`); zero-field named structs encode as an empty
+/// map (`0xa0`). The custom `Deserialize` impl handles null, empty map, and
+/// the current map encoding transparently so old-peer requests are accepted.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct AdmissionRequest {
     /// Fresh 32-byte nonce the requester wants the responder to sign.
     /// `None` on pre-Phase-A2 peers; responders skip challenge-response if absent.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_bytes")]
     pub challenge: Option<Vec<u8>>,
+}
+
+impl<'de> serde::Deserialize<'de> for AdmissionRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = AdmissionRequest;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "AdmissionRequest map or null (pre-Phase-A2 compat)")
+            }
+            // CBOR null — pre-Phase-A2 unit-struct wire format.
+            fn visit_none<E: serde::de::Error>(self) -> Result<AdmissionRequest, E> {
+                Ok(AdmissionRequest { challenge: None })
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<AdmissionRequest, E> {
+                Ok(AdmissionRequest { challenge: None })
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<AdmissionRequest, A::Error> {
+                let mut challenge: Option<Vec<u8>> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "challenge" => {
+                            let buf: serde_bytes::ByteBuf = map.next_value()?;
+                            challenge = Some(buf.into_vec());
+                        }
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AdmissionRequest { challenge })
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
 }
 
 /// Response carrying the peer's admission cert and (optionally) a
@@ -355,20 +403,36 @@ mod tests {
     /// to `None`. Pins the backwards-compat wire invariant.
     #[test]
     fn admission_request_decodes_pre_a2_wire_without_challenge_field() {
-        // Pre-Phase-A2 `AdmissionRequest` was a unit struct. ciborium
-        // serializes unit structs (`struct Foo;`) as CBOR null (0xf6), not
-        // as an empty map — so we reproduce the actual pre-A2 on-wire shape
-        // using a zero-named-field struct `{}` which ciborium encodes as an
-        // empty map (0xa0), exactly what the old `AdmissionRequest { }` emits.
+        // Pre-Phase-A2 `AdmissionRequest` had no fields. ciborium encodes
+        // a zero-named-field struct as CBOR empty map (0xa0). The Phase-A2
+        // schema must accept an empty map — no "challenge" key → `challenge`
+        // defaults to `None`. The custom `Deserialize` impl additionally
+        // handles actual null (0xf6) from any peer that sent a true unit
+        // struct, covering both wire variants for full backward compat.
         #[derive(Serialize)]
         struct PreA2Wire {}
         let pre_a2 = PreA2Wire {};
         let mut buf = Vec::new();
         ciborium::into_writer(&pre_a2, &mut buf).unwrap();
+        // PreA2Wire{} encodes as CBOR empty map (0xa0); verify that.
+        assert_eq!(
+            buf,
+            &[0xa0u8],
+            "PreA2Wire{{}} must encode as CBOR empty map"
+        );
         let round: AdmissionRequest = ciborium::from_reader(&buf[..]).unwrap();
         assert!(
             round.challenge.is_none(),
             "missing Phase-A2 challenge field must default to None"
+        );
+
+        // Also verify that actual CBOR null (0xf6) — the true unit-struct
+        // encoding — is accepted by the custom Deserialize impl.
+        let null_buf = &[0xf6u8];
+        let from_null: AdmissionRequest = ciborium::from_reader(&null_buf[..]).unwrap();
+        assert!(
+            from_null.challenge.is_none(),
+            "CBOR null must also decode as default AdmissionRequest"
         );
     }
 

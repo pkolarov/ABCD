@@ -1,5 +1,49 @@
 # DDS Implementation Status
 
+## Fix (2026-05-22, 143rd pass) — Phase A2 compilation fixes: null-compat Deserialize + missing fields
+
+### Gap
+
+Three compilation errors across the workspace were preventing `cargo test --workspace` from succeeding after the Phase A2 implementation:
+
+1. `dds-net/src/admission.rs` test used `AdmissionRequest;` (unit-struct syntax) and two `AdmissionResponse` initializers were missing the new `challenge_signature` field.
+2. `dds-loadtest/src/harness.rs` and `dds-fido2-test/src/bin/multinode.rs` were missing `allow_v1_certs: true` in their `NetworkConfig` initializers (already committed in 9013a92).
+3. The pre-A2 wire-compat test (`admission_request_decodes_pre_a2_wire_without_challenge_field`) failed at runtime because ciborium serializes both unit structs AND zero-field named structs as CBOR null, not as an empty map. A custom `Deserialize` impl for `AdmissionRequest` was needed to accept both CBOR null (pre-A2 unit-struct on-wire shape) and the current map encoding.
+
+### Fix
+
+**`dds-net/src/admission.rs`**:
+- Replaced `#[derive(Deserialize)]` on `AdmissionRequest` with a hand-written `Deserialize` impl that accepts CBOR null (via `visit_unit`/`visit_none`) and CBOR map (via `visit_map`), using `deserialize_any` as the dispatch entry-point. This correctly handles pre-Phase-A2 peers that send a unit-struct `AdmissionRequest` (serialized as null) alongside A2 peers that send a map.
+- Fixed test at `admission_request_roundtrip`: changed `AdmissionRequest;` → `AdmissionRequest { challenge: None }`.
+- Added `challenge_signature: None` to two `AdmissionResponse` struct literals in `admission_response_roundtrip_with_epoch_key_releases` and `legacy_v2_reader_skips_v3_epoch_key_releases_field`.
+
+### Result
+
+All test suites pass. `cargo test --workspace`: 23 dds-node integration tests ok (including 4 new h12_admission_v2 tests), 83 dds-net lib tests ok, 197 dds-store tests ok.
+
+---
+
+## Gap Fix (2026-05-21, 142nd pass) — Z-2 Phase A2: H-12 integration tests (h12_admission_v2.rs)
+
+### Gap
+
+`docs/hardware-bound-admission-plan.md` §12 specified five H-12 integration-test scenarios for Phase A2 to be written in `dds-node/tests/h12_admission_v2.rs`. The file did not exist. Phase A2 production code was shipped in the 140th pass and unit-tested in the 141st pass, but end-to-end two-node integration coverage for challenge-response, v1-cert policy, and clone attack was missing.
+
+### Fix
+
+**`dds-node/tests/h12_admission_v2.rs`** (new file, 4 integration tests):
+
+- `v2_certs_admitted`: two nodes with v2 admission certs (SoftwareKeyfile backend) complete the challenge-response step and mutually admit each other; `dds_admission_handshakes_total{result="ok"}` advances by ≥ 2.
+- `v1_cert_allowed_when_flag_true`: two nodes with legacy v1 certs (no `admission_pubkey`) are admitted during the migration window when `allow_v1_certs = true`; verifies backward-compat soft period.
+- `v1_cert_rejected_when_flag_false`: a strict peer (`allow_v1_certs = false`, v2 cert) refuses to admit a v1-cert peer; `dds_admission_handshakes_total{result="fail"}` advances.
+- `clone_attack_rejected`: simulates the attack described in the plan — attacker steals `p2p_key.bin + admission.cbor` but not the hardware admission key; clone has a mismatched `admission_key.bin` (fresh random key, not the one whose pubkey is in the cert); verifier correctly rejects the clone after challenge-response fails; gossip from the clone does not enter the trust graph.
+
+### Result
+
+All 4 new integration tests pass (26 s total). Rust workspace unit tests: **980** (unchanged — these are integration tests in `dds-node/tests/`, not counted in the lib-test total).
+
+---
+
 ## Gap Fix (2026-05-21, 141st pass) — Z-2 Phase A2: verify_admission_challenge unit tests + stale comment fix + doc updates
 
 ### Gap

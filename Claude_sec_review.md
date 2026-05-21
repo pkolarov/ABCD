@@ -2057,6 +2057,11 @@ for the complete ledger.
 - **8 new unit tests** in `dds-node::node::admission_challenge_tests`:
   Ed25519 valid/wrong-sig/wrong-key/bad-pubkey-len/bad-sig-len,
   ECDSA-P256 valid/wrong-sig/bad-pubkey.
+- **4 new integration tests** in `dds-node/tests/h12_admission_v2.rs`
+  (142nd pass): `v2_certs_admitted` (two-node challenge-response positive),
+  `clone_attack_rejected` (stolen cert + mismatched admission key → H-12
+  rejection), `v1_cert_allowed_when_flag_true` (migration-window compat),
+  `v1_cert_rejected_when_flag_false` (post-migration enforcement).
 
 **Attack status after Phase A2:** A peer presenting a v2 cert
 (admission_pubkey set) must prove possession of the matching private key

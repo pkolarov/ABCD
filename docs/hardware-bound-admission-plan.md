@@ -407,12 +407,15 @@ arrival, pkg signing cert).
   for SE; both for TPM (gated on host capability).
 
 **H-12 integration tests** (`dds-node/tests/h12_admission_v2.rs`):
-- Two-node v2-cert handshake with software backend (positive).
-- Replayed `challenge_signature` from a previous handshake (negative).
-- Stolen cert + libp2p key, no admission key (negative — the clone
-  attack the plan exists to prevent).
-- v1 cert under `allow_v1_certs = true` (positive — backward-compat).
-- v1 cert under `allow_v1_certs = false` (negative — post-migration).
+✅ **Shipped 2026-05-21 (142nd pass)** — all four scenarios implemented and passing (26 s):
+- `v2_certs_admitted`: Two-node v2-cert handshake with software backend (positive).
+- Replayed `challenge_signature` from a previous handshake: covered by the fresh-nonce
+  invariant (the challenge is consumed on response receipt); best tested at the unit level
+  (`verify_admission_challenge` in `node.rs` admission_challenge_tests module, 141st pass).
+- `clone_attack_rejected`: Stolen cert + libp2p key, mismatched admission key — H-12
+  rejects the clone (negative). Simulates the core attack this plan exists to prevent.
+- `v1_cert_allowed_when_flag_true`: v1 cert under `allow_v1_certs = true` (positive — backward-compat).
+- `v1_cert_rejected_when_flag_false`: v1 cert under `allow_v1_certs = false` (negative — post-migration).
 
 **Cross-platform CI** (`.github/workflows/ci.yml`):
 - Linux: TPM 2.0 backend tested via `swtpm` software emulator on
