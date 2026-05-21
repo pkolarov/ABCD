@@ -58,7 +58,10 @@ impl SoftwareKeyfile {
              docs/hardware-bound-admission-plan.md §7"
         );
 
-        Ok(Self { signing_key, handle })
+        Ok(Self {
+            signing_key,
+            handle,
+        })
     }
 }
 
@@ -111,7 +114,10 @@ mod tests {
             _ => panic!("expected Ed25519"),
         };
 
-        assert_eq!(pubkey1, pubkey2, "admission key must be stable across loads");
+        assert_eq!(
+            pubkey1, pubkey2,
+            "admission key must be stable across loads"
+        );
     }
 
     #[test]
@@ -133,8 +139,7 @@ mod tests {
             AdmissionPublicKey::Ed25519(b) => b,
             _ => panic!("expected Ed25519"),
         };
-        let verifying_key =
-            ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes).unwrap();
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes).unwrap();
         let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().unwrap();
         let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
         verifying_key.verify(msg, &sig).unwrap();

@@ -550,11 +550,16 @@ impl DdsNode {
         // and platform availability. Zero behavioral change in Phase A1 —
         // the key is loaded and held but not yet wired into H-12 (Phase A2).
         let admission_key_path = config.admission_key_path();
-        let admission_key_provider: Box<dyn dds_core::key_provider::KeyProvider> =
-            Box::new(
-                crate::key_provider::SoftwareKeyfile::load_or_create(&admission_key_path)
-                    .map_err(|e| format!("failed to load/create admission key at {}: {e}", admission_key_path.display()))?,
-            );
+        let admission_key_provider: Box<dyn dds_core::key_provider::KeyProvider> = Box::new(
+            crate::key_provider::SoftwareKeyfile::load_or_create(&admission_key_path).map_err(
+                |e| {
+                    format!(
+                        "failed to load/create admission key at {}: {e}",
+                        admission_key_path.display()
+                    )
+                },
+            )?,
+        );
         info!(
             handle = %admission_key_provider.identity_handle(),
             kind = ?admission_key_provider.provider_kind(),
