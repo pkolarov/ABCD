@@ -299,6 +299,15 @@ pub struct DdsNode {
     /// PeerIds carry the public key via the identity multihash).
     /// `None` only in unit tests that bypass `init()`.
     p2p_signing_key: Option<ed25519_dalek::SigningKey>,
+    /// **Z-2 / Phase A1 — hardware-bound admission key provider**.
+    ///
+    /// Phase A1 ships the `SoftwareKeyfile` backend (`admission_key.bin`).
+    /// Phase A2 wires `sign()` into the H-12 challenge-response step.
+    /// Phase A3/A4 replace the backend with TPM 2.0 / Secure Enclave so
+    /// that exfiltrating files is no longer enough to clone the node.
+    ///
+    /// See `docs/hardware-bound-admission-plan.md` §5 and §7.
+    pub admission_key_provider: Box<dyn dds_core::key_provider::KeyProvider>,
 }
 
 /// Shared live-state snapshot for the Prometheus exposition and the
@@ -535,6 +544,23 @@ impl DdsNode {
         // non-zero from the first Prometheus scrape after init.
         crate::telemetry::record_pq_epoch_id(epoch_keys.my_current_epoch().0);
 
+        // **Z-2 / Phase A1** — load or create the admission key.
+        // Phase A1: always the SoftwareKeyfile backend (admission_key.bin).
+        // Phase A3/A4 will select TPM 2.0 or Secure Enclave based on config
+        // and platform availability. Zero behavioral change in Phase A1 —
+        // the key is loaded and held but not yet wired into H-12 (Phase A2).
+        let admission_key_path = config.admission_key_path();
+        let admission_key_provider: Box<dyn dds_core::key_provider::KeyProvider> =
+            Box::new(
+                crate::key_provider::SoftwareKeyfile::load_or_create(&admission_key_path)
+                    .map_err(|e| format!("failed to load/create admission key at {}: {e}", admission_key_path.display()))?,
+            );
+        info!(
+            handle = %admission_key_provider.identity_handle(),
+            kind = ?admission_key_provider.provider_kind(),
+            "admission key provider loaded"
+        );
+
         // Build trusted roots set
         let trusted_roots: BTreeSet<String> = config.trusted_roots.iter().cloned().collect();
 
@@ -597,6 +623,7 @@ impl DdsNode {
             manual_rotate: Arc::new(tokio::sync::Notify::new()),
             bootstrap_addrs,
             p2p_signing_key,
+            admission_key_provider,
         })
     }
 

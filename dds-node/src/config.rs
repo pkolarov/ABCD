@@ -421,6 +421,15 @@ impl NodeConfig {
         self.data_dir.join("p2p_key.bin")
     }
 
+    /// Path to the admission key file (Phase A1).
+    ///
+    /// Separate from `p2p_key.bin` so the admission key can be migrated to
+    /// a hardware backend (Phase A3/A4) without touching the libp2p identity.
+    /// See `docs/hardware-bound-admission-plan.md` §7.1.
+    pub fn admission_key_path(&self) -> PathBuf {
+        self.data_dir.join("admission_key.bin")
+    }
+
     /// Path to the admission certificate file.
     pub fn admission_path(&self) -> PathBuf {
         self.domain

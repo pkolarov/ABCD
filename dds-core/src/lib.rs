@@ -23,3 +23,4 @@ pub mod token;
 pub mod trust;
 
 pub mod audit;
+pub mod key_provider;

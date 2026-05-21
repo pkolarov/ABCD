@@ -2012,35 +2012,57 @@ cover all five lifecycle scenarios from `docs/pqc-phase-b-plan.md §7`.
 [STATUS.md](STATUS.md) and [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md)
 for the complete ledger.
 
-### Z-2 (High) ❌ open — Hardware-bound identities not implemented
+### Z-2 (High) ⚠ Phase A1 shipped — Hardware-bound identities (A2–A6 pending)
 
 [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md)
-(committed 2026-04-26 as `d5c2da5`) is a design document. **Zero
-production code has shipped.** The current node admission stack is
-software-keyed end-to-end:
+(committed 2026-04-26 as `d5c2da5`) has moved from design-only to
+first production code. **Phase A1 landed 2026-05-21:** the
+`dds-core::key_provider::KeyProvider` trait and the `SoftwareKeyfile`
+backend are in-tree. `DdsNode` now loads / creates `admission_key.bin`
+on every startup via `SoftwareKeyfile::load_or_create`, logs a WARN
+when the software fallback is in use, and holds the provider as
+`DdsNode::admission_key_provider: Box<dyn KeyProvider>` ready for
+Phase A2 wiring.
 
-- libp2p `PeerId` is a software Ed25519 key in
-  `dds-node/src/p2p_identity.rs:115-361`. ChaCha20-Poly1305 + Argon2id
-  at rest, **plaintext in process memory**.
-- `AdmissionBody` (`dds-domain/src/domain.rs`) has no `admission_pubkey`
-  field; H-12 has no challenge-response signing step.
+**What Phase A1 ships:**
+
+- `dds-core/src/key_provider.rs` — `KeyProvider` trait (sign-only, no
+  export; `Send + Sync`), `AdmissionPublicKey` enum (Ed25519 / ECDSA-P256),
+  `ProviderKind` enum (SoftwareKeyfile / Tpm2 / AppleSecureEnclave).
+- `dds-node/src/key_provider.rs` — `SoftwareKeyfile` backend wrapping
+  `p2p_identity::load_or_create` against `<data_dir>/admission_key.bin`.
+  Stable `identity_handle` is SHA-256 of the key path (not a secret).
+  4 unit tests: stable-across-loads, sign/verify round-trip, provider_kind,
+  handle deterministic.
+- `dds-node/src/config.rs` — `NodeConfig::admission_key_path()`.
+- `dds-node/src/node.rs` — `DdsNode::admission_key_provider` field;
+  load-or-create in `DdsNode::init()`.
+
+**What Phase A1 does NOT yet change (attack surface unchanged):**
+
+- `AdmissionBody` (`dds-domain/src/domain.rs`) still has no
+  `admission_pubkey` field; H-12 still has no challenge-response step
+  (Phase A2).
 - Admin-key OS-keystore binding is an explicit TODO in
   `dds-node/src/service.rs` (deferred as M-22 in this review).
-- User FIDO2 attestation is parsed but `none` and `packed`
-  self-attestation are accepted without x5c chain validation by design
+- User FIDO2 attestation: `none` and `packed` self-attestation accepted
+  without x5c chain validation by design
   ([docs/fido2-attestation-allowlist.md](docs/fido2-attestation-allowlist.md)).
 - Domain root key is software Ed25519 by default; FIDO2 only with
-  `--fido2` flag at `init-domain`.
+  `--fido2` at `init-domain`.
 
-**Attack:** Exfiltrating `p2p_key.bin + admission.cbor` from any
-domain node clones the node onto attacker-controlled hardware. With
-the new H-12 admission revocation list (closed 2026-04-26 morning),
-the clone can be contained *after* detection — but detection is the
-hard part, exactly the gap the plan exists to close.
+**Attack still applies until Phase A2 lands:** Exfiltrating
+`p2p_key.bin + admission.cbor` from any domain node clones the node.
+Phase A1 is infrastructure only — it creates the key and holds the
+provider but does not gate admission on it. The structural fix (H-12
+challenge-response) lands in Phase A2.
 
-**Remediation:** execute Phases A1–A6 of
-[docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md).
-Promote the plan from Draft → CRITICAL.
+**Remediation track:** A2 (AdmissionCert v2 + H-12 challenge-response)
+→ A3 (TPM 2.0 Linux/Windows) → A4 (Apple Secure Enclave) → A5
+(Ed25519 on capable dTPMs) → A6 (migration tooling + `allow_v1_certs
+= false` flip) → A7 (threat-model close-out). See
+[docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md)
+§10 for the full phasing table.
 
 ### Z-3 (High) ✅ closed 2026-04-26 follow-up #17 — Audit emission wired
 
