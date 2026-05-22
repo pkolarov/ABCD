@@ -1,5 +1,52 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-23, 152nd pass) — CLI integration tests for init-domain + gen-node-key
+
+### Gaps
+
+**`dds-node init-domain` and `dds-node gen-node-key` had no dedicated CLI integration
+test files.** Both are used as helper functions in many test suites (e.g.,
+`self_admit_cli.rs`, `admission_revocation_cli.rs`) but their own flag validation,
+output format, file creation, and idempotency were never explicitly asserted. Given
+that these are the first two commands in every deployment workflow, a regression in
+either command would silently break the entire admission chain.
+
+### Fix
+
+**`dds-node/tests/init_domain_cli.rs`** — 9 new CLI integration tests:
+- `init_domain_hybrid_creates_files`: `domain.toml` and `domain_key.bin` created.
+- `init_domain_hybrid_stdout_reports_fields`: stdout includes name, id, pubkey,
+  pq_pubkey, and "v2 hybrid" scheme line.
+- `init_domain_legacy_no_pq_pubkey_in_stdout`: `--legacy` prints "v1 legacy"; no
+  `pq_pubkey:` line.
+- `init_domain_legacy_domain_toml_has_no_pq_pubkey`: legacy `domain.toml` omits
+  the `pq_pubkey` field.
+- `init_domain_hybrid_domain_toml_has_pq_pubkey`: hybrid `domain.toml` carries
+  the `pq_pubkey` field.
+- `init_domain_legacy_and_fido2_are_mutually_exclusive`: `--legacy --fido2` exits
+  non-zero and names the conflict in stderr.
+- `init_domain_requires_name_flag`: missing `--name` → non-zero exit + stderr mention.
+- `init_domain_requires_dir_flag`: missing `--dir` → non-zero exit + stderr mention.
+- `init_domain_creates_dir_if_absent`: deeply nested non-existent `--dir` is created.
+
+**`dds-node/tests/gen_node_key_cli.rs`** — 7 new CLI integration tests:
+- `gen_node_key_creates_key_files`: `p2p_key.bin` and `epoch_keys.cbor` created.
+- `gen_node_key_stdout_reports_peer_id_and_kem_pubkey`: stdout includes `data_dir:`,
+  `peer_id:`, `kem_pubkey_hex:`.
+- `gen_node_key_peer_id_has_expected_prefix`: peer_id contains "12D3KooW" (libp2p
+  Ed25519 PeerId prefix).
+- `gen_node_key_kem_pubkey_is_hex`: kem_pubkey_hex is 2432 hex chars (1216-byte
+  HybridKemPublicKey = 32 X25519 + 1184 ML-KEM-768).
+- `gen_node_key_is_idempotent`: two consecutive runs return the same peer_id.
+- `gen_node_key_requires_data_dir_flag`: missing `--data-dir` → non-zero exit.
+- `gen_node_key_creates_data_dir_if_absent`: missing data dir is created on first run.
+
+### Test results
+
+macOS test count: **154 → 170** (16 new passing tests; 0 failures).
+
+---
+
 ## Gap Fix (2026-05-23, 151st pass) — CLI integration tests for stamp-agent-pubkey + Admin Guide Windows MSI helper docs + http_binary_e2e macOS timeout fix
 
 ### Gaps
