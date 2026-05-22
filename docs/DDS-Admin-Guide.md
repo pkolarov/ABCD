@@ -718,6 +718,7 @@ The `dds.toml` file controls all node behavior.
 | `org_hash` | string | required | Organization identifier for gossip topic partitioning |
 | `data_dir` | path | `~/.dds` | Storage directory for database, keys, and certs |
 | `trusted_roots` | string[] | `[]` | Vouchsafe URNs of trust anchors for policy evaluation |
+| `bootstrap_admin_urn` | string | _unset_ | Vouchsafe URN of the bootstrap admin. When set, this admin can vouch for any purpose; non-bootstrap admins must hold a `dds:admin-vouch:<purpose>` capability vouch from the bootstrap admin. Persists across restarts. |
 | `identity_path` | path | `<data_dir>/node_key.bin` | Path to the node's Vouchsafe signing identity |
 | `expiry_scan_interval_secs` | int | `60` | Seconds between expired-token sweep runs |
 
@@ -733,6 +734,7 @@ The `dds.toml` file controls all node behavior.
 | `api_addr` | string | `127.0.0.1:5551` (Linux/macOS dev), `pipe:dds-api` (Windows MSI) | Local HTTP API bind. See **HTTP API transport** below. |
 | `allow_legacy_v1_tokens` | bool | `false` | Accept legacy pre-canonical-CBOR token envelopes on ingest. Turn on briefly during a domain-wide v1 → v2 cutover. |
 | `allow_v1_certs` | bool | `true` | Accept inbound H-12 admission requests from peers that carry a v1 cert (no `admission_pubkey`). Keep `true` during the software→hardware admission key migration window; flip to `false` once every node in the domain has been re-admitted with a v2 cert. See `docs/hardware-bound-admission-plan.md §9`. |
+| `metrics_addr` | string | _unset_ | Optional Prometheus text exposition listener (e.g. `127.0.0.1:9495`). Unset by default so existing deployments do not open a second port without opt-in. Recommended value in cluster: `127.0.0.1:9495` plus a TLS sidecar for off-host scrape. See `docs/observability-plan.md`. |
 | `admission_key_backend` | `"software"` \| `"secure-enclave"` \| `"tpm2"` | `"software"` | Which backend backs the node's admission key at startup. After running `dds-node provision-admission-key --backend secure-enclave`, set this to `"secure-enclave"` so the node loads the macOS Secure Enclave key instead of `admission_key.bin`. `"tpm2"` is pending Phase A3. |
 
 #### HTTP API transport (H-7)
@@ -817,8 +819,16 @@ A matching client knob lives in the Policy Agent's
 | `name` | string | required | Human-readable domain name |
 | `id` | string | required | `dds-dom:<base32>` domain identifier |
 | `pubkey` | string | required | Hex-encoded 32-byte Ed25519 domain public key |
+| `pq_pubkey` | string | `""` (absent) | Hex-encoded 1,952-byte ML-DSA-65 public key. Populated automatically by `init-domain` (hybrid mode default). When non-empty, nodes reject any admission cert or revocation that lacks the ML-DSA-65 component — disabling this field is a security downgrade. |
+| `capabilities` | array of strings | `["enc-v3"]` | Domain capability tags. `"enc-v3"` enables Phase B per-message encrypted gossip and sync (publishers wrap payloads in a hybrid ML-KEM-768 AEAD envelope; receivers reject plaintext). Set to `[]` to disable enc-v3 for benchmarks or legacy-fleet compatibility; unrecognised tags are ignored. |
 | `admission_path` | path | `<data_dir>/admission.cbor` | Path to the admission certificate |
 | `audit_log_enabled` | bool | `false` | Enable append-only cryptographic audit log |
+| `audit_log_max_entries` | int | `0` (unlimited) | Maximum audit log entries to retain; oldest are pruned on the next sweep when exceeded |
+| `audit_log_retention_days` | int | `0` (no age limit) | Maximum age in days for audit log entries; older entries are pruned on the next sweep |
+| `max_delegation_depth` | int | `5` | Maximum vouch chain depth (root → admin → sub-admin → user = depth 3). Bounds trust graph traversal; chains longer than this are rejected. |
+| `enforce_device_scope_vouch` | bool | `false` | (M-7) When `true`, a device's self-attested `tags` / `org_unit` are only honoured for policy or software scoping if a trusted root has also vouched for the device with purpose `dds:device-scope`. Flip on once all enrolled devices have been vouched. |
+| `allow_unattested_credentials` | bool | `false` | Accept FIDO2 credentials with `fmt = "none"` (no attestation). **Dev/test only** — each unattested enrollment is logged at WARN. Do not set in production. |
+| `epoch_rotation_secs` | int | `86400` (24 h) | Phase B PQC epoch key rotation interval in seconds. The node rolls a new 32-byte AEAD epoch key and re-emits `EpochKeyRelease` to admitted peers on this cadence. Shorter values increase rekeying overhead; longer values widen the window if an epoch key is compromised. Must be > 0. |
 | `fido2_allowed_aaguids` | list of UUID strings | `[]` (any AAGUID accepted) | Phase 1 of [`fido2-attestation-allowlist.md`](fido2-attestation-allowlist.md). When non-empty, enrollment rejects any FIDO2 credential whose AAGUID is not in the list. Each entry is a canonical UUID or a 32-char bare hex string. Unparseable entries make the node refuse to start. |
 | `fido2_attestation_roots` | array of tables `{ aaguid, ca_pem_path }` | `[]` (no per-AAGUID strict mode) | Phase 2 of [`fido2-attestation-allowlist.md`](fido2-attestation-allowlist.md). Per-AAGUID PEM trust roots. For any listed AAGUID, enrollment requires `attStmt.x5c` and validates the chain to one of the certs in `ca_pem_path`. The leaf's `id-fido-gen-ce-aaguid` extension must match the authData AAGUID. Use `[[domain.fido2_attestation_roots]]` table-array entries in TOML. |
 
@@ -863,6 +873,12 @@ id = "dds-dom:4z2vjf6zjk3j3xkwcu58ftwks61uyd4a"
 pubkey = "a1b2c3d4e5f6..."
 admission_path = "/opt/dds/data/admission.cbor"
 audit_log_enabled = true
+audit_log_max_entries = 100_000   # 0 = unlimited
+audit_log_retention_days = 90     # 0 = no age limit
+# Uncomment to disable enc-v3 encrypted gossip (default enabled):
+# capabilities = []
+# Uncomment to tune Phase B PQC epoch key rotation interval (default 24 h):
+# epoch_rotation_secs = 86400
 ```
 
 ### Environment Variables

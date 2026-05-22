@@ -1,5 +1,56 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-22, 149th pass) — Test + doc: rewrap-identity CLI tests + Admin Guide config table gaps
+
+### Gaps
+
+**1. `dds-node rewrap-identity` had no CLI integration tests.**
+`cmd_rewrap_identity` re-encrypts `node_key.bin` and `p2p_key.bin` under a
+new passphrase (or strips encryption). It is the primary key-passphrase
+migration path described in the Admin Guide, but had zero CLI-level test
+coverage. Similar commands (`rotate-identity`, `provision-admission-key`,
+etc.) have dedicated integration test files.
+
+**2. `DDS-Admin-Guide.md` config reference tables were missing fields.**
+The `[domain]` section table was missing 8 fields that `DomainConfig` carries:
+`pq_pubkey`, `capabilities`, `audit_log_max_entries`, `audit_log_retention_days`,
+`max_delegation_depth`, `enforce_device_scope_vouch`, `allow_unattested_credentials`,
+and `epoch_rotation_secs` (Phase B.9 PQC rotation knob). The `[network]` section
+table was missing `metrics_addr`. The top-level table was missing
+`bootstrap_admin_urn`. Operators who relied on the table as the authoritative
+reference could not discover these knobs.
+
+### Fix
+
+**`dds-node/tests/rewrap_identity_cli.rs`** — 7 new CLI integration tests:
+- `rewrap_identity_missing_data_dir_fails`: error when data_dir absent.
+- `rewrap_identity_missing_node_key_fails`: error when only `p2p_key.bin` present.
+- `rewrap_identity_missing_p2p_key_fails`: error when only `node_key.bin` present.
+- `rewrap_identity_plaintext_roundtrip_peer_id_unchanged`: PeerId identical
+  after rewrap; both key files remain loadable.
+- `rewrap_identity_backup_created_by_default`: `node_key.bin.bak` and
+  `p2p_key.bin.bak` appear without `--no-backup`.
+- `rewrap_identity_no_backup_skips_backup_files`: `--no-backup` skips backups.
+- `rewrap_identity_stdout_reports_peer_id_and_encryption_status`: stdout
+  includes PeerId and `PLAINTEXT` annotation when no passphrase is set.
+
+**`docs/DDS-Admin-Guide.md`** — added missing config table rows:
+- `[domain]` table: `pq_pubkey`, `capabilities`, `audit_log_max_entries`,
+  `audit_log_retention_days`, `max_delegation_depth`, `enforce_device_scope_vouch`,
+  `allow_unattested_credentials`, `epoch_rotation_secs`.
+- `[network]` table: `metrics_addr`.
+- Top-level table: `bootstrap_admin_urn`.
+- Full-config example: added `audit_log_max_entries`, `audit_log_retention_days`,
+  and commented guidance for `capabilities` / `epoch_rotation_secs`.
+
+### Result
+
+All `rewrap-identity` error and success paths are now pinned by integration
+tests (7 new, all passing in 379 s). Admin Guide config reference tables now
+match `config.rs` completely. **0 failures.**
+
+---
+
 ## Gap Fix (2026-05-22, 148th pass) — Docs: add cert_version to self-admit/admit sample output
 
 ### Gap
