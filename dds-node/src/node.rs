@@ -558,23 +558,57 @@ impl DdsNode {
         // non-zero from the first Prometheus scrape after init.
         crate::telemetry::record_pq_epoch_id(epoch_keys.my_current_epoch().0);
 
-        // **Z-2 / Phase A2** — load or create the admission key.
-        // Phase A2: SoftwareKeyfile backend (admission_key.bin); the key is
-        // now wired into H-12 challenge-response (challenge generation in
-        // `send_admission_request`, signing in `handle_admission_event`,
-        // verification in `verify_peer_admission`). Phase A3/A4 will swap in
-        // TPM 2.0 or Secure Enclave without changing the H-12 protocol.
-        let admission_key_path = config.admission_key_path();
-        let admission_key_provider: Box<dyn dds_core::key_provider::KeyProvider> = Box::new(
-            crate::key_provider::SoftwareKeyfile::load_or_create(&admission_key_path).map_err(
-                |e| {
-                    format!(
-                        "failed to load/create admission key at {}: {e}",
-                        admission_key_path.display()
+        // **Z-2 / Phase A2/A4** — load or create the admission key using the
+        // backend selected by `config.network.admission_key_backend`.
+        // Software backend: Ed25519 key at `<data_dir>/admission_key.bin`.
+        // SecureEnclave backend (macOS, Phase A4): ECDSA-P256 key in the
+        //   system keychain; requires `provision-admission-key --backend
+        //   secure-enclave` to have run first.
+        // Tpm2 backend (Phase A3 — pending): returns a startup error.
+        let admission_key_provider: Box<dyn dds_core::key_provider::KeyProvider> = {
+            use crate::config::AdmissionKeyBackend;
+            match config.network.admission_key_backend {
+                AdmissionKeyBackend::Software => {
+                    let admission_key_path = config.admission_key_path();
+                    Box::new(
+                        crate::key_provider::SoftwareKeyfile::load_or_create(
+                            &admission_key_path,
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "failed to load/create software admission key at {}: {e}",
+                                admission_key_path.display()
+                            )
+                        })?,
                     )
-                },
-            )?,
-        );
+                }
+                AdmissionKeyBackend::SecureEnclave => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        Box::new(
+                            crate::apple_secure_enclave::AppleSecureEnclaveKeyProvider::load_or_create(
+                                "dds-node-admission",
+                            )
+                            .map_err(|e| {
+                                format!("failed to load Secure Enclave admission key: {e}")
+                            })?,
+                        )
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    return Err(
+                        "admission_key_backend = \"secure-enclave\" is only supported on macOS"
+                            .into(),
+                    );
+                }
+                AdmissionKeyBackend::Tpm2 => {
+                    return Err(
+                        "admission_key_backend = \"tpm2\" is not yet implemented (Phase A3 pending). \
+                         See docs/hardware-bound-admission-plan.md §7.2."
+                            .into(),
+                    );
+                }
+            }
+        };
         info!(
             handle = %admission_key_provider.identity_handle(),
             kind = ?admission_key_provider.provider_kind(),

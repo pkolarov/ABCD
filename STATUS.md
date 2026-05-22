@@ -1,5 +1,50 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-22, 146th pass) — Phase A4/A6: wire `admission_key_backend` config into `DdsNode::new`
+
+### Gap
+
+Phase A4 shipped `AppleSecureEnclaveKeyProvider` and Phase A6 wired it into
+`provision-admission-key --backend secure-enclave`, but `DdsNode::new` still
+unconditionally loaded `SoftwareKeyfile` regardless of which backend the
+operator had provisioned. An operator who ran
+`provision-admission-key --backend secure-enclave` and then started the node
+would silently get a *different* software key — defeating the hardware-bound
+admission design.
+
+### Fix
+
+**`dds-node/src/config.rs`** — new `AdmissionKeyBackend` enum
+(`Software` | `SecureEnclave` | `Tpm2`) and new
+`network.admission_key_backend` field (default `Software`) in
+`NetworkConfig`. Four new config unit tests:
+`test_admission_key_backend_default_is_software`,
+`test_admission_key_backend_secure_enclave`,
+`test_admission_key_backend_software_explicit`,
+`test_admission_key_backend_tpm2`.
+
+**`dds-node/src/node.rs`** — `DdsNode::new` now matches on
+`config.network.admission_key_backend` to select the correct
+`Box<dyn KeyProvider>`:
+- `Software` → existing `SoftwareKeyfile::load_or_create` path (no behaviour change)
+- `SecureEnclave` → `AppleSecureEnclaveKeyProvider::load_or_create("dds-node-admission")`
+  (`#[cfg(target_os = "macos")]`; returns startup error on other platforms)
+- `Tpm2` → startup error with Phase A3 pending message
+
+**`dds-node/src/main.rs`** — `cmd_provision_admission_key` now prints
+additional instructions when `--backend secure-enclave` is used,
+reminding operators to add `[network] admission_key_backend = "secure-enclave"`
+to `dds.toml` so node startup uses the correct backend.
+
+### Result
+
+Rust workspace: **786 lib tests (4 new config tests); 0 failures.** `cargo
+build -p dds-node` clean. The `secure-enclave` backend provisioned by
+`provision-admission-key` is now the same backend the node uses at startup
+when `network.admission_key_backend = "secure-enclave"` is set.
+
+---
+
 ## Gap Fix (2026-05-22, 145th pass) — Phase A6 (partial): `provision-admission-key` + `rotate-admission-key` CLI subcommands
 
 ### Gap

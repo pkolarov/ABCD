@@ -2107,6 +2107,20 @@ with `issue-self-admission` and flip `allow_v1_certs = false`.
 - Remaining A6 items: TPM 2.0 wiring, `allow_v1_certs = false` default
   flip (deferred until A3 ships).
 
+**Follow-up fix (2026-05-22, 146th pass):**
+
+- `dds-node/src/config.rs` — `AdmissionKeyBackend` enum
+  (`Software` | `SecureEnclave` | `Tpm2`) and new
+  `NetworkConfig.admission_key_backend` field (serde `"software"` |
+  `"secure-enclave"` | `"tpm2"`, default `Software`). 4 new config tests.
+- `dds-node/src/node.rs` — `DdsNode::new` now matches on this field to
+  select `SoftwareKeyfile`, `AppleSecureEnclaveKeyProvider`, or a startup
+  error (Tpm2 pending). Previously always loaded `SoftwareKeyfile`
+  regardless of what `provision-admission-key` had provisioned.
+- `dds-node/src/main.rs` — `provision-admission-key --backend
+  secure-enclave` now prints a reminder to set
+  `[network] admission_key_backend = "secure-enclave"` in `dds.toml`.
+
 **Remediation track:** ~~A1 ✅~~ → ~~A2 ✅~~ → A3 (TPM 2.0 Linux/Windows)
 → ~~A4 ✅~~ → A5 (Ed25519 on capable dTPMs) → A6⚠ (TPM wiring +
 `allow_v1_certs = false` flip) → A7 (threat-model close-out). See

@@ -180,6 +180,26 @@ pub struct Fido2AttestationRoot {
     pub ca_pem_path: PathBuf,
 }
 
+/// Which hardware (or software) backend backs the node's admission key at runtime.
+///
+/// Set `[network] admission_key_backend = "secure-enclave"` in `dds.toml` after
+/// running `dds-node provision-admission-key --backend secure-enclave`.
+/// Defaults to `"software"` so existing deployments that only have
+/// `admission_key.bin` keep working without a config change.
+///
+/// See `docs/hardware-bound-admission-plan.md §7` for the full backend matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdmissionKeyBackend {
+    /// Ed25519 key stored in `<data_dir>/admission_key.bin` (dev/CI fallback).
+    #[default]
+    Software,
+    /// ECDSA-P256 key in the macOS system keychain via Apple Secure Enclave (Phase A4).
+    SecureEnclave,
+    /// TPM 2.0 resident key on Linux/Windows (Phase A3 — pending).
+    Tpm2,
+}
+
 /// Network settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
@@ -245,6 +265,17 @@ pub struct NetworkConfig {
     /// `docs/hardware-bound-admission-plan.md §9`).
     #[serde(default = "default_true")]
     pub allow_v1_certs: bool,
+
+    /// **Phase A4** — which backend backs the node's admission key at runtime.
+    ///
+    /// After running `dds-node provision-admission-key --backend secure-enclave`
+    /// set this to `"secure-enclave"` in `dds.toml` so the node loads the key
+    /// from the macOS system keychain instead of `admission_key.bin`.
+    /// Defaults to `"software"` for backward compatibility.
+    ///
+    /// See `docs/hardware-bound-admission-plan.md §7`.
+    #[serde(default)]
+    pub admission_key_backend: AdmissionKeyBackend,
 }
 
 impl Default for NetworkConfig {
@@ -260,6 +291,7 @@ impl Default for NetworkConfig {
             allow_legacy_v1_tokens: false,
             metrics_addr: None,
             allow_v1_certs: true,
+            admission_key_backend: AdmissionKeyBackend::Software,
         }
     }
 }
@@ -705,5 +737,71 @@ pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
         assert!(config.domain.audit_log_enabled);
         assert_eq!(config.domain.audit_log_max_entries, 10000);
         assert_eq!(config.domain.audit_log_retention_days, 90);
+    }
+
+    #[test]
+    fn test_admission_key_backend_default_is_software() {
+        let toml = format!(
+            r#"
+            org_hash = "abc123"
+            {DOMAIN_TOML}
+        "#
+        );
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert_eq!(
+            config.network.admission_key_backend,
+            AdmissionKeyBackend::Software
+        );
+    }
+
+    #[test]
+    fn test_admission_key_backend_secure_enclave() {
+        let toml = format!(
+            r#"
+            org_hash = "abc123"
+            {DOMAIN_TOML}
+            [network]
+            admission_key_backend = "secure-enclave"
+        "#
+        );
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert_eq!(
+            config.network.admission_key_backend,
+            AdmissionKeyBackend::SecureEnclave
+        );
+    }
+
+    #[test]
+    fn test_admission_key_backend_software_explicit() {
+        let toml = format!(
+            r#"
+            org_hash = "abc123"
+            {DOMAIN_TOML}
+            [network]
+            admission_key_backend = "software"
+        "#
+        );
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert_eq!(
+            config.network.admission_key_backend,
+            AdmissionKeyBackend::Software
+        );
+    }
+
+    #[test]
+    fn test_admission_key_backend_tpm2() {
+        let toml = format!(
+            r#"
+            org_hash = "abc123"
+            {DOMAIN_TOML}
+            [network]
+            admission_key_backend = "tpm2"
+        "#
+        );
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert_eq!(
+            config.network.admission_key_backend,
+            AdmissionKeyBackend::Tpm2
+        );
     }
 }

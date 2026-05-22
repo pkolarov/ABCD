@@ -612,6 +612,8 @@ The `dds.toml` file controls all node behavior.
 | `idle_timeout_secs` | int | `60` | Close idle peer connections after this duration |
 | `api_addr` | string | `127.0.0.1:5551` (Linux/macOS dev), `pipe:dds-api` (Windows MSI) | Local HTTP API bind. See **HTTP API transport** below. |
 | `allow_legacy_v1_tokens` | bool | `false` | Accept legacy pre-canonical-CBOR token envelopes on ingest. Turn on briefly during a domain-wide v1 → v2 cutover. |
+| `allow_v1_certs` | bool | `true` | Accept inbound H-12 admission requests from peers that carry a v1 cert (no `admission_pubkey`). Keep `true` during the software→hardware admission key migration window; flip to `false` once every node in the domain has been re-admitted with a v2 cert. See `docs/hardware-bound-admission-plan.md §9`. |
+| `admission_key_backend` | `"software"` \| `"secure-enclave"` \| `"tpm2"` | `"software"` | Which backend backs the node's admission key at startup. After running `dds-node provision-admission-key --backend secure-enclave`, set this to `"secure-enclave"` so the node loads the macOS Secure Enclave key instead of `admission_key.bin`. `"tpm2"` is pending Phase A3. |
 
 #### HTTP API transport (H-7)
 

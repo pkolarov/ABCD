@@ -889,6 +889,15 @@ fn cmd_provision_admission_key(args: &[String]) -> Result<(), Box<dyn std::error
     println!("  dds-node admit --domain-key <FILE> --domain <FILE> \\");
     println!("    --peer-id <PEER_ID> --admission-pubkey {pubkey_hex} --out admission.cbor");
     println!();
+    if backend == "secure-enclave" {
+        println!("Because you used --backend secure-enclave, also add to dds.toml:");
+        println!("  [network]");
+        println!("  admission_key_backend = \"secure-enclave\"");
+        println!();
+        println!("Without this config change the node will fall back to the software backend");
+        println!("on startup and sign with a different key than what was provisioned.");
+        println!();
+    }
     println!("(Omit --admission-pubkey to issue a v1 cert; v1 certs skip hardware attestation)");
     Ok(())
 }
