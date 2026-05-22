@@ -1,5 +1,27 @@
 # DDS Implementation Status
 
+## Fix (2026-05-22, 144th pass) — Phase A4: Apple Secure Enclave backend compile fixes + SE test #[ignore]
+
+### Gap
+
+`dds-node/src/apple_secure_enclave.rs` was added (Phase A4) but had three compile errors and four tests that failed at runtime in headless/CI contexts:
+
+1. **`SearchResult` missing from import**: `find_existing` matched `Some(Reference::Key(k))` but `ItemSearchOptions::search()` returns `Vec<SearchResult>`, so the correct pattern is `Some(SearchResult::Ref(Reference::Key(k)))`. `SearchResult` was not in the `use security_framework::item::{...}` import.
+2. **`ToVoid` trait not in scope**: `cleanup_test_key` calls `.to_void()` on `CFString` and `CFBoolean` values but only imported `base::TCFType`, not `base::ToVoid`. The compiler suggested `use core_foundation::base::ToVoid;`.
+3. **Doc comment incorrect**: The `AdmissionRequest` doc said ciborium serializes "unit structs (and zero-field structs)" as CBOR null, but zero-field named structs `struct Foo {}` encode as CBOR empty map (0xa0); only true unit structs `struct Foo;` encode as null. Fixed to distinguish the two.
+4. **SE hardware tests not `#[ignore]`d**: `se_sign_verify_roundtrip`, `se_stable_across_loads`, `provider_kind_is_apple_se`, `identity_handle_is_64_char_hex` call `SecKeyCreateRandomKey` which returns OSStatus -25308 (`errSecInteractionNotAllowed`) in non-interactive sessions (CI, background shell). Tests marked `#[ignore = "requires SE hardware with interactive keychain session"]`.
+
+### Fix
+
+- **`dds-node/src/apple_secure_enclave.rs`**: Added `SearchResult` to `use security_framework::item::{}` import; added `ToVoid` to `use core_foundation::base::{}` import; added `#[ignore]` to the 4 SE-hardware tests.
+- **`dds-net/src/admission.rs`**: Fixed doc comment — "unit structs (and zero-field structs)" → "unit structs; zero-field named structs encode as empty map (`0xa0`)".
+
+### Result
+
+Rust workspace: **346 lib tests pass, 4 ignored** (SE hardware); 0 failures. `cargo check -p dds-node` clean.
+
+---
+
 ## Fix (2026-05-22, 143rd pass) — Phase A2 compilation fixes: null-compat Deserialize + missing fields
 
 ### Gap

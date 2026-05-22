@@ -84,6 +84,15 @@ windows-sys = { version = "0.60", features = [
 # this, SCM times out and orphans the process.
 windows-service = "0.7"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Phase A4 — Apple Secure Enclave admission key backend.
+# `security-framework` wraps Apple Security.framework for SE key generation
+# and ECDSA-P256 signing; `security-framework-sys` exposes the raw constants
+# we need (kSecAccessControlPrivateKeyUsage).
+security-framework = "3"
+security-framework-sys = "2"
+core-foundation = "0.10"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 ed25519-dalek = { workspace = true, features = ["std"] }
