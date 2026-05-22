@@ -192,6 +192,48 @@ fn self_admit_fails_without_p2p_key() {
     );
 }
 
+/// Phase A6 migration: when `admission_key.bin` exists in the data dir
+/// (created by `provision-admission-key`), `self-admit` embeds the pubkey
+/// and produces a v2 cert. The output must confirm `cert_version: v2`.
+#[test]
+fn self_admit_with_admission_key_produces_v2_cert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    init_hybrid_domain(dir);
+    gen_node_key(dir);
+
+    // Provision the admission key so self-admit picks it up.
+    let status = dds_node_bin()
+        .args([
+            "provision-admission-key",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--backend",
+            "software",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "provision-admission-key should succeed");
+    assert!(
+        dir.join("admission_key.bin").exists(),
+        "admission_key.bin must exist after provisioning"
+    );
+
+    let (ok, stdout, stderr) =
+        run_capture(dds_node_bin().args(["self-admit", "--data-dir", dir.to_str().unwrap()]));
+    assert!(
+        ok,
+        "self-admit should succeed with admission key; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("cert_version: v2"),
+        "cert_version must be v2 when admission_key.bin is present; got:\n{stdout}"
+    );
+}
+
 /// On a hybrid domain with epoch_keys.cbor missing, self-admit should warn
 /// but still succeed (produces cert without kem_pubkey).
 #[test]

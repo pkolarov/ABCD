@@ -176,6 +176,7 @@ Self-admission cert issued:
   issued_at:  1714086000
   expires:    never
   kem_pubkey: set
+  cert_version: v1 (no admission key — run provision-admission-key first for v2)
   out:        acme/admission.cbor
 ```
 
@@ -580,6 +581,19 @@ dds-node admit \
   --domain-key /path/to/domain_key.bin \
   --peer-id 12D3KooW... \
   --data-dir /opt/dds/data
+```
+
+Sample output:
+
+```
+Admission cert issued:
+  domain:      acme.com (dds-dom:XXXXX)
+  peer_id:     12D3KooWAbCdEf...
+  issued_at:   1714086000
+  expires:     never
+  kem_pubkey:  set (1216 bytes)
+  cert_version: v2 (hardware-bound admission key embedded)
+  out:         /opt/dds/data/admission.cbor
 ```
 
 Copy the resulting `admission.cbor` to the node and place it at

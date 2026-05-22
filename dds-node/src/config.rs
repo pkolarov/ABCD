@@ -739,6 +739,37 @@ pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
         assert_eq!(config.domain.audit_log_retention_days, 90);
     }
 
+    /// **Phase A6 migration knob** — `allow_v1_certs` defaults to `true`
+    /// (migration window open). When every node in the domain has been
+    /// re-admitted with a v2 cert, flip this to `false` and the default
+    /// here must change to match (see `hardware-bound-admission-plan.md §9`).
+    #[test]
+    fn test_allow_v1_certs_defaults_true() {
+        let toml = format!(r#"org_hash = "abc123"{DOMAIN_TOML}"#);
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert!(
+            config.network.allow_v1_certs,
+            "allow_v1_certs must default to true during the migration window"
+        );
+    }
+
+    #[test]
+    fn test_allow_v1_certs_roundtrip_false() {
+        let toml = format!(
+            r#"
+            org_hash = "abc123"
+            {DOMAIN_TOML}
+            [network]
+            allow_v1_certs = false
+        "#
+        );
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert!(
+            !config.network.allow_v1_certs,
+            "allow_v1_certs = false must round-trip through TOML"
+        );
+    }
+
     #[test]
     fn test_admission_key_backend_default_is_software() {
         let toml = format!(

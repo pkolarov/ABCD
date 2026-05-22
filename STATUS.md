@@ -1,5 +1,94 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-22, 148th pass) — Docs: add cert_version to self-admit/admit sample output
+
+### Gap
+
+`DDS-Admin-Guide.md` showed stale sample output blocks for `self-admit` and
+`admit` that were missing the `cert_version` field added in the 147th pass.
+Operators following the guide would not see the v1/v2 indicator in the
+"expected" output, making it harder to verify a successful hardware-bound
+migration.
+
+### Fix
+
+**`docs/DDS-Admin-Guide.md`**:
+- `self-admit` sample output (§ Completing Genesis on the Anchor Node) now
+  includes `cert_version: v1 (no admission key — run provision-admission-key
+  first for v2)`.
+- `admit` sample output added to Step 2 of § Hardware-Bound Admission Keys
+  showing `cert_version: v2 (hardware-bound admission key embedded)` and
+  corrected `kem_pubkey: set (1216 bytes)`.
+
+### Result
+
+Documentation matches the actual CLI output. No code changes; all existing
+tests pass unchanged.
+
+---
+
+## Gap Fix (2026-05-22, 147th pass) — Test gaps + Phase A6 operator UX
+
+### Gaps
+
+Three clusters of missing test coverage and one operator UX gap were found
+in the Phase A6 admission-key CLI tooling:
+
+**1. `provision-admission-key` error paths untested (3 paths).**
+`cmd_provision_admission_key` had three error-return branches with no unit
+tests: (a) unknown backend string, (b) missing `--data-dir` flag, (c)
+`--backend secure-enclave` on non-macOS. These are error paths exercised
+by operators typing wrong flags and should be pinned.
+
+**2. `allow_v1_certs` config field untested.**
+`NetworkConfig.allow_v1_certs` (the Phase A6 migration knob, default `true`)
+had no config unit tests, despite its security significance — the default
+will flip to `false` once Phase A3 ships, and a pinned default test
+makes that change visible. `allow_legacy_v1_tokens` had parallel tests;
+`allow_v1_certs` did not.
+
+**3. `self-admit` with admission key untested.**
+`cmd_self_admit` automatically embeds `admission_key.bin` when present (v2
+cert path), but no CLI integration test covered this workflow. The v2 cert
+path is what closes the clone attack in Phase A2, so the production path
+deserved an end-to-end test.
+
+**4. `cert_version` not printed in `self-admit`/`admit` output.**
+Both `cmd_self_admit` and `cmd_admit` printed `kem_pubkey: set/not set` but
+gave no indication whether the cert was v1 or v2. Operators migrating to
+hardware-bound admission keys (Phase A6) had no way to confirm success
+from the command output.
+
+### Fix
+
+**`dds-node/src/main.rs`** — three new unit tests in `admission_key_cmd_tests`:
+- `provision_admission_key_unknown_backend_returns_error`: error mentions "unknown backend" and lists valid options.
+- `provision_admission_key_missing_data_dir_returns_error`: error mentions `--data-dir`.
+- `provision_admission_key_secure_enclave_non_macos_returns_error` (`#[cfg(not(target_os = "macos"))]`): error mentions macOS restriction.
+
+Both `cmd_self_admit` and `cmd_admit` now print:
+- `cert_version: v2 (hardware-bound admission key embedded)` when `cert.body.admission_pubkey.is_some()`
+- `cert_version: v1 (no admission key — run provision-admission-key first for v2)` otherwise
+
+**`dds-node/src/config.rs`** — two new unit tests:
+- `test_allow_v1_certs_defaults_true`: pins the current migration-window default with a
+  doc comment noting the flip target when Phase A3 ships.
+- `test_allow_v1_certs_roundtrip_false`: verifies TOML round-trip for `allow_v1_certs = false`.
+
+**`dds-node/tests/self_admit_cli.rs`** — one new integration test:
+- `self_admit_with_admission_key_produces_v2_cert`: provisions `admission_key.bin` via
+  `provision-admission-key --backend software`, runs `self-admit`, and asserts the output
+  contains `cert_version: v2`.
+
+### Result
+
+Rust workspace: lib tests +2 config; binary unit tests 7 → 9 (+2 error-path tests);
+integration tests 6 → 7 (+1 v2-cert test); **0 failures**. Operators now
+see explicit v1/v2 cert-version confirmation in both `admit` and `self-admit`
+output, closing a Phase A6 UX gap.
+
+---
+
 ## Gap Fix (2026-05-22, 146th pass) — Phase A4/A6: wire `admission_key_backend` config into `DdsNode::new`
 
 ### Gap

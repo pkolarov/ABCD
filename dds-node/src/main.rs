@@ -526,6 +526,11 @@ fn cmd_self_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("  kem_pubkey: not set");
     }
+    if cert.body.admission_pubkey.is_some() {
+        println!("  cert_version: v2 (hardware-bound admission key embedded)");
+    } else {
+        println!("  cert_version: v1 (no admission key — run provision-admission-key first for v2)");
+    }
     println!("  out:        {}", out.display());
     Ok(())
 }
@@ -1165,6 +1170,11 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         );
     } else {
         println!("  kem_pubkey:  not set");
+    }
+    if cert.body.admission_pubkey.is_some() {
+        println!("  cert_version: v2 (hardware-bound admission key embedded)");
+    } else {
+        println!("  cert_version: v1 (no admission key — run provision-admission-key on the node first for v2)");
     }
     println!("  out:         {}", out.display());
     Ok(())
@@ -2070,6 +2080,47 @@ mod admission_key_cmd_tests {
         assert!(
             msg.contains("provision-admission-key"),
             "error must hint at provision-admission-key: {msg}"
+        );
+    }
+
+    #[test]
+    fn provision_admission_key_unknown_backend_returns_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let args = str_args(&["--data-dir", &data_dir, "--backend", "hsm"]);
+        let err = cmd_provision_admission_key(&args).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown backend"),
+            "error must mention unknown backend: {msg}"
+        );
+        assert!(
+            msg.contains("software"),
+            "error must list valid options including software: {msg}"
+        );
+    }
+
+    #[test]
+    fn provision_admission_key_missing_data_dir_returns_error() {
+        let err = cmd_provision_admission_key(&[]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--data-dir"),
+            "error must mention missing --data-dir flag: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn provision_admission_key_secure_enclave_non_macos_returns_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let args = str_args(&["--data-dir", &data_dir, "--backend", "secure-enclave"]);
+        let err = cmd_provision_admission_key(&args).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("macOS"),
+            "error must mention macOS restriction: {msg}"
         );
     }
 }
