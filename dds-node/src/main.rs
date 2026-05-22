@@ -1008,6 +1008,13 @@ fn cmd_rotate_admission_key(args: &[String]) -> Result<(), Box<dyn std::error::E
     );
     println!();
     println!("  2. Restart the node so the new admission key takes effect.");
+    println!();
+    println!("  3. (Optional — if the old key may have been compromised) Revoke the current");
+    println!("     PeerId admission so all peers flush their cached cert and re-verify against");
+    println!("     the new pubkey on next reconnect:");
+    println!("       dds-node revoke-admission --domain-key <FILE> --domain <FILE> \\");
+    println!("         --peer-id <PEER_ID> --reason \"admission key rotated\" --out revocation.cbor");
+    println!("     Distribute revocation.cbor to peers via `import-revocation` or H-12 piggy-back.");
     Ok(())
 }
 

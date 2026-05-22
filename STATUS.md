@@ -1,5 +1,77 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-23, 150th pass) — CLI integration tests for provision-admission-key + rotate-admission-key; UX fix: revoke-admission hint
+
+### Gaps
+
+**1. `dds-node provision-admission-key` and `dds-node rotate-admission-key` had no CLI integration tests.**
+Both Phase A6 subcommands had unit tests inside `dds-node/src/main.rs` (calling
+the `cmd_*` functions directly) but no dedicated integration test files that
+exercise the compiled binary through `Command::new(env!("CARGO_BIN_EXE_dds-node"))`.
+This mirrors the gap closed for `dds-node rewrap-identity` in the 149th pass.
+Without integration tests, stdout format regressions (pubkey hex, backup path,
+admin follow-up hints) go undetected.
+
+**2. `rotate-admission-key` stdout was missing a revoke-admission hint.**
+`cmd_rotate_admission_key` printed a 2-step admin sequence (issue new cert →
+restart) but omitted an optional step 3 advising operators to revoke the
+current PeerId's admission if the old key may have been compromised. The
+`rotate-identity` command includes the equivalent hint (pointing to
+`revoke-admission` for the old PeerId); `rotate-admission-key` did not,
+leaving operators without guidance for the compromise-recovery path.
+
+### Fix
+
+**`dds-node/tests/provision_admission_key_cli.rs`** — 8 new CLI integration tests:
+- `provision_admission_key_software_creates_key_file`: key file written; printed
+  pubkey matches the on-disk key.
+- `provision_admission_key_software_pubkey_is_32_bytes_hex`: Ed25519 pubkey is
+  exactly 64 hex chars.
+- `provision_admission_key_is_idempotent`: two consecutive runs on the same
+  data_dir return the identical pubkey_hex.
+- `provision_admission_key_stdout_includes_backend_and_data_dir`: stdout includes
+  backend label, data_dir path, and `dds-node admit` follow-up hint.
+- `provision_admission_key_default_backend_is_software`: omitting `--backend`
+  creates `admission_key.bin` (software default).
+- `provision_admission_key_tpm2_returns_phase_a3_error`: `--backend tpm2` fails
+  with a Phase A3 pending message.
+- `provision_admission_key_unknown_backend_returns_error`: unknown backend is
+  rejected; error lists `software` as a valid option.
+- `provision_admission_key_fails_without_data_dir_flag`: missing `--data-dir`
+  names the flag in stderr.
+
+**`dds-node/tests/rotate_admission_key_cli.rs`** — 6 new CLI integration tests:
+- `rotate_admission_key_replaces_key_and_keeps_backup_by_default`: key changes;
+  backup file is byte-identical to the pre-rotation key; stdout includes both
+  pubkeys and the `dds-node admit` + `dds-node revoke-admission` hints.
+- `rotate_admission_key_no_backup_skips_backup_file`: `--no-backup` leaves no
+  `.rotated.*` siblings; new key is present.
+- `rotate_admission_key_stdout_reports_old_and_new_pubkey_hex`: both hex strings
+  are 64 chars and present in stdout.
+- `rotate_admission_key_fails_when_data_dir_missing`: error explains missing dir.
+- `rotate_admission_key_fails_when_admission_key_missing`: error names
+  `provision-admission-key` as the remediation step; no files created.
+- `rotate_admission_key_fails_without_data_dir_flag`: missing `--data-dir` is
+  named in stderr.
+
+**`dds-node/src/main.rs` — `cmd_rotate_admission_key`**: added optional step 3
+to stdout: if the old admission key may have been compromised, operators are
+told to run `dds-node revoke-admission ... --peer-id <PEER_ID>` and distribute
+the revocation file so peers flush their cached cert and re-verify against the
+new pubkey on next reconnect.
+
+### Result
+
+All new integration tests pass (8 + 6 = 14 new tests; `rotate` suite 133 s,
+`provision` suite 1.4 s). All existing 352 `dds-node` lib tests continue to
+pass. The two Phase A6 operator-facing subcommands now have end-to-end binary
+coverage matching the pattern set by `rewrap-identity` (149th pass) and
+`rotate-identity`. `rotate-admission-key` stdout now matches the UX pattern
+of `rotate-identity` — both commands direct operators to the revocation step
+when a key compromise is suspected. **0 failures.**
+
+---
+
 ## Gap Fix (2026-05-22, 149th pass) — Test + doc: rewrap-identity CLI tests + Admin Guide config table gaps
 
 ### Gaps
