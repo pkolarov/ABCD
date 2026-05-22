@@ -13,23 +13,24 @@ For background on how DDS works internally, see the [Developer Guide](DDS-Develo
 3. [Adding Nodes](#adding-nodes)
 4. [Revoking a Node's Admission](#revoking-a-nodes-admission)
 5. [Rotating a Node's Identity](#rotating-a-nodes-identity)
-6. [Single-File Provisioning](#single-file-provisioning)
-7. [Node Configuration Reference](#node-configuration-reference)
-8. [Enrolling Users](#enrolling-users)
-9. [Enrolling Devices](#enrolling-devices)
-10. [Admin Bootstrap](#admin-bootstrap)
-11. [Sessions and Authentication](#sessions-and-authentication)
-12. [Groups and Trust](#groups-and-trust)
-13. [Policy Management](#policy-management)
-14. [Windows Deployment](#windows-deployment)
-15. [macOS Deployment](#macos-deployment)
-16. [Linux Deployment](#linux-deployment)
-17. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
-18. [Audit Log](#audit-log)
-19. [Debugging](#debugging)
-20. [Air-Gapped Sync (USB Stick / Courier)](#air-gapped-sync-usb-stick--courier)
-21. [Security Reference](#security-reference)
-22. [Troubleshooting](#troubleshooting)
+6. [Hardware-Bound Admission Keys](#hardware-bound-admission-keys)
+7. [Single-File Provisioning](#single-file-provisioning)
+8. [Node Configuration Reference](#node-configuration-reference)
+9. [Enrolling Users](#enrolling-users)
+10. [Enrolling Devices](#enrolling-devices)
+11. [Admin Bootstrap](#admin-bootstrap)
+12. [Sessions and Authentication](#sessions-and-authentication)
+13. [Groups and Trust](#groups-and-trust)
+14. [Policy Management](#policy-management)
+15. [Windows Deployment](#windows-deployment)
+16. [macOS Deployment](#macos-deployment)
+17. [Linux Deployment](#linux-deployment)
+18. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
+19. [Audit Log](#audit-log)
+20. [Debugging](#debugging)
+21. [Air-Gapped Sync (USB Stick / Courier)](#air-gapped-sync-usb-stick--courier)
+22. [Security Reference](#security-reference)
+23. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -527,6 +528,111 @@ sealed-passphrase runbooks
 ([Linux](../platform/linux/packaging/SEALED-PASSPHRASE.md),
 [macOS](../platform/macos/packaging/SEALED-PASSPHRASE.md)) contain
 the complete seal-then-rewrap procedure for each OS.
+
+---
+
+## Hardware-Bound Admission Keys
+
+By default, each node's admission key is a software Ed25519 key stored in
+`<data_dir>/admission_key.bin`.  An attacker who copies `p2p_key.bin` and
+`admission.cbor` off disk can clone the node on different hardware.
+Hardware-bound backends prevent this by making the private key
+non-exportable — tied to the Apple Secure Enclave (macOS) or TPM 2.0
+(Linux/Windows, Phase A3 pending).
+
+This section covers the currently-available **software → Secure Enclave**
+migration path for macOS nodes.  The TPM 2.0 path is identical in structure
+but is blocked on Phase A3 hardware testing.  See
+`docs/hardware-bound-admission-plan.md` for the full plan and migration guide.
+
+### Step 1: Generate the Hardware-Bound Key
+
+On the node machine (macOS only for Secure Enclave):
+
+```bash
+dds-node provision-admission-key --data-dir /opt/dds/data --backend secure-enclave
+```
+
+Sample output:
+
+```
+admission_key_backend: secure-enclave
+admission_pubkey_hex:  04a1b2c3d4...f0  (65 bytes uncompressed P-256)
+
+Next step (admin machine):
+  dds-node admit --admission-pubkey 04a1b2c3d4...f0 --domain-key /path/to/domain_key.bin \
+    --peer-id 12D3KooW... --data-dir /opt/dds/data
+Also update dds.toml:
+  [network]
+  admission_key_backend = "secure-enclave"
+```
+
+Copy the `admission_pubkey_hex` for the next step.  The command is idempotent
+— running it a second time prints the existing key without generating a new one.
+
+### Step 2: Issue a v2 Admission Certificate
+
+On the **admin machine**, bind the hardware public key into the cert:
+
+```bash
+dds-node admit \
+  --admission-pubkey 04a1b2c3d4...f0 \
+  --domain-key /path/to/domain_key.bin \
+  --peer-id 12D3KooW... \
+  --data-dir /opt/dds/data
+```
+
+Copy the resulting `admission.cbor` to the node and place it at
+`<data_dir>/admission.cbor` (the node detects the new cert on restart).
+
+### Step 3: Configure the Node to Use the Hardware Backend
+
+Edit `<data_dir>/dds.toml` and add the backend field under `[network]`:
+
+```toml
+[network]
+admission_key_backend = "secure-enclave"
+```
+
+Restart the node.  On startup it now loads the Secure Enclave key instead
+of `admission_key.bin`.  The log line will say `admission_key_backend=secure-enclave`
+rather than the WARNING about software-resident keys.
+
+### Rotating the Admission Key
+
+If the admission key is compromised (or as a scheduled rotation), generate a
+new key and re-issue the cert in one pass:
+
+```bash
+# Stop the node first.
+sudo systemctl stop dds-node   # or launchctl unload on macOS
+
+# Rotate (software backend only — SE keys must be deleted from Keychain
+# manually before re-running provision-admission-key --backend secure-enclave).
+dds-node rotate-admission-key --data-dir /opt/dds/data
+# Default: backs up admission_key.bin → admission_key.bin.rotated.<timestamp>
+# Add --no-backup to skip the backup.
+```
+
+The command prints the old and new public keys and the admin follow-up steps
+(re-issue cert, restart node) — the same workflow as Step 2 above.
+
+### Domain-Wide Migration Window
+
+During rollout, nodes with old v1 certs (no `admission_pubkey`) can still
+connect because `allow_v1_certs = true` (the default).  Once **every** node
+has been migrated and restarted with a v2 cert, flip the flag in every node's
+`dds.toml`:
+
+```toml
+[network]
+allow_v1_certs = false
+```
+
+This enforces hardware-bound identity for all future H-12 admission
+handshakes.  The v2 cert carries the admission public key; peers challenge
+the new joiner to prove possession — a file copy without the hardware cannot
+respond.
 
 ---
 

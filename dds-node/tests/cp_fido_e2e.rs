@@ -190,6 +190,7 @@ fn write_node_fixture(
             allow_legacy_v1_tokens: false,
             metrics_addr: None,
             allow_v1_certs: true,
+            admission_key_backend: Default::default(),
         },
         org_hash: "cp-e2e-org".to_string(),
         domain: DomainConfig {

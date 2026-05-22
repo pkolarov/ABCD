@@ -84,6 +84,7 @@ fn spawn_node(domain_key: &DomainKey) -> (DdsNode, tempfile::TempDir) {
             allow_legacy_v1_tokens: false,
             metrics_addr: None,
             allow_v1_certs: true,
+            admission_key_backend: Default::default(),
         },
         org_hash: "test-org".to_string(),
         domain: dds_node::config::DomainConfig {

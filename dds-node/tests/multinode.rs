@@ -63,6 +63,7 @@ async fn spawn_node_with_bootstrap(org: &str, bootstrap_peers: Vec<String>) -> (
             allow_legacy_v1_tokens: false,
             metrics_addr: None,
             allow_v1_certs: true,
+            admission_key_backend: Default::default(),
         },
         org_hash: org.to_string(),
         domain: dds_node::config::DomainConfig {
@@ -131,6 +132,7 @@ async fn spawn_node(org: &str) -> (DdsNode, TempDir) {
             allow_legacy_v1_tokens: false,
             metrics_addr: None,
             allow_v1_certs: true,
+            admission_key_backend: Default::default(),
         },
         org_hash: org.to_string(),
         domain: dds_node::config::DomainConfig {
