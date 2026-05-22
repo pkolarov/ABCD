@@ -1919,6 +1919,85 @@ dotnet test
 
 See [platform/windows/e2e/README.md](../platform/windows/e2e/README.md) for the full test matrix.
 
+### Windows MSI Helper Commands
+
+The MSI installer runs several `dds-node.exe` custom actions during install and
+repair. These commands are safe to run manually for debugging or re-application.
+
+#### `dds-node stamp-agent-pubkey`
+
+Derives the node's Ed25519 public key from `<data_dir>/node_key.bin` (creating
+the identity if absent) and writes the Base64-encoded key into the
+`DdsPolicyAgent.PinnedNodePubkeyB64` field of the Policy Agent's
+`appsettings.json`. The Policy Agent fails closed when this field is empty, so
+without this stamp the service would crash-loop on first start.
+
+```powershell
+dds-node.exe stamp-agent-pubkey `
+    --data-dir   "C:\ProgramData\DDS\node-data" `
+    --config-dir "C:\Program Files\DDS\config"
+```
+
+Sample output (file present):
+
+```
+Stamped Policy Agent PinnedNodePubkeyB64 from C:\ProgramData\DDS\node-data\node_key.bin into appsettings.json (config_dir=C:\Program Files\DDS\config)
+```
+
+If `appsettings.json` is not found in `config_dir` (or
+`%ProgramFiles%\DDS\config\` as a fallback), the command succeeds silently
+with a "nothing to stamp" notice. This is the expected outcome on dev/loadtest
+hosts without the Policy Agent installed.
+
+The command is idempotent — re-running after a repair or re-provision prints
+the same pubkey and leaves `appsettings.json` unchanged.
+
+MSI custom action: `CA_StampAgentPubkey` (runs after `CA_Provision`).
+
+#### `dds-node seal-passphrase` (Windows only)
+
+Generates a cryptographically random 32-byte passphrase, DPAPI-seals it for
+the local machine account, and writes the sealed blob to
+`%ProgramData%\DDS\node-passphrase.dpapi`. The plaintext passphrase is printed
+to stdout once so the operator can set `DDS_NODE_PASSPHRASE` for the initial
+`rewrap-identity` call.
+
+```powershell
+# Run once during initial setup (requires elevation for %ProgramData%\DDS\):
+$pass = dds-node.exe seal-passphrase
+$env:DDS_NODE_PASSPHRASE = $pass
+dds-node.exe rewrap-identity --data-dir "C:\ProgramData\DDS\node-data"
+```
+
+An existing blob is refused unless `--force` is passed (overwriting makes
+previous node keys unreadable unless `rewrap-identity` is also run):
+
+```powershell
+dds-node.exe seal-passphrase --force          # regenerate
+dds-node.exe seal-passphrase --out <PATH>     # write to a custom path
+```
+
+The sealed blob is consumed at node start by a service wrapper script that
+calls `dds-node.exe unseal-passphrase-from <PATH>` and sets
+`DDS_NODE_PASSPHRASE` before launching `dds-node.exe run`. See
+`platform/windows/installer/DdsBundle.wxs` for the full sequence.
+
+> **Note:** `seal-passphrase` is only functional on Windows (DPAPI). On
+> macOS/Linux the equivalent is the `dds-keychain-seal` / `dds-tpm-seal`
+> helper scripts described in the sealed-passphrase runbooks.
+
+#### `dds-node restrict-data-dir-acl`
+
+Applies a restrictive DACL (`D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`) to
+`<data_dir>` so that only `LocalSystem` and `BUILTIN\Administrators` have
+access — child files inherit. On non-Windows this is a friendly no-op.
+
+```powershell
+dds-node.exe restrict-data-dir-acl --data-dir "C:\ProgramData\DDS"
+```
+
+MSI custom action: `CA_RestrictDataDirAcl` (runs before `CA_Provision`).
+
 ### DDS Console
 
 The MSI installs a PowerShell WPF GUI (`DdsConsole.ps1`) reachable from the

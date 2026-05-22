@@ -414,7 +414,9 @@ fn publish_revocation(node: &mut DdsNode, token: &Token) {
 }
 
 async fn wait_for_status(client: &Client, api_url: &str) -> NodeStatus {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // 60 s to accommodate macOS Gatekeeper binary verification on first run
+    // after a fresh `cargo build`.  On a warm system the node is up in < 2 s.
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Ok(resp) = client.get(format!("{api_url}/v1/status")).send().await {
             if resp.status().is_success() {
@@ -427,6 +429,15 @@ async fn wait_for_status(client: &Client, api_url: &str) -> NodeStatus {
         );
         sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// Pre-warm the dds-node binary so macOS Gatekeeper verification completes
+/// before the long-running node is spawned.  Without this, the first
+/// `RunningNode::spawn` may exceed the `wait_for_status` deadline.
+fn warmup_binary() {
+    // `version` is a fast no-op that forces dyld + Gatekeeper to finish
+    // security verification before we rely on a 20 s startup window.
+    let _ = dds_node_bin().arg("version").output();
 }
 
 /// Enroll a user via FIDO2 attestation on the given node and return
@@ -568,6 +579,7 @@ async fn wait_for_session_failure(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn binary_http_api_end_to_end() {
+    warmup_binary();
     let _lock = BIN_TEST_LOCK
         .get_or_init(tokio::sync::Mutex::default)
         .lock()
@@ -715,6 +727,7 @@ async fn binary_http_api_end_to_end() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn binary_nodes_converge_on_gossip_and_revocation() {
+    warmup_binary();
     let _lock = BIN_TEST_LOCK
         .get_or_init(tokio::sync::Mutex::default)
         .lock()
