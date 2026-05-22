@@ -1,5 +1,51 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-22, 145th pass) — Phase A6 (partial): `provision-admission-key` + `rotate-admission-key` CLI subcommands
+
+### Gap
+
+`docs/hardware-bound-admission-plan.md` §8 and §9 specified two CLI subcommands for Phase A6 migration tooling:
+- `dds-node provision-admission-key --data-dir <DIR> [--backend software|secure-enclave|tpm2]`
+- `dds-node rotate-admission-key --data-dir <DIR> [--no-backup]`
+
+Neither command existed in `dds-node/src/main.rs`. Without `provision-admission-key`, an operator has no standard way to generate the admission key and print the public half that the admin needs for `dds-node admit --admission-pubkey <HEX>`. Without `rotate-admission-key`, there is no scripted path to replace a compromised software admission key.
+
+The `software` backend (`SoftwareKeyfile`) and `secure-enclave` backend (`AppleSecureEnclaveKeyProvider`) are fully implemented (Phase A1 and A4 respectively). The TPM 2.0 backend (Phase A3) is still pending.
+
+### Fix
+
+**`dds-node/src/main.rs`** (+2 new commands, +7 unit tests):
+
+`cmd_provision_admission_key`:
+- `--backend software` (default): calls `SoftwareKeyfile::load_or_create(<data_dir>/admission_key.bin)`, prints pubkey hex.
+- `--backend secure-enclave` (macOS only, `#[cfg(target_os = "macos")]`): calls `AppleSecureEnclaveKeyProvider::load_or_create("dds-node-admission")`, prints pubkey hex.
+- `--backend tpm2`: returns a clear Phase A3 stub error ("TPM 2.0 backend not yet implemented (Phase A3 pending)").
+- Idempotent: re-running with the same backend and data_dir loads the existing key rather than generating a new one.
+- Prints the admin follow-up command (`dds-node admit … --admission-pubkey <HEX>`) so operators have a copy-pasteable workflow.
+
+`cmd_rotate_admission_key`:
+- Software backend only (SE rotation requires deleting from the keychain manually; TPM rotation is blocked on A3).
+- Loads old key to capture old pubkey, optionally backs up `admission_key.bin` to `admission_key.bin.rotated.<unix-ts>`, removes old file, calls `SoftwareKeyfile::load_or_create` to generate a fresh Ed25519 key.
+- `--no-backup` skips the rename and removes the file directly.
+- Prints old and new pubkeys with numbered follow-up admin steps (re-issue cert, restart node).
+
+Both commands added to the `async_main` match and `print_usage()` output.
+
+Unit tests in `admission_key_cmd_tests` module:
+- `provision_admission_key_software_creates_file_and_returns_pubkey`: file exists after provision.
+- `provision_admission_key_is_idempotent`: pubkey unchanged on second call.
+- `provision_admission_key_tpm2_returns_error`: error message mentions Phase A3.
+- `rotate_admission_key_generates_different_key`: new pubkey != old pubkey.
+- `rotate_admission_key_backup_is_created`: `.rotated.` backup present after default rotation.
+- `rotate_admission_key_no_backup_removes_old_file_temporarily`: no backup, new key still present with `--no-backup`.
+- `rotate_admission_key_fails_without_existing_key`: error hints at `provision-admission-key`.
+
+### Result
+
+Rust workspace: **782 lib tests + 7 new binary tests; 5 ignored (SE hardware); 0 failures.** `cargo check --workspace` clean. The 7 new tests are in `dds-node` binary (`admission_key_cmd_tests` module); all pre-existing lib and integration tests unaffected.
+
+---
+
 ## Fix (2026-05-22, 144th pass) — Phase A4: Apple Secure Enclave backend compile fixes + SE test #[ignore]
 
 ### Gap

@@ -1,14 +1,18 @@
 # DDS Hardware-Bound Admission Plan
 
-**Status:** ⚠ **Phase A2 shipped 2026-05-21 — A3–A6 pending.**
+**Status:** ⚠ **Phase A4 + A6 (partial) shipped 2026-05-22 — A3/A5/A6(full) pending.**
 Tracked as **Z-2 (High)** in
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
 Principles Audit". Phase A1 delivered the `KeyProvider` trait and
 `SoftwareKeyfile` backend. Phase A2 wires the challenge-response step
-into H-12: `AdmissionBody.admission_pubkey`, `AdmissionRequest.challenge`,
-`AdmissionResponse.challenge_signature`, `verify_admission_challenge`, and
-8 unit tests. The clone attack is now blocked for v2-cert peers.
-Phases A3–A6 remain top-of-queue (TPM 2.0, Secure Enclave, migration).
+into H-12. Phase A4 added `AppleSecureEnclaveKeyProvider` (ECDSA-P256,
+macOS system keychain). Phase A6 (partial) landed `provision-admission-key`
+and `rotate-admission-key` CLI subcommands for the `software` and
+`secure-enclave` backends with 7 new unit tests.
+Phase A3 (TPM 2.0) and A5 (Ed25519 on capable TPM) remain pending;
+`provision-admission-key --backend tpm2` returns a Phase A3 stub error.
+`allow_v1_certs = false` default flip (A6 final step) is deferred until
+the TPM backend ships.
 
 **Date:** 2026-04-26
 **Closes:** [docs/threat-model-review.md](threat-model-review.md) §1 "Bearer
@@ -357,9 +361,9 @@ fresh cert and revoke the old PeerId binding.
 | **A1** | ✅ **Shipped 2026-05-21** — `KeyProvider` trait + `SoftwareKeyfile` backend. Refactor all `<data_dir>/p2p_key.bin` callers in `dds-node` to route through the trait. Zero behavioural change. | ~1 week | A0 |
 | **A2** | ✅ **Shipped 2026-05-21** — AdmissionCert v2 wire format + H-12 challenge-response step. `AdmissionBody.admission_pubkey` (CBOR-optional), `AdmissionRequest.challenge` (32-byte nonce), `AdmissionResponse.challenge_signature`. `verify_admission_challenge` verifies Ed25519 and ECDSA-P256. `allow_v1_certs = true` (default) allows soft migration; v2 certs verified end-to-end. 8 new unit tests. | ~1 week | A1 |
 | **A3** | TPM 2.0 backend (Linux + Windows) with ECDSA-P256 only. Provisioning subcommand + MSI custom action + Linux systemd hook. Test matrix on Intel PTT + AMD fTPM. | ~2 weeks | A2 |
-| **A4** | Apple Secure Enclave backend. Gated on Developer ID signing for the pkg. | ~1 week | A2 + pkg signing |
+| **A4** | ✅ **Shipped 2026-05-22** — `AppleSecureEnclaveKeyProvider` (ECDSA-P256, system keychain). `load_or_create("dds-node-admission")` idempotent. `#[ignore]`d hardware tests; 2 non-hardware tests. Requires `com.apple.developer.kernel.secure-enclave` entitlement for distribution builds. | ~1 week | A2 + pkg signing |
 | **A5** | Ed25519 path on Infineon / Nuvoton dTPM. Rev 1.59 capability detection + algorithm switch. | ~3 days | A3 |
-| **A6** | Migration tooling (`provision-admission-key`, `rotate-admission-key`, `admit --admission-pubkey`) + per-platform docs + `allow_v1_certs = false` default flip. | ~3 days | A3 + A4 |
+| **A6** | ⚠ **Partial — 2026-05-22.** `provision-admission-key --backend software|secure-enclave|tpm2` and `rotate-admission-key --data-dir <DIR> [--no-backup]` landed. 7 unit tests. `admit --admission-pubkey` was already shipped in Phase A2. Remaining: TPM 2.0 backend wiring into both CLI commands (blocked on A3), `allow_v1_certs = false` default flip (blocked on A3+A4 fleet rollout). | ~3 days | A3 + A4 |
 | **A7** | Threat-model close-out: §1 "Bearer token" risk struck through; STATUS / Claude_sec_review updated. | ~1 day | A6 |
 
 Total: ~6–7 weeks of focused work, dependency-bound (TPM hardware

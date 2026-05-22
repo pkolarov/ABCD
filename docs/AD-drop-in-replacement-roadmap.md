@@ -81,7 +81,7 @@ Current blockers to treat as roadmap input, not footnotes:
 
 | Requirement for Drop-in Claim | Current DDS State | Gap | Priority | Acceptance Criteria |
 |---|---|---|---|---|
-| No known High findings in trust graph, sync, auth, endpoint enforcement | ✅ **B-1, B-2, B-3 fixed 2026-04-25; A-2 fixed 2026-04-26.** Zero open Critical/High findings in the current review ledger (Z-2 hardware-bound identities is the one open High item; tracked in `hardware-bound-admission-plan.md`). **Z-2 Phase A2 shipped 2026-05-21** (AdmissionCert v2 + H-12 challenge-response; clone attack closed for v2-cert peers). | Z-2 Phase A2 shipped; A3–A6 (TPM 2.0, Secure Enclave, migration, allow_v1_certs=false) pending per `Claude_sec_review.md` | P0 | See Z-2 plan; all other Critical/High findings closed |
+| No known High findings in trust graph, sync, auth, endpoint enforcement | ✅ **B-1, B-2, B-3 fixed 2026-04-25; A-2 fixed 2026-04-26.** Zero open Critical/High findings in the current review ledger (Z-2 hardware-bound identities is the one open High item; tracked in `hardware-bound-admission-plan.md`). **Z-2 Phase A2 shipped 2026-05-21** (AdmissionCert v2 + H-12 challenge-response; clone attack closed for v2-cert peers). **Z-2 Phase A4 + A6 (partial) shipped 2026-05-22** (Apple SE backend; `provision-admission-key` + `rotate-admission-key` CLI subcommands with 7 unit tests). | Z-2 Phase A4+A6-partial shipped; A3 (TPM 2.0), A5 (Ed25519 dTPM), A6-full (`allow_v1_certs=false` flip) pending per `Claude_sec_review.md` | P0 | See Z-2 plan; all other Critical/High findings closed |
 | Durable store cannot persist rejected trust graph data | ✅ **B-1 fixed 2026-04-25.** Graph acceptance is now the first durable gate; store insert is put-if-absent or exact-byte idempotent. | None — acceptance criteria met | P0 | Regression tests cover the adversarial ingest path |
 | Purpose grants only valid while target attestation is active | ✅ **B-2 fixed 2026-04-25.** Shared structural validator across token create, validate, ingest; purpose lookup requires active target. | None — acceptance criteria met | P0 | Regression tests cover revoked/expired target paths |
 | Policy/software failures retry instead of being marked applied | ✅ **B-3 fixed 2026-04-25.** Applied state records success only for success; failure status participates in change detection. | None — acceptance criteria met | P0 | Regression tests cover failure-retry cycle on Windows and macOS |
@@ -219,7 +219,7 @@ Exit gate:
 
 | Gate | Required Evidence | Status |
 |---|---|---|
-| P0-G1 | Zero open Critical/High findings in current review ledger | ⚠ **Z-2 (node clone / hardware-bound identities) Phase A2 shipped 2026-05-21 — H-12 challenge-response closes clone attack for v2-cert peers; A3–A6 pending (TPM 2.0, SE, migration, allow_v1_certs=false)** |
+| P0-G1 | Zero open Critical/High findings in current review ledger | ⚠ **Z-2 (node clone / hardware-bound identities) Phase A4 + A6 (partial) shipped 2026-05-22 — Apple SE backend + `provision-admission-key`/`rotate-admission-key` CLI; A3 (TPM 2.0), A5 (Ed25519 dTPM), A6-full (`allow_v1_certs=false`) pending** |
 | P0-G2 | Windows production install defaults to named pipe plus response MAC | ✅ **Met** — A-2 + A-3 fixed 2026-04-26 |
 | P0-G3 | Sync and trust graph persistence have adversarial tests | ✅ **Met** — B-1/B-2 regression tests landed |
 | P0-G4 | Policy/software failure retry behavior is tested on Windows and macOS | ✅ **Met** — B-3 regression tests landed |

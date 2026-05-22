@@ -2012,7 +2012,7 @@ cover all five lifecycle scenarios from `docs/pqc-phase-b-plan.md §7`.
 [STATUS.md](STATUS.md) and [docs/pqc-phase-b-plan.md](docs/pqc-phase-b-plan.md)
 for the complete ledger.
 
-### Z-2 (High) ⚠ Phase A2 shipped — Hardware-bound identities (A3–A6 pending)
+### Z-2 (High) ⚠ Phase A4 + A6 (partial) shipped — Hardware-bound identities (A3/A5/A6-full pending)
 
 [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md)
 (committed 2026-04-26 as `d5c2da5`). **Phase A1 landed 2026-05-21**
@@ -2084,10 +2084,32 @@ with `issue-self-admission` and flip `allow_v1_certs = false`.
 - Domain root key is software Ed25519 by default; FIDO2 only with
   `--fido2` at `init-domain`.
 
+**What Phase A4 ships (2026-05-22):**
+
+- `dds-node/src/apple_secure_enclave.rs` — `AppleSecureEnclaveKeyProvider`:
+  ECDSA-P256 key stored in macOS system keychain with
+  `kSecAccessControlPrivateKeyUsage`. `load_or_create("dds-node-admission")`
+  is idempotent. `sign()` calls `SecKeyCreateSignature` (hardware-signed,
+  never exported). 4 SE-hardware tests `#[ignore]`d (require interactive
+  keychain session); 2 non-hardware tests for `compress_p256_point` and
+  error-path coverage.
+
+**What Phase A6 (partial) ships (2026-05-22):**
+
+- `dds-node/src/main.rs` — `provision-admission-key --data-dir <DIR>
+  [--backend software|secure-enclave|tpm2]`: generates or loads the
+  admission key and prints `pubkey_hex` for the admin's `admit` command.
+  Idempotent. `tpm2` backend returns a Phase A3 stub error.
+- `dds-node/src/main.rs` — `rotate-admission-key --data-dir <DIR>
+  [--no-backup]`: backs up and replaces `admission_key.bin`, prints old
+  and new pubkeys with admin follow-up steps. Software backend only.
+- **7 new unit tests** in `admission_key_cmd_tests` module.
+- Remaining A6 items: TPM 2.0 wiring, `allow_v1_certs = false` default
+  flip (deferred until A3 ships).
+
 **Remediation track:** ~~A1 ✅~~ → ~~A2 ✅~~ → A3 (TPM 2.0 Linux/Windows)
-→ A4 (Apple Secure Enclave) → A5 (Ed25519 on capable dTPMs) → A6
-(migration tooling + `allow_v1_certs = false` flip) → A7
-(threat-model close-out). See
+→ ~~A4 ✅~~ → A5 (Ed25519 on capable dTPMs) → A6⚠ (TPM wiring +
+`allow_v1_certs = false` flip) → A7 (threat-model close-out). See
 [docs/hardware-bound-admission-plan.md](docs/hardware-bound-admission-plan.md)
 §10 for the full phasing table.
 

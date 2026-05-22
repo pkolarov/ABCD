@@ -177,6 +177,8 @@ async fn async_main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
         "restrict-data-dir-acl" => cmd_restrict_data_dir_acl(&args[1..]),
         "create-provision-bundle" => cmd_create_bundle(&args[1..]),
         "provision" => cmd_provision(&args[1..]),
+        "provision-admission-key" => cmd_provision_admission_key(&args[1..]),
+        "rotate-admission-key" => cmd_rotate_admission_key(&args[1..]),
         "stamp-agent-pubkey" => cmd_stamp_agent_pubkey(&args[1..]),
         #[cfg(windows)]
         "seal-passphrase" => cmd_seal_passphrase(&args[1..]),
@@ -217,6 +219,8 @@ fn print_usage() {
   dds-node restrict-data-dir-acl --data-dir <DIR>
   dds-node create-provision-bundle --dir <DIR> --org <ORG> [--out <FILE>]
   dds-node provision <BUNDLE.dds> [--data-dir <DIR>] [--no-start]
+  dds-node provision-admission-key --data-dir <DIR> [--backend software|secure-enclave|tpm2]
+  dds-node rotate-admission-key --data-dir <DIR> [--no-backup]
   dds-node stamp-agent-pubkey --data-dir <DIR> --config-dir <DIR>
   dds-node run [config.toml]
   dds-node seal-passphrase [--out <PATH>]  (Windows only)"
@@ -814,6 +818,182 @@ fn cmd_rotate_identity(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     println!("     or rely on H-12 piggy-back gossip once at least one peer has it.");
     println!();
     println!("  3. Restart the node so the new identity takes effect.");
+    Ok(())
+}
+
+/// **Phase A6** — generate or load the admission key for this node and print
+/// the public key hex that the domain admin needs to issue a v2 admission cert.
+///
+/// `--backend software` (default): Ed25519 key at `<data_dir>/admission_key.bin`.
+/// `--backend secure-enclave` (macOS only): ECDSA-P256 key in the system keychain.
+/// `--backend tpm2`: not yet implemented (Phase A3 pending).
+///
+/// The command is idempotent — running it again with the same backend and
+/// data_dir loads and re-prints the existing key rather than generating a new one.
+fn cmd_provision_admission_key(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = PathBuf::from(require_flag(args, "--data-dir")?);
+    let backend = flag(args, "--backend").unwrap_or("software");
+    std::fs::create_dir_all(&data_dir)?;
+
+    use dds_core::key_provider::{AdmissionPublicKey, KeyProvider};
+
+    let (pubkey_hex, backend_label) = match backend {
+        "software" => {
+            let key_path = data_dir.join("admission_key.bin");
+            let kp = dds_node::key_provider::SoftwareKeyfile::load_or_create(&key_path)
+                .map_err(|e| format!("software admission key: {e}"))?;
+            let hex = match kp.public_key() {
+                AdmissionPublicKey::Ed25519(b) => to_hex(&b),
+                AdmissionPublicKey::EcdsaP256(b) => to_hex(&b),
+            };
+            (hex, format!("software ({})", key_path.display()))
+        }
+        "secure-enclave" => {
+            #[cfg(target_os = "macos")]
+            {
+                let kp = dds_node::apple_secure_enclave::AppleSecureEnclaveKeyProvider::load_or_create(
+                    "dds-node-admission",
+                )
+                .map_err(|e| format!("Secure Enclave admission key: {e}"))?;
+                let hex = match kp.public_key() {
+                    AdmissionPublicKey::EcdsaP256(b) => to_hex(&b),
+                    _ => unreachable!("Apple SE always returns EcdsaP256"),
+                };
+                (hex, "secure-enclave (system keychain label: dds-node-admission)".to_string())
+            }
+            #[cfg(not(target_os = "macos"))]
+            return Err("--backend secure-enclave is only available on macOS".into())
+        }
+        "tpm2" => {
+            return Err(
+                "TPM 2.0 backend not yet implemented (Phase A3 pending).\n\
+                 See docs/hardware-bound-admission-plan.md §7.2 for the roadmap.\n\
+                 Use --backend software as a fallback for non-production nodes."
+                    .into(),
+            )
+        }
+        other => {
+            return Err(format!(
+                "unknown backend {other:?}; valid options: software, secure-enclave (macOS only), tpm2 (pending Phase A3)"
+            )
+            .into())
+        }
+    };
+
+    println!("Admission key provisioned:");
+    println!("  data_dir:   {}", data_dir.display());
+    println!("  backend:    {backend_label}");
+    println!("  pubkey_hex: {pubkey_hex}");
+    println!();
+    println!("Send the pubkey_hex to the domain admin to obtain a v2 admission cert:");
+    println!("  dds-node admit --domain-key <FILE> --domain <FILE> \\");
+    println!("    --peer-id <PEER_ID> --admission-pubkey {pubkey_hex} --out admission.cbor");
+    println!();
+    println!("(Omit --admission-pubkey to issue a v1 cert; v1 certs skip hardware attestation)");
+    Ok(())
+}
+
+/// **Phase A6** — rotate the software admission key.
+///
+/// Replaces `<data_dir>/admission_key.bin` with a freshly generated Ed25519
+/// key. The old key is backed up to `admission_key.bin.rotated.<timestamp>`
+/// unless `--no-backup` is passed.
+///
+/// After rotating, the admin must issue a new v2 admission cert bound to the
+/// new pubkey and restart the node.
+///
+/// Only the `software` backend is supported by this command. To rotate a
+/// Secure Enclave key, delete the old key from the system keychain and re-run
+/// `provision-admission-key --backend secure-enclave`. TPM 2.0 rotation is
+/// pending Phase A3.
+fn cmd_rotate_admission_key(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = PathBuf::from(require_flag(args, "--data-dir")?);
+    let no_backup = args.iter().any(|a| a == "--no-backup");
+
+    if !data_dir.exists() {
+        return Err(format!(
+            "data_dir {} does not exist — run provision-admission-key first",
+            data_dir.display()
+        )
+        .into());
+    }
+
+    let key_path = data_dir.join("admission_key.bin");
+    if !key_path.exists() {
+        return Err(format!(
+            "no admission_key.bin at {} — run provision-admission-key --data-dir {} --backend software first",
+            key_path.display(),
+            data_dir.display()
+        )
+        .into());
+    }
+
+    use dds_core::key_provider::{AdmissionPublicKey, KeyProvider};
+
+    // Load the old key to capture the old pubkey for the report.
+    let old_kp = dds_node::key_provider::SoftwareKeyfile::load_or_create(&key_path)
+        .map_err(|e| format!("failed to read existing admission key: {e}"))?;
+    let old_pubkey_hex = match old_kp.public_key() {
+        AdmissionPublicKey::Ed25519(b) => to_hex(&b),
+        AdmissionPublicKey::EcdsaP256(b) => to_hex(&b),
+    };
+
+    // Back up or remove the old key file.
+    let backup_path = if no_backup {
+        std::fs::remove_file(&key_path).map_err(|e| {
+            format!("failed to remove old admission_key.bin for rotation: {e}")
+        })?;
+        None
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut final_path = data_dir.join(format!("admission_key.bin.rotated.{now}"));
+        let mut suffix = 1u32;
+        while final_path.exists() {
+            final_path = data_dir.join(format!("admission_key.bin.rotated.{now}.{suffix}"));
+            suffix += 1;
+        }
+        std::fs::rename(&key_path, &final_path).map_err(|e| {
+            format!(
+                "failed to back up admission_key.bin to {}: {e}",
+                final_path.display()
+            )
+        })?;
+        Some(final_path)
+    };
+
+    // Create a fresh key (file is gone so load_or_create generates a new one).
+    let new_kp = dds_node::key_provider::SoftwareKeyfile::load_or_create(&key_path)
+        .map_err(|e| format!("failed to generate new admission key: {e}"))?;
+    let new_pubkey_hex = match new_kp.public_key() {
+        AdmissionPublicKey::Ed25519(b) => to_hex(&b),
+        AdmissionPublicKey::EcdsaP256(b) => to_hex(&b),
+    };
+
+    println!("Rotated software admission key:");
+    println!("  data_dir:       {}", data_dir.display());
+    println!("  old_pubkey_hex: {old_pubkey_hex}");
+    println!("  new_pubkey_hex: {new_pubkey_hex}");
+    if let Some(ref bak) = backup_path {
+        println!("  backup:         {}", bak.display());
+    } else {
+        println!("  backup:         (skipped — --no-backup)");
+    }
+    println!();
+    println!("The existing admission cert is now invalid (it was bound to the old pubkey).");
+    println!("Before restarting the node, the admin must:");
+    println!();
+    println!("  1. Issue a new v2 admission cert for the new admission pubkey:");
+    println!("       dds-node admit --domain-key <FILE> --domain <FILE> \\");
+    println!("         --peer-id <PEER_ID> --admission-pubkey {new_pubkey_hex} --out admission.cbor");
+    println!(
+        "     Then place admission.cbor at {}.",
+        data_dir.join("admission.cbor").display()
+    );
+    println!();
+    println!("  2. Restart the node so the new admission key takes effect.");
     Ok(())
 }
 
@@ -1689,4 +1869,198 @@ fn cmd_seal_passphrase(args: &[String]) -> Result<(), Box<dyn std::error::Error>
 fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     let pos = args.iter().position(|a| a == flag)?;
     args.get(pos + 1).map(String::as_str)
+}
+
+#[cfg(test)]
+mod admission_key_cmd_tests {
+    use super::*;
+    use dds_core::key_provider::{AdmissionPublicKey, KeyProvider};
+
+    // Serialize tests that clear DDS_NODE_PASSPHRASE against parallel lib
+    // tests that may also read it.  This binary runs in its own process so
+    // the mutex only needs to cover in-process parallelism.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn str_args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn clear_passphrase() {
+        unsafe { std::env::remove_var("DDS_NODE_PASSPHRASE") };
+    }
+
+    #[test]
+    fn provision_admission_key_software_creates_file_and_returns_pubkey() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_passphrase();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let args = str_args(&["--data-dir", &data_dir, "--backend", "software"]);
+
+        cmd_provision_admission_key(&args).expect("provision should succeed");
+
+        let key_file = dir.path().join("admission_key.bin");
+        assert!(key_file.exists(), "admission_key.bin must be created");
+    }
+
+    #[test]
+    fn provision_admission_key_is_idempotent() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_passphrase();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let args = str_args(&["--data-dir", &data_dir, "--backend", "software"]);
+
+        cmd_provision_admission_key(&args).expect("first provision should succeed");
+        let kp1 = dds_node::key_provider::SoftwareKeyfile::load_or_create(
+            &dir.path().join("admission_key.bin"),
+        )
+        .unwrap();
+        let pubkey1 = match kp1.public_key() {
+            AdmissionPublicKey::Ed25519(b) => b,
+            _ => panic!("expected Ed25519"),
+        };
+
+        cmd_provision_admission_key(&args).expect("second provision should succeed");
+        let kp2 = dds_node::key_provider::SoftwareKeyfile::load_or_create(
+            &dir.path().join("admission_key.bin"),
+        )
+        .unwrap();
+        let pubkey2 = match kp2.public_key() {
+            AdmissionPublicKey::Ed25519(b) => b,
+            _ => panic!("expected Ed25519"),
+        };
+
+        assert_eq!(pubkey1, pubkey2, "repeated provision must not change the key");
+    }
+
+    #[test]
+    fn provision_admission_key_tpm2_returns_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let args = str_args(&["--data-dir", &data_dir, "--backend", "tpm2"]);
+        let err = cmd_provision_admission_key(&args).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Phase A3"),
+            "tpm2 error must mention Phase A3: {msg}"
+        );
+    }
+
+    #[test]
+    fn rotate_admission_key_generates_different_key() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_passphrase();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+
+        // First provision to create the initial key.
+        cmd_provision_admission_key(&str_args(&["--data-dir", &data_dir, "--backend", "software"]))
+            .expect("provision should succeed");
+        let old_pubkey = match dds_node::key_provider::SoftwareKeyfile::load_or_create(
+            &dir.path().join("admission_key.bin"),
+        )
+        .unwrap()
+        .public_key()
+        {
+            AdmissionPublicKey::Ed25519(b) => b,
+            _ => panic!("expected Ed25519"),
+        };
+
+        // Rotate with --no-backup for simplicity.
+        cmd_rotate_admission_key(&str_args(&["--data-dir", &data_dir, "--no-backup"]))
+            .expect("rotate should succeed");
+        let new_pubkey = match dds_node::key_provider::SoftwareKeyfile::load_or_create(
+            &dir.path().join("admission_key.bin"),
+        )
+        .unwrap()
+        .public_key()
+        {
+            AdmissionPublicKey::Ed25519(b) => b,
+            _ => panic!("expected Ed25519"),
+        };
+
+        assert_ne!(old_pubkey, new_pubkey, "rotation must produce a different key");
+    }
+
+    #[test]
+    fn rotate_admission_key_backup_is_created() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_passphrase();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+
+        cmd_provision_admission_key(&str_args(&["--data-dir", &data_dir, "--backend", "software"]))
+            .expect("provision should succeed");
+
+        // Rotate without --no-backup.
+        cmd_rotate_admission_key(&str_args(&["--data-dir", &data_dir]))
+            .expect("rotate should succeed");
+
+        // New key file must exist.
+        assert!(
+            dir.path().join("admission_key.bin").exists(),
+            "new admission_key.bin must exist after rotation"
+        );
+
+        // A backup file with the `.rotated.` infix must exist.
+        let has_backup = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("admission_key.bin.rotated.")
+            });
+        assert!(has_backup, "a .rotated. backup file must be present");
+    }
+
+    #[test]
+    fn rotate_admission_key_no_backup_removes_old_file_temporarily() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_passphrase();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+
+        cmd_provision_admission_key(&str_args(&["--data-dir", &data_dir, "--backend", "software"]))
+            .expect("provision should succeed");
+
+        cmd_rotate_admission_key(&str_args(&["--data-dir", &data_dir, "--no-backup"]))
+            .expect("rotate --no-backup should succeed");
+
+        // No backup file.
+        let has_backup = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("admission_key.bin.rotated.")
+            });
+        assert!(!has_backup, "no backup file with --no-backup");
+
+        // New key still exists.
+        assert!(
+            dir.path().join("admission_key.bin").exists(),
+            "new admission_key.bin must exist after --no-backup rotation"
+        );
+    }
+
+    #[test]
+    fn rotate_admission_key_fails_without_existing_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let err =
+            cmd_rotate_admission_key(&str_args(&["--data-dir", &data_dir])).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("provision-admission-key"),
+            "error must hint at provision-admission-key: {msg}"
+        );
+    }
 }
