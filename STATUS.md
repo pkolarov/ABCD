@@ -1,5 +1,54 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-23, 151st pass) — CLI integration tests for stamp-agent-pubkey + Admin Guide Windows MSI helper docs + http_binary_e2e macOS timeout fix
+
+### Gaps
+
+**1. `dds-node stamp-agent-pubkey` had no CLI integration tests.**
+The MSI custom action `CA_StampAgentPubkey` calls this command during every
+install and repair to pin `PinnedNodePubkeyB64` into the Policy Agent's
+`appsettings.json`. Without integration tests, regressions in arg parsing,
+the no-op path (absent appsettings.json), or the stamping path could silently
+break the MSI installer.
+
+**2. `stamp-agent-pubkey`, `seal-passphrase`, and `restrict-data-dir-acl` were
+undocumented in the Admin Guide.**
+The Windows Deployment section mentioned `restrict-data-dir-acl` only in a table
+footnote and made no mention of `stamp-agent-pubkey` or `seal-passphrase`.
+Operators rebuilding or repairing a Windows install had no guidance on when or
+how to run these MSI helper commands manually.
+
+**3. `http_binary_e2e.rs` startup window too narrow for macOS Gatekeeper.**
+`wait_for_status` used a 20 s deadline; on a cold macOS host after `cargo build`,
+Gatekeeper binary verification adds several seconds before the node is ready.
+
+### Fix
+
+**`dds-node/tests/stamp_agent_pubkey_cli.rs`** — 8 new CLI integration tests:
+- `stamp_agent_pubkey_no_appsettings_returns_success`: absent appsettings.json →
+  exit 0 + "nothing to stamp" notice.
+- `stamp_agent_pubkey_no_appsettings_creates_node_key`: node_key.bin is created
+  even on the no-op path.
+- `stamp_agent_pubkey_writes_pinned_pubkey_into_appsettings`: pubkey written;
+  value is 44-char Base64 (Ed25519 32 bytes → standard B64 with padding).
+- `stamp_agent_pubkey_preserves_existing_appsettings_fields`: Logging and other
+  DdsPolicyAgent fields survive the stamp.
+- `stamp_agent_pubkey_is_idempotent`: two consecutive runs produce identical pubkeys.
+- `stamp_agent_pubkey_requires_data_dir_flag`: missing --data-dir → non-zero exit.
+- `stamp_agent_pubkey_requires_config_dir_flag`: missing --config-dir → non-zero exit.
+- `stamp_agent_pubkey_missing_data_dir_names_flag_in_stderr`: error names the flag.
+
+**`docs/DDS-Admin-Guide.md`** — new "Windows MSI Helper Commands" subsection under
+Windows Deployment covering `stamp-agent-pubkey`, `seal-passphrase`, and
+`restrict-data-dir-acl` with purpose, sample invocations, and MSI custom action
+cross-references.
+
+**`dds-node/tests/http_binary_e2e.rs`** — `warmup_binary()` helper added;
+`wait_for_status` deadline extended 20 s → 60 s to absorb macOS Gatekeeper
+verification on cold builds.
+
+---
+
 ## Gap Fix (2026-05-23, 150th pass) — CLI integration tests for provision-admission-key + rotate-admission-key; UX fix: revoke-admission hint
 
 ### Gaps
