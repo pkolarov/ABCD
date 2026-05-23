@@ -279,6 +279,10 @@ criteria = "safe-to-deploy"
 version = "0.4.3"
 criteria = "safe-to-deploy"
 
+[[exemptions.core-foundation]]
+version = "0.10.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.core-foundation-sys]]
 version = "0.8.7"
 criteria = "safe-to-deploy"
@@ -1333,6 +1337,14 @@ criteria = "safe-to-deploy"
 
 [[exemptions.sec1]]
 version = "0.7.3"
+criteria = "safe-to-deploy"
+
+[[exemptions.security-framework]]
+version = "3.7.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.security-framework-sys]]
+version = "2.17.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.semver]]
