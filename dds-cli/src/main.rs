@@ -654,8 +654,15 @@ fn handle_group(action: GroupAction, data_dir: &PathBuf) {
                 body_type: None,
                 body_cbor: None,
             };
-            let token = dds_core::token::Token::sign(payload, &voucher.signing_key).unwrap();
-            store.put_token(&token).unwrap();
+            let token =
+                dds_core::token::Token::sign(payload, &voucher.signing_key).unwrap_or_else(|e| {
+                    eprintln!("Error: failed to sign vouch token: {e}");
+                    std::process::exit(1);
+                });
+            store.put_token(&token).unwrap_or_else(|e| {
+                eprintln!("Error: failed to save vouch token: {e}");
+                std::process::exit(1);
+            });
             println!("Vouch created:");
             println!("  JTI:     {}", token.payload.jti);
             println!("  Purpose: {purpose}");
@@ -678,9 +685,19 @@ fn handle_group(action: GroupAction, data_dir: &PathBuf) {
                 body_type: None,
                 body_cbor: None,
             };
-            let token = dds_core::token::Token::sign(payload, &revoker.signing_key).unwrap();
-            store.put_token(&token).unwrap();
-            store.revoke(&jti).unwrap();
+            let token =
+                dds_core::token::Token::sign(payload, &revoker.signing_key).unwrap_or_else(|e| {
+                    eprintln!("Error: failed to sign revocation token: {e}");
+                    std::process::exit(1);
+                });
+            store.put_token(&token).unwrap_or_else(|e| {
+                eprintln!("Error: failed to save revocation token: {e}");
+                std::process::exit(1);
+            });
+            store.revoke(&jti).unwrap_or_else(|e| {
+                eprintln!("Error: failed to revoke JTI {jti}: {e}");
+                std::process::exit(1);
+            });
             println!("Revoked JTI: {jti}");
         }
     }
@@ -1481,7 +1498,11 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
                 )
                 .await;
                 let bytes = unwrap_envelope(env, dds_core::envelope::kind::WINDOWS_POLICIES);
-                let r: WindowsPoliciesPayload = serde_json::from_slice(&bytes).unwrap();
+                let r: WindowsPoliciesPayload =
+                    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                        eprintln!("Error: failed to parse windows/policies payload: {e}");
+                        std::process::exit(1);
+                    });
                 println!(
                     "Windows policies for {} ({}):",
                     device_urn,
@@ -1499,7 +1520,11 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
                 )
                 .await;
                 let bytes = unwrap_envelope(env, dds_core::envelope::kind::WINDOWS_SOFTWARE);
-                let r: WindowsSoftwarePayload = serde_json::from_slice(&bytes).unwrap();
+                let r: WindowsSoftwarePayload =
+                    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                        eprintln!("Error: failed to parse windows/software payload: {e}");
+                        std::process::exit(1);
+                    });
                 println!(
                     "Windows software for {} ({}):",
                     device_urn,
@@ -1544,7 +1569,11 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
                 )
                 .await;
                 let bytes = unwrap_envelope(env, dds_core::envelope::kind::MACOS_POLICIES);
-                let r: MacosPoliciesPayload = serde_json::from_slice(&bytes).unwrap();
+                let r: MacosPoliciesPayload =
+                    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                        eprintln!("Error: failed to parse macos/policies payload: {e}");
+                        std::process::exit(1);
+                    });
                 println!("macOS policies for {} ({}):", device_urn, r.policies.len());
                 for p in &r.policies {
                     println!("  - jti={} issuer={} iat={}", p.jti, p.issuer, p.iat);
@@ -1558,7 +1587,11 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
                 )
                 .await;
                 let bytes = unwrap_envelope(env, dds_core::envelope::kind::MACOS_SOFTWARE);
-                let r: MacosSoftwarePayload = serde_json::from_slice(&bytes).unwrap();
+                let r: MacosSoftwarePayload =
+                    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                        eprintln!("Error: failed to parse macos/software payload: {e}");
+                        std::process::exit(1);
+                    });
                 println!("macOS software for {} ({}):", device_urn, r.software.len());
                 for s in &r.software {
                     println!("  - jti={} issuer={} iat={}", s.jti, s.issuer, s.iat);
@@ -1579,7 +1612,11 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
                 )
                 .await;
                 let bytes = unwrap_envelope(env, dds_core::envelope::kind::LINUX_POLICIES);
-                let r: LinuxPoliciesPayload = serde_json::from_slice(&bytes).unwrap();
+                let r: LinuxPoliciesPayload =
+                    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                        eprintln!("Error: failed to parse linux/policies payload: {e}");
+                        std::process::exit(1);
+                    });
                 println!("Linux policies for {} ({}):", device_urn, r.policies.len());
                 for p in &r.policies {
                     println!("  - jti={} issuer={} iat={}", p.jti, p.issuer, p.iat);
@@ -1593,7 +1630,11 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
                 )
                 .await;
                 let bytes = unwrap_envelope(env, dds_core::envelope::kind::LINUX_SOFTWARE);
-                let r: LinuxSoftwarePayload = serde_json::from_slice(&bytes).unwrap();
+                let r: LinuxSoftwarePayload =
+                    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                        eprintln!("Error: failed to parse linux/software payload: {e}");
+                        std::process::exit(1);
+                    });
                 println!("Linux software for {} ({}):", device_urn, r.software.len());
                 for s in &r.software {
                     println!("  - jti={} issuer={} iat={}", s.jti, s.issuer, s.iat);
