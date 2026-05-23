@@ -2393,7 +2393,7 @@ fn handle_pq_list_pubkeys(data_dir: &Path) {
 fn now_epoch() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
 }
 

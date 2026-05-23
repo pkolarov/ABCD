@@ -1,5 +1,44 @@
 # DDS Implementation Status
 
+## Bug Fix (2026-05-23, 171st pass) — `dds-cli::now_epoch` panics on pre-epoch system clock
+
+### Bug
+
+`dds-cli/src/main.rs` contained a private `now_epoch()` helper at the bottom of the
+file (line 2393) that used `.duration_since(UNIX_EPOCH).unwrap().as_secs()`. This is
+the same pattern fixed in `service.rs` during the 163rd pass and in `provision.rs`
+during the 167th pass.
+
+If the system clock is set before 1970-01-01 (possible on misconfigured or virtualised
+hosts with corrupt NVRAM), `SystemTime::now().duration_since(UNIX_EPOCH)` returns `Err`
+and `.unwrap()` panics — crashing any `dds-cli` subcommand that calls `now_epoch()`,
+including `dds-cli admin issue-key`, `dds-cli sign`, and any other command that
+constructs a time-stamped document.
+
+Concrete impact: any CLI invocation that reaches `now_epoch()` on a pre-epoch host
+panics with an unhelpful `SystemTimeError` backtrace instead of producing a useful
+error message or returning a safe default.
+
+### Fix
+
+**`dds-cli/src/main.rs`** — `now_epoch()`:
+- Changed `.unwrap().as_secs()` to `.unwrap_or_default().as_secs()`.
+- On a pre-epoch clock, `now` returns 0. Downstream callers embed the value in
+  CBOR document fields (`issued_at`, `exp`, etc.) — they will produce documents
+  with `issued_at = 0`, which peers will accept as legacy/unstamped tokens (matching
+  the behaviour already documented in `dds-ffi/src/ffi_core.rs`'s `now_epoch()`).
+- Mirrors the identical one-line fix applied to `service.rs` (163rd pass) and
+  `provision.rs` (167th pass). The dds-ffi `now_epoch()` already used `.unwrap_or(0)`.
+- No new test added: the fix is a one-line guard on an error path unreachable on any
+  host with a sane clock; the existing CLI tests exercise the happy path.
+
+### Test results
+
+`cargo check -p dds-cli`: clean. `cargo test -p dds-cli`: all passing (no behaviour
+change — the guard is never triggered on a sane clock).
+
+---
+
 ## Doc Fix (2026-05-23, 170th pass) — PQ metrics missing from Admin Guide catalog + stale `sweep_once` doc comment
 
 ### Gaps
