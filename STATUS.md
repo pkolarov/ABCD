@@ -1,5 +1,43 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-23, 178th pass) — Prune stale `rand 0.9.2` exemption from supply-chain
+
+### Summary
+
+Automated scheduled sweep of the full Rust workspace.
+
+**Audit (`cargo audit`):** 0 vulnerabilities. Same 4 informational-only advisories
+as the 177th pass (`atomic-polyfill`, `core2`, `paste`, `lru` — all unactionable
+without a libp2p or pqcrypto-mldsa major-version bump). No new advisories.
+
+**Supply-chain fix:** `cargo vet` emitted a `WARN: unnecessary exemptions` notice
+because the `rand 0.9.2` exemption was left in `supply-chain/config.toml` after
+the 176th-pass lockfile bump to `rand 0.9.4`. Ran `cargo vet prune`; the stale
+exemption was removed. `cargo vet` now passes cleanly with no warnings:
+14 fully audited, 1 partially audited, 498 exempted.
+
+**Gap analysis:** all doc sections cross-checked against implementation — no new gaps.
+- Prometheus metrics table, `[network.api_auth]` config struct, `dds pq` CLI
+  commands — all verified present and matching (same baseline as 177th pass).
+- Deferred security items (M-13, M-15, M-18, L-17, M-22) — still blocked on
+  external design or Windows CI; no change.
+
+**Bug scan:** all `.unwrap()` / `.expect()` in production code audited — all
+provably safe or deliberate mutex-poison panics (same baseline as 177th pass).
+
+### Test results
+
+`cargo test --workspace --lib` — **796 passed; 0 failed** (macOS ARM64, 2026-05-23;
+supply-chain metadata change only, no source changed, count unchanged).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean.
+
+`cargo vet` — passes, no warnings (after `rand 0.9.2` exemption pruned).
+
+---
+
 ## Maintenance (2026-05-23, 177th pass) — Automated gap/bug sweep, all green
 
 ### Summary
