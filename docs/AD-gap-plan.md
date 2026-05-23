@@ -264,9 +264,9 @@ Use specific user-facing failures:
 
 | ID | Task | Repo Area | Deliverable |
 | --- | --- | --- | --- |
-| AD-01 | Add shared Windows `JoinState` model | `platform/windows/DdsPolicyAgent/`, `platform/windows/native/DdsAuthBridge/` | Replace boolean domain-join checks with a richer state model |
-| AD-02 | Implement AD + Entra host-state probes | Same as above | Native and managed detection path with matching semantics |
-| AD-03 | Add tests for `JoinState` classification | `platform/windows/DdsPolicyAgent.Tests/`, `platform/windows/native/Tests/` | Workgroup, AD, hybrid, Entra-only, unknown cases |
+| AD-01 ✅ | Add shared Windows `JoinState` model | `platform/windows/DdsPolicyAgent/`, `platform/windows/native/DdsAuthBridge/` | Landed 2026-04-26: new `JoinState.cs`, `IJoinStateProbe.cs` (managed) and `JoinState.h` (native); replaced all `IsDomainJoined()` calls with `GetJoinState()` / injected `IJoinStateProbe`; `AccountEnforcer`, `WindowsAccountOperations`, `InMemoryAccountOperations`, `DdsAuthBridgeMain` updated. |
+| AD-02 ✅ | Implement AD + Entra host-state probes | Same as above | Landed 2026-04-26: `WindowsJoinStateProbe.cs` P/Invokes `NetGetJoinInformation` + `NetGetAadJoinInformation`; native `JoinState.cpp` loads `netapi32.dll` + `GetProcAddress`; both classify `DSREG_DEVICE_JOIN` as `EntraOnlyJoined`, missing symbol as no Entra signal. Periodic re-probe via IHostedService (managed) and a dedicated thread (native). |
+| AD-03 ✅ | Add tests for `JoinState` classification | `platform/windows/DdsPolicyAgent.Tests/`, `platform/windows/native/Tests/` | Landed 2026-04-26: `JoinStateProbeTests.cs` (5 managed cases via `FakeJoinStateProbe`), `test_join_state.cpp` (native helper tests). |
 
 ### Phase 2 - Safe Policy Coexistence
 
@@ -291,16 +291,16 @@ Use specific user-facing failures:
 | ID | Task | Repo Area | Deliverable |
 | --- | --- | --- | --- |
 | AD-12 ✅ | Document AD coexistence enrollment flow | `docs/`, possibly tray text strings | Landed 2026-04-26: new operator-facing guide [windows-ad-enrollment.md](windows-ad-enrollment.md) covers enrollment per JoinState (Workgroup, AD/Hybrid, Entra-only, Unknown), the post-password-change refresh flow, and the canonical string reference. Tray-side text-string updates in `EnrollmentFlow.cpp` deferred to AD-13 (when the tray gains a `JoinState` probe seam). |
-| AD-13 | Add "refresh vault password" workflow for post-password-change recovery | `platform/windows/native/DdsTrayAgent/` | User can re-wrap a new AD password without deleting the credential |
+| AD-13 ✅ | Add "refresh vault password" workflow for post-password-change recovery | `platform/windows/native/DdsTrayAgent/` | Landed 2026-05-02: new `RefreshVaultFlow.{h,cpp}` adds "Refresh Stored Password…" tray menu item; flow: JoinState check → vault lookup by SID → password prompt → `GetAssertion` hmac-secret → re-encrypt → save vault → fire-and-forget `DDS_CLEAR_STALE` to Auth Bridge. |
 | AD-14 ✅ | Add stale-password detection / guided recovery text | `platform/windows/native/DdsAuthBridge/`, `DdsCredentialProvider/` | Landed 2026-04-26: CP `ReportResult` maps `STATUS_LOGON_FAILURE` / `STATUS_PASSWORD_MUST_CHANGE` / `STATUS_PASSWORD_EXPIRED` to distinct guided-recovery strings and fires a `DDS_REPORT_LOGON_RESULT` IPC; the Auth Bridge installs a 15-minute (configurable) cooldown keyed on the credential_id and returns `STALE_VAULT_PASSWORD` for any `DDS_START_AUTH` against that credential while the cooldown is active, short-circuiting the WebAuthn ceremony before AD lockout exposure. New IPC message `DDS_CLEAR_STALE` lets AD-13 clear the cooldown after a successful refresh; the handler is in place so AD-13 can wire the tray side without a second protocol change. |
 
 ### Phase 5 - End-To-End Validation
 
 | ID | Task | Repo Area | Deliverable |
 | --- | --- | --- | --- |
-| AD-15 | AD-joined VM E2E test plan | `platform/windows/e2e/` | Repeatable validation on a domain-joined test box |
-| AD-16 | Entra-only unsupported test case | Same | Explicit unsupported behavior test |
-| AD-17 | Security review of vault semantics on domain accounts | `security-gaps.md` follow-up | Confirm no new password-handling regressions |
+| AD-15 ✅ | AD-joined VM E2E test plan | `platform/windows/e2e/` | Landed 2026-05-02: `e2e/ad_joined_smoke.ps1` covers workgroup regression, node init, audit-mode policy agent, stale-vault detection, lockout-prevention invariant, vault-refresh clearing cooldown. `e2e/README.md` updated. Script skips gracefully on non-AD-joined hosts. |
+| AD-16 ✅ | Entra-only unsupported test case | Same | Landed 2026-05-02: `e2e/entra_only_unsupported.ps1` covers `UNSUPPORTED_HOST` IPC code, bridge startup log, policy agent heartbeat, CP string, `AppliedReason.UnsupportedEntra` constant. Script skips on non-Entra-only hosts. |
+| AD-17 ✅ | Security review of vault semantics on domain accounts | `security-gaps.md` follow-up | Landed 2026-05-02: password-replay threat model documented in `security-gaps.md §AD-17`. Vault is DPAPI-machine-scope + DACL-protected; AD-14 cooldown ensures ≤ 1 failed DC serialisation per stale-vault incident. No new code required. |
 
 ---
 

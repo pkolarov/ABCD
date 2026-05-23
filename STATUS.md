@@ -1,5 +1,38 @@
 # DDS Implementation Status
 
+## Doc Fix (2026-05-23, 160th pass) — Sync ✅ status markers in AD gap docs
+
+### Gap
+
+`docs/AD-gap-plan.md` showed AD-01, AD-02, AD-03, AD-13, AD-15, AD-16, and
+AD-17 without ✅ markers even though the canonical spec
+(`windows-ad-coexistence-spec.md`) and its changelog confirmed all 17 AD tasks
+landed by 2026-05-02 and are fully resolved.  `windows-ad-coexistence-spec.md`
+likewise had no "Landed" annotation on the Phase 1 rows (AD-01/02/03).
+
+### Fix
+
+**`docs/AD-gap-plan.md`**:
+- Phase 1: marked AD-01, AD-02, AD-03 ✅ with brief landing notes
+  (Landed 2026-04-26).
+- Phase 4: marked AD-13 ✅ with brief landing note (Landed 2026-05-02).
+- Phase 5: marked AD-15, AD-16, AD-17 ✅ with brief landing notes
+  (Landed 2026-05-02).
+
+**`docs/windows-ad-coexistence-spec.md`**:
+- Phase 1 table: added ✅ and "Landed 2026-04-26." prefix to AD-01, AD-02,
+  AD-03 rows for consistency with the Phase 2–5 rows.
+
+No code changes.  All AD gaps (AD-01 through AD-17) are now consistently
+marked resolved in both documents.
+
+### Test results
+
+`cargo test --workspace --lib`: 352 + 197 + 95 + 83 + 38 + 10 + 13 = all
+passing.  No failures.
+
+---
+
 ## Gap Fix (2026-05-23, 159th pass) — `rotate-identity` prints `kem_pubkey_hex` directly when `epoch_keys.cbor` exists
 
 ### Gap

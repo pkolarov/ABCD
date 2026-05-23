@@ -741,9 +741,9 @@ The 5-phase split holds, with these refinements:
 
 | Task | Files | Function-level change |
 |---|---|---|
-| **AD-01** | New: `JoinState.cs`, `IJoinStateProbe.cs`, `JoinState.h`. Modify: `AccountEnforcer.cs:34,208,250`, `IAccountOperations.cs:53`, `WindowsAccountOperations.cs:18-25`, `InMemoryAccountOperations.cs:118`, `DdsAuthBridgeMain.h:115`, `DdsAuthBridgeMain.cpp:487-500,1035`. | Replace `_ops.IsDomainJoined()` with injected probe; remove interface method; replace native static helper with `GetJoinState()`. |
-| **AD-02** | `WindowsJoinStateProbe.cs`, `JoinState.cpp`. | P/Invoke `NetGetJoinInformation` + `NetGetAadJoinInformation` (managed); load `netapi32.dll` + `GetProcAddress` for `NetGetAadJoinInformation` (native). Inspect `DSREG_JOIN_INFO.joinType`; `DSREG_DEVICE_JOIN` is device-Entra, `DSREG_WORKPLACE_JOIN` is registration only. Catch missing-symbol case → "no Entra signal"; free non-null join info with `NetFreeAadJoinInformation`. Periodic re-probe via `IHostedService` (managed) and a dedicated thread (native). |
-| **AD-03** | `JoinStateProbeTests.cs`, `test_join_state.cpp` + `build_test_join_state.bat`. | Five managed test cases via `FakeJoinStateProbe`. Native tests run pure helpers; real-host probe is logged not asserted. |
+| **AD-01** ✅ | New: `JoinState.cs`, `IJoinStateProbe.cs`, `JoinState.h`. Modify: `AccountEnforcer.cs:34,208,250`, `IAccountOperations.cs:53`, `WindowsAccountOperations.cs:18-25`, `InMemoryAccountOperations.cs:118`, `DdsAuthBridgeMain.h:115`, `DdsAuthBridgeMain.cpp:487-500,1035`. | **Landed 2026-04-26.** Replace `_ops.IsDomainJoined()` with injected probe; remove interface method; replace native static helper with `GetJoinState()`. |
+| **AD-02** ✅ | `WindowsJoinStateProbe.cs`, `JoinState.cpp`. | **Landed 2026-04-26.** P/Invoke `NetGetJoinInformation` + `NetGetAadJoinInformation` (managed); load `netapi32.dll` + `GetProcAddress` for `NetGetAadJoinInformation` (native). Inspect `DSREG_JOIN_INFO.joinType`; `DSREG_DEVICE_JOIN` is device-Entra, `DSREG_WORKPLACE_JOIN` is registration only. Catch missing-symbol case → "no Entra signal"; free non-null join info with `NetFreeAadJoinInformation`. Periodic re-probe via `IHostedService` (managed) and a dedicated thread (native). |
+| **AD-03** ✅ | `JoinStateProbeTests.cs`, `test_join_state.cpp` + `build_test_join_state.bat`. | **Landed 2026-04-26.** Five managed test cases via `FakeJoinStateProbe`. Native tests run pure helpers; real-host probe is logged not asserted. |
 
 ### Phase 2 — Safe Policy Coexistence
 
