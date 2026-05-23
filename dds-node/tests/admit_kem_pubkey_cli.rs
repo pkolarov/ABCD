@@ -234,6 +234,121 @@ fn admit_without_kem_pubkey_on_hybrid_domain_warns() {
     );
 }
 
+/// **PQ-DEFAULT-2** — `admit --kem-pubkey-path <FILE>` must read the hex from
+/// the file and produce an equivalent cert to `--kem-pubkey <HEX>`.
+#[test]
+fn admit_kem_pubkey_path_reads_hex_from_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let domain_dir = tmp.path().join("domain");
+    let data_dir = tmp.path().join("node");
+    std::fs::create_dir_all(&domain_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    init_hybrid_domain(&domain_dir, "path-test");
+
+    let (ok, stdout, stderr) = run_capture(dds_node_bin().args([
+        "gen-node-key",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]));
+    assert!(ok, "gen-node-key failed: {stderr}");
+
+    let peer_id = stdout
+        .lines()
+        .find(|l| l.contains("peer_id:"))
+        .and_then(|l| l.split(':').nth(1))
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    let kem_hex = stdout
+        .lines()
+        .find(|l| l.contains("kem_pubkey_hex:"))
+        .and_then(|l| l.split(':').nth(1))
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+
+    // Write the hex to a file (with surrounding whitespace to test trimming).
+    let hex_file = tmp.path().join("kem_pubkey.hex");
+    std::fs::write(&hex_file, format!("  {kem_hex}\n")).unwrap();
+
+    let cert_path = tmp.path().join("admission.cbor");
+    let (ok, _stdout, stderr) = run_capture(dds_node_bin().args([
+        "admit",
+        "--domain-key",
+        domain_dir.join("domain_key.bin").to_str().unwrap(),
+        "--domain",
+        domain_dir.join("domain.toml").to_str().unwrap(),
+        "--peer-id",
+        &peer_id,
+        "--kem-pubkey-path",
+        hex_file.to_str().unwrap(),
+        "--out",
+        cert_path.to_str().unwrap(),
+    ]));
+    assert!(ok, "admit --kem-pubkey-path must succeed; stderr={stderr}");
+
+    let cert = dds_node::domain_store::load_admission_cert(&cert_path).unwrap();
+    assert!(
+        cert.pq_kem_pubkey.is_some(),
+        "cert must carry pq_kem_pubkey when --kem-pubkey-path is used"
+    );
+    assert_eq!(
+        cert.pq_kem_pubkey.as_ref().unwrap().len(),
+        dds_domain::HYBRID_KEM_PUBKEY_LEN,
+        "pq_kem_pubkey length must be HYBRID_KEM_PUBKEY_LEN"
+    );
+}
+
+/// **PQ-DEFAULT-2** — `admit --kem-pubkey-path <MISSING>` must fail with a
+/// descriptive error rather than silently issuing a cert without the KEM pubkey.
+#[test]
+fn admit_kem_pubkey_path_missing_file_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let domain_dir = tmp.path().join("domain");
+    let data_dir = tmp.path().join("node");
+    std::fs::create_dir_all(&domain_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    init_hybrid_domain(&domain_dir, "path-err-test");
+
+    let (ok, stdout, _) = run_capture(dds_node_bin().args([
+        "gen-node-key",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]));
+    assert!(ok);
+    let peer_id = stdout
+        .lines()
+        .find(|l| l.contains("peer_id:"))
+        .and_then(|l| l.split(':').nth(1))
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+
+    let (ok, _stdout, stderr) = run_capture(dds_node_bin().args([
+        "admit",
+        "--domain-key",
+        domain_dir.join("domain_key.bin").to_str().unwrap(),
+        "--domain",
+        domain_dir.join("domain.toml").to_str().unwrap(),
+        "--peer-id",
+        &peer_id,
+        "--kem-pubkey-path",
+        "/nonexistent/path/kem.hex",
+        "--out",
+        tmp.path().join("admission.cbor").to_str().unwrap(),
+    ]));
+    assert!(
+        !ok,
+        "admit --kem-pubkey-path pointing at a missing file must fail"
+    );
+    assert!(
+        stderr.contains("--kem-pubkey-path"),
+        "error must mention --kem-pubkey-path; stderr={stderr}"
+    );
+}
+
 /// **PQ-DEFAULT-2** — `admit` on a legacy (Ed25519-only) domain without
 /// `--kem-pubkey` must succeed silently (no warning expected).
 #[test]

@@ -1115,14 +1115,18 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // gossip can start immediately after admission. The peer obtains the hex
     // from `gen-node-key` output (printed as `kem_pubkey_hex`).
     // `--kem-pubkey-path <FILE>` is an alternative for scripted workflows.
-    let kem_pubkey_hex: Option<String> =
-        flag(args, "--kem-pubkey")
-            .map(|s| s.to_string())
-            .or_else(|| {
-                flag(args, "--kem-pubkey-path")
-                    .and_then(|p| std::fs::read_to_string(p).ok())
-                    .map(|s| s.trim().to_string())
-            });
+    let kem_pubkey_hex: Option<String> = if let Some(hex) = flag(args, "--kem-pubkey") {
+        Some(hex.to_string())
+    } else if let Some(path) = flag(args, "--kem-pubkey-path") {
+        Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("--kem-pubkey-path: {e}"))?
+                .trim()
+                .to_string(),
+        )
+    } else {
+        None
+    };
 
     let kem_pubkey_bytes: Option<Vec<u8>> = match kem_pubkey_hex.as_deref() {
         Some(hex) if !hex.is_empty() => {

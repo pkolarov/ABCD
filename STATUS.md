@@ -1,5 +1,60 @@
 # DDS Implementation Status
 
+## Bug Fix (2026-05-23, 155th pass) — `admit --kem-pubkey-path` silently swallowed file-read errors
+
+### Bug
+
+**`dds-node admit --kem-pubkey-path <FILE>`** used `.ok()` to read the file, silently ignoring any
+IO error. If the operator passed a path to a non-existent or unreadable file, the command would
+succeed as if `--kem-pubkey-path` had not been provided at all — issuing the admission cert
+without the KEM pubkey and printing only a hybrid-domain warning. On hybrid domains this means
+`enc-v3` gossip coverage stays at 0% with no diagnostic pointing to the real cause (bad path).
+
+The bug is in `dds-node/src/main.rs` `cmd_admit`:
+
+```rust
+// Before (silently swallows error):
+flag(args, "--kem-pubkey-path")
+    .and_then(|p| std::fs::read_to_string(p).ok())   // ← .ok() discards the error
+    .map(|s| s.trim().to_string())
+```
+
+### Fix
+
+**`dds-node/src/main.rs`** — replace the `or_else(|| ...)` chain with explicit `if let` branches
+so `std::fs::read_to_string` errors propagate via `?`:
+
+```rust
+// After (error propagates):
+} else if let Some(path) = flag(args, "--kem-pubkey-path") {
+    Some(
+        std::fs::read_to_string(path)
+            .map_err(|e| format!("--kem-pubkey-path: {e}"))?  // ← errors now surface
+            .trim()
+            .to_string(),
+    )
+}
+```
+
+When the path does not exist or cannot be read, the command now exits non-zero with a message
+that names `--kem-pubkey-path` and the underlying OS error.
+
+### Tests added
+
+**`dds-node/tests/admit_kem_pubkey_cli.rs`** — 2 new tests:
+
+- `admit_kem_pubkey_path_reads_hex_from_file`: writes KEM hex (with surrounding whitespace) to a
+  temp file, passes `--kem-pubkey-path` to `admit`, verifies the cert carries `pq_kem_pubkey` of
+  the correct length.  Also validates that the file content is trimmed before hex decode.
+- `admit_kem_pubkey_path_missing_file_fails`: passes `--kem-pubkey-path /nonexistent/path/kem.hex`,
+  asserts exit non-zero and that stderr names `--kem-pubkey-path`.
+
+### Test results
+
+macOS test count: **183 → 185** (2 new passing tests; 0 failures).
+
+---
+
 ## Fix (2026-05-23, 154th pass) — Use `new_current_thread` Tokio runtime for all CLI subcommands
 
 ### Bug
