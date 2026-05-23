@@ -16,27 +16,36 @@ fn dds_node_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_dds-node"))
 }
 
+/// Pre-warm the binary so macOS Gatekeeper security verification completes
+/// before the timed test invocations run.  Without this, the first spawn in
+/// a cold binary run can take several seconds and push subsequent spawns into
+/// unexpected territory under concurrent load.
+fn warmup_binary() {
+    let _ = dds_node_bin().arg("version").output();
+}
+
 #[test]
 fn restrict_data_dir_acl_succeeds_on_existing_dir() {
     // On Windows this actually applies the DACL; on macOS / Linux it
     // is a no-op that prints a friendly explanation. Either way, the
     // binary must exit 0 and the directory must remain readable to
     // the calling process (so subsequent CA steps can write into it).
+    warmup_binary();
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path();
 
-    let status = dds_node_bin()
+    let out = dds_node_bin()
         .args([
             "restrict-data-dir-acl",
             "--data-dir",
             data_dir.to_str().unwrap(),
         ])
-        .stdout(Stdio::null())
-        .status()
+        .output()
         .unwrap();
     assert!(
-        status.success(),
-        "restrict-data-dir-acl must succeed on a freshly-created directory"
+        out.status.success(),
+        "restrict-data-dir-acl must succeed on a freshly-created directory; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(
         data_dir.exists() && data_dir.is_dir(),
@@ -114,19 +123,23 @@ fn restrict_data_dir_acl_is_idempotent() {
     // DACL must succeed. (On non-Windows this is trivially true since
     // we only print; on Windows SetNamedSecurityInfoW with the same
     // SDDL is a documented no-op.)
+    warmup_binary();
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path();
 
-    for _ in 0..3 {
-        let status = dds_node_bin()
+    for i in 0..3 {
+        let out = dds_node_bin()
             .args([
                 "restrict-data-dir-acl",
                 "--data-dir",
                 data_dir.to_str().unwrap(),
             ])
-            .stdout(Stdio::null())
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success(), "repeat invocation must succeed");
+        assert!(
+            out.status.success(),
+            "repeat invocation {i} must succeed; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
