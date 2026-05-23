@@ -1,5 +1,70 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-24, 180th pass) — Bulk dependency refresh (cargo update, ~40 crates)
+
+### Summary
+
+Automated scheduled sweep of the full Rust workspace.
+
+**Audit (`cargo audit`):** 0 vulnerabilities. Same 3 informational-only warnings as 179th
+pass (`atomic-polyfill` RUSTSEC-2023-0089, `paste` RUSTSEC-2024-0436, `lru`
+RUSTSEC-2026-0002 — all unactionable without a libp2p or pqcrypto-mldsa major-version
+bump). No new advisories.
+
+**Gap analysis:** No documentation–code gaps found. Explore agent confirmed all CLI
+commands, HTTP endpoints, public APIs, and observability features are fully implemented
+(same baseline as 179th pass). Deferred items (M-13, M-15, M-18, M-22, L-17) remain
+blocked on external design or Windows CI; no change.
+
+**Bug scan:** No new panicking paths found. All `.unwrap()` / `.expect()` in production
+code remain in test code or are provably safe structural invariants (same baseline as
+178th pass).
+
+**Supply-chain refresh:** Ran `cargo update` (no yanked advisories; routine maintenance).
+~40 crates bumped, including:
+
+| Crate | Old | New |
+|---|---|---|
+| `aes` | 0.8.4 (only) | 0.8.4 + 0.9.0 (new major; pulled by updated crypto stack) |
+| `cipher` | 0.4.4 (only) | 0.4.4 + 0.5.2 (new major) |
+| `block-padding` | 0.3.3 | 0.4.2 |
+| `cbc` | 0.1.2 | 0.2.1 |
+| `inout` | — | 0.2.2 (new transitive dep) |
+| `cpubits` | — | 0.1.1 (new transitive dep) |
+| `core2` | 0.4.0 | dropped |
+| `iri-string` | 0.7.12 | dropped |
+| `idna_adapter` | 1.2.0/1.2.1 | 1.2.2 |
+| `wit-bindgen` | — | 0.57.1 (new transitive dep) |
+| `rustls` | 0.23.37 | 0.23.40 |
+| `tokio` | 1.44.2 | 1.45.0+ range |
+| `serde` | 1.0.149 | 1.0.150 |
+| `asn1-rs` | 0.7.1 | 0.7.2 |
+| `bitflags` | 2.11.0 | 2.11.1 |
+| `autocfg` | 1.5.0 | 1.5.1 |
+| ~30 other minor/patch bumps | — | — |
+
+`cargo vet` passes after updating `supply-chain/config.toml` exemptions to match new
+versions (new exemptions added for `aes 0.9.0`, `cipher 0.5.2`, `cpubits 0.1.1`,
+`inout 0.2.2`, `idna_adapter 1.2.2`, `wit-bindgen 0.57.1`; stale `core2 0.4.0` and
+`iri-string 0.7.12` exemptions removed; `imports.lock` pruned of stale `idna_adapter`
+1.2.0/1.2.1 mozilla audit entries).
+
+### Test results
+
+`cargo test --workspace --lib` — **796 passed; 0 failed; 5 ignored** (macOS ARM64,
+2026-05-24; count unchanged from 179th pass).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean.
+
+`cargo vet` — passes (13 fully audited, 1 partially audited, 502 exempted).
+
+`cargo audit` — 0 vulnerabilities; 3 informational-only warnings (same unactionable
+baseline as 179th pass).
+
+---
+
 ## Maintenance (2026-05-23, 179th pass) — Bump fastrand 2.4.0→2.4.1 (yanked release)
 
 ### Summary
