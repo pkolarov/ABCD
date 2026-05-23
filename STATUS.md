@@ -1,5 +1,51 @@
 # DDS Implementation Status
 
+## Bug Fix (2026-05-23, 166th pass) — Validate zero-value timing config at startup instead of panicking at runtime
+
+### Bug
+
+`DdsNode::init` did not validate `expiry_scan_interval_secs` or
+`epoch_rotation_secs` before storing the `NodeConfig`. When either field was
+set to `0`, the panic did not appear at startup — it was deferred to `run()`
+when `tokio::time::interval(Duration::ZERO)` panicked (tokio documents this
+as a panic condition for zero-period intervals). The Admin Guide already
+documented `epoch_rotation_secs` as "Must be > 0", but the code silently
+clamped it to 1 via `.max(1)` without any operator-visible signal.
+
+Concrete impact:
+- `expiry_scan_interval_secs = 0` → node crashes inside `run()` with a tokio
+  interval panic instead of a clear startup error.
+- `epoch_rotation_secs = 0` → node silently uses a 1-second rotation interval
+  (from `.max(1)`) instead of the configured value; no warning was logged.
+
+### Fix
+
+**`dds-node/src/node.rs`** — `DdsNode::init`:
+- Added two early-exit validation checks immediately after
+  `create_dir_all(&config.data_dir)` and before domain parsing:
+  - `expiry_scan_interval_secs == 0` → returns `Err("expiry_scan_interval_secs must be > 0 ...")`.
+  - `epoch_rotation_secs == 0` → returns `Err("epoch_rotation_secs must be > 0 ...")`.
+- Both error messages name the offending config field and reference the
+  Admin Guide for context.
+
+**`dds-node/src/node.rs`** — new `timing_config_validation_tests` module
+(2 tests):
+- `zero_expiry_scan_interval_rejected_at_init`: zero `expiry_scan_interval_secs`
+  → `init` returns `Err` whose message contains `"expiry_scan_interval_secs"`.
+- `zero_epoch_rotation_secs_rejected_at_init`: zero `epoch_rotation_secs`
+  → `init` returns `Err` whose message contains `"epoch_rotation_secs"`.
+
+Both tests use a minimal `NodeConfig` (valid `data_dir`, bogus domain fields)
+because the validation fires before domain parsing, so no admission cert setup
+is required.
+
+### Test results
+
+`cargo test -p dds-node --lib`: 359 passed; 0 failed; 4 ignored (was 357
+before this pass — 2 new regression tests).
+
+---
+
 ## Bug Fix (2026-05-23, 165th pass) — Persist epoch-key removal immediately on admission-cert revocation
 
 ### Bug

@@ -367,6 +367,18 @@ impl DdsNode {
         // Ensure data directory exists
         std::fs::create_dir_all(&config.data_dir)?;
 
+        // Validate timing configuration early — tokio::time::interval panics on
+        // Duration::ZERO, so a zero value for either parameter would cause a
+        // panic inside run() rather than a clean startup error.
+        if config.expiry_scan_interval_secs == 0 {
+            return Err("expiry_scan_interval_secs must be > 0 (see DDS-Admin-Guide.md)".into());
+        }
+        if config.domain.epoch_rotation_secs == 0 {
+            return Err(
+                "epoch_rotation_secs must be > 0 (see DDS-Admin-Guide.md §[domain])".into(),
+            );
+        }
+
         // Parse domain id and pubkey from config (fail fast on bad config).
         let domain_id = DomainId::parse(&config.domain.id)?;
         let pubkey_bytes = from_hex(&config.domain.pubkey)?;
@@ -4587,17 +4599,124 @@ mod admission_cert_revocation_epoch_rotation_tests {
             // victim's entry is not present. This guards against a restart
             // within the Phase B.9 rotation jitter window reloading a stale
             // peer entry from epoch_keys.cbor.
-            let reloaded =
-                crate::epoch_key_store::EpochKeyStore::load_or_create(
-                    &epoch_keys_path,
-                    &mut rand::rngs::OsRng,
-                )
-                .expect("reload epoch_keys.cbor");
+            let reloaded = crate::epoch_key_store::EpochKeyStore::load_or_create(
+                &epoch_keys_path,
+                &mut rand::rngs::OsRng,
+            )
+            .expect("reload epoch_keys.cbor");
             assert!(
                 reloaded.peer_epoch_key(victim_peer_str, 1).is_none(),
                 "epoch-key release must not be present on disk after revocation \
                  (guards against stale entry reappearing after a restart)"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod timing_config_validation_tests {
+    //! Regression tests for the zero-value timing-config validation added
+    //! in `DdsNode::init`. A zero `expiry_scan_interval_secs` or
+    //! `epoch_rotation_secs` would otherwise cause a panic inside `run()`
+    //! when `tokio::time::interval` receives a `Duration::ZERO` (which
+    //! tokio documents as a panic condition). The validation fires early
+    //! in `init()` — before domain parsing or admission-cert loading — so
+    //! the tests only need a valid `data_dir`; a full admission cert is
+    //! not required for the error path.
+
+    use super::*;
+    use crate::config::{DomainConfig, NetworkConfig, NodeConfig};
+    use crate::identity_store::{PASSPHRASE_ENV, PASSPHRASE_ENV_LOCK};
+
+    /// Minimal config that passes data_dir creation and reaches the timing
+    /// validation checks. Domain id / pubkey fields are deliberately left as
+    /// empty strings — they are never reached because the error fires first.
+    fn minimal_config(data_dir: std::path::PathBuf) -> NodeConfig {
+        NodeConfig {
+            data_dir,
+            network: NetworkConfig {
+                listen_addr: "/ip4/127.0.0.1/tcp/0".to_string(),
+                bootstrap_peers: Vec::new(),
+                mdns_enabled: false,
+                heartbeat_secs: 1,
+                idle_timeout_secs: 60,
+                api_addr: "127.0.0.1:0".to_string(),
+                api_auth: Default::default(),
+                allow_legacy_v1_tokens: false,
+                metrics_addr: None,
+                allow_v1_certs: true,
+                admission_key_backend: Default::default(),
+            },
+            org_hash: "test-org".to_string(),
+            domain: DomainConfig {
+                name: "test".to_string(),
+                id: String::new(), // never reached; error fires before domain parsing
+                pubkey: String::new(),
+                pq_pubkey: None,
+                capabilities: Vec::new(),
+                admission_path: None,
+                audit_log_enabled: false,
+                max_delegation_depth: 5,
+                audit_log_max_entries: 0,
+                audit_log_retention_days: 0,
+                enforce_device_scope_vouch: false,
+                allow_unattested_credentials: false,
+                fido2_allowed_aaguids: Vec::new(),
+                fido2_attestation_roots: Vec::new(),
+                epoch_rotation_secs: 86_400,
+            },
+            trusted_roots: Vec::new(),
+            bootstrap_admin_urn: None,
+            identity_path: None,
+            expiry_scan_interval_secs: 60,
+        }
+    }
+
+    #[test]
+    fn zero_expiry_scan_interval_rejected_at_init() {
+        let _g = PASSPHRASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(PASSPHRASE_ENV) };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = minimal_config(dir.path().to_path_buf());
+        cfg.expiry_scan_interval_secs = 0;
+
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        match DdsNode::init(cfg, kp) {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("expiry_scan_interval_secs"),
+                    "error must name the offending field: {msg}"
+                );
+            }
+            Ok(_) => panic!("init must fail when expiry_scan_interval_secs = 0"),
+        }
+    }
+
+    #[test]
+    fn zero_epoch_rotation_secs_rejected_at_init() {
+        let _g = PASSPHRASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(PASSPHRASE_ENV) };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = minimal_config(dir.path().to_path_buf());
+        cfg.domain.epoch_rotation_secs = 0;
+
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        match DdsNode::init(cfg, kp) {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("epoch_rotation_secs"),
+                    "error must name the offending field: {msg}"
+                );
+            }
+            Ok(_) => panic!("init must fail when epoch_rotation_secs = 0"),
+        }
     }
 }
