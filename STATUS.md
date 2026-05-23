@@ -1,5 +1,59 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-23, 177th pass) — Automated gap/bug sweep, all green
+
+### Summary
+
+Automated scheduled sweep of the full Rust workspace for documentation–code
+gaps and production panic paths.
+
+**Audit (`cargo audit`):** 0 vulnerabilities. 6 informational-only warnings
+(same baseline as 176th pass — `atomic-polyfill`, `core2`, `paste`, `lru`,
+`fastrand` via upstream transitive deps, all unactionable without libp2p or
+pqcrypto-mldsa major-version bumps).
+
+**Gap analysis:** all doc sections cross-checked against implementation.
+- Prometheus metrics table in Admin Guide cross-checked against `telemetry.rs`.
+  All 34 documented metric families present and wired. One future planned metric
+  (`dds_sync_serves_total`) correctly absent from docs (marked as deferred in
+  code comment).
+- `[network.api_auth]` config struct: all 5 documented fields match `config.rs`
+  types and defaults exactly.
+- `dds pq status / list-pubkeys / rotate` — verified against CLI source and
+  Admin Guide "Phase B: Epoch Key Management" section: match.
+- Deferred security items (M-13 FIDO MDS, M-15 bundle re-wrap, M-18 WiX
+  service-account split, L-17 mutex refactor) — all still blocked on external
+  design or Windows CI; no change.
+
+**Bug scan:** every `.unwrap()` / `.expect()` call in production code paths
+across all Rust crates audited. All instances are in test code or provably safe:
+- `now_epoch()` defined in 6 files (ffi_core.rs, main.rs, service.rs,
+  expiry.rs, provision.rs, dds-macos-e2e.rs) — all use `.unwrap_or_default()`
+  or `.unwrap_or(0)`, consistent with the 173rd-pass fix.
+- `TrustGraph::sweep_expired()` uses `now > exp` (line 223 trust.rs);
+  `expiry::sweep_once` also uses `now > exp` (line 41 expiry.rs);
+  `Token::validate()` uses `now > exp` (line 338 token.rs). All three expiry
+  paths are consistent with the codebase-wide convention.
+- Session expiry: `validate_local_session_token` calls `token.validate()` which
+  enforces `now > exp`, so expired sessions are rejected.
+- `expiry_loop` is a `pub` helper in `expiry.rs` exercised only by tests; the
+  production run loop uses the inline `TrustGraph::sweep_expired()` path in
+  `node.rs:840`. Both paths enforce `now > exp` consistently. The function is
+  tested and harmless; refactoring it out would have no security impact.
+- `.max(1)` guard for `epoch_rotation_secs` confirmed removed (0928ca2).
+  `init()` validation at line 376–378 node.rs correctly rejects zero values.
+
+No code or documentation changes required.
+
+### Test results
+
+`cargo test --workspace --lib` — **796 passed; 0 failed** (macOS ARM64,
+2026-05-23; lockfile-only change since 175th pass, count unchanged).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+---
+
 ## Security (2026-05-23, 176th pass) — Bump rand 0.8→0.8.6 and rand 0.9→0.9.4 to close RUSTSEC-2026-0097
 
 ### Finding
