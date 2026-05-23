@@ -1,5 +1,39 @@
 # DDS Implementation Status
 
+## Bug Fix (2026-05-23, 163rd pass) — Silent port truncation in provision bundles + now_epoch panic on bad clock
+
+### Bugs
+
+**Bug 1 — Silent port truncation (`provision.rs`)**
+
+`load_bundle` decoded `listen_port` and `api_port` from the provision bundle
+CBOR by calling `get_u64(...) as u16`. A malformed or hand-crafted bundle with
+a port value outside 1–65535 would silently truncate (e.g. port 65537 → port 1,
+port 0 → 0) and the node would bind to the wrong port with no error. Added
+explicit range validation (`1..=65535`) that returns a `ProvisionError::Format`
+on out-of-range values. Added regression test
+`bundle_rejects_out_of_range_ports`.
+
+**Bug 2 — Panic in `now_epoch()` on pre-epoch system clock (`service.rs`)**
+
+`now_epoch()` called `.duration_since(UNIX_EPOCH).unwrap()`. If the system
+clock is set before 1970-01-01 (possible on misconfigured or mocked clocks),
+`duration_since` returns `Err` and the node panics. Changed to
+`.unwrap_or_default()` which returns 0 seconds — tokens would then appear
+expired but the node does not crash.
+
+### Fix
+
+- `dds-node/src/provision.rs`: validate `listen_port` and `api_port` in
+  `load_bundle`; add `bundle_rejects_out_of_range_ports` test.
+- `dds-node/src/service.rs`: `now_epoch()` uses `.unwrap_or_default()`.
+
+### Test results
+
+`cargo test -p dds-node --lib`: 357 passed; 0 failed; 4 ignored.
+
+---
+
 ## Bug Fix (2026-05-23, 162nd pass) — Epoch-key grace entries never pruned + stale peer entries on revocation
 
 ### Bugs

@@ -276,7 +276,14 @@ pub struct DdsNode {
     /// REVOCATION_ROTATION_JITTER_SECS)` so the rotation-triggered
     /// thundering-herd (§6.1) is staggered across the mesh. `None`
     /// means no revocation rotation is pending.
-    pending_revocation_rotation: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    ///
+    /// Stored as a `std::time::Instant` deadline rather than an eager
+    /// `tokio::time::Sleep` so that callers outside a Tokio runtime
+    /// (e.g. unit/integration tests that call
+    /// `merge_piggybacked_revocations` synchronously) can set it
+    /// without panicking. The `run()` `select!` loop converts it to a
+    /// `tokio::time::sleep_until` lazily, where a runtime is guaranteed.
+    pending_revocation_rotation: Option<std::time::Instant>,
     /// **Z-1 Phase B.9 / B.10** — manual-rotation notifier. The HTTP
     /// handler for `POST /v1/pq/rotate` calls `notify_one()` on this
     /// `Arc<Notify>`; the `run()` loop wakes up and calls
@@ -870,8 +877,10 @@ impl DdsNode {
                 // after the jitter expires (0..REVOCATION_ROTATION_JITTER_SECS)
                 // and is cleared here so it only fires once per revocation.
                 _ = async {
-                    if let Some(ref mut sleep) = self.pending_revocation_rotation {
-                        sleep.await
+                    if let Some(deadline) = self.pending_revocation_rotation {
+                        tokio::time::sleep_until(
+                            tokio::time::Instant::from_std(deadline)
+                        ).await
                     } else {
                         std::future::pending().await
                     }
@@ -1574,9 +1583,8 @@ impl DdsNode {
                 jitter_secs,
                 "Phase B.9: scheduling jittered epoch rotation after admission-cert revocation"
             );
-            self.pending_revocation_rotation = Some(Box::pin(tokio::time::sleep(
-                std::time::Duration::from_secs(jitter_secs),
-            )));
+            self.pending_revocation_rotation =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(jitter_secs));
         }
     }
 
@@ -2201,9 +2209,8 @@ impl DdsNode {
                 jitter_secs,
                 "Phase B.9: scheduling jittered epoch rotation after revocation"
             );
-            self.pending_revocation_rotation = Some(Box::pin(tokio::time::sleep(
-                std::time::Duration::from_secs(jitter_secs),
-            )));
+            self.pending_revocation_rotation =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(jitter_secs));
         }
     }
 

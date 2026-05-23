@@ -431,8 +431,24 @@ pub fn load_bundle(path: &Path) -> Result<ProvisionBundle, ProvisionError> {
         domain_pq_pubkey: if version >= 4 { stored_pq_pubkey } else { None },
         domain_key_blob: get_bytes("domain_key")?,
         org_hash: get_text("org_hash")?,
-        listen_port: get_u64("listen_port", 4001) as u16,
-        api_port: get_u64("api_port", 5551) as u16,
+        listen_port: {
+            let p = get_u64("listen_port", 4001);
+            if p == 0 || p > 65535 {
+                return Err(ProvisionError::Format(format!(
+                    "listen_port {p} is out of valid range 1–65535"
+                )));
+            }
+            p as u16
+        },
+        api_port: {
+            let p = get_u64("api_port", 5551);
+            if p == 0 || p > 65535 {
+                return Err(ProvisionError::Format(format!(
+                    "api_port {p} is out of valid range 1–65535"
+                )));
+            }
+            p as u16
+        },
         mdns_enabled: get_bool("mdns_enabled", true),
         fingerprint: String::new(),
     };
@@ -2578,5 +2594,82 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::remove_var(crate::identity_store::PASSPHRASE_ENV) };
         warn_at_rest_storage(); // must not panic on any supported platform
+    }
+
+    /// Port values outside 1–65535 must be rejected at bundle-decode time
+    /// so malformed bundles never silently truncate to a different port.
+    #[test]
+    fn bundle_rejects_out_of_range_ports() {
+        use ciborium::value::Value as CborValue;
+
+        let key = DomainKey::generate("port-test.local", &mut OsRng);
+        let domain = key.domain();
+
+        // Helper: write a CBOR bundle map with an overridden port to a temp
+        // file and attempt to load it. The fingerprint check runs inside
+        // `load_bundle`; we reach the port validation first.
+        let load_with_port =
+            |field: &str, port_val: u64| -> Result<ProvisionBundle, ProvisionError> {
+                let other_port_field = if field == "listen_port" {
+                    "api_port"
+                } else {
+                    "listen_port"
+                };
+                let map = vec![
+                    (
+                        CborValue::Text("version".into()),
+                        CborValue::Integer(3u64.into()),
+                    ),
+                    (
+                        CborValue::Text("domain_name".into()),
+                        CborValue::Text(domain.name.clone()),
+                    ),
+                    (
+                        CborValue::Text("domain_id".into()),
+                        CborValue::Text(domain.id.to_string()),
+                    ),
+                    (
+                        CborValue::Text("domain_pubkey".into()),
+                        CborValue::Text(to_hex(&domain.pubkey)),
+                    ),
+                    (
+                        CborValue::Text("domain_key".into()),
+                        CborValue::Bytes(vec![1, 2, 3]),
+                    ),
+                    (
+                        CborValue::Text("org_hash".into()),
+                        CborValue::Text("test-org".into()),
+                    ),
+                    (
+                        CborValue::Text(field.to_string()),
+                        CborValue::Integer(port_val.into()),
+                    ),
+                    (
+                        CborValue::Text(other_port_field.to_string()),
+                        CborValue::Integer(4001u64.into()),
+                    ),
+                ];
+                let mut buf = Vec::new();
+                ciborium::into_writer(&CborValue::Map(map), &mut buf).unwrap();
+                let dir = TempDir::new().unwrap();
+                let path = dir.path().join("bad.dds");
+                std::fs::write(&path, &buf).unwrap();
+                load_bundle(&path)
+            };
+
+        // port 0 is invalid
+        let err = load_with_port("listen_port", 0).expect_err("port 0 must be rejected");
+        assert!(
+            err.to_string().contains("listen_port")
+                && err.to_string().contains("out of valid range"),
+            "unexpected error: {err}"
+        );
+
+        // port 65536 exceeds u16::MAX
+        let err = load_with_port("api_port", 65536).expect_err("port 65536 must be rejected");
+        assert!(
+            err.to_string().contains("api_port") && err.to_string().contains("out of valid range"),
+            "unexpected error: {err}"
+        );
     }
 }

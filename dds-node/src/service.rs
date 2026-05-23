@@ -3153,7 +3153,7 @@ fn supersede_software(items: Vec<ApplicableSoftware>) -> Vec<ApplicableSoftware>
 fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
 }
 
