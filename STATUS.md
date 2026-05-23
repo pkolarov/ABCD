@@ -1,5 +1,29 @@
 # DDS Implementation Status
 
+## Bug Fix (2026-05-23, 173rd pass) — 9 unwrap panics in dds-cli replaced with actionable errors
+
+### Bug
+
+`dds-cli/src/main.rs` contained 9 unguarded `.unwrap()` calls in two handlers:
+
+- **`handle_platform`** (6 calls): `serde_json::from_slice(&bytes).unwrap()` for each of the
+  Windows/macOS/Linux policies and software envelope payloads. A malformed or tampered response
+  from the node would panic the CLI instead of printing a diagnostic.
+- **`handle_group`** (3 calls): `Token::sign(...).unwrap()`, `store.put_token(...).unwrap()`,
+  and `store.revoke(...).unwrap()` in the `Vouch` and `Revoke` arms. A signing failure or disk
+  I/O error would panic instead of giving the operator an actionable message.
+
+### Fix
+
+All 9 replaced with the codebase-standard `unwrap_or_else(|e| { eprintln!("Error: …"); std::process::exit(1); })` pattern, matching how `handle_health`, `run_audit_tail`, and `unwrap_envelope` already handle errors.
+
+### Test results
+
+`cargo clippy -p dds-cli --all-targets -- -D warnings` — clean.
+`cargo test --workspace --lib` — **796 passed; 0 failed** (macOS ARM64, 2026-05-23).
+
+---
+
 ## Doc Fix (2026-05-23, 172nd pass) — Stale Rust test count in Build Health metrics table
 
 ### Gap
