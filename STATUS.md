@@ -1,5 +1,63 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-23, 153rd pass) — CLI integration tests for create-provision-bundle + provision
+
+### Gap
+
+**`dds-node create-provision-bundle` and `dds-node provision` had no dedicated CLI
+integration test files.**
+
+These two commands form the primary air-gapped deployment workflow — an admin
+creates a bundle on the anchor node, carries it to each worker node, and
+provisions it there. Despite having extensive unit tests calling the underlying
+`create_bundle` / `run_provision` functions directly (in `dds-node/src/provision.rs`),
+neither command had a test that exercised the compiled binary end-to-end through
+`Command::new(env!("CARGO_BIN_EXE_dds-node"))`.
+
+Specific gaps:
+1. `create-provision-bundle`: no CLI test for happy path, fingerprint output, hybrid
+   domain support, missing-flag errors, or missing-domain.toml error.
+2. `provision`: no CLI test for file creation invariants (admission.cbor, domain.toml,
+   p2p_key.bin, node_key.bin — and the security invariant that domain_key.bin must
+   NOT be written to the data dir), stdout content (domain name, "Node Provisioned"
+   banner, Peer ID prefix), dds.toml config creation, double-provision rejection,
+   missing bundle path, or nonexistent bundle error.
+
+### Fix
+
+**`dds-node/tests/provision_bundle_cli.rs`** — 13 new CLI integration tests:
+
+**`create-provision-bundle` (6 tests):**
+- `create_provision_bundle_creates_file`: bundle file created at `--out` path; non-empty.
+- `create_provision_bundle_stdout_includes_fingerprint`: stdout includes "Bundle integrity
+  fingerprint:" and the operator confirmation reminder.
+- `create_provision_bundle_hybrid_domain_succeeds`: hybrid (Ed25519+ML-DSA-65) domain
+  bundles work without passphrase.
+- `create_provision_bundle_requires_dir_flag`: missing `--dir` → non-zero + mentions flag.
+- `create_provision_bundle_requires_org_flag`: missing `--org` → non-zero + mentions flag.
+- `create_provision_bundle_fails_on_missing_domain_toml`: empty dir → non-zero; no bundle
+  file created.
+
+**`provision` (7 tests):**
+- `provision_creates_expected_files`: admission.cbor, domain.toml, p2p_key.bin,
+  node_key.bin all created; domain_key.bin NOT written (security invariant).
+- `provision_stdout_reports_domain_and_peer_id`: "Node Provisioned" banner, domain name,
+  and "Peer ID:" present in stdout.
+- `provision_stdout_peer_id_has_expected_prefix`: Peer ID contains the libp2p Ed25519
+  prefix "12D3KooW".
+- `provision_writes_dds_toml_config`: sibling dds.toml created; contains domain name.
+- `provision_refuses_double_provision`: second run on same data dir exits non-zero with
+  "already" in error output.
+- `provision_requires_bundle_path`: no positional arg → non-zero.
+- `provision_fails_with_nonexistent_bundle`: nonexistent bundle path → non-zero + non-empty
+  error message.
+
+### Test results
+
+macOS test count: **170 → 183** (13 new passing tests; 0 failures).
+
+---
+
 ## Gap Fix (2026-05-23, 152nd pass) — CLI integration tests for init-domain + gen-node-key
 
 ### Gaps
