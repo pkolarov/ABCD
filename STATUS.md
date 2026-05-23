@@ -1,5 +1,47 @@
 # DDS Implementation Status
 
+## Bug Fix (2026-05-23, 169th pass) — `expiry::sweep_once` used wrong comparison operator
+
+### Bug
+
+`dds-node/src/expiry.rs::sweep_once` used `exp_secs <= now` to decide whether a token
+is expired, while every other expiry check in the codebase uses `now > exp` (strictly
+greater than):
+
+- `dds-core/src/token.rs:338` — `if now > exp { return Err(TokenError::Expired) }`
+- `dds-core/src/trust.rs:223,235` — `.filter(|(_, t)| t.payload.exp.is_some_and(|exp| now > exp))`
+- `dds-core/src/trust.rs:201` — `TrustGraph::is_expired` returns `now.as_secs() > exp`
+- `dds-domain/src/domain.rs:686` — `if let Some(exp) = self.body.expires_at && now > exp`
+
+The `<=` form treated a token as expired at the exact second its `exp` field equals `now`
+(`exp == now` → expired), whereas the `now > exp` convention says the token is still
+valid at that second (only expired starting from `exp + 1`).
+
+`sweep_once` is not called in the production run loop — the run loop uses
+`TrustGraph::sweep_expired()` directly — so there was no live behaviour difference.
+However, `DdsNode::sweep_expired()` (a `pub` method used in tests) delegates to
+`sweep_once`, meaning test-driven sweeps silently used different semantics from
+production sweeps, which could mask off-by-one issues in future tests.
+
+### Fix
+
+**`dds-node/src/expiry.rs`** — `sweep_once`:
+- Changed `if exp_secs <= now {` to `if now > exp_secs {`, matching the `now > exp`
+  convention used everywhere else.
+
+**`dds-node/src/expiry.rs`** — new `test_sweep_not_expired_at_exact_boundary` test:
+- Seeds a token with `exp = 500`.
+- Asserts `sweep_once(..., 500)` sweeps nothing (`exp == now` → not expired).
+- Asserts `sweep_once(..., 501)` sweeps the token (`now > exp` → expired).
+- Documents the rationale so future readers understand why `exp == now` is not swept.
+
+### Test results
+
+`cargo test -p dds-node --lib`: 360 passed; 0 failed; 4 ignored (was 359 before this
+pass — 1 new boundary regression test).
+
+---
+
 ## Doc Fix (2026-05-23, 168th pass) — `expiry_scan_interval_secs` missing "Must be > 0" constraint
 
 ### Gap

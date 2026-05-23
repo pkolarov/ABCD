@@ -34,7 +34,7 @@ where
     };
     for (jti, exp) in entries {
         if let Some(exp_secs) = exp {
-            if exp_secs <= now {
+            if now > exp_secs {
                 if graph.remove_token(&jti) {
                     stats.expired += 1;
                 }
@@ -145,6 +145,20 @@ mod tests {
         let s2 = sweep_once(&mut graph, &mut store, 1000);
         assert_eq!(s2.expired, 0);
         assert_eq!(s2.scanned, 0);
+    }
+
+    #[test]
+    fn test_sweep_not_expired_at_exact_boundary() {
+        // Convention across the codebase: `now > exp` means expired.
+        // A token is NOT swept when exp == now (only when exp < now).
+        // This matches token.rs and trust.rs so test/production behaviour is consistent.
+        let mut graph = TrustGraph::new();
+        let mut store = MemoryBackend::new();
+        graph.add_token(make_token("boundary", Some(500))).unwrap();
+        let s = sweep_once(&mut graph, &mut store, 500); // exp == now
+        assert_eq!(s.expired, 0, "token at exp==now must NOT be swept");
+        let s2 = sweep_once(&mut graph, &mut store, 501); // now > exp
+        assert_eq!(s2.expired, 1, "token with now > exp must be swept");
     }
 
     #[test]
