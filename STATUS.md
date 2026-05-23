@@ -1,5 +1,50 @@
 # DDS Implementation Status
 
+## Security (2026-05-23, 176th pass) — Bump rand 0.8→0.8.6 and rand 0.9→0.9.4 to close RUSTSEC-2026-0097
+
+### Finding
+
+`cargo audit` flagged **RUSTSEC-2026-0097** — *Rand is unsound with a custom logger using `rand::rng()`* —
+against both transitive `rand` versions in the lockfile:
+
+| Package | Old version | New version |
+|---|---|---|
+| `rand` (yamux 0.12 path) | 0.8.5 | **0.8.6** |
+| `rand` (yamux 0.13 path) | 0.9.2 | **0.9.4** |
+
+Both were pulled in transitively through `yamux → libp2p-yamux → libp2p`. Neither version is
+a direct workspace dependency, so no `Cargo.toml` changes are needed — only the lockfile.
+
+### Fix
+
+```
+cargo update -p rand@0.8.5   # → 0.8.6 (SemVer-compatible patch)
+cargo update -p rand@0.9.2   # → 0.9.4 (SemVer-compatible patch)
+```
+
+`cargo audit` after: RUSTSEC-2026-0097 no longer appears (8 allowed warnings → 6 allowed warnings).
+
+Remaining informational-only advisories (all in deep transitive deps, no patch available without a
+libp2p or pqcrypto-mldsa major-version bump):
+
+| ID | Package | Nature |
+|---|---|---|
+| RUSTSEC-2023-0089 | `atomic-polyfill 1.0.3` via `heapless → postcard → dds-store` | Unmaintained notice |
+| RUSTSEC-2026-0105 | `core2 0.4.0` via `multihash → libp2p` | Unmaintained / all versions yanked |
+| RUSTSEC-2024-0436 | `paste 1.0.15` via `pqcrypto-mldsa` | Unmaintained notice |
+| RUSTSEC-2026-0002 | `lru 0.12.5` via `libp2p-swarm` | `IterMut` Stacked Borrows (fixed in lru 0.13+, blocked on libp2p upgrade) |
+
+These four are tracked but not actionable in this patch cycle.
+
+### Test results
+
+`cargo test --workspace --lib` — **796 passed; 0 failed** (macOS ARM64, 2026-05-23;
+lockfile-only change, no source changed, count unchanged from 175th pass).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+---
+
 ## Maintenance (2026-05-23, 175th pass) — No-op: full gap/bug sweep, all green
 
 ### Summary
