@@ -1513,6 +1513,7 @@ impl DdsNode {
         // persist; the in-memory eviction is the load-bearing
         // mutation. Idempotent on a peer not currently cached.
         let mut evicted = false;
+        let mut epoch_key_removed = false;
         for revoked_peer in &newly_revoked_peers {
             if self.peer_certs.remove(revoked_peer).is_some() {
                 evicted = true;
@@ -1522,11 +1523,15 @@ impl DdsNode {
             // isn't incorrectly throttled by a stale cooldown entry.
             self.epoch_key_request_last.remove(revoked_peer);
             // Drop the revoked peer's cached epoch-key release so
-            // the next `epoch_keys.save` does not persist a stale
-            // publisher entry for a revoked node. Grace entries are
-            // intentionally left in place — they age out via
-            // `prune_grace` within `EPOCH_KEY_GRACE_SECS`.
-            self.epoch_keys.remove_peer(revoked_peer);
+            // the on-disk snapshot does not contain a stale publisher
+            // entry for a revoked node. Persist immediately (see below)
+            // so a restart within the Phase B.9 rotation jitter window
+            // does not reload the stale entry from epoch_keys.cbor.
+            // Grace entries are intentionally left in place — they age
+            // out via `prune_grace` within `EPOCH_KEY_GRACE_SECS`.
+            if self.epoch_keys.remove_peer(revoked_peer).is_some() {
+                epoch_key_removed = true;
+            }
         }
         if evicted {
             if let Err(e) = self.peer_certs.save(&self.peer_certs_path) {
@@ -1534,6 +1539,15 @@ impl DdsNode {
                     error = %e,
                     path = %self.peer_certs_path.display(),
                     "H-12: failed to persist peer cert cache after revocation eviction"
+                );
+            }
+        }
+        if epoch_key_removed {
+            if let Err(e) = self.epoch_keys.save(&self.epoch_keys_path) {
+                warn!(
+                    error = %e,
+                    path = %self.epoch_keys_path.display(),
+                    "H-12: failed to persist epoch-key store after revoked-peer removal"
                 );
             }
         }
@@ -3648,6 +3662,12 @@ impl DdsNode {
     pub fn epoch_key_request_last_for_tests(&self) -> &BTreeMap<String, std::time::Instant> {
         &self.epoch_key_request_last
     }
+
+    /// Path to the on-disk epoch-key store (`epoch_keys.cbor`). Test-only.
+    #[doc(hidden)]
+    pub fn epoch_keys_path_for_tests(&self) -> &std::path::Path {
+        &self.epoch_keys_path
+    }
 }
 
 /// **Z-1 Phase B.5** — canonical hybrid-KEM `binding_info` for a
@@ -4550,15 +4570,33 @@ mod admission_cert_revocation_epoch_rotation_tests {
                 "pre-condition: epoch-key entry present for victim"
             );
 
+            let epoch_keys_path = node.epoch_keys_path_for_tests().to_path_buf();
             let rev = dkey.revoke_admission(victim_peer_str.into(), 1_000_004, Some("d".into()));
             let blob = rev.to_cbor().expect("cbor");
             node.merge_piggybacked_revocations(&peer_id, vec![blob]);
 
+            // Verify in-memory removal.
             assert!(
                 node.epoch_keys_for_tests()
                     .peer_epoch_key(victim_peer_str, 1)
                     .is_none(),
                 "epoch-key release must be removed when the peer's admission cert is revoked"
+            );
+
+            // Verify on-disk removal: reload from the path and confirm the
+            // victim's entry is not present. This guards against a restart
+            // within the Phase B.9 rotation jitter window reloading a stale
+            // peer entry from epoch_keys.cbor.
+            let reloaded =
+                crate::epoch_key_store::EpochKeyStore::load_or_create(
+                    &epoch_keys_path,
+                    &mut rand::rngs::OsRng,
+                )
+                .expect("reload epoch_keys.cbor");
+            assert!(
+                reloaded.peer_epoch_key(victim_peer_str, 1).is_none(),
+                "epoch-key release must not be present on disk after revocation \
+                 (guards against stale entry reappearing after a restart)"
             );
         });
     }

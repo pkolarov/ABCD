@@ -1,5 +1,47 @@
 # DDS Implementation Status
 
+## Bug Fix (2026-05-23, 165th pass) — Persist epoch-key removal immediately on admission-cert revocation
+
+### Bug
+
+`merge_piggybacked_revocations` called `epoch_keys.remove_peer(revoked_peer)` to evict the
+revoked peer's cached epoch-key release from memory, but did **not** immediately persist the
+updated epoch-key store to disk. The comment claimed "the next `epoch_keys.save` does not
+persist a stale publisher entry" — but this only held if the node did NOT restart before the
+Phase B.9 rotation jitter fired (0–30 s). A restart within that window would reload the stale
+entry from `epoch_keys.cbor`, defeating the intended cleanup.
+
+This was a minor storage artifact and had **no security impact**: the revoked peer is blocked
+at H-12 admission and cannot reconnect or send gossip that would cause us to use their epoch
+key. However, the on-disk state was inconsistent with the intended invariant.
+
+### Fix
+
+**`dds-node/src/node.rs`** — `merge_piggybacked_revocations` peer-eviction loop:
+
+- Changed `epoch_keys.remove_peer(revoked_peer)` to check the return value (`Option`), setting
+  a new `epoch_key_removed: bool` flag when any entry was actually present and removed.
+- Added an `if epoch_key_removed` block after the existing `if evicted` block that persists
+  `epoch_keys` to disk immediately, mirroring the same best-effort pattern used for
+  `peer_certs` (log WARN on failure, do not propagate the error).
+
+**`dds-node/src/node.rs`** — test accessors:
+
+- Added `epoch_keys_path_for_tests(&self) -> &Path` accessor so tests can reload the store
+  from disk to verify persistence.
+
+**`dds-node/src/node.rs`** — `admission_cert_revocation_removes_peer_epoch_key_entry` test:
+
+- Extended to also reload `epoch_keys.cbor` from disk and assert the victim peer's entry is
+  absent, guarding against the restart-before-rotation regression.
+
+### Test results
+
+`cargo test -p dds-node --lib`: 357 passed; 0 failed; 4 ignored.
+4/4 admission-cert revocation epoch-rotation tests pass including the enhanced on-disk check.
+
+---
+
 ## CI Fix (2026-05-23, 164th pass) — Opt all workflows into Node.js 24 before June 2 deadline
 
 ### Background
