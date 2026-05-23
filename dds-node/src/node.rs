@@ -1497,6 +1497,10 @@ impl DdsNode {
             if self.peer_certs.remove(revoked_peer).is_some() {
                 evicted = true;
             }
+            // Also clean up the epoch-key request cooldown map so a
+            // future re-admitted peer (different cert, same PeerId)
+            // isn't incorrectly throttled by a stale cooldown entry.
+            self.epoch_key_request_last.remove(revoked_peer);
         }
         if evicted {
             if let Err(e) = self.peer_certs.save(&self.peer_certs_path) {
@@ -1536,6 +1540,26 @@ impl DdsNode {
                 path = %self.admission_revocations_path.display(),
                 "H-12: merged revocations into memory but failed to persist"
             ),
+        }
+        // **Z-1 Phase B.9** — admission-cert revocation also triggers
+        // epoch key rotation so a newly-revoked peer loses the ability
+        // to decrypt future gossip/sync payloads once the epoch turns.
+        // Mirrors the identical block in `ingest_revocation` (user-token
+        // path). Deduplicated: if a user-token revocation already
+        // scheduled a rotation, the admission-cert revocation does not
+        // reset the jitter window.
+        if self.pending_revocation_rotation.is_none() {
+            let jitter_secs = rand::Rng::gen_range(
+                &mut rand::rngs::OsRng,
+                0u64..REVOCATION_ROTATION_JITTER_SECS,
+            );
+            debug!(
+                jitter_secs,
+                "Phase B.9: scheduling jittered epoch rotation after admission-cert revocation"
+            );
+            self.pending_revocation_rotation = Some(Box::pin(tokio::time::sleep(
+                std::time::Duration::from_secs(jitter_secs),
+            )));
         }
     }
 
@@ -3587,6 +3611,19 @@ impl DdsNode {
         let g = self.trust_graph.read().expect("trust_graph poisoned");
         policy_engine.evaluate(subject_urn, resource, action, &g, &self.trusted_roots)
     }
+
+    /// Returns `true` if a revocation-triggered epoch rotation is
+    /// pending (scheduled but not yet fired). Test-only.
+    #[doc(hidden)]
+    pub fn has_pending_revocation_rotation_for_tests(&self) -> bool {
+        self.pending_revocation_rotation.is_some()
+    }
+
+    /// Read-only handle to the epoch-key request cooldown map. Test-only.
+    #[doc(hidden)]
+    pub fn epoch_key_request_last_for_tests(&self) -> &BTreeMap<String, std::time::Instant> {
+        &self.epoch_key_request_last
+    }
 }
 
 /// **Z-1 Phase B.5** — canonical hybrid-KEM `binding_info` for a
@@ -4250,5 +4287,183 @@ mod publisher_identity_gate_tests {
         };
         let token = Token::sign(payload, &ident.signing_key).expect("sign");
         assert!(software_publisher_identity_ok(&token));
+    }
+}
+
+#[cfg(test)]
+mod admission_cert_revocation_epoch_rotation_tests {
+    //! Phase B.9 follow-up — regression tests for the property that an
+    //! admission-cert revocation (arriving via H-12 piggy-back) schedules
+    //! a jittered epoch-key rotation, exactly as a user-token revocation
+    //! (gossip path) does.
+    //!
+    //! Also covers the `epoch_key_request_last` cooldown-map pruning that
+    //! prevents a revoked peer's stale cooldown entry from throttling
+    //! legitimate late-join requests after re-admission.
+
+    use super::*;
+    use crate::config::{DomainConfig, NetworkConfig, NodeConfig};
+
+    fn make_node(domain_key: &dds_domain::DomainKey) -> (DdsNode, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let domain = domain_key.domain();
+        let p2p_kp = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = libp2p::PeerId::from(p2p_kp.public());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let cert = domain_key.issue_admission(peer_id.to_string(), now, None);
+        crate::domain_store::save_admission_cert(&data_dir.join("admission.cbor"), &cert).unwrap();
+        let cfg = NodeConfig {
+            data_dir,
+            network: NetworkConfig {
+                listen_addr: "/ip4/127.0.0.1/tcp/0".to_string(),
+                bootstrap_peers: Vec::new(),
+                mdns_enabled: false,
+                heartbeat_secs: 1,
+                idle_timeout_secs: 60,
+                api_addr: "127.0.0.1:0".to_string(),
+                api_auth: Default::default(),
+                allow_legacy_v1_tokens: false,
+                metrics_addr: None,
+                allow_v1_certs: true,
+                admission_key_backend: Default::default(),
+            },
+            org_hash: "test-org".to_string(),
+            domain: DomainConfig {
+                name: domain.name.clone(),
+                id: domain.id.to_string(),
+                pubkey: dds_domain::domain::to_hex(&domain.pubkey),
+                pq_pubkey: None,
+                capabilities: Vec::new(),
+                admission_path: None,
+                audit_log_enabled: false,
+                max_delegation_depth: 5,
+                audit_log_max_entries: 0,
+                audit_log_retention_days: 0,
+                enforce_device_scope_vouch: false,
+                allow_unattested_credentials: false,
+                fido2_allowed_aaguids: Vec::new(),
+                fido2_attestation_roots: Vec::new(),
+                epoch_rotation_secs: 86_400,
+            },
+            trusted_roots: Vec::new(),
+            bootstrap_admin_urn: None,
+            identity_path: None,
+            expiry_scan_interval_secs: 60,
+        };
+        let node = DdsNode::init(cfg, p2p_kp).expect("init node");
+        (node, dir)
+    }
+
+    /// Wrap a test body in a minimal single-thread Tokio runtime with
+    /// time enabled. Required because `merge_piggybacked_revocations`
+    /// → `ingest_revocation_piggybacked` creates a `tokio::time::sleep`
+    /// future when scheduling the jittered epoch rotation.
+    fn run_with_time<F: FnOnce()>(f: F) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async { f() });
+    }
+
+    /// Ingesting a valid admission-cert revocation via the H-12 piggy-back
+    /// path must schedule a pending epoch rotation (same as a user-token
+    /// revocation does on the gossip path).
+    #[test]
+    fn admission_cert_revocation_schedules_epoch_rotation() {
+        run_with_time(|| {
+            let dkey = dds_domain::DomainKey::from_secret_bytes("revoke-epoch.local", [42u8; 32]);
+            let (mut node, _dir) = make_node(&dkey);
+            let peer_id: libp2p::PeerId = "12D3KooWNodeX"
+                .parse()
+                .unwrap_or_else(|_| libp2p::PeerId::random());
+
+            assert!(
+                !node.has_pending_revocation_rotation_for_tests(),
+                "no rotation should be pending before any revocation"
+            );
+
+            // Build a domain-signed revocation for an arbitrary peer and
+            // ship it as a piggy-back blob.
+            let rev =
+                dkey.revoke_admission("12D3KooWVictim".into(), 1_000_000, Some("test".into()));
+            let blob = rev.to_cbor().expect("cbor");
+            node.merge_piggybacked_revocations(&peer_id, vec![blob]);
+
+            assert!(
+                node.has_pending_revocation_rotation_for_tests(),
+                "admission-cert revocation must schedule a pending epoch rotation"
+            );
+        });
+    }
+
+    /// A second admission-cert revocation while a rotation is already
+    /// pending must NOT reset or create a second timer — deduplication
+    /// must hold just as it does for user-token revocations.
+    #[test]
+    fn admission_cert_revocation_deduplicates_pending_rotation() {
+        run_with_time(|| {
+            let dkey = dds_domain::DomainKey::from_secret_bytes("revoke-dedup.local", [43u8; 32]);
+            let (mut node, _dir) = make_node(&dkey);
+            let peer_id: libp2p::PeerId = "12D3KooWNodeY"
+                .parse()
+                .unwrap_or_else(|_| libp2p::PeerId::random());
+
+            let rev1 = dkey.revoke_admission("12D3KooWVictimA".into(), 1_000_001, Some("a".into()));
+            let rev2 = dkey.revoke_admission("12D3KooWVictimB".into(), 1_000_002, Some("b".into()));
+            let blob1 = rev1.to_cbor().expect("cbor");
+            let blob2 = rev2.to_cbor().expect("cbor");
+
+            node.merge_piggybacked_revocations(&peer_id, vec![blob1]);
+            assert!(node.has_pending_revocation_rotation_for_tests());
+
+            // A second call must not panic and must leave the rotation pending.
+            node.merge_piggybacked_revocations(&peer_id, vec![blob2]);
+            assert!(
+                node.has_pending_revocation_rotation_for_tests(),
+                "rotation must remain pending after a second revocation"
+            );
+        });
+    }
+
+    /// Revoking a peer clears their stale entry from the epoch-key-request
+    /// cooldown map so a future re-admitted peer with the same PeerId
+    /// can immediately request a late-join epoch key without hitting the
+    /// cooldown from the previous (now-revoked) identity.
+    #[test]
+    fn admission_cert_revocation_clears_epoch_key_request_cooldown() {
+        run_with_time(|| {
+            let dkey =
+                dds_domain::DomainKey::from_secret_bytes("revoke-cooldown.local", [44u8; 32]);
+            let (mut node, _dir) = make_node(&dkey);
+            let peer_id: libp2p::PeerId = "12D3KooWNodeZ"
+                .parse()
+                .unwrap_or_else(|_| libp2p::PeerId::random());
+
+            // Pre-seed a stale cooldown entry for the peer we're about to revoke.
+            let victim_peer_str = "12D3KooWVictimCooldown";
+            node.epoch_key_request_last
+                .insert(victim_peer_str.to_string(), std::time::Instant::now());
+            assert!(
+                node.epoch_key_request_last_for_tests()
+                    .contains_key(victim_peer_str),
+                "pre-condition: cooldown entry present"
+            );
+
+            let rev = dkey.revoke_admission(victim_peer_str.into(), 1_000_003, Some("c".into()));
+            let blob = rev.to_cbor().expect("cbor");
+            node.merge_piggybacked_revocations(&peer_id, vec![blob]);
+
+            assert!(
+                !node
+                    .epoch_key_request_last_for_tests()
+                    .contains_key(victim_peer_str),
+                "cooldown entry must be removed when the peer's admission cert is revoked"
+            );
+        });
     }
 }

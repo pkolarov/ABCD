@@ -1,5 +1,45 @@
 # DDS Implementation Status
 
+## Security Fix (2026-05-23, 161st pass) — Admission-cert revocation triggers epoch key rotation (Phase B.9)
+
+### Bug
+
+`ingest_revocation_piggybacked` (the H-12 piggyback path for admission cert
+revocation) did not schedule a `pending_revocation_rotation`, while the gossip
+user-token path (`ingest_revocation`) did.  A peer whose admission cert was
+revoked could therefore continue decrypting gossip and sync payloads for up to
+24 hours (until the next scheduled epoch rotation) after revocation.
+
+Additionally, stale `epoch_key_request_last` cooldown entries for revoked peers
+were never cleaned up, meaning a re-admitted peer with the same `PeerId` would
+be incorrectly throttled on its first epoch-key request.
+
+### Fix
+
+**`dds-node/src/node.rs`** — `ingest_revocation_piggybacked`:
+
+1. Added the same jittered `pending_revocation_rotation` scheduling block
+   (0..30 s) that already exists in `ingest_revocation`, guarded by
+   `if self.pending_revocation_rotation.is_none()` so a concurrent
+   user-token revocation does not reset the jitter window.
+2. Added `self.epoch_key_request_last.remove(revoked_peer)` inside the peer
+   eviction loop to clear stale cooldown entries on cert revocation.
+3. Added two test accessor helpers:
+   `has_pending_revocation_rotation_for_tests` and
+   `epoch_key_request_last_for_tests`.
+4. Added new test module
+   `admission_cert_revocation_epoch_rotation_tests` (3 tests):
+   - `admission_cert_revocation_schedules_epoch_rotation`
+   - `admission_cert_revocation_deduplicates_pending_rotation`
+   - `admission_cert_revocation_clears_epoch_key_request_cooldown`
+
+### Test results
+
+`cargo test --workspace`: 197 + 95 + 13 + 83 + 355 + 38 + 10 = all passing
+(355 in dds-node, up from 352 — 3 new regression tests).
+
+---
+
 ## Doc Fix (2026-05-23, 160th pass) — Sync ✅ status markers in AD gap docs
 
 ### Gap
