@@ -813,8 +813,8 @@ impl DdsNode {
 
         // **Z-1 Phase B.9** — epoch-key rotation timer. The first tick
         // fires after `epoch_rotation_secs` (not immediately) so we
-        // don't rotate on every startup.
-        let epoch_rotation_secs = self.config.domain.epoch_rotation_secs.max(1);
+        // don't rotate on every startup. `init()` already validated > 0.
+        let epoch_rotation_secs = self.config.domain.epoch_rotation_secs;
         let mut epoch_rotation_timer =
             tokio::time::interval(std::time::Duration::from_secs(epoch_rotation_secs));
         epoch_rotation_timer.tick().await; // consume the immediate tick

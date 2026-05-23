@@ -42,7 +42,7 @@ pub struct NodeConfig {
 
     /// Interval in seconds between scans for expired tokens. The expiry
     /// sweeper drops expired attestations/vouches from the trust graph
-    /// and revokes them in the store. Default: 60 seconds.
+    /// and revokes them in the store. Default: 60 seconds. Must be > 0.
     #[serde(default = "default_expiry_scan_interval")]
     pub expiry_scan_interval_secs: u64,
 }

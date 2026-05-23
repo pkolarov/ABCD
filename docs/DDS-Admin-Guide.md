@@ -724,7 +724,7 @@ The `dds.toml` file controls all node behavior.
 | `trusted_roots` | string[] | `[]` | Vouchsafe URNs of trust anchors for policy evaluation |
 | `bootstrap_admin_urn` | string | _unset_ | Vouchsafe URN of the bootstrap admin. When set, this admin can vouch for any purpose; non-bootstrap admins must hold a `dds:admin-vouch:<purpose>` capability vouch from the bootstrap admin. Persists across restarts. |
 | `identity_path` | path | `<data_dir>/node_key.bin` | Path to the node's Vouchsafe signing identity |
-| `expiry_scan_interval_secs` | int | `60` | Seconds between expired-token sweep runs |
+| `expiry_scan_interval_secs` | int | `60` | Seconds between expired-token sweep runs. Must be > 0. |
 
 ### `[network]` Section
 

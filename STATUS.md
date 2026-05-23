@@ -1,5 +1,44 @@
 # DDS Implementation Status
 
+## Doc Fix (2026-05-23, 168th pass) — `expiry_scan_interval_secs` missing "Must be > 0" constraint
+
+### Gap
+
+The 166th pass added startup validation in `DdsNode::init` that returns a clear
+error if `expiry_scan_interval_secs == 0` (a zero interval would cause a
+`tokio::time::interval` panic inside `run()`). The change was documented in
+`STATUS.md` and the Admin Guide table row for `epoch_rotation_secs` already
+carried a "Must be > 0" annotation — but the parallel row for
+`expiry_scan_interval_secs` and its `config.rs` doc comment did not.
+
+### Fix
+
+**`docs/DDS-Admin-Guide.md`** — `[node]` section table, `expiry_scan_interval_secs` row:
+- Added "Must be > 0." to the description (mirrors the identical note on
+  `epoch_rotation_secs` in the `[domain]` table).
+
+**`dds-node/src/config.rs`** — `NodeConfig::expiry_scan_interval_secs` doc comment:
+- Added "Must be > 0." to the one-line summary (mirrors the identical note on
+  `DomainConfig::epoch_rotation_secs`).
+
+**`dds-node/src/node.rs`** — `DdsNode::run`, epoch-rotation timer setup:
+- Removed the redundant `.max(1)` guard on `epoch_rotation_secs` at line 817.
+  This guard was added as a safety net before the 166th pass; now that
+  `DdsNode::init` rejects a zero value, the guard is dead code and implies
+  (incorrectly) that zero is a reachable state in `run()`. The comment was
+  updated to note that init already validated `> 0`.
+  Companion: the sibling `expiry_scan_interval_secs` path at line 792 never
+  had a `.max(1)` guard (the fix above is consistent with that pattern).
+
+### Test results
+
+`cargo check -p dds-node`: clean. `cargo fmt --all -- --check`: clean.
+All pre-existing tests unaffected (no behavior change — the guard was never
+triggered because `init()` refused the zero-value before the struct was
+constructed).
+
+---
+
 ## Bug Fix (2026-05-23, 167th pass) — Non-panicking `now_epoch()` in provision.rs on pre-epoch clock
 
 ### Bug
