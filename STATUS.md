@@ -1,5 +1,45 @@
 # DDS Implementation Status
 
+## Doc Fix (2026-05-23, 172nd pass) — Stale Rust test count in Build Health metrics table
+
+### Gap
+
+The Build Health metrics table and the Cross-Platform Build Status table both showed
+**963 Rust tests** — the count from the 140th-pass snapshot (2026-05-21). Passes
+141–171 added 128 new Rust tests across multiple areas:
+
+- Admission revocation integration tests (`admission_revocation.rs`,
+  `admission_revocation_cli.rs` — 12 tests).
+- Epoch-key rotation regression tests in `node.rs`
+  (`admission_cert_revocation_epoch_rotation_tests` — 3 tests + supporting unit tests).
+- Bundle port validation test (`bundle_rejects_out_of_range_ports`).
+- Timing-config validation tests (`zero_expiry_scan_interval_rejected_at_init`,
+  `zero_epoch_rotation_secs_rejected_at_init`).
+- Expiry boundary test (`test_sweep_not_expired_at_exact_boundary`).
+- And many more across the admission-cert revocation, provision, and node hardening
+  work in passes 141–171.
+
+The full `cargo test --workspace` count is now **1091**, making the table and the
+build-status row stale by 128.
+
+### Fix
+
+**`STATUS.md`** Build Health table:
+- `Rust tests` row: updated from 963 to **1091 total** with a 2026-05-23 snapshot
+  note listing the kinds of tests added.
+- `Total tests` row: updated from 1768 to **1896** (Rust 1091 + .NET 805 = 1896 on
+  macOS; +Windows-only .NET 39 + C++ 47 = 1982 across all hosts).
+
+**`STATUS.md`** Cross-Platform Build Status table:
+- macOS ARM64 row: updated from 963 to **1091 Rust tests**.
+
+### Test results
+
+`cargo test --workspace` — **1091 passed; 0 failed** (all suites green on macOS dev
+host 2026-05-23). `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+---
+
 ## Bug Fix (2026-05-23, 171st pass) — `dds-cli::now_epoch` panics on pre-epoch system clock
 
 ### Bug
@@ -11774,11 +11814,11 @@ M-1…M-22 ledger; the addendum table below is the per-finding view.
 | **Edition** | 2024 |
 | **Workspace crates** | 10 (dds-core, dds-domain, dds-store, dds-net, dds-node, dds-ffi, dds-cli, dds-loadtest, dds-fido2-test, pam-dds) |
 | **Rust LOC** | 8,400+ |
-| **Rust tests** | 963 total (macOS dev host 2026-05-21; +4 `dds-node::key_provider` tests from Phase A1; up from 959 at 2026-05-18 snapshot) |
+| **Rust tests** | 1091 total (macOS dev host 2026-05-23; +128 tests since the 2026-05-21 snapshot across passes 141–171 — admission revocation integration tests, epoch-key rotation tests, port-validation tests, timing-config validation tests, expiry boundary tests, and others) |
 | **.NET tests** | 805 passing on macOS dev host: Linux 364 + macOS 166 + Windows 275 (39 Windows-host-only integration tests skipped on macOS; 314 Windows total) |
 | **C++ native tests** | 47 (Windows) |
 | **Python tests** | 13 (requires `pip install pytest`; `bindings/python/test_dds.py`) |
-| **Total tests** | 1768 passing on macOS dev host (Rust 963 + .NET 805); add Windows-only .NET 39 + C++ 47 = 1854 across all hosts |
+| **Total tests** | 1896 passing on macOS dev host (Rust 1091 + .NET 805); add Windows-only .NET 39 + C++ 47 = 1982 across all hosts |
 | **Shared library** | libdds\_ffi.dylib (739 KB) |
 
 Verification note (2026-04-13, Windows 11 ARM64):
@@ -12039,7 +12079,7 @@ Classical-only available for embedded/`no_std` targets.
 
 | Target | Status | Notes |
 |---|---|---|
-| macOS ARM64 (aarch64-apple-darwin) | ✅ Builds + tests | Dev host, 963 Rust tests + 166 macOS .NET + 364 Linux .NET + 275 Windows .NET (on macOS) |
+| macOS ARM64 (aarch64-apple-darwin) | ✅ Builds + tests | Dev host, 1091 Rust tests + 166 macOS .NET + 364 Linux .NET + 275 Windows .NET (on macOS) |
 | Linux x86\_64 | ✅ Expected to build | Standard Rust target |
 | **Windows ARM64 (aarch64-pc-windows-msvc)** | ✅ **298 Rust + 56 .NET + 47 C++ tests pass** | **Win11 ARM64, MSVC 14.44 + LLVM 22.1.3, full workspace verified 2026-04-13 (post security merge)** |
 | Windows x86\_64 | ✅ Expected to build (cross) | CI cross-compile gate |
