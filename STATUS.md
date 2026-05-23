@@ -1,5 +1,46 @@
 # DDS Implementation Status
 
+## Bug Fix (2026-05-23, 167th pass) — Non-panicking `now_epoch()` in provision.rs on pre-epoch clock
+
+### Bug
+
+`provision.rs` contained a `now_epoch()` helper at line 621 that used
+`.duration_since(UNIX_EPOCH).unwrap().as_secs()`. This is identical to the
+pattern fixed in `service.rs` during the 163rd pass. If the system clock is
+set before 1970-01-01 (possible on misconfigured or virtualised hosts with
+corrupt NVRAM), `SystemTime::now().duration_since(UNIX_EPOCH)` returns `Err`
+and `unwrap()` panics — crashing the provisioning path before the admission
+cert is signed.
+
+The fix in the 163rd pass correctly patched `service.rs::now_epoch()` but
+missed the identical copy in `provision.rs`. Both files define their own
+private `now_epoch()` function; the `provision.rs` copy was overlooked.
+
+Concrete impact:
+- `dds-node provision <bundle>` crashes with a panic on a host whose clock is
+  before the Unix epoch, leaving the node unprovisioned and the domain key
+  zeroed in memory. Operator must re-run provisioning once the clock is fixed.
+
+### Fix
+
+**`dds-node/src/provision.rs`** — `now_epoch()`:
+- Changed `.unwrap().as_secs()` to `.unwrap_or_default().as_secs()`.
+- On a pre-epoch clock, `now` returns 0. The admission cert is issued with
+  `issued_at = 0` and `expires_at = 31_536_000` (1 year after epoch). Modern
+  peers will see this cert as already expired and reject connection, but the
+  provisioning command itself completes without a panic. The operator gets a
+  clear "admission cert expired" error at startup rather than an unintelligible
+  panic trace at provision time.
+- Mirrors the identical one-line fix applied to `service.rs` in the 163rd pass.
+
+### Test results
+
+`cargo test -p dds-node --lib`: 359 passed; 0 failed; 4 ignored (no change —
+the fix is a one-line guard on an error path that is unreachable on any host
+with a sane clock; the existing provision tests exercise the happy path).
+
+---
+
 ## Bug Fix (2026-05-23, 166th pass) — Validate zero-value timing config at startup instead of panicking at runtime
 
 ### Bug
