@@ -117,20 +117,19 @@ fn create_provision_bundle_stdout_includes_fingerprint() {
 
     let bundle_path = tmp.path().join("fp.dds");
 
-    let (ok, stdout, stderr) = run_capture(
-        dds_node_bin()
-            .env("DDS_DOMAIN_PASSPHRASE", "")
-            .args([
-                "create-provision-bundle",
-                "--dir",
-                domain_dir.to_str().unwrap(),
-                "--org",
-                "test-org",
-                "--out",
-                bundle_path.to_str().unwrap(),
-            ]),
+    let (ok, stdout, stderr) = run_capture(dds_node_bin().env("DDS_DOMAIN_PASSPHRASE", "").args([
+        "create-provision-bundle",
+        "--dir",
+        domain_dir.to_str().unwrap(),
+        "--org",
+        "test-org",
+        "--out",
+        bundle_path.to_str().unwrap(),
+    ]));
+    assert!(
+        ok,
+        "create-provision-bundle should succeed; stderr={stderr}"
     );
-    assert!(ok, "create-provision-bundle should succeed; stderr={stderr}");
     assert!(
         stdout.contains("Bundle integrity fingerprint:"),
         "stdout must report fingerprint; got: {stdout}"
@@ -150,19 +149,16 @@ fn create_provision_bundle_hybrid_domain_succeeds() {
 
     let bundle_path = tmp.path().join("hybrid.dds");
 
-    let (ok, _stdout, stderr) = run_capture(
-        dds_node_bin()
-            .env("DDS_DOMAIN_PASSPHRASE", "")
-            .args([
-                "create-provision-bundle",
-                "--dir",
-                domain_dir.to_str().unwrap(),
-                "--org",
-                "hybrid-org",
-                "--out",
-                bundle_path.to_str().unwrap(),
-            ]),
-    );
+    let (ok, _stdout, stderr) =
+        run_capture(dds_node_bin().env("DDS_DOMAIN_PASSPHRASE", "").args([
+            "create-provision-bundle",
+            "--dir",
+            domain_dir.to_str().unwrap(),
+            "--org",
+            "hybrid-org",
+            "--out",
+            bundle_path.to_str().unwrap(),
+        ]));
     assert!(
         ok,
         "create-provision-bundle on hybrid domain should succeed; stderr={stderr}"
@@ -175,17 +171,14 @@ fn create_provision_bundle_requires_dir_flag() {
     let tmp = tempfile::tempdir().unwrap();
     let bundle_path = tmp.path().join("out.dds");
 
-    let (ok, _stdout, stderr) = run_capture(
-        dds_node_bin()
-            .env("DDS_DOMAIN_PASSPHRASE", "")
-            .args([
-                "create-provision-bundle",
-                "--org",
-                "test-org",
-                "--out",
-                bundle_path.to_str().unwrap(),
-            ]),
-    );
+    let (ok, _stdout, stderr) =
+        run_capture(dds_node_bin().env("DDS_DOMAIN_PASSPHRASE", "").args([
+            "create-provision-bundle",
+            "--org",
+            "test-org",
+            "--out",
+            bundle_path.to_str().unwrap(),
+        ]));
     assert!(!ok, "missing --dir must fail");
     assert!(
         stderr.contains("--dir"),
@@ -202,17 +195,14 @@ fn create_provision_bundle_requires_org_flag() {
 
     let bundle_path = tmp.path().join("out.dds");
 
-    let (ok, _stdout, stderr) = run_capture(
-        dds_node_bin()
-            .env("DDS_DOMAIN_PASSPHRASE", "")
-            .args([
-                "create-provision-bundle",
-                "--dir",
-                domain_dir.to_str().unwrap(),
-                "--out",
-                bundle_path.to_str().unwrap(),
-            ]),
-    );
+    let (ok, _stdout, stderr) =
+        run_capture(dds_node_bin().env("DDS_DOMAIN_PASSPHRASE", "").args([
+            "create-provision-bundle",
+            "--dir",
+            domain_dir.to_str().unwrap(),
+            "--out",
+            bundle_path.to_str().unwrap(),
+        ]));
     assert!(!ok, "missing --org must fail");
     assert!(
         stderr.contains("--org"),
@@ -227,19 +217,16 @@ fn create_provision_bundle_fails_on_missing_domain_toml() {
     std::fs::create_dir_all(&empty_dir).unwrap();
     let bundle_path = tmp.path().join("out.dds");
 
-    let (ok, _stdout, _stderr) = run_capture(
-        dds_node_bin()
-            .env("DDS_DOMAIN_PASSPHRASE", "")
-            .args([
-                "create-provision-bundle",
-                "--dir",
-                empty_dir.to_str().unwrap(),
-                "--org",
-                "test-org",
-                "--out",
-                bundle_path.to_str().unwrap(),
-            ]),
-    );
+    let (ok, _stdout, _stderr) =
+        run_capture(dds_node_bin().env("DDS_DOMAIN_PASSPHRASE", "").args([
+            "create-provision-bundle",
+            "--dir",
+            empty_dir.to_str().unwrap(),
+            "--org",
+            "test-org",
+            "--out",
+            bundle_path.to_str().unwrap(),
+        ]));
     assert!(
         !ok,
         "create-provision-bundle must fail when domain.toml is absent"
@@ -305,7 +292,12 @@ fn provision_creates_expected_files() {
     assert!(ok, "provision should succeed; stderr={stderr}");
 
     // Critical files that provision must create.
-    for fname in ["admission.cbor", "domain.toml", "p2p_key.bin", "node_key.bin"] {
+    for fname in [
+        "admission.cbor",
+        "domain.toml",
+        "p2p_key.bin",
+        "node_key.bin",
+    ] {
         assert!(
             data_dir.join(fname).exists(),
             "provision must create {fname}; stderr={stderr}"

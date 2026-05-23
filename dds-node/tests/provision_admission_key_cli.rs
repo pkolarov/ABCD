@@ -51,7 +51,10 @@ fn provision_admission_key_software_creates_key_file() {
         "--backend",
         "software",
     ]));
-    assert!(ok, "provision-admission-key --backend software must succeed; stderr={stderr}");
+    assert!(
+        ok,
+        "provision-admission-key --backend software must succeed; stderr={stderr}"
+    );
 
     // admission_key.bin must exist on disk.
     assert!(
@@ -176,7 +179,10 @@ fn provision_admission_key_default_backend_is_software() {
         data_dir.to_str().unwrap(),
         // No --backend flag.
     ]));
-    assert!(ok, "provision without --backend must succeed; stderr={stderr}");
+    assert!(
+        ok,
+        "provision without --backend must succeed; stderr={stderr}"
+    );
     assert!(
         data_dir.join("admission_key.bin").exists(),
         "admission_key.bin must be written when --backend is omitted"

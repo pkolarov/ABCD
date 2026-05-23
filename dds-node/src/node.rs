@@ -571,10 +571,8 @@ impl DdsNode {
                 AdmissionKeyBackend::Software => {
                     let admission_key_path = config.admission_key_path();
                     Box::new(
-                        crate::key_provider::SoftwareKeyfile::load_or_create(
-                            &admission_key_path,
-                        )
-                        .map_err(|e| {
+                        crate::key_provider::SoftwareKeyfile::load_or_create(&admission_key_path)
+                            .map_err(|e| {
                             format!(
                                 "failed to load/create software admission key at {}: {e}",
                                 admission_key_path.display()

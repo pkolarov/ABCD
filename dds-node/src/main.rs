@@ -545,7 +545,9 @@ fn cmd_self_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if cert.body.admission_pubkey.is_some() {
         println!("  cert_version: v2 (hardware-bound admission key embedded)");
     } else {
-        println!("  cert_version: v1 (no admission key — run provision-admission-key first for v2)");
+        println!(
+            "  cert_version: v1 (no admission key — run provision-admission-key first for v2)"
+        );
     }
     println!("  out:        {}", out.display());
     Ok(())
@@ -970,9 +972,8 @@ fn cmd_rotate_admission_key(args: &[String]) -> Result<(), Box<dyn std::error::E
 
     // Back up or remove the old key file.
     let backup_path = if no_backup {
-        std::fs::remove_file(&key_path).map_err(|e| {
-            format!("failed to remove old admission_key.bin for rotation: {e}")
-        })?;
+        std::fs::remove_file(&key_path)
+            .map_err(|e| format!("failed to remove old admission_key.bin for rotation: {e}"))?;
         None
     } else {
         let now = std::time::SystemTime::now()
@@ -1017,7 +1018,9 @@ fn cmd_rotate_admission_key(args: &[String]) -> Result<(), Box<dyn std::error::E
     println!();
     println!("  1. Issue a new v2 admission cert for the new admission pubkey:");
     println!("       dds-node admit --domain-key <FILE> --domain <FILE> \\");
-    println!("         --peer-id <PEER_ID> --admission-pubkey {new_pubkey_hex} --out admission.cbor");
+    println!(
+        "         --peer-id <PEER_ID> --admission-pubkey {new_pubkey_hex} --out admission.cbor"
+    );
     println!(
         "     Then place admission.cbor at {}.",
         data_dir.join("admission.cbor").display()
@@ -1029,8 +1032,12 @@ fn cmd_rotate_admission_key(args: &[String]) -> Result<(), Box<dyn std::error::E
     println!("     PeerId admission so all peers flush their cached cert and re-verify against");
     println!("     the new pubkey on next reconnect:");
     println!("       dds-node revoke-admission --domain-key <FILE> --domain <FILE> \\");
-    println!("         --peer-id <PEER_ID> --reason \"admission key rotated\" --out revocation.cbor");
-    println!("     Distribute revocation.cbor to peers via `import-revocation` or H-12 piggy-back.");
+    println!(
+        "         --peer-id <PEER_ID> --reason \"admission key rotated\" --out revocation.cbor"
+    );
+    println!(
+        "     Distribute revocation.cbor to peers via `import-revocation` or H-12 piggy-back."
+    );
     Ok(())
 }
 
@@ -1201,7 +1208,9 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if cert.body.admission_pubkey.is_some() {
         println!("  cert_version: v2 (hardware-bound admission key embedded)");
     } else {
-        println!("  cert_version: v1 (no admission key — run provision-admission-key on the node first for v2)");
+        println!(
+            "  cert_version: v1 (no admission key — run provision-admission-key on the node first for v2)"
+        );
     }
     println!("  out:         {}", out.display());
     Ok(())
@@ -1979,7 +1988,10 @@ mod admission_key_cmd_tests {
             _ => panic!("expected Ed25519"),
         };
 
-        assert_eq!(pubkey1, pubkey2, "repeated provision must not change the key");
+        assert_eq!(
+            pubkey1, pubkey2,
+            "repeated provision must not change the key"
+        );
     }
 
     #[test]
@@ -2004,8 +2016,13 @@ mod admission_key_cmd_tests {
         let data_dir = dir.path().to_str().unwrap().to_string();
 
         // First provision to create the initial key.
-        cmd_provision_admission_key(&str_args(&["--data-dir", &data_dir, "--backend", "software"]))
-            .expect("provision should succeed");
+        cmd_provision_admission_key(&str_args(&[
+            "--data-dir",
+            &data_dir,
+            "--backend",
+            "software",
+        ]))
+        .expect("provision should succeed");
         let old_pubkey = match dds_node::key_provider::SoftwareKeyfile::load_or_create(
             &dir.path().join("admission_key.bin"),
         )
@@ -2029,7 +2046,10 @@ mod admission_key_cmd_tests {
             _ => panic!("expected Ed25519"),
         };
 
-        assert_ne!(old_pubkey, new_pubkey, "rotation must produce a different key");
+        assert_ne!(
+            old_pubkey, new_pubkey,
+            "rotation must produce a different key"
+        );
     }
 
     #[test]
@@ -2040,8 +2060,13 @@ mod admission_key_cmd_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
 
-        cmd_provision_admission_key(&str_args(&["--data-dir", &data_dir, "--backend", "software"]))
-            .expect("provision should succeed");
+        cmd_provision_admission_key(&str_args(&[
+            "--data-dir",
+            &data_dir,
+            "--backend",
+            "software",
+        ]))
+        .expect("provision should succeed");
 
         // Rotate without --no-backup.
         cmd_rotate_admission_key(&str_args(&["--data-dir", &data_dir]))
@@ -2054,14 +2079,11 @@ mod admission_key_cmd_tests {
         );
 
         // A backup file with the `.rotated.` infix must exist.
-        let has_backup = std::fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .any(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains("admission_key.bin.rotated.")
-            });
+        let has_backup = std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .contains("admission_key.bin.rotated.")
+        });
         assert!(has_backup, "a .rotated. backup file must be present");
     }
 
@@ -2073,21 +2095,23 @@ mod admission_key_cmd_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
 
-        cmd_provision_admission_key(&str_args(&["--data-dir", &data_dir, "--backend", "software"]))
-            .expect("provision should succeed");
+        cmd_provision_admission_key(&str_args(&[
+            "--data-dir",
+            &data_dir,
+            "--backend",
+            "software",
+        ]))
+        .expect("provision should succeed");
 
         cmd_rotate_admission_key(&str_args(&["--data-dir", &data_dir, "--no-backup"]))
             .expect("rotate --no-backup should succeed");
 
         // No backup file.
-        let has_backup = std::fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .any(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains("admission_key.bin.rotated.")
-            });
+        let has_backup = std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .contains("admission_key.bin.rotated.")
+        });
         assert!(!has_backup, "no backup file with --no-backup");
 
         // New key still exists.
@@ -2101,8 +2125,7 @@ mod admission_key_cmd_tests {
     fn rotate_admission_key_fails_without_existing_key() {
         let dir = tempfile::TempDir::new().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
-        let err =
-            cmd_rotate_admission_key(&str_args(&["--data-dir", &data_dir])).unwrap_err();
+        let err = cmd_rotate_admission_key(&str_args(&["--data-dir", &data_dir])).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("provision-admission-key"),

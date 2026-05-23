@@ -70,7 +70,11 @@ impl AppleSecureEnclaveKeyProvider {
     pub fn load_or_create(label: &str) -> Result<Self, SeError> {
         let private_key = Self::find_existing(label)
             .or_else(|_| Self::create_new(label))
-            .map_err(|e| SeError(format!("SE key load/create failed for label {label:?}: {e}")))?;
+            .map_err(|e| {
+                SeError(format!(
+                    "SE key load/create failed for label {label:?}: {e}"
+                ))
+            })?;
 
         let compressed_pubkey = Self::extract_compressed_pubkey(&private_key)
             .map_err(|e| SeError(format!("could not read SE public key: {e}")))?;
@@ -122,7 +126,10 @@ impl AppleSecureEnclaveKeyProvider {
         )
         .map_err(|e| format!("SecKeyCreateRandomKey failed: {e}"))?;
 
-        tracing::info!(label = label, "new Apple Secure Enclave P-256 admission key created");
+        tracing::info!(
+            label = label,
+            "new Apple Secure Enclave P-256 admission key created"
+        );
         Ok(key)
     }
 
@@ -194,7 +201,7 @@ impl KeyProvider for AppleSecureEnclaveKeyProvider {
 mod tests {
     use super::*;
     use dds_core::key_provider::AdmissionPublicKey;
-    use p256::ecdsa::{signature::Verifier as _, Signature as P256Sig, VerifyingKey as P256Vk};
+    use p256::ecdsa::{Signature as P256Sig, VerifyingKey as P256Vk, signature::Verifier as _};
 
     fn unique_label() -> String {
         format!("dds-test-se-{}", uuid::Uuid::new_v4())
@@ -221,8 +228,7 @@ mod tests {
         assert_eq!(compressed.len(), 33, "compressed P-256 pubkey is 33 bytes");
 
         // Decompress via p256 crate and verify.
-        let vk =
-            P256Vk::from_sec1_bytes(&compressed).expect("valid SEC1 compressed P-256 pubkey");
+        let vk = P256Vk::from_sec1_bytes(&compressed).expect("valid SEC1 compressed P-256 pubkey");
         let sig = P256Sig::from_der(&sig_bytes).expect("SE returns DER signature");
         vk.verify(msg, &sig).expect("signature must verify");
 
@@ -306,36 +312,26 @@ mod tests {
         };
         use security_framework_sys::{
             item::{
-                kSecAttrKeyClass, kSecAttrKeyClassPrivate, kSecAttrLabel, kSecClass,
-                kSecClassKey, kSecMatchLimit, kSecMatchLimitAll,
+                kSecAttrKeyClass, kSecAttrKeyClassPrivate, kSecAttrLabel, kSecClass, kSecClassKey,
+                kSecMatchLimit, kSecMatchLimitAll,
             },
             keychain_item::SecItemDelete,
         };
 
         let query = CFMutableDictionary::from_CFType_pairs(&[
-            (
-                unsafe { kSecClass.to_void() },
-                unsafe { CFString::wrap_under_get_rule(kSecClassKey).to_void() },
-            ),
-            (
-                unsafe { kSecAttrKeyClass.to_void() },
-                unsafe {
-                    CFString::wrap_under_get_rule(kSecAttrKeyClassPrivate).to_void()
-                },
-            ),
+            (unsafe { kSecClass.to_void() }, unsafe {
+                CFString::wrap_under_get_rule(kSecClassKey).to_void()
+            }),
+            (unsafe { kSecAttrKeyClass.to_void() }, unsafe {
+                CFString::wrap_under_get_rule(kSecAttrKeyClassPrivate).to_void()
+            }),
             (
                 unsafe { kSecAttrLabel.to_void() },
                 CFString::new(label).to_void(),
             ),
-            (
-                unsafe { kSecMatchLimit.to_void() },
-                unsafe {
-                    CFBoolean::wrap_under_get_rule(
-                        kSecMatchLimitAll as *mut _
-                    )
-                    .to_void()
-                },
-            ),
+            (unsafe { kSecMatchLimit.to_void() }, unsafe {
+                CFBoolean::wrap_under_get_rule(kSecMatchLimitAll as *mut _).to_void()
+            }),
         ]);
         unsafe { SecItemDelete(query.as_concrete_TypeRef()) };
     }

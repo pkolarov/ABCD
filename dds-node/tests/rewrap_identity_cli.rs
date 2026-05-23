@@ -180,7 +180,10 @@ fn rewrap_identity_no_backup_skips_backup_files() {
         data_dir.to_str().unwrap(),
         "--no-backup",
     ]));
-    assert!(ok, "rewrap-identity --no-backup must succeed; stderr={stderr}");
+    assert!(
+        ok,
+        "rewrap-identity --no-backup must succeed; stderr={stderr}"
+    );
 
     assert!(
         !data_dir.join("node_key.bin.bak").exists(),

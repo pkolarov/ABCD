@@ -7,6 +7,8 @@
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub mod admission_revocation_store;
+#[cfg(target_os = "macos")]
+pub mod apple_secure_enclave;
 pub mod config;
 pub mod device_binding;
 pub mod domain_store;
@@ -16,8 +18,6 @@ pub(crate) mod file_acl;
 pub mod http;
 pub mod identity_store;
 pub mod key_provider;
-#[cfg(target_os = "macos")]
-pub mod apple_secure_enclave;
 pub mod node;
 pub mod p2p_identity;
 pub mod peer_cert_store;

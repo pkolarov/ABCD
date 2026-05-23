@@ -29,14 +29,26 @@ fn init_domain_hybrid_creates_files() {
     let dom = tmp.path().join("dom");
 
     let status = dds_node_bin()
-        .args(["init-domain", "--name", "acme.test", "--dir", dom.to_str().unwrap()])
+        .args([
+            "init-domain",
+            "--name",
+            "acme.test",
+            "--dir",
+            dom.to_str().unwrap(),
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .unwrap();
     assert!(status.success(), "init-domain should succeed");
-    assert!(dom.join("domain.toml").exists(), "domain.toml should be created");
-    assert!(dom.join("domain_key.bin").exists(), "domain_key.bin should be created");
+    assert!(
+        dom.join("domain.toml").exists(),
+        "domain.toml should be created"
+    );
+    assert!(
+        dom.join("domain_key.bin").exists(),
+        "domain_key.bin should be created"
+    );
 }
 
 #[test]
@@ -45,14 +57,33 @@ fn init_domain_hybrid_stdout_reports_fields() {
     let dom = tmp.path().join("dom");
 
     let (ok, stdout, _stderr) = run_capture(dds_node_bin().args([
-        "init-domain", "--name", "acme.test", "--dir", dom.to_str().unwrap(),
+        "init-domain",
+        "--name",
+        "acme.test",
+        "--dir",
+        dom.to_str().unwrap(),
     ]));
     assert!(ok, "init-domain should succeed; stderr may contain errors");
-    assert!(stdout.contains("acme.test"), "stdout should include the domain name; got: {stdout}");
-    assert!(stdout.contains("id:"), "stdout should include id; got: {stdout}");
-    assert!(stdout.contains("pubkey:"), "stdout should include pubkey; got: {stdout}");
-    assert!(stdout.contains("pq_pubkey:"), "hybrid stdout should include pq_pubkey; got: {stdout}");
-    assert!(stdout.contains("v2 hybrid"), "hybrid scheme line; got: {stdout}");
+    assert!(
+        stdout.contains("acme.test"),
+        "stdout should include the domain name; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("id:"),
+        "stdout should include id; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("pubkey:"),
+        "stdout should include pubkey; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("pq_pubkey:"),
+        "hybrid stdout should include pq_pubkey; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("v2 hybrid"),
+        "hybrid scheme line; got: {stdout}"
+    );
 }
 
 #[test]
@@ -61,11 +92,22 @@ fn init_domain_legacy_no_pq_pubkey_in_stdout() {
     let dom = tmp.path().join("dom");
 
     let (ok, stdout, _stderr) = run_capture(dds_node_bin().args([
-        "init-domain", "--name", "acme.test", "--dir", dom.to_str().unwrap(), "--legacy",
+        "init-domain",
+        "--name",
+        "acme.test",
+        "--dir",
+        dom.to_str().unwrap(),
+        "--legacy",
     ]));
     assert!(ok, "init-domain --legacy should succeed; got: {stdout}");
-    assert!(stdout.contains("v1 legacy"), "legacy scheme line; got: {stdout}");
-    assert!(!stdout.contains("pq_pubkey:"), "legacy domain must not report pq_pubkey; got: {stdout}");
+    assert!(
+        stdout.contains("v1 legacy"),
+        "legacy scheme line; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("pq_pubkey:"),
+        "legacy domain must not report pq_pubkey; got: {stdout}"
+    );
 }
 
 #[test]
@@ -74,7 +116,14 @@ fn init_domain_legacy_domain_toml_has_no_pq_pubkey() {
     let dom = tmp.path().join("dom");
 
     let status = dds_node_bin()
-        .args(["init-domain", "--name", "test.local", "--dir", dom.to_str().unwrap(), "--legacy"])
+        .args([
+            "init-domain",
+            "--name",
+            "test.local",
+            "--dir",
+            dom.to_str().unwrap(),
+            "--legacy",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -82,7 +131,10 @@ fn init_domain_legacy_domain_toml_has_no_pq_pubkey() {
     assert!(status.success());
 
     let toml_str = std::fs::read_to_string(dom.join("domain.toml")).unwrap();
-    assert!(!toml_str.contains("pq_pubkey"), "legacy domain.toml must not carry pq_pubkey; got: {toml_str}");
+    assert!(
+        !toml_str.contains("pq_pubkey"),
+        "legacy domain.toml must not carry pq_pubkey; got: {toml_str}"
+    );
 }
 
 #[test]
@@ -91,7 +143,13 @@ fn init_domain_hybrid_domain_toml_has_pq_pubkey() {
     let dom = tmp.path().join("dom");
 
     let status = dds_node_bin()
-        .args(["init-domain", "--name", "test.local", "--dir", dom.to_str().unwrap()])
+        .args([
+            "init-domain",
+            "--name",
+            "test.local",
+            "--dir",
+            dom.to_str().unwrap(),
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -99,7 +157,10 @@ fn init_domain_hybrid_domain_toml_has_pq_pubkey() {
     assert!(status.success());
 
     let toml_str = std::fs::read_to_string(dom.join("domain.toml")).unwrap();
-    assert!(toml_str.contains("pq_pubkey"), "hybrid domain.toml must carry pq_pubkey; got: {toml_str}");
+    assert!(
+        toml_str.contains("pq_pubkey"),
+        "hybrid domain.toml must carry pq_pubkey; got: {toml_str}"
+    );
 }
 
 #[test]
@@ -108,12 +169,19 @@ fn init_domain_legacy_and_fido2_are_mutually_exclusive() {
     let dom = tmp.path().join("dom");
 
     let (ok, _stdout, stderr) = run_capture(dds_node_bin().args([
-        "init-domain", "--name", "acme.test", "--dir", dom.to_str().unwrap(),
-        "--legacy", "--fido2",
+        "init-domain",
+        "--name",
+        "acme.test",
+        "--dir",
+        dom.to_str().unwrap(),
+        "--legacy",
+        "--fido2",
     ]));
     assert!(!ok, "--legacy --fido2 must fail");
     assert!(
-        stderr.contains("mutually exclusive") || stderr.contains("--legacy") || stderr.contains("--fido2"),
+        stderr.contains("mutually exclusive")
+            || stderr.contains("--legacy")
+            || stderr.contains("--fido2"),
         "stderr should mention mutual exclusion; got: {stderr}",
     );
 }
@@ -123,9 +191,8 @@ fn init_domain_requires_name_flag() {
     let tmp = tempfile::tempdir().unwrap();
     let dom = tmp.path().join("dom");
 
-    let (ok, _stdout, stderr) = run_capture(dds_node_bin().args([
-        "init-domain", "--dir", dom.to_str().unwrap(),
-    ]));
+    let (ok, _stdout, stderr) =
+        run_capture(dds_node_bin().args(["init-domain", "--dir", dom.to_str().unwrap()]));
     assert!(!ok, "missing --name must fail");
     assert!(
         stderr.contains("--name") || stderr.contains("name"),
@@ -135,9 +202,8 @@ fn init_domain_requires_name_flag() {
 
 #[test]
 fn init_domain_requires_dir_flag() {
-    let (ok, _stdout, stderr) = run_capture(dds_node_bin().args([
-        "init-domain", "--name", "acme.test",
-    ]));
+    let (ok, _stdout, stderr) =
+        run_capture(dds_node_bin().args(["init-domain", "--name", "acme.test"]));
     assert!(!ok, "missing --dir must fail");
     assert!(
         stderr.contains("--dir") || stderr.contains("dir"),
@@ -152,7 +218,13 @@ fn init_domain_creates_dir_if_absent() {
     assert!(!dom.exists(), "test setup: dir must not exist yet");
 
     let status = dds_node_bin()
-        .args(["init-domain", "--name", "acme.test", "--dir", dom.to_str().unwrap()])
+        .args([
+            "init-domain",
+            "--name",
+            "acme.test",
+            "--dir",
+            dom.to_str().unwrap(),
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
