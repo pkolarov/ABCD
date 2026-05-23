@@ -799,11 +799,25 @@ fn cmd_rotate_identity(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     }
     let new_peer_id = libp2p::PeerId::from(new_kp.public());
 
+    // Try to read the existing epoch KEM pubkey — unchanged by rotation.
+    let epoch_keys_path = data_dir.join("epoch_keys.cbor");
+    let kem_pubkey_hex: Option<String> = if epoch_keys_path.exists() {
+        let mut rng = rand::thread_rng();
+        dds_node::epoch_key_store::EpochKeyStore::load_or_create(&epoch_keys_path, &mut rng)
+            .ok()
+            .map(|ek| to_hex(&ek.kem_public().to_bytes()))
+    } else {
+        None
+    };
+
     println!("Rotated node libp2p identity:");
     println!("  data_dir:    {}", data_dir.display());
     println!("  p2p_key:     {}", p2p_path.display());
     println!("  old_peer_id: {old_peer_id}");
     println!("  new_peer_id: {new_peer_id}");
+    if let Some(ref hex) = kem_pubkey_hex {
+        println!("  kem_pubkey_hex: {hex}");
+    }
     if let Some(ref bak) = backup_path {
         println!("  backup:      {}", bak.display());
     } else {
@@ -814,16 +828,22 @@ fn cmd_rotate_identity(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     println!("Before restarting the node, the admin must:");
     println!();
     println!("  1. Issue a fresh admission cert for the new peer id and ship it to this node:");
-    println!(
-        "       # The epoch (KEM) key is unchanged by rotation — get kem_pubkey_hex by running:"
-    );
-    println!(
-        "       #   dds-node gen-node-key --data-dir {}",
-        data_dir.display()
-    );
-    println!(
-        "       dds-node admit --domain-key <FILE> --domain <FILE> \\\n         --peer-id {new_peer_id} --kem-pubkey <HEX> --out admission.cbor"
-    );
+    if let Some(ref hex) = kem_pubkey_hex {
+        println!(
+            "       dds-node admit --domain-key <FILE> --domain <FILE> \\\n         --peer-id {new_peer_id} --kem-pubkey {hex} --out admission.cbor"
+        );
+    } else {
+        println!(
+            "       # The epoch (KEM) key is unchanged by rotation — get kem_pubkey_hex by running:"
+        );
+        println!(
+            "       #   dds-node gen-node-key --data-dir {}",
+            data_dir.display()
+        );
+        println!(
+            "       dds-node admit --domain-key <FILE> --domain <FILE> \\\n         --peer-id {new_peer_id} --kem-pubkey <HEX> --out admission.cbor"
+        );
+    }
     println!(
         "     Then place admission.cbor at {}.",
         data_dir.join("admission.cbor").display()

@@ -390,20 +390,19 @@ Sample output:
 
 ```
 Rotated node libp2p identity:
-  data_dir:    /opt/dds/data
-  p2p_key:     /opt/dds/data/p2p_key.bin
-  old_peer_id: 12D3KooWOldPeer…
-  new_peer_id: 12D3KooWNewPeer…
-  backup:      /opt/dds/data/p2p_key.bin.rotated.1714090000
+  data_dir:       /opt/dds/data
+  p2p_key:        /opt/dds/data/p2p_key.bin
+  old_peer_id:    12D3KooWOldPeer…
+  new_peer_id:    12D3KooWNewPeer…
+  backup:         /opt/dds/data/p2p_key.bin.rotated.1714090000
+  kem_pubkey_hex: 04ab7f…<2432 hex chars>…
 
 The existing admission cert is now invalid (it was bound to the old peer id).
 Before restarting the node, the admin must:
 
   1. Issue a fresh admission cert for the new peer id and ship it to this node:
-       # The epoch (KEM) key is unchanged by rotation — get kem_pubkey_hex:
-       #   dds-node gen-node-key --data-dir /opt/dds/data
        dds-node admit --domain-key <FILE> --domain <FILE> \
-         --peer-id 12D3KooWNewPeer… --kem-pubkey <HEX> --out admission.cbor
+         --peer-id 12D3KooWNewPeer… --kem-pubkey 04ab7f…<2432 hex chars>… --out admission.cbor
      Then place admission.cbor at /opt/dds/data/admission.cbor.
 
   2. (Recommended) Revoke the old peer id so a stolen copy of the old keypair cannot rejoin:
@@ -414,6 +413,10 @@ Before restarting the node, the admin must:
 
   3. Restart the node so the new identity takes effect.
 ```
+
+> **Note:** `kem_pubkey_hex` is printed directly when `epoch_keys.cbor` exists on the node (created
+> by `gen-node-key`). For older nodes without that file, rotate-identity instead prints a hint to
+> run `gen-node-key --data-dir …` to retrieve it separately.
 
 `rotate-identity` refuses to run if `p2p_key.bin` is missing
 (redirects you to `gen-node-key`) or if the existing key is
@@ -430,13 +433,14 @@ Capture both PeerIds from the rotation output and produce a fresh
 admission cert plus the matching revocation:
 
 ```bash
-# Run gen-node-key on the node to retrieve the (unchanged) kem_pubkey_hex,
-# then use it in the admit command so enc-v3 coverage is preserved.
+# Copy kem_pubkey_hex from the rotate-identity output above.
+# (If the node predates PQC, run gen-node-key first to generate epoch_keys.cbor
+#  and retrieve the kem_pubkey_hex before running admit.)
 dds-node admit \
   --domain-key ./acme/domain_key.bin \
   --domain ./acme/domain.toml \
   --peer-id 12D3KooWNewPeer… \
-  --kem-pubkey <HEX> \
+  --kem-pubkey 04ab7f…<2432 hex chars>… \
   --out admission.cbor
 
 dds-node revoke-admission \

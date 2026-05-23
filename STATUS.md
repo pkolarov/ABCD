@@ -1,5 +1,52 @@
 # DDS Implementation Status
 
+## Gap Fix (2026-05-23, 159th pass) — `rotate-identity` prints `kem_pubkey_hex` directly when `epoch_keys.cbor` exists
+
+### Gap
+
+`rotate-identity` always printed a hint to run `gen-node-key --data-dir …` to obtain
+`kem_pubkey_hex` after rotation. Since the epoch KEM keypair (`epoch_keys.cbor`) is
+**unchanged** by identity rotation, the command could read it directly and print
+`kem_pubkey_hex` in the same output block — avoiding a second round-trip to the node.
+Operators following the rotation checklist had to manually run an extra command to get a
+value that was already available on disk.
+
+### Fix
+
+**`dds-node/src/main.rs` — `cmd_rotate_identity`**:
+- After generating the new p2p keypair, attempts to load `epoch_keys.cbor` from `data_dir`.
+- If found: prints `  kem_pubkey_hex: <2432 hex chars>` and embeds the actual hex in the
+  `dds-node admit` hint (replaces the `--kem-pubkey <HEX>` placeholder with the real value).
+- If not found (pre-PQC node without `epoch_keys.cbor`): falls back to the previous behavior —
+  prints a `# run gen-node-key` hint and uses the `--kem-pubkey <HEX>` placeholder.
+
+**`dds-node/tests/rotate_identity_cli.rs`**:
+- Updated `rotate_identity_replaces_keypair_and_keeps_backup_by_default` to assert that
+  `kem_pubkey_hex:` appears in output (since `gen_initial_key` calls `gen-node-key` which
+  creates `epoch_keys.cbor`), that the hex is 2432 chars, and that the `admit` hint embeds
+  the actual hex rather than the `<HEX>` placeholder.
+- Added new test `rotate_identity_falls_back_to_gen_node_key_hint_when_no_epoch_keys`:
+  creates only `p2p_key.bin` (no `epoch_keys.cbor`, simulating a pre-PQC node), asserts
+  that `kem_pubkey_hex:` is absent, that the `gen-node-key` hint is present, and that
+  `--kem-pubkey <HEX>` placeholder is present.
+
+**`docs/DDS-Admin-Guide.md`**:
+- Updated `rotate-identity` sample output to include the `kem_pubkey_hex:` line and the
+  actual hex embedded in the `admit` hint.
+- Updated Step 2 comment from "Run gen-node-key to retrieve kem_pubkey_hex" to "Copy
+  kem_pubkey_hex from the rotate-identity output above."
+- Added a note explaining the fallback behavior for older nodes without `epoch_keys.cbor`.
+
+### Test results
+
+`cargo test -p dds-node --lib`: 352/352 passing.
+`cargo build -p dds-node`: clean.
+`cargo fmt --all -- --check`: clean.
+`cargo test -p dds-node --test rotate_identity_cli`: 7/7 passing (including the new
+`rotate_identity_falls_back_to_gen_node_key_hint_when_no_epoch_keys` test).
+
+---
+
 ## Fix (2026-05-23, 158th pass) — Harden `relay_revocation_propagates_via_sync_after_originator_drops` against CI flakiness
 
 ### Problem

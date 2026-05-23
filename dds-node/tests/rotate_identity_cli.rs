@@ -107,6 +107,32 @@ fn rotate_identity_replaces_keypair_and_keeps_backup_by_default() {
         stdout.contains(&new_id.to_string()),
         "stdout must include the new peer id in the admit hint: {stdout}"
     );
+
+    // gen-node-key also creates epoch_keys.cbor, so rotate-identity must
+    // print kem_pubkey_hex directly (2432 hex chars = 1216-byte hybrid KEM pubkey).
+    assert!(
+        stdout.contains("kem_pubkey_hex:"),
+        "stdout must include kem_pubkey_hex when epoch_keys.cbor exists; got: {stdout}"
+    );
+    let kem_line = stdout
+        .lines()
+        .find(|l| l.contains("kem_pubkey_hex:"))
+        .unwrap_or("");
+    let hex_val = kem_line.split(':').nth(1).unwrap_or("").trim();
+    assert_eq!(
+        hex_val.len(),
+        2432,
+        "kem_pubkey_hex must be 2432 hex chars (1216-byte hybrid KEM pubkey); got: {hex_val}"
+    );
+    // The admit hint must embed the actual hex, not the <HEX> placeholder.
+    assert!(
+        stdout.contains(hex_val),
+        "admit hint must embed the actual kem_pubkey_hex; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("--kem-pubkey <HEX>"),
+        "admit hint must not show <HEX> placeholder when kem_pubkey_hex is known; got: {stdout}"
+    );
 }
 
 #[test]
@@ -270,6 +296,42 @@ fn rotate_identity_requires_no_flag_other_than_data_dir() {
     assert!(
         stderr.contains("--data-dir"),
         "missing --data-dir must be named in stderr: {stderr}"
+    );
+}
+
+/// When epoch_keys.cbor does not exist (pre-PQC / older nodes), rotate-identity
+/// must fall back to the gen-node-key hint instead of printing kem_pubkey_hex.
+#[test]
+fn rotate_identity_falls_back_to_gen_node_key_hint_when_no_epoch_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path();
+
+    // Create only p2p_key.bin — no epoch_keys.cbor (pre-PQC node).
+    let p2p_path = data_dir.join("p2p_key.bin");
+    let kp = libp2p::identity::Keypair::generate_ed25519();
+    dds_node::p2p_identity::save(&p2p_path, &kp).unwrap();
+
+    let (ok, stdout, stderr) = run_capture(dds_node_bin().args([
+        "rotate-identity",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]));
+    assert!(ok, "rotate-identity must succeed; stderr={stderr}");
+
+    // No epoch_keys.cbor → no kem_pubkey_hex line.
+    assert!(
+        !stdout.contains("kem_pubkey_hex:"),
+        "stdout must not include kem_pubkey_hex when epoch_keys.cbor absent; got: {stdout}"
+    );
+    // Must still emit the gen-node-key hint so the operator knows how to get the KEM pubkey.
+    assert!(
+        stdout.contains("gen-node-key"),
+        "stdout must include gen-node-key hint when epoch_keys.cbor absent; got: {stdout}"
+    );
+    // Must still emit the <HEX> placeholder in the admit hint.
+    assert!(
+        stdout.contains("--kem-pubkey <HEX>"),
+        "admit hint must use <HEX> placeholder when epoch_keys.cbor absent; got: {stdout}"
     );
 }
 
