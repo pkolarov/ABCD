@@ -1215,6 +1215,10 @@ criteria = "safe-to-deploy"
 version = "0.9.2"
 criteria = "safe-to-deploy"
 
+[[exemptions.rand]]
+version = "0.9.4"
+criteria = "safe-to-deploy"
+
 [[exemptions.rand_chacha]]
 version = "0.3.1"
 criteria = "safe-to-deploy"

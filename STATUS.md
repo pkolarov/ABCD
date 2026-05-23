@@ -43,7 +43,21 @@ across all Rust crates audited. All instances are in test code or provably safe:
 - `.max(1)` guard for `epoch_rotation_secs` confirmed removed (0928ca2).
   `init()` validation at line 376–378 node.rs correctly rejects zero values.
 
-No code or documentation changes required.
+**CI fixes (pre-existing, found and resolved this pass):**
+
+1. **`cargo fmt` drift in `dds-cli/src/main.rs`** — four `let r: TypeName =\n
+   serde_json::from_slice(...)` bindings were formatted across two lines but
+   rustfmt wants them on one. Applied `cargo fmt --all`; four closures
+   reformatted. No logic change.
+
+2. **`cargo vet` missing exemption for `rand 0.9.4`** — the 176th-pass lockfile
+   bump added `rand 0.9.4` but did not update `supply-chain/config.toml`.
+   Added `[[exemptions.rand]] version = "0.9.4" criteria = "safe-to-deploy"`.
+   `rand 0.8.6` was automatically covered by a new Mozilla supply-chain audit
+   (`0.8.5 → 0.8.6 delta`, `RUSTSEC-2026-0097 fix, no new unsafe`), so no
+   exemption was needed for the 0.8 series. `supply-chain/imports.lock`
+   updated to reflect the pulled Mozilla audit. `cargo vet` now passes:
+   14 fully audited, 1 partially audited, 498 exempted.
 
 ### Test results
 
@@ -51,6 +65,10 @@ No code or documentation changes required.
 2026-05-23; lockfile-only change since 175th pass, count unchanged).
 
 `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean (after four-closure reformat above).
+
+`cargo vet` — passes (after rand 0.9.4 exemption + Mozilla import refresh).
 
 ---
 
