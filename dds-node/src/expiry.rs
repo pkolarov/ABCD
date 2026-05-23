@@ -21,8 +21,12 @@ pub struct SweepStats {
 /// Run a single expiry sweep.
 ///
 /// `now` is the current epoch second. Any token in the trust graph whose
-/// `exp` is `Some(t)` with `t <= now` will be removed from the graph and
-/// marked revoked in the store. Tokens with no expiry are left alone.
+/// `exp` is `Some(t)` with `now > t` (i.e. `t < now`, strictly) will be
+/// removed from the graph and marked revoked in the store. A token is
+/// **not** swept when `exp == now`; only the next second (`now == exp + 1`)
+/// triggers removal. This matches the `now > exp` convention used by
+/// `token.rs`, `trust.rs`, and `domain.rs`. Tokens with no expiry are left
+/// alone.
 pub fn sweep_once<S>(graph: &mut TrustGraph, store: &mut S, now: u64) -> SweepStats
 where
     S: TokenStore + RevocationStore,

@@ -1,5 +1,65 @@
 # DDS Implementation Status
 
+## Doc Fix (2026-05-23, 170th pass) — PQ metrics missing from Admin Guide catalog + stale `sweep_once` doc comment
+
+### Gaps
+
+**Gap 1 — `sweep_once` doc comment inconsistent with 169th-pass fix.**
+
+The 169th pass changed `exp_secs <= now` to `now > exp_secs` in `sweep_once`, which
+shifts the boundary: a token is now NOT swept when `exp == now` (only swept when
+`now > exp`, i.e. `exp < now`). The doc comment was not updated and still read:
+
+> Any token in the trust graph whose `exp` is `Some(t)` with **`t <= now`** will be
+> removed from the graph
+
+Under `t <= now`, a token with `exp == now` would be described as swept — but the
+code (correctly) does not sweep it. An operator or future developer reading the doc
+would build the wrong mental model of the expiry boundary.
+
+**Gap 2 — Six Phase B PQC metrics absent from `docs/DDS-Admin-Guide.md` catalog.**
+
+Phase B.11 (landed 2026-05-02) implemented six PQC metric families in
+`dds-node/src/telemetry.rs`:
+
+| Metric | Purpose |
+|---|---|
+| `dds_pq_envelope_decrypt_total` | Phase B enc-v3 gossip/sync AEAD decrypt outcomes |
+| `dds_pq_rotation_total` | Epoch-key rotation triggers |
+| `dds_pq_epoch_id` | Current epoch_id of the local node's AEAD epoch key |
+| `dds_pq_releases_installed_total` | Inbound EpochKeyRelease install outcomes |
+| `dds_pq_releases_emitted_total` | Outbound EpochKeyRelease mint-and-emit outcomes |
+| `dds_pq_release_requests_total` | EpochKeyRequest late-join recovery outcomes |
+
+These are referenced by the active `dds-pqc` Alertmanager rules
+(`DdsPqcDecryptFailureSpike`, `DdsPqcKeyRequestSpike`) in
+`docs/observability/alerts/dds.rules.yml` and documented in `pqc-phase-b-plan.md §B.11`,
+but they were absent from the Admin Guide metrics reference table — the main operator
+reference for `/metrics` output. An operator reading the table to understand what
+`/metrics` exposes would not find the PQC metrics.
+
+### Fixes
+
+**`dds-node/src/expiry.rs`** — `sweep_once` doc comment:
+- Replaced `t <= now` with `now > t (i.e. t < now, strictly)`.
+- Added a sentence explicitly stating that `exp == now` does NOT trigger a sweep.
+- Added a note naming the other files (`token.rs`, `trust.rs`, `domain.rs`) that
+  share this convention, consistent with the test comment added in the 169th pass.
+
+**`docs/DDS-Admin-Guide.md`** — Prometheus metrics catalog table:
+- Added 6 rows for the PQC metric families after `dds_sync_payloads_rejected_total`
+  and before the trust-graph gauges (logical grouping: sync → PQC → graph state).
+- Each row includes the `result` / `reason` label vocabulary, a plain-English
+  description, and a cross-reference to the alert that fires on anomalous values.
+
+### Test results
+
+`cargo test -p dds-node --lib -- expiry`: 6 passed; 0 failed (doc-only change, no
+behaviour impact). `cargo check -p dds-node`: clean. `cargo clippy --workspace
+--all-targets -- -D warnings`: clean (run before this pass).
+
+---
+
 ## Bug Fix (2026-05-23, 169th pass) — `expiry::sweep_once` used wrong comparison operator
 
 ### Bug
