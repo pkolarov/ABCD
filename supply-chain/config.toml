@@ -456,7 +456,7 @@ version = "0.5.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.fastrand]]
-version = "2.4.0"
+version = "2.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.ff]]

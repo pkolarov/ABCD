@@ -1,5 +1,47 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-23, 179th pass) — Bump fastrand 2.4.0→2.4.1 (yanked release)
+
+### Summary
+
+Automated scheduled sweep of the full Rust workspace.
+
+**Audit (`cargo audit`):** 0 vulnerabilities. The `fastrand 2.4.0` yanked warning
+from prior passes is now resolved. Remaining 4 informational advisories
+(`atomic-polyfill`, `core2`, `paste`, `lru`) are unchanged and unactionable without
+libp2p or pqcrypto-mldsa major-version bumps. `core2 0.4.0` yanked warning persists
+as it is transitively required by postcard/heapless in the libp2p stack.
+
+**Gap analysis:** No documentation–code gaps found. All 34 documented Prometheus
+metric families present and wired (same baseline as 178th pass). Deferred security
+items (M-13 FIDO MDS, M-15 bundle re-wrap, M-18 WiX service-account split, L-17
+mutex refactor) remain blocked on external design or Windows CI; no change.
+
+**Bug scan:** No new panicking paths found. All `.unwrap()` / `.expect()` calls in
+production code remain in test code or are provably safe structural invariants
+(same baseline as 177th pass).
+
+**Supply-chain fix:** `fastrand 2.4.0` was yanked upstream. Bumped to `2.4.1` via
+`cargo update -p fastrand`. Updated `supply-chain/config.toml` exemption from
+`2.4.0` to `2.4.1` (patch release: 4 files changed, 7 insertions, 3 deletions —
+no logic change, only yanked-release cleanup).
+
+### Test results
+
+`cargo test --workspace --lib` — **796 passed; 0 failed** (macOS ARM64, 2026-05-23;
+count unchanged from 178th pass).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean.
+
+`cargo vet` — passes (14 fully audited, 1 partially audited, 498 exempted).
+
+`cargo audit` — 0 vulnerabilities; `fastrand` yanked advisory resolved; 4 remaining
+informational-only warnings (same unactionable baseline).
+
+---
+
 ## Maintenance (2026-05-23, 178th pass) — Prune stale `rand 0.9.2` exemption from supply-chain
 
 ### Summary
