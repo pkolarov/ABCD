@@ -1,5 +1,36 @@
 # DDS Implementation Status
 
+## Fix (2026-05-23, 158th pass) — Harden `relay_revocation_propagates_via_sync_after_originator_drops` against CI flakiness
+
+### Problem
+
+The multinode test `relay_revocation_propagates_via_sync_after_originator_drops` failed once
+in the `fix(vet)` CI run (26320100861) but passed in every other run, including the immediately
+following `docs(status)` run (26320111897). The supply-chain config change between those runs
+cannot affect test execution, confirming this was a timing flake, not a regression.
+
+**Root cause**: The test waits up to `PROPAGATION_TIMEOUT` (20 s) for node C to learn a
+revocation from node B via the sync protocol. However, the sync protocol only fires *after*
+H-12 admission completes (see `node.rs` line ~1383 — `try_sync_with` is called in the
+admission-success path, not at `ConnectionEstablished`). On a loaded CI runner, the admission
+round-trip plus the sync transfer can consume most of the 20 s window, leaving no margin
+for scheduling jitter.
+
+### Fix
+
+**`dds-node/tests/multinode.rs`** — change the sync-specific wait in this test from
+`PROPAGATION_TIMEOUT` (20 s) to `PROPAGATION_TIMEOUT * 2` (40 s). No production code changed.
+The longer deadline is only needed on this one test because no other multinode test chains
+admission → sync in a single window; all other tests either wait for gossip propagation (which
+fires regardless of admission state) or have separate admission phases.
+
+### Test results
+
+`cargo test -p dds-node --test multinode relay_revocation_propagates_via_sync_after_originator_drops`: passes.
+`cargo fmt --all -- --check`: clean. No other tests affected.
+
+---
+
 ## CI Fix (2026-05-23, 157th pass) — Resolve CI failures: cargo fmt drift + cargo vet unvetted deps
 
 ### Issues

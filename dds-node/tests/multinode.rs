@@ -887,7 +887,12 @@ async fn relay_revocation_propagates_via_sync_after_originator_drops() {
     // the revocations topic is one-shot and was published before C
     // joined, so the only path left is the request_response sync
     // protocol firing on ConnectionEstablished + admission completion.
-    let sync_deadline = Instant::now() + PROPAGATION_TIMEOUT;
+    //
+    // H-12 admission must complete before try_sync_with fires (node.rs
+    // line ~1383). On a loaded CI runner the admission round-trip + sync
+    // transfer can consume most of the standard PROPAGATION_TIMEOUT.
+    // Use 2x to prevent spurious flakes without affecting any logic.
+    let sync_deadline = Instant::now() + PROPAGATION_TIMEOUT * 2;
     while Instant::now() < sync_deadline {
         {
             let mut refs: Vec<&mut DdsNode> = vec![&mut b, &mut c];
