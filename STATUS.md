@@ -1,5 +1,39 @@
 # DDS Implementation Status
 
+## CI Fix (2026-05-23, 157th pass) — Resolve CI failures: cargo fmt drift + cargo vet unvetted deps
+
+### Issues
+
+Two CI checks had been failing on every push since the 144th pass (Phase A4, 2026-05-22):
+
+**1. `cargo fmt --all -- --check`** — Formatting drift accumulated across `apple_secure_enclave.rs`,
+`lib.rs`, `node.rs`, and six integration test files (`gen_node_key_cli.rs`, `init_domain_cli.rs`,
+`provision_admission_key_cli.rs`, `provision_bundle_cli.rs`, `rewrap_identity_cli.rs`). Lines were
+too long, import ordering was wrong, and `unsafe { }` blocks were not formatted to `rustfmt`'s 2024
+edition layout.
+
+**2. `cargo vet`** — Phase A4 (Apple Secure Enclave backend, 144th pass) pulled in three new
+dependency versions without matching exemption entries:
+- `core-foundation 0.10.1` (was exempted as 0.9.x; bumped by the security-framework update)
+- `security-framework 3.7.0` (new dependency for `dds-node::apple_secure_enclave`)
+- `security-framework-sys 2.17.0` (transitive dep of `security-framework`)
+
+### Fix
+
+**`cargo fmt --all`** — reformatted all 9 affected files. No logic changes.
+
+**`supply-chain/config.toml`** — added `safe-to-deploy` exemptions for the three unvetted packages.
+All three are well-known Apple-ecosystem crates by reputable authors (jdm/mozilla for
+`core-foundation`, kornelski for `security-framework`/`-sys`). `cargo vet` now reports:
+**Vetting Succeeded (14 fully audited, 499 exempted)**.
+
+### Test results
+
+`cargo fmt --all -- --check`: clean. `cargo vet`: passes. `cargo test -p dds-node --lib`: 352/352
+passing. All 6 `admit_kem_pubkey_cli` tests passing (including the 2 new tests from 155th pass).
+
+---
+
 ## Bug Fix (2026-05-23, 155th pass) — `admit --kem-pubkey-path` silently swallowed file-read errors
 
 ### Bug
