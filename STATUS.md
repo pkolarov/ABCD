@@ -6,10 +6,12 @@
 
 Automated scheduled sweep of the full Rust workspace.
 
-**Audit (`cargo audit`):** 0 vulnerabilities. Same 3 informational-only warnings as 179th
-pass (`atomic-polyfill` RUSTSEC-2023-0089, `paste` RUSTSEC-2024-0436, `lru`
-RUSTSEC-2026-0002 — all unactionable without a libp2p or pqcrypto-mldsa major-version
-bump). No new advisories.
+**Audit (`cargo audit`):** 0 vulnerabilities. Warning count drops from **5 → 3**: the
+`core2 0.4.0` crate (RUSTSEC-2026-0105 unmaintained + yanked — two advisory entries)
+was removed from the dependency tree entirely via the `multihash 0.19.3→0.19.5` bump.
+Remaining 3 informational advisories (`atomic-polyfill` RUSTSEC-2023-0089, `paste`
+RUSTSEC-2024-0436, `lru` RUSTSEC-2026-0002) are unactionable without libp2p or
+pqcrypto-mldsa major-version bumps.
 
 **Gap analysis:** No documentation–code gaps found. Explore agent confirmed all CLI
 commands, HTTP endpoints, public APIs, and observability features are fully implemented
@@ -36,7 +38,7 @@ code remain in test code or are provably safe structural invariants (same baseli
 | `idna_adapter` | 1.2.0/1.2.1 | 1.2.2 |
 | `wit-bindgen` | — | 0.57.1 (new transitive dep) |
 | `rustls` | 0.23.37 | 0.23.40 |
-| `tokio` | 1.44.2 | 1.45.0+ range |
+| `tokio` | 1.51.0 | 1.52.3 |
 | `serde` | 1.0.149 | 1.0.150 |
 | `asn1-rs` | 0.7.1 | 0.7.2 |
 | `bitflags` | 2.11.0 | 2.11.1 |
