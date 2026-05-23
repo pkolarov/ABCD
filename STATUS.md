@@ -1,5 +1,45 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-23, 175th pass) — No-op: full gap/bug sweep, all green
+
+### Summary
+
+Automated scheduled sweep of the full Rust workspace for documentation–code
+gaps and production panic paths.
+
+**Gap analysis**: all doc sections cross-checked against implementation.
+- `dds pq status / list-pubkeys / rotate` (Phase B operator surface) —
+  documented in 174th pass; implementation verified to match sample output
+  in Admin Guide.
+- `dds-node rewrap-identity` — present in `dds-node/src/main.rs`, documented
+  in Admin Guide.
+- Security review item counts in `docs/DDS-Implementation-Whitepaper.md §19.5`
+  (19/22 Medium fixed, 17/18 Low fixed, 4 deferred) — confirmed accurate.
+- All `§19.2 Implemented But Not Fully Wired` items — confirmed resolved.
+
+**Bug scan**: every `.unwrap()` / `.expect()` call in production code paths
+across all Rust crates audited. All instances are provably safe:
+- CBOR serialization into `Vec<u8>` (infallible by `io::Write` contract).
+- Fixed-size slice conversions with preceding length guards.
+- OID construction from compile-time `&[u64]` constants.
+- Uncompressed EC point `x()`/`y()` on a valid verifying key.
+- `key.pq.as_ref().expect("hybrid branch implies pq is Some")` — invariant
+  holds because `is_hybrid()` ≡ `pq.is_some()`.
+- `Mutex::lock().expect("poisoned")` — deliberate panic on mutex poison.
+- `reqwest::Client::builder().timeout().build().expect()` — infallible with
+  only a timeout set.
+
+No code or documentation changes required.
+
+### Test results
+
+`cargo test --workspace --lib` — **796 passed; 0 failed** (macOS ARM64,
+2026-05-23; count unchanged from 174th pass).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+---
+
 ## Doc Fix (2026-05-23, 174th pass) — Admin Guide: document `dds pq` commands + admission-revocation epoch-rotation side-effect
 
 ### Gaps
