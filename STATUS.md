@@ -1,5 +1,47 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-24, 181st pass) — Fix stale test-count in Developer Guide
+
+### Summary
+
+Automated scheduled sweep of the full Rust workspace.
+
+**Audit (`cargo audit`):** 0 vulnerabilities. 3 informational-only warnings
+(`atomic-polyfill` RUSTSEC-2023-0089, `paste` RUSTSEC-2024-0436, `lru`
+RUSTSEC-2026-0002) — unchanged from 180th pass, still unactionable without
+libp2p or pqcrypto-mldsa major-version bumps.
+
+**Gap analysis:** One stale documentation datum found and fixed.
+`docs/DDS-Developer-Guide.md` §"Read the tests" cited `724 / 724 passing as
+of 2026-04-28` (the suite baseline from the early April review). The workspace
+now has **796 passing tests** (grown through all the observability, AD
+coexistence, and supply-chain work since April). Updated to
+`796 / 796 passing as of 2026-05-24, 5 ignored`. STATUS.md and the Admin Guide
+were already current. No other stale counts found in any doc.
+
+Deferred items (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain blocked
+on external design, infrastructure provisioning, or Windows CI; no change.
+
+**Bug scan:** No new panicking paths found. All `.unwrap()` / `.expect()` in
+production code remain in test code or are provably safe structural invariants
+(same baseline as 180th pass).
+
+### Test results
+
+`cargo test --workspace --lib` — **796 passed; 0 failed; 5 ignored** (macOS ARM64,
+2026-05-24; count unchanged from 180th pass).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean.
+
+`cargo vet` — passes (13 fully audited, 1 partially audited, 502 exempted).
+
+`cargo audit` — 0 vulnerabilities; 3 informational-only warnings (same
+unactionable baseline as 180th pass).
+
+---
+
 ## Maintenance (2026-05-24, 180th pass) — Bulk dependency refresh (cargo update, ~40 crates)
 
 ### Summary
