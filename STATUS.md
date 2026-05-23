@@ -1,5 +1,37 @@
 # DDS Implementation Status
 
+## Fix (2026-05-23, 154th pass) — Use `new_current_thread` Tokio runtime for all CLI subcommands
+
+### Bug
+
+Under heavy concurrent load (workspace `cargo test` runs all integration test
+files in parallel, each spawning the `dds-node` binary many times), the binary's
+`tokio::runtime::Builder::new_multi_thread()` call could fail with a resource
+exhaustion error. Every CLI invocation — even a trivial `restrict-data-dir-acl`
+that simply prints a string — was spawning a full multi-thread Tokio thread pool
+(default: one thread per CPU core). With dozens of concurrent test processes each
+spinning up their own thread pools, macOS thread limits were reached, causing some
+process launches to return a non-zero exit code and failing tests like
+`restrict_data_dir_acl_is_idempotent`.
+
+### Fix
+
+**`dds-node/src/main.rs`** — detect the subcommand in `main()` before building
+the Tokio runtime; use `new_current_thread()` for all subcommands except `run`.
+
+- `run` remains `new_multi_thread` because the live P2P node uses libp2p swarm
+  tasks and gossip work that genuinely benefit from OS thread parallelism.
+- All CLI subcommands (`init-domain`, `gen-node-key`, `restrict-data-dir-acl`,
+  `provision-admission-key`, etc.) are short-lived synchronous operations that
+  only incidentally go through the async executor — `new_current_thread` is
+  sufficient and avoids spawning any extra OS threads.
+
+This is a complementary fix to the `warmup_binary()` approach added in 7dedaf1:
+warmup pre-flushes Gatekeeper verification; this change eliminates the thread-pool
+exhaustion that caused the underlying binary failure.
+
+---
+
 ## Gap Fix (2026-05-23, 153rd pass) — CLI integration tests for create-provision-bundle + provision
 
 ### Gap

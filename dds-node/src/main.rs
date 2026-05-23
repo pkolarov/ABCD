@@ -154,9 +154,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // CLI / interactive path — build a tokio runtime ourselves so the
     // service-mode early-return above can stay synchronous.
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    //
+    // The `run` subcommand starts a full P2P node and needs the multi-thread
+    // executor (libp2p swarm + gossip tasks run concurrently). Every other
+    // subcommand is a short-lived synchronous operation (key generation,
+    // cert signing, file manipulation) that doesn't need a thread pool.
+    // Using `new_current_thread` for CLI commands avoids spawning dozens of
+    // OS threads per invocation — this matters when many CLI test binaries
+    // run concurrently (workspace `cargo test`) and would otherwise exhaust
+    // macOS thread limits, causing random runtime-build failures.
+    let sub = raw_args.first().map(String::as_str).unwrap_or("run");
+    let rt = if sub == "run" {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+    };
     rt.block_on(async_main(raw_args))
 }
 
