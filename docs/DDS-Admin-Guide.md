@@ -13,24 +13,25 @@ For background on how DDS works internally, see the [Developer Guide](DDS-Develo
 3. [Adding Nodes](#adding-nodes)
 4. [Revoking a Node's Admission](#revoking-a-nodes-admission)
 5. [Rotating a Node's Identity](#rotating-a-nodes-identity)
-6. [Hardware-Bound Admission Keys](#hardware-bound-admission-keys)
-7. [Single-File Provisioning](#single-file-provisioning)
-8. [Node Configuration Reference](#node-configuration-reference)
-9. [Enrolling Users](#enrolling-users)
-10. [Enrolling Devices](#enrolling-devices)
-11. [Admin Bootstrap](#admin-bootstrap)
-12. [Sessions and Authentication](#sessions-and-authentication)
-13. [Groups and Trust](#groups-and-trust)
-14. [Policy Management](#policy-management)
-15. [Windows Deployment](#windows-deployment)
-16. [macOS Deployment](#macos-deployment)
-17. [Linux Deployment](#linux-deployment)
-18. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
-19. [Audit Log](#audit-log)
-20. [Debugging](#debugging)
-21. [Air-Gapped Sync (USB Stick / Courier)](#air-gapped-sync-usb-stick--courier)
-22. [Security Reference](#security-reference)
-23. [Troubleshooting](#troubleshooting)
+6. [Phase B: Epoch Key Management](#phase-b-epoch-key-management)
+7. [Hardware-Bound Admission Keys](#hardware-bound-admission-keys)
+8. [Single-File Provisioning](#single-file-provisioning)
+9. [Node Configuration Reference](#node-configuration-reference)
+10. [Enrolling Users](#enrolling-users)
+11. [Enrolling Devices](#enrolling-devices)
+12. [Admin Bootstrap](#admin-bootstrap)
+13. [Sessions and Authentication](#sessions-and-authentication)
+14. [Groups and Trust](#groups-and-trust)
+15. [Policy Management](#policy-management)
+16. [Windows Deployment](#windows-deployment)
+17. [macOS Deployment](#macos-deployment)
+18. [Linux Deployment](#linux-deployment)
+19. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
+20. [Audit Log](#audit-log)
+21. [Debugging](#debugging)
+22. [Air-Gapped Sync (USB Stick / Courier)](#air-gapped-sync-usb-stick--courier)
+23. [Security Reference](#security-reference)
+24. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -327,6 +328,17 @@ handshake round-trip. The manual `import-revocation` flow remains as a
 force-immediate path for emergency rollouts and for nodes that aren't
 currently on the network.
 
+> **Phase B (`enc-v3`) side-effect:** On domains with `capabilities = ["enc-v3"]`,
+> every node that ingests a new revocation immediately schedules an epoch key
+> rotation (within a random 0–30 s jitter window, to prevent a broadcast storm).
+> The rotation rolls a new 32-byte AEAD epoch key, persists it atomically to
+> `epoch_keys.cbor`, and fans out a fresh `EpochKeyRelease` to all admitted peers
+> — excluding the revoked peer.  This ensures the revoked node cannot decrypt
+> gossip or sync traffic published after the rotation even if it retained the
+> pre-rotation epoch key.  You can confirm the rotation occurred by watching the
+> `dds_pq_rotation_total{reason="revocation"}` counter increment or by checking
+> `dds pq status` and observing the `Current epoch_id` advance.
+
 ### Step 3: Verify the revocation landed
 
 ```bash
@@ -472,6 +484,89 @@ The node will verify the new admission cert against the freshly-
 rotated PeerId at startup and refuse to start if the cert was
 issued for the wrong PeerId — which is the safety property that
 makes the manual admin signature load-bearing.
+
+---
+
+## Phase B: Epoch Key Management
+
+On domains with `capabilities = ["enc-v3"]` (Phase B PQC), each node
+holds a 32-byte AEAD epoch key used to encrypt gossip and sync payloads.
+The following `dds pq` subcommands let operators inspect and control the
+epoch key lifecycle.
+
+### Check PQ status (`dds pq status`)
+
+```bash
+dds --data-dir /opt/dds/data pq status
+```
+
+Sample output:
+
+```
+DDS PQ Status (Z-1 Phase B)
+  Data dir:                 /opt/dds/data
+  KEM pubkey hash (sha256:8): 3f1a9b2c4d5e6f70
+  KEM pubkey size:          1216 bytes
+  KEM pubkey (hex):         04ab3c…  (2432 hex chars)
+  Current epoch_id:         7
+  Cached peer releases:     4
+  Cached peer certs:        5
+    With pq_kem_pubkey:     5
+    v3 coverage:            100.0%
+```
+
+Key fields:
+
+| Field | Meaning |
+|---|---|
+| `KEM pubkey (hex)` | 1,216-byte hybrid X25519 + ML-KEM-768 public key — pass to `dds export --encrypt-to` on another node |
+| `Current epoch_id` | Monotonically increasing epoch counter; advances on every rotation |
+| `Cached peer releases` | Number of inbound publisher epoch keys held in the local store |
+| `v3 coverage` | Fraction of admitted peers already running Phase B (have a KEM pubkey in their cert); must reach 100 % before enabling `enc-v3` on the domain |
+
+Reads `epoch_keys.cbor` and `peer_certs.cbor` directly — no running
+node required.
+
+### List peer KEM pubkeys (`dds pq list-pubkeys`)
+
+```bash
+dds --data-dir /opt/dds/data pq list-pubkeys
+```
+
+Sample output:
+
+```
+Cached peer admission certs (3 total)
+PEER_ID                                                       KEM  KEM_HASH (sha256:8)
+12D3KooWAbc…                                                1216  3f1a9b2c4d5e6f70
+12D3KooWDef…                                                1216  a1b2c3d4e5f60718
+12D3KooWXyz…                                                none  -
+```
+
+Use this before flipping `enc-v3` on a domain to confirm every admitted
+peer has a v3 admission cert carrying a KEM pubkey.  A `none` row means
+that peer is still running an older node binary (v1/v2 cert) and will
+not be able to decrypt enc-v3 gossip.
+
+### Manual epoch key rotation (`dds pq rotate`)
+
+```bash
+dds --node-url http://127.0.0.1:5551 pq rotate
+# Epoch key rotation triggered.
+```
+
+Sends `POST /v1/pq/rotate` to the running node, which immediately rolls
+a new epoch key, persists it to `epoch_keys.cbor`, and fans out a fresh
+`EpochKeyRelease` to all admitted peers.  Use this after a suspected
+epoch-key compromise or as a proactive security measure.
+
+Automatic triggers (no operator action needed):
+
+| Trigger | `dds_pq_rotation_total` label | Notes |
+|---|---|---|
+| Scheduled cadence | `reason=time` | Every `epoch_rotation_secs` (default 24 h) |
+| Admission revocation | `reason=revocation` | 0–30 s jitter to prevent broadcast storm |
+| This command | `reason=manual` | Immediate |
 
 ---
 

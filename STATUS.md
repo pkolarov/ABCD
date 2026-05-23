@@ -1,5 +1,57 @@
 # DDS Implementation Status
 
+## Doc Fix (2026-05-23, 174th pass) — Admin Guide: document `dds pq` commands + admission-revocation epoch-rotation side-effect
+
+### Gaps
+
+**Gap 1 — "Revoking a Node's Admission" section missing Phase B epoch-key rotation behavior.**
+
+The admission revocation workflow section described propagation mechanics
+(H-12 piggybacking, manual `import-revocation`) but did not mention that on
+`enc-v3` domains (Phase B PQC), every node that ingests a new revocation
+immediately schedules an epoch key rotation with a 0–30 s jitter window.
+An operator revoking a peer on an enc-v3 domain would not know from the
+Admin Guide that the revoked peer also loses the ability to decrypt future
+gossip/sync traffic — a security property that makes the revocation more
+than just an admission gate, and one that can be verified via
+`dds_pq_rotation_total{reason="revocation"}` or `dds pq status`.
+
+**Gap 2 — `dds pq` operator commands undocumented.**
+
+`dds pq status`, `dds pq list-pubkeys`, and `dds pq rotate` were implemented
+in the B.10 pass (2026-05-01) and mentioned only in passing in the
+"Air-Gapped Sync" section (to retrieve the KEM pubkey for `dds export --encrypt-to`)
+and the metrics table (`POST /v1/pq/rotate` as a metric label note). There was
+no dedicated section showing operators how to use these commands, what the
+output means, or when to trigger a manual rotation.
+
+### Fixes
+
+**`docs/DDS-Admin-Guide.md`** — "Revoking a Node's Admission" section:
+- Added a blockquote note after the H-12 propagation paragraph explaining
+  the enc-v3 epoch-key rotation side-effect, the 0–30 s jitter, the
+  `epoch_keys.cbor` persistence step, the fan-out exclusion of the revoked
+  peer, and how to verify via `dds_pq_rotation_total{reason="revocation"}`
+  or `dds pq status`.
+
+**`docs/DDS-Admin-Guide.md`** — new "Phase B: Epoch Key Management" section
+(inserted between "Rotating a Node's Identity" and "Re-encrypting Node Keys"):
+- Documents `dds pq status` with sample output and field table.
+- Documents `dds pq list-pubkeys` with sample output and guidance on when
+  to use it (before enabling `enc-v3` on a domain).
+- Documents `dds pq rotate` (manual trigger), sample output, and a table
+  of all three automatic rotation triggers with their metric labels.
+- Table of Contents updated (entry 6 added; entries 6–23 renumbered to 7–24).
+
+No code changes. No new tests needed (documentation-only).
+
+### Test results
+
+`cargo test --workspace --lib` — **796 passed; 0 failed** (macOS ARM64, 2026-05-23;
+no code changed, count unchanged from 173rd pass).
+
+---
+
 ## Bug Fix (2026-05-23, 173rd pass) — 9 unwrap panics in dds-cli replaced with actionable errors
 
 ### Bug
