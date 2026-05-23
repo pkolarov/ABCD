@@ -831,6 +831,17 @@ impl DdsNode {
                     if self.config.domain.audit_log_enabled {
                         self.prune_audit_log();
                     }
+
+                    // **Z-1 Phase B.6** — prune the epoch-key grace cache so
+                    // previous-epoch entries don't accumulate across rotations.
+                    // Grace entries are only needed for the 5-minute window after
+                    // a rotation; dropping them here (keyed to the expiry-sweep
+                    // interval, default 60 s) bounds the in-memory and on-disk
+                    // size of `epoch_keys.cbor`.
+                    let pruned = self.epoch_keys.prune_grace(Instant::now());
+                    if pruned > 0 {
+                        debug!(pruned, "pruned expired epoch-key grace entries");
+                    }
                 }
                 _ = anti_entropy.tick() => {
                     let peers: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
@@ -1501,6 +1512,12 @@ impl DdsNode {
             // future re-admitted peer (different cert, same PeerId)
             // isn't incorrectly throttled by a stale cooldown entry.
             self.epoch_key_request_last.remove(revoked_peer);
+            // Drop the revoked peer's cached epoch-key release so
+            // the next `epoch_keys.save` does not persist a stale
+            // publisher entry for a revoked node. Grace entries are
+            // intentionally left in place — they age out via
+            // `prune_grace` within `EPOCH_KEY_GRACE_SECS`.
+            self.epoch_keys.remove_peer(revoked_peer);
         }
         if evicted {
             if let Err(e) = self.peer_certs.save(&self.peer_certs_path) {
@@ -4300,9 +4317,19 @@ mod admission_cert_revocation_epoch_rotation_tests {
     //! Also covers the `epoch_key_request_last` cooldown-map pruning that
     //! prevents a revoked peer's stale cooldown entry from throttling
     //! legitimate late-join requests after re-admission.
+    //!
+    //! **Env-lock discipline**: `DdsNode::init` creates an `admission_key.bin`
+    //! via the `SoftwareKeyfile` backend. When another test (e.g. in
+    //! `domain_store` or `identity_store`) sets `DDS_REQUIRE_ENCRYPTED_KEYS=1`
+    //! concurrently, `init` refuses to write a plaintext key and panics.
+    //! Every test in this module acquires `TEST_ENV_LOCK` (the process-wide
+    //! env-var mutex) inside its `run_with_time` closure and clears
+    //! `DDS_REQUIRE_ENCRYPTED_KEYS` before calling `make_node`, preventing
+    //! the race.
 
     use super::*;
     use crate::config::{DomainConfig, NetworkConfig, NodeConfig};
+    use crate::identity_store::REQUIRE_ENCRYPTED_KEYS_ENV;
 
     fn make_node(domain_key: &dds_domain::DomainKey) -> (DdsNode, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -4376,6 +4403,10 @@ mod admission_cert_revocation_epoch_rotation_tests {
     #[test]
     fn admission_cert_revocation_schedules_epoch_rotation() {
         run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
             let dkey = dds_domain::DomainKey::from_secret_bytes("revoke-epoch.local", [42u8; 32]);
             let (mut node, _dir) = make_node(&dkey);
             let peer_id: libp2p::PeerId = "12D3KooWNodeX"
@@ -4407,6 +4438,10 @@ mod admission_cert_revocation_epoch_rotation_tests {
     #[test]
     fn admission_cert_revocation_deduplicates_pending_rotation() {
         run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
             let dkey = dds_domain::DomainKey::from_secret_bytes("revoke-dedup.local", [43u8; 32]);
             let (mut node, _dir) = make_node(&dkey);
             let peer_id: libp2p::PeerId = "12D3KooWNodeY"
@@ -4437,6 +4472,10 @@ mod admission_cert_revocation_epoch_rotation_tests {
     #[test]
     fn admission_cert_revocation_clears_epoch_key_request_cooldown() {
         run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
             let dkey =
                 dds_domain::DomainKey::from_secret_bytes("revoke-cooldown.local", [44u8; 32]);
             let (mut node, _dir) = make_node(&dkey);
@@ -4463,6 +4502,56 @@ mod admission_cert_revocation_epoch_rotation_tests {
                     .epoch_key_request_last_for_tests()
                     .contains_key(victim_peer_str),
                 "cooldown entry must be removed when the peer's admission cert is revoked"
+            );
+        });
+    }
+
+    /// Revoking a peer also drops their cached epoch-key release from the
+    /// local epoch-key store so the stale entry is not persisted on the
+    /// next `epoch_keys.cbor` write.
+    #[test]
+    fn admission_cert_revocation_removes_peer_epoch_key_entry() {
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let dkey =
+                dds_domain::DomainKey::from_secret_bytes("revoke-epochkey.local", [45u8; 32]);
+            let (mut node, _dir) = make_node(&dkey);
+            let peer_id: libp2p::PeerId = "12D3KooWNodeW"
+                .parse()
+                .unwrap_or_else(|_| libp2p::PeerId::random());
+
+            let victim_peer_str = "12D3KooWVictimEpoch";
+
+            // Seed a fake peer epoch-key release in the epoch-key store so we
+            // can verify it's removed on revocation.
+            {
+                let store = node.epoch_keys_mut_for_tests();
+                let far_future = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 86_400;
+                store.install_peer_release(victim_peer_str, 1, [0u8; 32], far_future);
+            }
+            assert!(
+                node.epoch_keys_for_tests()
+                    .peer_epoch_key(victim_peer_str, 1)
+                    .is_some(),
+                "pre-condition: epoch-key entry present for victim"
+            );
+
+            let rev = dkey.revoke_admission(victim_peer_str.into(), 1_000_004, Some("d".into()));
+            let blob = rev.to_cbor().expect("cbor");
+            node.merge_piggybacked_revocations(&peer_id, vec![blob]);
+
+            assert!(
+                node.epoch_keys_for_tests()
+                    .peer_epoch_key(victim_peer_str, 1)
+                    .is_none(),
+                "epoch-key release must be removed when the peer's admission cert is revoked"
             );
         });
     }

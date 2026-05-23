@@ -1,5 +1,72 @@
 # DDS Implementation Status
 
+## Bug Fix (2026-05-23, 162nd pass) — Epoch-key grace entries never pruned + stale peer entries on revocation
+
+### Bugs
+
+**Bug 1 — `prune_grace` never called in production (memory leak)**
+
+`EpochKeyStore::prune_grace` removes grace-period entries for superseded epoch
+keys (both `previous_my_epoch` and `peer_grace`). These entries are created
+every time an epoch rotates (default 24 h). The function was called only in
+tests (`pqc_b12_integration.rs`) — never in the production run loop. Over many
+rotation cycles, grace entries accumulated in memory and on disk (`epoch_keys.cbor`)
+without bound.
+
+**Bug 2 — `epoch_keys.remove_peer()` not called on admission-cert revocation**
+
+When `ingest_revocation_piggybacked` revoked a peer's admission cert, the peer's
+cached epoch-key release in `EpochKeyStore::peer_releases` was not removed.
+The stale entry was then persisted to `epoch_keys.cbor` on the next rotation.
+The `EpochKeyStore::remove_peer` doc comment says "e.g. on admission revocation"
+but the call site was missing. This was a minor storage leak (no security impact:
+H-12 blocks the revoked peer from connecting so the stale key is never used for
+decryption, and the epoch rotation triggered within 30 s ensures future gossip
+uses a new epoch key the revoked peer cannot decrypt).
+
+**Bug 3 — Latent test race: admission-cert revocation tests lacked `TEST_ENV_LOCK`**
+
+The 3 regression tests in `admission_cert_revocation_epoch_rotation_tests` (added
+in the 161st pass) called `DdsNode::init` without holding `TEST_ENV_LOCK`. When
+`domain_store` or `identity_store` tests set `DDS_REQUIRE_ENCRYPTED_KEYS=1`
+concurrently, `DdsNode::init` refused to write a plaintext `admission_key.bin`
+and panicked. In the full test suite (`cargo test -p dds-node`) all 3 tests
+failed non-deterministically. The 161st pass STATUS claimed all tests passing
+because a selective run (`--lib -- admission_cert_revocation`) happened to avoid
+the race; the full suite run confirmed the failure.
+
+### Fix
+
+**`dds-node/src/node.rs`** — `DdsNode::run` expiry-sweep tick:
+- Added `self.epoch_keys.prune_grace(Instant::now())` at the end of the
+  existing expiry-sweep tick (fires every `expiry_scan_interval_secs`, default
+  60 s). This bounds grace-entry lifetime to `EPOCH_KEY_GRACE_SECS` (300 s)
+  regardless of how many epoch rotations occur.
+
+**`dds-node/src/node.rs`** — `ingest_revocation_piggybacked` peer-eviction loop:
+- Added `self.epoch_keys.remove_peer(revoked_peer)` after the existing
+  `peer_certs.remove` + `epoch_key_request_last.remove` calls, so the revoked
+  peer's `peer_releases` entry is cleared immediately on cert eviction.
+
+**`dds-node/src/node.rs`** — `admission_cert_revocation_epoch_rotation_tests`:
+- Added `use crate::identity_store::REQUIRE_ENCRYPTED_KEYS_ENV` import and a
+  module-level comment explaining the env-lock discipline.
+- Each of the 4 tests now acquires `crate::TEST_ENV_LOCK` and clears
+  `DDS_REQUIRE_ENCRYPTED_KEYS` inside its `run_with_time` closure before
+  calling `make_node`, preventing the race.
+- Added 1 new regression test:
+  `admission_cert_revocation_removes_peer_epoch_key_entry` — seeds a fake
+  epoch-key release for a victim peer, revokes that peer via
+  `merge_piggybacked_revocations`, and asserts the cached release is gone.
+
+### Test results
+
+`cargo test -p dds-node --lib`: 356 passed; 0 failed (up from 352+3=355 before
+this pass — 1 new regression test + 3 pre-existing tests now reliably pass under
+concurrent load).
+
+---
+
 ## Security Fix (2026-05-23, 161st pass) — Admission-cert revocation triggers epoch key rotation (Phase B.9)
 
 ### Bug
