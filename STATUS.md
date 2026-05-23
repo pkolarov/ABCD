@@ -1,5 +1,34 @@
 # DDS Implementation Status
 
+## CI Fix (2026-05-23, 164th pass) — Opt all workflows into Node.js 24 before June 2 deadline
+
+### Background
+
+GitHub Actions will force all `node20` actions to use Node.js 24 on **June 2,
+2026** (10 days from this commit). After that date, actions still pinned to
+`node20` will break. All six CI workflows were emitting deprecation warnings on
+every run for: `actions/checkout@v4`, `actions/setup-dotnet@v4`,
+`actions/upload-artifact@v4`, `actions/download-artifact@v4`,
+`actions/setup-python@v5`.
+
+### Fix
+
+Added `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true` to the top-level `env:` block
+of all six workflow files:
+
+- `.github/workflows/ci.yml`
+- `.github/workflows/loadtest-smoke.yml`
+- `.github/workflows/linux.yml`
+- `.github/workflows/cli.yml`
+- `.github/workflows/msi.yml`
+- `.github/workflows/pkg.yml`
+
+This is GitHub's recommended opt-in path. All first-party GitHub actions
+(`checkout`, `upload-artifact`, `setup-dotnet`, `setup-python`) are compatible
+with Node.js 24. No code changes.
+
+---
+
 ## Bug Fix (2026-05-23, 163rd pass) — Silent port truncation in provision bundles + now_epoch panic on bad clock
 
 ### Bugs

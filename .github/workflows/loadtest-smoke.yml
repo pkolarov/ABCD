@@ -14,6 +14,7 @@ env:
   CARGO_TERM_COLOR: always
   # Warnings-as-errors keeps the smoke binary consistent with CI.
   RUSTFLAGS: -D warnings
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   smoke:
