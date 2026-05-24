@@ -1,5 +1,55 @@
 # DDS Implementation Status
 
+## Fix (2026-05-24, 197th pass) — Add 6 missing PQ metric rows to observability-plan.md Phase C catalog
+
+### Summary
+
+Automated scheduled sweep found a documentation gap: six PQ / key-management
+Prometheus metrics that are fully implemented in `dds-node/src/telemetry.rs` and
+documented in the Admin Guide metric catalog were absent from the
+`docs/observability-plan.md` Phase C catalog (§C.3).
+
+**Affected metrics:**
+
+| Metric | Type | Labels |
+|---|---|---|
+| `dds_pq_envelope_decrypt_total` | counter | `result=ok\|no_key\|aead_fail` |
+| `dds_pq_rotation_total` | counter | `reason=time\|revocation\|manual` |
+| `dds_pq_epoch_id` | gauge | — |
+| `dds_pq_releases_installed_total` | counter | `result=ok\|schema\|…\|decap\|aead` |
+| `dds_pq_releases_emitted_total` | counter | `result=ok\|no_kem_pk\|…\|cbor_fail` |
+| `dds_pq_release_requests_total` | counter | `result=sent\|cooldown\|not_admitted\|malformed_peer_id` |
+
+The Admin Guide had correct, complete rows for all six. They were referenced in
+passing in other catalog rows (e.g. `dds_pq_envelope_decrypt_total` is mentioned
+in `dds_gossip_messages_dropped_total`) but never appeared as their own catalog
+entries in the observability plan.
+
+### Fix
+
+**`docs/observability-plan.md`** — added a new **PQC / key management** section
+header and six ✅ metric rows between the existing sync section and the Trust graph
+section in the Phase C catalog. Each row includes the implementation references
+(function names and file paths in `dds-node/src/telemetry.rs` and
+`dds-node/src/node.rs`) in the same style as surrounding rows.
+
+No Rust code or Admin Guide touched; observability plan only.
+
+### Root cause
+
+The PQ metrics were added in a follow-up that targeted the Admin Guide for
+documentation (the primary operator reference) but did not also update the
+observability plan catalog, which is the design-level specification document. The
+196th-pass audit incorrectly reported all 37 metrics as present in both documents.
+
+### Test results
+
+- `cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored** (macOS ARM64, 2026-05-24).
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+---
+
 ## Maintenance (2026-05-24, 196th pass) — Automated gap/bug sweep, all green
 
 ### Summary
