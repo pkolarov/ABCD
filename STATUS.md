@@ -1,5 +1,36 @@
 # DDS Implementation Status
 
+## Docs (2026-05-24, 191st pass) — Add `dds_sync_serves_total` to Admin Guide metric catalog
+
+### Summary
+
+Automated scheduled sweep identified a documentation gap: `dds_sync_serves_total` was fully
+implemented in `dds-node/src/telemetry.rs` and correctly catalogued in `docs/observability-plan.md`
+(both added in the 190th pass), but the `DDS-Admin-Guide.md` operator metric reference table was
+not updated to include the new metric.
+
+### Fix
+
+**`docs/DDS-Admin-Guide.md`** — inserted one row for `dds_sync_serves_total` between
+`dds_sync_pulls_total` and `dds_sync_payloads_rejected_total` in the metric catalog table
+(§ Prometheus Metrics). The row includes the three `result` label values (`ok`, `unadmitted`,
+`channel_closed`) and a concise description pairing it with `dds_sync_pulls_total` as the
+responder-side complement. The existing `dds_sync_pulls_total` row description was also tightened
+to say "requester side" to make the pairing explicit.
+
+No logic changes; the metric implementation, Prometheus exposition, and unit tests were already
+correct from the 190th pass.
+
+### Test results
+
+`cargo test --workspace --lib` — **798 passed; 0 failed; 5 ignored** (macOS ARM64, 2026-05-24).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean.
+
+---
+
 ## Feature (2026-05-24, 190th pass) — Implement `dds_sync_serves_total` metric
 
 ### Summary

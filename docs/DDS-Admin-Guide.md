@@ -2894,7 +2894,8 @@ Catalog (full list with semantics is in
 | `dds_admission_handshake_last_failure_seconds` | gauge | — | Unix-seconds of the most recent non-`ok` handshake (sentinel `0` before any failure lands) |
 | `dds_gossip_messages_total` | counter | `kind=op\|revocation\|burn\|audit` | Inbound gossip volume |
 | `dds_gossip_messages_dropped_total` | counter | `reason` | Pre-decode drops (unadmitted peer, unknown topic, decode error, kind mismatch) |
-| `dds_sync_pulls_total` | counter | `result=ok\|fail` | Anti-entropy pull outcomes |
+| `dds_sync_pulls_total` | counter | `result=ok\|fail` | Anti-entropy pull outcomes (requester side) |
+| `dds_sync_serves_total` | counter | `result=ok\|unadmitted\|channel_closed` | Anti-entropy serve outcomes (responder side) — `ok` = admitted peer answered; `unadmitted` = H-12 gate dropped the request; `channel_closed` = response channel closed before reply was queued |
 | `dds_sync_payloads_rejected_total` | counter | `reason` | Pre/post-apply sync rejections (legacy v1, publisher capability, replay window, signature, duplicate JTI, graph) |
 | `dds_pq_envelope_decrypt_total` | counter | `result=ok\|no_key\|aead_fail` | Phase B enc-v3 gossip/sync envelope AEAD decrypt outcomes. `no_key` = epoch key not yet received (self-heals via EpochKeyRequest within ~30 s); `aead_fail` = ciphertext tampered or wrong epoch key. Sustained `no_key` or `aead_fail` activity triggers `DdsPqcDecryptFailureSpike`. |
 | `dds_pq_rotation_total` | counter | `reason=time\|revocation\|manual` | Epoch-key rotation triggers. `time` = scheduled cadence (default 24 h); `revocation` = admission revocation triggered early rotation; `manual` = `POST /v1/pq/rotate` operator override. |
