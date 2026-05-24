@@ -1,5 +1,37 @@
 # DDS Implementation Status
 
+## Fix (2026-05-24, 193rd pass) — Update stale test counts in STATUS.md
+
+### Summary
+
+Automated scheduled sweep found three stale test counts in `STATUS.md`:
+
+1. **Plan to Production note (line 13604)**: `201 passing .NET tests (macOS; 39 Windows-only
+   integration tests require real Win32)` — the 201 figure referred to the Windows Policy Agent
+   `.NET` test count at the time of the 35th pass (2026-05-04). The suite has grown since; the
+   actual count today is 283 passing (39 Windows-host-only skipped on macOS, 322 total). The
+   parenthetical was also ambiguous — updated to be explicit about the scope.
+
+2. **Main status table `Rust tests` row**: `1091 total (macOS dev host 2026-05-23)` — three new
+   Rust unit tests were added in passes 190 and 192 (`sync_serves_counter_renders`,
+   `sync_serves_renders_empty_family`, `gossip_messages_dropped_enc_v3_reasons_render`). Updated
+   to **1094 total (macOS dev host 2026-05-24)**.
+
+3. **Main status table `Total tests` and `macOS ARM64` rows**: derived totals updated to match
+   (1915 → **1918** on macOS; 2001 → **2004** all hosts; 1091 → **1094** Rust in platform matrix).
+
+No code changes. All quality checks:
+- `cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored** (macOS ARM64, 2026-05-24).
+- `cargo fmt --all -- --check` — clean.
+- `cargo audit` — 0 vulnerabilities; 3 informational-only warnings (same baseline).
+- `cargo vet` — succeeded (13 fully audited, 1 partially audited, 502 exempted).
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `dotnet test platform/macos/DdsPolicyAgent.Tests/` — 172 passed.
+- `dotnet test platform/linux/DdsPolicyAgent.Tests/` — 369 passed.
+- `dotnet test platform/windows/DdsPolicyAgent.Tests/` — 283 passed, 39 skipped.
+
+---
+
 ## Fix (2026-05-24, 192nd pass) — Document `enc_v3_*` reason labels for `dds_gossip_messages_dropped_total`
 
 ### Summary
@@ -12749,11 +12781,11 @@ M-1…M-22 ledger; the addendum table below is the per-finding view.
 | **Edition** | 2024 |
 | **Workspace crates** | 10 (dds-core, dds-domain, dds-store, dds-net, dds-node, dds-ffi, dds-cli, dds-loadtest, dds-fido2-test, pam-dds) |
 | **Rust LOC** | 8,400+ |
-| **Rust tests** | 1091 total (macOS dev host 2026-05-23; +128 tests since the 2026-05-21 snapshot across passes 141–171 — admission revocation integration tests, epoch-key rotation tests, port-validation tests, timing-config validation tests, expiry boundary tests, and others) |
+| **Rust tests** | 1094 total (macOS dev host 2026-05-24; +3 new telemetry unit tests since 2026-05-23 snapshot: `sync_serves_counter_renders`, `sync_serves_renders_empty_family`, `gossip_messages_dropped_enc_v3_reasons_render`) |
 | **.NET tests** | 824 passing on macOS dev host: Linux 369 + macOS 172 + Windows 283 (39 Windows-host-only integration tests skipped on macOS; 322 Windows total) |
 | **C++ native tests** | 47 (Windows) |
 | **Python tests** | 13 (requires `pip install pytest`; `bindings/python/test_dds.py`) |
-| **Total tests** | 1915 passing on macOS dev host (Rust 1091 + .NET 824); add Windows-only .NET 39 + C++ 47 = 2001 across all hosts |
+| **Total tests** | 1918 passing on macOS dev host (Rust 1094 + .NET 824); add Windows-only .NET 39 + C++ 47 = 2004 across all hosts |
 | **Shared library** | libdds\_ffi.dylib (739 KB) |
 
 Verification note (2026-04-13, Windows 11 ARM64):
@@ -13014,7 +13046,7 @@ Classical-only available for embedded/`no_std` targets.
 
 | Target | Status | Notes |
 |---|---|---|
-| macOS ARM64 (aarch64-apple-darwin) | ✅ Builds + tests | Dev host, 1091 Rust tests + 172 macOS .NET + 369 Linux .NET + 283 Windows .NET (on macOS) |
+| macOS ARM64 (aarch64-apple-darwin) | ✅ Builds + tests | Dev host, 1094 Rust tests + 172 macOS .NET + 369 Linux .NET + 283 Windows .NET (on macOS) |
 | Linux x86\_64 | ✅ Expected to build | Standard Rust target |
 | **Windows ARM64 (aarch64-pc-windows-msvc)** | ✅ **298 Rust + 56 .NET + 47 C++ tests pass** | **Win11 ARM64, MSVC 14.44 + LLVM 22.1.3, full workspace verified 2026-04-13 (post security merge)** |
 | Windows x86\_64 | ✅ Expected to build (cross) | CI cross-compile gate |
@@ -13601,7 +13633,7 @@ Deferred to post-GA:
 - Phase 4 items 13–15 (sharded Kad, offline enrollment)
 - Open items from threat model review (admission cert revocation list, key rotation — see `docs/threat-model-review.md` §6)
 
-Note: Phase 3 items 9–10 (WindowsPolicyDocument distribution + SoftwareAssignment) are fully implemented through all phases A–I including G+H — all 5 Windows enforcers have production Win32 implementations with full reconciliation/drift-detection (Service enforcer added 2026-05-03, service reconciliation wired 2026-05-04), 201 passing .NET tests (macOS; 39 Windows-only integration tests require real Win32), WiX MSI installer verified, CI integration complete with MSI compile verification and E2E smoke test.
+Note: Phase 3 items 9–10 (WindowsPolicyDocument distribution + SoftwareAssignment) are fully implemented through all phases A–I including G+H — all 5 Windows enforcers have production Win32 implementations with full reconciliation/drift-detection (Service enforcer added 2026-05-03, service reconciliation wired 2026-05-04), 283 passing .NET tests on macOS (39 Windows-only integration tests skipped; 322 total in Windows agent suite), WiX MSI installer verified, CI integration complete with MSI compile verification and E2E smoke test.
 
 ### Phase 4 — Scale
 

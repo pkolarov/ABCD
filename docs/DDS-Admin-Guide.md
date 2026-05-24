@@ -2907,13 +2907,13 @@ Catalog (full list with semantics is in
 | `dds_trust_graph_{vouches,revocations,burned}` | gauge | — | Current trust-graph state for vouches / revocations / burned identities |
 | `dds_purpose_lookups_total` | counter | `result=ok\|denied` | Capability-gate outcomes |
 | `dds_fido2_assertions_total` | counter | `result=ok\|signature\|rp_id\|up\|sign_count\|other` | FIDO2 assertion outcomes |
-| `dds_fido2_attestation_verify_total` | counter | `result, fmt` | Enrollment-time attestation verify outcomes |
+| `dds_fido2_attestation_verify_total` | counter | `result=ok\|fail`, `fmt=packed\|none\|unknown` | Enrollment-time attestation verify outcomes. `result=ok` carries the parsed format (`fmt=packed` or `fmt=none`); `result=fail` always uses `fmt=unknown` because the verifier may reject before the `fmt` field is extracted. `sum(rate(...{result="ok"}))` is the clean enrollment rate. |
 | `dds_sessions_issued_total` | counter | `via=fido2\|legacy` | Session minting (legacy must be 0 in production) |
 | `dds_challenges_outstanding` | gauge | — | Live FIDO2 challenges (B-5 cap reference) |
 | `dds_audit_entries_total` | counter | `action` | Per-action audit emission rate |
 | `dds_audit_chain_length` | gauge | — | Local chain entry count |
 | `dds_audit_chain_head_age_seconds` | gauge | — | `now − last_entry.timestamp` (alert if too old) |
-| `dds_store_bytes` | gauge | `table` | Per-redb-table stored bytes |
+| `dds_store_bytes` | gauge | `table=tokens\|revoked\|burned\|operations\|challenges\|credential_state\|audit_log` | Per-redb-table stored bytes (`TableStats::stored_bytes`). The seven table names are a fixed vocabulary; the family emits `# HELP` / `# TYPE` headers even when the read fails so it remains discoverable in Prometheus. |
 | `dds_store_writes_total` | counter | `result=ok\|conflict\|fail` | Per-result store write outcomes |
 | `dds_http_requests_total` | counter | `route, method, status` | Route-level HTTP traffic |
 | `dds_http_caller_identity_total` | counter | `kind=anonymous\|uds\|pipe\|admin` | Caller transport mix — H-7 cutover regression alarm. Each request bumps **two** buckets: its transport kind (`anonymous`/`uds`/`pipe`) **plus** `admin` when the caller passes admin policy — so `admin` is orthogonal and `sum(rate(...{kind=~"anonymous\|uds\|pipe"}))` equals the total request rate. |
