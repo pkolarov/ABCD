@@ -1,5 +1,44 @@
 # DDS Implementation Status
 
+## Fix (2026-05-24, 186th pass) — Correct stale .NET test counts in Build Health table
+
+### Summary
+
+Automated scheduled sweep identified stale `.NET tests` row in the Build Health table.
+Passes 128–132 and commit `42282b0` added 19 new .NET tests across the three platform
+agents, but the Build Health table was only updated through passes 123–127 (commit
+`6b1d7a2`). The 742ba7c Rust-count-only update on 2026-05-23 carried the stale .NET
+numbers forward.
+
+### Fix
+
+**`STATUS.md`** Build Health table and platform tables:
+- `.NET tests` row: Linux 364 → **369**, macOS 166 → **172**, Windows 275 → **283**.
+  Windows total: 314 → **322**. Total .NET on macOS dev host: 805 → **824**.
+- `Total tests` row: 1896 → **1915** (Rust 1091 + .NET 824); all hosts 1982 → **2001**.
+- macOS platform row: ".NET build + 166 tests" → ".NET build + 172 tests".
+- Linux platform row: "✅ 364 C# tests" → "✅ 369 C# tests".
+- Cross-platform table macOS ARM64 row: 166/364/275 → 172/369/283.
+
+All three .NET test suites run clean on macOS dev host:
+- Linux: 369 / 369 passed
+- macOS: 172 / 172 passed
+- Windows (non-integration): 283 / 283 passed
+
+No code changes required.
+
+### Test results
+
+`.NET platform tests` — **824 / 824 passed** (macOS dev host, 2026-05-24).
+
+`cargo audit` — 0 vulnerabilities; 3 informational-only warnings (same baseline).
+
+`cargo vet` — succeeded.
+
+`cargo fmt --all -- --check` — clean.
+
+---
+
 ## Maintenance (2026-05-24, 185th pass) — Routine sweep, all green
 
 ### Summary
@@ -12426,10 +12465,10 @@ M-1…M-22 ledger; the addendum table below is the per-finding view.
 | **Workspace crates** | 10 (dds-core, dds-domain, dds-store, dds-net, dds-node, dds-ffi, dds-cli, dds-loadtest, dds-fido2-test, pam-dds) |
 | **Rust LOC** | 8,400+ |
 | **Rust tests** | 1091 total (macOS dev host 2026-05-23; +128 tests since the 2026-05-21 snapshot across passes 141–171 — admission revocation integration tests, epoch-key rotation tests, port-validation tests, timing-config validation tests, expiry boundary tests, and others) |
-| **.NET tests** | 805 passing on macOS dev host: Linux 364 + macOS 166 + Windows 275 (39 Windows-host-only integration tests skipped on macOS; 314 Windows total) |
+| **.NET tests** | 824 passing on macOS dev host: Linux 369 + macOS 172 + Windows 283 (39 Windows-host-only integration tests skipped on macOS; 322 Windows total) |
 | **C++ native tests** | 47 (Windows) |
 | **Python tests** | 13 (requires `pip install pytest`; `bindings/python/test_dds.py`) |
-| **Total tests** | 1896 passing on macOS dev host (Rust 1091 + .NET 805); add Windows-only .NET 39 + C++ 47 = 1982 across all hosts |
+| **Total tests** | 1915 passing on macOS dev host (Rust 1091 + .NET 824); add Windows-only .NET 39 + C++ 47 = 2001 across all hosts |
 | **Shared library** | libdds\_ffi.dylib (739 KB) |
 
 Verification note (2026-04-13, Windows 11 ARM64):
@@ -12661,8 +12700,8 @@ Global flags: `--data-dir <dir>` (local store), `--node-url <url>` (dds-node HTT
 | Platform | Path | Status | Verified | Notes |
 |---|---|---|---|---|
 | **Windows** | `platform/windows/` | 🟢 **Login verified** | ✅ 298 Rust + 56 .NET + 47 C++ + 3 E2E | Native CP DLL + Auth Bridge + Tray Agent + Policy Agent all build + test on Win11 ARM64; **FIDO2 passwordless lock screen login re-verified after security hardening merge (2026-04-13)**; security fixes: credential_id-based vault lookup, RP-ID binding, removed unauth session endpoint; WebAuthn hmac-secret two-phase challenge/response verified with real authenticator |
-| **macOS** | `platform/macos/` | 🟢 **Smoke verified** | ✅ .NET build + 166 tests + smoke e2e | `DdsPolicyAgent.MacOS` worker with 5 host-backed enforcers, `.pkg` installer, single-command smoke test passing (6/6 checks), preference + launchd + account backends validated on real macOS ARM64 hardware; enterprise account/SSO coexistence is now modeled in `dds-domain`, while login-window/FileVault integration remains future `DdsLoginBridge` work |
-| **Linux** | `platform/linux/` | 🟡 **L-2 enforcers** | ✅ 364 C# tests | `DdsPolicyAgent.Linux` .NET 9 worker service — L-1 skeleton (signed envelope verification, applied-state reporting) promoted to **L-2**: seven typed enforcers wired into `Worker.PollOnceAsync` dispatch all `linux.*` directive arrays in each policy document: `UserEnforcer` (create/delete/enable/disable/modify with UID-floor guard ≥1000 and DDS-managed-set delete guard), `SudoersEnforcer` (visudo-validated drop-in write/delete under `/etc/sudoers.d/`, SHA-256 content integrity), `FileEnforcer` (atomic temp+rename set, ensureDir, guarded delete, SHA-256 + path-traversal checks), `SystemdEnforcer` (enable/disable/start/stop/restart + drop-in write/remove with daemon-reload), `PackageEnforcer` (apt-get/dnf/rpm auto-detect, install/remove with managed-set guard), `SysctlEnforcer` (kernel parameter write/delete to `/etc/sysctl.d/60-dds-managed.conf` via `sysctl --system`, `sysctl -n` read-back, stale-key reconciliation), `SshdEnforcer` (OpenSSH config drop-in write/delete under `/etc/ssh/sshd_config.d/` with `sshd -t` pre-apply validation, stale drop-in reconciliation); `AuditOnly: true` default suppresses all host mutations with audit-log lines; managed usernames/paths/packages/sysctl-keys persisted in `applied-state.json` for cross-cycle delete guards; delete/remove directives correctly remove entries from the managed set; reconciliation pass removes stale sysctl keys, sudoers drop-ins, systemd drop-ins, and the sshd drop-in when no current policy declares an ssh field; `NullCommandRunner` test double; `ProcessCommandRunner` executes real processes; typed L-2 directives (`LinuxSettings`, `LinuxUserDirective`, `LinuxSudoersDirective`, `LinuxFileDirective`, `LinuxSystemdDirective`, `LinuxPackageDirective`, `SysctlDirective`, `SshdPolicy`) landed in `dds-domain`; `pam_dds.so` cdylib + `dds-pam-helper` binary in `platform/linux/pam_dds/` implement the PAM authentication path (see Developer Guide Chapter 13); L-3 (privilege guard, real-device e2e) not started |
+| **macOS** | `platform/macos/` | 🟢 **Smoke verified** | ✅ .NET build + 172 tests + smoke e2e | `DdsPolicyAgent.MacOS` worker with 5 host-backed enforcers, `.pkg` installer, single-command smoke test passing (6/6 checks), preference + launchd + account backends validated on real macOS ARM64 hardware; enterprise account/SSO coexistence is now modeled in `dds-domain`, while login-window/FileVault integration remains future `DdsLoginBridge` work |
+| **Linux** | `platform/linux/` | 🟡 **L-2 enforcers** | ✅ 369 C# tests | `DdsPolicyAgent.Linux` .NET 9 worker service — L-1 skeleton (signed envelope verification, applied-state reporting) promoted to **L-2**: seven typed enforcers wired into `Worker.PollOnceAsync` dispatch all `linux.*` directive arrays in each policy document: `UserEnforcer` (create/delete/enable/disable/modify with UID-floor guard ≥1000 and DDS-managed-set delete guard), `SudoersEnforcer` (visudo-validated drop-in write/delete under `/etc/sudoers.d/`, SHA-256 content integrity), `FileEnforcer` (atomic temp+rename set, ensureDir, guarded delete, SHA-256 + path-traversal checks), `SystemdEnforcer` (enable/disable/start/stop/restart + drop-in write/remove with daemon-reload), `PackageEnforcer` (apt-get/dnf/rpm auto-detect, install/remove with managed-set guard), `SysctlEnforcer` (kernel parameter write/delete to `/etc/sysctl.d/60-dds-managed.conf` via `sysctl --system`, `sysctl -n` read-back, stale-key reconciliation), `SshdEnforcer` (OpenSSH config drop-in write/delete under `/etc/ssh/sshd_config.d/` with `sshd -t` pre-apply validation, stale drop-in reconciliation); `AuditOnly: true` default suppresses all host mutations with audit-log lines; managed usernames/paths/packages/sysctl-keys persisted in `applied-state.json` for cross-cycle delete guards; delete/remove directives correctly remove entries from the managed set; reconciliation pass removes stale sysctl keys, sudoers drop-ins, systemd drop-ins, and the sshd drop-in when no current policy declares an ssh field; `NullCommandRunner` test double; `ProcessCommandRunner` executes real processes; typed L-2 directives (`LinuxSettings`, `LinuxUserDirective`, `LinuxSudoersDirective`, `LinuxFileDirective`, `LinuxSystemdDirective`, `LinuxPackageDirective`, `SysctlDirective`, `SshdPolicy`) landed in `dds-domain`; `pam_dds.so` cdylib + `dds-pam-helper` binary in `platform/linux/pam_dds/` implement the PAM authentication path (see Developer Guide Chapter 13); L-3 (privilege guard, real-device e2e) not started |
 
 ## Cryptography
 
@@ -12690,7 +12729,7 @@ Classical-only available for embedded/`no_std` targets.
 
 | Target | Status | Notes |
 |---|---|---|
-| macOS ARM64 (aarch64-apple-darwin) | ✅ Builds + tests | Dev host, 1091 Rust tests + 166 macOS .NET + 364 Linux .NET + 275 Windows .NET (on macOS) |
+| macOS ARM64 (aarch64-apple-darwin) | ✅ Builds + tests | Dev host, 1091 Rust tests + 172 macOS .NET + 369 Linux .NET + 283 Windows .NET (on macOS) |
 | Linux x86\_64 | ✅ Expected to build | Standard Rust target |
 | **Windows ARM64 (aarch64-pc-windows-msvc)** | ✅ **298 Rust + 56 .NET + 47 C++ tests pass** | **Win11 ARM64, MSVC 14.44 + LLVM 22.1.3, full workspace verified 2026-04-13 (post security merge)** |
 | Windows x86\_64 | ✅ Expected to build (cross) | CI cross-compile gate |
