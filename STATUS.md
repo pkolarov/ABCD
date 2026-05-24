@@ -1,5 +1,28 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-24, 196th pass) — Automated gap/bug sweep, all green
+
+### Summary
+
+Automated scheduled sweep completed with no actionable findings:
+
+**Gap analysis:** No documentation–code gaps found. All 37 Prometheus metrics defined in
+`dds-node/src/telemetry.rs` are present in both the Admin Guide metric catalog and
+`docs/observability-plan.md` Phase C. Production TODO scan: the single
+`TODO(security)` at `dds-node/src/service.rs:2718` is the tracked M-22 OS-bound
+key-wrapping item, unchanged and already documented. No new `todo!()`, `unimplemented!()`,
+`FIXME`, or `HACK` markers in production src.
+
+**Bug scan:** Shell script audit of `platform/linux/packaging/scripts/` — all scripts
+checked; no remaining gaps after the 195th-pass TPM unseal fix.
+
+All quality checks:
+- `cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored** (macOS ARM64, 2026-05-24).
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+---
+
 ## Fix (2026-05-24, 195th pass) — Fix stale primary.ctx reuse in `dds-tpm-unseal.sh`
 
 ### Summary
