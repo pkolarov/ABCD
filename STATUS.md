@@ -1,5 +1,51 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-24, 187th pass) — Routine sweep, all green
+
+### Summary
+
+Automated scheduled sweep of the full Rust workspace.
+
+**Audit (`cargo audit`):** 0 vulnerabilities. 3 informational-only warnings
+(`atomic-polyfill` RUSTSEC-2023-0089, `paste` RUSTSEC-2024-0436, `lru`
+RUSTSEC-2026-0002) — unchanged from 186th pass, still unactionable without
+libp2p or pqcrypto-mldsa major-version bumps.
+
+**Gap analysis:** No documentation–code gaps found. All sample outputs
+verified by prior passes; Developer Guide test count (796 / 796, 5 ignored)
+and Build Health table (.NET 824 = Linux 369 + macOS 172 + Windows 283)
+confirmed accurate against current binaries and test runs.
+
+**Bug scan:** No new panicking paths found. All `unwrap()` / `expect()`
+calls outside test code verified inside `#[cfg(test)]` blocks. The single
+TODO(security) in `dds-node/src/service.rs:2718` is the tracked M-22
+OS-bound key-wrapping item, unchanged. No other actionable TODOs in
+production code.
+
+**Dependency update:** `cargo update --dry-run` reports 0 packages to update;
+lockfile is already at latest compatible versions.
+
+Deferred items (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI;
+no change.
+
+### Test results
+
+`cargo test --workspace --lib` — **796 passed; 0 failed; 5 ignored** (macOS ARM64,
+2026-05-24; count unchanged from 186th pass).
+
+`.NET platform tests` — **824 / 824 passed** (macOS dev host, 2026-05-24):
+Linux 369 / 369, macOS 172 / 172, Windows 283 / 283 (39 Windows-only skipped).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean.
+
+`cargo audit` — 0 vulnerabilities; 3 informational-only warnings (same
+unactionable baseline as 186th pass).
+
+---
+
 ## Fix (2026-05-24, 186th pass) — Correct stale .NET test counts in Build Health table
 
 ### Summary
