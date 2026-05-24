@@ -1,5 +1,59 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-24, 183rd pass) — Fix stale sample output in Admin Guide §Hardware-Bound Admission Keys
+
+### Summary
+
+Automated scheduled sweep of the full Rust workspace.
+
+**Audit (`cargo audit`):** 0 vulnerabilities. 3 informational-only warnings
+(`atomic-polyfill` RUSTSEC-2023-0089, `paste` RUSTSEC-2024-0436, `lru`
+RUSTSEC-2026-0002) — unchanged from 182nd pass, still unactionable without
+libp2p or pqcrypto-mldsa major-version bumps.
+
+**Gap analysis:** One documentation–code gap found and fixed.
+`docs/DDS-Admin-Guide.md` §"Hardware-Bound Admission Keys" §"Step 1" and
+§"Step 2" contained stale sample output that no longer matched the actual
+`provision-admission-key` and `admit` command output:
+
+1. **Step 1 sample output** showed old field names (`admission_key_backend:`,
+   `admission_pubkey_hex:`) instead of the current output format
+   (`Admission key provisioned:` / `data_dir:` / `backend:` / `pubkey_hex:`).
+2. **Step 1 pubkey format** documented `04a1b2c3...f0 (65 bytes uncompressed
+   P-256)` — the uncompressed X9.62 form — but `AppleSecureEnclaveKeyProvider`
+   compresses the SE public key to SEC1 form (33 bytes, `02`/`03` prefix)
+   before returning it through `KeyProvider::public_key()`. Passing a 65-byte
+   hex to `--admission-pubkey` would cause a parse error (`expected 32 or 33
+   bytes, got 65`).
+3. **Step 2 command** used `--data-dir /opt/dds/data` which is not a valid
+   flag for `dds-node admit`; the correct flags are `--domain <FILE>` (for
+   `domain.toml`) and `--out <FILE>` (for the output cert path).
+
+Updated all three to match the current code behaviour. Deferred items
+(M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain blocked on external
+design, infrastructure provisioning, or Windows CI; no change.
+
+**Bug scan:** No new panicking paths found. The single TODO(security) in
+`dds-node/src/service.rs:2718` is the tracked M-22 OS-bound key-wrapping item,
+unchanged. No other actionable TODOs in production code.
+
+**Dependency update:** `cargo update --dry-run` reports 0 packages to update;
+lockfile is already at latest compatible versions.
+
+### Test results
+
+`cargo test --workspace --lib` — **796 passed; 0 failed; 5 ignored** (macOS ARM64,
+2026-05-24; count unchanged from 182nd pass).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean.
+
+`cargo audit` — 0 vulnerabilities; 3 informational-only warnings (same
+unactionable baseline as 182nd pass).
+
+---
+
 ## Maintenance (2026-05-24, 182nd pass) — Routine sweep, all green
 
 ### Summary

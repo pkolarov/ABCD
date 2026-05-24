@@ -656,19 +656,28 @@ dds-node provision-admission-key --data-dir /opt/dds/data --backend secure-encla
 Sample output:
 
 ```
-admission_key_backend: secure-enclave
-admission_pubkey_hex:  04a1b2c3d4...f0  (65 bytes uncompressed P-256)
+Admission key provisioned:
+  data_dir:   /opt/dds/data
+  backend:    secure-enclave (system keychain label: dds-node-admission)
+  pubkey_hex: 02a1b2c3d4e5f60708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
 
-Next step (admin machine):
-  dds-node admit --admission-pubkey 04a1b2c3d4...f0 --domain-key /path/to/domain_key.bin \
-    --peer-id 12D3KooW... --data-dir /opt/dds/data
-Also update dds.toml:
+Send the pubkey_hex to the domain admin to obtain a v2 admission cert:
+  dds-node admit --domain-key <FILE> --domain <FILE> \
+    --peer-id <PEER_ID> --admission-pubkey 02a1b2c3... --out admission.cbor
+
+Because you used --backend secure-enclave, also add to dds.toml:
   [network]
   admission_key_backend = "secure-enclave"
+
+Without this config change the node will fall back to the software backend
+on startup and sign with a different key than what was provisioned.
+
+(Omit --admission-pubkey to issue a v1 cert; v1 certs skip hardware attestation)
 ```
 
-Copy the `admission_pubkey_hex` for the next step.  The command is idempotent
-— running it a second time prints the existing key without generating a new one.
+The `pubkey_hex` is the SEC1-compressed P-256 public key (33 bytes = 66 hex characters,
+starting with `02` or `03`).  Copy it for Step 2.  The command is idempotent —
+running it a second time prints the existing key without generating a new one.
 
 ### Step 2: Issue a v2 Admission Certificate
 
@@ -676,10 +685,11 @@ On the **admin machine**, bind the hardware public key into the cert:
 
 ```bash
 dds-node admit \
-  --admission-pubkey 04a1b2c3d4...f0 \
+  --admission-pubkey 02a1b2c3d4...f0 \
   --domain-key /path/to/domain_key.bin \
+  --domain /path/to/domain.toml \
   --peer-id 12D3KooW... \
-  --data-dir /opt/dds/data
+  --out admission.cbor
 ```
 
 Sample output:
