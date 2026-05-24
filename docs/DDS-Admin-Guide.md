@@ -402,12 +402,12 @@ Sample output:
 
 ```
 Rotated node libp2p identity:
-  data_dir:       /opt/dds/data
-  p2p_key:        /opt/dds/data/p2p_key.bin
-  old_peer_id:    12D3KooWOldPeer…
-  new_peer_id:    12D3KooWNewPeer…
-  backup:         /opt/dds/data/p2p_key.bin.rotated.1714090000
+  data_dir:    /opt/dds/data
+  p2p_key:     /opt/dds/data/p2p_key.bin
+  old_peer_id: 12D3KooWOldPeer…
+  new_peer_id: 12D3KooWNewPeer…
   kem_pubkey_hex: 04ab7f…<2432 hex chars>…
+  backup:      /opt/dds/data/p2p_key.bin.rotated.1714090000
 
 The existing admission cert is now invalid (it was bound to the old peer id).
 Before restarting the node, the admin must:

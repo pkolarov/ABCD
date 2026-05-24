@@ -1,5 +1,55 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-24, 184th pass) — Fix stale `rotate-identity` sample output in Admin Guide
+
+### Summary
+
+Automated scheduled sweep of the full Rust workspace.
+
+**Audit (`cargo audit`):** 0 vulnerabilities. 3 informational-only warnings
+(`atomic-polyfill` RUSTSEC-2023-0089, `paste` RUSTSEC-2024-0436, `lru`
+RUSTSEC-2026-0002) — unchanged from 183rd pass, still unactionable without
+libp2p or pqcrypto-mldsa major-version bumps.
+
+**Gap analysis:** One documentation–code gap found and fixed.
+`docs/DDS-Admin-Guide.md` §"Rotating the Node Identity" contained a stale
+`rotate-identity` sample output block with two issues:
+
+1. **Field alignment**: the sample used wide padding (`data_dir:       `,
+   `old_peer_id:    `) to align values, but the actual command uses narrow
+   padding (`data_dir:    `, `old_peer_id: `).
+2. **Field order**: the sample showed `backup` before `kem_pubkey_hex`, but
+   the code prints `kem_pubkey_hex` (if present) before `backup`.
+
+Verified by running the actual binary (`dds-node gen-node-key && dds-node
+rotate-identity`) and comparing stdout. Updated the Admin Guide block to
+match the real output format.
+
+Deferred items (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI;
+no change.
+
+**Bug scan:** No new panicking paths found. The single TODO(security) in
+`dds-node/src/service.rs:2718` is the tracked M-22 OS-bound key-wrapping
+item, unchanged. No other actionable TODOs in production code.
+
+**Dependency update:** `cargo update --dry-run` reports 0 packages to update;
+lockfile is already at latest compatible versions.
+
+### Test results
+
+`cargo test --workspace --lib` — **796 passed; 0 failed; 5 ignored** (macOS ARM64,
+2026-05-24; count unchanged from 183rd pass).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean.
+
+`cargo audit` — 0 vulnerabilities; 3 informational-only warnings (same
+unactionable baseline as 183rd pass).
+
+---
+
 ## Maintenance (2026-05-24, 183rd pass) — Fix stale sample output in Admin Guide §Hardware-Bound Admission Keys
 
 ### Summary
