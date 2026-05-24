@@ -3037,6 +3037,7 @@ impl DdsNode {
                     // `OutboundFailure::ConnectionClosed`.
                     if !self.admitted_peers.contains(&peer) {
                         debug!(%peer, "H-12: dropping sync request from unadmitted peer");
+                        crate::telemetry::record_sync_serve("unadmitted");
                         drop(channel);
                         return;
                     }
@@ -3050,8 +3051,10 @@ impl DdsNode {
                         .is_err()
                     {
                         warn!(%peer, "sync: failed to send response (channel closed)");
+                        crate::telemetry::record_sync_serve("channel_closed");
                     } else {
                         debug!(%peer, payload_count, "sync: served request");
+                        crate::telemetry::record_sync_serve("ok");
                     }
                 }
                 RrMessage::Response { response, .. } => {

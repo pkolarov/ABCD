@@ -37,6 +37,7 @@
 //! | `dds_fido2_attestation_verify_total` | counter | `result=ok\|fail`, `fmt=packed\|none\|unknown` | bumped by [`record_fido2_attestation_verify`] |
 //! | `dds_fido2_assertions_total` | counter | `result=ok\|signature\|rp_id\|up\|sign_count\|other` | bumped by [`record_fido2_assertion`] |
 //! | `dds_sync_pulls_total` | counter | `result=ok\|fail` | bumped by [`record_sync_pull`] |
+//! | `dds_sync_serves_total` | counter | `result=ok\|unadmitted\|channel_closed` | bumped by [`record_sync_serve`] |
 //! | `dds_sync_payloads_rejected_total` | counter | `reason=legacy_v1\|publisher_capability\|publisher_identity\|replay_window\|signature\|duplicate_jti\|graph` | bumped by [`record_sync_payloads_rejected`] |
 //! | `dds_pq_releases_installed_total` | counter | `result=ok\|schema\|recipient_mismatch\|replay_window\|bad_peer_id\|no_inline_pubkey\|bad_pubkey\|bad_sig\|kem_ct\|decap\|aead` | bumped by [`record_pq_release_installed`] at every exit branch of [`crate::node::DdsNode::install_epoch_key_release`] |
 //! | `dds_pq_releases_emitted_total` | counter | `result=ok\|no_kem_pk\|malformed_kem_pk\|not_for_self\|clock_error\|mint_fail\|cbor_fail` | bumped by [`record_pq_releases_emitted`] at every exit branch of [`crate::node::DdsNode::build_epoch_key_response`] |
@@ -436,12 +437,36 @@
 //! `SYNC_PERIODIC_INTERVAL` floor.
 //!
 //! Inbound responder-side outcomes (request received, response sent
-//! / not sent) are not counted here — a future
-//! `dds_sync_serves_total{result}` family can split those out without
-//! renaming this metric. The catalog row in `observability-plan.md`
+//! / not sent) are counted separately under `dds_sync_serves_total`.
+//! The catalog row in `observability-plan.md`
 //! Phase C names the `dds_sync_lag_seconds` histogram as a sibling;
 //! it still ships as a separate follow-up since it needs op-timestamp
 //! plumbing.
+//!
+//! ### `dds_sync_serves_total` semantics
+//!
+//! Bumped exactly once per inbound sync request this node receives in
+//! its responder role — i.e. per `RrMessage::Request` arm of
+//! [`crate::node::DdsNode::handle_sync_event`]. Complements
+//! `dds_sync_pulls_total` (outbound-pull view) with the inbound-serve
+//! view.
+//!
+//! Result buckets:
+//!
+//! - `result="ok"` — request received from an admitted peer and the
+//!   response was dispatched successfully via `send_response`.
+//! - `result="unadmitted"` — H-12 gate: the requesting peer is not in
+//!   `admitted_peers`; the channel is dropped without a response.
+//! - `result="channel_closed"` — request received from an admitted
+//!   peer but `send_response` returned `Err` because the channel was
+//!   closed before the response could be queued (peer disconnected
+//!   between the request arriving and the response being built).
+//!
+//! [`libp2p::request_response::Event::InboundFailure`] (connection
+//! error during inbound handling) and `ResponseSent` (confirmation
+//! the kernel accepted the bytes) are not counted — they are logged at
+//! `debug` level and do not represent a completed serve attempt that
+//! either succeeded or failed from the application's perspective.
 //!
 //! ### `dds_sync_payloads_rejected_total` semantics
 //!
@@ -802,6 +827,11 @@ pub struct Telemetry {
     /// `OutboundFailure` → `fail`, H-12 unadmitted-peer response drop
     /// → `fail`).
     sync_pulls: Mutex<BTreeMap<String, u64>>,
+    /// Per-`result` inbound sync-serve counts (responder side).
+    /// `result` is one of `ok|unadmitted|channel_closed` — bounded by
+    /// the three outcome branches of `RrMessage::Request` inside
+    /// [`crate::node::DdsNode::handle_sync_event`].
+    sync_serves: Mutex<BTreeMap<String, u64>>,
     /// Per-`reason` pre-apply sync-payload rejection counts. `reason`
     /// is one of
     /// `legacy_v1|publisher_capability|publisher_identity|replay_window`
@@ -909,6 +939,7 @@ impl Telemetry {
             fido2_attestation_verifies: Mutex::new(BTreeMap::new()),
             fido2_assertions: Mutex::new(BTreeMap::new()),
             sync_pulls: Mutex::new(BTreeMap::new()),
+            sync_serves: Mutex::new(BTreeMap::new()),
             sync_payloads_rejected: Mutex::new(BTreeMap::new()),
             http_requests: Mutex::new(BTreeMap::new()),
             pq_releases_installed: Mutex::new(BTreeMap::new()),
@@ -1199,6 +1230,31 @@ impl Telemetry {
     /// without scraping the renderer.
     pub fn sync_pulls_count(&self, result: &str) -> u64 {
         match self.sync_pulls.lock() {
+            Ok(g) => g.get(result).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(result).copied().unwrap_or(0),
+        }
+    }
+
+    fn bump_sync_serve(&self, result: &str) {
+        let mut g = match self.sync_serves.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.entry(result.to_string()).or_insert(0) += 1;
+    }
+
+    fn sync_serves_snapshot(&self) -> BTreeMap<String, u64> {
+        match self.sync_serves.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Current value of `dds_sync_serves_total{result=...}`. Public so
+    /// the `DdsNode` regression tests can take before/after snapshots
+    /// without scraping the renderer.
+    pub fn sync_serves_count(&self, result: &str) -> u64 {
+        match self.sync_serves.lock() {
             Ok(g) => g.get(result).copied().unwrap_or(0),
             Err(p) => p.into_inner().get(result).copied().unwrap_or(0),
         }
@@ -1568,6 +1624,22 @@ pub fn record_fido2_assertion(result: &str) {
 pub fn record_sync_pull(result: &str) {
     if let Some(t) = TELEMETRY.get() {
         t.bump_sync_pull(result);
+    }
+}
+
+/// Bump `dds_sync_serves_total{result=...}` by one. Called from the
+/// inbound-request outcome branches of
+/// [`crate::node::DdsNode::handle_sync_event`] (responder role).
+/// `result` is one of `ok|unadmitted|channel_closed`:
+/// - `ok` — response was dispatched to an admitted peer successfully.
+/// - `unadmitted` — H-12: peer not in `admitted_peers`; channel
+///   dropped without a response.
+/// - `channel_closed` — admitted peer, but `send_response` returned
+///   `Err` (channel closed before the response was queued).
+/// No-op when telemetry has not been installed (tests, harnesses).
+pub fn record_sync_serve(result: &str) {
+    if let Some(t) = TELEMETRY.get() {
+        t.bump_sync_serve(result);
     }
 }
 
@@ -2165,6 +2237,28 @@ fn render_exposition(
     for (result, count) in sync_pulls_snapshot.iter() {
         out.push_str(&format!(
             "dds_sync_pulls_total{{result=\"{}\"}} {}\n",
+            escape_label_value(result),
+            count
+        ));
+    }
+
+    // `dds_sync_serves_total` — per-`result` inbound sync serve outcome
+    // counter (responder side). Bumped from the `RrMessage::Request`
+    // arm of `DdsNode::handle_sync_event`: `ok` when an admitted
+    // peer's request is answered successfully, `unadmitted` when the
+    // H-12 gate drops the channel, `channel_closed` when send_response
+    // returns Err on an admitted peer.
+    out.push_str(
+        "# HELP dds_sync_serves_total Inbound anti-entropy sync requests served since process \
+         start, partitioned by outcome (ok = admitted peer's request was answered; unadmitted = \
+         H-12 gate dropped the channel — peer not in admitted_peers; channel_closed = admitted \
+         peer but send_response returned Err — channel closed before the response was queued).\n",
+    );
+    out.push_str("# TYPE dds_sync_serves_total counter\n");
+    let sync_serves_snapshot = telemetry.sync_serves_snapshot();
+    for (result, count) in sync_serves_snapshot.iter() {
+        out.push_str(&format!(
+            "dds_sync_serves_total{{result=\"{}\"}} {}\n",
             escape_label_value(result),
             count
         ));
@@ -3565,6 +3659,48 @@ mod tests {
         // in the catalog (alert expressions resolve immediately).
         assert!(body.contains("# TYPE dds_sync_pulls_total counter\n"));
         assert!(!body.contains("dds_sync_pulls_total{"));
+    }
+
+    #[test]
+    fn sync_serves_counter_renders_in_exposition() {
+        let t = Telemetry::new();
+        t.bump_sync_serve("ok");
+        t.bump_sync_serve("ok");
+        t.bump_sync_serve("unadmitted");
+
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
+        assert!(body.contains("# TYPE dds_sync_serves_total counter\n"));
+        assert!(body.contains("dds_sync_serves_total{result=\"ok\"} 2\n"));
+        assert!(body.contains("dds_sync_serves_total{result=\"unadmitted\"} 1\n"));
+        assert_eq!(t.sync_serves_count("ok"), 2);
+        assert_eq!(t.sync_serves_count("unadmitted"), 1);
+        assert_eq!(t.sync_serves_count("channel_closed"), 0);
+    }
+
+    #[test]
+    fn sync_serves_renders_empty_family_with_help_and_type() {
+        let t = Telemetry::new();
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
+        assert!(body.contains("# TYPE dds_sync_serves_total counter\n"));
+        assert!(!body.contains("dds_sync_serves_total{"));
     }
 
     #[test]

@@ -1,5 +1,70 @@
 # DDS Implementation Status
 
+## Feature (2026-05-24, 190th pass) — Implement `dds_sync_serves_total` metric
+
+### Summary
+
+Automated scheduled sweep identified a documented-but-unimplemented observability gap:
+`docs/observability-plan.md` Phase C noted that `dds_sync_serves_total{result}` was a
+planned future metric ("a future `dds_sync_serves_total{result}` family can split those
+out without renaming this metric") and `dds-node/src/telemetry.rs` contained the same
+forward reference in its `dds_sync_pulls_total` semantics comment. The gap: the existing
+`dds_sync_pulls_total` only tracks outbound pull outcomes (requester side); the inbound
+responder side — how many sync requests were served, how many were dropped for H-12
+(unadmitted peer), how many failed because the channel closed — was not instrumented.
+
+### Fix
+
+**`dds-node/src/telemetry.rs`**:
+- Added `dds_sync_serves_total` row to module-level catalog table (between
+  `dds_sync_pulls_total` and `dds_sync_payloads_rejected_total`).
+- Added `### dds_sync_serves_total semantics` section documenting the three `result`
+  buckets and explaining why `InboundFailure` / `ResponseSent` are not counted.
+- Updated the forward-reference in `dds_sync_pulls_total` semantics to say the inbound
+  side is now tracked separately.
+- Added `sync_serves: Mutex<BTreeMap<String, u64>>` field to `Telemetry` struct.
+- Added `bump_sync_serve`, `sync_serves_snapshot`, `sync_serves_count` methods.
+- Added `record_sync_serve(result: &str)` public function.
+- Added Prometheus renderer block (between `dds_sync_pulls_total` and
+  `dds_sync_payloads_rejected_total` renderers).
+- Added 2 unit tests: `sync_serves_counter_renders_in_exposition` and
+  `sync_serves_renders_empty_family_with_help_and_type`.
+
+**`dds-node/src/node.rs`**:
+- Added `record_sync_serve("unadmitted")` at the H-12 drop site in
+  `handle_sync_event` (peer not in `admitted_peers`).
+- Added `record_sync_serve("channel_closed")` when `send_response` returns `Err`.
+- Added `record_sync_serve("ok")` when `send_response` succeeds.
+
+**`docs/observability-plan.md`**:
+- Replaced the forward-reference sentence in the `dds_sync_pulls_total` catalog row
+  with "Inbound responder-side outcomes are counted separately under
+  `dds_sync_serves_total`".
+- Added a new `dds_sync_serves_total` row in the Phase C metric catalog table, marked ✅.
+
+**`docs/DDS-Developer-Guide.md`**:
+- Updated Rust test count from 796 → 798 (two new `sync_serves` unit tests).
+
+### Metric semantics
+
+`result=ok` — admitted peer's request was answered successfully.
+`result=unadmitted` — H-12 gate: peer not in `admitted_peers`; channel dropped without a response.
+`result=channel_closed` — admitted peer, but `send_response` returned `Err` (channel closed before response was queued).
+
+### Test results
+
+`cargo test --workspace --lib` — **798 passed; 0 failed; 5 ignored** (macOS ARM64, 2026-05-24).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean.
+
+`cargo audit` — 0 vulnerabilities; 3 informational-only warnings (same baseline).
+
+`cargo vet` — succeeded.
+
+---
+
 ## Fix (2026-05-24, 189th pass) — Add missing `dds_store_bytes` entry to telemetry module catalog
 
 ### Summary
