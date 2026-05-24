@@ -1,5 +1,34 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-24, 194th pass) — Automated gap/bug sweep, all green
+
+### Summary
+
+Automated scheduled sweep completed with no actionable findings:
+
+**Gap analysis:** No documentation–code gaps found. All 37 Prometheus metrics defined in
+`dds-node/src/telemetry.rs` (catalog lines 25–61) are present in both the Admin Guide metric
+catalog and `docs/observability-plan.md` Phase C. The three `dds_trust_graph_*` companion
+gauges (`vouches`, `revocations`, `burned`) appear in the Admin Guide as a combined row
+(`dds_trust_graph_{vouches,revocations,burned}`) — consistent with their unlabeled status
+and the observability-plan's three separate ✅ rows. Config struct fields, CLI subcommands,
+and alert rules all cross-checked — no new gaps.
+
+**Bug scan:** No new panicking paths found. The single TODO(security) in
+`dds-node/src/service.rs:2718` is the tracked M-22 OS-bound key-wrapping item, unchanged.
+No other actionable TODOs in production code.
+
+All quality checks:
+- `cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored** (macOS ARM64, 2026-05-24).
+- `cargo fmt --all -- --check` — clean.
+- `cargo audit` — 0 vulnerabilities; 3 informational-only warnings (`atomic-polyfill`
+  RUSTSEC-2023-0089, `paste` RUSTSEC-2024-0436, `lru` RUSTSEC-2026-0002) — unchanged from
+  187th pass, still unactionable without upstream libp2p / pqcrypto-mldsa / postcard bumps.
+- `cargo vet` — succeeded (13 fully audited, 1 partially audited, 502 exempted).
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+---
+
 ## Fix (2026-05-24, 193rd pass) — Update stale test counts in STATUS.md
 
 ### Summary
