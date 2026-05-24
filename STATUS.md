@@ -1,5 +1,50 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-24, 185th pass) — Routine sweep, all green
+
+### Summary
+
+Automated scheduled sweep of the full Rust workspace.
+
+**Audit (`cargo audit`):** 0 vulnerabilities. 3 informational-only warnings
+(`atomic-polyfill` RUSTSEC-2023-0089, `paste` RUSTSEC-2024-0436, `lru`
+RUSTSEC-2026-0002) — unchanged from 184th pass, still unactionable without
+libp2p or pqcrypto-mldsa major-version bumps.
+
+**Gap analysis:** No documentation–code gaps found. All sample outputs
+verified against current binaries (`init-domain`, `gen-node-key`,
+`rotate-identity`, `pq status`). The Admin Guide and Developer Guide match
+the real command output. Documented "future work" items (`MacAccountBindingDocument`
+/ `SsoIdentityLinkDocument` CLI flows, admin-signed device enrollment, TPM2
+backend, `SecretReleaseDocument`) remain explicitly deferred by design.
+
+**Bug scan:** No new panicking paths found. All `unwrap()` / `expect()`
+calls outside test code were verified to be inside `#[cfg(test)]` blocks.
+The single TODO(security) in `dds-node/src/service.rs:2718` is the tracked
+M-22 OS-bound key-wrapping item, unchanged. No other actionable TODOs in
+production code.
+
+**Dependency update:** `cargo update --dry-run` reports 0 packages to update;
+lockfile is already at latest compatible versions.
+
+Deferred items (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI;
+no change.
+
+### Test results
+
+`cargo test --workspace --lib` — **796 passed; 0 failed; 5 ignored** (macOS ARM64,
+2026-05-24; count unchanged from 184th pass).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean.
+
+`cargo audit` — 0 vulnerabilities; 3 informational-only warnings (same
+unactionable baseline as 184th pass).
+
+---
+
 ## Maintenance (2026-05-24, 184th pass) — Fix stale `rotate-identity` sample output in Admin Guide
 
 ### Summary
