@@ -1,5 +1,43 @@
 # DDS Implementation Status
 
+## Fix (2026-05-24, 189th pass) — Add missing `dds_store_bytes` entry to telemetry module catalog
+
+### Summary
+
+Automated scheduled sweep found a documentation–code gap: `dds_store_bytes` (a per-redb-table
+stored-byte gauge with a `table` label) was fully implemented in `dds-node/src/telemetry.rs` and
+correctly documented in the Admin Guide metric catalog, but was absent from the internal
+module-level `//!` doc table in `telemetry.rs` itself. All other 34 metrics in the catalog were
+present; `dds_store_bytes` was the sole omission.
+
+### Fix
+
+**`dds-node/src/telemetry.rs`** — inserted one row for `dds_store_bytes` between the
+`dds_store_writes_total` and `dds_memory_resident_bytes` rows in the module-level catalog table
+(line 58):
+
+```
+| `dds_store_bytes` | gauge | `table` | Per-redb-table stored bytes … |
+```
+
+No logic changes; the metric implementation and its Prometheus exposition path were already correct
+and tested by three existing unit tests (`store_bytes_family_is_discoverable_when_snapshot_is_empty`,
+`store_bytes_renders_one_series_per_supplied_table`, etc.).
+
+### Test results
+
+`cargo test --workspace --lib` — **796 passed; 0 failed; 5 ignored** (macOS ARM64, 2026-05-24).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean.
+
+`cargo audit` — 0 vulnerabilities; 3 informational-only warnings (same baseline).
+
+`cargo vet` — succeeded.
+
+---
+
 ## Maintenance (2026-05-24, 188th pass) — Routine sweep, all green
 
 ### Summary

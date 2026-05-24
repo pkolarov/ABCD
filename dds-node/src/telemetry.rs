@@ -54,6 +54,7 @@
 //! | `dds_challenges_outstanding` | gauge | — | [`crate::service::LocalService::challenges_outstanding`] at scrape |
 //! | `dds_peers_admitted` | gauge | — | [`crate::node::NodePeerCounts::admitted`] refreshed by [`crate::node::DdsNode::refresh_peer_count_gauges`] |
 //! | `dds_peers_connected` | gauge | — | [`crate::node::NodePeerCounts::connected`] refreshed at the same call sites |
+//! | `dds_store_bytes` | gauge | `table` | Per-redb-table stored bytes (`TableStats::stored_bytes`) read at scrape via [`crate::service::LocalService::store_byte_sizes`]; `# HELP` / `# TYPE` headers emitted even when the read fails so the family stays discoverable |
 //! | `dds_store_writes_total` | counter | `result=ok\|conflict\|fail` | [`dds_store::traits::StoreWriteStats::store_write_counts`] read at scrape via [`crate::service::LocalService::store_write_counts`] |
 //! | `dds_memory_resident_bytes` | gauge | — | [`process_resident_bytes`] (sysinfo `Process::memory`) read at scrape time |
 //! | `dds_thread_count` | gauge | — | [`process_thread_count`] (platform-native syscall) read at scrape time |
