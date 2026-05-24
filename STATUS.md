@@ -1,5 +1,45 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-24, 182nd pass) — Routine sweep, all green
+
+### Summary
+
+Automated scheduled sweep of the full Rust workspace.
+
+**Audit (`cargo audit`):** 0 vulnerabilities. 3 informational-only warnings
+(`atomic-polyfill` RUSTSEC-2023-0089, `paste` RUSTSEC-2024-0436, `lru`
+RUSTSEC-2026-0002) — unchanged from 181st pass, still unactionable without
+libp2p or pqcrypto-mldsa major-version bumps.
+
+**Gap analysis:** No documentation–code gaps found. Explored CLI commands, HTTP
+endpoints, public APIs, and observability features — all fully implemented. Six
+AD-parity document types (GroupDocument, OrgUnitDocument, DnsRecordDocument,
+CertTemplateDocument, SchemaExtensionDocument, PasswordPolicyDocument) remain
+explicitly deferred to post-GA in the design docs. Deferred items (M-13, M-15,
+M-18, M-22, L-17, Z-2, Z-4, Z-6) remain blocked on external design,
+infrastructure provisioning, or Windows CI; no change.
+
+**Bug scan:** No new panicking paths found. The single TODO(security) in
+`dds-node/src/service.rs:2718` is the tracked M-22 OS-bound key-wrapping item,
+unchanged. No other actionable TODOs in production code.
+
+**Dependency update:** `cargo update --dry-run` reports 0 packages to update;
+lockfile is already at latest compatible versions.
+
+### Test results
+
+`cargo test --workspace --lib` — **796 passed; 0 failed; 5 ignored** (macOS ARM64,
+2026-05-24; count unchanged from 181st pass).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean.
+
+`cargo audit` — 0 vulnerabilities; 3 informational-only warnings (same
+unactionable baseline as 181st pass).
+
+---
+
 ## Maintenance (2026-05-24, 181st pass) — Fix stale test-count in Developer Guide
 
 ### Summary
