@@ -61,9 +61,15 @@ domain.toml          # joined-domain info (plaintext, public)
 epoch_keys.cbor      # epoch encryption keys
 node_key.bin         # node identity, AES-GCM + Argon2id wrap
 p2p_key.bin          # libp2p keypair, ChaCha20-Poly1305 + Argon2id wrap
-primary.ctx          # TPM2 owner-hierarchy primary key context
+primary.ctx          # TPM2 primary context (seal-time only; NOT used at unseal)
 seal.pub seal.priv   # TPM2-sealed object holding the passphrase
 ```
+
+> **Note on `primary.ctx`:** TPM transient object contexts are invalidated on
+> power cycle. `dds-tpm-unseal` therefore re-derives the owner-hierarchy primary
+> key fresh on every call (same `-C o -G ecc` template → same deterministic key)
+> rather than reloading the saved context. `primary.ctx` is only kept for
+> troubleshooting; it is not required for normal unseal operation.
 
 ## Existing already-provisioned host
 

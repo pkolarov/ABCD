@@ -1,5 +1,53 @@
 # DDS Implementation Status
 
+## Fix (2026-05-24, 195th pass) — Fix stale primary.ctx reuse in `dds-tpm-unseal.sh`
+
+### Summary
+
+Automated scheduled sweep found a boot-time correctness bug in the Linux TPM-sealed
+passphrase helper: `dds-tpm-unseal.sh` was passing `$SEAL_DIR/primary.ctx` (the context
+file written by `dds-tpm-seal.sh`) to `tpm2_load -C`, relying on that saved context to
+still be valid at unseal time. TPM transient-object contexts are invalidated on power cycle
+— the TPM resets all loaded objects on reboot — so the first service start after any reboot
+would fail: `tpm2_load` would receive a stale handle that the TPM no longer recognises.
+
+### Fix
+
+**`platform/linux/packaging/scripts/dds-tpm-unseal.sh`**:
+- Removed the `if [ ! -f "$SEAL_DIR/primary.ctx" ]; then exit 1; fi` guard (the saved
+  context is no longer needed at unseal time).
+- Added a fresh `tpm2_createprimary -Q -C o -c "$PRIMARY_CTX" -G ecc` call at the top of
+  the unseal sequence, using a tmpfs-backed temp file for the context. TPM2 primary keys
+  are deterministic — same hierarchy, same algorithm template = same key — so re-deriving
+  produces the identical parent under which `seal.pub`/`seal.priv` were created.
+- Changed `tpm2_load -C "$SEAL_DIR/primary.ctx"` → `tpm2_load -C "$PRIMARY_CTX"` to use
+  the fresh context.
+- Expanded `trap` to clean up both `$PRIMARY_CTX` and `$CTX` on exit.
+
+**`platform/linux/packaging/SEALED-PASSPHRASE.md`**:
+- Added a note below the file-listing explaining that `primary.ctx` is kept only for
+  troubleshooting; it is not needed for normal unseal operation after this fix.
+
+**`docs/sealed-passphrase-design.md`**:
+- Updated the Linux storage description to say `seal.pub` and `seal.priv` are the durable
+  artifacts; `primary.ctx` is a seal-time snapshot only; the unseal script re-derives fresh.
+
+### Root cause
+
+The original script was modelled on the common single-session pattern (seal → unseal in the
+same boot / TPM session) where the primary context file is still valid. For a service that
+seals once and then unseals on every subsequent reboot, the context must be re-derived.
+
+### Test results
+
+- `cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored** (macOS ARM64, 2026-05-24).
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+No Rust code touched; shell script only.
+
+---
+
 ## Maintenance (2026-05-24, 194th pass) — Automated gap/bug sweep, all green
 
 ### Summary

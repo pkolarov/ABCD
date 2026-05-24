@@ -16,6 +16,12 @@
 # Usage:
 #   dds-tpm-unseal [SEAL_DIR]
 #   dds-tpm-unseal --env-file PATH [SEAL_DIR]
+#
+# NOTE: primary.ctx saved by dds-tpm-seal is a transient TPM handle
+# that becomes invalid after a power cycle — the TPM resets all loaded
+# objects on reboot. We therefore re-derive the primary key fresh on
+# every unseal call using the same algorithm and hierarchy so that it
+# is deterministically identical to the key used at seal time.
 
 set -eu
 
@@ -29,13 +35,19 @@ SEAL_DIR="${1:-/var/lib/dds/node}"
 if [ ! -e /dev/tpm0 ] && [ ! -e /dev/tpmrm0 ]; then exit 1; fi
 if ! command -v tpm2_unseal >/dev/null 2>&1; then exit 1; fi
 if [ ! -f "$SEAL_DIR/seal.priv" ] || [ ! -f "$SEAL_DIR/seal.pub" ]; then exit 1; fi
-if [ ! -f "$SEAL_DIR/primary.ctx" ]; then exit 1; fi
 
-# Ephemeral object context in tmpfs.
+# Ephemeral context files in tmpfs — cleaned up on exit.
+PRIMARY_CTX="$(mktemp -p /run dds-primary.ctx.XXXXXX 2>/dev/null || mktemp)"
 CTX="$(mktemp -p /run dds-seal.ctx.XXXXXX 2>/dev/null || mktemp)"
-trap 'rm -f "$CTX"' EXIT INT TERM
+trap 'rm -f "$PRIMARY_CTX" "$CTX"' EXIT INT TERM
 
-tpm2_load -Q -C "$SEAL_DIR/primary.ctx" \
+# Re-derive the owner-hierarchy primary key with the same algorithm
+# used at seal time. TPM2 primary keys are deterministic — same
+# hierarchy + same template = same key — so this produces an identical
+# parent to load the sealed object against.
+tpm2_createprimary -Q -C o -c "$PRIMARY_CTX" -G ecc
+
+tpm2_load -Q -C "$PRIMARY_CTX" \
     -u "$SEAL_DIR/seal.pub" -r "$SEAL_DIR/seal.priv" -c "$CTX"
 
 PASS="$(tpm2_unseal -Q -c "$CTX" | base64 | tr -d '\n')"

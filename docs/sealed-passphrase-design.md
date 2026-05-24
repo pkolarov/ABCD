@@ -43,9 +43,13 @@ on the live host — that's a separate problem (M-22, key-resident-in-TPM).
 
 ### Linux — TPM2
 
-- **Storage**: sealed-object blobs (`primary.ctx`, `seal.pub`,
-  `seal.priv`) under `data_dir`. The TPM's owner-hierarchy primary key
-  is the actual hardware-bound root.
+- **Storage**: sealed-object blobs (`seal.pub`, `seal.priv`) under
+  `data_dir`. A `primary.ctx` snapshot is also written at seal time
+  but is **not** reused at unseal — the unseal script re-derives the
+  owner-hierarchy primary fresh on each call (same `-C o -G ecc`
+  template → same deterministic key) so that TPM transient context
+  invalidation after a power cycle does not break unseal. The TPM's
+  owner-hierarchy primary key is the actual hardware-bound root.
 - **Tools**: `tpm2-tools` (Alpine `apk add tpm2-tools`, Debian
   `apt install tpm2-tools`).
 - **Boot timing**: `/dev/tpm0` is created by the kernel TPM driver
