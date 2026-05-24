@@ -1,5 +1,56 @@
 # DDS Implementation Status
 
+## Fix (2026-05-24, 192nd pass) — Document `enc_v3_*` reason labels for `dds_gossip_messages_dropped_total`
+
+### Summary
+
+Automated scheduled sweep found a documentation gap: three `reason` label values added to
+`dds_gossip_messages_dropped_total` during the PQC envelope (Phase B) work —
+`enc_v3_no_key`, `enc_v3_aead_fail`, and `enc_v3_plaintext_rejected` — were not reflected in:
+
+1. The `dds_gossip_messages_dropped_total` row in the internal module-level catalog table in
+   `dds-node/src/telemetry.rs` (listed only the original four labels).
+2. The semantics section in the same file (described only the original four drop sites).
+3. The `dds_gossip_messages_dropped_total` row in `docs/DDS-Admin-Guide.md` (described drops
+   as "unadmitted peer, unknown topic, decode error, kind mismatch" without the enc-v3 reasons).
+4. The catalog table and inline description in `docs/observability-plan.md`.
+
+The metric implementation itself (BTreeMap-keyed counter) and the three call sites in
+`dds-node/src/node.rs` were already correct and working — this was purely a documentation gap.
+
+### Fix
+
+**`dds-node/src/telemetry.rs`**:
+- Extended `dds_gossip_messages_dropped_total` catalog row to list all seven `reason` values.
+- Added three `enc_v3_*` bullet points to the `### dds_gossip_messages_dropped_total semantics`
+  section, each documenting its drop site, pairing with `dds_pq_envelope_decrypt_total`, and
+  describing the self-healing or misbehaving-peer implications.
+- Added new unit test `gossip_messages_dropped_enc_v3_reasons_render_in_exposition` verifying
+  that all three enc_v3 labels render correctly in Prometheus exposition output.
+- Fixed pre-existing `rustdoc` lint (`missing_doc_list_item_indent`) in `record_sync_serve`:
+  added a blank `///` line between the bullet list and the trailing "No-op" sentence.
+
+**`docs/DDS-Admin-Guide.md`**:
+- Replaced the brief `reason` description with an explicit enumeration of all seven label values
+  including the three `enc_v3_*` reasons, with cross-reference to `dds_pq_envelope_decrypt_total`.
+
+**`docs/observability-plan.md`**:
+- Updated the inline mention at Phase C follow-up #32 to list all seven labels.
+- Updated the catalog table row with the full seven-label enumeration and an expanded description
+  of the enc_v3 drop sites.
+
+### Test results
+
+`cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored** (macOS ARM64, 2026-05-24).
+
+`cargo fmt --all -- --check` — clean.
+
+`cargo audit` — 0 vulnerabilities; 3 informational-only warnings (same baseline).
+
+`cargo vet` — succeeded.
+
+---
+
 ## Docs (2026-05-24, 191st pass) — Add `dds_sync_serves_total` to Admin Guide metric catalog
 
 ### Summary

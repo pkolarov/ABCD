@@ -33,7 +33,7 @@
 //! | `dds_admission_handshakes_total` | counter | `result=ok\|fail\|revoked` | bumped by [`record_admission_handshake`] |
 //! | `dds_admission_handshake_last_failure_seconds` | gauge | — | Unix-seconds of the most recent non-`ok` outcome; bumped at the same call site as the counter; read at scrape via [`last_admission_failure_ts`] |
 //! | `dds_gossip_messages_total` | counter | `kind=op\|revocation\|burn\|audit` | bumped by [`record_gossip_message`] |
-//! | `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted\|unknown_topic\|decode_error\|topic_kind_mismatch` | bumped by [`record_gossip_messages_dropped`] |
+//! | `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted\|unknown_topic\|decode_error\|topic_kind_mismatch\|enc_v3_no_key\|enc_v3_aead_fail\|enc_v3_plaintext_rejected` | bumped by [`record_gossip_messages_dropped`] |
 //! | `dds_fido2_attestation_verify_total` | counter | `result=ok\|fail`, `fmt=packed\|none\|unknown` | bumped by [`record_fido2_attestation_verify`] |
 //! | `dds_fido2_assertions_total` | counter | `result=ok\|signature\|rp_id\|up\|sign_count\|other` | bumped by [`record_fido2_assertion`] |
 //! | `dds_sync_pulls_total` | counter | `result=ok\|fail` | bumped by [`record_sync_pull`] |
@@ -282,6 +282,21 @@
 //!   successfully but its variant did not match the topic family
 //!   (e.g. a `Burn` payload arriving on a `DdsTopic::Operations`
 //!   topic). Indicates a misbehaving or downgraded peer.
+//! - `reason="enc_v3_no_key"` — an enc-v3 encrypted gossip envelope
+//!   arrived but no cached epoch key for the publisher was found.
+//!   Paired with `dds_pq_envelope_decrypt_total{result="no_key"}`.
+//!   Self-heals: `try_epoch_key_request` is called immediately to
+//!   fetch the missing key (throttled by
+//!   `EPOCH_KEY_REQUEST_COOLDOWN`).
+//! - `reason="enc_v3_aead_fail"` — AEAD decryption of an enc-v3
+//!   envelope failed (ciphertext tampered or wrong epoch key).
+//!   Paired with `dds_pq_envelope_decrypt_total{result="aead_fail"}`.
+//!   A sustained rate indicates a misbehaving peer or epoch-key
+//!   rotation skew.
+//! - `reason="enc_v3_plaintext_rejected"` — a plaintext gossip
+//!   envelope was received on a domain that has advertised the
+//!   `enc-v3` capability, meaning all traffic must be encrypted.
+//!   Indicates a downgraded or misconfigured peer.
 //!
 //! The catalog in `observability-plan.md` Phase C originally named
 //! the labels `unadmitted|invalid_token|duplicate|backpressure`; the
@@ -1636,6 +1651,7 @@ pub fn record_sync_pull(result: &str) {
 ///   dropped without a response.
 /// - `channel_closed` — admitted peer, but `send_response` returned
 ///   `Err` (channel closed before the response was queued).
+///
 /// No-op when telemetry has not been installed (tests, harnesses).
 pub fn record_sync_serve(result: &str) {
     if let Some(t) = TELEMETRY.get() {
@@ -3477,6 +3493,40 @@ mod tests {
         assert_eq!(t.gossip_messages_dropped_count("decode_error"), 1);
         assert_eq!(t.gossip_messages_dropped_count("topic_kind_mismatch"), 1);
         assert_eq!(t.gossip_messages_dropped_count("other"), 0);
+    }
+
+    #[test]
+    fn gossip_messages_dropped_enc_v3_reasons_render_in_exposition() {
+        let t = Telemetry::new();
+        t.bump_gossip_messages_dropped("enc_v3_no_key");
+        t.bump_gossip_messages_dropped("enc_v3_no_key");
+        t.bump_gossip_messages_dropped("enc_v3_aead_fail");
+        t.bump_gossip_messages_dropped("enc_v3_plaintext_rejected");
+
+        let body = render_exposition(
+            &t,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            StoreWriteCounts::default(),
+        );
+        assert!(body.contains("# TYPE dds_gossip_messages_dropped_total counter\n"));
+        assert!(body.contains("dds_gossip_messages_dropped_total{reason=\"enc_v3_no_key\"} 2\n"));
+        assert!(
+            body.contains("dds_gossip_messages_dropped_total{reason=\"enc_v3_aead_fail\"} 1\n")
+        );
+        assert!(body.contains(
+            "dds_gossip_messages_dropped_total{reason=\"enc_v3_plaintext_rejected\"} 1\n"
+        ));
+        assert_eq!(t.gossip_messages_dropped_count("enc_v3_no_key"), 2);
+        assert_eq!(t.gossip_messages_dropped_count("enc_v3_aead_fail"), 1);
+        assert_eq!(
+            t.gossip_messages_dropped_count("enc_v3_plaintext_rejected"),
+            1
+        );
     }
 
     #[test]

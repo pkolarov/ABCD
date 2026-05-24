@@ -2893,7 +2893,7 @@ Catalog (full list with semantics is in
 | `dds_admission_handshakes_total` | counter | `result=ok\|fail\|revoked` | H-12 inbound-handshake outcomes |
 | `dds_admission_handshake_last_failure_seconds` | gauge | — | Unix-seconds of the most recent non-`ok` handshake (sentinel `0` before any failure lands) |
 | `dds_gossip_messages_total` | counter | `kind=op\|revocation\|burn\|audit` | Inbound gossip volume |
-| `dds_gossip_messages_dropped_total` | counter | `reason` | Pre-decode drops (unadmitted peer, unknown topic, decode error, kind mismatch) |
+| `dds_gossip_messages_dropped_total` | counter | `reason=unadmitted\|unknown_topic\|decode_error\|topic_kind_mismatch\|enc_v3_no_key\|enc_v3_aead_fail\|enc_v3_plaintext_rejected` | Pre-decode drops: `unadmitted` = H-12 gate; `unknown_topic` = topic-id drift; `decode_error` = wire-format regression; `topic_kind_mismatch` = misbehaving peer; `enc_v3_no_key` / `enc_v3_aead_fail` = PQC envelope key missing or AEAD fail (see also `dds_pq_envelope_decrypt_total`); `enc_v3_plaintext_rejected` = plaintext envelope on an enc-v3 domain |
 | `dds_sync_pulls_total` | counter | `result=ok\|fail` | Anti-entropy pull outcomes (requester side) |
 | `dds_sync_serves_total` | counter | `result=ok\|unadmitted\|channel_closed` | Anti-entropy serve outcomes (responder side) — `ok` = admitted peer answered; `unadmitted` = H-12 gate dropped the request; `channel_closed` = response channel closed before reply was queued |
 | `dds_sync_payloads_rejected_total` | counter | `reason` | Pre/post-apply sync rejections (legacy v1, publisher capability, replay window, signature, duplicate JTI, graph) |
