@@ -3441,3 +3441,39 @@ After enrollment on one node, `UserAuthAttestation` tokens propagate via gossip.
 4. Check agent logs for errors (permissions, missing paths, etc.)
 5. On macOS: agent must run as `root` for most operations
 6. On Windows: Policy Agent service must run as `LocalSystem`
+
+### Windows: Policy Agent service crash-loops with "PinnedNodePubkeyB64 is not configured"
+
+The `DdsPolicyAgent` service fails to start when `appsettings.json` does not
+contain a value for `DdsPolicyAgent:PinnedNodePubkeyB64`. The service fails
+closed by design (see H-2 in the security review).
+
+**Root cause (pre-3348f44 MSI):** Installers built before the 2026-05-25
+fix started the service with `--contentRoot` pointing at the install root
+(`C:\Program Files\DDS\`) instead of the config subdirectory
+(`C:\Program Files\DDS\config\`). The `CA_StampAgentPubkey` custom action
+wrote `appsettings.json` into the `config\` subdirectory, but the service
+never found it.
+
+**Remediation:**
+
+1. Re-install from a release dated 2026-05-25 or later (the WiX installer
+   sets `--contentRoot` to the correct `config\` directory automatically).
+
+2. If re-installing is not immediately possible, run the stamp command manually:
+
+   ```powershell
+   & "C:\Program Files\DDS\dds-node.exe" stamp-agent-pubkey `
+       --data-dir   "C:\ProgramData\DDS" `
+       --config-dir "C:\Program Files\DDS\config"
+   ```
+
+   Then restart the service:
+
+   ```powershell
+   Restart-Service DdsPolicyAgent
+   ```
+
+3. Verify the service started: `Get-Service DdsPolicyAgent` should show
+   `Running`, and `appsettings.json` should contain a non-empty
+   `PinnedNodePubkeyB64` value.

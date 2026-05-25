@@ -1,5 +1,54 @@
 # DDS Implementation Status
 
+## Fix (2026-05-25, 203rd pass) — Add troubleshooting entry for Policy Agent PinnedNodePubkeyB64 crash
+
+### Summary
+
+Automated scheduled sweep found one documentation gap in the Admin Guide
+troubleshooting section: the `PinnedNodePubkeyB64 is not configured` crash
+introduced by the installer contentRoot bug (fixed in commit 3348f44,
+documented in the 202nd pass) had no corresponding troubleshooting entry in
+`docs/DDS-Admin-Guide.md`. Operators running legacy MSI builds (pre-2026-05-25)
+who observe a crash-looping `DdsPolicyAgent` service would not have found
+remediation steps in the guide.
+
+### File changed
+
+**`docs/DDS-Admin-Guide.md`** — added new troubleshooting section
+"Windows: Policy Agent service crash-loops with 'PinnedNodePubkeyB64 is not
+configured'" immediately after "Policy agent not applying policy". The new
+section:
+- explains the root cause (pre-3348f44 MSI set `--contentRoot` to install
+  root instead of `config\` subdirectory)
+- gives a three-step remediation: re-install from ≥ 2026-05-25 release;
+  or run `stamp-agent-pubkey` manually + restart the service; or verify
+  the service is running and `appsettings.json` is populated
+
+### Gap analysis (full 203rd-pass sweep)
+
+- **Code / doc gaps:** all 37 Prometheus metrics in `dds-node/src/telemetry.rs`
+  are documented in both the Admin Guide metric catalog and
+  `docs/observability-plan.md` Phase C. The single `TODO(security)` at
+  `dds-node/src/service.rs:2718` remains the tracked M-22 OS-bound
+  key-wrapping item, unchanged and documented.
+- **Bug scan:** no new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK`
+  markers in production src. TPM stubs (`--backend tpm2`) are correctly
+  returning Phase A3 stub errors, as expected.
+- **Open architectural items** (unchanged from 202nd pass): Z-4 (redb store
+  encryption), Z-6 (code signing cert), M-13/M-15/M-18 (deferred), Z-2 Phase
+  A3/A5/A6-full (TPM 2.0 backend), Phase D (fleet self-update) — all
+  intentionally deferred by design and tracked in Claude_sec_review.md.
+
+### Test results
+
+Documentation-only change; no Rust code altered.
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored**
+  (macOS ARM64, 2026-05-25 — no code changes from 202nd-pass baseline).
+
+---
+
 ## Fix (2026-05-25, 202nd pass) — Document 201st-pass findings; add STATUS entry for Policy Agent contentRoot installer bug fix
 
 ### Summary
