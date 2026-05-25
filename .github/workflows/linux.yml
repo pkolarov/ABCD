@@ -18,6 +18,7 @@ on:
       - 'dds-net/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'VERSION'
       - '.github/workflows/linux.yml'
   pull_request:
     paths:
@@ -29,6 +30,7 @@ on:
       - 'dds-net/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'VERSION'
       - '.github/workflows/linux.yml'
   workflow_dispatch:
     inputs:

@@ -13,6 +13,7 @@ on:
       - 'dds-net/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'VERSION'
       - '.github/workflows/msi.yml'
   pull_request:
     paths:
@@ -24,6 +25,7 @@ on:
       - 'dds-net/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'VERSION'
       - '.github/workflows/msi.yml'
   workflow_dispatch:
     inputs:

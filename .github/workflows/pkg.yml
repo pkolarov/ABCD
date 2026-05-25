@@ -15,6 +15,7 @@ on:
       - 'dds-fido2-test/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'VERSION'
       - '.github/workflows/pkg.yml'
   pull_request:
     paths:
@@ -28,6 +29,7 @@ on:
       - 'dds-fido2-test/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'VERSION'
       - '.github/workflows/pkg.yml'
   workflow_dispatch:
     inputs:
