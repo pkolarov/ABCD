@@ -730,8 +730,13 @@ new key and re-issue the cert in one pass:
 # Stop the node first.
 sudo systemctl stop dds-node   # or launchctl unload on macOS
 
-# Rotate (software backend only — SE keys must be deleted from Keychain
-# manually before re-running provision-admission-key --backend secure-enclave).
+# Rotate (software backend only).
+# SE backend: delete the old key from Keychain manually, then re-run
+#   provision-admission-key --backend secure-enclave.
+# TPM2 backend: rotation is pending Phase A3 (not yet implemented).
+#   Nodes configured with admission_key_backend = "tpm2" cannot use
+#   rotate-admission-key; the TPM key must be replaced via the TPM
+#   management tools once Phase A3 ships.
 dds-node rotate-admission-key --data-dir /opt/dds/data
 # Default: backs up admission_key.bin → admission_key.bin.rotated.<timestamp>
 # Add --no-backup to skip the backup.

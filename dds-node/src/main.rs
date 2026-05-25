@@ -235,7 +235,7 @@ fn print_usage() {
   dds-node restrict-data-dir-acl --data-dir <DIR>
   dds-node create-provision-bundle --dir <DIR> --org <ORG> [--out <FILE>]
   dds-node provision <BUNDLE.dds> [--data-dir <DIR>] [--no-start]
-  dds-node provision-admission-key --data-dir <DIR> [--backend software|secure-enclave|tpm2]
+  dds-node provision-admission-key --data-dir <DIR> [--backend software|secure-enclave|tpm2(pending)]
   dds-node rotate-admission-key --data-dir <DIR> [--no-backup]
   dds-node stamp-agent-pubkey --data-dir <DIR> --config-dir <DIR>
   dds-node run [config.toml]

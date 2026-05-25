@@ -1,5 +1,76 @@
 # DDS Implementation Status
 
+## Fix (2026-05-25, 199th pass) — Document Phase A2 hardware admission key attestation in whitepaper and fix TPM2 rotation gaps
+
+### Summary
+
+Automated scheduled sweep found three documentation gaps relating to the
+Phase A2 admission key hardware-binding work shipped in the 141st–146th
+passes.
+
+**Finding 1:** `docs/DDS-Implementation-Whitepaper.md` §12.5 described the
+H-12 handshake as it existed before Phase A2 (2026-05-21). It made no
+mention of the AdmissionCert v2 wire format, the `admission_pubkey` field,
+or the challenge-response step that prevents a node-clone attack. This is
+the core architectural guarantee of the Z-2 hardware-binding plan.
+
+**Finding 2:** `docs/DDS-Implementation-Whitepaper.md` Final Assessment
+(§24) said the hardware binding for long-lived keys (Z-2) was still open
+(date: 2026-05-03). Phase A2 (AdmissionCert v2 + challenge-response) and
+Phase A4 (Apple Secure Enclave) have since shipped; only the TPM 2.0
+backend (Phase A3 / Linux + Windows) and A6-full remain pending.
+
+**Finding 3:** `docs/DDS-Admin-Guide.md` "Rotating the Admission Key"
+section noted the Secure Enclave manual rotation procedure but said nothing
+about the TPM2 backend. Since `admission_key_backend = "tpm2"` is a valid
+config value, operators need guidance. Additionally, the
+`dds-node provision-admission-key` usage string listed `tpm2` without
+indicating it is not yet implemented.
+
+### Files changed
+
+**`docs/DDS-Implementation-Whitepaper.md`** §12.5 — expanded the H-12
+section with a new "Phase A2 upgrade" paragraph describing AdmissionCert
+v2 (`admission_pubkey`, `challenge`, `challenge_signature`), the
+`verify_admission_challenge` step, how it prevents node-clone attacks, and
+the v1 migration window semantics. Domain-enforcement bullet list updated
+to include "hardware-key challenge-response (Phase A2 — v2 certs only)".
+
+**`docs/DDS-Implementation-Whitepaper.md`** §24 Final Assessment — updated
+the "weakest areas" paragraph from 2026-05-03 to 2026-05-25, noting that
+Z-2 hardware binding is partially shipped (Phase A2 + A4 live, Phase A3
+TPM 2.0 pending), and that supply-chain Phase B (two-sig gate) + Phase C
+(SBOM) are complete while Phase A (code-signing) and Phase D (self-update)
+remain open.
+
+**`docs/DDS-Admin-Guide.md`** "Rotating the Admission Key" code block —
+added a comment explaining that TPM2 backend nodes cannot use
+`rotate-admission-key` (pending Phase A3), and how to handle TPM key
+replacement once Phase A3 ships.
+
+**`dds-node/src/main.rs`** `print_usage()` — changed
+`--backend software|secure-enclave|tpm2` to
+`--backend software|secure-enclave|tpm2(pending)` to surface the
+not-yet-implemented status at the usage level.
+
+### Root cause
+
+The Phase A2 work (141st–146th passes) updated the Admin Guide's admission
+key section, the hardware-bound-admission-plan.md, and the security review,
+but did not update the Implementation Whitepaper which describes H-12 at
+the protocol level. Similarly, the whitepaper's final-assessment date stamp
+was not refreshed after A2/A4 shipped.
+
+### Test results
+
+Documentation-only changes; no Rust code altered.
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored**
+  (macOS ARM64, 2026-05-25 — no code changes from 198th-pass baseline).
+
+---
+
 ## Fix (2026-05-25, 198th pass) — Update stale cargo-audit warning counts in CI comment and security-gaps.md
 
 ### Summary

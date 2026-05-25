@@ -893,7 +893,7 @@ If a node regenerated its libp2p key every time it started, its `PeerId` would c
 So the persistent transport identity is not optional decoration.
 It is part of the security model.
 
-### 12.5 Per-Peer Admission Handshake (H-12, 2026-04-20)
+### 12.5 Per-Peer Admission Handshake (H-12, 2026-04-20; Phase A2 2026-05-21)
 
 Updated since earlier drafts of this whitepaper. The node now
 performs a full mutual admission-verification exchange in addition
@@ -916,10 +916,35 @@ to verifying its own cert at startup:
 - `ConnectionClosed` clears the peer from the set, so reconnects
   re-verify.
 
+**Phase A2 upgrade (2026-05-21) — hardware-bound admission key
+attestation.** `AdmissionCert v2` carries an optional
+`admission_pubkey` (Ed25519 or ECDSA-P256) alongside the libp2p
+`peer_id`. When present, H-12 adds a challenge-response step:
+
+- the verifier generates a fresh 32-byte random `challenge` and
+  sends it inside `AdmissionRequest`;
+- the peer signs it with its hardware-bound admission key
+  (`KeyProvider::sign`) and returns the signature in
+  `AdmissionResponse.challenge_signature`;
+- the verifier checks the signature against
+  `body.admission_pubkey` before admitting the peer.
+
+This step kills the node-clone attack: a clone with only a stolen
+`p2p_key.bin + admission.cbor` completes Noise but fails H-12
+because it cannot produce a valid challenge signature from the
+hardware-bound key it doesn't possess.
+
+v1 certs (no `admission_pubkey`) skip the challenge-response step
+and are still honoured when `network.admission.allow_v1_certs =
+true` (the default during migration). Flip to `false` once every
+node has a v2 cert. See `docs/hardware-bound-admission-plan.md`
+for the full migration guide and per-platform backend details.
+
 Domain enforcement today is therefore:
 
 - **local startup validation** (unchanged);
 - **per-peer admission exchange post-Noise** (H-12);
+- **hardware-key challenge-response** (Phase A2 — v2 certs only);
 - **namespaced protocol strings** on every behaviour (domain tag
   baked into the protocol IDs for kad, identify, sync, admission);
 - **namespaced gossip topics**;
@@ -2214,11 +2239,17 @@ Its strongest implemented ideas are:
 - good tests and meaningful load instrumentation.
 
 Its weakest or most transitional areas are not conceptual weakness so much as wiring gaps
-(state as of 2026-05-03):
+(state as of 2026-05-25):
 
 - post-quantum: Phase B (encrypted gossip + sync) is complete; hardware
-  binding for long-lived keys (Z-2) and full store-at-rest encryption
-  (Z-4) remain open.
+  binding for long-lived keys (Z-2) is partially shipped — AdmissionCert
+  v2 with hardware-key challenge-response (Phase A2) and Apple Secure
+  Enclave backend (Phase A4) are live; TPM 2.0 backend for Linux and
+  Windows (Phase A3) remains pending. Full store-at-rest encryption
+  (Z-4) remains open.
+- supply-chain: SBOM (Phase C) and two-signature gate on managed
+  software (Phase B) are complete; code-signing for DDS release
+  artifacts (Phase A) and fleet self-update (Phase D) remain open.
 
 Previously-noted gaps that are now resolved: sync is live (§4.5 / B.8);
 audit is full end-to-end (Z-3); domain admission is a live H-12
