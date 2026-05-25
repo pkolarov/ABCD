@@ -1,5 +1,54 @@
 # DDS Implementation Status
 
+## Fix (2026-05-25, 202nd pass) — Document 201st-pass findings; add STATUS entry for Policy Agent contentRoot installer bug fix
+
+### Summary
+
+Two items from the prior automated pass required documentation:
+
+**Item 1 (pass 202 documentation):** The `fix(installer): point Policy
+Agent contentRoot at DIR_CONFIG` commit (3348f44) was merged without a
+STATUS.md entry. The bug and fix are documented below.
+
+**Item 2:** The 201st pass documentation findings (Z-2 / Z-8 stale
+entries in threat-model-review.md and Claude_sec_review.md) are already
+committed — no additional documentation needed here.
+
+### Installer bug: DdsPolicyAgent crashed on every SCM start (Policy Agent contentRoot)
+
+**Root cause:** `platform/windows/installer/DdsBundle.wxs` started the
+`DdsPolicyAgent` service with `--contentRoot "[INSTALLFOLDER]."` (i.e.,
+the install root). `Host.CreateApplicationBuilder` searches the content
+root for `appsettings.json`. `CA_StampAgentPubkey` correctly wrote the
+`PinnedNodePubkeyB64` value to `[INSTALLFOLDER]config\appsettings.json`,
+one directory below where the service was looking. As a result, the
+`DdsPolicyAgent:PinnedNodePubkeyB64` binding came back empty on every
+SCM start, the H-2 fail-closed guard in `Program.cs` detected the empty
+value, and the service crashed before it could process any policy.
+
+**Fix (`platform/windows/installer/DdsBundle.wxs`):** Changed
+`Arguments="--contentRoot &quot;[INSTALLFOLDER].&quot;"` to
+`Arguments="--contentRoot &quot;[INSTALLFOLDER]config&quot;"` so the
+content root aligns with the directory `CA_StampAgentPubkey` already
+writes to. A WiX comment documenting the prior mis-configuration was
+added inline for future maintainers.
+
+**Impact:** Every MSI-installed `DdsPolicyAgent` service would have
+failed to start since `CA_StampAgentPubkey` (follow-up #60, 2026-04-28)
+began requiring a non-empty pubkey. This was a silent breakage — the
+underlying `stamp-agent-pubkey` subcommand and the custom action wrote
+the stamped value correctly, but the service never read it.
+
+### Test results
+
+Installer-only change (WiX XML); no Rust or C# code altered.
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored**
+  (macOS ARM64, 2026-05-25 — no code changes from 201st-pass baseline).
+
+---
+
 ## Fix (2026-05-25, 201st pass) — Update stale Z-2 and Z-8 entries in threat-model-review.md and Claude_sec_review.md
 
 ### Summary
