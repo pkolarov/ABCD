@@ -118,6 +118,13 @@
     </Feature>
 
     <!-- ============================================================ -->
+    <!-- Feature: DDS CLI (dds.exe + machine PATH entry)              -->
+    <!-- ============================================================ -->
+    <Feature Id="F_Cli" Title="DDS CLI" Description="The 'dds' command-line tool, plus DDS\bin on the machine PATH" Level="1">
+      <ComponentGroupRef Id="CG_DdsCli" />
+    </Feature>
+
+    <!-- ============================================================ -->
     <!-- Feature: Onboarding Wizard helper (file association +        -->
     <!-- per-user auto-launch via Active Setup, plus dds-enroll-user) -->
     <!-- ============================================================ -->
@@ -504,6 +511,30 @@
                        Type="string"
                        Value='"[#tray_agent_exe]" --minimized'
                        KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- ============================================================ -->
+    <!-- Component: dds CLI (Rust) + machine PATH entry               -->
+    <!-- ============================================================ -->
+    <ComponentGroup Id="CG_DdsCli" Directory="DIR_BIN">
+      <Component Id="C_DdsCli" Guid="EAEAEAEA-EAEA-EAEA-EAEA-EAEAEAEAEAEA">
+        <File Id="dds_cli_exe" Source="$(var.BuildDir)\dds.exe" KeyPath="yes" />
+        <!-- Append DDS\bin to the machine PATH so `dds` and the other
+             helper binaries are runnable from any shell after install.
+             Action="set" Part="last" appends; System="yes" writes the
+             machine-wide PATH (HKLM\...\Session Manager\Environment)
+             rather than the installing user's. Permanent="no" so the
+             entry is removed on uninstall, keeping PATH clean. Bound
+             to the dds.exe component so installing F_Cli adds PATH and
+             uninstalling F_Cli removes it as a single atomic change. -->
+        <Environment Id="E_PathDdsBin"
+                     Name="PATH"
+                     Action="set"
+                     Part="last"
+                     System="yes"
+                     Permanent="no"
+                     Value="[DIR_BIN]" />
       </Component>
     </ComponentGroup>
 

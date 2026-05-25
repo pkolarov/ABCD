@@ -164,8 +164,8 @@ jobs:
             Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Exported CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$linker"
 
-      - name: Build dds-node (${{ matrix.rust_target }})
-        run: cargo build --package dds-node --target ${{ matrix.rust_target }} --release
+      - name: Build dds-node + dds CLI (${{ matrix.rust_target }})
+        run: cargo build --package dds-node --package dds-cli --target ${{ matrix.rust_target }} --release
 
       # ── C++ native ──────────────────────────────────────────────
       - name: Add MSBuild to PATH
@@ -204,6 +204,7 @@ jobs:
 
           # Rust
           Copy-Item "target\${{ matrix.rust_target }}\release\dds-node.exe" $stage
+          Copy-Item "target\${{ matrix.rust_target }}\release\dds.exe"      $stage
 
           # C++ native
           $nativeBuild = "${{ matrix.native_build_dir }}"
