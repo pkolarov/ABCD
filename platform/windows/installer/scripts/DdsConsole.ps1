@@ -1016,7 +1016,7 @@ function Run-JoinUnseal {
     Append-Log $el.TbJoinLog "[Console] A new console window will open. Touch the admin's FIDO2 key when prompted."
 
     $cmd = @"
-& '$NodeBin' provision '$script:joinBundlePath'
+& '$NodeBin' provision --no-start '$script:joinBundlePath'
 `$code = `$LASTEXITCODE
 Write-Host ''
 if (`$code -eq 0) { Write-Host '=== Provision Complete ===' -ForegroundColor Green }

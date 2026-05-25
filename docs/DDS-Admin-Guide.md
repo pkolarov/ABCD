@@ -2288,8 +2288,11 @@ using the CLI.
   at import time. The button is disabled when no bundle is present.
 - **Import provision bundle**: opens a File dialog to pick a `.dds` file,
   then spawns a visible PowerShell console running
-  `dds-node provision <bundle>` — a real console is required so the
-  libfido2 PIN/touch prompts reach the user (a redirected child times out).
+  `dds-node provision --no-start <bundle>` — a real console is required so
+  the libfido2 PIN/touch prompts reach the user (a redirected child times
+  out). After the console closes, the wizard calls `Enroll-DdsDevice.ps1`
+  to start the node service (with `node.toml` patched from the provisioned
+  config) and enroll this machine.
   Import is disabled while the machine is already domain-joined; use the
   Bootstrap tab's wipe option first.
 
@@ -2366,17 +2369,32 @@ are written. A progress transcript is saved to `%TEMP%\dds-bootstrap-*.log`.
 #### `Enroll-DdsDevice.ps1`
 
 Handles steps 6–9 only: start the node, enroll this machine, stamp
-`appsettings.json`, start the remaining services. Run after
-`dds-node provision <bundle>` has already written `domain.toml`,
-`admission.cbor`, and `node.toml` (Branch B / "Join Domain" path).
+`appsettings.json`, start the remaining services. Always run with
+`--no-start` on the preceding provision call (the wizard does this
+automatically):
 
 ```powershell
-# OrgUnit is read from node.toml's org_hash when omitted:
+# Wizard / scripted Join path — provision first (no-start), then enroll:
+dds-node.exe provision --no-start D:\provision.dds
 & "C:\Program Files\DDS\bin\Enroll-DdsDevice.ps1"
 
 # Explicit org_unit override:
 & "C:\Program Files\DDS\bin\Enroll-DdsDevice.ps1" -OrgUnit acme
 ```
+
+`dds-node provision --no-start` writes `admission.cbor` and `domain.toml`
+into `%ProgramData%\DDS\node-data\` and a complete node config to
+`%ProgramData%\DDS\dds.toml`. Because the DdsNode Windows service reads
+`C:\Program Files\DDS\config\node.toml` (the MSI-shipped stub that has no
+`[domain]` section), `Enroll-DdsDevice.ps1` automatically patches `node.toml`
+from `dds.toml` before starting the service. This is transparent and
+idempotent — re-running the script on an already-patched node is safe.
+
+> **Do not omit `--no-start`.** Running `dds-node provision` without
+> `--no-start` causes provision to attempt an auto-start via `sc.exe`
+> (which fails because the stub `node.toml` is missing required fields),
+> fall back to a background process reading `dds.toml`, and attempt
+> enrollment — racing with the subsequent `Enroll-DdsDevice.ps1` call.
 
 The script emits `##DDS-DEVICE-ENROLL## phase=<slug>` markers that the
 wizard tails for progress. Useful for scripted provisioning pipelines that
@@ -2402,7 +2420,7 @@ Possible `Branch` values:
 | Value | Meaning |
 |---|---|
 | `NewDomain` | No `domain.toml` — run `Bootstrap-DdsDomain.ps1` |
-| `JoinDomain` | No `domain.toml` but `-BundlePath` was supplied — run `dds-node provision` then `Enroll-DdsDevice.ps1` |
+| `JoinDomain` | No `domain.toml` but `-BundlePath` was supplied — run `dds-node provision --no-start` then `Enroll-DdsDevice.ps1` |
 | `EnrollUser` | Domain provisioned, current user not in vault — user should enroll FIDO2 |
 | `Health` | Fully provisioned and current user enrolled |
 | `ResumeBootstrap` | A `.in-progress.json` resume marker exists (bootstrap interrupted) |
@@ -2414,7 +2432,7 @@ Pass `-BundlePath <path.dds>` to pre-load a provision bundle:
 $state = & "C:\Program Files\DDS\bin\Get-DdsOnboardingState.ps1" `
     -BundlePath "D:\provision.dds"
 if ($state.Branch -eq 'JoinDomain') {
-    dds-node.exe provision "D:\provision.dds"
+    dds-node.exe provision --no-start "D:\provision.dds"
     & "C:\Program Files\DDS\bin\Enroll-DdsDevice.ps1"
 }
 ```

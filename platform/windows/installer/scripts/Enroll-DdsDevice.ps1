@@ -1,8 +1,8 @@
 ﻿<#
 .SYNOPSIS
     Post-provision device-enrollment helper. Used by Branch B (Join Domain)
-    of the onboarding wizard, after `dds-node provision <bundle>` has
-    written domain.toml + admission.cbor + node.toml.
+    of the onboarding wizard, after `dds-node provision --no-start <bundle>` has
+    written domain.toml + admission.cbor + dds.toml (node-data dir).
 
 .DESCRIPTION
     Equivalent to steps 6-9 of Bootstrap-DdsDomain.ps1, factored out so
@@ -61,18 +61,66 @@ $NodeBin     = Join-Path $InstallRoot "bin\dds-node.exe"
 $ConfigDir   = Join-Path $InstallRoot "config"
 $NodeToml    = Join-Path $ConfigDir   "node.toml"
 $AppSettings = Join-Path $ConfigDir   "appsettings.json"
+# dds.toml written by 'dds-node provision --no-start' (Join path).
+# provision.rs writes this to the parent of its default data-dir:
+#   default data-dir = %ProgramData%\DDS\node-data
+#   config-dir      = %ProgramData%\DDS   → dds.toml
+$ProvisionedToml = Join-Path $DataRoot "dds.toml"
+$NodeDataDir     = Join-Path $DataRoot "node-data"
 
 if (-not (Test-Path $NodeBin))    { throw "dds-node.exe not found at $NodeBin." }
 if (-not (Test-Path $NodeToml))   { throw "node.toml not found at $NodeToml. Run 'dds-node provision <bundle>' first." }
 if (-not (Test-Path $AppSettings)) { throw "appsettings.json not found at $AppSettings (MSI install incomplete?)." }
 
-# Recover OrgUnit from node.toml when not supplied.
+# ── Patch stub node.toml from provisioned dds.toml (Join path) ───
+# Bootstrap-DdsDomain.ps1 writes a complete node.toml directly.
+# 'dds-node provision --no-start' instead writes dds.toml to
+# %ProgramData%\DDS\ and leaves the MSI-shipped stub node.toml
+# untouched (no org_hash, no [domain] section).  The DdsNode service
+# reads node.toml at startup; without the domain section it cannot
+# start.  Detect the stub and patch it here so the service comes up
+# cleanly on Start-Service and survives reboots.
+$nText = Get-Content $NodeToml -Raw
+if ($nText -notmatch '\[domain\]') {
+    if (-not (Test-Path $ProvisionedToml)) {
+        throw ("node.toml at $NodeToml has no [domain] section and the " +
+               "provisioned config $ProvisionedToml was not found. " +
+               "Run 'dds-node provision --no-start <bundle>' first.")
+    }
+    $pText = Get-Content $ProvisionedToml -Raw
+
+    # Extract the [domain] block (everything from "[domain]" to the next
+    # top-level section or end-of-file).
+    if ($pText -notmatch '(?ms)(\[domain\](?:.|\n)+?)(?=\n\[[^\[.]|\z)') {
+        throw "$ProvisionedToml is missing a [domain] section — provision may have failed."
+    }
+    $domainBlock = $Matches[1].Trim()
+
+    # Insert org_hash + trusted_roots = [] before [network] if absent.
+    if ($nText -notmatch '(?m)^\s*org_hash\s*=') {
+        if ($pText -match '(?m)^(org_hash\s*=\s*"[^"]+")') {
+            $orgHashLine = $Matches[1]
+            $nText = $nText -replace '(?m)^(\[network\])', "$orgHashLine`ntrusted_roots = []`n`n`$1"
+        }
+    }
+    # Append the [domain] block.
+    $nText = $nText.TrimEnd() + "`n`n$domainBlock`n"
+    [IO.File]::WriteAllText($NodeToml, $nText, (New-Object Text.UTF8Encoding $false))
+    Write-Host "  Patched $NodeToml with [domain] config from $ProvisionedToml (Join path)." -ForegroundColor Cyan
+}
+
+# Recover OrgUnit from node.toml; fall back to provisioned dds.toml
+# for the Join path (node.toml may have just been patched above, or
+# Bootstrap wrote it directly).
 if ([string]::IsNullOrWhiteSpace($OrgUnit)) {
     $tomlText = Get-Content $NodeToml -Raw
     if ($tomlText -match '(?m)^\s*org_hash\s*=\s*"([^"]+)"') {
         $OrgUnit = $Matches[1]
+    } elseif ((Test-Path $ProvisionedToml) -and
+              ((Get-Content $ProvisionedToml -Raw) -match '(?m)^\s*org_hash\s*=\s*"([^"]+)"')) {
+        $OrgUnit = $Matches[1]
     } else {
-        throw "Cannot read org_hash from $NodeToml — pass -OrgUnit explicitly."
+        throw "Cannot read org_hash from $NodeToml or $ProvisionedToml — pass -OrgUnit explicitly."
     }
 }
 

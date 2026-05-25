@@ -1,5 +1,77 @@
 # DDS Implementation Status
 
+## Fix (2026-05-25, 212th pass) — Windows Join workflow: patch stub node.toml from provisioned dds.toml
+
+### Summary
+
+Automated scheduled sweep following the 211th-pass baseline.
+
+**Bug found and fixed:** The Windows "Join Domain" wizard branch (`Branch B`)
+was broken end-to-end after the 211th-pass fix unblocked the `Run-JoinUnseal`
+function. Specifically:
+
+`dds-node provision --no-start <bundle>` writes its output to:
+- `%ProgramData%\DDS\node-data\admission.cbor`
+- `%ProgramData%\DDS\node-data\domain.toml`
+- `%ProgramData%\DDS\dds.toml`  ← complete node config (org_hash + [domain])
+
+However, the DdsNode Windows service is registered with `--config
+"C:\Program Files\DDS\config\node.toml"` (the MSI-shipped stub). The stub
+contains only network settings — no `org_hash` and no `[domain]` section.
+This caused two failures:
+
+1. **`Enroll-DdsDevice.ps1` threw immediately** with "Cannot read org_hash
+   from node.toml" because the stub has no `org_hash` field.
+2. **`Start-Service DdsNode` fails and stays failed across reboots** because
+   `NodeConfig::from_file("node.toml")` errors on the missing `[domain]` table.
+
+Additionally, `DdsConsole.ps1` was calling provision **without `--no-start`**,
+causing provision to attempt an auto-start via `sc.exe` (which fails on the
+stub config), fall back to a background `dds-node run dds.toml` process, and
+attempt enrollment — racing with the subsequent `Enroll-DdsDevice.ps1` call.
+
+**Fixes applied:**
+
+- **`DdsConsole.ps1`** — added `--no-start` to the provision invocation in
+  `Run-JoinUnseal`, preventing the double-enrollment race and the spurious
+  `sc.exe` failure.
+
+- **`Enroll-DdsDevice.ps1`** — before starting `DdsNode`, detects the stub
+  `node.toml` (no `[domain]` section) and patches it in place using content
+  from `%ProgramData%\DDS\dds.toml`. Specifically: extracts `org_hash` and
+  the `[domain]` block from the provisioned config and inserts them into the
+  stub's text. The patching is idempotent — re-running when already patched
+  is a no-op. Also added a fallback for `org_hash` lookup: checks
+  `dds.toml` when `node.toml` doesn't contain it (belt-and-suspenders for
+  any future ordering edge case).
+
+**Documentation gaps fixed:**
+- `Enroll-DdsDevice.ps1` section: corrected the claim that provision "writes
+  node.toml" (it writes `dds.toml`); added `--no-start` to all example
+  invocations; added a warning callout about the race condition.
+- `JoinDomain` branch table entry: updated to `--no-start`.
+- Wizard Provision-tab description: updated to reflect the two-phase flow
+  (provision then enroll).
+
+**Test results:** `cargo test --workspace --lib` — **799 passed; 0 failed;
+5 ignored** (macOS ARM64, 2026-05-25; unchanged from 211th-pass baseline).
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI; no
+change.
+
+### Files changed
+
+- **`platform/windows/installer/scripts/DdsConsole.ps1`** — `--no-start`
+  added to `Run-JoinUnseal`'s provision invocation.
+- **`platform/windows/installer/scripts/Enroll-DdsDevice.ps1`** — node.toml
+  stub-detection + patching block; org_hash fallback to `dds.toml`; updated
+  `.SYNOPSIS` comment.
+- **`docs/DDS-Admin-Guide.md`** — corrected `Enroll-DdsDevice.ps1` section;
+  `--no-start` in all Windows Join examples; wizard description updated.
+
+---
+
 ## Maintenance (2026-05-25, 211th pass) — Document `dds` CLI usage in Windows Deployment section
 
 ### Summary
