@@ -1947,6 +1947,7 @@ what *would* be cleaned up but does not remove or disable anything.
 | Component | Type | Purpose |
 |---|---|---|
 | `dds-node.exe` | Rust binary (Windows Service) | P2P node + HTTP API |
+| `dds.exe` | Rust binary (CLI) | Admin and operator commands (same binary as `dds` on Linux/macOS) |
 | DDS Credential Provider | C++ COM DLL | Logon screen FIDO2 tile |
 | DDS Auth Bridge | C++ Windows Service | Mediates between CP and dds-node |
 | DDS Policy Agent | .NET Windows Service | Enforces GPO-equivalent policy |
@@ -1979,7 +1980,10 @@ Windows Services (`DdsNode`, `DdsAuthBridge`, `DdsPolicyAgent`), registers
 the Credential Provider COM DLL in System32, and creates
 `C:\ProgramData\DDS\` for vault/logs/state. Configuration templates are
 installed to `C:\Program Files\DDS\config\` (`node.toml` and
-`appsettings.json`).
+`appsettings.json`). `C:\Program Files\DDS\bin\` is appended to the
+machine-wide `PATH` (`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`)
+so `dds` and the other helper binaries are available from any shell immediately
+after installation; it is removed cleanly on uninstall.
 
 To build the MSI locally:
 
@@ -2068,7 +2072,7 @@ For per-domain reset (wipe identity but leave the MSI installed), use
 
 | Path | Purpose |
 |---|---|
-| `C:\Program Files\DDS\bin\` | Binaries (dds-node, Auth Bridge, Policy Agent, Tray Agent) |
+| `C:\Program Files\DDS\bin\` | Binaries (dds-node, **dds** CLI, Auth Bridge, Policy Agent, Tray Agent). This directory is appended to the machine-wide `PATH` by the MSI. |
 | `C:\Program Files\DDS\config\node.toml` | Node configuration |
 | `C:\Program Files\DDS\config\appsettings.json` | Policy Agent configuration |
 | `C:\ProgramData\DDS\` | Runtime data directory (vault, logs, applied-state). MSI install applies SDDL `D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` so only `LocalSystem` and `BUILTIN\Administrators` have access — child files inherit. See `dds-node restrict-data-dir-acl` and the MSI's `CA_RestrictDataDirAcl` custom action. |

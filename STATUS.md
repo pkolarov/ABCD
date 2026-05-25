@@ -1,5 +1,49 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-25, 207th pass) — Document dds CLI in MSI bundle and machine PATH in Admin Guide
+
+### Summary
+
+Automated scheduled sweep following the 206th-pass baseline.
+
+**Documentation gap found and fixed:** commit `9039b9d` (feat(installer): ship
+dds CLI in MSI) added `dds.exe` to the MSI and appended `C:\Program Files\DDS\bin\`
+to the machine-wide `PATH` via a WiX `<Environment>` element, but the Admin
+Guide had not been updated to reflect either change.
+
+Three places in `docs/DDS-Admin-Guide.md` were updated:
+
+- **Components table** (Windows Deployment section) — added a `dds.exe` row
+  alongside `dds-node.exe` so operators know the CLI is available post-install.
+- **MSI install description** — added a sentence noting that `DDS\bin` is
+  appended to the machine `PATH` and removed cleanly on uninstall.
+- **Data Paths table** — updated the `C:\Program Files\DDS\bin\` row to list
+  `dds` CLI among the shipped binaries and note the PATH effect.
+
+No code changes were made; the gap was documentation-only.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers
+in production src. The single `TODO(security)` at `dds-node/src/service.rs:2718`
+(M-22 OS-bound key-wrapping) remains unchanged.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI; no
+change.
+
+### Files changed
+
+- **`docs/DDS-Admin-Guide.md`** — three edits: Components table, MSI install
+  description, Data Paths table; all now reflect `dds.exe` in MSI + PATH entry.
+
+### Test results
+
+`cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored**
+(macOS ARM64, 2026-05-25; count unchanged from 206th-pass baseline).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+---
+
 ## Maintenance (2026-05-25, 206th pass) — Update stale threat-model item 21 (Z-8) to reflect Phase C.1/C.2/C.5 landed
 
 ### Summary
