@@ -17,21 +17,22 @@ For background on how DDS works internally, see the [Developer Guide](DDS-Develo
 7. [Hardware-Bound Admission Keys](#hardware-bound-admission-keys)
 8. [Single-File Provisioning](#single-file-provisioning)
 9. [Node Configuration Reference](#node-configuration-reference)
-10. [Enrolling Users](#enrolling-users)
-11. [Enrolling Devices](#enrolling-devices)
-12. [Admin Bootstrap](#admin-bootstrap)
-13. [Sessions and Authentication](#sessions-and-authentication)
-14. [Groups and Trust](#groups-and-trust)
-15. [Policy Management](#policy-management)
-16. [Windows Deployment](#windows-deployment)
-17. [macOS Deployment](#macos-deployment)
-18. [Linux Deployment](#linux-deployment)
-19. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
-20. [Audit Log](#audit-log)
-21. [Debugging](#debugging)
-22. [Air-Gapped Sync (USB Stick / Courier)](#air-gapped-sync-usb-stick--courier)
-23. [Security Reference](#security-reference)
-24. [Troubleshooting](#troubleshooting)
+10. [Identity Generation](#identity-generation)
+11. [Enrolling Users](#enrolling-users)
+12. [Enrolling Devices](#enrolling-devices)
+13. [Admin Bootstrap](#admin-bootstrap)
+14. [Sessions and Authentication](#sessions-and-authentication)
+15. [Groups and Trust](#groups-and-trust)
+16. [Policy Management](#policy-management)
+17. [Windows Deployment](#windows-deployment)
+18. [macOS Deployment](#macos-deployment)
+19. [Linux Deployment](#linux-deployment)
+20. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
+21. [Audit Log](#audit-log)
+22. [Debugging](#debugging)
+23. [Air-Gapped Sync (USB Stick / Courier)](#air-gapped-sync-usb-stick--courier)
+24. [Security Reference](#security-reference)
+25. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -1004,6 +1005,50 @@ audit_log_retention_days = 90     # 0 = no age limit
 | `DDS_REQUIRE_ENCRYPTED_KEYS` | Fail-closed gate. When set to a truthy value (`1`, `true`, `yes`, case-insensitive), `dds-node` refuses to write any plaintext key blob to disk: the node identity (`node_key.bin`), the libp2p key (`p2p_key.bin`), and the domain key (`domain_key.bin` v=1 / v=4 plain hybrid). The save returns an error and writes nothing — operators must supply `DDS_NODE_PASSPHRASE` / `DDS_DOMAIN_PASSPHRASE` (or use `--fido2`) before re-running. Default off so dev workflows that intentionally write plaintext keep working; production deployments turn it on alongside the passphrase env vars. |
 | `DDS_NODE_ALLOW_PLAINTEXT_DOWNGRADE` | Escape hatch for dev/testing — allows `identity_store::save` to overwrite an encrypted node-key blob with a plaintext one when `DDS_NODE_PASSPHRASE` is empty. Off by default; set to `1` to override the M-14 sticky-marker guard. |
 | `RUST_LOG` | Controls log verbosity (e.g. `info`, `debug`, `dds_node=debug`) |
+
+---
+
+## Identity Generation
+
+`dds identity` provides offline utilities for creating and inspecting Vouchsafe IDs. No running node is required.
+
+### Generate an identity (`dds identity create`)
+
+```bash
+# Classical Ed25519 identity
+dds identity create alice
+# Generated classical (Ed25519) identity:
+#   URN:    urn:vouchsafe:alice.4z2vjf6zjk3j3xkwcu58ftwks61uyd4a
+#   Scheme: Ed25519
+#   PubKey: 32 bytes
+
+# Hybrid post-quantum identity (Ed25519 + ML-DSA-65)
+dds identity create alice --hybrid
+# Generated hybrid (Ed25519+ML-DSA-65) identity:
+#   URN:    urn:vouchsafe:alice.4z2vjf6zjk3j3xkwcu58ftwks61uyd4a
+#   Scheme: hybrid
+#   PubKey: 1984 bytes
+```
+
+The URN printed is a self-verifying identifier derived from the public key (see **Vouchsafe ID** in Concepts). It can be passed directly to `dds enroll user`, `dds group vouch`, or the HTTP enrollment API.
+
+> **`--hybrid` requires the `pq` feature.** Standard release builds include it. If you see `Error: hybrid crypto requires the 'pq' feature`, rebuild with `--features pq`.
+
+> **Key material is not persisted by this command.** `dds identity create` prints the URN and exits — it does not write a key file. For enrollment flows that need long-lived credentials, use FIDO2 via `dds enroll user` or `dds-node admit`.
+
+### Inspect a URN (`dds identity show`)
+
+Decode a Vouchsafe URN back to its components without contacting a node:
+
+```bash
+dds identity show urn:vouchsafe:alice.4z2vjf6zjk3j3xkwcu58ftwks61uyd4a
+# Identity:
+#   Label: alice
+#   Hash:  4z2vjf6zjk3j3xkwcu58ftwks61uyd4a
+#   URN:   urn:vouchsafe:alice.4z2vjf6zjk3j3xkwcu58ftwks61uyd4a
+```
+
+Useful for verifying that a URN is well-formed before passing it to an enrollment or policy command.
 
 ---
 

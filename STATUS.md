@@ -1,5 +1,57 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-25, 208th pass) — Document `dds identity` CLI subcommand
+
+### Summary
+
+Automated scheduled sweep following the 207th-pass baseline.
+
+**Documentation gap found and fixed:** `dds identity create` and `dds identity show`
+subcommands (in `dds-cli/src/main.rs`) were fully implemented but absent from
+the Admin Guide. No previous pass had documented them.
+
+- `dds identity create <label>` — generates an offline Ed25519 (or
+  `--hybrid` Ed25519+ML-DSA-65) Vouchsafe ID and prints the URN. No node
+  required.
+- `dds identity show <urn>` — parses a Vouchsafe URN and prints its
+  components (label, hash, canonical URN). Useful for pre-flight validation
+  before passing a URN to enrollment or policy commands.
+
+A new **§ Identity Generation** section was added to `docs/DDS-Admin-Guide.md`
+(inserted between Node Configuration Reference and Enrolling Users), with a
+Table of Contents entry (now item 10, renumbering 10–24 to 11–25).
+
+**Observation (not changed):** Cargo.toml workspace version remains `0.1.0`
+while the new `VERSION` file (added in commit `6af49c4`) records `1.3.0`.
+This appears intentional — installer versioning and crate SemVer are tracked
+separately. The `CARGO_PKG_VERSION` baked into CEF audit logs and Prometheus
+metrics (`dds_build_info`) will therefore report `0.1.0` rather than `1.3.0`;
+operators should correlate by git SHA (`DDS_GIT_SHA` metric label) rather than
+by version string if the distinction matters.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers
+in production src. The single `TODO(security)` at `dds-node/src/service.rs:2718`
+(M-22 OS-bound key-wrapping) remains unchanged.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI; no
+change.
+
+### Files changed
+
+- **`docs/DDS-Admin-Guide.md`** — new §10 "Identity Generation" section (two
+  subsections: `dds identity create`, `dds identity show`) and Table of
+  Contents renumber (items 10–24 → 11–25).
+
+### Test results
+
+`cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored**
+(macOS ARM64, 2026-05-25; count unchanged from 207th-pass baseline).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+---
+
 ## Maintenance (2026-05-25, 207th pass) — Document dds CLI in MSI bundle and machine PATH in Admin Guide
 
 ### Summary
