@@ -2103,6 +2103,11 @@ What it removes:
    (`HKLM\SYSTEM\…\EventLog\Application\DdsAuthBridge`) — registered at
    first run by `EventLogger.cpp` and never tracked by the MSI.
 5. Wipes (unless `-KeepData`):
+   - `C:\Program Files\DDS\` — the entire install dir. `node.toml` and
+     `appsettings.json` are `NeverOverwrite + Permanent` so MSI uninstall
+     deliberately keeps them; a surviving `node.toml` makes the Onboarding
+     Wizard's "Join domain" branch fail with *"admission.cbor or
+     node.toml already exists"*.
    - `C:\ProgramData\DDS\` — node identity, vault, FIDO2 state, audit logs
    - `%LOCALAPPDATA%\DDS\`
    - `HKLM\SOFTWARE\DDS` (entire subtree — covers AuthBridge stamp,

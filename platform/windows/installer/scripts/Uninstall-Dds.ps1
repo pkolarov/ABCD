@@ -18,6 +18,12 @@
       - HKLM\SYSTEM\CurrentControlSet\Services\EventLog\Application\
         DdsAuthBridge   (event-log source registered by EventLogger.cpp)
       - HKLM\SOFTWARE\DDS (entire subtree)
+      - C:\Program Files\DDS\config\node.toml          (NeverOverwrite+Permanent)
+      - C:\Program Files\DDS\config\appsettings.json   (NeverOverwrite+Permanent)
+        These two block 'Join domain' on a fresh install because
+        DdsConsole.ps1 (Run-JoinUnseal) errors with "admission.cbor or
+        node.toml already exists" when the install-dir node.toml
+        survives the previous uninstall.
       - C:\ProgramData\DDS (node identity, vault, FIDO2 state, audit logs)
       - %LOCALAPPDATA%\DDS
       - %TEMP%\dds-bootstrap-*.log, dds-console-*.log, dds-deviceenroll-*.log,
@@ -106,13 +112,13 @@ Write-Host "  - HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Cr
 Write-Host "Will remove event-log source: DdsAuthBridge"
 if (-not $KeepData) {
     Write-Host "Will wipe:"
-    foreach ($p in @($DataRoot, $UserAppData)) {
+    foreach ($p in @($InstallRoot, $DataRoot, $UserAppData)) {
         if (Test-Path $p) { Write-Host "  - $p" }
     }
     Write-Host "  - HKLM\SOFTWARE\DDS (entire subtree)"
     Write-Host "  - %TEMP%\dds-{bootstrap,console,deviceenroll,enroll,join}-*.log"
 } else {
-    Write-Host "Data dir, registry subtree, and TEMP transcripts preserved (-KeepData)." -ForegroundColor Cyan
+    Write-Host "Install dir, data dir, registry subtree, and TEMP transcripts preserved (-KeepData)." -ForegroundColor Cyan
 }
 Write-Host ""
 
@@ -207,6 +213,15 @@ catch {
 }
 
 if (-not $KeepData) {
+    # Install dir — msiexec leaves config\node.toml and config\appsettings.json
+    # behind (NeverOverwrite+Permanent) and DdsConsole's Run-JoinUnseal
+    # treats a surviving node.toml as "machine already part of a domain"
+    # and refuses to join a new one. Nuke the whole tree so a fresh
+    # install starts from zero.
+    Write-Host "Removing install dir + permanent config..." -ForegroundColor Yellow
+    if (Test-Path $InstallRoot) {
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $InstallRoot
+    }
     Write-Host "Removing data..." -ForegroundColor Yellow
     foreach ($p in @($DataRoot, $UserAppData)) {
         if (Test-Path $p) {
@@ -238,9 +253,11 @@ if (-not $KeepData) {
     }
 }
 
-# Sanity check
+# Sanity check. Under -KeepData we deliberately leave $InstallRoot
+# alone (it still holds node.toml + appsettings.json), so don't flag
+# its presence as residue in that mode.
 $leftServices = Get-Service Dds* -ErrorAction SilentlyContinue
-$leftInstall  = Test-Path $InstallRoot
+$leftInstall  = (-not $KeepData) -and (Test-Path $InstallRoot)
 $leftData     = (-not $KeepData) -and (Test-Path $DataRoot)
 $leftCpReg    = $cpRegKeys | Where-Object { Test-Path -LiteralPath $_ }
 

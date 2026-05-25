@@ -110,6 +110,7 @@ $AuthBridgeLog       = Join-Path $DataRoot    "authbridge.log"
 $ProvisionBundle     = Join-Path $DataRoot    "provision.dds"
 $NodeData            = Join-Path $DataRoot    "node-data"
 $AdmissionCert       = Join-Path $NodeData    "admission.cbor"
+$DomainTomlFile      = Join-Path $NodeData    "domain.toml"
 $NodeConfigFile      = Join-Path $InstallRoot "config\node.toml"
 
 # ── Initial state probe ───────────────────────────────────────────
@@ -994,8 +995,15 @@ function Run-JoinUnseal {
         Set-Error -Message "No bundle selected."
         return
     }
-    if ((Test-Path $AdmissionCert) -or (Test-Path $NodeConfigFile)) {
-        Set-Error -Message "This machine is already part of a domain. Run 'Discard and start over' from the wizard's resume page first." -Detail "admission.cbor or node.toml already exists."
+    # "Already provisioned" means the node has a domain identity, not
+    # merely the MSI-shipped stub node.toml. The MSI ships an
+    # unprovisioned template node.toml (DdsBundle.wxs:166-169) and
+    # NeverOverwrite preserves it across reinstalls, so checking node.toml
+    # would block Join on every fresh install. Match the signal
+    # Get-DdsOnboardingState.ps1 uses — domain.toml AND admission.cbor —
+    # which is what 'dds-node provision' actually writes.
+    if ((Test-Path $AdmissionCert) -and (Test-Path $DomainTomlFile)) {
+        Set-Error -Message "This machine is already part of a domain. Run 'Discard and start over' from the wizard's resume page first." -Detail "admission.cbor and domain.toml already exist."
         return
     }
 
