@@ -2438,8 +2438,8 @@ dependency-audit half of this gap closed 2026-04-29
 (supply-chain-plan.md Phase C.4): the new `audit` job in
 `.github/workflows/ci.yml` runs `cargo audit` on every PR + push to
 `main` and exits non-zero on any RUSTSEC vulnerability advisory
-(eight upstream-blocked informational warnings tracked in
-`security-gaps.md`). The 2026-04-12 `security-gaps.md` flagged
+(three upstream-blocked informational warnings tracked in
+`security-gaps.md` — down from eight as of 2026-05-25). The 2026-04-12 `security-gaps.md` flagged
 that as an operational item; **C.2 SBOM landed 2026-05-02** — the new
 `sbom` CI job runs `cargo cyclonedx --format json --all` on every PR
 and push, uploading the resulting `*.cdx.json` artifacts. **C.1 SLSA

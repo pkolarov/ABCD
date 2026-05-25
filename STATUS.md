@@ -1,5 +1,63 @@
 # DDS Implementation Status
 
+## Fix (2026-05-25, 201st pass) — Update stale Z-2 and Z-8 entries in threat-model-review.md and Claude_sec_review.md
+
+### Summary
+
+Automated scheduled sweep found two stale entries in the security
+documentation that had not been updated to reflect work shipped in
+passes 141–146 and earlier supply-chain passes.
+
+**Finding 1:** `docs/threat-model-review.md` item 15 (Z-2) still said
+`❌ open 2026-04-26 — design-only; libp2p PeerId, admin keys, default
+domain root all software-resident`. Phase A1 (`KeyProvider` trait),
+Phase A2 (AdmissionCert v2 + H-12 challenge-response), Phase A4 (Apple
+Secure Enclave backend), and Phase A6 (partial — `provision-admission-key`
+/ `rotate-admission-key` CLI subcommands) all shipped by 2026-05-22.
+The entry was never updated when those passes landed.
+
+**Finding 2:** `docs/threat-model-review.md` item 21 (Z-8) still said
+"no `cargo-vet`" and referenced "eight upstream-blocked informational
+warnings" for `cargo audit`. `cargo-vet` (Phase C.3) landed 2026-05-02;
+the warning count dropped from 8 to 3 as of the 198th pass (2026-05-25).
+The same stale "eight" count existed in `Claude_sec_review.md` Z-8 section.
+
+### Files changed
+
+**`docs/threat-model-review.md`** item 15 — updated from `❌ open` to
+`⚠ partially closed (Phase A1+A2+A4+A6-partial 2026-05-22)` with an
+itemised summary of what shipped (KeyProvider trait, AdmissionCert v2
+wire + H-12 challenge-response, SE backend, provision/rotate CLI) and
+what remains pending (A3 TPM 2.0, A5 Ed25519 on capable TPMs, A6-full
+`allow_v1_certs = false` flip).
+
+**`docs/threat-model-review.md`** item 21 — updated to note `cargo-vet`
+(C.3) landed 2026-05-02 and the informational warning count dropped from
+eight to three; removed "no `cargo-vet`" from the open-item description.
+
+**`Claude_sec_review.md`** Z-8 section — updated "eight upstream-blocked
+informational warnings" to "three … down from eight as of 2026-05-25".
+
+### Root cause
+
+The 141st–146th passes (Phase A1/A2/A4/A6) updated `hardware-bound-
+admission-plan.md`, the Admin Guide, and the Implementation Whitepaper,
+but did not update `docs/threat-model-review.md` item 15, which was an
+independent tracking table. Similarly, the supply-chain passes updated
+`security-gaps.md` and the CI comment when warning counts changed but
+did not update the corresponding rows in the threat-model tracking table
+or the Z-8 section of `Claude_sec_review.md`.
+
+### Test results
+
+Documentation-only changes; no Rust code altered.
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored**
+  (macOS ARM64, 2026-05-25 — no code changes from 200th-pass baseline).
+
+---
+
 ## Fix (2026-05-25, 200th pass) — Update stale alert-rules header and Grafana overview description
 
 ### Summary
