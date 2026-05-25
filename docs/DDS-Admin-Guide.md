@@ -2263,6 +2263,122 @@ connectivity indicator, the applied-state inventory, and a live tail of
 `authbridge.log`. Buttons allow starting or stopping all three services and
 opening the Tray Agent.
 
+### Windows Onboarding Scripts
+
+The wizard (`DdsConsole.ps1`) delegates its three setup branches to three
+standalone PowerShell scripts. These scripts can also be run directly —
+useful for automated or unattended deployments and for troubleshooting
+wizard failures.
+
+All scripts self-elevate via UAC when not already running as Administrator.
+
+#### `Bootstrap-DdsDomain.ps1`
+
+Automates the full 9-step first-node setup (the Branch A / "New Domain"
+path). Equivalent to the manual steps in
+[Creating a Domain](#creating-a-domain) and [Adding Nodes](#adding-nodes)
+run together on the first Windows host.
+
+```powershell
+# Interactive (prompts for name + org hash):
+& "C:\Program Files\DDS\bin\Bootstrap-DdsDomain.ps1"
+
+# Scripted (no prompts):
+& "C:\Program Files\DDS\bin\Bootstrap-DdsDomain.ps1" `
+    -Name    acme.corp `
+    -OrgHash acme
+
+# Passphrase mode instead of FIDO2:
+& "C:\Program Files\DDS\bin\Bootstrap-DdsDomain.ps1" `
+    -Name acme.corp -OrgHash acme -NoFido2
+
+# Skip confirmation when re-bootstrapping over existing state:
+& "C:\Program Files\DDS\bin\Bootstrap-DdsDomain.ps1" `
+    -Name acme.corp -OrgHash acme -Force
+```
+
+What it does (steps printed as `[N/9] …` to stdout):
+
+1. `init-domain` — creates the domain key (FIDO2 or passphrase).
+2. `create-provision-bundle` — writes `C:\ProgramData\DDS\provision.dds`
+   for sibling nodes.
+3. `seal-passphrase` — generates and DPAPI-seals a random node passphrase
+   so the `DdsNode` service can unseal it at every start without operator
+   input.
+4. `gen-node-key` — generates the libp2p peer identity.
+5. `admit` — self-issues an admission cert (10-year TTL).
+6. Writes `C:\Program Files\DDS\config\node.toml` with the operator's SID
+   added to `windows_admin_sids` so bootstrap-time API calls succeed.
+7. Starts `DdsNode` and waits for the named-pipe API.
+8. `POST /v1/enroll/device` — registers this machine; stamps
+   `DeviceUrn` + `PinnedNodePubkeyB64` into `appsettings.json` and
+   `HKLM\SOFTWARE\DDS\AuthBridge\DeviceUrn`.
+9. Starts `DdsAuthBridge` and `DdsPolicyAgent`.
+
+On completion a human-readable summary and `C:\ProgramData\DDS\bootstrap.env`
+are written. A progress transcript is saved to `%TEMP%\dds-bootstrap-*.log`.
+
+> **Re-bootstrap:** Running the script when `domain.toml` or `node_key.bin`
+> already exist prints a list of existing files and asks for `WIPE`
+> confirmation (bypassed by `-Force`). The old domain key is destroyed;
+> any users and sibling nodes must re-enroll.
+
+#### `Enroll-DdsDevice.ps1`
+
+Handles steps 6–9 only: start the node, enroll this machine, stamp
+`appsettings.json`, start the remaining services. Run after
+`dds-node provision <bundle>` has already written `domain.toml`,
+`admission.cbor`, and `node.toml` (Branch B / "Join Domain" path).
+
+```powershell
+# OrgUnit is read from node.toml's org_hash when omitted:
+& "C:\Program Files\DDS\bin\Enroll-DdsDevice.ps1"
+
+# Explicit org_unit override:
+& "C:\Program Files\DDS\bin\Enroll-DdsDevice.ps1" -OrgUnit acme
+```
+
+The script emits `##DDS-DEVICE-ENROLL## phase=<slug>` markers that the
+wizard tails for progress. Useful for scripted provisioning pipelines that
+want to parse completion state without screen-scraping.
+
+#### `Get-DdsOnboardingState.ps1`
+
+A read-only probe that returns a `[pscustomobject]` describing the current
+install and provisioning state. Used by the wizard to pick the initial
+branch; also useful in deployment scripts.
+
+```powershell
+$state = & "C:\Program Files\DDS\bin\Get-DdsOnboardingState.ps1"
+$state.Branch              # Recommended wizard branch
+$state.DomainProvisioned   # $true when domain.toml + admission.cbor exist
+$state.NodeServiceState    # 'Running', 'Stopped', 'NotRegistered', …
+$state.NodePipeOpen        # $true when \\.\pipe\dds-api is available
+$state.VaultHasCurrentUser # $true / $false / $null (unknown / unreadable)
+```
+
+Possible `Branch` values:
+
+| Value | Meaning |
+|---|---|
+| `NewDomain` | No `domain.toml` — run `Bootstrap-DdsDomain.ps1` |
+| `JoinDomain` | No `domain.toml` but `-BundlePath` was supplied — run `dds-node provision` then `Enroll-DdsDevice.ps1` |
+| `EnrollUser` | Domain provisioned, current user not in vault — user should enroll FIDO2 |
+| `Health` | Fully provisioned and current user enrolled |
+| `ResumeBootstrap` | A `.in-progress.json` resume marker exists (bootstrap interrupted) |
+| `Welcome` | Provisioned but vault state unknown — let the user decide |
+
+Pass `-BundlePath <path.dds>` to pre-load a provision bundle:
+
+```powershell
+$state = & "C:\Program Files\DDS\bin\Get-DdsOnboardingState.ps1" `
+    -BundlePath "D:\provision.dds"
+if ($state.Branch -eq 'JoinDomain') {
+    dds-node.exe provision "D:\provision.dds"
+    & "C:\Program Files\DDS\bin\Enroll-DdsDevice.ps1"
+}
+```
+
 ### DDS Tray Agent — Autostart and Vault Refresh
 
 The MSI installs an `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`

@@ -1,5 +1,58 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-25, 209th pass) — Document Windows onboarding scripts
+
+### Summary
+
+Automated scheduled sweep following the 208th-pass baseline.
+
+**Documentation gap found and fixed:** Three PowerShell scripts in
+`platform/windows/installer/scripts/` were fully implemented but absent from
+the Admin Guide:
+
+- `Bootstrap-DdsDomain.ps1` — Full 9-step first-node domain bootstrap (the
+  Branch A / "New Domain" path). Covers init-domain, provision-bundle creation,
+  passphrase sealing (DPAPI), node-key generation, self-admission, node.toml
+  authoring, service startup, device enrollment, and appsettings stamping.
+  Referenced indirectly by the DDS Console section, but never documented as a
+  standalone callable script. Operators cannot script automated deployments
+  without this documentation.
+- `Enroll-DdsDevice.ps1` — Post-provision device enrollment helper (Branch B /
+  "Join Domain" path, steps 6–9 after `dds-node provision`). Emits
+  `##DDS-DEVICE-ENROLL##` progress markers usable in scripted pipelines.
+- `Get-DdsOnboardingState.ps1` — Read-only state probe used by the wizard to
+  pick an initial branch (NewDomain / JoinDomain / EnrollUser / Health /
+  ResumeBootstrap / Welcome). Also useful for scripted provisioning pipelines.
+
+A new **§ Windows Onboarding Scripts** subsection was added to the Windows
+Deployment section of `docs/DDS-Admin-Guide.md`, inserted after the existing
+DDS Console subsection and before the DDS Tray Agent subsection. Each script
+gets an `####`-level entry with synopsis, usage examples, parameter table or
+flag list, and a brief description of what the script does.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers
+in production src. The single `TODO(security)` at `dds-node/src/service.rs:2718`
+(M-22 OS-bound key-wrapping) remains unchanged.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI; no
+change.
+
+### Files changed
+
+- **`docs/DDS-Admin-Guide.md`** — new `### Windows Onboarding Scripts`
+  subsection (116 lines; three `####` entries for Bootstrap-DdsDomain.ps1,
+  Enroll-DdsDevice.ps1, and Get-DdsOnboardingState.ps1).
+
+### Test results
+
+`cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored**
+(macOS ARM64, 2026-05-25; count unchanged from 208th-pass baseline).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+---
+
 ## Maintenance (2026-05-25, 208th pass) — Document `dds identity` CLI subcommand
 
 ### Summary
