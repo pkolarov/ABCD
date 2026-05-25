@@ -1,5 +1,51 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-25, 205th pass) — Prune stale log 0.4.29 cargo-vet exemption
+
+### Summary
+
+Automated scheduled sweep of the full Rust workspace.
+
+**Supply-chain cleanup:** `supply-chain/config.toml` retained a stale
+`[[exemptions.log]] version = "0.4.29"` entry after the 204th-pass upgrade to
+`log 0.4.30`. The 0.4.29 entry was no longer referenced by `Cargo.lock` and
+triggered a `cargo vet` advisory warning (`unnecessary exemptions — consider
+running cargo vet prune`). Ran `cargo vet prune` to remove it; the 0.4.30
+exemption and all 502 other exemptions remain intact. `cargo vet` now
+succeeds cleanly with no warnings.
+
+**Gap analysis:** No documentation–code gaps found. All 37 Prometheus metrics in
+`dds-node/src/telemetry.rs` remain documented in both the Admin Guide metric
+catalog and `docs/observability-plan.md` Phase C. The single `TODO(security)` at
+`dds-node/src/service.rs:2718` remains the tracked M-22 OS-bound key-wrapping
+item, unchanged. No other actionable TODOs in production code.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain blocked on
+external design, infrastructure provisioning, or Windows CI; no change.
+
+### Files changed
+
+- **`supply-chain/config.toml`** — stale `[[exemptions.log]] version = "0.4.29"` removed
+
+### Test results
+
+`cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored** (macOS ARM64,
+2026-05-25; count unchanged from 204th-pass baseline).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean.
+
+`cargo audit` — 0 vulnerabilities; 3 informational-only warnings (same unactionable
+baseline as 204th pass).
+
+`cargo vet` — succeeded (13 fully audited, 1 partially audited, 502 exempted); no warnings.
+
+---
+
 ## Maintenance (2026-05-25, 204th pass) — Update log crate 0.4.29 → 0.4.30; add cargo-vet exemption
 
 ### Summary
