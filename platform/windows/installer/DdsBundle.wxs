@@ -545,6 +545,11 @@
               Source="$(var.BuildDir)\Reset-DdsBootstrap.ps1"
               KeyPath="yes" />
       </Component>
+      <Component Id="C_UninstallScript" Guid="D4D4D4D4-D4D4-D4D4-D4D4-D4D4D4D4D4D4">
+        <File Id="uninstall_ps1"
+              Source="$(var.BuildDir)\Uninstall-Dds.ps1"
+              KeyPath="yes" />
+      </Component>
     </ComponentGroup>
 
     <!-- ============================================================ -->

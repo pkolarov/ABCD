@@ -2000,6 +2000,69 @@ Then register services and the Credential Provider COM DLL manually.
 The MSI source (`platform/windows/installer/DdsBundle.wxs`) documents the
 exact registry keys, service definitions, and COM registration needed.
 
+### Uninstallation
+
+Use `platform\windows\installer\scripts\Uninstall-Dds.ps1` for a full,
+clean removal. The script self-elevates via UAC and goes beyond
+`msiexec /x` to strip residue the MSI deliberately leaves behind:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+    "C:\Program Files\DDS\bin\Uninstall-Dds.ps1" -Force
+```
+
+Flags:
+
+- `-Force` — skip the `WIPE` confirmation prompt
+- `-KeepData` — uninstall the MSI and remove the Credential Provider, but
+  preserve `C:\ProgramData\DDS\`, `%LOCALAPPDATA%\DDS\`,
+  `HKLM\SOFTWARE\DDS`, and `%TEMP%\dds-*.log` transcripts. Use when
+  reinstalling the same domain identity.
+- `-InstallRoot <path>` / `-DataRoot <path>` — override the defaults
+  (`C:\Program Files\DDS` and `C:\ProgramData\DDS`).
+
+What it removes:
+
+1. Resolves every installed `ProductCode` under the DDS `UpgradeCode`
+   (`{F1A2B3C4-…}`) via the `WindowsInstaller` COM object and runs
+   `msiexec /x /qn /norestart /l*v` against each — survives version
+   bumps without hardcoding a ProductCode.
+2. Stops `DdsPolicyAgent`, `DdsAuthBridge`, `DdsNode`. Force-deletes
+   any leftover service via `sc.exe delete`.
+3. Strips the Credential Provider, which `DdsBundle.wxs` marks
+   `Permanent="yes"` (logonui.exe may have the DLL mapped at LSA-logon
+   time):
+   - `C:\Windows\System32\DdsCredentialProvider.dll` (falls back to
+     `MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT)` if the file is locked —
+     in that case the script reports `REBOOT REQUIRED`)
+   - `HKLM\SOFTWARE\Classes\CLSID\{a7f3b2c1-…}` (and `InprocServer32`)
+   - `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{a7f3b2c1-…}`
+4. Removes the `DdsAuthBridge` event-log source
+   (`HKLM\SYSTEM\…\EventLog\Application\DdsAuthBridge`) — registered at
+   first run by `EventLogger.cpp` and never tracked by the MSI.
+5. Wipes (unless `-KeepData`):
+   - `C:\ProgramData\DDS\` — node identity, vault, FIDO2 state, audit logs
+   - `%LOCALAPPDATA%\DDS\`
+   - `HKLM\SOFTWARE\DDS` (entire subtree — covers AuthBridge stamp,
+     `Version`, future stamps)
+   - `%TEMP%\dds-{bootstrap,console,deviceenroll,enroll,join}-*.log`
+     wizard transcripts. The script's own
+     `%TEMP%\dds-uninstall-*.log` files are kept so a failed run
+     remains debuggable.
+6. Final sanity check verifies no services, install dir, data dir, or
+   credential-provider registry keys are left. Exits `1` with a residue
+   report otherwise.
+
+> **Warning:** wiping `C:\ProgramData\DDS\` destroys the node's libp2p
+> PeerId, admission cert, vault, and FIDO2 enrollment. The reinstalled
+> node must be re-admitted by an admin (see
+> [Adding Nodes](#adding-nodes)) and any users must re-enroll FIDO2
+> credentials. Use `-KeepData` to retain the identity across a
+> reinstall of the same MSI.
+
+For per-domain reset (wipe identity but leave the MSI installed), use
+`Reset-DdsBootstrap.ps1` instead.
+
 ### Data Paths (Windows)
 
 | Path | Purpose |
