@@ -1,5 +1,53 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-25, 210th pass) — Document `GET /v1/node/info` response schema
+
+### Summary
+
+Automated scheduled sweep following the 209th-pass baseline.
+
+**Documentation gap found and fixed:** `GET /v1/node/info` has been referenced
+in four places in the Admin Guide (macOS Policy Agent, Linux Node Setup, Linux
+Policy Agent Setup) as a utility to retrieve `node_pubkey_b64` and `peer_id`,
+but the full response schema was never documented. In particular, the
+`admin_setup_available` boolean field — added to `NodeInfoResponse` in
+`dds-node/src/http.rs` and used by the Windows tray agent to pre-check the
+C-2 gate before opening a FIDO2 ceremony — was completely absent from the
+Admin Guide.
+
+A new **`### Node Identity (`GET /v1/node/info`)`** subsection was added to
+the **Monitoring and Diagnostics** section, inserted between the existing
+"Node Status" and "List Enrolled Users" subsections. It includes:
+
+- curl examples for loopback TCP, macOS UDS, and Linux UDS transports
+- A 4-row response-field table documenting `node_urn`, `node_pubkey_b64`,
+  `peer_id`, and `admin_setup_available` with precise semantics for each
+- An explanatory note that `admin_setup_available` is a read-only pre-flight
+  flag that does not consume the `.bootstrap` sentinel
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK`
+markers found in production src. The single `TODO(security)` at
+`dds-node/src/service.rs:2718` (M-22 OS-bound key-wrapping) remains
+unchanged.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI; no
+change.
+
+### Files changed
+
+- **`docs/DDS-Admin-Guide.md`** — new `### Node Identity (GET /v1/node/info)`
+  subsection in Monitoring and Diagnostics (26 lines inserted).
+
+### Test results
+
+`cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored**
+(macOS ARM64, 2026-05-25; count unchanged from 209th-pass baseline).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+---
+
 ## Maintenance (2026-05-25, 209th pass) — Document Windows onboarding scripts
 
 ### Summary

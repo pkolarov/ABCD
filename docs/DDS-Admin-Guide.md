@@ -3042,6 +3042,32 @@ plumbed through `/v1/status::last_admission_failure_ts`); `(none since
 boot)` denotes a fresh process or older node that has not stamped a
 value.
 
+### Node Identity (`GET /v1/node/info`)
+
+Returns static identity fields for the local node plus one runtime
+flag that client tools use to pre-check before triggering FIDO2 flows.
+Auth: same transport as the API listener (loopback TCP, UDS, or Windows
+named pipe — no session token required).
+
+```bash
+curl http://127.0.0.1:5551/v1/node/info | jq
+# macOS UDS:  curl --unix-socket /Library/Application\ Support/DDS/dds.sock http://localhost/v1/node/info | jq
+# Linux UDS:  curl --unix-socket /var/lib/dds/dds.sock http://localhost/v1/node/info | jq
+```
+
+Response fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `node_urn` | string | Stable Vouchsafe URN for this node's admission key (e.g. `urn:vouchsafe:mynode.ab12…`). Persists across restarts; changes only on `dds-node rotate-identity`. |
+| `node_pubkey_b64` | string | Base64-encoded (standard alphabet) Ed25519 admission public key. Used by Policy Agent `PinnedNodePubkeyB64` and by `stamp-agent-pubkey`. Rotate via `dds-node rotate-identity`. |
+| `peer_id` | string | libp2p peer ID derived from the P2P identity key (distinct from the admission key). Changes on `rotate-identity`. |
+| `admin_setup_available` | bool | `true` iff `POST /v1/admin/setup` would currently be accepted: the `trusted_roots` list is still empty **and** the `<data_dir>/.bootstrap` sentinel file exists. Client tools (e.g. the Windows tray agent's Admin Setup flow) check this flag before opening a WebAuthn ceremony — a `false` response means the bootstrap window is closed and the ceremony would be rejected by the C-2 gate. |
+
+The `admin_setup_available` flag is a read-only pre-flight check; it
+does not consume the sentinel. Once `dds admin setup` succeeds, the
+sentinel is removed and this field returns `false` permanently.
+
 ### List Enrolled Users
 
 ```bash
