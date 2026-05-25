@@ -2045,8 +2045,9 @@ What it removes:
    - `%LOCALAPPDATA%\DDS\`
    - `HKLM\SOFTWARE\DDS` (entire subtree — covers AuthBridge stamp,
      `Version`, future stamps)
-   - `%TEMP%\dds-{bootstrap,console,deviceenroll,enroll,join}-*.log`
-     wizard transcripts. The script's own
+   - `%TEMP%\dds-{bootstrap,bootstrap-console,console,deviceenroll,enroll,enroll-out,join}-*.log`
+     wizard transcripts (`dds-bootstrap-console-*` and `dds-enroll-out-*`
+     are produced by `DdsConsole.ps1`). The script's own
      `%TEMP%\dds-uninstall-*.log` files are kept so a failed run
      remains debuggable.
 6. Final sanity check verifies no services, install dir, data dir, or

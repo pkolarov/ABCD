@@ -12,17 +12,27 @@ documented in the 202nd pass) had no corresponding troubleshooting entry in
 who observe a crash-looping `DdsPolicyAgent` service would not have found
 remediation steps in the guide.
 
-### File changed
+### Files changed
 
-**`docs/DDS-Admin-Guide.md`** — added new troubleshooting section
-"Windows: Policy Agent service crash-loops with 'PinnedNodePubkeyB64 is not
-configured'" immediately after "Policy agent not applying policy". The new
-section:
-- explains the root cause (pre-3348f44 MSI set `--contentRoot` to install
-  root instead of `config\` subdirectory)
-- gives a three-step remediation: re-install from ≥ 2026-05-25 release;
-  or run `stamp-agent-pubkey` manually + restart the service; or verify
-  the service is running and `appsettings.json` is populated
+**`docs/DDS-Admin-Guide.md`** — two fixes:
+
+1. Added troubleshooting section "Windows: Policy Agent service crash-loops
+   with 'PinnedNodePubkeyB64 is not configured'" immediately after "Policy
+   agent not applying policy". The new section explains the root cause
+   (pre-3348f44 MSI set `--contentRoot` to install root instead of the
+   `config\` subdirectory), and gives a three-step remediation: re-install
+   from ≥ 2026-05-25 release; or run `stamp-agent-pubkey` manually + restart
+   the service; or verify the service is running and `appsettings.json` is
+   populated.
+
+2. Fixed the uninstall log-pattern list in the "Uninstallation" section
+   (added by `feat(installer): add Uninstall-Dds.ps1` commit 88082b9). The
+   `Uninstall-Dds.ps1` script also deletes `dds-bootstrap-console-*.log` and
+   `dds-enroll-out-*.log` transcripts produced by `DdsConsole.ps1`, but the
+   Admin Guide described only
+   `dds-{bootstrap,console,deviceenroll,enroll,join}-*.log`. Updated to the
+   full pattern list: `dds-{bootstrap,bootstrap-console,console,deviceenroll,
+   enroll,enroll-out,join}-*.log`.
 
 ### Gap analysis (full 203rd-pass sweep)
 
