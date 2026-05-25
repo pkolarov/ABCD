@@ -1,5 +1,60 @@
 # DDS Implementation Status
 
+## Fix (2026-05-25, 200th pass) — Update stale alert-rules header and Grafana overview description
+
+### Summary
+
+Automated scheduled sweep found two stale documentation strings in the
+observability assets.
+
+**Finding 1:** `docs/observability/alerts/dds.rules.yml` header described a
+two-tier system ("Active" vs "Reference (commented)") that was accurate when
+Phase E initially shipped only the audit subset. All Phase C catalog metrics
+have since shipped (follow-up #46, 2026-05-02) and all 14 alert rules are
+active. The header still said "rules whose source metrics are still open under
+Phase C … are kept verbatim so each Phase C follow-up can uncomment its tier
+atomically" — which no longer reflects reality (per the file's own trailing
+comment: "There are no remaining commented-out reference rules").
+
+**Finding 2:** `docs/observability/grafana/dds-overview.json` dashboard
+description said "Panels keyed off Phase C metrics that have not shipped yet
+(network, FIDO2, store, HTTP) are intentionally omitted from this dashboard
+until those metrics land". All those metrics have since landed; the language
+implied the dashboard would gain panels once they did, which is misleading —
+the overview dashboard is intentionally scoped to fleet-level health, with
+per-metric detail in `dds-trust-graph.json` and `dds.rules.yml`.
+
+### Files changed
+
+**`docs/observability/alerts/dds.rules.yml`** — replaced the stale two-tier
+header block with an accurate summary: "All 14 rules are active — all Phase C
+catalog metrics shipped as of follow-up #46", plus a concise rule-group
+inventory (`dds-audit`, `dds-process`, `dds-storage`, `dds-http`,
+`dds-network`, `dds-fido2`, `dds-pqc`, `dds-sync-lag`).
+
+**`docs/observability/grafana/dds-overview.json`** — updated the dashboard
+`description` field to remove the "until those metrics land" language and
+replace it with "Intentionally scoped to fleet-level health; per-metric detail
+(network, FIDO2, store, HTTP, PQC, sync lag) is in dds-trust-graph.json and
+the alert groups in dds.rules.yml."
+
+### Root cause
+
+The Phase E alert rules shipped incrementally (follow-ups #22 through #47),
+with each follow-up uncommenting one tier of reference rules. The file header
+was written for the initial state and was not updated as tiers were activated.
+The Grafana overview description was similarly not updated as Phase C metrics
+completed.
+
+### Test results
+
+Documentation-only changes; no Rust code altered.
+- `cargo fmt --all -- --check` — clean.
+- `cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored**
+  (macOS ARM64, 2026-05-25 — no code changes from 199th-pass baseline).
+
+---
+
 ## Fix (2026-05-25, 199th pass) — Document Phase A2 hardware admission key attestation in whitepaper and fix TPM2 rotation gaps
 
 ### Summary

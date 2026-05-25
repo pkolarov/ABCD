@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "DDS fleet overview — driven by the Phase C audit subset shipped in observability-plan.md follow-up #22 (build_info, uptime, audit entries/length/head-age) plus the Prometheus-built-in `up` series. Panels keyed off Phase C metrics that have not shipped yet (network, FIDO2, store, HTTP) are intentionally omitted from this dashboard until those metrics land — see dds.rules.yml for the parallel staging on the Alertmanager side.",
+  "description": "DDS fleet overview — driven by the Phase C audit subset (build_info, uptime, audit entries/length/head-age) plus the Prometheus-built-in `up` series. Intentionally scoped to fleet-level health; per-metric detail (network, FIDO2, store, HTTP, PQC, sync lag) is in dds-trust-graph.json and the alert groups in dds.rules.yml.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,

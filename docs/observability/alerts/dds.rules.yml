@@ -4,23 +4,19 @@
 # `/metrics` endpoint shipped by `dds-node` on the `metrics_addr`
 # listener (default `127.0.0.1:9495` once configured — opt-in).
 #
-# Two tiers:
+# All 14 rules are active — all Phase C catalog metrics shipped as of
+# follow-up #46 (dds_sync_lag_seconds + dds_http_request_duration_seconds,
+# 2026-05-02). There are no remaining commented-out reference tiers.
 #
-#   1. **Active** — rules whose source metrics ship today
-#      (Phase C audit subset: `dds_build_info`, `dds_uptime_seconds`,
-#      `dds_audit_entries_total{action}`, `dds_audit_chain_length`,
-#      `dds_audit_chain_head_age_seconds`, plus the Prometheus-built-in
-#      `up{job=...}` scrape-health series). These rules are uncommented
-#      and ready to load.
-#
-#   2. **Reference (commented)** — rules whose source metrics are still
-#      open under Phase C (network / FIDO2 / store / HTTP). They are
-#      kept verbatim so each Phase C follow-up can uncomment its tier
-#      atomically — the rule expressions are the spec the metric must
-#      satisfy. Do **not** uncomment these without confirming the
-#      underlying metric ships in the `dds-node` build deployed to the
-#      scrape target; an inert rule on a missing series silently never
-#      fires, which is worse than no rule at all.
+# Rule groups:
+#   dds-audit    — DdsAuditChainStalled, DdsAuditEmissionsFlat, DdsAuditRejectionSpike
+#   dds-process  — DdsNodeDown, DdsNodeFlapping, DdsBuildSkew
+#   dds-storage  — DdsStoreWriteFailures
+#   dds-http     — DdsLoopbackTcpAdminUsed
+#   dds-network  — DdsAdmissionFailureSpike, DdsSyncRejectsSpike
+#   dds-fido2    — DdsFido2AssertionFailureSpike
+#   dds-pqc      — DdsPqcDecryptFailureSpike, DdsPqcKeyRequestSpike
+#   dds-sync-lag — DdsSyncLagHigh
 #
 # Load with:
 #
