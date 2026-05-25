@@ -448,6 +448,16 @@
     <ComponentGroup Id="CG_PolicyAgent" Directory="DIR_BIN">
       <Component Id="C_PolicyAgent" Guid="55555555-5555-5555-5555-555555555555">
         <File Id="policy_agent_exe" Source="$(var.BuildDir)\DdsPolicyAgent.exe" KeyPath="yes" />
+        <!-- contentRoot points at DIR_CONFIG (not INSTALLFOLDER) so the
+             .NET Generic Host's default appsettings.json lookup lands on
+             C_PolicyAgentConfig below. Earlier revisions pointed at
+             INSTALLFOLDER, leaving appsettings.json one directory away
+             from where Host.CreateApplicationBuilder searched — the
+             DdsPolicyAgent:PinnedNodePubkeyB64 binding then came back
+             empty and the H-2 fail-closed guard in Program.cs crashed
+             the service on every SCM start. CA_StampAgentPubkey already
+             writes to [INSTALLFOLDER]config, so this aligns the read
+             path with the write path. -->
         <ServiceInstall Id="SI_PolicyAgent"
                         Name="DdsPolicyAgent"
                         DisplayName="DDS Policy Agent"
@@ -456,7 +466,7 @@
                         Start="auto"
                         Account="LocalSystem"
                         ErrorControl="normal"
-                        Arguments="--contentRoot &quot;[INSTALLFOLDER].&quot;">
+                        Arguments="--contentRoot &quot;[INSTALLFOLDER]config&quot;">
           <ServiceDependency Id="DdsNode" />
         </ServiceInstall>
         <!-- Start="install" Wait="no": same pattern as SC_DdsNode/SC_AuthBridge. -->
