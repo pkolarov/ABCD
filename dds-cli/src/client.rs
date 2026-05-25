@@ -424,6 +424,7 @@ async fn pipe_request(
 /// server-side helper in `dds-node::http::normalize_pipe_name` so a
 /// `pipe:dds-api` URL on the CLI side resolves to the same
 /// `\\.\pipe\dds-api` the node bound to.
+#[cfg(windows)]
 fn normalize_pipe_name(spec: &str) -> String {
     if spec.starts_with(r"\\") {
         spec.to_string()
@@ -510,16 +511,15 @@ mod tests {
         assert_eq!(got, "/v1/audit/entries?action=vouch&limit=10");
     }
 
+    #[cfg(windows)]
     #[test]
     fn normalize_pipe_name_bare() {
         assert_eq!(normalize_pipe_name("dds-api"), r"\\.\pipe\dds-api");
     }
 
+    #[cfg(windows)]
     #[test]
     fn normalize_pipe_name_full_path_passthrough() {
-        assert_eq!(
-            normalize_pipe_name(r"\\.\pipe\custom"),
-            r"\\.\pipe\custom"
-        );
+        assert_eq!(normalize_pipe_name(r"\\.\pipe\custom"), r"\\.\pipe\custom");
     }
 }
