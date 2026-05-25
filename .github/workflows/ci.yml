@@ -205,8 +205,8 @@ jobs:
         run: dotnet test platform\windows\DdsPolicyAgent.Tests\DdsPolicyAgent.Tests.csproj -c Debug --framework net9.0 --filter "Category!=Integration"
 
       # ---- MSI compile verification ----
-      - name: Build dds-node (release, for MSI staging)
-        run: cargo build -p dds-node --target x86_64-pc-windows-msvc --release
+      - name: Build dds-node + dds CLI (release, for MSI staging)
+        run: cargo build -p dds-node -p dds-cli --target x86_64-pc-windows-msvc --release
       - name: Install WiX
         run: dotnet tool install --global wix --version 5.0.2
       - name: Publish DdsPolicyAgent for MSI staging
@@ -232,6 +232,7 @@ jobs:
           $stage = "stage\x64"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
           Copy-Item "target\x86_64-pc-windows-msvc\release\dds-node.exe" $stage -ErrorAction Stop
+          Copy-Item "target\x86_64-pc-windows-msvc\release\dds.exe"      $stage -ErrorAction Stop
           $nativeBuild = "platform\windows\native\build\Release"
           @("DdsAuthBridge.exe", "DdsCredentialProvider.dll", "DdsTrayAgent.exe", "dds-enroll-user.exe") | ForEach-Object {
             $src = Join-Path $nativeBuild $_
