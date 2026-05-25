@@ -552,9 +552,15 @@ not be able to decrypt enc-v3 gossip.
 ### Manual epoch key rotation (`dds pq rotate`)
 
 ```bash
-dds --node-url http://127.0.0.1:5551 pq rotate
+dds pq rotate
 # Epoch key rotation triggered.
 ```
+
+The CLI default matches the MSI-shipped transport (`pipe:dds-api` on
+Windows, `http://127.0.0.1:5551` elsewhere). Pass `--node-url` to
+override — e.g. `--node-url pipe:other-name` or `--node-url
+http://127.0.0.1:5551` against a hand-installed Windows node still on
+TCP.
 
 Sends `POST /v1/pq/rotate` to the running node, which immediately rolls
 a new epoch key, persists it to `epoch_keys.cbor`, and fans out a fresh
@@ -879,6 +885,13 @@ registry value still falls back to TCP loopback via `DdsNodePort`
 **Linux / macOS deployments** stay on TCP by default for backward
 compat — switch `api_addr` to `unix:…` and then drop
 `trust_loopback_tcp_admin` once every client is on the new transport.
+
+**The `dds` CLI** picks its default `--node-url` to match the MSI
+shipped transport: `pipe:dds-api` on Windows, `http://127.0.0.1:5551`
+elsewhere. The CLI accepts all three schemes — `http://`, `https://`,
+`unix:` (Unix only), and `pipe:` (Windows only) — so `dds status
+--remote` works against any deployment without an explicit
+`--node-url`.
 
 ### `[network.api_auth]` Section (H-6 / H-7 / M-8)
 

@@ -1,12 +1,18 @@
 //! Shared HTTP client helpers for CLI subcommands that call `dds-node`.
 //!
-//! Two transports are supported:
+//! Three transports are supported:
 //! - `http://host:port` / `https://host:port` — normal TCP, via reqwest.
 //! - `unix:/path/to/dds.sock` — Unix domain socket (H-7 step-2), served
 //!   by `dds-node` when `network.api_addr = "unix:/..."` in the node's
-//!   TOML config. The CLI runs an HTTP/1 client directly over the
-//!   socket using hyper + hyper-util so reqwest's TCP-only connector
-//!   doesn't get in the way.
+//!   TOML config.
+//! - `pipe:<name>` — Windows named pipe (H-7 step-2b), served by
+//!   `dds-node` when `network.api_addr = "pipe:..."`. `<name>` is
+//!   either a bare name (`pipe:dds-api`, expanded to
+//!   `\\.\pipe\dds-api`) or a full path (`pipe:\\.\pipe\...`).
+//!
+//! For UDS / named-pipe transports the CLI runs an HTTP/1 client
+//! directly over the connection using hyper + hyper-util so reqwest's
+//! TCP-only connector doesn't get in the way.
 
 use bytes::Bytes;
 use reqwest::{Client, StatusCode};
@@ -24,7 +30,27 @@ use hyper_util::rt::TokioIo;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
-/// Default dds-node loopback API base URL.
+// Named-pipe transport — Windows-only. Same hyper plumbing as the UDS
+// branch, but the underlying byte stream is a NamedPipeClient.
+#[cfg(windows)]
+use http_body_util::{BodyExt as _, Full as PipeFull};
+#[cfg(windows)]
+use hyper::client::conn::http1 as pipe_http1;
+#[cfg(windows)]
+use hyper_util::rt::TokioIo as PipeTokioIo;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::ClientOptions;
+
+/// Default dds-node API base URL.
+///
+/// Matches the transport the MSI installer ships on Windows
+/// (`api_addr = "pipe:dds-api"` — see `platform/windows/installer/
+/// config/node.toml`). On other platforms the loopback-TCP default
+/// is kept because there's no equivalent OS-level peer-credential
+/// transport pre-configured by the install path.
+#[cfg(windows)]
+pub const DEFAULT_NODE_URL: &str = "pipe:dds-api";
+#[cfg(not(windows))]
 pub const DEFAULT_NODE_URL: &str = "http://127.0.0.1:5551";
 
 /// Build a short-timeout HTTP client suitable for local CLI calls.
@@ -44,12 +70,12 @@ pub fn new_client() -> Client {
 /// and bypass the check.
 fn enforce_tls_for_non_loopback(url: &str) {
     let lower = url.to_ascii_lowercase();
-    if lower.starts_with("https://") || lower.starts_with("unix:") {
+    if lower.starts_with("https://") || lower.starts_with("unix:") || lower.starts_with("pipe:") {
         return;
     }
     if !lower.starts_with("http://") {
         fail(&format!(
-            "unsupported URL scheme (only http, https, and unix: are allowed): {url}"
+            "unsupported URL scheme (only http, https, unix:, and pipe: are allowed): {url}"
         ));
     }
     // Extract the host between "http://" and the next '/' or ':'.
@@ -80,6 +106,12 @@ where
         return handle_uds_response(status, body);
     }
 
+    if let Some(pipe_spec) = base.strip_prefix("pipe:") {
+        let full_path = build_path_with_query(path, query);
+        let (status, body) = pipe_request(pipe_spec, "GET", &full_path, Bytes::new(), None).await;
+        return handle_uds_response(status, body);
+    }
+
     let client = new_client();
     let url = format!("{base}{path}");
     let resp = client
@@ -106,6 +138,11 @@ pub async fn get_with_status(
     if let Some(sock) = base.strip_prefix("unix:") {
         let full_path = build_path_with_query(path, query);
         return uds_request(sock, "GET", &full_path, Bytes::new(), None).await;
+    }
+
+    if let Some(pipe_spec) = base.strip_prefix("pipe:") {
+        let full_path = build_path_with_query(path, query);
+        return pipe_request(pipe_spec, "GET", &full_path, Bytes::new(), None).await;
     }
 
     let client = new_client();
@@ -146,6 +183,19 @@ where
         return handle_uds_response(status, body);
     }
 
+    if let Some(pipe_spec) = base.strip_prefix("pipe:") {
+        let json = serde_json::to_vec(body).unwrap_or_else(|e| fail(&format!("serialize: {e}")));
+        let (status, body) = pipe_request(
+            pipe_spec,
+            "POST",
+            path,
+            Bytes::from(json),
+            Some("application/json"),
+        )
+        .await;
+        return handle_uds_response(status, body);
+    }
+
     let client = new_client();
     let url = format!("{base}{path}");
     let resp = client
@@ -169,6 +219,25 @@ where
         let json = serde_json::to_vec(body).unwrap_or_else(|e| fail(&format!("serialize: {e}")));
         let (status, bytes) = uds_request(
             sock,
+            "POST",
+            path,
+            Bytes::from(json),
+            Some("application/json"),
+        )
+        .await;
+        return if status.is_success() {
+            status
+        } else {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            eprintln!("Error: HTTP {status} — {text}");
+            std::process::exit(1);
+        };
+    }
+
+    if let Some(pipe_spec) = base.strip_prefix("pipe:") {
+        let json = serde_json::to_vec(body).unwrap_or_else(|e| fail(&format!("serialize: {e}")));
+        let (status, bytes) = pipe_request(
+            pipe_spec,
             "POST",
             path,
             Bytes::from(json),
@@ -290,6 +359,79 @@ async fn uds_request(
     }
 }
 
+/// Mirror of `uds_request` for Windows named pipes. Opens a fresh
+/// `NamedPipeClient`, performs an HTTP/1 handshake over it via hyper,
+/// and returns `(StatusCode, body)`. The pipe path is expanded by
+/// [`normalize_pipe_name`] so the caller can pass either a bare name
+/// (`dds-api`) or a full path (`\\.\pipe\dds-api`).
+async fn pipe_request(
+    pipe_spec: &str,
+    method: &str,
+    path_and_query: &str,
+    body: Bytes,
+    content_type: Option<&str>,
+) -> (StatusCode, Bytes) {
+    #[cfg(windows)]
+    {
+        let pipe_path = normalize_pipe_name(pipe_spec);
+        let stream = ClientOptions::new().open(&pipe_path).unwrap_or_else(|e| {
+            fail_reach(&format!("pipe:{pipe_spec}"), &e.to_string());
+        });
+        let io = PipeTokioIo::new(stream);
+        let (mut sender, conn) = pipe_http1::handshake::<_, PipeFull<Bytes>>(io)
+            .await
+            .unwrap_or_else(|e| fail(&format!("HTTP handshake over named pipe failed: {e}")));
+        tokio::spawn(async move {
+            // Drive the per-request I/O future; errors surface through
+            // `send_request` below, so we can drop them here.
+            let _ = conn.await;
+        });
+
+        let mut req = hyper::Request::builder()
+            .method(method)
+            .uri(path_and_query)
+            .header("host", "localhost");
+        if let Some(ct) = content_type {
+            req = req.header("content-type", ct);
+        }
+        req = req.header("content-length", body.len().to_string());
+        let req = req
+            .body(PipeFull::new(body))
+            .unwrap_or_else(|e| fail(&format!("build request: {e}")));
+
+        let resp = sender
+            .send_request(req)
+            .await
+            .unwrap_or_else(|e| fail_reach(&format!("pipe:{pipe_spec}"), &e.to_string()));
+        let status = StatusCode::from_u16(resp.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let collected = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|e| fail(&format!("read response body: {e}")));
+        let body = collected.to_bytes();
+        (status, body)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (pipe_spec, method, path_and_query, body, content_type);
+        fail("named-pipe transport is only supported on Windows");
+    }
+}
+
+/// Expand a `pipe:` URL's body to a full Win32 pipe path. Mirrors the
+/// server-side helper in `dds-node::http::normalize_pipe_name` so a
+/// `pipe:dds-api` URL on the CLI side resolves to the same
+/// `\\.\pipe\dds-api` the node bound to.
+fn normalize_pipe_name(spec: &str) -> String {
+    if spec.starts_with(r"\\") {
+        spec.to_string()
+    } else {
+        format!(r"\\.\pipe\{spec}")
+    }
+}
+
 fn build_path_with_query(path: &str, query: &[(&str, &str)]) -> String {
     if query.is_empty() {
         return path.to_string();
@@ -366,5 +508,18 @@ mod tests {
         let got =
             build_path_with_query("/v1/audit/entries", &[("action", "vouch"), ("limit", "10")]);
         assert_eq!(got, "/v1/audit/entries?action=vouch&limit=10");
+    }
+
+    #[test]
+    fn normalize_pipe_name_bare() {
+        assert_eq!(normalize_pipe_name("dds-api"), r"\\.\pipe\dds-api");
+    }
+
+    #[test]
+    fn normalize_pipe_name_full_path_passthrough() {
+        assert_eq!(
+            normalize_pipe_name(r"\\.\pipe\custom"),
+            r"\\.\pipe\custom"
+        );
     }
 }
