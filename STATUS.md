@@ -1,5 +1,47 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-25, 211th pass) — Document `dds` CLI usage in Windows Deployment section
+
+### Summary
+
+Automated scheduled sweep following the 210th-pass baseline.
+
+**Documentation gap found and fixed:** The latest commit (`b416167`) added
+Windows named-pipe transport to the `dds` CLI and updated two short paragraphs
+in the Admin Guide. However, the **Windows Deployment** section had no
+dedicated guidance on using the `dds.exe` CLI after installation — operators
+landing in that section had no indication that `dds status`, `dds health`,
+`dds stats`, and `dds status --remote` work out of the box (defaulting to
+`pipe:dds-api`), nor which `--node-url` overrides apply.
+
+A new **`### Using the \`dds\` CLI on Windows`** subsection was inserted
+immediately before `### DDS Console` (at line 2241). It covers:
+
+- Zero-config usage for standard MSI installs (`pipe:dds-api` default).
+- Four representative command examples (`dds status`, `dds status --remote`,
+  `dds health`, `dds stats`).
+- A 3-row table mapping `--node-url` values to their use cases.
+- A note that `unix:` is not supported on Windows (use `pipe:` instead).
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK`
+markers found in production src. The single `TODO(security)` at
+`dds-node/src/service.rs:2718` (M-22 OS-bound key-wrapping) remains
+unchanged.
+
+**Test results:** `cargo test --workspace --lib` — **799 passed; 0 failed;
+5 ignored** (macOS ARM64, 2026-05-25; count unchanged from 210th-pass baseline).
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI; no
+change.
+
+### Files changed
+
+- **`docs/DDS-Admin-Guide.md`** — new `### Using the \`dds\` CLI on Windows`
+  subsection in Windows Deployment (20 lines inserted).
+
+---
+
 ## Maintenance (2026-05-25, 210th pass) — Document `GET /v1/node/info` response schema
 
 ### Summary

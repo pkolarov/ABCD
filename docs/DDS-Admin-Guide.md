@@ -2238,6 +2238,28 @@ dds-node.exe restrict-data-dir-acl --data-dir "C:\ProgramData\DDS"
 
 MSI custom action: `CA_RestrictDataDirAcl` (runs before `CA_Provision`).
 
+### Using the `dds` CLI on Windows
+
+The MSI places `dds.exe` on the machine-wide `PATH` (see [Installation](#installation)). On Windows the CLI defaults to `pipe:dds-api` — no `--node-url` flag is required for a standard MSI installation:
+
+```powershell
+dds status           # domain identity and peer count
+dds status --remote  # live node stats via named pipe
+dds health           # orchestrator-friendly /readyz check
+dds stats            # node counters
+```
+
+All three CLI transport schemes work on Windows; pass `--node-url` to
+override the default:
+
+| `--node-url` value | When to use |
+|---|---|
+| _(omitted)_ → `pipe:dds-api` | Standard MSI install (default) |
+| `pipe:<name>` | Custom `api_addr = "pipe:<name>"` in `node.toml` |
+| `http://127.0.0.1:<port>` | Dev or hand-installed node still on TCP loopback |
+
+> **Note:** `unix:` URLs are not supported on Windows; use `pipe:` instead.
+
 ### DDS Console
 
 The MSI installs a PowerShell WPF GUI (`DdsConsole.ps1`) reachable from the
