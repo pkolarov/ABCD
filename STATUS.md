@@ -1,5 +1,61 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-25, 206th pass) — Update stale threat-model item 21 (Z-8) to reflect Phase C.1/C.2/C.5 landed
+
+### Summary
+
+Automated scheduled sweep of the full Rust workspace.
+
+**Documentation gap found and fixed:** `docs/threat-model-review.md` item 21
+(Z-8) still described Phase C.1 (SLSA provenance), C.2 (SBOM), and C.5
+(Sigstore signing) as "Remaining" despite all three having shipped on
+2026-05-02. Verified against the actual CI workflows:
+- `msi.yml` + `pkg.yml` SLSA Level 3 provenance job (C.1)
+- `ci.yml` `cargo cyclonedx --format json --all` SBOM job (C.2)
+- `msi.yml` + `pkg.yml` `cosign sign-blob` keyless signing job (C.5)
+
+`Claude_sec_review.md` Z-8 section was already correct (updated in an
+earlier pass). The row in `threat-model-review.md` was the only stale
+reference. Updated it to "Phase C.1–C.5 all landed 2026-05-02" with a
+per-item CI summary; only Phase D (fleet self-update) remains open.
+
+**Gap analysis:** No other documentation–code gaps found. All 37
+Prometheus metrics in `dds-node/src/telemetry.rs` remain documented in
+both the Admin Guide metric catalog and `docs/observability-plan.md`
+Phase C. The single `TODO(security)` at `dds-node/src/service.rs:2718`
+remains the tracked M-22 OS-bound key-wrapping item, unchanged.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK`
+markers in production src.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6)
+remain blocked on external design, infrastructure provisioning, or
+Windows CI; no change.
+
+### Files changed
+
+- **`docs/threat-model-review.md`** — item 21 (Z-8) updated: "partially
+  closed (Phase C.3 + C.4 landed)" → "Phase C.1–C.5 all landed
+  2026-05-02"; "no SLSA provenance, no SBOM" language removed; per-item
+  CI job descriptions added; Remaining section narrowed to Phase D only.
+
+### Test results
+
+`cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored**
+(macOS ARM64, 2026-05-25; count unchanged from 205th-pass baseline).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean.
+
+`cargo audit` — 0 vulnerabilities; 3 informational-only warnings (same
+unactionable baseline as 205th pass).
+
+`cargo vet` — succeeded (13 fully audited, 1 partially audited, 502
+exempted); no warnings.
+
+---
+
 ## Maintenance (2026-05-25, 205th pass) — Prune stale log 0.4.29 cargo-vet exemption
 
 ### Summary
