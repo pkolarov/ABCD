@@ -1,5 +1,51 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-25, 204th pass) — Update log crate 0.4.29 → 0.4.30; add cargo-vet exemption
+
+### Summary
+
+Automated scheduled sweep of the full Rust workspace.
+
+**Dependency update:** `log 0.4.29 → 0.4.30` — patch-level update. Changes reviewed
+via `cargo vet diff log 0.4.29 0.4.30`: CI workflow hardening (pinned GitHub Actions
+action versions, added `persist-credentials: false`), MSRV bump from `1.68.0` to
+`1.71.0`, and `std::net` type capture support added to the optional `kv` feature. No
+unsafe code changes. Added `[[exemptions.log]] version = "0.4.30"` entry to
+`supply-chain/config.toml`; `cargo vet` still passes (13 fully audited, 502 exempted).
+
+**Gap analysis:** No documentation–code gaps found. All 37 Prometheus metrics in
+`dds-node/src/telemetry.rs` remain documented in both the Admin Guide metric catalog
+and `docs/observability-plan.md` Phase C. The single `TODO(security)` at
+`dds-node/src/service.rs:2718` remains the tracked M-22 OS-bound key-wrapping item,
+unchanged. No other actionable TODOs in production code.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain blocked on
+external design, infrastructure provisioning, or Windows CI; no change.
+
+### Files changed
+
+- **`Cargo.lock`** — `log` updated `0.4.29 → 0.4.30`
+- **`supply-chain/config.toml`** — `[[exemptions.log]] version = "0.4.30"` added
+
+### Test results
+
+`cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored** (macOS ARM64,
+2026-05-25; count unchanged from 203rd-pass baseline).
+
+`cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+`cargo fmt --all -- --check` — clean.
+
+`cargo audit` — 0 vulnerabilities; 3 informational-only warnings (same unactionable
+baseline as 203rd pass).
+
+`cargo vet` — succeeded (13 fully audited, 502 exempted).
+
+---
+
 ## Fix (2026-05-25, 203rd pass) — Add troubleshooting entry for Policy Agent PinnedNodePubkeyB64 crash
 
 ### Summary
