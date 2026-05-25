@@ -123,10 +123,12 @@ jobs:
     # supply-chain-plan.md Phase C.4 — cargo audit on every PR + push.
     # Default behaviour: exit non-zero on any RUSTSEC vulnerability advisory.
     # Informational warnings (unmaintained / unsound / yanked) surface in
-    # the log but do not block — the eight currently-tracked warnings are
+    # the log but do not block — the three currently-tracked warnings are
     # upstream-blocked transitive deps documented in security-gaps.md
-    # "Dependency Audit Gap". When upstream releases land, graduate this
-    # step to `-D warnings` so a fresh advisory immediately surfaces a PR.
+    # "Dependency Audit Gap" (2026-05-25: reduced from 8 to 3 as upstream
+    # fixed core2, rand-0.8/0.9, and fastrand transitive deps).
+    # When upstream releases land, graduate this step to `-D warnings`
+    # so a fresh advisory immediately surfaces a PR.
     name: cargo audit
     runs-on: ubuntu-latest
     steps:

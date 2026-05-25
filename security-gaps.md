@@ -115,14 +115,30 @@ Full workspace test run after the bump: **701 / 701** passing
 `audit` job in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
 installs `cargo-audit` via `taiki-e/install-action@v2` and runs
 `cargo audit` on every PR and every push to `main`. Default behaviour:
-exit non-zero on any RUSTSEC *vulnerability* advisory; the eight
-informational warnings above (unmaintained / unsound / yanked) surface
-in the build log but do not block — they are upstream-blocked
-transitive deps tracked here. When upstream releases land and clear
-those warnings, graduate the CI step to `cargo audit -D warnings` so a
-fresh advisory immediately surfaces a PR. Pre-commit `cargo audit`
-re-run on the macOS dev host: **0 vulnerabilities, 8 informational
-warnings** (matches the 2026-04-28 baseline above).
+exit non-zero on any RUSTSEC *vulnerability* advisory; informational
+warnings (unmaintained / unsound / yanked) surface in the build log but
+do not block — they are upstream-blocked transitive deps tracked here.
+When upstream releases land and clear those warnings, graduate the CI
+step to `cargo audit -D warnings` so a fresh advisory immediately
+surfaces a PR. Pre-commit `cargo audit` re-run on the macOS dev host:
+**0 vulnerabilities, 8 informational warnings** (matches the 2026-04-28
+baseline above).
+
+**2026-05-25 follow-up:** upstream releases cleared 5 of the 8 warnings
+(`core2`, `rand-0.8`/`rand-0.9`, `fastrand`). Running `cargo update`
+shows no further compatible bumps available. Current state:
+**0 vulnerabilities, 3 informational warnings**:
+
+| RUSTSEC ID | Crate | Severity | Via |
+|---|---|---|---|
+| RUSTSEC-2023-0089 | `atomic-polyfill 1.0.3` | unmaintained | `heapless → postcard → dds-store` |
+| RUSTSEC-2024-0436 | `paste 1.0.15` | unmaintained | `pqcrypto-mldsa → dds-domain` |
+| RUSTSEC-2026-0002 | `lru 0.12.5` | unsound (IterMut Stacked Borrows) | `libp2p-swarm → libp2p` |
+
+All three are upstream-blocked (no compatible newer versions available).
+`lru` is the most interesting: RUSTSEC-2026-0002 (unsound `IterMut`) is
+used only by `libp2p-swarm` internals, not by DDS code directly; the
+risk is mitigated by the libp2p crate's own iterator encapsulation.
 
 ## AD-17: Password-Replay Model and Lockout-Prevention Review
 

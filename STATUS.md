@@ -1,5 +1,58 @@
 # DDS Implementation Status
 
+## Fix (2026-05-25, 198th pass) — Update stale cargo-audit warning counts in CI comment and security-gaps.md
+
+### Summary
+
+Automated scheduled sweep found two stale documentation entries after upstream
+dependencies fixed 5 of the 8 previously-tracked `cargo audit` informational
+warnings.
+
+**Finding:** `cargo audit` now reports **0 vulnerabilities, 3 informational
+warnings** (down from 8 since the 2026-04-28 baseline). The warnings cleared
+upstream are `core2`, `rand-0.8`, `rand-0.9`, and `fastrand`. `cargo update`
+confirms no further compatible bumps are available.
+
+**Remaining 3 warnings (all upstream-blocked):**
+
+| RUSTSEC ID | Crate | Severity | Transitive path |
+|---|---|---|---|
+| RUSTSEC-2023-0089 | `atomic-polyfill 1.0.3` | unmaintained | `heapless → postcard → dds-store` |
+| RUSTSEC-2024-0436 | `paste 1.0.15` | unmaintained | `pqcrypto-mldsa → dds-domain` |
+| RUSTSEC-2026-0002 | `lru 0.12.5` | unsound (IterMut) | `libp2p-swarm → libp2p` |
+
+The `lru` RUSTSEC-2026-0002 (unsound `IterMut` via Stacked Borrows) is used
+only by `libp2p-swarm` internals, not by DDS code directly. No DDS code
+iterates over the `lru` cache directly.
+
+### Files changed
+
+**`.github/workflows/ci.yml`** — updated the `audit` job comment from
+"eight currently-tracked warnings" to "three currently-tracked warnings",
+and noted the 2026-05-25 reduction with the list of cleared crates.
+
+**`security-gaps.md`** — updated the "Dependency Audit Gap" section to
+reflect the current baseline (0 vulnerabilities, 3 informational warnings)
+with a per-warning table and risk note for the `lru` unsoundness.
+
+### Root cause
+
+The security-gaps.md and CI comment were written against the 2026-04-28
+baseline when 8 informational warnings were present. Upstream releases
+(`quinn-proto`/`yamux`/`hickory-*` updated `rand`, `libp2p-noise` dropped
+`core2`, `tempfile` updated `fastrand`) cleared 5 of those warnings without
+requiring any action in this repository.
+
+### Test results
+
+No Rust code changed; no new tests required.
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored**
+  (macOS ARM64, 2026-05-25 — no code changes from 197th-pass baseline).
+
+---
+
 ## Fix (2026-05-24, 197th pass) — Add 6 missing PQ metric rows to observability-plan.md Phase C catalog
 
 ### Summary
