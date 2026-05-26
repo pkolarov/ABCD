@@ -1,5 +1,46 @@
 # DDS Implementation Status
 
+## Fix (2026-05-26, 219th pass) — Fix smoke tests broken by 218th-pass NodeConfig schema validation upgrade
+
+### Summary
+
+Automated scheduled sweep following the 218th-pass baseline.
+
+**Bug found and fixed:** The 218th pass committed a schema-validation upgrade
+to `dds debug config` (`dds-cli/src/main.rs`) but omitted updates to the
+corresponding smoke tests in `dds-cli/tests/smoke.rs`. Two tests were broken:
+
+- `test_debug_config_parses_toml` — expected a config with only `[domain]`
+  and three optional fields to succeed, but `NodeConfig::from_str` requires
+  the three top-level required fields (`org_hash`, `domain.name`, `domain.id`,
+  `domain.pubkey`). Fixed by supplying a minimal valid config with all required
+  fields and adding an assertion on `Schema: OK` in stdout.
+
+- `test_debug_config_rejects_invalid_toml` — expected `"Invalid TOML"` in
+  stderr but the new code emits `"Schema validation failed: …"`. Fixed by
+  updating the assertion to match the new error prefix.
+
+**Test results:** `cargo test --package dds-cli --test smoke` — **23 passed;
+0 failed; 0 ignored** (macOS ARM64, 2026-05-26; count unchanged).
+`cargo test --workspace --lib` — **799 passed; 0 failed; 5 ignored**.
+
+**CI:** The `CI` job for commit `8de4e23` (218th pass) was `failure` because
+the integration tests ran against the new code without the test update. This
+commit closes that CI failure.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI; no
+change.
+
+### Files changed
+
+- **`dds-cli/tests/smoke.rs`** — `test_debug_config_parses_toml`: updated
+  config fixture to include all required `NodeConfig` fields and added
+  `Schema: OK` assertion. `test_debug_config_rejects_invalid_toml`: updated
+  error-string assertion from `"Invalid TOML"` to `"Schema validation failed"`.
+
+---
+
 ## Fix (2026-05-26, 218th pass) — `dds debug config`: replace generic TOML dump with full NodeConfig schema validation
 
 ### Summary

@@ -171,9 +171,21 @@ fn test_debug_config_parses_toml() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg_path = tmp.path().join("test-config.toml");
     let mut f = std::fs::File::create(&cfg_path).unwrap();
+    // Minimal valid NodeConfig — all required fields present.
+    // pubkey is a 64-char hex (32-byte all-zero Ed25519 key, acceptable for schema tests).
     writeln!(
         f,
-        "[domain]\nmax_delegation_depth = 7\naudit_log_enabled = true\naudit_log_max_entries = 500\n"
+        r#"
+org_hash = "test-org-hash"
+
+[domain]
+name = "test.local"
+id = "dds-dom:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
+max_delegation_depth = 7
+audit_log_enabled = true
+audit_log_max_entries = 500
+"#
     )
     .unwrap();
     let out = dds_cli()
@@ -186,6 +198,7 @@ fn test_debug_config_parses_toml() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Schema: OK"));
     assert!(stdout.contains("max_delegation_depth: 7"));
     assert!(stdout.contains("audit_log_enabled: true"));
     assert!(stdout.contains("audit_log_max_entries: 500"));
@@ -204,7 +217,7 @@ fn test_debug_config_rejects_invalid_toml() {
         .unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("Invalid TOML"));
+    assert!(stderr.contains("Schema validation failed"));
 }
 
 #[test]
