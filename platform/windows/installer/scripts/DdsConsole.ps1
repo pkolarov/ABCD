@@ -1042,7 +1042,7 @@ exit `$code
         if ($script:joinProcess.HasExited) {
             $script:joinTimer.Stop(); $script:joinTimer = $null
             $code = $script:joinProcess.ExitCode
-            if ($code -eq 0 -and (Test-Path $AdmissionCert) -and (Test-Path $NodeConfigFile)) {
+            if ($code -eq 0 -and (Test-Path $AdmissionCert) -and (Test-Path $DomainTomlFile)) {
                 Append-Log $el.TbJoinLog "[Console] Provision succeeded; running device enrollment..."
                 Show-Page -Name 'PageJoinDomain_DeviceEnroll'
                 Run-DeviceEnroll

@@ -1,5 +1,64 @@
 # DDS Implementation Status
 
+## Fix (2026-05-26, 215th pass) — DdsConsole.ps1: provision success check used wrong path variable
+
+### Summary
+
+Automated scheduled sweep following the 214th-pass baseline.
+
+**Bug found and fixed:** In `DdsConsole.ps1`, the `Run-JoinUnseal` dispatch
+timer (Branch B — Join Domain) checked the wrong path variable in its provision
+success condition:
+
+```powershell
+# Before (bug):
+if ($code -eq 0 -and (Test-Path $AdmissionCert) -and (Test-Path $NodeConfigFile)) {
+
+# After (fix):
+if ($code -eq 0 -and (Test-Path $AdmissionCert) -and (Test-Path $DomainTomlFile)) {
+```
+
+`$NodeConfigFile` is `C:\Program Files\DDS\config\node.toml` — the MSI-shipped
+stub, which is always present from the moment the MSI installs. Using it as a
+success signal means the third condition was always `$true` and added no value.
+
+`$DomainTomlFile` is `%ProgramData%\DDS\node-data\domain.toml` — one of the two
+files that `dds-node provision --no-start` actually writes (alongside
+`admission.cbor`). Using it makes the check consistent with:
+
+- The guard at the top of `Run-JoinUnseal` (line 1005): blocks re-running when
+  both `AdmissionCert` **and** `DomainTomlFile` already exist.
+- `Get-DdsOnboardingState.ps1`, which sets `DomainProvisioned = $true` only when
+  both `domain.toml` and `admission.cbor` are present.
+- The Admin Guide §JoinDomain branch table: "No `domain.toml`" is the Join trigger.
+
+**Impact of the bug:** If `dds-node provision --no-start` exited with code 0
+and wrote `admission.cbor` but failed to write `domain.toml` (e.g. a mid-write
+crash or disk-full condition), the wizard would falsely proceed to
+`Run-DeviceEnroll`. `Enroll-DdsDevice.ps1` would then fail mid-way when
+attempting `Start-Service DdsNode` because the node cannot start without the
+`[domain]` section — leaving the machine in a partially-enrolled state that
+requires `Reset-DdsBootstrap.ps1` to clean up.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK`
+markers found in production src. The single `TODO(security)` at
+`dds-node/src/service.rs:2718` (M-22 OS-bound key-wrapping) remains
+unchanged.
+
+**Test results:** `cargo test --workspace --lib` — **799 passed; 0 failed;
+5 ignored** (macOS ARM64, 2026-05-26; count unchanged from 214th-pass baseline).
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI; no
+change.
+
+### Files changed
+
+- **`platform/windows/installer/scripts/DdsConsole.ps1`** — `$NodeConfigFile`
+  → `$DomainTomlFile` in the `Run-JoinUnseal` provision success condition.
+
+---
+
 ## Docs fix (2026-05-26, 214th pass) — Correct `init-domain` flag synopsis in README
 
 ### Summary
