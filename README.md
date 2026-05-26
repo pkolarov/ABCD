@@ -152,6 +152,28 @@ dds-node provision bundle.dds [--data-dir ~/.dds] [--no-start]
 
 # Start the node
 dds-node run [config.toml]
+
+# Admit this node as its own domain authority (single-node / dev deployments)
+dds-node self-admit --data-dir ~/.dds [--domain-key ./acme/domain_key.bin] \
+    [--domain ./acme/domain.toml] [--ttl-days 365] [--force]
+
+# Re-encrypt node and p2p keys under the current envelope / new passphrase
+dds-node rewrap-identity --data-dir ~/.dds [--no-backup]
+
+# Generate HMAC secret for HTTP response-integrity verification
+dds-node gen-hmac-secret --out ~/.dds/node-hmac.key [--force]
+
+# Provision the admission signing key (software, secure-enclave, or tpm2)
+dds-node provision-admission-key --data-dir ~/.dds [--backend software]
+
+# Rotate the admission signing key in place (backs up old key by default)
+dds-node rotate-admission-key --data-dir ~/.dds [--no-backup]
+
+# Stamp the Policy Agent's pinned pubkey into its appsettings.json (Windows)
+dds-node stamp-agent-pubkey --data-dir ~/.dds --config-dir 'C:\ProgramData\DDS\config'
+
+# (Windows only) Seal a random node passphrase with DPAPI
+dds-node seal-passphrase [--force] [--out 'C:\ProgramData\DDS\node-passphrase.dpapi']
 ```
 
 ### CLI (`dds-cli`)

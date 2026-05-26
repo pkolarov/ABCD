@@ -1,5 +1,53 @@
 # DDS Implementation Status
 
+## Docs fix (2026-05-27, 221st pass) — Add 7 missing dds-node subcommands to README quick reference
+
+### Summary
+
+Automated scheduled sweep following the 220th-pass baseline.
+
+**Documentation gap found and fixed:**
+
+**README.md** — The `### Node Daemon (dds-node)` quick-reference block documented
+11 of the 18 implemented `dds-node` subcommands. Seven commands that have been
+implemented since earlier passes were absent from the quick reference (though all
+are documented in DDS-Admin-Guide.md). Added the following to the README code
+block immediately after `dds-node run`:
+
+| Command | First implemented |
+|---|---|
+| `self-admit` | Early P2P passes |
+| `rewrap-identity` | Key-management passes |
+| `gen-hmac-secret` | Windows Auth Bridge passes |
+| `provision-admission-key` | Admission-key backend passes |
+| `rotate-admission-key` | Admission-key backend passes |
+| `stamp-agent-pubkey` | Windows Policy Agent passes |
+| `seal-passphrase` | Windows DPAPI passes |
+
+Each entry includes the required flags and the most commonly used optional flags,
+matching the style of the existing quick-reference entries.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src. The single `TODO(security)` at `dds-node/src/service.rs:2718`
+(M-22 OS-bound key-wrapping) is unchanged.
+
+**Test results:** All pass — 799 lib tests (0 failed, 5 ignored), 23 CLI smoke
+tests (0 failed). Documentation-only change; no new tests required.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI;
+no change.
+
+### Files changed
+
+- **`README.md`** — `### Node Daemon (dds-node)` code block: added 7 previously-
+  missing subcommands (`self-admit`, `rewrap-identity`, `gen-hmac-secret`,
+  `provision-admission-key`, `rotate-admission-key`, `stamp-agent-pubkey`,
+  `seal-passphrase`) with flags matching their implementations in
+  `dds-node/src/main.rs`.
+
+---
+
 ## Docs fix (2026-05-26, 220th pass) — Add dds pq CLI examples to README and update debug config description in Admin Guide
 
 ### Summary
