@@ -2129,7 +2129,7 @@ What it removes:
 > reinstall of the same MSI.
 
 For per-domain reset (wipe identity but leave the MSI installed), use
-`Reset-DdsBootstrap.ps1` instead.
+[`Reset-DdsBootstrap.ps1`](#reset-ddsbootstrapps1) instead.
 
 ### Data Paths (Windows)
 
@@ -2436,6 +2436,59 @@ if ($state.Branch -eq 'JoinDomain') {
     & "C:\Program Files\DDS\bin\Enroll-DdsDevice.ps1"
 }
 ```
+
+#### `Reset-DdsBootstrap.ps1`
+
+Wipes DDS provisioning state on the local machine so the onboarding wizard
+can restart bootstrap from a clean slate. Leaves the MSI's installed binaries,
+services registrations, and data-dir DACL intact — only the per-domain identity
+is removed. Intended for the wizard's "Discard and restart" button and for
+operator recovery after a failed or partial bootstrap.
+
+```powershell
+# Interactive (prompts for 'WIPE' confirmation):
+& "C:\Program Files\DDS\bin\Reset-DdsBootstrap.ps1"
+
+# Skip confirmation prompt:
+& "C:\Program Files\DDS\bin\Reset-DdsBootstrap.ps1" -Force
+```
+
+What it does:
+
+1. Self-elevates via UAC if not already running as Administrator.
+2. Lists paths that will be removed and prompts for `WIPE` confirmation
+   (bypassed by `-Force`).
+3. Stops `DdsPolicyAgent`, `DdsAuthBridge`, and `DdsNode` services (graceful
+   stop, errors silently ignored so the script continues if a service is
+   already stopped or not registered).
+4. Removes the following files and directories:
+   - `%ProgramData%\DDS\node-data\` (entire directory — libp2p keypair,
+     domain key, admission cert, node database)
+   - `%ProgramData%\DDS\node_key.bin`
+   - `%ProgramData%\DDS\node-passphrase.dpapi`
+   - `%ProgramData%\DDS\provision.dds`
+   - `C:\Program Files\DDS\config\node.toml` (the MSI stub)
+   - `%ProgramData%\DDS\bootstrap\.in-progress.json` (resume marker)
+   - `%ProgramData%\DDS\join.env`
+   - `%ProgramData%\DDS\bootstrap.env`
+5. Clears the `DeviceUrn` registry value under
+   `HKLM\SOFTWARE\DDS\AuthBridge` so the Auth Bridge does not reference a
+   now-deleted device identity.
+
+After reset, re-run the onboarding wizard (or `Bootstrap-DdsDomain.ps1` /
+`Enroll-DdsDevice.ps1` directly) to bootstrap or join again.
+
+> **Note:** `Reset-DdsBootstrap.ps1` is a lighter alternative to
+> `Uninstall-Dds.ps1` when you want to keep the MSI installed. For a full
+> removal of all DDS components, use `Uninstall-Dds.ps1 -Force` instead.
+
+Parameters:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `-Force` | `$false` | Skip the `WIPE` confirmation prompt |
+| `-InstallRoot` | `C:\Program Files\DDS` | DDS install directory |
+| `-DataRoot` | `C:\ProgramData\DDS` | DDS data directory |
 
 ### DDS Tray Agent — Autostart and Vault Refresh
 
