@@ -1,5 +1,51 @@
 # DDS Implementation Status
 
+## Maintenance (2026-05-26, 213th pass) — Document `Reset-DdsBootstrap.ps1` in Admin Guide
+
+### Summary
+
+Automated scheduled sweep following the 212th-pass baseline.
+
+**Documentation gap found and fixed:** `Reset-DdsBootstrap.ps1` was fully
+implemented (used by the onboarding wizard's "Discard and restart" button) but
+only referenced with a single line in the Admin Guide, unlike the three sibling
+scripts (`Bootstrap-DdsDomain.ps1`, `Enroll-DdsDevice.ps1`,
+`Get-DdsOnboardingState.ps1`) which each have a dedicated `####` subsection.
+
+A new **`#### \`Reset-DdsBootstrap.ps1\``** subsection was added to the
+"Windows Onboarding Scripts" section (after `Get-DdsOnboardingState.ps1`)
+documenting:
+
+- Purpose: wipes per-domain provisioning state while leaving the MSI installed.
+- Two usage examples (interactive and `-Force`).
+- Step-by-step behavior (5 steps: UAC elevation, confirmation prompt, service
+  stop, file removal, registry cleanup).
+- Enumeration of all 8 paths removed.
+- Comparison note vs. `Uninstall-Dds.ps1`.
+- Parameter table (`-Force`, `-InstallRoot`, `-DataRoot`).
+
+The bare mention in the Uninstall section (line 2131) was also converted to an
+anchor link pointing at the new subsection.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK`
+markers found in production src. The single `TODO(security)` at
+`dds-node/src/service.rs:2718` (M-22 OS-bound key-wrapping) remains
+unchanged.
+
+**Test results:** `cargo test --workspace --lib` — **799 passed; 0 failed;
+5 ignored** (macOS ARM64, 2026-05-26; count unchanged from 212th-pass baseline).
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI; no
+change.
+
+### Files changed
+
+- **`docs/DDS-Admin-Guide.md`** — new `Reset-DdsBootstrap.ps1` subsection;
+  anchor link from Uninstall section.
+
+---
+
 ## Fix (2026-05-25, 212th pass) — Windows Join workflow: patch stub node.toml from provisioned dds.toml
 
 ### Summary
