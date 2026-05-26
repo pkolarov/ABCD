@@ -95,6 +95,48 @@ public class WorkerTests
         Assert.Null(Worker.EffectiveModeReason(JoinState.EntraOnlyJoined));
     }
 
+    // --- ResolveReason ---------------------------------------------------
+
+    [Fact]
+    public void ResolveReason_no_transition_no_override_returns_null()
+    {
+        Assert.Null(Worker.ResolveReason(null, transitionDetected: false, hostStateOnlyChange: false));
+    }
+
+    [Fact]
+    public void ResolveReason_no_transition_with_ad_override_returns_mode_reason()
+    {
+        Assert.Equal(
+            AppliedReason.AuditDueToAdCoexistence,
+            Worker.ResolveReason(AppliedReason.AuditDueToAdCoexistence, transitionDetected: false, hostStateOnlyChange: false));
+    }
+
+    [Fact]
+    public void ResolveReason_transition_null_modeReason_returns_transition_reason_once()
+    {
+        // Regression test: previously Combine(HostStateTransitionDetected, HostStateTransitionDetected)
+        // produced "host_state_transition_detected:host_state_transition_detected".
+        var result = Worker.ResolveReason(null, transitionDetected: true, hostStateOnlyChange: false);
+        Assert.Equal(AppliedReason.HostStateTransitionDetected, result);
+    }
+
+    [Fact]
+    public void ResolveReason_hostStateOnly_null_modeReason_returns_transition_reason_once()
+    {
+        var result = Worker.ResolveReason(null, transitionDetected: false, hostStateOnlyChange: true);
+        Assert.Equal(AppliedReason.HostStateTransitionDetected, result);
+    }
+
+    [Fact]
+    public void ResolveReason_transition_with_ad_override_combines_both_reasons()
+    {
+        var result = Worker.ResolveReason(
+            AppliedReason.AuditDueToAdCoexistence, transitionDetected: true, hostStateOnlyChange: false);
+        Assert.Equal(
+            $"{AppliedReason.AuditDueToAdCoexistence}:{AppliedReason.HostStateTransitionDetected}",
+            result);
+    }
+
     // --- AD-06: Entra-only short-circuit --------------------------------
 
     [Fact]

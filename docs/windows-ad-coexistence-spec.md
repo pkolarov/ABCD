@@ -749,11 +749,11 @@ The 5-phase split holds, with these refinements:
 
 | Task | Files | Change |
 |---|---|---|
-| **AD-07** | `Client/DdsNodeClient.cs:53-75 AppliedReport`, new `State/AppliedReason.cs`, `Worker.cs:343 ReportAsync`. | Add `Reason` JSON property; declare reason-code constants; thread `reason` through `ReportAsync`. |
-| **AD-04** | `Worker.cs:91 PollAndApplyAsync`, `:64 ExecuteAsync`. | Inject `IJoinStateProbe`, cache result on start. Add `EffectiveMode(EnforcementMode)` helper, wrap every `mode` argument passed to enforcers and reconciliation. Force one audit evaluation when JoinState changes even if policy/software content hashes are unchanged. |
-| **AD-05** | `Worker.cs:177` software dispatch, `Worker.cs:284` reconcile dispatch. | Replace hardcoded `EnforcementMode.Enforce` with `EffectiveMode(EnforcementMode.Enforce)`. |
-| **AD-06** | `Program.cs`, `Worker.cs:64`. | On `EntraOnlyJoined`, short-circuit `ExecuteAsync` to a heartbeat-only loop reporting `unsupported_entra`. |
-| **(AD-04/05 schema)** | `State/AppliedStateStore.cs:47`. | Migrate `managed_items` from sets to per-item metadata records. Add `host_state_at_apply`, `audit_frozen`, `last_outcome`, and `last_reason`. Default legacy records to `Unknown` / `false` / `legacy`. |
+| **AD-07** ✅ | `Client/DdsNodeClient.cs:53-75 AppliedReport`, new `State/AppliedReason.cs`, `Worker.cs:343 ReportAsync`. | **Landed 2026-04-26.** `AppliedReport.Reason` (`string?`) added; `State/AppliedReason.cs` declares all canonical lower-case wire values; `Worker.ReportAsync` threads `reason` through on every report. |
+| **AD-04** ✅ | `Worker.cs:91 PollAndApplyAsync`, `:64 ExecuteAsync`. | **Landed 2026-04-26.** `IJoinStateProbe` injected into `Worker`; `Refresh()` + `Detect()` called at the top of every `ExecuteAsync` cycle; `EffectiveMode(EnforcementMode, JoinState)` helper forces `Audit` on `AdJoined` / `HybridJoined` / `Unknown`; transition since previous cycle forces a one-shot re-evaluation even when content hash is unchanged. |
+| **AD-05** ✅ | `Worker.cs:177` software dispatch, `Worker.cs:284` reconcile dispatch. | **Landed 2026-04-26.** All hardcoded `EnforcementMode.Enforce` arguments replaced with `EffectiveMode(requestedSoftware, hostState)` (software loop) and `effectiveMode` derived from `auditMode` flag (reconciliation); stale-item removal skipped when `auditMode` is true. |
+| **AD-06** ✅ | `Program.cs`, `Worker.cs:64`. | **Landed 2026-04-26.** `ExecuteAsync` checks `hostState == JoinState.EntraOnlyJoined` first; on match, dispatches to `EmitEntraHeartbeatAsync` (one `_host_state` report per cycle with reason `unsupported_entra`) instead of `PollAndApplyAsync`. |
+| **(AD-04/05 schema)** ✅ | `State/AppliedStateStore.cs:47`. | **Landed 2026-04-26.** `managed_items` migrated from `HashSet<string>` to `Dictionary<string, ManagedItemRecord>` with `host_state_at_apply`, `audit_frozen`, `last_outcome`, `last_reason`. Backward-compatible `ManagedItemsConverter` migrates legacy flat arrays to records with `last_outcome="legacy"`, `host_state_at_apply="Unknown"`, `audit_frozen=false`. |
 
 ### Phase 3 — Authentication Coexistence
 

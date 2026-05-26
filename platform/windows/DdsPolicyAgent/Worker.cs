@@ -328,14 +328,14 @@ public sealed class Worker : BackgroundService
         return prior.Value != current;
     }
 
-    private static string? ResolveReason(
+    internal static string? ResolveReason(
         string? modeReason, bool transitionDetected, bool hostStateOnlyChange)
     {
         if (transitionDetected || hostStateOnlyChange)
         {
-            return AppliedReason.Combine(
-                modeReason ?? AppliedReason.HostStateTransitionDetected,
-                AppliedReason.HostStateTransitionDetected);
+            if (modeReason is null)
+                return AppliedReason.HostStateTransitionDetected;
+            return AppliedReason.Combine(modeReason, AppliedReason.HostStateTransitionDetected);
         }
         return modeReason;
     }
