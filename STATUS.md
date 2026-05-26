@@ -1,5 +1,40 @@
 # DDS Implementation Status
 
+## Docs fix (2026-05-26, 214th pass) — Correct `init-domain` flag synopsis in README
+
+### Summary
+
+Automated scheduled sweep following the 213th-pass baseline.
+
+**Documentation gap found and fixed:** `README.md` still described
+`--hybrid` as an opt-in flag for `dds-node init-domain` and showed the
+synopsis as `[--fido2 | --hybrid]`. Since Z-1 Phase A landed, hybrid
+(Ed25519 + ML-DSA-65) is the **default** — the actual opt-out flag is
+`--legacy` (Ed25519-only, tests/benchmarks only). The code's own usage
+string and the DDS-Admin-Guide were already correct; only the README
+lagged.
+
+Updated the README comment block (lines 114–118) and synopsis (line
+119) to:
+- State that hybrid is the default, requiring no flag.
+- List `--legacy` as the opt-out (benchmarks/tests only; never
+  production).
+- List `--fido2` as the hardware-authenticator opt-in.
+- Change `[--fido2 | --hybrid]` → `[--fido2 | --legacy]`.
+
+**Test results:** cargo test --workspace — **799 passed; 0 failed;
+5 ignored** (macOS ARM64, 2026-05-26; count unchanged from 213th-pass
+baseline).
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6)
+remain blocked on external design or infrastructure; no change.
+
+### Files changed
+
+- **`README.md`** — corrected `init-domain` flag synopsis and comment block.
+
+---
+
 ## Maintenance (2026-05-26, 213th pass) — Document `Reset-DdsBootstrap.ps1` in Admin Guide
 
 ### Summary

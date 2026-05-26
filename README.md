@@ -111,12 +111,13 @@ See [DDS Admin Guide — Windows Deployment](docs/DDS-Admin-Guide.md#windows-dep
 
 ```bash
 # Genesis ceremony — create a new DDS domain
-# `--fido2` protects the domain key with a hardware authenticator;
-# `--hybrid` (Z-1 Phase A) opts the new domain into Ed25519 + ML-DSA-65
-# so admission certs + revocations carry a PQ signature alongside the
-# Ed25519 one. The two flags are mutually exclusive (v6 hybrid+FIDO2
-# is a future Phase A-3 follow-up).
-dds-node init-domain --name acme.com --dir ./acme [--fido2 | --hybrid]
+# Hybrid (Ed25519 + ML-DSA-65) is the default — no flag needed for
+# production deployments. `--fido2` protects the domain key with a
+# hardware authenticator (Ed25519-only today; v6 hybrid+FIDO2 is a
+# future Phase A-3 follow-up). `--legacy` opts back into Ed25519-only
+# v1/v2 and is for benchmarks/tests only; never use in production.
+# `--fido2` and `--legacy` are mutually exclusive.
+dds-node init-domain --name acme.com --dir ./acme [--fido2 | --legacy]
 
 # Generate node identity and print PeerId
 dds-node gen-node-key --data-dir ~/.dds
