@@ -228,10 +228,17 @@ dds stats --format json                  # same, scriptable
 dds health                               # /readyz + summary; exit 0 when ready
 dds health --format json                 # checks body for orchestrator parsing
 
+# Post-quantum (Z-1 Phase B — enc-v3 domains)
+dds pq status                            # hybrid KEM pubkey, epoch_id, peer coverage
+dds pq list-pubkeys                      # per-peer KEM pubkey hashes (100% = enc-v3 ready)
+dds pq rotate                            # manual epoch-key rotation (admin-gated)
+
 # Air-gapped sync (USB stick / courier)
 dds --data-dir ./node-a export --out sync.ddsdump   # package tokens + CRDT ops + revocations
 dds --data-dir ./node-b import --in  sync.ddsdump   # idempotent merge into sibling node
 dds --data-dir ./node-b import --in  sync.ddsdump --dry-run   # preview only
+dds --data-dir ./node-a export --out sync.ddsdump \
+    --encrypt-to <hex-kem-pubkey>        # Z-5: encrypt for a specific recipient
 ```
 
 ### HTTP API (`dds-node`)

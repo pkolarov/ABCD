@@ -3509,19 +3509,27 @@ dds debug stats
 
 ### Validate a config file
 
-Parses a `dds-node` `config.toml` without starting the node, and surfaces
-the operational-readiness fields that are easy to misspell:
+Parses a `dds-node` `config.toml` without starting the node and prints a
+structured summary of every meaningful field:
 
 ```bash
 dds debug config ./dds.toml
 ```
 
-Prints the top-level keys plus any of:
-`max_chain_depth`, `max_delegation_depth`, `audit_log_enabled`,
-`audit_log_max_entries`, `audit_log_retention_days`.
+On success (`Schema: OK`) the output includes:
 
-Bad TOML exits non-zero with a clear message — use this in CI to smoke-
-test generated configs before rolling them out.
+- Top-level: `org_hash`, `data_dir`, `expiry_scan_interval_secs`
+- `[domain]`: `name`, `id`, pubkey preview, hybrid/legacy status
+  (`pq_pubkey`), `max_delegation_depth`, `audit_log_enabled`,
+  `audit_log_max_entries` and `audit_log_retention_days` (when non-zero),
+  `enforce_device_scope_vouch`, `allow_unattested_credentials`,
+  AAGUID allowlist size, attestation-root table size
+- `[network]`: `listen_addr`, `api_addr`, `mdns_enabled`, bootstrap-peer
+  count, `metrics_addr` (when set)
+- Trusted-roots count
+
+Bad TOML or a schema error exits non-zero with a clear message — use
+this in CI to smoke-test generated configs before rolling them out.
 
 ### Node-side logs
 
