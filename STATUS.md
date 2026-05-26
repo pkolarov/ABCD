@@ -1,5 +1,60 @@
 # DDS Implementation Status
 
+## Docs fix (2026-05-26, 220th pass) — Add dds pq CLI examples to README and update debug config description in Admin Guide
+
+### Summary
+
+Automated scheduled sweep following the 219th-pass baseline.
+
+**Documentation gaps found and fixed:**
+
+**README.md** — CLI quick-reference block was missing the `dds pq`
+subcommands (`status`, `list-pubkeys`, `rotate`) and the `--encrypt-to`
+flag for `dds export`. These commands have been fully implemented since
+the Z-1 Phase B passes (2026-05-01) and documented in the Admin Guide's
+Phase B section, but the quick-reference was never updated. Added:
+
+```
+# Post-quantum (Z-1 Phase B — enc-v3 domains)
+dds pq status                            # hybrid KEM pubkey, epoch_id, peer coverage
+dds pq list-pubkeys                      # per-peer KEM pubkey hashes (100% = enc-v3 ready)
+dds pq rotate                            # manual epoch-key rotation (admin-gated)
+```
+
+and the `--encrypt-to <hex-kem-pubkey>` example for `dds export`.
+
+**docs/DDS-Admin-Guide.md** — the "Validate a config file" section for
+`dds debug config` still described the pre-218th-pass output: _"Prints
+the top-level keys plus any of: max_chain_depth, max_delegation_depth,
+audit_log_enabled, audit_log_max_entries, audit_log_retention_days."_
+The 218th pass upgraded the command to full NodeConfig schema validation
+with a rich structured summary (all `[domain]`, `[network]`, and
+top-level fields), but the Admin Guide was not updated. Rewrote the
+section to match the current output.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK`
+markers in production src. The single `TODO(security)` at
+`dds-node/src/service.rs:2718` (M-22 OS-bound key-wrapping) is
+unchanged.
+
+**Test results:** All pass — 799 lib tests (0 failed, 5 ignored),
+23 CLI smoke tests (0 failed), 2 http_binary_e2e tests (0 failed).
+Documentation-only change; no new tests required.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI;
+no change.
+
+### Files changed
+
+- **`README.md`** — CLI block: added `dds pq status/list-pubkeys/rotate`
+  quick-reference section and `dds export --encrypt-to` example.
+- **`docs/DDS-Admin-Guide.md`** — "Validate a config file" section:
+  replaced stale field list with accurate structured-summary description
+  matching the 218th-pass implementation.
+
+---
+
 ## Fix (2026-05-26, 219th pass) — Fix smoke tests broken by 218th-pass NodeConfig schema validation upgrade
 
 ### Summary
