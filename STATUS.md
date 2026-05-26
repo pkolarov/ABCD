@@ -1,5 +1,66 @@
 # DDS Implementation Status
 
+## Docs fix (2026-05-26, 217th pass) — README HTTP API table and CLI block missing 11 implemented endpoints
+
+### Summary
+
+Automated scheduled sweep following the 216th-pass baseline.
+
+**Documentation gap found and fixed:** The `README.md` HTTP API table and
+`dds platform` CLI example block were still incomplete after the 216th pass,
+which only added `GET /v1/linux/policies`. The following 11 implemented
+endpoints were missing from the table, and the CLI block was missing 4 examples:
+
+**HTTP API table additions (11 endpoints):**
+
+| Added | Purpose |
+|---|---|
+| `GET /v1/enroll/challenge` | FIDO2 challenge for enrollment ceremony (admin-gated) |
+| `GET /v1/admin/challenge` | FIDO2 challenge for admin ceremony (admin-gated) |
+| `POST /v1/admin/setup` | One-time bootstrap / first trusted root (admin-gated) |
+| `POST /v1/admin/vouch` | Issue vouch token for subject (admin-gated) |
+| `GET /v1/windows/software` | Windows software assignments for device |
+| `POST /v1/windows/applied` | Windows applied-policy report from agent |
+| `POST /v1/windows/claim-account` | Bind Windows logon session to DDS identity |
+| `GET /v1/macos/software` | macOS software assignments for device |
+| `POST /v1/macos/applied` | macOS applied-policy report from agent |
+| `GET /v1/linux/software` | Linux software assignments for device |
+| `POST /v1/linux/applied` | Linux applied-policy report from agent |
+
+All of these routes have been in `dds-node/src/http.rs` since their respective
+implementation passes and are already covered by the 216th-pass http.rs docstring
+update. The README table is the developer-facing quick reference and was lagging.
+
+**CLI example block additions (4 lines):**
+- `dds platform macos software --device-urn ...`
+- `dds platform macos applied --from-file report.json`
+- `dds platform linux software --device-urn ...`
+- `dds platform linux applied --from-file report.json`
+
+The Windows examples for these subcommands were already present; macOS and Linux
+were absent despite the subcommands shipping alongside Windows in the same pass.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK`
+markers found in production src. The single `TODO(security)` at
+`dds-node/src/service.rs:2718` (M-22 OS-bound key-wrapping) remains
+unchanged.
+
+**Test results:** `cargo test --workspace --lib` — **799 passed; 0 failed;
+5 ignored** (macOS ARM64, 2026-05-26; count unchanged from 216th-pass
+baseline). Documentation-only change; no new tests required.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI; no
+change.
+
+### Files changed
+
+- **`README.md`** — HTTP API table: added 11 previously-missing endpoint rows
+  and clarified admin-gating on 5 existing rows. CLI block: added 4 macOS and
+  Linux platform subcommand examples that matched the existing Windows pattern.
+
+---
+
 ## Fix (2026-05-26, 215th pass) — DdsConsole.ps1: provision success check used wrong path variable
 
 ### Summary

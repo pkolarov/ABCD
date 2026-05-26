@@ -206,7 +206,11 @@ dds platform windows software  --device-urn urn:vouchsafe:laptop.<hash>
 dds platform windows applied   --from-file report.json
 dds platform windows claim-account --device-urn ... --session-token-b64 <b64>
 dds platform macos   policies  --device-urn ...
+dds platform macos   software  --device-urn ...
+dds platform macos   applied   --from-file report.json
 dds platform linux   policies  --device-urn ...
+dds platform linux   software  --device-urn ...
+dds platform linux   applied   --from-file report.json
 
 # Credential Provider helpers
 dds cp enrolled-users [--device-urn ...]
@@ -251,19 +255,30 @@ this secret; locally, run
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| `POST` | `/v1/enroll/user` | FIDO2/passkey user enrollment |
-| `POST` | `/v1/enroll/device` | Device enrollment + hardware attestation |
+| `GET` | `/v1/enroll/challenge` | Fresh FIDO2 challenge for enrollment ceremony (admin-gated) |
+| `POST` | `/v1/enroll/user` | FIDO2/passkey user enrollment (admin-gated) |
+| `POST` | `/v1/enroll/device` | Device enrollment + hardware attestation (admin-gated) |
+| `GET` | `/v1/enrolled-users` | List enrolled users (admin-gated) |
+| `GET` | `/v1/admin/challenge` | Fresh FIDO2 challenge for admin ceremony (admin-gated) |
+| `POST` | `/v1/admin/setup` | One-time bootstrap: create first trusted root (admin-gated) |
+| `POST` | `/v1/admin/vouch` | Issue vouch token for a subject (admin-gated) |
 | `GET` | `/v1/session/challenge` | Fresh single-use session challenge |
 | `POST` | `/v1/session/assert` | Issue session from FIDO2 assertion |
-| `GET` | `/v1/enrolled-users` | List enrolled users |
 | `POST` | `/v1/policy/evaluate` | Offline policy evaluation |
 | `GET` | `/v1/status` | Node diagnostics (peers, DAG, trust) |
 | `GET` | `/v1/node/info` | Node pubkey + peer id (for agent pinning) |
-| `GET` | `/v1/windows/policies` | Windows policy for this device |
-| `GET` | `/v1/macos/policies` | macOS policy for this device |
-| `GET` | `/v1/linux/policies` | Linux policy for this device |
-| `GET` | `/v1/audit/entries` | Signed audit-log slice |
-| `POST` | `/v1/pq/rotate` | Rotate PQ epoch key (admin) |
+| `GET` | `/v1/audit/entries` | Signed audit-log slice (admin-gated) |
+| `POST` | `/v1/pq/rotate` | Rotate PQ epoch key (admin-gated) |
+| `GET` | `/v1/windows/policies` | Windows policy documents for this device |
+| `GET` | `/v1/windows/software` | Windows software assignments for this device |
+| `POST` | `/v1/windows/applied` | Record Windows applied-policy report from agent |
+| `POST` | `/v1/windows/claim-account` | Bind a Windows logon session to a DDS identity |
+| `GET` | `/v1/macos/policies` | macOS policy documents for this device |
+| `GET` | `/v1/macos/software` | macOS software assignments for this device |
+| `POST` | `/v1/macos/applied` | Record macOS applied-policy report from agent |
+| `GET` | `/v1/linux/policies` | Linux policy documents for this device |
+| `GET` | `/v1/linux/software` | Linux software assignments for this device |
+| `POST` | `/v1/linux/applied` | Record Linux applied-policy report from agent |
 | `GET` | `/healthz`, `/readyz` | Orchestrator probes (Phase D) |
 
 Set `network.metrics_addr = "127.0.0.1:9495"` to expose Prometheus
