@@ -1,5 +1,52 @@
 # DDS Implementation Status
 
+## Fix (2026-05-26, 218th pass) — `dds debug config`: replace generic TOML dump with full NodeConfig schema validation
+
+### Summary
+
+Manual sweep following the 217th-pass baseline.
+
+**In-progress change found and completed:** `dds-cli/src/main.rs` had an
+unstaged improvement to the `dds debug config` subcommand. The original
+implementation parsed the TOML file as a generic `toml::Value` and printed
+a handful of hard-coded field names via optional `.get()` lookups. The
+new implementation calls `NodeConfig::from_str()` directly, which:
+
+1. **Schema-validates the file** — unknown fields, type mismatches, and
+   missing required fields are caught and reported as `Schema validation
+   failed: …` instead of silently succeeding with incomplete output.
+2. **Shows a rich summary** — org_hash, data_dir, expiry_scan_interval_secs,
+   all DomainConfig fields (name, id, pubkey preview, pq_pubkey hybrid
+   status, max_delegation_depth, audit settings, enforce_device_scope_vouch,
+   allow_unattested_credentials, AAGUID/attestation-root counts), all
+   NetworkConfig fields (listen_addr, api_addr, mdns_enabled,
+   bootstrap_peers count, metrics_addr if set), and trusted_roots count.
+3. **Uses typed accessors** — no more optional `.get()` chains; every
+   field is guaranteed present by the deserializer.
+
+The change also drops the stale `Note: dds-node does not expose logs
+over HTTP` footer that was misplaced under `debug config`; log tooling
+guidance belongs under `debug` or in the admin guide, not after config
+output.
+
+**Compilation:** `cargo build -p dds-cli` — clean (0 warnings).
+
+**Test results:** `cargo test --workspace --lib` — **411 passed; 0 failed;
+4 ignored** (macOS ARM64, 2026-05-26; count unchanged from 217th-pass baseline).
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI; no
+change.
+
+### Files changed
+
+- **`dds-cli/src/main.rs`** — `handle_debug` / `DebugAction::Config`:
+  replaced `toml::Value` generic parse + ad-hoc field prints with
+  `NodeConfig::from_str` schema validation and a structured summary.
+  Added `use dds_node::config::NodeConfig` import.
+
+---
+
 ## Docs fix (2026-05-26, 217th pass) — README HTTP API table and CLI block missing 11 implemented endpoints
 
 ### Summary

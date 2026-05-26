@@ -15,6 +15,7 @@ mod dump;
 use clap::{Parser, Subcommand};
 use client::{DEFAULT_NODE_URL, get_json, get_with_status, post_json, post_no_body};
 use dds_core::identity::Identity;
+use dds_node::config::NodeConfig;
 use dds_store::RedbBackend;
 use dds_store::traits::*;
 use dump::{DUMP_VERSION, DdsDump};
@@ -1729,37 +1730,60 @@ async fn handle_debug(action: DebugAction, node_url: &str) {
                 eprintln!("Failed to read {}: {e}", file.display());
                 std::process::exit(1);
             });
-            // Parse as generic TOML first so we can reject bad syntax cleanly.
-            let doc: toml::Value = toml::from_str(&body).unwrap_or_else(|e| {
-                eprintln!("Invalid TOML: {e}");
-                std::process::exit(1);
-            });
             println!("Config file: {}", file.display());
-            println!(
-                "  Top-level keys: {:?}",
-                doc.as_table().map(|t| t.keys().collect::<Vec<_>>())
-            );
-            // Highlight a few well-known fields if present.
-            if let Some(domain) = doc.get("domain") {
-                println!("\n[domain]");
-                if let Some(v) = domain.get("max_chain_depth") {
-                    println!("  max_chain_depth: {v}");
+            match NodeConfig::from_str(&body) {
+                Ok(cfg) => {
+                    println!("  Schema: OK");
+                    println!("  org_hash: {}", cfg.org_hash);
+                    println!("  data_dir: {}", cfg.data_dir.display());
+                    println!("  expiry_scan_interval_secs: {}", cfg.expiry_scan_interval_secs);
+                    println!("\n[domain]");
+                    println!("  name: {}", cfg.domain.name);
+                    println!("  id: {}", cfg.domain.id);
+                    let pubkey_preview = &cfg.domain.pubkey[..cfg.domain.pubkey.len().min(16)];
+                    println!("  pubkey: {}…", pubkey_preview);
+                    println!(
+                        "  pq_pubkey: {}",
+                        if cfg.domain.pq_pubkey.as_deref().unwrap_or("").is_empty() {
+                            "absent (Ed25519-only / legacy domain)"
+                        } else {
+                            "present (hybrid domain)"
+                        }
+                    );
+                    println!("  max_delegation_depth: {}", cfg.domain.max_delegation_depth);
+                    println!("  audit_log_enabled: {}", cfg.domain.audit_log_enabled);
+                    if cfg.domain.audit_log_max_entries > 0 {
+                        println!("  audit_log_max_entries: {}", cfg.domain.audit_log_max_entries);
+                    }
+                    if cfg.domain.audit_log_retention_days > 0 {
+                        println!("  audit_log_retention_days: {}", cfg.domain.audit_log_retention_days);
+                    }
+                    println!("  enforce_device_scope_vouch: {}", cfg.domain.enforce_device_scope_vouch);
+                    println!("  allow_unattested_credentials: {}", cfg.domain.allow_unattested_credentials);
+                    if !cfg.domain.fido2_allowed_aaguids.is_empty() {
+                        println!("  fido2_allowed_aaguids: {} entries", cfg.domain.fido2_allowed_aaguids.len());
+                    }
+                    if !cfg.domain.fido2_attestation_roots.is_empty() {
+                        println!("  fido2_attestation_roots: {} entries", cfg.domain.fido2_attestation_roots.len());
+                    }
+                    println!("\n[network]");
+                    println!("  listen_addr: {}", cfg.network.listen_addr);
+                    println!("  api_addr: {}", cfg.network.api_addr);
+                    println!("  mdns_enabled: {}", cfg.network.mdns_enabled);
+                    println!(
+                        "  bootstrap_peers: {} configured",
+                        cfg.network.bootstrap_peers.len()
+                    );
+                    if let Some(m) = &cfg.network.metrics_addr {
+                        println!("  metrics_addr: {m}");
+                    }
+                    println!("\n  trusted_roots: {} configured", cfg.trusted_roots.len());
                 }
-                if let Some(v) = domain.get("max_delegation_depth") {
-                    println!("  max_delegation_depth: {v}");
-                }
-                if let Some(v) = domain.get("audit_log_enabled") {
-                    println!("  audit_log_enabled: {v}");
-                }
-                if let Some(v) = domain.get("audit_log_max_entries") {
-                    println!("  audit_log_max_entries: {v}");
-                }
-                if let Some(v) = domain.get("audit_log_retention_days") {
-                    println!("  audit_log_retention_days: {v}");
+                Err(e) => {
+                    eprintln!("Schema validation failed: {e}");
+                    std::process::exit(1);
                 }
             }
-            println!("\nNote: dds-node does not expose logs over HTTP — use OS log tooling");
-            println!("  (journalctl, Event Viewer, `Console.app`) to view tracing output.");
         }
     }
 }
