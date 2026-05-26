@@ -59,6 +59,61 @@ change.
 
 ---
 
+## Docs fix (2026-05-26, 216th pass) — http.rs module docstring and README missing Linux API endpoints
+
+### Summary
+
+Automated scheduled sweep following the 215th-pass baseline.
+
+**Documentation gap found and fixed:** Two places omitted the Linux
+platform policy endpoints introduced alongside the Windows and macOS
+equivalents:
+
+1. **`dds-node/src/http.rs` module docstring** — The `//!` endpoint
+   list at the top of the file documented the Windows and macOS platform
+   endpoints (`GET /v1/windows/policies`, `GET /v1/macos/policies`, etc.)
+   but was entirely missing:
+   - `GET  /v1/linux/policies` / `/software` / `POST /v1/linux/applied`
+   
+   Additionally, the docstring omitted several other already-implemented
+   endpoints (`GET /v1/enroll/challenge`, `GET /v1/admin/challenge`,
+   `POST /v1/admin/setup`, `POST /v1/admin/vouch`, `GET /v1/audit/entries`,
+   `POST /v1/pq/rotate`, `GET /v1/node/info`, `GET /healthz`,
+   `GET /readyz`). Updated the docstring to list all 22 routes.
+
+2. **`README.md` API endpoint table** — The quick-reference table in the
+   Architecture/API section listed `GET /v1/windows/policies` and
+   `GET /v1/macos/policies` but omitted `GET /v1/linux/policies`. Added
+   the Linux row.
+
+3. **`README.md` CLI example block** — The `dds platform` examples showed
+   `dds platform windows policies` and `dds platform macos policies` but
+   not `dds platform linux policies`, which has been in the CLI since the
+   Linux L-2 pass. Added the Linux example line.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK`
+markers found in production src. The single `TODO(security)` at
+`dds-node/src/service.rs:2718` (M-22 OS-bound key-wrapping) remains
+unchanged.
+
+**Test results:** `cargo test --workspace --lib` — **799 passed; 0 failed;
+5 ignored** (macOS ARM64, 2026-05-26; count unchanged from 215th-pass
+baseline). Documentation-only change; no new tests required.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI; no
+change.
+
+### Files changed
+
+- **`dds-node/src/http.rs`** — Updated `//!` module docstring to list all
+  22 API routes, including the previously missing Linux, admin, pq, node-info,
+  healthz, and readyz endpoints.
+- **`README.md`** — Added `GET /v1/linux/policies` row to the API endpoint
+  table; added `dds platform linux policies` to the CLI example block.
+
+---
+
 ## Docs fix (2026-05-26, 214th pass) — Correct `init-domain` flag synopsis in README
 
 ### Summary

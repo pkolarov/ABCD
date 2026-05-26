@@ -7,15 +7,26 @@
 //! or local IPC).
 //!
 //! Endpoints:
-//! - `POST /v1/enroll/user`     -> EnrollmentResponse
-//! - `POST /v1/enroll/device`   -> EnrollmentResponse
-//! - `POST /v1/session/assert`  -> SessionResponse (from FIDO2 assertion)
-//! - `GET  /v1/enrolled-users`  -> EnrolledUsersResponse
-//! - `POST /v1/policy/evaluate` -> PolicyResponse
-//! - `GET  /v1/status`          -> StatusResponse
-//! - `GET  /v1/windows/policies` / `/software` / `POST /applied`
+//! - `POST /v1/enroll/user`       -> EnrollmentResponse
+//! - `POST /v1/enroll/device`     -> EnrollmentResponse
+//! - `GET  /v1/enroll/challenge`  -> ChallengeResponse (FIDO2 enroll ceremony)
+//! - `GET  /v1/enrolled-users`    -> EnrolledUsersResponse
+//! - `GET  /v1/admin/challenge`   -> ChallengeResponse (FIDO2 admin ceremony)
+//! - `POST /v1/admin/setup`       -> (one-time bootstrap)
+//! - `POST /v1/admin/vouch`       -> (issue vouch token)
+//! - `GET  /v1/audit/entries`     -> AuditEntriesResponse
+//! - `POST /v1/pq/rotate`         -> (manual epoch-key rotation)
+//! - `GET  /v1/session/challenge` -> ChallengeResponse (FIDO2 session ceremony)
+//! - `POST /v1/session/assert`    -> SessionResponse (from FIDO2 assertion)
+//! - `POST /v1/policy/evaluate`   -> PolicyResponse
+//! - `GET  /v1/status`            -> StatusResponse
+//! - `GET  /v1/node/info`         -> NodeInfoResponse
+//! - `GET  /healthz`              -> 200 OK (liveness probe)
+//! - `GET  /readyz`               -> 200 OK / 503 (readiness probe)
+//! - `GET  /v1/windows/policies` / `/software` / `POST /v1/windows/applied`
 //! - `POST /v1/windows/claim-account`
-//! - `GET  /v1/macos/policies` / `/software` / `POST /applied`
+//! - `GET  /v1/macos/policies` / `/software` / `POST /v1/macos/applied`
+//! - `GET  /v1/linux/policies` / `/software` / `POST /v1/linux/applied`
 
 use std::sync::Arc;
 

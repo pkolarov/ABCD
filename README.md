@@ -206,6 +206,7 @@ dds platform windows software  --device-urn urn:vouchsafe:laptop.<hash>
 dds platform windows applied   --from-file report.json
 dds platform windows claim-account --device-urn ... --session-token-b64 <b64>
 dds platform macos   policies  --device-urn ...
+dds platform linux   policies  --device-urn ...
 
 # Credential Provider helpers
 dds cp enrolled-users [--device-urn ...]
@@ -260,6 +261,7 @@ this secret; locally, run
 | `GET` | `/v1/node/info` | Node pubkey + peer id (for agent pinning) |
 | `GET` | `/v1/windows/policies` | Windows policy for this device |
 | `GET` | `/v1/macos/policies` | macOS policy for this device |
+| `GET` | `/v1/linux/policies` | Linux policy for this device |
 | `GET` | `/v1/audit/entries` | Signed audit-log slice |
 | `POST` | `/v1/pq/rotate` | Rotate PQ epoch key (admin) |
 | `GET` | `/healthz`, `/readyz` | Orchestrator probes (Phase D) |
