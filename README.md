@@ -180,7 +180,8 @@ dds-node seal-passphrase [--force] [--out 'C:\ProgramData\DDS\node-passphrase.dp
 
 The `dds` CLI wraps every `dds-node` HTTP endpoint and also exposes
 offline local-store operations. Remote subcommands share the global
-`--node-url` flag (default `http://127.0.0.1:5551`). Offline subcommands
+`--node-url` flag (default `pipe:dds-api` on Windows, `http://127.0.0.1:5551`
+on Linux/macOS — matches the MSI-installed node's `api_addr`). Offline subcommands
 share `--data-dir` (default `.dds`).
 
 ```bash

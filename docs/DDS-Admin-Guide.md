@@ -735,15 +735,13 @@ new key and re-issue the cert in one pass:
 
 ```bash
 # Stop the node first.
-sudo systemctl stop dds-node   # or launchctl unload on macOS
+sudo launchctl unload /Library/LaunchDaemons/com.dds.node.plist   # macOS
+# sudo systemctl stop dds-node   # Linux
+```
 
-# Rotate (software backend only).
-# SE backend: delete the old key from Keychain manually, then re-run
-#   provision-admission-key --backend secure-enclave.
-# TPM2 backend: rotation is pending Phase A3 (not yet implemented).
-#   Nodes configured with admission_key_backend = "tpm2" cannot use
-#   rotate-admission-key; the TPM key must be replaced via the TPM
-#   management tools once Phase A3 ships.
+**Software backend** (default): `rotate-admission-key` handles everything in one step:
+
+```bash
 dds-node rotate-admission-key --data-dir /opt/dds/data
 # Default: backs up admission_key.bin → admission_key.bin.rotated.<timestamp>
 # Add --no-backup to skip the backup.
@@ -751,6 +749,46 @@ dds-node rotate-admission-key --data-dir /opt/dds/data
 
 The command prints the old and new public keys and the admin follow-up steps
 (re-issue cert, restart node) — the same workflow as Step 2 above.
+
+**Secure Enclave backend** (macOS): `rotate-admission-key` only rotates the
+software key file. For a Secure Enclave key you must delete the existing
+Keychain entry first, then re-provision:
+
+```bash
+# Step 1 — Delete the old SE private key from the system keychain.
+# The key is stored as a kSecClassKey item with label "dds-node-admission".
+# The macOS `security` CLI does not expose a delete-key subcommand for
+# kSecClassKey items. Use one of:
+#
+#   a) Keychain Access.app:
+#      Open the System keychain → select the "Keys" category →
+#      find "dds-node-admission" → right-click → Delete.
+#
+#   b) Swift one-liner (no Xcode required, macOS 12+):
+swift - <<'EOF'
+import Security
+let query: NSDictionary = [
+    kSecClass: kSecClassKey,
+    kSecAttrKeyClass: kSecAttrKeyClassPrivate,
+    kSecAttrLabel: "dds-node-admission",
+    kSecMatchLimit: kSecMatchLimitAll,
+]
+let status = SecItemDelete(query)
+print(status == errSecSuccess || status == errSecItemNotFound
+    ? "deleted (or already absent)"
+    : "error: \(status)")
+EOF
+
+# Step 2 — Re-provision a new SE key with the same label.
+dds-node provision-admission-key --data-dir /opt/dds/data --backend secure-enclave
+```
+
+After re-provisioning, follow the same cert-reissue and restart workflow as Step 2 above.
+
+**TPM2 backend**: rotation is pending Phase A3 (not yet implemented).
+Nodes configured with `admission_key_backend = "tpm2"` cannot use
+`rotate-admission-key`; the TPM key must be replaced via the TPM
+management tools once Phase A3 ships.
 
 ### Domain-Wide Migration Window
 

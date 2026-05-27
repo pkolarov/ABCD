@@ -1,5 +1,50 @@
 # DDS Implementation Status
 
+## Docs fix (2026-05-27, 223rd pass) — Document --node-url Windows default and expand SE rotate-admission-key
+
+### Summary
+
+Automated scheduled sweep following the 222nd-pass baseline.
+
+**Documentation gaps found and fixed:**
+
+1. **`--node-url` platform default** — The CLI global flag description in README said
+   the default was `http://127.0.0.1:5551` unconditionally. In fact `client.rs` defines
+   `DEFAULT_NODE_URL` as `"pipe:dds-api"` on Windows (cfg(windows)) and
+   `"http://127.0.0.1:5551"` on Linux/macOS. Updated the README description to show
+   both values and note that the Windows pipe default matches the MSI-installed node's
+   `api_addr`.
+
+2. **`dds-node rotate-admission-key` — Secure Enclave rotation steps** — The previous
+   (222nd-pass) Admin Guide text told operators to "delete the old key from Keychain
+   manually, then re-run provision-admission-key" but gave no concrete instructions.
+   Expanded the section with:
+   - Separate headings for Software, Secure Enclave (macOS), and TPM2 backends
+   - Keychain Access.app navigation path for SE key deletion
+   - Swift one-liner (no Xcode required, macOS 12+) to delete a `kSecClassKey` item
+     with label "dds-node-admission" via `SecItemDelete`
+   - TPM2 limitation (pending Phase A3) kept intact
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src. The single `TODO(security)` at `dds-node/src/service.rs` (M-22
+OS-bound key-wrapping) is unchanged.
+
+**Test results:** All pass — 799 lib tests (0 failed, 5 ignored). Documentation-only
+change; no new tests required.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain blocked on
+external design, infrastructure provisioning, or Windows CI; no change.
+
+### Files changed
+
+- **`README.md`** — `--node-url` global flag description: clarified Windows default
+  (`pipe:dds-api`) vs Linux/macOS default (`http://127.0.0.1:5551`).
+- **`docs/DDS-Admin-Guide.md`** — `rotate-admission-key` section: replaced brief
+  comment with three clearly labelled backend subsections; added Swift/Keychain
+  step-by-step for SE rotation.
+
+---
+
 ## Docs fix (2026-05-27, 222nd pass) — Document 3 missing dds import/cp flags and fix stale --challenge-id
 
 ### Summary
