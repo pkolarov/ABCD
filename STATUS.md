@@ -1,5 +1,50 @@
 # DDS Implementation Status
 
+## Docs fix (2026-05-27, 224th pass) — Document 4 missing flags in admit/gen-hmac-secret/seal-passphrase/enroll
+
+### Summary
+
+Automated scheduled sweep following the 223rd-pass baseline.
+
+**Documentation gaps found and fixed:**
+
+1. **`dds-node admit --kem-pubkey <HEX> | --kem-pubkey-path <FILE>`** — PQ KEM pubkey flags
+   for enc-v3 encrypted gossip admission certs. Printed by `gen-node-key` and `self-admit`
+   output. Present in `main.rs` usage string and module-level doc comment but absent from
+   README quick reference. Added to README `admit` example.
+
+2. **`dds-node gen-hmac-secret --keep-existing`** — Silently no-ops if the HMAC secret file
+   already exists; used by the MSI `CA_GenHmacSecret` custom action on reinstall/repair.
+   Added `--force` / `--keep-existing` flags table to Admin Guide; updated README to show
+   both optional flags.
+
+3. **`dds-node seal-passphrase --force`** — Overwrites existing DPAPI blob with a warning
+   that identity rewrap is required. Present in code but missing from usage string and README.
+   Updated `print_usage()` and README.
+
+4. **`dds enroll user / dds admin setup --authenticator-type platform|cross-platform`** —
+   Default `"platform"`. Present in Admin Guide but missing from README quick-reference.
+   Added to both enrollment examples in README.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src. The single `TODO(security)` at `dds-node/src/service.rs` (M-22
+OS-bound key-wrapping) is unchanged.
+
+**Test results:** All pass (799 lib tests, 0 failed, 5 ignored — unchanged from 223rd-pass
+baseline). Documentation-only change; no new tests required.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain blocked; no change.
+
+### Files changed
+
+- **`README.md`** — `admit` example: added `--kem-pubkey`/`--kem-pubkey-path`; `gen-hmac-secret`:
+  added `--keep-existing`; `enroll user` and `admin setup`: added `--authenticator-type`.
+- **`dds-node/src/main.rs`** — `print_usage()`: added `--force` to `seal-passphrase` synopsis.
+- **`docs/DDS-Admin-Guide.md`** — `gen-hmac-secret`: replaced inline prose with `--force` /
+  `--keep-existing` flags table.
+
+---
+
 ## Docs fix (2026-05-27, 223rd pass) — Document --node-url Windows default and expand SE rotate-admission-key
 
 ### Summary
