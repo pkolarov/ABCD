@@ -131,7 +131,7 @@ dds-node rotate-identity --data-dir ~/.dds [--no-backup]
 # Issue admission cert for a sibling node
 dds-node admit --domain-key ./acme/domain_key.bin --domain ./acme/domain.toml \
     --peer-id 12D3KooW… [--kem-pubkey <HEX> | --kem-pubkey-path <FILE>] \
-    [--out admission.cbor] [--ttl-days 365]
+    [--admission-pubkey <HEX>] [--out admission.cbor] [--ttl-days 365]
 
 # Revoke / inspect / import an admission revocation
 # (revocations propagate domain-wide via H-12 piggy-back gossip;

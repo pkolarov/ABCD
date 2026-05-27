@@ -53,7 +53,7 @@
 //!   command refuses to run if `<DIR>/p2p_key.bin` is missing — use
 //!   `gen-node-key` for first-time provisioning.
 //!
-//! - `dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--out FILE] [--ttl-days N] [--kem-pubkey <HEX> | --kem-pubkey-path <FILE>]`
+//! - `dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--out FILE] [--ttl-days N] [--kem-pubkey <HEX> | --kem-pubkey-path <FILE>] [--admission-pubkey <HEX>]`
 //!   The admin signs an admission cert for a sibling node's peer id.
 //!   Pass `--kem-pubkey <HEX>` (from the peer's `gen-node-key` output) to
 //!   embed the peer's hybrid KEM pubkey so enc-v3 encrypted gossip works on
@@ -228,7 +228,7 @@ fn print_usage() {
   dds-node rewrap-identity --data-dir <DIR> [--no-backup]
   dds-node rotate-identity --data-dir <DIR> [--no-backup]
   dds-node gen-hmac-secret --out <FILE> [--force] [--keep-existing]
-  dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--kem-pubkey <HEX> | --kem-pubkey-path <FILE>] [--out <FILE>] [--ttl-days <N>]
+  dds-node admit --domain-key <FILE> --domain <FILE> --peer-id <ID> [--kem-pubkey <HEX> | --kem-pubkey-path <FILE>] [--admission-pubkey <HEX>] [--out <FILE>] [--ttl-days <N>]
   dds-node revoke-admission --domain-key <FILE> --domain <FILE> --peer-id <ID> [--reason <STR>] [--out <FILE>]
   dds-node import-revocation --data-dir <DIR> --in <FILE> [--config <PATH>]
   dds-node list-revocations --data-dir <DIR> [--json] [--config <PATH>]

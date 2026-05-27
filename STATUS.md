@@ -1,5 +1,40 @@
 # DDS Implementation Status
 
+## Docs fix (2026-05-27, 225th pass) — Document --admission-pubkey in admit usage string and README
+
+### Summary
+
+Automated scheduled sweep following the 224th-pass baseline.
+
+**Documentation gap found and fixed:**
+
+1. **`dds-node admit --admission-pubkey <HEX>`** — The Phase A2 flag for hardware-bound
+   admission key binding was fully implemented in `cmd_admit` via `parse_admission_pubkey_flag`
+   and documented in the Admin Guide (`docs/DDS-Admin-Guide.md` §7, lines 673, 682, 695), but
+   was absent from three places:
+   - The module-level doc comment in `dds-node/src/main.rs` (admit subcommand synopsis)
+   - The `print_usage()` synopsis string in `dds-node/src/main.rs`
+   - The README quick-reference `admit` example block
+
+   Added `[--admission-pubkey <HEX>]` to all three locations, consistent with the Admin Guide.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src. The single `TODO(security)` at `dds-node/src/service.rs` (M-22
+OS-bound key-wrapping) is unchanged.
+
+**Test results:** All pass (799 lib tests, 0 failed, 5 ignored — unchanged from 224th-pass
+baseline). Documentation-only change; no new tests required.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain blocked; no change.
+
+### Files changed
+
+- **`dds-node/src/main.rs`** — module-level `admit` doc synopsis: added `[--admission-pubkey <HEX>]`;
+  `print_usage()` admit line: same addition.
+- **`README.md`** — `admit` quick-reference example: added `[--admission-pubkey <HEX>]`.
+
+---
+
 ## Docs fix (2026-05-27, 224th pass) — Document 4 missing flags in admit/gen-hmac-secret/seal-passphrase/enroll
 
 ### Summary
