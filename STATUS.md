@@ -1,5 +1,49 @@
 # DDS Implementation Status
 
+## Docs fix (2026-05-27, 222nd pass) — Document 3 missing dds import/cp flags and fix stale --challenge-id
+
+### Summary
+
+Automated scheduled sweep following the 221st-pass baseline.
+
+**Documentation gaps found and fixed:**
+
+**README.md + docs/DDS-Admin-Guide.md** — Three CLI documentation issues:
+
+1. **`dds import --allow-unsigned`** — M-16 escape hatch for one-time migration of
+   pre-v2 (unsigned) dumps. Implemented in `dds-cli/src/main.rs` (CL `allow_unsigned:
+   bool`) but never documented. Added to README quick-reference and Admin Guide
+   air-gapped sync commands block with the CLI's own warning text.
+
+2. **`dds cp session-assert --subject-urn / --duration-secs`** — two optional flags
+   in the clap definition (`subject_urn: Option<String>` and `duration_secs: u64`,
+   default 3600) that were absent from both README and Admin Guide.
+
+3. **Stale `--challenge-id` in Admin Guide** — the `dds cp session-assert` "Via CLI"
+   example listed `--challenge-id` which was never part of the CLI implementation
+   (the challenge is embedded in the authenticator-data). Removed the bogus flag.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src. The single `TODO(security)` at `dds-node/src/service.rs:2718`
+(M-22 OS-bound key-wrapping) is unchanged.
+
+**Test results:** All pass — 799 lib tests (0 failed, 5 ignored), 23 CLI smoke
+tests (0 failed). Documentation-only change; no new tests required.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI;
+no change.
+
+### Files changed
+
+- **`README.md`** — CLI block: added `--allow-unsigned` to `dds import` example;
+  added `[--subject-urn …] [--duration-secs 3600]` to `dds cp session-assert`.
+- **`docs/DDS-Admin-Guide.md`** — "Via CLI" (session-assert): removed bogus
+  `--challenge-id`, added `--subject-urn` and `--duration-secs`. Air-gapped sync
+  commands block: added `--allow-unsigned` example with warning text.
+
+---
+
 ## Docs fix (2026-05-27, 221st pass) — Add 7 missing dds-node subcommands to README quick reference
 
 ### Summary
