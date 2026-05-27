@@ -237,7 +237,8 @@ dds platform linux   applied   --from-file report.json
 # Credential Provider helpers
 dds cp enrolled-users [--device-urn ...]
 dds cp session-assert --credential-id ... --authenticator-data ... \
-    --client-data-hash ... --signature ...
+    --client-data-hash ... --signature ... \
+    [--subject-urn urn:vouchsafe:...] [--duration-secs 3600]
 
 # Debugging
 dds debug ping                           # reachability check
@@ -259,6 +260,7 @@ dds pq rotate                            # manual epoch-key rotation (admin-gate
 dds --data-dir ./node-a export --out sync.ddsdump   # package tokens + CRDT ops + revocations
 dds --data-dir ./node-b import --in  sync.ddsdump   # idempotent merge into sibling node
 dds --data-dir ./node-b import --in  sync.ddsdump --dry-run   # preview only
+dds --data-dir ./node-b import --in  sync.ddsdump --allow-unsigned  # M-16: migrate pre-v2 (unsigned) dump
 dds --data-dir ./node-a export --out sync.ddsdump \
     --encrypt-to <hex-kem-pubkey>        # Z-5: encrypt for a specific recipient
 ```

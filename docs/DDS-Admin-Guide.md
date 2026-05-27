@@ -1293,10 +1293,11 @@ The `challenge_id` is single-use: a second POST with the same ID is rejected wit
 ```bash
 dds cp --node-url http://127.0.0.1:5551 session-assert \
     --credential-id <b64> \
-    --challenge-id <challenge_id> \
     --authenticator-data <b64> \
     --client-data-hash <b64> \
-    --signature <b64>
+    --signature <b64> \
+    [--subject-urn urn:vouchsafe:<user>.<hash>]  # optional: assert on behalf of a specific user
+    [--duration-secs 3600]                        # optional: session TTL (default 3600 s)
 ```
 
 ### Session Expiry
@@ -3657,6 +3658,14 @@ dds --data-dir /var/lib/dds import --in /mnt/usb/acme-2026-05.ddsdump
 
 # Preview-only (no writes). Useful when verifying a dump before applying.
 dds --data-dir /var/lib/dds import --in /mnt/usb/acme-2026-05.ddsdump --dry-run
+
+# Legacy migration: import a pre-v2 (unsigned) dump (M-16 escape hatch).
+# Only use when migrating from a host that predates the M-16 signature
+# requirement; requires out-of-band chain of custody verification.
+dds --data-dir /var/lib/dds import --in /mnt/usb/legacy.ddsdump --allow-unsigned
+# WARNING: loading legacy vN dump with --allow-unsigned — no cryptographic
+#          integrity check is possible. Verify the dump was transferred
+#          through a trusted channel.
 ```
 
 ### Domain-id enforcement
