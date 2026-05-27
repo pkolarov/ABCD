@@ -956,8 +956,12 @@ dds-node gen-hmac-secret --out /var/lib/dds/node-hmac.key
 ```
 
 The file is a fresh 32-byte random key with `0o600` permissions on
-Unix. Pass `--force` to rotate; reinstalls skip overwriting so the
-node and Auth Bridge stay in sync.
+Unix.
+
+| Flag | Purpose |
+|---|---|
+| `--force` | Overwrite an existing secret (use for manual rotation). |
+| `--keep-existing` | Silently no-op if the file already exists. Passed by the MSI `CA_GenHmacSecret` custom action on reinstall/repair so the node and Auth Bridge stay in sync. Not intended for direct operator use. |
 
 ##### Windows Auth Bridge registry knobs (`HKLM\SOFTWARE\DDS\AuthBridge`)
 

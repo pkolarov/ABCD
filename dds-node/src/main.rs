@@ -239,7 +239,7 @@ fn print_usage() {
   dds-node rotate-admission-key --data-dir <DIR> [--no-backup]
   dds-node stamp-agent-pubkey --data-dir <DIR> --config-dir <DIR>
   dds-node run [config.toml]
-  dds-node seal-passphrase [--out <PATH>]  (Windows only)"
+  dds-node seal-passphrase [--force] [--out <PATH>]  (Windows only)"
     );
 }
 

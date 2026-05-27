@@ -130,7 +130,8 @@ dds-node rotate-identity --data-dir ~/.dds [--no-backup]
 
 # Issue admission cert for a sibling node
 dds-node admit --domain-key ./acme/domain_key.bin --domain ./acme/domain.toml \
-    --peer-id 12D3KooW… [--out admission.cbor] [--ttl-days 365]
+    --peer-id 12D3KooW… [--kem-pubkey <HEX> | --kem-pubkey-path <FILE>] \
+    [--out admission.cbor] [--ttl-days 365]
 
 # Revoke / inspect / import an admission revocation
 # (revocations propagate domain-wide via H-12 piggy-back gossip;
@@ -161,7 +162,7 @@ dds-node self-admit --data-dir ~/.dds [--domain-key ./acme/domain_key.bin] \
 dds-node rewrap-identity --data-dir ~/.dds [--no-backup]
 
 # Generate HMAC secret for HTTP response-integrity verification
-dds-node gen-hmac-secret --out ~/.dds/node-hmac.key [--force]
+dds-node gen-hmac-secret --out ~/.dds/node-hmac.key [--force] [--keep-existing]
 
 # Provision the admission signing key (software, secure-enclave, or tpm2)
 dds-node provision-admission-key --data-dir ~/.dds [--backend software]
@@ -204,14 +205,14 @@ dds policy check --user ... --resource ... --action ... --remote
 # Enrollment
 dds enroll user   --label alice --credential-id <b64url> \
     --attestation-object <b64> --client-data-hash <b64> \
-    --rp-id example.com --display-name "Alice"
+    --rp-id example.com --display-name "Alice" [--authenticator-type platform|cross-platform]
 dds enroll device --label laptop --device-id <uuid> --hostname lap01 \
     --os windows --os-version 11
 
 # Admin bootstrap (first admin / subsequent vouches)
 dds admin setup --label root-admin --credential-id <b64url> \
     --attestation-object <b64> --client-data-hash <b64> \
-    --rp-id example.com --display-name "Root"
+    --rp-id example.com --display-name "Root" [--authenticator-type platform|cross-platform]
 dds admin vouch --subject-urn urn:vouchsafe:bob.<hash> \
     --credential-id <b64url> --authenticator-data <b64> \
     --client-data-hash <b64> --signature <b64> --purpose group:admins
