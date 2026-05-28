@@ -1,5 +1,46 @@
 # DDS Implementation Status
 
+## Docs fix (2026-05-28, 226th pass) — Document 3 missing CLI flags (admit KEM, gen-hmac-secret keep-existing)
+
+### Summary
+
+Automated scheduled sweep following the 225th-pass baseline.
+
+**Documentation gaps found and fixed:**
+
+1. **README `dds-node admit` missing `--kem-pubkey` / `--kem-pubkey-path`** — The
+   quick-reference example omitted the optional PQ flags `--kem-pubkey <HEX>` and
+   `--kem-pubkey-path <FILE>` even though they have been implemented since Z-1 Phase A
+   and are well-documented in the Admin Guide. Added both to the README admit example
+   (mirroring the full usage string in `dds-node/src/main.rs`).
+
+2. **README `dds-node gen-hmac-secret` missing `--keep-existing`** — Only `--force`
+   was documented; the `--keep-existing` flag used by the MSI `CA_GenHmacSecret`
+   custom action on reinstall/repair was absent from both README and Admin Guide.
+   Added `[--keep-existing]` to the README quick-reference and added a two-row flags
+   table to the Admin Guide prose block explaining both `--force` and `--keep-existing`
+   with their distinct use-cases.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src. The single `TODO(security)` at `dds-node/src/service.rs` (M-22
+OS-bound key-wrapping) is unchanged.
+
+**Test results:** All pass — 799 lib tests (0 failed, 5 ignored). Documentation-only
+change; no new tests required.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain blocked on
+external design, infrastructure provisioning, or Windows CI; no change.
+
+### Files changed
+
+- **`README.md`** — `dds-node admit`: added `--kem-pubkey`/`--kem-pubkey-path` flags.
+  `dds-node gen-hmac-secret`: added `--keep-existing` flag.
+- **`docs/DDS-Admin-Guide.md`** — `Provisioning the response-MAC secret`: replaced
+  one-sentence prose on `--force` with an explicit two-row flags table covering both
+  `--force` and `--keep-existing`.
+
+---
+
 ## Docs fix (2026-05-27, 225th pass) — Document --admission-pubkey in admit usage string and README
 
 ### Summary

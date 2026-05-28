@@ -138,8 +138,8 @@ dds-node admit --domain-key ./acme/domain_key.bin --domain ./acme/domain.toml \
 #  the manual import path stays as a force-immediate fallback)
 dds-node revoke-admission --domain-key ./acme/domain_key.bin --domain ./acme/domain.toml \
     --peer-id 12D3KooW… [--reason "key compromise"] [--out admission_revocation.cbor]
-dds-node import-revocation --data-dir ~/.dds --in admission_revocation.cbor
-dds-node list-revocations --data-dir ~/.dds [--json]
+dds-node import-revocation --data-dir ~/.dds --in admission_revocation.cbor [--config <PATH>]
+dds-node list-revocations --data-dir ~/.dds [--json] [--config <PATH>]
 
 # Tighten the data-directory DACL (Windows MSI custom action target;
 # no-op on macOS/Linux where Unix file modes are authoritative)

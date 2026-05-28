@@ -313,7 +313,8 @@ dds-node revoke-admission \
 ```bash
 dds-node import-revocation \
   --data-dir /opt/dds/data \
-  --in admission_revocation.cbor
+  --in admission_revocation.cbor \
+  [--config /etc/dds/node.toml]   # optional; falls back to <data_dir>/dds.toml
 ```
 
 The new entry takes effect at the next admission handshake — restart
@@ -343,7 +344,7 @@ currently on the network.
 ### Step 3: Verify the revocation landed
 
 ```bash
-dds-node list-revocations --data-dir /opt/dds/data
+dds-node list-revocations --data-dir /opt/dds/data [--json] [--config /etc/dds/node.toml]
 ```
 
 Sample output:
@@ -2265,10 +2266,23 @@ dds-node.exe seal-passphrase --force          # regenerate
 dds-node.exe seal-passphrase --out <PATH>     # write to a custom path
 ```
 
-The sealed blob is consumed at node start by a service wrapper script that
-calls `dds-node.exe unseal-passphrase-from <PATH>` and sets
-`DDS_NODE_PASSPHRASE` before launching `dds-node.exe run`. See
-`platform/windows/installer/DdsBundle.wxs` for the full sequence.
+The sealed blob is consumed at node start by the built-in `service-run`
+subcommand. The MSI registers the Windows service with:
+
+```
+dds-node.exe service-run --config "<DIR_CONFIG>node.toml"
+    --unseal-passphrase-from "%ProgramData%\DDS\node-passphrase.dpapi"
+```
+
+`service-run` reads the DPAPI blob at `--unseal-passphrase-from`, calls
+`CryptUnprotectData`, sets `DDS_NODE_PASSPHRASE` in-process, and then
+starts the node — all before the Service Control Manager dispatcher is
+entered. See `platform/windows/installer/DdsBundle.wxs` and
+`dds-node/src/win_service.rs` for the full sequence.
+
+> **Note:** `service-run` is an internal SCM dispatch path used only by
+> the service registration. Do not invoke it directly from a shell — use
+> `dds-node run <config.toml>` for interactive starts.
 
 > **Note:** `seal-passphrase` is only functional on Windows (DPAPI). On
 > macOS/Linux the equivalent is the `dds-keychain-seal` / `dds-tpm-seal`
