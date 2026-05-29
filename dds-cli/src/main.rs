@@ -1739,7 +1739,11 @@ async fn handle_debug(action: DebugAction, node_url: &str) {
             println!("  node_pubkey_b64:     {}", info.node_pubkey_b64);
             println!(
                 "  admin_setup_open:    {}",
-                if info.admin_setup_available { "yes (bootstrap gate open)" } else { "no" }
+                if info.admin_setup_available {
+                    "yes (bootstrap gate open)"
+                } else {
+                    "no"
+                }
             );
         }
         DebugAction::Config { file } => {
@@ -1753,7 +1757,10 @@ async fn handle_debug(action: DebugAction, node_url: &str) {
                     println!("  Schema: OK");
                     println!("  org_hash: {}", cfg.org_hash);
                     println!("  data_dir: {}", cfg.data_dir.display());
-                    println!("  expiry_scan_interval_secs: {}", cfg.expiry_scan_interval_secs);
+                    println!(
+                        "  expiry_scan_interval_secs: {}",
+                        cfg.expiry_scan_interval_secs
+                    );
                     println!("\n[domain]");
                     println!("  name: {}", cfg.domain.name);
                     println!("  id: {}", cfg.domain.id);
@@ -1767,21 +1774,42 @@ async fn handle_debug(action: DebugAction, node_url: &str) {
                             "present (hybrid domain)"
                         }
                     );
-                    println!("  max_delegation_depth: {}", cfg.domain.max_delegation_depth);
+                    println!(
+                        "  max_delegation_depth: {}",
+                        cfg.domain.max_delegation_depth
+                    );
                     println!("  audit_log_enabled: {}", cfg.domain.audit_log_enabled);
                     if cfg.domain.audit_log_max_entries > 0 {
-                        println!("  audit_log_max_entries: {}", cfg.domain.audit_log_max_entries);
+                        println!(
+                            "  audit_log_max_entries: {}",
+                            cfg.domain.audit_log_max_entries
+                        );
                     }
                     if cfg.domain.audit_log_retention_days > 0 {
-                        println!("  audit_log_retention_days: {}", cfg.domain.audit_log_retention_days);
+                        println!(
+                            "  audit_log_retention_days: {}",
+                            cfg.domain.audit_log_retention_days
+                        );
                     }
-                    println!("  enforce_device_scope_vouch: {}", cfg.domain.enforce_device_scope_vouch);
-                    println!("  allow_unattested_credentials: {}", cfg.domain.allow_unattested_credentials);
+                    println!(
+                        "  enforce_device_scope_vouch: {}",
+                        cfg.domain.enforce_device_scope_vouch
+                    );
+                    println!(
+                        "  allow_unattested_credentials: {}",
+                        cfg.domain.allow_unattested_credentials
+                    );
                     if !cfg.domain.fido2_allowed_aaguids.is_empty() {
-                        println!("  fido2_allowed_aaguids: {} entries", cfg.domain.fido2_allowed_aaguids.len());
+                        println!(
+                            "  fido2_allowed_aaguids: {} entries",
+                            cfg.domain.fido2_allowed_aaguids.len()
+                        );
                     }
                     if !cfg.domain.fido2_attestation_roots.is_empty() {
-                        println!("  fido2_attestation_roots: {} entries", cfg.domain.fido2_attestation_roots.len());
+                        println!(
+                            "  fido2_attestation_roots: {} entries",
+                            cfg.domain.fido2_attestation_roots.len()
+                        );
                     }
                     println!("\n[network]");
                     println!("  listen_addr: {}", cfg.network.listen_addr);
