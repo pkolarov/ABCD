@@ -165,7 +165,7 @@ dds-node rewrap-identity --data-dir ~/.dds [--no-backup]
 dds-node gen-hmac-secret --out ~/.dds/node-hmac.key [--force] [--keep-existing]
 
 # Provision the admission signing key (software, secure-enclave, or tpm2)
-dds-node provision-admission-key --data-dir ~/.dds [--backend software]
+dds-node provision-admission-key --data-dir ~/.dds [--backend software|secure-enclave|tpm2(pending)]
 
 # Rotate the admission signing key in place (backs up old key by default)
 dds-node rotate-admission-key --data-dir ~/.dds [--no-backup]
@@ -220,9 +220,10 @@ dds admin vouch --subject-urn urn:vouchsafe:bob.<hash> \
 # Audit log
 dds audit list                           # newest first
 dds audit list --action vouch --limit 50
-dds audit tail --follow-interval 5       # SIEM JSONL stream
+dds audit tail [--since <TS>] [--format jsonl|cef|syslog] [--follow-interval 5] [--action <ACT>]
 dds audit verify                         # walk + verify the chain
-dds audit export --since 0 --out audit.jsonl   # one-shot range dump for forensics
+dds audit export --since 0 --out audit.jsonl \
+    [--until <TS>] [--format jsonl|cef|syslog] [--action <ACT>]  # one-shot range dump
 
 # Platform applier queries (agent-facing, but useful for debugging)
 dds platform windows policies  --device-urn urn:vouchsafe:laptop.<hash>

@@ -1,5 +1,49 @@
 # DDS Implementation Status
 
+## Docs fix (2026-05-29, 227th pass) — Document 3 README gaps (provision-admission-key backends, audit tail/export options)
+
+### Summary
+
+Automated scheduled sweep following the 226th-pass baseline.
+
+**Documentation gaps found and fixed:**
+
+1. **README `dds-node provision-admission-key` backend options incomplete** — The
+   quick-reference showed only `[--backend software]` even though the comment above
+   the line says "software, secure-enclave, or tpm2" and `print_usage()` correctly
+   prints `[--backend software|secure-enclave|tpm2(pending)]`. Updated the README
+   example to match `print_usage()` exactly: `[--backend software|secure-enclave|tpm2(pending)]`.
+
+2. **README `dds audit tail` missing `--since`, `--format`, `--action` options** —
+   The quick-reference only showed `--follow-interval 5`, omitting the three other
+   supported flags (`--since <TS>`, `--format jsonl|cef|syslog`, `--action <ACT>`).
+   Expanded the example to show all four flags. The Admin Guide already had the full
+   form at line 3496.
+
+3. **README `dds audit export` missing `--until`, `--format`, `--action` options** —
+   Only `--since` and `--out` were shown; the remaining three optional flags were
+   absent. Expanded to show all optional flags inline. The Admin Guide already had
+   the complete example at lines 3507–3509.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src. The single `TODO(security)` at `dds-node/src/service.rs` (M-22
+OS-bound key-wrapping) is unchanged.
+
+**Test results:** All pass — 799 lib tests (0 failed, 5 ignored). Documentation-only
+change; no new tests required.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain blocked on
+external design, infrastructure provisioning, or Windows CI; no change.
+
+### Files changed
+
+- **`README.md`** — `dds-node provision-admission-key`: expanded `[--backend software]`
+  to `[--backend software|secure-enclave|tpm2(pending)]`; `dds audit tail`: added
+  `--since`, `--format`, `--action`; `dds audit export`: added `--until`, `--format`,
+  `--action`.
+
+---
+
 ## Docs fix (2026-05-28, 226th pass) — Document 3 missing CLI flags (admit KEM, gen-hmac-secret keep-existing)
 
 ### Summary
