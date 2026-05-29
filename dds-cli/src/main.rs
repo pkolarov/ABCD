@@ -506,6 +506,12 @@ enum DebugAction {
         /// Path to the config.toml to validate.
         file: PathBuf,
     },
+    /// Fetch the node's identity info from /v1/node/info — URN, Ed25519
+    /// signing pubkey (base64), and peer ID. Used by Policy Agents to
+    /// pin the key at first contact (H-2 / H-3). Also reports whether
+    /// the one-time admin-setup gate is currently open so that tray
+    /// agents can gate the "Admin Setup" flow before attempting FIDO2.
+    NodeInfo,
 }
 
 // ---- Pq (Z-1 Phase B operator surface) ----
@@ -1725,6 +1731,17 @@ async fn handle_debug(action: DebugAction, node_url: &str) {
             let s: NodeStatusJson = get_json(node_url, "/v1/status", &[]).await;
             print_status(&s);
         }
+        DebugAction::NodeInfo => {
+            let info: NodeInfoJson = get_json(node_url, "/v1/node/info", &[]).await;
+            println!("DDS Node Identity");
+            println!("  node_urn:            {}", info.node_urn);
+            println!("  peer_id:             {}", info.peer_id);
+            println!("  node_pubkey_b64:     {}", info.node_pubkey_b64);
+            println!(
+                "  admin_setup_open:    {}",
+                if info.admin_setup_available { "yes (bootstrap gate open)" } else { "no" }
+            );
+        }
         DebugAction::Config { file } => {
             let body = std::fs::read_to_string(&file).unwrap_or_else(|e| {
                 eprintln!("Failed to read {}: {e}", file.display());
@@ -2578,6 +2595,15 @@ struct NodeStatusJson {
     /// the first non-`ok` admission outcome lands.
     #[serde(default)]
     last_admission_failure_ts: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct NodeInfoJson {
+    node_urn: String,
+    node_pubkey_b64: String,
+    peer_id: String,
+    #[serde(default)]
+    admin_setup_available: bool,
 }
 
 #[derive(Serialize)]

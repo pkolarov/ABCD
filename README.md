@@ -247,6 +247,7 @@ dds cp session-assert --credential-id ... --authenticator-data ... \
 dds debug ping                           # reachability check
 dds debug stats                          # pretty-printed NodeStatus
 dds debug config ./config.toml           # offline TOML validation
+dds debug node-info                      # GET /v1/node/info — URN, Ed25519 pubkey, peer ID, admin-setup gate
 
 # Operational snapshots (observability-plan.md Phase F)
 dds stats                                # peers + trust-graph + audit head age

@@ -3588,6 +3588,32 @@ On success (`Schema: OK`) the output includes:
 Bad TOML or a schema error exits non-zero with a clear message — use
 this in CI to smoke-test generated configs before rolling them out.
 
+### Node identity and agent-pinning info
+
+`dds debug node-info` calls `GET /v1/node/info` and prints the node's
+URN, Ed25519 signing public key (base64), libp2p peer ID, and whether
+the one-time admin-setup gate is currently open:
+
+```bash
+dds debug node-info
+# DDS Node Identity
+#   node_urn:            urn:vouchsafe:node.<hash>
+#   peer_id:             12D3KooW...
+#   node_pubkey_b64:     <base64>
+#   admin_setup_open:    no
+```
+
+Policy Agents use this endpoint to pin the node's signing key at first
+contact (H-2 / H-3). The `admin_setup_open: yes` state indicates that
+`POST /v1/admin/setup` would be accepted — tray agents use this to gate
+the "Admin Setup" FIDO2 flow before beginning a ceremony that would
+otherwise fail.
+
+**Trust caveat:** the response is served over unauthenticated loopback
+HTTP. For install-time agent pinning, embed the expected `node_pubkey_b64`
+value directly in the agent config (written by the MSI provisioning step)
+and compare it to the live value on startup rather than relying on TOFU.
+
 ### Node-side logs
 
 `dds-node` does not expose logs over HTTP. Logs go to stdout via the

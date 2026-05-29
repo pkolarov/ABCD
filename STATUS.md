@@ -1,5 +1,59 @@
 # DDS Implementation Status
 
+## feat(cli+docs): add `dds debug node-info` command (228th pass) — 2026-05-29
+
+### Summary
+
+Automated scheduled sweep following the 227th-pass baseline.
+
+**Gap found and fixed:**
+
+The README claimed "The `dds` CLI wraps every `dds-node` HTTP endpoint" but the
+`GET /v1/node/info` endpoint had no corresponding CLI command. This endpoint is
+used by Policy Agents to discover the node's URN, Ed25519 signing pubkey (base64),
+libp2p peer ID, and whether the one-time admin-setup gate is open.
+
+**Implementation:**
+
+- `dds-cli/src/main.rs` — Added `NodeInfo` variant to `DebugAction` enum.
+  Handler calls `GET /v1/node/info` and pretty-prints the four fields.
+  Added `NodeInfoJson` deserialization struct (matches `NodeInfoResponse`
+  in `dds-node/src/http.rs`; `admin_setup_available` uses `#[serde(default)]`
+  for backward compatibility with older node builds).
+
+- `dds-cli/tests/smoke.rs` — Added `debug node-info --help` to
+  `test_subcommand_help` and `debug node-info` to
+  `test_remote_commands_fail_when_node_absent`.
+
+- `README.md` — Added `dds debug node-info` to the CLI quick-reference
+  debugging block.
+
+- `docs/DDS-Admin-Guide.md` — Added "Node identity and agent-pinning info"
+  subsection under the Diagnostics chapter, with example output and the
+  trust-model caveat (TOFU vs. install-time pinning).
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src. The single `TODO(security)` at `dds-node/src/service.rs` (M-22
+OS-bound key-wrapping) is unchanged.
+
+**Test results:** 799 lib tests pass (0 failed, 5 ignored) — unchanged from
+227th-pass baseline. New smoke tests validate `dds debug node-info --help` parses
+correctly and that the command fails gracefully when the node is unreachable.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain blocked
+on external design, infrastructure provisioning, or Windows CI; no change.
+
+### Files changed
+
+- **`dds-cli/src/main.rs`** — `DebugAction::NodeInfo` variant and handler;
+  `NodeInfoJson` struct.
+- **`dds-cli/tests/smoke.rs`** — `debug node-info --help` and
+  `debug node-info` (unreachable-node) test entries.
+- **`README.md`** — `dds debug node-info` CLI reference line.
+- **`docs/DDS-Admin-Guide.md`** — "Node identity and agent-pinning info" section.
+
+---
+
 ## Docs fix (2026-05-29, 227th pass) — Document 3 README gaps (provision-admission-key backends, audit tail/export options)
 
 ### Summary
