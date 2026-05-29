@@ -2,6 +2,10 @@
 
 ## feat(cli+docs): add `dds debug node-info` command (228th pass) — 2026-05-29
 
+*(Follow-up formatting fix also committed: `fix(cli): cargo fmt — split long println! lines`.
+Pre-existing cargo fmt failures from 218th-pass `debug config` upgrade were carried in
+the 228th-pass commit; addressed immediately after CI flagged them.)*
+
 ### Summary
 
 Automated scheduled sweep following the 227th-pass baseline.
