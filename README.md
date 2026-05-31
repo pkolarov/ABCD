@@ -293,7 +293,7 @@ this secret; locally, run
 | `GET` | `/v1/enroll/challenge` | Fresh FIDO2 challenge for enrollment ceremony (admin-gated) |
 | `POST` | `/v1/enroll/user` | FIDO2/passkey user enrollment (admin-gated) |
 | `POST` | `/v1/enroll/device` | Device enrollment + hardware attestation (admin-gated) |
-| `GET` | `/v1/enrolled-users` | List enrolled users (admin-gated) |
+| `GET` | `/v1/enrolled-users` | List enrolled users (admin-gated); optional query param: `device_urn=<URN>` |
 | `GET` | `/v1/admin/challenge` | Fresh FIDO2 challenge for admin ceremony (admin-gated) |
 | `POST` | `/v1/admin/setup` | One-time bootstrap: create first trusted root (admin-gated) |
 | `POST` | `/v1/admin/vouch` | Issue vouch token for a subject (admin-gated) |
@@ -302,17 +302,17 @@ this secret; locally, run
 | `POST` | `/v1/policy/evaluate` | Offline policy evaluation |
 | `GET` | `/v1/status` | Node diagnostics (peers, DAG, trust) |
 | `GET` | `/v1/node/info` | Node pubkey + peer id (for agent pinning) |
-| `GET` | `/v1/audit/entries` | Signed audit-log slice (admin-gated) |
+| `GET` | `/v1/audit/entries` | Signed audit-log slice (admin-gated); query params: `since=<unix-ts>`, `action=<act>`, `limit=<n>` |
 | `POST` | `/v1/pq/rotate` | Rotate PQ epoch key (admin-gated) |
-| `GET` | `/v1/windows/policies` | Windows policy documents for this device |
-| `GET` | `/v1/windows/software` | Windows software assignments for this device |
+| `GET` | `/v1/windows/policies` | Windows policy documents for this device; query param: `device_urn=<URN>` |
+| `GET` | `/v1/windows/software` | Windows software assignments for this device; query param: `device_urn=<URN>` |
 | `POST` | `/v1/windows/applied` | Record Windows applied-policy report from agent |
 | `POST` | `/v1/windows/claim-account` | Bind a Windows logon session to a DDS identity |
-| `GET` | `/v1/macos/policies` | macOS policy documents for this device |
-| `GET` | `/v1/macos/software` | macOS software assignments for this device |
+| `GET` | `/v1/macos/policies` | macOS policy documents for this device; query param: `device_urn=<URN>` |
+| `GET` | `/v1/macos/software` | macOS software assignments for this device; query param: `device_urn=<URN>` |
 | `POST` | `/v1/macos/applied` | Record macOS applied-policy report from agent |
-| `GET` | `/v1/linux/policies` | Linux policy documents for this device |
-| `GET` | `/v1/linux/software` | Linux software assignments for this device |
+| `GET` | `/v1/linux/policies` | Linux policy documents for this device; query param: `device_urn=<URN>` |
+| `GET` | `/v1/linux/software` | Linux software assignments for this device; query param: `device_urn=<URN>` |
 | `POST` | `/v1/linux/applied` | Record Linux applied-policy report from agent |
 | `GET` | `/healthz`, `/readyz` | Orchestrator probes (Phase D) |
 

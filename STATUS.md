@@ -1,5 +1,52 @@
 # DDS Implementation Status
 
+## docs(readme): document HTTP API query parameters (229th pass) — 2026-05-31
+
+### Summary
+
+Automated scheduled sweep following the 228th-pass baseline.
+
+**Documentation gap found and fixed:**
+
+The README HTTP API reference table listed all endpoints but omitted query parameters
+for four endpoint groups:
+
+1. **`GET /v1/enrolled-users`** — accepts optional `device_urn=<URN>` query param to
+   filter the response to users enrolled on a specific device. The CLI's
+   `dds cp enrolled-users [--device-urn ...]` already documented this, and the
+   Admin Guide had a curl example (line 3242), but the HTTP table row was silent on it.
+
+2. **`GET /v1/audit/entries`** — accepts `since=<unix-ts>`, `action=<act>`, and
+   `limit=<n>` query params. These drive `dds audit tail` polling, action filtering,
+   and result capping, and were documented in the Admin Guide (line 3466) and the
+   CLI quick-reference (line 223), but were absent from the HTTP table row.
+
+3. **`GET /v1/windows|macos|linux/policies`** and **`GET /v1/windows|macos|linux/software`**
+   — each requires `device_urn=<URN>` to scope results to the requesting device.
+   The Admin Guide curl examples (lines 1461, 1567, 1613) already showed this;
+   the HTTP table rows did not.
+
+All query parameters verified against the `AuditQueryParams` and `DeviceUrnQuery`
+structs in `dds-node/src/http.rs`.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src. The single `TODO(security)` at `dds-node/src/service.rs` (M-22
+OS-bound key-wrapping) is unchanged.
+
+**Test results:** Documentation-only change; all 799 lib tests pass (0 failed,
+5 ignored) — no Rust code touched.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI; no change.
+
+### Files changed
+
+- **`README.md`** — HTTP API table: added `device_urn` query param to
+  `/v1/enrolled-users`; added `since`, `action`, `limit` to `/v1/audit/entries`;
+  added `device_urn` to all six platform policies/software GET rows.
+
+---
+
 ## feat(cli+docs): add `dds debug node-info` command (228th pass) — 2026-05-29
 
 *(Follow-up formatting fix also committed: `fix(cli): cargo fmt — split long println! lines`.
