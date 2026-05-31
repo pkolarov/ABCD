@@ -203,7 +203,7 @@ dds policy check --user ... --resource ... --action ... --remote
                                          # POST /v1/policy/evaluate
 
 # Enrollment (FIDO2 ceremony: fetch challenge, sign offline, then submit)
-dds enroll challenge                     # GET /v1/enroll/challenge — returns challenge_id + challenge_b64url
+dds enroll challenge                     # GET /v1/enroll/challenge — returns challenge_id + challenge_b64url + expires_at
 dds enroll user   --label alice --credential-id <b64url> \
     --attestation-object <b64> --client-data-hash <b64> \
     --rp-id example.com --display-name "Alice" [--authenticator-type platform|cross-platform]
@@ -211,7 +211,7 @@ dds enroll device --label laptop --device-id <uuid> --hostname lap01 \
     --os windows --os-version 11
 
 # Admin bootstrap (first admin / subsequent vouches)
-dds admin challenge                      # GET /v1/admin/challenge — returns challenge_id + challenge_b64url
+dds admin challenge                      # GET /v1/admin/challenge — returns challenge_id + challenge_b64url + expires_at
 dds admin setup --label root-admin --credential-id <b64url> \
     --attestation-object <b64> --client-data-hash <b64> \
     --rp-id example.com --display-name "Root" [--authenticator-type platform|cross-platform]
@@ -241,7 +241,7 @@ dds platform linux   applied   --from-file report.json
 
 # Credential Provider helpers
 dds cp enrolled-users [--device-urn ...]
-dds cp session-challenge                 # GET /v1/session/challenge — returns challenge_id + challenge_b64url
+dds cp session-challenge                 # GET /v1/session/challenge — returns challenge_id + challenge_b64url + expires_at
 dds cp session-assert --credential-id ... --authenticator-data ... \
     --client-data-hash ... --signature ... \
     [--subject-urn urn:vouchsafe:...] [--duration-secs 3600]

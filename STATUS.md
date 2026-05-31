@@ -1,5 +1,49 @@
 # DDS Implementation Status
 
+## docs(readme): fix challenge command output docs + record 230th-pass status (231st pass) — 2026-06-01
+
+### Summary
+
+Automated scheduled sweep following the 230th-pass baseline.
+
+**Documentation gap found and fixed:**
+
+The README CLI quick-reference described the three challenge-fetch commands as
+returning `challenge_id + challenge_b64url`, but the `print_challenge` helper
+(introduced in the 230th pass, `dds-cli/src/main.rs:879`) also prints `expires_at`
+— confirmed against `ChallengeResponseJson` in `dds-node/src/http.rs:918–920`.
+The Admin Guide already showed `expires_at` in the `/v1/session/challenge` curl
+example (line 1294). Updated the three README comment lines to read
+`… + expires_at` to match actual output.
+
+**STATUS.md:** The 230th-pass commit (`9921cc2`) was missing a STATUS entry.
+It added:
+- `dds enroll challenge` → `GET /v1/enroll/challenge`
+- `dds admin challenge`  → `GET /v1/admin/challenge`
+- `dds cp session-challenge` → `GET /v1/session/challenge`
+- Split `dds health` to probe both `/healthz` (liveness) and `/readyz` (readiness)
+  with updated JSON output fields (`alive`, `liveness_http_status`, `ready`, `readiness_http_status`).
+- Smoke tests extended to cover `--help` and unreachable-node failure for all three
+  new subcommands (6 new smoke test entries, total 23 passing).
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src. The single `TODO(security)` at `dds-node/src/service.rs` (M-22
+OS-bound key-wrapping) is unchanged.
+
+**Test results:** All lib and smoke tests pass — 799 lib tests (0 failed, 5 ignored),
+23 smoke tests. Documentation-only change; no Rust code modified.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI; no change.
+
+### Files changed
+
+- **`README.md`** — three challenge command comments: added `+ expires_at` to
+  `dds enroll challenge`, `dds admin challenge`, and `dds cp session-challenge` lines.
+- **`STATUS.md`** — this entry (230th-pass backfill + 231st-pass doc fix).
+
+---
+
 ## docs(readme): document HTTP API query parameters (229th pass) — 2026-05-31
 
 ### Summary
