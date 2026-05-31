@@ -32,11 +32,14 @@ fn test_subcommand_help() {
         vec!["admin", "--help"],
         vec!["admin", "setup", "--help"],
         vec!["admin", "vouch", "--help"],
+        vec!["admin", "challenge", "--help"],
         vec!["enroll", "--help"],
         vec!["enroll", "user", "--help"],
         vec!["enroll", "device", "--help"],
+        vec!["enroll", "challenge", "--help"],
         vec!["cp", "--help"],
         vec!["cp", "enrolled-users", "--help"],
+        vec!["cp", "session-challenge", "--help"],
         vec!["cp", "session-assert", "--help"],
         vec!["platform", "--help"],
         vec!["platform", "windows", "--help"],
@@ -90,6 +93,9 @@ fn test_remote_commands_fail_when_node_absent() {
         vec!["--node-url", bad_url, "stats"],
         vec!["--node-url", bad_url, "health"],
         vec!["--node-url", bad_url, "audit", "export"],
+        vec!["--node-url", bad_url, "enroll", "challenge"],
+        vec!["--node-url", bad_url, "admin", "challenge"],
+        vec!["--node-url", bad_url, "cp", "session-challenge"],
     ] {
         let out = dds_cli().args(&tree).output().unwrap();
         assert!(!out.status.success(), "expected failure for {tree:?}");

@@ -259,6 +259,9 @@ enum EnrollAction {
         #[arg(long)]
         tag: Vec<String>,
     },
+    /// Fetch a fresh FIDO2 challenge for an enrollment ceremony (GET /v1/enroll/challenge).
+    /// Returns the challenge_id and challenge_b64url needed as inputs to `enroll user`.
+    Challenge,
 }
 
 // ---- Admin ----
@@ -297,6 +300,9 @@ enum AdminAction {
         #[arg(long)]
         purpose: Option<String>,
     },
+    /// Fetch a fresh FIDO2 challenge for an admin ceremony (GET /v1/admin/challenge).
+    /// Returns the challenge_id and challenge_b64url needed as inputs to `admin vouch`.
+    Challenge,
 }
 
 // ---- Audit ----
@@ -476,6 +482,9 @@ enum CpAction {
         #[arg(long, default_value = "")]
         device_urn: String,
     },
+    /// Fetch a fresh single-use FIDO2 challenge for a session ceremony (GET /v1/session/challenge).
+    /// Returns the challenge_id and challenge_b64url needed as inputs to `cp session-assert`.
+    SessionChallenge,
     /// POST /v1/session/assert
     SessionAssert {
         #[arg(long)]
@@ -850,6 +859,10 @@ async fn handle_enroll(action: EnrollAction, node_url: &str) {
             let r: EnrollmentResponse = post_json(node_url, "/v1/enroll/device", &req).await;
             print_enrollment(&r);
         }
+        EnrollAction::Challenge => {
+            let r: ChallengeResponseJson = get_json(node_url, "/v1/enroll/challenge", &[]).await;
+            print_challenge(&r);
+        }
     }
 }
 
@@ -861,6 +874,13 @@ fn print_enrollment(r: &EnrollmentResponse) {
         "  Token: {}...",
         &r.token_cbor_b64[..64.min(r.token_cbor_b64.len())]
     );
+}
+
+fn print_challenge(r: &ChallengeResponseJson) {
+    println!("FIDO2 Challenge:");
+    println!("  challenge_id:     {}", r.challenge_id);
+    println!("  challenge_b64url: {}", r.challenge_b64url);
+    println!("  expires_at:       {}", r.expires_at);
 }
 
 // ================================================================
@@ -912,6 +932,10 @@ async fn handle_admin(action: AdminAction, node_url: &str) {
             println!("  Vouch JTI:   {}", r.vouch_jti);
             println!("  Subject URN: {}", r.subject_urn);
             println!("  Admin URN:   {}", r.admin_urn);
+        }
+        AdminAction::Challenge => {
+            let r: ChallengeResponseJson = get_json(node_url, "/v1/admin/challenge", &[]).await;
+            print_challenge(&r);
         }
     }
 }
@@ -1249,13 +1273,16 @@ async fn run_audit_export(
     }
 }
 
-/// **observability-plan.md Phase F.** Probe the node's `/readyz`
-/// endpoint and summarize. Exits 0 when ready, 1 otherwise — so
-/// `dds-cli health && deploy.sh` works as the natural gate. We use
+/// **observability-plan.md Phase F.** Probe the node's `/healthz` (liveness) and
+/// `/readyz` (readiness) endpoints and summarize. Exits 0 when ready, 1 otherwise —
+/// so `dds-cli health && deploy.sh` works as the natural gate. We use
 /// `get_with_status` rather than `get_json` because `/readyz` returns
 /// HTTP 503 with a JSON body when not ready and that body is the
 /// expected output, not an error to propagate.
 async fn handle_health(node_url: &str, format: &str) {
+    let (live_status, _) = get_with_status(node_url, "/healthz", &[]).await;
+    let alive = live_status.is_success();
+
     let (status, body) = get_with_status(node_url, "/readyz", &[]).await;
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -1276,7 +1303,12 @@ async fn handle_health(node_url: &str, format: &str) {
         "json" => {
             let mut envelope = serde_json::Map::new();
             envelope.insert(
-                "http_status".to_string(),
+                "liveness_http_status".to_string(),
+                serde_json::Value::from(live_status.as_u16()),
+            );
+            envelope.insert("alive".to_string(), serde_json::Value::Bool(alive));
+            envelope.insert(
+                "readiness_http_status".to_string(),
                 serde_json::Value::from(status.as_u16()),
             );
             envelope.insert("ready".to_string(), serde_json::Value::Bool(ready));
@@ -1287,7 +1319,12 @@ async fn handle_health(node_url: &str, format: &str) {
         }
         "text" => {
             println!(
-                "DDS Node Health: {} (HTTP {})",
+                "Liveness (/healthz):  {} (HTTP {})",
+                if alive { "ALIVE" } else { "UNREACHABLE" },
+                live_status.as_u16()
+            );
+            println!(
+                "Readiness (/readyz):  {} (HTTP {})",
                 if ready { "READY" } else { "NOT READY" },
                 status.as_u16()
             );
@@ -1685,6 +1722,10 @@ async fn handle_cp(action: CpAction, node_url: &str) {
                     println!("    credential_id: {}", u.credential_id);
                 }
             }
+        }
+        CpAction::SessionChallenge => {
+            let r: ChallengeResponseJson = get_json(node_url, "/v1/session/challenge", &[]).await;
+            print_challenge(&r);
         }
         CpAction::SessionAssert {
             credential_id,
@@ -2632,6 +2673,13 @@ struct NodeInfoJson {
     peer_id: String,
     #[serde(default)]
     admin_setup_available: bool,
+}
+
+#[derive(Deserialize)]
+struct ChallengeResponseJson {
+    challenge_id: String,
+    challenge_b64url: String,
+    expires_at: u64,
 }
 
 #[derive(Serialize)]
