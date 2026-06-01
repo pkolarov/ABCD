@@ -4431,9 +4431,7 @@ mod publisher_capability_dds_self_update_tests {
     #[test]
     fn rejects_self_update_token_without_publisher_capability() {
         let token = make_self_update_token(body_types::DDS_SELF_UPDATE);
-        let graph = Arc::new(RwLock::new(TrustGraph::new(
-            dds_core::trust::DEFAULT_MAX_CHAIN_DEPTH,
-        )));
+        let graph = Arc::new(RwLock::new(TrustGraph::new()));
         let roots: BTreeSet<String> = BTreeSet::new();
         // No vouches in the graph → publisher_capability_ok returns false.
         assert!(!publisher_capability_ok(&token, &graph, &roots));
@@ -4459,9 +4457,7 @@ mod publisher_capability_dds_self_update_tests {
             body_cbor: None,
         };
         let token = Token::sign(payload, &ident.signing_key).expect("sign");
-        let graph = Arc::new(RwLock::new(TrustGraph::new(
-            dds_core::trust::DEFAULT_MAX_CHAIN_DEPTH,
-        )));
+        let graph = Arc::new(RwLock::new(TrustGraph::new()));
         let roots: BTreeSet<String> = BTreeSet::new();
         assert!(publisher_capability_ok(&token, &graph, &roots));
     }
@@ -4471,9 +4467,7 @@ mod publisher_capability_dds_self_update_tests {
     #[test]
     fn passes_attest_tokens_with_unknown_body_type() {
         let token = make_self_update_token("dds:unknown-future-type");
-        let graph = Arc::new(RwLock::new(TrustGraph::new(
-            dds_core::trust::DEFAULT_MAX_CHAIN_DEPTH,
-        )));
+        let graph = Arc::new(RwLock::new(TrustGraph::new()));
         let roots: BTreeSet<String> = BTreeSet::new();
         assert!(publisher_capability_ok(&token, &graph, &roots));
     }
