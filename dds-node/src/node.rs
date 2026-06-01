@@ -2114,10 +2114,7 @@ impl DdsNode {
         use dds_core::token::purpose;
 
         let content_hash = self_update_content_hash(token);
-        let signers = self
-            .pending_self_updates
-            .entry(content_hash)
-            .or_default();
+        let signers = self.pending_self_updates.entry(content_hash).or_default();
         signers.insert(token.payload.iss.clone());
         let signer_count = signers.len();
 

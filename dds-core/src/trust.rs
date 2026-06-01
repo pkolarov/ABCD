@@ -463,11 +463,7 @@ impl TrustGraph {
     /// so the quorum threshold K = max(2, ceil(M/2)) can be derived.
     /// O(V) in the vouch count — acceptable since it is called only on
     /// `DdsSelfUpdateDocument` ingest, not on the hot evaluation path.
-    pub fn count_purpose_holders(
-        &self,
-        purpose: &str,
-        trusted_roots: &BTreeSet<String>,
-    ) -> usize {
+    pub fn count_purpose_holders(&self, purpose: &str, trusted_roots: &BTreeSet<String>) -> usize {
         let mut holders: BTreeSet<&str> = BTreeSet::new();
         for vouch in self.vouches.values() {
             if vouch.payload.purpose.as_deref() != Some(purpose) {
@@ -489,7 +485,10 @@ impl TrustGraph {
             {
                 continue;
             }
-            if self.validate_chain(&vouch.payload.iss, trusted_roots).is_ok() {
+            if self
+                .validate_chain(&vouch.payload.iss, trusted_roots)
+                .is_ok()
+            {
                 holders.insert(subject);
             }
         }
