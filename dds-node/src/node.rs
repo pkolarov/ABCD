@@ -2129,11 +2129,27 @@ impl DdsNode {
             // Remove the accumulator entry so additional stragglers don't
             // re-fire evaluate_self_update_rollout for the same content.
             self.pending_self_updates.remove(&content_hash);
+
+            // Phase D.5: if this document carries a Halt policy, drain every
+            // other pending accumulator entry. Without this, a non-halted
+            // document that already has K-1 signers could collect one more
+            // signature after the halt lands and bypass the halt order.
+            let halt = is_self_update_halt(&token.payload);
+            if halt && !self.pending_self_updates.is_empty() {
+                warn!(
+                    jti = %token.payload.jti,
+                    drained = self.pending_self_updates.len(),
+                    "self-update: Halt quorum reached — clearing all pending update accumulators (D.5)"
+                );
+                self.pending_self_updates.clear();
+            }
+
             info!(
                 jti = %token.payload.jti,
                 signer_count,
                 quorum_k = k,
                 publisher_count = m,
+                is_halt = halt,
                 "self-update: quorum reached — evaluating rollout"
             );
             self.evaluate_self_update_rollout(&token.payload);
@@ -4075,6 +4091,18 @@ fn self_update_quorum_k(m: usize) -> usize {
     m.div_ceil(2).max(2)
 }
 
+/// Phase D.5 — Return `true` if the token payload contains a
+/// `DdsSelfUpdateDocument` whose rollout policy is `RolloutPolicy::Halt`.
+/// Used to clear all other pending accumulator entries when a Halt reaches
+/// quorum, so no queued non-halted update can fire while the halt is active.
+fn is_self_update_halt(payload: &dds_core::token::TokenPayload) -> bool {
+    use dds_domain::{DomainDocument, types::RolloutPolicy};
+    matches!(
+        dds_domain::DdsSelfUpdateDocument::extract(payload),
+        Ok(Some(doc)) if matches!(doc.rollout, RolloutPolicy::Halt)
+    )
+}
+
 fn publisher_capability_ok(
     token: &Token,
     trust_graph: &Arc<RwLock<TrustGraph>>,
@@ -4729,6 +4757,99 @@ mod d2_multisig_quorum_tests {
         let h1 = self_update_content_hash(&t);
         let h2 = self_update_content_hash(&t);
         assert_eq!(h1, h2, "content hash must be deterministic");
+    }
+}
+
+#[cfg(test)]
+mod d5_halt_tests {
+    //! Phase D.5 — unit tests for `is_self_update_halt` and the
+    //! "Halt clears pending accumulator" behaviour in
+    //! `check_self_update_quorum_and_maybe_apply`.
+
+    use super::*;
+    use dds_core::identity::Identity;
+    use dds_core::token::{Token, TokenKind, TokenPayload};
+    use dds_domain::body_types;
+    use dds_domain::types::{
+        DdsSelfUpdateDocument, Platform, PublisherIdentity, ReleaseChannel, RolloutPolicy, SemVer,
+        UpdateArtifact,
+    };
+    use rand::rngs::OsRng;
+
+    fn make_self_update_token(rollout: RolloutPolicy, jti: &str) -> Token {
+        let ident = Identity::generate("publisher", &mut OsRng);
+        let doc = DdsSelfUpdateDocument {
+            channel: ReleaseChannel::Stable,
+            version: SemVer { major: 1, minor: 2, patch: 3 },
+            artifacts: vec![UpdateArtifact {
+                platform: Platform::LinuxX86_64,
+                url: "https://example.com/dds-1.2.3-linux-x86_64.tar.gz".to_string(),
+                sha256: "a".repeat(64),
+                size_bytes: 1024,
+                signature_b64: "sig".to_string(),
+                publisher: PublisherIdentity {
+                    subject_urn: ident.id.to_urn(),
+                    signing_cert_sha256: "b".repeat(64),
+                },
+            }],
+            min_supported_from: None,
+            rollout,
+            provenance: None,
+        };
+        use dds_domain::DomainDocument;
+        let body_cbor = doc.to_cbor().expect("cbor");
+        let payload = TokenPayload {
+            iss: ident.id.to_urn(),
+            iss_key: ident.public_key.clone(),
+            jti: jti.to_string(),
+            sub: ident.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1714605000,
+            exp: Some(4102444800),
+            body_type: Some(body_types::DDS_SELF_UPDATE.to_string()),
+            body_cbor: Some(body_cbor),
+        };
+        Token::sign(payload, &ident.signing_key).expect("sign")
+    }
+
+    #[test]
+    fn is_self_update_halt_returns_true_for_halt_document() {
+        let token = make_self_update_token(RolloutPolicy::Halt, "halt-jti");
+        assert!(is_self_update_halt(&token.payload));
+    }
+
+    #[test]
+    fn is_self_update_halt_returns_false_for_pinned_document() {
+        let token = make_self_update_token(
+            RolloutPolicy::Pinned { allow_versions: vec![] },
+            "pinned-jti",
+        );
+        assert!(!is_self_update_halt(&token.payload));
+    }
+
+    #[test]
+    fn is_self_update_halt_returns_false_for_no_body() {
+        let ident = Identity::generate("p", &mut OsRng);
+        let payload = TokenPayload {
+            iss: ident.id.to_urn(),
+            iss_key: ident.public_key.clone(),
+            jti: "no-body".to_string(),
+            sub: ident.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1714605000,
+            exp: Some(4102444800),
+            body_type: Some(body_types::DDS_SELF_UPDATE.to_string()),
+            body_cbor: None,
+        };
+        assert!(!is_self_update_halt(&payload));
     }
 }
 
