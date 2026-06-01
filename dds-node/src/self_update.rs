@@ -318,7 +318,7 @@ async fn run_installer(path: &Path) -> Result<(), String> {
                 "self-update: macOS installer exited with non-zero status ({status})"
             ));
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {

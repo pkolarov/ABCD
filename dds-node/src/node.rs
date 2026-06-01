@@ -2057,7 +2057,8 @@ impl DdsNode {
         match dds_domain::DdsSelfUpdateDocument::extract(payload) {
             Ok(Some(doc)) => {
                 let peer_bytes = self.peer_id.to_bytes();
-                let decision = doc.evaluate(&peer_bytes, &payload.jti, None);
+                let current_version = installed_semver();
+                let decision = doc.evaluate(&peer_bytes, &payload.jti, current_version.as_ref());
                 match decision {
                     RolloutDecision::ApplyNow => {
                         let jti = payload.jti.clone();
@@ -4091,6 +4092,19 @@ fn self_update_quorum_k(m: usize) -> usize {
     m.div_ceil(2).max(2)
 }
 
+/// Parse the application release version (from the repo-root `VERSION` file,
+/// injected as `DDS_VERSION` at compile time by `build.rs`) into a
+/// [`dds_domain::types::SemVer`] so that `Pinned` rollout policies can compare
+/// against the installed version. Returns `None` if the string is malformed.
+fn installed_semver() -> Option<dds_domain::types::SemVer> {
+    let v = env!("DDS_VERSION");
+    let mut parts = v.splitn(3, '.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    let patch = parts.next()?.parse::<u32>().ok()?;
+    Some(dds_domain::types::SemVer { major, minor, patch })
+}
+
 /// Phase D.5 — Return `true` if the token payload contains a
 /// `DdsSelfUpdateDocument` whose rollout policy is `RolloutPolicy::Halt`.
 /// Used to clear all other pending accumulator entries when a Halt reaches
@@ -4843,6 +4857,15 @@ mod d5_halt_tests {
             body_cbor: None,
         };
         assert!(!is_self_update_halt(&payload));
+    }
+
+    #[test]
+    fn installed_semver_parses_dds_version() {
+        let sv = installed_semver().expect("DDS_VERSION should always parse as semver");
+        // We can't assert exact values since they change with releases, but we
+        // can assert the format parsed as a valid triple.  The version from the
+        // repo-root VERSION file is "major.minor.patch" with no pre-release suffix.
+        let _ = format!("{}.{}.{}", sv.major, sv.minor, sv.patch);
     }
 }
 

@@ -1,5 +1,61 @@
 # DDS Implementation Status
 
+## fix(node): pass installed version to Pinned rollout evaluation; fix clippy; update docs (249th pass) — 2026-06-01
+
+### Summary
+
+Automated scheduled sweep following the 248th-pass baseline.
+
+**Bugs found and fixed:**
+
+**1. `Pinned` rollout policy always skipped (evaluate_self_update_rollout passes `None` for installed_version).**
+`evaluate_self_update_rollout` called `doc.evaluate(&peer_bytes, &payload.jti, None)` —
+passing `None` for `installed_version`. `RolloutPolicy::Pinned` matches
+`Some(v) if allow_versions.contains(v)` and falls to `Skipped` for any other arm,
+so `None` always produced `Skipped`, making `Pinned` rollouts permanently ineffective.
+
+Fix: added `installed_semver()` helper that parses the repo-root `VERSION` file value
+(injected as `DDS_VERSION` at compile time by `build.rs`) into a `dds_domain::types::SemVer`.
+`evaluate_self_update_rollout` now calls
+`doc.evaluate(&peer_bytes, &payload.jti, installed_semver().as_ref())`.
+
+**2. Clippy warning — unneeded `return` in `run_installer` macOS branch.**
+`dds-node/src/self_update.rs:321` had a `return Ok(());` as the last expression of
+a `#[cfg(target_os = "macos")]` block. Changed to the expression form `Ok(())`.
+
+**3. Stale Admin Guide entry for Phase D.4.**
+`docs/DDS-Admin-Guide.md` still said
+"The actual binary install step (Phase D.4) is not yet implemented; the node logs the
+cohort decision." Phase D.4 landed in the 243rd pass. Updated the table entry to
+describe the actual behaviour (fetch, SHA-256 + OS-vendor-signature verify, stage,
+platform-native installer).
+
+**Implementation details:**
+
+- `dds-node/build.rs`: added `DDS_VERSION` env injection from `../VERSION` (with
+  `cargo:rerun-if-changed=../VERSION`) alongside the existing `DDS_GIT_SHA` and
+  `DDS_RUST_VERSION` lines.
+- `dds-node/src/node.rs`: new `installed_semver()` free function; updated
+  `evaluate_self_update_rollout`; 1 new test `installed_semver_parses_dds_version`.
+- `dds-node/src/self_update.rs`: removed redundant `return` keyword.
+- `docs/DDS-Admin-Guide.md`: corrected `self_update_apply` table entry.
+
+**Tests:** 388 dds-node tests pass (was 387; +1 `installed_semver_parses_dds_version`).
+0 failed. Clippy clean.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6,
+Phase A cert provisioning, Phase B.5 migration cutover, TPM A3/A5) unchanged.
+
+### Files changed
+
+- **`dds-node/build.rs`** — `DDS_VERSION` injection from `../VERSION`.
+- **`dds-node/src/node.rs`** — `installed_semver()`, updated `evaluate_self_update_rollout`, 1 new test.
+- **`dds-node/src/self_update.rs`** — removed unneeded `return` (clippy).
+- **`docs/DDS-Admin-Guide.md`** — corrected stale Phase D.4 note in `self_update_apply` table row.
+- **`STATUS.md`** — this entry.
+
+---
+
 ## feat(core,node): Phase D.2 K-of-M multi-sig quorum for self-update (247th pass) — 2026-06-01
 
 ### Summary

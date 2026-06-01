@@ -26,6 +26,14 @@ fn main() {
     let rust_version = run("rustc", &["--version"]).unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=DDS_RUST_VERSION={rust_version}");
 
+    // Inject the application release version from the repo-root VERSION file
+    // so `env!("DDS_VERSION")` resolves to e.g. "1.3.2" at compile time.
+    // Falls back to "0.0.0" if the file is missing (sandbox / tarball builds).
+    let dds_version = std::fs::read_to_string("../VERSION")
+        .unwrap_or_else(|_| "0.0.0".to_string());
+    println!("cargo:rustc-env=DDS_VERSION={}", dds_version.trim());
+    println!("cargo:rerun-if-changed=../VERSION");
+
     // Re-run if the working-tree HEAD moves. We watch HEAD itself (so a
     // branch switch / checkout fires) and the packed-refs file (so a
     // commit that does not move HEAD still busts the cache when refs
