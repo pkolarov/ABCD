@@ -730,37 +730,86 @@ bool CDdsBridgeClient::HandleWebAuthnChallenge(
         const_cast<char*>(clientDataJson.data()));
     clientData.pwszHashAlgId = WEBAUTHN_HASH_ALGORITHM_SHA_256;
 
-    // Build allow list with the specific credential ID
-    // Must use CredentialList (inline WEBAUTHN_CREDENTIALS) — not pAllowCredentialList —
-    // to match the enrollment flow exactly. Using pAllowCredentialList + different flags
-    // causes the Windows WebAuthn API to produce different hmac-secret output.
-    WEBAUTHN_CREDENTIAL allowCred = {};
-    allowCred.dwVersion = WEBAUTHN_CREDENTIAL_CURRENT_VERSION;
-    allowCred.cbId = pChallenge->credential_id_len;
-    allowCred.pbId = const_cast<PBYTE>(pChallenge->credential_id);
-    allowCred.pwszCredentialType = WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY;
+    // Multi-credential auto-select: the bridge sends every FIDO2 credential
+    // enrolled for this Windows user (creds[]/cred_count); we offer them all
+    // to WebAuthn so the authenticator silently uses whichever one it holds.
+    // cred_count == 0 is the legacy / first-claim shape — fall back to the
+    // single credential_id/salt fields. Each credential carries its OWN
+    // hmac-secret salt (the password blob is sealed under the hmac output of
+    // that salt), so salts travel per-credential in pCredWithHmacSecretSaltList.
+    //
+    // Must use CredentialList (inline WEBAUTHN_CREDENTIALS) — not
+    // pAllowCredentialList — to match the enrollment flow exactly. Using
+    // pAllowCredentialList + different flags causes the Windows WebAuthn API to
+    // produce different hmac-secret output.
+    struct OfferCred { const BYTE* id; DWORD idLen; const BYTE* salt; DWORD saltLen; };
+    OfferCred offers[IPC_MAX_DDS_AUTH_CREDS] = {};
+    DWORD nOffers = 0;
+    if (pChallenge->cred_count > 0)
+    {
+        DWORD n = pChallenge->cred_count;
+        if (n > (DWORD)IPC_MAX_DDS_AUTH_CREDS)
+            n = (DWORD)IPC_MAX_DDS_AUTH_CREDS;
+        for (DWORD i = 0; i < n; ++i)
+        {
+            if (pChallenge->creds[i].credential_id_len == 0)
+                continue;
+            offers[nOffers].id      = pChallenge->creds[i].credential_id;
+            offers[nOffers].idLen   = pChallenge->creds[i].credential_id_len;
+            offers[nOffers].salt    = pChallenge->creds[i].salt;
+            offers[nOffers].saltLen = pChallenge->creds[i].salt_len;
+            nOffers++;
+        }
+    }
+    if (nOffers == 0)
+    {
+        // Legacy / first-claim fallback: single credential from the flat fields.
+        offers[0].id      = pChallenge->credential_id;
+        offers[0].idLen   = pChallenge->credential_id_len;
+        offers[0].salt    = pChallenge->salt;
+        offers[0].saltLen = pChallenge->salt_len;
+        nOffers = 1;
+    }
+
+    CPLog("HandleWebAuthnChallenge: seqId=%u offering %lu credential(s)",
+          seqId, (unsigned long)nOffers);
+
+    WEBAUTHN_CREDENTIAL              allowCred[IPC_MAX_DDS_AUTH_CREDS] = {};
+    WEBAUTHN_HMAC_SECRET_SALT        hmacSalt[IPC_MAX_DDS_AUTH_CREDS]  = {};
+    WEBAUTHN_CRED_WITH_HMAC_SECRET_SALT credSalt[IPC_MAX_DDS_AUTH_CREDS] = {};
+    for (DWORD i = 0; i < nOffers; ++i)
+    {
+        allowCred[i].dwVersion = WEBAUTHN_CREDENTIAL_CURRENT_VERSION;
+        allowCred[i].cbId = offers[i].idLen;
+        allowCred[i].pbId = const_cast<PBYTE>(offers[i].id);
+        allowCred[i].pwszCredentialType = WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY;
+
+        // Per-credential hmac-secret salt.
+        hmacSalt[i].cbFirst  = offers[i].saltLen;
+        hmacSalt[i].pbFirst  = const_cast<PBYTE>(offers[i].salt);
+        hmacSalt[i].cbSecond = 0;
+        hmacSalt[i].pbSecond = nullptr;
+
+        credSalt[i].cbCredID = offers[i].idLen;
+        credSalt[i].pbCredID = const_cast<PBYTE>(offers[i].id);
+        credSalt[i].pHmacSecretSalt = &hmacSalt[i];
+    }
 
     WEBAUTHN_CREDENTIALS allowList = {};
-    allowList.cCredentials = 1;
-    allowList.pCredentials = &allowCred;
+    allowList.cCredentials = nOffers;
+    allowList.pCredentials = allowCred;
 
-    // Build hmac-secret salt — must match enrollment's approach exactly:
-    // both pGlobalHmacSalt AND per-credential salt with cCredWithHmacSecretSaltList=1
-    WEBAUTHN_HMAC_SECRET_SALT hmacSalt = {};
-    hmacSalt.cbFirst = pChallenge->salt_len;
-    hmacSalt.pbFirst = const_cast<PBYTE>(pChallenge->salt);
-    hmacSalt.cbSecond = 0;
-    hmacSalt.pbSecond = nullptr;
-
-    WEBAUTHN_CRED_WITH_HMAC_SECRET_SALT credSalt = {};
-    credSalt.cbCredID = pChallenge->credential_id_len;
-    credSalt.pbCredID = const_cast<PBYTE>(pChallenge->credential_id);
-    credSalt.pHmacSecretSalt = &hmacSalt;
-
+    // hmac-secret salts — must match enrollment's approach exactly: a global
+    // salt PLUS the per-credential salt list. With one credential this is byte
+    // identical to the prior single-credential path (pGlobalHmacSalt ==
+    // creds[0].salt). With several, the per-credential list is authoritative
+    // for whichever credential the authenticator actually signs with; the
+    // global salt only ever applies to credentials absent from the list (none
+    // here, since every offered credential is listed).
     WEBAUTHN_HMAC_SECRET_SALT_VALUES hmacSaltValues = {};
-    hmacSaltValues.pGlobalHmacSalt = &hmacSalt;
-    hmacSaltValues.cCredWithHmacSecretSaltList = 1;
-    hmacSaltValues.pCredWithHmacSecretSaltList = &credSalt;
+    hmacSaltValues.pGlobalHmacSalt = &hmacSalt[0];
+    hmacSaltValues.cCredWithHmacSecretSaltList = nOffers;
+    hmacSaltValues.pCredWithHmacSecretSaltList = credSalt;
 
     // Convert RP ID to wide string
     wchar_t rpIdW[IPC_MAX_RPID_LEN]{};

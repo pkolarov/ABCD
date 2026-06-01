@@ -36,6 +36,14 @@ constexpr DWORD IPC_MAX_SIGNATURE_LEN    = 256;   // ECDSA/EdDSA signature
 constexpr DWORD IPC_MAX_HMAC_SECRET_LEN  = 32;    // hmac-secret output is always 32 bytes
 constexpr DWORD IPC_MAX_SALT_LEN         = 32;    // hmac-secret salt is 32 bytes
 
+// Multi-credential auto-select: a single Windows user may have several FIDO2
+// credentials enrolled (backup keys, or re-enrollments — each WebAuthn
+// create() mints a fresh credential_id). The auth challenge offers all of
+// them to WebAuthNAuthenticatorGetAssertion at once and the authenticator
+// uses whichever one it physically holds. This caps how many are offered in
+// one ceremony.
+constexpr DWORD IPC_MAX_DDS_AUTH_CREDS   = 8;
+
 #pragma pack(push, 1)
 
 // ============================================================================
@@ -218,11 +226,27 @@ struct IPC_REQ_DDS_LIST_USERS
 // DDS Response Payloads (Auth Bridge -> CP)
 // ============================================================================
 
+// One (credential_id, hmac-secret salt) pair offered in an auth ceremony.
+// Each enrolled credential for a user has its own salt; the password blob in
+// the vault is sealed under the hmac-secret output derived from that salt, so
+// the salt MUST travel with its credential_id.
+struct IPC_DDS_AUTH_CRED
+{
+    BYTE   credential_id[IPC_MAX_CREDENTIAL_ID_LEN]; // Raw FIDO2 credential ID bytes
+    DWORD  credential_id_len;                         // Actual length of credential ID
+    BYTE   salt[IPC_MAX_SALT_LEN];                    // hmac-secret salt from vault
+    DWORD  salt_len;                                  // Actual salt length (32)
+};
+
 // DDS_AUTH_CHALLENGE (0x8063)
 // Sent by Bridge to CP after DDS_START_AUTH. Contains the credential info
 // the CP needs to call WebAuthNAuthenticatorGetAssertion locally.
 struct IPC_RESP_DDS_AUTH_CHALLENGE
 {
+    // Legacy single-credential fields. Mirror creds[0] so existing logging,
+    // and the first-claim path (which has exactly one synthetic credential),
+    // keep working unchanged. CP readers prefer `creds`/`cred_count` when
+    // cred_count > 0 and fall back to these otherwise.
     BYTE   credential_id[IPC_MAX_CREDENTIAL_ID_LEN]; // Raw FIDO2 credential ID bytes
     DWORD  credential_id_len;                         // Actual length of credential ID
     char   rp_id[IPC_MAX_RPID_LEN];                  // RP ID (UTF-8, null-terminated)
@@ -234,6 +258,16 @@ struct IPC_RESP_DDS_AUTH_CHALLENGE
     // BuildClientData and echoes challenge_id back in IPC_REQ_DDS_AUTH_RESPONSE.
     char   challenge_id[64];      // Server challenge ID (null-terminated, max 63 chars)
     char   challenge_b64url[48];  // Base64url challenge nonce (44 chars + NUL) for clientDataJSON
+    // Multi-credential auto-select: every FIDO2 credential enrolled for THIS
+    // Windows user. The CP passes them all to WebAuthn (allowCredentials +
+    // per-credential hmac-secret salt) so the authenticator silently uses
+    // whichever one it holds. The assertion echoes back the credential_id it
+    // used; the bridge resolves the matching vault entry from that. One shared
+    // server challenge nonce covers every credential (the nonce binds into
+    // clientDataHash, independent of which key signs). cred_count == 0 means
+    // "use the legacy single fields above" (first-claim path).
+    DWORD            cred_count;
+    IPC_DDS_AUTH_CRED creds[IPC_MAX_DDS_AUTH_CREDS];
 };
 
 // DDS_AUTH_RESPONSE (0x0061)

@@ -1284,12 +1284,47 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     }
     challenge.salt_len = saltLen;
 
+    // Multi-credential auto-select: offer EVERY credential enrolled for this
+    // Windows user so the authenticator can use whichever key is physically
+    // present. The representative entry resolved above gives us the SID;
+    // expand to all of the user's vault entries. Each carries its own
+    // hmac-secret salt, which must travel with its credential_id (the password
+    // blob is sealed under the hmac output derived from that salt). creds[0]
+    // mirrors the legacy single fields. Claim mode (no vault entry) keeps
+    // cred_count == 0, so the CP falls back to the single legacy fields.
+    challenge.cred_count = 0;
+    if (pVaultEntry)
+    {
+        std::vector<const VaultEntry*> userEntries =
+            m_vault.FindByUserSid(pVaultEntry->userSid);
+        for (const VaultEntry* e : userEntries)
+        {
+            if (challenge.cred_count >= IPC_MAX_DDS_AUTH_CREDS)
+                break;
+            if (!e || e->credentialId.empty())
+                continue;
+            IPC_DDS_AUTH_CRED& slot = challenge.creds[challenge.cred_count];
+            const DWORD cl = static_cast<DWORD>(
+                (std::min)(e->credentialId.size(), sizeof(slot.credential_id)));
+            memcpy(slot.credential_id, e->credentialId.data(), cl);
+            slot.credential_id_len = cl;
+            const DWORD sl = static_cast<DWORD>(
+                (std::min)(e->salt.size(), sizeof(slot.salt)));
+            if (sl > 0)
+                memcpy(slot.salt, e->salt.data(), sl);
+            slot.salt_len = sl;
+            challenge.cred_count++;
+        }
+        FileLog::Writef("DdsAuth.worker: offering %lu credential(s) for sid='%ls'\n",
+                        (unsigned long)challenge.cred_count, pVaultEntry->userSid.c_str());
+    }
+
     // Populate server challenge fields so the CP uses the server nonce in WebAuthn.
     strncpy_s(challenge.challenge_id, serverChallenge.challengeId.c_str(), _TRUNCATE);
     strncpy_s(challenge.challenge_b64url, serverChallenge.challengeB64url.c_str(), _TRUNCATE);
 
-    FileLog::Writef("DdsAuth.worker: sending AUTH_CHALLENGE (credIdLen=%u saltLen=%u challengeId='%s')\n",
-                    credIdLen, saltLen, challenge.challenge_id);
+    FileLog::Writef("DdsAuth.worker: sending AUTH_CHALLENGE (credIdLen=%u saltLen=%u credCount=%lu challengeId='%s')\n",
+                    credIdLen, saltLen, (unsigned long)challenge.cred_count, challenge.challenge_id);
 
     m_pipeServer.SendNotification(pOp->pClientCtx, IPC_MSG::DDS_AUTH_CHALLENGE, pOp->seqId,
         reinterpret_cast<const BYTE*>(&challenge), sizeof(challenge));
@@ -1412,14 +1447,47 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     std::string claimedSubjectUrnUtf8;
     if (!pOp->claimMode)
     {
+        // Multi-credential auto-select: the CP offered every credential
+        // enrolled for this user and the authenticator signed with whichever
+        // key it physically held — which may NOT be the representative entry
+        // (`pVaultEntry`) the tile carried. The password blob and salt are
+        // per-credential, so we MUST decrypt with the vault entry that matches
+        // the credential the assertion actually used (pResp->credential_id),
+        // not the representative. Re-resolve here; fall back to the
+        // representative only if the lookup somehow misses.
+        const VaultEntry* pUsedEntry = nullptr;
+        {
+            std::vector<uint8_t> usedCredId(
+                pResp->credential_id,
+                pResp->credential_id + pResp->credential_id_len);
+            if (!usedCredId.empty())
+                pUsedEntry = m_vault.FindByCredentialId(usedCredId);
+        }
+        if (!pUsedEntry)
+        {
+            FileLog::Write("DdsAuth.worker: used credential not in vault — "
+                           "falling back to representative entry\n");
+            pUsedEntry = pVaultEntry;
+        }
+        else if (pUsedEntry != pVaultEntry)
+        {
+            FileLog::Writef("DdsAuth.worker: authenticator used a different "
+                            "enrolled credential than the tile's representative "
+                            "(sid='%ls') — decrypting with the used entry\n",
+                            pUsedEntry->userSid.c_str());
+        }
+
         if (!CCredentialVault::DecryptPassword(pResp->hmac_secret, pResp->hmac_secret_len,
-                                               *pVaultEntry, password))
+                                               *pUsedEntry, password))
         {
             FileLog::Write("DdsAuth.worker: password decryption failed (wrong key or corrupt vault)\n");
             SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::VAULT_ERROR,
                 L"Failed to decrypt stored password — re-enrollment may be required");
             return;
         }
+
+        // Keep the resolved SID consistent with the credential actually used.
+        resolvedSid = pUsedEntry->userSid;
 
         FileLog::Write("DdsAuth.worker: password decrypted successfully\n");
     }
@@ -1613,6 +1681,51 @@ struct StagedUserEntry
     std::wstring credentialId; // base64url-encoded
 };
 
+// Extract the Windows-user grouping key (the SID) from a DDS subject URN.
+// Enrollment uses the Windows SID as the Vouchsafe label, so the URN is
+// `urn:vouchsafe:<SID>.<hash>` on the dds-node path and a bare SID on the
+// vault-synthesis fallback path. Stripping the scheme prefix and taking the
+// text up to the first '.' yields the SID in both cases (a SID never contains
+// a '.'). Two enrollments of the same user therefore share a key.
+std::wstring GroupKeyFromSubjectUrn(const std::wstring& urn)
+{
+    static const std::wstring kPrefix = L"urn:vouchsafe:";
+    std::wstring s = urn;
+    if (s.rfind(kPrefix, 0) == 0)
+        s = s.substr(kPrefix.size());
+    const size_t dot = s.find(L'.');
+    if (dot != std::wstring::npos)
+        s = s.substr(0, dot);
+    return s;
+}
+
+// Collapse multiple enrollments of the same Windows user to a single tile.
+// A user with several FIDO2 credentials (backup keys, or re-enrollments —
+// every WebAuthn create() mints a fresh credential_id) shows up once. The
+// auth flow then offers ALL of that user's credentials to the authenticator
+// (see HandleDdsStartAuth's FindByUserSid expansion), which uses whichever
+// key it holds. The kept entry's credential_id is only a representative the
+// bridge uses to resolve the user's SID; every credential is offered at auth.
+std::vector<StagedUserEntry> CollapseByUser(const std::vector<StagedUserEntry>& in)
+{
+    std::vector<StagedUserEntry> out;
+    std::vector<std::wstring> seen;
+    for (const auto& e : in)
+    {
+        const std::wstring key = GroupKeyFromSubjectUrn(e.subjectUrn);
+        bool dup = false;
+        for (const auto& k : seen)
+        {
+            if (k == key) { dup = true; break; }
+        }
+        if (dup)
+            continue;
+        seen.push_back(key);
+        out.push_back(e);
+    }
+    return out;
+}
+
 BOOL SendDdsUserListResponse(
     CIpcPipeServer& pipeServer,
     IPC_CLIENT_CONTEXT* pClientCtx,
@@ -1624,9 +1737,14 @@ BOOL SendDdsUserListResponse(
     BYTE buffer[IPC_PIPE::BUFFER_SIZE]{};
     IPC_RESP_DDS_USER_LIST* pList = reinterpret_cast<IPC_RESP_DDS_USER_LIST*>(buffer);
 
+    // Collapse multiple credentials of the same Windows user to one tile.
+    // Every caller of this function funnels through here, so both the
+    // dds-node and vault-synthesis paths get one-tile-per-user for free.
+    const std::vector<StagedUserEntry> collapsed = CollapseByUser(entries);
+
     const size_t maxUsers =
         (sizeof(buffer) - sizeof(IPC_RESP_DDS_USER_LIST)) / sizeof(IPC_DDS_USER_ENTRY);
-    const UINT32 count = static_cast<UINT32>((std::min)(entries.size(), maxUsers));
+    const UINT32 count = static_cast<UINT32>((std::min)(collapsed.size(), maxUsers));
 
     pList->count = count;
     pList->status_code = statusCode;
@@ -1638,9 +1756,9 @@ BOOL SendDdsUserListResponse(
     for (UINT32 i = 0; i < count; ++i)
     {
         ZeroMemory(&pEntries[i], sizeof(IPC_DDS_USER_ENTRY));
-        wcsncpy_s(pEntries[i].subject_urn,   entries[i].subjectUrn.c_str(),   _TRUNCATE);
-        wcsncpy_s(pEntries[i].display_name,  entries[i].displayName.c_str(),  _TRUNCATE);
-        wcsncpy_s(pEntries[i].credential_id, entries[i].credentialId.c_str(), _TRUNCATE);
+        wcsncpy_s(pEntries[i].subject_urn,   collapsed[i].subjectUrn.c_str(),   _TRUNCATE);
+        wcsncpy_s(pEntries[i].display_name,  collapsed[i].displayName.c_str(),  _TRUNCATE);
+        wcsncpy_s(pEntries[i].credential_id, collapsed[i].credentialId.c_str(), _TRUNCATE);
     }
 
     const DWORD totalSize =
