@@ -4463,7 +4463,7 @@ mod platform_applier_tests {
             ));
         }
         assert!(
-            handle.purpose_lookups_count("ok") >= ok_before + 1,
+            handle.purpose_lookups_count("ok") > ok_before,
             "ok bucket must advance on grant-granted (before={ok_before}, after={})",
             handle.purpose_lookups_count("ok")
         );
@@ -4481,7 +4481,7 @@ mod platform_applier_tests {
             ));
         }
         assert!(
-            handle.purpose_lookups_count("denied") >= denied_before + 1,
+            handle.purpose_lookups_count("denied") > denied_before,
             "denied bucket must advance on grant-denied (before={denied_before}, after={})",
             handle.purpose_lookups_count("denied")
         );

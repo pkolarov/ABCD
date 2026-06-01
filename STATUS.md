@@ -1,10 +1,10 @@
 # DDS Implementation Status
 
-## docs: fix enroll-device optional flags, admin-vouch purpose, Developer Guide lib-test count (235th pass) — 2026-06-01
+## fix(clippy): int_plus_one lint + docs: enroll-device flags, admin-vouch purpose, Developer Guide test count (235th pass) — 2026-06-01
 
 ### Summary
 
-Automated scheduled sweep. No functional code changes. Three documentation gaps fixed.
+Automated scheduled sweep. One pre-existing clippy lint error fixed; three documentation gaps fixed.
 
 **Gaps found and fixed:**
 
@@ -38,17 +38,27 @@ Automated scheduled sweep. No functional code changes. Three documentation gaps 
    Corrected to "801 / 801 passing as of 2026-06-01 — `cargo test --workspace --lib`,
    5 ignored".
 
+**Clippy lint fixed (pre-existing, caused CI failure since 232nd pass):**
+
+`dds-node/src/service.rs` — the 232nd-pass flaky-test fix introduced two
+`assert!(x >= y + 1, ...)` patterns in
+`has_purpose_observed_advances_ok_and_denied_telemetry_counters`. The
+`clippy::int_plus_one` lint (`-D warnings` on CI) rejects `>= y + 1` in favour of
+the equivalent `> y`. Changed both to `> ok_before` / `> denied_before`. The
+semantic property (each branch bumps its counter at least once) is identical.
+
 **Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
 production src. The single `TODO(security)` at `dds-node/src/service.rs` (M-22
 OS-bound key-wrapping) is unchanged.
 
 **Test results:** All 801 lib tests pass (365 dds-node lib; 0 failed; 5 ignored).
-No code changes — lib count unchanged from the 234th-pass baseline.
+`cargo clippy --workspace --all-targets -- -D warnings` passes clean.
 
 **Deferred items** (M-22, TPM2 backend, Authenticode code signing) unchanged.
 
 ### Files changed
 
+- `dds-node/src/service.rs` — `>= ok_before + 1` → `> ok_before`; `>= denied_before + 1` → `> denied_before`
 - `README.md` — `dds enroll device` synopsis: added `[--tpm-ek-hash <hex>] [--org-unit <unit>] [--tag <tag>...]`; `dds admin vouch`: bracketed `--purpose`
 - `docs/DDS-Developer-Guide.md` — lib test count corrected from 865/4-ignored to 801/5-ignored
 - `STATUS.md` — this entry
