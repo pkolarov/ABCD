@@ -3,8 +3,8 @@
 **Status:** Phase B (B.1–B.4) ✅ landed 2026-04-29. Phase C (C.1–C.5) ✅
 landed 2026-05-02. Phase A (cert provisioning) pending — no CI secrets
 provisioned yet. Phase B.5 (publisher migration cutover) gated on Phase A.
-Phase D (fleet self-update) partially landed: D.1 ✅ 2026-06-01, D.3 ✅
-2026-06-01, D.4 ✅ 2026-06-01; D.2 (multi-sig quorum) open.
+Phase D (fleet self-update) partially landed: D.1 ✅ 2026-06-01, D.2 ✅
+2026-06-01, D.3 ✅ 2026-06-01, D.4 ✅ 2026-06-01.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-6 / Z-7 / Z-8 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -653,17 +653,28 @@ Two config tests: `test_self_update_apply_defaults_true` and
 `test_self_update_apply_roundtrip_false`. Documented in
 [`docs/DDS-Admin-Guide.md`](DDS-Admin-Guide.md) top-level fields table.
 
-**D.2 — Publisher-capability gate (partial). ✅ Landed 2026-06-01.** The
-`publisher_capability_ok` ingest gate in `dds-node/src/node.rs` now requires
-`dds:dds-self-update-publisher` for `DdsSelfUpdateDocument` tokens, matching
-the pattern already in place for Windows/macOS policy and software assignment
-tokens. Three unit tests in `publisher_capability_dds_self_update_tests` cover:
-rejecting a self-update token from an issuer without the capability, passing
-non-Attest tokens unconditionally, and passing tokens with unknown body types.
+**D.2 — K-of-M multi-sig quorum. ✅ Landed 2026-06-01.** Full multi-sig
+enforcement is now in place. `DdsNode::check_self_update_quorum_and_maybe_apply`
+accumulates distinct `dds:dds-self-update-publisher` signers in a
+`pending_self_updates: HashMap<[u8;32], BTreeSet<String>>` map keyed on
+`SHA-256(body_cbor)` (the document content hash). The quorum threshold
+`K = max(2, ⌈M/2⌉)` is derived at evaluation time from
+`TrustGraph::count_purpose_holders("dds:dds-self-update-publisher", trusted_roots)`.
+Only when K distinct publishers have signed the same document content is
+`evaluate_self_update_rollout` called; the accumulator entry is then removed
+so additional stragglers cannot re-fire the apply step. Propagation of
+individual tokens is unconditional (quorum gates only the apply path).
 
-Full K-of-M multi-sig enforcement (the rest of Phase D.2) remains open — it
-requires a redesign of the trust-graph admission path to accumulate and count
-independent vouches before activating a manifest.
+`TrustGraph::count_purpose_holders` (new in `dds-core/src/trust.rs`) counts
+distinct subjects holding a non-revoked, non-expired purpose grant from a
+trusted-root-connected issuer with an active attestation. Five unit tests in
+`trust.rs` cover: empty graph, one holder, two holders, untrusted root not
+counted, and revoked vouch not counted.
+
+`self_update_quorum_k` and `self_update_content_hash` helpers in `node.rs`
+each have dedicated unit tests in `d2_multisig_quorum_tests`. The capability
+gate (`publisher_capability_ok` requiring `dds:dds-self-update-publisher`) from
+the partial landing remains, now acting as a pre-quorum identity check.
 
 **D.3 — Rollout cohort evaluation. ✅ Landed 2026-06-01.** The
 `RolloutPolicy::evaluate(peer_id_bytes, jti, installed_version)` method and the
