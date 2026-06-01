@@ -411,7 +411,85 @@ fn test_windows_policy_with_bundle_in_signed_token() {
 }
 
 // ============================================================
-// 4. SoftwareAssignment
+// 4. MacOsPolicyDocument
+// ============================================================
+
+#[test]
+fn test_macos_policy_roundtrip() {
+    let doc = MacOsPolicyDocument {
+        policy_id: "security/screensaver".into(),
+        display_name: "Screensaver Lock".into(),
+        version: 3,
+        scope: PolicyScope {
+            device_tags: vec!["mac-laptop".into()],
+            org_units: vec!["engineering".into()],
+            identity_urns: vec![],
+        },
+        settings: vec![PolicySetting {
+            key: "password.min_length".into(),
+            value: SettingValue::Int(12),
+        }],
+        enforcement: Enforcement::Enforce,
+        macos: Some(MacOsSettings {
+            preferences: vec![PreferenceDirective {
+                domain: "com.apple.screensaver".into(),
+                key: "idleTime".into(),
+                value: Some(serde_json::json!(600)),
+                scope: PreferenceScope::System,
+                action: PreferenceAction::Set,
+            }],
+            local_accounts: vec![MacAccountDirective {
+                username: "svcaccount".into(),
+                action: MacAccountAction::Create,
+                full_name: Some("Service Account".into()),
+                shell: Some("/usr/bin/false".into()),
+                admin: Some(false),
+                hidden: Some(true),
+            }],
+            launchd: vec![LaunchdDirective {
+                label: "com.dds.policyagent".into(),
+                plist_path: "/Library/LaunchDaemons/com.dds.policyagent.plist".into(),
+                enabled: Some(true),
+                action: LaunchdAction::Load,
+            }],
+            profiles: vec![ProfileDirective {
+                identifier: "com.example.vpn".into(),
+                display_name: "Corporate VPN".into(),
+                payload_sha256: "abcdef1234567890".into(),
+                mobileconfig_b64: "PD94bWwgdmVyc2lvbj0iMS4wIj8+".into(),
+                action: ProfileAction::Install,
+            }],
+        }),
+    };
+    let cbor = doc.to_cbor().unwrap();
+    assert_eq!(MacOsPolicyDocument::from_cbor(&cbor).unwrap(), doc);
+}
+
+#[test]
+fn test_macos_policy_minimal_roundtrip() {
+    // Only required fields; no typed `macos` bundle.
+    let doc = MacOsPolicyDocument {
+        policy_id: "security/baseline".into(),
+        display_name: "Baseline".into(),
+        version: 1,
+        scope: PolicyScope {
+            device_tags: vec![],
+            org_units: vec![],
+            identity_urns: vec![],
+        },
+        settings: vec![],
+        enforcement: Enforcement::Audit,
+        macos: None,
+    };
+    let cbor = doc.to_cbor().unwrap();
+    let decoded = MacOsPolicyDocument::from_cbor(&cbor).unwrap();
+    assert_eq!(decoded, doc);
+    assert!(decoded.macos.is_none());
+    assert!(decoded.settings.is_empty());
+}
+
+// ============================================================
+// 5. SoftwareAssignment
 // ============================================================
 
 #[test]
@@ -679,7 +757,7 @@ fn test_publisher_identity_validate_apple_team_id() {
 }
 
 // ============================================================
-// 5. ServicePrincipalDocument
+// 6. ServicePrincipalDocument
 // ============================================================
 
 #[test]
@@ -698,7 +776,7 @@ fn test_service_principal_roundtrip() {
 }
 
 // ============================================================
-// 6. SessionDocument
+// 7. SessionDocument
 // ============================================================
 
 #[test]
@@ -782,8 +860,10 @@ fn test_no_body_returns_none() {
 }
 
 // ============================================================
-// L-2 Linux typed directives
+// 8. LinuxPolicyDocument
 // ============================================================
+
+// ---- L-2 Linux typed directives ----
 
 #[test]
 fn test_linux_settings_default_is_empty() {
@@ -1122,7 +1202,7 @@ fn test_linux_policy_with_sysctl_and_ssh_roundtrip() {
 }
 
 // ============================================================
-// MacAccountBindingDocument
+// 9. MacAccountBindingDocument
 // ============================================================
 
 #[test]
@@ -1166,7 +1246,7 @@ fn test_mac_account_binding_optional_fields_default() {
 }
 
 // ============================================================
-// SsoIdentityLinkDocument
+// 10. SsoIdentityLinkDocument
 // ============================================================
 
 #[test]

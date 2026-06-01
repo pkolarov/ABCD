@@ -803,7 +803,7 @@ impl DomainDocument for MacAccountBindingDocument {
 }
 
 // ============================================================
-// 6. SsoIdentityLinkDocument — enterprise identity mapping
+// 7. SsoIdentityLinkDocument — enterprise identity mapping
 // ============================================================
 
 /// Links an enterprise IdP identity to a DDS subject URN.
@@ -841,7 +841,7 @@ impl DomainDocument for SsoIdentityLinkDocument {
 }
 
 // ============================================================
-// 7. SoftwareAssignment — app/package deployment manifest
+// 8. SoftwareAssignment — app/package deployment manifest
 // ============================================================
 
 /// A software package assignment for managed devices.
@@ -1018,7 +1018,7 @@ impl DomainDocument for SoftwareAssignment {
 }
 
 // ============================================================
-// 8. ServicePrincipalDocument — machine/service identity
+// 9. ServicePrincipalDocument — machine/service identity
 // ============================================================
 
 /// A service principal (machine identity) registration.
@@ -1048,7 +1048,7 @@ impl DomainDocument for ServicePrincipalDocument {
 }
 
 // ============================================================
-// 9. SessionDocument — short-lived auth session
+// 10. SessionDocument — short-lived auth session
 // ============================================================
 
 /// A short-lived session token for < 1ms local validation.

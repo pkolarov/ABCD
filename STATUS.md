@@ -1,5 +1,50 @@
 # DDS Implementation Status
 
+## refactor(domain): fix section numbering in types.rs and domain_tests.rs (238th pass) — 2026-06-01
+
+### Summary
+
+Automated scheduled sweep following the 237th-pass baseline.
+
+**Gap found and fixed:**
+
+Two section-numbering inconsistencies in `dds-domain`:
+
+1. **`dds-domain/src/types.rs`** — `SsoIdentityLinkDocument` was labeled `// 6.`
+   (duplicate of `MacAccountBindingDocument`). With 10 document types defined,
+   the correct sequence is 6=MacAccountBinding, 7=SsoIdentityLink,
+   8=SoftwareAssignment, 9=ServicePrincipal, 10=Session. Fixed all four
+   comment lines accordingly.
+
+2. **`dds-domain/tests/domain_tests.rs`** — The integration-test file gained
+   sections 1–7 but had no numbered header for `LinuxPolicyDocument` tests
+   (section 8), and `MacAccountBindingDocument` / `SsoIdentityLinkDocument`
+   sections (added in the 237th pass) were unnumbered. Added `// 8. LinuxPolicyDocument`
+   above the Linux test group; numbered the final two sections as 9 and 10.
+
+Also incorporates the 237th-pass unstaged additions: two new `MacOsPolicyDocument`
+CBOR round-trip tests (`test_macos_policy_roundtrip`, `test_macos_policy_minimal_roundtrip`).
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src. The single `TODO(security)` at `dds-node/src/service.rs` (M-22
+OS-bound key-wrapping) is unchanged.
+
+**Test results:** All tests pass — comment-only and test-addition changes; no
+functional Rust code modified.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) remain
+blocked on external design, infrastructure provisioning, or Windows CI; no change.
+
+### Files changed
+
+- **`dds-domain/src/types.rs`** — section numbers 6(Sso)→7, 7(Software)→8,
+  8(ServicePrincipal)→9, 9(Session)→10.
+- **`dds-domain/tests/domain_tests.rs`** — added `// 8. LinuxPolicyDocument` section
+  header; numbered MacAccountBinding as 9, SsoIdentityLink as 10; added
+  `test_macos_policy_roundtrip` and `test_macos_policy_minimal_roundtrip`.
+
+---
+
 ## test(domain): add CBOR round-trip tests for MacAccountBindingDocument and SsoIdentityLinkDocument (237th pass) — 2026-06-01
 
 ### Summary
