@@ -1178,6 +1178,111 @@ pub enum RolloutPolicy {
     Halt,
 }
 
+/// The outcome of evaluating a [`RolloutPolicy`] for a specific node.
+/// Returned by [`RolloutPolicy::evaluate`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum RolloutDecision {
+    /// This node is in the canary cohort (or meets `Pinned` criteria);
+    /// the apply path (Phase D.4) may proceed.
+    ApplyNow,
+    /// This node is outside the canary cohort; it should wait until the
+    /// canary has soaked for `promote_to_full_after_secs` seconds.
+    WaitForCanary {
+        /// Seconds the canary must run before this node becomes eligible.
+        promote_to_full_after_secs: u64,
+    },
+    /// The rollout policy is [`RolloutPolicy::Halt`]; do not apply.
+    Halted,
+    /// The `Pinned` policy lists specific versions but the node's
+    /// installed version was not among them (or is unknown).
+    Skipped,
+    /// The node's installed version predates `min_supported_from`; a
+    /// step-upgrade is required before this manifest can be applied.
+    StepUpgradeRequired,
+}
+
+impl RolloutPolicy {
+    /// Evaluate whether this node should apply a self-update described by
+    /// `jti`. `peer_id_bytes` is the node's stable identity (e.g. the
+    /// multihash bytes of the libp2p `PeerId`). `installed_version` is the
+    /// version currently running on this node, if known.
+    ///
+    /// The caller is responsible for also checking
+    /// [`DdsSelfUpdateDocument::min_supported_from`] against
+    /// `installed_version` *before* calling this method; the helper
+    /// [`DdsSelfUpdateDocument::evaluate`] does both checks in one call.
+    pub fn evaluate(
+        &self,
+        peer_id_bytes: &[u8],
+        jti: &str,
+        installed_version: Option<&SemVer>,
+    ) -> RolloutDecision {
+        match self {
+            RolloutPolicy::Halt => RolloutDecision::Halted,
+            RolloutPolicy::Pinned { allow_versions } => match installed_version {
+                Some(v) if allow_versions.contains(v) => RolloutDecision::ApplyNow,
+                _ => RolloutDecision::Skipped,
+            },
+            RolloutPolicy::Staged {
+                canary_pct,
+                promote_to_full_after_secs,
+                ..
+            } => {
+                if is_in_canary_cohort(peer_id_bytes, jti, *canary_pct) {
+                    RolloutDecision::ApplyNow
+                } else {
+                    RolloutDecision::WaitForCanary {
+                        promote_to_full_after_secs: *promote_to_full_after_secs,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Determines whether a node falls in the canary cohort for a given update.
+///
+/// Computes `SHA-256(peer_id_bytes || jti) mod 100` and returns `true` when
+/// the result is strictly less than `canary_pct`. The cohort re-randomises on
+/// every new JTI, so no node is permanently in the canary.
+fn is_in_canary_cohort(peer_id_bytes: &[u8], jti: &str, canary_pct: u8) -> bool {
+    if canary_pct == 0 {
+        return false;
+    }
+    if canary_pct >= 100 {
+        return true;
+    }
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(peer_id_bytes);
+    h.update(jti.as_bytes());
+    let digest = h.finalize();
+    let value = u64::from_le_bytes(digest[..8].try_into().unwrap()) % 100;
+    value < u64::from(canary_pct)
+}
+
+impl DdsSelfUpdateDocument {
+    /// Evaluate the full rollout decision for this node, checking both the
+    /// `min_supported_from` version floor and the [`RolloutPolicy`].
+    ///
+    /// Returns [`RolloutDecision::StepUpgradeRequired`] when `installed_version`
+    /// is known and older than `min_supported_from`, taking precedence over
+    /// the policy check.
+    pub fn evaluate(
+        &self,
+        peer_id_bytes: &[u8],
+        jti: &str,
+        installed_version: Option<&SemVer>,
+    ) -> RolloutDecision {
+        if let (Some(floor), Some(installed)) = (&self.min_supported_from, installed_version) {
+            if installed < floor {
+                return RolloutDecision::StepUpgradeRequired;
+            }
+        }
+        self.rollout.evaluate(peer_id_bytes, jti, installed_version)
+    }
+}
+
 /// Fleet-wide DDS self-update manifest. Published by admins holding the
 /// `dds:dds-self-update-publisher` capability (see
 /// `dds_core::token::purpose::SELF_UPDATE_PUBLISHER`). Trust-graph
@@ -1450,6 +1555,161 @@ mod tests {
             SsoIdentityLinkDocument::extract(&payload)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    // ---- Phase D.3: RolloutPolicy::evaluate + is_in_canary_cohort ----
+
+    #[test]
+    fn rollout_halt_always_halts() {
+        assert_eq!(
+            RolloutPolicy::Halt.evaluate(b"peer1", "jti-1", None),
+            RolloutDecision::Halted
+        );
+    }
+
+    #[test]
+    fn rollout_pinned_matches_installed_version() {
+        let v1 = SemVer {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        };
+        let v2 = SemVer {
+            major: 2,
+            minor: 0,
+            patch: 0,
+        };
+        let policy = RolloutPolicy::Pinned {
+            allow_versions: vec![v1.clone()],
+        };
+        assert_eq!(
+            policy.evaluate(b"peer1", "jti-1", Some(&v1)),
+            RolloutDecision::ApplyNow
+        );
+        assert_eq!(
+            policy.evaluate(b"peer1", "jti-1", Some(&v2)),
+            RolloutDecision::Skipped
+        );
+        assert_eq!(
+            policy.evaluate(b"peer1", "jti-1", None),
+            RolloutDecision::Skipped
+        );
+    }
+
+    #[test]
+    fn rollout_staged_canary_pct_zero_never_applies() {
+        let policy = RolloutPolicy::Staged {
+            canary_pct: 0,
+            promote_to_full_after_secs: 3600,
+            halt_on_health_regression: false,
+        };
+        // With canary_pct=0 no node is ever in the cohort.
+        assert!(matches!(
+            policy.evaluate(b"peer1", "jti-1", None),
+            RolloutDecision::WaitForCanary { .. }
+        ));
+    }
+
+    #[test]
+    fn rollout_staged_canary_pct_100_always_applies() {
+        let policy = RolloutPolicy::Staged {
+            canary_pct: 100,
+            promote_to_full_after_secs: 3600,
+            halt_on_health_regression: false,
+        };
+        assert_eq!(
+            policy.evaluate(b"peer1", "jti-1", None),
+            RolloutDecision::ApplyNow
+        );
+    }
+
+    #[test]
+    fn rollout_staged_cohort_is_deterministic() {
+        let policy = RolloutPolicy::Staged {
+            canary_pct: 50,
+            promote_to_full_after_secs: 7200,
+            halt_on_health_regression: true,
+        };
+        let d1 = policy.evaluate(b"fixed-peer", "fixed-jti", None);
+        let d2 = policy.evaluate(b"fixed-peer", "fixed-jti", None);
+        assert_eq!(d1, d2, "cohort selection must be deterministic");
+    }
+
+    #[test]
+    fn rollout_staged_cohort_rerandomises_on_new_jti() {
+        // With 50% canary, we should see both outcomes across different JTIs
+        // for the same peer. Try 20 JTIs; statistically the chance of all being
+        // the same outcome is 2 * (0.5^20) < 0.000002.
+        let policy = RolloutPolicy::Staged {
+            canary_pct: 50,
+            promote_to_full_after_secs: 3600,
+            halt_on_health_regression: false,
+        };
+        let decisions: Vec<_> = (0..20)
+            .map(|i| policy.evaluate(b"stable-peer", &format!("jti-{i}"), None))
+            .collect();
+        let has_apply = decisions.iter().any(|d| *d == RolloutDecision::ApplyNow);
+        let has_wait = decisions
+            .iter()
+            .any(|d| matches!(d, RolloutDecision::WaitForCanary { .. }));
+        assert!(
+            has_apply && has_wait,
+            "cohort should vary across JTIs with 50% canary_pct"
+        );
+    }
+
+    #[test]
+    fn rollout_staged_wait_carries_soak_duration() {
+        let policy = RolloutPolicy::Staged {
+            canary_pct: 0,
+            promote_to_full_after_secs: 7200,
+            halt_on_health_regression: false,
+        };
+        match policy.evaluate(b"peer1", "jti-1", None) {
+            RolloutDecision::WaitForCanary {
+                promote_to_full_after_secs,
+            } => {
+                assert_eq!(promote_to_full_after_secs, 7200);
+            }
+            other => panic!("expected WaitForCanary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dds_self_update_evaluate_step_upgrade_required() {
+        let v100 = SemVer {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        };
+        let v200 = SemVer {
+            major: 2,
+            minor: 0,
+            patch: 0,
+        };
+        let doc = DdsSelfUpdateDocument {
+            channel: ReleaseChannel::Stable,
+            version: v200.clone(),
+            artifacts: vec![],
+            min_supported_from: Some(v200.clone()),
+            rollout: RolloutPolicy::Staged {
+                canary_pct: 100,
+                promote_to_full_after_secs: 0,
+                halt_on_health_regression: false,
+            },
+            provenance: None,
+        };
+        // installed v1.0.0 < floor v2.0.0 → step-upgrade required even though
+        // canary_pct is 100 (would otherwise be ApplyNow).
+        assert_eq!(
+            doc.evaluate(b"peer1", "jti-1", Some(&v100)),
+            RolloutDecision::StepUpgradeRequired
+        );
+        // installed v2.0.0 == floor → proceed to policy evaluation.
+        assert_eq!(
+            doc.evaluate(b"peer1", "jti-1", Some(&v200)),
+            RolloutDecision::ApplyNow
         );
     }
 }

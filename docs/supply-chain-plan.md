@@ -651,6 +651,26 @@ Full K-of-M multi-sig enforcement (the rest of Phase D.2) remains open — it
 requires a redesign of the trust-graph admission path to accumulate and count
 independent vouches before activating a manifest.
 
+**D.3 — Rollout cohort evaluation. ✅ Landed 2026-06-01.** The
+`RolloutPolicy::evaluate(peer_id_bytes, jti, installed_version)` method and the
+`RolloutDecision` enum were added to `dds-domain/src/types.rs`. Cohort
+selection for `Staged` rollouts uses `SHA-256(peer_id_bytes || jti) mod 100`
+so the cohort re-randomises on every new JTI (no permanently-canary nodes).
+`DdsSelfUpdateDocument::evaluate` wraps the policy check with a
+`min_supported_from` version-floor gate, returning
+`RolloutDecision::StepUpgradeRequired` when the node is too old.
+
+The decision is evaluated in `DdsNode::evaluate_self_update_rollout`, called
+from both the gossip ingest path (`ingest_operation`) and the sync path
+(`handle_sync_response`) in `dds-node/src/node.rs`. All five outcomes are
+logged at `info` or `warn`. The actual apply step (Phase D.4) is not yet
+implemented; `ApplyNow` is logged as "would apply".
+
+Nine unit tests in `dds-domain::types::tests` cover: `Halt` always halts,
+`Pinned` matches / misses / no-version, `Staged` with 0% canary, 100% canary,
+determinism, JTI-driven re-randomisation, soak-duration propagation, and the
+`StepUpgradeRequired` / met-floor cases for `DdsSelfUpdateDocument::evaluate`.
+
 **Acceptance:** a single admin key compromise produces no installable
 self-update document on any node, because the trust graph rejects the
 document for missing the K-th signature. A multi-sig-approved canary

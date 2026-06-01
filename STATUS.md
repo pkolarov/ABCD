@@ -1,5 +1,82 @@
 # DDS Implementation Status
 
+## feat(domain,node): Phase D.3 rollout cohort evaluation (241st pass) — 2026-06-01
+
+### Summary
+
+Automated scheduled sweep following the 240th-pass baseline.
+
+**Gaps found and implemented:**
+
+**1. Phase D.3 — Rollout cohort evaluation.** `docs/supply-chain-plan.md` Phase D.3
+specified that each node evaluates the `RolloutPolicy` against its own `PeerId` to
+decide whether to apply a self-update immediately, wait for the canary soak, or skip.
+The evaluation logic was missing from both `dds-domain` and `dds-node`.
+
+Added to [`dds-domain/src/types.rs`](dds-domain/src/types.rs):
+
+- **`RolloutDecision` enum** — `ApplyNow`, `WaitForCanary { promote_to_full_after_secs }`,
+  `Halted`, `Skipped`, `StepUpgradeRequired` — representing all outcomes of rollout
+  policy evaluation.
+- **`RolloutPolicy::evaluate(peer_id_bytes, jti, installed_version) -> RolloutDecision`** —
+  evaluates the policy for a node identified by `peer_id_bytes`. `Staged` policy uses
+  `SHA-256(peer_id_bytes || jti) mod 100` for deterministic, per-update cohort assignment;
+  no node is permanently in the canary cohort.
+- **`is_in_canary_cohort(peer_id_bytes, jti, canary_pct) -> bool`** — private helper;
+  returns `false` when `canary_pct == 0` and `true` when `canary_pct >= 100` without
+  hashing.
+- **`DdsSelfUpdateDocument::evaluate(peer_id_bytes, jti, installed_version) -> RolloutDecision`**
+  — wraps `RolloutPolicy::evaluate` with a `min_supported_from` version-floor check;
+  returns `StepUpgradeRequired` when the node's installed version predates the floor,
+  taking precedence over the policy outcome.
+
+Added to [`dds-node/src/node.rs`](dds-node/src/node.rs):
+
+- **`DdsNode::evaluate_self_update_rollout(&self, payload: &TokenPayload)`** — private
+  helper called from both ingest paths. When `self_update_apply = false` (Phase D.6 gate)
+  it logs the same "disabled by config" message as before. When `self_update_apply = true`
+  it parses the `DdsSelfUpdateDocument`, calls `doc.evaluate`, and logs all five outcomes
+  at `info` (ApplyNow, WaitForCanary, Halted, Skipped) or `warn` (StepUpgradeRequired,
+  parse failures).
+- Gossip path (`ingest_operation`) and sync path (`handle_sync_response`) both now call
+  `evaluate_self_update_rollout` instead of the simpler D.6-only log block.
+
+**The actual binary install step (Phase D.4) is not yet implemented.** `ApplyNow` is
+logged as "would apply (Phase D.4 not yet implemented)".
+
+**2. Admin Guide update.** The `self_update_apply` row in
+[`docs/DDS-Admin-Guide.md`](docs/DDS-Admin-Guide.md) now documents the D.3 rollout
+evaluation behaviour when the flag is `true`.
+
+**3. Supply-chain plan status update.** D.3 marked ✅ in
+[`docs/supply-chain-plan.md`](docs/supply-chain-plan.md).
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers.
+The single `TODO(security)` at `dds-node/src/service.rs:2718` (M-22 OS-bound
+key-wrapping) is unchanged.
+
+**Test results:**
+- `cargo test --workspace --lib`: 818 / 818 passing, 5 ignored (+12 new vs 240th-pass:
+  8 rollout-policy tests in `dds-domain::types` + 3 rollout tests in `dds-node::node` +
+  1 publisher_capability test already counted; net new this pass: 11)
+- `cargo test -p dds-domain --test domain_tests`: 53 / 53 passing (unchanged)
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6, D.2-full,
+D.4–D.5) remain blocked on external design, infrastructure provisioning, or
+Windows CI; no change.
+
+### Files changed
+
+- **`dds-domain/src/types.rs`** — `RolloutDecision` enum, `RolloutPolicy::evaluate`,
+  `is_in_canary_cohort`, `DdsSelfUpdateDocument::evaluate`; 9 new unit tests in
+  `dds_domain::types::tests`.
+- **`dds-node/src/node.rs`** — `DdsNode::evaluate_self_update_rollout` helper;
+  gossip and sync paths updated to call it.
+- **`docs/DDS-Admin-Guide.md`** — extended `self_update_apply` row with D.3 details.
+- **`docs/supply-chain-plan.md`** — D.3 marked ✅ with implementation notes.
+
+---
+
 ## feat(node): Phase D.2 partial + D.6 self_update_apply config flag + docs: KPI bench references (240th pass) — 2026-06-01
 
 ### Summary

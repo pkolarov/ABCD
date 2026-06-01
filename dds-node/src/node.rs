@@ -2014,21 +2014,70 @@ impl DdsNode {
                     token_bytes.to_vec(),
                     None,
                 );
-                // Phase D.6: when self_update_apply = false, log that an
-                // update is available but skip the apply step. The document
-                // is still stored and propagated to peers that are opted-in.
-                if !self.config.self_update_apply
-                    && token.payload.body_type.as_deref()
-                        == Some(dds_domain::body_types::DDS_SELF_UPDATE)
+                // Phase D.3 + D.6: evaluate rollout policy for this node.
+                // The document is always stored and propagated; only the
+                // apply step (Phase D.4, not yet implemented) is gated here.
+                if token.payload.body_type.as_deref()
+                    == Some(dds_domain::body_types::DDS_SELF_UPDATE)
                 {
-                    info!(
-                        jti = %token.payload.jti,
-                        "self-update available, apply disabled by config (self_update_apply=false)"
-                    );
+                    self.evaluate_self_update_rollout(&token.payload);
                 }
             }
             Ok(false) => {} // duplicate
             Err(e) => warn!("DAG insert failed: {e}"),
+        }
+    }
+
+    /// Phase D.3 — evaluate the rollout policy for a `DdsSelfUpdateDocument`
+    /// token and log the decision. Called from both gossip and sync ingest
+    /// paths. The actual apply step (Phase D.4) is not yet implemented;
+    /// `ApplyNow` is logged as "would apply".
+    fn evaluate_self_update_rollout(&self, payload: &dds_core::token::TokenPayload) {
+        use dds_domain::{DomainDocument, RolloutDecision};
+        if !self.config.self_update_apply {
+            info!(
+                jti = %payload.jti,
+                "self-update available, apply disabled by config (self_update_apply=false)"
+            );
+            return;
+        }
+        match dds_domain::DdsSelfUpdateDocument::extract(payload) {
+            Ok(Some(doc)) => {
+                let peer_bytes = self.peer_id.to_bytes();
+                let decision = doc.evaluate(&peer_bytes, &payload.jti, None);
+                match decision {
+                    RolloutDecision::ApplyNow => info!(
+                        jti = %payload.jti,
+                        version = %format!("{}.{}.{}", doc.version.major, doc.version.minor, doc.version.patch),
+                        "self-update: in canary cohort, would apply (Phase D.4 not yet implemented)"
+                    ),
+                    RolloutDecision::WaitForCanary {
+                        promote_to_full_after_secs,
+                    } => info!(
+                        jti = %payload.jti,
+                        wait_secs = promote_to_full_after_secs,
+                        "self-update: not in canary cohort, waiting for canary soak"
+                    ),
+                    RolloutDecision::Halted => info!(
+                        jti = %payload.jti,
+                        "self-update: rollout halted by policy"
+                    ),
+                    RolloutDecision::Skipped => info!(
+                        jti = %payload.jti,
+                        "self-update: installed version not in allow_versions list, skipping"
+                    ),
+                    RolloutDecision::StepUpgradeRequired => warn!(
+                        jti = %payload.jti,
+                        "self-update: step-upgrade required, installed version predates min_supported_from"
+                    ),
+                }
+            }
+            Ok(None) => {
+                warn!(jti = %payload.jti, "self-update: token body_type mismatch, skipping rollout evaluation");
+            }
+            Err(e) => {
+                warn!(jti = %payload.jti, err = %e, "self-update: failed to parse DdsSelfUpdateDocument");
+            }
         }
     }
 
@@ -3025,19 +3074,17 @@ impl DdsNode {
                 self.cache_sync_payload(&id, &op, &payload.token_bytes);
             }
         }
-        // Phase D.6: log when a self-update manifest arrives via sync but
-        // apply is disabled by config.
-        if !self.config.self_update_apply && result.ops_merged > 0 {
+        // Phase D.3 + D.6: evaluate rollout policy for each self-update
+        // manifest that arrived via sync. The document is always stored and
+        // propagated; only the apply step (Phase D.4, not yet implemented)
+        // is gated here.
+        if result.ops_merged > 0 {
             for payload in &payloads {
                 if let Ok(token) = Token::from_cbor(&payload.token_bytes) {
                     if token.payload.body_type.as_deref()
                         == Some(dds_domain::body_types::DDS_SELF_UPDATE)
                     {
-                        info!(
-                            %peer,
-                            jti = %token.payload.jti,
-                            "self-update available (via sync), apply disabled by config (self_update_apply=false)"
-                        );
+                        self.evaluate_self_update_rollout(&token.payload);
                     }
                 }
             }
