@@ -17,6 +17,7 @@
 //! | `SoftwareAssignment` | `dds:software-assignment` | App deployment manifests |
 //! | `ServicePrincipalDocument` | `dds:service-principal` | Machine/service identity |
 //! | `SessionDocument` | `dds:session` | Short-lived auth session |
+//! | `DdsSelfUpdateDocument` | `dds:dds-self-update` | Fleet-wide DDS self-update manifest |
 
 pub mod domain;
 pub mod fido2;
@@ -42,6 +43,7 @@ pub mod body_types {
     pub const SOFTWARE_ASSIGNMENT: &str = "dds:software-assignment";
     pub const SERVICE_PRINCIPAL: &str = "dds:service-principal";
     pub const SESSION: &str = "dds:session";
+    pub const DDS_SELF_UPDATE: &str = "dds:dds-self-update";
 }
 
 /// Trait for domain documents that can be embedded in a token payload.

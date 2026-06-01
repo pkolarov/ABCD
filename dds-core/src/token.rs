@@ -61,6 +61,11 @@ pub mod purpose {
     pub const POLICY_PUBLISHER_LINUX: &str = "dds:policy-publisher-linux";
     /// Authorized to publish `SoftwareAssignment` attestations.
     pub const SOFTWARE_PUBLISHER: &str = "dds:software-publisher";
+    /// Authorized to publish `DdsSelfUpdateDocument` attestations.
+    /// Intentionally separate from `SOFTWARE_PUBLISHER` so that a
+    /// compromised third-party software publisher key cannot be
+    /// repurposed to ship code to every node in the fleet.
+    pub const SELF_UPDATE_PUBLISHER: &str = "dds:dds-self-update-publisher";
 
     /// Special purpose: the subject of a vouch with this purpose is
     /// being promoted to a trusted-root admin. `admin_vouch` enforces

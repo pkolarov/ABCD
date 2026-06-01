@@ -49,3 +49,11 @@ harness = false
 [[bench]]
 name = "policy_eval"
 harness = false
+
+[[bench]]
+name = "sync_protocol"
+harness = false
+
+[[bench]]
+name = "memory_budget"
+harness = false

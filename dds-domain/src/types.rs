@@ -1080,6 +1080,145 @@ impl DomainDocument for SessionDocument {
     const BODY_TYPE: &'static str = body_types::SESSION;
 }
 
+// ============================================================
+// 11. DdsSelfUpdateDocument — fleet DDS self-update manifest
+// ============================================================
+
+/// Release channel for a `DdsSelfUpdateDocument`. Agents only apply
+/// updates whose channel matches their configured channel (or a more
+/// stable one). `Canary` ⊆ `Beta` ⊆ `Stable` from a stability
+/// guarantee standpoint; a `Stable` node does not apply `Beta` or
+/// `Canary` documents.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReleaseChannel {
+    Stable,
+    Beta,
+    Canary,
+}
+
+/// Semantic version triple. Used instead of a bare `String` so that
+/// the `min_supported_from` field can be compared without parsing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SemVer {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+}
+
+/// Target platform for an [`UpdateArtifact`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Platform {
+    WinX64,
+    WinArm64,
+    MacosX64,
+    MacosArm64,
+    LinuxX64,
+    LinuxArm64,
+}
+
+/// Reference to the SLSA Level 3 provenance attestation (`.intoto.jsonl`)
+/// for a release artifact. Lets a node or an operator verify the build
+/// chain before applying the update.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvenanceRef {
+    /// URL of the `.intoto.jsonl` attestation file.
+    pub attestation_url: String,
+    /// Lowercase hex SHA-256 of the attestation file itself, so the
+    /// node can verify the provenance document was not swapped in
+    /// transit.
+    pub attestation_sha256_hex: String,
+}
+
+/// Per-platform artifact descriptor inside a [`DdsSelfUpdateDocument`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UpdateArtifact {
+    /// Target platform.
+    pub platform: Platform,
+    /// Download URL (HTTPS only; agents must refuse non-HTTPS URLs).
+    pub url: String,
+    /// SHA-256 of the artifact binary, as 64 lowercase hex chars.
+    pub sha256_hex: String,
+    /// Required OS-vendor-rooted signer identity. Agents run the
+    /// same two-signature gate as `SoftwareAssignment`: DDS document
+    /// signature (already verified at trust-graph admission) **and**
+    /// OS-vendor signature on the downloaded blob (supply-chain Phase
+    /// B, closes Z-7 for fleet updates too).
+    pub publisher_identity: PublisherIdentity,
+}
+
+/// Rollout policy for a [`DdsSelfUpdateDocument`]. Each node evaluates
+/// the policy against its own `PeerId` to decide whether to apply
+/// immediately, wait for the canary soak, or skip entirely.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum RolloutPolicy {
+    /// Apply only if the node's installed version is in
+    /// `allow_versions`. Useful for targeted hot-patches to a known
+    /// broken version without touching the wider fleet.
+    Pinned { allow_versions: Vec<SemVer> },
+    /// Staged rollout: a `canary_pct`% cohort applies immediately;
+    /// the rest wait until the canary has soaked for
+    /// `promote_to_full_after_secs` seconds without a health
+    /// regression. The cohort is chosen by hashing
+    /// `PeerId || document_jti` mod 100, so it re-randomises on
+    /// every update (no permanently-canary nodes).
+    Staged {
+        /// Fraction of the fleet that applies immediately (0–100).
+        canary_pct: u8,
+        /// Minimum age (seconds) the canary must run before the
+        /// rest of the fleet is eligible.
+        promote_to_full_after_secs: u64,
+        /// When `true`, a liveness regression (node stop responding
+        /// to `/healthz`) in the canary cohort halts the rollout for
+        /// the non-canary fleet automatically.
+        halt_on_health_regression: bool,
+    },
+    /// Emergency lever: all pending updates are halted. A subsequent
+    /// `DdsSelfUpdateDocument` with a non-`Halt` policy re-enables
+    /// normal rollout.
+    Halt,
+}
+
+/// Fleet-wide DDS self-update manifest. Published by admins holding the
+/// `dds:dds-self-update-publisher` capability (see
+/// `dds_core::token::purpose::SELF_UPDATE_PUBLISHER`). Trust-graph
+/// admission requires **K-of-M** admin signatures where
+/// `K = max(2, ceil(M / 2))` and M is the number of admins in the
+/// graph at admission time — supply-chain Phase D.2.
+///
+/// Intentionally separate from `SoftwareAssignment`: the capability
+/// gate, staging behaviour, and multi-sig trust model are different.
+/// A compromised `dds:software-publisher` key cannot produce a valid
+/// `DdsSelfUpdateDocument`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DdsSelfUpdateDocument {
+    /// Release channel. Agents only apply updates on their configured
+    /// channel or a more stable one.
+    pub channel: ReleaseChannel,
+    /// Version being distributed.
+    pub version: SemVer,
+    /// Per-platform artifact descriptors. An agent skips platforms it
+    /// does not recognise; a node whose platform has no entry logs
+    /// "no artifact for this platform" and takes no action.
+    pub artifacts: Vec<UpdateArtifact>,
+    /// Minimum installed version from which this update may be applied.
+    /// A node whose installed version is older than `min_supported_from`
+    /// must step-upgrade rather than skip versions. `None` means no
+    /// minimum (applies from any prior version).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_supported_from: Option<SemVer>,
+    /// Rollout policy.
+    pub rollout: RolloutPolicy,
+    /// SLSA Level 3 provenance attestation reference. Nodes that have
+    /// `verify_provenance = true` in their config must fetch and verify
+    /// this before applying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ProvenanceRef>,
+}
+
+impl DomainDocument for DdsSelfUpdateDocument {
+    const BODY_TYPE: &'static str = body_types::DDS_SELF_UPDATE;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

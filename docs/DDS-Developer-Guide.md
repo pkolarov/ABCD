@@ -722,6 +722,24 @@ authorization source.
 **`ServicePrincipalDocument`** — registers machine/service identities such as
 `HTTP/api.example.com`.
 
+**`DdsSelfUpdateDocument`** — a fleet-wide DDS self-update manifest published
+by admins holding the `dds:dds-self-update-publisher` capability. Carries
+per-platform artifact URLs, SHA-256 hashes, required OS-vendor signer
+identities, and a `RolloutPolicy` that controls canary staging. Trust-graph
+admission requires K-of-M admin signatures (Phase D.2), making a single
+compromised admin key insufficient to ship code to the entire fleet.
+
+```rust
+pub struct DdsSelfUpdateDocument {
+    pub channel: ReleaseChannel,           // Stable | Beta | Canary
+    pub version: SemVer,                   // e.g. SemVer { major: 1, minor: 2, patch: 3 }
+    pub artifacts: Vec<UpdateArtifact>,    // per-platform: MSI, pkg, …
+    pub min_supported_from: Option<SemVer>,// step-upgrade guard
+    pub rollout: RolloutPolicy,            // Pinned | Staged | Halt
+    pub provenance: Option<ProvenanceRef>, // SLSA attestation URL + sha256
+}
+```
+
 #### How documents flow through the system
 
 ```

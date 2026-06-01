@@ -3769,6 +3769,78 @@ optimisation.
 
 ---
 
+## Verifying a DDS Release
+
+Every DDS release artifact ships with two independent verification paths
+so operators can confirm the bits they received are the bits that were
+built by CI.
+
+### Sigstore / cosign (all platforms — available now)
+
+Each released binary is signed via Sigstore keyless signing using the
+GitHub Actions OIDC identity. The signature is stored in a
+`<name>.bundle` file alongside the binary in the GitHub Release.
+
+**Verify a Linux CLI binary:**
+```bash
+cosign verify-blob \
+  --bundle dds-linux-x86_64.bundle \
+  --certificate-identity-regexp \
+    "https://github.com/.*/\.github/workflows/cli\.yml@.*" \
+  --certificate-oidc-issuer \
+    "https://token.actions.githubusercontent.com" \
+  dds-linux-x86_64
+```
+
+For the Windows MSI and macOS pkg, substitute the workflow path:
+- Windows MSI: `\.github/workflows/msi\.yml@.*`
+- macOS pkg: `\.github/workflows/pkg\.yml@.*`
+
+### SLSA Level 3 provenance (all platforms — available now)
+
+Each release also ships an in-toto provenance attestation
+(`<name>.intoto.jsonl`). Verify it with `slsa-verifier`:
+
+```bash
+slsa-verifier verify-artifact dds-linux-x86_64 \
+  --provenance-path dds-linux-x86_64.intoto.jsonl \
+  --source-uri github.com/<org>/<repo>
+```
+
+The attestation links the binary back to the specific commit and GitHub
+Actions workflow run that produced it. A passing `slsa-verifier` check
+proves the binary was built in CI from the tagged commit — not assembled
+on a developer workstation or by an attacker with repository access.
+
+### Authenticode (Windows — once Phase A cert provisioning ships)
+
+Once an EV / OV code-signing certificate has been provisioned (supply-chain
+Phase A), the Windows MSI and every bundled `.exe` / `.dll` will carry an
+Authenticode signature. Verify with:
+
+```powershell
+signtool verify /pa /v dds-installer.msi
+```
+
+A valid Authenticode signature chains to a Microsoft-accepted CA root and
+includes a trusted timestamp so it remains valid after the signing
+certificate expires.
+
+### Developer ID (macOS — once Phase A cert provisioning ships)
+
+Once an Apple Developer ID certificate has been provisioned and the package
+has been notarized (supply-chain Phase A), verify the `.pkg` with:
+
+```bash
+# Check Developer ID signature and notarization staple
+pkgutil --check-signature dds-installer.pkg
+
+# Gatekeeper assessment (requires Apple notarization)
+spctl --assess --verbose=4 --type install dds-installer.pkg
+```
+
+---
+
 ## Security Reference
 
 ### Cryptography

@@ -1,6 +1,9 @@
 # DDS Supply-Chain Integrity & Self-Update Plan
 
-**Status:** Plan — open for implementation
+**Status:** Phase B (B.1–B.4) ✅ landed 2026-04-29. Phase C (C.1–C.5) ✅
+landed 2026-05-02. Phase A (cert provisioning) pending — no CI secrets
+provisioned yet. Phase B.5 (publisher migration cutover) gated on Phase A.
+Phase D (fleet self-update) not yet implemented.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-6 / Z-7 / Z-8 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -525,24 +528,40 @@ This is the largest piece. Two design tensions:
 
 The proposed envelope:
 
-**D.1 — New document type:** `DdsSelfUpdateDocument` (separate from
-`SoftwareAssignment` deliberately — the capability gate, the staging
-behaviour, and the trust model are different).
+**D.1 — New document type. ✅ Landed 2026-06-01.** `DdsSelfUpdateDocument`
+(separate from `SoftwareAssignment` deliberately — the capability gate, the
+staging behaviour, and the trust model are different) is now in
+[`dds-domain/src/types.rs`](../dds-domain/src/types.rs). The `SELF_UPDATE_PUBLISHER`
+capability constant was added to [`dds-core/src/token.rs`](../dds-core/src/token.rs).
+`body_types::DDS_SELF_UPDATE = "dds:dds-self-update"` is registered in
+[`dds-domain/src/lib.rs`](../dds-domain/src/lib.rs). 6 CBOR round-trip tests
+in [`dds-domain/tests/domain_tests.rs`](../dds-domain/tests/domain_tests.rs) cover
+the full struct, minimal struct (no optional fields), `Pinned` rollout, embed/extract
+lifecycle, wrong-body-type returns None, and `SemVer` ordering.
+
+Implementation notes vs the design sketch:
+- `min_supported_from` is `Option<SemVer>` (None = no minimum) rather than a
+  bare `SemVer`, to allow a publisher to omit the field on initial releases.
+- `sha256` uses a `String` (64 lowercase hex chars) rather than `[u8; 32]` so
+  it round-trips through CBOR text encoding identically to `SoftwareAssignment`
+  and doesn't require a custom serde implementation.
+- `promote_to_full_after_secs: u64` (seconds) replaces `Duration` to stay
+  `no_std`-friendly and CBOR-native.
 
 ```rust
 pub struct DdsSelfUpdateDocument {
-    pub channel: ReleaseChannel,         // Stable | Beta | Canary
+    pub channel: ReleaseChannel,              // Stable | Beta | Canary
     pub version: SemVer,
-    pub artifacts: Vec<UpdateArtifact>,  // per-platform: msi, pkg, …
-    pub min_supported_from: SemVer,      // refuse to update from < this
-    pub rollout: RolloutPolicy,          // see D.3
-    pub provenance: ProvenanceRef,       // SLSA attestation URL + sha256
+    pub artifacts: Vec<UpdateArtifact>,       // per-platform: msi, pkg, …
+    pub min_supported_from: Option<SemVer>,   // None = applies from any version
+    pub rollout: RolloutPolicy,               // Pinned | Staged | Halt
+    pub provenance: Option<ProvenanceRef>,    // SLSA attestation URL + sha256
 }
 
 pub struct UpdateArtifact {
-    pub platform: Platform,              // win-x64, win-arm64, macos-x64, macos-arm64
+    pub platform: Platform,              // WinX64 | WinArm64 | MacosX64 | MacosArm64 | LinuxX64 | LinuxArm64
     pub url: String,
-    pub sha256: [u8; 32],
+    pub sha256_hex: String,              // 64 lowercase hex chars
     pub publisher_identity: PublisherIdentity,  // OS-vendor signer (Phase B)
 }
 ```

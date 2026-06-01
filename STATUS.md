@@ -1,5 +1,94 @@
 # DDS Implementation Status
 
+## feat(domain): implement DdsSelfUpdateDocument (Phase D.1) + docs: release verification, supply-chain status (239th pass) — 2026-06-01
+
+### Summary
+
+Automated scheduled sweep following the 238th-pass baseline.
+
+**Gaps found and implemented:**
+
+**1. Phase D.1 — `DdsSelfUpdateDocument` type** (supply-chain Phase D — fleet
+self-update). The `DdsSelfUpdateDocument` and all supporting types
+(`ReleaseChannel`, `SemVer`, `Platform`, `ProvenanceRef`, `UpdateArtifact`,
+`RolloutPolicy`) were missing from `dds-domain` despite being fully specified in
+[`docs/supply-chain-plan.md`](docs/supply-chain-plan.md) Phase D.1. Added:
+- All seven types in `dds-domain/src/types.rs` (section 11)
+- `DomainDocument` impl with `body_types::DDS_SELF_UPDATE = "dds:dds-self-update"`
+- `SELF_UPDATE_PUBLISHER = "dds:dds-self-update-publisher"` capability constant
+  in `dds-core/src/token.rs`
+- `body_types::DDS_SELF_UPDATE` constant in `dds-domain/src/lib.rs`
+- 6 CBOR round-trip tests in `dds-domain/tests/domain_tests.rs`:
+  `test_dds_self_update_full_roundtrip` (all fields populated, Staged rollout,
+  ProvenanceRef, two platform artifacts, Authenticode + AppleDeveloperId),
+  `test_dds_self_update_minimal_roundtrip` (optional fields absent, Halt policy),
+  `test_dds_self_update_pinned_rollout_roundtrip` (Pinned policy, multiple
+  allow_versions), `test_dds_self_update_embed_extract_roundtrip`
+  (embed/extract lifecycle in a token payload),
+  `test_dds_self_update_extract_returns_none_for_other_body_type`
+  (body-type mismatch returns `Ok(None)`), `test_semver_ordering` (PartialOrd /
+  Ord on major → minor → patch).
+
+Implementation deviations from the plan sketch: `min_supported_from` is
+`Option<SemVer>` (None = no minimum) rather than a bare `SemVer`;
+`sha256_hex` is a `String` (64 lowercase hex) rather than `[u8; 32]` to
+match `SoftwareAssignment` conventions; `promote_to_full_after` is `u64`
+(seconds) rather than `std::time::Duration` for CBOR and `no_std` compatibility.
+
+**2. Admin Guide — "Verifying a DDS Release" section** (supply-chain Phase
+A.4). The section was missing from `docs/DDS-Admin-Guide.md` despite Phase
+A.4 requiring it. Added between Air-Gapped Sync and Security Reference,
+covering: cosign/Sigstore verification (available now via Phase C.5), SLSA
+Level 3 provenance verification via `slsa-verifier` (available now via Phase
+C.1), and Authenticode/pkgutil verification instructions (gated on Phase A
+cert provisioning, not yet available).
+
+**3. Supply-chain plan status update** — stale "Plan — open for
+implementation" header updated to reflect current state: Phase B.1–B.4 and
+Phase C.1–C.5 all landed; Phase D.1 landed (this pass); Phase A and D.2–D.6
+pending.
+
+**4. Developer Guide Chapter 7 update** — `DdsSelfUpdateDocument` added to
+the domain document catalog with struct sketch.
+
+**5. Bench files committed** — `dds-core/benches/sync_protocol.rs` and
+`dds-core/benches/memory_budget.rs` (and corresponding `Cargo.toml` entries)
+were written but uncommitted. Committed in this pass.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK`
+markers. The single `TODO(security)` at `dds-node/src/service.rs:2718`
+(M-22 OS-bound key-wrapping) is unchanged.
+
+**Test results:**
+- `cargo test --workspace --lib`: 801 / 801 passing, 5 ignored (unchanged —
+  new types are in `dds-domain`, no lib tests added)
+- `cargo test -p dds-domain --test domain_tests`: 53 / 53 passing (+6 new
+  vs 238th-pass baseline of 47)
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6,
+D.2–D.6) remain blocked on external design, infrastructure provisioning, or
+Windows CI; no change.
+
+### Files changed
+
+- **`dds-domain/src/types.rs`** — section 11: `ReleaseChannel`, `SemVer`,
+  `Platform`, `ProvenanceRef`, `UpdateArtifact`, `RolloutPolicy`,
+  `DdsSelfUpdateDocument`, `DomainDocument` impl.
+- **`dds-domain/src/lib.rs`** — `body_types::DDS_SELF_UPDATE` constant;
+  doc table row; `DdsSelfUpdateDocument` re-exported via `pub use types::*`.
+- **`dds-core/src/token.rs`** — `purpose::SELF_UPDATE_PUBLISHER` constant.
+- **`dds-domain/tests/domain_tests.rs`** — 6 new CBOR round-trip tests (section 11).
+- **`dds-core/benches/sync_protocol.rs`** — new bench (was untracked).
+- **`dds-core/benches/memory_budget.rs`** — new bench (was untracked).
+- **`dds-core/Cargo.toml`** — `[[bench]]` entries for `sync_protocol` and
+  `memory_budget`.
+- **`docs/DDS-Admin-Guide.md`** — new "Verifying a DDS Release" section.
+- **`docs/supply-chain-plan.md`** — status header updated; D.1 marked ✅.
+- **`docs/DDS-Developer-Guide.md`** — `DdsSelfUpdateDocument` added to
+  Chapter 7 domain document catalog.
+
+---
+
 ## refactor(domain): fix section numbering in types.rs and domain_tests.rs (238th pass) — 2026-06-01
 
 ### Summary

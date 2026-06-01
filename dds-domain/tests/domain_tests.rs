@@ -1286,3 +1286,143 @@ fn test_sso_identity_link_minimal_roundtrip() {
     assert!(decoded.issuer.is_none());
     assert!(decoded.email.is_none());
 }
+
+// ============================================================
+// 11. DdsSelfUpdateDocument
+// ============================================================
+
+#[test]
+fn test_dds_self_update_full_roundtrip() {
+    let doc = DdsSelfUpdateDocument {
+        channel: ReleaseChannel::Stable,
+        version: SemVer { major: 1, minor: 2, patch: 3 },
+        artifacts: vec![
+            UpdateArtifact {
+                platform: Platform::WinX64,
+                url: "https://releases.example.com/dds-1.2.3-win-x64.msi".into(),
+                sha256_hex: "a".repeat(64),
+                publisher_identity: PublisherIdentity::Authenticode {
+                    subject: "Acme Corp".into(),
+                    root_thumbprint: Some("b".repeat(40)),
+                },
+            },
+            UpdateArtifact {
+                platform: Platform::MacosArm64,
+                url: "https://releases.example.com/dds-1.2.3-macos-arm64.pkg".into(),
+                sha256_hex: "c".repeat(64),
+                publisher_identity: PublisherIdentity::AppleDeveloperId {
+                    team_id: "ABCDE12345".into(),
+                },
+            },
+        ],
+        min_supported_from: Some(SemVer { major: 0, minor: 9, patch: 0 }),
+        rollout: RolloutPolicy::Staged {
+            canary_pct: 5,
+            promote_to_full_after_secs: 86400,
+            halt_on_health_regression: true,
+        },
+        provenance: Some(ProvenanceRef {
+            attestation_url: "https://releases.example.com/dds-1.2.3.intoto.jsonl".into(),
+            attestation_sha256_hex: "d".repeat(64),
+        }),
+    };
+    let cbor = doc.to_cbor().unwrap();
+    assert_eq!(DdsSelfUpdateDocument::from_cbor(&cbor).unwrap(), doc);
+}
+
+#[test]
+fn test_dds_self_update_minimal_roundtrip() {
+    // No optional fields: min_supported_from = None, provenance = None, Halt policy.
+    let doc = DdsSelfUpdateDocument {
+        channel: ReleaseChannel::Canary,
+        version: SemVer { major: 0, minor: 1, patch: 0 },
+        artifacts: vec![UpdateArtifact {
+            platform: Platform::LinuxX64,
+            url: "https://releases.example.com/dds-0.1.0-linux-x64".into(),
+            sha256_hex: "e".repeat(64),
+            publisher_identity: PublisherIdentity::Authenticode {
+                subject: "Test Publisher".into(),
+                root_thumbprint: None,
+            },
+        }],
+        min_supported_from: None,
+        rollout: RolloutPolicy::Halt,
+        provenance: None,
+    };
+    let cbor = doc.to_cbor().unwrap();
+    let decoded = DdsSelfUpdateDocument::from_cbor(&cbor).unwrap();
+    assert_eq!(decoded, doc);
+    assert!(decoded.min_supported_from.is_none());
+    assert!(decoded.provenance.is_none());
+    assert_eq!(decoded.rollout, RolloutPolicy::Halt);
+}
+
+#[test]
+fn test_dds_self_update_pinned_rollout_roundtrip() {
+    let doc = DdsSelfUpdateDocument {
+        channel: ReleaseChannel::Beta,
+        version: SemVer { major: 1, minor: 0, patch: 5 },
+        artifacts: vec![],
+        min_supported_from: None,
+        rollout: RolloutPolicy::Pinned {
+            allow_versions: vec![
+                SemVer { major: 1, minor: 0, patch: 3 },
+                SemVer { major: 1, minor: 0, patch: 4 },
+            ],
+        },
+        provenance: None,
+    };
+    let cbor = doc.to_cbor().unwrap();
+    assert_eq!(DdsSelfUpdateDocument::from_cbor(&cbor).unwrap(), doc);
+}
+
+#[test]
+fn test_dds_self_update_embed_extract_roundtrip() {
+    let ident = Identity::generate("test-updater", &mut rand::rngs::OsRng);
+    let mut payload = make_payload(&ident);
+
+    let doc = DdsSelfUpdateDocument {
+        channel: ReleaseChannel::Stable,
+        version: SemVer { major: 2, minor: 0, patch: 0 },
+        artifacts: vec![],
+        min_supported_from: None,
+        rollout: RolloutPolicy::Staged {
+            canary_pct: 10,
+            promote_to_full_after_secs: 3600,
+            halt_on_health_regression: false,
+        },
+        provenance: None,
+    };
+    doc.embed(&mut payload).unwrap();
+    assert_eq!(payload.body_type.as_deref(), Some("dds:dds-self-update"));
+    let extracted = DdsSelfUpdateDocument::extract(&payload).unwrap().unwrap();
+    assert_eq!(extracted, doc);
+}
+
+#[test]
+fn test_dds_self_update_extract_returns_none_for_other_body_type() {
+    let ident = Identity::generate("test-ident", &mut rand::rngs::OsRng);
+    let mut payload = make_payload(&ident);
+    DeviceJoinDocument {
+        device_id: "win-001".into(),
+        hostname: "win-001".into(),
+        os: "Windows".into(),
+        os_version: "11".into(),
+        tpm_ek_hash: None,
+        org_unit: None,
+        tags: vec![],
+    }
+    .embed(&mut payload)
+    .unwrap();
+    assert!(DdsSelfUpdateDocument::extract(&payload).unwrap().is_none());
+}
+
+#[test]
+fn test_semver_ordering() {
+    assert!(SemVer { major: 1, minor: 0, patch: 0 } > SemVer { major: 0, minor: 9, patch: 9 });
+    assert!(SemVer { major: 1, minor: 2, patch: 3 } < SemVer { major: 1, minor: 2, patch: 4 });
+    assert_eq!(
+        SemVer { major: 2, minor: 0, patch: 0 },
+        SemVer { major: 2, minor: 0, patch: 0 }
+    );
+}
