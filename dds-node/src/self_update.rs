@@ -56,11 +56,17 @@ pub fn current_platform() -> Option<Platform> {
 /// installation.  Must be writable only by SYSTEM/root so an attacker
 /// cannot substitute the artifact after signature verification.
 fn staging_dir() -> PathBuf {
-    #[cfg(windows)]
+    // Redirect to a writable temp location in tests so the test process
+    // never tries to touch protected system directories (which triggers
+    // macOS TCC/SIP termination).
+    #[cfg(test)]
+    return std::env::temp_dir().join("dds-test-update-cache");
+
+    #[cfg(all(not(test), windows))]
     return PathBuf::from(r"C:\ProgramData\DDS\update-cache");
-    #[cfg(target_os = "macos")]
+    #[cfg(all(not(test), target_os = "macos"))]
     return PathBuf::from("/Library/Application Support/DDS/update-cache");
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(test, windows, target_os = "macos")))]
     PathBuf::from("/var/cache/dds")
 }
 

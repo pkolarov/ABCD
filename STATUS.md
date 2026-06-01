@@ -1,5 +1,40 @@
 # DDS Implementation Status
 
+## fix(test): redirect staging_dir to temp in test builds — avoid macOS TCC/SIP kill (244th pass) — 2026-06-01
+
+### Summary
+
+Automated scheduled sweep following the 243rd-pass baseline.
+
+**Bug found and fixed:**
+
+`staging_dir()` in `dds-node/src/self_update.rs` returned the production system
+path unconditionally — `/Library/Application Support/DDS/update-cache` on macOS.
+The `apply_update_rejects_http_url` test (added in the 243rd pass) exercises the
+`apply_update` path, which calls `staging_dir()` to create the staging directory.
+On macOS, attempting `fs::create_dir_all("/Library/Application Support/DDS/...")` in
+a test process triggers TCC/SIP and terminates the test runner with a signal.
+
+**Fix:** Added a `#[cfg(test)]` arm that returns
+`std::env::temp_dir().join("dds-test-update-cache")` before the platform-specific
+arms. The production arms are guarded with `#[cfg(all(not(test), ...))]` so
+compilation remains exhaustive. `staging_dir_is_absolute` still passes because
+`temp_dir()` is always absolute.
+
+**Test results:** 10 self-update tests pass (0 failed). `cargo check --workspace`
+clean. All prior tests unaffected.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) unchanged.
+
+### Files changed
+
+- **`dds-node/src/self_update.rs`** — `staging_dir()`: added `#[cfg(test)]` arm
+  returning `temp_dir().join("dds-test-update-cache")`; guarded platform arms with
+  `#[cfg(all(not(test), ...))]`.
+- **`STATUS.md`** — this entry.
+
+---
+
 ## feat(node): Phase D.4 self-update apply path (243rd pass) — 2026-06-01
 
 ### Summary
