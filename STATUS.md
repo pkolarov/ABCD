@@ -1,5 +1,62 @@
 # DDS Implementation Status
 
+## test(domain): add CBOR round-trip tests for MacAccountBindingDocument and SsoIdentityLinkDocument (237th pass) — 2026-06-01
+
+### Summary
+
+Automated scheduled sweep. No functional code changes. Two missing test coverage gaps fixed.
+
+**Gap found and fixed:**
+
+`dds-domain/tests/domain_tests.rs` covers CBOR round-trip serialization for every
+domain document type defined in `dds-domain/src/types.rs` — except two:
+
+1. **`MacAccountBindingDocument`** (`dds:macos-account-binding`): binds a DDS
+   subject + device to a macOS local account with join-state and authority metadata.
+   Defined in types.rs, implements `DomainDocument`, re-exported via `pub use types::*`.
+   No CBOR test existed despite the type being fully implemented and referenced in
+   `body_type_label` (service.rs) and the `body_type_label_maps_every_body_type_constant`
+   test.
+
+2. **`SsoIdentityLinkDocument`** (`dds:sso-identity-link`): links an enterprise
+   IdP identity (Entra, Okta, AD, OpenID Connect) to a DDS subject URN. Same status —
+   fully implemented, no CBOR test.
+
+Added four tests to `dds-domain/tests/domain_tests.rs`:
+
+- `test_mac_account_binding_roundtrip` — full document with all optional fields present
+- `test_mac_account_binding_optional_fields_default` — `local_display_name: None`,
+  `admin_groups: vec![]` absent on the wire; verifies they deserialize back correctly
+- `test_sso_identity_link_roundtrip` — full document (Entra provider) with all
+  optional `String` fields populated
+- `test_sso_identity_link_minimal_roundtrip` — only required fields; all four
+  `Option<String>` fields absent; verifies they round-trip to `None`
+
+Also updated the top-level file comment from "all 6 domain document types" to
+"all domain document types" to reflect the file now covers all 10 types.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src. The single `TODO(security)` at `dds-node/src/service.rs` (M-22
+OS-bound key-wrapping) is unchanged.
+
+**Test results:**
+- `cargo test --workspace --lib`: 801 / 801 passing, 5 ignored (unchanged — new
+  tests are integration tests in `dds-domain/tests/`, not counted by `--lib`)
+- `cargo test -p dds-domain --test domain_tests`: 47 / 47 passing (+4 new vs baseline)
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean (no new lints)
+
+**Deferred items** (M-22, TPM2 backend, Authenticode code signing) unchanged.
+
+### Files changed
+
+- `dds-domain/tests/domain_tests.rs` — 4 new CBOR round-trip tests for
+  `MacAccountBindingDocument` and `SsoIdentityLinkDocument`; file header comment updated
+- `README.md` — `dds-domain` crate table: added `macos-account-binding` and
+  `sso-identity-link` to the typed documents list
+- `STATUS.md` — this entry
+
+---
+
 ## fix(clippy): int_plus_one lint + docs: enroll-device flags, admin-vouch purpose, Developer Guide test count (235th pass) — 2026-06-01
 
 ### Summary

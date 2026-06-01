@@ -96,7 +96,7 @@ See [DDS Admin Guide — Windows Deployment](docs/DDS-Admin-Guide.md#windows-dep
 | Crate | Type | Purpose |
 |---|---|---|
 | `dds-core` | lib (`no_std`) | Crypto, identity, tokens (extensible body), CRDTs, trust graph, policy engine |
-| `dds-domain` | lib | Typed domain documents: auth, device, policy, software, service, session |
+| `dds-domain` | lib | Typed domain documents: auth, device, policy, software, macos-account-binding, sso-identity-link, service, session |
 | `dds-store` | lib | Storage traits + MemoryBackend + RedbBackend (ACID) |
 | `dds-net` | lib | libp2p transport, gossipsub, Kademlia, mDNS, delta-sync |
 | `dds-node` | lib + bin | P2P daemon + local authority HTTP API |

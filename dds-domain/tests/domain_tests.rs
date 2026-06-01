@@ -1,4 +1,4 @@
-//! Unit tests for all 6 domain document types + embed/extract lifecycle.
+//! Unit tests for all domain document types + embed/extract lifecycle.
 
 use dds_core::identity::Identity;
 use dds_core::token::{Token, TokenKind, TokenPayload};
@@ -1119,4 +1119,90 @@ fn test_linux_policy_with_sysctl_and_ssh_roundtrip() {
     };
     let cbor = doc.to_cbor().unwrap();
     assert_eq!(LinuxPolicyDocument::from_cbor(&cbor).unwrap(), doc);
+}
+
+// ============================================================
+// MacAccountBindingDocument
+// ============================================================
+
+#[test]
+fn test_mac_account_binding_roundtrip() {
+    let doc = MacAccountBindingDocument {
+        binding_id: "bind-abc-123".into(),
+        subject_urn: "urn:vouchsafe:alice.ed25519.abc123".into(),
+        device_urn: "urn:vouchsafe:mac-laptop.ed25519.def456".into(),
+        local_short_name: "alice".into(),
+        local_display_name: Some("Alice Example".into()),
+        join_state: MacJoinState::Standalone,
+        authority: MacAccountAuthority::DdsLocal,
+        admin_groups: vec!["admin".into()],
+        sso_link_id: None,
+        created_at: 1_700_000_000,
+    };
+    let cbor = doc.to_cbor().unwrap();
+    assert_eq!(MacAccountBindingDocument::from_cbor(&cbor).unwrap(), doc);
+}
+
+#[test]
+fn test_mac_account_binding_optional_fields_default() {
+    // Optional fields absent on the wire must deserialize back to None / empty.
+    let doc = MacAccountBindingDocument {
+        binding_id: "bind-min".into(),
+        subject_urn: "urn:vouchsafe:bob.ed25519.abc".into(),
+        device_urn: "urn:vouchsafe:macmini.ed25519.def".into(),
+        local_short_name: "bob".into(),
+        local_display_name: None,
+        join_state: MacJoinState::DirectoryBound,
+        authority: MacAccountAuthority::ExternalDirectory,
+        admin_groups: vec![],
+        sso_link_id: Some("sso-link-xyz".into()),
+        created_at: 1_700_000_001,
+    };
+    let cbor = doc.to_cbor().unwrap();
+    let decoded = MacAccountBindingDocument::from_cbor(&cbor).unwrap();
+    assert_eq!(decoded, doc);
+    assert!(decoded.local_display_name.is_none());
+    assert!(decoded.admin_groups.is_empty());
+}
+
+// ============================================================
+// SsoIdentityLinkDocument
+// ============================================================
+
+#[test]
+fn test_sso_identity_link_roundtrip() {
+    let doc = SsoIdentityLinkDocument {
+        link_id: "link-entra-001".into(),
+        subject_urn: "urn:vouchsafe:carol.ed25519.abc123".into(),
+        provider: "entra".into(),
+        provider_subject: "00000000-0000-0000-0000-000000000001".into(),
+        issuer: Some("https://login.microsoftonline.com/tenant-id".into()),
+        principal_name: Some("carol@example.com".into()),
+        email: Some("carol@example.com".into()),
+        display_name: Some("Carol Example".into()),
+        created_at: 1_700_000_002,
+    };
+    let cbor = doc.to_cbor().unwrap();
+    assert_eq!(SsoIdentityLinkDocument::from_cbor(&cbor).unwrap(), doc);
+}
+
+#[test]
+fn test_sso_identity_link_minimal_roundtrip() {
+    // Only required fields; all Option<String> absent.
+    let doc = SsoIdentityLinkDocument {
+        link_id: "link-okta-min".into(),
+        subject_urn: "urn:vouchsafe:dave.ed25519.xyz".into(),
+        provider: "okta".into(),
+        provider_subject: "okta-sub-id-12345".into(),
+        issuer: None,
+        principal_name: None,
+        email: None,
+        display_name: None,
+        created_at: 1_700_000_003,
+    };
+    let cbor = doc.to_cbor().unwrap();
+    let decoded = SsoIdentityLinkDocument::from_cbor(&cbor).unwrap();
+    assert_eq!(decoded, doc);
+    assert!(decoded.issuer.is_none());
+    assert!(decoded.email.is_none());
 }
