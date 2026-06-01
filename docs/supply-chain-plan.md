@@ -3,7 +3,8 @@
 **Status:** Phase B (B.1–B.4) ✅ landed 2026-04-29. Phase C (C.1–C.5) ✅
 landed 2026-05-02. Phase A (cert provisioning) pending — no CI secrets
 provisioned yet. Phase B.5 (publisher migration cutover) gated on Phase A.
-Phase D (fleet self-update) not yet implemented.
+Phase D (fleet self-update) partially landed: D.1 ✅ 2026-06-01, D.3 ✅
+2026-06-01, D.4 ✅ 2026-06-01; D.2 (multi-sig quorum) open.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-6 / Z-7 / Z-8 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
