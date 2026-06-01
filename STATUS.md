@@ -68,7 +68,7 @@ Windows CI; no change.
 ### Files changed
 
 - **`dds-domain/src/types.rs`** — `RolloutDecision` enum, `RolloutPolicy::evaluate`,
-  `is_in_canary_cohort`, `DdsSelfUpdateDocument::evaluate`; 9 new unit tests in
+  `is_in_canary_cohort`, `DdsSelfUpdateDocument::evaluate`; 8 new unit tests in
   `dds_domain::types::tests`.
 - **`dds-node/src/node.rs`** — `DdsNode::evaluate_self_update_rollout` helper;
   gossip and sync paths updated to call it.

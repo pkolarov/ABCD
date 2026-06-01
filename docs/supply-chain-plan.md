@@ -666,7 +666,7 @@ from both the gossip ingest path (`ingest_operation`) and the sync path
 logged at `info` or `warn`. The actual apply step (Phase D.4) is not yet
 implemented; `ApplyNow` is logged as "would apply".
 
-Nine unit tests in `dds-domain::types::tests` cover: `Halt` always halts,
+Eight unit tests in `dds-domain::types::tests` cover: `Halt` always halts,
 `Pinned` matches / misses / no-version, `Staged` with 0% canary, 100% canary,
 determinism, JTI-driven re-randomisation, soak-duration propagation, and the
 `StepUpgradeRequired` / met-floor cases for `DdsSelfUpdateDocument::evaluate`.
