@@ -1,5 +1,88 @@
 # DDS Implementation Status
 
+## feat(node): Phase D.2 partial + D.6 self_update_apply config flag + docs: KPI bench references (240th pass) — 2026-06-01
+
+### Summary
+
+Automated scheduled sweep following the 239th-pass baseline.
+
+**Gaps found and implemented:**
+
+**1. Phase D.6 — `self_update_apply` config flag.** The `NodeConfig` was missing the
+`self_update_apply: bool` field (default `true`) specified in `docs/supply-chain-plan.md`
+Phase D.6. Added to [`dds-node/src/config.rs`](dds-node/src/config.rs) with a doc
+comment referencing D.6. The flag is checked after novel-op ingest in both wire paths:
+
+- `DdsNode::ingest_operation` (gossip path): logs `"self-update available, apply disabled
+  by config (self_update_apply=false)"` when a novel `DdsSelfUpdateDocument` is ingested
+  and the flag is `false`.
+- `DdsNode::handle_sync_response` (sync path): same log for each `DdsSelfUpdateDocument`
+  token present in the sync payload batch, guarded by `ops_merged > 0` so the token
+  decode loop only runs when something actually changed.
+
+The node still ingests, stores, and propagates the manifest to opted-in peers in both
+cases — only the (currently unimplemented) install step is suppressed.
+
+**2. Phase D.2 (partial) — `SELF_UPDATE_PUBLISHER` capability gate.** The ingest-time
+`publisher_capability_ok` function in [`dds-node/src/node.rs`](dds-node/src/node.rs) was
+not gating `DdsSelfUpdateDocument` tokens. Added `DDS_SELF_UPDATE → SELF_UPDATE_PUBLISHER`
+to the existing match arm, exactly as Windows/macOS policy and software-assignment tokens
+are gated. An issuer without a `dds:dds-self-update-publisher` vouch chained to a trusted
+root is now rejected at ingest on both the gossip and sync paths.
+
+Full K-of-M multi-sig enforcement (the original Phase D.2 scope) remains deferred — it
+requires redesigning trust-graph admission to accumulate and count N independent vouches
+before activating a manifest, which is a larger architectural change.
+
+**3. Developer Guide KPI section update** (uncommitted from 239th pass). The Chapter 12
+KPI section improvements that were left in the working tree were committed:
+- KPI #3: points to `dds-core/benches/crdt_merge.rs` as the enforcement benchmark.
+- KPI #3 addendum: documents `dds-core/benches/sync_protocol.rs` for the ≤30 s bootstrap
+  KPI and what it validates (`compute_missing_ops` + `CausalDag::merge` at 100 and 1K ops).
+- KPI #4: replaces the single "honest disclosure" block with a two-level breakdown:
+  `memory_budget.rs` as the authoritative CI gate (DAG-layer, unaffected by libp2p
+  baseline) and RSS as a trend proxy. Adds a note on estimation accuracy and the deferred
+  `dhat` improvement.
+- KPI "What's still soft" summary: updated to reflect that peak-heap now has partial direct
+  coverage (the Criterion gate) rather than being fully proxy-measured.
+
+**4. Admin Guide top-level fields table** — `self_update_apply` added to the
+`docs/DDS-Admin-Guide.md` configuration reference.
+
+**5. Supply-chain plan status update** — D.6 and D.2 (partial) marked ✅ in
+`docs/supply-chain-plan.md`.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers.
+The single `TODO(security)` at `dds-node/src/service.rs:2718` (M-22 OS-bound
+key-wrapping) is unchanged.
+
+**Test results:**
+- `cargo test --workspace --lib`: 806 / 806 passing, 5 ignored (+5 new: 2 config
+  tests in `dds-node::config` + 3 capability-gate tests in
+  `dds-node::node::publisher_capability_dds_self_update_tests`)
+- `cargo test -p dds-domain --test domain_tests`: 53 / 53 passing (unchanged)
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6, D.2-full,
+D.3–D.5) remain blocked on external design, infrastructure provisioning, or
+Windows CI; no change.
+
+### Files changed
+
+- **`dds-node/src/config.rs`** — `NodeConfig::self_update_apply: bool` (default `true`,
+  Phase D.6); 2 new config tests.
+- **`dds-node/src/node.rs`** — `publisher_capability_ok`: added `DDS_SELF_UPDATE →
+  SELF_UPDATE_PUBLISHER` arm (Phase D.2 partial); gossip and sync paths: Phase D.6
+  `self_update_apply` log; new test module
+  `publisher_capability_dds_self_update_tests` (3 tests).
+- **`docs/DDS-Admin-Guide.md`** — `self_update_apply` row added to top-level fields
+  config reference table.
+- **`docs/supply-chain-plan.md`** — D.6 and D.2 (partial) marked ✅; implementation
+  notes added.
+- **`docs/DDS-Developer-Guide.md`** — KPI #3 and KPI #4 section improvements committed
+  (previously in working tree).
+
+---
+
 ## feat(domain): implement DdsSelfUpdateDocument (Phase D.1) + docs: release verification, supply-chain status (239th pass) — 2026-06-01
 
 ### Summary

@@ -1294,11 +1294,20 @@ CRDTs ([Chapter 4](#chapter-4-magic-auto-merging-spreadsheets)) are how DDS hand
 
 50 microseconds is way under what `BTreeMap` and `BTreeSet` operations cost in Rust at our scale, so this KPI is mostly a safety net. It would only fail if someone accidentally introduced a quadratic loop somewhere. Which is exactly the kind of thing we want a regression gate for.
 
+The benchmark that enforces this is `dds-core/benches/crdt_merge.rs`.
+
+**Sync protocol throughput** is a related concern: §10 specifies that a new node must be able to bootstrap (full sync from zero to 10K entries) in ≤ 30 seconds over a 10 Mbps link. The `dds-core/benches/sync_protocol.rs` benchmark validates the CRDT-layer operations that dominate this: `compute_missing_ops` (negotiation) and `CausalDag::merge` (transfer) at 100 and 1K op scales.
+
 #### KPI #4 — Peak heap per 1K entries
 
 DDS is meant to run on small devices (think: a Raspberry Pi at the edge of a network) as well as servers. The §10 budget says that each 1,000 directory entries (users + devices + vouches + revocations) should fit in 5 MB of RAM. That's tight enough to keep us honest about data structure overhead but loose enough that we don't have to micro-optimize every byte.
 
-> **Honest disclosure**: we currently measure this as **whole-process RSS** (Resident Set Size — how much memory the OS thinks the process is using) divided by the number of trust graph entries. This includes the libp2p runtime baseline (~30 MB), so the number always looks worse than the real cost of an entry. The real fix is to wire up the [`dhat`](https://docs.rs/dhat) heap profiler, which can answer "how much of the heap is owned by the trust graph specifically?" — we deferred that to post-pilot.
+We validate this at two levels:
+
+- **`dds-core/benches/memory_budget.rs`** — a Criterion benchmark that builds `CausalDag` instances at 1K and 10K entries, estimates their heap footprint (summing owned String/Vec bytes plus BTreeMap node overhead), and asserts the §10 bounds as a CI gate. This runs at the data-structure layer and is not affected by the libp2p runtime baseline.
+- **Whole-process RSS** measured by `dds-loadtest` — always overstates the true cost because it includes the libp2p runtime (~30 MB). Kept for trend tracking during chaos soaks; the Criterion benchmark above is the authoritative CI gate.
+
+> **Note on estimation accuracy**: `memory_budget.rs` sums owned bytes directly rather than using a heap profiler. It's a lower-bound estimate — allocator alignment padding and BTreeMap page boundaries can add another 10–20% in practice. Wiring up [`dhat`](https://docs.rs/dhat) for exact per-allocation accounting remains a post-pilot improvement (see risk **R5** in STATUS.md).
 
 #### KPI #5 — Idle gossip bandwidth
 
@@ -1376,10 +1385,10 @@ Things to look at, in order:
 
 ### What's still soft
 
-Two of the §10 KPIs are currently measured by **proxy** rather than directly:
+One of the §10 KPIs is still measured by **proxy**, and one has partial direct coverage:
 
-- **Peak heap** uses whole-process RSS, which always overstates the true cost because it includes the libp2p runtime baseline (~30 MB)
-- **Idle bandwidth** uses RSS-delta over time, because libp2p doesn't expose per-direction network counters
+- **Peak heap** — `dds-core/benches/memory_budget.rs` now provides a direct DAG-layer estimate (CI gate). The `dds-loadtest` RSS measurement is kept for trend tracking but remains a proxy because it includes the libp2p runtime baseline (~30 MB).
+- **Idle bandwidth** uses RSS-delta over time, because libp2p doesn't expose per-direction network counters.
 
 For pilot deployments these proxies are good enough — we know the *trend* is flat and the *order of magnitude* is right. Before general availability we plan to wire up `dhat` for real heap profiling and a custom transport wrapper for real byte counters. See risk **R5** in [STATUS.md](../STATUS.md) for details.
 

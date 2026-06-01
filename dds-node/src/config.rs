@@ -45,6 +45,19 @@ pub struct NodeConfig {
     /// and revokes them in the store. Default: 60 seconds. Must be > 0.
     #[serde(default = "default_expiry_scan_interval")]
     pub expiry_scan_interval_secs: u64,
+
+    /// **Phase D.6 (supply-chain-plan.md)** — whether this node should
+    /// attempt to apply inbound `DdsSelfUpdateDocument` tokens. When
+    /// `true` (the default), a node that receives a self-update manifest
+    /// and decides it is in the target cohort will download and install
+    /// the update artifact. Set to `false` for air-gapped or regulated
+    /// deployments that maintain their own change-control pipeline — the
+    /// node will still ingest, store, and propagate self-update documents
+    /// (so peers that are opted-in receive them), but will log
+    /// "self-update available, apply disabled by config" and take no
+    /// install action itself.
+    #[serde(default = "default_true")]
+    pub self_update_apply: bool,
 }
 
 fn default_expiry_scan_interval() -> u64 {
@@ -834,5 +847,28 @@ pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
             config.network.admission_key_backend,
             AdmissionKeyBackend::Tpm2
         );
+    }
+
+    /// Phase D.6: self_update_apply defaults to true (updates are applied by
+    /// default; opt-out is explicit for air-gapped/regulated deployments).
+    #[test]
+    fn test_self_update_apply_defaults_true() {
+        let toml = format!(r#"org_hash = "abc123"{DOMAIN_TOML}"#);
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert!(config.self_update_apply);
+    }
+
+    /// Phase D.6: self_update_apply = false round-trips through TOML.
+    #[test]
+    fn test_self_update_apply_roundtrip_false() {
+        let toml = format!(
+            r#"
+            org_hash = "abc123"
+            self_update_apply = false
+            {DOMAIN_TOML}
+        "#
+        );
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert!(!config.self_update_apply);
     }
 }

@@ -624,12 +624,32 @@ multi-sig requirement supersedes any pending update. Rollback is a
 `DdsSelfUpdateDocument` with a lower `version` field — admins
 explicitly approve the downgrade with the same multi-sig.
 
-**D.6 — Non-self-update path.** For air-gapped / regulated deployments
+**D.6 — Non-self-update path. ✅ Landed 2026-06-01.** For air-gapped / regulated deployments
 that must keep their own change-control pipeline, the document
 *type* can be deserialized but the apply step is gated by a node
 config flag `self_update_apply = false` (default `true`). Such nodes
 log "self-update available, apply disabled by config" and continue
 running the installed version.
+
+Implementation: `NodeConfig::self_update_apply: bool` (default `true`) added to
+[`dds-node/src/config.rs`](../dds-node/src/config.rs). Checked after novel op ingest
+in both the gossip path (`DdsNode::ingest_operation`) and the sync path
+(`DdsNode::handle_sync_response`) in [`dds-node/src/node.rs`](../dds-node/src/node.rs).
+Two config tests: `test_self_update_apply_defaults_true` and
+`test_self_update_apply_roundtrip_false`. Documented in
+[`docs/DDS-Admin-Guide.md`](DDS-Admin-Guide.md) top-level fields table.
+
+**D.2 — Publisher-capability gate (partial). ✅ Landed 2026-06-01.** The
+`publisher_capability_ok` ingest gate in `dds-node/src/node.rs` now requires
+`dds:dds-self-update-publisher` for `DdsSelfUpdateDocument` tokens, matching
+the pattern already in place for Windows/macOS policy and software assignment
+tokens. Three unit tests in `publisher_capability_dds_self_update_tests` cover:
+rejecting a self-update token from an issuer without the capability, passing
+non-Attest tokens unconditionally, and passing tokens with unknown body types.
+
+Full K-of-M multi-sig enforcement (the rest of Phase D.2) remains open — it
+requires a redesign of the trust-graph admission path to accumulate and count
+independent vouches before activating a manifest.
 
 **Acceptance:** a single admin key compromise produces no installable
 self-update document on any node, because the trust graph rejects the

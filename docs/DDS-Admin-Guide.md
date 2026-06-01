@@ -881,6 +881,7 @@ The `dds.toml` file controls all node behavior.
 | `bootstrap_admin_urn` | string | _unset_ | Vouchsafe URN of the bootstrap admin. When set, this admin can vouch for any purpose; non-bootstrap admins must hold a `dds:admin-vouch:<purpose>` capability vouch from the bootstrap admin. Persists across restarts. |
 | `identity_path` | path | `<data_dir>/node_key.bin` | Path to the node's Vouchsafe signing identity |
 | `expiry_scan_interval_secs` | int | `60` | Seconds between expired-token sweep runs. Must be > 0. |
+| `self_update_apply` | bool | `true` | **Phase D.6** — whether the node should apply inbound `DdsSelfUpdateDocument` update manifests. When `false`, the node still ingests and propagates the manifest (so opted-in peers receive it) but logs "self-update available, apply disabled by config" and skips the install step. Set to `false` for air-gapped or regulated deployments that maintain their own change-control pipeline. |
 
 ### `[network]` Section
 
