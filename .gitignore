@@ -47,6 +47,12 @@ platform/windows/installer/out/
 # Claude Code per-repo state
 .claude/
 
+# Scratch / temp working dir (downloaded MSIs, install logs, etc.)
+.tmp/
+
+# C# language-server cache files
+*.lscache
+
 # macOS metadata
 .DS_Store
 ._*
