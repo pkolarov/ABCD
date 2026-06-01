@@ -106,6 +106,7 @@ fn spawn_node(domain_key: &DomainKey, capabilities: Vec<String>) -> (DdsNode, te
         bootstrap_admin_urn: None,
         identity_path: None,
         expiry_scan_interval_secs: 60,
+        self_update_apply: true,
     };
     let node = DdsNode::init(cfg, p2p_keypair).expect("init node");
     (node, dir)

@@ -230,6 +230,7 @@ fn write_node_fixture(
         bootstrap_admin_urn: None,
         identity_path: None,
         expiry_scan_interval_secs: 1,
+        self_update_apply: true,
     };
     let config_path = dir.path().join(format!("{name}.toml"));
     std::fs::write(&config_path, toml::to_string_pretty(&cfg).unwrap()).unwrap();
@@ -333,6 +334,7 @@ impl Publisher {
             bootstrap_admin_urn: None,
             identity_path: None,
             expiry_scan_interval_secs: 60,
+        self_update_apply: true,
         };
         let mut node = DdsNode::init(cfg, p2p_keypair).unwrap();
         node.start().unwrap();

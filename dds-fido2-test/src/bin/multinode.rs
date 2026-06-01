@@ -333,6 +333,7 @@ async fn spawn_node(
         bootstrap_admin_urn: None,
         identity_path: None,
         expiry_scan_interval_secs: 60,
+        self_update_apply: true,
     };
 
     let mut node = DdsNode::init(cfg, p2p_keypair)?;

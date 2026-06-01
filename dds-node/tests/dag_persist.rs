@@ -66,6 +66,7 @@ fn make_node(domain_key: &DomainKey) -> (dds_node::node::DdsNode, tempfile::Temp
         bootstrap_admin_urn: None,
         identity_path: None,
         expiry_scan_interval_secs: 60,
+        self_update_apply: true,
     };
     let node = dds_node::node::DdsNode::init(cfg, p2p_keypair).expect("init node");
     (node, dir)
