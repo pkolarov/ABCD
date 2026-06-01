@@ -4770,10 +4770,7 @@ mod d5_halt_tests {
     use dds_core::identity::Identity;
     use dds_core::token::{Token, TokenKind, TokenPayload};
     use dds_domain::body_types;
-    use dds_domain::types::{
-        DdsSelfUpdateDocument, Platform, PublisherIdentity, ReleaseChannel, RolloutPolicy, SemVer,
-        UpdateArtifact,
-    };
+    use dds_domain::types::{DdsSelfUpdateDocument, ReleaseChannel, RolloutPolicy, SemVer};
     use rand::rngs::OsRng;
 
     fn make_self_update_token(rollout: RolloutPolicy, jti: &str) -> Token {
@@ -4785,17 +4782,7 @@ mod d5_halt_tests {
                 minor: 2,
                 patch: 3,
             },
-            artifacts: vec![UpdateArtifact {
-                platform: Platform::LinuxX86_64,
-                url: "https://example.com/dds-1.2.3-linux-x86_64.tar.gz".to_string(),
-                sha256: "a".repeat(64),
-                size_bytes: 1024,
-                signature_b64: "sig".to_string(),
-                publisher: PublisherIdentity {
-                    subject_urn: ident.id.to_urn(),
-                    signing_cert_sha256: "b".repeat(64),
-                },
-            }],
+            artifacts: vec![],
             min_supported_from: None,
             rollout,
             provenance: None,
