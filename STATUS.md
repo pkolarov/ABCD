@@ -62,6 +62,10 @@ key-wrapping) is unchanged.
   `dds-node::node::publisher_capability_dds_self_update_tests`)
 - `cargo test -p dds-domain --test domain_tests`: 53 / 53 passing (unchanged)
 
+**CI fix:** `TrustGraph::new()` takes 0 arguments but the test code called it
+with `DEFAULT_MAX_CHAIN_DEPTH` as an argument (E0061). Fixed in a follow-up
+commit (`ce4ae28`) — all three occurrences in `publisher_capability_dds_self_update_tests`.
+
 **Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6, D.2-full,
 D.3–D.5) remain blocked on external design, infrastructure provisioning, or
 Windows CI; no change.
