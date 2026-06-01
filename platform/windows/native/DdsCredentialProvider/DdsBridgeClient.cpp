@@ -16,6 +16,12 @@
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "hid.lib")
 
+// Defined in winerror.h on current SDKs; pin a fallback so older SDKs that
+// build the CP DLL still compile the UV-cancel classification below.
+#ifndef NTE_USER_CANCELLED
+#define NTE_USER_CANCELLED ((HRESULT)0x80090036L)
+#endif
+
 // FIDO Alliance HID usage page for CTAPHID — every USB FIDO2 authenticator
 // reports this on its HID interface (per CTAP2 spec §8.1.2).
 static const USHORT FIDO_USAGE_PAGE = 0xF1D0;
@@ -882,9 +888,15 @@ bool CDdsBridgeClient::HandleWebAuthnChallenge(
         // Map cancellation to USER_CANCELLED specifically so the CP can
         // distinguish "user gave up" from a real auth failure. Everything
         // else is still AUTH_FAILED.
+        //
+        // NTE_USER_CANCELLED (0x80090036) covers UV cancel on the FIDO key
+        // itself (e.g. fingerprint sensor cancel, YubiKey-style cancel
+        // button during UV) — its low 16 bits are 0x0036, so the generic
+        // ERROR_CANCELLED low-bits check below would miss it.
         const bool isUserCancel =
             hr == HRESULT_FROM_WIN32(ERROR_CANCELLED) ||
             hr == HRESULT_FROM_WIN32(ERROR_TIMEOUT)   ||
+            hr == NTE_USER_CANCELLED                  ||
             (hr & 0x0000FFFF) == ERROR_CANCELLED;
         result.errorCode = isUserCancel ? IPC_ERROR::USER_CANCELLED
                                         : IPC_ERROR::AUTH_FAILED;

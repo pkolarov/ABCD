@@ -506,6 +506,27 @@ HRESULT CDdsCredential::GetSerializationDds(
         // Don't auto-trigger again on next tile select — let user click Submit manually
         auto_tries = 0;
 
+        // User cancelled UV on the FIDO key or pressed ESC in the WebAuthn
+        // prompt. Treat the whole passwordless attempt as cancelled so
+        // LogonUI returns to the credential picker, instead of leaving the
+        // tile zoomed with a "Cancelled. Try again…" status that the user
+        // already deliberately dismissed. CPGSR_NO_CREDENTIAL_FINISHED is
+        // the documented signal for "user is done with this tile, no
+        // credential supplied" and matches what pressing Cancel on a
+        // standard CP tile produces.
+        if (authResult.errorCode == 5 /* IPC_ERROR::USER_CANCELLED */)
+        {
+            if (ppwszOptionalStatusText)
+            {
+                CoTaskMemFree(*ppwszOptionalStatusText);
+                *ppwszOptionalStatusText = nullptr;
+            }
+            if (pcpsiOptionalStatusIcon)
+                *pcpsiOptionalStatusIcon = CPSI_NONE;
+            *pcpgsr = CPGSR_NO_CREDENTIAL_FINISHED;
+            return S_OK;
+        }
+
         // AD-10 — map AD-coexistence IPC error codes to the canonical §4.4
         // status text and icon owned by the credential provider. Codes
         // outside the taxonomy fall back to the bridge-supplied message
