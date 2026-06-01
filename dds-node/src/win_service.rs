@@ -232,7 +232,10 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         let mut checkpoint = 0u32;
         loop {
             if named_pipe_exists(pipe_path) {
-                tracing::info!(pipe = pipe_path, "API pipe bound — reporting SERVICE_RUNNING");
+                tracing::info!(
+                    pipe = pipe_path,
+                    "API pipe bound — reporting SERVICE_RUNNING"
+                );
                 break;
             }
             if shutdown_rx.try_recv().is_ok() {

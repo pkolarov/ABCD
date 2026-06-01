@@ -1274,10 +1274,10 @@ impl DdsSelfUpdateDocument {
         jti: &str,
         installed_version: Option<&SemVer>,
     ) -> RolloutDecision {
-        if let (Some(floor), Some(installed)) = (&self.min_supported_from, installed_version) {
-            if installed < floor {
-                return RolloutDecision::StepUpgradeRequired;
-            }
+        if let (Some(floor), Some(installed)) = (&self.min_supported_from, installed_version)
+            && installed < floor
+        {
+            return RolloutDecision::StepUpgradeRequired;
         }
         self.rollout.evaluate(peer_id_bytes, jti, installed_version)
     }
@@ -1649,7 +1649,7 @@ mod tests {
         let decisions: Vec<_> = (0..20)
             .map(|i| policy.evaluate(b"stable-peer", &format!("jti-{i}"), None))
             .collect();
-        let has_apply = decisions.iter().any(|d| *d == RolloutDecision::ApplyNow);
+        let has_apply = decisions.contains(&RolloutDecision::ApplyNow);
         let has_wait = decisions
             .iter()
             .any(|d| matches!(d, RolloutDecision::WaitForCanary { .. }));
