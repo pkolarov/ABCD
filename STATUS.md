@@ -1,5 +1,60 @@
 # DDS Implementation Status
 
+## docs: fix enroll-device optional flags, admin-vouch purpose, Developer Guide lib-test count (235th pass) — 2026-06-01
+
+### Summary
+
+Automated scheduled sweep. No functional code changes. Three documentation gaps fixed.
+
+**Gaps found and fixed:**
+
+1. **README.md — `dds enroll device` synopsis**: The example showed only the five
+   required flags (`--label`, `--device-id`, `--hostname`, `--os`, `--os-version`)
+   but omitted the three optional ones — `--tpm-ek-hash`, `--org-unit`, and `--tag`
+   — that are documented in the Admin Guide (§ Device Enrollment, lines 1213–1215)
+   and implemented as `Option<String>` / `Vec<String>` fields in both
+   `dds-cli/src/main.rs` (`EnrollAction::Device`) and
+   `dds-node/src/http.rs` (`EnrollDeviceRequestJson`). Updated the README line to
+   show the optional parameters in bracket notation, consistent with the
+   `[--authenticator-type ...]` pattern already used on the same page.
+
+2. **README.md — `dds admin vouch --purpose` bracket notation**: The synopsis showed
+   `--purpose group:admins` without brackets, implying it is required, but the clap
+   struct declares `purpose: Option<String>` and the server defaults to
+   `"dds:session"` when the field is absent (service.rs line 2564:
+   `.unwrap_or_else(|| "dds:session".to_string())`). Changed to `[--purpose group:admins]`
+   to match the optional nature of the flag.
+
+3. **docs/DDS-Developer-Guide.md §3 "Read the tests"**: The 234th pass updated
+   the Developer Guide from "799 / 799 passing, 5 ignored" to "865 / 865 passing,
+   4 ignored", but this was wrong on both counts:
+   - 865 is the total (`cargo test --workspace`, lib + integration). The command
+     cited in the sentence is `cargo test --workspace --lib`, which yields **801**.
+   - The ignored count is **5**, not 4: 1 in `dds-core`
+     (`test_purposes_for_scales_to_10k_vouches`, marked `#[ignore]` since it is
+     slow on CI in debug mode) and 4 in `dds-node` (Apple Secure Enclave hardware
+     tests). The 234th pass STATUS.md even recorded "4 ignored" in its Test
+     results but missed the dds-core ignored test.
+   Corrected to "801 / 801 passing as of 2026-06-01 — `cargo test --workspace --lib`,
+   5 ignored".
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src. The single `TODO(security)` at `dds-node/src/service.rs` (M-22
+OS-bound key-wrapping) is unchanged.
+
+**Test results:** All 801 lib tests pass (365 dds-node lib; 0 failed; 5 ignored).
+No code changes — lib count unchanged from the 234th-pass baseline.
+
+**Deferred items** (M-22, TPM2 backend, Authenticode code signing) unchanged.
+
+### Files changed
+
+- `README.md` — `dds enroll device` synopsis: added `[--tpm-ek-hash <hex>] [--org-unit <unit>] [--tag <tag>...]`; `dds admin vouch`: bracketed `--purpose`
+- `docs/DDS-Developer-Guide.md` — lib test count corrected from 865/4-ignored to 801/5-ignored
+- `STATUS.md` — this entry
+
+---
+
 ## docs: fix stale metric family count + Developer Guide test count (234th pass) — 2026-06-01
 
 ### Summary

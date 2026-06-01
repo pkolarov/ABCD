@@ -208,7 +208,8 @@ dds enroll user   --label alice --credential-id <b64url> \
     --attestation-object <b64> --client-data-hash <b64> \
     --rp-id example.com --display-name "Alice" [--authenticator-type platform|cross-platform]
 dds enroll device --label laptop --device-id <uuid> --hostname lap01 \
-    --os windows --os-version 11
+    --os windows --os-version 11 \
+    [--tpm-ek-hash <hex>] [--org-unit <unit>] [--tag <tag>...]
 
 # Admin bootstrap (first admin / subsequent vouches)
 dds admin challenge                      # GET /v1/admin/challenge — returns challenge_id + challenge_b64url + expires_at
@@ -217,7 +218,7 @@ dds admin setup --label root-admin --credential-id <b64url> \
     --rp-id example.com --display-name "Root" [--authenticator-type platform|cross-platform]
 dds admin vouch --subject-urn urn:vouchsafe:bob.<hash> \
     --credential-id <b64url> --authenticator-data <b64> \
-    --client-data-hash <b64> --signature <b64> --purpose group:admins
+    --client-data-hash <b64> --signature <b64> [--purpose group:admins]
 
 # Audit log
 dds audit list                           # newest first
