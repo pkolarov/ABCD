@@ -1001,9 +1001,29 @@ DWORD CDdsNodeHttpClient::SendRequestPipe(
     std::wstring fullPipePath = L"\\\\.\\pipe\\";
     fullPipePath += m_pipeName;
 
-    // Open the pipe. Retry once on ERROR_PIPE_BUSY via WaitNamedPipe.
+    // Open the pipe, riding through two transient conditions for up to
+    // kConnectBudgetMs before giving up:
+    //
+    //   ERROR_FILE_NOT_FOUND — the node has not (re)created the pipe name.
+    //     At boot the SCM dependency in DdsBundle.wxs holds this service
+    //     until DdsNode reports Running, and DdsNode now reports Running
+    //     only once the pipe is bound (dds-node/src/win_service.rs), so the
+    //     boot race is already closed there. This branch covers the *runtime*
+    //     window: a node restart (crash recovery, upgrade) briefly removes
+    //     the pipe while this service keeps running and LogonUI queries us.
+    //     Without the wait we'd fail straight to the vault-synthesis fallback
+    //     in HandleDdsListUsers, which renders duplicate / SID-only logon
+    //     tiles.
+    //   ERROR_PIPE_BUSY — the name exists but every server instance is in
+    //     use; block (bounded) in WaitNamedPipe for one to free up.
+    //
+    // CreateFile is re-issued as the authoritative readiness test after each
+    // wait. The budget is deliberately short so a genuinely-down node does
+    // not stall the logon screen — it falls back to the vault as before.
+    const DWORD kConnectBudgetMs = 3000;
+    const ULONGLONG connectStart = GetTickCount64();
     HANDLE hPipe = INVALID_HANDLE_VALUE;
-    for (int attempt = 0; attempt < 2; ++attempt)
+    for (;;)
     {
         hPipe = CreateFileW(
             fullPipePath.c_str(),
@@ -1016,18 +1036,28 @@ DWORD CDdsNodeHttpClient::SendRequestPipe(
         if (hPipe != INVALID_HANDLE_VALUE)
             break;
 
-        DWORD err = GetLastError();
-        if (err != ERROR_PIPE_BUSY)
+        const DWORD err = GetLastError();
+        const ULONGLONG elapsed = GetTickCount64() - connectStart;
+        if ((err != ERROR_FILE_NOT_FOUND && err != ERROR_PIPE_BUSY) ||
+            elapsed >= kConnectBudgetMs)
         {
             FileLog::Writef(
-                "DdsNodeHttpClient: CreateFile(pipe) failed: %lu\n", err);
+                "DdsNodeHttpClient: CreateFile(pipe) failed: %lu (waited %llu ms)\n",
+                err, elapsed);
             return 0;
         }
-        if (!WaitNamedPipeW(fullPipePath.c_str(), 5000 /* ms */))
+
+        if (err == ERROR_PIPE_BUSY)
         {
-            FileLog::Writef(
-                "DdsNodeHttpClient: WaitNamedPipe timed out: %lu\n", GetLastError());
-            return 0;
+            // Name exists; wait (bounded by the remaining budget) for a
+            // free instance, then retry CreateFile.
+            const DWORD remaining =
+                kConnectBudgetMs - static_cast<DWORD>(elapsed);
+            WaitNamedPipeW(fullPipePath.c_str(), remaining);
+        }
+        else // ERROR_FILE_NOT_FOUND — name not bound yet; poll for it.
+        {
+            Sleep(100);
         }
     }
 

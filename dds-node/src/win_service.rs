@@ -37,8 +37,9 @@
 #![cfg(windows)]
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_service::define_windows_service;
 use windows_service::service::{
@@ -49,6 +50,15 @@ use windows_service::service_dispatcher;
 
 const SERVICE_NAME: &str = "DdsNode";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+
+/// Upper bound on how long [`run_service`] waits for the node's API pipe to
+/// be bound before reporting SERVICE_RUNNING anyway. Comfortably inside the
+/// 60s StartPending `wait_hint` below so SCM never times the start out, yet
+/// long enough to cover a cold-boot node init (redb open, identity load,
+/// swarm bring-up).
+const PIPE_READY_TIMEOUT_SECS: u64 = 30;
+/// Poll cadence while waiting for the API pipe to appear.
+const PIPE_POLL_INTERVAL_MS: u64 = 100;
 
 define_windows_service!(ffi_service_main, service_main);
 
@@ -174,6 +184,14 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     // doesn't mistake the blob path for the config file.
     let cli_args = strip_unseal_flag(std::env::args().skip(2).collect());
 
+    // If the node serves its HTTP API over a named pipe, resolve the full
+    // pipe path now (before `cli_args` is moved into the task below). We use
+    // it to gate the StartPending → Running transition on the pipe actually
+    // being bound. `None` for non-pipe transports (loopback TCP, dev configs)
+    // or if the config can't be read — both fall through to reporting Running
+    // immediately, exactly as before.
+    let ready_pipe = pipe_ready_target(&cli_args);
+
     // Build a multi-thread tokio runtime — the swarm + HTTP server
     // pair both demand it.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -181,8 +199,8 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Run the node inside the runtime. We spawn it as a task so the
-    // main thread stays free to listen for SCM Stop and to report
-    // SERVICE_RUNNING the moment node init signals readiness.
+    // main thread stays free to listen for SCM Stop and to gate the
+    // SERVICE_RUNNING report on the API pipe coming up.
     let node_handle = runtime.spawn(async move {
         // Same code path as `dds-node run <config>` — `cmd_run` is the
         // existing main.rs entry that loads the config, brings up the
@@ -192,12 +210,71 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 2. Tell SCM we're up. We do this immediately after kicking off
-    //    the spawn — the actual readiness gate is the named pipe
-    //    appearing in the filesystem, but SCM only cares that we
-    //    answered StartPending → Running within wait_hint. Operator
-    //    health checks (via DDS Console / DdsAuthBridge) wait for
-    //    the pipe.
+    // 2. Gate SERVICE_RUNNING on the API pipe being bound.
+    //
+    //    SCM starts DdsAuthBridge only after we report Running (it declares
+    //    `<ServiceDependency Id="DdsNode" />` in DdsBundle.wxs). If we report
+    //    Running the instant after `spawn` — before the spawned task has
+    //    created `\\.\pipe\dds-api` — the bridge's first `GET
+    //    /v1/enrolled-users` hits ERROR_FILE_NOT_FOUND, falls back to
+    //    synthesizing the user list from the local vault, and LogonUI renders
+    //    duplicate / SID-only credential tiles. Holding Running until the pipe
+    //    exists makes the SCM dependency mean what it says: "dds-node is ready
+    //    to serve."
+    //
+    //    Bounded by PIPE_READY_TIMEOUT_SECS so a node that never binds
+    //    (mis-config, crash in init) still surfaces as Running (degraded)
+    //    rather than pinning SCM at StartPending until the 60s wait_hint
+    //    lapses. We pump StartPending checkpoints while waiting, and bail to
+    //    the shutdown path if SCM asks us to stop before the API comes up.
+    if let Some(pipe_path) = ready_pipe.as_deref() {
+        let deadline = Instant::now() + Duration::from_secs(PIPE_READY_TIMEOUT_SECS);
+        let mut checkpoint = 0u32;
+        loop {
+            if named_pipe_exists(pipe_path) {
+                tracing::info!(pipe = pipe_path, "API pipe bound — reporting SERVICE_RUNNING");
+                break;
+            }
+            if shutdown_rx.try_recv().is_ok() {
+                tracing::warn!(
+                    "SCM Stop received during startup — shutting down before API came up"
+                );
+                node_handle.abort();
+                drop(runtime);
+                status_handle.set_service_status(ServiceStatus {
+                    service_type: SERVICE_TYPE,
+                    current_state: ServiceState::Stopped,
+                    controls_accepted: ServiceControlAccept::empty(),
+                    exit_code: ServiceExitCode::Win32(0),
+                    checkpoint: 0,
+                    wait_hint: Duration::ZERO,
+                    process_id: None,
+                })?;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    pipe = pipe_path,
+                    timeout_secs = PIPE_READY_TIMEOUT_SECS,
+                    "API pipe not bound within timeout — reporting SERVICE_RUNNING anyway (degraded)"
+                );
+                break;
+            }
+            checkpoint = checkpoint.wrapping_add(1);
+            status_handle.set_service_status(ServiceStatus {
+                service_type: SERVICE_TYPE,
+                current_state: ServiceState::StartPending,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(0),
+                checkpoint,
+                wait_hint: Duration::from_secs(10),
+                process_id: None,
+            })?;
+            std::thread::sleep(Duration::from_millis(PIPE_POLL_INTERVAL_MS));
+        }
+    }
+
+    // 3. Tell SCM we're up.
     status_handle.set_service_status(ServiceStatus {
         service_type: SERVICE_TYPE,
         current_state: ServiceState::Running,
@@ -208,7 +285,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         process_id: None,
     })?;
 
-    // 3. Block until SCM Stop / Shutdown.
+    // 4. Block until SCM Stop / Shutdown.
     let _ = shutdown_rx.recv();
     tracing::info!("SCM Stop received — shutting down dds-node");
 
@@ -217,7 +294,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     node_handle.abort();
     drop(runtime);
 
-    // 4. Tell SCM we're stopped.
+    // 5. Tell SCM we're stopped.
     status_handle.set_service_status(ServiceStatus {
         service_type: SERVICE_TYPE,
         current_state: ServiceState::Stopped,
@@ -229,6 +306,60 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     Ok(())
+}
+
+/// If the node will serve its HTTP API over a Windows named pipe, return the
+/// full pipe path (`\\.\pipe\<name>`); otherwise `None`.
+///
+/// Best-effort: any failure to locate or parse the config yields `None`, which
+/// makes [`run_service`] skip the readiness gate and report Running
+/// immediately — the pre-existing behaviour. We never want a config-read quirk
+/// here to block the service from starting; `cmd_run` is the authority on
+/// config validity and will fail loudly on the task side if it's broken.
+fn pipe_ready_target(cli_args: &[String]) -> Option<String> {
+    // Mirror cmd_run's config-path resolution: first non-flag arg, else the
+    // conventional dds.toml in the working directory.
+    let config_path = cli_args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("dds.toml"));
+    let config = dds_node::config::NodeConfig::from_file(&config_path).ok()?;
+    let spec = config.network.api_addr.strip_prefix("pipe:")?;
+    Some(normalize_pipe_path(spec))
+}
+
+/// Expand a bare pipe name to its full `\\.\pipe\<name>` path; pass an
+/// already-qualified path through unchanged. Mirrors
+/// `http::normalize_pipe_name` so the path we probe is byte-identical to the
+/// one the server binds.
+fn normalize_pipe_path(spec: &str) -> String {
+    if spec.starts_with(r"\\") {
+        spec.to_string()
+    } else {
+        format!(r"\\.\pipe\{spec}")
+    }
+}
+
+/// Return `true` once a named pipe with this path exists. An available
+/// instance returns immediately; if all instances are momentarily busy the
+/// 1ms wait lapses with `ERROR_SEM_TIMEOUT` — both mean the server has bound
+/// the name, so we treat them as ready. Only `ERROR_FILE_NOT_FOUND` means the
+/// name has not been created yet.
+fn named_pipe_exists(pipe_path: &str) -> bool {
+    use std::ffi::OsStr;
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, GetLastError};
+    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+
+    let wide: Vec<u16> = OsStr::new(pipe_path).encode_wide().chain(once(0)).collect();
+    // 1ms: long enough to distinguish "name missing" (returns instantly with
+    // ERROR_FILE_NOT_FOUND) from "name exists but busy" (ERROR_SEM_TIMEOUT).
+    if unsafe { WaitNamedPipeW(wide.as_ptr(), 1) } != 0 {
+        return true;
+    }
+    unsafe { GetLastError() != ERROR_FILE_NOT_FOUND }
 }
 
 #[cfg(test)]
@@ -284,5 +415,26 @@ mod tests {
     fn flag_value_returns_none_when_absent() {
         let args = vec!["--config".to_string(), "node.toml".to_string()];
         assert_eq!(flag_value(&args, "--unseal-passphrase-from"), None);
+    }
+
+    #[test]
+    fn normalize_pipe_path_expands_bare_name() {
+        assert_eq!(normalize_pipe_path("dds-api"), r"\\.\pipe\dds-api");
+    }
+
+    #[test]
+    fn normalize_pipe_path_passes_through_full_path() {
+        assert_eq!(
+            normalize_pipe_path(r"\\.\pipe\dds-api"),
+            r"\\.\pipe\dds-api"
+        );
+    }
+
+    #[test]
+    fn pipe_ready_target_none_when_config_missing() {
+        // No config file at the resolved path → best-effort returns None so
+        // the readiness gate is skipped rather than blocking startup.
+        let args = vec![r"C:\does\not\exist\nope.toml".to_string()];
+        assert_eq!(pipe_ready_target(&args), None);
     }
 }
