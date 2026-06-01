@@ -2014,6 +2014,18 @@ impl DdsNode {
                     token_bytes.to_vec(),
                     None,
                 );
+                // Phase D.6: when self_update_apply = false, log that an
+                // update is available but skip the apply step. The document
+                // is still stored and propagated to peers that are opted-in.
+                if !self.config.self_update_apply
+                    && token.payload.body_type.as_deref()
+                        == Some(dds_domain::body_types::DDS_SELF_UPDATE)
+                {
+                    info!(
+                        jti = %token.payload.jti,
+                        "self-update available, apply disabled by config (self_update_apply=false)"
+                    );
+                }
             }
             Ok(false) => {} // duplicate
             Err(e) => warn!("DAG insert failed: {e}"),
@@ -3013,6 +3025,23 @@ impl DdsNode {
                 self.cache_sync_payload(&id, &op, &payload.token_bytes);
             }
         }
+        // Phase D.6: log when a self-update manifest arrives via sync but
+        // apply is disabled by config.
+        if !self.config.self_update_apply && result.ops_merged > 0 {
+            for payload in &payloads {
+                if let Ok(token) = Token::from_cbor(&payload.token_bytes) {
+                    if token.payload.body_type.as_deref()
+                        == Some(dds_domain::body_types::DDS_SELF_UPDATE)
+                    {
+                        info!(
+                            %peer,
+                            jti = %token.payload.jti,
+                            "self-update available (via sync), apply disabled by config (self_update_apply=false)"
+                        );
+                    }
+                }
+            }
+        }
         info!(
             %peer,
             ops_merged = result.ops_merged,
@@ -3929,6 +3958,9 @@ fn publisher_capability_ok(
         body_types::WINDOWS_POLICY => purpose::POLICY_PUBLISHER_WINDOWS,
         body_types::MACOS_POLICY => purpose::POLICY_PUBLISHER_MACOS,
         body_types::SOFTWARE_ASSIGNMENT => purpose::SOFTWARE_PUBLISHER,
+        // Phase D.2 (partial): require the dedicated SELF_UPDATE_PUBLISHER capability.
+        // Full K-of-M multi-sig enforcement is deferred to Phase D.2 proper.
+        body_types::DDS_SELF_UPDATE => purpose::SELF_UPDATE_PUBLISHER,
         _ => return true,
     };
     let g = match trust_graph.read() {
@@ -4350,6 +4382,104 @@ mod publisher_identity_gate_tests {
 }
 
 #[cfg(test)]
+mod publisher_capability_dds_self_update_tests {
+    //! Phase D.2 (partial) — unit coverage confirming that
+    //! [`publisher_capability_ok`] demands `SELF_UPDATE_PUBLISHER`
+    //! for `DdsSelfUpdateDocument` tokens.
+    //!
+    //! Full K-of-M multi-sig is deferred to Phase D.2 proper. This module
+    //! covers the capability-gate layer only: a token whose issuer
+    //! lacks the `dds:dds-self-update-publisher` vouch must be rejected
+    //! even if its body_type is `dds:dds-self-update`.
+    //!
+    //! The gate is exercised via an empty trust graph (no vouches), which
+    //! makes `has_purpose` return `false` for any issuer, simulating an
+    //! unauthorized publisher. Separately we verify the gate is a no-op for
+    //! body types it doesn't know about.
+
+    use super::*;
+    use dds_core::identity::Identity;
+    use dds_core::token::{Token, TokenKind, TokenPayload};
+    use dds_domain::body_types;
+    use rand::rngs::OsRng;
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, RwLock};
+
+    fn make_self_update_token(body_type: &str) -> Token {
+        let ident = Identity::generate("publisher", &mut OsRng);
+        let payload = TokenPayload {
+            iss: ident.id.to_urn(),
+            iss_key: ident.public_key.clone(),
+            jti: "self-update-cap-test".to_string(),
+            sub: ident.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1714605000,
+            exp: Some(4102444800),
+            body_type: Some(body_type.to_string()),
+            body_cbor: Some(vec![0xA0]), // empty CBOR map — shape not inspected by the capability gate
+        };
+        Token::sign(payload, &ident.signing_key).expect("sign")
+    }
+
+    /// An issuer without a SELF_UPDATE_PUBLISHER vouch must be rejected for
+    /// DDS_SELF_UPDATE tokens. An empty trust graph has no vouches, so
+    /// `has_purpose` returns false for every issuer.
+    #[test]
+    fn rejects_self_update_token_without_publisher_capability() {
+        let token = make_self_update_token(body_types::DDS_SELF_UPDATE);
+        let graph = Arc::new(RwLock::new(TrustGraph::new(
+            dds_core::trust::DEFAULT_MAX_CHAIN_DEPTH,
+        )));
+        let roots: BTreeSet<String> = BTreeSet::new();
+        // No vouches in the graph → publisher_capability_ok returns false.
+        assert!(!publisher_capability_ok(&token, &graph, &roots));
+    }
+
+    /// Non-Attest tokens (Vouch, Revoke, Burn) are not publisher-gated.
+    #[test]
+    fn passes_non_attest_tokens_unconditionally() {
+        let ident = Identity::generate("revoker", &mut OsRng);
+        let payload = TokenPayload {
+            iss: ident.id.to_urn(),
+            iss_key: ident.public_key.clone(),
+            jti: "revoke-test".to_string(),
+            sub: ident.id.to_urn(),
+            kind: TokenKind::Revoke,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: Some("some-target-jti".to_string()),
+            iat: 1714605000,
+            exp: None,
+            body_type: Some(body_types::DDS_SELF_UPDATE.to_string()),
+            body_cbor: None,
+        };
+        let token = Token::sign(payload, &ident.signing_key).expect("sign");
+        let graph = Arc::new(RwLock::new(TrustGraph::new(
+            dds_core::trust::DEFAULT_MAX_CHAIN_DEPTH,
+        )));
+        let roots: BTreeSet<String> = BTreeSet::new();
+        assert!(publisher_capability_ok(&token, &graph, &roots));
+    }
+
+    /// Attest tokens with an unknown body_type are not publisher-gated —
+    /// the gate only covers the explicitly enumerated types.
+    #[test]
+    fn passes_attest_tokens_with_unknown_body_type() {
+        let token = make_self_update_token("dds:unknown-future-type");
+        let graph = Arc::new(RwLock::new(TrustGraph::new(
+            dds_core::trust::DEFAULT_MAX_CHAIN_DEPTH,
+        )));
+        let roots: BTreeSet<String> = BTreeSet::new();
+        assert!(publisher_capability_ok(&token, &graph, &roots));
+    }
+}
+
+#[cfg(test)]
 mod admission_cert_revocation_epoch_rotation_tests {
     //! Phase B.9 follow-up — regression tests for the property that an
     //! admission-cert revocation (arriving via H-12 piggy-back) schedules
@@ -4422,6 +4552,7 @@ mod admission_cert_revocation_epoch_rotation_tests {
             bootstrap_admin_urn: None,
             identity_path: None,
             expiry_scan_interval_secs: 60,
+            self_update_apply: true,
         };
         let node = DdsNode::init(cfg, p2p_kp).expect("init node");
         (node, dir)
@@ -4672,6 +4803,7 @@ mod timing_config_validation_tests {
             bootstrap_admin_urn: None,
             identity_path: None,
             expiry_scan_interval_secs: 60,
+            self_update_apply: true,
         }
     }
 

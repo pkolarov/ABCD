@@ -369,6 +369,7 @@ async fn publish_fixture(
         bootstrap_admin_urn: None,
         identity_path: None,
         expiry_scan_interval_secs: 60,
+        self_update_apply: true,
     };
 
     let mut node = DdsNode::init(config, p2p_keypair)?;
