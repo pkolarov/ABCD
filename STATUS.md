@@ -1,5 +1,48 @@
 # DDS Implementation Status
 
+## docs: fix stale Windows Policy Applier phase status and supply-chain Phase D header (250th pass) — 2026-06-01
+
+### Summary
+
+Automated scheduled sweep following the 249th-pass baseline.
+
+**Bugs found and fixed:**
+
+No code bugs found. All 1144 workspace tests pass. Clippy clean.
+
+**Documentation gaps fixed:**
+
+**1. Stale Windows Policy Applier phase summary (STATUS.md §Phase 3 item 9).**
+Line 15719 said "Phases A–F + I (reconciliation) complete; G–H remaining" despite the
+phasing table at line 15833 showing all of A–I ✅ and a note at line 15845 confirming
+"A–I complete (2026-04-13)." The G+H phases (WiX MSI bundle + CI integration) were
+verified on ARM64 on 2026-04-13. Fixed to "Phases A–I all complete (G+H — WiX MSI +
+CI — verified 2026-04-13 on ARM64)."
+
+**2. Stale component-layout code block (STATUS.md §Windows Policy Applier Plan).**
+The `DdsPolicyAgent/` comment still said "Phases A–F ✅" while I is also complete.
+Fixed to "Phases A–I ✅".
+
+**3. Stale Phase D status header in supply-chain-plan.md.**
+The header read "Phase D (fleet self-update) **partially** landed: D.1…D.5 ✅" but
+D.6 (the `self_update_apply` config flag) also landed in the 240th pass. Fixed to
+"Phase D (fleet self-update) **fully** landed: D.1–D.6 all ✅ 2026-06-01."
+
+**Tests:** 1144 workspace tests pass (unchanged). 0 failed. Clippy clean.
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6,
+Phase A cert provisioning, Phase B.5 migration cutover, TPM A3/A5,
+`halt_on_health_regression` automatic canary-promotion) unchanged.
+
+### Files changed
+
+- **`STATUS.md`** — corrected Windows Policy Applier phase summary (item 9) and
+  component-layout comment; this entry.
+- **`docs/supply-chain-plan.md`** — corrected Phase D status header (partially → fully;
+  added D.6 to the landed list).
+
+---
+
 ## fix(node): pass installed version to Pinned rollout evaluation; fix clippy; update docs (249th pass) — 2026-06-01
 
 ### Summary
@@ -15716,7 +15759,7 @@ All 9 crates are functionally complete. The following work is ordered by impact 
 
 ### Phase 3 — Enterprise Features
 
-9. **WindowsPolicyDocument distribution** — End-to-end flow: admin creates a policy document, signs it, gossip propagates to target devices, dds-node on each device evaluates scope + applies settings (registry keys, security policy). **Plan landed 2026-04-09 — see [Windows Policy Applier Plan](#windows-policy-applier-plan-phase-3-items-910) below. Phases A–F + I (reconciliation) complete; G–H remaining.**
+9. **WindowsPolicyDocument distribution** — End-to-end flow: admin creates a policy document, signs it, gossip propagates to target devices, dds-node on each device evaluates scope + applies settings (registry keys, security policy). **Plan landed 2026-04-09 — see [Windows Policy Applier Plan](#windows-policy-applier-plan-phase-3-items-910) below. Phases A–I all complete (G+H — WiX MSI + CI — verified 2026-04-13 on ARM64).**
 
 10. **SoftwareAssignment workflow** — Admin publishes a software assignment, devices poll/receive via gossip, local agent downloads package, verifies SHA-256, installs silently. **Enforcement implemented (Phase F, 2026-04-13):** `SoftwareInstaller` + `WindowsSoftwareOperations` with HTTP download, SHA-256 verify, msiexec install/uninstall, registry-based detection. 7 integration tests including real MSI install/uninstall on ARM64.
 
@@ -15777,7 +15820,7 @@ macOS/Linux/embedded.
 ```text
 platform/windows/
 ├── DdsCredentialProvider/        # exists — logon, untouched
-├── DdsPolicyAgent/               # worker service (Phases A–F ✅)
+├── DdsPolicyAgent/               # worker service (Phases A–I ✅)
 │   ├── Worker.cs                 # poll loop, dispatch
 │   ├── Client/DdsNodeClient.cs   # GET /v1/windows/* + POST /v1/windows/applied
 │   ├── State/AppliedStateStore.cs# %ProgramData%\DDS\applied-state.json
