@@ -46,18 +46,14 @@ fn bench_compute_missing_ops(c: &mut Criterion) {
         let remote_ids = make_linear_dag(size).operation_ids();
         let local_ids: BTreeSet<String> = BTreeSet::new();
 
-        group.bench_with_input(
-            BenchmarkId::new("compute_missing", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    std::hint::black_box(compute_missing_ops(
-                        std::hint::black_box(&local_ids),
-                        std::hint::black_box(&remote_ids),
-                    ));
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("compute_missing", size), &size, |b, _| {
+            b.iter(|| {
+                std::hint::black_box(compute_missing_ops(
+                    std::hint::black_box(&local_ids),
+                    std::hint::black_box(&remote_ids),
+                ));
+            });
+        });
     }
 
     group.finish();
