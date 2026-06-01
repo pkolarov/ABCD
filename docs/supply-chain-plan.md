@@ -4,7 +4,7 @@
 landed 2026-05-02. Phase A (cert provisioning) pending — no CI secrets
 provisioned yet. Phase B.5 (publisher migration cutover) gated on Phase A.
 Phase D (fleet self-update) partially landed: D.1 ✅ 2026-06-01, D.2 ✅
-2026-06-01, D.3 ✅ 2026-06-01, D.4 ✅ 2026-06-01.
+2026-06-01, D.3 ✅ 2026-06-01, D.4 ✅ 2026-06-01, D.5 ✅ 2026-06-01.
 **Date:** 2026-04-26
 **Closes (when implemented):** Z-6 / Z-7 / Z-8 from
 [Claude_sec_review.md](../Claude_sec_review.md) "2026-04-26 Zero-Trust
@@ -633,10 +633,22 @@ Phase A completion. Four unit tests in `dds_node::self_update::tests` cover:
 `current_platform_is_some`, `staging_dir_is_absolute`, `apply_update_rejects_http_url`,
 `apply_update_skips_when_no_artifact_for_platform`, `apply_update_no_concurrent_install`.
 
-**D.5 — Halt & rollback.** A `Halt` rollout published with the same
+**D.5 — Halt & rollback. ✅ Landed 2026-06-01.** A `Halt` rollout published with the same
 multi-sig requirement supersedes any pending update. Rollback is a
 `DdsSelfUpdateDocument` with a lower `version` field — admins
 explicitly approve the downgrade with the same multi-sig.
+
+Implementation: when `check_self_update_quorum_and_maybe_apply` detects K-of-M quorum
+on a `Halt`-policy document, it immediately calls `self.pending_self_updates.clear()`
+before evaluating the rollout. This ensures no concurrently-accumulating non-halted
+update (already at K-1 signers) can collect a final signature and fire after the halt
+lands. The `is_self_update_halt` helper in [`dds-node/src/node.rs`](../dds-node/src/node.rs)
+inspects the token payload. Three unit tests in `d5_halt_tests` cover:
+`is_self_update_halt` returns true for `Halt`, false for `Pinned`, and false for
+a token with no body. Rollback (publishing a lower-version `DdsSelfUpdateDocument`)
+works via the existing quorum + apply path — no downgrade guard is imposed, so K
+admin signatures on a lower-version document trigger `evaluate_self_update_rollout`
+normally.
 
 **D.6 — Non-self-update path. ✅ Landed 2026-06-01.** For air-gapped / regulated deployments
 that must keep their own change-control pipeline, the document

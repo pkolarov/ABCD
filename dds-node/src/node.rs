@@ -4780,7 +4780,11 @@ mod d5_halt_tests {
         let ident = Identity::generate("publisher", &mut OsRng);
         let doc = DdsSelfUpdateDocument {
             channel: ReleaseChannel::Stable,
-            version: SemVer { major: 1, minor: 2, patch: 3 },
+            version: SemVer {
+                major: 1,
+                minor: 2,
+                patch: 3,
+            },
             artifacts: vec![UpdateArtifact {
                 platform: Platform::LinuxX86_64,
                 url: "https://example.com/dds-1.2.3-linux-x86_64.tar.gz".to_string(),
@@ -4825,7 +4829,9 @@ mod d5_halt_tests {
     #[test]
     fn is_self_update_halt_returns_false_for_pinned_document() {
         let token = make_self_update_token(
-            RolloutPolicy::Pinned { allow_versions: vec![] },
+            RolloutPolicy::Pinned {
+                allow_versions: vec![],
+            },
             "pinned-jti",
         );
         assert!(!is_self_update_halt(&token.payload));
