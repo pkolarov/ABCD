@@ -2031,7 +2031,10 @@ impl DdsNode {
     /// Phase D.3 — evaluate the rollout policy for a `DdsSelfUpdateDocument`
     /// token and log the decision. Called from both gossip and sync ingest
     /// paths. The actual apply step (Phase D.4) is not yet implemented;
-    /// `ApplyNow` is logged as "would apply".
+    /// Phase D.4: when the decision is `ApplyNow`, spawn a Tokio task that
+    /// downloads, verifies, and installs the artifact via
+    /// [`crate::self_update::apply_update`].  All other decisions are logged
+    /// only.
     fn evaluate_self_update_rollout(&self, payload: &dds_core::token::TokenPayload) {
         use dds_domain::{DomainDocument, RolloutDecision};
         if !self.config.self_update_apply {
@@ -2046,11 +2049,19 @@ impl DdsNode {
                 let peer_bytes = self.peer_id.to_bytes();
                 let decision = doc.evaluate(&peer_bytes, &payload.jti, None);
                 match decision {
-                    RolloutDecision::ApplyNow => info!(
-                        jti = %payload.jti,
-                        version = %format!("{}.{}.{}", doc.version.major, doc.version.minor, doc.version.patch),
-                        "self-update: in canary cohort, would apply (Phase D.4 not yet implemented)"
-                    ),
+                    RolloutDecision::ApplyNow => {
+                        let jti = payload.jti.clone();
+                        let version_str = format!(
+                            "{}.{}.{}",
+                            doc.version.major, doc.version.minor, doc.version.patch
+                        );
+                        info!(
+                            jti = %jti,
+                            version = %version_str,
+                            "self-update: ApplyNow — spawning Phase D.4 apply task"
+                        );
+                        tokio::spawn(crate::self_update::apply_update(doc, jti));
+                    }
                     RolloutDecision::WaitForCanary {
                         promote_to_full_after_secs,
                     } => info!(

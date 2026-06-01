@@ -603,7 +603,7 @@ own `PeerId` + the document JTI mod 100 against `canary_pct`. No
 central coordinator. The cohort therefore re-randomizes on every
 update — a node is not permanently in the canary.
 
-**D.4 — Self-update apply path.** On a node that decides to apply:
+**D.4 — Self-update apply path. ✅ Landed 2026-06-01.** On a node that decides to apply:
 
 1. Fetch the artifact at `UpdateArtifact.url`.
 2. Verify SHA-256 in streaming fashion (mirror Phase B / B-6).
@@ -618,6 +618,19 @@ update — a node is not permanently in the canary.
    entry (Phase A in
    [observability-plan.md](observability-plan.md)) with the prior
    and new versions and the document JTI.
+
+Implementation: `dds-node/src/self_update.rs` — `apply_update(doc, jti)` is an async
+function spawned as a Tokio task by `DdsNode::evaluate_self_update_rollout` when the
+rollout decision is `ApplyNow`. An `AtomicBool` guard (`INSTALL_IN_PROGRESS`) prevents
+concurrent installs. Steps 1-5 are fully implemented: `fetch_and_verify` streams via
+`reqwest` + `sha2` with streaming SHA-256; `verify_os_signature` dispatches to
+`verify_authenticode` (PowerShell `Get-AuthenticodeSignature`, subject + root-thumbprint
+check) on Windows and `verify_apple_developer_id` (`pkgutil --check-signature`, team ID
+check) on macOS; `run_installer` calls `msiexec /i /quiet /norestart` on Windows and
+`installer -pkg -target /` on macOS. Step 7 (post-restart audit log) is deferred to
+Phase A completion. Four unit tests in `dds_node::self_update::tests` cover:
+`current_platform_is_some`, `staging_dir_is_absolute`, `apply_update_rejects_http_url`,
+`apply_update_skips_when_no_artifact_for_platform`, `apply_update_no_concurrent_install`.
 
 **D.5 — Halt & rollback.** A `Halt` rollout published with the same
 multi-sig requirement supersedes any pending update. Rollback is a
@@ -663,8 +676,9 @@ so the cohort re-randomises on every new JTI (no permanently-canary nodes).
 The decision is evaluated in `DdsNode::evaluate_self_update_rollout`, called
 from both the gossip ingest path (`ingest_operation`) and the sync path
 (`handle_sync_response`) in `dds-node/src/node.rs`. All five outcomes are
-logged at `info` or `warn`. The actual apply step (Phase D.4) is not yet
-implemented; `ApplyNow` is logged as "would apply".
+logged at `info` or `warn`. When the decision is `ApplyNow`,
+`evaluate_self_update_rollout` spawns `crate::self_update::apply_update` as a Tokio task
+(Phase D.4, landed same pass).
 
 Eight unit tests in `dds-domain::types::tests` cover: `Halt` always halts,
 `Pinned` matches / misses / no-version, `Staged` with 0% canary, 100% canary,

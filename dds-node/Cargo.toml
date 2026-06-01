@@ -57,7 +57,7 @@ sha2.workspace = true
 # `default-features = false, features = ["ecdsa"]` which is all that is needed
 # at runtime. Dev-dependencies add `["pkcs8"]` for test key synthesis.
 p256 = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 toml_edit = "0.22"
 tempfile = "3"
 # observability-plan.md Phase C `dds_memory_resident_bytes` — process RSS at

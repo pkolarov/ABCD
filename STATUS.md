@@ -1,5 +1,84 @@
 # DDS Implementation Status
 
+## feat(node): Phase D.4 self-update apply path (243rd pass) — 2026-06-01
+
+### Summary
+
+Automated scheduled sweep following the 242nd-pass baseline.
+
+**Gaps found and implemented:**
+
+**1. Phase D.4 — Self-update apply path.** `docs/supply-chain-plan.md` Phase D.4
+specified the full download-verify-sign-install pipeline invoked when a node is in the
+`ApplyNow` cohort. The apply step was missing — `evaluate_self_update_rollout` only
+logged "would apply (Phase D.4 not yet implemented)".
+
+Added [`dds-node/src/self_update.rs`](dds-node/src/self_update.rs):
+
+- **`apply_update(doc, jti)`** — `pub async fn` spawned as a Tokio task by
+  `evaluate_self_update_rollout` when `RolloutDecision::ApplyNow`. An `AtomicBool`
+  guard (`INSTALL_IN_PROGRESS`) prevents concurrent installs; an RAII `InstallGuard`
+  clears the flag on any exit path.
+- **`fetch_and_verify(artifact, dest)`** — streams the download via `reqwest` (stream
+  feature now enabled) computing SHA-256 as bytes arrive; compares against
+  `artifact.sha256_hex` before committing the staged file. HTTPS-only guard.
+- **`verify_os_signature(path, identity)`** — platform-dispatched:
+  - Windows: `verify_authenticode` — PowerShell `Get-AuthenticodeSignature`, checks
+    signer subject and optional root-thumbprint against `PublisherIdentity::Authenticode`.
+  - macOS: `verify_apple_developer_id` — `pkgutil --check-signature`, extracts team ID
+    from Developer ID line, checks against `PublisherIdentity::AppleDeveloperId`.
+  - Linux: no-op; SHA-256 is the integrity anchor.
+- **`run_installer(path)`** — `msiexec /i /quiet /norestart` on Windows; `installer
+  -pkg -target /` on macOS; error stub on Linux.
+- **`current_platform() -> Option<Platform>`** — returns `Platform` variant for the
+  compile-time target triple; used to locate the matching `UpdateArtifact`.
+- **`staging_dir() -> PathBuf`** — platform-specific SYSTEM-owned path
+  (`C:\ProgramData\DDS\update-cache`, `/Library/Application Support/DDS/update-cache`,
+  `/var/cache/dds`).
+
+Updated [`dds-node/src/node.rs`](dds-node/src/node.rs): `evaluate_self_update_rollout`
+now calls `tokio::spawn(crate::self_update::apply_update(doc, jti))` for `ApplyNow`
+instead of logging "would apply". All other decision arms unchanged.
+
+Added `dds-node/src/lib.rs`: `pub mod self_update`.
+
+Updated `dds-node/Cargo.toml`: `reqwest` gained `"stream"` feature for
+`response.bytes_stream()`.
+
+**2. Supply-chain plan update.** D.4 marked ✅ in
+[`docs/supply-chain-plan.md`](docs/supply-chain-plan.md) with implementation notes.
+Stale D.3 reference ("not yet implemented") corrected.
+
+**Deferred:** Step 7 (post-restart `audit.action = self.update` log) waits on Phase A
+completion. Linux installer stub returns an error (not yet specified). D.5 (halt &
+rollback) not yet implemented.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers.
+
+**Test results:**
+- `cargo test -p dds-node --lib -- self_update`: 5 / 5 passing (`current_platform_is_some`,
+  `staging_dir_is_absolute`, `apply_update_rejects_http_url`,
+  `apply_update_skips_when_no_artifact_for_platform`, `apply_update_no_concurrent_install`)
+- `cargo test --workspace --lib`: 823 / 823 passing, 5 ignored (+5 vs 241st-pass baseline)
+- `cargo check -p dds-node`: clean (all deps present: `reqwest[stream]`, `futures`,
+  `sha2`, `hex`, `tokio`, `tracing`)
+- `cargo fmt --check -p dds-node`: clean
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6, D.2-full,
+D.5, D.4-linux-installer, D.4-post-restart-audit) remain blocked on external design,
+infrastructure provisioning, or Windows CI; no change.
+
+### Files changed
+
+- **`dds-node/src/self_update.rs`** *(new)* — `apply_update`, `fetch_and_verify`,
+  `verify_os_signature`, `run_installer`, `current_platform`, `staging_dir`; 5 unit tests.
+- **`dds-node/src/node.rs`** — `evaluate_self_update_rollout` updated to spawn D.4 task.
+- **`dds-node/src/lib.rs`** — `pub mod self_update` added.
+- **`dds-node/Cargo.toml`** — `reqwest` stream feature enabled.
+- **`docs/supply-chain-plan.md`** — D.4 marked ✅, implementation notes added.
+
+---
+
 ## feat(domain,node): Phase D.3 rollout cohort evaluation (241st pass) — 2026-06-01
 
 ### Summary
@@ -41,8 +120,7 @@ Added to [`dds-node/src/node.rs`](dds-node/src/node.rs):
 - Gossip path (`ingest_operation`) and sync path (`handle_sync_response`) both now call
   `evaluate_self_update_rollout` instead of the simpler D.6-only log block.
 
-**The actual binary install step (Phase D.4) is not yet implemented.** `ApplyNow` is
-logged as "would apply (Phase D.4 not yet implemented)".
+**The actual binary install step (Phase D.4) was implemented in the 243rd pass.**
 
 **2. Admin Guide update.** The `self_update_apply` row in
 [`docs/DDS-Admin-Guide.md`](docs/DDS-Admin-Guide.md) now documents the D.3 rollout
@@ -62,8 +140,8 @@ key-wrapping) is unchanged.
 - `cargo test -p dds-domain --test domain_tests`: 53 / 53 passing (unchanged)
 
 **Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6, D.2-full,
-D.4–D.5) remain blocked on external design, infrastructure provisioning, or
-Windows CI; no change.
+D.5, D.4-linux-installer, D.4-post-restart-audit) remain blocked on external design,
+infrastructure provisioning, or Windows CI; no change.
 
 ### Files changed
 

@@ -22,5 +22,6 @@ pub mod node;
 pub mod p2p_identity;
 pub mod peer_cert_store;
 pub mod provision;
+pub mod self_update;
 pub mod service;
 pub mod telemetry;
