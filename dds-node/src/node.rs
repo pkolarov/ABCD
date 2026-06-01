@@ -329,6 +329,14 @@ pub struct DdsNode {
     /// re-admitted with a v2 cert. Sourced from
     /// `config.network.allow_v1_certs`.
     allow_v1_certs: bool,
+    /// **Phase D.2** — K-of-M multi-sig accumulator for `DdsSelfUpdateDocument`
+    /// tokens. Maps the SHA-256 of the document body to the set of issuer URNs
+    /// that have published an attest containing that exact document. Only when
+    /// `signers.len() >= K` (where K = max(2, ceil(M/2)) and M = count of
+    /// `dds:dds-self-update-publisher` holders in the trust graph) is
+    /// `evaluate_self_update_rollout` called. Tokens are always stored and
+    /// propagated regardless of quorum; this map gates only the *apply* path.
+    pending_self_updates: std::collections::HashMap<[u8; 32], BTreeSet<String>>,
 }
 
 /// Shared live-state snapshot for the Prometheus exposition and the
@@ -700,6 +708,7 @@ impl DdsNode {
             admission_key_provider,
             pending_challenges: BTreeMap::new(),
             allow_v1_certs,
+            pending_self_updates: std::collections::HashMap::new(),
         })
     }
 
@@ -2014,13 +2023,14 @@ impl DdsNode {
                     token_bytes.to_vec(),
                     None,
                 );
-                // Phase D.3 + D.6: evaluate rollout policy for this node.
-                // The document is always stored and propagated; only the
-                // apply step (Phase D.4, not yet implemented) is gated here.
+                // Phase D.2 + D.3 + D.6: gate rollout evaluation behind K-of-M
+                // quorum. Tokens are always stored and propagated; only the
+                // apply step is held until K distinct self-update-publisher
+                // holders have signed the same document content.
                 if token.payload.body_type.as_deref()
                     == Some(dds_domain::body_types::DDS_SELF_UPDATE)
                 {
-                    self.evaluate_self_update_rollout(&token.payload);
+                    self.check_self_update_quorum_and_maybe_apply(&token);
                 }
             }
             Ok(false) => {} // duplicate
@@ -2028,13 +2038,13 @@ impl DdsNode {
         }
     }
 
-    /// Phase D.3 — evaluate the rollout policy for a `DdsSelfUpdateDocument`
-    /// token and log the decision. Called from both gossip and sync ingest
-    /// paths. The actual apply step (Phase D.4) is not yet implemented;
-    /// Phase D.4: when the decision is `ApplyNow`, spawn a Tokio task that
-    /// downloads, verifies, and installs the artifact via
-    /// [`crate::self_update::apply_update`].  All other decisions are logged
-    /// only.
+    /// Phase D.3 + D.4 — evaluate the rollout policy for a `DdsSelfUpdateDocument`
+    /// token and act on the decision. Called by
+    /// [`Self::check_self_update_quorum_and_maybe_apply`] only after K-of-M
+    /// quorum is satisfied (Phase D.2). When the decision is `ApplyNow`, spawns
+    /// a Tokio task that downloads, verifies, and installs the artifact via
+    /// [`crate::self_update::apply_update`] (Phase D.4). All other decisions
+    /// are logged only.
     fn evaluate_self_update_rollout(&self, payload: &dds_core::token::TokenPayload) {
         use dds_domain::{DomainDocument, RolloutDecision};
         if !self.config.self_update_apply {
@@ -2089,6 +2099,55 @@ impl DdsNode {
             Err(e) => {
                 warn!(jti = %payload.jti, err = %e, "self-update: failed to parse DdsSelfUpdateDocument");
             }
+        }
+    }
+
+    /// Phase D.2 — K-of-M multi-sig quorum check for `DdsSelfUpdateDocument`.
+    ///
+    /// The token has already been admitted to the trust graph and the store
+    /// (propagation is unconditional). This method accumulates distinct
+    /// `dds:dds-self-update-publisher` signers for the same document content
+    /// and fires [`Self::evaluate_self_update_rollout`] only when K distinct
+    /// signers have been seen, where K = max(2, ⌈M/2⌉) and M is the count of
+    /// self-update publishers currently in the trust graph.
+    fn check_self_update_quorum_and_maybe_apply(&mut self, token: &Token) {
+        use dds_core::token::purpose;
+
+        let content_hash = self_update_content_hash(token);
+        let signers = self
+            .pending_self_updates
+            .entry(content_hash)
+            .or_default();
+        signers.insert(token.payload.iss.clone());
+        let signer_count = signers.len();
+
+        let m = self
+            .trust_graph
+            .read()
+            .map(|g| g.count_purpose_holders(purpose::SELF_UPDATE_PUBLISHER, &self.trusted_roots))
+            .unwrap_or(0);
+        let k = self_update_quorum_k(m);
+
+        if signer_count >= k {
+            // Remove the accumulator entry so additional stragglers don't
+            // re-fire evaluate_self_update_rollout for the same content.
+            self.pending_self_updates.remove(&content_hash);
+            info!(
+                jti = %token.payload.jti,
+                signer_count,
+                quorum_k = k,
+                publisher_count = m,
+                "self-update: quorum reached — evaluating rollout"
+            );
+            self.evaluate_self_update_rollout(&token.payload);
+        } else {
+            info!(
+                jti = %token.payload.jti,
+                signer_count,
+                quorum_k = k,
+                publisher_count = m,
+                "self-update: pending quorum (have {signer_count}/{k} signatures)"
+            );
         }
     }
 
@@ -3085,17 +3144,15 @@ impl DdsNode {
                 self.cache_sync_payload(&id, &op, &payload.token_bytes);
             }
         }
-        // Phase D.3 + D.6: evaluate rollout policy for each self-update
-        // manifest that arrived via sync. The document is always stored and
-        // propagated; only the apply step (Phase D.4, not yet implemented)
-        // is gated here.
+        // Phase D.2 + D.3 + D.6: gate rollout evaluation behind K-of-M quorum
+        // for self-update manifests arriving via anti-entropy sync.
         if result.ops_merged > 0 {
             for payload in &payloads {
                 if let Ok(token) = Token::from_cbor(&payload.token_bytes) {
                     if token.payload.body_type.as_deref()
                         == Some(dds_domain::body_types::DDS_SELF_UPDATE)
                     {
-                        self.evaluate_self_update_rollout(&token.payload);
+                        self.check_self_update_quorum_and_maybe_apply(&token);
                     }
                 }
             }
@@ -3997,6 +4054,30 @@ fn synthetic_op_for_token(token: &Token) -> Operation {
 /// vouches, revocations, burns) are always accepted here — this
 /// gate is specifically for the unauthenticated-remote-state
 /// injection path the security review called out as C-3.
+/// Phase D.2 — Compute the SHA-256 of a token's body bytes, used as the
+/// content-identity key for the multi-sig accumulator. Tokens with the same
+/// document content (same version, artifacts, rollout policy) share the same
+/// hash regardless of issuer or JTI.
+fn self_update_content_hash(token: &Token) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let body = token.payload.body_cbor.as_deref().unwrap_or(&[]);
+    let mut h = Sha256::new();
+    h.update(body);
+    h.finalize().into()
+}
+
+/// Phase D.2 — Derive the quorum threshold K from the publisher count M.
+///
+/// K = max(2, ⌈M/2⌉) so that:
+/// - A single-admin deployment (M=1) still requires 2 signatures → impossible
+///   to satisfy, which is intentional: self-update should not be possible with
+///   a single key. Operators must provision at least 2 self-update publishers.
+/// - A two-admin deployment (M=2) requires both to sign (K=2).
+/// - A five-admin deployment (M=5) requires 3 of 5 to sign (K=3).
+fn self_update_quorum_k(m: usize) -> usize {
+    m.div_ceil(2).max(2)
+}
+
 fn publisher_capability_ok(
     token: &Token,
     trust_graph: &Arc<RwLock<TrustGraph>>,
@@ -4016,8 +4097,9 @@ fn publisher_capability_ok(
         body_types::WINDOWS_POLICY => purpose::POLICY_PUBLISHER_WINDOWS,
         body_types::MACOS_POLICY => purpose::POLICY_PUBLISHER_MACOS,
         body_types::SOFTWARE_ASSIGNMENT => purpose::SOFTWARE_PUBLISHER,
-        // Phase D.2 (partial): require the dedicated SELF_UPDATE_PUBLISHER capability.
-        // Full K-of-M multi-sig enforcement is deferred to Phase D.2 proper.
+        // Phase D.2: require the dedicated SELF_UPDATE_PUBLISHER capability.
+        // K-of-M quorum enforcement runs after the capability gate in
+        // DdsNode::check_self_update_quorum_and_maybe_apply.
         body_types::DDS_SELF_UPDATE => purpose::SELF_UPDATE_PUBLISHER,
         _ => return true,
     };
@@ -4441,19 +4523,18 @@ mod publisher_identity_gate_tests {
 
 #[cfg(test)]
 mod publisher_capability_dds_self_update_tests {
-    //! Phase D.2 (partial) — unit coverage confirming that
-    //! [`publisher_capability_ok`] demands `SELF_UPDATE_PUBLISHER`
-    //! for `DdsSelfUpdateDocument` tokens.
+    //! Phase D.2 — unit coverage confirming that [`publisher_capability_ok`]
+    //! demands `SELF_UPDATE_PUBLISHER` for `DdsSelfUpdateDocument` tokens.
     //!
-    //! Full K-of-M multi-sig is deferred to Phase D.2 proper. This module
-    //! covers the capability-gate layer only: a token whose issuer
-    //! lacks the `dds:dds-self-update-publisher` vouch must be rejected
-    //! even if its body_type is `dds:dds-self-update`.
+    //! This module covers the capability-gate layer: a token whose issuer lacks
+    //! the `dds:dds-self-update-publisher` vouch must be rejected even if its
+    //! body_type is `dds:dds-self-update`. The K-of-M quorum accumulation is
+    //! covered in `d2_multisig_quorum_tests`.
     //!
-    //! The gate is exercised via an empty trust graph (no vouches), which
-    //! makes `has_purpose` return `false` for any issuer, simulating an
-    //! unauthorized publisher. Separately we verify the gate is a no-op for
-    //! body types it doesn't know about.
+    //! The gate is exercised via an empty trust graph (no vouches), which makes
+    //! `has_purpose` return `false` for any issuer, simulating an unauthorized
+    //! publisher. Separately we verify the gate is a no-op for body types it
+    //! doesn't know about.
 
     use super::*;
     use dds_core::identity::Identity;
@@ -4528,6 +4609,129 @@ mod publisher_capability_dds_self_update_tests {
         let graph = Arc::new(RwLock::new(TrustGraph::new()));
         let roots: BTreeSet<String> = BTreeSet::new();
         assert!(publisher_capability_ok(&token, &graph, &roots));
+    }
+}
+
+#[cfg(test)]
+mod d2_multisig_quorum_tests {
+    //! Phase D.2 — unit tests for the K-of-M quorum threshold and the
+    //! `self_update_content_hash` / `self_update_quorum_k` helpers.
+
+    use super::*;
+    use dds_core::identity::Identity;
+    use dds_core::token::{Token, TokenKind, TokenPayload};
+    use dds_domain::body_types;
+    use rand::rngs::OsRng;
+
+    // --- self_update_quorum_k ---
+
+    #[test]
+    fn quorum_k_zero_publishers_requires_two() {
+        // M=0 → K=max(2,0)=2.  No self-update is possible without at least 2 publishers.
+        assert_eq!(self_update_quorum_k(0), 2);
+    }
+
+    #[test]
+    fn quorum_k_one_publisher_requires_two() {
+        // M=1 → ceil(1/2)=1, K=max(2,1)=2.
+        assert_eq!(self_update_quorum_k(1), 2);
+    }
+
+    #[test]
+    fn quorum_k_two_publishers_requires_two() {
+        // M=2 → ceil(2/2)=1, K=max(2,1)=2.
+        assert_eq!(self_update_quorum_k(2), 2);
+    }
+
+    #[test]
+    fn quorum_k_four_publishers_requires_two() {
+        // M=4 → ceil(4/2)=2, K=max(2,2)=2.
+        assert_eq!(self_update_quorum_k(4), 2);
+    }
+
+    #[test]
+    fn quorum_k_five_publishers_requires_three() {
+        // M=5 → ceil(5/2)=3, K=max(2,3)=3.
+        assert_eq!(self_update_quorum_k(5), 3);
+    }
+
+    #[test]
+    fn quorum_k_six_publishers_requires_three() {
+        // M=6 → ceil(6/2)=3, K=max(2,3)=3.
+        assert_eq!(self_update_quorum_k(6), 3);
+    }
+
+    // --- self_update_content_hash ---
+
+    fn make_self_update_attest(body_cbor: Vec<u8>, jti: &str) -> Token {
+        let ident = Identity::generate("publisher", &mut OsRng);
+        let payload = TokenPayload {
+            iss: ident.id.to_urn(),
+            iss_key: ident.public_key.clone(),
+            jti: jti.to_string(),
+            sub: ident.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1714605000,
+            exp: Some(4102444800),
+            body_type: Some(body_types::DDS_SELF_UPDATE.to_string()),
+            body_cbor: Some(body_cbor),
+        };
+        Token::sign(payload, &ident.signing_key).expect("sign")
+    }
+
+    #[test]
+    fn same_body_different_jti_yields_same_hash() {
+        // Two admins publish the same DdsSelfUpdateDocument body content
+        // but with different JTIs (their own random token IDs).
+        let body = vec![0xA1, 0x61, 0x76, 0x61, 0x31]; // CBOR: {"v": "1"}
+        let t1 = make_self_update_attest(body.clone(), "jti-admin1");
+        let t2 = make_self_update_attest(body.clone(), "jti-admin2");
+        assert_eq!(
+            self_update_content_hash(&t1),
+            self_update_content_hash(&t2),
+            "identical body must produce identical content hash regardless of JTI or issuer"
+        );
+    }
+
+    #[test]
+    fn different_body_yields_different_hash() {
+        let body1 = vec![0xA1, 0x61, 0x76, 0x61, 0x31]; // {"v": "1"}
+        let body2 = vec![0xA1, 0x61, 0x76, 0x61, 0x32]; // {"v": "2"}
+        let t1 = make_self_update_attest(body1, "jti-v1");
+        let t2 = make_self_update_attest(body2, "jti-v2");
+        assert_ne!(
+            self_update_content_hash(&t1),
+            self_update_content_hash(&t2),
+            "different body content must produce different hashes"
+        );
+    }
+
+    #[test]
+    fn empty_body_produces_deterministic_hash() {
+        let ident = Identity::generate("p", &mut OsRng);
+        let payload = TokenPayload {
+            iss: ident.id.to_urn(),
+            iss_key: ident.public_key.clone(),
+            jti: "empty-body".to_string(),
+            sub: ident.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1714605000,
+            exp: Some(4102444800),
+            body_type: Some(body_types::DDS_SELF_UPDATE.to_string()),
+            body_cbor: None, // no body
+        };
+        let t = Token::sign(payload, &ident.signing_key).expect("sign");
+        let h1 = self_update_content_hash(&t);
+        let h2 = self_update_content_hash(&t);
+        assert_eq!(h1, h2, "content hash must be deterministic");
     }
 }
 

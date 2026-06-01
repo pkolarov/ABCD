@@ -456,6 +456,46 @@ impl TrustGraph {
         })
     }
 
+    /// Count how many distinct identities hold a valid purpose grant for
+    /// `purpose` reachable from a trusted root.
+    ///
+    /// Used by Phase D.2 to compute M (total self-update-publisher holders)
+    /// so the quorum threshold K = max(2, ceil(M/2)) can be derived.
+    /// O(V) in the vouch count — acceptable since it is called only on
+    /// `DdsSelfUpdateDocument` ingest, not on the hot evaluation path.
+    pub fn count_purpose_holders(
+        &self,
+        purpose: &str,
+        trusted_roots: &BTreeSet<String>,
+    ) -> usize {
+        let mut holders: BTreeSet<&str> = BTreeSet::new();
+        for vouch in self.vouches.values() {
+            if vouch.payload.purpose.as_deref() != Some(purpose) {
+                continue;
+            }
+            if self.is_revoked(&vouch.payload.jti) || Self::is_expired(vouch) {
+                continue;
+            }
+            let subject = match vouch.payload.vch_iss.as_deref() {
+                Some(s) => s,
+                None => continue,
+            };
+            if self.burned.contains(subject) {
+                continue;
+            }
+            if self
+                .active_attestation_for_iss(subject, vouch.payload.vch_sum.as_deref())
+                .is_none()
+            {
+                continue;
+            }
+            if self.validate_chain(&vouch.payload.iss, trusted_roots).is_ok() {
+                holders.insert(subject);
+            }
+        }
+        holders.len()
+    }
+
     /// Get all purposes a subject has been vouched for (by trusted vouchers).
     ///
     /// **B-2 (security review):** see [`has_purpose`] — every grant
@@ -1604,5 +1644,142 @@ mod tests {
         // Sanity: the structure is correct (the leaf vouch is fresh and
         // would resolve if the intermediate were not expired).
         assert_eq!(graph.vouch_count(), 2);
+    }
+
+    /// Phase D.2 — `count_purpose_holders` returns 0 for an empty graph.
+    #[test]
+    fn count_purpose_holders_empty_graph() {
+        let graph = TrustGraph::new();
+        let roots: BTreeSet<String> = BTreeSet::new();
+        assert_eq!(
+            graph.count_purpose_holders("dds:dds-self-update-publisher", &roots),
+            0
+        );
+    }
+
+    /// Phase D.2 — `count_purpose_holders` returns 1 when exactly one
+    /// identity has been granted the purpose by a trusted root.
+    #[test]
+    fn count_purpose_holders_one_holder() {
+        let mut graph = TrustGraph::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let admin = Identity::generate("admin", &mut OsRng);
+        let admin_attest = make_attest(&admin);
+        let vouch = make_vouch(
+            &root,
+            &admin,
+            &admin_attest,
+            "dds:dds-self-update-publisher",
+            "vouch-admin1",
+        );
+        graph.add_token(admin_attest).unwrap();
+        graph.add_token(vouch).unwrap();
+        let roots = roots_with(&root.id.to_urn());
+        assert_eq!(
+            graph.count_purpose_holders("dds:dds-self-update-publisher", &roots),
+            1
+        );
+    }
+
+    /// Phase D.2 — `count_purpose_holders` returns 2 when two distinct
+    /// admins each hold the purpose.
+    #[test]
+    fn count_purpose_holders_two_holders() {
+        let mut graph = TrustGraph::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let admin1 = Identity::generate("admin1", &mut OsRng);
+        let admin2 = Identity::generate("admin2", &mut OsRng);
+        let a1_attest = make_attest(&admin1);
+        let a2_attest = make_attest(&admin2);
+        let v1 = make_vouch(
+            &root,
+            &admin1,
+            &a1_attest,
+            "dds:dds-self-update-publisher",
+            "vouch-admin1",
+        );
+        let v2 = make_vouch(
+            &root,
+            &admin2,
+            &a2_attest,
+            "dds:dds-self-update-publisher",
+            "vouch-admin2",
+        );
+        graph.add_token(a1_attest).unwrap();
+        graph.add_token(a2_attest).unwrap();
+        graph.add_token(v1).unwrap();
+        graph.add_token(v2).unwrap();
+        let roots = roots_with(&root.id.to_urn());
+        assert_eq!(
+            graph.count_purpose_holders("dds:dds-self-update-publisher", &roots),
+            2
+        );
+    }
+
+    /// Phase D.2 — an identity vouched by an untrusted root does not
+    /// count as a holder.
+    #[test]
+    fn count_purpose_holders_untrusted_root_not_counted() {
+        let mut graph = TrustGraph::new();
+        let untrusted_root = Identity::generate("rogue-root", &mut OsRng);
+        let admin = Identity::generate("admin", &mut OsRng);
+        let admin_attest = make_attest(&admin);
+        let vouch = make_vouch(
+            &untrusted_root,
+            &admin,
+            &admin_attest,
+            "dds:dds-self-update-publisher",
+            "vouch-admin",
+        );
+        graph.add_token(admin_attest).unwrap();
+        graph.add_token(vouch).unwrap();
+        // Trusted roots is empty — untrusted_root is not in it.
+        let roots: BTreeSet<String> = BTreeSet::new();
+        assert_eq!(
+            graph.count_purpose_holders("dds:dds-self-update-publisher", &roots),
+            0
+        );
+    }
+
+    /// Phase D.2 — a revoked vouch does not count toward the holder total.
+    #[test]
+    fn count_purpose_holders_revoked_vouch_not_counted() {
+        let mut graph = TrustGraph::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let admin = Identity::generate("admin", &mut OsRng);
+        let admin_attest = make_attest(&admin);
+        let vouch = make_vouch(
+            &root,
+            &admin,
+            &admin_attest,
+            "dds:dds-self-update-publisher",
+            "vouch-to-revoke",
+        );
+        graph.add_token(admin_attest).unwrap();
+        graph.add_token(vouch.clone()).unwrap();
+        // Root revokes its own vouch.
+        let revoke_payload = TokenPayload {
+            iss: root.id.to_urn(),
+            iss_key: root.public_key.clone(),
+            jti: "revoke-vouch".to_string(),
+            sub: root.id.to_urn(),
+            kind: TokenKind::Revoke,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: Some(vouch.payload.jti.clone()),
+            iat: 1000,
+            exp: None,
+            body_type: None,
+            body_cbor: None,
+        };
+        let revoke = Token::sign(revoke_payload, &root.signing_key).unwrap();
+        graph.add_token(revoke).unwrap();
+        let roots = roots_with(&root.id.to_urn());
+        assert_eq!(
+            graph.count_purpose_holders("dds:dds-self-update-publisher", &roots),
+            0,
+            "revoked vouch must not count toward holder total"
+        );
     }
 }

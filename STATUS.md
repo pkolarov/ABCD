@@ -1,5 +1,54 @@
 # DDS Implementation Status
 
+## feat(core,node): Phase D.2 K-of-M multi-sig quorum for self-update (247th pass) — 2026-06-01
+
+### Summary
+
+Automated scheduled sweep following the 246th-pass baseline.
+
+**Gap found and implemented:**
+
+Phase D.2 of the supply-chain plan specifies K-of-M multi-signature quorum for
+`DdsSelfUpdateDocument` tokens — a rollout must not be applied until at least
+K = max(2, ⌈M/2⌉) distinct self-update publishers have signed the same document
+content, where M is the number of identities currently holding the
+`dds:dds-self-update-publisher` grant in the trust graph. The previous code
+called `evaluate_self_update_rollout` immediately on the first valid token,
+effectively treating K=1.
+
+**Implementation:**
+
+- `dds-core/src/trust.rs` — `TrustGraph::count_purpose_holders(purpose, roots)`:
+  returns the count of distinct subject URNs with a non-revoked, non-expired,
+  non-burned vouch for `purpose` reachable from a trusted root. O(V) on vouch
+  count; called only on self-update ingest.
+
+- `dds-node/src/node.rs`:
+  - `DdsNode::pending_self_updates: HashMap<[u8;32], BTreeSet<String>>` —
+    accumulates issuer URNs per document-content hash.
+  - `self_update_content_hash(token)` — SHA-256 of `body_cbor` bytes, identical
+    across signers publishing the same document content.
+  - `self_update_quorum_k(m)` — derives K = max(2, m.div_ceil(2)).
+  - `check_self_update_quorum_and_maybe_apply(&mut self, token)` — replaces
+    direct `evaluate_self_update_rollout` calls on both gossip and sync ingest
+    paths; fires evaluation only once K signers have been seen.
+
+**Tests:** 14 new tests (0 failed):
+- `dds-core`: 5 `count_purpose_holders_*` tests.
+- `dds-node`: 9 `d2_multisig_quorum_tests::*` tests (quorum_k thresholds M=0..6;
+  content-hash determinism, same-body/different-JTI, different-body).
+
+**Deferred items** (M-13, M-15, M-18, M-22, L-17, Z-2, Z-4, Z-6) unchanged.
+
+### Files changed
+
+- **`dds-core/src/trust.rs`** — `count_purpose_holders` + 5 tests.
+- **`dds-node/src/node.rs`** — `pending_self_updates`, quorum helpers,
+  `check_self_update_quorum_and_maybe_apply`, 9 tests; doc-comment updates.
+- **`STATUS.md`** — this entry.
+
+---
+
 ## fix(test): redirect staging_dir to temp in test builds — avoid macOS TCC/SIP kill (244th pass) — 2026-06-01
 
 ### Summary
