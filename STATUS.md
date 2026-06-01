@@ -1,5 +1,46 @@
 # DDS Implementation Status
 
+## test(http): add uniqueness tests for session and admin challenge endpoints (233rd pass) — 2026-06-01
+
+### Summary
+
+Automated scheduled sweep. No functional code changes. Two missing test cases added.
+
+**Gap found and fixed:**
+
+`test_enroll_challenge_issues_unique_nonces` (introduced in the 230th pass) pins the
+contract for `/v1/enroll/challenge`: every call returns a unique ID with the
+`chall-enroll-` prefix and a unique nonce. The parallel contracts for
+`/v1/session/challenge` and `/v1/admin/challenge` had no equivalent test — the
+endpoints were exercised indirectly in `test_admin_vouch_*` and
+`test_session_and_vouch_challenges_independent`, but no test pinned:
+
+1. the `chall-session-` / `chall-admin-` ID prefix that proves `issue_challenge`'s
+   `kind` parameter flows through correctly, and
+2. uniqueness of consecutive calls (two calls → two distinct IDs and b64url values).
+
+Added `test_session_challenge_issues_unique_nonces` and
+`test_admin_challenge_issues_unique_nonces` in
+[`dds-node/src/http.rs`](dds-node/src/http.rs) as direct mirrors of the enroll test.
+
+**Bug scan:** No new `todo!()`, `unimplemented!()`, `FIXME`, or `HACK` markers in
+production src. The single `TODO(security)` at `dds-node/src/service.rs` (M-22
+OS-bound key-wrapping) is unchanged.
+
+**Test results:** All 865 Rust tests pass (365 dds-node lib; 0 failed; 4 ignored).
++2 new tests vs. the 232nd-pass baseline.
+
+**Deferred items** (M-22, TPM2 backend, Authenticode code signing) unchanged.
+
+### Files changed
+
+- `dds-node/src/http.rs` — `test_session_challenge_issues_unique_nonces` and
+  `test_admin_challenge_issues_unique_nonces` added after
+  `test_enroll_challenge_issues_unique_nonces`
+- `STATUS.md` — this entry
+
+---
+
 ## fix(test): eliminate flaky telemetry-counter assertion in parallel test run (232nd pass) — 2026-06-01
 
 ### Summary

@@ -3084,6 +3084,38 @@ mod tests {
         assert_ne!(b64_1, b64_2);
     }
 
+    /// `/v1/session/challenge` returns unique challenge IDs with the
+    /// `chall-session-` prefix and unique nonce bytes on each call.
+    /// Mirrors `test_enroll_challenge_issues_unique_nonces` for the
+    /// session ceremony endpoint.
+    #[tokio::test]
+    async fn test_session_challenge_issues_unique_nonces() {
+        let state = make_state();
+        let base = spawn_server(state).await;
+        let (id1, b64_1) = fetch_challenge(&base, "/v1/session/challenge").await;
+        let (id2, b64_2) = fetch_challenge(&base, "/v1/session/challenge").await;
+        assert!(id1.starts_with("chall-session-"), "id was {id1}");
+        assert!(id2.starts_with("chall-session-"), "id was {id2}");
+        assert_ne!(id1, id2);
+        assert_ne!(b64_1, b64_2);
+    }
+
+    /// `/v1/admin/challenge` returns unique challenge IDs with the
+    /// `chall-admin-` prefix and unique nonce bytes on each call.
+    /// Mirrors `test_enroll_challenge_issues_unique_nonces` for the
+    /// admin ceremony endpoint.
+    #[tokio::test]
+    async fn test_admin_challenge_issues_unique_nonces() {
+        let state = make_state();
+        let base = spawn_server(state).await;
+        let (id1, b64_1) = fetch_challenge(&base, "/v1/admin/challenge").await;
+        let (id2, b64_2) = fetch_challenge(&base, "/v1/admin/challenge").await;
+        assert!(id1.starts_with("chall-admin-"), "id was {id1}");
+        assert!(id2.starts_with("chall-admin-"), "id was {id2}");
+        assert_ne!(id1, id2);
+        assert_ne!(b64_1, b64_2);
+    }
+
     /// Round-trip: fetch challenge, enroll a user with a clientDataJSON
     /// whose `challenge` field encodes the server-issued bytes — must
     /// succeed. Then re-using the same `challenge_id` must fail
