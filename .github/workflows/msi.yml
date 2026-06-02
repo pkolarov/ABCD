@@ -167,7 +167,17 @@ jobs:
           Write-Host "Exported CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$linker"
 
       - name: Build dds-node + dds CLI (${{ matrix.rust_target }})
-        run: cargo build --package dds-node --package dds-cli --target ${{ matrix.rust_target }} --release
+        # --features dds-node/fido2 is mandatory: the MSI ships the
+        # bootstrap + join wizards which call `dds-node init-domain
+        # --fido2` and `dds-node provision` against FIDO2-protected
+        # bundles. Without the feature, dds-node refuses both with
+        # "Error: --fido2 requires dds-node built with --features fido2"
+        # / "domain key is FIDO2-protected but dds-node was built without
+        # --features fido2". Mirrors platform/windows/installer/Build-Msi.ps1.
+        # Package-scoped form is required because dds-cli has no `fido2`
+        # feature; plain `--features fido2` would fail the multi-package
+        # build.
+        run: cargo build --package dds-node --package dds-cli --features dds-node/fido2 --target ${{ matrix.rust_target }} --release
 
       # ── C++ native ──────────────────────────────────────────────
       - name: Add MSBuild to PATH

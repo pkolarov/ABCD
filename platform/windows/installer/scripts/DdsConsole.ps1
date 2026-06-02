@@ -1015,15 +1015,21 @@ function Run-JoinUnseal {
     Append-Log $el.TbJoinLog "[Console] Starting: dds-node provision $script:joinBundlePath"
     Append-Log $el.TbJoinLog "[Console] A new console window will open. Touch the admin's FIDO2 key when prompted."
 
-    $cmd = @"
-& '$NodeBin' provision --no-start '$script:joinBundlePath'
-`$code = `$LASTEXITCODE
+    # Use a single-quoted here-string and encode to UTF-16LE base64 for
+    # -EncodedCommand. powershell.exe -Command corrupts inner double-quoted
+    # strings when the payload spans multiple lines (drops the surrounding
+    # quotes), turning the failure branch into a parser error on `exit`.
+    # -EncodedCommand bypasses the quoting layer entirely.
+    $payload = @'
+& '__NODEBIN__' provision --no-start '__BUNDLE__'
+$code = $LASTEXITCODE
 Write-Host ''
-if (`$code -eq 0) { Write-Host '=== Provision Complete ===' -ForegroundColor Green }
-else              { Write-Host "=== Provision FAILED (exit `$code) ===" -ForegroundColor Red }
+if ($code -eq 0) { Write-Host '=== Provision Complete ===' -ForegroundColor Green }
+else             { Write-Host "=== Provision FAILED (exit $code) ===" -ForegroundColor Red }
 Read-Host 'Press Enter to close'
-exit `$code
-"@
+exit $code
+'@ -replace '__NODEBIN__', $NodeBin -replace '__BUNDLE__', $script:joinBundlePath
+    $cmd = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
     $script:joinStdoutPath = Join-Path $env:TEMP ("dds-join-{0:yyyyMMdd-HHmmss-fff}.log" -f (Get-Date))
     $script:joinStdoutPos  = 0
     # The visible window is required for libfido2 to treat stdin as interactive,
@@ -1031,7 +1037,7 @@ exit `$code
     # window after success/failure; we poll for HasExited.
     $script:joinProcess = Start-Process `
         -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" `
-        -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command', $cmd) `
+        -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand', $cmd) `
         -PassThru
 
     Append-Log $el.TbJoinLog "[Console] Provision PID $($script:joinProcess.Id)"
