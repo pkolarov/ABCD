@@ -2,8 +2,15 @@
 # Installed to: C:\Program Files\DDS\config\node.toml
 # Edit this file to configure the DDS node service.
 
-# Data directory for vault, certificates, and replication state
-data_dir = 'C:\ProgramData\DDS'
+# Data directory for keys, admission cert, audit log, replication state.
+# Must match `dds-node provision`'s default_data_dir() in provision.rs
+# (which appends "node-data" on Windows). Before this was lined up, the
+# MSI's auto-started DdsNode wrote p2p_key.bin / node_key.bin at the
+# parent path while `dds-node provision` wrote a different keypair into
+# the node-data subdir along with the admission cert minted for it; the
+# runtime then loaded the wrong p2p_key and bailed with
+# "admission cert verification failed: peer_id mismatch".
+data_dir = 'C:\ProgramData\DDS\node-data'
 
 [network]
 # HTTP API listen address (used by Auth Bridge and Policy Agent).
