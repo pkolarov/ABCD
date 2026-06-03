@@ -355,6 +355,16 @@ Write-Host ""
 Write-Host "[6/9] Starting DdsNode service..." -ForegroundColor Green
 Write-DdsStep 6 "start-node"
 Write-BootstrapMarker 6 "start-node"
+# Stop first if already running so the freshly written node.toml
+# is loaded; see the same pattern in Enroll-DdsDevice.ps1. The MSI
+# auto-starts DdsNode at install time with a stub config that has
+# no [domain] / admission_path; a plain Start-Service is a no-op
+# in that state and leaves the API pipe closed.
+$svc = Get-Service -Name DdsNode
+if ($svc.Status -ne 'Stopped') {
+    Stop-Service -Name DdsNode -Force
+    $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
+}
 Start-Service -Name DdsNode
 
 $pipePath = "\\.\pipe\dds-api"
@@ -478,8 +488,19 @@ Write-Host ""
 Write-Host "[9/9] Starting DdsAuthBridge and DdsPolicyAgent..." -ForegroundColor Green
 Write-DdsStep 9 "start-bridge-policyagent"
 Write-BootstrapMarker 9 "start-bridge-policyagent"
-Start-Service -Name DdsAuthBridge
-Start-Service -Name DdsPolicyAgent
+# Same stale-config trap as step 6 above. AuthBridge auto-started
+# at MSI install with empty HKLM\SOFTWARE\DDS\AuthBridge\DeviceUrn,
+# and PolicyAgent crashed at install with "DeviceUrn is required".
+# Force a fresh load of the appsettings.json + registry values
+# step 8 just wrote.
+foreach ($svc in @('DdsAuthBridge','DdsPolicyAgent')) {
+    $s = Get-Service -Name $svc
+    if ($s.Status -ne 'Stopped') {
+        Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+        $s.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
+    }
+    Start-Service -Name $svc
+}
 
 # ── Bootstrap.env ──────────────────────────────────────────────────
 @"

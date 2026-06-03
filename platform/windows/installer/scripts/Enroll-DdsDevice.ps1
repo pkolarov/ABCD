@@ -135,6 +135,18 @@ foreach ($svc in @('DdsNode','DdsAuthBridge','DdsPolicyAgent')) {
 
 Write-Host ""
 Write-Host "[1/4] Starting DdsNode service..." -ForegroundColor Green
+# The MSI auto-starts DdsNode at install time with the stub node.toml
+# (no [domain] section, no admission cert). By the time we run, the
+# service is already RUNNING but holds stale config — Start-Service
+# is then a no-op and \\.\pipe\dds-api never opens. Stop first, wait
+# for full Stopped, then Start so the freshly patched node.toml is
+# loaded. WaitForStatus is the only way to be sure SCM has fully
+# released the SCM-state lock before we Start-Service again.
+$svc = Get-Service -Name DdsNode
+if ($svc.Status -ne 'Stopped') {
+    Stop-Service -Name DdsNode -Force
+    $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
+}
 Start-Service -Name DdsNode
 
 $pipePath = "\\.\pipe\dds-api"
@@ -239,8 +251,19 @@ Write-Host "##DDS-DEVICE-ENROLL## phase=appsettings-stamped"
 # ── 9. start DdsAuthBridge + DdsPolicyAgent ───────────────────────
 Write-Host ""
 Write-Host "[4/4] Starting DdsAuthBridge and DdsPolicyAgent..." -ForegroundColor Green
-Start-Service -Name DdsAuthBridge
-Start-Service -Name DdsPolicyAgent
+# Same stale-config trap as DdsNode above. The MSI auto-starts
+# DdsAuthBridge at install time, and DdsPolicyAgent likely crashed
+# at install with "DeviceUrn is required" — both need a fresh load
+# now that appsettings.json + HKLM\SOFTWARE\DDS\AuthBridge\DeviceUrn
+# carry real values.
+foreach ($svc in @('DdsAuthBridge','DdsPolicyAgent')) {
+    $s = Get-Service -Name $svc
+    if ($s.Status -ne 'Stopped') {
+        Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+        $s.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
+    }
+    Start-Service -Name $svc
+}
 Write-Host "##DDS-DEVICE-ENROLL## phase=services-started"
 
 # ── Bootstrap.env-style summary so siblings tooling stays consistent ──
