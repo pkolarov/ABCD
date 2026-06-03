@@ -205,8 +205,14 @@ jobs:
         run: dotnet test platform\windows\DdsPolicyAgent.Tests\DdsPolicyAgent.Tests.csproj -c Debug --framework net9.0 --filter "Category!=Integration"
 
       # ---- MSI compile verification ----
+      # Must mirror msi.yml's flags exactly — otherwise this step
+      # silently misses the same regressions msi.yml would. The bare
+      # `cargo build -p dds-node -p dds-cli` form here masked a
+      # missing --features dds-node/fido2 in msi.yml for ~10 release
+      # cycles; the regression only surfaced when an operator tried
+      # to provision against a FIDO2-protected bundle.
       - name: Build dds-node + dds CLI (release, for MSI staging)
-        run: cargo build -p dds-node -p dds-cli --target x86_64-pc-windows-msvc --release
+        run: cargo build -p dds-node -p dds-cli --features dds-node/fido2 --target x86_64-pc-windows-msvc --release
       - name: Install WiX
         run: dotnet tool install --global wix --version 5.0.2
       - name: Publish DdsPolicyAgent for MSI staging

@@ -230,7 +230,11 @@ jobs:
         run: |
           which cargo
           cargo --version
-          cargo build -p dds-node --bin dds-node --bin dds-macos-e2e
+          # --features fido2 mirrors the release build at pkg.yml line ~110.
+          # Without it the smoke test cannot exercise FIDO2-protected
+          # provisioning and silently misses the bug class that
+          # ci.yml/msi.yml regressed for ~10 cycles.
+          cargo build -p dds-node --features fido2 --bin dds-node --bin dds-macos-e2e
           dotnet build platform/macos/DdsPolicyAgent/DdsPolicyAgent.MacOS.csproj -c Debug
 
       - name: Run smoke test
