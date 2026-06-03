@@ -155,6 +155,52 @@ if (-not (Test-Path $NodeBin)) {
     exit 1
 }
 
+# Idempotently append $Sid to [network.api_auth].windows_admin_sids in
+# a TOML file. Handles three cases: key already exists with $Sid (no-op),
+# key exists without $Sid (append), key absent (insert). Creates the
+# [network.api_auth] section if it does not exist either. Mirrors the
+# helper in Enroll-DdsDevice.ps1.
+function Add-WindowsAdminSid {
+    param([Parameter(Mandatory)][string]$TomlPath, [Parameter(Mandatory)][string]$Sid)
+    $lines = Get-Content -LiteralPath $TomlPath
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $inSection = $false
+    $stamped   = $false
+    foreach ($line in $lines) {
+        if ($line -match '^\s*\[([^\]]+)\]') {
+            if ($inSection -and -not $stamped) {
+                $out.Add("windows_admin_sids = [`"$Sid`"]")
+                $stamped = $true
+            }
+            $inSection = ($matches[1] -eq 'network.api_auth')
+            $out.Add($line)
+            continue
+        }
+        if ($inSection -and $line -match '^\s*windows_admin_sids\s*=\s*\[([^\]]*)\]') {
+            $current = $matches[1]
+            if ($current -match [Regex]::Escape($Sid)) {
+                $out.Add($line)
+            } else {
+                $appended = if ($current.Trim()) { "$current, `"$Sid`"" } else { "`"$Sid`"" }
+                $out.Add($line -replace 'windows_admin_sids\s*=\s*\[[^\]]*\]', "windows_admin_sids = [$appended]")
+            }
+            $stamped = $true
+            continue
+        }
+        $out.Add($line)
+    }
+    if ($inSection -and -not $stamped) {
+        $out.Add("windows_admin_sids = [`"$Sid`"]")
+        $stamped = $true
+    }
+    if (-not $stamped) {
+        $out.Add("")
+        $out.Add("[network.api_auth]")
+        $out.Add("windows_admin_sids = [`"$Sid`"]")
+    }
+    Set-Content -LiteralPath $TomlPath -Value $out -Encoding UTF8
+}
+
 # ── Check service registration first ──────────────────────────────
 foreach ($svc in @("DdsNode","DdsAuthBridge","DdsPolicyAgent")) {
     if (-not (Get-Service -Name $svc -ErrorAction SilentlyContinue)) {
@@ -355,6 +401,17 @@ Write-Host ""
 Write-Host "[6/9] Starting DdsNode service..." -ForegroundColor Green
 Write-DdsStep 6 "start-node"
 Write-BootstrapMarker 6 "start-node"
+
+# Stamp the invoking user's primary SID into
+# [network.api_auth].windows_admin_sids so the next dds-node restart
+# admits this user as admin on the named-pipe transport. Without this,
+# step 7's POST /v1/enroll/device fails with 403 not_authorized because
+# dds-node only allowlists primary SIDs (BUILTIN\Administrators is a
+# group SID, never a primary; see http.rs G1-S3 workaround).
+$callerSid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+Add-WindowsAdminSid -TomlPath $NodeToml -Sid $callerSid
+Write-Host "  Allowlisted SID $callerSid in node.toml windows_admin_sids."
+
 # Stop first if already running so the freshly written node.toml
 # is loaded; see the same pattern in Enroll-DdsDevice.ps1. The MSI
 # auto-starts DdsNode at install time with a stub config that has

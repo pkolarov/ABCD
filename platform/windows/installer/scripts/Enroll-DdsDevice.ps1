@@ -72,6 +72,51 @@ if (-not (Test-Path $NodeBin))    { throw "dds-node.exe not found at $NodeBin." 
 if (-not (Test-Path $NodeToml))   { throw "node.toml not found at $NodeToml. Run 'dds-node provision <bundle>' first." }
 if (-not (Test-Path $AppSettings)) { throw "appsettings.json not found at $AppSettings (MSI install incomplete?)." }
 
+# Idempotently append $Sid to [network.api_auth].windows_admin_sids in
+# a TOML file. Handles three cases: key already exists with $Sid (no-op),
+# key exists without $Sid (append), key absent (insert). Creates the
+# [network.api_auth] section if it does not exist either.
+function Add-WindowsAdminSid {
+    param([Parameter(Mandatory)][string]$TomlPath, [Parameter(Mandatory)][string]$Sid)
+    $lines = Get-Content -LiteralPath $TomlPath
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $inSection = $false
+    $stamped   = $false
+    foreach ($line in $lines) {
+        if ($line -match '^\s*\[([^\]]+)\]') {
+            if ($inSection -and -not $stamped) {
+                $out.Add("windows_admin_sids = [`"$Sid`"]")
+                $stamped = $true
+            }
+            $inSection = ($matches[1] -eq 'network.api_auth')
+            $out.Add($line)
+            continue
+        }
+        if ($inSection -and $line -match '^\s*windows_admin_sids\s*=\s*\[([^\]]*)\]') {
+            $current = $matches[1]
+            if ($current -match [Regex]::Escape($Sid)) {
+                $out.Add($line)
+            } else {
+                $appended = if ($current.Trim()) { "$current, `"$Sid`"" } else { "`"$Sid`"" }
+                $out.Add($line -replace 'windows_admin_sids\s*=\s*\[[^\]]*\]', "windows_admin_sids = [$appended]")
+            }
+            $stamped = $true
+            continue
+        }
+        $out.Add($line)
+    }
+    if ($inSection -and -not $stamped) {
+        $out.Add("windows_admin_sids = [`"$Sid`"]")
+        $stamped = $true
+    }
+    if (-not $stamped) {
+        $out.Add("")
+        $out.Add("[network.api_auth]")
+        $out.Add("windows_admin_sids = [`"$Sid`"]")
+    }
+    Set-Content -LiteralPath $TomlPath -Value $out -Encoding UTF8
+}
+
 # ── Patch stub node.toml from provisioned dds.toml (Join path) ───
 # Bootstrap-DdsDomain.ps1 writes a complete node.toml directly.
 # 'dds-node provision --no-start' instead writes dds.toml to
@@ -132,6 +177,17 @@ foreach ($svc in @('DdsNode','DdsAuthBridge','DdsPolicyAgent')) {
         throw "Service '$svc' is not registered. Reinstall the DDS MSI."
     }
 }
+
+# Stamp the invoking user's primary SID into
+# [network.api_auth].windows_admin_sids so the next dds-node restart
+# admits this user as admin on the named-pipe transport. Without this,
+# every API call from the wizard fails 403 not_authorized because
+# dds-node treats BUILTIN\Administrators as a group SID (never a
+# primary SID) and only allowlists primaries (http.rs G1-S3 workaround).
+$callerSid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+$NodeTomlPath = Join-Path $ConfigDir "node.toml"
+Add-WindowsAdminSid -TomlPath $NodeTomlPath -Sid $callerSid
+Write-Host "  Allowlisted SID $callerSid in node.toml windows_admin_sids."
 
 Write-Host ""
 Write-Host "[1/4] Starting DdsNode service..." -ForegroundColor Green
