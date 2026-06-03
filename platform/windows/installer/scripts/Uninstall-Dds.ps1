@@ -130,6 +130,14 @@ if (-not $Force) {
     }
 }
 
+# Kill the per-user Tray Agent. It is launched via HKLM Run key (not a
+# Windows service), so MSI uninstall does not touch it; if left alive it
+# holds C:\Program Files\DDS\bin\DdsTrayAgent.exe open, blocking the
+# install-dir wipe with a sharing violation and leaving a residue dir
+# the next installer can't fully overwrite.
+Write-Host "Killing DdsTrayAgent (per-user, not service-managed)..." -ForegroundColor Yellow
+Get-Process -Name DdsTrayAgent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
 # Stop services up-front. msiexec stops them too, but doing it here makes
 # the failure mode explicit if a handle is being held.
 Write-Host "Stopping services..." -ForegroundColor Yellow
