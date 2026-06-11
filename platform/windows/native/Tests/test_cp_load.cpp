@@ -7,6 +7,9 @@
 #include <windows.h>
 #include <credentialprovider.h>
 #include <stdio.h>
+#include <shlobj.h>
+
+#pragma comment(lib, "shell32.lib")
 
 // {a7f3b2c1-9d4e-4f8a-b6c5-2e1d0a3f7b9c}
 static const CLSID CLSID_CDdsProvider = {
@@ -81,16 +84,24 @@ int wmain()
     pProvider->Release();
     CoUninitialize();
 
-    // Show log
+    // Show log.
+    // AUDIT-2026-06-11 #14: dds_cp.log moved from world-readable C:\Temp to
+    // %ProgramData%\DDS\logs with a SYSTEM/Administrators-only DACL (see
+    // CPLogPath() in CDdsProvider.cpp) — read it from the new location.
+    // Run this harness elevated or the open fails and "(no log file)" prints.
     printf("\n=== dds_cp.log contents ===\n");
+    wchar_t programData[MAX_PATH] = {0};
+    if (SHGetFolderPathW(NULL, CSIDL_COMMON_APPDATA, NULL, 0, programData) != S_OK)
+        wcscpy_s(programData, L"C:\\ProgramData");
+    wchar_t logPath[MAX_PATH];
+    swprintf_s(logPath, L"%s\\DDS\\logs\\dds_cp.log", programData);
     FILE* f = nullptr;
-    fopen_s(&f, "C:\\Temp\\dds_cp.log", "r");
-    if (f) {
+    if (_wfopen_s(&f, logPath, L"r") == 0 && f) {
         char buf[512];
         while (fgets(buf, sizeof(buf), f)) fputs(buf, stdout);
         fclose(f);
     } else {
-        printf("(no log file)\n");
+        printf("(no log file at %ls)\n", logPath);
     }
 
     return 0;

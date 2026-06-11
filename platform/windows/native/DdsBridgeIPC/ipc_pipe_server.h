@@ -71,6 +71,23 @@ public:
         _In_ DWORD payloadLen
     );
 
+    // AUDIT-2026-06-11 #17: identity-checked send. The pClientCtx pointer
+    // aliases a recyclable slot in m_clients[]; a long-running worker that
+    // retained it across a wait could deliver a response (e.g. a decrypted
+    // password) to a DIFFERENT client that was assigned the same slot after
+    // the original disconnected. This variant verifies, under the client lock,
+    // that the slot still holds the expected unique clientId and an open pipe
+    // before writing. Returns FALSE (sends nothing) if the client is gone or
+    // the slot was recycled. Use this for any response carrying secrets.
+    BOOL SendResponseToClient(
+        _In_ IPC_CLIENT_CONTEXT* pClientCtx,
+        _In_ DWORD expectedClientId,
+        _In_ UINT16 responseType,
+        _In_ UINT32 seqId,
+        _In_reads_bytes_opt_(payloadLen) const BYTE* pPayload,
+        _In_ DWORD payloadLen
+    );
+
     // Send a notification to ALL connected clients.
     void BroadcastNotification(
         _In_ UINT16 notificationType,
@@ -95,7 +112,9 @@ private:
     DWORD                   m_nextClientId;
 
     // Create a pipe instance with the proper security descriptor.
-    HANDLE CreatePipeInstance();
+    // AUDIT-2026-06-11 #6: bFirstInstance adds FILE_FLAG_FIRST_PIPE_INSTANCE
+    // so the first CreateNamedPipeW fails if a squatter pre-owns the name.
+    HANDLE CreatePipeInstance(_In_ BOOL bFirstInstance);
 
     // Create security descriptor: allow SYSTEM and INTERACTIVE sessions only.
     BOOL CreatePipeSecurity(_Out_ PSECURITY_DESCRIPTOR* ppSD, _Out_ PSECURITY_ATTRIBUTES* ppSA);

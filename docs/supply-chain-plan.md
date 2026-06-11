@@ -630,7 +630,7 @@ concurrent installs. Steps 1-5 are fully implemented: `fetch_and_verify` streams
 check) on Windows and `verify_apple_developer_id` (`pkgutil --check-signature`, team ID
 check) on macOS; `run_installer` calls `msiexec /i /quiet /norestart` on Windows and
 `installer -pkg -target /` on macOS. Step 7 (post-restart audit log) is deferred to
-Phase A completion. Four unit tests in `dds_node::self_update::tests` cover:
+Phase A completion. Five unit tests in `dds_node::self_update::tests` cover:
 `current_platform_is_some`, `staging_dir_is_absolute`, `apply_update_rejects_http_url`,
 `apply_update_skips_when_no_artifact_for_platform`, `apply_update_no_concurrent_install`.
 
@@ -688,6 +688,29 @@ counted, and revoked vouch not counted.
 each have dedicated unit tests in `d2_multisig_quorum_tests`. The capability
 gate (`publisher_capability_ok` requiring `dds:dds-self-update-publisher`) from
 the partial landing remains, now acting as a pre-quorum identity check.
+
+**Sync-path quorum-eligibility gate (hardening, 2026-06-11).** The capability
+gate above checks only that the *claimed* `iss` URN holds the publisher
+purpose in the trust graph — it does **not** verify the token signature. On
+the gossip ingest path that is sufficient, because the accumulator is reached
+only after `TrustGraph::add_token` has already enforced shape + signature +
+issuer-URN↔key binding. The anti-entropy **sync** path, however, fed
+capability-filtered payloads to the accumulator without that guarantee:
+`apply_sync_payloads_with_graph` only *counts* signature/binding rejections, it
+does not drop them from the batch the quorum loop iterates. A single admitted,
+non-publisher peer could therefore submit K self-update payloads — each stamped
+with a real publisher's (public) `iss` URN but the attacker's own key and
+signature — pass the capability gate on the URN, and reach quorum with **zero**
+publisher keys, defeating the multi-sig control (the apply-time OS-vendor
+signature check on Windows/macOS remained as the only backstop; Linux has none).
+`check_self_update_quorum_and_maybe_apply` now calls
+`self_update_token_quorum_eligible` (shape + `verify_signature` +
+`verify_issuer_binding`) before accumulating any signer, so both ingest paths
+require K genuine publisher signatures. Three regression tests in
+`d2_quorum_eligibility_tests` pin the contract: a validly-signed token is
+eligible, a token spoofing a real publisher's URN with the attacker's key is
+rejected by the binding gate, and a token with a mismatched signature is
+rejected by the signature gate.
 
 **D.3 — Rollout cohort evaluation. ✅ Landed 2026-06-01.** The
 `RolloutPolicy::evaluate(peer_id_bytes, jti, installed_version)` method and the

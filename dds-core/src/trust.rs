@@ -258,7 +258,8 @@ impl TrustGraph {
         trusted_roots: &BTreeSet<String>,
     ) -> Result<Vec<String>, TrustError> {
         let mut chain = Vec::new();
-        self.walk_chain(subject_urn, trusted_roots, &mut chain, 0)
+        let mut visited = BTreeSet::new();
+        self.walk_chain(subject_urn, trusted_roots, &mut chain, 0, &mut visited)
             .map(|_| chain)
     }
 
@@ -268,6 +269,7 @@ impl TrustGraph {
         trusted_roots: &BTreeSet<String>,
         chain: &mut Vec<String>,
         depth: usize,
+        visited: &mut BTreeSet<String>,
     ) -> Result<(), TrustError> {
         if depth > self.max_chain_depth {
             return Err(TrustError::ChainTooDeep(self.max_chain_depth));
@@ -280,6 +282,16 @@ impl TrustGraph {
         // If this identity is a trusted root, chain is valid
         if trusted_roots.contains(current_urn) {
             return Ok(());
+        }
+
+        // **AUDIT-2026-06-11 #30**: cycle / diamond guard. A URN's reachability
+        // to a trusted root is path-independent, so once we begin exploring a
+        // URN we never need to explore it again. Without this, a crafted vouch
+        // graph with shared sub-paths fans out exponentially on this hot auth
+        // path (and on the self-update ingest path via `count_purpose_holders`)
+        // — a cheap CPU-DoS by any party who can publish vouches.
+        if !visited.insert(current_urn.to_string()) {
+            return Err(TrustError::NoValidChain);
         }
 
         // Find vouches that vouch for this identity via the secondary
@@ -338,7 +350,7 @@ impl TrustGraph {
             let voucher_urn = &vouch.payload.iss;
             chain.push(vouch.payload.jti.clone());
 
-            match self.walk_chain(voucher_urn, trusted_roots, chain, depth + 1) {
+            match self.walk_chain(voucher_urn, trusted_roots, chain, depth + 1, visited) {
                 Ok(()) => return Ok(()),
                 Err(e @ TrustError::ChainTooDeep(_)) => return Err(e),
                 Err(e @ TrustError::IdentityBurned(_)) => return Err(e),
@@ -425,15 +437,62 @@ impl TrustGraph {
     /// exactly that value; the vouch is not allowed to fall back to
     /// "first attestation for issuer" if that attestation does not
     /// match the embedded hash.
+    /// **AUDIT-2026-06-11 #3** — purposes whose grant is *attenuated*: a vouch
+    /// conferring one is honored only if the voucher is a trusted root or
+    /// itself holds it. These are the capabilities that confer power — publish
+    /// managed policy/software, push self-updates, act as or delegate admin,
+    /// claim a device scope. Group memberships (notably `dds:group:*`) are
+    /// deliberately NOT attenuated: admins routinely assign users to groups
+    /// they are not members of, so groups keep the looser chain-to-root model.
+    fn is_privileged_capability(purpose: &str) -> bool {
+        use crate::token::purpose as p;
+        purpose == p::POLICY_PUBLISHER_WINDOWS
+            || purpose == p::POLICY_PUBLISHER_MACOS
+            || purpose == p::POLICY_PUBLISHER_LINUX
+            || purpose == p::SOFTWARE_PUBLISHER
+            || purpose == p::SELF_UPDATE_PUBLISHER
+            || purpose == p::ADMIN
+            || purpose == p::DEVICE_SCOPE
+            || purpose.starts_with("dds:admin-vouch:")
+    }
+
     pub fn has_purpose(
         &self,
         subject_urn: &str,
         purpose: &str,
         trusted_roots: &BTreeSet<String>,
     ) -> bool {
+        let mut visited = BTreeSet::new();
+        self.has_purpose_inner(subject_urn, purpose, trusted_roots, &mut visited)
+    }
+
+    /// Cycle-guarded core of [`has_purpose`]. `visited` accumulates subjects
+    /// already being evaluated for this purpose so the privileged-purpose
+    /// attenuation recursion (below) can't loop on a `A grants P to B,
+    /// B grants P to A` cycle.
+    fn has_purpose_inner(
+        &self,
+        subject_urn: &str,
+        purpose: &str,
+        trusted_roots: &BTreeSet<String>,
+        visited: &mut BTreeSet<String>,
+    ) -> bool {
         if self.burned.contains(subject_urn) {
             return false;
         }
+        if !visited.insert(subject_urn.to_string()) {
+            return false;
+        }
+        // **AUDIT-2026-06-11 #3**: privileged `dds:` capabilities are
+        // *attenuated* — a vouch granting one is honored only if the voucher is
+        // a trusted root or itself holds that exact capability. Without this,
+        // any identity merely chain-connected to a root (e.g. a plain group
+        // member) could mint a `dds:policy-publisher-*` / `dds:dds-self-update-
+        // publisher` / `dds:admin-*` vouch and have it honored — a privilege
+        // escalation that also inflates the self-update quorum's M. Non-`dds:`
+        // purposes (group memberships) keep the looser chain-to-root model:
+        // admins routinely assign users to groups they are not members of.
+        let privileged = Self::is_privileged_capability(purpose);
         self.vouches_for_subject(subject_urn).any(|t| {
             if self.is_revoked(&t.payload.jti)
                 || Self::is_expired(t)
@@ -452,7 +511,18 @@ impl TrustGraph {
             {
                 return false;
             }
-            self.validate_chain(&t.payload.iss, trusted_roots).is_ok()
+            if self.validate_chain(&t.payload.iss, trusted_roots).is_err() {
+                return false;
+            }
+            if privileged {
+                let voucher = &t.payload.iss;
+                if !trusted_roots.contains(voucher)
+                    && !self.has_purpose_inner(voucher, purpose, trusted_roots, visited)
+                {
+                    return false;
+                }
+            }
+            true
         })
     }
 
@@ -469,26 +539,18 @@ impl TrustGraph {
             if vouch.payload.purpose.as_deref() != Some(purpose) {
                 continue;
             }
-            if self.is_revoked(&vouch.payload.jti) || Self::is_expired(vouch) {
-                continue;
-            }
             let subject = match vouch.payload.vch_iss.as_deref() {
                 Some(s) => s,
                 None => continue,
             };
-            if self.burned.contains(subject) {
+            if holders.contains(subject) {
                 continue;
             }
-            if self
-                .active_attestation_for_iss(subject, vouch.payload.vch_sum.as_deref())
-                .is_none()
-            {
-                continue;
-            }
-            if self
-                .validate_chain(&vouch.payload.iss, trusted_roots)
-                .is_ok()
-            {
+            // **AUDIT-2026-06-11 #3**: route through the attenuated `has_purpose`
+            // so a privileged capability (e.g. the self-update-publisher count M
+            // that sets the K-of-M quorum threshold) can't be inflated by an
+            // unauthorized chain member granting the purpose to extra subjects.
+            if self.has_purpose(subject, purpose, trusted_roots) {
                 holders.insert(subject);
             }
         }
@@ -518,7 +580,23 @@ impl TrustGraph {
                 {
                     return false;
                 }
-                self.validate_chain(&t.payload.iss, trusted_roots).is_ok()
+                if self.validate_chain(&t.payload.iss, trusted_roots).is_err() {
+                    return false;
+                }
+                // **AUDIT-2026-06-11 #3**: don't surface a privileged capability
+                // unless the voucher was authorized to grant it (trusted root or
+                // holds it itself), matching `has_purpose`.
+                if let Some(p) = t.payload.purpose.as_deref() {
+                    if Self::is_privileged_capability(p) {
+                        let voucher = &t.payload.iss;
+                        if !trusted_roots.contains(voucher)
+                            && !self.has_purpose(voucher, p, trusted_roots)
+                        {
+                            return false;
+                        }
+                    }
+                }
+                true
             })
             .filter_map(|t| t.payload.purpose.clone())
             .collect()
@@ -1000,6 +1078,68 @@ mod tests {
         let roots = roots_with(&root.id.to_urn());
         assert!(g.has_purpose(&user.id.to_urn(), "group:backend", &roots));
         assert!(!g.has_purpose(&user.id.to_urn(), "group:frontend", &roots));
+    }
+
+    /// AUDIT-2026-06-11 #3 — a chain-connected identity that does NOT hold a
+    /// privileged `dds:` capability cannot grant it. (A plain group member
+    /// must not be able to mint a self-update-publisher capability.)
+    #[test]
+    fn privileged_purpose_requires_authorized_voucher() {
+        let mut g = TrustGraph::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let admin = Identity::generate("admin", &mut OsRng); // holds only a group
+        let target = Identity::generate("target", &mut OsRng);
+        const CAP: &str = "dds:dds-self-update-publisher";
+
+        let admin_token = make_attest(&admin);
+        let target_token = make_attest(&target);
+        // root → admin for a GROUP (not the capability)
+        let v1 = make_vouch(&root, &admin, &admin_token, "group:ops", "v1");
+        // admin → target for the privileged capability (admin does not hold it)
+        let v2 = make_vouch(&admin, &target, &target_token, CAP, "v2");
+        g.add_token(admin_token).unwrap();
+        g.add_token(target_token).unwrap();
+        g.add_token(v1).unwrap();
+        g.add_token(v2).unwrap();
+
+        let roots = roots_with(&root.id.to_urn());
+        assert!(
+            !g.has_purpose(&target.id.to_urn(), CAP, &roots),
+            "unauthorized voucher must not be able to grant a dds: capability"
+        );
+        assert_eq!(g.count_purpose_holders(CAP, &roots), 0);
+        assert!(!g.purposes_for(&target.id.to_urn(), &roots).contains(CAP));
+        // The non-privileged group purpose still resolves through the chain.
+        assert!(g.has_purpose(&admin.id.to_urn(), "group:ops", &roots));
+    }
+
+    /// AUDIT-2026-06-11 #3 — attenuated delegation IS honored: root grants the
+    /// capability to admin, admin (now a holder) delegates to a second
+    /// publisher. Both count toward `count_purpose_holders` (the quorum M).
+    #[test]
+    fn privileged_purpose_attenuated_delegation_is_honored() {
+        let mut g = TrustGraph::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let admin = Identity::generate("admin", &mut OsRng);
+        let pub2 = Identity::generate("pub2", &mut OsRng);
+        const CAP: &str = "dds:dds-self-update-publisher";
+
+        let admin_token = make_attest(&admin);
+        let pub2_token = make_attest(&pub2);
+        let v1 = make_vouch(&root, &admin, &admin_token, CAP, "v1");
+        let v2 = make_vouch(&admin, &pub2, &pub2_token, CAP, "v2");
+        g.add_token(admin_token).unwrap();
+        g.add_token(pub2_token).unwrap();
+        g.add_token(v1).unwrap();
+        g.add_token(v2).unwrap();
+
+        let roots = roots_with(&root.id.to_urn());
+        assert!(g.has_purpose(&admin.id.to_urn(), CAP, &roots));
+        assert!(
+            g.has_purpose(&pub2.id.to_urn(), CAP, &roots),
+            "a holder may delegate a dds: capability it itself holds"
+        );
+        assert_eq!(g.count_purpose_holders(CAP, &roots), 2);
     }
 
     #[test]

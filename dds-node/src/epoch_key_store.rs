@@ -441,8 +441,18 @@ fn save(path: &Path, store: &EpochKeyStore) -> Result<(), EpochKeyStoreError> {
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600))
             .map_err(|e| EpochKeyStoreError::Io(e.to_string()))?;
     }
+    // AUDIT-2026-06-11 #35: apply the owner-only restriction on the
+    // tempfile before the rename (Unix 0o600 + Windows protected DACL)
+    // so the hybrid-KEM secret file is ACL-restricted on Windows like
+    // the other secret stores (identity_store / domain_store), not just
+    // chmod'd on Unix.
+    crate::file_acl::restrict_to_owner(tmp.path());
     tmp.persist(path)
         .map_err(|e| EpochKeyStoreError::Io(e.to_string()))?;
+    // Re-apply on the final path: NamedTempFile::persist preserves perms
+    // on Unix, but mirror identity_store/domain_store which harden the
+    // post-rename path too (defensive on platforms where persist resets).
+    crate::file_acl::restrict_to_owner(path);
     Ok(())
 }
 

@@ -20,10 +20,11 @@ internal sealed class RecordingCommandRunner : ICommandRunner
         string fileName,
         IEnumerable<string> arguments,
         string? standardInput = null,
+        bool sensitive = false,
         CancellationToken ct = default)
     {
         var args = arguments.ToArray();
-        Invocations.Add(new RecordedCommand(fileName, args, standardInput));
+        Invocations.Add(new RecordedCommand(fileName, args, standardInput, sensitive));
         return _handler(fileName, args, standardInput);
     }
 }
@@ -31,7 +32,8 @@ internal sealed class RecordingCommandRunner : ICommandRunner
 internal sealed record RecordedCommand(
     string FileName,
     IReadOnlyList<string> Arguments,
-    string? StandardInput);
+    string? StandardInput,
+    bool Sensitive = false);
 
 internal sealed class StaticHttpClientFactory : IHttpClientFactory
 {

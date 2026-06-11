@@ -248,6 +248,14 @@ pub fn encap<R: CryptoRngCore>(
     let x_eph_pub = XPublicKey::from(&x_eph_static).to_bytes();
     let x_recipient_pk = XPublicKey::from(recipient_pk.x_pub);
     let ss_classical = x_eph_static.diffie_hellman(&x_recipient_pk);
+    // AUDIT-2026-06-11 #32: reject a non-contributory X25519 exchange. A
+    // low-order / all-zero recipient point yields an all-zero shared
+    // secret, silently zeroing the classical leg and defeating the PQ
+    // hybrid hedge (and breaking classical contributory security). Fail
+    // loud instead of deriving a secret with a dead classical half.
+    if !ss_classical.was_contributory() {
+        return Err(CryptoError::InvalidPublicKey);
+    }
 
     // PQ leg — ML-KEM-768 encapsulation. We feed 32 bytes of strong
     // randomness from the caller's RNG into the deterministic
@@ -310,6 +318,13 @@ pub fn decap(
     let x_static = XStaticSecret::from(secret_key.x_sk);
     let x_eph_pub = XPublicKey::from(ciphertext.x_eph_pub);
     let ss_classical = x_static.diffie_hellman(&x_eph_pub);
+    // AUDIT-2026-06-11 #32: enforce contributory behaviour on decap too —
+    // an attacker-supplied low-order / all-zero ephemeral public key in
+    // the ciphertext would otherwise zero the classical leg. Both encap
+    // and decap must reject it.
+    if !ss_classical.was_contributory() {
+        return Err(CryptoError::InvalidSignature);
+    }
 
     // PQ leg.
     let seed = ml_kem::Seed::from(secret_key.mlkem_seed);
@@ -565,5 +580,43 @@ mod tests {
     #[test]
     fn hkdf_salt_pins_version() {
         assert_eq!(HKDF_SALT_V1, b"dds-pqc-kem-hybrid-v1");
+    }
+
+    /// **AUDIT-2026-06-11 #32**: encapsulating to a recipient whose X25519
+    /// public point is all-zero (a low-order point) must error rather than
+    /// silently produce a secret with a dead, all-zero classical leg.
+    #[test]
+    fn encap_rejects_low_order_x25519_recipient() {
+        let (_, pk) = fresh_keypair();
+        // Replace only the X25519 leg with the all-zero low-order point;
+        // keep the valid ML-KEM leg so we know the rejection is the
+        // contributory check, not an ML-KEM parse failure.
+        let bad_pk = HybridKemPublicKey {
+            x_pub: [0u8; X25519_KEY_LEN],
+            mlkem_pub: pk.mlkem_pub.clone(),
+        };
+        let mut rng = OsRng;
+        assert_eq!(
+            encap(&mut rng, &bad_pk, b"binding"),
+            Err(CryptoError::InvalidPublicKey),
+            "encap must reject a non-contributory X25519 recipient point"
+        );
+    }
+
+    /// **AUDIT-2026-06-11 #32**: decapsulating a ciphertext whose embedded
+    /// ephemeral X25519 public point is all-zero must error — an attacker
+    /// cannot force an all-zero classical shared secret on the receiver.
+    #[test]
+    fn decap_rejects_low_order_x25519_ephemeral() {
+        let (sk, pk) = fresh_keypair();
+        let mut rng = OsRng;
+        let (mut ct, _) = encap(&mut rng, &pk, b"binding").expect("encap");
+        // Force the ephemeral X25519 pubkey to the all-zero low-order point.
+        ct.x_eph_pub = [0u8; X25519_KEY_LEN];
+        assert_eq!(
+            decap(&sk, &ct, b"binding"),
+            Err(CryptoError::InvalidSignature),
+            "decap must reject a non-contributory X25519 ephemeral point"
+        );
     }
 }

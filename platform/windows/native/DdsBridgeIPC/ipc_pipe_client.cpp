@@ -4,7 +4,14 @@
 
 #include "ipc_pipe_client.h"
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
+#include <shlobj.h>
+#include <sddl.h>
+#include <aclapi.h>
+
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "shell32.lib")
 
 namespace {
 // RAII helper for CRITICAL_SECTION — keeps the per-method lock/unlock noise low
@@ -17,6 +24,135 @@ struct CsLock
     CsLock(const CsLock&) = delete;
     CsLock& operator=(const CsLock&) = delete;
 };
+
+// AUDIT-2026-06-11 #6: verify the named-pipe SERVER is the LocalSystem
+// (SID S-1-5-18) DdsAuthBridge service and not a low-priv squatter that
+// pre-created the pipe to capture plaintext logon passwords. The server adds
+// FILE_FLAG_FIRST_PIPE_INSTANCE so it can never attach to a squatted name,
+// but a squatter could still create the name first and have the bridge fail
+// to start; in that case the CP must refuse to talk to the impostor. We pull
+// the server process id off the connected handle, open the process, read its
+// token user SID, and require it to equal LocalSystem.
+bool ServerIsLocalSystem(HANDLE hPipe)
+{
+    if (hPipe == INVALID_HANDLE_VALUE || hPipe == NULL)
+        return false;
+
+    ULONG serverPid = 0;
+    if (!GetNamedPipeServerProcessId(hPipe, &serverPid) || serverPid == 0)
+        return false;
+
+    // PROCESS_QUERY_LIMITED_INFORMATION is sufficient to open the token and is
+    // grantable across integrity levels for a SYSTEM process when the caller is
+    // SYSTEM (the CP runs in winlogon.exe as SYSTEM).
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, serverPid);
+    if (hProc == NULL)
+        return false;
+
+    bool isSystem = false;
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(hProc, TOKEN_QUERY, &hToken))
+    {
+        DWORD len = 0;
+        GetTokenInformation(hToken, TokenUser, NULL, 0, &len);
+        if (len > 0)
+        {
+            BYTE* buf = static_cast<BYTE*>(LocalAlloc(LMEM_FIXED, len));
+            if (buf != nullptr)
+            {
+                if (GetTokenInformation(hToken, TokenUser, buf, len, &len))
+                {
+                    PSID pTokenSid = reinterpret_cast<TOKEN_USER*>(buf)->User.Sid;
+
+                    // Build the well-known LocalSystem SID (S-1-5-18) and compare.
+                    SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+                    PSID pSystemSid = NULL;
+                    if (AllocateAndInitializeSid(&ntAuth, 1, SECURITY_LOCAL_SYSTEM_RID,
+                                                 0, 0, 0, 0, 0, 0, 0, &pSystemSid))
+                    {
+                        isSystem = (EqualSid(pTokenSid, pSystemSid) == TRUE);
+                        FreeSid(pSystemSid);
+                    }
+                }
+                LocalFree(buf);
+            }
+        }
+        CloseHandle(hToken);
+    }
+
+    CloseHandle(hProc);
+    return isSystem;
+}
+
+// AUDIT-2026-06-11 #14 (same world-readable-diagnostic-log class as the
+// CDdsProvider.cpp CPLog finding): the Connect() diagnostics previously went
+// to C:\Temp\dds_pipe.log with no DACL, so any local user could read
+// boot-time pipe diagnostics emitted from the winlogon-hosted SYSTEM
+// credential provider. Write to %ProgramData%\DDS\logs\dds_pipe.log instead,
+// with the protected DACL granting FullControl only to LocalSystem and
+// BUILTIN\Administrators — mirrors CDdsProvider.cpp's CPLogPath() and
+// DdsAuthBridge/FileLog.cpp's ApplyRestrictedDacl(). When this code runs in
+// a non-privileged process (e.g. the tray agent), opening the log simply
+// fails and the write is silently skipped.
+
+// Resolve %ProgramData%\DDS\logs\dds_pipe.log once, creating the directory
+// with the protected DACL. Returns the path, or "" on failure.
+const wchar_t* PipeLogPath()
+{
+    static wchar_t g_pipeLogPath[MAX_PATH] = L"";
+    static bool    g_resolved = false;
+    if (g_resolved)
+        return g_pipeLogPath;
+    g_resolved = true;
+
+    wchar_t programData[MAX_PATH] = {0};
+    if (SHGetFolderPathW(NULL, CSIDL_COMMON_APPDATA, NULL, 0, programData) != S_OK)
+        wcscpy_s(programData, L"C:\\ProgramData");
+
+    wchar_t parent[MAX_PATH];
+    swprintf_s(parent, L"%s\\DDS", programData);
+    wchar_t dir[MAX_PATH];
+    swprintf_s(dir, L"%s\\DDS\\logs", programData);
+    CreateDirectoryW(parent, NULL);
+    CreateDirectoryW(dir, NULL);
+
+    // SY -> LocalSystem, BA -> BUILTIN\Administrators; PAI = protected +
+    // non-inherited; OICI propagates to files created inside.
+    const wchar_t* sddl = L"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl, SDDL_REVISION_1, &pSD, nullptr))
+    {
+        BOOL daclPresent = FALSE, daclDefaulted = FALSE;
+        PACL pDacl = nullptr;
+        if (GetSecurityDescriptorDacl(pSD, &daclPresent, &pDacl, &daclDefaulted) &&
+            daclPresent)
+        {
+            SetNamedSecurityInfoW(dir, SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                nullptr, nullptr, pDacl, nullptr);
+        }
+        LocalFree(pSD);
+    }
+
+    swprintf_s(g_pipeLogPath, L"%s\\dds_pipe.log", dir);
+    return g_pipeLogPath;
+}
+
+void PipeLog(const char* fmt, ...)
+{
+    const wchar_t* path = PipeLogPath();
+    if (path[0] == L'\0') return;
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"a") != 0 || !f) return;
+    SYSTEMTIME st{}; GetLocalTime(&st);
+    fprintf(f, "[%02d:%02d:%02d PID=%lu TID=%lu] ",
+            st.wHour, st.wMinute, st.wSecond,
+            GetCurrentProcessId(), GetCurrentThreadId());
+    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
 } // namespace
 
 CIpcPipeClient::CIpcPipeClient()
@@ -83,33 +219,14 @@ BOOL CIpcPipeClient::Connect(_In_ DWORD timeoutMs)
         }
     }
 
+    // AUDIT-2026-06-11 #14: diagnostics go to the DACL-protected PipeLog —
+    // never to world-readable C:\Temp.
     if (!available)
     {
-        // Log to C:\Temp for diagnostics (visible after reboot)
-        {
-            CreateDirectoryA("C:\\Temp", nullptr);
-            FILE* f = nullptr; fopen_s(&f, "C:\\Temp\\dds_pipe.log", "a");
-            if (f) {
-                SYSTEMTIME st{}; GetLocalTime(&st);
-                fprintf(f, "[%02d:%02d:%02d PID=%lu SID=%lu] WaitNamedPipe FAILED err=%lu to=%lu\n",
-                        st.wHour, st.wMinute, st.wSecond,
-                        GetCurrentProcessId(),
-                        (ULONG)GetCurrentThreadId(),
-                        err, timeoutMs);
-                fclose(f);
-            }
-        }
+        PipeLog("WaitNamedPipe FAILED err=%lu to=%lu", err, timeoutMs);
         return FALSE;
     }
-    {
-        FILE* f = nullptr; fopen_s(&f, "C:\\Temp\\dds_pipe.log", "a");
-        if (f) {
-            SYSTEMTIME st{}; GetLocalTime(&st);
-            fprintf(f, "[%02d:%02d:%02d PID=%lu] WaitNamedPipe OK — connecting\n",
-                    st.wHour, st.wMinute, st.wSecond, GetCurrentProcessId());
-            fclose(f);
-        }
-    }
+    PipeLog("WaitNamedPipe OK — connecting");
 
     // FILE_FLAG_OVERLAPPED is required for ReadRaw/WriteRaw to honour their
     // timeoutMs argument. Without it, ReadFile/WriteFile ignore the OVERLAPPED
@@ -134,6 +251,18 @@ BOOL CIpcPipeClient::Connect(_In_ DWORD timeoutMs)
     // Set pipe to message-read mode
     DWORD dwMode = PIPE_READMODE_MESSAGE;
     if (!SetNamedPipeHandleState(m_hPipe, &dwMode, NULL, NULL))
+    {
+        CloseHandle(m_hPipe);
+        m_hPipe = INVALID_HANDLE_VALUE;
+        return FALSE;
+    }
+
+    // AUDIT-2026-06-11 #6: verify the connected server is the LocalSystem
+    // DdsAuthBridge service before sending any request. A squatter that
+    // pre-created the pipe name would be running at a lower privilege; refuse
+    // to hand it FIDO2 assertions / plaintext passwords. This runs on every
+    // (re)connect so the named-pipe instance race cannot be exploited.
+    if (!ServerIsLocalSystem(m_hPipe))
     {
         CloseHandle(m_hPipe);
         m_hPipe = INVALID_HANDLE_VALUE;
@@ -744,5 +873,22 @@ INT32 CIpcPipeClient::ListDdsUsers(
     }
 
     const IPC_RESP_DDS_USER_LIST* pUserList = reinterpret_cast<const IPC_RESP_DDS_USER_LIST*>(pPayload);
-    return (INT32)pUserList->count;
+
+    // AUDIT-2026-06-11 #18: do NOT trust pUserList->count verbatim. The caller
+    // (CDdsBridgeClient::ListDdsUsers) reads `count` IPC_DDS_USER_ENTRY structs
+    // straight out of the fixed pipe buffer; a malicious/buggy server could send
+    // a header that passes length validation but declares more entries than were
+    // actually received, causing an out-of-bounds read inside winlogon. Require
+    // header + count*sizeof(entry) to fit within the validated payload length
+    // (hdr.length, already bounded against bytesRead and BUFFER_SIZE by
+    // IpcDeserializeHeader). Reject on mismatch rather than clamp so a corrupt
+    // frame is never partially trusted.
+    const DWORD count = pUserList->count;
+    const DWORD maxEntries =
+        (hdr.length - (DWORD)sizeof(IPC_RESP_DDS_USER_LIST)) / (DWORD)sizeof(IPC_DDS_USER_ENTRY);
+    if (count > maxEntries)
+    {
+        return -1;
+    }
+    return (INT32)count;
 }

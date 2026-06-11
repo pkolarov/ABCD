@@ -116,7 +116,7 @@ void CIpcPipeServer::Stop()
     }
 }
 
-HANDLE CIpcPipeServer::CreatePipeInstance()
+HANDLE CIpcPipeServer::CreatePipeInstance(_In_ BOOL bFirstInstance)
 {
     PSECURITY_DESCRIPTOR pSD = nullptr;
     PSECURITY_ATTRIBUTES pSA = nullptr;
@@ -126,9 +126,22 @@ HANDLE CIpcPipeServer::CreatePipeInstance()
         return INVALID_HANDLE_VALUE;
     }
 
+    // AUDIT-2026-06-11 #6: the FIRST instance of the pipe is created with
+    // FILE_FLAG_FIRST_PIPE_INSTANCE so CreateNamedPipeW fails with
+    // ERROR_ACCESS_DENIED if a low-priv process has already squatted the
+    // name. Without this, a squatter that wins the boot race could
+    // pre-create \\.\pipe\DdsBridge and impersonate the bridge, capturing
+    // plaintext logon passwords from CP clients. Subsequent instances must
+    // NOT set the flag (the server itself already owns the name by then).
+    DWORD openMode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+    if (bFirstInstance)
+    {
+        openMode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+    }
+
     HANDLE hPipe = CreateNamedPipeW(
         IPC_PIPE::PIPE_NAME,
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        openMode,
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
         IPC_PIPE::MAX_INSTANCES,
         IPC_PIPE::BUFFER_SIZE,
@@ -208,19 +221,33 @@ DWORD WINAPI CIpcPipeServer::ListenerThreadProc(_In_ LPVOID pParam)
 
 DWORD CIpcPipeServer::ListenerThread()
 {
+    // AUDIT-2026-06-11 #6: the very first CreateNamedPipeW must claim the
+    // name with FILE_FLAG_FIRST_PIPE_INSTANCE so a squatter cannot pre-own
+    // it. Once we have successfully created the first instance we own the
+    // name; every later instance must omit the flag (it would otherwise
+    // fail because instances already exist).
+    BOOL bFirstInstance = TRUE;
+
     while (m_bRunning)
     {
         // Create a new pipe instance for the next client
-        HANDLE hPipe = CreatePipeInstance();
+        HANDLE hPipe = CreatePipeInstance(bFirstInstance);
         if (hPipe == INVALID_HANDLE_VALUE)
         {
-            // Failed to create pipe, wait briefly and retry
+            // Failed to create pipe, wait briefly and retry. If this was the
+            // first-instance attempt, a squatter likely owns the name (or all
+            // instances are busy); keep requiring first-instance semantics on
+            // retry so we never attach to a pipe we did not create.
             if (WaitForSingleObject(m_hStopEvent, 1000) == WAIT_OBJECT_0)
             {
                 break;
             }
             continue;
         }
+
+        // We now own the pipe name; further instances are additional servers
+        // for the same name and must not request first-instance semantics.
+        bFirstInstance = FALSE;
 
         // Wait for a client to connect
         OVERLAPPED ov = {};
@@ -440,6 +467,56 @@ BOOL CIpcPipeServer::SendNotification(
     _In_ DWORD payloadLen)
 {
     return SendResponse(pClientCtx, notificationType, seqId, pPayload, payloadLen);
+}
+
+// AUDIT-2026-06-11 #17: identity-checked send — see header. The pointer passed
+// here aliases a slot in m_clients[]; we hold m_csClients across the identity
+// check AND the write so the slot cannot be recycled to another client between
+// validating and delivering. If the slot no longer holds expectedClientId, or
+// its pipe is closed, we send nothing and return FALSE.
+BOOL CIpcPipeServer::SendResponseToClient(
+    _In_ IPC_CLIENT_CONTEXT* pClientCtx,
+    _In_ DWORD expectedClientId,
+    _In_ UINT16 responseType,
+    _In_ UINT32 seqId,
+    _In_reads_bytes_opt_(payloadLen) const BYTE* pPayload,
+    _In_ DWORD payloadLen)
+{
+    if (pClientCtx == nullptr)
+    {
+        return FALSE;
+    }
+
+    BYTE sendBuffer[IPC_PIPE::BUFFER_SIZE];
+    DWORD sendLen = IpcSerializeMessage(
+        sendBuffer, sizeof(sendBuffer),
+        responseType, seqId,
+        pPayload, payloadLen
+    );
+
+    if (sendLen == 0)
+    {
+        return FALSE;
+    }
+
+    BOOL result = FALSE;
+    EnterCriticalSection(&m_csClients);
+
+    // The slot must still belong to the original client (same unique id) and
+    // have a live pipe. A zeroed/recycled slot has clientId == 0 or a different
+    // id, so a mismatch means the original client is gone — refuse to deliver.
+    if (pClientCtx->clientId == expectedClientId &&
+        expectedClientId != 0 &&
+        pClientCtx->hPipe != NULL &&
+        pClientCtx->hPipe != INVALID_HANDLE_VALUE)
+    {
+        DWORD bytesWritten = 0;
+        result = WriteFile(pClientCtx->hPipe, sendBuffer, sendLen, &bytesWritten, NULL)
+            && (bytesWritten == sendLen);
+    }
+
+    LeaveCriticalSection(&m_csClients);
+    return result;
 }
 
 void CIpcPipeServer::BroadcastNotification(

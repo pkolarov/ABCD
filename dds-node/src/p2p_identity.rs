@@ -45,7 +45,22 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::identity_store::{PASSPHRASE_ENV, REQUIRE_ENCRYPTED_KEYS_ENV, require_encrypted_keys};
+use crate::identity_store::{
+    ALLOW_PLAINTEXT_DOWNGRADE_ENV, PASSPHRASE_ENV, REQUIRE_ENCRYPTED_KEYS_ENV,
+    require_encrypted_keys,
+};
+
+/// **AUDIT-2026-06-11 #27**: path of the sticky "this p2p key was once
+/// encrypted" marker file. Mirrors identity_store's M-14 marker (which
+/// only covered node_key.bin) so an attacker who clears
+/// `DDS_NODE_PASSPHRASE` cannot force a silent downgrade of an encrypted
+/// `p2p_key.bin` to plaintext. Side file (not a blob field) so the
+/// invariant is checkable without parsing an attacker-swappable file.
+fn encrypted_marker_path(key_path: &Path) -> std::path::PathBuf {
+    let mut p = key_path.as_os_str().to_os_string();
+    p.push(".encrypted-marker");
+    std::path::PathBuf::from(p)
+}
 
 const VERSION_PLAIN: u8 = 1;
 const VERSION_ENCRYPTED: u8 = 2;
@@ -150,6 +165,30 @@ pub fn save(path: &Path, kp: &Keypair) -> Result<(), P2pIdentityError> {
             path.display()
         )));
     }
+    // AUDIT-2026-06-11 #27: sticky plaintext-downgrade guard. If a prior
+    // save wrote an encrypted blob (marker present) and this save would
+    // write plaintext (passphrase cleared), refuse unless the operator
+    // override is set — blocks a silent downgrade of p2p_key.bin.
+    if will_be_plaintext && encrypted_marker_path(path).exists() {
+        let allow_downgrade = std::env::var(ALLOW_PLAINTEXT_DOWNGRADE_ENV)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !allow_downgrade {
+            proto.zeroize();
+            return Err(P2pIdentityError::Crypto(format!(
+                "refusing to overwrite encrypted libp2p identity at {} with plaintext \
+                 ({PASSPHRASE_ENV} is empty but an encrypted-marker is present). \
+                 If this is intentional (e.g., rotating to a new passphrase), \
+                 set {ALLOW_PLAINTEXT_DOWNGRADE_ENV}=1 to override.",
+                path.display()
+            )));
+        }
+        tracing::warn!(
+            "plaintext downgrade of encrypted libp2p identity at {} permitted by \
+             {ALLOW_PLAINTEXT_DOWNGRADE_ENV}",
+            path.display()
+        );
+    }
     let map = match passphrase {
         Ok(pass) if !pass.is_empty() => {
             // M-10: emit v=3 with parameters embedded in the blob.
@@ -233,6 +272,17 @@ pub fn save(path: &Path, kp: &Keypair) -> Result<(), P2pIdentityError> {
     tmp.persist(path)
         .map_err(|e| P2pIdentityError::Io(format!("rename: {e}")))?;
     set_owner_only_permissions(path);
+
+    // AUDIT-2026-06-11 #27: drop the sticky marker once an encrypted blob
+    // is on disk. Created only on success, never removed, so any later
+    // plaintext downgrade is forced to be explicit.
+    if !will_be_plaintext {
+        let marker = encrypted_marker_path(path);
+        if !marker.exists() {
+            let _ = std::fs::write(&marker, []);
+            set_owner_only_permissions(&marker);
+        }
+    }
     Ok(())
 }
 
@@ -674,5 +724,44 @@ mod tests {
             P2pIdentityError::Io(_) => {}
             other => panic!("expected Io error from O_NOFOLLOW, got {other:?}"),
         }
+    }
+
+    /// **AUDIT-2026-06-11 #27**: once an encrypted p2p key has been
+    /// written (marker present), a later plaintext save (passphrase
+    /// cleared) is refused unless the explicit override is set.
+    #[test]
+    fn save_refuses_plaintext_downgrade() {
+        use crate::identity_store::ALLOW_PLAINTEXT_DOWNGRADE_ENV;
+        let _g = PASSPHRASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(ALLOW_PLAINTEXT_DOWNGRADE_ENV) };
+        unsafe { std::env::set_var(PASSPHRASE_ENV, "audit27-p2p") };
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("p2p_key.bin");
+        let kp = Keypair::generate_ed25519();
+
+        // (1) Encrypted save drops the sticky marker.
+        save(&path, &kp).unwrap();
+        assert!(encrypted_marker_path(&path).exists(), "marker must be set");
+
+        // (2) Clear the passphrase: a plaintext save must be refused.
+        unsafe { std::env::remove_var(PASSPHRASE_ENV) };
+        let err = save(&path, &kp).expect_err("plaintext downgrade must be refused");
+        match err {
+            P2pIdentityError::Crypto(msg) => {
+                assert!(
+                    msg.contains("refusing to overwrite encrypted libp2p identity"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected Crypto error, got {other:?}"),
+        }
+
+        // (3) With the override set, the downgrade proceeds.
+        unsafe { std::env::set_var(ALLOW_PLAINTEXT_DOWNGRADE_ENV, "1") };
+        save(&path, &kp).expect("override must permit downgrade");
+        unsafe { std::env::remove_var(ALLOW_PLAINTEXT_DOWNGRADE_ENV) };
     }
 }

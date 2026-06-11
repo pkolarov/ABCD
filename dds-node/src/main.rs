@@ -1928,6 +1928,12 @@ fn cmd_seal_passphrase(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     }
     std::fs::write(&out_path, &blob)?;
 
+    // AUDIT-2026-06-11 #28: the DPAPI blob is machine-scoped, so any local
+    // process can unprotect it once it can read the file. Default file
+    // perms leave it world-readable, so apply an owner-only restriction
+    // (Unix 0o600 + Windows protected DACL) immediately after writing.
+    dds_node::file_acl::restrict_to_owner(&out_path);
+
     // Print the plaintext passphrase so the caller can set DDS_NODE_PASSPHRASE.
     println!("{passphrase}");
     eprintln!(

@@ -24,6 +24,23 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 pub const DOMAIN_PASSPHRASE_ENV: &str = "DDS_DOMAIN_PASSPHRASE";
+
+// AUDIT-2026-06-11 #26: the domain root key is the most sensitive key
+// (embedded in provision bundles), so its KDF must be at least as strong
+// as the per-node keys hardened under M-10. We raise the Argon2id params
+// to OWASP tier 2 (m=64 MiB, t=3, p=4) to match `identity_store` /
+// `p2p_identity`. Backward compatibility: existing on-disk blobs were
+// written with the legacy params (m=19 MiB, t=2, p=1) and did NOT store
+// the params in the blob, so we cannot bump them blindly. Approach
+// (mirrors M-10's v=2->v=3 migration): the encrypted passphrase blobs
+// (v=2 / v=5) now carry `m_cost` / `t_cost` / `p_cost` fields. On load,
+// params are read from the blob when present and fall back to the legacy
+// V2 constants when absent (the pre-#26 on-disk shape) so existing
+// `domain_key.bin` files still DECRYPT. On save we always write the
+// strong V3 params + the fields, so the next save lazily upgrades the
+// blob. No keyfile version bump was needed: CBOR maps are open, and the
+// legacy reader tolerated unknown keys, so adding the param fields to
+// v=2 / v=5 is forward- and backward-compatible.
 const VERSION_PLAIN: u8 = 1;
 const VERSION_ENCRYPTED: u8 = 2;
 /// Version 3: domain key encrypted with FIDO2 hmac-secret output.
@@ -49,6 +66,60 @@ const VERSION_PLAIN_HYBRID: u8 = 4;
 /// managing three nonces and avoids the nonce-reuse foot-gun if a
 /// future maintainer copy-pastes the encrypt path.
 const VERSION_ENCRYPTED_HYBRID: u8 = 5;
+
+// AUDIT-2026-06-11 #26: legacy Argon2id params, retained only for
+// backward-compatible decryption of pre-#26 blobs that did not embed
+// their KDF params. New blobs always use `KdfParams::V3`.
+const V2_M_COST_KIB: u32 = 19 * 1024;
+const V2_T_COST: u32 = 2;
+const V2_P_COST: u32 = 1;
+
+// AUDIT-2026-06-11 #26: strong Argon2id params (OWASP tier 2), matching
+// `identity_store` / `p2p_identity` M-10. The domain root key is the
+// most sensitive key in the system, so it must not be weaker than the
+// per-node keys.
+const V3_M_COST_KIB: u32 = 64 * 1024;
+const V3_T_COST: u32 = 3;
+const V3_P_COST: u32 = 4;
+
+/// AUDIT-2026-06-11 #26: Argon2id parameters read from / written to the
+/// encrypted domain-key blob. Carried in the blob so a future bump is
+/// just another value here plus a lazy rewrap (no new keyfile version),
+/// mirroring `identity_store::KdfParams`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KdfParams {
+    m_cost_kib: u32,
+    t_cost: u32,
+    p_cost: u32,
+}
+
+impl KdfParams {
+    /// Legacy params for pre-#26 blobs that lack embedded param fields.
+    const V2: Self = Self {
+        m_cost_kib: V2_M_COST_KIB,
+        t_cost: V2_T_COST,
+        p_cost: V2_P_COST,
+    };
+    /// Strong params written by all new saves.
+    const V3: Self = Self {
+        m_cost_kib: V3_M_COST_KIB,
+        t_cost: V3_T_COST,
+        p_cost: V3_P_COST,
+    };
+}
+
+/// **security-gaps.md remaining work / AUDIT-2026-06-11 #27**: path of
+/// the sticky "this domain key was once encrypted" marker file. Mirrors
+/// [`crate::identity_store`]'s M-14 marker so an attacker who clears
+/// `DDS_DOMAIN_PASSPHRASE` cannot force a silent downgrade of an
+/// encrypted `domain_key.bin` to plaintext. Kept as a side file (not a
+/// blob field) so the invariant is checkable without first parsing an
+/// attacker-swappable file.
+fn encrypted_marker_path(key_path: &Path) -> std::path::PathBuf {
+    let mut p = key_path.as_os_str().to_os_string();
+    p.push(".encrypted-marker");
+    std::path::PathBuf::from(p)
+}
 
 /// **Z-1 Phase A** — inner CBOR struct that is the plaintext payload
 /// of a v5 encrypted blob (and the conceptual shape of v4 plain
@@ -211,6 +282,35 @@ pub fn save_domain_key(path: &Path, key: &DomainKey) -> Result<(), DomainStoreEr
         )));
     }
 
+    // AUDIT-2026-06-11 #27: sticky plaintext-downgrade guard, mirroring
+    // identity_store's M-14 marker (which only covered node_key.bin).
+    // If a previous save wrote an encrypted domain key (the marker is
+    // present) and this save would write plaintext (passphrase cleared),
+    // refuse so an attacker with filesystem write cannot force a silent
+    // downgrade by clearing DDS_DOMAIN_PASSPHRASE. Override is the same
+    // operator-acknowledged DDS_NODE_ALLOW_PLAINTEXT_DOWNGRADE env var.
+    let will_be_plaintext = passphrase.is_none();
+    if will_be_plaintext && encrypted_marker_path(path).exists() {
+        let allow_downgrade = std::env::var(crate::identity_store::ALLOW_PLAINTEXT_DOWNGRADE_ENV)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !allow_downgrade {
+            return Err(DomainStoreError::Crypto(format!(
+                "refusing to overwrite encrypted domain key at {} with plaintext \
+                 ({DOMAIN_PASSPHRASE_ENV} is empty but an encrypted-marker is present). \
+                 If this is intentional (e.g., rotating to a new passphrase), set {}=1 \
+                 to override.",
+                path.display(),
+                crate::identity_store::ALLOW_PLAINTEXT_DOWNGRADE_ENV,
+            )));
+        }
+        tracing::warn!(
+            "plaintext downgrade of encrypted domain key at {} permitted by {}",
+            path.display(),
+            crate::identity_store::ALLOW_PLAINTEXT_DOWNGRADE_ENV,
+        );
+    }
+
     // **Z-1 Phase A** — branch on hybrid vs Ed25519-only and on
     // whether a passphrase is set, picking one of v1 / v2 / v4 / v5.
     // (v3 = FIDO2 stays Ed25519-only via `save_domain_key_fido2`.)
@@ -233,11 +333,15 @@ pub fn save_domain_key(path: &Path, key: &DomainKey) -> Result<(), DomainStoreEr
             ]
         }
         (false, Some(pass)) => {
+            // AUDIT-2026-06-11 #26: derive with the strong V3 params and
+            // embed them in the blob so this and future bumps migrate
+            // lazily without a keyfile version change.
+            let params = KdfParams::V3;
             let mut salt = [0u8; 16];
             OsRng.fill_bytes(&mut salt);
             let mut nonce = [0u8; 12];
             OsRng.fill_bytes(&mut nonce);
-            let mut k = derive_key(pass.as_bytes(), &salt)?;
+            let mut k = derive_key(pass.as_bytes(), &salt, params)?;
             let cipher = ChaCha20Poly1305::new(Key::from_slice(&k));
             let ct = cipher
                 .encrypt(Nonce::from_slice(&nonce), secret.as_ref())
@@ -256,6 +360,19 @@ pub fn save_domain_key(path: &Path, key: &DomainKey) -> Result<(), DomainStoreEr
                 (
                     CborValue::Text("nonce".into()),
                     CborValue::Bytes(nonce.to_vec()),
+                ),
+                // AUDIT-2026-06-11 #26: embed Argon2id params.
+                (
+                    CborValue::Text("m_cost".into()),
+                    CborValue::Integer(params.m_cost_kib.into()),
+                ),
+                (
+                    CborValue::Text("t_cost".into()),
+                    CborValue::Integer(params.t_cost.into()),
+                ),
+                (
+                    CborValue::Text("p_cost".into()),
+                    CborValue::Integer(params.p_cost.into()),
                 ),
                 (CborValue::Text("key".into()), CborValue::Bytes(ct)),
             ]
@@ -300,11 +417,13 @@ pub fn save_domain_key(path: &Path, key: &DomainKey) -> Result<(), DomainStoreEr
             let mut inner_bytes = Vec::new();
             ciborium::into_writer(&inner, &mut inner_bytes)
                 .map_err(|e| DomainStoreError::Cbor(e.to_string()))?;
+            // AUDIT-2026-06-11 #26: strong V3 params, embedded in the blob.
+            let params = KdfParams::V3;
             let mut salt = [0u8; 16];
             OsRng.fill_bytes(&mut salt);
             let mut nonce = [0u8; 12];
             OsRng.fill_bytes(&mut nonce);
-            let mut k = derive_key(pass.as_bytes(), &salt)?;
+            let mut k = derive_key(pass.as_bytes(), &salt, params)?;
             let cipher = ChaCha20Poly1305::new(Key::from_slice(&k));
             let ct = cipher
                 .encrypt(Nonce::from_slice(&nonce), inner_bytes.as_ref())
@@ -325,6 +444,19 @@ pub fn save_domain_key(path: &Path, key: &DomainKey) -> Result<(), DomainStoreEr
                     CborValue::Text("nonce".into()),
                     CborValue::Bytes(nonce.to_vec()),
                 ),
+                // AUDIT-2026-06-11 #26: embed Argon2id params.
+                (
+                    CborValue::Text("m_cost".into()),
+                    CborValue::Integer(params.m_cost_kib.into()),
+                ),
+                (
+                    CborValue::Text("t_cost".into()),
+                    CborValue::Integer(params.t_cost.into()),
+                ),
+                (
+                    CborValue::Text("p_cost".into()),
+                    CborValue::Integer(params.p_cost.into()),
+                ),
                 (CborValue::Text("blob".into()), CborValue::Bytes(ct)),
             ]
         }
@@ -333,6 +465,17 @@ pub fn save_domain_key(path: &Path, key: &DomainKey) -> Result<(), DomainStoreEr
     ciborium::into_writer(&CborValue::Map(map), &mut buf)
         .map_err(|e| DomainStoreError::Cbor(e.to_string()))?;
     atomic_write_owner_only(path, &buf)?;
+
+    // AUDIT-2026-06-11 #27: drop the sticky marker once an encrypted blob
+    // has been written. Created only on success and never removed, so a
+    // later plaintext downgrade is always explicit (see the guard above).
+    if !will_be_plaintext {
+        let marker = encrypted_marker_path(path);
+        if !marker.exists() {
+            let _ = std::fs::write(&marker, []);
+            set_owner_only_permissions(&marker);
+        }
+    }
     Ok(())
 }
 
@@ -421,6 +564,11 @@ pub fn load_domain_key_from_bytes(bytes: &[u8]) -> Result<DomainKey, DomainStore
     let mut pq_sk_field: Option<Vec<u8>> = None;
     let mut pq_pk_field: Option<Vec<u8>> = None;
     let mut blob_field: Option<Vec<u8>> = None;
+    // AUDIT-2026-06-11 #26: optional embedded Argon2id params (absent on
+    // pre-#26 blobs, in which case we fall back to the legacy V2 params).
+    let mut m_cost: Option<u32> = None;
+    let mut t_cost: Option<u32> = None;
+    let mut p_cost: Option<u32> = None;
     for (k, v) in map.iter() {
         if let Some(n) = k.as_text() {
             match n {
@@ -433,11 +581,27 @@ pub fn load_domain_key_from_bytes(bytes: &[u8]) -> Result<DomainKey, DomainStore
                 "pq_sk" => pq_sk_field = v.as_bytes().cloned(),
                 "pq_pk" => pq_pk_field = v.as_bytes().cloned(),
                 "blob" => blob_field = v.as_bytes().cloned(),
+                "m_cost" => m_cost = v.as_integer().and_then(|i| u32::try_from(i).ok()),
+                "t_cost" => t_cost = v.as_integer().and_then(|i| u32::try_from(i).ok()),
+                "p_cost" => p_cost = v.as_integer().and_then(|i| u32::try_from(i).ok()),
                 _ => {}
             }
         }
     }
     let name = name.ok_or_else(|| DomainStoreError::Format("missing name".into()))?;
+
+    // AUDIT-2026-06-11 #26: resolve the KDF params for the encrypted
+    // paths. If the blob carries all three fields, use them; otherwise
+    // (pre-#26 blob) fall back to the legacy V2 params so existing
+    // `domain_key.bin` files still decrypt.
+    let kdf_params = match (m_cost, t_cost, p_cost) {
+        (Some(m), Some(t), Some(p)) => KdfParams {
+            m_cost_kib: m,
+            t_cost: t,
+            p_cost: p,
+        },
+        _ => KdfParams::V2,
+    };
 
     // **Z-1 Phase A** — short-circuit for hybrid (v4 / v5) so we can
     // return a `from_secret_bytes_hybrid` DomainKey before falling
@@ -469,7 +633,7 @@ pub fn load_domain_key_from_bytes(bytes: &[u8]) -> Result<DomainKey, DomainStore
             let salt = salt.ok_or_else(|| DomainStoreError::Format("missing salt".into()))?;
             let nonce = nonce.ok_or_else(|| DomainStoreError::Format("missing nonce".into()))?;
             let blob = blob_field.ok_or_else(|| DomainStoreError::Format("missing blob".into()))?;
-            let mut k = derive_key(pass.as_bytes(), &salt)?;
+            let mut k = derive_key(pass.as_bytes(), &salt, kdf_params)?;
             let cipher = ChaCha20Poly1305::new(Key::from_slice(&k));
             let mut pt = cipher
                 .decrypt(Nonce::from_slice(&nonce), blob.as_ref())
@@ -511,7 +675,7 @@ pub fn load_domain_key_from_bytes(bytes: &[u8]) -> Result<DomainKey, DomainStore
             })?;
             let salt = salt.ok_or_else(|| DomainStoreError::Format("missing salt".into()))?;
             let nonce = nonce.ok_or_else(|| DomainStoreError::Format("missing nonce".into()))?;
-            let mut k = derive_key(pass.as_bytes(), &salt)?;
+            let mut k = derive_key(pass.as_bytes(), &salt, kdf_params)?;
             let cipher = ChaCha20Poly1305::new(Key::from_slice(&k));
             let pt = cipher
                 .decrypt(Nonce::from_slice(&nonce), key_field.as_ref())
@@ -553,7 +717,12 @@ pub fn load_domain_key_from_bytes(bytes: &[u8]) -> Result<DomainKey, DomainStore
 
             tracing::info!("Domain key is FIDO2-protected — touch your key to unlock");
             let hmac_key = fido2_hmac_secret(&cred_id, &hmac_salt)?;
-            let mut k = derive_key(&hmac_key, &salt)?;
+            // AUDIT-2026-06-11 #26: the FIDO2 hmac-secret output is already
+            // a 32-byte high-entropy key, so Argon2 params are not a
+            // weakness here; we keep this path on V2-equivalent params via
+            // the `kdf_params` fallback (v3 FIDO2 blobs do not embed
+            // params) to avoid breaking existing FIDO2-protected blobs.
+            let mut k = derive_key(&hmac_key, &salt, kdf_params)?;
             let cipher = ChaCha20Poly1305::new(Key::from_slice(&k));
             let pt = cipher
                 .decrypt(Nonce::from_slice(&nonce), key_field.as_ref())
@@ -655,7 +824,10 @@ pub fn save_domain_key_fido2(path: &Path, key: &DomainKey) -> Result<Vec<u8>, Do
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
 
-    let mut k = derive_key(&hmac_output, &salt)?;
+    // AUDIT-2026-06-11 #26: hmac-secret output is already high-entropy;
+    // keep V2 params (no embedded param fields) so the load-path
+    // fallback decrypts both pre- and post-#26 FIDO2 blobs identically.
+    let mut k = derive_key(&hmac_output, &salt, KdfParams::V2)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&k));
     let ct = cipher
         .encrypt(Nonce::from_slice(&nonce), secret.as_ref())
@@ -690,6 +862,14 @@ pub fn save_domain_key_fido2(path: &Path, key: &DomainKey) -> Result<Vec<u8>, Do
     ciborium::into_writer(&CborValue::Map(map), &mut buf)
         .map_err(|e| DomainStoreError::Cbor(e.to_string()))?;
     atomic_write_owner_only(path, &buf)?;
+
+    // AUDIT-2026-06-11 #27: a FIDO2-protected domain key is encrypted, so
+    // drop the sticky marker to block any later silent plaintext downgrade.
+    let marker = encrypted_marker_path(path);
+    if !marker.exists() {
+        let _ = std::fs::write(&marker, []);
+        set_owner_only_permissions(&marker);
+    }
 
     tracing::info!(
         "Domain key saved (FIDO2-protected, credential_id={} bytes)",
@@ -744,8 +924,11 @@ fn fido2_hmac_secret(credential_id: &[u8], hmac_salt: &[u8]) -> Result<Vec<u8>, 
     ))
 }
 
-fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; 32], DomainStoreError> {
-    let params = Params::new(19 * 1024, 2, 1, Some(32))
+fn derive_key(passphrase: &[u8], salt: &[u8], p: KdfParams) -> Result<[u8; 32], DomainStoreError> {
+    // AUDIT-2026-06-11 #26: params are now supplied by the caller (read
+    // from the blob on load, `KdfParams::V3` on save) rather than
+    // hardcoded to the weak legacy values.
+    let params = Params::new(p.m_cost_kib, p.t_cost, p.p_cost, Some(32))
         .map_err(|e| DomainStoreError::Crypto(e.to_string()))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = [0u8; 32];
@@ -1124,5 +1307,122 @@ pubkey = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
 
         unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
         unsafe { std::env::remove_var(DOMAIN_PASSPHRASE_ENV) };
+    }
+
+    /// **AUDIT-2026-06-11 #26**: a new encrypted domain-key save embeds
+    /// the strong V3 Argon2id params (m=64 MiB, t=3, p=4) in the blob.
+    #[test]
+    fn save_domain_key_embeds_v3_params() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::set_var(DOMAIN_PASSPHRASE_ENV, "audit26-params") };
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("domain_key.bin");
+        save_domain_key(&path, &key).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let val: CborValue = ciborium::from_reader(&bytes[..]).unwrap();
+        let map = val.as_map().unwrap();
+        let get_u32 = |name: &str| -> Option<u32> {
+            map.iter().find_map(|(k, v)| {
+                (k.as_text() == Some(name))
+                    .then(|| v.as_integer().and_then(|i| u32::try_from(i).ok()))
+                    .flatten()
+            })
+        };
+        assert_eq!(get_u32("m_cost"), Some(V3_M_COST_KIB));
+        assert_eq!(get_u32("t_cost"), Some(V3_T_COST));
+        assert_eq!(get_u32("p_cost"), Some(V3_P_COST));
+
+        // And it still round-trips.
+        let loaded = load_domain_key(&path).unwrap();
+        assert_eq!(loaded.pubkey(), key.pubkey());
+        unsafe { std::env::remove_var(DOMAIN_PASSPHRASE_ENV) };
+    }
+
+    /// **AUDIT-2026-06-11 #26 backward-compat**: a legacy v=2 blob written
+    /// with the old params and WITHOUT embedded param fields must still
+    /// decrypt (params fall back to `KdfParams::V2`).
+    #[test]
+    fn legacy_v2_domain_key_without_params_still_decrypts() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let pass = "audit26-legacy";
+        unsafe { std::env::set_var(DOMAIN_PASSPHRASE_ENV, pass) };
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let secret = key.signing_key.to_bytes();
+
+        // Hand-craft a pre-#26 v=2 blob: legacy params, no m/t/p fields.
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        let mut nonce = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce);
+        let mut k = derive_key(pass.as_bytes(), &salt, KdfParams::V2).unwrap();
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&k));
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), secret.as_ref())
+            .unwrap();
+        k.zeroize();
+        let map = vec![
+            (
+                CborValue::Text("v".into()),
+                CborValue::Integer((VERSION_ENCRYPTED as i64).into()),
+            ),
+            (
+                CborValue::Text("name".into()),
+                CborValue::Text("acme.com".into()),
+            ),
+            (
+                CborValue::Text("salt".into()),
+                CborValue::Bytes(salt.to_vec()),
+            ),
+            (
+                CborValue::Text("nonce".into()),
+                CborValue::Bytes(nonce.to_vec()),
+            ),
+            (CborValue::Text("key".into()), CborValue::Bytes(ct)),
+        ];
+        let mut buf = Vec::new();
+        ciborium::into_writer(&CborValue::Map(map), &mut buf).unwrap();
+
+        let loaded = load_domain_key_from_bytes(&buf).expect("legacy v=2 blob must decrypt");
+        assert_eq!(loaded.pubkey(), key.pubkey());
+        unsafe { std::env::remove_var(DOMAIN_PASSPHRASE_ENV) };
+    }
+
+    /// **AUDIT-2026-06-11 #27**: once an encrypted domain key has been
+    /// written (marker present), a subsequent plaintext save (passphrase
+    /// cleared) is refused — unless the explicit override is set.
+    #[test]
+    fn save_domain_key_refuses_plaintext_downgrade() {
+        use crate::identity_store::ALLOW_PLAINTEXT_DOWNGRADE_ENV;
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(ALLOW_PLAINTEXT_DOWNGRADE_ENV) };
+        unsafe { std::env::set_var(DOMAIN_PASSPHRASE_ENV, "audit27-pass") };
+
+        let key = DomainKey::generate("acme.com", &mut OsRng);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("domain_key.bin");
+
+        // (1) Encrypted save drops the sticky marker.
+        save_domain_key(&path, &key).unwrap();
+        assert!(encrypted_marker_path(&path).exists(), "marker must be set");
+
+        // (2) Clearing the passphrase and saving again must be refused.
+        unsafe { std::env::remove_var(DOMAIN_PASSPHRASE_ENV) };
+        let err = save_domain_key(&path, &key).expect_err("plaintext downgrade must be refused");
+        match err {
+            DomainStoreError::Crypto(msg) => {
+                assert!(
+                    msg.contains("refusing to overwrite encrypted domain key"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected Crypto error, got {other:?}"),
+        }
+
+        // (3) With the override set, the downgrade proceeds.
+        unsafe { std::env::set_var(ALLOW_PLAINTEXT_DOWNGRADE_ENV, "1") };
+        save_domain_key(&path, &key).expect("override must permit downgrade");
+        unsafe { std::env::remove_var(ALLOW_PLAINTEXT_DOWNGRADE_ENV) };
     }
 }

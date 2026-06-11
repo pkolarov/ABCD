@@ -116,7 +116,16 @@ public sealed class HostMacAccountOperations : IMacAccountOperations
         // The current policy model does not distribute a login password.
         // v1 therefore seeds a random local secret and expects a later
         // DDS login/bootstrap flow to rotate credentials as needed.
-        RunDscl("-passwd", UserPath(username), GenerateBootstrapPassword());
+        //
+        // AUDIT-2026-06-11 #13: the bootstrap password must NEVER appear in
+        // argv (visible to any local user via `ps`) nor in any log/report.
+        // Pass it on stdin via `sysadminctl -resetPasswordFor … -newPassword -`
+        // and mark the command sensitive so the runner redacts args and stdin.
+        _runner.RunChecked(
+            "/usr/sbin/sysadminctl",
+            ["-resetPasswordFor", username, "-newPassword", "-"],
+            standardInput: GenerateBootstrapPassword(),
+            sensitive: true);
 
         if (File.Exists("/usr/sbin/createhomedir"))
             _runner.RunChecked("/usr/sbin/createhomedir", ["-c", "-u", username]);

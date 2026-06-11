@@ -438,6 +438,9 @@ pub fn apply_sync_payloads_with_graph(
         TokenKind::Vouch => 3,
     });
 
+    // Ops whose backing token the trust graph accepted; only these are merged
+    // into the DAG (AUDIT-2026-06-11 #4).
+    let mut accepted: Vec<&Operation> = Vec::new();
     for (op, token) in &items {
         // **B-1**: feed the trust graph FIRST. If it rejects (duplicate
         // JTI, unauthorized revocation, bad signature, …), skip the
@@ -495,26 +498,26 @@ pub fn apply_sync_payloads_with_graph(
                 }
                 _ => {}
             }
-        }
 
-        // Insert into the DAG. Independent of the token-graph decision
-        // — the DAG is keyed by op.id, not jti, and a duplicate-JTI
-        // attack carries no privileges into the operation graph.
-        match dag.insert(op.clone()) {
-            Ok(true) => result.ops_merged += 1,
-            Ok(false) => {} // duplicate
-            Err(DagError::MissingDependency(_)) => {
-                // Retried below.
-            }
+            // **AUDIT-2026-06-11 #4**: only an op whose backing token the
+            // trust graph ACCEPTED may enter the causal DAG. The DAG insert
+            // previously ran unconditionally (outside this block), so an
+            // admitted peer could seed attacker-chosen `Operation`s — any
+            // `op.id` / dependency edges — into the graph even when the token
+            // was rejected (bad signature, duplicate JTI, unauthorized
+            // revoke). That let an attacker squat the `op.id` a future
+            // legitimate revocation/policy op would use (so the real one is
+            // dropped as a duplicate) and inject causal-graph nodes — a
+            // targeted eclipse that suppresses revocations/burns/policy.
+            // Collect accepted ops and merge them (with the dependency-retry
+            // fixpoint) below, so rejected-token ops never reach the DAG.
+            accepted.push(op);
         }
     }
 
-    // Retry pass for ops with deps that landed later in the same batch.
-    let mut retry: Vec<&Operation> = items
-        .iter()
-        .filter(|(op, _)| !dag.contains(&op.id))
-        .map(|(op, _)| op)
-        .collect();
+    // Merge graph-accepted ops into the DAG with a fixpoint retry so ops whose
+    // dependencies land later in the same batch still merge.
+    let mut retry: Vec<&Operation> = accepted;
     let mut progress = true;
     while progress && !retry.is_empty() {
         progress = false;
@@ -661,6 +664,68 @@ mod tests {
         assert!(result.errors.is_empty());
         assert!(dag.contains("op-1"));
         assert!(store.has_token(&format!("attest-{}", ident.id.label())));
+    }
+
+    /// AUDIT-2026-06-11 #4 — in the graph-backed apply path, an op whose
+    /// backing token the trust graph REJECTS (here: a duplicate JTI) must NOT
+    /// be inserted into the causal DAG. Otherwise an admitted peer could seed
+    /// attacker-chosen ops (squatting op.ids, injecting causal nodes) to
+    /// suppress legitimate revocations/policy ops.
+    #[test]
+    fn graph_rejected_token_op_not_inserted_into_dag() {
+        use dds_core::trust::TrustGraph;
+        let mk = |ident: &Identity, jti: &str| {
+            Token::sign(
+                TokenPayload {
+                    iss: ident.id.to_urn(),
+                    iss_key: ident.public_key.clone(),
+                    jti: jti.to_string(),
+                    sub: ident.id.to_urn(),
+                    kind: TokenKind::Attest,
+                    purpose: Some("test".to_string()),
+                    vch_iss: None,
+                    vch_sum: None,
+                    revokes: None,
+                    iat: 1000,
+                    exp: Some(4102444800),
+                    body_type: None,
+                    body_cbor: None,
+                },
+                &ident.signing_key,
+            )
+            .unwrap()
+        };
+        let alice = make_identity("alice");
+        let bob = make_identity("bob");
+        // Same JTI from two different issuers → the graph accepts the first and
+        // rejects the second as DuplicateJti.
+        let tok1 = mk(&alice, "dup-jti");
+        let tok2 = mk(&bob, "dup-jti");
+        let op_ok = make_op("op-accepted", vec![]);
+        let op_rejected = make_op("op-rejected", vec![]);
+        let payloads = vec![
+            SyncPayload {
+                op_bytes: serialize_op(&op_ok),
+                token_bytes: tok1.to_cbor().unwrap(),
+            },
+            SyncPayload {
+                op_bytes: serialize_op(&op_rejected),
+                token_bytes: tok2.to_cbor().unwrap(),
+            },
+        ];
+        let mut dag = CausalDag::new();
+        let mut store = MemoryBackend::new();
+        let mut graph = TrustGraph::new();
+        let result = apply_sync_payloads_with_graph(&payloads, &mut dag, &mut store, &mut graph);
+        assert!(
+            dag.contains("op-accepted"),
+            "accepted token's op must be in the DAG"
+        );
+        assert!(
+            !dag.contains("op-rejected"),
+            "graph-rejected token's op must NOT enter the DAG (AUDIT #4)"
+        );
+        assert_eq!(result.ops_merged, 1);
     }
 
     #[test]

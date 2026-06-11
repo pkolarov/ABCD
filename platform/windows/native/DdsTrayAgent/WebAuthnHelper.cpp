@@ -108,17 +108,21 @@ std::string CWebAuthnHelper::FormatWebAuthnError(HRESULT hr)
 // MakeCredential
 // ---------------------------------------------------------------------------
 
+// AUDIT-2026-06-11 #22a: requireUserVerification added so the admin-key
+// registration path can mint a UV-required credential while the normal
+// passwordless enrollment path keeps UV=DISCOURAGED.
 MakeCredentialResult CWebAuthnHelper::MakeCredential(
     HWND hwnd,
     const std::string& rpId,
     const std::vector<uint8_t>& userId,
     const std::wstring& displayName,
-    bool hmacSecret)
+    bool hmacSecret,
+    bool requireUserVerification)
 {
     MakeCredentialResult result = {};
 
-    FileLog::Writef("WebAuthn.MakeCredential: rpId='%s' hmacSecret=%d\n",
-                    rpId.c_str(), hmacSecret ? 1 : 0);
+    FileLog::Writef("WebAuthn.MakeCredential: rpId='%s' hmacSecret=%d uv=%d\n",
+                    rpId.c_str(), hmacSecret ? 1 : 0, requireUserVerification ? 1 : 0);
 
     // Build client data (raw JSON + its SHA-256 hash)
     auto cd = BuildClientData("webauthn.create", rpId);
@@ -166,7 +170,12 @@ MakeCredentialResult CWebAuthnHelper::MakeCredential(
     options.dwAttestationConveyancePreference = WEBAUTHN_ATTESTATION_CONVEYANCE_PREFERENCE_DIRECT;
     options.dwAuthenticatorAttachment = WEBAUTHN_AUTHENTICATOR_ATTACHMENT_ANY;
     options.bRequireResidentKey = FALSE;
-    options.dwUserVerificationRequirement = WEBAUTHN_USER_VERIFICATION_REQUIREMENT_DISCOURAGED;
+    // AUDIT-2026-06-11 #22a: privileged (admin) credentials are registered with
+    // UV=REQUIRED so later admin assertions enforce user verification; the
+    // normal passwordless enrollment path keeps UV=DISCOURAGED.
+    options.dwUserVerificationRequirement = requireUserVerification
+        ? WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED
+        : WEBAUTHN_USER_VERIFICATION_REQUIREMENT_DISCOURAGED;
 
     // hmac-secret extension
     WEBAUTHN_EXTENSION hmacExt = {};
@@ -387,7 +396,11 @@ GetAssertionResult CWebAuthnHelper::GetAssertionProof(
     options.dwVersion = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_CURRENT_VERSION;
     options.dwTimeoutMilliseconds = 60000;
     options.CredentialList = allowList;
-    options.dwUserVerificationRequirement = WEBAUTHN_USER_VERIFICATION_REQUIREMENT_DISCOURAGED;
+    // AUDIT-2026-06-11 #22a: GetAssertionProof is the admin-vouch / admin
+    // assertion path (AdminFlow approving a user enrollment). Privileged admin
+    // actions must require user verification (PIN/biometric), not mere touch.
+    // Require UV so a stolen-but-unlocked-by-presence admin key cannot vouch.
+    options.dwUserVerificationRequirement = WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED;
 
     PWEBAUTHN_ASSERTION pAssertion = nullptr;
     HRESULT hr = WebAuthNAuthenticatorGetAssertion(

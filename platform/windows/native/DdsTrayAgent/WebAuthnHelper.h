@@ -44,12 +44,18 @@ public:
     // userId:      Opaque user ID bytes (e.g., UTF-16 SID).
     // displayName: Human-readable name shown in the prompt.
     // hmacSecret:  If true, request the hmac-secret extension.
+    // requireUserVerification: AUDIT-2026-06-11 #22a — when true, register the
+    //              credential with UV=REQUIRED so subsequent privileged
+    //              assertions (admin vouch) demand PIN/biometric, not just
+    //              touch. Defaults to false for the normal passwordless
+    //              sign-in enrollment path (UV=DISCOURAGED preserved).
     static MakeCredentialResult MakeCredential(
         HWND hwnd,
         const std::string& rpId,
         const std::vector<uint8_t>& userId,
         const std::wstring& displayName,
-        bool hmacSecret
+        bool hmacSecret,
+        bool requireUserVerification = false
     );
 
     // Get an assertion with hmac-secret output for password decryption.

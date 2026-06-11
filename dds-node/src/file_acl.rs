@@ -23,7 +23,9 @@ use std::path::Path;
 ///   replaces).
 /// - Windows: apply protected DACL `D:PAI(A;;FA;;;SY)(A;;FA;;;BA)` via
 ///   `SetNamedSecurityInfoW`; failures are logged at warn.
-pub(crate) fn restrict_to_owner(path: &Path) {
+// AUDIT-2026-06-11 #28: `pub` (was `pub(crate)`) so the `dds-node`
+// binary's `cmd_seal_passphrase` can harden the DPAPI seal blob.
+pub fn restrict_to_owner(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

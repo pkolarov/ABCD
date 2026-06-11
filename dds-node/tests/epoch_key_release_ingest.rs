@@ -127,7 +127,25 @@ fn spawn_node(domain_key: &DomainKey) -> (DdsNode, tempfile::TempDir) {
 /// path — the canonical binding [`epoch_key_binding`] is what allows a
 /// real publisher and a real receiver to derive the same shared
 /// secret without any out-of-band negotiation.
+/// A deterministic Ed25519 publisher identity: the `SigningKey` plus the
+/// libp2p `PeerId` string the receiver recovers the verifying key from.
+/// AUDIT-2026-06-11 C2: `install_epoch_key_release` now requires a valid
+/// publisher signature, so test releases must be signed by a key whose
+/// PeerId is used as `publisher`.
+fn test_publisher() -> (ed25519_dalek::SigningKey, String) {
+    dds_node::node::ed25519_identity_from_seed([7u8; 32])
+}
+
+/// Sign `release` in place with the publisher's Ed25519 key (over
+/// `signing_bytes`), as the real publisher mint path does.
+fn sign_release(release: &mut EpochKeyRelease, sk: &ed25519_dalek::SigningKey) {
+    use ed25519_dalek::Signer;
+    release.signature = sk.sign(&release.signing_bytes()).to_bytes().to_vec();
+}
+
+#[allow(clippy::too_many_arguments)]
 fn mint_release(
+    signing_key: &ed25519_dalek::SigningKey,
     publisher_id: &str,
     recipient_id: &str,
     epoch_id: u64,
@@ -141,7 +159,7 @@ fn mint_release(
     let (kem_ct, shared) = kem::encap(&mut rng, recipient_kem_pk, &binding).expect("encap");
     let (aead_nonce, aead_ciphertext) =
         ek_crypto::wrap(&mut rng, &shared, epoch_key).expect("wrap");
-    EpochKeyRelease {
+    let mut release = EpochKeyRelease {
         publisher: publisher_id.to_string(),
         epoch_id,
         issued_at,
@@ -150,9 +168,70 @@ fn mint_release(
         kem_ct: kem_ct.to_bytes(),
         aead_nonce,
         aead_ciphertext,
-        signature: vec![0u8; 64], // not yet verified at the install layer
+        signature: vec![0u8; 64],
         pq_signature: None,
-    }
+    };
+    sign_release(&mut release, signing_key);
+    release
+}
+
+/// AUDIT-2026-06-11 C2 regression: a release with an all-zero signature
+/// (and one with an attacker key not matching the claimed publisher) must
+/// be rejected — the publisher signature is the only authenticator on this
+/// path, so skipping it for zero-sigs let any admitted peer plant an
+/// attacker-chosen epoch key for any publisher.
+#[test]
+fn install_rejects_zero_and_forged_signature() {
+    let domain_key = DomainKey::generate("test-domain", &mut OsRng);
+    let (mut node, _dir) = spawn_node(&domain_key);
+    let recipient_id = node.peer_id.to_string();
+    let kem_pk = node.epoch_keys_for_tests().kem_public().clone();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let (pub_sk, publisher_id) = test_publisher();
+    let epoch_key = [9u8; 32];
+
+    // (a) all-zero signature → bad_sig (previously this was silently accepted).
+    let mut zero_sig = mint_release(
+        &pub_sk,
+        &publisher_id,
+        &recipient_id,
+        7,
+        now,
+        now + 86_400,
+        &epoch_key,
+        &kem_pk,
+    );
+    zero_sig.signature = vec![0u8; 64];
+    let err = node
+        .install_epoch_key_release(&zero_sig, &recipient_id, now)
+        .unwrap_err();
+    assert_eq!(err, "bad_sig", "all-zero signature must be rejected");
+
+    // (b) valid signature but from a DIFFERENT key than the claimed publisher
+    //     PeerId embeds → bad_sig (an admitted peer cannot sign as a publisher
+    //     whose key it does not hold).
+    let (attacker_sk, _attacker_id) = dds_node::node::ed25519_identity_from_seed([42u8; 32]);
+    let mut forged = mint_release(
+        &pub_sk,
+        &publisher_id, // claim the real publisher's PeerId...
+        &recipient_id,
+        8,
+        now,
+        now + 86_400,
+        &epoch_key,
+        &kem_pk,
+    );
+    sign_release(&mut forged, &attacker_sk); // ...but sign with the attacker key
+    let err = node
+        .install_epoch_key_release(&forged, &recipient_id, now)
+        .unwrap_err();
+    assert_eq!(
+        err, "bad_sig",
+        "signature not matching publisher PeerId must be rejected"
+    );
 }
 
 #[test]
@@ -165,11 +244,12 @@ fn install_inserts_well_formed_release() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let publisher_id = "12D3KooWPublisherSyntheticForTest".to_string();
+    let (pub_sk, publisher_id) = test_publisher();
     let mut epoch_key = [0u8; 32];
     use rand_core::RngCore;
     OsRng.fill_bytes(&mut epoch_key);
     let release = mint_release(
+        &pub_sk,
         &publisher_id,
         &recipient_id,
         7,
@@ -204,12 +284,13 @@ fn install_rejects_release_for_other_recipient() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let publisher_id = "12D3KooWPublisherSyntheticForTest".to_string();
+    let (pub_sk, publisher_id) = test_publisher();
     let mut epoch_key = [0u8; 32];
     use rand_core::RngCore;
     OsRng.fill_bytes(&mut epoch_key);
     // Mint release for someone else, even though encrypted to us.
     let mut release = mint_release(
+        &pub_sk,
         &publisher_id,
         &recipient_id,
         7,
@@ -238,12 +319,13 @@ fn install_rejects_release_outside_replay_window() {
     let recipient_id = node.peer_id.to_string();
     let kem_pk = node.epoch_keys_for_tests().kem_public().clone();
     let now: u64 = 1_700_000_000;
-    let publisher_id = "12D3KooWPublisherSyntheticForTest".to_string();
+    let (pub_sk, publisher_id) = test_publisher();
     let mut epoch_key = [0u8; 32];
     use rand_core::RngCore;
     OsRng.fill_bytes(&mut epoch_key);
     let stale_issued_at = now - EPOCH_RELEASE_REPLAY_WINDOW_SECS - 1;
     let release = mint_release(
+        &pub_sk,
         &publisher_id,
         &recipient_id,
         7,
@@ -269,11 +351,12 @@ fn install_rejects_tampered_aead_ciphertext() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let publisher_id = "12D3KooWPublisherSyntheticForTest".to_string();
+    let (pub_sk, publisher_id) = test_publisher();
     let mut epoch_key = [0u8; 32];
     use rand_core::RngCore;
     OsRng.fill_bytes(&mut epoch_key);
     let mut release = mint_release(
+        &pub_sk,
         &publisher_id,
         &recipient_id,
         7,
@@ -285,6 +368,9 @@ fn install_rejects_tampered_aead_ciphertext() {
     // Flip a single byte in the AEAD ciphertext — Poly1305 must catch
     // it on `unwrap`.
     release.aead_ciphertext[0] ^= 0x01;
+    // Re-sign so the (mandatory, AUDIT C2) signature passes and the corrupt
+    // ciphertext reaches the AEAD/Poly1305 check rather than failing as bad_sig.
+    sign_release(&mut release, &pub_sk);
 
     let err = node
         .install_epoch_key_release(&release, &recipient_id, now)
@@ -307,11 +393,12 @@ fn install_rejects_release_bound_to_different_epoch() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let publisher_id = "12D3KooWPublisherSyntheticForTest".to_string();
+    let (pub_sk, publisher_id) = test_publisher();
     let mut epoch_key = [0u8; 32];
     use rand_core::RngCore;
     OsRng.fill_bytes(&mut epoch_key);
     let mut release = mint_release(
+        &pub_sk,
         &publisher_id,
         &recipient_id,
         7,
@@ -321,6 +408,9 @@ fn install_rejects_release_bound_to_different_epoch() {
         &kem_pk,
     );
     release.epoch_id = 8;
+    // Re-sign for the new epoch_id (AUDIT C2: epoch_id is covered by
+    // signing_bytes) so the binding-mismatch surfaces at AEAD, not bad_sig.
+    sign_release(&mut release, &pub_sk);
 
     let err = node
         .install_epoch_key_release(&release, &recipient_id, now)
@@ -371,11 +461,12 @@ fn epoch_key_store_persists_after_install() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let publisher_id = "12D3KooWPublisherSyntheticForTest".to_string();
+    let (pub_sk, publisher_id) = test_publisher();
     let mut epoch_key = [0u8; 32];
     use rand_core::RngCore;
     OsRng.fill_bytes(&mut epoch_key);
     let release = mint_release(
+        &pub_sk,
         &publisher_id,
         &recipient_id,
         42,
@@ -430,7 +521,7 @@ fn install_bumps_pq_releases_installed_metric() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let publisher_id = "12D3KooWPublisherSyntheticForTest".to_string();
+    let (pub_sk, publisher_id) = test_publisher();
     let mut epoch_key = [0u8; 32];
     OsRng.fill_bytes(&mut epoch_key);
 
@@ -442,6 +533,7 @@ fn install_bumps_pq_releases_installed_metric() {
 
     // 1) ok — well-formed release, decap+unwrap succeeds.
     let release = mint_release(
+        &pub_sk,
         &publisher_id,
         &recipient_id,
         100,
@@ -455,6 +547,7 @@ fn install_bumps_pq_releases_installed_metric() {
 
     // 2) recipient_mismatch — release.recipient lies about who it's for.
     let mut wrong_recipient = mint_release(
+        &pub_sk,
         &publisher_id,
         &recipient_id,
         101,
@@ -470,6 +563,7 @@ fn install_bumps_pq_releases_installed_metric() {
     let stale_now: u64 = 1_700_000_000;
     let stale_issued = stale_now - EPOCH_RELEASE_REPLAY_WINDOW_SECS - 1;
     let stale = mint_release(
+        &pub_sk,
         &publisher_id,
         &recipient_id,
         102,
@@ -483,6 +577,7 @@ fn install_bumps_pq_releases_installed_metric() {
     // 4) aead — single-byte flip in the AEAD ciphertext, Poly1305
     //    catches it on unwrap.
     let mut tampered = mint_release(
+        &pub_sk,
         &publisher_id,
         &recipient_id,
         103,
@@ -492,6 +587,10 @@ fn install_bumps_pq_releases_installed_metric() {
         &kem_pk,
     );
     tampered.aead_ciphertext[0] ^= 0x01;
+    // Re-sign after the flip so the (now-mandatory, AUDIT C2) signature check
+    // passes and the corrupt ciphertext reaches the AEAD/Poly1305 unwrap —
+    // otherwise the tamper would be caught earlier as `bad_sig`.
+    sign_release(&mut tampered, &pub_sk);
     let _ = node.install_epoch_key_release(&tampered, &recipient_id, now);
 
     // 5) schema — wrong-length kem_ct caught by validate().

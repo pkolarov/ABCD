@@ -2050,7 +2050,11 @@ impl<
         //    serializes these calls, but if L-17 is ever fixed the check
         //    here must remain race-free on its own.
         if parsed.sign_count > 0 {
-            match self.store.bump_sign_count(credential_id, parsed.sign_count) {
+            // AUDIT-2026-06-11 #9: key the sign-count store on the canonical
+            // (decoded) credential id so a re-encoded request can't dodge the
+            // replay check by minting a fresh key.
+            let sc_key = canonical_credential_key(credential_id);
+            match self.store.bump_sign_count(&sc_key, parsed.sign_count) {
                 Ok(()) => {}
                 Err(dds_store::traits::StoreError::SignCountReplay { stored, attempted }) => {
                     metric.bucket = "sign_count";
@@ -3380,6 +3384,26 @@ fn credential_ids_eq(a: &str, b: &str) -> bool {
         (Some(da), Some(db)) => da == db,
         _ => a == b,
     }
+}
+
+/// **AUDIT-2026-06-11 #9** — canonical, encoding-independent key for the
+/// per-credential sign-count store. Credential *lookup* matches by decoded
+/// bytes (`credential_ids_eq`), so the sign-count replay check must key on a
+/// representation that is identical across base64 encodings. Keying on the raw
+/// request string let an attacker re-encode the same credential id (url-safe
+/// vs standard, padded vs not) so `bump_sign_count` saw a brand-new key and
+/// the cloned-authenticator / replay detection (L-18) was bypassed. Decoded
+/// bytes are hex-encoded; a value that is not base64 at all falls back to
+/// itself.
+fn canonical_credential_key(credential_id: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(credential_id)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(credential_id))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(credential_id))
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(credential_id))
+        .map(hex::encode)
+        .unwrap_or_else(|_| credential_id.to_string())
 }
 
 /// Find the device's `tags` + `org_unit` by walking the trust graph
