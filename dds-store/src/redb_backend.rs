@@ -459,30 +459,50 @@ impl AuditStore for RedbBackend {
                 // **L-12 (security review)**: enforce the hash chain
                 // inside the same write transaction so a chain-break is
                 // either atomically rejected or the append is atomic.
-                let next_id = table.len().unwrap_or(0);
-                if next_id > 0 {
-                    // Fetch the last entry (highest id).
-                    let last_bytes = table
-                        .get(next_id - 1)
-                        .map_err(|e| StoreError::Io(e.to_string()))?
-                        .ok_or_else(|| StoreError::Io("missing last audit entry".into()))?;
-                    let last: AuditLogEntry = ciborium::from_reader(last_bytes.value())
-                        .map_err(|e| StoreError::Serde(format!("prev audit decode: {e}")))?;
-                    let expected = last
-                        .chain_hash()
-                        .map_err(|e| StoreError::Serde(format!("prev chain_hash: {e}")))?;
-                    if entry.prev_hash != expected {
-                        return Err(StoreError::Serde(format!(
-                            "audit chain break: entry prev_hash does not match last entry's \
-                             chain_hash (expected {} bytes, got {} bytes)",
-                            expected.len(),
-                            entry.prev_hash.len()
-                        )));
+                // **AUDIT-2026-06-11 #5**: derive the next key AND the previous
+                // entry from the HIGHEST existing key (`table.last()`), never
+                // from `table.len()`. Keys are assigned monotonically, but
+                // `prune_audit_entries_*` deletes the OLDEST entries, so after
+                // any retention prune `len()` no longer equals `max_key + 1`.
+                // The old code then (a) computed `next_id = len()` which
+                // collides with a live key and `insert` silently OVERWRITES it,
+                // and (b) read `get(len()-1)` which is a pruned/missing key —
+                // either corrupting or wedging the L-12 tamper-evident chain
+                // under documented production retention config. Using the real
+                // max key keeps appends monotonic and the chain link correct.
+                let (next_id, prev_chain_hash) = {
+                    match table.last().map_err(|e| StoreError::Io(e.to_string()))? {
+                        Some((k, v)) => {
+                            let last: AuditLogEntry =
+                                ciborium::from_reader(v.value()).map_err(|e| {
+                                    StoreError::Serde(format!("prev audit decode: {e}"))
+                                })?;
+                            let expected = last
+                                .chain_hash()
+                                .map_err(|e| StoreError::Serde(format!("prev chain_hash: {e}")))?;
+                            (k.value() + 1, Some(expected))
+                        }
+                        None => (0u64, None),
                     }
-                } else if !entry.prev_hash.is_empty() {
-                    return Err(StoreError::Serde(
-                        "audit chain break: first entry must have empty prev_hash".into(),
-                    ));
+                };
+                match prev_chain_hash {
+                    Some(expected) => {
+                        if entry.prev_hash != expected {
+                            return Err(StoreError::Serde(format!(
+                                "audit chain break: entry prev_hash does not match last entry's \
+                                 chain_hash (expected {} bytes, got {} bytes)",
+                                expected.len(),
+                                entry.prev_hash.len()
+                            )));
+                        }
+                    }
+                    None => {
+                        if !entry.prev_hash.is_empty() {
+                            return Err(StoreError::Serde(
+                                "audit chain break: first entry must have empty prev_hash".into(),
+                            ));
+                        }
+                    }
                 }
                 table
                     .insert(next_id, buf.as_slice())

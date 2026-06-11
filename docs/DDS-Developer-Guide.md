@@ -810,9 +810,9 @@ The codebase is split into several packages (called "crates"). Each crate has a 
 | `dds-core` | `dds-domain` | Crypto, CRDTs, policy engine | Yes |
 | `dds-store` | `dds-core` | Persistence (redb, memory) | No |
 | `dds-net` | `dds-core` | libp2p, Gossipsub, DHT, sync | No |
-| `dds-node` | `dds-core`, `dds-store`, `dds-net` | Daemon that wires it all | No |
+| `dds-node` | `dds-core`, `dds-domain`, `dds-store`, `dds-net` | Daemon that wires it all | No |
 | `dds-cli` | `dds-node` | Command-line interface | No |
-| `dds-ffi` | `dds-core` | C ABI for foreign languages | No |
+| `dds-ffi` | `dds-core`, `dds-store` | C ABI for foreign languages | No |
 
 #### The interfaces between crates
 

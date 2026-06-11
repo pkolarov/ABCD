@@ -16,10 +16,15 @@ public sealed record CommandResult(
 
 public interface ICommandRunner
 {
+    // AUDIT-2026-06-11 #13: `sensitive` marks a command whose arguments and
+    // stdin may carry plaintext secrets (e.g. account passwords). When set,
+    // the runner must NOT log the argument list or stdin, and failure messages
+    // must redact the arguments so secrets never reach logs or off-host reports.
     CommandResult Run(
         string fileName,
         IEnumerable<string> arguments,
         string? standardInput = null,
+        bool sensitive = false,
         CancellationToken ct = default);
 }
 
@@ -43,6 +48,7 @@ public sealed class ProcessCommandRunner : ICommandRunner
         string fileName,
         IEnumerable<string> arguments,
         string? standardInput = null,
+        bool sensitive = false,
         CancellationToken ct = default)
     {
         using var process = new Process
@@ -50,8 +56,15 @@ public sealed class ProcessCommandRunner : ICommandRunner
             StartInfo = BuildStartInfo(fileName, arguments, standardInput is not null),
         };
 
-        var argList = process.StartInfo.ArgumentList.ToArray();
-        _log.LogDebug("Executing {Command} {Arguments}", fileName, string.Join(" ", argList));
+        // AUDIT-2026-06-11 #13: never log arguments or stdin for sensitive
+        // commands — they may contain plaintext account passwords.
+        if (sensitive)
+            _log.LogDebug("Executing {Command} (arguments redacted)", fileName);
+        else
+            _log.LogDebug(
+                "Executing {Command} {Arguments}",
+                fileName,
+                string.Join(" ", process.StartInfo.ArgumentList.ToArray()));
 
         process.Start();
 
@@ -110,21 +123,27 @@ internal static class CommandRunnerExtensions
         string fileName,
         IEnumerable<string> arguments,
         string? standardInput = null,
+        bool sensitive = false,
         CancellationToken ct = default)
     {
-        var result = runner.Run(fileName, arguments, standardInput, ct);
+        var result = runner.Run(fileName, arguments, standardInput, sensitive, ct);
         if (result.Succeeded)
             return result;
 
-        throw new CommandExecutionException(BuildFailureMessage(fileName, arguments, result));
+        throw new CommandExecutionException(BuildFailureMessage(fileName, arguments, result, sensitive));
     }
 
     public static string BuildFailureMessage(
         string fileName,
         IEnumerable<string> arguments,
-        CommandResult result)
+        CommandResult result,
+        bool sensitive = false)
     {
-        var command = string.Join(" ", new[] { fileName }.Concat(arguments));
+        // AUDIT-2026-06-11 #13: redact arguments for sensitive commands so a
+        // plaintext password can never reach logs or an off-host failure report.
+        var command = sensitive
+            ? $"{fileName} (arguments redacted)"
+            : string.Join(" ", new[] { fileName }.Concat(arguments));
         var stderr = string.IsNullOrWhiteSpace(result.StandardError)
             ? "(empty)"
             : result.StandardError.Trim();

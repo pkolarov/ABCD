@@ -720,8 +720,12 @@ fn locate_tbs_bytes(cert_der: &[u8]) -> Option<&[u8]> {
         return None;
     }
     let (inner_body_off, inner_body_len) = der_seq_body_offset(inner)?;
-    let tbs_total = inner_body_off + inner_body_len;
-    Some(&inner[..tbs_total])
+    // AUDIT-2026-06-11 #34: `der_seq_body_offset` now bound-checks the
+    // declared length against the buffer, but compute `tbs_total` with a
+    // checked add and use checked slicing so an out-of-range or
+    // overflowing length returns `None` instead of panicking.
+    let tbs_total = inner_body_off.checked_add(inner_body_len)?;
+    inner.get(..tbs_total)
 }
 
 /// Decode a DER definite-length SEQUENCE header and return
@@ -733,7 +737,14 @@ fn der_seq_body_offset(buf: &[u8]) -> Option<(usize, usize)> {
     }
     let len_byte = buf[1];
     if len_byte & 0x80 == 0 {
-        return Some((2, len_byte as usize));
+        let body_off = 2usize;
+        let body_len = len_byte as usize;
+        // AUDIT-2026-06-11 #34: reject a declared length that exceeds the
+        // bytes actually present, so callers cannot slice out of range.
+        if body_off.checked_add(body_len)? > buf.len() {
+            return None;
+        }
+        return Some((body_off, body_len));
     }
     let n = (len_byte & 0x7f) as usize;
     if n == 0 || n > 8 || buf.len() < 2 + n {
@@ -743,7 +754,13 @@ fn der_seq_body_offset(buf: &[u8]) -> Option<(usize, usize)> {
     for &b in &buf[2..2 + n] {
         len = len.checked_shl(8)?.checked_add(b as usize)?;
     }
-    Some((2 + n, len))
+    let body_off = 2 + n;
+    // AUDIT-2026-06-11 #34: bound-check the multi-byte declared length
+    // against the remaining buffer before returning it.
+    if body_off.checked_add(len)? > buf.len() {
+        return None;
+    }
+    Some((body_off, len))
 }
 
 // =========================================================================
@@ -2108,5 +2125,49 @@ mod tests {
             now,
         );
         assert!(matches!(res, Err(Fido2Error::Format(_))));
+    }
+
+    /// **AUDIT-2026-06-11 #34**: a DER SEQUENCE header that declares a
+    /// length larger than the bytes actually present must be rejected by
+    /// the length parser (no out-of-range slice / panic).
+    #[test]
+    fn der_seq_body_offset_rejects_over_declared_short_form() {
+        // 0x30 (SEQUENCE), len = 0x7F (127) but only 2 bytes total.
+        assert_eq!(der_seq_body_offset(&[0x30, 0x7f]), None);
+    }
+
+    #[test]
+    fn der_seq_body_offset_rejects_over_declared_long_form() {
+        // 0x30, 0x82 (2-byte len follows), len = 0x0100 (256) but buffer
+        // is far shorter — must be rejected, not sliced.
+        assert_eq!(der_seq_body_offset(&[0x30, 0x82, 0x01, 0x00]), None);
+    }
+
+    #[test]
+    fn der_seq_body_offset_accepts_well_formed() {
+        // 0x30, len=3, three content bytes present.
+        assert_eq!(
+            der_seq_body_offset(&[0x30, 0x03, 0xAA, 0xBB, 0xCC]),
+            Some((2, 3))
+        );
+    }
+
+    /// **AUDIT-2026-06-11 #34**: `locate_tbs_bytes` must return `None`
+    /// (clean error) rather than panic when fed a truncated certificate
+    /// whose inner TBS SEQUENCE over-declares its length.
+    #[test]
+    fn locate_tbs_bytes_no_panic_on_truncated_inner_seq() {
+        // Outer SEQUENCE claims 4 content bytes (present); those 4 bytes
+        // are an inner SEQUENCE (0x30) declaring length 0x7F (127) with no
+        // content — previously this would slice `&inner[..129]` and panic.
+        let cert = [0x30, 0x04, 0x30, 0x7f, 0x00, 0x00];
+        assert_eq!(locate_tbs_bytes(&cert), None);
+    }
+
+    #[test]
+    fn locate_tbs_bytes_no_panic_on_empty_or_tiny() {
+        assert_eq!(locate_tbs_bytes(&[]), None);
+        assert_eq!(locate_tbs_bytes(&[0x30]), None);
+        assert_eq!(locate_tbs_bytes(&[0x30, 0x00]), None);
     }
 }

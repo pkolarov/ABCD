@@ -1070,6 +1070,11 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
 
     // Set up auth operation using the matched vault entry
     m_activeAuth.pClientCtx = pClientCtx;
+    // AUDIT-2026-06-11 #17: snapshot the initiating client's unique id so the
+    // worker can verify the pipe slot still belongs to this client before
+    // sending the decrypted password (the slot may be recycled if the client
+    // disconnects during the wait).
+    m_activeAuth.clientId = pClientCtx ? pClientCtx->clientId : 0;
     m_activeAuth.seqId = seqId;
     m_activeAuth.authMethod = IPC_AUTH_METHOD::FIDO2;
     m_activeAuth.deviceUrn = m_config.DeviceUrn();
@@ -1377,6 +1382,29 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     FileLog::Writef("DdsAuth.worker: got AUTH_RESPONSE (authDataLen=%u sigLen=%u hmacLen=%u)\n",
                     pResp->authenticator_data_len, pResp->signature_len, pResp->hmac_secret_len);
 
+    // AUDIT-2026-06-11 #19: the inner *_len fields are attacker-controllable
+    // (a malicious CP, or anything that wins the pipe ACL) and are used below to
+    // slice fixed-size arrays for Base64Url encoding into an outbound HTTP POST
+    // and to build the used-credential vector. HandleDdsAuthResponse only checks
+    // that the payload is at least sizeof(IPC_REQ_DDS_AUTH_RESPONSE); it does not
+    // bound these inner lengths. Without this check a declared length larger than
+    // its array would read past the field into adjacent bridge memory and
+    // base64-encode it into the request body (info leak). Bound every inner
+    // length against its actual array capacity and reject on overflow.
+    if (pResp->authenticator_data_len > sizeof(pResp->authenticator_data) ||
+        pResp->signature_len          > sizeof(pResp->signature)          ||
+        pResp->credential_id_len      > sizeof(pResp->credential_id)      ||
+        pResp->hmac_secret_len        > sizeof(pResp->hmac_secret))
+    {
+        FileLog::Writef("DdsAuth.worker: AUTH_RESPONSE inner length out of bounds "
+                        "(authDataLen=%u sigLen=%u credIdLen=%u hmacLen=%u) — rejecting\n",
+                        pResp->authenticator_data_len, pResp->signature_len,
+                        pResp->credential_id_len, pResp->hmac_secret_len);
+        SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::SERVICE_ERROR,
+            L"Malformed authentication response");
+        return;
+    }
+
     // Step 5: Build assertion JSON and POST to dds-node /v1/session/assert
     SendAuthProgress(pOp->pClientCtx, pOp->seqId,
         IPC_AUTH_STATE::PROCESSING, L"Verifying assertion with DDS node...");
@@ -1645,8 +1673,19 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
               _TRUNCATE);
     result.expires_at = assertResult.expiresAt; // from dds-node response
 
-    m_pipeServer.SendResponse(pOp->pClientCtx, IPC_MSG::DDS_AUTH_COMPLETE, pOp->seqId,
-        reinterpret_cast<const BYTE*>(&result), sizeof(result));
+    // AUDIT-2026-06-11 #17: deliver the decrypted password ONLY if the pipe slot
+    // still belongs to the client that initiated this auth. During the ~60s wait
+    // the original client may have disconnected and its slot been recycled to a
+    // different SYSTEM client; SendResponseToClient validates the unique clientId
+    // under the server lock and refuses to send to a recycled/closed slot, so
+    // one client's password can never be delivered to another.
+    if (!m_pipeServer.SendResponseToClient(pOp->pClientCtx, pOp->clientId,
+            IPC_MSG::DDS_AUTH_COMPLETE, pOp->seqId,
+            reinterpret_cast<const BYTE*>(&result), sizeof(result)))
+    {
+        FileLog::Write("DdsAuth.worker: initiating client gone/recycled — "
+                       "DDS_AUTH_COMPLETE withheld (password not delivered)\n");
+    }
 
     // Secure cleanup
     SecureZeroWString(password);

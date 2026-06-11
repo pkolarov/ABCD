@@ -13,6 +13,14 @@ HINSTANCE g_hinst = NULL;
 extern HRESULT CDdsProvider_CreateInstance(REFIID riid, void** ppv);
 EXTERN_C GUID CLSID_CDdsProvider;
 
+// AUDIT-2026-06-11 #14: diagnostics must go through CPLog (CDdsProvider.cpp),
+// which writes to %ProgramData%\DDS\logs\dds_cp.log under a protected DACL
+// (LocalSystem + Administrators only) — never to world-readable C:\Temp.
+// Resolved at DLL link time like CDdsProvider_CreateInstance above; Helpers
+// is linked only by DdsCredentialProvider.vcxproj, so the symbol is always
+// present. Same extern-declaration style as CDdsCredential.cpp.
+extern void CPLog(const char* fmt, ...);
+
 class CClassFactory : public IClassFactory
 {
 public:
@@ -73,16 +81,7 @@ STDAPI DllCanUnloadNow()
 
 STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void** ppv)
 {
-    {
-        CreateDirectoryA("C:\\Temp", nullptr);
-        FILE* f = nullptr; fopen_s(&f, "C:\\Temp\\dds_cp.log", "a");
-        if (f) {
-            SYSTEMTIME st{}; GetLocalTime(&st);
-            fprintf(f, "[%02d:%02d:%02d.%03d PID=%lu] DllGetClassObject called\n",
-                    st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, GetCurrentProcessId());
-            fclose(f);
-        }
-    }
+    CPLog("DllGetClassObject called");
     return CClassFactory_CreateInstance(rclsid, riid, ppv);
 }
 

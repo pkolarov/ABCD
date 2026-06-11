@@ -384,6 +384,15 @@ pub async fn apply_update(doc: DdsSelfUpdateDocument, jti: String) {
         error!(jti = %jti, err = %e, "self-update: failed to create staging directory");
         return;
     }
+    // AUDIT-2026-06-11 #11: lock the staging directory to the owner
+    // (root/SYSTEM) so a co-resident attacker cannot drop or swap an artifact
+    // into it. `create_dir_all` otherwise honors the umask. On Windows the
+    // cache lives under a SYSTEM/Administrators-restricted %ProgramData% path.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
 
     // Derive a stable filename from the JTI so concurrent documents don't
     // clobber each other during download.
@@ -412,6 +421,11 @@ pub async fn apply_update(doc: DdsSelfUpdateDocument, jti: String) {
         let _ = tokio::fs::remove_file(&staged).await;
         return;
     }
+    // AUDIT-2026-06-11 #11: restrict the staged artifact to the owner the
+    // instant its content is verified, closing the verify→install TOCTOU window
+    // in which a co-resident attacker could replace the bytes we just hashed
+    // (and OS-vendor-signature-check) before `run_installer` executes them.
+    crate::file_acl::restrict_to_owner(&staged);
 
     // 4. OS-vendor signature verification.
     if let Err(e) = verify_os_signature(&staged, &artifact.publisher_identity).await {
@@ -442,6 +456,12 @@ pub async fn apply_update(doc: DdsSelfUpdateDocument, jti: String) {
 mod tests {
     use super::*;
 
+    /// Serialises the `apply_update*` tests: they all touch the process-global
+    /// `INSTALL_IN_PROGRESS` flag, so running them concurrently let one test's
+    /// `InstallGuard` drop clear the flag another test had just set (a flaky
+    /// race independent of product code). Each apply test holds this lock.
+    static APPLY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn current_platform_is_some() {
         // Verify we recognise all CI matrix platforms at compile time.
@@ -457,7 +477,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // current-thread test runtime; lock only serialises tests
     async fn apply_update_rejects_http_url() {
+        let _serial = APPLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use dds_domain::types::{
             DdsSelfUpdateDocument, Platform, PublisherIdentity, ReleaseChannel, RolloutPolicy,
             SemVer, UpdateArtifact,
@@ -494,7 +516,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // current-thread test runtime; lock only serialises tests
     async fn apply_update_skips_when_no_artifact_for_platform() {
+        let _serial = APPLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use dds_domain::types::{DdsSelfUpdateDocument, ReleaseChannel, RolloutPolicy, SemVer};
 
         // Empty artifact list — should log "no artifact for this platform".
@@ -519,7 +543,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // current-thread test runtime; lock only serialises tests
     async fn apply_update_no_concurrent_install() {
+        let _serial = APPLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Set the flag manually to simulate an in-progress install.
         INSTALL_IN_PROGRESS.store(true, Ordering::Release);
 

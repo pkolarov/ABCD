@@ -12,14 +12,75 @@
 #include <process.h>
 #include <functional>
 #include <stdio.h>
+#include <shlobj.h>
+#include <sddl.h>
+#include <aclapi.h>
 
-// ---- Diagnostic log to C:\Temp\dds_cp.log ----
+#pragma comment(lib, "advapi32.lib")
+
+// ---- Diagnostic log ----
+//
+// AUDIT-2026-06-11 #14: the diagnostic log previously lived at
+// C:\Temp\dds_cp.log with no DACL — world-readable, so any user could read CP
+// diagnostics (which until #12 also leaked password-derived data). Write to
+// %ProgramData%\DDS\logs\dds_cp.log instead, with an explicit protected DACL
+// granting FullControl only to LocalSystem and BUILTIN\Administrators. This
+// mirrors the FileLog::ApplyRestrictedDacl idiom in DdsAuthBridge/FileLog.cpp.
+namespace
+{
+    // Resolve %ProgramData%\DDS\logs\dds_cp.log into g_cpLogPath once, creating
+    // the directory with a protected DACL. Returns the path, or "" on failure.
+    const wchar_t* CPLogPath()
+    {
+        static wchar_t g_cpLogPath[MAX_PATH] = L"";
+        static bool    g_resolved = false;
+        if (g_resolved)
+            return g_cpLogPath;
+        g_resolved = true;
+
+        wchar_t programData[MAX_PATH] = {0};
+        if (SHGetFolderPathW(NULL, CSIDL_COMMON_APPDATA, NULL, 0, programData) != S_OK)
+            wcscpy_s(programData, L"C:\\ProgramData");
+
+        wchar_t dir[MAX_PATH];
+        swprintf_s(dir, L"%s\\DDS\\logs", programData);
+
+        // Ensure the parent (%ProgramData%\DDS) and the logs dir exist.
+        wchar_t parent[MAX_PATH];
+        swprintf_s(parent, L"%s\\DDS", programData);
+        CreateDirectoryW(parent, NULL);
+        CreateDirectoryW(dir, NULL);
+
+        // SY -> LocalSystem, BA -> BUILTIN\Administrators; PAI = protected +
+        // non-inherited; OICI propagates to files created inside.
+        const wchar_t* sddl = L"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+        PSECURITY_DESCRIPTOR pSD = nullptr;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl, SDDL_REVISION_1, &pSD, nullptr))
+        {
+            BOOL daclPresent = FALSE, daclDefaulted = FALSE;
+            PACL pDacl = nullptr;
+            if (GetSecurityDescriptorDacl(pSD, &daclPresent, &pDacl, &daclDefaulted) &&
+                daclPresent)
+            {
+                SetNamedSecurityInfoW(dir, SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    nullptr, nullptr, pDacl, nullptr);
+            }
+            LocalFree(pSD);
+        }
+
+        swprintf_s(g_cpLogPath, L"%s\\dds_cp.log", dir);
+        return g_cpLogPath;
+    }
+}
+
 void CPLog(const char* fmt, ...)
 {
-    CreateDirectoryA("C:\\Temp", nullptr); // ensure dir exists
+    const wchar_t* path = CPLogPath();
+    if (path[0] == L'\0') return;
     FILE* f = nullptr;
-    fopen_s(&f, "C:\\Temp\\dds_cp.log", "a");
-    if (!f) return;
+    if (_wfopen_s(&f, path, L"a") != 0 || !f) return;
     SYSTEMTIME st{}; GetLocalTime(&st);
     fprintf(f, "[%02d:%02d:%02d.%03d PID=%lu] ",
             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
@@ -591,6 +652,15 @@ HRESULT CDdsProvider::_EnumerateOneCredential(
     OutputDebugString(L"_EnumerateOneCredential()\n");
     HRESULT hr;
 
+    // AUDIT-2026-06-11 #7: hard bound the index to the array capacity. The
+    // _rgpCredentials array has exactly MAX_CREDENTIALS slots; writing past it
+    // is an out-of-bounds pointer write in SYSTEM-context LogonUI. Callers cap
+    // the loop, but enforce it here too so no path can overflow the array.
+    if (dwCredentialIndex >= MAX_CREDENTIALS)
+    {
+        return E_INVALIDARG;
+    }
+
     CDdsCredential* ppc = new CDdsCredential();
 
     if (ppc)
@@ -686,6 +756,14 @@ HRESULT CDdsProvider::_EnumerateCredentials()
     if (g_ddsUsers.count > 0) {
         DWORD credIdx = 0;
         for (int i = 0; i < g_ddsUsers.count; i++) {
+            // AUDIT-2026-06-11 #7: _rgpCredentials holds only MAX_CREDENTIALS
+            // (3) slots, but g_ddsUsers can carry up to MAX_DDS_USERS (5).
+            // _EnumerateOneCredential writes _rgpCredentials[credIdx] and
+            // increments, so without this cap a 4th/5th non-admin user would
+            // write past the array end in SYSTEM-context LogonUI. Stop
+            // enumerating once the array is full.
+            if (credIdx >= MAX_CREDENTIALS)
+                break;
             // Skip admin accounts — they don't log into Windows
             std::wstring urn(g_ddsUsers.users[i].subjectUrn);
             if (urn.find(L"urn:vouchsafe:admin.") == 0)

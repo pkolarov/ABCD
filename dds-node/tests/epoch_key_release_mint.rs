@@ -134,7 +134,9 @@ fn mint_helper_produces_release_decryptable_by_recipient() {
     let recipient_id = recipient_node.peer_id.to_string();
     let recipient_kem_pk = recipient_node.epoch_keys_for_tests().kem_public().clone();
 
-    let publisher_id = "12D3KooWPublisherSyntheticForTest".to_string();
+    // AUDIT-2026-06-11 C2: a signed publisher identity (the release must carry
+    // a valid Ed25519 signature recoverable from this PeerId to install).
+    let (pub_sk, publisher_id) = dds_node::node::ed25519_identity_from_seed([7u8; 32]);
     let mut epoch_key = [0u8; 32];
     use rand_core::RngCore;
     OsRng.fill_bytes(&mut epoch_key);
@@ -152,7 +154,7 @@ fn mint_helper_produces_release_decryptable_by_recipient() {
         &recipient_kem_pk,
         now,
         now + 86_400,
-        None,
+        Some(&pub_sk),
     )
     .expect("mint ok");
 
@@ -250,7 +252,9 @@ fn mint_two_releases_for_different_recipients_decap_independently() {
     let r1_kem = node1.epoch_keys_for_tests().kem_public().clone();
     let r2_kem = node2.epoch_keys_for_tests().kem_public().clone();
 
-    let publisher_id = "12D3KooWPublisherSyntheticForTest".to_string();
+    // AUDIT-2026-06-11 C2: a signed publisher identity (the release must carry
+    // a valid Ed25519 signature recoverable from this PeerId to install).
+    let (pub_sk, publisher_id) = dds_node::node::ed25519_identity_from_seed([7u8; 32]);
     let mut epoch_key = [0u8; 32];
     use rand_core::RngCore;
     OsRng.fill_bytes(&mut epoch_key);
@@ -265,7 +269,7 @@ fn mint_two_releases_for_different_recipients_decap_independently() {
         &r1_kem,
         now,
         now + 86_400,
-        None,
+        Some(&pub_sk),
     )
     .unwrap();
     let rel_for_r2 = mint_epoch_key_release_for_recipient(
@@ -277,7 +281,7 @@ fn mint_two_releases_for_different_recipients_decap_independently() {
         &r2_kem,
         now,
         now + 86_400,
-        None,
+        Some(&pub_sk),
     )
     .unwrap();
 
@@ -301,6 +305,12 @@ fn mint_two_releases_for_different_recipients_decap_independently() {
     // encapsulated to r2_kem, so node1's KEM secret cannot decap.
     let mut forged = rel_for_r2.clone();
     forged.recipient = r1_id.clone();
+    // Re-sign after relabelling the recipient (AUDIT C2: recipient is covered
+    // by signing_bytes) so the test reaches the KEM decap rather than bad_sig.
+    {
+        use ed25519_dalek::Signer;
+        forged.signature = pub_sk.sign(&forged.signing_bytes()).to_bytes().to_vec();
+    }
     let err = node1
         .install_epoch_key_release(&forged, &r1_id, now)
         .unwrap_err();

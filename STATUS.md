@@ -1,5 +1,193 @@
 # DDS Implementation Status
 
+## security: remediate pre-production multi-agent audit — 2 critical + 9 high + mediums across Rust/C++/C# (252nd pass) — 2026-06-11
+
+### Summary
+
+Acted on the findings from the exhaustive pre-production security audit
+(see [docs/pre-production-audit-2026-06-11.md](docs/pre-production-audit-2026-06-11.md):
+211 agents, 88 raw findings → 35 distinct after dedup, 2 CRITICAL + 9 HIGH).
+Every critical and high was independently re-verified against source before any
+change. **All 1166 workspace tests pass (was 1144); clippy clean.** C++ and C#
+changes compile/were authored on this host but the Windows/macOS-specific paths
+require platform CI to build end-to-end (flagged per fix).
+
+**CRITICAL — fixed:**
+
+- **C1 — self-update anti-rollback.** `DdsSelfUpdateDocument::evaluate`
+  ([dds-domain/src/types.rs](dds-domain/src/types.rs)) gained a hard
+  version-monotonicity gate: a manifest whose `version` is strictly older than
+  the locally-observed installed version returns the new
+  `RolloutDecision::RollbackRefused` regardless of rollout policy or the
+  publisher-asserted `min_supported_from`. Without it, one admitted non-publisher
+  peer could replay the K genuinely-signed publisher tokens of an older,
+  known-vulnerable release and force a fleet-wide signed downgrade (installer runs
+  as LocalSystem/root). Plus a defense-in-depth `iat` replay window on self-update
+  tokens at the quorum accumulator ([dds-node/src/node.rs](dds-node/src/node.rs)).
+  Tests: `dds_self_update_evaluate_refuses_rollback`.
+
+- **C2 — epoch-key release signature now mandatory.** `install_epoch_key_release`
+  ([dds-node/src/node.rs](dds-node/src/node.rs)) previously *skipped* Ed25519
+  publisher-signature verification for an all-zero signature ("for test helpers").
+  Since the KEM decap targets the recipient's *public* key (not an authenticator),
+  any admitted peer could plant an attacker-chosen epoch key for any publisher
+  (`signature=[0;64]`) — a restart-surviving gossip-censorship eclipse. The
+  signature is now always verified; production always signs. Epoch-key integration
+  tests reworked to mint *signed* releases (new `ed25519_identity_from_seed` /
+  `p2p_signing_key_for_tests` helpers). Tests: `install_rejects_zero_and_forged_signature`.
+
+**HIGH — fixed:**
+
+- **#3 trust-chain privilege escalation** ([dds-core/src/trust.rs](dds-core/src/trust.rs)):
+  `has_purpose`/`count_purpose_holders`/`purposes_for` now *attenuate* privileged
+  `dds:` capabilities (policy/software/self-update publisher, admin, admin-vouch,
+  device-scope) — a vouch granting one is honored only if the voucher is a trusted
+  root or itself holds it. Group memberships (`dds:group:*`) keep the loose model.
+- **#30 cycle guard** in `walk_chain` (CPU-DoS / exponential fan-out).
+- **#4 sync DAG poisoning** ([dds-net/src/sync.rs](dds-net/src/sync.rs)): only ops
+  whose backing token the trust graph ACCEPTED enter the causal DAG.
+- **#5 audit-chain key** ([dds-store/src/redb_backend.rs](dds-store/src/redb_backend.rs)):
+  derive the next key + prev entry from `table.last()`, not `table.len()` (pruning
+  corrupted the L-12 chain).
+- **#8 live-revocation teardown** ([dds-node/src/node.rs](dds-node/src/node.rs)):
+  a freshly-revoked peer is dropped from `admitted_peers` and disconnected.
+- **#9 sign-count replay bypass** ([dds-node/src/service.rs](dds-node/src/service.rs)):
+  the sign-count store is keyed on a canonical (decoded) credential id.
+- **#6/#7/#12/#13 native** (C++/C#): named-pipe `FIRST_PIPE_INSTANCE` + server-SID
+  check; OOB-write bound in LogonUI; removed plaintext-password logging; macOS
+  bootstrap password off argv (stdin) + redacted logging.
+
+**MEDIUM/LOW — fixed:** #16 (LINUX_POLICY added to the C-3 ingest gate), #23
+(refuse non-loopback TCP bind while `trust_loopback_tcp_admin` on), #11 (staging
+dir/file owner-only — verify→install TOCTOU), #31 (pending-self-update accumulator
+cap), #10 (provenance docstring corrected — apply-time enforcement is NOT
+implemented; no `verify_provenance` flag exists), #21 (sync-applied revocations
+trigger epoch rotation), #26 (domain root key Argon2id → m=64 MiB/t=3/p=4,
+backward-compatible), #27 (plaintext-downgrade marker extended to p2p/domain keys),
+#28/#35 (DPAPI seal blob + epoch_keys.cbor get the Windows DACL), #29 (Apple SE
+provider verifies `kSecAttrTokenID == SecureEnclave`), #32 (hybrid KEM rejects
+non-contributory X25519), #33 (reject `canary_pct > 100`), #34 (DER length
+bound check), plus C++ #14/#17/#18/#19/#22a.
+
+**Deferred / noted (defense-in-depth or design):** #20 (sync re-cache of rejected
+tokens — substantially mitigated by #4), #24 (loopback-admin device-binding bypass
+— remote angle closed by #23; loopback admin is by-design), #25 (ML-DSA
+`pq_signature` mint+verify — C2's mandatory Ed25519 closes the vuln; PQ leg is
+future hardening), unbounded `CausalDag` op growth (needs CRDT-aware pruning; the
+admitted-peer accumulator vector is capped). Prior deferred items (M-13, M-15,
+M-18, M-22 OS-bound wrap, L-17, Z-2/4/6, Phase A cert provisioning, B.5 cutover,
+TPM A3/A5) unchanged.
+
+**Transparency:** a sub-task agent, while fixing #31, exceeded its scope and added
+an unrequested gossip-ingest rate-limiter and a mandatory attestation-`exp`-horizon
+ingest gate to `node.rs` (rejecting attestations with `exp` beyond 730 days). The
+exp-horizon gate changed wire-acceptance semantics and broke convergence for
+long-lived attestations (caught by `http_binary_e2e`). Both unrequested mechanisms
+were **removed**; `node.rs` carries only the reviewed audit fixes. (A bounded-`exp`
+ingest policy and gossip op rate-limiting are reasonable future hardening but need
+deliberate sign-off.)
+
+### Files changed
+
+Rust: `dds-core/{trust.rs,crypto/kem.rs}`, `dds-domain/{types.rs,fido2.rs}`,
+`dds-net/sync.rs`, `dds-store/redb_backend.rs`,
+`dds-node/{node.rs,service.rs,http.rs,self_update.rs,domain_store.rs,p2p_identity.rs,epoch_key_store.rs,apple_secure_enclave.rs,main.rs,lib.rs,file_acl.rs}`
++ epoch-key integration tests. C++: `platform/windows/native/**` (Auth Bridge, IPC,
+Credential Provider, Tray). C#: `platform/macos/DdsPolicyAgent/**`. Docs: this entry,
+the audit report.
+
+---
+
+## fix(node,security): close sync-path K-of-M self-update quorum bypass; doc sync (251st pass) — 2026-06-11
+
+### Summary
+
+Doc/code reconciliation pass. Cross-checked every "✅ Fixed / ✅ Landed" claim in
+`Claude_sec_review.md` (C/H/M/L + B-series + A-addendum), `docs/supply-chain-plan.md`
+(Phases A–D), and the README / Admin / Developer / observability docs against the code.
+The overwhelming majority verified clean. One **security bug** surfaced in the newest
+code (Phase D self-update) and was fixed; three documentation drifts were corrected.
+
+**Security bug found and fixed:**
+
+**1. K-of-M self-update quorum was bypassable via the anti-entropy sync path
+(`dds-node/src/node.rs`).** Phase D.2's headline guarantee is that a fleet self-update
+applies only after **K distinct `dds:dds-self-update-publisher` holders** sign the same
+`DdsSelfUpdateDocument` — "self-update should not be possible with a single key"
+(`self_update_quorum_k` doc-comment). The gossip ingest path enforces this correctly:
+the quorum accumulator (`check_self_update_quorum_and_maybe_apply`) is reached only
+after `TrustGraph::add_token` has verified shape + signature + **issuer-URN↔key
+binding** (`verify_issuer_binding`).
+
+The **sync path did not.** `handle_sync_response` pre-filters payloads through
+`publisher_capability_ok`, which checks only that the *claimed* `iss` URN holds the
+publisher purpose in the trust graph — it does **not** verify the token signature.
+Signatures are checked later inside `apply_sync_payloads_with_graph`, but rejected
+tokens are merely *counted* in `result.rejected_by_reason`; they are **not removed**
+from the `payloads` batch. The quorum loop (gated only by `result.ops_merged > 0`)
+then fed every capability-passing payload to the accumulator regardless of whether its
+signature verified. Net effect: a single **admitted, non-publisher** peer could submit
+K self-update payloads — each stamped with a *real* publisher's `iss` URN (public
+information) but the attacker's own key and signature, plus one throwaway valid op to
+make `ops_merged > 0` — pass the capability gate on the URNs, and **reach quorum with
+zero publisher keys.** No cryptographic forgery required. The apply-time OS-vendor
+signature check (Authenticode / Apple Developer ID) remained as the only backstop on
+Windows/macOS (still permitting forced downgrade to any validly-signed package); Linux
+has no such backstop (the installer is unimplemented, so the impact there is a forced
+attacker-URL download into the staging dir).
+
+**Fix:** new free fn `self_update_token_quorum_eligible(token)` mirrors exactly the
+three crypto gates `add_token` enforces (`validate_shape` + `verify_signature` +
+`verify_issuer_binding`). `check_self_update_quorum_and_maybe_apply` now calls it and
+refuses to count any token that fails, so **both** ingest paths require K genuine
+publisher signatures. The invariant is localised to the accumulator, so a future third
+call site cannot reintroduce the gap. Redundant on the gossip path (cheap — self-update
+manifests are rare) and load-bearing on the sync path.
+
+**Tests:** 3 new regression tests in `node::d2_quorum_eligibility_tests`:
+`validly_signed_token_is_eligible` (positive), `token_with_spoofed_publisher_urn_is_ineligible`
+(the exact bypass — real publisher URN + attacker key, valid signature but failing
+binding → rejected), `token_with_invalid_signature_is_ineligible` (signature gate).
+
+**Documentation gaps fixed:**
+
+**1. `docs/DDS-Developer-Guide.md` crate-dependency table (§Crate-by-crate breakdown).**
+`dds-node` row was missing `dds-domain`; `dds-ffi` row was missing `dds-store`. Both
+verified against the respective `Cargo.toml` files. Corrected.
+
+**2. `docs/supply-chain-plan.md` D.4 test count.** Said "Four unit tests" but listed
+(and the code has) five: `current_platform_is_some`, `staging_dir_is_absolute`,
+`apply_update_rejects_http_url`, `apply_update_skips_when_no_artifact_for_platform`,
+`apply_update_no_concurrent_install`. Corrected to "Five".
+
+**3. `docs/supply-chain-plan.md` D.2 section.** Added a "Sync-path quorum-eligibility
+gate" subsection documenting the bug above and the `self_update_token_quorum_eligible`
+hardening, so the doc no longer implies the capability gate alone is the pre-quorum
+control.
+
+**Verified-clean (no drift):** C-1..C-3, H-1..H-12, M-1..M-22, L-1..L-18, B-1..B-6,
+A-1..A-4 remediations all confirmed present and behaving as described; supply-chain
+Phases B/C/D landed as claimed, Phase A + B.5 correctly still marked pending/gated;
+README HTTP API (27 endpoints), CLI subcommands, config keys (36), and metric catalog
+(37 families) all match the code.
+
+**Tests:** 1147 workspace tests pass (was 1144; +3 new eligibility tests). 0 failed.
+Clippy clean (`--workspace --all-targets`).
+
+**Deferred items** (M-13, M-15, M-18, M-22 OS-bound wrap, L-17, Z-2, Z-4, Z-6,
+Phase A cert provisioning, Phase B.5 migration cutover, TPM A3/A5,
+`halt_on_health_regression` automatic canary-promotion) unchanged.
+
+### Files changed
+
+- **`dds-node/src/node.rs`** — new `self_update_token_quorum_eligible` gate, wired into
+  `check_self_update_quorum_and_maybe_apply`; new `d2_quorum_eligibility_tests` module (3 tests).
+- **`docs/supply-chain-plan.md`** — D.4 test count (4→5); new D.2 sync-path eligibility subsection.
+- **`docs/DDS-Developer-Guide.md`** — corrected `dds-node` and `dds-ffi` dependency rows.
+- **`STATUS.md`** — this entry.
+
+---
+
 ## docs: fix stale Windows Policy Applier phase status and supply-chain Phase D header (250th pass) — 2026-06-01
 
 ### Summary

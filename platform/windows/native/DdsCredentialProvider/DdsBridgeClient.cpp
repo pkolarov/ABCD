@@ -26,9 +26,10 @@
 // reports this on its HID interface (per CTAP2 spec §8.1.2).
 static const USHORT FIDO_USAGE_PAGE = 0xF1D0;
 
-// File logger shared with CDdsProvider.cpp — writes to C:\Temp\dds_cp.log.
-// Declared here so every WebAuthn checkpoint reaches the on-disk log instead
-// of only the debugger via OutputDebugString.
+// File logger shared with CDdsProvider.cpp — writes to the DACL-protected
+// %ProgramData%\DDS\logs\dds_cp.log (AUDIT-2026-06-11 #14). Declared here so
+// every WebAuthn checkpoint reaches the on-disk log instead of only the
+// debugger via OutputDebugString.
 extern void CPLog(const char* fmt, ...);
 
 // Hex-dump the first `n` bytes of a buffer into a caller-supplied string

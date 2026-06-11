@@ -2252,6 +2252,31 @@ where
         }
     }
 
+    // AUDIT-2026-06-11 #23: `trust_loopback_tcp_admin` grants admin to any
+    // credential-less TCP caller (TCP supplies no peer credentials), but TCP
+    // carries no proof the connection actually originates from loopback.
+    // Binding a non-loopback address with this trust enabled would hand
+    // unauthenticated *remote* admin to anyone who can reach the port. Refuse
+    // it fail-closed: the operator must bind a loopback address, or explicitly
+    // disable `trust_loopback_tcp_admin` and rely on UDS/named-pipe peer creds
+    // (and the response MAC).
+    if admin_policy.trust_loopback_tcp_admin {
+        use std::net::ToSocketAddrs;
+        let all_loopback = addr
+            .to_socket_addrs()
+            .map(|mut it| it.all(|sa| sa.ip().is_loopback()))
+            .unwrap_or(false);
+        if !all_loopback {
+            return Err(format!(
+                "refusing to bind non-loopback TCP address {addr:?} while \
+                 trust_loopback_tcp_admin is enabled: this would grant \
+                 unauthenticated remote admin. Bind a loopback address (e.g. \
+                 127.0.0.1) or set [api_auth].trust_loopback_tcp_admin = false."
+            )
+            .into());
+        }
+    }
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "HTTP API listening on TCP");
     // Loopback TCP cannot supply peer credentials, so no `CallerIdentity`

@@ -1553,6 +1553,20 @@ impl DdsNode {
             if self.epoch_keys.remove_peer(revoked_peer).is_some() {
                 epoch_key_removed = true;
             }
+            // **AUDIT-2026-06-11 #8**: tear down the revoked peer's *live*
+            // admission immediately. Previously `admitted_peers` was only
+            // pruned on `ConnectionClosed`, so a peer whose admission cert was
+            // just revoked kept ingesting gossip/sync and serving data over its
+            // existing connection until it happened to disconnect. Drop it from
+            // `admitted_peers` (the H-12 gate refuses its traffic from here on)
+            // and close the connection; on reconnect `verify_peer_admission`
+            // rejects it because `admission_revocations.is_revoked` now matches.
+            if let Ok(pid) = revoked_peer.parse::<PeerId>() {
+                if self.admitted_peers.remove(&pid) {
+                    let _ = self.swarm.disconnect_peer_id(pid);
+                    warn!(%pid, "AUDIT #8: dropped live admission for revoked peer");
+                }
+            }
         }
         if evicted {
             if let Err(e) = self.peer_certs.save(&self.peer_certs_path) {
@@ -2092,6 +2106,11 @@ impl DdsNode {
                         jti = %payload.jti,
                         "self-update: step-upgrade required, installed version predates min_supported_from"
                     ),
+                    RolloutDecision::RollbackRefused => warn!(
+                        jti = %payload.jti,
+                        installed = ?installed_semver(),
+                        "self-update: REFUSED — manifest version is older than installed (anti-rollback, AUDIT C1)"
+                    ),
                 }
             }
             Ok(None) => {
@@ -2114,7 +2133,54 @@ impl DdsNode {
     fn check_self_update_quorum_and_maybe_apply(&mut self, token: &Token) {
         use dds_core::token::purpose;
 
+        // Phase D.2 hardening: a token only counts toward the K-of-M quorum if
+        // it passes the same crypto gates `TrustGraph::add_token` enforces on
+        // the gossip path (shape + signature + issuer-URN↔key binding). The
+        // anti-entropy sync path reaches here without that guarantee (see
+        // `self_update_token_quorum_eligible`), so verify before accumulating —
+        // otherwise an admitted non-publisher peer could manufacture quorum
+        // from K payloads bearing real publisher URNs it holds no keys for.
+        if let Err(e) = self_update_token_quorum_eligible(token) {
+            warn!(
+                jti = %token.payload.jti,
+                issuer = %token.payload.iss,
+                err = %e,
+                "self-update: token failed verification — refusing to count toward quorum"
+            );
+            return;
+        }
+
+        // AUDIT-2026-06-11 C1 (defense-in-depth): drop stale self-update tokens
+        // before they accumulate toward quorum, so a year-old (still-signed)
+        // manifest cannot be replayed into an apply. The version-monotonicity
+        // gate in `DdsSelfUpdateDocument::evaluate` is the primary control.
+        if !self_update_within_replay_window(token.payload.iat) {
+            warn!(
+                jti = %token.payload.jti,
+                iat = token.payload.iat,
+                "self-update: token iat outside replay window — not counting toward quorum (AUDIT C1)"
+            );
+            return;
+        }
+
+        // AUDIT-2026-06-11 #31: bound the pending multi-sig accumulator. Entries
+        // are only removed when quorum is reached, so an admitted peer could
+        // otherwise exhaust memory by sending many distinct self-update
+        // documents that each gather K-1 signatures and never resolve. Once the
+        // cap is hit, new distinct documents are not tracked until an existing
+        // accumulator entry clears.
+        const MAX_PENDING_SELF_UPDATES: usize = 64;
         let content_hash = self_update_content_hash(token);
+        if !self.pending_self_updates.contains_key(&content_hash)
+            && self.pending_self_updates.len() >= MAX_PENDING_SELF_UPDATES
+        {
+            warn!(
+                jti = %token.payload.jti,
+                cap = MAX_PENDING_SELF_UPDATES,
+                "self-update: pending accumulator at capacity — not tracking new document (AUDIT #31)"
+            );
+            return;
+        }
         let signers = self.pending_self_updates.entry(content_hash).or_default();
         signers.insert(token.payload.iss.clone());
         let signer_count = signers.len();
@@ -3171,6 +3237,26 @@ impl DdsNode {
                 }
             }
         }
+        // **AUDIT-2026-06-11 #21**: a revocation/burn applied via anti-entropy
+        // sync must trigger the same jittered epoch-key rotation the gossip
+        // ingest path schedules (forward secrecy — rotate the epoch key away
+        // from a just-revoked/burned member). Previously only the gossip path
+        // scheduled it, so a revocation that arrived purely via sync left the
+        // epoch key un-rotated. Dedup against an already-pending rotation.
+        if (result.revocations_applied > 0 || result.burns_applied > 0)
+            && self.pending_revocation_rotation.is_none()
+        {
+            let jitter_secs = rand::Rng::gen_range(
+                &mut rand::rngs::OsRng,
+                0u64..REVOCATION_ROTATION_JITTER_SECS,
+            );
+            debug!(
+                jitter_secs,
+                "Phase B.9 / AUDIT #21: scheduling jittered epoch rotation after sync-applied revocation/burn"
+            );
+            self.pending_revocation_rotation =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(jitter_secs));
+        }
         info!(
             %peer,
             ops_merged = result.ops_merged,
@@ -3582,16 +3668,18 @@ impl DdsNode {
     ///    which classifies the install as Inserted / Rotated /
     ///    AlreadyCurrent / Stale.
     ///
-    /// Publisher-signature verification (Ed25519) is performed at step 3a
-    /// below when the `signature` field is non-zero (i.e. when the release
-    /// was minted with a real signing key). The public key is recovered from
-    /// the publisher PeerId via the libp2p identity multihash — Ed25519
-    /// libp2p PeerIds embed the 32-byte public key in the PeerId bytes, so no
-    /// out-of-band pubkey distribution is required. A zero signature (64 zero
-    /// bytes) is accepted without verification for backward compat with test
-    /// helpers that bypass `mint_epoch_key_release_for_recipient`'s signing
-    /// path. The load-bearing forgery defence remains the KEM decap + AEAD
-    /// unwrap pipeline at steps 4–5; the publisher signature is defense in depth.
+    /// Publisher-signature verification (Ed25519) is MANDATORY at step 3a
+    /// below (AUDIT-2026-06-11 C2). The public key is recovered from the
+    /// publisher PeerId via the libp2p identity multihash — Ed25519 libp2p
+    /// PeerIds embed the 32-byte public key in the PeerId bytes, so no
+    /// out-of-band pubkey distribution is required. This signature is the
+    /// load-bearing forgery defence: the KEM decap + AEAD unwrap pipeline at
+    /// steps 4–5 only proves the release was sealed to *this recipient's
+    /// public key*, which any admitted peer can do, so it authenticates
+    /// nothing about the publisher. A release with a missing, all-zero, or
+    /// invalid signature is rejected. (Tests must mint releases with a real
+    /// signing key; `mint_epoch_key_release_for_recipient`'s `signing_key`
+    /// argument is `None` only in production-bypassing unit fixtures.)
     pub fn install_epoch_key_release(
         &mut self,
         release: &EpochKeyRelease,
@@ -3611,13 +3699,24 @@ impl DdsNode {
             return Err("replay_window");
         }
 
-        // Step 3a — Ed25519 publisher-signature verification.
-        // Skip for zero-signature releases (test helpers / pre-signing nodes).
-        if release.signature.iter().any(|&b| b != 0) {
-            if let Err(reason) = verify_epoch_key_release_signature(release, &release.publisher) {
-                crate::telemetry::record_pq_release_installed(reason);
-                return Err(reason);
-            }
+        // Step 3a — Ed25519 publisher-signature verification. AUDIT-2026-06-11 C2:
+        // this signature is the ONLY publisher authenticator on the install path.
+        // KEM decap + AEAD unwrap prove nothing about who minted the release:
+        // encap targets the recipient's *public* hybrid-KEM key (published in
+        // AdmissionCert.pq_kem_pubkey and served to any admitted peer) and the
+        // binding is derived from public PeerId strings, so any admitted peer can
+        // produce a decap-able release for any claimed `publisher`. Previously
+        // this check was skipped whenever the signature was all-zero ("for test
+        // helpers / pre-signing nodes"), which let one admitted, non-publisher
+        // peer plant an attacker-chosen epoch key for any publisher
+        // (signature=[0;64]) — a persistent, restart-surviving gossip-censorship
+        // eclipse. Verification is now MANDATORY: an absent/zero/invalid
+        // signature is rejected. Production always signs (`p2p_signing_key` is
+        // `None` only in unit tests that bypass `init()`), so this closes the
+        // hole without affecting any legitimate flow.
+        if let Err(reason) = verify_epoch_key_release_signature(release, &release.publisher) {
+            crate::telemetry::record_pq_release_installed(reason);
+            return Err(reason);
         }
 
         // Defensive re-check on the two length-bound slices. Schema
@@ -3673,6 +3772,15 @@ impl DdsNode {
     #[doc(hidden)]
     pub fn epoch_keys_for_tests(&self) -> &EpochKeyStore {
         &self.epoch_keys
+    }
+
+    /// This node's libp2p Ed25519 signing key, used to sign minted
+    /// `EpochKeyRelease`s. Test-only — integration tests need it to mint a
+    /// release whose signature verifies against this node's PeerId now that
+    /// the receive path makes the signature mandatory (AUDIT-2026-06-11 C2).
+    #[doc(hidden)]
+    pub fn p2p_signing_key_for_tests(&self) -> Option<&ed25519_dalek::SigningKey> {
+        self.p2p_signing_key.as_ref()
     }
 
     /// **Z-1 Phase B.7 test hook.** Drive the
@@ -3894,8 +4002,9 @@ pub fn epoch_key_binding(publisher: &str, recipient: &str, epoch_id: u64) -> Vec
 /// extracting the public key embedded in the publisher's PeerId
 /// (libp2p Ed25519 PeerIds embed the public key via the identity
 /// multihash). When `signing_key` is `None` (tests only), the
-/// signature field is a 64-byte zero placeholder — `install_epoch_key_release`
-/// skips verification for zero-signatures.
+/// signature field is a 64-byte zero placeholder; such a release is
+/// REJECTED by `install_epoch_key_release` (AUDIT-2026-06-11 C2) — a real
+/// signing key is required for a release to be accepted by any receiver.
 ///
 /// Errors are short `&'static str` reasons suitable for log + metric
 /// labels at the call site, mirroring the receive-side
@@ -3997,6 +4106,24 @@ fn verify_epoch_key_release_signature(
         .map_err(|_| "bad_sig")
 }
 
+/// Derive a libp2p Ed25519 identity from a 32-byte secret seed, returning
+/// both the [`ed25519_dalek::SigningKey`] (for signing `EpochKeyRelease`
+/// bodies) and the matching `PeerId` string from which a receiver recovers
+/// the verifying key in [`ed25519_vk_from_peer_id_str`].
+///
+/// Exposed (non-`cfg(test)`) so integration tests in sibling crates can
+/// construct a *signed* publisher identity — required now that
+/// [`DdsNode::install_epoch_key_release`] makes the publisher signature
+/// mandatory (AUDIT-2026-06-11 C2) — without taking a direct libp2p
+/// dependency. Forward inverse of [`ed25519_vk_from_peer_id_str`].
+pub fn ed25519_identity_from_seed(seed: [u8; 32]) -> (ed25519_dalek::SigningKey, String) {
+    let dalek = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let kp = libp2p::identity::Keypair::ed25519_from_bytes(seed)
+        .expect("ed25519 keypair from 32-byte seed");
+    let peer_id = kp.public().to_peer_id().to_string();
+    (dalek, peer_id)
+}
+
 /// **M-9 (security review)**: return `true` if a revocation or burn
 /// token's `iat` is within `REVOCATION_REPLAY_WINDOW_SECS` of the
 /// local wall clock — i.e. neither far in the future (clock skew or
@@ -4018,6 +4145,15 @@ fn revocation_within_replay_window(iat: u64) -> bool {
         return false;
     }
     now.saturating_sub(iat) <= REVOCATION_REPLAY_WINDOW_SECS
+}
+
+/// **AUDIT-2026-06-11 C1 (defense-in-depth)** — a `DdsSelfUpdateDocument`
+/// Attest token must be fresh to count toward the K-of-M quorum, mirroring
+/// the revoke/burn replay window. This bounds how long a genuinely-signed
+/// self-update manifest stays replayable; the primary anti-rollback control
+/// is the version-monotonicity gate in `DdsSelfUpdateDocument::evaluate`.
+fn self_update_within_replay_window(iat: u64) -> bool {
+    revocation_within_replay_window(iat)
 }
 
 /// Z-3 Phase A.1 audit-action vocabulary helpers (observability-plan.md).
@@ -4102,7 +4238,11 @@ fn installed_semver() -> Option<dds_domain::types::SemVer> {
     let major = parts.next()?.parse::<u32>().ok()?;
     let minor = parts.next()?.parse::<u32>().ok()?;
     let patch = parts.next()?.parse::<u32>().ok()?;
-    Some(dds_domain::types::SemVer { major, minor, patch })
+    Some(dds_domain::types::SemVer {
+        major,
+        minor,
+        patch,
+    })
 }
 
 /// Phase D.5 — Return `true` if the token payload contains a
@@ -4115,6 +4255,32 @@ fn is_self_update_halt(payload: &dds_core::token::TokenPayload) -> bool {
         dds_domain::DdsSelfUpdateDocument::extract(payload),
         Ok(Some(doc)) if matches!(doc.rollout, RolloutPolicy::Halt)
     )
+}
+
+/// Phase D.2 hardening — confirm a `DdsSelfUpdateDocument` token clears the
+/// same cryptographic bar the gossip ingest path enforces through
+/// [`dds_core::trust::TrustGraph::add_token`] before it may be counted toward
+/// the K-of-M quorum: canonical shape, a valid issuer signature, and an
+/// issuer URN cryptographically bound to the signing key.
+///
+/// The gossip path satisfies this implicitly — it only reaches
+/// [`DdsNode::check_self_update_quorum_and_maybe_apply`] after `add_token`
+/// already succeeded. The anti-entropy **sync** path does not: its pre-apply
+/// filter runs only the publisher-capability gate, and
+/// `apply_sync_payloads_with_graph` merely *counts* signature / issuer-binding
+/// rejections without removing the offending payloads from the batch the
+/// quorum loop iterates. Without this gate a single admitted, non-publisher
+/// peer could submit K self-update payloads — each carrying a real publisher's
+/// `iss` URN (public information) but the attacker's own key and signature, so
+/// `publisher_capability_ok` passes on the URN while `verify_issuer_binding`
+/// would have failed — and reach quorum with zero publisher keys, defeating
+/// the entire multi-signature control. Verifying here keeps both call sites
+/// safe and localises the invariant to the accumulator.
+fn self_update_token_quorum_eligible(token: &Token) -> Result<(), dds_core::token::TokenError> {
+    token.validate_shape()?;
+    token.verify_signature()?;
+    token.verify_issuer_binding()?;
+    Ok(())
 }
 
 fn publisher_capability_ok(
@@ -4135,6 +4301,11 @@ fn publisher_capability_ok(
     let required = match body_type {
         body_types::WINDOWS_POLICY => purpose::POLICY_PUBLISHER_WINDOWS,
         body_types::MACOS_POLICY => purpose::POLICY_PUBLISHER_MACOS,
+        // AUDIT-2026-06-11 #16: LinuxPolicyDocument was missing from this C-3
+        // ingest gate, so one admitted peer could seed unauthorized Linux
+        // policy into every peer's trust graph (and have it propagate). Gate it
+        // like the Windows/macOS policy publishers.
+        body_types::LINUX_POLICY => purpose::POLICY_PUBLISHER_LINUX,
         body_types::SOFTWARE_ASSIGNMENT => purpose::SOFTWARE_PUBLISHER,
         // Phase D.2: require the dedicated SELF_UPDATE_PUBLISHER capability.
         // K-of-M quorum enforcement runs after the capability gate in
@@ -4771,6 +4942,115 @@ mod d2_multisig_quorum_tests {
         let h1 = self_update_content_hash(&t);
         let h2 = self_update_content_hash(&t);
         assert_eq!(h1, h2, "content hash must be deterministic");
+    }
+}
+
+#[cfg(test)]
+mod d2_quorum_eligibility_tests {
+    //! Phase D.2 hardening — `self_update_token_quorum_eligible` gates the
+    //! K-of-M accumulator so the anti-entropy sync path cannot count a
+    //! self-update token toward quorum unless it clears the same crypto bar as
+    //! the gossip path (shape + signature + issuer-URN↔key binding).
+    //!
+    //! Regression for the sync-path quorum bypass: a single admitted,
+    //! non-publisher peer could otherwise submit K payloads each stamped with a
+    //! real publisher's `iss` URN (public information) but the attacker's own
+    //! key, pass `publisher_capability_ok` on the URN, and forge quorum with
+    //! zero publisher keys.
+
+    use super::*;
+    use dds_core::identity::Identity;
+    use dds_core::token::{Token, TokenKind, TokenPayload};
+    use dds_domain::DomainDocument;
+    use dds_domain::body_types;
+    use dds_domain::types::{DdsSelfUpdateDocument, ReleaseChannel, RolloutPolicy, SemVer};
+    use rand::rngs::OsRng;
+
+    fn self_update_body() -> Vec<u8> {
+        DdsSelfUpdateDocument {
+            channel: ReleaseChannel::Stable,
+            version: SemVer {
+                major: 9,
+                minor: 9,
+                patch: 9,
+            },
+            artifacts: vec![],
+            min_supported_from: None,
+            rollout: RolloutPolicy::Staged {
+                canary_pct: 100,
+                promote_to_full_after_secs: 0,
+                halt_on_health_regression: false,
+            },
+            provenance: None,
+        }
+        .to_cbor()
+        .expect("cbor")
+    }
+
+    /// Build a self-update Attest payload whose `iss` URN is `iss` and whose
+    /// embedded `iss_key` is `key_owner`'s public key. Separating the two lets
+    /// the spoof test claim one identity's URN while embedding another's key.
+    fn self_update_payload(iss: String, key_owner: &Identity) -> TokenPayload {
+        TokenPayload {
+            iss,
+            iss_key: key_owner.public_key.clone(),
+            jti: "elig-test".to_string(),
+            sub: key_owner.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1714605000,
+            exp: Some(4102444800),
+            body_type: Some(body_types::DDS_SELF_UPDATE.to_string()),
+            body_cbor: Some(self_update_body()),
+        }
+    }
+
+    /// A normally-signed self-update token (issuer URN bound to the signing
+    /// key) is eligible to count toward quorum.
+    #[test]
+    fn validly_signed_token_is_eligible() {
+        let publisher = Identity::generate("publisher", &mut OsRng);
+        let payload = self_update_payload(publisher.id.to_urn(), &publisher);
+        let token = Token::sign(payload, &publisher.signing_key).expect("sign");
+        assert!(self_update_token_quorum_eligible(&token).is_ok());
+    }
+
+    /// THE SYNC-PATH BYPASS: a token claiming a real publisher's `iss` URN but
+    /// carrying the attacker's own key — and a signature valid under that
+    /// attacker key — is NOT eligible. The issuer-binding gate rejects it even
+    /// though `publisher_capability_ok` would accept the (real) URN, so a
+    /// single admitted peer cannot forge quorum without the publisher keys.
+    #[test]
+    fn token_with_spoofed_publisher_urn_is_ineligible() {
+        let real_publisher = Identity::generate("real-publisher", &mut OsRng);
+        let attacker = Identity::generate("attacker", &mut OsRng);
+        // iss = the real publisher's URN, iss_key = the attacker's key.
+        let payload = self_update_payload(real_publisher.id.to_urn(), &attacker);
+        // Signed by the attacker key, so the signature itself is valid against
+        // the embedded iss_key — proving the rejection comes from the binding
+        // gate, not the signature gate.
+        let token = Token::sign(payload, &attacker.signing_key).expect("sign");
+        assert!(token.verify_signature().is_ok());
+        assert!(
+            self_update_token_quorum_eligible(&token).is_err(),
+            "a spoofed publisher URN must not be eligible for quorum"
+        );
+    }
+
+    /// A token whose signature does not match its embedded issuer key is not
+    /// eligible (covers a corrupted / forged signature arriving via sync).
+    #[test]
+    fn token_with_invalid_signature_is_ineligible() {
+        let publisher = Identity::generate("publisher", &mut OsRng);
+        let wrong_signer = Identity::generate("wrong-signer", &mut OsRng);
+        // iss/iss_key are self-consistent (binding would pass) but the token is
+        // signed by a different key, so verify_signature fails first.
+        let payload = self_update_payload(publisher.id.to_urn(), &publisher);
+        let token = Token::sign(payload, &wrong_signer.signing_key).expect("sign");
+        assert!(self_update_token_quorum_eligible(&token).is_err());
     }
 }
 

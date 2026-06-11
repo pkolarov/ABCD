@@ -25,6 +25,14 @@
 struct AuthOperation
 {
     IPC_CLIENT_CONTEXT* pClientCtx; // Client that initiated the auth
+    // AUDIT-2026-06-11 #17: a stable identity for the initiating client. The
+    // pClientCtx pointer aliases a slot in the server's reusable m_clients[]
+    // array; if the original client disconnects during the ~60s wait the slot
+    // is zeroed and can be handed to a DIFFERENT client. Capturing the unique
+    // clientId lets every send validate the slot still belongs to the same
+    // client before delivering the decrypted password, so a recycled slot can
+    // never receive another client's secrets.
+    DWORD               clientId;   // Unique id of the initiating client (server-assigned)
     UINT32              seqId;      // IPC sequence ID for correlating progress/result
     UINT32              authMethod; // IPC_AUTH_METHOD::FIDO2
     std::string         deviceUrn;  // DDS device URN for this endpoint

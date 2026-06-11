@@ -14,7 +14,9 @@ pub mod device_binding;
 pub mod domain_store;
 pub mod epoch_key_store;
 pub mod expiry;
-pub(crate) mod file_acl;
+// AUDIT-2026-06-11 #28: `pub` (was `pub(crate)`) so the `dds-node`
+// binary can apply the owner-only restriction to the DPAPI seal blob.
+pub mod file_acl;
 pub mod http;
 pub mod identity_store;
 pub mod key_provider;

@@ -178,8 +178,12 @@ bool RunAdminSetupFlow(HWND hwnd)
         L"This key will be used to approve user enrollments.",
         L"DDS Admin Setup", MB_OK | MB_ICONINFORMATION);
 
+    // AUDIT-2026-06-11 #22a: register the admin key with UV=REQUIRED so the
+    // admin-vouch assertion path (which also requires UV) can succeed and
+    // privileged admin actions always demand PIN/biometric, not just touch.
     auto makeResult = CWebAuthnHelper::MakeCredential(
-        hwnd, rpId, userId, L"DDS Administrator", false /*no hmac-secret*/);
+        hwnd, rpId, userId, L"DDS Administrator",
+        false /*no hmac-secret*/, true /*requireUserVerification*/);
 
     if (!makeResult.success)
     {

@@ -559,13 +559,13 @@ HRESULT CDdsCredential::GetSerializationDds(
         char domA[64]{}, userA[64]{};
         WideCharToMultiByte(CP_UTF8, 0, authResult.domain.c_str(), -1, domA, sizeof(domA), NULL, NULL);
         WideCharToMultiByte(CP_UTF8, 0, authResult.username.c_str(), -1, userA, sizeof(userA), NULL, NULL);
-        CPLog("GetSerializationDds: domain='%s' user='%s' pwdLen=%zu cpus=%d",
-            domA, userA, authResult.password.size(), (int)_cpus);
-        // Log first/last wchar code points to verify encoding (not the actual password)
-        if (!authResult.password.empty())
-            CPLog("GetSerializationDds: pwd[0]=0x%04X pwd[last]=0x%04X",
-                (unsigned)authResult.password[0],
-                (unsigned)authResult.password[authResult.password.size()-1]);
+        // AUDIT-2026-06-11 #12: never log password-derived data. The previous
+        // lines recorded pwdLen and the first/last password code points into a
+        // world-readable log, leaking length and partial plaintext for every
+        // sign-in. Log only non-secret routing context (domain/user/cpus) and a
+        // content-free marker that the credential was serialized.
+        CPLog("GetSerializationDds: domain='%s' user='%s' cpus=%d (password serialized)",
+            domA, userA, (int)_cpus);
     }
 
     PWSTR pwzProtectedPassword = nullptr;

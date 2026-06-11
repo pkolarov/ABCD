@@ -93,6 +93,16 @@ impl AppleSecureEnclaveKeyProvider {
     }
 
     /// Look up an existing SE key by label in the default keychain.
+    ///
+    /// **AUDIT-2026-06-11 #29**: a keychain search by label alone will
+    /// happily return a *software* key with the same label. Since
+    /// `provider_kind()` and the startup log report this key as
+    /// hardware-bound, we must confirm the returned `SecKey` actually
+    /// resides in the Secure Enclave before trusting it. We require its
+    /// `kSecAttrTokenID` attribute to equal `kSecAttrTokenIDSecureEnclave`
+    /// and treat a key that is not SE-resident as not-found, so the
+    /// caller's `.or_else(create_new)` regenerates a genuine SE key
+    /// rather than adopting a planted software impostor.
     fn find_existing(label: &str) -> Result<SecKey, String> {
         let results = ItemSearchOptions::new()
             .class(ItemClass::key())
@@ -104,7 +114,20 @@ impl AppleSecureEnclaveKeyProvider {
             .map_err(|e| format!("keychain search error: {e}"))?;
 
         match results.into_iter().next() {
-            Some(SearchResult::Ref(Reference::Key(k))) => Ok(k),
+            Some(SearchResult::Ref(Reference::Key(k))) => {
+                // AUDIT-2026-06-11 #29: reject a same-label key that is not
+                // SE-resident. Without this, a planted software key is
+                // trusted and misreported as hardware-bound.
+                if is_secure_enclave_resident(&k) {
+                    Ok(k)
+                } else {
+                    Err(format!(
+                        "key with label {label:?} exists but is not Secure-Enclave-resident \
+                         (kSecAttrTokenID != kSecAttrTokenIDSecureEnclave); refusing to treat \
+                         a software key as hardware-bound"
+                    ))
+                }
+            }
             Some(_) => Err("unexpected non-key reference in keychain search".to_string()),
             None => Err(format!("no SE key found with label {label:?}")),
         }
@@ -150,6 +173,40 @@ impl AppleSecureEnclaveKeyProvider {
 
         let uncompressed = repr.to_vec();
         compress_p256_point(&uncompressed)
+    }
+}
+
+/// **AUDIT-2026-06-11 #29**: return `true` iff `key`'s `kSecAttrTokenID`
+/// attribute equals `kSecAttrTokenIDSecureEnclave`, i.e. the private key
+/// genuinely lives in the Secure Enclave.
+///
+/// `SecKeyCopyAttributes` (via [`SecKey::attributes`]) returns the
+/// effective key attributes; SE-resident keys carry
+/// `kSecAttrTokenID = kSecAttrTokenIDSecureEnclave`, software keys omit
+/// the attribute (or carry a different value). We compare the CFString
+/// value for exact equality and fail closed if the attribute is missing.
+///
+/// macOS-only (`security-framework`); flagged for macOS CI — it cannot
+/// be exercised on the build host used for this change.
+fn is_secure_enclave_resident(key: &SecKey) -> bool {
+    use core_foundation::base::{TCFType, ToVoid};
+    use core_foundation::string::CFString;
+    use security_framework_sys::item::{kSecAttrTokenID, kSecAttrTokenIDSecureEnclave};
+
+    let attrs = key.attributes();
+    match attrs.find(unsafe { kSecAttrTokenID }.to_void()) {
+        Some(value) => {
+            // `value` is a borrowed CFStringRef inside the dictionary; the
+            // SE token-id constant is also a CFString. Wrap both under the
+            // get rule (no ownership transfer) and compare for equality.
+            // `.cast()` on the `&*const c_void` mirrors the idiom in
+            // `SecKey::application_label` upstream.
+            let found = unsafe { CFString::wrap_under_get_rule(value.cast()) };
+            let expected = unsafe { CFString::wrap_under_get_rule(kSecAttrTokenIDSecureEnclave) };
+            found == expected
+        }
+        // No token id at all => software key. Fail closed.
+        None => false,
     }
 }
 

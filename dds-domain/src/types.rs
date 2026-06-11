@@ -1199,6 +1199,11 @@ pub enum RolloutDecision {
     /// The node's installed version predates `min_supported_from`; a
     /// step-upgrade is required before this manifest can be applied.
     StepUpgradeRequired,
+    /// **AUDIT-2026-06-11 C1** — the manifest's `version` is strictly older
+    /// than the version already installed on this node. Applying it would be
+    /// a downgrade (a replayed, genuinely-signed older manifest is the
+    /// rollback-attack vector), so it is refused regardless of rollout policy.
+    RollbackRefused,
 }
 
 impl RolloutPolicy {
@@ -1249,7 +1254,16 @@ fn is_in_canary_cohort(peer_id_bytes: &[u8], jti: &str, canary_pct: u8) -> bool 
     if canary_pct == 0 {
         return false;
     }
-    if canary_pct >= 100 {
+    // AUDIT-2026-06-11 #32: `canary_pct` is documented 0–100. Treat
+    // exactly 100 as fleet-wide, but values 101–255 as out-of-range and
+    // fail CLOSED (not in cohort) rather than silently 100%. The primary
+    // defence is rejecting such manifests at decode in
+    // `DdsSelfUpdateDocument::validate` / `from_cbor`; this clamp is the
+    // belt-and-braces for any path that constructs a policy in-process.
+    if canary_pct > 100 {
+        return false;
+    }
+    if canary_pct == 100 {
         return true;
     }
     use sha2::{Digest, Sha256};
@@ -1274,6 +1288,21 @@ impl DdsSelfUpdateDocument {
         jti: &str,
         installed_version: Option<&SemVer>,
     ) -> RolloutDecision {
+        // AUDIT-2026-06-11 C1 — anti-rollback gate. Refuse any manifest whose
+        // `version` is strictly older than the locally-observed installed
+        // version, regardless of rollout policy or the publisher-asserted
+        // `min_supported_from` floor (which an attacker-replayed old manifest
+        // sets to `None`/low). Without this, a single admitted peer replays the
+        // K genuinely-signed publisher tokens for an older, known-vulnerable
+        // release and forces a fleet-wide signed downgrade — the installer runs
+        // as LocalSystem/root. `installed_version` is read locally from the
+        // running binary, so the manifest cannot spoof it. Equal versions are
+        // permitted (a no-op re-install / repair, not a downgrade).
+        if let Some(installed) = installed_version
+            && self.version < *installed
+        {
+            return RolloutDecision::RollbackRefused;
+        }
         if let (Some(floor), Some(installed)) = (&self.min_supported_from, installed_version)
             && installed < floor
         {
@@ -1313,15 +1342,57 @@ pub struct DdsSelfUpdateDocument {
     pub min_supported_from: Option<SemVer>,
     /// Rollout policy.
     pub rollout: RolloutPolicy,
-    /// SLSA Level 3 provenance attestation reference. Nodes that have
-    /// `verify_provenance = true` in their config must fetch and verify
-    /// this before applying.
+    /// SLSA Level 3 provenance attestation reference, carried in the manifest
+    /// for out-of-band / operator verification.
+    ///
+    /// **AUDIT-2026-06-11 #10:** apply-time provenance *enforcement* is NOT yet
+    /// implemented — `dds-node`'s `apply_update` does not fetch or verify this
+    /// reference, and there is no `verify_provenance` config flag (the previous
+    /// docstring claimed one, which did not exist). The integrity anchors that
+    /// ARE enforced today are the manifest's K-of-M publisher quorum, the
+    /// per-artifact SHA-256, and the OS-vendor code signature (Authenticode /
+    /// Apple Developer ID). Wiring `provenance` into the apply path (fetch the
+    /// `.intoto.jsonl`, verify the Sigstore/Rekor bundle and the builder
+    /// identity, bind it to the artifact digest) behind a real config flag is
+    /// tracked as follow-up work; until then this field is advisory only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<ProvenanceRef>,
 }
 
+impl DdsSelfUpdateDocument {
+    /// AUDIT-2026-06-11 #32: validate field-level invariants on the
+    /// manifest. Rejects a `Staged` rollout whose `canary_pct` is outside
+    /// the documented 0–100 range. Without this, `canary_pct` values
+    /// 101–255 were silently treated as 100% (instant fleet-wide apply) by
+    /// `is_in_canary_cohort`, so a malformed (or maliciously crafted)
+    /// manifest could skip the staged-canary soak entirely. Fail closed at
+    /// the schema layer instead.
+    pub fn validate(&self) -> Result<(), crate::DomainError> {
+        if let RolloutPolicy::Staged { canary_pct, .. } = &self.rollout
+            && *canary_pct > 100
+        {
+            return Err(crate::DomainError::Deserialize(format!(
+                "DdsSelfUpdateDocument: Staged canary_pct must be 0..=100, got {canary_pct}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl DomainDocument for DdsSelfUpdateDocument {
     const BODY_TYPE: &'static str = body_types::DDS_SELF_UPDATE;
+
+    /// AUDIT-2026-06-11 #32: reject out-of-range `canary_pct` at the
+    /// decode/ingest boundary. `extract` calls `from_cbor`, so every
+    /// ingest path (gossip / sync) that turns a token body into a
+    /// `DdsSelfUpdateDocument` now refuses an out-of-range manifest with a
+    /// parse error rather than silently treating it as 100%.
+    fn from_cbor(bytes: &[u8]) -> Result<Self, crate::DomainError> {
+        let doc: Self = dds_core::cbor_bounded::from_reader(bytes)
+            .map_err(|e| crate::DomainError::Deserialize(e.to_string()))?;
+        doc.validate()?;
+        Ok(doc)
+    }
 }
 
 #[cfg(test)]
@@ -1624,6 +1695,74 @@ mod tests {
         );
     }
 
+    /// **AUDIT-2026-06-11 #32**: an out-of-range `canary_pct` (101–255)
+    /// must NOT silently behave as 100% (instant fleet-wide apply). The
+    /// cohort function fails closed (treats the node as not-in-cohort), so
+    /// in-process evaluation waits rather than applying everywhere.
+    #[test]
+    fn rollout_staged_canary_pct_over_100_fails_closed() {
+        let policy = RolloutPolicy::Staged {
+            canary_pct: 101,
+            promote_to_full_after_secs: 3600,
+            halt_on_health_regression: false,
+        };
+        assert!(
+            matches!(
+                policy.evaluate(b"peer1", "jti-1", None),
+                RolloutDecision::WaitForCanary { .. }
+            ),
+            "canary_pct > 100 must not be treated as 100%"
+        );
+    }
+
+    fn doc_with_canary(canary_pct: u8) -> DdsSelfUpdateDocument {
+        DdsSelfUpdateDocument {
+            channel: ReleaseChannel::Stable,
+            version: SemVer {
+                major: 1,
+                minor: 0,
+                patch: 0,
+            },
+            artifacts: vec![],
+            min_supported_from: None,
+            rollout: RolloutPolicy::Staged {
+                canary_pct,
+                promote_to_full_after_secs: 3600,
+                halt_on_health_regression: false,
+            },
+            provenance: None,
+        }
+    }
+
+    /// **AUDIT-2026-06-11 #32**: `validate()` rejects an out-of-range
+    /// `canary_pct` and accepts in-range values.
+    #[test]
+    fn dds_self_update_validate_rejects_out_of_range_canary() {
+        assert!(doc_with_canary(100).validate().is_ok());
+        assert!(doc_with_canary(0).validate().is_ok());
+        assert!(doc_with_canary(50).validate().is_ok());
+        assert!(doc_with_canary(101).validate().is_err());
+        assert!(doc_with_canary(255).validate().is_err());
+    }
+
+    /// **AUDIT-2026-06-11 #32**: the decode boundary (`from_cbor`, used by
+    /// `extract`) refuses an out-of-range manifest with a parse error
+    /// rather than silently accepting it. We hand-encode the CBOR with the
+    /// default serializer (which does not validate) and confirm
+    /// `from_cbor` rejects it while accepting an in-range manifest.
+    #[test]
+    fn dds_self_update_from_cbor_rejects_out_of_range_canary() {
+        // `to_cbor` is the default trait method (no validation), so it
+        // serializes the bad doc fine; `from_cbor` must reject it.
+        let bad_bytes = doc_with_canary(200).to_cbor().expect("serialize");
+        assert!(
+            DdsSelfUpdateDocument::from_cbor(&bad_bytes).is_err(),
+            "from_cbor must reject canary_pct > 100"
+        );
+        let good_bytes = doc_with_canary(25).to_cbor().expect("serialize");
+        assert!(DdsSelfUpdateDocument::from_cbor(&good_bytes).is_ok());
+    }
+
     #[test]
     fn rollout_staged_cohort_is_deterministic() {
         let policy = RolloutPolicy::Staged {
@@ -1709,6 +1848,54 @@ mod tests {
         // installed v2.0.0 == floor → proceed to policy evaluation.
         assert_eq!(
             doc.evaluate(b"peer1", "jti-1", Some(&v200)),
+            RolloutDecision::ApplyNow
+        );
+    }
+
+    /// AUDIT-2026-06-11 C1 — a manifest whose version is strictly older than
+    /// the installed version is refused as a rollback, regardless of rollout
+    /// policy or `min_supported_from`. Equal versions remain applicable.
+    #[test]
+    fn dds_self_update_evaluate_refuses_rollback() {
+        let v1 = SemVer {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        };
+        let v2 = SemVer {
+            major: 2,
+            minor: 0,
+            patch: 0,
+        };
+        // Manifest for the OLDER v1.0.0; node is already on v2.0.0.
+        let doc = DdsSelfUpdateDocument {
+            channel: ReleaseChannel::Stable,
+            version: v1.clone(),
+            artifacts: vec![],
+            // A replayed/forged old manifest typically has no floor; even with
+            // a high floor the rollback gate must win.
+            min_supported_from: None,
+            rollout: RolloutPolicy::Staged {
+                canary_pct: 100,
+                promote_to_full_after_secs: 0,
+                halt_on_health_regression: false,
+            },
+            provenance: None,
+        };
+        // Installed v2.0.0 > manifest v1.0.0 → refuse the downgrade even though
+        // canary_pct=100 would otherwise be ApplyNow.
+        assert_eq!(
+            doc.evaluate(b"peer1", "jti-1", Some(&v2)),
+            RolloutDecision::RollbackRefused
+        );
+        // Same version is a no-op re-install, not a downgrade → allowed.
+        assert_eq!(
+            doc.evaluate(b"peer1", "jti-1", Some(&v1)),
+            RolloutDecision::ApplyNow
+        );
+        // Unknown installed version → cannot gate; fall through to policy.
+        assert_eq!(
+            doc.evaluate(b"peer1", "jti-1", None),
             RolloutDecision::ApplyNow
         );
     }
