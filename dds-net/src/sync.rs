@@ -776,8 +776,12 @@ mod tests {
         let mut graph = TrustGraph::new();
 
         // First delivery: payload A's op newly merges and is reported.
-        let first =
-            apply_sync_payloads_with_graph(&[payload_a.clone()], &mut dag, &mut store, &mut graph);
+        let first = apply_sync_payloads_with_graph(
+            std::slice::from_ref(&payload_a),
+            &mut dag,
+            &mut store,
+            &mut graph,
+        );
         assert_eq!(first.ops_merged, 1);
         assert_eq!(first.merged_op_ids, vec!["op-a".to_string()]);
 
