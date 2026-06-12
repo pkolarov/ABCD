@@ -221,6 +221,11 @@ enum PolicyAction {
 #[derive(Subcommand)]
 enum EnrollAction {
     /// Register a user via FIDO2 attestation (POST /v1/enroll/user).
+    ///
+    /// For challenge-bound enrollment (A-1, WebAuthn §7.1 step 9): run
+    /// `enroll challenge` first, sign over that challenge, then pass
+    /// `--challenge-id` together with `--client-data-json`. Omit both for
+    /// the legacy no-challenge path.
     User {
         #[arg(long)]
         label: String,
@@ -238,6 +243,15 @@ enum EnrollAction {
         display_name: String,
         #[arg(long, default_value = "platform")]
         authenticator_type: String,
+        /// Optional base64 of the raw clientDataJSON (A-1). When supplied
+        /// with --challenge-id the node validates type/origin/challenge
+        /// per WebAuthn §7.1.
+        #[arg(long)]
+        client_data_json: Option<String>,
+        /// Optional server-issued challenge ID from `enroll challenge`
+        /// (A-1 challenge-bound enrollment).
+        #[arg(long)]
+        challenge_id: Option<String>,
     },
     /// Register a device (POST /v1/enroll/device).
     Device {
@@ -269,6 +283,10 @@ enum EnrollAction {
 #[derive(Subcommand)]
 enum AdminAction {
     /// Bootstrap the first admin (POST /v1/admin/setup).
+    ///
+    /// Supports the same optional A-1 challenge-bound enrollment as
+    /// `enroll user`: pass `--challenge-id` (from `enroll challenge`)
+    /// together with `--client-data-json`, or omit both for the legacy path.
     Setup {
         #[arg(long)]
         label: String,
@@ -284,17 +302,38 @@ enum AdminAction {
         display_name: String,
         #[arg(long, default_value = "platform")]
         authenticator_type: String,
+        /// Optional base64 of the raw clientDataJSON (A-1).
+        #[arg(long)]
+        client_data_json: Option<String>,
+        /// Optional server-issued challenge ID from `enroll challenge`.
+        #[arg(long)]
+        challenge_id: Option<String>,
     },
     /// Admin vouches for a subject via FIDO2 assertion (POST /v1/admin/vouch).
+    ///
+    /// Two-step ceremony: first run `admin challenge` to obtain a
+    /// `challenge_id` + challenge bytes, perform the FIDO2 assertion over
+    /// that challenge, then pass `--challenge-id` here alongside the
+    /// assertion outputs. The node requires the assertion to be
+    /// user-verified (UV — PIN/biometric; AUDIT-2026-06-12 R2), so the
+    /// admin credential must live on a UV-capable authenticator.
     Vouch {
         #[arg(long)]
         subject_urn: String,
         #[arg(long)]
         credential_id: String,
+        /// Server-issued challenge ID from `dds admin challenge`.
+        #[arg(long)]
+        challenge_id: String,
         #[arg(long)]
         authenticator_data: String,
         #[arg(long)]
         client_data_hash: String,
+        /// Optional base64 of the exact clientDataJSON the authenticator
+        /// signed (M-12) — include it whenever available so the node can
+        /// verify the hash against the canonical bytes.
+        #[arg(long)]
+        client_data_json: Option<String>,
         #[arg(long)]
         signature: String,
         #[arg(long)]
@@ -486,13 +525,26 @@ enum CpAction {
     /// Returns the challenge_id and challenge_b64url needed as inputs to `cp session-assert`.
     SessionChallenge,
     /// POST /v1/session/assert
+    ///
+    /// Two-step like `admin vouch`: run `cp session-challenge` first, sign
+    /// over that challenge, then pass `--challenge-id` here. The node
+    /// requires it (a POST without it fails Json deserialization with HTTP
+    /// 422 before any verification — the pre-1.4.1 CLI shipped that bug).
     SessionAssert {
         #[arg(long)]
         credential_id: String,
+        /// Server-issued challenge ID from `dds cp session-challenge`.
+        #[arg(long)]
+        challenge_id: String,
         #[arg(long)]
         authenticator_data: String,
         #[arg(long)]
         client_data_hash: String,
+        /// Optional base64 of the exact clientDataJSON the authenticator
+        /// signed (M-12) — include it whenever available so the node can
+        /// validate type/origin/challenge per WebAuthn §7.2.
+        #[arg(long)]
+        client_data_json: Option<String>,
         #[arg(long)]
         signature: String,
         #[arg(long)]
@@ -823,6 +875,8 @@ async fn handle_enroll(action: EnrollAction, node_url: &str) {
             rp_id,
             display_name,
             authenticator_type,
+            client_data_json,
+            challenge_id,
         } => {
             let req = EnrollUserRequest {
                 label,
@@ -832,6 +886,8 @@ async fn handle_enroll(action: EnrollAction, node_url: &str) {
                 rp_id,
                 display_name,
                 authenticator_type,
+                client_data_json_b64: client_data_json,
+                challenge_id,
             };
             let r: EnrollmentResponse = post_json(node_url, "/v1/enroll/user", &req).await;
             print_enrollment(&r);
@@ -897,6 +953,8 @@ async fn handle_admin(action: AdminAction, node_url: &str) {
             rp_id,
             display_name,
             authenticator_type,
+            client_data_json,
+            challenge_id,
         } => {
             let req = EnrollUserRequest {
                 label,
@@ -906,6 +964,8 @@ async fn handle_admin(action: AdminAction, node_url: &str) {
                 rp_id,
                 display_name,
                 authenticator_type,
+                client_data_json_b64: client_data_json,
+                challenge_id,
             };
             let r: EnrollmentResponse = post_json(node_url, "/v1/admin/setup", &req).await;
             println!("Admin provisioned:");
@@ -914,16 +974,20 @@ async fn handle_admin(action: AdminAction, node_url: &str) {
         AdminAction::Vouch {
             subject_urn,
             credential_id,
+            challenge_id,
             authenticator_data,
             client_data_hash,
+            client_data_json,
             signature,
             purpose,
         } => {
             let req = AdminVouchRequest {
                 subject_urn,
                 credential_id,
+                challenge_id,
                 authenticator_data,
                 client_data_hash,
+                client_data_json_b64: client_data_json,
                 signature,
                 purpose,
             };
@@ -1729,8 +1793,10 @@ async fn handle_cp(action: CpAction, node_url: &str) {
         }
         CpAction::SessionAssert {
             credential_id,
+            challenge_id,
             authenticator_data,
             client_data_hash,
+            client_data_json,
             signature,
             subject_urn,
             duration_secs,
@@ -1738,7 +1804,9 @@ async fn handle_cp(action: CpAction, node_url: &str) {
             let req = SessionAssertRequest {
                 subject_urn,
                 credential_id,
+                challenge_id,
                 client_data_hash,
+                client_data_json_b64: client_data_json,
                 authenticator_data,
                 signature,
                 duration_secs: Some(duration_secs),
@@ -2572,6 +2640,14 @@ fn uuid_v4() -> String {
 // ---- Wire types (mirror dds-node::http shapes, but defined locally so
 // the CLI doesn't depend on the full dds-node crate) ----
 
+/// Wire-compatible with `dds_node::http::EnrollUserRequestJson` — pinned by
+/// `enroll_user_request_matches_server_contract` below. Used for both
+/// `POST /v1/enroll/user` and `POST /v1/admin/setup`. Unlike admin-vouch /
+/// session-assert, `challenge_id` here is OPTIONAL on the server (A-1
+/// challenge-bound enrollment): omitting both `challenge_id` and
+/// `client_data_json_b64` runs the legacy no-challenge path; supplying them
+/// together closes WebAuthn §7.1 step 9 at enrollment. `skip_serializing_if`
+/// keeps the legacy shape byte-identical (no key, not `null`).
 #[derive(Serialize)]
 struct EnrollUserRequest {
     label: String,
@@ -2581,6 +2657,10 @@ struct EnrollUserRequest {
     rp_id: String,
     display_name: String,
     authenticator_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_data_json_b64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    challenge_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2602,12 +2682,20 @@ struct EnrollmentResponse {
     token_cbor_b64: String,
 }
 
+/// Wire-compatible with `dds_node::http::AdminVouchRequestJson` — the
+/// round-trip is pinned by `admin_vouch_request_matches_server_contract`
+/// below. `challenge_id` is required by the server (a POST without it
+/// fails axum Json deserialization with HTTP 422 before any
+/// verification runs — the pre-1.4.1 CLI shipped exactly that bug).
 #[derive(Serialize)]
 struct AdminVouchRequest {
     subject_urn: String,
     credential_id: String,
+    challenge_id: String,
     authenticator_data: String,
     client_data_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_data_json_b64: Option<String>,
     signature: String,
     purpose: Option<String>,
 }
@@ -2682,10 +2770,19 @@ struct ChallengeResponseJson {
     expires_at: u64,
 }
 
+/// Wire-compatible with `dds_node::http::AssertionSessionRequestJson` —
+/// pinned by `session_assert_request_matches_server_contract` below.
+/// `challenge_id` is required by the server (a POST without it fails axum
+/// Json deserialization with HTTP 422 before any verification runs — the
+/// pre-1.4.1 CLI shipped exactly that bug, the sibling of the admin-vouch
+/// one).
 #[derive(Serialize)]
 struct SessionAssertRequest {
     subject_urn: Option<String>,
     credential_id: String,
+    challenge_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_data_json_b64: Option<String>,
     client_data_hash: String,
     authenticator_data: String,
     signature: String,
@@ -2840,4 +2937,194 @@ struct AuditEntry {
 struct AuditEntriesResponse {
     entries: Vec<AuditEntry>,
     total: usize,
+}
+
+#[cfg(test)]
+mod admin_vouch_contract_tests {
+    //! **AUDIT-2026-06-12 R2 follow-up** — the CLI's `AdminVouchRequest`
+    //! must stay wire-compatible with the server's
+    //! `dds_node::http::AdminVouchRequestJson`. The pre-1.4.1 CLI lacked
+    //! `challenge_id` entirely, so every `dds admin vouch` POST failed
+    //! axum Json deserialization (HTTP 422) before any verification ran.
+    //! These tests deserialize the CLI's serialized JSON into the actual
+    //! server struct, so a future field drift on either side fails here
+    //! instead of at runtime.
+
+    use super::{AdminVouchRequest, EnrollUserRequest, SessionAssertRequest};
+    use dds_node::http::{
+        AdminVouchRequestJson, AssertionSessionRequestJson, EnrollUserRequestJson,
+    };
+
+    fn sample(client_data_json_b64: Option<String>) -> AdminVouchRequest {
+        AdminVouchRequest {
+            subject_urn: "urn:vouchsafe:bob.7k3mf9".into(),
+            credential_id: "Y3JlZA".into(),
+            challenge_id: "chal-123".into(),
+            authenticator_data: "YXV0aA".into(),
+            client_data_hash: "aGFzaA".into(),
+            client_data_json_b64,
+            signature: "c2ln".into(),
+            purpose: Some("group:admins".into()),
+        }
+    }
+
+    #[test]
+    fn admin_vouch_request_matches_server_contract() {
+        let value =
+            serde_json::to_value(sample(Some("e30".into()))).expect("CLI request serializes");
+        let server: AdminVouchRequestJson =
+            serde_json::from_value(value).expect("server must accept the CLI's request shape");
+        assert_eq!(server.subject_urn, "urn:vouchsafe:bob.7k3mf9");
+        assert_eq!(server.credential_id, "Y3JlZA");
+        assert_eq!(server.challenge_id, "chal-123");
+        assert_eq!(server.authenticator_data, "YXV0aA");
+        assert_eq!(server.client_data_hash, "aGFzaA");
+        assert_eq!(server.client_data_json_b64.as_deref(), Some("e30"));
+        assert_eq!(server.signature, "c2ln");
+        assert_eq!(server.purpose.as_deref(), Some("group:admins"));
+    }
+
+    #[test]
+    fn omitted_client_data_json_round_trips_as_none() {
+        // M-12 field is optional on the server (`#[serde(default)]`); the
+        // CLI omits the key entirely when the operator doesn't pass
+        // `--client-data-json`.
+        let value = serde_json::to_value(sample(None)).expect("CLI request serializes");
+        assert!(
+            value.get("client_data_json_b64").is_none(),
+            "None must omit the key, not send null"
+        );
+        let server: AdminVouchRequestJson =
+            serde_json::from_value(value).expect("server must accept the CLI's request shape");
+        assert!(server.client_data_json_b64.is_none());
+    }
+
+    #[test]
+    fn server_rejects_request_without_challenge_id() {
+        // Pins the original bug: a request shaped like the pre-1.4.1 CLI's
+        // (no challenge_id) must NOT deserialize on the server side.
+        let mut value = serde_json::to_value(sample(None)).expect("CLI request serializes");
+        value
+            .as_object_mut()
+            .expect("request is a JSON object")
+            .remove("challenge_id")
+            .expect("challenge_id is serialized");
+        assert!(
+            serde_json::from_value::<AdminVouchRequestJson>(value).is_err(),
+            "challenge_id is a required server field; its absence was the pre-1.4.1 422"
+        );
+    }
+
+    fn session_sample(client_data_json_b64: Option<String>) -> SessionAssertRequest {
+        SessionAssertRequest {
+            subject_urn: Some("urn:vouchsafe:bob.7k3mf9".into()),
+            credential_id: "Y3JlZA".into(),
+            challenge_id: "chal-123".into(),
+            client_data_json_b64,
+            client_data_hash: "aGFzaA".into(),
+            authenticator_data: "YXV0aA".into(),
+            signature: "c2ln".into(),
+            duration_secs: Some(3600),
+        }
+    }
+
+    #[test]
+    fn session_assert_request_matches_server_contract() {
+        // Sibling of admin vouch: `dds cp session-assert` -> POST
+        // /v1/session/assert. Same challenge_id requirement, same 422 class
+        // of bug if the CLI omits it.
+        let value = serde_json::to_value(session_sample(Some("e30".into())))
+            .expect("CLI request serializes");
+        let server: AssertionSessionRequestJson =
+            serde_json::from_value(value).expect("server must accept the CLI's request shape");
+        assert_eq!(
+            server.subject_urn.as_deref(),
+            Some("urn:vouchsafe:bob.7k3mf9")
+        );
+        assert_eq!(server.credential_id, "Y3JlZA");
+        assert_eq!(server.challenge_id, "chal-123");
+        assert_eq!(server.client_data_json_b64.as_deref(), Some("e30"));
+        assert_eq!(server.client_data_hash, "aGFzaA");
+        assert_eq!(server.authenticator_data, "YXV0aA");
+        assert_eq!(server.signature, "c2ln");
+        assert_eq!(server.duration_secs, Some(3600));
+    }
+
+    #[test]
+    fn session_assert_omitted_client_data_json_round_trips_as_none() {
+        let value = serde_json::to_value(session_sample(None)).expect("CLI request serializes");
+        assert!(
+            value.get("client_data_json_b64").is_none(),
+            "None must omit the key, not send null"
+        );
+        let server: AssertionSessionRequestJson =
+            serde_json::from_value(value).expect("server must accept the CLI's request shape");
+        assert!(server.client_data_json_b64.is_none());
+    }
+
+    #[test]
+    fn session_assert_server_rejects_request_without_challenge_id() {
+        let mut value = serde_json::to_value(session_sample(None)).expect("CLI request serializes");
+        value
+            .as_object_mut()
+            .expect("request is a JSON object")
+            .remove("challenge_id")
+            .expect("challenge_id is serialized");
+        assert!(
+            serde_json::from_value::<AssertionSessionRequestJson>(value).is_err(),
+            "challenge_id is a required server field; its absence was the pre-1.4.1 422"
+        );
+    }
+
+    fn enroll_sample(
+        client_data_json_b64: Option<String>,
+        challenge_id: Option<String>,
+    ) -> EnrollUserRequest {
+        EnrollUserRequest {
+            label: "alice".into(),
+            credential_id: "Y3JlZA".into(),
+            attestation_object_b64: "YXR0".into(),
+            client_data_hash_b64: "aGFzaA".into(),
+            rp_id: "dds.local".into(),
+            display_name: "Alice".into(),
+            authenticator_type: "platform".into(),
+            client_data_json_b64,
+            challenge_id,
+        }
+    }
+
+    // Unlike admin-vouch / session-assert, enrollment's challenge_id is
+    // OPTIONAL on the server (A-1 challenge-bound enrollment is opt-in), so
+    // BOTH shapes must deserialize — the legacy path is not a bug.
+    #[test]
+    fn enroll_user_request_challenge_bound_matches_server_contract() {
+        let value =
+            serde_json::to_value(enroll_sample(Some("e30".into()), Some("chal-123".into())))
+                .expect("CLI request serializes");
+        let server: EnrollUserRequestJson =
+            serde_json::from_value(value).expect("server must accept the challenge-bound shape");
+        assert_eq!(server.label, "alice");
+        assert_eq!(server.credential_id, "Y3JlZA");
+        assert_eq!(server.attestation_object_b64, "YXR0");
+        assert_eq!(server.client_data_hash_b64, "aGFzaA");
+        assert_eq!(server.rp_id, "dds.local");
+        assert_eq!(server.display_name, "Alice");
+        assert_eq!(server.authenticator_type, "platform");
+        assert_eq!(server.client_data_json_b64.as_deref(), Some("e30"));
+        assert_eq!(server.challenge_id.as_deref(), Some("chal-123"));
+    }
+
+    #[test]
+    fn enroll_user_request_legacy_shape_matches_server_contract() {
+        let value =
+            serde_json::to_value(enroll_sample(None, None)).expect("CLI request serializes");
+        // Both optional fields omit their key (not null) on the legacy path,
+        // keeping the wire shape byte-identical to the pre-A-1 CLI.
+        assert!(value.get("client_data_json_b64").is_none());
+        assert!(value.get("challenge_id").is_none());
+        let server: EnrollUserRequestJson = serde_json::from_value(value)
+            .expect("server must accept the legacy no-challenge shape");
+        assert!(server.client_data_json_b64.is_none());
+        assert!(server.challenge_id.is_none());
+    }
 }

@@ -1659,8 +1659,12 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
         char domA[64]{}, userA[64]{};
         WideCharToMultiByte(CP_UTF8, 0, result.domain, -1, domA, sizeof(domA), NULL, NULL);
         WideCharToMultiByte(CP_UTF8, 0, result.username, -1, userA, sizeof(userA), NULL, NULL);
-        FileLog::Writef("DdsAuth.worker: domain='%s' username='%s' pwdLen=%zu\n",
-            domA, userA, password.size());
+        // AUDIT-2026-06-12 R4: never log password-derived data, in any form —
+        // the exact plaintext length collapses the offline-cracking space and
+        // was written here for every DDS logon (sibling of the #12 site).
+        // Domain/username are non-secret routing context and stay.
+        FileLog::Writef("DdsAuth.worker: domain='%s' username='%s'\n",
+            domA, userA);
     }
 
     // Fill session token (token_cbor_b64 from Rust /v1/session/assert)

@@ -1,5 +1,212 @@
 # DDS Implementation Status
 
+## fix(cli): A-1 challenge-bound enrollment reachable from dds-cli; CLI↔server request surface now drift-free (255th pass) — 2026-06-12
+
+### Summary
+
+Closed the LOW item the 254th pass flagged: CLI-driven `enroll user` and
+`admin setup` could not exercise the server's optional A-1 challenge-bound
+enrollment hardening (WebAuthn §7.1 step 9). Unlike the admin-vouch /
+session-assert siblings this was **not** a 422 — the server fields are
+`#[serde(default)]`, so the legacy path worked; the hardening was just
+unreachable from the CLI.
+
+- **[dds-cli/src/main.rs](dds-cli/src/main.rs)** — added optional
+  `--challenge-id` and `--client-data-json` clap args to both `enroll user`
+  and `admin setup`; added the two fields to `EnrollUserRequest` as
+  `Option<String>` with `#[serde(skip_serializing_if = "Option::is_none")]`
+  (legacy shape stays byte-identical — keys omitted, not `null`); threaded
+  through both handlers. Two contract tests round-trip the CLI struct through
+  the real `dds_node::http::EnrollUserRequestJson`, pinning **both** the
+  challenge-bound and legacy shapes (the legacy one is not a bug, so both must
+  deserialize). Docs: challenge-bound flow noted in
+  [DDS-Admin-Guide.md](docs/DDS-Admin-Guide.md) and the
+  [README.md](README.md) enroll/setup examples; the README `admin vouch`
+  example also gained the `--challenge-id` it was still missing.
+- **CLI↔server request surface is now drift-free.** An independent final sweep
+  (matching every dds-cli `#[derive(Serialize)]` POST body against its
+  `dds-node/src/http.rs` counterpart by route) confirmed no remaining
+  missing-required-field (422 class) or missing-optional-field (unreachable-
+  hardening class) mismatch across all routes: enroll/user, admin/setup,
+  admin/vouch, session/assert (the four fixed in passes 254–255) plus
+  enroll/device, policy/evaluate, windows/claim-account, pq/rotate (already
+  clean). Response-decode structs spot-checked — no CLI field expects a
+  server-renamed key (server has no `deny_unknown_fields`, so extra server
+  fields are ignored). The whole-of-CLI drift class this thread kept surfacing
+  is now closed.
+
+### Files changed
+
+Rust: `dds-cli/src/main.rs` (+ 2 contract tests, 8 total in the module).
+Docs: `docs/DDS-Admin-Guide.md`, `README.md`, this entry. dds-cli tests green
+(48 incl. smoke; 2 new). Full workspace: 1179 pass, 0 fail; clippy + fmt clean.
+
+---
+
+## fix(native,cli): clear 253rd-pass follow-ups — CDdsProvider memory-safety cluster + dds-cli admin-vouch contract (254th pass) — 2026-06-12
+
+### Summary
+
+Cleared the two follow-up items the 253rd-pass review flagged as "Found during
+review, NOT fixed here". Each fix was adversarially reviewed by independent
+agents before landing.
+
+- **CDdsProvider memory-safety cluster** ([CDdsProvider.cpp](platform/windows/native/DdsCredentialProvider/CDdsProvider.cpp)) —
+  four interdependent defects in the SYSTEM-context LogonUI credential
+  enumerator, all OOM-class triggers (not attacker-controlled) but real
+  use-after-free / refcount bugs:
+  (1) **Dangling-slot UAF** — `_EnumerateOneCredential` indexed writes by the
+  caller-supplied `dwCredentialIndex`, which advances even when `Initialize`
+  fails, while the release loop left freed pointers in the slots; a mid-loop
+  failure produced a `[new, FREED, new]` array that `GetCredentialAt`/the
+  destructor would dereference. Now appends **densely** at `_dwNumCreds`
+  (index arg demoted to a log label) and the release loop **NULLs** each slot
+  after `Release()`, so slots `[0, _dwNumCreds)` are always live — holes are
+  structurally impossible. The capacity bound was also re-keyed from `credIdx`
+  to `_dwNumCreds` (they diverge exactly on an `Initialize` failure).
+  (2) **Stale `_dwSetSerializationCred`** — reset to `NO_DEFAULT` after the
+  release loop in `_EnumerateCredentials`, so a dirty re-enumeration re-creates
+  a still-pending SetSerialization tile instead of (a) silently dropping it or
+  (b) Release-ing a legitimate user tile that recycled the stale slot.
+  (3) **Three `%zu`-for-DWORD format mismatches** (UB on x64 varargs) → `%lu`
+  with `(unsigned long)` casts.
+  (4) **Initialize-failure leak** in `_EnumerateSetSerialization` → `Release()`
+  on the failure path, mirroring the sibling.
+  Three-lens adversarial review (memory-safety / state-machine / compile-proxy)
+  returned correct with zero issues; the compile lens verified real-code
+  delimiter balance (parens 302/302 after stripping comments/literals). The
+  R1 invariant (`_dwNumCreds <= MAX_CREDENTIALS`, every write in bounds) holds
+  globally. **Windows CI must compile this** — no Windows build host here.
+- **dds-cli `admin vouch` contract** ([dds-cli/src/main.rs](dds-cli/src/main.rs)) —
+  the subcommand could never succeed: the server's `AdminVouchRequestJson`
+  requires `challenge_id` (from `GET /v1/admin/challenge`), which the CLI never
+  sent, so every POST 422'd before any verification. Added the required
+  `--challenge-id` and optional `--client-data-json` (M-12) args, threaded them
+  through `AdminVouchRequest` (now `#[serde(skip_serializing_if)]` on the
+  optional field so `None` omits the key rather than sending `null`), and added
+  a contract-test module that round-trips the CLI's serialized request through
+  the real `dds_node::http::AdminVouchRequestJson` — including a test that pins
+  the original bug (a request without `challenge_id` must fail server-side
+  deserialization). Stale docs fixed: [DDS-Admin-Guide.md](docs/DDS-Admin-Guide.md)
+  showed `admin vouch` without `--challenge-id` and a second example with
+  `--as-label`/`--subject` flags that never existed; both now show the real
+  two-step challenge→vouch flow, and [dds-enroll-admin.sh](platform/macos/packaging/dds-enroll-admin.sh)'s
+  header no longer claims a vouch step it doesn't perform.
+- **dds-cli `cp session-assert` — identical sibling bug, found by the
+  contract-fix's drift sweep and fixed in the same pass.** The server's
+  `AssertionSessionRequestJson` also requires `challenge_id` (from
+  `GET /v1/session/challenge`), which the CLI's `SessionAssertRequest` never
+  sent — so every `dds cp session-assert` 422'd too, despite the CLI already
+  exposing `cp session-challenge` to fetch the id. Added `--challenge-id`
+  (required) + `--client-data-json` (optional), threaded through the request
+  struct, added three more contract tests mirroring the admin-vouch ones, and
+  corrected the stale `session-assert` examples in the Admin Guide and README
+  (both omitted `--challenge-id`). **~~Still open (LOW, flagged)~~ FIXED in the
+  255th pass above:** CLI-driven `enroll user` / `admin setup`
+  (`EnrollUserRequest`) omitted the *optional* `challenge_id` +
+  `client_data_json_b64`, so the A-1 challenge-bound enrollment hardening was
+  unreachable from the CLI — not a 422 (requests succeed on the legacy path),
+  a feature-completeness gap.
+
+### Files changed
+
+Rust: `dds-cli/src/main.rs` (+ 6 contract tests: admin-vouch ×3, session-assert ×3).
+C++: `platform/windows/native/DdsCredentialProvider/CDdsProvider.cpp`.
+Docs: `docs/DDS-Admin-Guide.md` (admin-vouch + session-assert examples),
+`README.md` (session-assert example),
+`platform/macos/packaging/dds-enroll-admin.sh`, this entry. dds-cli tests green
+(6 new). C++ authored on macOS — Windows CI must compile it.
+
+---
+
+## security: fix ship-readiness audit punch list — R1/R2/R4/R5 (253rd pass) — 2026-06-12
+
+### Summary
+
+Independent ship-readiness verification of the 252nd-pass remediation
+(see [docs/ship-readiness-audit-2026-06-12.md](docs/ship-readiness-audit-2026-06-12.md))
+confirmed both CRITICALs and the HIGH cluster genuinely fixed, lifted the BLOCK
+verdict, and produced a 4-item pre-ship punch list — all four fixed in this pass.
+Each fix was implemented and adversarially reviewed by independent agents, then
+re-verified by direct read. **All 1171 workspace tests pass (was 1166; 5 new
+regression tests); clippy clean; fmt clean. `cargo audit`: 0 vulnerabilities.**
+
+- **R1 (HIGH) — OOB pointer write in `_EnumerateSetSerialization`**
+  ([CDdsProvider.cpp](platform/windows/native/DdsCredentialProvider/CDdsProvider.cpp)):
+  the 252nd-pass #7 fix bounded the main enumeration path but missed the
+  SetSerialization append, which wrote `_rgpCredentials[_dwNumCreds]` unguarded —
+  with 3 enrolled tiles + a pending SetSerialization blob (remote-cred/unlock),
+  a one-slot OOB pointer write in SYSTEM-context LogonUI and a wild `Release()`
+  in the destructor. Guard added before any allocation (fail-safe: the
+  SetSerialization tile is skipped, enrolled tiles still enumerate; sole call
+  site ignores the HRESULT, matching prior behavior).
+- **R2 — server-side UV gate on admin vouch**
+  ([dds-node/src/service.rs](dds-node/src/service.rs)): `admin_vouch` now rejects
+  assertions whose `user_verified` (UV, flags bit 0x04) is unset — previously only
+  UP was enforced server-side and the tray's UV=REQUIRED was the sole (client-side,
+  non-boundary) control, so a stolen-but-presence-unlocked admin key could mint
+  vouches. Gate sits before any side effect (key load, token mint, store write,
+  trusted-roots promotion). `issue_session_from_assertion` deliberately ungated
+  (reflects UV as `mfa_verified`). Operator impact documented in the Admin Guide:
+  admin vouching now requires a UV-capable authenticator (PIN/biometric);
+  `dds group vouch` remains the non-FIDO2 escape hatch. Test:
+  `admin_vouch_rejects_assertion_without_uv` (UV-clear properly re-signed, so
+  rejection is attributable to the gate alone; UV-set positive control mints).
+- **R4 — password-length logging eradicated (4 sites; H8/#12 siblings)**:
+  [DdsBridgeClient.cpp](platform/windows/native/DdsCredentialProvider/DdsBridgeClient.cpp)
+  (`pwdLen` on every successful logon),
+  [DdsAuthBridgeMain.cpp](platform/windows/native/DdsAuthBridge/DdsAuthBridgeMain.cpp)
+  (`pwdLen` in the auth worker), and **two** in
+  [CredentialVault.cpp](platform/windows/native/DdsAuthBridge/CredentialVault.cpp):
+  `encPwdLen` *and* the `cbResult` success log — both exact plaintext-length
+  equivalents (AES-256-GCM, tag stored separately ⇒ ciphertext length ==
+  password byte length; the audit's original "harmless" note was wrong and is
+  corrected in the audit doc). Replacements are length-free (1-bit emptiness
+  flag, fixed iv/tag sizes, content-free success marker). Independent sweep of
+  `platform/windows` + `platform/macos` (excl. Tests/) found no remaining
+  password-length logging.
+- **R5 — sync-path self-update quorum replay / equal-version reinstall loop**
+  ([dds-net/src/sync.rs](dds-net/src/sync.rs), [dds-node/src/node.rs](dds-node/src/node.rs)):
+  the batch-level `ops_merged > 0` gate let an admitted peer re-send the K
+  already-counted, genuinely-signed tokens of the CURRENT release alongside one
+  novel benign op and refill the fired accumulator — equal versions pass the C1
+  gate by design, so `msiexec` re-ran on every replay for the 7-day iat window
+  (fleet restart-loop DoS). `SyncResult` gained `merged_op_ids` (ops whose
+  `dag.insert` returned `Ok(true)`, fixpoint-retry included); the quorum loop
+  now credits a token only when its OWN payload's op id newly merged — the same
+  novelty gate as gossip — **plus** a fail-closed duplicate-op-id check: the
+  prescribed merged-set lookup alone was bypassable by pairing
+  `{op-X, novel-attacker-token}` with `{op-X, replayed-publisher-token}` (ops
+  are not bound to tokens — open finding R3), so an op id occurring more than
+  once per batch credits nothing (honest responders cannot emit duplicates —
+  the response cache is op-id-keyed). Tests: novel-merge reporting (dds-net),
+  K-across-two-batches still fires (anti-over-tightening), duplicate replay
+  does not re-count, alias laundering refused — reviewer mutation-tested that
+  the gates are load-bearing.
+
+**Found during review (pre-existing) — both FIXED in the 254th pass above:** the
+dds-cli `admin vouch` flow was non-functional independent of R2 (its request
+struct lacked the server-required `challenge_id`, so it 422'd before any
+verification; Admin Guide examples matched the broken syntax). CDdsProvider
+re-enumeration kept freed pointers in released slots (dangling-slot
+use-after-free on mid-loop Initialize failure, OOM-class trigger),
+`_dwSetSerializationCred` was never reset on re-enumeration, three
+`%zu`-for-DWORD format mismatches, and an Initialize-failure `Release()` leak.
+Audit findings R3, R6–R8 and the T-series test gaps remain open as documented
+fast-follow hardening.
+
+### Files changed
+
+Rust: `dds-net/src/sync.rs`, `dds-node/src/{node.rs,service.rs}`.
+C++: `platform/windows/native/DdsCredentialProvider/{CDdsProvider.cpp,DdsBridgeClient.cpp}`,
+`platform/windows/native/DdsAuthBridge/{DdsAuthBridgeMain.cpp,CredentialVault.cpp}`.
+Docs: `docs/ship-readiness-audit-2026-06-12.md` (remediation banner + R4
+correction + punch-list status), `docs/DDS-Admin-Guide.md` (UV requirement for
+admin vouch), this entry. VERSION → 1.4.1. C++ changes authored on macOS;
+Windows CI must compile them (no Windows build host here).
+
+---
+
 ## security: remediate pre-production multi-agent audit — 2 critical + 9 high + mediums across Rust/C++/C# (252nd pass) — 2026-06-11
 
 ### Summary

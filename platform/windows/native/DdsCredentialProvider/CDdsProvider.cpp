@@ -414,8 +414,10 @@ HRESULT CDdsProvider::SetUsageScenario(
     case CPUS_UNLOCK_WORKSTATION:
         _cpus = cpus;
         hr = this->_EnumerateCredentials();
-        CPLog("SetUsageScenario: _EnumerateCredentials returned hr=0x%08X _dwNumCreds=%zu",
-              (unsigned)hr, _dwNumCreds);
+        // AUDIT-2026-06-12 R1 follow-up: _dwNumCreds is DWORD — %zu reads a
+        // 64-bit size_t for a 32-bit vararg on x64 (UB, desyncs later args).
+        CPLog("SetUsageScenario: _EnumerateCredentials returned hr=0x%08X _dwNumCreds=%lu",
+              (unsigned)hr, (unsigned long)_dwNumCreds);
         g_BridgePollActive = true;
         break;
 
@@ -582,8 +584,8 @@ HRESULT CDdsProvider::GetCredentialCount(
     }
 
     *pdwCount = (_dwNumCreds > 0) ? (DWORD)_dwNumCreds : 0;
-    CPLog("GetCredentialCount: pdwCount=%lu _dwNumCreds=%zu ddsUserCount=%d",
-          (unsigned long)*pdwCount, _dwNumCreds, g_ddsUsers.count);
+    CPLog("GetCredentialCount: pdwCount=%lu _dwNumCreds=%lu ddsUserCount=%d",
+          (unsigned long)*pdwCount, (unsigned long)_dwNumCreds, g_ddsUsers.count);
     if (*pdwCount > 0)
     {
         if (_dwSetSerializationCred != CREDENTIAL_PROVIDER_NO_DEFAULT)
@@ -652,11 +654,14 @@ HRESULT CDdsProvider::_EnumerateOneCredential(
     OutputDebugString(L"_EnumerateOneCredential()\n");
     HRESULT hr;
 
-    // AUDIT-2026-06-11 #7: hard bound the index to the array capacity. The
-    // _rgpCredentials array has exactly MAX_CREDENTIALS slots; writing past it
-    // is an out-of-bounds pointer write in SYSTEM-context LogonUI. Callers cap
-    // the loop, but enforce it here too so no path can overflow the array.
-    if (dwCredentialIndex >= MAX_CREDENTIALS)
+    // AUDIT-2026-06-11 #7 / AUDIT-2026-06-12 R1 follow-up: hard bound the
+    // write cursor to the array capacity. The _rgpCredentials array has
+    // exactly MAX_CREDENTIALS slots; writing past it is an out-of-bounds
+    // pointer write in SYSTEM-context LogonUI. The slot is appended densely
+    // at _dwNumCreds (dwCredentialIndex is a log label only — see below), so
+    // the cursor is the value that must stay in bounds. Callers cap their
+    // loops, but enforce it here too so no path can overflow the array.
+    if (_dwNumCreds >= MAX_CREDENTIALS)
     {
         return E_INVALIDARG;
     }
@@ -683,7 +688,16 @@ HRESULT CDdsProvider::_EnumerateOneCredential(
 
         if (SUCCEEDED(hr))
         {
-            _rgpCredentials[dwCredentialIndex] = ppc;
+            // AUDIT-2026-06-12 R1 follow-up: append densely at _dwNumCreds
+            // instead of trusting dwCredentialIndex. The caller's loop
+            // advances its index even when Initialize fails, so indexed
+            // writes could leave holes: a slot skipped on failure keeps
+            // whatever pointer the release loop left behind while
+            // _dwNumCreds counts later successes past it — and
+            // GetCredentialAt(hole) would QueryInterface a freed pointer in
+            // SYSTEM-context LogonUI. Dense appends make holes structurally
+            // impossible: slots [0, _dwNumCreds) are always live.
+            _rgpCredentials[_dwNumCreds] = ppc;
             _dwNumCreds++;
         }
         else
@@ -703,16 +717,30 @@ HRESULT CDdsProvider::_EnumerateOneCredential(
 HRESULT CDdsProvider::_EnumerateCredentials()
 {
     OutputDebugString(L"_EnumerateCredentials()\n");
-    CPLog("_EnumerateCredentials: start ddsUserCount=%d numCreds=%zu", g_ddsUsers.count, _dwNumCreds);
+    CPLog("_EnumerateCredentials: start ddsUserCount=%d numCreds=%lu",
+          g_ddsUsers.count, (unsigned long)_dwNumCreds);
 
     for (size_t i = 0; i < _dwNumCreds; i++)
     {
         if (_rgpCredentials[i] != NULL)
         {
             _rgpCredentials[i]->Release();
+            // AUDIT-2026-06-12 R1 follow-up: NULL the slot after Release. A
+            // freed pointer left behind here is what turned a later mid-loop
+            // Initialize failure into a use-after-free hole (see the
+            // dense-append rationale in _EnumerateOneCredential).
+            _rgpCredentials[i] = NULL;
         }
     }
     _dwNumCreds = 0;
+    // AUDIT-2026-06-12 R1 follow-up: the loop above destroyed the
+    // SetSerialization tile along with every other tile, so the index that
+    // labeled it must not survive re-enumeration. A stale index (a) blocks
+    // GetCredentialCount's `_dwSetSerializationCred == NO_DEFAULT` check from
+    // re-creating the tile for a still-pending _pkiulSetSerialization blob,
+    // and (b) lets a second SetSerialization call Release a legitimate user
+    // tile that now occupies the stale slot.
+    _dwSetSerializationCred = CREDENTIAL_PROVIDER_NO_DEFAULT;
 
     // If g_ddsUsers is empty, attempt an inline load from the bridge.
     if (g_ddsUsers.count == 0)
@@ -756,13 +784,14 @@ HRESULT CDdsProvider::_EnumerateCredentials()
     if (g_ddsUsers.count > 0) {
         DWORD credIdx = 0;
         for (int i = 0; i < g_ddsUsers.count; i++) {
-            // AUDIT-2026-06-11 #7: _rgpCredentials holds only MAX_CREDENTIALS
-            // (3) slots, but g_ddsUsers can carry up to MAX_DDS_USERS (5).
-            // _EnumerateOneCredential writes _rgpCredentials[credIdx] and
-            // increments, so without this cap a 4th/5th non-admin user would
-            // write past the array end in SYSTEM-context LogonUI. Stop
-            // enumerating once the array is full.
-            if (credIdx >= MAX_CREDENTIALS)
+            // AUDIT-2026-06-11 #7 / AUDIT-2026-06-12 R1 follow-up:
+            // _rgpCredentials holds only MAX_CREDENTIALS (3) slots, but
+            // g_ddsUsers can carry up to MAX_DDS_USERS (5). Stop enumerating
+            // once the array is full. The bound is _dwNumCreds (the dense
+            // append cursor _EnumerateOneCredential actually writes at), not
+            // credIdx — the two diverge when an Initialize fails, and credIdx
+            // is only a log label.
+            if (_dwNumCreds >= MAX_CREDENTIALS)
                 break;
             // Skip admin accounts — they don't log into Windows
             std::wstring urn(g_ddsUsers.users[i].subjectUrn);
@@ -821,6 +850,25 @@ HRESULT CDdsProvider_CreateInstance(REFIID riid, void** ppv)
 HRESULT CDdsProvider::_EnumerateSetSerialization()
 {
     OutputDebugString(L"_EnumerateSetSerialization()\n");
+
+    // AUDIT-2026-06-12 R1: hard bound the append to the array capacity. The
+    // _rgpCredentials array has exactly MAX_CREDENTIALS slots, and
+    // GetCredentialCount runs _EnumerateCredentials() (which can legitimately
+    // fill all MAX_CREDENTIALS of them) before calling this function in the
+    // same pass — so with a full tile set plus a pending SetSerialization
+    // blob, the unguarded append would write _rgpCredentials[MAX_CREDENTIALS],
+    // an out-of-bounds pointer write in SYSTEM-context LogonUI, and the
+    // bumped _dwNumCreds would drive the destructor's Release() over a wild
+    // pointer. Enforce the bound before any allocation so the refusal path
+    // cannot leak a CDdsCredential.
+    if (_dwNumCreds >= MAX_CREDENTIALS)
+    {
+        CPLog("_EnumerateSetSerialization: credential array full "
+              "(_dwNumCreds=%lu, max=%d) — refusing SetSerialization tile",
+              (unsigned long)_dwNumCreds, MAX_CREDENTIALS);
+        return E_INVALIDARG;
+    }
+
     KERB_INTERACTIVE_LOGON* pkil = &_pkiulSetSerialization->Logon;
 
     // SAFETY: auto-submit with SetSerialization data could push an empty /
@@ -846,6 +894,13 @@ HRESULT CDdsProvider::_EnumerateSetSerialization()
                     _rgpCredentials[_dwNumCreds] = pCred;
                     _dwSetSerializationCred = _dwNumCreds;
                     _dwNumCreds++;
+                }
+                else
+                {
+                    // AUDIT-2026-06-12 R1 follow-up: the slot was never
+                    // written, so the allocation must be released here —
+                    // mirrors _EnumerateOneCredential's failure path.
+                    pCred->Release();
                 }
             }
             else

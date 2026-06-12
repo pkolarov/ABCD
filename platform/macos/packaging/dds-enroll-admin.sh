@@ -12,7 +12,10 @@
 #   1. Runs dds-fido2-test to create a credential and enroll the user
 #   2. Adds the user to trusted_roots in dds.toml
 #   3. Restarts dds-node to pick up the new root
-#   4. Creates a vouch granting the admin session privileges
+#
+# It does NOT mint any vouch — root status comes from the trusted_roots
+# config entry alone. Subsequent vouches go through `dds admin challenge`
+# + `dds admin vouch` (UV-verified FIDO2 assertion required).
 set -euo pipefail
 
 DDS_ROOT="/Library/Application Support/DDS"

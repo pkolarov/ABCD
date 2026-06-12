@@ -1156,6 +1156,15 @@ dds enroll user \
     --authenticator-type cross-platform
 ```
 
+> **Challenge-bound enrollment (A-1, recommended).** The example above
+> runs the legacy path. To close WebAuthn §7.1 step 9 at enrollment, run
+> `dds enroll challenge` first, perform the registration ceremony over the
+> returned challenge, then add `--challenge-id <id>` and
+> `--client-data-json <base64 of the raw clientDataJSON>` to the command.
+> When both are supplied the node consumes the challenge atomically and
+> verifies `type`/`origin`/`challenge`. Omitting both keeps the legacy
+> no-challenge behaviour. `dds admin setup` accepts the same two flags.
+
 ### Enrollment Flow (Windows Credential Provider)
 
 On Windows with the DDS Credential Provider installed:
@@ -1256,12 +1265,34 @@ FIDO2 *assertion* (proof-of-possession): the admin signs a challenge
 with their already-enrolled credential, and `dds-node` issues the vouch
 on their behalf.
 
+> **UV required (v1.4.1).** The node rejects admin-vouch assertions
+> whose User-Verification (UV) flag is not set — a touch (User
+> Presence) alone is not enough; the authenticator must perform
+> PIN or biometric verification during the assertion. This means the
+> vouching admin's credential must live on a UV-capable authenticator
+> with a PIN (or biometric) configured; bare U2F/CTAP1-only keys
+> without a PIN cannot perform admin vouches. (Windows-enrolled admin
+> credentials already require UV at registration time, so any admin
+> enrolled through the tray agent is unaffected.) For scripted or
+> offline flows, `dds group vouch` below remains the non-FIDO2 path.
+
+The ceremony is two steps: fetch a server-issued challenge, perform the
+FIDO2 assertion over it, then submit the assertion outputs together with
+the `challenge_id` (required — the node rejects vouch requests without
+it):
+
 ```bash
+# Step 1: obtain a fresh challenge (returns challenge_id + challenge bytes).
+dds admin challenge
+
+# Step 2: after the authenticator signs the challenge, submit the vouch.
 dds admin vouch \
     --subject-urn urn:vouchsafe:bob.7k3mf9... \
     --credential-id <b64> \
+    --challenge-id <challenge_id from step 1> \
     --authenticator-data <b64> \
     --client-data-hash <b64> \
+    --client-data-json <b64, recommended> \
     --signature <b64> \
     --purpose group:admins
 ```
@@ -1335,10 +1366,16 @@ The `challenge_id` is single-use: a second POST with the same ID is rejected wit
 ### Via CLI
 
 ```bash
+# Step 1: obtain a single-use challenge.
+dds cp --node-url http://127.0.0.1:5551 session-challenge
+
+# Step 2: after the authenticator signs the challenge, assert.
 dds cp --node-url http://127.0.0.1:5551 session-assert \
     --credential-id <b64> \
+    --challenge-id <challenge_id from step 1> \
     --authenticator-data <b64> \
     --client-data-hash <b64> \
+    --client-data-json <b64, recommended> \
     --signature <b64> \
     [--subject-urn urn:vouchsafe:<user>.<hash>]  # optional: assert on behalf of a specific user
     [--duration-secs 3600]                        # optional: session TTL (default 3600 s)
@@ -1435,14 +1472,21 @@ publisher-capability vouch. The supported purposes are:
 | `dds:software-publisher` | `SoftwareAssignment` attestations |
 
 Before an operator identity can publish policy or software, an admin
-must vouch for that identity with the right purpose. Example:
+must vouch for that identity with the right purpose, using the same
+two-step FIDO2 ceremony as any other admin vouch (challenge → UV-verified
+assertion — see "Subsequent vouches" above). Example:
 
 ```bash
 # Assume `alice-ops` is already enrolled as a DDS user.
 # Give her permission to publish Windows policy:
+dds admin challenge
 dds admin vouch \
-    --as-label admin \
-    --subject urn:vouchsafe:alice-ops.7k3mf9... \
+    --subject-urn urn:vouchsafe:alice-ops.7k3mf9... \
+    --credential-id <b64> \
+    --challenge-id <challenge_id> \
+    --authenticator-data <b64> \
+    --client-data-hash <b64> \
+    --signature <b64> \
     --purpose dds:policy-publisher-windows
 ```
 

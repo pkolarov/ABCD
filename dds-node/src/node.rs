@@ -3226,8 +3226,60 @@ impl DdsNode {
         }
         // Phase D.2 + D.3 + D.6: gate rollout evaluation behind K-of-M quorum
         // for self-update manifests arriving via anti-entropy sync.
-        if result.ops_merged > 0 {
-            for payload in &payloads {
+        //
+        // **AUDIT-2026-06-12 R5**: a token may count toward the K-of-M quorum
+        // only when its OWN operation newly merged into the DAG — the same
+        // novelty gate the gossip path enforces (`ingest_operation` reaches
+        // the accumulator only on `dag.insert == Ok(true)`). The constraint
+        // exists because the accumulator entry is removed when quorum fires
+        // and an equal-version manifest passes the C1 anti-rollback gate by
+        // design (reinstall/repair allowance), so quorum counting must be
+        // idempotent per token: `apply_sync_payloads_with_graph` keeps
+        // duplicate-JTI-rejected payloads in the batch (it only tallies the
+        // rejects), and a batch-level `ops_merged > 0` gate would let an
+        // admitted peer re-send the K already-counted, genuinely-signed
+        // tokens of the CURRENT release alongside one novel benign op and
+        // refill the emptied accumulator to quorum — re-running msiexec on
+        // every replay for the full self-update iat window after each
+        // release (fleet service-restart-loop DoS).
+        //
+        // The merged-id lookup must also be alias-proof: crediting any
+        // payload whose op id is in the merged set would let a crafted batch
+        // pair `{op-X, novel-attacker-token}` (which merges op-X) with
+        // `{op-X, replayed-publisher-token}` and launder the replay through
+        // op-X's novelty. An honest responder can never emit two payloads
+        // with the same op id — `build_sync_response` walks a cache keyed by
+        // op id — so an op id occurring more than once in one batch is
+        // crafted by construction and credits nothing (fail closed).
+        if !result.merged_op_ids.is_empty() {
+            let merged_ids: std::collections::HashSet<&str> =
+                result.merged_op_ids.iter().map(String::as_str).collect();
+            // Bounded depth: peer-supplied. Security review I-6.
+            let ops: Vec<Option<Operation>> = payloads
+                .iter()
+                .map(|p| {
+                    dds_core::cbor_bounded::from_reader::<Operation, _>(p.op_bytes.as_slice()).ok()
+                })
+                .collect();
+            let mut op_id_occurrences: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for op in ops.iter().flatten() {
+                *op_id_occurrences.entry(op.id.as_str()).or_insert(0) += 1;
+            }
+            for (payload, op) in payloads.iter().zip(&ops) {
+                let Some(op) = op else { continue };
+                if !merged_ids.contains(op.id.as_str()) {
+                    continue;
+                }
+                if op_id_occurrences.get(op.id.as_str()).copied().unwrap_or(0) != 1 {
+                    warn!(
+                        %peer,
+                        op_id = %op.id,
+                        "sync: op id appears in multiple payloads of one batch — \
+                         refusing self-update quorum credit (AUDIT-2026-06-12 R5)"
+                    );
+                    continue;
+                }
                 if let Ok(token) = Token::from_cbor(&payload.token_bytes) {
                     if token.payload.body_type.as_deref()
                         == Some(dds_domain::body_types::DDS_SELF_UPDATE)
@@ -3936,6 +3988,18 @@ impl DdsNode {
     #[doc(hidden)]
     pub fn has_pending_revocation_rotation_for_tests(&self) -> bool {
         self.pending_revocation_rotation.is_some()
+    }
+
+    /// Read-only view of the Phase D.2 pending self-update quorum
+    /// accumulator (content hash → distinct signer URNs). Test-only —
+    /// lets the **AUDIT-2026-06-12 R5** regression suite observe whether
+    /// a replayed duplicate-JTI sync payload was (wrongly) counted
+    /// toward quorum.
+    #[doc(hidden)]
+    pub fn pending_self_updates_for_tests(
+        &self,
+    ) -> &std::collections::HashMap<[u8; 32], BTreeSet<String>> {
+        &self.pending_self_updates
     }
 
     /// Read-only handle to the epoch-key request cooldown map. Test-only.
@@ -5523,5 +5587,424 @@ mod timing_config_validation_tests {
             }
             Ok(_) => panic!("init must fail when epoch_rotation_secs = 0"),
         }
+    }
+}
+
+#[cfg(test)]
+mod r5_sync_quorum_replay_tests {
+    //! **AUDIT-2026-06-12 R5** — the sync-path self-update quorum must count
+    //! a token only when its OWN op newly merged into the DAG (matching the
+    //! gossip path's novelty gate). The accumulator entry is removed when
+    //! quorum fires and an equal-version manifest passes the C1 anti-rollback
+    //! gate by design (reinstall/repair allowance), so an admitted peer who
+    //! could re-credit the K already-known, genuinely-signed tokens of the
+    //! CURRENT release — by pairing them with one novel benign op so the old
+    //! batch-level `ops_merged > 0` gate opened — would refill the emptied
+    //! accumulator and re-trigger msiexec on every replay for the full
+    //! self-update iat window after each release.
+    //!
+    //! Observability: `pending_self_updates_for_tests` exposes the Phase D.2
+    //! accumulator. A counted signer creates/extends an entry; a fired quorum
+    //! removes it. The replay test asserts the accumulator stays EMPTY after
+    //! a duplicate-token re-delivery — any entry means the replay was counted.
+    //!
+    //! **Env-lock discipline**: same as
+    //! `admission_cert_revocation_epoch_rotation_tests` — `DdsNode::init`
+    //! writes a plaintext `admission_key.bin`, so each test holds
+    //! `TEST_ENV_LOCK` and clears `DDS_REQUIRE_ENCRYPTED_KEYS` first.
+
+    use super::*;
+    use crate::config::{DomainConfig, NetworkConfig, NodeConfig};
+    use crate::identity_store::REQUIRE_ENCRYPTED_KEYS_ENV;
+    use dds_core::token::{TokenPayload, purpose};
+    use dds_domain::DomainDocument;
+    use dds_domain::body_types;
+    use dds_domain::types::{DdsSelfUpdateDocument, ReleaseChannel, RolloutPolicy, SemVer};
+    use rand::rngs::OsRng;
+
+    /// Same shape as the `admission_cert_revocation_epoch_rotation_tests`
+    /// node builder, except `trusted_roots` is caller-supplied (the quorum
+    /// publishers must chain to a trusted root) and `self_update_apply` is
+    /// false so a fired quorum only logs instead of spawning the Phase D.4
+    /// download task.
+    fn make_node(
+        domain_key: &dds_domain::DomainKey,
+        trusted_roots: Vec<String>,
+    ) -> (DdsNode, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let domain = domain_key.domain();
+        let p2p_kp = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = libp2p::PeerId::from(p2p_kp.public());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let cert = domain_key.issue_admission(peer_id.to_string(), now, None);
+        crate::domain_store::save_admission_cert(&data_dir.join("admission.cbor"), &cert).unwrap();
+        let cfg = NodeConfig {
+            data_dir,
+            network: NetworkConfig {
+                listen_addr: "/ip4/127.0.0.1/tcp/0".to_string(),
+                bootstrap_peers: Vec::new(),
+                mdns_enabled: false,
+                heartbeat_secs: 1,
+                idle_timeout_secs: 60,
+                api_addr: "127.0.0.1:0".to_string(),
+                api_auth: Default::default(),
+                allow_legacy_v1_tokens: false,
+                metrics_addr: None,
+                allow_v1_certs: true,
+                admission_key_backend: Default::default(),
+            },
+            org_hash: "test-org".to_string(),
+            domain: DomainConfig {
+                name: domain.name.clone(),
+                id: domain.id.to_string(),
+                pubkey: dds_domain::domain::to_hex(&domain.pubkey),
+                pq_pubkey: None,
+                capabilities: Vec::new(),
+                admission_path: None,
+                audit_log_enabled: false,
+                max_delegation_depth: 5,
+                audit_log_max_entries: 0,
+                audit_log_retention_days: 0,
+                enforce_device_scope_vouch: false,
+                allow_unattested_credentials: false,
+                fido2_allowed_aaguids: Vec::new(),
+                fido2_attestation_roots: Vec::new(),
+                epoch_rotation_secs: 86_400,
+            },
+            trusted_roots,
+            bootstrap_admin_urn: None,
+            identity_path: None,
+            expiry_scan_interval_secs: 60,
+            self_update_apply: false,
+        };
+        let node = DdsNode::init(cfg, p2p_kp).expect("init node");
+        (node, dir)
+    }
+
+    /// Minimal single-thread Tokio runtime, matching the sibling module —
+    /// `DdsNode::init` is driven inside an async context in production.
+    fn run_with_time<F: FnOnce()>(f: F) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async { f() });
+    }
+
+    fn make_attest(ident: &Identity) -> Token {
+        let payload = TokenPayload {
+            iss: ident.id.to_urn(),
+            iss_key: ident.public_key.clone(),
+            jti: format!("attest-{}", ident.id.label()),
+            sub: ident.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: Some(String::from("dds:directory-entry")),
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1000,
+            exp: Some(4102444800), // 2100-01-01
+            body_type: None,
+            body_cbor: None,
+        };
+        Token::sign(payload, &ident.signing_key).unwrap()
+    }
+
+    fn make_vouch(
+        voucher: &Identity,
+        target: &Identity,
+        target_token: &Token,
+        purpose: &str,
+        jti: &str,
+    ) -> Token {
+        let payload = TokenPayload {
+            iss: voucher.id.to_urn(),
+            iss_key: voucher.public_key.clone(),
+            jti: String::from(jti),
+            sub: target.id.to_urn(),
+            kind: TokenKind::Vouch,
+            purpose: Some(String::from(purpose)),
+            vch_iss: Some(target.id.to_urn()),
+            vch_sum: Some(target_token.payload_hash()),
+            revokes: None,
+            iat: 1000,
+            exp: Some(4102444800), // 2100-01-01
+            body_type: None,
+            body_cbor: None,
+        };
+        Token::sign(payload, &voucher.signing_key).unwrap()
+    }
+
+    /// Shared `DdsSelfUpdateDocument` body — both publishers sign the SAME
+    /// content so their tokens accumulate under one content hash.
+    fn self_update_body() -> Vec<u8> {
+        DdsSelfUpdateDocument {
+            channel: ReleaseChannel::Stable,
+            version: SemVer {
+                major: 9,
+                minor: 9,
+                patch: 9,
+            },
+            artifacts: vec![],
+            min_supported_from: None,
+            rollout: RolloutPolicy::Staged {
+                canary_pct: 100,
+                promote_to_full_after_secs: 0,
+                halt_on_health_regression: false,
+            },
+            provenance: None,
+        }
+        .to_cbor()
+        .expect("cbor")
+    }
+
+    /// A publisher-signed self-update Attest with a fresh `iat` (the C1
+    /// replay-window gate runs against the wall clock).
+    fn self_update_token(publisher: &Identity, jti: &str) -> Token {
+        let iat = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let payload = TokenPayload {
+            iss: publisher.id.to_urn(),
+            iss_key: publisher.public_key.clone(),
+            jti: jti.to_string(),
+            sub: publisher.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat,
+            exp: Some(4102444800),
+            body_type: Some(body_types::DDS_SELF_UPDATE.to_string()),
+            body_cbor: Some(self_update_body()),
+        };
+        Token::sign(payload, &publisher.signing_key).expect("sign")
+    }
+
+    fn sync_payload(op_id: &str, token: &Token) -> SyncPayload {
+        let op = Operation {
+            id: op_id.to_string(),
+            author: token.payload.iss.clone(),
+            deps: Vec::new(),
+            data: Vec::new(),
+            timestamp: 0,
+        };
+        let mut op_bytes = Vec::new();
+        ciborium::into_writer(&op, &mut op_bytes).unwrap();
+        SyncPayload {
+            op_bytes,
+            token_bytes: token.to_cbor().unwrap(),
+        }
+    }
+
+    fn sync_response(payloads: Vec<SyncPayload>) -> SyncResponse {
+        SyncResponse {
+            payloads,
+            complete: true,
+            enc_payloads: Vec::new(),
+        }
+    }
+
+    /// Set up a node whose trust graph holds two self-update publishers
+    /// (M=2 ⇒ K=2) chained to a trusted root, plus the publisher identities.
+    fn node_with_two_publishers() -> (DdsNode, tempfile::TempDir, Identity, Identity) {
+        let root = Identity::generate("root", &mut OsRng);
+        let pub1 = Identity::generate("pub1", &mut OsRng);
+        let pub2 = Identity::generate("pub2", &mut OsRng);
+        let dkey = dds_domain::DomainKey::from_secret_bytes("r5-quorum.local", [7u8; 32]);
+        let (node, dir) = make_node(&dkey, vec![root.id.to_urn()]);
+        {
+            let mut g = node.trust_graph.write().unwrap();
+            let a1 = make_attest(&pub1);
+            let a2 = make_attest(&pub2);
+            let v1 = make_vouch(
+                &root,
+                &pub1,
+                &a1,
+                purpose::SELF_UPDATE_PUBLISHER,
+                "r5-vouch-pub1",
+            );
+            let v2 = make_vouch(
+                &root,
+                &pub2,
+                &a2,
+                purpose::SELF_UPDATE_PUBLISHER,
+                "r5-vouch-pub2",
+            );
+            g.add_token(a1).unwrap();
+            g.add_token(a2).unwrap();
+            g.add_token(v1).unwrap();
+            g.add_token(v2).unwrap();
+            assert_eq!(
+                g.count_purpose_holders(purpose::SELF_UPDATE_PUBLISHER, &node.trusted_roots),
+                2,
+                "fixture: both publishers must count toward M"
+            );
+        }
+        (node, dir, pub1, pub2)
+    }
+
+    /// Positive path (guards against over-tightening): K publisher tokens
+    /// delivered across TWO separate sync batches still reach quorum — each
+    /// token's op merges as novel in its own batch, so each is counted.
+    #[test]
+    fn k_tokens_across_two_sync_batches_reach_quorum() {
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let (mut node, _dir, pub1, pub2) = node_with_two_publishers();
+            let peer = PeerId::random();
+
+            let tok1 = self_update_token(&pub1, "r5-su-pub1");
+            let tok2 = self_update_token(&pub2, "r5-su-pub2");
+
+            // Batch 1: first publisher signature — counted, below quorum.
+            node.handle_sync_response_for_tests(
+                peer,
+                sync_response(vec![sync_payload("r5-op-su-1", &tok1)]),
+            );
+            let pending = node.pending_self_updates_for_tests();
+            assert_eq!(
+                pending.len(),
+                1,
+                "first signer must open an accumulator entry"
+            );
+            assert_eq!(
+                pending.values().next().unwrap().len(),
+                1,
+                "exactly one distinct signer counted after batch 1"
+            );
+
+            // Batch 2: second publisher signature — quorum fires (K=2) and
+            // the accumulator entry is removed.
+            node.handle_sync_response_for_tests(
+                peer,
+                sync_response(vec![sync_payload("r5-op-su-2", &tok2)]),
+            );
+            assert!(
+                node.pending_self_updates_for_tests().is_empty(),
+                "quorum must fire across two separate sync batches (entry removed)"
+            );
+        });
+    }
+
+    /// THE R5 REPLAY: after quorum fired once via sync, re-delivering an
+    /// already-counted publisher token (duplicate JTI, op already in the
+    /// DAG) alongside one NOVEL benign op must not credit the replayed
+    /// token again — the batch merges something, but the replayed token's
+    /// own op did not newly merge. Before the fix the batch-level
+    /// `ops_merged > 0` gate re-counted it, refilling the emptied
+    /// accumulator toward a second (equal-version ⇒ C1-passing) apply.
+    #[test]
+    fn replayed_duplicate_token_does_not_recount_toward_quorum() {
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let (mut node, _dir, pub1, pub2) = node_with_two_publishers();
+            let peer = PeerId::random();
+
+            let tok1 = self_update_token(&pub1, "r5-su-pub1");
+            let tok2 = self_update_token(&pub2, "r5-su-pub2");
+            let payload1 = sync_payload("r5-op-su-1", &tok1);
+            let payload2 = sync_payload("r5-op-su-2", &tok2);
+
+            // Reach quorum once (same flow the positive test pins).
+            node.handle_sync_response_for_tests(peer, sync_response(vec![payload1.clone()]));
+            node.handle_sync_response_for_tests(peer, sync_response(vec![payload2]));
+            assert!(
+                node.pending_self_updates_for_tests().is_empty(),
+                "fixture: quorum must have fired and emptied the accumulator"
+            );
+            let ops_before = node.operation_count();
+
+            // The attack batch: replay one already-counted publisher token
+            // plus a novel benign op (a fresh identity attestation) that
+            // opens the old batch-level gate.
+            let benign = Identity::generate("benign", &mut OsRng);
+            let benign_payload = sync_payload("r5-op-benign", &make_attest(&benign));
+            node.handle_sync_response_for_tests(
+                peer,
+                sync_response(vec![payload1, benign_payload]),
+            );
+
+            // The novel op merged — the batch was NOT empty, so the old
+            // `ops_merged > 0` gate would have iterated every payload.
+            assert_eq!(
+                node.operation_count(),
+                ops_before + 1,
+                "the benign op must have merged (the gate the attack pried open)"
+            );
+            // …but the replayed token must not have been counted: any
+            // accumulator entry here means the duplicate re-entered the
+            // quorum count and the reinstall loop is back.
+            assert!(
+                node.pending_self_updates_for_tests().is_empty(),
+                "replayed duplicate-JTI self-update token must NOT re-open \
+                 the quorum accumulator (AUDIT-2026-06-12 R5)"
+            );
+        });
+    }
+
+    /// The op-id ALIAS variant of the R5 replay: a crafted batch pairs a
+    /// replayed publisher token with the op id of a novel attacker payload
+    /// (`{op-X, novel-attacker-token}` + `{op-X, replayed-publisher-token}`)
+    /// so the replayed token's payload bears an op id that DID newly merge.
+    /// An honest responder can never emit duplicate op ids in one batch
+    /// (`build_sync_response` walks an op-id-keyed cache), so the handler
+    /// fails closed on the duplicate and the replay still must not count.
+    #[test]
+    fn aliased_op_id_does_not_launder_replayed_token_into_quorum() {
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let (mut node, _dir, pub1, pub2) = node_with_two_publishers();
+            let peer = PeerId::random();
+
+            let tok1 = self_update_token(&pub1, "r5-su-pub1");
+            let tok2 = self_update_token(&pub2, "r5-su-pub2");
+
+            // Reach quorum once; the accumulator empties.
+            node.handle_sync_response_for_tests(
+                peer,
+                sync_response(vec![sync_payload("r5-op-su-1", &tok1)]),
+            );
+            node.handle_sync_response_for_tests(
+                peer,
+                sync_response(vec![sync_payload("r5-op-su-2", &tok2)]),
+            );
+            assert!(
+                node.pending_self_updates_for_tests().is_empty(),
+                "fixture: quorum must have fired and emptied the accumulator"
+            );
+
+            // The alias batch: a novel attacker token merges op id
+            // "r5-op-alias"; the replayed publisher token rides the same
+            // op id in a second payload.
+            let attacker = Identity::generate("alias-attacker", &mut OsRng);
+            node.handle_sync_response_for_tests(
+                peer,
+                sync_response(vec![
+                    sync_payload("r5-op-alias", &make_attest(&attacker)),
+                    sync_payload("r5-op-alias", &tok1),
+                ]),
+            );
+            assert!(
+                node.pending_self_updates_for_tests().is_empty(),
+                "a replayed token aliased onto a merged op id must NOT be \
+                 credited toward quorum (AUDIT-2026-06-12 R5)"
+            );
+        });
     }
 }

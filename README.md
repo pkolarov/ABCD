@@ -206,7 +206,8 @@ dds policy check --user ... --resource ... --action ... --remote
 dds enroll challenge                     # GET /v1/enroll/challenge — returns challenge_id + challenge_b64url + expires_at
 dds enroll user   --label alice --credential-id <b64url> \
     --attestation-object <b64> --client-data-hash <b64> \
-    --rp-id example.com --display-name "Alice" [--authenticator-type platform|cross-platform]
+    --rp-id example.com --display-name "Alice" [--authenticator-type platform|cross-platform] \
+    [--challenge-id <id>] [--client-data-json <b64>]   # A-1 challenge-bound enrollment (optional; omit both for legacy path)
 dds enroll device --label laptop --device-id <uuid> --hostname lap01 \
     --os windows --os-version 11 \
     [--tpm-ek-hash <hex>] [--org-unit <unit>] [--tag <tag>...]
@@ -215,10 +216,11 @@ dds enroll device --label laptop --device-id <uuid> --hostname lap01 \
 dds admin challenge                      # GET /v1/admin/challenge — returns challenge_id + challenge_b64url + expires_at
 dds admin setup --label root-admin --credential-id <b64url> \
     --attestation-object <b64> --client-data-hash <b64> \
-    --rp-id example.com --display-name "Root" [--authenticator-type platform|cross-platform]
+    --rp-id example.com --display-name "Root" [--authenticator-type platform|cross-platform] \
+    [--challenge-id <id>] [--client-data-json <b64>]   # A-1 challenge-bound enrollment (optional)
 dds admin vouch --subject-urn urn:vouchsafe:bob.<hash> \
-    --credential-id <b64url> --authenticator-data <b64> \
-    --client-data-hash <b64> --signature <b64> [--purpose group:admins]
+    --credential-id <b64url> --challenge-id <id> --authenticator-data <b64> \
+    --client-data-hash <b64> --signature <b64> [--client-data-json <b64>] [--purpose group:admins]
 
 # Audit log
 dds audit list                           # newest first
@@ -243,8 +245,8 @@ dds platform linux   applied   --from-file report.json
 # Credential Provider helpers
 dds cp enrolled-users [--device-urn ...]
 dds cp session-challenge                 # GET /v1/session/challenge — returns challenge_id + challenge_b64url + expires_at
-dds cp session-assert --credential-id ... --authenticator-data ... \
-    --client-data-hash ... --signature ... \
+dds cp session-assert --credential-id ... --challenge-id ... --authenticator-data ... \
+    --client-data-hash ... --signature ... [--client-data-json ...] \
     [--subject-urn urn:vouchsafe:...] [--duration-secs 3600]
 
 # Debugging

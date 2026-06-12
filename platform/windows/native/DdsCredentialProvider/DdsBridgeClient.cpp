@@ -444,10 +444,15 @@ DdsBridgeAuthResult CDdsBridgeClient::WaitForDdsAuthComplete(
                     reinterpret_cast<const IPC_RESP_DDS_AUTH_COMPLETE*>(payload);
                 if (complete->success)
                 {
+                    // AUDIT-2026-06-12 R4: never log password-derived data, in
+                    // any form — the exact plaintext length collapses the
+                    // offline-cracking space and was recorded here on every
+                    // successful logon (sibling of the #12 site). tokenLen
+                    // stays: the session token is server-generated random
+                    // material, so its length carries no user-secret signal.
                     CPLog("WaitForDdsAuthComplete: seqId=%u DDS_AUTH_COMPLETE success=true "
-                          "(pwdLen=%zu tokenLen=%zu) after %lu ms",
+                          "(tokenLen=%zu) after %lu ms",
                           seqId,
-                          wcsnlen(complete->password, IPC_MAX_PASSWORD_LEN),
                           strnlen(complete->session_token, IPC_MAX_SESSION_TOKEN_LEN),
                           (unsigned long)(GetTickCount() - start));
                     result.success         = true;

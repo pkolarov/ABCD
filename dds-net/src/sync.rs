@@ -208,6 +208,18 @@ pub struct SyncResult {
     /// once the consumer (the dds-node sync handler) bumps the counter
     /// off this map.
     pub rejected_by_reason: BTreeMap<SyncRejectReason, usize>,
+    /// `op.id` of every operation that NEWLY merged into the DAG during
+    /// this apply (`dag.insert` returned `Ok(true)`). **AUDIT-2026-06-12
+    /// R5**: callers must gate per-op side effects — specifically the
+    /// self-update K-of-M quorum accumulator — on membership in this set,
+    /// never on the batch-level `ops_merged` count. The payload list is
+    /// not pruned of rejected entries (a duplicate-JTI token is only
+    /// *counted* in `rejected_by_reason`), so `ops_merged > 0` proves
+    /// only that *something* in the batch was novel: a batch pairing one
+    /// novel benign op with replayed already-counted tokens would
+    /// otherwise credit those replays toward fire-once side effects a
+    /// second time.
+    pub merged_op_ids: Vec<String>,
 }
 
 impl SyncResult {
@@ -336,7 +348,10 @@ pub fn apply_sync_payloads(
 
         // Insert operation into DAG
         match dag.insert(op.clone()) {
-            Ok(true) => result.ops_merged += 1,
+            Ok(true) => {
+                result.ops_merged += 1;
+                result.merged_op_ids.push(op.id.clone());
+            }
             Ok(false) => {} // duplicate, skip
             Err(DagError::MissingDependency(_)) => {
                 // Will retry in topological sort pass below
@@ -360,6 +375,7 @@ pub fn apply_sync_payloads(
             match dag.insert(op.clone()) {
                 Ok(true) => {
                     result.ops_merged += 1;
+                    result.merged_op_ids.push(op.id.clone());
                     progress = true;
                 }
                 Ok(false) => {}
@@ -526,6 +542,7 @@ pub fn apply_sync_payloads_with_graph(
             match dag.insert(op.clone()) {
                 Ok(true) => {
                     result.ops_merged += 1;
+                    result.merged_op_ids.push(op.id.clone());
                     progress = true;
                 }
                 Ok(false) => {}
@@ -664,6 +681,10 @@ mod tests {
         assert!(result.errors.is_empty());
         assert!(dag.contains("op-1"));
         assert!(store.has_token(&format!("attest-{}", ident.id.label())));
+        // AUDIT-2026-06-12 R5: the graphless variant reports novel merges
+        // through `merged_op_ids` with the same semantics as the graph-backed
+        // variant.
+        assert_eq!(result.merged_op_ids, vec!["op-1".to_string()]);
     }
 
     /// AUDIT-2026-06-11 #4 — in the graph-backed apply path, an op whose
@@ -726,6 +747,58 @@ mod tests {
             "graph-rejected token's op must NOT enter the DAG (AUDIT #4)"
         );
         assert_eq!(result.ops_merged, 1);
+    }
+
+    /// **AUDIT-2026-06-12 R5** — `merged_op_ids` must contain exactly the
+    /// ops that NEWLY merged into the DAG. First delivery of a payload
+    /// reports its op id; re-delivering the same payload in a later batch
+    /// (duplicate JTI → graph-rejected) must NOT report it again, even when
+    /// a second, novel payload in that same batch merges. The dds-node sync
+    /// handler keys the self-update K-of-M quorum accumulator off this set;
+    /// if a replayed duplicate ever reappears here, the equal-version
+    /// reinstall-loop DoS the field was added to block comes back.
+    #[test]
+    fn merged_op_ids_reports_only_novel_merges() {
+        use dds_core::trust::TrustGraph;
+        let alice = make_identity("alice");
+        let bob = make_identity("bob");
+        let payload_a = SyncPayload {
+            op_bytes: serialize_op(&make_op("op-a", vec![])),
+            token_bytes: make_attest_token(&alice).to_cbor().unwrap(),
+        };
+        let payload_b = SyncPayload {
+            op_bytes: serialize_op(&make_op("op-b", vec![])),
+            token_bytes: make_attest_token(&bob).to_cbor().unwrap(),
+        };
+
+        let mut dag = CausalDag::new();
+        let mut store = MemoryBackend::new();
+        let mut graph = TrustGraph::new();
+
+        // First delivery: payload A's op newly merges and is reported.
+        let first =
+            apply_sync_payloads_with_graph(&[payload_a.clone()], &mut dag, &mut store, &mut graph);
+        assert_eq!(first.ops_merged, 1);
+        assert_eq!(first.merged_op_ids, vec!["op-a".to_string()]);
+
+        // Re-delivery of A (duplicate JTI → graph-rejected) alongside the
+        // novel B: the batch as a whole merges something (`ops_merged > 0`),
+        // but only B's op id may appear in `merged_op_ids`.
+        let second = apply_sync_payloads_with_graph(
+            &[payload_a, payload_b],
+            &mut dag,
+            &mut store,
+            &mut graph,
+        );
+        assert_eq!(second.ops_merged, 1);
+        assert!(
+            second.merged_op_ids.contains(&"op-b".to_string()),
+            "the novel payload's op id must be reported"
+        );
+        assert!(
+            !second.merged_op_ids.contains(&"op-a".to_string()),
+            "the replayed duplicate-JTI payload's op id must NOT be reported (R5)"
+        );
     }
 
     #[test]

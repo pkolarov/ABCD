@@ -2526,9 +2526,10 @@ impl<
 
     /// Admin vouches for an enrolled user. The admin proves presence via
     /// FIDO2 assertion. The node verifies the assertion (UP, RP-ID, challenge
-    /// freshness, and sign-count via `verify_assertion_common`), checks admin
-    /// is a trusted root, loads the admin's persisted signing key, and signs a
-    /// Vouch token granting the subject the requested purpose.
+    /// freshness, and sign-count via `verify_assertion_common`), requires the
+    /// assertion to be user-verified (UV — see AUDIT-2026-06-12 R2), checks
+    /// admin is a trusted root, loads the admin's persisted signing key, and
+    /// signs a Vouch token granting the subject the requested purpose.
     pub fn admin_vouch(
         &mut self,
         req: AdminVouchRequest,
@@ -2543,6 +2544,29 @@ impl<
             &req.authenticator_data,
             &req.signature,
         )?;
+
+        // **AUDIT-2026-06-12 R2**: admin vouching mints durable trust
+        // material (Vouch tokens, including `dds:admin` promotions into
+        // `trusted_roots`), so it must require User Verification (UV —
+        // PIN/biometric, flags bit 0x04), not merely User Presence (UP —
+        // a touch, bit 0x01). The Windows tray client requests
+        // UV=REQUIRED, but a client-side parameter is not a security
+        // boundary: anything that can reach this endpoint can replay a
+        // UP-only assertion from a stolen-but-presence-unlocked admin
+        // authenticator and mint vouches. The "stolen admin key cannot
+        // vouch" guarantee therefore only exists if the node enforces UV
+        // here, server-side. (Session issuance via
+        // `issue_session_from_assertion` is deliberately NOT gated —
+        // it authenticates-and-reflects, surfacing UV downstream as the
+        // session's `mfa_verified` property.)
+        if !out.user_verified {
+            return Err(ServiceError::Fido2(
+                "admin vouch requires a user-verified (UV) assertion: \
+                 user_verified flag not set — presence-only (UP) is \
+                 insufficient for privileged step-up"
+                    .into(),
+            ));
+        }
         let admin_urn = out.subject_urn;
 
         // 7. Check admin is a trusted root.
@@ -4602,12 +4626,14 @@ mod platform_applier_tests {
     ///   has no record of (lookup miss).
     ///
     /// The catalog's `uv` bucket is *not* covered here because
-    /// `verify_assertion_common` does not currently gate on the
+    /// `verify_assertion_common` itself does not gate on the
     /// User-Verified flag; UV is reported through
-    /// [`CommonAssertionOutput::user_verified`] but never causes a
-    /// reject. A future UV-required gate can extend both this test
-    /// and the renderer test side-by-side without renaming the
-    /// metric.
+    /// [`CommonAssertionOutput::user_verified`] and gated by the
+    /// privileged caller (`admin_vouch`, AUDIT-2026-06-12 R2) *after*
+    /// the verifier — and the metric guard — have already exited with
+    /// `result="ok"`. A future in-verifier UV gate can extend both
+    /// this test and the renderer test side-by-side without renaming
+    /// the metric.
     #[test]
     fn verify_assertion_common_advances_each_result_bucket() {
         use dds_domain::fido2::{build_assertion_auth_data, build_packed_self_attestation};
@@ -4854,13 +4880,137 @@ mod platform_applier_tests {
             "other bucket must advance on credential lookup miss"
         );
 
-        // The catalog's `uv` bucket must remain untouched — no
-        // UV-required gate ships today.
+        // The catalog's `uv` bucket must remain untouched — the
+        // UV-required gate (AUDIT-2026-06-12 R2) lives in `admin_vouch`,
+        // downstream of this verifier, so it never reaches this metric.
         assert_eq!(
             handle.fido2_assertions_count("uv"),
             0,
-            "uv bucket is reserved and must not advance until a UV-required gate ships"
+            "uv bucket is reserved for an in-verifier UV gate and must not advance"
         );
+    }
+
+    /// **AUDIT-2026-06-12 R2** — regression: `admin_vouch` must reject a
+    /// cryptographically valid assertion whose User-Verified flag (UV,
+    /// flags bit 0x04) is clear, and accept the identical flow once UV
+    /// is set. The Windows tray client requests UV=REQUIRED at
+    /// getAssertion time, but that lives in the client binary — a
+    /// tampered client can submit a UP-only assertion, so the
+    /// "stolen-but-presence-unlocked admin key cannot vouch" guarantee
+    /// holds only if the node enforces UV server-side at the vouch
+    /// boundary.
+    #[test]
+    fn admin_vouch_rejects_assertion_without_uv() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use dds_domain::fido2::{build_assertion_auth_data, build_packed_self_attestation};
+        use ed25519_dalek::{Signer, SigningKey};
+        use sha2::Digest;
+
+        let (mut svc, _, _) = setup();
+        svc.set_verify_fido2(true);
+        let data_dir = tempfile::tempdir().expect("tempdir for admin_keys");
+        svc.set_data_dir(data_dir.path().to_path_buf());
+
+        // Enroll the vouching admin's FIDO2 credential.
+        let cred_sk = SigningKey::generate(&mut OsRng);
+        let cred_bytes = b"cred-admin-vouch-uv";
+        let rp_id = "dds.local";
+        let attestation = build_packed_self_attestation(rp_id, cred_bytes, &cred_sk, &[0u8; 32]);
+        let cred_id_b64 = URL_SAFE_NO_PAD.encode(cred_bytes);
+        let enrolled = svc
+            .enroll_user(EnrollUserRequest {
+                label: "vouching-admin-uv".into(),
+                credential_id: cred_id_b64.clone(),
+                attestation_object: attestation,
+                client_data_hash: vec![0u8; 32],
+                rp_id: rp_id.into(),
+                display_name: "Vouching Admin".into(),
+                authenticator_type: "platform".into(),
+                challenge_id: None,
+                client_data_json: None,
+            })
+            .expect("admin credential enrollment");
+        let admin_urn = enrolled.urn;
+
+        // Promote the credential owner to bootstrap admin: trusted
+        // root, bootstrap URN (so the H-8 capability gate does not
+        // apply), and a persisted signing key for vouch minting.
+        svc.trusted_roots.insert(admin_urn.clone());
+        svc.set_bootstrap_admin_urn(Some(admin_urn.clone()));
+        let admin_sk = SigningKey::generate(&mut OsRng);
+        svc.store_admin_key(&admin_urn, &admin_sk)
+            .expect("persist admin signing key");
+
+        // The vouch subject needs an attestation in the graph (step 9
+        // of `admin_vouch` computes `vch_sum` from it).
+        let subject = Identity::generate("vouch-subject-uv", &mut OsRng);
+        let subject_urn = subject.id.to_urn();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(make_attest_for_publisher_setup(&subject))
+            .expect("subject attestation");
+
+        // Helper: assemble a full `AdminVouchRequest` around the given
+        // auth_data — fresh challenge, matching clientDataJSON, valid
+        // signature. Everything except the flags byte is held valid so
+        // a reject can only come from the flag gates.
+        let mut next = 0u8;
+        let mut vouch_req =
+            |svc: &mut LocalService<MemoryBackend>, auth_data: Vec<u8>| -> AdminVouchRequest {
+                next += 1;
+                let ch_id = format!("ch-vouch-uv-{next}");
+                let ch_bytes = [0x40 + next; 32];
+                svc.store_mut()
+                    .put_challenge(&ch_id, &ch_bytes, now_epoch() + 600)
+                    .expect("put_challenge");
+                let ch_b64 = URL_SAFE_NO_PAD.encode(ch_bytes);
+                let cdj = format!(
+                    r#"{{"type":"webauthn.get","challenge":"{ch_b64}","origin":"https://{rp_id}"}}"#
+                );
+                let cdh = sha2::Sha256::digest(cdj.as_bytes());
+                let mut signed_msg = Vec::new();
+                signed_msg.extend_from_slice(&auth_data);
+                signed_msg.extend_from_slice(&cdh);
+                let sig = cred_sk.sign(&signed_msg);
+                AdminVouchRequest {
+                    subject_urn: subject_urn.clone(),
+                    credential_id: cred_id_b64.clone(),
+                    challenge_id: ch_id,
+                    client_data_hash: cdh.to_vec(),
+                    client_data_json: Some(cdj.into_bytes()),
+                    authenticator_data: auth_data,
+                    signature: sig.to_bytes().to_vec(),
+                    purpose: None,
+                }
+            };
+
+        // UV clear, UP still set (flags 0x01): the assertion passes the
+        // shared verifier, so the reject must come from the R2 gate.
+        let mut auth_data = build_assertion_auth_data(rp_id, 1);
+        auth_data[32] &= !0x04; // clear UV; UP (0x01) stays set
+        let req = vouch_req(&mut svc, auth_data);
+        let err = svc
+            .admin_vouch(req)
+            .expect_err("UP-only assertion must not mint an admin vouch");
+        match &err {
+            ServiceError::Fido2(msg) => assert!(
+                msg.contains("user-verified (UV)"),
+                "reject must name the UV requirement, got: {msg}"
+            ),
+            other => {
+                panic!("expected ServiceError::Fido2 for UV-clear assertion, got: {other:?}")
+            }
+        }
+
+        // UV set (helper default flags 0x05 = UP|UV): the identical
+        // flow must succeed end-to-end.
+        let req = vouch_req(&mut svc, build_assertion_auth_data(rp_id, 2));
+        let ok = svc
+            .admin_vouch(req)
+            .expect("UV-set assertion must mint the vouch");
+        assert_eq!(ok.subject_urn, subject_urn);
+        assert_eq!(ok.admin_urn, admin_urn);
     }
 
     #[test]

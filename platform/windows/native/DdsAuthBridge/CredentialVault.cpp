@@ -302,11 +302,17 @@ bool CCredentialVault::DecryptPassword(
     const VaultEntry& entry,
     std::wstring& outPassword)
 {
-    FileLog::Writef("DecryptPassword: encPwdLen=%zu ivLen=%zu tagLen=%zu\n",
-        entry.encryptedPassword.size(), entry.iv.size(), entry.authTag.size());
+    FileLog::Writef("DecryptPassword: encPwdEmpty=%d ivLen=%zu tagLen=%zu\n",
+        (int)entry.encryptedPassword.empty(), entry.iv.size(), entry.authTag.size());
     // A-4 (security review): the previous build also logged the first four bytes of
     // the hmac-secret-derived key here. Removed — the size triple above is enough to
     // diagnose vault-entry shape issues without disclosing key material.
+    // AUDIT-2026-06-12 R4: the "size triple" no longer includes the ciphertext
+    // length. AES-256-GCM is a stream construction and the 16-byte auth tag is
+    // stored separately in entry.authTag, so encryptedPassword.size() equals the
+    // plaintext password byte length exactly — logging it IS password-length
+    // logging, which is never allowed in any form. Only an emptiness flag
+    // remains; iv/tag lengths are fixed at 12/16 and disclose nothing.
 
     if (hmacSecretOutput == nullptr || hmacSecretLen != 32)
         return false;
@@ -369,7 +375,11 @@ bool CCredentialVault::DecryptPassword(
         return false;
     }
 
-    FileLog::Writef("DecryptPassword: OK cbResult=%lu\n", cbResult);
+    // AUDIT-2026-06-12 R4: never log password-derived data, in any form —
+    // cbResult is the decrypted plaintext byte count, i.e. the exact password
+    // byte length (GCM adds no padding). A content-free success marker is all
+    // the diagnostic this path needs.
+    FileLog::Writef("DecryptPassword: OK\n");
     // Convert bytes back to wstring
     outPassword.assign(
         reinterpret_cast<const wchar_t*>(plaintext.data()),
