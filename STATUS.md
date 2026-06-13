@@ -1,5 +1,67 @@
 # DDS Implementation Status
 
+## fix(cp): CP-side NgcSvc re-kick + retry closes the secure-desktop WebAuthn 0x8000401A TOCTOU race (256th pass) — 2026-06-13
+
+### Summary
+
+FIDO2 passwordless sign-in failed intermittently at the lock screen with the
+key never being contacted. The CP log showed `WebAuthNAuthenticatorGetAssertion`
+returning `CO_E_RUNAS_LOGON_FAILURE (0x8000401A)` in ~31 ms — far too fast to
+have reached the authenticator. On the secure desktop that HRESULT means the
+WebAuthn UI broker could not DCOM-activate because **NgcSvc** (Microsoft Passport
+Container, which hosts the broker) was not running.
+
+This failure mode and its NgcSvc dependency were already known and partly
+mitigated: the bridge calls `EnsureNgcSvcRunning()` per challenge, and the WiX
+install sets NgcSvc `StartType=Automatic`. The gap this pass closes is a
+**TOCTOU race** the bridge mitigation structurally cannot win: on Hello-less Home
+SKUs NgcSvc idle-stops aggressively, and it can stop again in the sub-second
+window **between** the bridge's revive-and-check and the CP's WebAuthn call. The
+window is on the CP's side of the IPC, so only the CP can close it.
+
+Confirmed live on the ARM64 VM: `authbridge.log` logged
+`EnsureNgcSvcRunning: NgcSvc already running` at the moment of failure (so the
+bridge correctly did not restart it — it *was* running at the bridge's check),
+the CP's call milliseconds later returned `0x8000401A`, and NgcSvc was found
+`Stopped` shortly after. NgcSvc had idle-stopped inside the gap.
+
+- **[DdsBridgeClient.cpp](platform/windows/native/DdsCredentialProvider/DdsBridgeClient.cpp)** —
+  - New static `EnsureNgcSvcRunningCP()`: opens the SCM, `StartService(NgcSvc)`
+    if it is not already `SERVICE_RUNNING`, then polls (3 s cap) until RUNNING
+    and adds a 250 ms settle so the broker's DCOM registration completes before
+    the retry. The CP DLL runs inside LogonUI as SYSTEM, which holds SCM start
+    rights, so the re-kick happens at the tightest possible point — right before
+    the call — rather than across the IPC at the bridge.
+  - `HandleWebAuthnChallenge` now wraps `WebAuthNAuthenticatorGetAssertion` in a
+    two-attempt loop. On **exactly** `CO_E_RUNAS_LOGON_FAILURE` on the first
+    attempt it re-kicks NgcSvc and retries once; any other outcome (success,
+    user cancel, real auth failure) breaks out to the existing handling
+    unchanged. The retry is safe because `0x8000401A` returns *before* the
+    authenticator is contacted — there is no half-completed touch to unwind, so
+    no risk of a double user-presence prompt. The first `0x8000401A` does **not**
+    send `CANCEL_AUTH`, so the bridge worker stays parked on the seqId (its wait
+    is `AUTH_TIMEOUT_MS` = 60 s, vastly more than the ≤3.25 s re-kick) awaiting
+    `DDS_AUTH_RESPONSE`. Each attempt acquires a fresh `WebAuthNGetCancellationId`
+    GUID so cross-thread cancel still targets the in-flight call.
+  - If both attempts still fail with `0x8000401A`, the tile now shows
+    "Windows Hello service is unavailable. Please try again, or sign in with your
+    password." instead of a raw HRESULT.
+
+The bridge-side `EnsureNgcSvcRunning()` and the WiX `StartType=Automatic` +
+`ServiceDependency` remain as the first line of defence; the CP re-kick is the
+backstop for the idle-stop race they cannot observe.
+
+### Files changed
+
+Native: `platform/windows/native/DdsCredentialProvider/DdsBridgeClient.cpp`
+(+1 helper, GetAssertion retry loop, friendly 0x8000401A message). Built clean
+on the `DdsNative.sln` for both `Release|x64` and `Release|ARM64` (0 warnings,
+0 errors). Installed ARM64 DLL verified: correct PE machine (`0xAA64`), exports
+`DllGetClassObject`, and an in-proc CoCreateInstance smoke test loads and
+constructs the provider. `VERSION` 1.4.1 → 1.4.2.
+
+---
+
 ## fix(cli): A-1 challenge-bound enrollment reachable from dds-cli; CLI↔server request surface now drift-free (255th pass) — 2026-06-12
 
 ### Summary

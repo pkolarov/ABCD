@@ -10,16 +10,26 @@
 #include <stdio.h>
 #include <setupapi.h>
 #include <hidsdi.h>
+#include <winsvc.h>       // OpenSCManager / StartService for NgcSvc re-kick
 
 #pragma comment(lib, "webauthn.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "hid.lib")
+#pragma comment(lib, "advapi32.lib")
 
 // Defined in winerror.h on current SDKs; pin a fallback so older SDKs that
 // build the CP DLL still compile the UV-cancel classification below.
 #ifndef NTE_USER_CANCELLED
 #define NTE_USER_CANCELLED ((HRESULT)0x80090036L)
+#endif
+
+// CO_E_RUNAS_LOGON_FAILURE — returned by WebAuthNAuthenticatorGetAssertion on
+// the secure desktop when the WebAuthn UI broker can't DCOM-activate because
+// NgcSvc (Microsoft Passport Container) isn't running. Pin a fallback so the
+// NgcSvc re-kick classification below compiles on SDKs that don't define it.
+#ifndef CO_E_RUNAS_LOGON_FAILURE
+#define CO_E_RUNAS_LOGON_FAILURE ((HRESULT)0x8000401AL)
 #endif
 
 // FIDO Alliance HID usage page for CTAPHID — every USB FIDO2 authenticator
@@ -99,6 +109,96 @@ static std::string Base64UrlEncode(const uint8_t* data, size_t len)
         else if (c == '/') c = '_';
     }
     return out;
+}
+
+// Re-kick NgcSvc (Microsoft Passport Container) from the CP side and confirm
+// it reaches SERVICE_RUNNING.
+//
+// The bridge already revives NgcSvc per challenge in HandleDdsStartAuth, but on
+// Hello-less Home SKUs NgcSvc idle-stops aggressively and can stop again in the
+// sub-second window between that check and this CP's WebAuthn call — making
+// WebAuthNAuthenticatorGetAssertion fail instantly with CO_E_RUNAS_LOGON_FAILURE
+// (0x8000401A) before the key is ever touched. The bridge's check-then-use guard
+// can't close that window because the gap is on *our* side of the IPC.
+//
+// The CP DLL runs inside LogonUI as SYSTEM, which has SCM start rights, so we can
+// start the service ourselves right at the call site — the tightest possible
+// re-kick. Returns true if NgcSvc is RUNNING on return. The brief settle after
+// RUNNING lets the broker's DCOM registration come up before we retry.
+static bool EnsureNgcSvcRunningCP(UINT32 seqId)
+{
+    SC_HANDLE hScm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!hScm)
+    {
+        CPLog("EnsureNgcSvcRunningCP: seqId=%u OpenSCManager failed gle=%lu",
+              seqId, (unsigned long)GetLastError());
+        return false;
+    }
+
+    SC_HANDLE hSvc = OpenServiceW(hScm, L"NgcSvc",
+                                  SERVICE_QUERY_STATUS | SERVICE_START);
+    if (!hSvc)
+    {
+        CPLog("EnsureNgcSvcRunningCP: seqId=%u OpenService NgcSvc failed gle=%lu "
+              "(service not present?)", seqId, (unsigned long)GetLastError());
+        CloseServiceHandle(hScm);
+        return false;
+    }
+
+    SERVICE_STATUS_PROCESS ssp{};
+    DWORD cbNeeded = 0;
+    bool running = false;
+    if (QueryServiceStatusEx(hSvc, SC_STATUS_PROCESS_INFO,
+                             reinterpret_cast<BYTE*>(&ssp), sizeof(ssp), &cbNeeded))
+    {
+        running = (ssp.dwCurrentState == SERVICE_RUNNING);
+    }
+
+    if (!running)
+    {
+        if (!StartServiceW(hSvc, 0, nullptr))
+        {
+            DWORD gle = GetLastError();
+            if (gle == ERROR_SERVICE_ALREADY_RUNNING)
+            {
+                running = true;
+            }
+            else
+            {
+                CPLog("EnsureNgcSvcRunningCP: seqId=%u StartService NgcSvc failed gle=%lu",
+                      seqId, (unsigned long)gle);
+            }
+        }
+    }
+
+    // Poll until RUNNING or a short deadline. Kept under 3s so a stuck SCM can't
+    // push us past the bridge worker's AUTH_TIMEOUT_MS.
+    const DWORD start = GetTickCount();
+    const DWORD deadline = start + 3000;
+    while (!running && GetTickCount() < deadline)
+    {
+        Sleep(75);
+        if (QueryServiceStatusEx(hSvc, SC_STATUS_PROCESS_INFO,
+                                 reinterpret_cast<BYTE*>(&ssp), sizeof(ssp), &cbNeeded) &&
+            ssp.dwCurrentState == SERVICE_RUNNING)
+        {
+            running = true;
+        }
+    }
+
+    // Settle: NgcSvc reaching RUNNING precedes its DCOM broker registering by a
+    // short beat. Without this the immediate retry can still race the broker.
+    if (running)
+        Sleep(250);
+
+    CPLog("EnsureNgcSvcRunningCP: seqId=%u NgcSvc running=%d after %lu ms (state=%lu)",
+          seqId, running ? 1 : 0,
+          (unsigned long)(GetTickCount() - start),
+          (unsigned long)ssp.dwCurrentState);
+
+    CloseServiceHandle(hSvc);
+    CloseServiceHandle(hScm);
+    return running;
 }
 
 CDdsBridgeClient::CDdsBridgeClient()
@@ -840,37 +940,6 @@ bool CDdsBridgeClient::HandleWebAuthnChallenge(
           (unsigned long)hmacSaltValues.cCredWithHmacSecretSaltList,
           rpIdW);
 
-    // Use a cancellation GUID so the CP can abort if needed
-    GUID cancelId = {};
-    HRESULT hrCancel = WebAuthNGetCancellationId(&cancelId);
-    if (SUCCEEDED(hrCancel))
-    {
-        options.pCancellationId = &cancelId;
-        CPLog("HandleWebAuthnChallenge: seqId=%u cancellation GUID acquired "
-              "{%08lX-%04X-%04X-...}",
-              seqId, (unsigned long)cancelId.Data1,
-              (unsigned)cancelId.Data2, (unsigned)cancelId.Data3);
-
-        // Publish under the lock so CancelCurrentWebAuthn() (called from
-        // CDdsCredential::SetDeselected / UnAdvise on a different thread)
-        // can find this GUID and call WebAuthNCancelCurrentOperation,
-        // unblocking the platform API. Cleared in the post-call block
-        // below regardless of success/failure.
-        EnterCriticalSection(&m_csWebAuthn);
-        m_currentCancelId       = cancelId;
-        m_currentWebauthnSeqId  = seqId;
-        m_webauthnInProgress    = TRUE;
-        LeaveCriticalSection(&m_csWebAuthn);
-    }
-    else
-    {
-        CPLog("HandleWebAuthnChallenge: seqId=%u WebAuthNGetCancellationId FAILED hr=0x%08lX "
-              "— continuing without cancellation GUID (cross-thread cancel "
-              "will be unavailable for this attempt)",
-              seqId, (unsigned long)hrCancel);
-    }
-
-    // Call WebAuthNAuthenticatorGetAssertion
     // The CP runs inside LogonUI.exe on the secure desktop, so GetForegroundWindow()
     // gives us the correct HWND for the WebAuthn UI prompt.
     HWND hWndFg = GetForegroundWindow();
@@ -882,33 +951,100 @@ bool CDdsBridgeClient::HandleWebAuthnChallenge(
           hWnd ? IsWindowVisible(hWnd) : 0,
           (unsigned long)GetCurrentProcessId());
 
+    // Call WebAuthNAuthenticatorGetAssertion with a single NgcSvc-revive retry.
+    //
+    // CO_E_RUNAS_LOGON_FAILURE (0x8000401A) means the secure-desktop WebAuthn UI
+    // broker couldn't DCOM-activate because NgcSvc idle-stopped between the
+    // bridge's per-challenge revive and this call (see EnsureNgcSvcRunningCP).
+    // The call returns instantly without ever contacting the key, so retrying is
+    // safe — there's no half-completed authenticator interaction to unwind. On
+    // exactly that error we re-kick NgcSvc here, at the tightest possible point
+    // before the call, and try once more. Any other failure (user cancel, real
+    // auth failure) falls straight through to the error handling below.
     PWEBAUTHN_ASSERTION pAssertion = nullptr;
+    HRESULT hr = E_FAIL;
+    DWORD   callElapsed = 0;
 
-    const DWORD callStart = GetTickCount();
-    CPLog("HandleWebAuthnChallenge: seqId=%u >>> WebAuthNAuthenticatorGetAssertion CALL",
-          seqId);
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        // Fresh cancellation GUID per attempt so cross-thread cancel targets the
+        // in-flight call. Reset pCancellationId so a failed acquire on the retry
+        // doesn't reuse the prior (now invalid) GUID.
+        options.pCancellationId = nullptr;
+        GUID cancelId = {};
+        HRESULT hrCancel = WebAuthNGetCancellationId(&cancelId);
+        if (SUCCEEDED(hrCancel))
+        {
+            options.pCancellationId = &cancelId;
+            CPLog("HandleWebAuthnChallenge: seqId=%u attempt=%d cancellation GUID acquired "
+                  "{%08lX-%04X-%04X-...}",
+                  seqId, attempt, (unsigned long)cancelId.Data1,
+                  (unsigned)cancelId.Data2, (unsigned)cancelId.Data3);
 
-    HRESULT hr = WebAuthNAuthenticatorGetAssertion(
-        hWnd,
-        rpIdW,
-        &clientData,
-        &options,
-        &pAssertion);
+            // Publish under the lock so CancelCurrentWebAuthn() (called from
+            // CDdsCredential::SetDeselected / UnAdvise on a different thread)
+            // can find this GUID and call WebAuthNCancelCurrentOperation,
+            // unblocking the platform API. Cleared in the post-call block
+            // below regardless of success/failure.
+            EnterCriticalSection(&m_csWebAuthn);
+            m_currentCancelId       = cancelId;
+            m_currentWebauthnSeqId  = seqId;
+            m_webauthnInProgress    = TRUE;
+            LeaveCriticalSection(&m_csWebAuthn);
+        }
+        else
+        {
+            CPLog("HandleWebAuthnChallenge: seqId=%u attempt=%d WebAuthNGetCancellationId "
+                  "FAILED hr=0x%08lX — continuing without cancellation GUID (cross-thread "
+                  "cancel will be unavailable for this attempt)",
+                  seqId, attempt, (unsigned long)hrCancel);
+        }
 
-    const DWORD callElapsed = GetTickCount() - callStart;
-    const DWORD gleAfter   = GetLastError();
-    CPLog("HandleWebAuthnChallenge: seqId=%u <<< WebAuthNAuthenticatorGetAssertion RETURN "
-          "hr=0x%08lX pAssertion=%p elapsed=%lu ms GetLastError=%lu",
-          seqId, (unsigned long)hr, (void*)pAssertion,
-          (unsigned long)callElapsed, (unsigned long)gleAfter);
+        const DWORD callStart = GetTickCount();
+        CPLog("HandleWebAuthnChallenge: seqId=%u attempt=%d >>> WebAuthNAuthenticatorGetAssertion CALL",
+              seqId, attempt);
 
-    // Tear down the cross-thread cancel state right away — the call is done,
-    // any further CancelCurrentWebAuthn() invocation should be a no-op.
-    EnterCriticalSection(&m_csWebAuthn);
-    m_webauthnInProgress    = FALSE;
-    m_currentWebauthnSeqId  = 0;
-    m_currentCancelId       = GUID{};
-    LeaveCriticalSection(&m_csWebAuthn);
+        hr = WebAuthNAuthenticatorGetAssertion(
+            hWnd,
+            rpIdW,
+            &clientData,
+            &options,
+            &pAssertion);
+
+        callElapsed = GetTickCount() - callStart;
+        const DWORD gleAfter = GetLastError();
+        CPLog("HandleWebAuthnChallenge: seqId=%u attempt=%d <<< WebAuthNAuthenticatorGetAssertion "
+              "RETURN hr=0x%08lX pAssertion=%p elapsed=%lu ms GetLastError=%lu",
+              seqId, attempt, (unsigned long)hr, (void*)pAssertion,
+              (unsigned long)callElapsed, (unsigned long)gleAfter);
+
+        // Tear down the cross-thread cancel state right away — the call is done,
+        // any further CancelCurrentWebAuthn() invocation should be a no-op.
+        EnterCriticalSection(&m_csWebAuthn);
+        m_webauthnInProgress    = FALSE;
+        m_currentWebauthnSeqId  = 0;
+        m_currentCancelId       = GUID{};
+        LeaveCriticalSection(&m_csWebAuthn);
+
+        // Success, or a failure that isn't the NgcSvc broker case, or we've
+        // already retried once — stop here and let the code below handle it.
+        if ((SUCCEEDED(hr) && pAssertion != nullptr) ||
+            hr != CO_E_RUNAS_LOGON_FAILURE ||
+            attempt == 1)
+        {
+            break;
+        }
+
+        // First attempt hit 0x8000401A: NgcSvc broker unavailable. Re-kick the
+        // service and retry — without sending CANCEL_AUTH, so the bridge worker
+        // stays parked on this seqId waiting for our DDS_AUTH_RESPONSE.
+        CPLog("HandleWebAuthnChallenge: seqId=%u attempt=%d CO_E_RUNAS_LOGON_FAILURE "
+              "(0x8000401A) — NgcSvc broker unavailable; re-kicking NgcSvc and retrying",
+              seqId, attempt);
+        bool ngcUp = EnsureNgcSvcRunningCP(seqId);
+        CPLog("HandleWebAuthnChallenge: seqId=%u NgcSvc re-kick result running=%d — retrying "
+              "WebAuthn assertion", seqId, ngcUp ? 1 : 0);
+    }
 
     if (FAILED(hr) || pAssertion == nullptr)
     {
@@ -966,6 +1102,11 @@ bool CDdsBridgeClient::HandleWebAuthnChallenge(
         wchar_t errMsg[256];
         if (isUserCancel) {
             swprintf_s(errMsg, L"Cancelled. Try again or use a different sign-in.");
+        } else if (hr == CO_E_RUNAS_LOGON_FAILURE) {
+            // Survived the NgcSvc re-kick + retry above and still failed — the
+            // Passport broker is genuinely unavailable on this machine.
+            swprintf_s(errMsg, L"Windows Hello service is unavailable. "
+                               L"Please try again, or sign in with your password.");
         } else {
             swprintf_s(errMsg, L"WebAuthn assertion failed (HRESULT 0x%08lX)", hr);
         }
