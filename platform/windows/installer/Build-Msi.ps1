@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     Orchestrates the full build pipeline:
-      1. Rust binaries (dds-node) via cargo
+      1. Rust binaries (dds-node + dds-cli/dds.exe) via cargo
       2. C++ native components via MSBuild (DdsNative.sln)
       3. .NET Policy Agent via dotnet publish
       4. WiX v5 MSI packaging
@@ -23,8 +23,9 @@
 
 .PARAMETER Version
     MSI product version in Major.Minor.Patch.Build format. When omitted, the
-    last component is auto-bumped from a counter persisted at
-    target\.msi_build_counter so each build produces a strictly-greater
+    Major.Minor.Patch base is read from the repo VERSION file and the last
+    component is auto-bumped from a counter persisted at
+    target\.msi_build_counter, so each build produces a strictly-greater
     version that MajorUpgrade will accept (msiexec /i works without
     REINSTALL=ALL gymnastics). Pass an explicit -Version to override.
 
@@ -99,28 +100,45 @@ if ($Platform -eq "both") {
     $Targets = @($Platform)
 }
 
-# ── Auto-bump build counter when no explicit -Version was supplied ────
-# Each invocation persists an incrementing counter at target\.msi_build_counter
-# and uses 1.0.0.<counter> as the MSI version. This keeps `msiexec /i` happy
-# without REINSTALL=ALL on dev iteration. The counter is uint16-bounded to fit
-# the MSI version field (Major.Minor.Build.Revision are each 0..65535).
+# ── Derive the MSI version when no explicit -Version was supplied ─────
+# The Major.Minor.Patch base comes from the repo VERSION file (the single
+# source of truth, also stamped into binaries and CI). The 4th field
+# auto-bumps from a persisted counter so repeated dev installs of the SAME
+# release each get a strictly-greater ProductVersion (msiexec /i upgrades
+# cleanly without REINSTALL=ALL gymnastics). Windows Installer compares only
+# the first THREE fields for upgrade decisions, so every <base>.<counter>
+# still upgrades over older releases and over prior counters of the same base.
+# The counter is uint16-bounded to fit the MSI version field (each field 0..65535).
 if (-not $PSBoundParameters.ContainsKey('Version')) {
+    $versionFile = Join-Path $RepoRoot "VERSION"
+    $base = "1.1.8"
+    if (Test-Path $versionFile) {
+        $raw = (Get-Content $versionFile -Raw -ErrorAction SilentlyContinue)
+        if ($null -ne $raw -and $raw.Trim() -match '^\d+\.\d+\.\d+$') {
+            $base = $raw.Trim()
+        } else {
+            Write-Warning "VERSION file missing or not Major.Minor.Patch ('$($raw -replace '\s','')'); using base $base"
+        }
+    } else {
+        Write-Warning "VERSION file not found at $versionFile; using base $base"
+    }
+
     $counterFile = Join-Path $RepoRoot "target\.msi_build_counter"
     $counter = 0
     if (Test-Path $counterFile) {
-        $raw = (Get-Content $counterFile -Raw -ErrorAction SilentlyContinue)
-        if ($null -ne $raw -and $raw.Trim() -match '^\d+$') {
-            $counter = [int]$raw.Trim()
+        $rawc = (Get-Content $counterFile -Raw -ErrorAction SilentlyContinue)
+        if ($null -ne $rawc -and $rawc.Trim() -match '^\d+$') {
+            $counter = [int]$rawc.Trim()
         }
     }
     $counter++
     if ($counter -gt 65535) {
-        Write-Warning "Build counter exceeded 65535 -- wrapping to 1. Bump Major/Minor in Build-Msi.ps1 if you need to keep going."
+        Write-Warning "Build counter exceeded 65535 -- wrapping to 1. Bump the base in VERSION if you need to keep going."
         $counter = 1
     }
     New-Item -ItemType Directory -Path (Split-Path $counterFile) -Force | Out-Null
     Set-Content -Path $counterFile -Value $counter -Encoding ASCII -NoNewline
-    $Version = "1.1.8.$counter"
+    $Version = "$base.$counter"
 }
 
 # ── Prerequisite checks ──────────────────────────────────────────
@@ -184,32 +202,40 @@ trust_loopback_tcp_admin = false
 # ── Build functions ───────────────────────────────────────────────
 
 function Build-Rust([string]$target, [string]$stageDir) {
-    Write-Host "`n--- [Rust] Building dds-node for $target ---" -ForegroundColor Green
+    Write-Host "`n--- [Rust] Building dds-node + dds-cli for $target ---" -ForegroundColor Green
 
     # Ensure the target is installed (avoid 2>&1 — PS 5.1 turns native stderr into terminating ErrorRecords)
     & rustup target add $target | Out-Null
 
-    # MSI ships the bootstrap wizard + Bootstrap-DdsDomain.ps1, both of
-    # which call `dds-node init-domain --fido2`. The fido2 cargo feature
-    # is opt-in (gates the ctap-hid-fido2 dep), so it must be explicitly
-    # enabled here or the binary refuses --fido2 with
-    # "Error: --fido2 requires dds-node built with --features fido2".
-    $cargoArgs = @("build", "--package", "dds-node", "--target", $target, "--features", "fido2")
-    if ($Configuration -eq "Release") { $cargoArgs += "--release" }
+    $common = @("build", "--target", $target)
+    if ($Configuration -eq "Release") { $common += "--release" }
 
     Push-Location $RepoRoot
     try {
-        & cargo @cargoArgs
-        if ($LASTEXITCODE -ne 0) { throw "Cargo build failed for target $target" }
+        # dds-node: the MSI ships the bootstrap wizard + Bootstrap-DdsDomain.ps1,
+        # both of which call `dds-node init-domain --fido2`. The fido2 cargo
+        # feature is opt-in (gates the ctap-hid-fido2 dep), so it must be
+        # explicitly enabled here or the binary refuses --fido2 with
+        # "Error: --fido2 requires dds-node built with --features fido2".
+        & cargo @common --package dds-node --features fido2
+        if ($LASTEXITCODE -ne 0) { throw "Cargo build failed for dds-node ($target)" }
+
+        # dds-cli (dds.exe): the MSI's F_Cli feature installs it + a machine PATH
+        # entry, and DdsBundle.wxs hard-references $(var.BuildDir)\dds.exe, so WiX
+        # fails without it. dds-cli has no fido2 feature — build with its defaults.
+        & cargo @common --package dds-cli
+        if ($LASTEXITCODE -ne 0) { throw "Cargo build failed for dds-cli ($target)" }
     } finally {
         Pop-Location
     }
 
-    # Copy binary to stage
+    # Copy binaries to stage
     $profile = if ($Configuration -eq "Release") { "release" } else { "debug" }
-    $src = Join-Path $RepoRoot "target\$target\$profile\dds-node.exe"
-    Copy-Item $src -Destination $stageDir -Force
+    $binDir  = Join-Path $RepoRoot "target\$target\$profile"
+    Copy-Item (Join-Path $binDir "dds-node.exe") -Destination $stageDir -Force
     Write-Host "  -> Staged: $stageDir\dds-node.exe"
+    Copy-Item (Join-Path $binDir "dds.exe") -Destination $stageDir -Force
+    Write-Host "  -> Staged: $stageDir\dds.exe"
 }
 
 function Build-Native([string]$msbuildPlatform, [string]$stageDir, [string]$nativeSuffix) {

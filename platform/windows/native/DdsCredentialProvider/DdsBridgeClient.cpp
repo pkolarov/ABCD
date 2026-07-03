@@ -11,12 +11,14 @@
 #include <setupapi.h>
 #include <hidsdi.h>
 #include <winsvc.h>       // OpenSCManager / StartService for NgcSvc re-kick
+#include <wtsapi32.h>     // WTSEnumerateSessions — interactive-logon probe (0x8000401A)
 
 #pragma comment(lib, "webauthn.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "wtsapi32.lib")
 
 // Defined in winerror.h on current SDKs; pin a fallback so older SDKs that
 // build the CP DLL still compile the UV-cancel classification below.
@@ -24,10 +26,16 @@
 #define NTE_USER_CANCELLED ((HRESULT)0x80090036L)
 #endif
 
-// CO_E_RUNAS_LOGON_FAILURE — returned by WebAuthNAuthenticatorGetAssertion on
-// the secure desktop when the WebAuthn UI broker can't DCOM-activate because
-// NgcSvc (Microsoft Passport Container) isn't running. Pin a fallback so the
-// NgcSvc re-kick classification below compiles on SDKs that don't define it.
+// CO_E_RUNAS_LOGON_FAILURE (0x8000401A) — returned by
+// WebAuthNAuthenticatorGetAssertion on the secure desktop when WebAuthn's
+// internal DCOM activation of the credential-UX broker chain
+// (CredentialUIBroker.exe + shell hosts, all registered RunAs="Interactive
+// User") fails because no interactive logon token exists in the session yet.
+// This is the pre-first-logon cold-boot case: it is NOT a stopped service —
+// NgcSvc ("Microsoft Passport") is already running at every observed failure,
+// and NgcCtnrSvc ("Microsoft Passport Container") is up too. Root-cause
+// analysis 2026-07-02 (see project_fido2_login_status memory). Pin a fallback
+// so the classification below compiles on SDKs that don't define it.
 #ifndef CO_E_RUNAS_LOGON_FAILURE
 #define CO_E_RUNAS_LOGON_FAILURE ((HRESULT)0x8000401AL)
 #endif
@@ -111,20 +119,22 @@ static std::string Base64UrlEncode(const uint8_t* data, size_t len)
     return out;
 }
 
-// Re-kick NgcSvc (Microsoft Passport Container) from the CP side and confirm
-// it reaches SERVICE_RUNNING.
+// Re-kick NgcSvc ("Microsoft Passport") from the CP side and confirm it reaches
+// SERVICE_RUNNING.
 //
-// The bridge already revives NgcSvc per challenge in HandleDdsStartAuth, but on
-// Hello-less Home SKUs NgcSvc idle-stops aggressively and can stop again in the
-// sub-second window between that check and this CP's WebAuthn call — making
-// WebAuthNAuthenticatorGetAssertion fail instantly with CO_E_RUNAS_LOGON_FAILURE
-// (0x8000401A) before the key is ever touched. The bridge's check-then-use guard
-// can't close that window because the gap is on *our* side of the IPC.
+// NOTE (2026-07-02): this addresses only the WARM-session idle-stop race — on
+// Hello-less Home SKUs NgcSvc idle-stops aggressively and can stop between the
+// bridge's per-challenge revive and this CP's WebAuthn call. It does NOT fix the
+// dominant field failure (pre-first-logon cold boot), where NgcSvc is already
+// running and 0x8000401A comes from the Interactive-User UX broker having no
+// logon token to activate under — see AnyInteractiveUserSessionCP() and the
+// terminal-error handling in HandleWebAuthnChallenge. Kept as belt-and-suspenders
+// for the warm case; harmless when NgcSvc is already up (~1ms QueryServiceStatus).
 //
 // The CP DLL runs inside LogonUI as SYSTEM, which has SCM start rights, so we can
-// start the service ourselves right at the call site — the tightest possible
-// re-kick. Returns true if NgcSvc is RUNNING on return. The brief settle after
-// RUNNING lets the broker's DCOM registration come up before we retry.
+// start the service ourselves right at the call site. Returns true if NgcSvc is
+// RUNNING on return. The brief settle after RUNNING lets its DCOM registration
+// come up before we retry.
 static bool EnsureNgcSvcRunningCP(UINT32 seqId)
 {
     SC_HANDLE hScm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
@@ -199,6 +209,57 @@ static bool EnsureNgcSvcRunningCP(UINT32 seqId)
     CloseServiceHandle(hSvc);
     CloseServiceHandle(hScm);
     return running;
+}
+
+// Probe whether any interactive user session currently exists on this machine.
+//
+// This is the discriminator for the 0x8000401A failure. WebAuthn's secure-desktop
+// UX broker (CredentialUIBroker + shell hosts) is registered RunAs="Interactive
+// User", a COM identity that can only be launched once an interactive logon token
+// exists in the session. Before the FIRST interactive logon of a boot, no such
+// token exists, so WebAuthNAuthenticatorGetAssertion's internal DCOM activation
+// fails instantly with CO_E_RUNAS_LOGON_FAILURE — no UI, key never touched.
+// Field forensics (2026-07-02) confirmed: every 0x8000401A occurred in a boot
+// with zero prior interactive logons; every success had a prior logon.
+//
+// Enumerates the session table and logs each entry (for unambiguous field
+// diagnostics); returns TRUE if at least one session carries a non-empty user
+// name (i.e. someone has signed in since boot). Best-effort — on any API failure
+// it logs and returns FALSE, which only makes the message more conservative.
+static BOOL AnyInteractiveUserSessionCP(UINT32 seqId)
+{
+    PWTS_SESSION_INFOW pSessions = nullptr;
+    DWORD count = 0;
+    if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &pSessions, &count))
+    {
+        CPLog("AnyInteractiveUserSessionCP: seqId=%u WTSEnumerateSessions failed gle=%lu",
+              seqId, (unsigned long)GetLastError());
+        return FALSE;
+    }
+
+    BOOL any = FALSE;
+    for (DWORD i = 0; i < count; ++i)
+    {
+        LPWSTR pUser = nullptr;
+        DWORD  cb = 0;
+        std::wstring user;
+        if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE,
+                pSessions[i].SessionId, WTSUserName, &pUser, &cb) && pUser)
+        {
+            user.assign(pUser);
+            WTSFreeMemory(pUser);
+        }
+        if (!user.empty())
+            any = TRUE;
+        CPLog("AnyInteractiveUserSessionCP: seqId=%u session=%lu connectState=%d user='%ls'",
+              seqId, (unsigned long)pSessions[i].SessionId,
+              (int)pSessions[i].State, user.c_str());
+    }
+    WTSFreeMemory(pSessions);
+
+    CPLog("AnyInteractiveUserSessionCP: seqId=%u interactiveUserPresent=%d (sessionCount=%lu)",
+          seqId, any ? 1 : 0, (unsigned long)count);
+    return any;
 }
 
 CDdsBridgeClient::CDdsBridgeClient()
@@ -953,14 +1014,19 @@ bool CDdsBridgeClient::HandleWebAuthnChallenge(
 
     // Call WebAuthNAuthenticatorGetAssertion with a single NgcSvc-revive retry.
     //
-    // CO_E_RUNAS_LOGON_FAILURE (0x8000401A) means the secure-desktop WebAuthn UI
-    // broker couldn't DCOM-activate because NgcSvc idle-stopped between the
-    // bridge's per-challenge revive and this call (see EnsureNgcSvcRunningCP).
-    // The call returns instantly without ever contacting the key, so retrying is
-    // safe — there's no half-completed authenticator interaction to unwind. On
-    // exactly that error we re-kick NgcSvc here, at the tightest possible point
-    // before the call, and try once more. Any other failure (user cancel, real
-    // auth failure) falls straight through to the error handling below.
+    // CO_E_RUNAS_LOGON_FAILURE (0x8000401A) returns instantly without ever
+    // contacting the key, so retrying is safe — there's no half-completed
+    // authenticator interaction to unwind. There are two distinct causes:
+    //   (1) WARM idle-stop race — NgcSvc stopped between the bridge's revive and
+    //       this call; the re-kick below can genuinely recover it.
+    //   (2) COLD pre-first-logon — the Interactive-User UX broker has no logon
+    //       token to activate under; NgcSvc is already running and the re-kick is
+    //       a no-op. This is the dominant field case and is handled at the
+    //       terminal-error branch below (honest message via
+    //       AnyInteractiveUserSessionCP), not curable here.
+    // We re-kick once on the first 0x8000401A (cheap, helps case 1) and retry.
+    // Any other failure (user cancel, real auth failure) falls straight through
+    // to the error handling below.
     PWEBAUTHN_ASSERTION pAssertion = nullptr;
     HRESULT hr = E_FAIL;
     DWORD   callElapsed = 0;
@@ -1035,12 +1101,17 @@ bool CDdsBridgeClient::HandleWebAuthnChallenge(
             break;
         }
 
-        // First attempt hit 0x8000401A: NgcSvc broker unavailable. Re-kick the
-        // service and retry — without sending CANCEL_AUTH, so the bridge worker
-        // stays parked on this seqId waiting for our DDS_AUTH_RESPONSE.
+        // First attempt hit 0x8000401A. Log the interactive-session state now so
+        // the field record shows which cause this is (warm idle-stop vs. cold
+        // pre-first-logon), then re-kick NgcSvc for the warm case and retry —
+        // without sending CANCEL_AUTH, so the bridge worker stays parked on this
+        // seqId waiting for our DDS_AUTH_RESPONSE.
+        BOOL interactivePresent = AnyInteractiveUserSessionCP(seqId);
         CPLog("HandleWebAuthnChallenge: seqId=%u attempt=%d CO_E_RUNAS_LOGON_FAILURE "
-              "(0x8000401A) — NgcSvc broker unavailable; re-kicking NgcSvc and retrying",
-              seqId, attempt);
+              "(0x8000401A) interactiveUserPresent=%d — %s; re-kicking NgcSvc and retrying",
+              seqId, attempt, interactivePresent ? 1 : 0,
+              interactivePresent ? "warm idle-stop race candidate"
+                                 : "pre-first-logon broker-activation failure (re-kick will not help)");
         bool ngcUp = EnsureNgcSvcRunningCP(seqId);
         CPLog("HandleWebAuthnChallenge: seqId=%u NgcSvc re-kick result running=%d — retrying "
               "WebAuthn assertion", seqId, ngcUp ? 1 : 0);
@@ -1048,6 +1119,26 @@ bool CDdsBridgeClient::HandleWebAuthnChallenge(
 
     if (FAILED(hr) || pAssertion == nullptr)
     {
+        // Pre-first-logon broker failure: 0x8000401A means WebAuthn's
+        // Interactive-User UX broker cannot activate here (no interactive logon
+        // token exists yet this boot). WebAuthn simply cannot run — but the bridge
+        // (LocalSystem, session 0) CAN open the FIDO HID device directly and do
+        // the getAssertion via raw CTAP, with no UI broker. Hand off to it instead
+        // of failing. Crucially, do NOT send CANCEL_AUTH: the bridge worker is
+        // parked on this seqId and will perform the assertion itself and send
+        // DDS_AUTH_COMPLETE. We keep waiting (return true).
+        if (hr == CO_E_RUNAS_LOGON_FAILURE)
+        {
+            BOOL fbSent = m_client.SendMessageWithSeqId(
+                IPC_MSG::DDS_CTAP_FALLBACK, seqId, nullptr, 0);
+            CPLog("HandleWebAuthnChallenge: seqId=%u 0x8000401A — requested bridge "
+                  "raw-CTAP fallback (DDS_CTAP_FALLBACK sent=%d)", seqId, (int)fbSent);
+            if (fbSent)
+                return true;  // keep waiting for DDS_AUTH_COMPLETE from the bridge
+            CPLog("HandleWebAuthnChallenge: seqId=%u fallback request failed to send — "
+                  "falling through to error handling", seqId);
+        }
+
         // Common case: user pressed Esc / Cancel in the WebAuthn OS prompt
         // (NTE_USER_CANCELLED / WEBAUTHN_HRESULT_CANCELLED). Send an explicit
         // CANCEL_AUTH to the bridge so it wakes its worker immediately
@@ -1103,10 +1194,21 @@ bool CDdsBridgeClient::HandleWebAuthnChallenge(
         if (isUserCancel) {
             swprintf_s(errMsg, L"Cancelled. Try again or use a different sign-in.");
         } else if (hr == CO_E_RUNAS_LOGON_FAILURE) {
-            // Survived the NgcSvc re-kick + retry above and still failed — the
-            // Passport broker is genuinely unavailable on this machine.
-            swprintf_s(errMsg, L"Windows Hello service is unavailable. "
-                               L"Please try again, or sign in with your password.");
+            // Survived the re-kick + retry and still 0x8000401A. Distinguish the
+            // two causes so the user gets an honest, actionable message rather
+            // than the misleading "Hello unavailable": if NO interactive user
+            // has signed in since boot, this is the pre-first-logon broker case —
+            // the only remedy today is one password sign-in, after which the
+            // Interactive-User broker can activate and the key works.
+            if (!AnyInteractiveUserSessionCP(seqId)) {
+                swprintf_s(errMsg, L"Security-key sign-in isn't ready yet after a "
+                                   L"restart. Sign in once with your Windows "
+                                   L"password — your security key works right after.");
+            } else {
+                swprintf_s(errMsg, L"Windows Hello service is temporarily "
+                                   L"unavailable. Please try again, or sign in "
+                                   L"with your password.");
+            }
         } else {
             swprintf_s(errMsg, L"WebAuthn assertion failed (HRESULT 0x%08lX)", hr);
         }

@@ -1,6 +1,156 @@
 # DDS Implementation Status
 
+## feat(cp): cold-boot FIDO2 login via raw-CTAP fallback + installer fixes (258th pass) — 2026-07-03
+
+### Summary — cold-boot passwordless login now works, verified live
+
+The 257th pass (below) proved the real cause of the lock-screen `0x8000401A`:
+WebAuthn's Interactive-User UX broker cannot activate before the first
+interactive logon of a boot, so `webauthn.dll` cannot be used at the pre-logon
+screen at all. This pass adds the fix and **verifies it on a real hard-power-off
+cold boot** (ARSO chain broken; `interactiveUserPresent=0`): FIDO2 sign-in
+succeeds with no password.
+
+**Root cause of the parity gap, confirmed:** `webauthn.dll`'s hmac-secret path
+applies the WebAuthn PRF salt transform `SHA-256("WebAuthn PRF" || 0x00 || salt)`
+before the CTAP call (stated verbatim in Microsoft's `webauthn.h`; proven by a
+self-test that decrypted the vault only with the transformed salt). The vault is
+therefore sealed under `HMAC(CredRandom, PRF(salt))`.
+
+**The fix — raw CTAP2-over-HID fallback in the bridge.** When the CP's WebAuthn
+call returns `0x8000401A`, it sends `DDS_CTAP_FALLBACK` (0x0066) and keeps
+waiting instead of failing. The bridge — LocalSystem in session 0, which *can*
+open FIDO HID devices directly with no UI broker — performs the getAssertion
+itself (`CtapAuthenticator::GetAssertionWithHmac`, applying the PRF transform),
+fills the auth response exactly as the CP would, and the unchanged downstream
+(POST `/v1/session/assert`, vault decrypt, `DDS_AUTH_COMPLETE`) proceeds.
+
+Live proof (`authbridge.log`, 2026-07-03 cold boot):
+`DdsCtapFallback: seqId=2 — CP requested raw-CTAP getAssertion` →
+`ctap-fallback: assertion OK (uv=1 authDataLen=84 hmac=32)` →
+`dds-node assert OK` → `complete OK`, ~1.15 s, no password.
+
+- New `DdsAuthBridge/ctap2/`: `ctaphid_transport.{h,cpp}` (CTAPHID USB-HID,
+  interruptible), `ctap_authenticator.{h,cpp}` (getAssertion + PRF + hmac),
+  `ctap_selftest.{h,cpp}` (`DdsAuthBridge --ctap-selftest` parity gate).
+- Bridge: `DDS_CTAP_FALLBACK` handler (validates seqId + clientId),
+  `RunCtapFallbackFill`, interruptible cancel path (`m_hCtapCancel`), per-spawn
+  `opToken` so a superseded worker can't recycle the successor's slot, shutdown
+  joins the worker, `CTAP_FALLBACK_TIMEOUT_MS`=45 s.
+- CP: sends `DDS_CTAP_FALLBACK` on `0x8000401A`; honest pre-first-logon message
+  and session diagnostics (from 257th pass) retained.
+
+Two adversarial-review passes (parity self-test; Stage-2 integration) landed
+their confirmed critical/high fixes before ship. Deferred, non-blocking (see
+`docs/fido2-0x8000401A-rootcause.md`): live "touch" tile cue (key blinks
+meanwhile), a narrow non-secret progress-send race, and UV-parity validation on
+a PIN-only (non-bio) key (fails closed).
+
+### Installer fixes (found while packaging 1.5.x)
+
+- **`Build-Msi.ps1` never built `dds-cli`** → WiX failed on missing
+  `stage/<arch>/dds.exe`. `Build-Rust` now builds `dds-node` (with `fido2`) **and**
+  `dds-cli`, staging both.
+- **`Build-Msi.ps1` ignored the VERSION file** (hardcoded `1.1.8.<counter>`), so
+  an unversioned build was a downgrade over shipped releases. It now reads the
+  `Major.Minor.Patch` base from `VERSION` and auto-bumps only the 4th field.
+- **CP-DLL upgrade skip:** `C_CredProvDll` is `Permanent` with a fixed GUID and
+  the DLL has no version resource, so MSI silently skipped replacing
+  `DdsCredentialProvider.dll` on upgrade (the exact 1.1.7 trap, recurred on the
+  1.4.2→1.5.0 upgrade). Bumped the component GUID `...45→...46`; documented that
+  it MUST be bumped on every release that changes the CP DLL.
+
+Full solution builds clean Release ARM64+x64 (0 warnings). `VERSION` 1.5.0 → 1.5.1.
+
+---
+
+## fix(cp): correct 0x8000401A root cause — pre-first-logon Interactive-User broker, not NgcSvc; honest UX + diagnostics (257th pass) — 2026-07-02
+
+### Summary — the 256th-pass diagnosis was wrong
+
+The 256th pass (below) attributed the lock-screen `CO_E_RUNAS_LOGON_FAILURE
+(0x8000401A)` to an **NgcSvc idle-stop TOCTOU race** and shipped a CP-side
+NgcSvc re-kick + retry. **Field evidence collected 2026-07-02 disproves that
+diagnosis and shows the fix does not work.** On this ARM64 Win 11 Home machine,
+`dds_cp.log` records 13 login attempts on 2026-06-14/15 that **all** failed:
+attempt 0 returns `0x8000401A`, the re-kick fires and reports NgcSvc **already
+RUNNING** (state=4), attempt 1 fails identically within 16–47 ms. 0 successes,
+17 days of password fallback since. The single 2026-06-13 "re-verified" success
+was a warm session with prior logons.
+
+**Actual root cause (high confidence, multi-track forensics + Windows-internals
+research + live registry):** `WebAuthNAuthenticatorGetAssertion` on the secure
+desktop internally DCOM-activates the credential-UX broker chain
+(`CredentialUIBroker.exe` + `ShellServiceHost`/`ImmersiveShell`), whose AppIDs
+are all registered **`RunAs="Interactive User"`** (verified in `HKCR\AppID` on
+this machine). That COM identity can only launch once an **interactive logon
+token exists in the session**. Before the **first** interactive logon of a boot,
+none exists, so activation fails instantly with `0x8000401A` — no UI, key never
+blinks (WebAuthN/Operational: `CreateTicket` OK → `Error=0x8000401a`, CTAP
+GetAssertion never dispatched). Perfect discriminator across 26 failing calls /
+6 successes: **failure ⇔ zero prior interactive logon in that boot session.**
+NgcSvc ("Microsoft Passport") is already running at every failure; NgcCtnrSvc
+("Microsoft Passport Container") too. It is not a service problem, so no re-kick
+can fix it. Microsoft states webauthn.dll from a credential provider is
+unsupported; their own Web Sign-In works only by first logging on a throwaway
+`WsiAccount`, and vendors like Yubico use raw CTAP at the logon screen.
+
+**ARSO refinement (live-confirmed 2026-07-02 22:18 and 22:27):** any clean
+restart triggers ARSO auto-relogon (~4 s after boot, Security 4624 LT=2 via
+svchost), so an interactive token exists and FIDO2 succeeds at the first logon
+screen — verified attempt=0 success twice. ARSO is **self-sustaining across
+clean restarts**: the post-restart "login screen" is really the lock screen of
+a hidden ARSO session, so even a restart clicked there re-arms ARSO (verified
+22:26:45 winlogon restart → 22:27:03 ARSO logon → FIDO2 success). The broken
+case is boots with NO ARSO restore: crash/forced power-off boots, a restart
+from the logon screen when no session exists behind it (i.e. following a crash
+boot or a sign-out), or `DisableAutomaticRestartSignOn=1` (common enterprise
+baseline, CIS). All 13 June failures fit. Consumer exposure is low; enterprise
+(ARSO-disabled) exposure is every reboot — Stage 2 remains the production fix.
+
+### This pass (Stage 1 — safe, buildable now; does NOT restore cold-boot passwordless)
+
+- **[DdsBridgeClient.cpp](platform/windows/native/DdsCredentialProvider/DdsBridgeClient.cpp)** —
+  - New `AnyInteractiveUserSessionCP()`: enumerates the WTS session table, logs
+    every session, returns whether any interactive user is signed in. This is the
+    field discriminator for the two `0x8000401A` causes.
+  - On the terminal `0x8000401A`, the tile message is now **honest and
+    actionable**: if no interactive user has signed in since boot it shows
+    *"Security-key sign-in isn't ready yet after a restart. Sign in once with
+    your Windows password — your security key works right after."* instead of the
+    misleading "Windows Hello service is unavailable". The warm case keeps a
+    (temporary-unavailable) retry message.
+  - The first-`0x8000401A` log line now records `interactiveUserPresent` so every
+    future field failure is unambiguous (warm idle-stop vs. cold pre-first-logon).
+  - The NgcSvc re-kick is **retained** as belt-and-suspenders for the genuine
+    warm idle-stop race (harmless when NgcSvc is already up), with corrected
+    comments; it is no longer claimed to fix the cold-boot case.
+
+Built clean on `DdsNative.sln` for `Release|ARM64` and `Release|x64` (0 warnings,
+0 errors). No `VERSION` bump yet — Stage 1 is a UX/diagnostic correction, not the
+functional fix.
+
+### Stage 2 (the real fix, gated) — raw CTAP2-over-HID fallback in DdsAuthBridge
+
+The Interactive-User broker requirement is unfixable from our side pre-first-logon,
+so the plan is a raw CTAP2 fallback: the bridge (LocalSystem, session 0) can open
+FIDO HID devices directly and perform `getAssertion` + hmac-secret without any UI
+broker. The repo already ships most of the stack — `DdsAuthBridge/ctap2/`
+(`ctap2_protocol`, `ctap2_pin_protocol` ECDH+salt, `cbor`), compiled but unused;
+the missing pieces are a CTAPHID transport and a `DDS_CTAP_FALLBACK` IPC message.
+**Hard gate before building it:** prove the raw-CTAP hmac-secret output is
+byte-identical to what webauthn.dll produced at enrollment (UV state must match),
+or every vault password decrypt fails. That parity test requires the user's
+physical key and is the first Stage-2 task. See `docs/fido2-0x8000401A-rootcause.md`.
+
+---
+
 ## fix(cp): CP-side NgcSvc re-kick + retry closes the secure-desktop WebAuthn 0x8000401A TOCTOU race (256th pass) — 2026-06-13
+
+> **SUPERSEDED 2026-07-02 (257th pass, above): this root-cause diagnosis is
+> wrong.** 0x8000401A is a pre-first-logon Interactive-User broker activation
+> failure, not an NgcSvc idle-stop race; the re-kick shipped here does not fix
+> the field failure. Retained for history.
 
 ### Summary
 

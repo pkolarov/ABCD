@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include "DdsAuthBridgeMain.h"
 #include "EventLogger.h"
+#include "ctap2/ctap_selftest.h"
 
 #define SERVICE_NAME         _T("DdsAuthBridge")
 #define SERVICE_DISPLAY_NAME _T("DDS Auth Bridge Service")
@@ -189,6 +190,11 @@ int _tmain(int argc, TCHAR* argv[])
     if (argc > 1 && (_tcscmp(argv[1], _T("--uninstall")) == 0)) return ServiceUninstall() ? 0 : 1;
     if (argc > 1 && (_tcscmp(argv[1], _T("--start"))     == 0)) return ServiceStart()     ? 0 : 1;
     if (argc > 1 && (_tcscmp(argv[1], _T("--stop"))      == 0)) return ServiceStop()      ? 0 : 1;
+
+    // Stage-2 gate: offline raw-CTAP2 hmac-secret parity self-test. Run elevated
+    // with the enrolled security key inserted. Does not touch the service or the
+    // logon path — just proves raw CTAP can reproduce webauthn.dll's hmac-secret.
+    if (argc > 1 && (_tcscmp(argv[1], _T("--ctap-selftest")) == 0)) return RunCtapHmacParitySelfTest();
 
     // Check for --console flag for development/debugging
     if (argc > 1 && (_tcscmp(argv[1], _T("--console")) == 0 || _tcscmp(argv[1], _T("-c")) == 0))

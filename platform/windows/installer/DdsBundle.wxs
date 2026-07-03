@@ -422,8 +422,16 @@
            1.1.x upgrades. The DLL has no VERSIONINFO resource, so MSI
            had no way to detect that the source differed from the target.
            Keeping Permanent="yes" preserves the original ICE09 intent
-           (logonui.exe never sees the file vanish on uninstall). -->
-      <Component Id="C_CredProvDll" Guid="44444444-4444-4444-4444-444444444445" Permanent="yes">
+           (logonui.exe never sees the file vanish on uninstall).
+
+           1.5.0 fix: bumped ...45 -> ...46. The 1.5.0 upgrade over 1.4.2
+           reproduced the exact skip (still ...45 + Permanent + no version
+           resource), so the Stage-2 credential provider had to be copied
+           into System32 by hand. This GUID MUST be bumped on every release
+           that changes DdsCredentialProvider.dll until the DLL carries a
+           real VERSIONINFO resource (the durable fix — then MSI can detect
+           source-vs-target differences and this whole dance goes away). -->
+      <Component Id="C_CredProvDll" Guid="44444444-4444-4444-4444-444444444446" Permanent="yes">
         <File Id="credprov_dll" Source="$(var.BuildDir)\DdsCredentialProvider.dll" KeyPath="yes" />
 
         <!-- COM registration: HKCR\CLSID\{...}\InprocServer32 -->
