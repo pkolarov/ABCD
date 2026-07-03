@@ -162,6 +162,9 @@
     <ClCompile Include="ctap2\cbor.cpp" />
     <ClCompile Include="ctap2\ctap2_protocol.cpp" />
     <ClCompile Include="ctap2\ctap2_pin_protocol.cpp" />
+    <ClCompile Include="ctap2\ctaphid_transport.cpp" />
+    <ClCompile Include="ctap2\ctap_authenticator.cpp" />
+    <ClCompile Include="ctap2\ctap_selftest.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EventLogger.h" />
@@ -169,6 +172,9 @@
     <ClInclude Include="ctap2\cbor.h" />
     <ClInclude Include="ctap2\ctap2_protocol.h" />
     <ClInclude Include="ctap2\ctap2_pin_protocol.h" />
+    <ClInclude Include="ctap2\ctaphid_transport.h" />
+    <ClInclude Include="ctap2\ctap_authenticator.h" />
+    <ClInclude Include="ctap2\ctap_selftest.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\DdsBridgeIPC\DdsBridgeIPC.vcxproj">

@@ -101,9 +101,12 @@ bool CCtapPinProtocol::GetPlatformPublicKeyCbor(std::vector<uint8_t>& outCbor) c
 {
     if (!m_platformPub.valid) return false;
 
+    // COSE_Key labels: 1=kty, 3=alg (both unsigned); -1=crv, -2=x, -3=y.
+    // Insertion order is CTAP2 canonical (1, 3, then the negative labels ordered
+    // -1, -2, -3, whose CBOR encodings 0x20, 0x21, 0x22 sort ascending).
     CborMap m;
     m.push_back({ CborValue::Uint(1),    CborValue::Uint(2)    });  // kty = EC2
-    m.push_back({ CborValue::NegInt(-7), CborValue::NegInt(-25)});  // alg = ECDH-ES+HKDF-256
+    m.push_back({ CborValue::Uint(3),    CborValue::NegInt(-25)});  // alg = ECDH-ES+HKDF-256
     m.push_back({ CborValue::NegInt(-1), CborValue::Uint(1)    });  // crv = P-256
     m.push_back({ CborValue::NegInt(-2), CborValue::Bytes(m_platformPub.x, 32) });
     m.push_back({ CborValue::NegInt(-3), CborValue::Bytes(m_platformPub.y, 32) });

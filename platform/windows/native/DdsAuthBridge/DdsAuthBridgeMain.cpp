@@ -12,6 +12,7 @@
 #include "DdsAuthBridgeMain.h"
 #include "EventLogger.h"
 #include "FileLog.h"
+#include "ctap2/ctap_authenticator.h"  // raw-CTAP fallback (WebAuthn 0x8000401A)
 #include <algorithm>
 #include <ctime>
 #include <string.h>
@@ -430,6 +431,8 @@ CDdsAuthBridgeMain::CDdsAuthBridgeMain()
 {
     m_activeAuth = AuthOperation{};
     m_activeAuth.hResponseEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    m_nextOpToken = 0;
+    m_hCtapCancel = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
     InitializeCriticalSection(&m_csAuth);
     InitializeCriticalSection(&m_csCooldown);
 }
@@ -439,6 +442,8 @@ CDdsAuthBridgeMain::~CDdsAuthBridgeMain()
     Shutdown();
     if (m_activeAuth.hResponseEvent)
         CloseHandle(m_activeAuth.hResponseEvent);
+    if (m_hCtapCancel)
+        CloseHandle(m_hCtapCancel);
     DeleteCriticalSection(&m_csAuth);
     DeleteCriticalSection(&m_csCooldown);
 }
@@ -592,16 +597,27 @@ void CDdsAuthBridgeMain::Shutdown()
         return;
     }
 
-    // Cancel any active auth operation
+    // Cancel any active auth operation and JOIN it to completion before we tear
+    // down (the destructor deletes m_csAuth / closes the events right after). The
+    // CTAP call is interruptible via m_hCtapCancel, so a worker blocked on the
+    // user's touch aborts promptly. Signal under the lock, then join WITHOUT the
+    // lock so the worker's own cleanup (which takes m_csAuth) can run.
     EnterCriticalSection(&m_csAuth);
+    HANDLE oldThread = NULL;
     if (m_activeAuth.hThread != NULL)
     {
         m_activeAuth.cancelled = TRUE;
-        WaitForSingleObject(m_activeAuth.hThread, 5000);
-        CloseHandle(m_activeAuth.hThread);
+        SetEvent(m_activeAuth.hResponseEvent);
+        SetEvent(m_hCtapCancel);
+        oldThread = m_activeAuth.hThread;
         m_activeAuth.hThread = NULL;
     }
     LeaveCriticalSection(&m_csAuth);
+    if (oldThread != NULL)
+    {
+        WaitForSingleObject(oldThread, 10000);
+        CloseHandle(oldThread);
+    }
 
     m_pipeServer.Stop();
 
@@ -835,6 +851,10 @@ BOOL CALLBACK CDdsAuthBridgeMain::OnIpcRequest(
         }
         break;
 
+    case IPC_MSG::DDS_CTAP_FALLBACK:
+        // No payload — the seqId in the header identifies the in-flight auth.
+        return pSelf->HandleDdsCtapFallback(pClientCtx, pHeader->seqId);
+
     case IPC_MSG::DDS_LIST_USERS:
         return pSelf->HandleDdsListUsers(pClientCtx, pHeader->seqId);
 
@@ -948,12 +968,19 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
     {
         FileLog::Write("DdsStartAuth: cancelling stuck previous auth so new request can run\n");
         m_activeAuth.cancelled = TRUE;
-        SetEvent(m_activeAuth.hResponseEvent); // wake the worker so it observes cancelled=TRUE
+        SetEvent(m_activeAuth.hResponseEvent); // wake a worker parked on the event
+        SetEvent(m_hCtapCancel);               // abort a worker blocked in raw-CTAP HID I/O
         HANDLE oldThread = m_activeAuth.hThread;
         m_activeAuth.hThread = NULL; // claim the slot; worker will not double-close
+        UINT64 oldToken = m_activeAuth.opToken;
 
         LeaveCriticalSection(&m_csAuth);
-        WaitForSingleObject(oldThread, 5000);
+        // The CTAP call is now interruptible, so the old worker aborts promptly;
+        // wait to completion so its cleanup runs before we reuse the slot. The
+        // opToken guard in DdsAuthWorkerThread is the backstop if this ever times
+        // out (the abandoned worker then leaves m_activeAuth untouched).
+        (void)oldToken;
+        WaitForSingleObject(oldThread, 10000);
         CloseHandle(oldThread);
         EnterCriticalSection(&m_csAuth);
     }
@@ -1101,7 +1128,10 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
     }
     m_activeAuth.cancelled = FALSE;
     m_activeAuth.responseReceived = FALSE;
+    m_activeAuth.ctapFallback = FALSE;
+    m_activeAuth.opToken = ++m_nextOpToken; // stamp this spawn; teardown checks it
     ResetEvent(m_activeAuth.hResponseEvent);
+    ResetEvent(m_hCtapCancel);              // clear any prior cancel for the new op
     ZeroMemory(&m_activeAuth.responseData, sizeof(m_activeAuth.responseData));
 
     // Spawn worker thread
@@ -1158,6 +1188,43 @@ BOOL CDdsAuthBridgeMain::HandleDdsAuthResponse(
 }
 
 // ============================================================================
+// DDS_CTAP_FALLBACK handler — CP's WebAuthn hit 0x8000401A (pre-first-logon UX
+// broker unavailable); ask the worker to perform the getAssertion itself via raw
+// CTAP over HID. Just flags the active auth and wakes the worker (which owns the
+// challenge details and does the assertion in ExecuteDdsAuth).
+// ============================================================================
+
+BOOL CDdsAuthBridgeMain::HandleDdsCtapFallback(
+    _In_ IPC_CLIENT_CONTEXT* pClientCtx,
+    _In_ UINT32 seqId)
+{
+    FileLog::Writef("DdsCtapFallback: seqId=%u — CP requested raw-CTAP getAssertion\n", seqId);
+
+    EnterCriticalSection(&m_csAuth);
+    // Validate BOTH the seqId and the sender identity: seqId is a per-connection
+    // counter (not globally unique), so a stale/other SYSTEM pipe client could
+    // otherwise match the active op's seqId and divert it onto the CTAP path.
+    // Require the same client slot + clientId that initiated the auth, mirroring
+    // the password-delivery identity check.
+    if (m_activeAuth.hThread == NULL ||
+        m_activeAuth.seqId != seqId ||
+        pClientCtx == nullptr ||
+        pClientCtx != m_activeAuth.pClientCtx ||
+        pClientCtx->clientId != m_activeAuth.clientId)
+    {
+        LeaveCriticalSection(&m_csAuth);
+        SendAuthError(pClientCtx, seqId, IPC_ERROR::SERVICE_ERROR,
+            L"No active auth operation for CTAP fallback");
+        return TRUE;
+    }
+
+    m_activeAuth.ctapFallback = TRUE;
+    SetEvent(m_activeAuth.hResponseEvent);
+    LeaveCriticalSection(&m_csAuth);
+    return TRUE;
+}
+
+// ============================================================================
 // DDS Auth Worker Thread
 // ============================================================================
 
@@ -1171,17 +1238,153 @@ DWORD WINAPI CDdsAuthBridgeMain::DdsAuthWorkerThread(_In_ LPVOID pParam)
 
     pSelf->ExecuteDdsAuth(&op);
 
-    // Clean up — preserve the response event handle across operations
+    // Clean up — but ONLY if m_activeAuth still identifies THIS worker. If we were
+    // superseded (a newer DDS_START_AUTH claimed the slot and already CloseHandle'd
+    // our thread handle), m_activeAuth now belongs to the successor: closing its
+    // handle or resetting its op would corrupt the in-flight successor. The
+    // per-spawn opToken distinguishes us (a reset slot has opToken 0; our op's is
+    // always >= 1). Preserve the response event handle across operations.
     EnterCriticalSection(&pSelf->m_csAuth);
-    HANDLE hEvt = pSelf->m_activeAuth.hResponseEvent;
-    if (pSelf->m_activeAuth.hThread != NULL)
+    if (pSelf->m_activeAuth.opToken == op.opToken)
     {
-        CloseHandle(pSelf->m_activeAuth.hThread);
+        HANDLE hEvt = pSelf->m_activeAuth.hResponseEvent;
+        if (pSelf->m_activeAuth.hThread != NULL)
+            CloseHandle(pSelf->m_activeAuth.hThread);
+        ResetAuthOperation(pSelf->m_activeAuth, hEvt);
     }
-    ResetAuthOperation(pSelf->m_activeAuth, hEvt);
     LeaveCriticalSection(&pSelf->m_csAuth);
 
+    // Wipe this thread's local copy of the response (contains the 32-byte
+    // hmac-secret that unwraps the vault password) on every exit path.
+    SecureZeroMemory(&op.responseData, sizeof(op.responseData));
     return 0;
+}
+
+// SHA-256 helper for the CTAP-fallback clientDataHash.
+static bool Sha256Bytes(const uint8_t* data, size_t len, uint8_t out[32])
+{
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)))
+        return false;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    bool ok = false;
+    if (BCRYPT_SUCCESS(BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0)))
+    {
+        if (BCRYPT_SUCCESS(BCryptHashData(hHash, (PUCHAR)data, (ULONG)len, 0)) &&
+            BCRYPT_SUCCESS(BCryptFinishHash(hHash, out, 32, 0)))
+            ok = true;
+        BCryptDestroyHash(hHash);
+    }
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return ok;
+}
+
+bool CDdsAuthBridgeMain::RunCtapFallbackFill(_In_ AuthOperation* pOp,
+    _In_ const IPC_RESP_DDS_AUTH_CHALLENGE* pChallenge)
+{
+    FileLog::Writef("DdsAuth.worker: seqId=%u CTAP fallback — raw getAssertion via HID\n", pOp->seqId);
+
+    // Build clientDataJSON IDENTICALLY to the CP path (DdsBridgeClient.cpp) so the
+    // server's assertion verification, which reconstructs it from the challenge +
+    // origin, matches byte-for-byte.
+    std::string rpId(pChallenge->rp_id, strnlen(pChallenge->rp_id, sizeof(pChallenge->rp_id)));
+    std::string challengeB64(pChallenge->challenge_b64url,
+        strnlen(pChallenge->challenge_b64url, sizeof(pChallenge->challenge_b64url)));
+    if (rpId.empty() || challengeB64.empty())
+    {
+        SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::SERVICE_ERROR,
+            L"CTAP fallback: missing rpId/challenge");
+        return false;
+    }
+    std::string clientDataJson =
+        "{\"type\":\"webauthn.get\",\"challenge\":\"" + challengeB64 +
+        "\",\"origin\":\"https://" + rpId + "\"}";
+
+    uint8_t clientDataHash[32];
+    if (!Sha256Bytes(reinterpret_cast<const uint8_t*>(clientDataJson.data()),
+                     clientDataJson.size(), clientDataHash))
+    {
+        SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::SERVICE_ERROR,
+            L"CTAP fallback: clientDataHash failed");
+        return false;
+    }
+
+    // Collect (credentialId, rawSalt) pairs — prefer the multi-credential list,
+    // fall back to the legacy single fields.
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> creds;
+    if (pChallenge->cred_count > 0)
+    {
+        DWORD n = pChallenge->cred_count;
+        if (n > (DWORD)IPC_MAX_DDS_AUTH_CREDS) n = (DWORD)IPC_MAX_DDS_AUTH_CREDS;
+        for (DWORD i = 0; i < n; ++i)
+        {
+            const IPC_DDS_AUTH_CRED& c = pChallenge->creds[i];
+            if (c.credential_id_len == 0 || c.salt_len != 32) continue;
+            DWORD idLen = (c.credential_id_len > sizeof(c.credential_id))
+                              ? (DWORD)sizeof(c.credential_id) : c.credential_id_len;
+            creds.emplace_back(
+                std::vector<uint8_t>(c.credential_id, c.credential_id + idLen),
+                std::vector<uint8_t>(c.salt, c.salt + 32));
+        }
+    }
+    if (creds.empty())
+    {
+        DWORD idLen = (pChallenge->credential_id_len > sizeof(pChallenge->credential_id))
+                          ? (DWORD)sizeof(pChallenge->credential_id) : pChallenge->credential_id_len;
+        if (idLen > 0 && pChallenge->salt_len == 32)
+            creds.emplace_back(
+                std::vector<uint8_t>(pChallenge->credential_id, pChallenge->credential_id + idLen),
+                std::vector<uint8_t>(pChallenge->salt, pChallenge->salt + 32));
+    }
+    if (creds.empty())
+    {
+        SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::NO_CREDENTIAL,
+            L"CTAP fallback: no credential with a valid salt");
+        return false;
+    }
+
+    SendAuthProgress(pOp->pClientCtx, pOp->seqId, IPC_AUTH_STATE::USER_PRESENCE,
+        L"Touch your security key...");
+
+    // Use a window strictly shorter than the CP's AUTH_TIMEOUT_MS budget, and make
+    // the call interruptible via m_hCtapCancel (signaled by cancel/supersede/
+    // shutdown) so it can't block for the full timeout after the user gives up.
+    CtapAssertion a = CtapAuthenticator::GetAssertionWithHmac(
+        rpId, clientDataHash, creds, IPC_PIPE::CTAP_FALLBACK_TIMEOUT_MS, m_hCtapCancel);
+    if (!a.success)
+    {
+        FileLog::Writef("DdsAuth.worker: CTAP fallback failed: %s\n", a.error.c_str());
+        UINT32 ec = IPC_ERROR::AUTH_FAILED;
+        const wchar_t* msg = L"Security-key sign-in failed.";
+        if (a.cancelled) { ec = IPC_ERROR::USER_CANCELLED; msg = L"Authentication cancelled"; }
+        else if (a.timedOut) { ec = IPC_ERROR::AUTH_TIMEOUT; msg = L"Timed out waiting for your security key."; }
+        else if (a.noCredentialPresent) { ec = IPC_ERROR::NO_CREDENTIAL; msg = L"Insert the enrolled security key and try again."; }
+        SendAuthError(pOp->pClientCtx, pOp->seqId, ec, msg);
+        return false;
+    }
+
+    // Fill pOp->responseData exactly as the CP's DDS_AUTH_RESPONSE would; the
+    // downstream POST + vault-decrypt path is unchanged.
+    IPC_REQ_DDS_AUTH_RESPONSE& r = pOp->responseData;
+    ZeroMemory(&r, sizeof(r));
+    DWORD adLen = (DWORD)(std::min)(a.authenticatorData.size(), sizeof(r.authenticator_data));
+    memcpy(r.authenticator_data, a.authenticatorData.data(), adLen);
+    r.authenticator_data_len = adLen;
+    DWORD sgLen = (DWORD)(std::min)(a.signature.size(), sizeof(r.signature));
+    memcpy(r.signature, a.signature.data(), sgLen);
+    r.signature_len = sgLen;
+    DWORD ciLen = (DWORD)(std::min)(a.credentialId.size(), sizeof(r.credential_id));
+    memcpy(r.credential_id, a.credentialId.data(), ciLen);
+    r.credential_id_len = ciLen;
+    memcpy(r.hmac_secret, a.hmacSecret.data(), 32);
+    r.hmac_secret_len = 32;
+    memcpy(r.client_data_hash, clientDataHash, 32);
+    strncpy_s(r.challenge_id, sizeof(r.challenge_id), pChallenge->challenge_id, _TRUNCATE);
+
+    FileLog::Writef("DdsAuth.worker: CTAP fallback OK (uv=%d authDataLen=%u sigLen=%u)\n",
+                    a.uvFlag, r.authenticator_data_len, r.signature_len);
+    SecureZeroMemory(a.hmacSecret.data(), a.hmacSecret.size());
+    return true;
 }
 
 void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
@@ -1346,6 +1549,7 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
     EnterCriticalSection(&m_csAuth);
     pOp->cancelled        = m_activeAuth.cancelled;
     pOp->responseReceived = m_activeAuth.responseReceived;
+    bool ctapFallback     = m_activeAuth.ctapFallback;
     if (m_activeAuth.responseReceived)
         memcpy(&pOp->responseData, &m_activeAuth.responseData, sizeof(pOp->responseData));
     LeaveCriticalSection(&m_csAuth);
@@ -1362,20 +1566,36 @@ void CDdsAuthBridgeMain::ExecuteDdsAuth(_In_ AuthOperation* pOp)
         return;
     }
 
-    if (waitResult == WAIT_TIMEOUT)
+    if (ctapFallback)
     {
-        FileLog::Write("DdsAuth.worker: timed out waiting for WebAuthn response from CP\n");
-        SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::AUTH_TIMEOUT,
-            L"Authentication timed out waiting for authenticator");
-        return;
+        // The CP's WebAuthn call returned 0x8000401A — the Interactive-User UX
+        // broker cannot activate before the first interactive logon of a boot.
+        // Perform the getAssertion ourselves via raw CTAP over HID: the bridge
+        // runs as LocalSystem in session 0 and can open the FIDO HID device
+        // directly, with no UI broker. This fills pOp->responseData exactly as a
+        // CP DDS_AUTH_RESPONSE would, then falls through to the normal
+        // POST-to-node + vault-decrypt path below.
+        if (!RunCtapFallbackFill(pOp, &challenge))
+            return; // a specific error was already sent to the CP
+        pOp->responseReceived = TRUE;
     }
-
-    if (!pOp->responseReceived)
+    else
     {
-        FileLog::Write("DdsAuth.worker: response event signaled but no data\n");
-        SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::SERVICE_ERROR,
-            L"Internal error: no response data");
-        return;
+        if (waitResult == WAIT_TIMEOUT)
+        {
+            FileLog::Write("DdsAuth.worker: timed out waiting for WebAuthn response from CP\n");
+            SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::AUTH_TIMEOUT,
+                L"Authentication timed out waiting for authenticator");
+            return;
+        }
+
+        if (!pOp->responseReceived)
+        {
+            FileLog::Write("DdsAuth.worker: response event signaled but no data\n");
+            SendAuthError(pOp->pClientCtx, pOp->seqId, IPC_ERROR::SERVICE_ERROR,
+                L"Internal error: no response data");
+            return;
+        }
     }
 
     const IPC_REQ_DDS_AUTH_RESPONSE* pResp = &pOp->responseData;
@@ -2000,6 +2220,9 @@ BOOL CDdsAuthBridgeMain::HandleCancelAuth(
         // when the user presses Esc in the WebAuthn dialog.
         if (m_activeAuth.hResponseEvent != NULL)
             SetEvent(m_activeAuth.hResponseEvent);
+        // Also abort an in-flight raw-CTAP getAssertion (the worker is blocked in
+        // HID I/O, not on hResponseEvent, during the fallback).
+        SetEvent(m_hCtapCancel);
         FileLog::Write("CancelAuth: cancellation flag set, worker signalled\n");
     }
     else

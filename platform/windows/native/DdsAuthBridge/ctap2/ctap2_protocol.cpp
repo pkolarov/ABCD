@@ -58,18 +58,22 @@ bool CCtap2Protocol::BuildGetAssertionCommand(
         {
             CborMap hmacSecretMap;
 
-            // For simplified implementation: if keyAgreement is provided, include it
+            // Key agreement is a pre-encoded COSE_Key (platform public key).
+            // Decode-and-reembed so it becomes a proper nested CBOR value. A
+            // decode failure must be fatal: silently omitting key 0x01 would send
+            // an hmac-secret extension with no platform key, which the
+            // authenticator rejects and which would be misattributed as a crypto
+            // parity failure rather than the encoding bug it is.
             if (!request.hmacSecretKeyAgreement.empty())
             {
-                // Key agreement is a COSE_Key — we pass the pre-encoded bytes
-                // In a full implementation, this would be constructed from EC public key
                 CborValue keyAgreementVal;
                 CborDecoder decoder;
-                if (decoder.Decode(request.hmacSecretKeyAgreement.data(),
+                if (!decoder.Decode(request.hmacSecretKeyAgreement.data(),
                     request.hmacSecretKeyAgreement.size(), keyAgreementVal))
                 {
-                    hmacSecretMap.push_back({ CborValue::Uint(0x01), keyAgreementVal });
+                    return false;
                 }
+                hmacSecretMap.push_back({ CborValue::Uint(0x01), keyAgreementVal });
             }
 
             hmacSecretMap.push_back({ CborValue::Uint(0x02), CborValue::Bytes(request.hmacSecretSaltEnc) });

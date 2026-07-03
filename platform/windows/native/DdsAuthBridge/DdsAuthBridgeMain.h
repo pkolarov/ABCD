@@ -44,12 +44,18 @@ struct AuthOperation
     BYTE                claimSalt[IPC_MAX_SALT_LEN]; // hmac-secret salt for first claim
     DWORD               claimSaltLen; // Actual claimSalt length
     HANDLE              hThread;    // Worker thread handle
+    UINT64              opToken;    // Unique per-spawn id; a worker only tears down
+                                    // m_activeAuth if it still carries this token
+                                    // (a superseded worker must not recycle the slot)
     volatile BOOL       cancelled;  // Set to TRUE to cancel
 
     // Two-phase challenge/response: set by HandleDdsAuthResponse
     HANDLE              hResponseEvent; // Signaled when CP sends DDS_AUTH_RESPONSE
     IPC_REQ_DDS_AUTH_RESPONSE responseData; // Filled by HandleDdsAuthResponse
     BOOL                responseReceived;   // TRUE once responseData is valid
+    volatile BOOL       ctapFallback;   // TRUE when the CP asked the bridge to run
+                                         // raw-CTAP getAssertion itself (WebAuthn
+                                         // 0x8000401A pre-first-logon fallback)
 };
 
 class CDdsAuthBridgeMain
@@ -83,6 +89,9 @@ private:
     // Active auth operation (one at a time)
     AuthOperation       m_activeAuth;
     CRITICAL_SECTION    m_csAuth;
+    UINT64              m_nextOpToken;  // monotonic; stamped into each spawned op
+    HANDLE              m_hCtapCancel;  // manual-reset; signaled to abort an in-flight
+                                        // raw-CTAP getAssertion (cancel/supersede/shutdown)
 
     // IPC request handler callback
     static BOOL CALLBACK OnIpcRequest(
@@ -100,6 +109,10 @@ private:
         _In_ const BYTE* pPayload, _In_ DWORD payloadLen);
     BOOL HandleDdsAuthResponse(_In_ IPC_CLIENT_CONTEXT* pClientCtx, _In_ UINT32 seqId,
         _In_ const BYTE* pPayload, _In_ DWORD payloadLen);
+    // WebAuthn 0x8000401A pre-first-logon fallback: the CP asks the bridge to run
+    // the getAssertion itself via raw CTAP (no UI broker). Flags the active auth
+    // and wakes the worker, which performs the assertion in ExecuteDdsAuth.
+    BOOL HandleDdsCtapFallback(_In_ IPC_CLIENT_CONTEXT* pClientCtx, _In_ UINT32 seqId);
     BOOL HandleDdsListUsers(_In_ IPC_CLIENT_CONTEXT* pClientCtx, _In_ UINT32 seqId);
 
     // AD-14 — fire-and-forget post-logon NTSTATUS report from CP::ReportResult.
@@ -119,6 +132,13 @@ private:
     // DDS auth worker thread
     static DWORD WINAPI DdsAuthWorkerThread(_In_ LPVOID pParam);
     void ExecuteDdsAuth(_In_ AuthOperation* pOp);
+
+    // Raw-CTAP fallback: perform the getAssertion over HID (no webauthn.dll) and
+    // fill pOp->responseData exactly as a CP DDS_AUTH_RESPONSE would. Sends a
+    // specific IPC error and returns false on failure. `pChallenge` supplies the
+    // credential(s), rpId, salt(s) and server challenge the worker already built.
+    bool RunCtapFallbackFill(_In_ AuthOperation* pOp,
+                             _In_ const IPC_RESP_DDS_AUTH_CHALLENGE* pChallenge);
 
     // Send auth progress notification to client
     void SendAuthProgress(_In_ IPC_CLIENT_CONTEXT* pClientCtx, _In_ UINT32 seqId,

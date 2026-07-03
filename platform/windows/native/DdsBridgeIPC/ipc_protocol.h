@@ -70,6 +70,7 @@ namespace IPC_MSG
     constexpr UINT16 DDS_LIST_USERS         = 0x0062;  // List DDS-enrolled users for a device
     constexpr UINT16 DDS_REPORT_LOGON_RESULT = 0x0064; // CP reports post-logon NTSTATUS (AD-14, fire-and-forget)
     constexpr UINT16 DDS_CLEAR_STALE        = 0x0065;  // Tray clears stale-vault cooldown after refresh (AD-13, fire-and-forget)
+    constexpr UINT16 DDS_CTAP_FALLBACK      = 0x0066;  // CP asks Bridge to run getAssertion via raw CTAP (WebAuthn 0x8000401A pre-first-logon)
 
     // --- Responses (Auth Bridge -> CP) : DDS cloud auth path ---
 
@@ -156,6 +157,11 @@ namespace IPC_PIPE
     constexpr DWORD          PIPE_STATUS_MS         = 2000;    // 2 seconds
     constexpr DWORD          AUTH_TIMEOUT_MS        = 60000;   // 60 seconds
     constexpr DWORD          KEEPALIVE_TIMEOUT_MS   = 30000;   // 30 seconds
+    // Raw-CTAP fallback getAssertion window. Strictly shorter than AUTH_TIMEOUT_MS
+    // so the bridge finishes (and reports success/timeout) before the CP's own
+    // 60 s budget — which has already been partly spent on the failed WebAuthn
+    // attempt — expires. Leaves headroom for the POST + vault decrypt afterward.
+    constexpr DWORD          CTAP_FALLBACK_TIMEOUT_MS = 45000; // 45 seconds
 }
 
 #pragma pack(pop)
