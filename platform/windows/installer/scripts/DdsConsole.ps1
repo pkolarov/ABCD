@@ -1193,7 +1193,11 @@ exit $code
     $script:joinTimer = New-Object System.Windows.Threading.DispatcherTimer
     $script:joinTimer.Interval = [TimeSpan]::FromMilliseconds(700)
     $script:joinTimer.Add_Tick({
-        if ($script:joinProcess.HasExited) {
+        # Guard on the timer still existing: a second tick can be queued on a
+        # busy UI thread before the first nulls the timer; without this the
+        # re-entrant tick calls .Stop() on $null and the exception bubbles up
+        # through ShowDialog() as a spurious post-success crash.
+        if ($script:joinTimer -and $script:joinProcess.HasExited) {
             $script:joinTimer.Stop(); $script:joinTimer = $null
             $code = $script:joinProcess.ExitCode
             if ($code -eq 0 -and (Test-Path $AdmissionCert) -and (Test-Path $DomainTomlFile)) {
@@ -1272,7 +1276,9 @@ function Tick-DeviceEnroll {
             } finally { $fs.Dispose() }
         } catch { }
     }
-    if ($script:deviceEnrollProcess -and $script:deviceEnrollProcess.HasExited) {
+    # Guard on the timer still existing so a re-entrant tick queued before the
+    # first nulls it can't call .Stop() on $null (the post-success crash).
+    if ($script:deviceEnrollTimer -and $script:deviceEnrollProcess -and $script:deviceEnrollProcess.HasExited) {
         $script:deviceEnrollTimer.Stop(); $script:deviceEnrollTimer = $null
         $code = $script:deviceEnrollProcess.ExitCode
         if ($code -eq 0) {
@@ -1412,7 +1418,9 @@ function Tick-EnrollUser {
             } finally { $fs.Dispose() }
         } catch { }
     }
-    if ($script:enrollProcess -and $script:enrollProcess.HasExited) {
+    # Guard on the timer still existing so a re-entrant tick queued before the
+    # first nulls it can't call .Stop() on $null (the post-success crash).
+    if ($script:enrollTimer -and $script:enrollProcess -and $script:enrollProcess.HasExited) {
         $script:enrollTimer.Stop(); $script:enrollTimer = $null
         # Wipe the stdin password file ASAP.
         if ($script:enrollPwTempPath -and (Test-Path $script:enrollPwTempPath)) {
