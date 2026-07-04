@@ -214,6 +214,43 @@ enum PolicyAction {
         #[arg(long)]
         remote: bool,
     },
+    /// Publish a Windows policy document (POST /v1/policy/publish).
+    ///
+    /// The node signs the document with its own identity and gossips it
+    /// to peers. Requires the node to hold the `dds:policy-publisher-windows`
+    /// capability (see `policy publisher-status`).
+    PublishWindows {
+        /// Path to a JSON file containing a WindowsPolicyDocument.
+        #[arg(long)]
+        from_file: PathBuf,
+    },
+    /// Publish a macOS policy document (POST /v1/policy/publish).
+    PublishMacos {
+        /// Path to a JSON file containing a MacOsPolicyDocument.
+        #[arg(long)]
+        from_file: PathBuf,
+    },
+    /// Publish a Linux policy document (POST /v1/policy/publish).
+    PublishLinux {
+        /// Path to a JSON file containing a LinuxPolicyDocument.
+        #[arg(long)]
+        from_file: PathBuf,
+    },
+    /// Show whether this node can publish managed policy, and the
+    /// one-time grant command if not (GET /v1/policy/publisher-status).
+    PublisherStatus {
+        /// Platform to check: windows (default) | macos | linux.
+        #[arg(long, default_value = "windows")]
+        platform: String,
+    },
+    /// Publish this node's identity so an admin can grant it publish
+    /// rights (POST /v1/policy/publisher-init). Run once, then have an
+    /// admin run `dds admin vouch --subject-urn <node> --purpose ...`.
+    PublisherInit {
+        /// Platform capability to prepare: windows (default) | macos | linux.
+        #[arg(long, default_value = "windows")]
+        platform: String,
+    },
 }
 
 // ---- Enroll ----
@@ -803,7 +840,74 @@ async fn handle_policy(action: PolicyAction, node_url: &str) {
                 println!("Policy decision: {decision}");
             }
         }
+        PolicyAction::PublishWindows { from_file } => {
+            publish_policy(node_url, "windows", &from_file).await
+        }
+        PolicyAction::PublishMacos { from_file } => {
+            publish_policy(node_url, "macos", &from_file).await
+        }
+        PolicyAction::PublishLinux { from_file } => {
+            publish_policy(node_url, "linux", &from_file).await
+        }
+        PolicyAction::PublisherStatus { platform } => {
+            let s: PublisherStatusJson =
+                get_json(node_url, "/v1/policy/publisher-status", &[("platform", &platform)]).await;
+            println!("Publisher status ({}):", s.purpose);
+            println!("  Node URN:        {}", s.node_urn);
+            println!("  Trusted root:    {}", s.is_trusted_root);
+            println!("  Has capability:  {}", s.has_capability);
+            println!(
+                "  Can publish:     {}",
+                if s.can_publish { "YES" } else { "NO" }
+            );
+            if !s.can_publish {
+                println!("\nOne-time setup to authorize this node to publish policy:");
+                println!("  1) dds policy publisher-init");
+                println!("  2) {}  (needs an admin security key)", s.grant_command);
+            }
+        }
+        PolicyAction::PublisherInit { platform } => {
+            let path = format!("/v1/policy/publisher-init?platform={platform}");
+            let r: PublisherInitResponse = post_json(node_url, &path, &serde_json::json!({})).await;
+            if r.already_authorized {
+                println!("This node is already authorized to publish policy — nothing to do.");
+            } else {
+                println!("Published this node's identity: {}", r.node_urn);
+                if !r.attestation_jti.is_empty() {
+                    println!("  Attestation JTI: {}", r.attestation_jti);
+                }
+                println!("\nNext, an admin grants publish rights once (needs an admin security key):");
+                println!("  {}", r.grant_command);
+            }
+        }
     }
+}
+
+/// Read a policy document JSON file and POST it to `/v1/policy/publish`.
+async fn publish_policy(node_url: &str, platform: &str, from_file: &Path) {
+    let raw = std::fs::read_to_string(from_file).unwrap_or_else(|e| {
+        eprintln!("Error: cannot read {}: {e}", from_file.display());
+        std::process::exit(1);
+    });
+    let document: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|e| {
+        eprintln!("Error: {} is not valid JSON: {e}", from_file.display());
+        std::process::exit(1);
+    });
+    let req = PolicyPublishRequest {
+        platform: platform.to_string(),
+        document,
+    };
+    let r: PolicyPublishResponse = post_json(node_url, "/v1/policy/publish", &req).await;
+    println!("Published {} policy '{}'", platform, r.policy_id);
+    println!("  Issuer:  {}", r.issuer_urn);
+    println!("  JTI:     {}", r.jti);
+    if r.bootstrapped_capability {
+        println!(
+            "  Note:    node bootstrapped its publisher capability inline ({} tokens gossiped).",
+            r.tokens_published
+        );
+    }
+    println!("Peers will replicate within ~60s (gossip + anti-entropy).");
 }
 
 // ================================================================
@@ -2718,6 +2822,39 @@ struct PolicyRequest {
 struct PolicyResult {
     allowed: bool,
     reason: String,
+}
+
+#[derive(Serialize)]
+struct PolicyPublishRequest {
+    platform: String,
+    document: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct PolicyPublishResponse {
+    policy_id: String,
+    jti: String,
+    issuer_urn: String,
+    tokens_published: usize,
+    bootstrapped_capability: bool,
+}
+
+#[derive(Deserialize)]
+struct PublisherStatusJson {
+    node_urn: String,
+    purpose: String,
+    has_capability: bool,
+    is_trusted_root: bool,
+    can_publish: bool,
+    grant_command: String,
+}
+
+#[derive(Deserialize)]
+struct PublisherInitResponse {
+    node_urn: String,
+    attestation_jti: String,
+    grant_command: String,
+    already_authorized: bool,
 }
 
 #[derive(Deserialize)]

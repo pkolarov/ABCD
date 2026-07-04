@@ -1495,6 +1495,74 @@ also filtered at serve time as defense in depth. Operators migrating
 from a pre-C-3 deployment should vouch their existing publishers
 before the first ingest restart.
 
+### Authoring and publishing policy (Users & Policy)
+
+Policy documents are authored and published locally, then replicate to
+peers via gossip. There are three ways to publish, from most to least
+convenient:
+
+**DDS Console — Users & Policy tab.** The GUI (Start menu → DDS → DDS
+Console, or `DdsConsole.ps1 -Mode UsersPolicy`, or the **Users & Policy…**
+button on the Health tab) provides:
+
+- **New Windows account for a DDS user** — the passwordless first-logon
+  claim. Pick an enrolled user (or paste their subject URN), enter the
+  Windows username / groups / target device, and click **Publish new
+  account policy**. This emits a `WindowsPolicyDocument` whose
+  `local_accounts` entry carries `action: Create` + `claim_subject_urn`
+  (see [Windows First Account Claim](#windows-first-account-claim)).
+- **Author any policy** — a platform picker plus ready-to-edit templates
+  (registry value, service config, password policy, local account) in a
+  JSON editor, published with one click.
+
+A banner at the top shows whether this node is **authorized to publish**
+and, if not, the one-time grant command (see below).
+
+**CLI.** Author a policy document as JSON and publish it:
+
+```bash
+# Publish a Windows/macOS/Linux policy document from a JSON file.
+dds policy publish-windows --from-file claim.json
+dds policy publish-macos   --from-file mac-policy.json
+dds policy publish-linux   --from-file linux-policy.json
+
+# Check whether this node may publish, and how to authorize it if not.
+dds policy publisher-status
+```
+
+**HTTP.** `POST /v1/policy/publish` with `{"platform":"windows","document":{...}}`;
+`GET /v1/policy/publisher-status?platform=windows`. Both are admin-gated.
+
+Under the hood the node signs the document with its own identity into a
+Vouchsafe attestation, applies it to the local trust graph + store, and
+gossips it on the Operations topic; peers ingest it exactly as any other
+attestation (subject to the same C-3 capability gate).
+
+#### Authorizing a node to publish
+
+Because of C-3, the publishing node's URN must hold the matching
+`dds:policy-publisher-*` capability, or its policy is rejected fleet-wide.
+Two cases:
+
+- **The node is a domain trusted root** (e.g. a genesis / admin node whose
+  URN is in `trusted_roots`): it self-vouches the capability inline on the
+  first publish — no setup, fully touchless.
+- **Any other node**: authorize it once. Publish the node's identity so an
+  admin's vouch can bind to it, then have an admin (a trusted root) grant
+  the capability:
+
+  ```bash
+  # 1. On the publishing node — publish its identity (the console does
+  #    this automatically when it detects the node is unauthorized).
+  dds policy publisher-init
+
+  # 2. An admin grants the capability (FIDO2 admin ceremony, one time):
+  dds admin vouch --subject-urn <node-urn> --purpose dds:policy-publisher-windows
+  ```
+
+  After the vouch replicates, the node publishes touchlessly. Until then,
+  `dds policy publish-*` fails closed with a 403 describing these steps.
+
 ### Windows Policy (GPO Equivalent)
 
 DDS distributes Windows policy as `WindowsPolicyDocument` tokens, which are the decentralized equivalent of Group Policy Objects.

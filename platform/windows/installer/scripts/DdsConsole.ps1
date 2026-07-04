@@ -41,7 +41,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Auto','NewDomain','JoinDomain','EnrollUser','Health')]
+    [ValidateSet('Auto','NewDomain','JoinDomain','EnrollUser','Health','UsersPolicy')]
     [string]$Mode        = 'Auto',
     [string]$BundlePath  = '',
     [string]$InstallRoot = "C:\Program Files\DDS",
@@ -104,7 +104,11 @@ $EnrollDeviceScript  = Join-Path $BinDir      "Enroll-DdsDevice.ps1"
 $ResetScript         = Join-Path $BinDir      "Reset-DdsBootstrap.ps1"
 $StateScript         = Join-Path $BinDir      "Get-DdsOnboardingState.ps1"
 $NodeBin             = Join-Path $BinDir      "dds-node.exe"
+$DdsBin              = Join-Path $BinDir      "dds.exe"
 $EnrollUserBin       = Join-Path $BinDir      "dds-enroll-user.exe"
+# The node's local API listens on this named pipe (see node.toml
+# [network].api_addr). The `dds` CLI reaches it with the `pipe:` scheme.
+$NodeUrl             = 'pipe:dds-api'
 $TrayAgent           = Join-Path $BinDir      "DdsTrayAgent.exe"
 $AuthBridgeLog       = Join-Path $DataRoot    "authbridge.log"
 $ProvisionBundle     = Join-Path $DataRoot    "provision.dds"
@@ -142,6 +146,7 @@ function Resolve-InitialPage {
         'JoinDomain' { return 'PageJoinDomain_Bundle' }
         'EnrollUser' { return 'PageEnrollUser_Explainer' }
         'Health'     { return 'PageHealth' }
+        'UsersPolicy' { return 'PagePolicy' }
         default {
             switch ($State.Branch) {
                 'NewDomain'        { return 'PageWelcome' }   # Welcome highlights it.
@@ -575,11 +580,140 @@ function Resolve-InitialPage {
                    TextWrapping="NoWrap" Background="#1e1e1e" Foreground="#dcdcdc"/>
         </GroupBox>
         <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0">
+          <Button x:Name="BtnUsersPolicy" Content="Users &amp; Policy..." Padding="14,4" Margin="4"/>
           <Button x:Name="BtnRefresh" Content="Refresh now" Padding="14,4" Margin="4"/>
           <Button x:Name="BtnTray"    Content="Open Tray Agent" Padding="14,4" Margin="4"/>
           <Button x:Name="BtnStartAll" Content="Start all services" Padding="14,4" Margin="4"/>
           <Button x:Name="BtnStopAll"  Content="Stop all services"  Padding="14,4" Margin="4"/>
         </StackPanel>
+      </Grid>
+
+      <!-- ============ Users & Policy ============ -->
+      <Grid x:Name="PagePolicy" Visibility="Collapsed">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="*"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Publisher authorization banner -->
+        <Border Grid.Row="0" x:Name="PubBanner" Background="#FFF4CE" BorderBrush="#E0C36B"
+                BorderThickness="1" CornerRadius="3" Padding="10" Margin="0,0,0,8">
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" x:Name="TbPubStatus" TextWrapping="Wrap"
+                       VerticalAlignment="Center" Text="Checking publish authorization..."/>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+              <Button x:Name="BtnPubCopyGrant" Content="Copy grant command" Padding="8,3"
+                      Margin="8,0,0,0" Visibility="Collapsed"/>
+              <Button x:Name="BtnPubCheck" Content="Re-check" Padding="8,3" Margin="8,0,0,0"/>
+            </StackPanel>
+          </Grid>
+        </Border>
+
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+          <StackPanel>
+            <!-- New user account (first-account claim) -->
+            <GroupBox Header="New Windows account for a DDS user (passwordless first-logon claim)"
+                      Padding="10" Margin="0,0,0,10">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="160"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="DDS user (subject):"
+                           VerticalAlignment="Center" Margin="0,4"/>
+                <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Margin="0,4">
+                  <ComboBox x:Name="CbClaimSubject" Width="330" IsEditable="False"/>
+                  <Button x:Name="BtnLoadUsers" Content="Refresh users" Padding="8,2" Margin="8,0,0,0"/>
+                </StackPanel>
+
+                <TextBlock Grid.Row="1" Grid.Column="0" Text="Subject URN:"
+                           VerticalAlignment="Center" Margin="0,4"/>
+                <TextBox x:Name="TbClaimSubject" Grid.Row="1" Grid.Column="1" Margin="0,4"
+                         FontFamily="Consolas"/>
+
+                <TextBlock Grid.Row="2" Grid.Column="0" Text="Windows username:"
+                           VerticalAlignment="Center" Margin="0,4"/>
+                <TextBox x:Name="TbAcctUser" Grid.Row="2" Grid.Column="1" Width="220"
+                         HorizontalAlignment="Left" Margin="0,4"/>
+
+                <TextBlock Grid.Row="3" Grid.Column="0" Text="Full name (optional):"
+                           VerticalAlignment="Center" Margin="0,4"/>
+                <TextBox x:Name="TbAcctFullName" Grid.Row="3" Grid.Column="1" Margin="0,4"/>
+
+                <TextBlock Grid.Row="4" Grid.Column="0" Text="Groups (comma-sep):"
+                           VerticalAlignment="Center" Margin="0,4"/>
+                <TextBox x:Name="TbAcctGroups" Grid.Row="4" Grid.Column="1" Margin="0,4"
+                         Text="Users"/>
+
+                <TextBlock Grid.Row="5" Grid.Column="0" Text="Applies to:"
+                           VerticalAlignment="Center" Margin="0,4"/>
+                <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Margin="0,4">
+                  <RadioButton x:Name="RbAcctAllDevices" GroupName="AcctScope" Content="All devices"
+                               IsChecked="True" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                  <RadioButton x:Name="RbAcctDevice" GroupName="AcctScope" Content="Device URN:"
+                               VerticalAlignment="Center" Margin="0,0,6,0"/>
+                  <TextBox x:Name="TbAcctDeviceUrn" Width="260" FontFamily="Consolas"/>
+                  <CheckBox x:Name="CbAcctPwNever" Content="Password never expires"
+                            VerticalAlignment="Center" Margin="16,0,0,0" IsChecked="True"/>
+                </StackPanel>
+
+                <Button x:Name="BtnCreateAccount" Grid.Row="6" Grid.Column="1"
+                        Content="Publish new account policy" HorizontalAlignment="Left"
+                        Padding="14,5" Margin="0,10,0,0"/>
+              </Grid>
+            </GroupBox>
+
+            <!-- Advanced: author any policy from JSON / templates -->
+            <GroupBox Header="Author any policy (registry, services, password, accounts)" Padding="10">
+              <StackPanel>
+                <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                  <TextBlock Text="Platform:" VerticalAlignment="Center"/>
+                  <ComboBox x:Name="CbPlatform" Width="110" Margin="6,0,16,0">
+                    <ComboBoxItem Content="windows" IsSelected="True"/>
+                    <ComboBoxItem Content="macos"/>
+                    <ComboBoxItem Content="linux"/>
+                  </ComboBox>
+                  <TextBlock Text="Template:" VerticalAlignment="Center"/>
+                  <ComboBox x:Name="CbTemplate" Width="200" Margin="6,0,12,0">
+                    <ComboBoxItem Content="Registry value" IsSelected="True"/>
+                    <ComboBoxItem Content="Service config"/>
+                    <ComboBoxItem Content="Password policy"/>
+                    <ComboBoxItem Content="Local account"/>
+                    <ComboBoxItem Content="Empty"/>
+                  </ComboBox>
+                  <Button x:Name="BtnFillTemplate" Content="Insert template" Padding="8,2"/>
+                </StackPanel>
+                <TextBox x:Name="TbPolicyJson" Height="170" AcceptsReturn="True" AcceptsTab="True"
+                         FontFamily="Consolas" FontSize="12" VerticalScrollBarVisibility="Auto"
+                         HorizontalScrollBarVisibility="Auto" TextWrapping="NoWrap"
+                         Background="#1e1e1e" Foreground="#dcdcdc"/>
+                <Button x:Name="BtnPublishJson" Content="Publish policy" HorizontalAlignment="Left"
+                        Padding="14,5" Margin="0,8,0,0"/>
+              </StackPanel>
+            </GroupBox>
+          </StackPanel>
+        </ScrollViewer>
+
+        <GroupBox Grid.Row="2" Header="Output" Margin="0,8,0,0">
+          <TextBox x:Name="TbPolicyLog" Height="96" IsReadOnly="True" FontFamily="Consolas"
+                   FontSize="11" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                   TextWrapping="NoWrap" Background="#1e1e1e" Foreground="#dcdcdc"/>
+        </GroupBox>
       </Grid>
 
       <!-- ============ Error ============ -->
@@ -628,7 +762,12 @@ $names = @(
     'PageNewDomain_Identity','PageNewDomain_KeyProtection','PageNewDomain_Run','PageNewDomain_Done',
     'PageJoinDomain_Bundle','PageJoinDomain_Confirm','PageJoinDomain_DeviceEnroll','PageJoinDomain_Done',
     'PageEnrollUser_Explainer','PageEnrollUser_Password','PageEnrollUser_Touch','PageEnrollUser_AwaitingApproval',
-    'PageHealth','PageError',
+    'PageHealth','PagePolicy','PageError',
+    'PubBanner','TbPubStatus','BtnPubCheck','BtnPubCopyGrant',
+    'CbClaimSubject','BtnLoadUsers','TbClaimSubject','TbAcctUser','TbAcctFullName','TbAcctGroups',
+    'RbAcctAllDevices','RbAcctDevice','TbAcctDeviceUrn','CbAcctPwNever','BtnCreateAccount',
+    'CbPlatform','CbTemplate','BtnFillTemplate','TbPolicyJson','BtnPublishJson','TbPolicyLog',
+    'BtnUsersPolicy',
     'WelcomeDetected','TileNewDomain','TileJoinDomain','TileEnrollUser','TileHealth',
     'ResumeDetail','BtnResumeRestart','BtnResumeNew',
     'TbName','TbOrg','CbForce','TbIdentityWarn',
@@ -658,7 +797,7 @@ $AllPages = @(
     'PageNewDomain_Identity','PageNewDomain_KeyProtection','PageNewDomain_Run','PageNewDomain_Done',
     'PageJoinDomain_Bundle','PageJoinDomain_Confirm','PageJoinDomain_DeviceEnroll','PageJoinDomain_Done',
     'PageEnrollUser_Explainer','PageEnrollUser_Password','PageEnrollUser_Touch','PageEnrollUser_AwaitingApproval',
-    'PageHealth','PageError'
+    'PageHealth','PagePolicy','PageError'
 )
 
 function Show-Page {
@@ -759,6 +898,15 @@ function Update-NavForPage {
             $el.BtnNext.Visibility = 'Hidden'
             $el.BtnBack.IsEnabled = $false
             $el.BtnCancel.Content = 'Close'
+        }
+        'PagePolicy' {
+            $el.HdrSubtitle.Text = 'Users & Policy'
+            $el.BtnNext.Visibility = 'Hidden'
+            # Back returns to Health when we came from there; otherwise Close.
+            $el.BtnBack.IsEnabled = ($script:pageStack.Count -gt 0)
+            $el.BtnCancel.Content = 'Close'
+            # Refresh live state on entry (publisher authorization + user list).
+            Enter-PolicyPage
         }
         'PageError' {
             $el.HdrSubtitle.Text = 'Error'
@@ -1493,6 +1641,306 @@ $el.BtnStopAll.add_Click({
         try { Stop-Service -Name $svc -Force -ErrorAction Stop } catch { }
     }
     Refresh-Health
+})
+
+# ── Users & Policy page ───────────────────────────────────────────
+$script:pubGrantCmd       = ''
+$script:policyUsersLoaded = $false
+$script:pubInitTried      = $false
+
+function Get-ComboText {
+    param($Cb)
+    if ($Cb -and $Cb.SelectedItem) { return [string]$Cb.SelectedItem.Content }
+    return ''
+}
+
+# Run the `dds` CLI, capturing stdout/stderr and the exit code without
+# tripping $ErrorActionPreference='Stop' (native stderr via `2>&1` would).
+function Invoke-DdsCli {
+    param([string[]]$DdsArgs)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName  = $DdsBin
+    $psi.Arguments = (($DdsArgs | ForEach-Object {
+        if ($_ -match '\s') { '"' + $_ + '"' } else { $_ }
+    }) -join ' ')
+    $psi.UseShellExecute        = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow         = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    # Drain stdout asynchronously while reading stderr, so a child that fills
+    # one pipe buffer can't deadlock against the parent reading the other.
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $err = $p.StandardError.ReadToEnd()
+    $p.WaitForExit()
+    $out = $outTask.GetAwaiter().GetResult()
+    return [pscustomobject]@{ ExitCode = $p.ExitCode; Out = $out; Err = $err }
+}
+
+function Refresh-PublisherStatus {
+    $amber  = [Windows.Media.BrushConverter]::new().ConvertFromString('#FFF4CE')
+    $amberB = [Windows.Media.BrushConverter]::new().ConvertFromString('#E0C36B')
+    $green  = [Windows.Media.BrushConverter]::new().ConvertFromString('#DFF6DD')
+    $greenB = [Windows.Media.BrushConverter]::new().ConvertFromString('#6BB700')
+    try {
+        $body = Invoke-DdsNodeGet -Path '/v1/policy/publisher-status?platform=windows'
+        $st = $body | ConvertFrom-Json
+        # Invoke-DdsNodeGet returns the body without inspecting the HTTP
+        # status. An admin-gate 403 yields a valid JSON error body
+        # ({"error":"not_authorized"}) with no can_publish field — detect it
+        # by shape so we don't mislabel a permission problem as "no capability".
+        $props = @($st.PSObject.Properties.Name)
+        if ($props -notcontains 'can_publish') {
+            $el.PubBanner.Background  = $amber
+            $el.PubBanner.BorderBrush = $amberB
+            $why = if ($props -contains 'error') { [string]$st.error } else { 'unexpected response' }
+            $el.TbPubStatus.Text = "Could not read publish authorization ($why). This console may not be running as a DDS admin; publishing is unavailable until it is."
+            $el.BtnPubCopyGrant.Visibility = 'Collapsed'
+            return
+        }
+        if ($st.can_publish) {
+            $el.PubBanner.Background  = $green
+            $el.PubBanner.BorderBrush = $greenB
+            $el.TbPubStatus.Text = "This node is authorized to publish policy. New accounts and policies replicate to peers within ~60 seconds."
+            $el.BtnPubCopyGrant.Visibility = 'Collapsed'
+            $script:pubGrantCmd = ''
+        } else {
+            $el.PubBanner.Background  = $amber
+            $el.PubBanner.BorderBrush = $amberB
+            $script:pubGrantCmd = [string]$st.grant_command
+            # One-time: publish this node's identity so the admin's vouch
+            # can bind to it (admin_vouch needs a live target attestation).
+            if (-not $script:pubInitTried) {
+                $script:pubInitTried = $true
+                try { $null = Invoke-DdsCli @('--node-url', $NodeUrl, 'policy', 'publisher-init') } catch { }
+            }
+            $el.TbPubStatus.Text = "This node is NOT yet authorized to publish policy. Its identity has been prepared; an admin must grant it once (needs a security key):`r`n$($script:pubGrantCmd)"
+            $el.BtnPubCopyGrant.Visibility = 'Visible'
+        }
+    } catch {
+        $el.PubBanner.Background  = $amber
+        $el.PubBanner.BorderBrush = $amberB
+        $el.TbPubStatus.Text = "Could not reach the DDS node to check publish authorization. Is the DdsNode service running?  ($($_.Exception.Message))"
+        $el.BtnPubCopyGrant.Visibility = 'Collapsed'
+    }
+}
+
+function Load-EnrolledUsers {
+    try {
+        $body = Invoke-DdsNodeGet -Path '/v1/enrolled-users'
+        $data = $body | ConvertFrom-Json
+        $el.CbClaimSubject.Items.Clear()
+        $count = 0
+        if ($data -and $data.users) {
+            foreach ($u in $data.users) {
+                $suffix = if ($u.vouched) { '' } else { '  (not yet approved)' }
+                $item = New-Object Windows.Controls.ComboBoxItem
+                $item.Content = "$($u.display_name)  -  $($u.subject_urn)$suffix"
+                $item.Tag     = [string]$u.subject_urn
+                [void]$el.CbClaimSubject.Items.Add($item)
+                $count++
+            }
+        }
+        Append-Log $el.TbPolicyLog "[users] loaded $count enrolled user(s)"
+        return $true
+    } catch {
+        Append-Log $el.TbPolicyLog "[users] could not load enrolled users: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Enter-PolicyPage {
+    Refresh-PublisherStatus
+    # Load the user list once, but only latch the flag on a successful load
+    # so a failure (e.g. node still starting) retries on the next entry.
+    if (-not $script:policyUsersLoaded) {
+        if (Load-EnrolledUsers) { $script:policyUsersLoaded = $true }
+    }
+}
+
+# Build a WindowsPolicyDocument JSON for a first-account claim.
+function New-ClaimPolicyJson {
+    param(
+        [string]$Username, [string]$Subject, [string]$FullName,
+        [string[]]$Groups, [string]$DeviceUrn, [bool]$PwNeverExpires
+    )
+    $acct = [ordered]@{
+        username          = $Username
+        action            = 'Create'
+        claim_subject_urn = $Subject
+    }
+    if ($FullName)                  { $acct.full_name = $FullName }
+    if ($Groups -and $Groups.Count) { $acct.groups = @($Groups) }
+    if ($PwNeverExpires)            { $acct.password_never_expires = $true }
+
+    $scope = [ordered]@{}
+    if ($DeviceUrn) { $scope.identity_urns = @($DeviceUrn) }
+
+    $doc = [ordered]@{
+        policy_id    = "windows/claim/$Username"
+        display_name = "New account: $Username"
+        version      = 1
+        scope        = $scope
+        settings     = @()
+        enforcement  = 'Enforce'
+        windows      = [ordered]@{ local_accounts = @($acct) }
+    }
+    return ($doc | ConvertTo-Json -Depth 12)
+}
+
+# Write the document to a temp file (UTF-8, no BOM — the CLI's JSON
+# parser does not skip a BOM) and publish via the `dds` CLI.
+function Publish-Policy {
+    param([string]$Platform, [string]$Json)
+    if (-not (Test-Path $DdsBin)) {
+        Append-Log $el.TbPolicyLog "[publish] dds.exe not found at $DdsBin — reinstall the MSI."
+        return
+    }
+    $sub = switch ($Platform) {
+        'windows' { 'publish-windows' }
+        'macos'   { 'publish-macos' }
+        'linux'   { 'publish-linux' }
+        default   { 'publish-windows' }
+    }
+    $tmp = Join-Path $env:TEMP ("dds-policy-{0:yyyyMMdd-HHmmss-fff}.json" -f (Get-Date))
+    try {
+        [System.IO.File]::WriteAllText($tmp, $Json, (New-Object System.Text.UTF8Encoding($false)))
+        Append-Log $el.TbPolicyLog "[publish] $Platform policy..."
+        $r = Invoke-DdsCli @('--node-url', $NodeUrl, 'policy', $sub, '--from-file', $tmp)
+        foreach ($line in ($r.Out -split "`r?`n")) { if ($line.Trim()) { Append-Log $el.TbPolicyLog $line } }
+        foreach ($line in ($r.Err -split "`r?`n")) { if ($line.Trim()) { Append-Log $el.TbPolicyLog $line } }
+        if ($r.ExitCode -eq 0) {
+            Append-Log $el.TbPolicyLog "[publish] OK — peers replicate within ~60 seconds."
+            Refresh-PublisherStatus
+        } else {
+            Append-Log $el.TbPolicyLog "[publish] FAILED (exit $($r.ExitCode))"
+        }
+    } catch {
+        Append-Log $el.TbPolicyLog "[publish] error: $($_.Exception.Message)"
+    } finally {
+        if (Test-Path $tmp) { Remove-Item -Force -ErrorAction SilentlyContinue $tmp }
+    }
+}
+
+function Set-PolicyTemplate {
+    param([string]$Name)
+    $tpl = switch ($Name) {
+        'Registry value' { @'
+{
+  "policy_id": "security/example-registry",
+  "display_name": "Example registry value",
+  "version": 1,
+  "scope": {},
+  "settings": [],
+  "enforcement": "Enforce",
+  "windows": {
+    "registry": [
+      { "hive": "LocalMachine", "key": "SOFTWARE\\Policies\\DDS\\Example", "name": "Enabled", "value": { "Dword": 1 }, "action": "Set" }
+    ]
+  }
+}
+'@ }
+        'Service config' { @'
+{
+  "policy_id": "services/example",
+  "display_name": "Example service config",
+  "version": 1,
+  "scope": {},
+  "settings": [],
+  "enforcement": "Enforce",
+  "windows": {
+    "services": [
+      { "name": "RemoteRegistry", "start_type": "Disabled", "action": "Stop" }
+    ]
+  }
+}
+'@ }
+        'Password policy' { @'
+{
+  "policy_id": "security/password-policy",
+  "display_name": "Password policy",
+  "version": 1,
+  "scope": {},
+  "settings": [],
+  "enforcement": "Enforce",
+  "windows": {
+    "password_policy": { "min_length": 12, "max_age_days": 90, "complexity_required": true, "lockout_threshold": 5, "lockout_duration_minutes": 15 }
+  }
+}
+'@ }
+        'Local account' { @'
+{
+  "policy_id": "windows/account/svc-example",
+  "display_name": "Local account: svc-example",
+  "version": 1,
+  "scope": {},
+  "settings": [],
+  "enforcement": "Enforce",
+  "windows": {
+    "local_accounts": [
+      { "username": "svc-example", "action": "Create", "full_name": "Example Service Account", "groups": ["Users"], "password_never_expires": true }
+    ]
+  }
+}
+'@ }
+        default { '' }
+    }
+    $el.TbPolicyJson.Text = $tpl
+}
+
+$el.BtnUsersPolicy.add_Click({ Show-Page -Name 'PagePolicy' })
+$el.BtnPubCheck.add_Click({ Refresh-PublisherStatus })
+$el.BtnPubCopyGrant.add_Click({
+    if ($script:pubGrantCmd) {
+        try { [Windows.Clipboard]::SetText($script:pubGrantCmd); Append-Log $el.TbPolicyLog "[grant] command copied to clipboard" } catch { }
+    }
+})
+$el.BtnLoadUsers.add_Click({ Load-EnrolledUsers })
+$el.CbClaimSubject.add_SelectionChanged({
+    $sel = $el.CbClaimSubject.SelectedItem
+    if ($sel -and $sel.Tag) { $el.TbClaimSubject.Text = [string]$sel.Tag }
+})
+$el.BtnFillTemplate.add_Click({ Set-PolicyTemplate (Get-ComboText $el.CbTemplate) })
+$el.BtnPublishJson.add_Click({
+    $platform = Get-ComboText $el.CbPlatform
+    $json = [string]$el.TbPolicyJson.Text
+    if (-not $json.Trim()) { Append-Log $el.TbPolicyLog "[publish] nothing to publish (JSON is empty)"; return }
+    try { $null = $json | ConvertFrom-Json } catch { Append-Log $el.TbPolicyLog "[publish] invalid JSON: $($_.Exception.Message)"; return }
+    Publish-Policy -Platform $platform -Json $json
+})
+$el.BtnCreateAccount.add_Click({
+    $user    = ([string]$el.TbAcctUser.Text).Trim()
+    $subject = ([string]$el.TbClaimSubject.Text).Trim()
+    if (-not $user)    { Append-Log $el.TbPolicyLog "[account] Windows username is required"; return }
+    if (-not $subject) { Append-Log $el.TbPolicyLog "[account] a DDS user (subject URN) is required — pick one or paste a URN"; return }
+    if ($user.Length -gt 20 -or ($user -notmatch '^[A-Za-z0-9._-]+$') -or $user.EndsWith('.')) {
+        Append-Log $el.TbPolicyLog "[account] invalid username: 1-20 chars, letters/digits/._- only, not ending in a dot"
+        return
+    }
+    $full = ([string]$el.TbAcctFullName.Text).Trim()
+    $groups = @()
+    $rawGroups = ([string]$el.TbAcctGroups.Text).Trim()
+    if ($rawGroups) { $groups = @($rawGroups -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+    # Mirror the applier's AccountEnforcer.IsValidGroupName so an invalid
+    # group is caught here rather than silently failing the whole directive
+    # on every endpoint.
+    $badGroup = $groups | Where-Object {
+        $_.Length -gt 256 -or $_.EndsWith('.') -or $_.EndsWith(' ') -or
+        ($_ -match '["/\\\[\]:;|=,+*?<>@]') -or ($_ -match '[\x00-\x1f]')
+    } | Select-Object -First 1
+    if ($badGroup) {
+        Append-Log $el.TbPolicyLog "[account] invalid group name '$badGroup' — avoid these characters: / \ [ ] : ; | = , + * ? < > @ and double-quotes; max 256 chars, no trailing dot/space"
+        return
+    }
+    $deviceUrn = ''
+    if ($el.RbAcctDevice.IsChecked) {
+        $deviceUrn = ([string]$el.TbAcctDeviceUrn.Text).Trim()
+        if (-not $deviceUrn) { Append-Log $el.TbPolicyLog "[account] enter a device URN or choose 'All devices'"; return }
+    }
+    $pwNever = [bool]$el.CbAcctPwNever.IsChecked
+    $json = New-ClaimPolicyJson -Username $user -Subject $subject -FullName $full -Groups $groups -DeviceUrn $deviceUrn -PwNeverExpires $pwNever
+    Append-Log $el.TbPolicyLog "[account] publishing first-logon claim: '$user' -> $subject"
+    Publish-Policy -Platform 'windows' -Json $json
 })
 
 # ── Wizard nav buttons ────────────────────────────────────────────

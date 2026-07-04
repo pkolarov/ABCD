@@ -53,7 +53,7 @@ use crate::service::{
     AdminSetupRequest, AdminVouchRequest, ApplicableLinuxPolicy, ApplicableMacOsPolicy,
     ApplicableSoftware, ApplicableWindowsPolicy, AppliedReport, AssertionSessionRequest,
     EnrollDeviceRequest, EnrollUserRequest, EnrolledUser, LocalService, NodeStatus, PolicyResult,
-    ServiceError,
+    PublisherStatus, ServiceError,
 };
 use dds_store::traits::{
     AuditStore, ChallengeStore, CredentialStateStore, RevocationStore, TokenStore,
@@ -497,6 +497,11 @@ pub struct NodeInfo {
     pub peer_counts: Option<crate::node::NodePeerCounts>,
 }
 
+/// Sender for locally-authored policy tokens into the swarm task's
+/// `run()` loop (see [`crate::node::PublishCommand`]). `None` in unit
+/// tests that build a bare router without a live `DdsNode`.
+type PublishSender = tokio::sync::mpsc::Sender<crate::node::PublishCommand>;
+
 struct AppState<
     S: TokenStore
         + RevocationStore
@@ -523,6 +528,10 @@ struct AppState<
     /// `rotate_and_fan_out("manual")`. `None` in tests that construct a
     /// bare router without a live DdsNode.
     manual_rotate: Option<Arc<tokio::sync::Notify>>,
+    /// **Local policy publish** — sender into [`crate::node::DdsNode`]'s
+    /// `run()` loop for locally-authored, already-signed policy tokens.
+    /// `None` in tests; `main.rs` supplies a real sender.
+    publish_tx: Option<PublishSender>,
 }
 
 impl<
@@ -543,6 +552,7 @@ impl<
             device_binding: self.device_binding.clone(),
             admin_policy: self.admin_policy.clone(),
             manual_rotate: self.manual_rotate.clone(),
+            publish_tx: self.publish_tx.clone(),
         }
     }
 }
@@ -719,6 +729,7 @@ pub fn router<S>(
     response_mac_key: Option<ResponseMacKey>,
     device_binding: Option<Arc<DeviceBindingStore>>,
     manual_rotate: Option<Arc<tokio::sync::Notify>>,
+    publish_tx: Option<PublishSender>,
 ) -> Router
 where
     S: TokenStore
@@ -739,6 +750,7 @@ where
         device_binding,
         admin_policy: admin_policy.clone(),
         manual_rotate,
+        publish_tx,
     };
 
     // **H-7 (security review)** — admin-gated sub-router. Every route
@@ -754,6 +766,14 @@ where
         .route("/v1/admin/vouch", post(admin_vouch::<S>))
         .route("/v1/audit/entries", get(list_audit_entries::<S>))
         .route("/v1/pq/rotate", post(pq_rotate::<S>))
+        // Local policy authoring (Users & Policy console). Admin-gated:
+        // publishing managed policy is a privileged mutation.
+        .route("/v1/policy/publish", post(publish_policy::<S>))
+        .route(
+            "/v1/policy/publisher-status",
+            get(publisher_status::<S>),
+        )
+        .route("/v1/policy/publisher-init", post(publisher_init::<S>))
         .route_layer(axum::middleware::from_fn_with_state(
             admin_policy.clone(),
             require_admin_middleware,
@@ -2149,6 +2169,284 @@ fn audit_entry_to_json(e: dds_core::audit::AuditLogEntry) -> Result<AuditEntryJs
     })
 }
 
+// ---------- Local policy authoring (Users & Policy console) ----------
+
+/// `POST /v1/policy/publish` request. `document` is the platform policy
+/// document as JSON (e.g. a `WindowsPolicyDocument`), authored by the
+/// Users & Policy console. The node signs it with its own identity and
+/// gossips it so peers replicate — no pre-signed token or publisher key
+/// is required from the caller.
+#[derive(Debug, Deserialize)]
+pub struct PolicyPublishRequestJson {
+    /// `"windows" | "macos" | "linux"`.
+    pub platform: String,
+    /// The policy document JSON.
+    pub document: serde_json::Value,
+}
+
+/// `POST /v1/policy/publish` response.
+#[derive(Debug, Serialize)]
+pub struct PolicyPublishResponseJson {
+    /// `policy_id` of the published document.
+    pub policy_id: String,
+    /// JTI of the signed policy attestation token.
+    pub jti: String,
+    /// The issuing node URN (policy provenance).
+    pub issuer_urn: String,
+    /// Tokens applied + gossiped: `1` normally, or `3` when the node
+    /// bootstrapped its own publisher capability inline (self-attest +
+    /// self-vouch + policy) on a trusted-root node's first publish.
+    pub tokens_published: usize,
+    /// True when this publish also bootstrapped the publisher capability.
+    pub bootstrapped_capability: bool,
+}
+
+/// `GET /v1/policy/publisher-status` query.
+#[derive(Debug, Deserialize)]
+pub struct PublisherStatusQuery {
+    /// `"windows"` (default) | `"macos"` | `"linux"`.
+    #[serde(default)]
+    pub platform: Option<String>,
+}
+
+/// Map a platform string to its `dds:policy-publisher-*` purpose.
+fn platform_to_purpose(platform: &str) -> Result<&'static str, HttpError> {
+    use dds_core::token::purpose;
+    match platform.to_ascii_lowercase().as_str() {
+        "windows" => Ok(purpose::POLICY_PUBLISHER_WINDOWS),
+        "macos" => Ok(purpose::POLICY_PUBLISHER_MACOS),
+        "linux" => Ok(purpose::POLICY_PUBLISHER_LINUX),
+        other => Err(HttpError::bad_request(format!(
+            "unknown platform '{other}' (expected windows|macos|linux)"
+        ))),
+    }
+}
+
+/// Sign a locally-authored policy document with the node identity and
+/// publish it into the domain (apply to graph+store, then gossip).
+///
+/// Authorization is by C-3 publisher capability on the node URN: the node
+/// self-signs, and if it lacks the capability it either bootstraps it
+/// inline (when the node is a trusted root) or returns 403 with the
+/// one-time `dds admin vouch` command to grant it. The heavy lifting
+/// (gossip) happens in the swarm task via the `publish_tx` channel.
+async fn publish_policy<S>(
+    State(state): State<AppState<S>>,
+    Json(req): Json<PolicyPublishRequestJson>,
+) -> Result<Json<PolicyPublishResponseJson>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    let publish_tx = state.publish_tx.clone().ok_or_else(|| HttpError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "policy publish unavailable: node is not running a swarm task".to_string(),
+    })?;
+
+    let purpose = platform_to_purpose(&req.platform)?;
+
+    // Build the signed policy attestation and plan the publish batch under
+    // the service lock, then release it before the (awaiting) channel send.
+    let (tokens, policy_id, jti, issuer_urn, bootstrapped) = {
+        let svc = state.svc.lock().await;
+        let (policy_token, policy_id) = match req.platform.to_ascii_lowercase().as_str() {
+            "windows" => {
+                let doc: dds_domain::WindowsPolicyDocument =
+                    serde_json::from_value(req.document).map_err(|e| {
+                        HttpError::bad_request(format!("invalid windows policy document: {e}"))
+                    })?;
+                let pid = doc.policy_id.clone();
+                (svc.build_policy_attestation(&doc)?, pid)
+            }
+            "macos" => {
+                let doc: dds_domain::MacOsPolicyDocument =
+                    serde_json::from_value(req.document).map_err(|e| {
+                        HttpError::bad_request(format!("invalid macos policy document: {e}"))
+                    })?;
+                let pid = doc.policy_id.clone();
+                (svc.build_policy_attestation(&doc)?, pid)
+            }
+            "linux" => {
+                let doc: dds_domain::LinuxPolicyDocument =
+                    serde_json::from_value(req.document).map_err(|e| {
+                        HttpError::bad_request(format!("invalid linux policy document: {e}"))
+                    })?;
+                let pid = doc.policy_id.clone();
+                (svc.build_policy_attestation(&doc)?, pid)
+            }
+            other => {
+                return Err(HttpError::bad_request(format!(
+                    "unknown platform '{other}' (expected windows|macos|linux)"
+                )));
+            }
+        };
+        let jti = policy_token.payload.jti.clone();
+        let issuer_urn = svc.node_urn();
+        let batch = match svc.plan_policy_publish(policy_token, purpose) {
+            Ok(b) => b,
+            // Surface the actionable grant command to the operator instead
+            // of the generic "permission_denied" the ServiceError mapper
+            // would otherwise emit.
+            Err(ServiceError::Trust(msg)) => {
+                return Err(HttpError {
+                    status: StatusCode::FORBIDDEN,
+                    message: msg,
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let bootstrapped = batch.len() > 1;
+        (batch, policy_id, jti, issuer_urn, bootstrapped)
+    };
+
+    let tokens_published = tokens.len();
+    let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
+    publish_tx
+        .send(crate::node::PublishCommand {
+            tokens,
+            respond: respond_tx,
+        })
+        .await
+        .map_err(|_| HttpError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "swarm task unavailable".to_string(),
+        })?;
+    // The apply outcome. On failure, log the detail server-side but return
+    // the opaque `internal_error` code — the apply message can carry
+    // trust-graph / store internals, so it follows the same L-9 coarse
+    // classification as `From<ServiceError>` (the 403 grant-command message
+    // above is intentional and safe by contrast).
+    match respond_rx.await {
+        Ok(Ok(_count)) => {}
+        Ok(Err(msg)) => return Err(HttpError::internal(msg)),
+        Err(_) => return Err(HttpError::internal("publish response channel dropped")),
+    }
+
+    Ok(Json(PolicyPublishResponseJson {
+        policy_id,
+        jti,
+        issuer_urn,
+        tokens_published,
+        bootstrapped_capability: bootstrapped,
+    }))
+}
+
+/// `POST /v1/policy/publisher-init` response.
+#[derive(Debug, Serialize)]
+pub struct PublisherInitResponseJson {
+    /// The node's own URN (the subject an admin must vouch).
+    pub node_urn: String,
+    /// JTI of the published self-attestation (empty when already authorized).
+    pub attestation_jti: String,
+    /// The one-time admin command that finishes authorization.
+    pub grant_command: String,
+    /// True when the node can already publish (no init was needed).
+    pub already_authorized: bool,
+}
+
+/// Publish the node's own identity self-attestation so that a subsequent
+/// `dds admin vouch --subject-urn <node-urn> --purpose dds:policy-publisher-*`
+/// can bind to it (admin_vouch requires a live target attestation for the
+/// subject). No-op when the node can already publish. This is the first
+/// step of the one-time authorization for a non-root publishing node.
+async fn publisher_init<S>(
+    State(state): State<AppState<S>>,
+    Query(q): Query<PublisherStatusQuery>,
+) -> Result<Json<PublisherInitResponseJson>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    let purpose = platform_to_purpose(q.platform.as_deref().unwrap_or("windows"))?;
+    let publish_tx = state.publish_tx.clone().ok_or_else(|| HttpError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "policy publish unavailable: node is not running a swarm task".to_string(),
+    })?;
+
+    let (maybe_attest, status) = {
+        let svc = state.svc.lock().await;
+        let status = svc.publisher_status(purpose);
+        // Only seed an identity when the node genuinely needs an external
+        // grant (non-root, no capability). A root bootstraps inline; a node
+        // that already holds the capability needs nothing.
+        let attest = if status.can_publish {
+            None
+        } else {
+            Some(svc.build_node_self_attestation()?)
+        };
+        (attest, status)
+    };
+
+    let attestation_jti = if let Some(attest) = maybe_attest {
+        let jti = attest.payload.jti.clone();
+        let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
+        publish_tx
+            .send(crate::node::PublishCommand {
+                tokens: vec![attest],
+                respond: respond_tx,
+            })
+            .await
+            .map_err(|_| HttpError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "swarm task unavailable".to_string(),
+            })?;
+        match respond_rx.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(msg)) => {
+                return Err(HttpError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: msg,
+                });
+            }
+            Err(_) => return Err(HttpError::internal("publisher-init response channel dropped")),
+        }
+        jti
+    } else {
+        String::new()
+    };
+
+    Ok(Json(PublisherInitResponseJson {
+        node_urn: status.node_urn,
+        attestation_jti,
+        grant_command: status.grant_command,
+        already_authorized: status.can_publish,
+    }))
+}
+
+/// Report whether this node can publish a class of managed policy, and
+/// the one-time grant command when it cannot. Backs the console's
+/// "authorized to publish" banner.
+async fn publisher_status<S>(
+    State(state): State<AppState<S>>,
+    Query(q): Query<PublisherStatusQuery>,
+) -> Result<Json<PublisherStatus>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    let purpose = platform_to_purpose(q.platform.as_deref().unwrap_or("windows"))?;
+    let svc = state.svc.lock().await;
+    Ok(Json(svc.publisher_status(purpose)))
+}
+
 /// Trigger a manual epoch-key rotation. Returns 200 OK when the signal is
 /// queued; 503 when the node is not running in PQ mode (no `Notify` handle).
 async fn pq_rotate<S>(State(state): State<AppState<S>>) -> impl IntoResponse
@@ -2198,6 +2496,7 @@ pub async fn serve<S>(
     response_mac_key: Option<ResponseMacKey>,
     device_binding: Option<Arc<DeviceBindingStore>>,
     manual_rotate: Option<Arc<tokio::sync::Notify>>,
+    publish_tx: Option<PublishSender>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: TokenStore
@@ -2221,6 +2520,7 @@ where
                 response_mac_key,
                 device_binding,
                 manual_rotate,
+                publish_tx,
             )
             .await;
         }
@@ -2242,6 +2542,7 @@ where
                 response_mac_key,
                 device_binding,
                 manual_rotate,
+                publish_tx,
             )
             .await;
         }
@@ -2292,6 +2593,7 @@ where
             response_mac_key,
             device_binding,
             manual_rotate,
+            publish_tx,
         ),
     )
     .await?;
@@ -2316,6 +2618,7 @@ async fn serve_unix<S>(
     response_mac_key: Option<ResponseMacKey>,
     device_binding: Option<Arc<DeviceBindingStore>>,
     manual_rotate: Option<Arc<tokio::sync::Notify>>,
+    publish_tx: Option<PublishSender>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: TokenStore
@@ -2366,6 +2669,7 @@ where
         response_mac_key,
         device_binding,
         manual_rotate,
+        publish_tx,
     );
 
     loop {
@@ -2436,6 +2740,7 @@ async fn serve_pipe<S>(
     response_mac_key: Option<ResponseMacKey>,
     device_binding: Option<Arc<DeviceBindingStore>>,
     manual_rotate: Option<Arc<tokio::sync::Notify>>,
+    publish_tx: Option<PublishSender>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: TokenStore
@@ -2463,6 +2768,7 @@ where
         response_mac_key,
         device_binding,
         manual_rotate,
+        publish_tx,
     );
 
     // First instance: `first_pipe_instance(true)` makes `create` fail
@@ -2747,6 +3053,7 @@ mod tests {
                 device_binding: None,
                 admin_policy: Arc::new(tcp_trust_policy()),
                 manual_rotate: None,
+                publish_tx: None,
             },
             root,
         }
@@ -5192,7 +5499,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None, None);
+        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5237,7 +5544,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5266,6 +5573,91 @@ mod tests {
             resp.status(),
             403,
             "admin/challenge must admit Anonymous when trust_loopback_tcp_admin=true"
+        );
+    }
+
+    // ---------- Local policy publish endpoint tests ----------
+
+    /// `GET /v1/policy/publisher-status` reports a non-root node with no
+    /// capability as unauthorized, and surfaces the grant command naming
+    /// the node's own URN. Exercises the route + handler + serialization.
+    #[tokio::test]
+    async fn publisher_status_endpoint_reports_unauthorized_for_non_root_node() {
+        let state = make_state();
+        let node_urn = {
+            let svc = state.svc.lock().await;
+            svc.node_urn()
+        };
+        let app = router::<MemoryBackend>(
+            state.svc.clone(),
+            state.info.clone(),
+            tcp_trust_policy(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{}", addr);
+
+        let resp = reqwest::get(format!("{base}/v1/policy/publisher-status?platform=windows"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["node_urn"], node_urn);
+        assert_eq!(body["purpose"], "dds:policy-publisher-windows");
+        assert_eq!(body["is_trusted_root"], false);
+        assert_eq!(body["has_capability"], false);
+        assert_eq!(body["can_publish"], false);
+        let grant = body["grant_command"].as_str().unwrap();
+        assert!(grant.contains("dds admin vouch"));
+        assert!(grant.contains(&node_urn));
+    }
+
+    /// `POST /v1/policy/publish` fails gracefully with 503 (not a panic or
+    /// 500) when the router was built without a swarm task (publish_tx=None),
+    /// proving the route is wired and the no-swarm guard fires first.
+    #[tokio::test]
+    async fn publish_policy_returns_503_without_swarm_task() {
+        let state = make_state();
+        let app = router::<MemoryBackend>(
+            state.svc.clone(),
+            state.info.clone(),
+            tcp_trust_policy(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{}", addr);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/v1/policy/publish"))
+            .json(&serde_json::json!({
+                "platform": "windows",
+                "document": {
+                    "policy_id": "windows/claim/x", "display_name": "x", "version": 1,
+                    "scope": {}, "settings": [], "enforcement": "Enforce"
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            503,
+            "publish must degrade to 503 when no swarm task is wired"
         );
     }
 
@@ -5325,7 +5717,7 @@ mod tests {
         let info = state.info.clone();
         let key = test_mac_key();
         let app =
-            router::<MemoryBackend>(svc, info, tcp_trust_policy(), Some(key.clone()), None, None);
+            router::<MemoryBackend>(svc, info, tcp_trust_policy(), Some(key.clone()), None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5351,7 +5743,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5534,7 +5926,7 @@ mod tests {
         let info = state.info.clone();
         let key = test_mac_key();
         let app =
-            router::<MemoryBackend>(svc, info, strict_policy(), Some(key.clone()), None, None);
+            router::<MemoryBackend>(svc, info, strict_policy(), Some(key.clone()), None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5806,7 +6198,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None, None);
+        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5881,7 +6273,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None, None);
+        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5913,7 +6305,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5958,7 +6350,7 @@ mod tests {
         }
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -6067,7 +6459,7 @@ mod tests {
         }
         let svc = state2.svc.clone();
         let info = state2.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

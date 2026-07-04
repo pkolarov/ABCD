@@ -1838,6 +1838,10 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     let manual_rotate = Some(node.manual_rotate.clone());
+    // Local policy-publish channel sender for the Users & Policy console
+    // (`POST /v1/policy/publish`). The receiver lives in the node's `run()`
+    // loop; this sender lets the HTTP task apply + gossip signed policy.
+    let publish_tx = Some(node.publish_sender());
     tokio::spawn(async move {
         if let Err(e) = http::serve(
             &api_addr,
@@ -1847,6 +1851,7 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             response_mac_key,
             device_binding,
             manual_rotate,
+            publish_tx,
         )
         .await
         {

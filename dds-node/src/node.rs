@@ -129,6 +129,28 @@ const EPOCH_KEY_FANOUT_CONCURRENCY: usize = 10;
 /// needing mDNS (which is disabled by default in the member config template).
 const BOOTSTRAP_REDIAL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// A request from the HTTP API task ([`LocalService`]) asking the swarm
+/// event loop to publish one or more locally-authored, already-signed
+/// tokens into the domain: apply them to the shared trust graph + store
+/// (the local-origin analog of [`DdsNode::ingest_operation`]) and then
+/// gossip each on the Operations topic so peers replicate them.
+///
+/// The HTTP service shares only `trust_graph` and `store` with the node
+/// and holds no swarm handle, so it cannot gossip directly. This command
+/// channel (mirroring the `manual_rotate` `Notify`) is the sole bridge:
+/// the handler runs inside `run()`'s `select!` where the swarm is owned.
+/// A `oneshot` carries the outcome back to the awaiting HTTP handler.
+pub struct PublishCommand {
+    /// Signed tokens to apply + gossip, in dependency order (e.g. a
+    /// self-attestation before the self-vouch that pins it, before the
+    /// policy attestation that needs the capability).
+    pub tokens: Vec<Token>,
+    /// Result channel: `Ok(count)` = tokens applied and gossip attempted;
+    /// `Err(msg)` = a token failed validation or the publisher-capability
+    /// gate (nothing after the failing token is applied).
+    pub respond: tokio::sync::oneshot::Sender<Result<usize, String>>,
+}
+
 /// The running DDS node state.
 ///
 /// `trust_graph` is shared (`Arc<RwLock<TrustGraph>>`) so the swarm event
@@ -292,6 +314,17 @@ pub struct DdsNode {
     /// both tasks share the same notification handle without additional
     /// channel plumbing.
     pub manual_rotate: Arc<tokio::sync::Notify>,
+    /// **Local policy publish (Users & Policy console)** — sender side of
+    /// the [`PublishCommand`] channel. Retained on the node (in addition to
+    /// the clone handed to the HTTP task via [`Self::publish_sender`]) so
+    /// the channel never closes while the node is alive, keeping the
+    /// `run()` `select!` arm permanently enabled.
+    publish_tx: tokio::sync::mpsc::Sender<PublishCommand>,
+    /// Receiver side of the [`PublishCommand`] channel, drained in the
+    /// `run()` loop. Locally-authored policy attestations arrive here from
+    /// `POST /v1/policy/publish` and are applied + gossiped by
+    /// [`Self::apply_local_publish`].
+    publish_rx: tokio::sync::mpsc::Receiver<PublishCommand>,
     /// **NET-REDIAL-1**: parsed bootstrap peer addresses (peer_id +
     /// multiaddr with /p2p/ suffix) retained so the periodic redial
     /// timer can call `swarm.dial()` without re-parsing the config
@@ -643,6 +676,12 @@ impl DdsNode {
         // Build trusted roots set
         let trusted_roots: BTreeSet<String> = config.trusted_roots.iter().cloned().collect();
 
+        // Local policy-publish command channel. Bounded so a runaway HTTP
+        // caller can't grow an unbounded backlog; 64 comfortably absorbs
+        // interactive console publishes. The node also keeps `publish_tx`
+        // so the channel stays open for the lifetime of the node.
+        let (publish_tx, publish_rx) = tokio::sync::mpsc::channel::<PublishCommand>(64);
+
         // Create topics for the (domain, org) pair.
         let topics = DdsTopic::for_domain_org(&domain_id.protocol_tag(), &config.org_hash);
 
@@ -703,6 +742,8 @@ impl DdsNode {
             epoch_key_request_last: BTreeMap::new(),
             pending_revocation_rotation: None,
             manual_rotate: Arc::new(tokio::sync::Notify::new()),
+            publish_tx,
+            publish_rx,
             bootstrap_addrs,
             p2p_signing_key,
             admission_key_provider,
@@ -913,6 +954,16 @@ impl DdsNode {
                 // `POST /v1/pq/rotate` calls `notify_one()` on `self.manual_rotate`.
                 _ = self.manual_rotate.notified() => {
                     self.rotate_and_fan_out("manual");
+                }
+                // **Local policy publish** — a `POST /v1/policy/publish`
+                // handler queued signed policy tokens. Apply them to the
+                // shared graph+store (local-origin ingest) and gossip each
+                // so peers replicate. The pattern always matches because the
+                // node retains its own `publish_tx`, so this arm never
+                // becomes permanently disabled by a closed channel.
+                Some(cmd) = self.publish_rx.recv() => {
+                    let result = self.apply_local_publish(cmd.tokens);
+                    let _ = cmd.respond.send(result);
                 }
                 // **NET-REDIAL-1**: re-dial bootstrap peers when orphaned.
                 // Fires every BOOTSTRAP_REDIAL_INTERVAL; is a no-op when
@@ -1905,6 +1956,112 @@ impl DdsNode {
             Ok(_) | Err(libp2p::gossipsub::PublishError::InsufficientPeers) => {}
             Err(e) => return Err(format!("gossipsub publish: {e:?}")),
         }
+        Ok(())
+    }
+
+    /// Hand out a [`PublishCommand`] sender clone for the HTTP API task.
+    /// Mirrors [`Self::manual_rotate`]'s `Arc::clone` sharing: `main.rs`
+    /// clones this before spawning `http::serve` so the policy-publish
+    /// handler can reach the swarm-owning `run()` loop.
+    pub fn publish_sender(&self) -> tokio::sync::mpsc::Sender<PublishCommand> {
+        self.publish_tx.clone()
+    }
+
+    /// Apply a batch of locally-authored, already-signed tokens to the
+    /// shared trust graph + store and gossip each on the Operations topic.
+    ///
+    /// This is the local-origin counterpart of [`Self::ingest_operation`]:
+    /// same authoritative C-3 publisher-capability gate, same
+    /// graph→store→DAG→sync-cache persistence sequence, then a
+    /// [`GossipMessage::DirectoryOp`] broadcast so peers replicate the
+    /// token via gossip (and via anti-entropy sync from the seeded cache).
+    ///
+    /// Tokens are processed in order and the batch is fail-fast: on the
+    /// first token that fails validation or the capability gate, returns
+    /// `Err` with the count applied so far left committed (callers order
+    /// their batches so a partial apply is still coherent — e.g.
+    /// `[self_attest, self_vouch, policy]`). A duplicate JTI (token already
+    /// present in the graph) is treated as idempotent success.
+    fn apply_local_publish(&mut self, tokens: Vec<Token>) -> Result<usize, String> {
+        let mut applied = 0usize;
+        for token in tokens {
+            self.apply_one_local(token)?;
+            applied += 1;
+        }
+        Ok(applied)
+    }
+
+    fn apply_one_local(&mut self, token: Token) -> Result<(), String> {
+        if let Err(e) = token.validate() {
+            return Err(format!("token validation failed: {e}"));
+        }
+        // **C-3**: authoritative publisher-capability gate — identical to
+        // the inbound gossip path. A policy attestation whose issuer lacks
+        // the matching `dds:policy-publisher-*` capability is refused here
+        // so we never gossip a token our own peers would reject at ingest.
+        if !publisher_capability_ok(&token, &self.trust_graph, &self.trusted_roots) {
+            return Err(format!(
+                "issuer '{}' lacks the required publisher capability for body_type {:?}",
+                token.payload.iss, token.payload.body_type
+            ));
+        }
+        // Add to the shared trust graph. A duplicate JTI means the token is
+        // already present (idempotent re-publish) — not an error.
+        {
+            let mut g = self.trust_graph.write().expect("trust_graph poisoned");
+            if let Err(e) = g.add_token(token.clone()) {
+                // Match the typed variant, not its Display text: a duplicate
+                // JTI means the token is already present (idempotent
+                // re-publish) and is not an error.
+                if !matches!(&e, dds_core::trust::TrustError::DuplicateJti(_)) {
+                    return Err(format!("trust graph rejected token: {e}"));
+                }
+            }
+        }
+        let token_bytes = token
+            .to_cbor()
+            .map_err(|e| format!("token encode: {e}"))?;
+        if let Err(e) = self.store.put_token(&token) {
+            error!("local publish: store put_token error: {e}");
+        }
+        let op = synthetic_op_for_token(&token);
+        let op_id = op.id.clone();
+        let op_for_cache = op.clone();
+        match self.dag.insert(op) {
+            Ok(true) => {
+                self.cache_sync_payload(&op_id, &op_for_cache, &token_bytes);
+                if let Err(e) = self.store.put_operation(&op_for_cache) {
+                    warn!("local publish: put_operation store error: {e}");
+                }
+                // Stamp the audit chain only on a novel op — a duplicate
+                // (DAG returned false) is not a state change, mirroring
+                // `ingest_operation`.
+                self.emit_audit_from_ingest(
+                    accepted_action_for(&token.payload.kind),
+                    token_bytes.clone(),
+                    None,
+                );
+            }
+            Ok(false) => {} // already in the DAG (idempotent)
+            Err(e) => warn!("local publish: DAG insert failed: {e}"),
+        }
+        // Gossip the (op, token) pair on the Operations topic so peers
+        // ingest it exactly as if it had originated remotely.
+        let mut op_bytes = Vec::new();
+        ciborium::into_writer(&op_for_cache, &mut op_bytes)
+            .map_err(|e| format!("op encode: {e}"))?;
+        let msg = GossipMessage::DirectoryOp {
+            op_bytes,
+            token_bytes,
+        };
+        let topic = self.topics.operations.to_ident_topic();
+        self.publish_gossip_op(topic, msg)?;
+        info!(
+            jti = %token.payload.jti,
+            issuer = %token.payload.iss,
+            body_type = ?token.payload.body_type,
+            "local publish: applied + gossiped token"
+        );
         Ok(())
     }
 

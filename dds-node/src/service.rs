@@ -376,6 +376,27 @@ pub struct WindowsAccountClaim {
     pub password_never_expires: Option<bool>,
 }
 
+/// The node's authorization to publish a class of managed policy
+/// (keyed by `dds:policy-publisher-*` purpose). Surfaced by
+/// `GET /v1/policy/publisher-status` so the Users & Policy console can
+/// show a ready-to-publish state or the one-time grant command.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PublisherStatus {
+    /// The node's own Vouchsafe URN — the issuer of locally-authored policy.
+    pub node_urn: String,
+    /// The publisher-capability purpose this status is for.
+    pub purpose: String,
+    /// Whether the node URN already holds `purpose` via a root-chained vouch.
+    pub has_capability: bool,
+    /// Whether the node URN is itself a domain trusted root (can self-vouch).
+    pub is_trusted_root: bool,
+    /// Whether a publish would succeed now (`has_capability || is_trusted_root`).
+    pub can_publish: bool,
+    /// The one-time admin command that grants the capability when a
+    /// non-root node lacks it.
+    pub grant_command: String,
+}
+
 /// Outcome the agent reports back after applying (or attempting to
 /// apply) a policy / software assignment directive.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -1261,6 +1282,136 @@ impl<
     /// provenance alongside its signature check).
     pub fn node_urn(&self) -> String {
         self.node_identity.id.to_urn()
+    }
+
+    // ---- Local policy publishing (Users & Policy console) ----
+    //
+    // The node self-signs locally-authored policy attestations with its own
+    // identity, then the swarm task applies + gossips them (see
+    // `DdsNode::apply_local_publish`). For peers to honor such a policy, the
+    // node URN must hold the matching `dds:policy-publisher-*` capability
+    // (C-3). Two ways that capability is established:
+    //   * the node is a domain trusted root -> it can self-vouch the
+    //     capability inline (touchless), or
+    //   * an admin (a trusted root) vouches the node URN once via
+    //     `dds admin vouch` (FIDO2).
+    // `plan_policy_publish` picks the right ordered token batch, or fails
+    // closed with the exact grant command when neither applies.
+
+    /// Whether the node's own identity URN is a domain trusted root.
+    pub fn node_is_trusted_root(&self) -> bool {
+        self.trusted_roots.contains(&self.node_identity.id.to_urn())
+    }
+
+    /// Whether the node currently holds `purpose` (a `dds:policy-publisher-*`
+    /// capability) via a trusted-root-chained vouch — i.e. whether it can
+    /// publish that policy class right now without bootstrapping.
+    pub fn node_has_publisher_capability(&self, purpose: &str) -> bool {
+        let g = self.trust_graph.read().expect("trust_graph poisoned");
+        g.has_purpose(&self.node_identity.id.to_urn(), purpose, &self.trusted_roots)
+    }
+
+    /// Report the node's publish authorization for `purpose`.
+    pub fn publisher_status(&self, purpose: &str) -> PublisherStatus {
+        let has_capability = self.node_has_publisher_capability(purpose);
+        let is_trusted_root = self.node_is_trusted_root();
+        PublisherStatus {
+            node_urn: self.node_identity.id.to_urn(),
+            purpose: purpose.to_string(),
+            has_capability,
+            is_trusted_root,
+            // A root can bootstrap the capability inline on first publish;
+            // a non-root that already holds it can publish directly.
+            can_publish: has_capability || is_trusted_root,
+            grant_command: format!(
+                "dds admin vouch --subject-urn {} --purpose {}",
+                self.node_identity.id.to_urn(),
+                purpose
+            ),
+        }
+    }
+
+    /// Build a self-signed attestation of the node's own identity — the
+    /// live target a publisher-capability self-vouch pins via `vch_sum`.
+    pub fn build_node_self_attestation(&self) -> Result<Token, ServiceError> {
+        let payload = self.make_attest_payload(&self.node_identity);
+        Token::sign(payload, &self.node_identity.signing_key)
+            .map_err(|e| ServiceError::Token(e.to_string()))
+    }
+
+    /// Build a self-vouch granting the node `purpose`, pinning `attest_hash`
+    /// (the payload hash of [`Self::build_node_self_attestation`]). Only
+    /// honored domain-wide when the node URN is a trusted root.
+    pub fn build_node_self_vouch(
+        &self,
+        attest_hash: &str,
+        purpose: &str,
+    ) -> Result<Token, ServiceError> {
+        let urn = self.node_identity.id.to_urn();
+        let payload = TokenPayload {
+            iss: urn.clone(),
+            iss_key: self.node_identity.public_key.clone(),
+            jti: format!(
+                "vouch-selfpub-{}-{}",
+                self.node_identity.id.label(),
+                Uuid::new_v4().simple()
+            ),
+            sub: urn.clone(),
+            kind: TokenKind::Vouch,
+            purpose: Some(purpose.to_string()),
+            vch_iss: Some(urn),
+            vch_sum: Some(attest_hash.to_string()),
+            revokes: None,
+            iat: now_epoch(),
+            exp: Some(now_epoch() + 365 * 86400),
+            body_type: None,
+            body_cbor: None,
+        };
+        Token::sign(payload, &self.node_identity.signing_key)
+            .map_err(|e| ServiceError::Token(e.to_string()))
+    }
+
+    /// Embed a domain document into a fresh Attest payload and sign it with
+    /// the node identity — the canonical policy-attestation construction.
+    pub fn build_policy_attestation<D: DomainDocument>(
+        &self,
+        doc: &D,
+    ) -> Result<Token, ServiceError> {
+        let mut payload = self.make_attest_payload(&self.node_identity);
+        doc.embed(&mut payload)
+            .map_err(|e| ServiceError::Domain(e.to_string()))?;
+        Token::sign(payload, &self.node_identity.signing_key)
+            .map_err(|e| ServiceError::Token(e.to_string()))
+    }
+
+    /// Decide the ordered token batch to publish so a freshly-built
+    /// `policy_token` (requiring `purpose`) is honored across the domain:
+    ///   * capability already held  -> `[policy_token]`
+    ///   * node is a trusted root   -> `[self_attest, self_vouch, policy_token]`
+    ///   * otherwise                -> fail closed with the grant command.
+    pub fn plan_policy_publish(
+        &self,
+        policy_token: Token,
+        purpose: &str,
+    ) -> Result<Vec<Token>, ServiceError> {
+        if self.node_has_publisher_capability(purpose) {
+            return Ok(vec![policy_token]);
+        }
+        if self.node_is_trusted_root() {
+            let attest = self.build_node_self_attestation()?;
+            let attest_hash = attest.payload_hash();
+            let vouch = self.build_node_self_vouch(&attest_hash, purpose)?;
+            return Ok(vec![attest, vouch, policy_token]);
+        }
+        Err(ServiceError::Trust(format!(
+            "node '{}' is not authorized to publish policy (purpose {}). One-time setup: \
+             (1) run `dds policy publisher-init` to publish this node's identity, then \
+             (2) an admin runs `dds admin vouch --subject-urn {} --purpose {}`.",
+            self.node_identity.id.to_urn(),
+            purpose,
+            self.node_identity.id.to_urn(),
+            purpose
+        )))
     }
 
     /// True iff `admin_setup` would currently pass its C-2 gate:
@@ -3501,6 +3652,197 @@ mod platform_applier_tests {
     use rand::rngs::OsRng;
     use serde_json::json;
     use std::sync::{Arc, Mutex, RwLock};
+
+    // ---- Local policy publishing (Users & Policy console) ----
+
+    fn minimal_windows_claim_doc(subject_urn: &str) -> WindowsPolicyDocument {
+        WindowsPolicyDocument {
+            policy_id: "windows/claim/bob".to_string(),
+            display_name: "New account: bob".to_string(),
+            version: 1,
+            scope: PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            settings: vec![],
+            enforcement: Enforcement::Enforce,
+            windows: Some(WindowsSettings {
+                local_accounts: vec![AccountDirective {
+                    username: "bob".to_string(),
+                    action: AccountAction::Create,
+                    claim_subject_urn: Some(subject_urn.to_string()),
+                    full_name: Some("Bob Novak".to_string()),
+                    description: None,
+                    groups: vec!["Users".to_string()],
+                    password_never_expires: Some(true),
+                }],
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// A trusted-root node with no publisher capability bootstraps it inline
+    /// (self-attest + self-vouch + policy) on first publish, then needs only
+    /// the policy token once the capability is established.
+    #[test]
+    fn plan_policy_publish_bootstraps_capability_on_trusted_root_node() {
+        let node = Identity::generate("pubnode", &mut OsRng);
+        let node_urn = node.id.to_urn();
+        let mut roots = BTreeSet::new();
+        roots.insert(node_urn.clone()); // node IS a trusted root
+        let graph = Arc::new(RwLock::new(TrustGraph::new()));
+        let svc = LocalService::new(node, graph, roots, MemoryBackend::new());
+
+        let purpose = dds_core::token::purpose::POLICY_PUBLISHER_WINDOWS;
+        assert!(!svc.node_has_publisher_capability(purpose));
+        assert!(svc.node_is_trusted_root());
+
+        let doc = minimal_windows_claim_doc("urn:vouchsafe:bob.deadbeef");
+        let token = svc.build_policy_attestation(&doc).unwrap();
+        assert_eq!(token.payload.iss, node_urn);
+        assert_eq!(
+            token.payload.body_type.as_deref(),
+            Some(dds_domain::body_types::WINDOWS_POLICY)
+        );
+
+        let batch = svc.plan_policy_publish(token, purpose).unwrap();
+        assert_eq!(
+            batch.len(),
+            3,
+            "root node bootstraps: self-attest + self-vouch + policy"
+        );
+
+        // Apply the self-attest + self-vouch as the node's run loop would.
+        {
+            let mut g = svc.trust_graph.write().unwrap();
+            g.add_token(batch[0].clone()).unwrap();
+            g.add_token(batch[1].clone()).unwrap();
+        }
+        assert!(
+            svc.node_has_publisher_capability(purpose),
+            "capability holds after applying the self-vouch"
+        );
+
+        // Second publish now needs only the policy token.
+        let doc2 = minimal_windows_claim_doc("urn:vouchsafe:carol.feedface");
+        let token2 = svc.build_policy_attestation(&doc2).unwrap();
+        let batch2 = svc.plan_policy_publish(token2, purpose).unwrap();
+        assert_eq!(batch2.len(), 1, "capability established -> only the policy");
+    }
+
+    /// A non-root node with no publisher capability fails closed with an
+    /// actionable grant command; `publisher_status` reflects the same.
+    #[test]
+    fn plan_policy_publish_fails_closed_when_node_not_authorized() {
+        let node = Identity::generate("pubnode", &mut OsRng);
+        let admin = Identity::generate("admin", &mut OsRng);
+        let mut roots = BTreeSet::new();
+        roots.insert(admin.id.to_urn()); // admin is root; node is NOT
+        let graph = Arc::new(RwLock::new(TrustGraph::new()));
+        let svc = LocalService::new(node, graph, roots, MemoryBackend::new());
+        let node_urn = svc.node_urn();
+
+        let purpose = dds_core::token::purpose::POLICY_PUBLISHER_WINDOWS;
+        let status = svc.publisher_status(purpose);
+        assert!(!status.can_publish);
+        assert!(!status.is_trusted_root);
+        assert!(!status.has_capability);
+        assert!(status.grant_command.contains("dds admin vouch"));
+        assert!(status.grant_command.contains(&node_urn));
+
+        let doc = minimal_windows_claim_doc("urn:vouchsafe:bob.deadbeef");
+        let token = svc.build_policy_attestation(&doc).unwrap();
+        match svc.plan_policy_publish(token, purpose) {
+            Err(ServiceError::Trust(msg)) => {
+                assert!(msg.contains("dds admin vouch"));
+                assert!(msg.contains(&node_urn));
+                assert!(msg.contains(purpose));
+            }
+            Ok(_) => panic!("expected fail-closed, got Ok"),
+            Err(e) => panic!("expected Trust error, got {e:?}"),
+        }
+    }
+
+    // ---- Console (Users & Policy) wire-format compatibility ----
+    //
+    // DdsConsole.ps1 builds WindowsPolicyDocument JSON in PowerShell (the
+    // first-account claim) and ships JSON templates. These pin the exact
+    // wire shapes the console emits — enum tags ("Create"/"Enforce"/"Set"),
+    // data-carrying enums ({"Dword":1}), field names — so a serde change
+    // here can't silently break the GUI publish path (POST /v1/policy/publish
+    // deserializes into these very types).
+
+    #[test]
+    fn console_first_account_claim_json_deserializes() {
+        // Byte-for-byte the shape `New-ClaimPolicyJson` produces.
+        let json = r#"{
+            "policy_id": "windows/claim/bob",
+            "display_name": "New account: bob",
+            "version": 1,
+            "scope": { "identity_urns": ["urn:vouchsafe:pc1.def"] },
+            "settings": [],
+            "enforcement": "Enforce",
+            "windows": { "local_accounts": [
+                { "username": "bob", "action": "Create",
+                  "claim_subject_urn": "urn:vouchsafe:bob.abc", "full_name": "Bob N",
+                  "groups": ["Users", "Remote Desktop Users"], "password_never_expires": true }
+            ] }
+        }"#;
+        let doc: WindowsPolicyDocument = serde_json::from_str(json).unwrap();
+        assert!(matches!(doc.enforcement, Enforcement::Enforce));
+        assert_eq!(doc.scope.identity_urns, vec!["urn:vouchsafe:pc1.def"]);
+        let a = &doc.windows.unwrap().local_accounts[0];
+        assert!(matches!(a.action, AccountAction::Create));
+        assert_eq!(a.claim_subject_urn.as_deref(), Some("urn:vouchsafe:bob.abc"));
+        assert_eq!(a.groups, vec!["Users", "Remote Desktop Users"]);
+        assert_eq!(a.password_never_expires, Some(true));
+    }
+
+    #[test]
+    fn console_policy_templates_deserialize() {
+        // Registry template.
+        let reg = r#"{ "policy_id":"security/example-registry","display_name":"x","version":1,
+            "scope":{},"settings":[],"enforcement":"Enforce","windows":{"registry":[
+            {"hive":"LocalMachine","key":"SOFTWARE\\Policies\\DDS\\Example","name":"Enabled",
+             "value":{"Dword":1},"action":"Set"}]}}"#;
+        let d: WindowsPolicyDocument = serde_json::from_str(reg).unwrap();
+        let r = &d.windows.unwrap().registry[0];
+        assert!(matches!(r.hive, RegistryHive::LocalMachine));
+        assert_eq!(r.key, r"SOFTWARE\Policies\DDS\Example");
+        assert!(matches!(r.action, RegistryAction::Set));
+        assert!(matches!(r.value, Some(RegistryValue::Dword(1))));
+
+        // Service template.
+        let svc = r#"{ "policy_id":"services/example","display_name":"x","version":1,
+            "scope":{},"settings":[],"enforcement":"Enforce","windows":{"services":[
+            {"name":"RemoteRegistry","start_type":"Disabled","action":"Stop"}]}}"#;
+        let d: WindowsPolicyDocument = serde_json::from_str(svc).unwrap();
+        let s = &d.windows.unwrap().services[0];
+        assert_eq!(s.name, "RemoteRegistry");
+        assert!(matches!(s.start_type, Some(dds_domain::ServiceStartType::Disabled)));
+        assert!(matches!(s.action, dds_domain::ServiceAction::Stop));
+
+        // Password policy template.
+        let pw = r#"{ "policy_id":"security/password-policy","display_name":"x","version":1,
+            "scope":{},"settings":[],"enforcement":"Enforce","windows":{"password_policy":{
+            "min_length":12,"max_age_days":90,"complexity_required":true,
+            "lockout_threshold":5,"lockout_duration_minutes":15}}}"#;
+        let d: WindowsPolicyDocument = serde_json::from_str(pw).unwrap();
+        let p = d.windows.unwrap().password_policy.unwrap();
+        assert_eq!(p.min_length, Some(12));
+        assert_eq!(p.complexity_required, Some(true));
+
+        // Local account template.
+        let acct = r#"{ "policy_id":"windows/account/svc-example","display_name":"x","version":1,
+            "scope":{},"settings":[],"enforcement":"Enforce","windows":{"local_accounts":[
+            {"username":"svc-example","action":"Create","full_name":"Example Service Account",
+             "groups":["Users"],"password_never_expires":true}]}}"#;
+        let d: WindowsPolicyDocument = serde_json::from_str(acct).unwrap();
+        let a = &d.windows.unwrap().local_accounts[0];
+        assert_eq!(a.username, "svc-example");
+        assert_eq!(a.claim_subject_urn, None);
+    }
 
     // Tests that read/compare process-global telemetry counters must hold
     // this lock for the duration of the before→action→after window so that
