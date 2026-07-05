@@ -104,8 +104,11 @@ static void EmitNdjson(const std::string& line)
 // ---------------------------------------------------------------------------
 struct CliArgs
 {
-    bool passwordStdin = false;
-    bool help          = false;
+    bool         passwordStdin = false;
+    bool         newUser       = false;   // --new-user (bare enroll)
+    std::wstring label;                    // --label <username>
+    std::wstring displayName;              // --display-name "<Full Name>"
+    bool         help          = false;
 };
 
 static CliArgs ParseArgs(int argc, wchar_t** argv)
@@ -115,6 +118,9 @@ static CliArgs ParseArgs(int argc, wchar_t** argv)
     {
         std::wstring a = argv[i];
         if      (a == L"--password-stdin") args.passwordStdin = true;
+        else if (a == L"--new-user")       args.newUser = true;
+        else if (a == L"--label" && i + 1 < argc)        args.label = argv[++i];
+        else if (a == L"--display-name" && i + 1 < argc) args.displayName = argv[++i];
         else if (a == L"--help" || a == L"-h" || a == L"/?") args.help = true;
     }
     return args;
@@ -125,19 +131,29 @@ static void PrintHelp()
     std::cerr <<
         "DdsEnrollUser — non-interactive FIDO2 enrollment helper\n"
         "\n"
-        "  Reads the current user's Windows password from stdin (one line,\n"
-        "  UTF-8) and runs the same enrollment ceremony the system tray\n"
-        "  agent runs — but emits NDJSON status to stdout instead of\n"
-        "  showing modal dialogs. Used by DdsConsole.ps1 (the onboarding\n"
-        "  wizard).\n"
+        "  Runs the FIDO2 enrollment ceremony and emits NDJSON status to\n"
+        "  stdout (instead of modal dialogs) for DdsConsole.ps1. Two modes:\n"
+        "\n"
+        "  --password-stdin\n"
+        "      Passwordless sign-in for the CURRENT Windows account. Reads\n"
+        "      that account's password from stdin (one UTF-8 line), does the\n"
+        "      two-touch ceremony, and wraps the password into the vault.\n"
+        "\n"
+        "  --new-user --label <username> --display-name \"<Full Name>\"\n"
+        "      Register a BRAND-NEW person's key from an admin session (their\n"
+        "      key, their touch). No existing Windows account or password is\n"
+        "      needed: does MakeCredential + POST /v1/enroll/user only. The\n"
+        "      DDS user is named <Full Name>; its Windows account is created\n"
+        "      later by the first-logon claim. One touch.\n"
         "\n"
         "Usage:\n"
         "  dds-enroll-user.exe --password-stdin\n"
+        "  dds-enroll-user.exe --new-user --label jsmith --display-name \"Jane Smith\"\n"
         "\n"
         "Exit codes:\n"
-        "  0  vault saved + dds-node enrollment posted\n"
-        "  1  vault saved, but POST /v1/enroll/user failed (retry later)\n"
-        "  2  error before vault was saved\n"
+        "  0  enrollment posted to dds-node\n"
+        "  1  (password-stdin only) vault saved, but POST failed (retry later)\n"
+        "  2  error\n"
         "  3  user cancelled\n";
 }
 
@@ -152,9 +168,16 @@ int wmain(int argc, wchar_t** argv)
         PrintHelp();
         return 0;
     }
-    if (!args.passwordStdin)
+    // Exactly one mode must be selected.
+    if (args.newUser == args.passwordStdin)
     {
-        std::cerr << "error: --password-stdin is required.\n\n";
+        std::cerr << "error: specify exactly one of --password-stdin or --new-user.\n\n";
+        PrintHelp();
+        return 2;
+    }
+    if (args.newUser && (args.label.empty() || args.displayName.empty()))
+    {
+        std::cerr << "error: --new-user requires --label and --display-name.\n\n";
         PrintHelp();
         return 2;
     }
@@ -169,35 +192,44 @@ int wmain(int argc, wchar_t** argv)
     EnrollmentFlowOptions opts;
     opts.hwnd        = hwnd;
     opts.interactive = false;
+    opts.onPhase     = [](const std::string& json) { EmitNdjson(json); };
 
-    if (!ReadPasswordLineFromStdin(opts.presetPassword))
+    if (args.newUser)
     {
-        EmitNdjson("{\"phase\":\"error\",\"at\":\"password\","
-                   "\"message\":\"Failed to read password from stdin.\"}");
-        if (hwnd) DestroyWindow(hwnd);
-        return 2;
+        // Bare enrollment: a brand-new person, no existing account/password.
+        opts.bareEnroll          = true;
+        opts.label               = args.label;
+        opts.displayNameOverride = args.displayName;
     }
-
-    if (opts.presetPassword.empty())
+    else
     {
-        EmitNdjson("{\"phase\":\"error\",\"at\":\"password\","
-                   "\"message\":\"Empty password from stdin.\"}");
-        if (hwnd) DestroyWindow(hwnd);
-        return 2;
+        if (!ReadPasswordLineFromStdin(opts.presetPassword))
+        {
+            EmitNdjson("{\"phase\":\"error\",\"at\":\"password\","
+                       "\"message\":\"Failed to read password from stdin.\"}");
+            if (hwnd) DestroyWindow(hwnd);
+            return 2;
+        }
+        if (opts.presetPassword.empty())
+        {
+            EmitNdjson("{\"phase\":\"error\",\"at\":\"password\","
+                       "\"message\":\"Empty password from stdin.\"}");
+            if (hwnd) DestroyWindow(hwnd);
+            return 2;
+        }
     }
-
-    opts.onPhase = [](const std::string& json) { EmitNdjson(json); };
 
     EnrollmentFlowResult r = RunEnrollmentFlowEx(opts);
 
-    // Wipe sensitive material from our local copy.
-    SecureZeroMemory(opts.presetPassword.data(),
-                     opts.presetPassword.size() * sizeof(wchar_t));
+    // Wipe sensitive material from our local copy (empty in --new-user mode).
+    if (!opts.presetPassword.empty())
+        SecureZeroMemory(opts.presetPassword.data(),
+                         opts.presetPassword.size() * sizeof(wchar_t));
 
     if (hwnd) DestroyWindow(hwnd);
 
     if (r.success && r.serverPosted) return 0;
-    if (r.success)                   return 1; // vault OK, post failed
+    if (r.success)                   return 1; // vault OK, post failed (self-service)
     if (r.errorPhase == "password" && r.errorMessage == "User cancelled.")
         return 3;
     return 2;

@@ -256,78 +256,114 @@ static EnrollmentFlowResult RunEnrollmentFlowImpl(const EnrollmentFlowOptions& o
 {
     EnrollmentFlowResult result = {};
     HWND hwnd = opts.hwnd;
+    const bool bare = opts.bareEnroll;
 
-    FileLog::Writef("EnrollmentFlow: begin (interactive=%d, preset=%d)\n",
+    FileLog::Writef("EnrollmentFlow: begin (interactive=%d, preset=%d, bare=%d)\n",
                     opts.interactive ? 1 : 0,
-                    opts.presetPassword.empty() ? 0 : 1);
+                    opts.presetPassword.empty() ? 0 : 1,
+                    bare ? 1 : 0);
     EmitPhase(opts, "{\"phase\":\"start\"}");
 
     // Load config
     CDdsConfiguration config;
     config.Load();
+    std::string rpId = config.RpId();
 
-    // Get current user info
-    std::wstring userSid;
-    if (!GetCurrentUserSid(userSid))
-    {
-        result.errorPhase   = "user_sid";
-        result.errorMessage = "Failed to determine current user SID.";
-        if (opts.interactive)
-            MessageBoxW(hwnd, L"Failed to determine current user SID.",
-                        L"Enrollment Error", MB_OK | MB_ICONERROR);
-        EmitPhase(opts,
-            "{\"phase\":\"error\",\"at\":\"user_sid\",\"message\":\""
-            + JsonEscape(result.errorMessage) + "\"}");
-        return result;
-    }
-    std::wstring displayName = GetCurrentDisplayName();
-    std::string  rpId        = config.RpId();
+    // ---- Identity ----
+    // Self-service: the CURRENT Windows account (label = SID, name = current
+    //   user); the flow later wraps that account's password into the vault.
+    // New-person (bare): a brand-new user with no account here — identity is
+    //   caller-supplied (label / display name), and there is no password/vault.
+    std::wstring userSid;                 // self-service only (vault key)
+    std::wstring displayName;
+    std::string  enrollLabel;             // enroll POST label + CTAP user.id
+    std::vector<uint8_t> userId;
 
-    FileLog::Writef("EnrollmentFlow: user='%ls' rpId='%s'\n",
-                    displayName.c_str(), rpId.c_str());
-
-    // Step 1: obtain Windows password
-    std::wstring password;
-    if (!opts.presetPassword.empty())
+    if (bare)
     {
-        password = opts.presetPassword;
-    }
-    else if (opts.interactive)
-    {
-        if (!PromptForPassword(hwnd, password))
+        if (opts.label.empty() || opts.displayNameOverride.empty())
         {
-            FileLog::Write("EnrollmentFlow: user cancelled password prompt\n");
-            result.errorPhase   = "password";
-            result.errorMessage = "User cancelled.";
-            EmitPhase(opts, "{\"phase\":\"cancelled\"}");
+            result.errorPhase   = "args";
+            result.errorMessage = "New-person enrollment requires a username and display name.";
+            EmitPhase(opts, "{\"phase\":\"error\",\"at\":\"args\",\"message\":\""
+                + JsonEscape(result.errorMessage) + "\"}");
             return result;
         }
+        displayName = opts.displayNameOverride;
+        char labelUtf8[128] = {};
+        int lblLen = WideCharToMultiByte(CP_UTF8, 0, opts.label.c_str(), -1,
+                            labelUtf8, sizeof(labelUtf8), NULL, NULL);
+        if (lblLen <= 0)   // 0 => ERROR_INSUFFICIENT_BUFFER (label > 127 UTF-8 bytes) or invalid
+        {
+            result.errorPhase   = "args";
+            result.errorMessage = "Username is too long or contains invalid characters.";
+            EmitPhase(opts, "{\"phase\":\"error\",\"at\":\"args\",\"message\":\""
+                + JsonEscape(result.errorMessage) + "\"}");
+            return result;
+        }
+        enrollLabel = std::string(labelUtf8);
+        userId.assign(enrollLabel.begin(), enrollLabel.end());
+        FileLog::Writef("EnrollmentFlow: NEW-PERSON label='%s' name='%ls' rpId='%s'\n",
+                        enrollLabel.c_str(), displayName.c_str(), rpId.c_str());
     }
     else
     {
-        result.errorPhase   = "password";
-        result.errorMessage = "Non-interactive mode requires presetPassword.";
-        EmitPhase(opts,
-            "{\"phase\":\"error\",\"at\":\"password\",\"message\":\""
-            + JsonEscape(result.errorMessage) + "\"}");
-        return result;
+        if (!GetCurrentUserSid(userSid))
+        {
+            result.errorPhase   = "user_sid";
+            result.errorMessage = "Failed to determine current user SID.";
+            if (opts.interactive)
+                MessageBoxW(hwnd, L"Failed to determine current user SID.",
+                            L"Enrollment Error", MB_OK | MB_ICONERROR);
+            EmitPhase(opts, "{\"phase\":\"error\",\"at\":\"user_sid\",\"message\":\""
+                + JsonEscape(result.errorMessage) + "\"}");
+            return result;
+        }
+        displayName = GetCurrentDisplayName();
+        // CTAP2 limits user.id to 64 bytes; use the narrow (ASCII) SID form.
+        char sidUtf8[128] = {};
+        WideCharToMultiByte(CP_UTF8, 0, userSid.c_str(), -1,
+                            sidUtf8, sizeof(sidUtf8), NULL, NULL);
+        enrollLabel = std::string(sidUtf8);
+        userId.assign(enrollLabel.begin(), enrollLabel.end());
+        FileLog::Writef("EnrollmentFlow: user='%ls' rpId='%s'\n",
+                        displayName.c_str(), rpId.c_str());
     }
 
-    // Step 2: MakeCredential (Touch 1)
-    // Build userId from the SID string as UTF-8 bytes.
-    // CTAP2 limits user.id to 64 bytes max — UTF-16LE encoding of a
-    // typical SID exceeds that, so we use the narrow (ASCII) form.
-    char sidUtf8[128] = {};
-    WideCharToMultiByte(CP_UTF8, 0, userSid.c_str(), -1,
-                        sidUtf8, sizeof(sidUtf8), NULL, NULL);
-    std::string sidStr(sidUtf8);
-    std::vector<uint8_t> userId(sidStr.begin(), sidStr.end());
+    // ---- Windows password (self-service only; bare has no existing account) ----
+    std::wstring password;
+    if (!bare)
+    {
+        if (!opts.presetPassword.empty())
+        {
+            password = opts.presetPassword;
+        }
+        else if (opts.interactive)
+        {
+            if (!PromptForPassword(hwnd, password))
+            {
+                FileLog::Write("EnrollmentFlow: user cancelled password prompt\n");
+                result.errorPhase   = "password";
+                result.errorMessage = "User cancelled.";
+                EmitPhase(opts, "{\"phase\":\"cancelled\"}");
+                return result;
+            }
+        }
+        else
+        {
+            result.errorPhase   = "password";
+            result.errorMessage = "Non-interactive mode requires presetPassword.";
+            EmitPhase(opts, "{\"phase\":\"error\",\"at\":\"password\",\"message\":\""
+                + JsonEscape(result.errorMessage) + "\"}");
+            return result;
+        }
+    }
 
+    // ---- MakeCredential (Touch 1) ----
     if (opts.interactive)
     {
         MessageBoxW(hwnd,
-            L"Touch your security key to register it.\n\n"
-            L"This is touch 1 of 2.",
+            L"Touch your security key to register it.\n\nThis is touch 1 of 2.",
             L"DDS Enrollment", MB_OK | MB_ICONINFORMATION);
     }
     EmitPhase(opts, "{\"phase\":\"touch1_prompt\"}");
@@ -348,141 +384,113 @@ static EnrollmentFlowResult RunEnrollmentFlowImpl(const EnrollmentFlowOptions& o
                        makeResult.errorMessage.c_str());
             MessageBoxW(hwnd, msg, L"Enrollment Error", MB_OK | MB_ICONERROR);
         }
-        SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
-        EmitPhase(opts,
-            "{\"phase\":\"error\",\"at\":\"make_credential\",\"message\":\""
+        if (!password.empty())
+            SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
+        EmitPhase(opts, "{\"phase\":\"error\",\"at\":\"make_credential\",\"message\":\""
             + JsonEscape(makeResult.errorMessage) + "\"}");
         return result;
     }
     EmitPhase(opts, "{\"phase\":\"key_made\"}");
 
-    // Step 3: Generate random 32-byte salt for hmac-secret
-    std::vector<uint8_t> salt(32);
-    BCryptGenRandom(NULL, salt.data(), (ULONG)salt.size(),
-                    BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-
-    // Step 4: GetAssertion with hmac-secret (Touch 2)
-    if (opts.interactive)
+    // ---- Self-service only: touch-2 hmac-secret, encrypt the Windows password,
+    //      save the local vault. New-person (bare) skips ALL of this — the
+    //      account and its password are materialized by the first-logon claim,
+    //      which creates its own vault entry keyed to the new account. ----
+    if (!bare)
     {
-        MessageBoxW(hwnd,
-            L"Touch your security key again to complete enrollment.\n\n"
-            L"This is touch 2 of 2.",
-            L"DDS Enrollment", MB_OK | MB_ICONINFORMATION);
-    }
-    EmitPhase(opts, "{\"phase\":\"touch2_prompt\"}");
+        std::vector<uint8_t> salt(32);
+        BCryptGenRandom(NULL, salt.data(), (ULONG)salt.size(),
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 
-    auto assertResult = CWebAuthnHelper::GetAssertionHmacSecret(
-        hwnd, rpId, makeResult.credentialId, salt);
-
-    if (!assertResult.success || assertResult.hmacSecretOutput.size() != 32)
-    {
-        FileLog::Writef("EnrollmentFlow: GetAssertion hmac failed: %s\n",
-                        assertResult.errorMessage.c_str());
-        result.errorPhase   = "get_assertion";
-        result.errorMessage = assertResult.errorMessage.empty()
-            ? std::string("hmac-secret output unavailable")
-            : assertResult.errorMessage;
         if (opts.interactive)
         {
             MessageBoxW(hwnd,
-                L"Failed to get hmac-secret from authenticator.\n"
-                L"Enrollment cannot proceed.",
-                L"Enrollment Error", MB_OK | MB_ICONERROR);
+                L"Touch your security key again to complete enrollment.\n\nThis is touch 2 of 2.",
+                L"DDS Enrollment", MB_OK | MB_ICONINFORMATION);
         }
-        SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
-        EmitPhase(opts,
-            "{\"phase\":\"error\",\"at\":\"get_assertion\",\"message\":\""
-            + JsonEscape(result.errorMessage) + "\"}");
-        return result;
-    }
-    EmitPhase(opts, "{\"phase\":\"hmac_done\"}");
+        EmitPhase(opts, "{\"phase\":\"touch2_prompt\"}");
 
-    // Step 5: Encrypt password using hmac-secret output
-    VaultEntry entry = {};
-    entry.userSid     = userSid;
-    entry.displayName = displayName;
-    entry.credentialId = makeResult.credentialId;
-    entry.rpId        = rpId;
-    entry.salt        = salt;
-    entry.authMethod  = 1; // FIDO2
+        auto assertResult = CWebAuthnHelper::GetAssertionHmacSecret(
+            hwnd, rpId, makeResult.credentialId, salt);
 
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    entry.enrollmentTime = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+        if (!assertResult.success || assertResult.hmacSecretOutput.size() != 32)
+        {
+            FileLog::Writef("EnrollmentFlow: GetAssertion hmac failed: %s\n",
+                            assertResult.errorMessage.c_str());
+            result.errorPhase   = "get_assertion";
+            result.errorMessage = assertResult.errorMessage.empty()
+                ? std::string("hmac-secret output unavailable")
+                : assertResult.errorMessage;
+            if (opts.interactive)
+                MessageBoxW(hwnd,
+                    L"Failed to get hmac-secret from authenticator.\nEnrollment cannot proceed.",
+                    L"Enrollment Error", MB_OK | MB_ICONERROR);
+            SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
+            EmitPhase(opts, "{\"phase\":\"error\",\"at\":\"get_assertion\",\"message\":\""
+                + JsonEscape(result.errorMessage) + "\"}");
+            return result;
+        }
+        EmitPhase(opts, "{\"phase\":\"hmac_done\"}");
 
-    if (!CCredentialVault::EncryptPassword(
-            assertResult.hmacSecretOutput.data(),
-            assertResult.hmacSecretOutput.size(),
-            password.c_str(),
-            entry))
-    {
-        FileLog::Write("EnrollmentFlow: password encryption failed\n");
-        result.errorPhase   = "encrypt";
-        result.errorMessage = "Failed to encrypt password with hmac-secret output.";
-        if (opts.interactive)
-            MessageBoxW(hwnd, L"Failed to encrypt password.",
-                        L"Enrollment Error", MB_OK | MB_ICONERROR);
+        VaultEntry entry = {};
+        entry.userSid      = userSid;
+        entry.displayName  = displayName;
+        entry.credentialId = makeResult.credentialId;
+        entry.rpId         = rpId;
+        entry.salt         = salt;
+        entry.authMethod   = 1; // FIDO2
+
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        entry.enrollmentTime = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+
+        if (!CCredentialVault::EncryptPassword(
+                assertResult.hmacSecretOutput.data(),
+                assertResult.hmacSecretOutput.size(),
+                password.c_str(), entry))
+        {
+            FileLog::Write("EnrollmentFlow: password encryption failed\n");
+            result.errorPhase   = "encrypt";
+            result.errorMessage = "Failed to encrypt password with hmac-secret output.";
+            if (opts.interactive)
+                MessageBoxW(hwnd, L"Failed to encrypt password.",
+                            L"Enrollment Error", MB_OK | MB_ICONERROR);
+            SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
+            SecureZeroMemory(assertResult.hmacSecretOutput.data(), 32);
+            EmitPhase(opts, "{\"phase\":\"error\",\"at\":\"encrypt\",\"message\":\""
+                + JsonEscape(result.errorMessage) + "\"}");
+            return result;
+        }
+
         SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
         SecureZeroMemory(assertResult.hmacSecretOutput.data(), 32);
-        EmitPhase(opts,
-            "{\"phase\":\"error\",\"at\":\"encrypt\",\"message\":\""
-            + JsonEscape(result.errorMessage) + "\"}");
-        return result;
+
+        CCredentialVault vault;
+        vault.Load();
+        if (!vault.EnrollUser(entry) || !vault.Save())
+        {
+            FileLog::Write("EnrollmentFlow: vault save failed\n");
+            result.errorPhase   = "vault_save";
+            result.errorMessage = "Failed to write the credential vault to disk.";
+            if (opts.interactive)
+                MessageBoxW(hwnd, L"Failed to save credential to vault.",
+                            L"Enrollment Error", MB_OK | MB_ICONERROR);
+            EmitPhase(opts, "{\"phase\":\"error\",\"at\":\"vault_save\",\"message\":\""
+                + JsonEscape(result.errorMessage) + "\"}");
+            return result;
+        }
+        EmitPhase(opts, "{\"phase\":\"vault_written\"}");
+        FileLog::Write("EnrollmentFlow: vault saved OK\n");
+
+        // Local vault is in place — provisional success even if the POST fails.
+        result.success = true;
     }
 
-    // Secure cleanup of sensitive material
-    SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
-    SecureZeroMemory(assertResult.hmacSecretOutput.data(), 32);
-
-    // Step 6: Save to local vault
-    CCredentialVault vault;
-    vault.Load(); // OK if file doesn't exist yet
-    if (!vault.EnrollUser(entry))
-    {
-        FileLog::Write("EnrollmentFlow: vault EnrollUser failed\n");
-        result.errorPhase   = "vault_save";
-        result.errorMessage = "Vault EnrollUser() failed.";
-        if (opts.interactive)
-            MessageBoxW(hwnd, L"Failed to save credential to vault.",
-                        L"Enrollment Error", MB_OK | MB_ICONERROR);
-        EmitPhase(opts,
-            "{\"phase\":\"error\",\"at\":\"vault_save\",\"message\":\""
-            + JsonEscape(result.errorMessage) + "\"}");
-        return result;
-    }
-    if (!vault.Save())
-    {
-        FileLog::Write("EnrollmentFlow: vault Save failed\n");
-        result.errorPhase   = "vault_save";
-        result.errorMessage = "Vault file write to disk failed.";
-        if (opts.interactive)
-            MessageBoxW(hwnd, L"Failed to write vault file to disk.",
-                        L"Enrollment Error", MB_OK | MB_ICONERROR);
-        EmitPhase(opts,
-            "{\"phase\":\"error\",\"at\":\"vault_save\",\"message\":\""
-            + JsonEscape(result.errorMessage) + "\"}");
-        return result;
-    }
-    EmitPhase(opts, "{\"phase\":\"vault_written\"}");
-    FileLog::Write("EnrollmentFlow: vault saved OK\n");
-
-    // Local vault is in place — set provisional success. Server POST is
-    // best-effort; if it fails, the user can still sign in locally.
-    result.success = true;
-
-    // Step 7: POST /v1/enroll/user to dds-node — prefer ApiAddr (A-2)
-    // so we hit the named-pipe transport when the operator's node.toml
-    // disables loopback TCP.
+    // ---- POST /v1/enroll/user (both modes) ----
     CDdsNodeHttpClient httpClient;
-    if (!config.ApiAddr().empty()) {
-        httpClient.SetBaseUrl(config.ApiAddr());
-    } else {
-        httpClient.SetPort(config.DdsNodePort());
-    }
-    // A-3 fail-closed: load HMAC secret so response MAC verifies.
-    if (!config.HmacSecretPath().empty()) {
-        httpClient.LoadHmacSecret(config.HmacSecretPath());
-    }
+    if (!config.ApiAddr().empty()) httpClient.SetBaseUrl(config.ApiAddr());
+    else                           httpClient.SetPort(config.DdsNodePort());
+    if (!config.HmacSecretPath().empty()) httpClient.LoadHmacSecret(config.HmacSecretPath());
 
     std::string credIdB64 = Base64UrlEncode(
         makeResult.credentialId.data(), makeResult.credentialId.size());
@@ -491,22 +499,17 @@ static EnrollmentFlowResult RunEnrollmentFlowImpl(const EnrollmentFlowOptions& o
     std::string cdhB64 = Base64UrlEncode(
         makeResult.clientDataHash.data(), makeResult.clientDataHash.size());
 
-    // Convert displayName to UTF-8 for JSON
     char displayNameUtf8[256] = {};
     WideCharToMultiByte(CP_UTF8, 0, displayName.c_str(), -1,
                         displayNameUtf8, sizeof(displayNameUtf8), NULL, NULL);
 
-    char userSidUtf8[160] = {};
-    WideCharToMultiByte(CP_UTF8, 0, userSid.c_str(), -1,
-                        userSidUtf8, sizeof(userSidUtf8), NULL, NULL);
-
     std::string enrollJson = "{";
-    enrollJson += "\"label\":\"" + std::string(userSidUtf8) + "\",";
+    enrollJson += "\"label\":\"" + JsonEscape(enrollLabel) + "\",";
     enrollJson += "\"credential_id\":\"" + credIdB64 + "\",";
     enrollJson += "\"attestation_object_b64\":\"" + attestB64 + "\",";
     enrollJson += "\"client_data_hash_b64\":\"" + cdhB64 + "\",";
     enrollJson += "\"rp_id\":\"" + rpId + "\",";
-    enrollJson += "\"display_name\":\"" + std::string(displayNameUtf8) + "\",";
+    enrollJson += "\"display_name\":\"" + JsonEscape(std::string(displayNameUtf8)) + "\",";
     enrollJson += "\"authenticator_type\":\"cross-platform\"";
     enrollJson += "}";
 
@@ -519,31 +522,41 @@ static EnrollmentFlowResult RunEnrollmentFlowImpl(const EnrollmentFlowOptions& o
         result.serverPosted = false;
         result.errorPhase   = "post_enroll";
         result.errorMessage = enrollResult.errorMessage;
-        if (opts.interactive)
+        if (bare)
         {
-            wchar_t msg[512];
-            swprintf_s(msg,
-                L"Credential saved locally, but DDS node enrollment failed:\n%hs\n\n"
-                L"You can retry enrollment later. The local vault entry is preserved.",
-                enrollResult.errorMessage.c_str());
-            MessageBoxW(hwnd, msg, L"Enrollment Warning", MB_OK | MB_ICONWARNING);
+            // No local vault to fall back on — a failed POST means the
+            // new-person enrollment did not happen.
+            result.success = false;
+            EmitPhase(opts, "{\"phase\":\"error\",\"at\":\"post_enroll\",\"message\":\""
+                + JsonEscape(enrollResult.errorMessage) + "\"}");
         }
-        EmitPhase(opts,
-            "{\"phase\":\"enroll_failed_local_only\",\"message\":\""
-            + JsonEscape(enrollResult.errorMessage) + "\"}");
-        // result.success stays true — local vault is in place.
+        else
+        {
+            if (opts.interactive)
+            {
+                wchar_t msg[512];
+                swprintf_s(msg,
+                    L"Credential saved locally, but DDS node enrollment failed:\n%hs\n\n"
+                    L"You can retry enrollment later. The local vault entry is preserved.",
+                    enrollResult.errorMessage.c_str());
+                MessageBoxW(hwnd, msg, L"Enrollment Warning", MB_OK | MB_ICONWARNING);
+            }
+            EmitPhase(opts, "{\"phase\":\"enroll_failed_local_only\",\"message\":\""
+                + JsonEscape(enrollResult.errorMessage) + "\"}");
+            // result.success stays true — local vault is in place.
+        }
         return result;
     }
 
     result.serverPosted = true;
     result.urn = enrollResult.urn;
     result.jti = enrollResult.jti;
+    if (bare) result.success = true;   // bare: success == server posted
 
     FileLog::Writef("EnrollmentFlow: dds-node enroll OK urn='%s' jti='%s'\n",
                     enrollResult.urn.c_str(), enrollResult.jti.c_str());
 
-    EmitPhase(opts,
-        "{\"phase\":\"enroll_posted\",\"urn\":\""
+    EmitPhase(opts, "{\"phase\":\"enroll_posted\",\"urn\":\""
         + JsonEscape(enrollResult.urn) + "\",\"jti\":\""
         + JsonEscape(enrollResult.jti) + "\"}");
 
@@ -551,8 +564,7 @@ static EnrollmentFlowResult RunEnrollmentFlowImpl(const EnrollmentFlowOptions& o
     {
         wchar_t successMsg[512];
         swprintf_s(successMsg,
-            L"FIDO2 key enrolled successfully!\n\n"
-            L"URN: %hs\n\n"
+            L"FIDO2 key enrolled successfully!\n\nURN: %hs\n\n"
             L"Ask your administrator to approve this enrollment.",
             enrollResult.urn.c_str());
         MessageBoxW(hwnd, successMsg, L"Enrollment Complete", MB_OK | MB_ICONINFORMATION);

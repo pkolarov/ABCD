@@ -64,6 +64,18 @@ struct EnrollmentFlowOptions
                                                        // phase boundary with
                                                        // a JSON line (no
                                                        // trailing newline).
+
+    // New-person ("bare") enrollment: register a BRAND-NEW user's key from an
+    // admin's session — the person has no Windows account here yet. When true,
+    // the identity comes from `label`/`displayNameOverride` (NOT the current
+    // Windows account), and the flow does MakeCredential + POST /v1/enroll/user
+    // ONLY: no Windows password, no touch-2 hmac assertion, no local vault
+    // write. The Windows account + its password are materialized later by the
+    // first-logon claim, which creates its own vault entry. Fixes the
+    // "borrowed account gets stamped as the DDS user's name" problem.
+    bool bareEnroll = false;
+    std::wstring label;                // enroll label / username (bare mode)
+    std::wstring displayNameOverride;  // DDS display name for the new user (bare)
 };
 
 // Legacy interactive entry point (used by DdsTrayAgent). Shows MessageBox

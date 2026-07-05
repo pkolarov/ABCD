@@ -209,7 +209,8 @@ function Resolve-InitialPage {
         <TextBlock Grid.Row="1" Foreground="#555555" Margin="0,4,0,12" TextWrapping="Wrap"
                    x:Name="WelcomeDetected"
                    Text="Pick the option that matches your role on this machine."/>
-        <StackPanel Grid.Row="2">
+        <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+        <StackPanel>
           <Border x:Name="TileNewDomain" CornerRadius="6" BorderBrush="#cccccc"
                   BorderThickness="1" Padding="14" Margin="0,0,0,10" Background="White"
                   Cursor="Hand">
@@ -240,8 +241,18 @@ function Resolve-InitialPage {
                          Text="Use this if this machine is already part of a domain but you sign in with a Windows password. You'll register a FIDO2 key for your account."/>
             </StackPanel>
           </Border>
+          <Border x:Name="TileUsersPolicy" CornerRadius="6" BorderBrush="#cccccc"
+                  BorderThickness="1" Padding="14" Margin="0,0,0,10" Background="White"
+                  Cursor="Hand">
+            <StackPanel>
+              <TextBlock FontSize="15" FontWeight="SemiBold"
+                         Text="Create a user account / manage policy"/>
+              <TextBlock Foreground="#555555" Margin="0,4,0,0" TextWrapping="Wrap"
+                         Text="Admin: create a new Windows account for an enrolled DDS user (passwordless first-logon), or publish registry / service / password policy to the domain."/>
+            </StackPanel>
+          </Border>
           <Border x:Name="TileHealth" CornerRadius="6" BorderBrush="#cccccc"
-                  BorderThickness="1" Padding="14" Background="White" Cursor="Hand">
+                  BorderThickness="1" Padding="14" Margin="0,0,0,2" Background="White" Cursor="Hand">
             <StackPanel>
               <TextBlock FontSize="15" FontWeight="SemiBold"
                          Text="View status / open Tray Agent"/>
@@ -250,6 +261,7 @@ function Resolve-InitialPage {
             </StackPanel>
           </Border>
         </StackPanel>
+        </ScrollViewer>
       </Grid>
 
       <!-- ============ Resume bootstrap ============ -->
@@ -484,12 +496,13 @@ function Resolve-InitialPage {
           <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
         <TextBlock Grid.Row="0" FontSize="16" FontWeight="SemiBold"
-                   Text="Step 1 of 4 — What's about to happen"/>
+                   Text="Step 1 of 4 — Register a key for THIS account"/>
         <TextBlock Grid.Row="1" Foreground="#555555" Margin="0,4,0,12" TextWrapping="Wrap"
                    x:Name="TbEnrollExplain"
-                   Text="We'll set up passwordless sign-in for your Windows account. This takes about 30 seconds."/>
+                   Text="This registers a security key for the Windows account you are currently signed in as. The new DDS user will be named after this account, so only this account's owner should register their key here."/>
         <StackPanel Grid.Row="2">
           <TextBlock FontWeight="SemiBold" Margin="0,0,0,4" Text="You'll need:"/>
+          <TextBlock Margin="0,0,0,2" Text="• To be signed in as the person whose key you're registering (the DDS user is named after this account)"/>
           <TextBlock Margin="0,0,0,2" Text="• Your current Windows password (used once to verify you, then encrypted with your key)"/>
           <TextBlock Margin="0,0,0,2" Text="• A FIDO2 security key plugged in"/>
           <TextBlock Text="• To touch the key twice when prompted"/>
@@ -607,7 +620,7 @@ function Resolve-InitialPage {
             <TextBlock Grid.Column="0" x:Name="TbPubStatus" TextWrapping="Wrap"
                        VerticalAlignment="Center" Text="Checking publish authorization..."/>
             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-              <Button x:Name="BtnPubCopyGrant" Content="Copy grant command" Padding="8,3"
+              <Button x:Name="BtnPubCopyGrant" Content="Copy machine ID" Padding="8,3"
                       Margin="8,0,0,0" Visibility="Collapsed"/>
               <Button x:Name="BtnPubCheck" Content="Re-check" Padding="8,3" Margin="8,0,0,0"/>
             </StackPanel>
@@ -617,65 +630,102 @@ function Resolve-InitialPage {
         <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
           <StackPanel>
             <!-- New user account (first-account claim) -->
-            <GroupBox Header="New Windows account for a DDS user (passwordless first-logon claim)"
-                      Padding="10" Margin="0,0,0,10">
-              <Grid>
-                <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="160"/>
-                  <ColumnDefinition Width="*"/>
-                </Grid.ColumnDefinitions>
-                <Grid.RowDefinitions>
-                  <RowDefinition Height="Auto"/>
-                  <RowDefinition Height="Auto"/>
-                  <RowDefinition Height="Auto"/>
-                  <RowDefinition Height="Auto"/>
-                  <RowDefinition Height="Auto"/>
-                  <RowDefinition Height="Auto"/>
-                  <RowDefinition Height="Auto"/>
-                </Grid.RowDefinitions>
+            <GroupBox Header="Create a Windows account for a person" Padding="12" Margin="0,0,0,10">
+              <StackPanel>
+                <TextBlock TextWrapping="Wrap" Foreground="#444444" Margin="0,0,0,12"
+                           Text="Onboard anyone onto DDS with their security key -- from THIS machine, whatever account you're signed in as. No password is ever typed and no borrowed account is used: the person's Windows account is created automatically the first time they sign in with their key."/>
 
-                <TextBlock Grid.Row="0" Grid.Column="0" Text="DDS user (subject):"
-                           VerticalAlignment="Center" Margin="0,4"/>
-                <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Margin="0,4">
-                  <ComboBox x:Name="CbClaimSubject" Width="330" IsEditable="False"/>
-                  <Button x:Name="BtnLoadUsers" Content="Refresh users" Padding="8,2" Margin="8,0,0,0"/>
+                <!-- 1. The person -->
+                <TextBlock Text="1.  Who is the account for?" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                <Grid Margin="0,0,0,2">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="150"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                  </Grid.RowDefinitions>
+                  <TextBlock Grid.Row="0" Grid.Column="0" Text="Windows username:" VerticalAlignment="Center" Margin="0,3"/>
+                  <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Margin="0,3">
+                    <TextBox x:Name="TbAcctUser" Width="200"
+                             ToolTip="1-20 characters: letters, numbers, . - _   (no spaces; cannot end with a dot)"/>
+                    <TextBlock VerticalAlignment="Center" Foreground="#888888" FontSize="11" Margin="10,0,0,0"
+                               Text="e.g. jsmith -- the name they sign in with"/>
+                  </StackPanel>
+                  <TextBlock Grid.Row="1" Grid.Column="0" Text="Full name:" VerticalAlignment="Center" Margin="0,3"/>
+                  <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Margin="0,3">
+                    <TextBox x:Name="TbAcctFullName" Width="240"/>
+                    <TextBlock VerticalAlignment="Center" Foreground="#888888" FontSize="11" Margin="10,0,0,0"
+                               Text="e.g. Jane Smith -- becomes the DDS user's name"/>
+                  </StackPanel>
+                </Grid>
+
+                <!-- 2. Their key -->
+                <TextBlock Text="2.  Their security key" FontWeight="SemiBold" Margin="0,10,0,4"/>
+                <Border Background="#EAF3FB" BorderBrush="#B9D6EE" BorderThickness="1" CornerRadius="3"
+                        Padding="10" Margin="0,0,0,6">
+                  <StackPanel>
+                    <TextBlock TextWrapping="Wrap" Foreground="#264a63"
+                               Text="New person (no key registered yet): have them plug THEIR security key into this PC, then click Register. They touch their own key -- this creates their DDS identity named after the Full name above. No borrowed account, no password."/>
+                    <Button x:Name="BtnEnrollNewPerson" Content="Register this person's key"
+                            HorizontalAlignment="Left" Padding="12,4" Margin="0,8,0,0"/>
+                    <TextBlock x:Name="TbEnrollNpStatus" Foreground="#264a63" FontSize="11"
+                               TextWrapping="Wrap" Margin="0,6,0,0" Text=""/>
+                  </StackPanel>
+                </Border>
+                <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                  <TextBlock VerticalAlignment="Center" Foreground="#888888" FontSize="11"
+                             Text="Already enrolled? Pick them:"/>
+                  <ComboBox x:Name="CbClaimSubject" Width="300" IsEditable="False" Margin="8,0,0,0"
+                            ToolTip="DDS users already enrolled on this domain."/>
+                  <Button x:Name="BtnLoadUsers" Content="Refresh" Padding="8,2" Margin="8,0,0,0"/>
+                </StackPanel>
+                <TextBlock Foreground="#888888" FontSize="11" TextWrapping="Wrap" Margin="0,4,0,2"
+                           Text="DDS identity (filled in by Register, or by picking from the list):"/>
+                <TextBox x:Name="TbClaimSubject" FontFamily="Consolas" FontSize="11" IsReadOnly="True"
+                         Margin="0,0,0,12" Background="#F3F3F3"/>
+
+                <!-- Groups -->
+                <StackPanel Margin="0,0,0,12">
+                  <TextBlock Text="Windows groups (optional)" FontWeight="SemiBold"/>
+                  <TextBlock Foreground="#666666" FontSize="11" TextWrapping="Wrap" Margin="0,2,0,5"
+                             Text="Which Windows groups the account belongs to, separated by commas. Leave 'Users' for a normal account; add 'Administrators' to make them a local admin on the PC."/>
+                  <TextBox x:Name="TbAcctGroups" Text="Users" Width="360" HorizontalAlignment="Left"
+                           ToolTip="Comma-separated Windows group names, e.g. Users, Remote Desktop Users"/>
                 </StackPanel>
 
-                <TextBlock Grid.Row="1" Grid.Column="0" Text="Subject URN:"
-                           VerticalAlignment="Center" Margin="0,4"/>
-                <TextBox x:Name="TbClaimSubject" Grid.Row="1" Grid.Column="1" Margin="0,4"
-                         FontFamily="Consolas"/>
-
-                <TextBlock Grid.Row="2" Grid.Column="0" Text="Windows username:"
-                           VerticalAlignment="Center" Margin="0,4"/>
-                <TextBox x:Name="TbAcctUser" Grid.Row="2" Grid.Column="1" Width="220"
-                         HorizontalAlignment="Left" Margin="0,4"/>
-
-                <TextBlock Grid.Row="3" Grid.Column="0" Text="Full name (optional):"
-                           VerticalAlignment="Center" Margin="0,4"/>
-                <TextBox x:Name="TbAcctFullName" Grid.Row="3" Grid.Column="1" Margin="0,4"/>
-
-                <TextBlock Grid.Row="4" Grid.Column="0" Text="Groups (comma-sep):"
-                           VerticalAlignment="Center" Margin="0,4"/>
-                <TextBox x:Name="TbAcctGroups" Grid.Row="4" Grid.Column="1" Margin="0,4"
-                         Text="Users"/>
-
-                <TextBlock Grid.Row="5" Grid.Column="0" Text="Applies to:"
-                           VerticalAlignment="Center" Margin="0,4"/>
-                <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Margin="0,4">
-                  <RadioButton x:Name="RbAcctAllDevices" GroupName="AcctScope" Content="All devices"
-                               IsChecked="True" VerticalAlignment="Center" Margin="0,0,12,0"/>
-                  <RadioButton x:Name="RbAcctDevice" GroupName="AcctScope" Content="Device URN:"
-                               VerticalAlignment="Center" Margin="0,0,6,0"/>
-                  <TextBox x:Name="TbAcctDeviceUrn" Width="260" FontFamily="Consolas"/>
-                  <CheckBox x:Name="CbAcctPwNever" Content="Password never expires"
-                            VerticalAlignment="Center" Margin="16,0,0,0" IsChecked="True"/>
+                <!-- 3. Which computers -->
+                <StackPanel Margin="0,0,0,12">
+                  <TextBlock Text="3.  Which computers can this account be created on?" FontWeight="SemiBold"/>
+                  <TextBlock Foreground="#666666" FontSize="11" TextWrapping="Wrap" Margin="0,2,0,5"
+                             Text="'All computers' is the usual choice. Pick a specific computer only if this account should exist on just one machine -- then paste that computer's device ID (starts with urn:vouchsafe:). Note: the account is auto-created only on workgroup or Entra-joined PCs, not on Active-Directory domain-joined machines."/>
+                  <RadioButton x:Name="RbAcctAllDevices" GroupName="AcctScope"
+                               Content="All computers in the domain" IsChecked="True" Margin="0,0,0,4"/>
+                  <StackPanel Orientation="Horizontal">
+                    <RadioButton x:Name="RbAcctDevice" GroupName="AcctScope"
+                                 Content="Only a specific computer:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                    <TextBox x:Name="TbAcctDeviceUrn" Width="300" FontFamily="Consolas" FontSize="11"
+                             ToolTip="The target computer's device ID (urn:vouchsafe:...). Run 'dds status' on that PC to find it."/>
+                  </StackPanel>
                 </StackPanel>
 
-                <Button x:Name="BtnCreateAccount" Grid.Row="6" Grid.Column="1"
-                        Content="Publish new account policy" HorizontalAlignment="Left"
-                        Padding="14,5" Margin="0,10,0,0"/>
-              </Grid>
+                <!-- Password never expires -->
+                <StackPanel Margin="0,0,0,12">
+                  <CheckBox x:Name="CbAcctPwNever" Content="Password never expires (recommended)" IsChecked="True"/>
+                  <TextBlock Foreground="#666666" FontSize="11" TextWrapping="Wrap" Margin="20,2,0,0"
+                             Text="Keep this on. DDS manages the password and wraps it with the security key, so it never needs to be changed."/>
+                </StackPanel>
+
+                <!-- 4. Approve + publish -->
+                <TextBlock Text="4.  Approve, then publish" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                <TextBlock Foreground="#666666" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,6"
+                           Text="Before the account can be created, an admin must approve the new user: open the DDS tray icon -> 'Approve Enrollments', select them, and touch the admin key. Then publish:"/>
+                <Button x:Name="BtnCreateAccount" Content="Publish -- create this account"
+                        HorizontalAlignment="Left" Padding="16,6" Margin="0,2,0,2"/>
+                <TextBlock Foreground="#666666" FontSize="11" TextWrapping="Wrap" Margin="0,3,0,0"
+                           Text="Publishes the account to the domain. It reaches the target computer(s) within about a minute and is created when the person first signs in with their security key. Progress and errors appear in the Output box below."/>
+              </StackPanel>
             </GroupBox>
 
             <!-- Advanced: author any policy from JSON / templates -->
@@ -764,11 +814,11 @@ $names = @(
     'PageEnrollUser_Explainer','PageEnrollUser_Password','PageEnrollUser_Touch','PageEnrollUser_AwaitingApproval',
     'PageHealth','PagePolicy','PageError',
     'PubBanner','TbPubStatus','BtnPubCheck','BtnPubCopyGrant',
-    'CbClaimSubject','BtnLoadUsers','TbClaimSubject','TbAcctUser','TbAcctFullName','TbAcctGroups',
+    'BtnEnrollNewPerson','TbEnrollNpStatus','CbClaimSubject','BtnLoadUsers','TbClaimSubject','TbAcctUser','TbAcctFullName','TbAcctGroups',
     'RbAcctAllDevices','RbAcctDevice','TbAcctDeviceUrn','CbAcctPwNever','BtnCreateAccount',
     'CbPlatform','CbTemplate','BtnFillTemplate','TbPolicyJson','BtnPublishJson','TbPolicyLog',
     'BtnUsersPolicy',
-    'WelcomeDetected','TileNewDomain','TileJoinDomain','TileEnrollUser','TileHealth',
+    'WelcomeDetected','TileNewDomain','TileJoinDomain','TileEnrollUser','TileUsersPolicy','TileHealth',
     'ResumeDetail','BtnResumeRestart','BtnResumeNew',
     'TbName','TbOrg','CbForce','TbIdentityWarn',
     'RbFido2','RbPass',
@@ -880,7 +930,7 @@ function Update-NavForPage {
             $el.BtnBack.IsEnabled = $false
             $el.BtnNext.Content = 'Finish'
         }
-        'PageEnrollUser_Explainer' { $el.HdrSubtitle.Text = 'Set up passwordless sign-in' }
+        'PageEnrollUser_Explainer' { $el.HdrSubtitle.Text = 'Set up passwordless sign-in'; Set-EnrollExplainerText }
         'PageEnrollUser_Password'  { $el.HdrSubtitle.Text = 'Set up passwordless sign-in' }
         'PageEnrollUser_Touch' {
             $el.HdrSubtitle.Text = 'Set up passwordless sign-in'
@@ -1303,8 +1353,10 @@ $script:enrollPollAttempts = 0
 function Set-EnrollExplainerText {
     try {
         $u = ([Security.Principal.WindowsIdentity]::GetCurrent()).Name
-        $el.TbEnrollExplain.Text = "We'll set up passwordless sign-in for $u. This takes about 30 seconds."
-    } catch { }
+        $el.TbEnrollExplain.Text = "This registers a security key for the Windows account you are signed in as right now -- $u -- and the new DDS user will be named after it. IMPORTANT: only the owner of '$u' should register their key here. Setting up a different person? Do NOT enroll them from this account -- their DDS user would be named '$u' and their key would unlock this account. Instead, have them sign in to their own Windows account and run this there. (An admin 'enroll a new person by name' flow is planned.)"
+    } catch {
+        $el.TbEnrollExplain.Text = "This registers a security key for the Windows account you are signed in as right now, and the new DDS user will be named after it. Only the account's own owner should register their key here."
+    }
 }
 
 function Validate-WindowsPassword {
@@ -1559,6 +1611,7 @@ $el.TileEnrollUser.add_MouseLeftButtonUp({
     Set-EnrollExplainerText
     Show-Page -Name 'PageEnrollUser_Explainer'
 })
+$el.TileUsersPolicy.add_MouseLeftButtonUp({ Show-Page -Name 'PagePolicy' })
 $el.TileHealth.add_MouseLeftButtonUp({
     Refresh-Health
     Show-Page -Name 'PageHealth'
@@ -1653,6 +1706,7 @@ $el.BtnStopAll.add_Click({
 
 # ── Users & Policy page ───────────────────────────────────────────
 $script:pubGrantCmd       = ''
+$script:pubNodeUrn        = ''
 $script:policyUsersLoaded = $false
 $script:pubInitTried      = $false
 
@@ -1715,14 +1769,15 @@ function Refresh-PublisherStatus {
         } else {
             $el.PubBanner.Background  = $amber
             $el.PubBanner.BorderBrush = $amberB
+            $script:pubNodeUrn  = [string]$st.node_urn
             $script:pubGrantCmd = [string]$st.grant_command
-            # One-time: publish this node's identity so the admin's vouch
-            # can bind to it (admin_vouch needs a live target attestation).
+            # One-time: publish this node's identity so a future admin
+            # approval can bind to it (admin_vouch needs a live attestation).
             if (-not $script:pubInitTried) {
                 $script:pubInitTried = $true
                 try { $null = Invoke-DdsCli @('--node-url', $NodeUrl, 'policy', 'publisher-init') } catch { }
             }
-            $el.TbPubStatus.Text = "This node is NOT yet authorized to publish policy. Its identity has been prepared; an admin must grant it once (needs a security key):`r`n$($script:pubGrantCmd)"
+            $el.TbPubStatus.Text = "This machine is not yet authorized to publish policy to the domain. Authorizing it takes a one-time admin approval with a security key. Tip: policy authoring works automatically from your genesis / admin node (a domain trusted root). To have an admin authorize this machine, give them its ID below."
             $el.BtnPubCopyGrant.Visibility = 'Visible'
         }
     } catch {
@@ -1735,7 +1790,10 @@ function Refresh-PublisherStatus {
 
 function Load-EnrolledUsers {
     try {
-        $body = Invoke-DdsNodeGet -Path '/v1/enrolled-users'
+        # /v1/enrolled-users requires a device_urn query param; the node
+        # ignores its value for the list, so an empty one satisfies the
+        # extractor (omitting it returns a plaintext 400, not JSON).
+        $body = Invoke-DdsNodeGet -Path '/v1/enrolled-users?device_urn='
         $data = $body | ConvertFrom-Json
         $el.CbClaimSubject.Items.Clear()
         $count = 0
@@ -1896,11 +1954,101 @@ function Set-PolicyTemplate {
     $el.TbPolicyJson.Text = $tpl
 }
 
+# ---- Enroll a brand-new person by name (bare enroll; works from any account) ----
+$script:npProc  = $null
+$script:npTimer = $null
+$script:npLog   = ''
+$script:npPos   = 0
+$script:npUrn   = ''
+
+function Start-EnrollNewPerson {
+    if ($script:npProc -and -not $script:npProc.HasExited) {
+        Append-Log $el.TbPolicyLog "[enroll] a registration is already in progress."
+        return
+    }
+    if (-not (Test-Path $EnrollUserBin)) {
+        $el.TbEnrollNpStatus.Text = "dds-enroll-user.exe not found -- reinstall the MSI."
+        return
+    }
+    $user = ([string]$el.TbAcctUser.Text).Trim()
+    $full = ([string]$el.TbAcctFullName.Text).Trim()
+    if ($user.Length -lt 1 -or $user.Length -gt 20 -or ($user -notmatch '^[A-Za-z0-9._-]+$') -or $user.EndsWith('.')) {
+        $el.TbEnrollNpStatus.Text = "Enter a valid Windows username first (1-20 chars: letters, numbers, . - _; no spaces)."
+        return
+    }
+    if (-not $full) {
+        $el.TbEnrollNpStatus.Text = "Enter the person's full name first (it becomes the DDS user's name)."
+        return
+    }
+    # Strip double-quotes AND backslashes: the name is placed inside a
+    # quoted CLI arg, and a trailing backslash would escape the closing
+    # quote (CommandLineToArgvW). Real names contain neither.
+    $fullClean = ($full -replace '["\\]','')
+    $script:npUrn = ''
+    $script:npLog = Join-Path $env:TEMP ("dds-newperson-{0:yyyyMMdd-HHmmss-fff}.log" -f (Get-Date))
+    $script:npPos = 0
+    $el.TbEnrollNpStatus.Text = "Ask $full to plug in THEIR security key and touch it when the Windows prompt appears..."
+    Append-Log $el.TbPolicyLog "[enroll] registering new person '$full' (username $user) -- waiting for their key touch..."
+    $argLine = "--new-user --label `"$user`" --display-name `"$fullClean`""
+    try {
+        $script:npProc = Start-Process -FilePath $EnrollUserBin -ArgumentList $argLine `
+            -RedirectStandardOutput $script:npLog -NoNewWindow -PassThru
+    } catch {
+        $el.TbEnrollNpStatus.Text = "Could not start enrollment: $($_.Exception.Message)"
+        return
+    }
+    $el.BtnEnrollNewPerson.IsEnabled = $false
+    $script:npTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:npTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+    $script:npTimer.Add_Tick({ Tick-EnrollNewPerson })
+    $script:npTimer.Start()
+}
+
+function Tick-EnrollNewPerson {
+    if ($script:npLog -and (Test-Path $script:npLog)) {
+        try {
+            $fs = [IO.File]::Open($script:npLog, 'Open', 'Read', 'ReadWrite')
+            try {
+                $fs.Seek($script:npPos, 'Begin') | Out-Null
+                $sr = New-Object IO.StreamReader($fs)
+                while ($null -ne ($line = $sr.ReadLine())) {
+                    $script:npPos = $fs.Position
+                    if (-not $line.Trim()) { continue }
+                    try { $obj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                    switch ($obj.phase) {
+                        'touch1_prompt' { $el.TbEnrollNpStatus.Text = "Touch the security key now..." }
+                        'key_made'      { $el.TbEnrollNpStatus.Text = "Key registered; posting to dds-node..." }
+                        'enroll_posted' { $script:npUrn = [string]$obj.urn; Append-Log $el.TbPolicyLog "[enroll] enrolled: $($obj.urn)" }
+                        'error'         { Append-Log $el.TbPolicyLog "[enroll] error: $($obj.message)" }
+                    }
+                }
+            } finally { $fs.Close() }
+        } catch { }
+    }
+    # Guard on the timer still existing so a re-entrant tick queued before the
+    # first nulls it can't call .Stop() on $null (the post-success crash guard,
+    # matching the join/device/enroll ticks).
+    if ($script:npTimer -and $script:npProc -and $script:npProc.HasExited) {
+        $script:npTimer.Stop(); $script:npTimer = $null
+        $el.BtnEnrollNewPerson.IsEnabled = $true
+        if ($script:npProc.ExitCode -eq 0 -and $script:npUrn) {
+            $el.TbClaimSubject.Text = $script:npUrn
+            $el.TbEnrollNpStatus.Text = "Registered. Next: approve this person in the tray's 'Approve Enrollments', then click 'Publish -- create this account' below."
+            Append-Log $el.TbPolicyLog "[enroll] DONE. Approve '$($el.TbAcctUser.Text)' in the tray, then Publish."
+            Load-EnrolledUsers | Out-Null
+        } else {
+            $el.TbEnrollNpStatus.Text = "Registration did not complete (exit $($script:npProc.ExitCode)). See the Output box."
+        }
+        if ($script:npLog -and (Test-Path $script:npLog)) { Remove-Item -Force -ErrorAction SilentlyContinue $script:npLog }
+    }
+}
+
 $el.BtnUsersPolicy.add_Click({ Show-Page -Name 'PagePolicy' })
+$el.BtnEnrollNewPerson.add_Click({ Start-EnrollNewPerson })
 $el.BtnPubCheck.add_Click({ Refresh-PublisherStatus })
 $el.BtnPubCopyGrant.add_Click({
-    if ($script:pubGrantCmd) {
-        try { [Windows.Clipboard]::SetText($script:pubGrantCmd); Append-Log $el.TbPolicyLog "[grant] command copied to clipboard" } catch { }
+    if ($script:pubNodeUrn) {
+        try { [Windows.Clipboard]::SetText($script:pubNodeUrn); Append-Log $el.TbPolicyLog "[authorize] machine ID copied to clipboard" } catch { }
     }
 })
 $el.BtnLoadUsers.add_Click({ Load-EnrolledUsers })
@@ -1971,7 +2119,7 @@ $el.BtnNext.add_Click({
 })
 
 $window.add_Closed({
-    foreach ($t in @($script:bootstrapTimer, $script:joinTimer, $script:deviceEnrollTimer, $script:enrollTimer, $script:enrollPollTimer, $healthTimer)) {
+    foreach ($t in @($script:bootstrapTimer, $script:joinTimer, $script:deviceEnrollTimer, $script:enrollTimer, $script:enrollPollTimer, $script:npTimer, $healthTimer)) {
         try { if ($t) { $t.Stop() } } catch { }
     }
     # Defensive: scrub any leftover password temp file.
