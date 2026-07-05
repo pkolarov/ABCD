@@ -719,14 +719,26 @@ function Resolve-InitialPage {
                              Text="Keep this on. DDS manages the password and wraps it with the security key, so it never needs to be changed."/>
                 </StackPanel>
 
-                <!-- 4. Approve + publish -->
-                <TextBlock Text="4.  Approve, then publish" FontWeight="SemiBold" Margin="0,0,0,4"/>
-                <TextBlock Foreground="#666666" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,6"
-                           Text="Before the account can be created, an admin must approve the new user: open the DDS tray icon -> 'Approve Enrollments', select them, and touch the admin key. Then publish:"/>
-                <Button x:Name="BtnCreateAccount" Content="Publish -- create this account"
+                <!-- 4. Approve (in-console admin vouch) -->
+                <TextBlock Text="4.  Approve this person (admin)" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                <Border Background="#FBF3EA" BorderBrush="#EED9B9" BorderThickness="1" CornerRadius="3"
+                        Padding="10" Margin="0,0,0,10">
+                  <StackPanel>
+                    <TextBlock TextWrapping="Wrap" Foreground="#63482a"
+                               Text="An administrator approves the new user by touching the ADMIN security key (not the person's key). This is the same approval the tray's 'Approve Enrollments' does -- now right here, so you don't have to leave this window. It unlocks once step 2 has registered someone (or you pick an enrolled person from the list)."/>
+                    <Button x:Name="BtnApproveNewPerson" Content="Approve (touch admin key)" IsEnabled="False"
+                            HorizontalAlignment="Left" Padding="12,4" Margin="0,8,0,0"/>
+                    <TextBlock x:Name="TbApproveNpStatus" Foreground="#63482a" FontSize="11"
+                               TextWrapping="Wrap" Margin="0,6,0,0" Text=""/>
+                  </StackPanel>
+                </Border>
+
+                <!-- 5. Publish -->
+                <TextBlock Text="5.  Create the account" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                <Button x:Name="BtnCreateAccount" Content="Publish -- create this account" IsEnabled="False"
                         HorizontalAlignment="Left" Padding="16,6" Margin="0,2,0,2"/>
                 <TextBlock Foreground="#666666" FontSize="11" TextWrapping="Wrap" Margin="0,3,0,0"
-                           Text="Publishes the account to the domain. It reaches the target computer(s) within about a minute and is created when the person first signs in with their security key. Progress and errors appear in the Output box below."/>
+                           Text="Unlocks once step 4 approves this person. Publishes the account to the domain; it reaches the target computer(s) within about a minute and is created when the person first signs in with their security key. Progress and errors appear in the Output box below."/>
               </StackPanel>
             </GroupBox>
 
@@ -818,6 +830,7 @@ $names = @(
     'PubBanner','TbPubStatus','BtnPubCheck','BtnPubCopyGrant','BtnPubAuthorize',
     'BtnEnrollNewPerson','TbEnrollNpStatus','CbClaimSubject','BtnLoadUsers','TbClaimSubject','TbAcctUser','TbAcctFullName','TbAcctGroups',
     'RbAcctAllDevices','RbAcctDevice','TbAcctDeviceUrn','CbAcctPwNever','BtnCreateAccount',
+    'BtnApproveNewPerson','TbApproveNpStatus',
     'CbPlatform','CbTemplate','BtnFillTemplate','TbPolicyJson','BtnPublishJson','TbPolicyLog',
     'BtnUsersPolicy',
     'WelcomeDetected','TileNewDomain','TileJoinDomain','TileEnrollUser','TileUsersPolicy','TileHealth',
@@ -1816,7 +1829,7 @@ function Load-EnrolledUsers {
                 $suffix = if ($u.vouched) { '' } else { '  (not yet approved)' }
                 $item = New-Object Windows.Controls.ComboBoxItem
                 $item.Content = "$($u.display_name)  -  $($u.subject_urn)$suffix"
-                $item.Tag     = [string]$u.subject_urn
+                $item.Tag     = [pscustomobject]@{ Urn = [string]$u.subject_urn; Vouched = [bool]$u.vouched; Display = [string]$u.display_name }
                 [void]$el.CbClaimSubject.Items.Add($item)
                 $count++
             }
@@ -2015,7 +2028,7 @@ function Start-EnrollNewPerson {
         $el.TbEnrollNpStatus.Text = "Could not start enrollment: $($_.Exception.Message)"
         return
     }
-    $el.BtnEnrollNewPerson.IsEnabled = $false
+    Update-AccountSteps   # locks the combo + Approve + Register while the key touch is pending
     $script:npTimer = New-Object System.Windows.Threading.DispatcherTimer
     $script:npTimer.Interval = [TimeSpan]::FromMilliseconds(500)
     $script:npTimer.Add_Tick({ Tick-EnrollNewPerson })
@@ -2072,14 +2085,17 @@ function Tick-EnrollNewPerson {
         # drained flag is the authoritative server-success signal regardless).
         if ($script:npUrn) {
             $el.TbClaimSubject.Text = $script:npUrn
-            $el.TbEnrollNpStatus.Text = "Registered. Next: approve this person in the tray's 'Approve Enrollments', then click 'Publish -- create this account' below."
-            Append-Log $el.TbPolicyLog "[enroll] DONE. Approve '$($el.TbAcctUser.Text)' in the tray, then Publish."
+            $script:approvedUrn = ''   # a freshly-registered person still needs approval
+            $el.TbEnrollNpStatus.Text = "Registered. Now do step 4: Approve (touch the ADMIN key), then step 5: Create the account."
+            Append-Log $el.TbPolicyLog "[enroll] DONE. Next: step 4 Approve '$($el.TbAcctUser.Text)', then step 5 Create."
             Load-EnrolledUsers | Out-Null
+            Update-AccountSteps
         } else {
             $code = $script:npProc.ExitCode
             $suffix = if ($null -ne $code) { " (exit $code)" } else { "" }
             $el.TbEnrollNpStatus.Text = "Registration did not complete$suffix. See the Output box."
         }
+        Update-AccountSteps   # re-enable the combo/Register/steps now that the ceremony finished
         if ($script:npLog -and (Test-Path $script:npLog)) { Remove-Item -Force -ErrorAction SilentlyContinue $script:npLog }
     }
 }
@@ -2180,8 +2196,125 @@ function Tick-AuthorizeMachine {
     }
 }
 
+# ---- Approve (admin-vouch) the selected person for dds:session, in-console ----
+# Same admin ceremony the tray's "Approve Enrollments" runs, via the generic
+# dds-enroll-user.exe --vouch mode (subject = the person's URN, purpose =
+# dds:session). Mirrors Start-AuthorizeMachine, including the PS 5.1 .Handle
+# quirk fix + post-exit final drain + flag-primary success gate.
+$script:apProc      = $null
+$script:apTimer     = $null
+$script:apLog       = ''
+$script:apPos       = 0
+$script:apOk        = $false
+$script:apSubject   = ''   # subject URN captured at approve LAUNCH (bind success to this)
+$script:approvedUrn = ''   # URN approved (or known-approved) for the current subject
+
+# Enable/lock the numbered account steps from the current state: Approve unlocks
+# once there is a subject; Create unlocks once that subject has been approved.
+function Update-AccountSteps {
+    $subj = ([string]$el.TbClaimSubject.Text).Trim()
+    $user = ([string]$el.TbAcctUser.Text).Trim()
+    $busy = (($script:apProc -and -not $script:apProc.HasExited) -or ($script:npProc -and -not $script:npProc.HasExited))
+    # While a register/approve ceremony is in flight, lock everything that could
+    # change the subject mid-touch -- otherwise a combo switch or a second
+    # Register could approve/create the WRONG person (the touch is asynchronous).
+    if ($el.BtnEnrollNewPerson)  { $el.BtnEnrollNewPerson.IsEnabled  = (-not $busy) }
+    if ($el.CbClaimSubject)      { $el.CbClaimSubject.IsEnabled      = (-not $busy) }
+    if ($el.BtnLoadUsers)        { $el.BtnLoadUsers.IsEnabled        = (-not $busy) }
+    if ($el.BtnApproveNewPerson) { $el.BtnApproveNewPerson.IsEnabled = ($subj.Length -gt 0) -and (-not $busy) }
+    # Create needs an approved subject AND a Windows username (the local account
+    # name). Picking an already-enrolled DDS user fills only the URN, so require
+    # the username here rather than failing with "username required" on click.
+    if ($el.BtnCreateAccount)    { $el.BtnCreateAccount.IsEnabled    = ($subj.Length -gt 0) -and ($user.Length -gt 0) -and ($script:approvedUrn -eq $subj) -and (-not $busy) }
+}
+
+function Read-ApLog {
+    if (-not ($script:apLog -and (Test-Path $script:apLog))) { return }
+    try {
+        $fs = [IO.File]::Open($script:apLog, 'Open', 'Read', 'ReadWrite')
+        try {
+            $fs.Seek($script:apPos, 'Begin') | Out-Null
+            $sr = New-Object IO.StreamReader($fs)
+            while ($null -ne ($line = $sr.ReadLine())) {
+                $script:apPos = $fs.Position
+                if (-not $line.Trim()) { continue }
+                try { $obj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                switch ($obj.phase) {
+                    'touch_prompt' { $el.TbApproveNpStatus.Text = "Touch the ADMIN security key now..." }
+                    'asserted'     { $el.TbApproveNpStatus.Text = "Admin key verified; submitting approval..." }
+                    'vouched'      { $script:apOk = $true; Append-Log $el.TbPolicyLog "[approve] approved by $($obj.admin_urn)" }
+                    'error'        { Append-Log $el.TbPolicyLog "[approve] error: $($obj.message)"; $el.TbApproveNpStatus.Text = "Approval failed: $($obj.message)" }
+                }
+            }
+        } finally { $fs.Close() }
+    } catch { }
+}
+
+function Start-ApproveNewPerson {
+    if ($script:apProc -and -not $script:apProc.HasExited) { return }
+    if (-not (Test-Path $EnrollUserBin)) {
+        $el.TbApproveNpStatus.Text = "dds-enroll-user.exe not found -- reinstall the MSI."
+        return
+    }
+    $subj = ([string]$el.TbClaimSubject.Text).Trim()
+    if ($subj.Length -lt 1) {
+        $el.TbApproveNpStatus.Text = "Register the person's key first (step 2), or pick an enrolled person, so there is someone to approve."
+        return
+    }
+    $script:apSubject = $subj   # bind the eventual approval to THIS subject, not the live box
+    $purpose = 'dds:session'
+    $script:apLog = Join-Path $env:TEMP ("dds-approve-{0:yyyyMMdd-HHmmss-fff}.log" -f (Get-Date))
+    $script:apPos = 0
+    $script:apOk  = $false
+    $el.TbApproveNpStatus.Text = "Touch the ADMIN security key when the Windows prompt appears to approve this person..."
+    Append-Log $el.TbPolicyLog "[approve] admin-vouching $subj ($purpose) -- waiting for admin key touch..."
+    $argLine = "--vouch --subject-urn `"$subj`" --purpose `"$purpose`""
+    try {
+        $script:apProc = Start-Process -FilePath $EnrollUserBin -ArgumentList $argLine `
+            -RedirectStandardOutput $script:apLog -NoNewWindow -PassThru
+        # Retain the process handle while the child is alive so $apProc.ExitCode
+        # is readable after exit (redirected Start-Process -PassThru drops it on
+        # Windows PowerShell 5.1 and ExitCode reads $null).
+        try { $null = $script:apProc.Handle } catch { }
+    } catch {
+        $el.TbApproveNpStatus.Text = "Could not start approval: $($_.Exception.Message)"
+        return
+    }
+    Update-AccountSteps   # locks Approve + the combo + Register while the touch is pending
+    $script:apTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:apTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+    $script:apTimer.Add_Tick({ Tick-ApproveNewPerson })
+    $script:apTimer.Start()
+}
+
+function Tick-ApproveNewPerson {
+    Read-ApLog
+    if ($script:apTimer -and $script:apProc -and $script:apProc.HasExited) {
+        # Final drain after exit: the helper flushes the terminal 'vouched' line
+        # then exits back-to-back. Gate on the drained flag, not ExitCode.
+        Read-ApLog
+        $script:apTimer.Stop(); $script:apTimer = $null
+        if ($script:apOk) {
+            # Bind to the subject captured at LAUNCH (inputs were locked against
+            # change during the touch, but be explicit): the person we vouched.
+            $script:approvedUrn = $script:apSubject
+            $u = ([string]$el.TbAcctUser.Text).Trim()
+            $el.TbApproveNpStatus.Text = if ($u) { "Approved. Now do step 5: 'Publish -- create this account'." } else { "Approved. Enter a Windows username in step 1, then do step 5 (Create)." }
+            Append-Log $el.TbPolicyLog "[approve] DONE -- $($script:approvedUrn) is approved."
+            Load-EnrolledUsers | Out-Null
+        } elseif (-not ($el.TbApproveNpStatus.Text -match 'failed')) {
+            $code = $script:apProc.ExitCode
+            $suffix = if ($null -ne $code) { " (exit $code)" } else { "" }
+            $el.TbApproveNpStatus.Text = "Approval did not complete$suffix. See the Output box."
+        }
+        Update-AccountSteps
+        if ($script:apLog -and (Test-Path $script:apLog)) { Remove-Item -Force -ErrorAction SilentlyContinue $script:apLog }
+    }
+}
+
 $el.BtnUsersPolicy.add_Click({ Show-Page -Name 'PagePolicy' })
 $el.BtnEnrollNewPerson.add_Click({ Start-EnrollNewPerson })
+$el.BtnApproveNewPerson.add_Click({ Start-ApproveNewPerson })
 $el.BtnPubAuthorize.add_Click({ Start-AuthorizeMachine })
 $el.BtnPubCheck.add_Click({ Refresh-PublisherStatus })
 $el.BtnPubCopyGrant.add_Click({
@@ -2190,9 +2323,27 @@ $el.BtnPubCopyGrant.add_Click({
     }
 })
 $el.BtnLoadUsers.add_Click({ Load-EnrolledUsers })
+# Create (step 5) is gated on a Windows username being present, so re-evaluate
+# the step buttons whenever the username field changes.
+$el.TbAcctUser.add_TextChanged({ Update-AccountSteps })
 $el.CbClaimSubject.add_SelectionChanged({
     $sel = $el.CbClaimSubject.SelectedItem
-    if ($sel -and $sel.Tag) { $el.TbClaimSubject.Text = [string]$sel.Tag }
+    if ($sel -and $sel.Tag) {
+        $info = $sel.Tag
+        $el.TbClaimSubject.Text = [string]$info.Urn
+        # Prefill the DDS display name (safe, non-identifying). The Windows
+        # username (step 1) is a login-name decision, so we do NOT guess it --
+        # but we hint when it's missing so Create isn't mysteriously locked.
+        if (-not ([string]$el.TbAcctFullName.Text).Trim() -and $info.Display) { $el.TbAcctFullName.Text = [string]$info.Display }
+        $needUser = -not ([string]$el.TbAcctUser.Text).Trim()
+        if ($info.Vouched) {
+            $script:approvedUrn = [string]$info.Urn
+            $el.TbApproveNpStatus.Text = if ($needUser) { "Already approved. Enter a Windows username in step 1 to create the account." } else { "Already approved -- go straight to step 5 (Create)." }
+        } else {
+            $el.TbApproveNpStatus.Text = "Not yet approved -- do step 4 (Approve) first."
+        }
+        Update-AccountSteps
+    }
 })
 $el.BtnFillTemplate.add_Click({ Set-PolicyTemplate (Get-ComboText $el.CbTemplate) })
 $el.BtnPublishJson.add_Click({
