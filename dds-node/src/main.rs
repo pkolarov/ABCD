@@ -237,7 +237,7 @@ fn print_usage() {
   dds-node provision <BUNDLE.dds> [--data-dir <DIR>] [--no-start]
   dds-node provision-admission-key --data-dir <DIR> [--backend software|secure-enclave|tpm2(pending)]
   dds-node rotate-admission-key --data-dir <DIR> [--no-backup]
-  dds-node stamp-agent-pubkey --data-dir <DIR> --config-dir <DIR>
+  dds-node stamp-agent-pubkey --data-dir <DIR> --config-dir <DIR> [--keep-existing]
   dds-node run [config.toml]
   dds-node seal-passphrase [--force] [--out <PATH>]  (Windows only)"
     );
@@ -1665,6 +1665,25 @@ fn cmd_provision(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 fn cmd_stamp_agent_pubkey(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = PathBuf::from(require_flag(args, "--data-dir")?);
     let config_dir = PathBuf::from(require_flag(args, "--config-dir")?);
+    // The MSI custom action passes --keep-existing so an UPGRADE/repair does
+    // NOT re-derive and overwrite an already-populated PinnedNodePubkeyB64.
+    // Re-deriving reads <data_dir>\node_key.bin, which on Windows can drift
+    // between %ProgramData%\DDS and ...\node-data (the two-locations issue),
+    // and would stamp the WRONG key into the operator's preserved
+    // appsettings.json — which MSI otherwise preserves untouched on upgrade.
+    // A fresh install ships the field empty so the stamp still runs there, and
+    // a repair that finds the field emptied re-populates it. Mirrors
+    // `gen-hmac-secret --keep-existing`.
+    let keep_existing = args.iter().any(|a| a == "--keep-existing");
+    if keep_existing {
+        if let Some(pin) = provision::agent_pinned_pubkey(&config_dir)? {
+            let shown = &pin[..pin.len().min(12)];
+            println!(
+                "Policy Agent PinnedNodePubkeyB64 already set ({shown}…) — keeping it (--keep-existing)"
+            );
+            return Ok(());
+        }
+    }
     match provision::stamp_pubkey(&data_dir, &config_dir)? {
         true => {
             println!(

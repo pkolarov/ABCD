@@ -54,7 +54,13 @@
               existing node.toml + appsettings.json.
            2. Old product uninstalls. Permanent="yes" tells MSI not to
               remove those two components.
-           3. Result: operator-customized configs survive every upgrade. -->
+           3. Result: operator-customized configs survive every upgrade.
+         INVARIANT: Schedule="afterInstallExecute" + Permanent="yes" + the
+         shared config-component GUIDs are JOINTLY, not independently, load-
+         bearing. Do NOT switch to afterInstallInitialize/afterInstallValidate —
+         an early RemoveExistingProducts would delete the operator's config
+         before the new product's files land, and NeverOverwrite would then lay
+         down a fresh template over the lost config. -->
     <MajorUpgrade DowngradeErrorMessage="A newer version of DDS is already installed."
                   Schedule="afterInstallExecute" />
     <MediaTemplate EmbedCab="yes" />
@@ -186,16 +192,56 @@
                         Remove="uninstall"
                         Wait="no" />
       </Component>
-      <!-- node.toml is install-once / preserve-forever:
-           * NeverOverwrite="yes" — install only if file doesn't exist.
-           * Permanent="yes"      — never removed by uninstall or by
-                                    MajorUpgrade's RemoveExistingProducts.
-           Combined with MajorUpgrade Schedule="afterInstallExecute"
-           above, the operator's customized node.toml survives every
-           upgrade. (If you really need to ship a new template, change
-           the path or rename so it lands as a new file.) -->
+      <!-- node.toml is install-once / preserve-forever. Its FOUR attributes are
+           JOINTLY load-bearing and MUST NOT change across releases — changing
+           any ONE silently wipes the operator's live security config
+           (trusted_roots, bootstrap_admin_urn, [domain]):
+             1. Guid = 2222…22 MUST stay STABLE — a shared GUID keeps the
+                component ref-counted across the upgrade so it is never removed.
+             2. Permanent="yes"      — never removed by uninstall or by
+                                       MajorUpgrade's RemoveExistingProducts.
+             3. NeverOverwrite="yes" — install only if node.toml is absent; an
+                                       existing operator file is left as-is.
+             4. Directory=DIR_CONFIG + File name "node.toml" MUST NOT be
+                repathed/renamed — NeverOverwrite keys on the RESOLVED
+                destination path, so a new path/name lays a fresh template while
+                the real config is orphaned at the old path.
+           Combined with MajorUpgrade Schedule="afterInstallExecute" above, the
+           operator's node.toml survives every upgrade. WARNING: this is the
+           OPPOSITE policy to C_CredProvDll below (which bumps its GUID every
+           release to FORCE replacement) — do NOT apply that habit here. To ship
+           an updated template, add it under a DIFFERENT name (e.g.
+           node.toml.dist) as a separate non-Permanent component merged only when
+           node.toml is absent; NEVER de-Permanent or repath this one.
+           C_ConfigBackup (below) is the safety net if a future edit regresses
+           one of these four rules. -->
       <Component Id="C_DdsNodeConfig" Guid="22222222-2222-2222-2222-222222222222" Directory="DIR_CONFIG" NeverOverwrite="yes" Permanent="yes">
         <File Id="node_config_toml" Source="$(var.ConfigDir)\node.toml" KeyPath="yes" />
+      </Component>
+      <!-- =====================================================================
+           Pre-upgrade config backup (defense-in-depth safety net). On a MAJOR
+           UPGRADE ONLY (Condition=WIX_UPGRADE_DETECTED, the property authored by
+           <MajorUpgrade> above and set by FindRelatedProducts before component
+           conditions are evaluated), snapshot the live node.toml + appsettings
+           .json to .bak siblings. Implemented with the transacted MoveFiles
+           standard action (via <CopyFile Delete="no">), which runs BEFORE
+           InstallFiles and long before the afterInstallExecute
+           RemoveExistingProducts — so the copy is captured before any file op
+           can touch the originals. Because the .bak files are written by
+           MoveFile (NOT tracked component resources) they survive even a future
+           package that regresses C_DdsNodeConfig (the exact clobber the
+           invariant note above guards against), giving a recoverable pre-image.
+           They live in DIR_CONFIG (same ACL as the originals, which hold only
+           public URNs/pubkeys — no private keys). CopyFile tolerates a missing
+           source, so it is a clean no-op on a fresh install (WIX_UPGRADE_DETECTED
+           unset → component skipped) or when appsettings.json / F_PolicyAgent is
+           not installed. Not Permanent / not NeverOverwrite: its registry
+           marker is cleaned on uninstall. Single static .bak name = most-recent
+           pre-upgrade snapshot. Keep this GUID stable across releases. -->
+      <Component Id="C_ConfigBackup" Guid="3C7A9E12-5B44-4A6D-8E21-9F0B7C2D5A18" Directory="DIR_CONFIG" Condition="WIX_UPGRADE_DETECTED">
+        <RegistryValue Root="HKLM" Key="Software\DDS\Backup" Name="LastConfigBackupVersion" Type="string" Value="[ProductVersion]" KeyPath="yes" />
+        <CopyFile Id="CF_BackupNodeToml" SourceDirectory="DIR_CONFIG" SourceName="node.toml" DestinationDirectory="DIR_CONFIG" DestinationName="node.toml.bak" Delete="no" />
+        <CopyFile Id="CF_BackupAppsettings" SourceDirectory="DIR_CONFIG" SourceName="appsettings.json" DestinationDirectory="DIR_CONFIG" DestinationName="appsettings.json.bak" Delete="no" />
       </Component>
     </ComponentGroup>
 
@@ -338,9 +384,16 @@
     <!-- and the freshly-created node_key.bin inherits the protected  -->
     <!-- DACL applied above by CA_RestrictDataDirAcl.                 -->
     <!-- ============================================================ -->
+    <!-- The keep-existing flag makes this CA idempotent on UPGRADE/repair: if
+         PinnedNodePubkeyB64 is already populated the CA is a field-level no-op
+         and does NOT re-derive from node_key.bin (which can drift between
+         %ProgramData%\DDS and the node-data subdir and stamp a WRONG key into
+         the preserved appsettings.json). A fresh install ships the field empty,
+         so the stamp still runs there; a repair that finds it emptied
+         re-populates it. Mirrors the gen-hmac-secret keep-existing flag. -->
     <CustomAction Id="CA_StampAgentPubkey"
                   FileRef="dds_node_exe"
-                  ExeCommand='stamp-agent-pubkey --data-dir "[CommonAppDataFolder]DDS" --config-dir "[INSTALLFOLDER]config"'
+                  ExeCommand='stamp-agent-pubkey --keep-existing --data-dir "[CommonAppDataFolder]DDS" --config-dir "[INSTALLFOLDER]config"'
                   Execute="deferred"
                   Impersonate="no"
                   Return="check" />
@@ -492,10 +545,16 @@
                         Remove="uninstall"
                         Wait="no" />
       </Component>
-      <!-- appsettings.json: same NeverOverwrite + Permanent pattern as
-           C_DdsNodeConfig. Carries DeviceUrn (only known after
-           enroll-device) and PinnedNodePubkeyB64 (re-stamped by
-           CA_StampAgentPubkey post-install). -->
+      <!-- appsettings.json: same install-once / preserve-forever contract as
+           C_DdsNodeConfig — GUID 8888…88, Permanent, NeverOverwrite and the
+           DIR_CONFIG\appsettings.json path are JOINTLY load-bearing; do not
+           bump / de-Permanent / repath (see the invariant note on
+           C_DdsNodeConfig). Carries DeviceUrn (known only after enroll-device)
+           and PinnedNodePubkeyB64 (stamped by CA_StampAgentPubkey). As of the
+           keep-existing flag on that CA, an UPGRADE no longer re-stamps an
+           already-populated pin — so this preserved file is left byte-untouched
+           on upgrade (avoiding the node_key.bin two-locations drift stamping a
+           wrong key); a fresh install still gets it stamped. -->
       <Component Id="C_PolicyAgentConfig" Guid="88888888-8888-8888-8888-888888888888" Directory="DIR_CONFIG" NeverOverwrite="yes" Permanent="yes">
         <File Id="policy_agent_appsettings" Source="$(var.ConfigDir)\appsettings.json" KeyPath="yes" />
       </Component>

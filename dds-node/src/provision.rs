@@ -1530,6 +1530,41 @@ pub fn stamp_pubkey(data_dir: &Path, config_dir: &Path) -> Result<bool, Provisio
     stamp_agent_appsettings(config_dir, None, Some(&node_pubkey_b64))
 }
 
+/// Read the current `DdsPolicyAgent.PinnedNodePubkeyB64` from the Policy
+/// Agent's `appsettings.json`, returning `Some(pin)` only when the file
+/// exists and the field is a non-empty string. Returns `Ok(None)` when the
+/// file is absent, the field is missing/empty, or the file cannot be
+/// read/parsed (best-effort: the caller then falls back to a normal stamp,
+/// which surfaces any real parse error consistently with today's behaviour).
+///
+/// Used by the `--keep-existing` guard on `stamp-agent-pubkey` so an MSI
+/// UPGRADE does not re-derive and overwrite an already-pinned key. Re-deriving
+/// reads `<data_dir>/node_key.bin`, which on Windows can drift between
+/// `%ProgramData%\DDS` and `…\node-data` (the two-locations issue) and would
+/// stamp the WRONG pubkey into the operator's preserved `appsettings.json`.
+pub fn agent_pinned_pubkey(config_dir: &Path) -> Result<Option<String>, ProvisionError> {
+    let path = match agent_appsettings_path(config_dir) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    let raw = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
+    let root: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let pin = root
+        .get("DdsPolicyAgent")
+        .and_then(|a| a.get("PinnedNodePubkeyB64"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
+    Ok(pin)
+}
+
 // ---- Tests ----
 
 #[cfg(test)]
@@ -2224,6 +2259,14 @@ mod tests {
     /// proceed even though there is no Policy Agent to pin.
     #[test]
     fn stamp_agent_appsettings_missing_returns_false() {
+        // Clear ProgramFiles so agent_appsettings_path's Windows fallback to
+        // %ProgramFiles%\DDS\config\appsettings.json cannot resolve to a REAL
+        // installed config on a developer machine — which this "missing" test
+        // would otherwise stamp, corrupting the operator's live pin. Held under
+        // ENV_LOCK because remove_var is process-global. Mirrors the guard in
+        // stamp_pubkey_returns_false_when_appsettings_absent.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("ProgramFiles") };
         let dir = TempDir::new().unwrap();
         let written =
             stamp_agent_appsettings(dir.path(), Some("urn:vouchsafe:abc"), Some("pk")).unwrap();

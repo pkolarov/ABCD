@@ -28,6 +28,28 @@ fn write_minimal_appsettings(config_dir: &std::path::Path) {
     std::fs::write(config_dir.join("appsettings.json"), json).unwrap();
 }
 
+/// True when a real machine-wide DDS install is present whose `appsettings.json`
+/// the `%ProgramFiles%\DDS\config\` fallback in `agent_appsettings_path` would
+/// resolve to. The "no appsettings" tests below pass a temp `config_dir` with no
+/// appsettings.json, expecting a "nothing to stamp" no-op — but on a developer
+/// box with DDS actually installed that fallback finds the operator's LIVE
+/// config and stamps it with a throwaway `node_key.bin`, corrupting the pinned
+/// node pubkey. That fallback reads the real system `ProgramFiles` and cannot be
+/// redirected/removed via the child process environment on Windows (verified
+/// against Rust `Command::env`/`env_remove` and .NET `ProcessStartInfo`), so the
+/// only safe course is to SKIP those tests when an install is present. CI/build
+/// agents have no such install, so coverage there is unaffected.
+fn real_dds_install_present() -> bool {
+    cfg!(windows)
+        && std::env::var("ProgramFiles").is_ok_and(|pf| {
+            std::path::Path::new(&pf)
+                .join("DDS")
+                .join("config")
+                .join("appsettings.json")
+                .exists()
+        })
+}
+
 // ---------------------------------------------------------------------------
 // No-op path (no appsettings.json)
 // ---------------------------------------------------------------------------
@@ -37,6 +59,13 @@ fn stamp_agent_pubkey_no_appsettings_returns_success() {
     // When `appsettings.json` is absent in config_dir the command must
     // succeed (exit 0) and print the "nothing to stamp" notice. This is
     // the expected outcome on dev/loadtest installs and non-Windows CI.
+    if real_dds_install_present() {
+        eprintln!(
+            "SKIP stamp_agent_pubkey_no_appsettings_returns_success: real DDS install present; \
+             the %ProgramFiles% fallback would stamp the live appsettings.json"
+        );
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     let config_dir = tmp.path().join("config");
@@ -71,6 +100,13 @@ fn stamp_agent_pubkey_no_appsettings_creates_node_key() {
     // Even on the no-op path the command must materialise node_key.bin
     // so that subsequent MSI custom actions (provision, restrict-data-dir-acl)
     // find a stable node identity.
+    if real_dds_install_present() {
+        eprintln!(
+            "SKIP stamp_agent_pubkey_no_appsettings_creates_node_key: real DDS install present; \
+             the %ProgramFiles% fallback would stamp the live appsettings.json"
+        );
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     let config_dir = tmp.path().join("config");
@@ -242,6 +278,109 @@ fn stamp_agent_pubkey_is_idempotent() {
         .to_owned();
 
     assert_eq!(pk1, pk2, "repeated stamp must produce the same pubkey");
+}
+
+// ---------------------------------------------------------------------------
+// --keep-existing (MSI upgrade idempotency; DdsBundle.wxs CA_StampAgentPubkey)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stamp_agent_pubkey_keep_existing_preserves_populated_pin() {
+    // On an UPGRADE the MSI passes --keep-existing. When PinnedNodePubkeyB64 is
+    // already populated the command must be a byte-for-byte no-op on
+    // appsettings.json AND must NOT create/touch node_key.bin — re-deriving it
+    // risks stamping a WRONG key given the node_key.bin two-locations drift.
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let config_dir = tmp.path().join("config");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&config_dir).unwrap();
+
+    let json = r#"{
+  "DdsPolicyAgent": { "PinnedNodePubkeyB64": "PREEXISTINGpinVALUEnotRederivedAAAAAAAAAAA=", "NodeBaseUrl": "pipe:dds-api" }
+}
+"#;
+    std::fs::write(config_dir.join("appsettings.json"), json).unwrap();
+    let before = std::fs::read_to_string(config_dir.join("appsettings.json")).unwrap();
+
+    let out = dds_node_bin()
+        .args([
+            "stamp-agent-pubkey",
+            "--keep-existing",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--config-dir",
+            config_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stamp-agent-pubkey --keep-existing must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("keeping it (--keep-existing)"),
+        "stdout must note the pin was kept; got: {stdout}"
+    );
+
+    let after = std::fs::read_to_string(config_dir.join("appsettings.json")).unwrap();
+    assert_eq!(
+        before, after,
+        "appsettings.json must be byte-identical when the pin is kept"
+    );
+    assert!(
+        !data_dir.join("node_key.bin").exists(),
+        "--keep-existing must NOT create/touch node_key.bin when a pin already exists"
+    );
+}
+
+#[test]
+fn stamp_agent_pubkey_keep_existing_stamps_empty_pin() {
+    // A fresh install ships PinnedNodePubkeyB64 empty; --keep-existing must
+    // still stamp it ("" == not yet pinned) and derive node_key.bin.
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let config_dir = tmp.path().join("config");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&config_dir).unwrap();
+
+    let json = r#"{
+  "DdsPolicyAgent": { "PinnedNodePubkeyB64": "", "NodeBaseUrl": "pipe:dds-api" }
+}
+"#;
+    std::fs::write(config_dir.join("appsettings.json"), json).unwrap();
+
+    let out = dds_node_bin()
+        .args([
+            "stamp-agent-pubkey",
+            "--keep-existing",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--config-dir",
+            config_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let raw = std::fs::read_to_string(config_dir.join("appsettings.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let pk = v["DdsPolicyAgent"]["PinnedNodePubkeyB64"].as_str().unwrap();
+    assert_eq!(
+        pk.len(),
+        44,
+        "empty pin must be stamped to a 44-char pubkey; got {pk:?}"
+    );
+    assert!(
+        data_dir.join("node_key.bin").exists(),
+        "stamping an empty pin must derive/create node_key.bin"
+    );
 }
 
 // ---------------------------------------------------------------------------
