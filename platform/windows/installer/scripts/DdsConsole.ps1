@@ -620,6 +620,8 @@ function Resolve-InitialPage {
             <TextBlock Grid.Column="0" x:Name="TbPubStatus" TextWrapping="Wrap"
                        VerticalAlignment="Center" Text="Checking publish authorization..."/>
             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+              <Button x:Name="BtnPubAuthorize" Content="Authorize this machine" Padding="8,3"
+                      Margin="8,0,0,0" Visibility="Collapsed"/>
               <Button x:Name="BtnPubCopyGrant" Content="Copy machine ID" Padding="8,3"
                       Margin="8,0,0,0" Visibility="Collapsed"/>
               <Button x:Name="BtnPubCheck" Content="Re-check" Padding="8,3" Margin="8,0,0,0"/>
@@ -813,7 +815,7 @@ $names = @(
     'PageJoinDomain_Bundle','PageJoinDomain_Confirm','PageJoinDomain_DeviceEnroll','PageJoinDomain_Done',
     'PageEnrollUser_Explainer','PageEnrollUser_Password','PageEnrollUser_Touch','PageEnrollUser_AwaitingApproval',
     'PageHealth','PagePolicy','PageError',
-    'PubBanner','TbPubStatus','BtnPubCheck','BtnPubCopyGrant',
+    'PubBanner','TbPubStatus','BtnPubCheck','BtnPubCopyGrant','BtnPubAuthorize',
     'BtnEnrollNewPerson','TbEnrollNpStatus','CbClaimSubject','BtnLoadUsers','TbClaimSubject','TbAcctUser','TbAcctFullName','TbAcctGroups',
     'RbAcctAllDevices','RbAcctDevice','TbAcctDeviceUrn','CbAcctPwNever','BtnCreateAccount',
     'CbPlatform','CbTemplate','BtnFillTemplate','TbPolicyJson','BtnPublishJson','TbPolicyLog',
@@ -1758,6 +1760,7 @@ function Refresh-PublisherStatus {
             $why = if ($props -contains 'error') { [string]$st.error } else { 'unexpected response' }
             $el.TbPubStatus.Text = "Could not read publish authorization ($why). This console may not be running as a DDS admin; publishing is unavailable until it is."
             $el.BtnPubCopyGrant.Visibility = 'Collapsed'
+            $el.BtnPubAuthorize.Visibility = 'Collapsed'
             return
         }
         if ($st.can_publish) {
@@ -1765,6 +1768,7 @@ function Refresh-PublisherStatus {
             $el.PubBanner.BorderBrush = $greenB
             $el.TbPubStatus.Text = "This node is authorized to publish policy. New accounts and policies replicate to peers within ~60 seconds."
             $el.BtnPubCopyGrant.Visibility = 'Collapsed'
+            $el.BtnPubAuthorize.Visibility = 'Collapsed'
             $script:pubGrantCmd = ''
         } else {
             $el.PubBanner.Background  = $amber
@@ -1777,14 +1781,16 @@ function Refresh-PublisherStatus {
                 $script:pubInitTried = $true
                 try { $null = Invoke-DdsCli @('--node-url', $NodeUrl, 'policy', 'publisher-init') } catch { }
             }
-            $el.TbPubStatus.Text = "This machine is not yet authorized to publish policy to the domain. Authorizing it takes a one-time admin approval with a security key. Tip: policy authoring works automatically from your genesis / admin node (a domain trusted root). To have an admin authorize this machine, give them its ID below."
+            $el.TbPubStatus.Text = "This machine is not yet authorized to publish policy to the domain. If the DDS admin key is on THIS PC, click 'Authorize this machine' and touch it (one-time). Otherwise, copy this machine's ID and have an admin authorize it from their PC."
             $el.BtnPubCopyGrant.Visibility = 'Visible'
+            $el.BtnPubAuthorize.Visibility = 'Visible'
         }
     } catch {
         $el.PubBanner.Background  = $amber
         $el.PubBanner.BorderBrush = $amberB
         $el.TbPubStatus.Text = "Could not reach the DDS node to check publish authorization. Is the DdsNode service running?  ($($_.Exception.Message))"
         $el.BtnPubCopyGrant.Visibility = 'Collapsed'
+        $el.BtnPubAuthorize.Visibility = 'Collapsed'
     }
 }
 
@@ -2043,8 +2049,82 @@ function Tick-EnrollNewPerson {
     }
 }
 
+# ---- Authorize THIS machine to publish (admin vouch of the node URN) ----
+$script:authProc  = $null
+$script:authTimer = $null
+$script:authLog   = ''
+$script:authPos   = 0
+$script:authOk    = $false
+
+function Start-AuthorizeMachine {
+    if ($script:authProc -and -not $script:authProc.HasExited) { return }
+    if (-not (Test-Path $EnrollUserBin)) {
+        $el.TbPubStatus.Text = "dds-enroll-user.exe not found -- reinstall the MSI."
+        return
+    }
+    if (-not $script:pubNodeUrn) {
+        Refresh-PublisherStatus
+        if (-not $script:pubNodeUrn) { $el.TbPubStatus.Text = "Machine ID not known yet -- click Re-check, then try again."; return }
+    }
+    $urn = $script:pubNodeUrn
+    $purpose = 'dds:policy-publisher-windows'
+    $script:authLog = Join-Path $env:TEMP ("dds-authorize-{0:yyyyMMdd-HHmmss-fff}.log" -f (Get-Date))
+    $script:authPos = 0
+    $script:authOk  = $false
+    $el.TbPubStatus.Text = "Touch your admin security key when the Windows prompt appears to authorize this machine..."
+    Append-Log $el.TbPolicyLog "[authorize] vouching this machine for $purpose -- waiting for admin key touch..."
+    $argLine = "--vouch --subject-urn `"$urn`" --purpose `"$purpose`""
+    try {
+        $script:authProc = Start-Process -FilePath $EnrollUserBin -ArgumentList $argLine `
+            -RedirectStandardOutput $script:authLog -NoNewWindow -PassThru
+    } catch {
+        $el.TbPubStatus.Text = "Could not start authorization: $($_.Exception.Message)"
+        return
+    }
+    $el.BtnPubAuthorize.IsEnabled = $false
+    $script:authTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:authTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+    $script:authTimer.Add_Tick({ Tick-AuthorizeMachine })
+    $script:authTimer.Start()
+}
+
+function Tick-AuthorizeMachine {
+    if ($script:authLog -and (Test-Path $script:authLog)) {
+        try {
+            $fs = [IO.File]::Open($script:authLog, 'Open', 'Read', 'ReadWrite')
+            try {
+                $fs.Seek($script:authPos, 'Begin') | Out-Null
+                $sr = New-Object IO.StreamReader($fs)
+                while ($null -ne ($line = $sr.ReadLine())) {
+                    $script:authPos = $fs.Position
+                    if (-not $line.Trim()) { continue }
+                    try { $obj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                    switch ($obj.phase) {
+                        'touch_prompt' { $el.TbPubStatus.Text = "Touch your admin security key now..." }
+                        'asserted'     { $el.TbPubStatus.Text = "Admin key verified; submitting authorization..." }
+                        'vouched'      { $script:authOk = $true; Append-Log $el.TbPolicyLog "[authorize] vouched by $($obj.admin_urn)" }
+                        'error'        { Append-Log $el.TbPolicyLog "[authorize] error: $($obj.message)"; $el.TbPubStatus.Text = "Authorization failed: $($obj.message)" }
+                    }
+                }
+            } finally { $fs.Close() }
+        } catch { }
+    }
+    if ($script:authTimer -and $script:authProc -and $script:authProc.HasExited) {
+        $script:authTimer.Stop(); $script:authTimer = $null
+        $el.BtnPubAuthorize.IsEnabled = $true
+        if ($script:authProc.ExitCode -eq 0 -and $script:authOk) {
+            Append-Log $el.TbPolicyLog "[authorize] DONE -- this machine can now publish policy."
+            Refresh-PublisherStatus
+        } elseif (-not ($el.TbPubStatus.Text -match 'failed')) {
+            $el.TbPubStatus.Text = "Authorization did not complete (exit $($script:authProc.ExitCode)). See the Output box."
+        }
+        if ($script:authLog -and (Test-Path $script:authLog)) { Remove-Item -Force -ErrorAction SilentlyContinue $script:authLog }
+    }
+}
+
 $el.BtnUsersPolicy.add_Click({ Show-Page -Name 'PagePolicy' })
 $el.BtnEnrollNewPerson.add_Click({ Start-EnrollNewPerson })
+$el.BtnPubAuthorize.add_Click({ Start-AuthorizeMachine })
 $el.BtnPubCheck.add_Click({ Refresh-PublisherStatus })
 $el.BtnPubCopyGrant.add_Click({
     if ($script:pubNodeUrn) {
@@ -2119,7 +2199,7 @@ $el.BtnNext.add_Click({
 })
 
 $window.add_Closed({
-    foreach ($t in @($script:bootstrapTimer, $script:joinTimer, $script:deviceEnrollTimer, $script:enrollTimer, $script:enrollPollTimer, $script:npTimer, $healthTimer)) {
+    foreach ($t in @($script:bootstrapTimer, $script:joinTimer, $script:deviceEnrollTimer, $script:enrollTimer, $script:enrollPollTimer, $script:npTimer, $script:authTimer, $healthTimer)) {
         try { if ($t) { $t.Stop() } } catch { }
     }
     # Defensive: scrub any leftover password temp file.

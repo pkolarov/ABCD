@@ -20,6 +20,9 @@
 //   dds-enroll-user.exe --password-stdin   (only mode supported in v1)
 
 #include "EnrollmentFlow.h"
+#include "WebAuthnHelper.h"
+#include "DdsNodeHttpClient.h"
+#include "Configuration.h"
 #include "FileLog.h"
 
 #include <windows.h>
@@ -27,8 +30,11 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string>
+#include <vector>
 #include <iostream>
 #include <atomic>
+
+#pragma comment(lib, "advapi32.lib")   // registry (admin credential id)
 
 // ---------------------------------------------------------------------------
 // Hidden message-only window for the WebAuthn API to anchor its dialogs.
@@ -100,6 +106,206 @@ static void EmitNdjson(const std::string& line)
 }
 
 // ---------------------------------------------------------------------------
+// Admin-vouch ceremony helpers (mirrors DdsTrayAgent/AdminFlow.cpp; the units
+// they call — CWebAuthnHelper, CDdsNodeHttpClient, CDdsConfiguration — are
+// already linked into this exe via WebAuthnHelper.cpp + DdsCommon).
+// ---------------------------------------------------------------------------
+
+static std::string VouchBase64UrlEncode(const uint8_t* data, size_t len)
+{
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((len * 4 + 2) / 3);
+    for (size_t i = 0; i < len; i += 3)
+    {
+        uint32_t n = static_cast<uint32_t>(data[i]) << 16;
+        if (i + 1 < len) n |= static_cast<uint32_t>(data[i + 1]) << 8;
+        if (i + 2 < len) n |= static_cast<uint32_t>(data[i + 2]);
+        out.push_back(table[(n >> 18) & 0x3F]);
+        out.push_back(table[(n >> 12) & 0x3F]);
+        if (i + 1 < len) out.push_back(table[(n >> 6) & 0x3F]);
+        if (i + 2 < len) out.push_back(table[n & 0x3F]);
+    }
+    for (auto& c : out) { if (c == '+') c = '-'; else if (c == '/') c = '_'; }
+    return out;
+}
+
+static std::vector<uint8_t> VouchBase64UrlDecode(const std::string& input)
+{
+    std::string b64 = input;
+    for (auto& c : b64) { if (c == '-') c = '+'; else if (c == '_') c = '/'; }
+    while (b64.size() % 4 != 0) b64.push_back('=');
+    static const int T[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+        52,53,54,55,56,57,58,59,60,61,-1,-1,-1, 0,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+    };
+    std::vector<uint8_t> out;
+    out.reserve(b64.size() * 3 / 4);
+    for (size_t i = 0; i + 3 < b64.size(); i += 4)
+    {
+        int a = T[(unsigned char)b64[i]];
+        int b = T[(unsigned char)b64[i+1]];
+        int c = T[(unsigned char)b64[i+2]];
+        int d = T[(unsigned char)b64[i+3]];
+        if (a < 0 || b < 0) break;
+        out.push_back((uint8_t)((a << 2) | (b >> 4)));
+        if (c >= 0) out.push_back((uint8_t)(((b & 0xF) << 4) | (c >> 2)));
+        if (d >= 0) out.push_back((uint8_t)(((c & 3) << 6) | d));
+    }
+    return out;
+}
+
+// Load the admin credential id written by Admin Setup
+// (HKLM\SOFTWARE\DDS\AuthBridge\AdminCredentialId, base64url).
+static bool LoadAdminCredentialIdFromRegistry(std::vector<uint8_t>& outCredId)
+{
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\DDS\\AuthBridge", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return false;
+    char buf[512] = {};
+    DWORD bufLen = sizeof(buf);
+    DWORD type = 0;
+    LONG ret = RegQueryValueExA(hKey, "AdminCredentialId", NULL, &type,
+        reinterpret_cast<LPBYTE>(buf), &bufLen);
+    RegCloseKey(hKey);
+    if (ret != ERROR_SUCCESS || type != REG_SZ || bufLen == 0)
+        return false;
+    outCredId = VouchBase64UrlDecode(std::string(buf));
+    return !outCredId.empty();
+}
+
+static std::string VouchJsonEscape(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char b[8]; sprintf_s(b, sizeof(b), "\\u%04x", c); out += b;
+                } else { out += c; }
+        }
+    }
+    return out;
+}
+
+static std::string WideToUtf8(const std::wstring& w)
+{
+    if (w.empty()) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return std::string();
+    std::string s(static_cast<size_t>(n - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, s.data(), n, nullptr, nullptr);
+    return s;
+}
+
+// Admin-vouch a subject URN for a purpose, using the admin key on THIS
+// machine. Argv-driven, purpose-carrying, headless (NDJSON) equivalent of
+// RunAdminApproveFlow — used by the console's "Authorize this machine to
+// publish" button (subject = node URN, purpose = dds:policy-publisher-*).
+// NDJSON phases: start, challenge, touch_prompt, asserted,
+//   vouched{subject_urn,admin_urn,jti} | error{at,message}.
+// Returns 0 on success, 2 on error.
+static int RunAdminVouchNdjson(HWND hwnd,
+                               const std::wstring& subjectUrnW,
+                               const std::wstring& purposeW,
+                               const std::wstring& credentialIdW)
+{
+    std::string subjectUrn = WideToUtf8(subjectUrnW);
+    std::string purpose    = WideToUtf8(purposeW);
+
+    FileLog::Writef("DdsEnrollUser: vouch subject='%s' purpose='%s'\n",
+                    subjectUrn.c_str(), purpose.c_str());
+    EmitNdjson("{\"phase\":\"start\"}");
+
+    CDdsConfiguration config;
+    config.Load();
+    std::string rpId = config.RpId();
+
+    std::vector<uint8_t> adminCredId;
+    if (!credentialIdW.empty())
+        adminCredId = VouchBase64UrlDecode(WideToUtf8(credentialIdW));
+    else if (!LoadAdminCredentialIdFromRegistry(adminCredId))
+    {
+        EmitNdjson("{\"phase\":\"error\",\"at\":\"admin_cred\",\"message\":\"No admin key on this machine. Run Admin Setup here first, or authorize from the admin's PC.\"}");
+        return 2;
+    }
+    if (adminCredId.empty())
+    {
+        EmitNdjson("{\"phase\":\"error\",\"at\":\"admin_cred\",\"message\":\"Admin credential id is empty or invalid.\"}");
+        return 2;
+    }
+
+    CDdsNodeHttpClient httpClient;
+    if (!config.ApiAddr().empty()) httpClient.SetBaseUrl(config.ApiAddr());
+    else                           httpClient.SetPort(config.DdsNodePort());
+    if (!config.HmacSecretPath().empty()) httpClient.LoadHmacSecret(config.HmacSecretPath());
+
+    DdsChallengeResult challenge = httpClient.GetAdminChallenge();
+    if (!challenge.success)
+    {
+        EmitNdjson("{\"phase\":\"error\",\"at\":\"challenge\",\"message\":\""
+            + VouchJsonEscape(challenge.errorMessage) + "\"}");
+        return 2;
+    }
+    EmitNdjson("{\"phase\":\"challenge\"}");
+
+    EmitNdjson("{\"phase\":\"touch_prompt\"}");
+    auto assertResult = CWebAuthnHelper::GetAssertionProof(
+        hwnd, rpId, adminCredId, challenge.challengeB64url);
+    if (!assertResult.success)
+    {
+        EmitNdjson("{\"phase\":\"error\",\"at\":\"assertion\",\"message\":\""
+            + VouchJsonEscape(assertResult.errorMessage) + "\"}");
+        return 2;
+    }
+    EmitNdjson("{\"phase\":\"asserted\"}");
+
+    std::string credIdB64   = VouchBase64UrlEncode(adminCredId.data(), adminCredId.size());
+    std::string authDataB64 = VouchBase64UrlEncode(assertResult.authenticatorData.data(), assertResult.authenticatorData.size());
+    std::string sigB64      = VouchBase64UrlEncode(assertResult.signature.data(), assertResult.signature.size());
+    std::string cdhB64      = VouchBase64UrlEncode(assertResult.clientDataHash.data(), assertResult.clientDataHash.size());
+
+    std::string vouchJson = "{";
+    vouchJson += "\"subject_urn\":\"" + VouchJsonEscape(subjectUrn) + "\",";
+    vouchJson += "\"credential_id\":\"" + credIdB64 + "\",";
+    vouchJson += "\"challenge_id\":\"" + VouchJsonEscape(challenge.challengeId) + "\",";
+    vouchJson += "\"authenticator_data\":\"" + authDataB64 + "\",";
+    vouchJson += "\"client_data_hash\":\"" + cdhB64 + "\",";
+    vouchJson += "\"signature\":\"" + sigB64 + "\",";
+    vouchJson += "\"purpose\":\"" + VouchJsonEscape(purpose) + "\"";
+    vouchJson += "}";
+
+    DdsAdminVouchResult vouchResult = httpClient.PostAdminVouch(vouchJson);
+    if (!vouchResult.success)
+    {
+        EmitNdjson("{\"phase\":\"error\",\"at\":\"vouch\",\"message\":\""
+            + VouchJsonEscape(vouchResult.errorMessage) + "\"}");
+        return 2;
+    }
+
+    FileLog::Writef("DdsEnrollUser: vouch OK jti='%s' subject='%s' admin='%s'\n",
+                    vouchResult.vouchJti.c_str(), vouchResult.subjectUrn.c_str(),
+                    vouchResult.adminUrn.c_str());
+    EmitNdjson("{\"phase\":\"vouched\",\"subject_urn\":\"" + VouchJsonEscape(vouchResult.subjectUrn)
+        + "\",\"admin_urn\":\"" + VouchJsonEscape(vouchResult.adminUrn)
+        + "\",\"jti\":\"" + VouchJsonEscape(vouchResult.vouchJti) + "\"}");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
 struct CliArgs
@@ -108,6 +314,10 @@ struct CliArgs
     bool         newUser       = false;   // --new-user (bare enroll)
     std::wstring label;                    // --label <username>
     std::wstring displayName;              // --display-name "<Full Name>"
+    bool         vouch         = false;   // --vouch (admin vouch a subject+purpose)
+    std::wstring subjectUrn;               // --subject-urn <urn>
+    std::wstring purpose;                  // --purpose <dds:...>
+    std::wstring credentialId;             // --credential-id <b64url> (else registry)
     bool         help          = false;
 };
 
@@ -119,8 +329,12 @@ static CliArgs ParseArgs(int argc, wchar_t** argv)
         std::wstring a = argv[i];
         if      (a == L"--password-stdin") args.passwordStdin = true;
         else if (a == L"--new-user")       args.newUser = true;
-        else if (a == L"--label" && i + 1 < argc)        args.label = argv[++i];
-        else if (a == L"--display-name" && i + 1 < argc) args.displayName = argv[++i];
+        else if (a == L"--vouch")          args.vouch = true;
+        else if (a == L"--label" && i + 1 < argc)         args.label = argv[++i];
+        else if (a == L"--display-name" && i + 1 < argc)  args.displayName = argv[++i];
+        else if (a == L"--subject-urn" && i + 1 < argc)   args.subjectUrn = argv[++i];
+        else if (a == L"--purpose" && i + 1 < argc)       args.purpose = argv[++i];
+        else if (a == L"--credential-id" && i + 1 < argc) args.credentialId = argv[++i];
         else if (a == L"--help" || a == L"-h" || a == L"/?") args.help = true;
     }
     return args;
@@ -146,12 +360,20 @@ static void PrintHelp()
         "      DDS user is named <Full Name>; its Windows account is created\n"
         "      later by the first-logon claim. One touch.\n"
         "\n"
+        "  --vouch --subject-urn <urn> --purpose <dds:...> [--credential-id <b64url>]\n"
+        "      Admin-vouch a subject for a purpose using the admin key on THIS\n"
+        "      machine (admin's touch, UV required). Used to authorize this\n"
+        "      node to publish policy (subject = node URN, purpose =\n"
+        "      dds:policy-publisher-windows). The admin credential id is read\n"
+        "      from the registry unless --credential-id is given.\n"
+        "\n"
         "Usage:\n"
         "  dds-enroll-user.exe --password-stdin\n"
         "  dds-enroll-user.exe --new-user --label jsmith --display-name \"Jane Smith\"\n"
+        "  dds-enroll-user.exe --vouch --subject-urn urn:vouchsafe:dds-node.abc --purpose dds:policy-publisher-windows\n"
         "\n"
         "Exit codes:\n"
-        "  0  enrollment posted to dds-node\n"
+        "  0  success (enrollment posted / vouch accepted)\n"
         "  1  (password-stdin only) vault saved, but POST failed (retry later)\n"
         "  2  error\n"
         "  3  user cancelled\n";
@@ -169,15 +391,22 @@ int wmain(int argc, wchar_t** argv)
         return 0;
     }
     // Exactly one mode must be selected.
-    if (args.newUser == args.passwordStdin)
+    int modes = (args.passwordStdin ? 1 : 0) + (args.newUser ? 1 : 0) + (args.vouch ? 1 : 0);
+    if (modes != 1)
     {
-        std::cerr << "error: specify exactly one of --password-stdin or --new-user.\n\n";
+        std::cerr << "error: specify exactly one of --password-stdin, --new-user, or --vouch.\n\n";
         PrintHelp();
         return 2;
     }
     if (args.newUser && (args.label.empty() || args.displayName.empty()))
     {
         std::cerr << "error: --new-user requires --label and --display-name.\n\n";
+        PrintHelp();
+        return 2;
+    }
+    if (args.vouch && (args.subjectUrn.empty() || args.purpose.empty()))
+    {
+        std::cerr << "error: --vouch requires --subject-urn and --purpose.\n\n";
         PrintHelp();
         return 2;
     }
@@ -188,6 +417,14 @@ int wmain(int argc, wchar_t** argv)
     HWND hwnd = CreateHiddenOwner();
     // hwnd may be NULL on rare failures; the WebAuthn API handles NULL by
     // anchoring on the foreground window, which is acceptable here.
+
+    // Admin-vouch mode is self-contained (no EnrollmentFlow machinery).
+    if (args.vouch)
+    {
+        int rc = RunAdminVouchNdjson(hwnd, args.subjectUrn, args.purpose, args.credentialId);
+        if (hwnd) DestroyWindow(hwnd);
+        return rc;
+    }
 
     EnrollmentFlowOptions opts;
     opts.hwnd        = hwnd;
