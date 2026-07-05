@@ -1422,6 +1422,14 @@ function Run-EnrollUser {
         -RedirectStandardOutput $script:enrollStdoutPath `
         -NoNewWindow -PassThru
 
+    # Cache the process handle NOW, while the child is alive. A Start-Process
+    # -PassThru object created WITH output redirection does not retain a
+    # process handle on Windows PowerShell 5.1, so a later $proc.ExitCode read
+    # returns $null -- which would defeat the exit-code gate in Tick-EnrollUser
+    # and misreport a successful enrollment as a failure. Touching .Handle
+    # forces the handle to be held so ExitCode is populated after exit.
+    try { $null = $script:enrollProcess.Handle } catch { }
+
     Append-Log $el.TbEnrollLog "[Console] dds-enroll-user PID $($script:enrollProcess.Id)"
 
     $script:enrollTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1999,6 +2007,10 @@ function Start-EnrollNewPerson {
     try {
         $script:npProc = Start-Process -FilePath $EnrollUserBin -ArgumentList $argLine `
             -RedirectStandardOutput $script:npLog -NoNewWindow -PassThru
+        # Retain the process handle while the child is alive so $npProc.ExitCode
+        # is readable after exit -- a redirected Start-Process -PassThru object
+        # drops its handle on Windows PowerShell 5.1 and ExitCode reads $null.
+        try { $null = $script:npProc.Handle } catch { }
     } catch {
         $el.TbEnrollNpStatus.Text = "Could not start enrollment: $($_.Exception.Message)"
         return
@@ -2010,40 +2022,63 @@ function Start-EnrollNewPerson {
     $script:npTimer.Start()
 }
 
-function Tick-EnrollNewPerson {
-    if ($script:npLog -and (Test-Path $script:npLog)) {
+# Drain any newly-written NDJSON lines from the new-person enroll log and
+# fold them into UI/status state. Factored out of Tick-EnrollNewPerson so the
+# exit branch can drain ONE more time after the process has exited (see the
+# race note there).
+function Read-NpLog {
+    if (-not ($script:npLog -and (Test-Path $script:npLog))) { return }
+    try {
+        $fs = [IO.File]::Open($script:npLog, 'Open', 'Read', 'ReadWrite')
         try {
-            $fs = [IO.File]::Open($script:npLog, 'Open', 'Read', 'ReadWrite')
-            try {
-                $fs.Seek($script:npPos, 'Begin') | Out-Null
-                $sr = New-Object IO.StreamReader($fs)
-                while ($null -ne ($line = $sr.ReadLine())) {
-                    $script:npPos = $fs.Position
-                    if (-not $line.Trim()) { continue }
-                    try { $obj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-                    switch ($obj.phase) {
-                        'touch1_prompt' { $el.TbEnrollNpStatus.Text = "Touch the security key now..." }
-                        'key_made'      { $el.TbEnrollNpStatus.Text = "Key registered; posting to dds-node..." }
-                        'enroll_posted' { $script:npUrn = [string]$obj.urn; Append-Log $el.TbPolicyLog "[enroll] enrolled: $($obj.urn)" }
-                        'error'         { Append-Log $el.TbPolicyLog "[enroll] error: $($obj.message)" }
-                    }
+            $fs.Seek($script:npPos, 'Begin') | Out-Null
+            $sr = New-Object IO.StreamReader($fs)
+            while ($null -ne ($line = $sr.ReadLine())) {
+                $script:npPos = $fs.Position
+                if (-not $line.Trim()) { continue }
+                try { $obj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                switch ($obj.phase) {
+                    'touch1_prompt' { $el.TbEnrollNpStatus.Text = "Touch the security key now..." }
+                    'key_made'      { $el.TbEnrollNpStatus.Text = "Key registered; posting to dds-node..." }
+                    'enroll_posted' { $script:npUrn = [string]$obj.urn; Append-Log $el.TbPolicyLog "[enroll] enrolled: $($obj.urn)" }
+                    'error'         { Append-Log $el.TbPolicyLog "[enroll] error: $($obj.message)" }
                 }
-            } finally { $fs.Close() }
-        } catch { }
-    }
+            }
+        } finally { $fs.Close() }
+    } catch { }
+}
+
+function Tick-EnrollNewPerson {
+    Read-NpLog
     # Guard on the timer still existing so a re-entrant tick queued before the
     # first nulls it can't call .Stop() on $null (the post-success crash guard,
     # matching the join/device/enroll ticks).
     if ($script:npTimer -and $script:npProc -and $script:npProc.HasExited) {
+        # Race fix: dds-enroll-user.exe flushes its terminal 'enroll_posted' line
+        # and exits back-to-back (DdsEnrollUser.cpp emit+flush then return 0), so
+        # the process can exit in the window BETWEEN the drain above and this
+        # HasExited check -- leaving $npUrn unset and a server-side-successful
+        # registration misreported as "did not complete". HasExited guarantees
+        # stdout is flushed and closed, so one final drain captures the last line
+        # before we judge the outcome.
+        Read-NpLog
         $script:npTimer.Stop(); $script:npTimer = $null
         $el.BtnEnrollNewPerson.IsEnabled = $true
-        if ($script:npProc.ExitCode -eq 0 -and $script:npUrn) {
+        # Success is signalled by the terminal 'enroll_posted' line captured
+        # above (the helper emits it iff the server accepted the enrollment and
+        # then exits 0 -- see DdsEnrollUser.cpp). Gate on that flag, NOT on
+        # ExitCode: a redirected Start-Process -PassThru can read back a $null
+        # ExitCode on PS 5.1 (the .Handle touch at launch mitigates it, but the
+        # drained flag is the authoritative server-success signal regardless).
+        if ($script:npUrn) {
             $el.TbClaimSubject.Text = $script:npUrn
             $el.TbEnrollNpStatus.Text = "Registered. Next: approve this person in the tray's 'Approve Enrollments', then click 'Publish -- create this account' below."
             Append-Log $el.TbPolicyLog "[enroll] DONE. Approve '$($el.TbAcctUser.Text)' in the tray, then Publish."
             Load-EnrolledUsers | Out-Null
         } else {
-            $el.TbEnrollNpStatus.Text = "Registration did not complete (exit $($script:npProc.ExitCode)). See the Output box."
+            $code = $script:npProc.ExitCode
+            $suffix = if ($null -ne $code) { " (exit $code)" } else { "" }
+            $el.TbEnrollNpStatus.Text = "Registration did not complete$suffix. See the Output box."
         }
         if ($script:npLog -and (Test-Path $script:npLog)) { Remove-Item -Force -ErrorAction SilentlyContinue $script:npLog }
     }
@@ -2077,6 +2112,10 @@ function Start-AuthorizeMachine {
     try {
         $script:authProc = Start-Process -FilePath $EnrollUserBin -ArgumentList $argLine `
             -RedirectStandardOutput $script:authLog -NoNewWindow -PassThru
+        # Retain the process handle while the child is alive so $authProc.ExitCode
+        # is readable after exit -- a redirected Start-Process -PassThru object
+        # drops its handle on Windows PowerShell 5.1 and ExitCode reads $null.
+        try { $null = $script:authProc.Handle } catch { }
     } catch {
         $el.TbPubStatus.Text = "Could not start authorization: $($_.Exception.Message)"
         return
@@ -2088,35 +2127,54 @@ function Start-AuthorizeMachine {
     $script:authTimer.Start()
 }
 
-function Tick-AuthorizeMachine {
-    if ($script:authLog -and (Test-Path $script:authLog)) {
+# Drain any newly-written NDJSON lines from the authorize log and fold them
+# into UI/status state. Factored out so the exit branch can drain ONE more
+# time after the process has exited (see the race note in Tick-AuthorizeMachine).
+function Read-AuthLog {
+    if (-not ($script:authLog -and (Test-Path $script:authLog))) { return }
+    try {
+        $fs = [IO.File]::Open($script:authLog, 'Open', 'Read', 'ReadWrite')
         try {
-            $fs = [IO.File]::Open($script:authLog, 'Open', 'Read', 'ReadWrite')
-            try {
-                $fs.Seek($script:authPos, 'Begin') | Out-Null
-                $sr = New-Object IO.StreamReader($fs)
-                while ($null -ne ($line = $sr.ReadLine())) {
-                    $script:authPos = $fs.Position
-                    if (-not $line.Trim()) { continue }
-                    try { $obj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-                    switch ($obj.phase) {
-                        'touch_prompt' { $el.TbPubStatus.Text = "Touch your admin security key now..." }
-                        'asserted'     { $el.TbPubStatus.Text = "Admin key verified; submitting authorization..." }
-                        'vouched'      { $script:authOk = $true; Append-Log $el.TbPolicyLog "[authorize] vouched by $($obj.admin_urn)" }
-                        'error'        { Append-Log $el.TbPolicyLog "[authorize] error: $($obj.message)"; $el.TbPubStatus.Text = "Authorization failed: $($obj.message)" }
-                    }
+            $fs.Seek($script:authPos, 'Begin') | Out-Null
+            $sr = New-Object IO.StreamReader($fs)
+            while ($null -ne ($line = $sr.ReadLine())) {
+                $script:authPos = $fs.Position
+                if (-not $line.Trim()) { continue }
+                try { $obj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                switch ($obj.phase) {
+                    'touch_prompt' { $el.TbPubStatus.Text = "Touch your admin security key now..." }
+                    'asserted'     { $el.TbPubStatus.Text = "Admin key verified; submitting authorization..." }
+                    'vouched'      { $script:authOk = $true; Append-Log $el.TbPolicyLog "[authorize] vouched by $($obj.admin_urn)" }
+                    'error'        { Append-Log $el.TbPolicyLog "[authorize] error: $($obj.message)"; $el.TbPubStatus.Text = "Authorization failed: $($obj.message)" }
                 }
-            } finally { $fs.Close() }
-        } catch { }
-    }
+            }
+        } finally { $fs.Close() }
+    } catch { }
+}
+
+function Tick-AuthorizeMachine {
+    Read-AuthLog
     if ($script:authTimer -and $script:authProc -and $script:authProc.HasExited) {
+        # Race fix: dds-enroll-user.exe flushes its terminal 'vouched' line and
+        # exits back-to-back (DdsEnrollUser.cpp emit+flush then return 0), so the
+        # process can exit in the window BETWEEN the drain above and this
+        # HasExited check -- leaving $authOk false and a server-side-successful
+        # vouch misreported as "did not complete". HasExited guarantees stdout is
+        # flushed and closed, so one final drain captures the last line before we
+        # judge the outcome.
+        Read-AuthLog
         $script:authTimer.Stop(); $script:authTimer = $null
         $el.BtnPubAuthorize.IsEnabled = $true
-        if ($script:authProc.ExitCode -eq 0 -and $script:authOk) {
+        # Success is signalled by the terminal 'vouched' line captured above
+        # (emitted iff the server accepted the vouch, then exit 0). Gate on that
+        # flag, NOT on ExitCode -- see the note in Tick-EnrollNewPerson.
+        if ($script:authOk) {
             Append-Log $el.TbPolicyLog "[authorize] DONE -- this machine can now publish policy."
             Refresh-PublisherStatus
         } elseif (-not ($el.TbPubStatus.Text -match 'failed')) {
-            $el.TbPubStatus.Text = "Authorization did not complete (exit $($script:authProc.ExitCode)). See the Output box."
+            $code = $script:authProc.ExitCode
+            $suffix = if ($null -ne $code) { " (exit $code)" } else { "" }
+            $el.TbPubStatus.Text = "Authorization did not complete$suffix. See the Output box."
         }
         if ($script:authLog -and (Test-Path $script:authLog)) { Remove-Item -Force -ErrorAction SilentlyContinue $script:authLog }
     }
