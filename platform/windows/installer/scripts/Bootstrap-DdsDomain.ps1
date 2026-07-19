@@ -586,6 +586,17 @@ foreach ($svc in @('DdsAuthBridge','DdsPolicyAgent')) {
     Start-Service -Name $svc
 }
 
+# ── Mark ready for first-admin bootstrap ───────────────────────────
+# dds-node's C-2 security gate refuses every POST /v1/admin/setup call
+# until this out-of-band sentinel exists (blocks a local unprivileged
+# process from self-enrolling as admin). It's checked live on each
+# request, not cached at node startup, so creating it here — after the
+# service is already running — is sufficient; no restart needed.
+# Consumed (deleted) automatically the moment admin_setup succeeds.
+$BootstrapSentinel = Join-Path $NodeData ".bootstrap"
+New-Item -ItemType File -Force -Path $BootstrapSentinel | Out-Null
+Write-Host "  Bootstrap sentinel: $BootstrapSentinel"
+
 # ── Bootstrap.env ──────────────────────────────────────────────────
 @"
 DOMAIN_NAME=$Name
@@ -624,7 +635,8 @@ Write-Host "  (Copy to a USB stick to add a sibling node.)"
 Write-Host ""
 Write-Host "  Service status:"
 Get-Service Dds* | Format-Table Name, Status, StartType -AutoSize | Out-String | Write-Host
-Write-Host "  Next: launch DDS Tray Agent from Start menu to enroll users."
+Write-Host "  Next: launch DDS Tray Agent from Start menu, then Admin Setup"
+Write-Host "        to register the first admin, then enroll users."
 Write-Host ""
 try { Stop-Transcript | Out-Null } catch { }
 Read-Host "Press Enter to close"

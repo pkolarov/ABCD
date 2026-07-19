@@ -351,7 +351,7 @@ function Resolve-InitialPage {
         <TextBlock Grid.Row="0" FontSize="16" FontWeight="SemiBold"
                    Text="Step 3 of 4 — Bootstrapping the domain"/>
         <TextBlock Grid.Row="1" Foreground="#555555" Margin="0,4,0,12" TextWrapping="Wrap"
-                   Text="A new console window will open shortly. Touch your FIDO2 key when it asks. Progress is mirrored here."/>
+                   Text="A new console window will open shortly. Follow its prompts to protect the domain key. Once bootstrap finishes, you'll be asked to touch your FIDO2 key once more to register yourself as the first admin. Progress is mirrored here."/>
         <Border Grid.Row="2" BorderBrush="#cccccc" BorderThickness="1" Padding="6" Margin="0,0,0,8">
           <ItemsControl x:Name="Steps">
             <ItemsControl.ItemTemplate>
@@ -1330,23 +1330,121 @@ function Tick-BootstrapTail {
             for ($i = 0; $i -lt $stepItems.Count; $i++) {
                 if ($stepItems[$i].Color -eq '#0078d4') { Mark-Step -Idx $stepItems[$i].Idx -State 'ok' }
             }
-            Set-Status "Bootstrap completed successfully." '#107C10'
-            # Read bootstrap.env to populate the Done page.
-            $bsEnv = Join-Path $DataRoot 'bootstrap.env'
-            if (Test-Path $bsEnv) {
-                $envLines = Get-Content $bsEnv
-                foreach ($ln in $envLines) {
-                    if ($ln -match '^DOMAIN_ID=(.+)$')   { $el.TbDoneDomainId.Text   = "Domain ID:  $($Matches[1])" }
-                    if ($ln -match '^DEVICE_URN=(.+)$')  { $el.TbDoneDeviceUrn.Text  = "Device URN: $($Matches[1])" }
-                    if ($ln -match '^PEER_ID=(.+)$')     { $el.TbDonePeerId.Text     = "Peer ID:    $($Matches[1])" }
-                }
-            }
-            Show-Page -Name 'PageNewDomain_Done'
+            Run-AdminSetupStep
         } else {
             Set-Status "Bootstrap failed (exit $code)." '#D13438'
             Set-Error -Message "Bootstrap failed with exit code $code." -Detail $el.TbLog.Text
         }
     }
+}
+
+# ── Branch A: admin setup (runs immediately after a successful bootstrap) ──
+# C-2 security gate: dds-node refuses POST /v1/admin/setup until the
+# operator has bootstrapped AND the .bootstrap sentinel exists (created by
+# Bootstrap-DdsDomain.ps1's final step). Historically the wizard just told
+# the operator to "launch the tray agent to enroll users" and left admin
+# creation as a separate, easy-to-forget manual step — so a freshly
+# bootstrapped domain had no admin and Admin Setup silently refused
+# client-side (see AUDIT-2026-07-19). Run it here instead, automatically,
+# via dds-enroll-user.exe --admin-setup -- same NDJSON/log-tail pattern as
+# Authorize/Approve/New Person above (Read-AuthLog et al.), no MessageBox
+# popups.
+$script:adminSetupProc  = $null
+$script:adminSetupTimer = $null
+$script:adminSetupLog   = ''
+$script:adminSetupPos   = 0
+$script:adminSetupOk    = $false
+
+function Stop-AdminSetupWait {
+    if ($script:adminSetupTimer) { $script:adminSetupTimer.Stop(); $script:adminSetupTimer = $null }
+}
+
+function Finish-NewDomainWizard {
+    # Read bootstrap.env to populate the Done page.
+    $bsEnv = Join-Path $DataRoot 'bootstrap.env'
+    if (Test-Path $bsEnv) {
+        $envLines = Get-Content $bsEnv
+        foreach ($ln in $envLines) {
+            if ($ln -match '^DOMAIN_ID=(.+)$')   { $el.TbDoneDomainId.Text   = "Domain ID:  $($Matches[1])" }
+            if ($ln -match '^DEVICE_URN=(.+)$')  { $el.TbDoneDeviceUrn.Text  = "Device URN: $($Matches[1])" }
+            if ($ln -match '^PEER_ID=(.+)$')     { $el.TbDonePeerId.Text     = "Peer ID:    $($Matches[1])" }
+        }
+    }
+    Show-Page -Name 'PageNewDomain_Done'
+}
+
+# Drain any newly-written NDJSON lines from the admin-setup log. Factored
+# out so the exit branch can drain ONE more time after the process has
+# exited (same race note as Read-AuthLog / Tick-AuthorizeMachine).
+function Read-AdminSetupLog {
+    if (-not ($script:adminSetupLog -and (Test-Path $script:adminSetupLog))) { return }
+    try {
+        $fs = [IO.File]::Open($script:adminSetupLog, 'Open', 'Read', 'ReadWrite')
+        try {
+            $fs.Seek($script:adminSetupPos, 'Begin') | Out-Null
+            $sr = New-Object IO.StreamReader($fs)
+            while ($null -ne ($line = $sr.ReadLine())) {
+                $script:adminSetupPos = $fs.Position
+                if (-not $line.Trim()) { continue }
+                try { $obj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                switch ($obj.phase) {
+                    'touch_prompt'       { Set-Status "Touch your FIDO2 key now to register the first admin..." '#0078d4' }
+                    'credential_created' { Set-Status "Key registered; submitting admin setup..." '#0078d4' }
+                    'admin_created'      { $script:adminSetupOk = $true; Append-Log $el.TbLog "[Console] Admin account created: $($obj.urn)" }
+                    'error'              { Append-Log $el.TbLog "[Console] Admin setup error ($($obj.at)): $($obj.message)" }
+                }
+            }
+        } finally { $fs.Close() }
+    } catch { }
+}
+
+function Tick-AdminSetupWait {
+    Read-AdminSetupLog
+    if (-not $script:adminSetupProc -or -not $script:adminSetupProc.HasExited) { return }
+    # Race fix (see Tick-AuthorizeMachine): the exe can flush its terminal
+    # line and exit back-to-back, landing between a drain and this
+    # HasExited check. One final drain guarantees the last line is read.
+    Read-AdminSetupLog
+    Stop-AdminSetupWait
+    if ($script:adminSetupOk) {
+        Set-Status "Bootstrap and admin setup completed successfully." '#107C10'
+    } elseif (-not ($el.TbStatus.Text -match 'error')) {
+        $code = $script:adminSetupProc.ExitCode
+        $suffix = if ($null -ne $code) { " (exit $code)" } else { "" }
+        Set-Status "Domain bootstrapped, but admin setup did not complete$suffix - retry from the tray icon's Admin Setup menu." '#D13438'
+    }
+    if ($script:adminSetupLog -and (Test-Path $script:adminSetupLog)) { Remove-Item -Force -ErrorAction SilentlyContinue $script:adminSetupLog }
+    Finish-NewDomainWizard
+}
+
+function Run-AdminSetupStep {
+    if (-not (Test-Path $EnrollUserBin)) {
+        Append-Log $el.TbLog "[Console] $EnrollUserBin not found -- skipping automatic admin setup. Reinstall the MSI, then use the tray icon's Admin Setup menu."
+        Set-Status "Domain bootstrapped. Admin setup skipped (dds-enroll-user.exe missing)." '#D13438'
+        Finish-NewDomainWizard
+        return
+    }
+    $script:adminSetupLog = Join-Path $env:TEMP ("dds-admin-setup-{0:yyyyMMdd-HHmmss-fff}.log" -f (Get-Date))
+    $script:adminSetupPos = 0
+    $script:adminSetupOk  = $false
+    Set-Status "Bootstrap complete. Registering the first admin - touch your FIDO2 key when prompted..." '#0078d4'
+    Append-Log $el.TbLog "[Console] Launching admin setup ($EnrollUserBin --admin-setup)..."
+    try {
+        $script:adminSetupProc = Start-Process -FilePath $EnrollUserBin -ArgumentList '--admin-setup' `
+            -RedirectStandardOutput $script:adminSetupLog -NoNewWindow -PassThru
+        # See Start-AuthorizeMachine: retain .Handle so ExitCode reads back
+        # on Windows PowerShell 5.1 after the child exits.
+        try { $null = $script:adminSetupProc.Handle } catch { }
+    } catch {
+        Append-Log $el.TbLog "[Console] Could not start admin setup: $($_.Exception.Message)"
+        Set-Status "Domain bootstrapped, but admin setup failed to start - retry from the tray icon." '#D13438'
+        Finish-NewDomainWizard
+        return
+    }
+    $script:adminSetupTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:adminSetupTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+    $script:adminSetupTimer.Add_Tick({ Tick-AdminSetupWait })
+    $script:adminSetupTimer.Start()
 }
 
 function Run-Bootstrap {
@@ -1365,6 +1463,7 @@ function Run-Bootstrap {
         return
     }
 
+    Stop-AdminSetupWait
     Show-Page -Name 'PageNewDomain_Run'
     $el.TbLog.Clear()
     Reset-Steps
@@ -3034,12 +3133,12 @@ $el.BtnNext.add_Click({
 })
 
 $window.add_Closed({
-    foreach ($t in @($script:bootstrapTimer, $script:joinTimer, $script:deviceEnrollTimer, $script:enrollTimer, $script:enrollPollTimer, $script:npTimer, $script:authTimer, $script:apTimer, $script:mgTimer, $healthTimer)) {
+    foreach ($t in @($script:bootstrapTimer, $script:adminSetupTimer, $script:joinTimer, $script:deviceEnrollTimer, $script:enrollTimer, $script:enrollPollTimer, $script:npTimer, $script:authTimer, $script:apTimer, $script:mgTimer, $healthTimer)) {
         try { if ($t) { $t.Stop() } } catch { }
     }
     # Don't orphan an in-flight FIDO2 ceremony helper (and its WebAuthn
     # prompt) if the operator closes the window mid-ceremony.
-    foreach ($p in @($script:mgProc, $script:apProc, $script:npProc, $script:authProc)) {
+    foreach ($p in @($script:mgProc, $script:apProc, $script:npProc, $script:authProc, $script:adminSetupProc)) {
         try { if ($p -and -not $p.HasExited) { $p.Kill() } } catch { }
     }
     # Defensive: scrub any leftover password temp file.

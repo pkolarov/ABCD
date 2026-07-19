@@ -162,6 +162,23 @@ static std::vector<uint8_t> VouchBase64UrlDecode(const std::string& input)
     return out;
 }
 
+// Save the admin credential id so later --vouch / --revoke-vouch calls
+// (and the tray agent's Approve Enrollments) can find it. Mirrors
+// SaveAdminCredentialIdToRegistry in DdsTrayAgent/AdminFlow.cpp — same
+// key/value names so either tool can write it and the other can read it.
+static bool SaveAdminCredentialIdToRegistry(const std::vector<uint8_t>& credId)
+{
+    HKEY hKey = NULL;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\DDS\\AuthBridge", 0, NULL,
+                        0, KEY_SET_VALUE, NULL, &hKey, NULL) != ERROR_SUCCESS)
+        return false;
+    std::string b64 = VouchBase64UrlEncode(credId.data(), credId.size());
+    LONG ret = RegSetValueExA(hKey, "AdminCredentialId", 0, REG_SZ,
+        reinterpret_cast<const BYTE*>(b64.c_str()), (DWORD)(b64.size() + 1));
+    RegCloseKey(hKey);
+    return ret == ERROR_SUCCESS;
+}
+
 // Load the admin credential id written by Admin Setup
 // (HKLM\SOFTWARE\DDS\AuthBridge\AdminCredentialId, base64url).
 static bool LoadAdminCredentialIdFromRegistry(std::vector<uint8_t>& outCredId)
@@ -328,6 +345,97 @@ static int RunAdminVouchNdjson(HWND hwnd,
     return 0;
 }
 
+// Bootstrap the very first admin for a freshly-created domain. Headless
+// NDJSON equivalent of DdsTrayAgent/AdminFlow.cpp's RunAdminSetupFlow —
+// used by DdsConsole.ps1 immediately after a successful New Domain
+// bootstrap so admin creation isn't left as a separate, easy-to-forget
+// manual step (AUDIT-2026-07-19: Bootstrap-DdsDomain.ps1 used to finish
+// "successfully" without ever creating the .bootstrap sentinel dds-node's
+// C-2 gate requires, so Admin Setup silently refused no matter how it was
+// invoked; the sentinel is now created as bootstrap's last step).
+// NDJSON phases: start, preflight_ok, touch_prompt, credential_created,
+//   admin_created{urn} | error{at,message}.
+// Returns 0 on success, 2 on error (gate refused / MakeCredential failed /
+// POST failed).
+static int RunAdminSetupNdjson(HWND hwnd)
+{
+    FileLog::Write("DdsEnrollUser: admin-setup begin\n");
+    EmitNdjson("{\"phase\":\"start\"}");
+
+    CDdsConfiguration config;
+    config.Load();
+    std::string rpId = config.RpId();
+
+    CDdsNodeHttpClient httpClient;
+    if (!config.ApiAddr().empty()) httpClient.SetBaseUrl(config.ApiAddr());
+    else                           httpClient.SetPort(config.DdsNodePort());
+    if (!config.HmacSecretPath().empty()) httpClient.LoadHmacSecret(config.HmacSecretPath());
+
+    // Pre-flight, same as AdminFlow.cpp: refuse client-side rather than
+    // burn a FIDO2 credential slot on a request guaranteed to be a 403.
+    auto info = httpClient.GetNodeInfo();
+    if (!info.success)
+    {
+        EmitNdjson("{\"phase\":\"error\",\"at\":\"node_info\",\"message\":\""
+            + VouchJsonEscape(info.errorMessage) + "\"}");
+        return 2;
+    }
+    if (!info.adminSetupAvailable)
+    {
+        EmitNdjson("{\"phase\":\"error\",\"at\":\"preflight\",\"message\":"
+            "\"Admin Setup is not available -- an admin already exists for "
+            "this domain, or the .bootstrap sentinel is absent.\"}");
+        return 2;
+    }
+    EmitNdjson("{\"phase\":\"preflight_ok\"}");
+
+    std::string adminLabel = "admin";
+    std::vector<uint8_t> userId(adminLabel.begin(), adminLabel.end());
+
+    EmitNdjson("{\"phase\":\"touch_prompt\"}");
+    // AUDIT-2026-06-11 #22a: register with UV=REQUIRED (mirrors
+    // AdminFlow.cpp) so the admin-vouch assertion path can later succeed.
+    auto makeResult = CWebAuthnHelper::MakeCredential(
+        hwnd, rpId, userId, L"DDS Administrator",
+        false /*no hmac-secret*/, true /*requireUserVerification*/);
+    if (!makeResult.success)
+    {
+        EmitNdjson("{\"phase\":\"error\",\"at\":\"make_credential\",\"message\":\""
+            + VouchJsonEscape(makeResult.errorMessage) + "\"}");
+        return 2;
+    }
+    EmitNdjson("{\"phase\":\"credential_created\"}");
+
+    std::string credIdB64 = VouchBase64UrlEncode(makeResult.credentialId.data(), makeResult.credentialId.size());
+    std::string attestB64 = VouchBase64UrlEncode(makeResult.attestationObject.data(), makeResult.attestationObject.size());
+    std::string cdhB64    = VouchBase64UrlEncode(makeResult.clientDataHash.data(), makeResult.clientDataHash.size());
+
+    std::string setupJson = "{";
+    setupJson += "\"label\":\"admin\",";
+    setupJson += "\"credential_id\":\"" + credIdB64 + "\",";
+    setupJson += "\"attestation_object_b64\":\"" + attestB64 + "\",";
+    setupJson += "\"client_data_hash_b64\":\"" + cdhB64 + "\",";
+    setupJson += "\"rp_id\":\"" + VouchJsonEscape(rpId) + "\",";
+    setupJson += "\"display_name\":\"DDS Administrator\",";
+    setupJson += "\"authenticator_type\":\"cross-platform\"";
+    setupJson += "}";
+
+    DdsAdminSetupResult setupResult = httpClient.PostAdminSetup(setupJson);
+    if (!setupResult.success)
+    {
+        EmitNdjson("{\"phase\":\"error\",\"at\":\"admin_setup\",\"message\":\""
+            + VouchJsonEscape(setupResult.errorMessage) + "\"}");
+        return 2;
+    }
+
+    if (!SaveAdminCredentialIdToRegistry(makeResult.credentialId))
+        FileLog::Write("DdsEnrollUser: WARN failed to save AdminCredentialId to registry\n");
+
+    FileLog::Writef("DdsEnrollUser: admin-setup OK adminUrn='%s'\n", setupResult.adminUrn.c_str());
+    EmitNdjson("{\"phase\":\"admin_created\",\"urn\":\"" + VouchJsonEscape(setupResult.adminUrn) + "\"}");
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
@@ -339,6 +447,7 @@ struct CliArgs
     std::wstring displayName;              // --display-name "<Full Name>"
     bool         vouch         = false;   // --vouch (admin vouch a subject+purpose)
     bool         revokeVouch   = false;   // --revoke-vouch (admin offboard a subject)
+    bool         adminSetup    = false;   // --admin-setup (bootstrap the first admin)
     std::wstring subjectUrn;               // --subject-urn <urn>
     std::wstring purpose;                  // --purpose <dds:...>
     std::wstring credentialId;             // --credential-id <b64url> (else registry)
@@ -355,6 +464,7 @@ static CliArgs ParseArgs(int argc, wchar_t** argv)
         else if (a == L"--new-user")       args.newUser = true;
         else if (a == L"--vouch")          args.vouch = true;
         else if (a == L"--revoke-vouch")   args.revokeVouch = true;
+        else if (a == L"--admin-setup")    args.adminSetup = true;
         else if (a == L"--label" && i + 1 < argc)         args.label = argv[++i];
         else if (a == L"--display-name" && i + 1 < argc)  args.displayName = argv[++i];
         else if (a == L"--subject-urn" && i + 1 < argc)   args.subjectUrn = argv[++i];
@@ -400,11 +510,19 @@ static void PrintHelp()
         "      'revoked' NDJSON line whose 'body' field is the server's JSON\n"
         "      response (revoked[], foreign[], demoted, published).\n"
         "\n"
+        "  --admin-setup\n"
+        "      Bootstrap the very first admin for a freshly-created domain\n"
+        "      (POST /v1/admin/setup, one touch, no existing admin needed).\n"
+        "      Only succeeds once, and only while dds-node's C-2 sentinel\n"
+        "      file is present; run this right after domain bootstrap.\n"
+        "      Subsequent admins go through --vouch --purpose dds:admin.\n"
+        "\n"
         "Usage:\n"
         "  dds-enroll-user.exe --password-stdin\n"
         "  dds-enroll-user.exe --new-user --label jsmith --display-name \"Jane Smith\"\n"
         "  dds-enroll-user.exe --vouch --subject-urn urn:vouchsafe:dds-node.abc --purpose dds:policy-publisher-windows\n"
         "  dds-enroll-user.exe --revoke-vouch --subject-urn urn:vouchsafe:jane.abc\n"
+        "  dds-enroll-user.exe --admin-setup\n"
         "\n"
         "Exit codes:\n"
         "  0  success (enrollment posted / vouch accepted)\n"
@@ -426,10 +544,11 @@ int wmain(int argc, wchar_t** argv)
     }
     // Exactly one mode must be selected.
     int modes = (args.passwordStdin ? 1 : 0) + (args.newUser ? 1 : 0)
-              + (args.vouch ? 1 : 0) + (args.revokeVouch ? 1 : 0);
+              + (args.vouch ? 1 : 0) + (args.revokeVouch ? 1 : 0)
+              + (args.adminSetup ? 1 : 0);
     if (modes != 1)
     {
-        std::cerr << "error: specify exactly one of --password-stdin, --new-user, --vouch, or --revoke-vouch.\n\n";
+        std::cerr << "error: specify exactly one of --password-stdin, --new-user, --vouch, --revoke-vouch, or --admin-setup.\n\n";
         PrintHelp();
         return 2;
     }
@@ -468,6 +587,13 @@ int wmain(int argc, wchar_t** argv)
     {
         int rc = RunAdminVouchNdjson(hwnd, args.subjectUrn, args.purpose,
                                      args.credentialId, args.revokeVouch);
+        if (hwnd) DestroyWindow(hwnd);
+        return rc;
+    }
+
+    if (args.adminSetup)
+    {
+        int rc = RunAdminSetupNdjson(hwnd);
         if (hwnd) DestroyWindow(hwnd);
         return rc;
     }
