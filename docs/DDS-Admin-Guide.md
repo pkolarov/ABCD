@@ -1238,7 +1238,11 @@ What offboarding does and does not do:
 - A JTI in `confirmed_jtis` has been independently verified present on at least one other node.
 - A per-peer result with `error` set and `complete: false` is **inconclusive**, not a denial — typically the encrypted (enc-v3) payloads from that peer could not be decrypted yet because the epoch-key exchange is still in flight. The probe triggers the key exchange as a side effect, so a retry a few seconds later normally resolves it. A JTI missing from `confirmed_jtis` means "not proven present", never "proven absent", unless every probed peer answered with `complete: true` and no `error`.
 
-> **Hybrid domains and the admission cert's KEM pubkey.** On a PQ-hybrid domain every node encrypts gossip and sync under its epoch key, and epoch keys are delivered encapsulated to the *recipient's* `pq_kem_pubkey` from its admission cert. A cert issued without `--kem-pubkey` therefore leaves that node unable to decrypt anything its peers send. Current builds repair this automatically: the node attaches its own KEM pubkey to its admission cert at startup and peers pick it up at the next handshake. If a fleet mixes in older builds, re-issue the cert with `dds-node admit --kem-pubkey <hex>` (the hex is printed by `gen-node-key`).
+> **Encrypted gossip (enc-v3) and the admission cert's KEM pubkey.** When `enc-v3` is active every node encrypts gossip and sync under its epoch key, and epoch keys are delivered encapsulated to the *recipient's* `pq_kem_pubkey` from its admission cert. A cert issued without a KEM pubkey therefore leaves that node unable to decrypt anything its peers send — replication looks dead even though the mesh and admission handshake succeed.
+>
+> **`enc-v3` is on by default and is independent of the domain's signing key.** A `[domain]` block that omits `capabilities` opts into `["enc-v3"]`, so even a **legacy non-hybrid domain** (Ed25519-only, no `pq_pubkey`) encrypts its gossip — the per-node ML-KEM epoch keypair exists regardless of the domain key. Such a domain still needs cert KEM pubkeys. To run plaintext gossip instead, set `capabilities = []` under `[domain]` in each node's config and restart.
+>
+> Current builds repair a missing (or stale) KEM pubkey automatically: at startup, whenever `enc-v3` is active, the node attaches its own live KEM pubkey to its admission cert and persists it; peers pick it up at the next handshake. Provisioning and bootstrap also embed the KEM pubkey up front. If a fleet mixes in older builds that lack the self-repair, upgrade every node — the self-repair only runs on the fixed build, so **all** nodes must be upgraded for full bidirectional replication (a node whose cert still lacks a KEM pubkey cannot be sent its peers' epoch keys). As a manual fallback, re-issue the cert with `dds-node admit --kem-pubkey <hex>` (the hex is printed by `gen-node-key`).
 
 The probe rides the sync protocol with no wire change, so it works even when peers run an older build.
 
@@ -4096,6 +4100,15 @@ After enrollment on one node, `UserAuthAttestation` tokens propagate via gossip.
 1. Check both nodes see each other: `connected_peers ≥ 1` on both
 2. Check the enrollment succeeded: `curl http://127.0.0.1:5551/v1/enrolled-users` on the enrolling node
 3. Wait 60 seconds, then check the other node
+
+**Mesh + admission succeed but nothing replicates (encrypted-gossip / `enc-v3`).** The most common cause once `enc-v3` is on (the default) is a missing admission-cert KEM pubkey: the nodes connect and admit each other, but every encrypted payload is silently dropped because peers can't deliver epoch keys to a cert that has no `pq_kem_pubkey`. Symptoms: `connected_peers ≥ 1`, admission handshake OK in the logs, but `trust_graph_tokens` never grows on the receiving node; `/v1/replication/confirm` returns empty `confirmed_jtis`; the log may repeat `no cached epoch key for sync responder` or an `err_count=1` sync line.
+
+Diagnose and fix (current builds):
+
+1. Run `Verify-DdsReplication.ps1` on each node (installed under `C:\Program Files\DDS\bin`, or from `platform/windows/installer/scripts/`). It reports whether `admission.cbor` carries a `pq_kem_pubkey` and flags any `err_count` loop. Add `-EnrollTest` on one node for an end-to-end replication proof.
+2. If a cert lacks the KEM pubkey, **restart that node once** — on a fixed build the node attaches its own KEM pubkey to its cert at startup whenever `enc-v3` is active, and peers pick it up at the next handshake.
+3. Because the self-repair only runs on the fixed build, **every node must be upgraded**: a node whose cert still lacks a KEM pubkey cannot be sent its peers' epoch keys, so it stays dark in that direction even if the other side is fixed.
+4. This affects **non-hybrid (legacy) domains too** — `enc-v3` is on by default regardless of whether the domain key is hybrid. To opt out and run plaintext gossip instead, set `capabilities = []` under `[domain]` in each node's config and restart. See [Confirming replication](#confirming-replication) for the full explanation.
 
 ### FIDO2 assertion fails
 

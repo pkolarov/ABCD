@@ -425,6 +425,108 @@
                   Impersonate="no"
                   Return="ignore" />
 
+    <!-- ============================================================ -->
+    <!-- Native-uninstall wiring — see Uninstall-Dds.ps1's own header  -->
+    <!-- comment for the full inventory this is closing the gap on.   -->
+    <!-- Before this pair of custom actions, clicking "Uninstall" in   -->
+    <!-- Windows Settings / Programs and Features ran only the        -->
+    <!-- standard msiexec /x sequence, which — by design (see the     -->
+    <!-- Permanent="yes"/NeverOverwrite="yes" components above) —      -->
+    <!-- leaves C:\ProgramData\DDS (node identity, domain state,      -->
+    <!-- audit logs), the Credential Provider DLL + its COM           -->
+    <!-- registration, node.toml/appsettings.json, and the whole      -->
+    <!-- HKLM\SOFTWARE\DDS tree behind. Only the standalone            -->
+    <!-- Uninstall-Dds.ps1 script cleaned that up, and nothing wired   -->
+    <!-- it into the native uninstall path.                            -->
+    <!--                                                                -->
+    <!-- CRITICAL correctness constraint — REMOVE vs. UPGRADE: MSI     -->
+    <!-- sets the exact same REMOVE="ALL" state during a genuine       -->
+    <!-- uninstall AND during every version upgrade's internal         -->
+    <!-- RemoveExistingProducts step (that's how the                   -->
+    <!-- Schedule="afterInstallExecute" MajorUpgrade above works).     -->
+    <!-- Gating only on REMOVE="ALL" would wipe C:\ProgramData\DDS —   -->
+    <!-- the live node identity — on every future MSI upgrade, not     -->
+    <!-- just on a real uninstall. UPGRADINGPRODUCTCODE is the         -->
+    <!-- standard MSI property (auto-populated by FindRelatedProducts, -->
+    <!-- same mechanism as WIX_UPGRADE_DETECTED used by C_ConfigBackup -->
+    <!-- above) that is set ONLY in the OLD product's own uninstall    -->
+    <!-- session when it is being removed as part of a NEW product's   -->
+    <!-- install — never during a standalone uninstall. Both new       -->
+    <!-- actions below are conditioned on                              -->
+    <!-- REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE for exactly this    -->
+    <!-- reason. Do NOT simplify this condition to just REMOVE="ALL".  -->
+    <!--                                                                -->
+    <!-- Split into two actions for a different, unrelated reason: a   -->
+    <!-- running process cannot reliably delete the directory          -->
+    <!-- containing its own currently-executing image, so              -->
+    <!-- CA_UninstallCleanup (dds-node.exe itself) never touches       -->
+    <!-- [INSTALLFOLDER]\bin — it removes everything ELSE (registry,   -->
+    <!-- ProgramData, the two Permanent config files, Credential       -->
+    <!-- Provider residue, per-user AppData\Local\DDS) and is          -->
+    <!-- scheduled to run BEFORE the standard RemoveFiles action so    -->
+    <!-- its own backing file still exists when it's launched.         -->
+    <!-- RemoveFiles then deletes dds-node.exe exactly as it already   -->
+    <!-- does on every uninstall today (unaffected by this change).    -->
+    <!-- CA_UninstallRemoveInstallDir runs AFTER RemoveFiles, using    -->
+    <!-- cmd.exe (a System32 binary with no self-reference to our      -->
+    <!-- package) to mop up the now near-empty install directory.      -->
+    <!--                                                                -->
+    <!-- Return="ignore" on both: cleanup must never fail an           -->
+    <!-- uninstall the user asked for — matches Uninstall-Dds.ps1's    -->
+    <!-- own tolerance for e.g. a Credential Provider DLL locked by    -->
+    <!-- logonui.exe (handled inside cmd_uninstall_cleanup via a       -->
+    <!-- MoveFileEx delete-on-reboot fallback, same as the script).    -->
+    <!-- ============================================================ -->
+    <!-- Path-quoting note: [INSTALLFOLDER] (and any MSI Directory
+         property) always resolves WITH a trailing backslash
+         (e.g. "C:\Program Files\DDS\"). Quoting it bare as "[INSTALLFOLDER]"
+         therefore ends the argument in `\"`, which the standard Windows
+         C-runtime argv parser reads as an ESCAPED literal quote rather
+         than "close the quoted string" — corrupting all subsequent
+         command-line argument boundaries. `[INSTALLFOLDER].` (trailing
+         period, the standard WiX/MSI workaround) keeps the same
+         resolved directory — Windows path resolution treats a trailing
+         `\.` component as a no-op — while moving the backslash away
+         from the closing quote. [CommonAppDataFolder]DDS does not need
+         this: "DDS" is appended directly onto the property's own
+         trailing backslash, so the composed value has no trailing `\`
+         of its own. -->
+    <CustomAction Id="CA_UninstallCleanup"
+                  FileRef="dds_node_exe"
+                  ExeCommand='uninstall-cleanup --install-root "[INSTALLFOLDER]." --data-root "[CommonAppDataFolder]DDS"'
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <!-- [System64Folder] (not [SystemFolder]) — [SystemFolder] resolved
+         to the WOW64-redirected SysWOW64 on this ARM64 build, where
+         cmd.exe either doesn't exist or can't run under a deferred
+         SYSTEM custom action, failing with MSI error 1721.
+         [System64Folder] is the native System32 reference already used
+         elsewhere in this file (C_CredProvDll's ComponentGroup). Same
+         trailing-backslash-before-quote fix as CA_UninstallCleanup
+         applies to [INSTALLFOLDER] here too.
+
+         Directory="TARGETDIR" (the install root, e.g. "C:\", always
+         exists) rather than DIR_BIN: this action's own ExeCommand only
+         references fully-qualified absolute paths, so its working
+         directory is otherwise irrelevant — but CreateProcess fails
+         outright if the specified working directory does NOT exist, and
+         by the time this action runs (late, After RemoveFiles /
+         RemoveFolders) [INSTALLFOLDER]\bin no longer exists — no
+         Permanent component still references it the way config\ is kept
+         alive by C_DdsNodeConfig / C_PolicyAgentConfig (exactly why
+         config\ gets resurrected by the standard CreateFolders action
+         but bin\ does not). DIR_BIN works for the pre-existing
+         install-time CAs above only because those always run while
+         bin\ still exists. -->
+    <CustomAction Id="CA_UninstallRemoveInstallDir"
+                  Directory="TARGETDIR"
+                  ExeCommand='"[System64Folder]cmd.exe" /c rmdir /s /q "[INSTALLFOLDER]." 2&gt;nul'
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
     <!-- Note: auto-launch of the onboarding wizard for the installing user
          is handled by Active Setup (CG_ActiveSetup below): on the next
          interactive logon Windows replays the StubPath into HKCU and
@@ -458,6 +560,30 @@
            LogonUI invokes our credential provider. Sequenced last among
            the deferred CAs so it shares the same elevated phase. -->
       <Custom Action="CA_SetNgcSvcAuto" After="CA_StampAgentPubkey" Condition="NOT REMOVE" />
+
+      <!-- Native-uninstall wiring (see the CA_UninstallCleanup /
+           CA_UninstallRemoveInstallDir definitions above for the full
+           rationale). A <Custom> entry takes exactly one of Before/After,
+           so this uses only the load-bearing constraint: dds-node.exe
+           (this action's own FileRef target) must still exist on disk
+           when it's launched, so it must run strictly before RemoveFiles.
+           RemoveRegistryValues already has a lower standard sequence
+           number than RemoveFiles, so this naturally lands after it too
+           without needing a second constraint. -->
+      <Custom Action="CA_UninstallCleanup" Before="RemoveFiles"
+              Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
+      <!-- Runs Before InstallFinalize — i.e. dead last, after RemoveFiles
+           has deleted dds-node.exe and everything else MSI tracks AND
+           after the standard CreateFolders action. CreateFolders always
+           unconditionally re-creates every Directory-table path that
+           doesn't currently exist (its job on a normal install: ensure
+           targets exist before files copy into them) — including during
+           an uninstall, where nothing then populates it. Scheduling
+           this any earlier (e.g. immediately After RemoveFiles) meant
+           CreateFolders re-created an empty [INSTALLFOLDER]\config right
+           behind it, leaving a stray empty directory. -->
+      <Custom Action="CA_UninstallRemoveInstallDir" Before="InstallFinalize"
+              Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
     </InstallExecuteSequence>
 
     <!-- ============================================================ -->

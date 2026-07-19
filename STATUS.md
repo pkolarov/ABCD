@@ -1,6 +1,64 @@
 # DDS Implementation Status
 
-## fix(pq): enc-v3 epoch-key bootstrap gap — replication + peer-confirm now work on hybrid domains — 2026-07-18
+## feat(installer): native Windows uninstall now fully cleans up DDS — 2026-07-19
+
+### Summary — "Uninstall" from Windows Settings now does what it should
+
+Previously, uninstalling via Windows Settings / Programs and Features (`msiexec /x`) ran only
+the standard MSI removal, which by design leaves substantial residue: `C:\ProgramData\DDS`
+(node identity, domain state, audit logs), the Credential Provider DLL + its COM registration,
+`node.toml`/`appsettings.json`, and the whole `HKLM\SOFTWARE\DDS` registry tree. Only the
+standalone `Uninstall-Dds.ps1` script cleaned that up — but nothing invoked it from the native
+uninstall path, so most users uninstalling normally never got a clean machine.
+
+**New: `dds-node.exe uninstall-cleanup`** (`dds-node/src/main.rs`, Windows-only) — a native
+subcommand mirroring `Uninstall-Dds.ps1 -Force`'s full wipe: kills the per-user
+`DdsTrayAgent.exe` (not service-managed, would lock files), removes the two `Permanent`
+config files + their `.bak` pre-upgrade snapshots, strips the Credential Provider DLL (with a
+`MoveFileEx` delete-on-reboot fallback if `logonui.exe` has it locked) + its two registry
+locations, the `DdsAuthBridge` Event Log source, the entire `HKLM\SOFTWARE\DDS` subtree,
+`C:\ProgramData\DDS`, and `AppData\Local\DDS` under every real user profile (enumerated from
+`C:\Users\*` since a SYSTEM-context deferred custom action has no interactive-user env vars to
+read `%LOCALAPPDATA%` from).
+
+**Wired into `DdsBundle.wxs`** as two new custom actions, `CA_UninstallCleanup` (the subcommand
+above) and `CA_UninstallRemoveInstallDir` (`cmd.exe /c rmdir /s /q`, mopping up the directory
+tree after standard `RemoveFiles` — a running process can't reliably delete its own containing
+directory, so `dds-node.exe` never touches `[INSTALLFOLDER]\bin`). Both are gated on
+`REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE` — **critically not just `REMOVE="ALL"`**, since MSI
+sets that same state during every version upgrade's internal `RemoveExistingProducts` step; the
+`UPGRADINGPRODUCTCODE` property (auto-populated by `FindRelatedProducts`, same mechanism as the
+pre-existing `WIX_UPGRADE_DETECTED`) distinguishes a real uninstall from an upgrade's removal of
+the old version. Verified end-to-end via a marker-file test: upgrading a build carrying this CA
+preserved `ProgramData`, `node.toml`, and planted marker content byte-for-byte, while a genuine
+`msiexec /x` fully wiped every tracked item.
+
+**Three real MSI-authoring bugs found and fixed along the way** (not logic errors — classic
+Windows Installer landmines):
+1. `"[INSTALLFOLDER]"` quoted bare ends in `\"` (Directory properties always resolve with a
+   trailing backslash) — Windows' argv parser reads that as an escaped literal quote, corrupting
+   all subsequent command-line argument boundaries. Fixed with the standard `"[INSTALLFOLDER]."`
+   trailing-period workaround (a `\.` path component is a no-op).
+2. `[SystemFolder]` resolved to the WOW64-redirected `SysWOW64` on this ARM64 build rather than
+   native `System32`, so `cmd.exe` couldn't run (MSI error 1721). Fixed with `[System64Folder]`
+   (already used elsewhere in this file for the Credential Provider DLL).
+3. `Directory="DIR_BIN"` (copied from the pre-existing `CA_SetNgcSvcAuto` install-time pattern)
+   set a working directory that no longer exists by the time an uninstall-time action runs this
+   late (`RemoveFiles`/`RemoveFolders` already cleared `bin\`, and nothing recreates it — unlike
+   `config\`, kept alive by two still-Permanent components) — `CreateProcess` fails outright if
+   its working directory doesn't exist. Fixed with `Directory="TARGETDIR"` (always exists).
+
+**Independent, pre-existing finding (not fixed — flagged for awareness):** MSI's `ProductVersion`
+is only significant to 3 fields (`major.minor.build`); a 4th field is silently ignored for
+upgrade-detection purposes. Every `1.5.7.x`-style dev build this session installed *side by
+side* rather than replacing the prior one (`RemoveExistingProducts` never fired — confirmed via
+verbose install logs and the `Upgrade` table). A genuine 3-field version bump (`1.5.8.0`)
+correctly consolidated all four stacked entries. This predates and is unrelated to the uninstall
+work above, but is worth knowing before adopting any 4th-field point-release convention.
+
+## fix(pq): enc-v3 epoch-key bootstrap gap — replication + peer-confirm now work (incl. non-hybrid domains) — 2026-07-18/19
+
+> **Confirmed on the real box-A/box-B mesh (2026-07-19, v1.5.7.5 on both):** box A's cert self-repaired (`pq_kem_pubkey` attached), a token minted on box A replicated to box B, `/v1/replication/confirm` returned CONFIRMED, no `err_count` loop. Landed as commit `b4d229c` on `main`.
 
 ### Summary — one root cause, three symptoms, five fixes
 

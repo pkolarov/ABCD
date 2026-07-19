@@ -198,6 +198,8 @@ async fn async_main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
         "stamp-agent-pubkey" => cmd_stamp_agent_pubkey(&args[1..]),
         #[cfg(windows)]
         "seal-passphrase" => cmd_seal_passphrase(&args[1..]),
+        #[cfg(windows)]
+        "uninstall-cleanup" => cmd_uninstall_cleanup(&args[1..]),
         // `args.get(1..)` instead of `&args[1..]` because the
         // `unwrap_or("run")` default at the top of this match means
         // `sub == "run"` is reachable with an empty `args` (bare
@@ -239,7 +241,8 @@ fn print_usage() {
   dds-node rotate-admission-key --data-dir <DIR> [--no-backup]
   dds-node stamp-agent-pubkey --data-dir <DIR> --config-dir <DIR> [--keep-existing]
   dds-node run [config.toml]
-  dds-node seal-passphrase [--force] [--out <PATH>]  (Windows only)"
+  dds-node seal-passphrase [--force] [--out <PATH>]  (Windows only)
+  dds-node uninstall-cleanup --install-root <DIR> --data-root <DIR>  (Windows only; MSI uninstall custom action)"
     );
 }
 
@@ -1588,6 +1591,281 @@ fn apply_windows_data_dir_dacl(path: &Path) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// **Native-uninstall wiring** — Windows MSI uninstall-time helper,
+/// invoked by `DdsBundle.wxs`'s `CA_UninstallCleanup` custom action when
+/// the product is genuinely being removed (Settings > Uninstall,
+/// Programs and Features, or `msiexec /x`) — never during a version
+/// upgrade's internal `RemoveExistingProducts` step, which the WiX
+/// condition on that action excludes via `NOT UPGRADINGPRODUCTCODE`.
+///
+/// Removes everything MSI's own uninstall deliberately leaves behind,
+/// mirroring `Uninstall-Dds.ps1 -Force`:
+/// - the two `Permanent="yes"` config files (`node.toml`,
+///   `appsettings.json`) under `<install-root>\config` — MSI's own file
+///   removal skips them by design so an *upgrade* preserves operator
+///   config; a real uninstall must still clear them so a later fresh
+///   install/join isn't blocked by "already part of a domain".
+/// - the Credential Provider DLL + its two registry locations
+///   (`Permanent="yes"` for the same "logonui.exe may have it mapped"
+///   reason `Uninstall-Dds.ps1` documents) — deleted immediately, or
+///   scheduled for delete-on-reboot via `MoveFileExW` if locked.
+/// - the `DdsAuthBridge` Event Log source (registered at runtime by the
+///   C++ binary itself, so MSI has no File/Registry row tracking it).
+/// - the entire `HKLM\SOFTWARE\DDS` registry subtree.
+/// - `<data-root>` (node identity, vault, FIDO2 state, audit logs) —
+///   entirely untracked by MSI, written by services/custom actions at
+///   runtime rather than the File table.
+/// - `AppData\Local\DDS` under every real user profile in `C:\Users` — a
+///   deferred custom action runs as SYSTEM with no user-session context,
+///   so `%LOCALAPPDATA%` can't be resolved the way an interactive script
+///   would; profile-directory enumeration is the SYSTEM-context
+///   equivalent (and is actually more thorough than a single-user
+///   script, which only ever reaches the invoking user's profile).
+/// - the per-user `DdsTrayAgent.exe` process (launched from an `HKLM
+///   Run` key, not a service, so nothing else stops it — a live
+///   instance holds `<install-root>\bin\DdsTrayAgent.exe` open, which
+///   would otherwise sharing-violation-block the standard `RemoveFiles`
+///   step).
+///
+/// Deliberately does **not** touch `<install-root>\bin\dds-node.exe`
+/// (this process's own backing file) or attempt to remove
+/// `<install-root>` itself: a process cannot reliably delete the
+/// directory containing its own currently-executing image. That is left
+/// to two things that already run after this custom action: MSI's
+/// standard `RemoveFiles` action (which reliably deletes `dds-node.exe`
+/// once this process has exited — the same mechanism that already
+/// removes it on every uninstall today), and the sibling
+/// `CA_UninstallRemoveInstallDir` custom action (`cmd.exe /c rmdir /s
+/// /q`, wired in `DdsBundle.wxs` to run *after* `RemoveFiles`), which
+/// mops up the now-near-empty `<install-root>` tree.
+///
+/// Every step is best-effort and only logs a warning on failure — a
+/// locked file or missing path must never abort the rest of the cleanup
+/// or fail the custom action (`Return="ignore"` on the WiX side expects
+/// this), exactly matching `Uninstall-Dds.ps1`'s own tolerance for a
+/// locked Credential Provider DLL.
+#[cfg(windows)]
+fn cmd_uninstall_cleanup(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let install_root = PathBuf::from(require_flag(args, "--install-root")?);
+    let data_root = PathBuf::from(require_flag(args, "--data-root")?);
+
+    println!("DDS uninstall cleanup starting.");
+    kill_tray_agent();
+    remove_permanent_config_files(&install_root);
+    remove_credential_provider_residue();
+    remove_event_log_source();
+    reg_delete_tree_best_effort(
+        windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE,
+        r"SOFTWARE\DDS",
+    );
+    remove_dir_best_effort(&data_root, "data root");
+    remove_per_user_local_app_data();
+    println!("DDS uninstall cleanup finished.");
+
+    Ok(())
+}
+
+/// `DdsTrayAgent.exe` is launched per-user from an `HKLM Run` key, not a
+/// Windows service, so nothing else in the uninstall sequence stops it.
+/// A live instance holds `<install-root>\bin\DdsTrayAgent.exe` open,
+/// which would otherwise block the standard `RemoveFiles` action with a
+/// sharing violation.
+#[cfg(windows)]
+fn kill_tray_agent() {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::new());
+    let mut killed = 0usize;
+    for process in sys.processes().values() {
+        if process
+            .name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("DdsTrayAgent.exe")
+            && process.kill()
+        {
+            killed += 1;
+        }
+    }
+    if killed > 0 {
+        println!("  Stopped {killed} DdsTrayAgent.exe process(es).");
+    }
+}
+
+/// Remove the two `Permanent="yes"` + `NeverOverwrite="yes"` config files
+/// MSI's own `RemoveFiles` deliberately leaves behind so an *upgrade*
+/// preserves operator config, plus their `.bak` siblings. A real
+/// uninstall must still clear them — otherwise `DdsConsole.ps1`'s
+/// `Run-JoinUnseal` sees a surviving `node.toml` and refuses to
+/// join/bootstrap a fresh domain on the next install.
+///
+/// The `.bak` files are `C_ConfigBackup`'s pre-upgrade snapshots
+/// (`DdsBundle.wxs`, written via `<CopyFile Delete="no">` on a
+/// `WIX_UPGRADE_DETECTED` major upgrade). `CopyFile` is a standard-action
+/// side effect, not a tracked File-table row, so — like `node.toml` and
+/// `appsettings.json` themselves — MSI's `RemoveFiles` has no component
+/// resource to remove them by and leaves them on disk indefinitely.
+#[cfg(windows)]
+fn remove_permanent_config_files(install_root: &Path) {
+    let config_dir = install_root.join("config");
+    for name in [
+        "node.toml",
+        "appsettings.json",
+        "node.toml.bak",
+        "appsettings.json.bak",
+    ] {
+        let p = config_dir.join(name);
+        if p.exists() {
+            match std::fs::remove_file(&p) {
+                Ok(()) => println!("  Removed {}", p.display()),
+                Err(e) => println!("  WARNING: failed to remove {}: {e}", p.display()),
+            }
+        }
+    }
+}
+
+/// Strip the Credential Provider COM registration and delete the DLL
+/// from `System32`. The component is `Permanent="yes"` in
+/// `DdsBundle.wxs` specifically so `logonui.exe` never sees the file
+/// vanish mid-session on an ordinary MSI uninstall; a real uninstall
+/// must remove it by hand. `logonui.exe` may have the DLL mapped at
+/// LSA-logon time, so a live delete can fail with a sharing violation —
+/// in that case schedule `MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT)`
+/// instead, matching `Uninstall-Dds.ps1`'s fallback.
+#[cfg(windows)]
+fn remove_credential_provider_residue() {
+    use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+
+    const CLSID: &str = "{a7f3b2c1-9d4e-4f8a-b6c5-2e1d0a3f7b9c}";
+    reg_delete_tree_best_effort(HKEY_LOCAL_MACHINE, &format!(r"SOFTWARE\Classes\CLSID\{CLSID}"));
+    reg_delete_tree_best_effort(
+        HKEY_LOCAL_MACHINE,
+        &format!(
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{CLSID}"
+        ),
+    );
+
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let dll = PathBuf::from(system_root).join(r"System32\DdsCredentialProvider.dll");
+    if !dll.exists() {
+        return;
+    }
+    match std::fs::remove_file(&dll) {
+        Ok(()) => println!("  Removed {}", dll.display()),
+        Err(e) => {
+            if schedule_delete_on_reboot(&dll) {
+                println!(
+                    "  {} is in use; scheduled for delete on reboot.",
+                    dll.display()
+                );
+            } else {
+                println!(
+                    "  WARNING: failed to remove or schedule for deletion {}: {e}",
+                    dll.display()
+                );
+            }
+        }
+    }
+}
+
+/// `MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)` — the standard
+/// Win32 idiom for deleting a currently-locked file on next boot, before
+/// any other process (here: a future `logonui.exe`) can re-lock it.
+#[cfg(windows)]
+fn schedule_delete_on_reboot(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe { MoveFileExW(wide.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) != 0 }
+}
+
+/// The `DdsAuthBridge` Windows Event Log source is registered at
+/// runtime by the C++ binary itself (`EventLogger.cpp`), so MSI has no
+/// File/Registry row tracking it and never removes it on uninstall.
+#[cfg(windows)]
+fn remove_event_log_source() {
+    use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+    reg_delete_tree_best_effort(
+        HKEY_LOCAL_MACHINE,
+        r"SYSTEM\CurrentControlSet\Services\EventLog\Application\DdsAuthBridge",
+    );
+}
+
+/// `RegDeleteTreeW` — recursively delete `subkey` (and everything under
+/// it) from `hive`. A missing key is not a failure (every call site here
+/// targets a path that may legitimately not exist, e.g. a fresh install
+/// that never wrote a Credential Provider registration); any other
+/// error only logs a warning, matching the best-effort contract of the
+/// whole cleanup pass.
+#[cfg(windows)]
+fn reg_delete_tree_best_effort(hive: windows_sys::Win32::System::Registry::HKEY, subkey: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows_sys::Win32::System::Registry::RegDeleteTreeW;
+
+    let wide: Vec<u16> = std::ffi::OsStr::new(subkey)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let rc = unsafe { RegDeleteTreeW(hive, wide.as_ptr()) };
+    if rc == 0 {
+        println!("  Removed registry key HKLM\\{subkey}");
+    } else if rc != ERROR_FILE_NOT_FOUND {
+        println!("  WARNING: failed to remove registry key HKLM\\{subkey} (Win32 err {rc})");
+    }
+}
+
+/// Best-effort `remove_dir_all` with a labeled log line either way —
+/// shared by the data-root wipe and (indirectly, via its own log
+/// prefix) the per-user `AppData\Local\DDS` sweep below.
+#[cfg(windows)]
+fn remove_dir_best_effort(path: &Path, label: &str) {
+    if !path.exists() {
+        return;
+    }
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => println!("  Removed {label}: {}", path.display()),
+        Err(e) => println!("  WARNING: failed to remove {label} {}: {e}", path.display()),
+    }
+}
+
+/// Remove `AppData\Local\DDS` under every real user profile in
+/// `C:\Users`. A deferred MSI custom action runs as SYSTEM with no
+/// interactive-user session context, so `%LOCALAPPDATA%` resolves to
+/// SYSTEM's own (irrelevant) profile rather than the person who clicked
+/// Uninstall — enumerating `C:\Users\*` directly is the SYSTEM-context
+/// equivalent, and incidentally more thorough than a single-user
+/// interactive script (which only ever reaches the invoking user).
+#[cfg(windows)]
+fn remove_per_user_local_app_data() {
+    let users_root = std::env::var("SystemDrive")
+        .map(|d| PathBuf::from(format!("{d}\\Users")))
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Users"));
+    let Ok(entries) = std::fs::read_dir(&users_root) else {
+        return;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let candidate = entry.path().join(r"AppData\Local\DDS");
+        if candidate.exists() {
+            match std::fs::remove_dir_all(&candidate) {
+                Ok(()) => removed += 1,
+                Err(e) => {
+                    println!("  WARNING: failed to remove {}: {e}", candidate.display())
+                }
+            }
+        }
+    }
+    if removed > 0 {
+        println!("  Removed AppData\\Local\\DDS for {removed} user profile(s).");
+    }
+}
+
 /// Minimal JSON string escape — covers the characters that can appear
 /// in a libp2p peer id (alphanumerics; never a quote or backslash) and
 /// in operator-supplied `reason` strings (free-form, so we must escape
@@ -2226,5 +2504,89 @@ mod admission_key_cmd_tests {
             msg.contains("macOS"),
             "error must mention macOS restriction: {msg}"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod uninstall_cleanup_tests {
+    //! Covers only the parts of `cmd_uninstall_cleanup` safe to exercise
+    //! in a `cargo test` process: argument validation and the
+    //! directory-scoped file helpers. The registry/System32/process-kill
+    //! helpers (`reg_delete_tree_best_effort`, `remove_credential_provider_residue`,
+    //! `remove_event_log_source`, `kill_tray_agent`,
+    //! `remove_per_user_local_app_data`) touch real machine-wide state
+    //! (HKLM, System32, every user profile, real processes by name) and
+    //! are — like the pre-existing MSI custom actions in this file
+    //! (`restrict-data-dir-acl`, `stamp-agent-pubkey`) — verified by
+    //! actually running the installer, not by unit test.
+    use super::*;
+
+    fn str_args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn uninstall_cleanup_requires_install_root_flag() {
+        let args = str_args(&["--data-root", r"C:\ProgramData\DDS"]);
+        let err = cmd_uninstall_cleanup(&args).unwrap_err();
+        assert!(err.to_string().contains("--install-root"));
+    }
+
+    #[test]
+    fn uninstall_cleanup_requires_data_root_flag() {
+        let args = str_args(&["--install-root", r"C:\Program Files\DDS"]);
+        let err = cmd_uninstall_cleanup(&args).unwrap_err();
+        assert!(err.to_string().contains("--data-root"));
+    }
+
+    #[test]
+    fn remove_permanent_config_files_removes_config_and_bak_siblings_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("node.toml"), b"trusted_roots = []").unwrap();
+        std::fs::write(config_dir.join("appsettings.json"), b"{}").unwrap();
+        std::fs::write(config_dir.join("node.toml.bak"), b"trusted_roots = []").unwrap();
+        std::fs::write(config_dir.join("appsettings.json.bak"), b"{}").unwrap();
+        std::fs::write(config_dir.join("unrelated.txt"), b"leave me alone").unwrap();
+
+        remove_permanent_config_files(dir.path());
+
+        assert!(!config_dir.join("node.toml").exists());
+        assert!(!config_dir.join("appsettings.json").exists());
+        assert!(!config_dir.join("node.toml.bak").exists());
+        assert!(!config_dir.join("appsettings.json.bak").exists());
+        assert!(
+            config_dir.join("unrelated.txt").exists(),
+            "must not remove files it doesn't own"
+        );
+    }
+
+    #[test]
+    fn remove_permanent_config_files_is_a_noop_when_config_dir_is_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // No config\ subdirectory at all — must not panic or error.
+        remove_permanent_config_files(dir.path());
+    }
+
+    #[test]
+    fn remove_dir_best_effort_removes_an_existing_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("data-root");
+        std::fs::create_dir_all(target.join("node-data")).unwrap();
+        std::fs::write(target.join("node-data").join("node_key.bin"), b"secret").unwrap();
+
+        remove_dir_best_effort(&target, "data root");
+
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn remove_dir_best_effort_is_a_noop_on_a_missing_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        // Must not panic or error — this is the common case (e.g. a
+        // fresh install that was uninstalled before ever provisioning).
+        remove_dir_best_effort(&missing, "data root");
     }
 }
