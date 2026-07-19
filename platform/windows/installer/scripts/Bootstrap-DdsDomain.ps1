@@ -329,23 +329,50 @@ Write-Host ""
 Write-Host "[3/9] Generating node libp2p identity..." -ForegroundColor Green
 Write-DdsStep 3 "gen-node-key"
 Write-BootstrapMarker 3 "gen-node-key"
+# Capture stdout+stderr WITHOUT letting a benign stderr line abort the
+# script: under $ErrorActionPreference='Stop', `native 2>&1` wraps each
+# stderr line as a NativeCommandError terminating error even when the
+# exe exits 0. Drop to 'Continue' for just this call, then gate on the
+# real exit code.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 $genOut = & $NodeBin gen-node-key --data-dir $NodeData 2>&1
+$genExit = $LASTEXITCODE
+$ErrorActionPreference = $prevEap
 $genOut | Tee-Object -FilePath (Join-Path $NodeData "gen-node-key.out")
-$peerId = ($genOut | Select-String -Pattern 'peer_id:\s*(\S+)' | Select-Object -Last 1).Matches.Groups[1].Value
+if ($genExit -ne 0) { throw "gen-node-key failed (exit $genExit)" }
+# StrictMode-safe parse: resolve the match to $null before touching
+# .Matches so a missing peer_id line yields the friendly throw below,
+# not a PropertyNotFound.
+$peerMatch = $genOut | Select-String -Pattern 'peer_id:\s*(\S+)' | Select-Object -Last 1
+$peerId = if ($peerMatch) { $peerMatch.Matches.Groups[1].Value } else { $null }
 if (-not $peerId) { throw "Failed to determine peer_id from gen-node-key output" }
 Write-Host "  peer_id: $peerId"
+# PQ-DEFAULT-2: capture this node's hybrid KEM pubkey so the self-admit
+# cert lets peers encapsulate epoch-key releases to it. Without it,
+# encrypted-gossip (enc-v3) peers can never deliver their epoch keys
+# here and replication from this node's peers stays dark.
+$kemMatch = $genOut | Select-String -Pattern 'kem_pubkey_hex:\s*([0-9a-fA-F]+)' | Select-Object -Last 1
+$kemHex = $null
+if ($kemMatch) { $kemHex = $kemMatch.Matches.Groups[1].Value }
+if ($kemHex) { Write-Host "  kem_pubkey: captured ($(($kemHex.Length / 2)) bytes)" }
+else { Write-Warning "gen-node-key printed no kem_pubkey_hex; self-admit cert will lack the KEM pubkey (node self-repairs it at first start)" }
 
 # ── 4. self-admit ──────────────────────────────────────────────────
 Write-Host ""
 Write-Host "[4/9] Self-admitting this node..." -ForegroundColor Green
 Write-DdsStep 4 "self-admit"
 Write-BootstrapMarker 4 "self-admit"
-& $NodeBin admit `
-    --domain-key (Join-Path $NodeData "domain_key.bin") `
-    --domain     (Join-Path $NodeData "domain.toml") `
-    --peer-id    $peerId `
-    --out        (Join-Path $NodeData "admission.cbor") `
-    --ttl-days   3650
+$admitArgs = @(
+    'admit',
+    '--domain-key', (Join-Path $NodeData "domain_key.bin"),
+    '--domain',     (Join-Path $NodeData "domain.toml"),
+    '--peer-id',    $peerId,
+    '--out',        (Join-Path $NodeData "admission.cbor"),
+    '--ttl-days',   '3650'
+)
+if ($kemHex) { $admitArgs += @('--kem-pubkey', $kemHex) }
+& $NodeBin @admitArgs
 if ($LASTEXITCODE -ne 0) { throw "admit failed" }
 
 # ── 5. node.toml ───────────────────────────────────────────────────

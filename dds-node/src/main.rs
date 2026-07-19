@@ -1861,6 +1861,9 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // (`POST /v1/policy/publish`). The receiver lives in the node's `run()`
     // loop; this sender lets the HTTP task apply + gossip signed policy.
     let publish_tx = Some(node.publish_sender());
+    // Replication-probe channel for GET /v1/replication/confirm — the
+    // lifecycle wizards' peer-confirmation check.
+    let probe_tx = Some(node.probe_sender());
     tokio::spawn(async move {
         if let Err(e) = http::serve(
             &api_addr,
@@ -1871,6 +1874,7 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             device_binding,
             manual_rotate,
             publish_tx,
+            probe_tx,
         )
         .await
         {

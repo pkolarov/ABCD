@@ -502,6 +502,10 @@ pub struct NodeInfo {
 /// tests that build a bare router without a live `DdsNode`.
 type PublishSender = tokio::sync::mpsc::Sender<crate::node::PublishCommand>;
 
+/// Sender for replication probes into the swarm task's `run()` loop
+/// (see [`crate::node::ProbeCommand`]). `None` in unit tests.
+type ProbeSender = tokio::sync::mpsc::Sender<crate::node::ProbeCommand>;
+
 struct AppState<
     S: TokenStore
         + RevocationStore
@@ -532,6 +536,9 @@ struct AppState<
     /// `run()` loop for locally-authored, already-signed policy tokens.
     /// `None` in tests; `main.rs` supplies a real sender.
     publish_tx: Option<PublishSender>,
+    /// **Replication probe** — sender into the swarm task for
+    /// `GET /v1/replication/confirm`. `None` in tests.
+    probe_tx: Option<ProbeSender>,
 }
 
 impl<
@@ -553,6 +560,7 @@ impl<
             admin_policy: self.admin_policy.clone(),
             manual_rotate: self.manual_rotate.clone(),
             publish_tx: self.publish_tx.clone(),
+            probe_tx: self.probe_tx.clone(),
         }
     }
 }
@@ -730,6 +738,7 @@ pub fn router<S>(
     device_binding: Option<Arc<DeviceBindingStore>>,
     manual_rotate: Option<Arc<tokio::sync::Notify>>,
     publish_tx: Option<PublishSender>,
+    probe_tx: Option<ProbeSender>,
 ) -> Router
 where
     S: TokenStore
@@ -751,6 +760,7 @@ where
         admin_policy: admin_policy.clone(),
         manual_rotate,
         publish_tx,
+        probe_tx,
     };
 
     // **H-7 (security review)** — admin-gated sub-router. Every route
@@ -764,6 +774,11 @@ where
         .route("/v1/admin/challenge", get(issue_admin_challenge::<S>))
         .route("/v1/admin/setup", post(admin_setup::<S>))
         .route("/v1/admin/vouch", post(admin_vouch::<S>))
+        // Lifecycle-wizard surfaces: offboarding (vouch revocation),
+        // admin enumeration, and peer replication confirmation.
+        .route("/v1/admin/revoke-vouch", post(admin_revoke_vouch::<S>))
+        .route("/v1/admin/roots", get(admin_roots::<S>))
+        .route("/v1/replication/confirm", get(replication_confirm::<S>))
         .route("/v1/audit/entries", get(list_audit_entries::<S>))
         .route("/v1/pq/rotate", post(pq_rotate::<S>))
         // Local policy authoring (Users & Policy console). Admin-gated:
@@ -902,6 +917,13 @@ pub struct EnrollmentResponse {
     pub urn: String,
     pub jti: String,
     pub token_cbor_b64: String,
+    /// Whether the enrollment token was handed to the swarm task for
+    /// gossip to peers. `false` means the enrollment is committed
+    /// LOCALLY but replication could not be initiated (no swarm in
+    /// tests, channel error) — callers should surface this and re-check
+    /// with `GET /v1/replication/confirm?jtis=<jti>`.
+    #[serde(default)]
+    pub published: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -981,6 +1003,66 @@ pub struct AdminVouchResponseJson {
     pub vouch_jti: String,
     pub subject_urn: String,
     pub admin_urn: String,
+    /// See [`EnrollmentResponse::published`].
+    #[serde(default)]
+    pub published: bool,
+}
+
+/// Request body for `POST /v1/admin/revoke-vouch` — identical FIDO2
+/// ceremony fields to [`AdminVouchRequestJson`]; `purpose` restricts
+/// which of the admin's vouches for the subject are revoked (`None`
+/// revokes all of them).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct AdminRevokeVouchRequestJson {
+    pub subject_urn: String,
+    pub credential_id: String,
+    /// Server-issued challenge ID from `GET /v1/admin/challenge`.
+    pub challenge_id: String,
+    pub authenticator_data: String,
+    pub client_data_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_data_json_b64: Option<String>,
+    pub signature: String,
+    pub purpose: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminRevokeVouchResponseJson {
+    pub subject_urn: String,
+    pub admin_urn: String,
+    pub revoked: Vec<crate::service::RevokedVouchInfo>,
+    /// Active vouches for the subject issued by OTHER admins — this
+    /// admin cannot revoke them (H-1); each named issuer must run the
+    /// same ceremony to complete the offboarding.
+    pub foreign: Vec<crate::service::ForeignVouchInfo>,
+    pub demoted_from_trusted_roots: bool,
+    /// See [`EnrollmentResponse::published`].
+    pub published: bool,
+}
+
+/// Response for `GET /v1/admin/roots`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdminRootsResponse {
+    pub roots: Vec<crate::service::AdminRootInfo>,
+    pub bootstrap_admin_urn: Option<String>,
+}
+
+/// Query for `GET /v1/replication/confirm?jtis=a,b,c`.
+#[derive(Debug, Deserialize)]
+pub struct ReplicationConfirmQuery {
+    /// Comma-separated token JTIs to confirm on peers.
+    pub jtis: String,
+}
+
+/// Response for `GET /v1/replication/confirm`.
+#[derive(Debug, Serialize)]
+pub struct ReplicationConfirmResponse {
+    /// Peers currently connected AND admitted when the probe ran.
+    pub admitted_connected: usize,
+    /// JTIs confirmed present on at least one peer.
+    pub confirmed_jtis: Vec<String>,
+    /// Per-peer detail (present JTIs, truncation flag, errors).
+    pub results: Vec<crate::node::PeerProbeResult>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -994,6 +1076,17 @@ pub struct EnrolledUsersResponse {
 #[derive(Debug, Deserialize)]
 pub struct DeviceUrnQuery {
     pub device_urn: String,
+}
+
+/// Query params for `GET /v1/enrolled-users`. `include_revoked=1`
+/// (console offboarding surfaces) also returns users whose every vouch
+/// was revoked; the default (bridge/CP tile enumeration) hides them so
+/// offboarded users' logon tiles disappear without a bridge change.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EnrolledUsersQuery {
+    pub device_urn: String,
+    #[serde(default)]
+    pub include_revoked: Option<u8>,
 }
 
 /// Response wrapping a list of windows policies for a device.
@@ -1194,12 +1287,19 @@ where
         client_data_json,
         challenge_id: req.challenge_id,
     };
-    let mut svc = state.svc.lock().await;
-    let r = svc.enroll_user(internal)?;
+    let r = {
+        let mut svc = state.svc.lock().await;
+        svc.enroll_user(internal)?
+    };
+    // Replicate: hand the enrollment attestation to the swarm task so
+    // peers learn this user exists. Without this the user could only
+    // ever authenticate against THIS node.
+    let published = publish_identity_tokens(&state, &[r.token_cbor.clone()]).await;
     Ok(Json(EnrollmentResponse {
         urn: r.urn,
         jti: r.jti,
         token_cbor_b64: b64_encode(&r.token_cbor),
+        published,
     }))
 }
 
@@ -1227,13 +1327,78 @@ where
         org_unit: req.org_unit,
         tags: req.tags,
     };
-    let mut svc = state.svc.lock().await;
-    let r = svc.enroll_device(internal)?;
+    let r = {
+        let mut svc = state.svc.lock().await;
+        svc.enroll_device(internal)?
+    };
+    let published = publish_identity_tokens(&state, &[r.token_cbor.clone()]).await;
     Ok(Json(EnrollmentResponse {
         urn: r.urn,
         jti: r.jti,
         token_cbor_b64: b64_encode(&r.token_cbor),
+        published,
     }))
+}
+
+/// Ship locally-minted identity-lifecycle tokens (attestations,
+/// vouches, revocations) into the swarm task for DAG apply + gossip so
+/// they REPLICATE to peers. Historically only policy tokens went
+/// through [`crate::node::PublishCommand`]; enrollments and approvals
+/// lived solely in the local service store, which made every
+/// multi-node lifecycle flow silently single-node.
+///
+/// Returns `false` (after logging) when the swarm channel is absent
+/// (unit tests), closed, or the apply failed — the local state is
+/// already committed either way, so callers surface `published: false`
+/// rather than failing the request, and the console re-checks via
+/// `GET /v1/replication/confirm`.
+async fn publish_identity_tokens<S>(state: &AppState<S>, token_cbors: &[Vec<u8>]) -> bool
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    let Some(tx) = state.publish_tx.clone() else {
+        return false;
+    };
+    let mut tokens = Vec::with_capacity(token_cbors.len());
+    for cbor in token_cbors {
+        match dds_core::token::Token::from_cbor(cbor) {
+            Ok(t) => tokens.push(t),
+            Err(e) => {
+                tracing::warn!(error = %e, "identity publish: token decode failed");
+                return false;
+            }
+        }
+    }
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    if tx
+        .send(crate::node::PublishCommand {
+            tokens,
+            respond: otx,
+        })
+        .await
+        .is_err()
+    {
+        tracing::warn!("identity publish: swarm channel closed");
+        return false;
+    }
+    match tokio::time::timeout(Duration::from_secs(5), orx).await {
+        Ok(Ok(Ok(_applied))) => true,
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, "identity publish: swarm apply/gossip failed");
+            false
+        }
+        _ => {
+            tracing::warn!("identity publish: no response from swarm task");
+            false
+        }
+    }
 }
 
 // The unauthenticated `issue_session` HTTP handler has been removed.
@@ -1616,7 +1781,7 @@ where
 
 async fn list_enrolled_users<S>(
     State(state): State<AppState<S>>,
-    Query(q): Query<DeviceUrnQuery>,
+    Query(q): Query<EnrolledUsersQuery>,
 ) -> Result<Json<EnrolledUsersResponse>, HttpError>
 where
     S: TokenStore
@@ -1628,8 +1793,12 @@ where
         + Sync
         + 'static,
 {
-    let svc = state.svc.lock().await;
-    let users = svc.list_enrolled_users(&q.device_urn)?;
+    let mut svc = state.svc.lock().await;
+    // Fold in replicated admin changes so the `vouched` flags below
+    // are computed against the current root set.
+    svc.reconcile_trusted_roots();
+    let include_revoked = q.include_revoked.unwrap_or(0) != 0;
+    let users = svc.list_enrolled_users(&q.device_urn, include_revoked)?;
     Ok(Json(EnrolledUsersResponse { users }))
 }
 
@@ -1666,12 +1835,19 @@ where
         client_data_json,
         challenge_id: req.challenge_id,
     };
-    let mut svc = state.svc.lock().await;
-    let r = svc.admin_setup(internal)?;
+    let r = {
+        let mut svc = state.svc.lock().await;
+        svc.admin_setup(internal)?
+    };
+    // Replicate: the bootstrap admin's attestation must reach peers or
+    // no other node can ever compute `vouched` for the users this
+    // admin approves.
+    let published = publish_identity_tokens(&state, &[r.token_cbor.clone()]).await;
     Ok(Json(EnrollmentResponse {
         urn: r.urn,
         jti: r.jti,
         token_cbor_b64: b64_encode(&r.token_cbor),
+        published,
     }))
 }
 
@@ -1703,12 +1879,189 @@ where
         signature: b64_decode(&req.signature, "signature")?,
         purpose: req.purpose,
     };
-    let mut svc = state.svc.lock().await;
-    let r = svc.admin_vouch(internal)?;
+    let r = {
+        let mut svc = state.svc.lock().await;
+        svc.admin_vouch(internal)?
+    };
+    // Replicate: the approval (vouch) must reach peers so the user can
+    // authenticate on machines other than the one where the admin
+    // happened to run the ceremony.
+    let published = publish_identity_tokens(&state, &[r.token_cbor.clone()]).await;
     Ok(Json(AdminVouchResponseJson {
         vouch_jti: r.vouch_jti,
         subject_urn: r.subject_urn,
         admin_urn: r.admin_urn,
+        published,
+    }))
+}
+
+/// `POST /v1/admin/revoke-vouch` — offboard a user or sub-admin by
+/// revoking this admin's vouches for them. Admin-gated (H-7) and
+/// FIDO2-UV-gated (same ceremony as `/v1/admin/vouch`). The minted
+/// Revoke tokens are gossiped so peers apply the revocation too;
+/// `foreign` lists vouches only another admin can revoke.
+async fn admin_revoke_vouch<S>(
+    State(state): State<AppState<S>>,
+    Json(req): Json<AdminRevokeVouchRequestJson>,
+) -> Result<Json<AdminRevokeVouchResponseJson>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    let client_data_json = match req.client_data_json_b64.as_deref() {
+        Some(s) => Some(b64_decode(s, "client_data_json_b64")?),
+        None => None,
+    };
+    let internal = crate::service::AdminRevokeVouchRequest {
+        subject_urn: req.subject_urn,
+        credential_id: req.credential_id,
+        challenge_id: req.challenge_id,
+        client_data_hash: b64_decode(&req.client_data_hash, "client_data_hash")?,
+        client_data_json,
+        authenticator_data: b64_decode(&req.authenticator_data, "authenticator_data")?,
+        signature: b64_decode(&req.signature, "signature")?,
+        purpose: req.purpose,
+    };
+    let r = {
+        let mut svc = state.svc.lock().await;
+        svc.admin_revoke_vouch(internal)?
+    };
+    let token_cbors: Vec<Vec<u8>> = r
+        .revoke_tokens
+        .iter()
+        .filter_map(|t| t.to_cbor().ok())
+        .collect();
+    let published = if token_cbors.is_empty() {
+        false
+    } else {
+        publish_identity_tokens(&state, &token_cbors).await
+    };
+    Ok(Json(AdminRevokeVouchResponseJson {
+        subject_urn: r.subject_urn,
+        admin_urn: r.admin_urn,
+        revoked: r.revoked,
+        foreign: r.foreign,
+        demoted_from_trusted_roots: r.demoted_from_trusted_roots,
+        published,
+    }))
+}
+
+/// `GET /v1/admin/roots` — list this node's trusted roots (admins)
+/// with display names and vouch status. Read surface for the console's
+/// admin-management page and the offboarding wizard's preflight.
+async fn admin_roots<S>(
+    State(state): State<AppState<S>>,
+) -> Result<Json<AdminRootsResponse>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    let mut svc = state.svc.lock().await;
+    let (roots, bootstrap_admin_urn) = svc.list_admin_roots()?;
+    Ok(Json(AdminRootsResponse {
+        roots,
+        bootstrap_admin_urn,
+    }))
+}
+
+/// `GET /v1/replication/confirm?jtis=a,b,c` — ask connected admitted
+/// peers whether they hold the given tokens. This is the lifecycle
+/// wizards' "did it actually replicate?" check: `admitted_connected ==
+/// 0` means nobody was reachable to ask (commit is local-only for
+/// now), while a JTI in `confirmed_jtis` was proven present on at
+/// least one independent node.
+async fn replication_confirm<S>(
+    State(state): State<AppState<S>>,
+    Query(q): Query<ReplicationConfirmQuery>,
+) -> Result<Json<ReplicationConfirmResponse>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    let jtis: Vec<String> = q
+        .jtis
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if jtis.is_empty() {
+        return Err(HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: "jtis query parameter is required (comma-separated token JTIs)".into(),
+        });
+    }
+    if jtis.len() > 32 {
+        return Err(HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: "at most 32 JTIs per probe".into(),
+        });
+    }
+    let Some(tx) = state.probe_tx.clone() else {
+        return Err(HttpError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "replication probe unavailable (no swarm task)".into(),
+        });
+    };
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    tx.send(crate::node::ProbeCommand {
+        jtis: jtis.clone(),
+        respond: otx,
+    })
+    .await
+    .map_err(|_| HttpError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "replication probe channel closed".into(),
+    })?;
+    // The swarm task's own probe deadline is 8s; give it headroom so
+    // the timeout answer comes from the probe (with per-peer detail),
+    // not from here.
+    let report = tokio::time::timeout(Duration::from_secs(12), orx)
+        .await
+        .map_err(|_| HttpError {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: "replication probe timed out".into(),
+        })?
+        .map_err(|_| HttpError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "replication probe dropped".into(),
+        })?;
+    let mut confirmed: Vec<String> = Vec::new();
+    for jti in &jtis {
+        // A JTI in `present_jtis` is positive evidence — the token was
+        // returned by the peer, decrypted, and decoded. Count it even
+        // when the same peer result carries an `error` for OTHER
+        // entries it couldn't decrypt (the error marks *absence* as
+        // inconclusive, never presence).
+        if report
+            .results
+            .iter()
+            .any(|r| r.present_jtis.iter().any(|p| p == jti))
+        {
+            confirmed.push(jti.clone());
+        }
+    }
+    Ok(Json(ReplicationConfirmResponse {
+        admitted_connected: report.admitted_connected,
+        confirmed_jtis: confirmed,
+        results: report.results,
     }))
 }
 
@@ -2497,6 +2850,7 @@ pub async fn serve<S>(
     device_binding: Option<Arc<DeviceBindingStore>>,
     manual_rotate: Option<Arc<tokio::sync::Notify>>,
     publish_tx: Option<PublishSender>,
+    probe_tx: Option<ProbeSender>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: TokenStore
@@ -2521,6 +2875,7 @@ where
                 device_binding,
                 manual_rotate,
                 publish_tx,
+                probe_tx,
             )
             .await;
         }
@@ -2543,6 +2898,7 @@ where
                 device_binding,
                 manual_rotate,
                 publish_tx,
+                probe_tx,
             )
             .await;
         }
@@ -2594,6 +2950,7 @@ where
             device_binding,
             manual_rotate,
             publish_tx,
+            probe_tx,
         ),
     )
     .await?;
@@ -2619,6 +2976,7 @@ async fn serve_unix<S>(
     device_binding: Option<Arc<DeviceBindingStore>>,
     manual_rotate: Option<Arc<tokio::sync::Notify>>,
     publish_tx: Option<PublishSender>,
+    probe_tx: Option<ProbeSender>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: TokenStore
@@ -2670,6 +3028,7 @@ where
         device_binding,
         manual_rotate,
         publish_tx,
+        probe_tx,
     );
 
     loop {
@@ -2741,6 +3100,7 @@ async fn serve_pipe<S>(
     device_binding: Option<Arc<DeviceBindingStore>>,
     manual_rotate: Option<Arc<tokio::sync::Notify>>,
     publish_tx: Option<PublishSender>,
+    probe_tx: Option<ProbeSender>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: TokenStore
@@ -2769,6 +3129,7 @@ where
         device_binding,
         manual_rotate,
         publish_tx,
+        probe_tx,
     );
 
     // First instance: `first_pipe_instance(true)` makes `create` fail
@@ -3054,6 +3415,7 @@ mod tests {
                 admin_policy: Arc::new(tcp_trust_policy()),
                 manual_rotate: None,
                 publish_tx: None,
+                probe_tx: None,
             },
             root,
         }
@@ -3126,6 +3488,11 @@ mod tests {
                 post(evaluate_policy::<MemoryBackend>),
             )
             .route("/v1/status", get(status::<MemoryBackend>))
+            .route("/v1/admin/roots", get(admin_roots::<MemoryBackend>))
+            .route(
+                "/v1/replication/confirm",
+                get(replication_confirm::<MemoryBackend>),
+            )
             .route(
                 "/v1/windows/policies",
                 get(list_windows_policies::<MemoryBackend>),
@@ -3232,6 +3599,49 @@ mod tests {
         // Default test fixture leaves `peer_counts: None`, so the
         // handler falls back to the placeholder 0.
         assert_eq!(body.connected_peers, 0);
+    }
+
+    /// `GET /v1/admin/roots` surfaces the node's trusted roots. The test
+    /// fixture seeds one root, so the listing returns it.
+    #[tokio::test]
+    async fn admin_roots_lists_trusted_roots() {
+        let TestState { app: state, root } = make_state_with_root();
+        let base = spawn_server(state).await;
+        let resp = reqwest::get(format!("{base}/v1/admin/roots"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: AdminRootsResponse = resp.json().await.unwrap();
+        assert!(
+            body.roots.iter().any(|r| r.urn == root.id.to_urn()),
+            "seeded root must appear in /v1/admin/roots"
+        );
+    }
+
+    /// `GET /v1/replication/confirm` without a `jtis` param is a 400 —
+    /// the console always passes the JTIs it just minted.
+    #[tokio::test]
+    async fn replication_confirm_requires_jtis() {
+        let state = make_state();
+        let base = spawn_server(state).await;
+        let resp = reqwest::get(format!("{base}/v1/replication/confirm"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    /// `GET /v1/replication/confirm?jtis=…` with no swarm task wired
+    /// (probe_tx = None, as in the bare test router) returns 503 — the
+    /// probe cannot run without the swarm loop. In production `main.rs`
+    /// always supplies the sender.
+    #[tokio::test]
+    async fn replication_confirm_503_without_swarm() {
+        let state = make_state();
+        let base = spawn_server(state).await;
+        let resp = reqwest::get(format!("{base}/v1/replication/confirm?jtis=abc,def"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
     }
 
     /// `/v1/status.connected_peers` reports whatever the swarm task
@@ -5499,7 +5909,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None, None, None);
+        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5544,7 +5954,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5596,6 +6006,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -5629,6 +6040,7 @@ mod tests {
             state.svc.clone(),
             state.info.clone(),
             tcp_trust_policy(),
+            None,
             None,
             None,
             None,
@@ -5717,7 +6129,7 @@ mod tests {
         let info = state.info.clone();
         let key = test_mac_key();
         let app =
-            router::<MemoryBackend>(svc, info, tcp_trust_policy(), Some(key.clone()), None, None, None);
+            router::<MemoryBackend>(svc, info, tcp_trust_policy(), Some(key.clone()), None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5743,7 +6155,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5926,7 +6338,7 @@ mod tests {
         let info = state.info.clone();
         let key = test_mac_key();
         let app =
-            router::<MemoryBackend>(svc, info, strict_policy(), Some(key.clone()), None, None, None);
+            router::<MemoryBackend>(svc, info, strict_policy(), Some(key.clone()), None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -6198,7 +6610,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None, None, None);
+        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -6273,7 +6685,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None, None, None);
+        let app = router::<MemoryBackend>(svc, info, strict_policy(), None, None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -6305,7 +6717,7 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -6350,7 +6762,7 @@ mod tests {
         }
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -6459,7 +6871,7 @@ mod tests {
         }
         let svc = state2.svc.clone();
         let info = state2.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None);
+        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

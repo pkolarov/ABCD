@@ -221,12 +221,14 @@ static std::string WideToUtf8(const std::wstring& w)
 static int RunAdminVouchNdjson(HWND hwnd,
                                const std::wstring& subjectUrnW,
                                const std::wstring& purposeW,
-                               const std::wstring& credentialIdW)
+                               const std::wstring& credentialIdW,
+                               bool revoke)
 {
     std::string subjectUrn = WideToUtf8(subjectUrnW);
     std::string purpose    = WideToUtf8(purposeW);
 
-    FileLog::Writef("DdsEnrollUser: vouch subject='%s' purpose='%s'\n",
+    FileLog::Writef("DdsEnrollUser: %s subject='%s' purpose='%s'\n",
+                    revoke ? "revoke-vouch" : "vouch",
                     subjectUrn.c_str(), purpose.c_str());
     EmitNdjson("{\"phase\":\"start\"}");
 
@@ -285,8 +287,29 @@ static int RunAdminVouchNdjson(HWND hwnd,
     vouchJson += "\"authenticator_data\":\"" + authDataB64 + "\",";
     vouchJson += "\"client_data_hash\":\"" + cdhB64 + "\",";
     vouchJson += "\"signature\":\"" + sigB64 + "\",";
-    vouchJson += "\"purpose\":\"" + VouchJsonEscape(purpose) + "\"";
+    // For revoke, an empty purpose means "all vouches for the subject",
+    // encoded as JSON null so the server's Option<String> is None.
+    if (revoke && purpose.empty())
+        vouchJson += "\"purpose\":null";
+    else
+        vouchJson += "\"purpose\":\"" + VouchJsonEscape(purpose) + "\"";
     vouchJson += "}";
+
+    if (revoke)
+    {
+        DdsAdminRevokeVouchResult r = httpClient.PostAdminRevokeVouch(vouchJson);
+        if (!r.success)
+        {
+            EmitNdjson("{\"phase\":\"error\",\"at\":\"revoke\",\"message\":\""
+                + VouchJsonEscape(r.errorMessage) + "\"}");
+            return 2;
+        }
+        FileLog::Writef("DdsEnrollUser: revoke-vouch OK subject='%s'\n", subjectUrn.c_str());
+        // Forward the raw response (revoked[], foreign[], demoted, published)
+        // as an escaped string field the console re-parses with ConvertFrom-Json.
+        EmitNdjson("{\"phase\":\"revoked\",\"body\":\"" + VouchJsonEscape(r.responseBody) + "\"}");
+        return 0;
+    }
 
     DdsAdminVouchResult vouchResult = httpClient.PostAdminVouch(vouchJson);
     if (!vouchResult.success)
@@ -315,6 +338,7 @@ struct CliArgs
     std::wstring label;                    // --label <username>
     std::wstring displayName;              // --display-name "<Full Name>"
     bool         vouch         = false;   // --vouch (admin vouch a subject+purpose)
+    bool         revokeVouch   = false;   // --revoke-vouch (admin offboard a subject)
     std::wstring subjectUrn;               // --subject-urn <urn>
     std::wstring purpose;                  // --purpose <dds:...>
     std::wstring credentialId;             // --credential-id <b64url> (else registry)
@@ -330,6 +354,7 @@ static CliArgs ParseArgs(int argc, wchar_t** argv)
         if      (a == L"--password-stdin") args.passwordStdin = true;
         else if (a == L"--new-user")       args.newUser = true;
         else if (a == L"--vouch")          args.vouch = true;
+        else if (a == L"--revoke-vouch")   args.revokeVouch = true;
         else if (a == L"--label" && i + 1 < argc)         args.label = argv[++i];
         else if (a == L"--display-name" && i + 1 < argc)  args.displayName = argv[++i];
         else if (a == L"--subject-urn" && i + 1 < argc)   args.subjectUrn = argv[++i];
@@ -367,10 +392,19 @@ static void PrintHelp()
         "      dds:policy-publisher-windows). The admin credential id is read\n"
         "      from the registry unless --credential-id is given.\n"
         "\n"
+        "  --revoke-vouch --subject-urn <urn> [--purpose <dds:...>] [--credential-id <b64url>]\n"
+        "      Offboard a subject: revoke the vouches THIS admin issued for it\n"
+        "      (admin's touch, UV required). Omit --purpose to revoke every\n"
+        "      vouch this admin issued for the subject (full offboarding);\n"
+        "      pass --purpose dds:admin to demote a sub-admin. Emits a\n"
+        "      'revoked' NDJSON line whose 'body' field is the server's JSON\n"
+        "      response (revoked[], foreign[], demoted, published).\n"
+        "\n"
         "Usage:\n"
         "  dds-enroll-user.exe --password-stdin\n"
         "  dds-enroll-user.exe --new-user --label jsmith --display-name \"Jane Smith\"\n"
         "  dds-enroll-user.exe --vouch --subject-urn urn:vouchsafe:dds-node.abc --purpose dds:policy-publisher-windows\n"
+        "  dds-enroll-user.exe --revoke-vouch --subject-urn urn:vouchsafe:jane.abc\n"
         "\n"
         "Exit codes:\n"
         "  0  success (enrollment posted / vouch accepted)\n"
@@ -391,10 +425,11 @@ int wmain(int argc, wchar_t** argv)
         return 0;
     }
     // Exactly one mode must be selected.
-    int modes = (args.passwordStdin ? 1 : 0) + (args.newUser ? 1 : 0) + (args.vouch ? 1 : 0);
+    int modes = (args.passwordStdin ? 1 : 0) + (args.newUser ? 1 : 0)
+              + (args.vouch ? 1 : 0) + (args.revokeVouch ? 1 : 0);
     if (modes != 1)
     {
-        std::cerr << "error: specify exactly one of --password-stdin, --new-user, or --vouch.\n\n";
+        std::cerr << "error: specify exactly one of --password-stdin, --new-user, --vouch, or --revoke-vouch.\n\n";
         PrintHelp();
         return 2;
     }
@@ -410,6 +445,14 @@ int wmain(int argc, wchar_t** argv)
         PrintHelp();
         return 2;
     }
+    // --revoke-vouch requires only a subject; an empty --purpose means
+    // "revoke every vouch this admin issued for the subject".
+    if (args.revokeVouch && args.subjectUrn.empty())
+    {
+        std::cerr << "error: --revoke-vouch requires --subject-urn.\n\n";
+        PrintHelp();
+        return 2;
+    }
 
     FileLog::Init();
     FileLog::Write("DdsEnrollUser: starting\n");
@@ -418,10 +461,13 @@ int wmain(int argc, wchar_t** argv)
     // hwnd may be NULL on rare failures; the WebAuthn API handles NULL by
     // anchoring on the foreground window, which is acceptable here.
 
-    // Admin-vouch mode is self-contained (no EnrollmentFlow machinery).
-    if (args.vouch)
+    // Admin-vouch / revoke-vouch modes are self-contained (no
+    // EnrollmentFlow machinery) — same FIDO2 UV ceremony, different
+    // endpoint + response.
+    if (args.vouch || args.revokeVouch)
     {
-        int rc = RunAdminVouchNdjson(hwnd, args.subjectUrn, args.purpose, args.credentialId);
+        int rc = RunAdminVouchNdjson(hwnd, args.subjectUrn, args.purpose,
+                                     args.credentialId, args.revokeVouch);
         if (hwnd) DestroyWindow(hwnd);
         return rc;
     }

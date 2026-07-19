@@ -1182,6 +1182,89 @@ A user can enroll additional FIDO2 credentials (e.g. a backup key). Each enrollm
 
 ---
 
+## Guided lifecycle management (DDS Console)
+
+The Windows DDS Console (`DdsConsole.ps1`, installed to `C:\Program Files\DDS\bin`) is the recommended front end for the day-to-day identity lifecycle. Every management action follows the same **bulletproof** pattern:
+
+1. **Journal first.** Before the security-key touch, the console writes a small journal file under `C:\ProgramData\DDS\wizard-journal\<flow>.json`. If the console crashes or is closed between the touch and the confirmation, the next launch of the Manage page detects the journal and either re-confirms the change or tells the operator the action may not have finished (re-running any of these flows is safe — they are idempotent).
+2. **Sign with the admin key.** The change is minted by `dds-enroll-user.exe` under a FIDO2 **user-verified** (PIN/biometric) admin assertion.
+3. **Confirm replication.** After the node accepts the change, the console calls `GET /v1/replication/confirm?jtis=<jti>` (see [Confirming replication](#confirming-replication)) and does not report success until at least one **other** node has proven it holds the new token — or, if no peer is currently connected, it says so explicitly and notes the change is committed locally and will sync when a peer connects.
+
+Reach these flows from the Console's **View status** page:
+
+- **Users & Policy…** — create a Windows account for an enrolled person (register key → approve → publish), the existing guided 1→5 flow. The approval step now confirms the approval vouch replicated before moving on.
+- **Manage people & admins…** — the lifecycle surface described below.
+- **Leave domain…** — decommission this machine (see [Leaving a domain](#leaving-a-domain-decommission)).
+
+### Approving a user
+
+An enrolled user cannot open a session until an admin **approves** (vouches for) them with the default purpose `dds:session`. In the Console this is the "Approve" step; on the CLI it is `dds admin vouch --subject-urn <user-urn>` (see [Admin Bootstrap](#admin-bootstrap)). The approval is a `Vouch` token signed by the admin's persisted key; it **replicates to every node** so the user can sign in on any machine in the domain, not just the one where the ceremony ran.
+
+### Removing a user (offboarding)
+
+**Manage people & admins… → select the person → Remove access (offboard).**
+
+Offboarding revokes the admin's `dds:session` vouch(es) for the user. Mechanically the Console runs `dds-enroll-user.exe --revoke-vouch --subject-urn <user-urn>`, which posts to `POST /v1/admin/revoke-vouch`. The node:
+
+- mints a `Revoke` token (signed by the persisted admin key) for each of **this admin's** vouches for the subject and gossips them so peers apply the revocation too;
+- returns any **foreign** vouches — grants issued by a *different* admin that this admin cannot revoke (trust-graph rule H-1: only the issuing admin can revoke its own vouch). The Console names the other admin; that admin must run the same offboarding to fully remove access.
+
+What offboarding does and does not do:
+
+- **Does:** stop *new* sign-ins across the domain (the revoked vouch no longer grants `dds:session`, so session issuance fails everywhere the revocation has replicated); hide the user's logon tile (the Credential Provider reads `GET /v1/enrolled-users`, which excludes fully-revoked users by default — the Console's "Show removed people" checkbox adds `?include_revoked=1`).
+- **Does not:** recall already-issued session tokens. Sessions are stateless bearer tokens capped at 24 h, so a session minted just before offboarding stays valid until it expires. For an immediate lock-out, also revoke the machine's admission or disable the Windows account.
+- **Does not:** delete the person's Windows account or profile. Use a `Local account` policy with `action: Delete`/`Disable` (Users & Policy → Author any policy) if you also want the OS account removed.
+
+### Adding and removing administrators
+
+**Manage people & admins…** lists the domain's administrators (trusted roots).
+
+- **Make this person an admin** vouches an already-approved person for the privileged purpose `dds:admin`. When that vouch replicates, every node promotes the subject into its trusted-root set automatically (the node reconciles trusted roots against the replicated trust graph — no manual `node.toml` edit on each machine).
+- **Remove admin rights** revokes *your* `dds:admin` vouch for that admin; nodes demote the subject when the revocation arrives. As with user offboarding, if another admin also vouched them `dds:admin`, that admin must revoke theirs too. The **founding (bootstrap) admin cannot be removed here** — its authority is anchored in each node's `[trusted_roots]` config, not a vouch; rotate or re-bootstrap the domain to change the anchor.
+
+> **Note on brownfield domains.** Cross-node admin promotion/demotion works because identity tokens (enrollments, approvals, admin vouches, and their revocations) now replicate via gossip like policy tokens always have. On a domain first provisioned before this change, run one admin ceremony (any approve/offboard) on each node, or restart the nodes, so their trusted-root sets reconcile against the replicated graph.
+
+### Confirming replication
+
+`GET /v1/replication/confirm?jtis=a,b,c` asks the node to probe its currently-connected, admitted peers over the existing anti-entropy sync protocol and report which of the listed token JTIs each peer already holds. The response:
+
+```json
+{ "admitted_connected": 2,
+  "confirmed_jtis": ["revoke-abc123"],
+  "results": [ { "peer_id": "12D3Koo…", "present_jtis": ["revoke-abc123"], "complete": true, "error": null } ] }
+```
+
+- `admitted_connected: 0` — no other node was reachable to ask. The change is durably committed on this node and will replicate when a peer connects; it is **not** a failure.
+- A JTI in `confirmed_jtis` has been independently verified present on at least one other node.
+- A per-peer result with `error` set and `complete: false` is **inconclusive**, not a denial — typically the encrypted (enc-v3) payloads from that peer could not be decrypted yet because the epoch-key exchange is still in flight. The probe triggers the key exchange as a side effect, so a retry a few seconds later normally resolves it. A JTI missing from `confirmed_jtis` means "not proven present", never "proven absent", unless every probed peer answered with `complete: true` and no `error`.
+
+> **Hybrid domains and the admission cert's KEM pubkey.** On a PQ-hybrid domain every node encrypts gossip and sync under its epoch key, and epoch keys are delivered encapsulated to the *recipient's* `pq_kem_pubkey` from its admission cert. A cert issued without `--kem-pubkey` therefore leaves that node unable to decrypt anything its peers send. Current builds repair this automatically: the node attaches its own KEM pubkey to its admission cert at startup and peers pick it up at the next handshake. If a fleet mixes in older builds, re-issue the cert with `dds-node admit --kem-pubkey <hex>` (the hex is printed by `gen-node-key`).
+
+The probe rides the sync protocol with no wire change, so it works even when peers run an older build.
+
+## How the lifecycle affects FIDO2 security keys
+
+**Short answer: you do not have to manage anything on the authenticator itself.** Setting up or tearing down domains, admins, and users never writes to, or needs to erase, credentials stored on a FIDO2 key.
+
+Why:
+
+- **DDS credentials are non-resident (non-discoverable).** Every enrollment path (self-enrollment, admin "register a new person", admin setup) calls the Windows WebAuthn API with `bRequireResidentKey = FALSE`. The credential is *not* stored on the authenticator — the credential ID handed back is a self-contained wrapped-key blob that the key can re-derive on demand. So a security key holds **no per-domain or per-account state** for DDS login, and there is nothing occupying its limited resident-credential slots.
+- **Removing access is a server-side trust change, not a key operation.** Offboarding a user, removing an admin, or decommissioning a machine revokes tokens in the trust graph and replicates the revocation. The authenticator-side credential still *exists* (it always did — it lives in the key's master secret, not a slot), but any assertion it produces is rejected because the vouch chain backing it is revoked. Nothing needs to be, or can be, deleted from the key by DDS.
+- **A departing person keeps their key; that is fine.** Because DDS stores no secrets from your domain on the key, a former user's authenticator is not a residual credential you must reclaim. If the *person* wants to wipe their key (e.g. it was enrolled elsewhere too), that is an optional, user-initiated **authenticator factory reset** performed outside DDS (Windows Settings → Sign-in options → Security Key → Reset, or the vendor tool). DDS neither requires nor performs it.
+- **Lost or stolen key.** Offboard the affected identity (revoke its vouches) and, if the person is still active, re-enroll them with a new key — enrollment adds a *separate* attestation, so multiple keys per person are supported and retiring one is just a revoke of that credential's grant. There is no authenticator-side cleanup step.
+
+The DDS credential-provider/auth-bridge stack has no code to enumerate or delete credentials from an authenticator (no CTAP `authenticatorCredentialManagement`, no WebAuthn platform-credential deletion), by design — non-resident credentials give it nothing to manage.
+
+---
+
+## Leaving a domain (decommission)
+
+**View status → Leave domain…** wipes this machine's DDS domain identity (node key, `domain.toml`/`domain_key.bin`, admission cert) and stops the three services, returning the machine to an un-provisioned state so it can be uninstalled or re-join a different domain. Windows accounts already created on the PC are **not** deleted.
+
+If you tick **"Also revoke this machine's admission"** and the domain key is present on this machine, the Console first runs `dds-node revoke-admission` + `import-revocation` so the revocation fans out to peers (H-12 gossip) before the local wipe — otherwise other nodes keep trusting this machine's peer id until its admission cert expires. If the domain key lives elsewhere, leave that option off and run `dds-node revoke-admission` from the machine that holds the key (see [Revoking a node](#revoking-a-node)).
+
+---
+
 ## Enrolling Devices
 
 Devices are enrolled to bind a machine identity to the directory.

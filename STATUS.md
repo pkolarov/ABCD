@@ -1,5 +1,150 @@
 # DDS Implementation Status
 
+## fix(pq): enc-v3 epoch-key bootstrap gap — replication + peer-confirm now work on hybrid domains — 2026-07-18
+
+### Summary — one root cause, three symptoms, five fixes
+
+Two-machine testing showed `/v1/replication/confirm` returning empty `confirmed_jtis`
+for tokens the peer *provably held*, box A→box B replication appearing dead
+(`trust_graph_tokens` stuck at 1 for days), and an eternal `err_count=1` anti-entropy
+loop. Loopback-pair ground truth + log archaeology traced all three to one chain:
+
+**`[domain]` blocks that omit `capabilities` default to `["enc-v3"]`** (PQ-by-default),
+so every node encrypts sync/gossip under its epoch key — and epoch keys are released
+encapsulated to the *recipient's* `pq_kem_pubkey` from its admission cert. The
+bootstrap node's cert was minted by `Bootstrap-DdsDomain.ps1` (`dds-node admit`)
+**without `--kem-pubkey`**, so peers could never key it: it silently dropped every
+encrypted payload, and the probe reported the dropped (undecryptable) offer as a
+definitive "peer doesn't hold the token".
+
+**Fixes (all verified live on the loopback pair):**
+
+1. **Startup cert self-repair** (`node.rs`): a node whose cert lacks (or has a stale)
+   `pq_kem_pubkey` attaches its own live KEM pubkey and persists the cert — legitimate
+   without the domain key because `pq_kem_pubkey` sits outside the signed
+   `AdmissionBody`. Peers pick it up at their next handshake. **The trigger is the
+   `enc-v3` capability, not domain hybrid-ness.** `capabilities` defaults to
+   `["enc-v3"]`, so a legacy **non-hybrid** domain (no `pq_pubkey`, e.g. the live
+   `acme.corp`) still encrypts gossip and still needs cert KEM pubkeys — the per-node
+   ML-KEM epoch keypair is independent of the domain signing key. An earlier
+   `is_hybrid()` guard missed exactly this, so `acme.corp` stayed broken even after the
+   first upgrade. Verified end-to-end on a **non-hybrid enc-v3 loopback pair**: certs
+   admitted without a KEM pubkey → both nodes self-repair at startup → fresh token
+   replicates → probe confirms both directions → no err_count loop. `provision.rs` now
+   always embeds the node's KEM pubkey too.
+2. **Probe honesty** (`node.rs`, `http.rs`): `decrypt_sync_payloads` now reports the
+   dropped-payload count; `probe_result_from_response` (pure, unit-tested) marks a
+   peer result with drops + missing targets as `error` + `complete:false`
+   (inconclusive, retry) instead of fabricating definitive absence. Positive evidence
+   still confirms.
+3. **Post-admission mutual key exchange** (`node.rs`): after admitting a peer,
+   deterministically push our epoch-key release and pull theirs (B.9
+   `outbound_releases` wire, no wire change) — closes the mutual-first-contact race
+   where both H-12 piggy-backs fire before either side has cached the other's cert.
+4. **`err_count=1` loop** (`dds-net/sync.rs`, `dds-node/node.rs`): the sync-apply
+   path stored the token but never the operation, so after a restart the DAG
+   (rebuilt from `operation_ids`) lost the op while the trust graph kept the token —
+   and anti-entropy re-requested that op every round forever. **Fixed at the source:**
+   sync-accepted ops are now persisted via `put_operation` (mirroring the gossip
+   path), and `seed_dag_from_store` reconciles any stored token whose canonical
+   `op-<jti>` is missing (one-time heal of state left by prior builds, from local
+   trusted data only). An earlier attempt that made `DuplicateJti` idempotent-merge
+   was **reverted** — an adversarial review proved it reopened the AUDIT-2026-06-12
+   R5 self-update quorum replay (a re-delivered self-update token would re-enter
+   `merged_op_ids` and re-fire msiexec fleet-wide). The persist+reconcile approach
+   never touches `merged_op_ids`, so R5 stays closed.
+5. **`Bootstrap-DdsDomain.ps1`** passes `--kem-pubkey` (captured from `gen-node-key`)
+   at self-admit, so new domains never enter the broken state.
+
+Observability: sync serve log now shows `enc_count` (encrypted payloads no longer
+read as "served nothing"), sync apply logs the first 3 actual error strings (this is
+what identified the DuplicateJti loop in minutes after days of opacity), and the B.7
+"requester has no cached KEM pubkey" skip is a warn.
+
+Loopback verification: fresh device token minted on n1 → n2 ingested in <4s →
+`/v1/replication/confirm` returns `confirmed_jtis:[jti], complete:true, error:null`
+in **both directions**; `err_count=0` steady state. Tests: dds-node 398 lib + all
+suites green; dds-net 86 green (incl. new `duplicate_jti_with_canonical_op_merges_without_error`).
+
+## feat(lifecycle): guided offboarding/admin-management + identity-token replication + peer-confirm — 2026-07-11
+
+### Summary — the identity lifecycle is now complete, replicated, and bulletproofed
+
+Prior to this pass the console could *create* users and admins but never *remove*
+them, and — more subtly — enrollments, approvals, and admin vouches lived only in
+the local node's store: they never gossiped, so a user approved on one node could
+not sign in on another. This pass closes both gaps and adds the "confirm it
+replicated" step the operator asked for.
+
+**Backend (`dds-node`, `dds-core`):**
+
+- **Identity tokens now replicate.** `POST /v1/enroll/user|device`, `/v1/admin/setup`,
+  and `/v1/admin/vouch` hand their signed token to the swarm task via the existing
+  `PublishCommand` channel (`http::publish_identity_tokens`), so peers apply + gossip
+  them exactly like policy tokens. Responses carry `published: bool`.
+- **`POST /v1/admin/revoke-vouch`** — the offboarding primitive. `LocalService::admin_revoke_vouch`
+  (FIDO2-UV-gated like `admin_vouch`) mints `Revoke` tokens for the vouches THIS admin
+  issued for a subject, gossips them, and returns `foreign[]` (vouches only another admin
+  can revoke, per trust-graph H-1: revoker == issuer). A `dds:admin` revoke also demotes
+  the subject from `trusted_roots`.
+- **`GET /v1/admin/roots`** lists trusted roots (admins) with display names + bootstrap flag.
+  `reconcile_trusted_roots` promotes/demotes roots against the replicated graph so admin
+  changes propagate cross-node without hand-editing `node.toml`; the swarm task mirrors this
+  in-memory on every accepted `dds:admin` vouch/revoke (`reconcile_roots_after_token`).
+- **`GET /v1/enrolled-users`** gained a `revoked` flag and `?include_revoked=` filter;
+  offboarded users are hidden from CP tile enumeration by default (tiles disappear with no
+  bridge change).
+- **`GET /v1/replication/confirm?jtis=…`** — the peer-confirmation probe. Rides the
+  anti-entropy sync request/response (`ProbeCommand` → `start_probe`) with no wire change,
+  asking up to 3 connected admitted peers whether they hold the given JTIs. Works against
+  older-build peers. `admitted_connected: 0` distinguishes "no peer online to ask" from denial.
+- Tests: `admin_revoke_vouch_offboards_user`, `reconcile_trusted_roots_promotes_and_demotes`
+  (dds-node, 388 lib tests green), `vouch_summaries_report_issuer_and_revocation_status`
+  (dds-core, 207 green).
+
+**Native (`dds-enroll-user.exe`, `DdsNodeHttpClient`):** new `--revoke-vouch` mode (same
+FIDO2 UV ceremony as `--vouch`, posts to `/v1/admin/revoke-vouch`, emits a `revoked` NDJSON
+line whose `body` is the raw server response). `--purpose` optional (omit = revoke all;
+`dds:admin` = demote). Builds clean Release|ARM64 via `DdsNative.sln`.
+
+**Console (`DdsConsole.ps1`):** every lifecycle flow is now bulletproofed and
+peer-confirmed:
+
+- **Journal engine** — `Write/Read/Clear-Journal` under `ProgramData\DDS\wizard-journal\`;
+  each flow journals before the key touch and `Resume-PendingLifecycleJournals` recovers an
+  interrupted flow (re-confirm or warn) on next Manage-page entry.
+- **`Confirm-Replication`** — polls `/v1/replication/confirm` and reports "confirmed on N
+  peers" / "no peer online, committed locally" / "still replicating".
+- **Manage people & admins page** — offboard a person, promote a person to admin, remove an
+  admin; each is an admin ceremony + peer-confirm, with `foreign`-vouch guidance surfaced.
+- **Leave domain page** — decommission (optional admission revoke + `Reset-DdsBootstrap`).
+- The existing create-account **Approve** step now confirms the approval vouch replicated
+  before advancing. XAML loads; all 122 named elements resolve.
+
+**Docs:** Admin Guide gains "Guided lifecycle management (DDS Console)", "How the lifecycle
+affects FIDO2 security keys" (answer: nothing to manage on the key — credentials are
+non-resident), and "Leaving a domain (decommission)".
+
+**Adversarial review pass (15-agent workflow, 12 findings, 10 confirmed → fixed/accepted):**
+- Fixed workspace build break (`dds-fido2-test/.../multinode.rs` missed the new `probe_tx`
+  arg on `http::serve`) — `cargo build --workspace` green.
+- Fixed admin demotion correctness: `admin_revoke_vouch` no longer demotes a co-vouched
+  admin whose OTHER admin's `dds:admin` vouch is still live (delegates to
+  `reconcile_trusted_roots`); `reconcile_trusted_roots` demotion is now the exact inverse
+  of promotion (requires a live `dds:admin` vouch from a CURRENT root) and iterates to a
+  fixpoint so offboarding cascades transitively (offboarding R also demotes the sub-admin
+  R promoted). New test `reconcile_trusted_roots_demotion_is_transitive_and_covouch_aware`.
+- Console: `Confirm-Replication` now detects a non-200 error-shaped body instead of throwing
+  under StrictMode and misreporting "unreachable"; retry defaults lowered and page-open
+  resume uses a single probe to bound UI-thread blocking; window-close now kills any
+  in-flight FIDO2 ceremony helper.
+- Accepted-as-designed: the admin FIDO2 challenge is operation-agnostic (shared with the
+  existing `admin_vouch`; single-use + live-UV-touch gated); enc-v3 replication-confirm can
+  under-report until the responder's epoch key is cached (safe — never over-reports; retry
+  + gossip converge). 392 dds-node lib + 207 dds-core tests green.
+
+---
+
 ## feat(cp): cold-boot FIDO2 login via raw-CTAP fallback + installer fixes (258th pass) — 2026-07-03
 
 ### Summary — cold-boot passwordless login now works, verified live

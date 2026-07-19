@@ -910,19 +910,16 @@ pub fn run_provision(
             .save(&epoch_keys_path)
             .map_err(|e| ProvisionError::Io(format!("epoch_keys save: {e}")))?;
     }
-    let kem_pubkey_bytes: Option<Vec<u8>> = if bundle.domain_pq_pubkey.is_some() {
-        Some(epoch_keys.kem_public().to_bytes())
-    } else {
-        None
-    };
-    println!(
-        "  KEM pubkey: {}",
-        if kem_pubkey_bytes.is_some() {
-            "set"
-        } else {
-            "not set (legacy domain)"
-        }
-    );
+    // Always embed this node's KEM pubkey. `enc-v3` (encrypted gossip)
+    // is on by default and is a per-node capability independent of the
+    // domain SIGNING key being hybrid — a non-hybrid domain still needs
+    // cert KEM pubkeys for epoch-key delivery (see the node.rs startup
+    // self-repair). The pubkey is harmless when enc-v3 is off (peers
+    // only encapsulate to it when encrypting), so embedding it
+    // unconditionally is strictly safer than gating on `domain_pq_pubkey`
+    // and avoids a first-start window where the cert lacks it.
+    let kem_pubkey_bytes: Option<Vec<u8>> = Some(epoch_keys.kem_public().to_bytes());
+    println!("  KEM pubkey: set");
 
     let now = now_epoch();
     let ttl = 365 * 86400; // 1 year — re-provision or re-admit to renew
@@ -2586,12 +2583,16 @@ mod tests {
         );
     }
 
-    /// **PQ-DEFAULT-2** — provisioning a legacy (Ed25519-only) domain
-    /// must NOT embed a KEM pubkey in the admission cert (the cert would
-    /// never be used with enc-v3 anyway, and embedding would be a waste
-    /// of bytes).
+    /// **PQ-DEFAULT-2** — provisioning now embeds this node's KEM pubkey
+    /// even on a legacy (Ed25519-only) domain. `enc-v3` (encrypted
+    /// gossip) is on by default and is independent of the domain signing
+    /// key being hybrid: a non-hybrid domain still needs cert KEM pubkeys
+    /// so peers can deliver epoch keys. The pubkey is harmless when
+    /// enc-v3 is off, so embedding unconditionally is strictly safer than
+    /// gating on `domain_pq_pubkey` (which left `acme.corp`-style
+    /// non-hybrid enc-v3 domains unable to replicate).
     #[test]
-    fn provision_legacy_domain_does_not_embed_kem_pubkey() {
+    fn provision_legacy_domain_embeds_kem_pubkey() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = TempDir::new().unwrap();
         let domain_dir = dir.path().join("domain");
@@ -2613,8 +2614,13 @@ mod tests {
 
         let cert = domain_store::load_admission_cert(&data_dir.join("admission.cbor")).unwrap();
         assert!(
-            cert.pq_kem_pubkey.is_none(),
-            "legacy domain admission cert must not carry pq_kem_pubkey"
+            cert.pq_kem_pubkey.is_some(),
+            "provisioned cert must carry this node's KEM pubkey (enc-v3 default-on)"
+        );
+        assert_eq!(
+            cert.pq_kem_pubkey.as_ref().unwrap().len(),
+            dds_domain::HYBRID_KEM_PUBKEY_LEN,
+            "embedded KEM pubkey length mismatch"
         );
     }
 

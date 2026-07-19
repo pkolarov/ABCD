@@ -298,6 +298,12 @@ impl EpochKeyStore {
             .map(|(key, _)| key)
     }
 
+    /// `true` when we hold a decapped current release (any epoch)
+    /// from `publisher` — i.e. we can decrypt what they send today.
+    pub fn has_peer_release(&self, publisher: &str) -> bool {
+        self.peer_releases.contains_key(publisher)
+    }
+
     /// Drop grace-cache entries (mine + peers') older than
     /// [`EPOCH_KEY_GRACE_SECS`] relative to `now`. Returns the number
     /// of entries pruned across both caches.

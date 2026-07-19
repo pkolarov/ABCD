@@ -377,6 +377,24 @@ impl TrustGraph {
             .filter_map(move |jti| self.vouches.get(jti))
     }
 
+    /// Public snapshot of every vouch targeting `subject_urn`, with its
+    /// revocation/expiry status. Powers the admin lifecycle surfaces
+    /// (offboarding wizard, `/v1/admin/revoke-vouch`): the caller needs
+    /// the JTI + issuer of each live vouch to decide which it can
+    /// H-1-revoke (issuer == its own admin identity) and which require
+    /// a different admin.
+    pub fn vouch_summaries_for_subject(&self, subject_urn: &str) -> Vec<VouchSummary> {
+        self.vouches_for_subject(subject_urn)
+            .map(|t| VouchSummary {
+                jti: t.payload.jti.clone(),
+                issuer: t.payload.iss.clone(),
+                purpose: t.payload.purpose.clone(),
+                revoked: self.is_revoked(&t.payload.jti),
+                expired: Self::is_expired(t),
+            })
+            .collect()
+    }
+
     /// Look up an attestation by issuer URN that is **active** —
     /// i.e. not revoked, not expired, and whose issuer is not burned.
     ///
@@ -696,12 +714,48 @@ impl TrustGraph {
     pub fn attestations_iter(&self) -> impl Iterator<Item = &Token> + '_ {
         self.attestations.values()
     }
+
+    /// Iterate over every vouch token currently in the graph. Order is
+    /// implementation-defined. Used by the trusted-roots reconciler in
+    /// `dds-node` to discover `dds:admin` promotions that arrived via
+    /// gossip/sync; deployments have few vouches relative to the hot
+    /// paths, and those still go through the secondary indices.
+    pub fn vouches_iter(&self) -> impl Iterator<Item = &Token> + '_ {
+        self.vouches.values()
+    }
+
+    /// Look up a vouch token by its JTI. Used by revocation-ingest
+    /// hooks that need to know what a just-revoked target *was*
+    /// (e.g. whether it carried the `dds:admin` purpose and therefore
+    /// demotes its subject from the trusted roots).
+    pub fn vouch_by_jti(&self, jti: &str) -> Option<&Token> {
+        self.vouches.get(jti)
+    }
 }
 
 impl Default for TrustGraph {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Status snapshot of one vouch targeting a subject, as returned by
+/// [`TrustGraph::vouch_summaries_for_subject`]. `revoked` reflects the
+/// graph's H-1-validated revocation set; `expired` is wall-clock expiry
+/// (always `false` in `no_std` builds, which have no clock).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VouchSummary {
+    /// The vouch token's JTI (the revocation target for offboarding).
+    pub jti: String,
+    /// URN of the admin that issued the vouch. Only this identity can
+    /// mint an H-1-valid revocation of it.
+    pub issuer: String,
+    /// The vouch's purpose (e.g. `dds:session`, `dds:admin`).
+    pub purpose: Option<String>,
+    /// Whether an authorized revocation for this vouch is in the graph.
+    pub revoked: bool,
+    /// Whether the vouch is past its `exp`.
+    pub expired: bool,
 }
 
 /// Errors from trust graph operations.
@@ -846,6 +900,39 @@ mod tests {
         let mut set = BTreeSet::new();
         set.insert(String::from(urn));
         set
+    }
+
+    /// `vouch_summaries_for_subject` must report every vouch targeting a
+    /// subject with its issuer and revocation status — the input the
+    /// offboarding wizard uses to split "vouches I can revoke" (issuer
+    /// == me) from "vouches another admin must revoke".
+    #[test]
+    fn vouch_summaries_report_issuer_and_revocation_status() {
+        let admin_a = Identity::generate("admin-a", &mut OsRng);
+        let admin_b = Identity::generate("admin-b", &mut OsRng);
+        let user = Identity::generate("user", &mut OsRng);
+        let user_attest = make_attest(&user);
+
+        let mut g = TrustGraph::new();
+        g.add_token(make_attest(&admin_a)).unwrap();
+        g.add_token(make_attest(&admin_b)).unwrap();
+        g.add_token(user_attest.clone()).unwrap();
+        // Two admins each vouch the same user for dds:session.
+        let v_a = make_vouch(&admin_a, &user, &user_attest, "dds:session", "vouch-a");
+        let v_b = make_vouch(&admin_b, &user, &user_attest, "dds:session", "vouch-b");
+        g.add_token(v_a).unwrap();
+        g.add_token(v_b).unwrap();
+        // admin_a revokes its own vouch.
+        g.add_token(make_revoke(&admin_a, "vouch-a")).unwrap();
+
+        let summaries = g.vouch_summaries_for_subject(&user.id.to_urn());
+        assert_eq!(summaries.len(), 2, "both vouches must be reported");
+        let a = summaries.iter().find(|s| s.jti == "vouch-a").unwrap();
+        assert_eq!(a.issuer, admin_a.id.to_urn());
+        assert!(a.revoked, "admin_a's vouch is revoked");
+        let b = summaries.iter().find(|s| s.jti == "vouch-b").unwrap();
+        assert_eq!(b.issuer, admin_b.id.to_urn());
+        assert!(!b.revoked, "admin_b's vouch is still live");
     }
 
     fn make_attest_with_exp(ident: &Identity, exp: Option<u64>) -> Token {

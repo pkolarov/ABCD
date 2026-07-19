@@ -87,6 +87,16 @@ struct DdsAdminVouchResult
     std::string errorMessage;
 };
 
+// Result of POST /v1/admin/revoke-vouch (user/admin offboarding). The
+// response carries arrays (revoked[], foreign[]) the console parses
+// itself, so we surface the raw body rather than pre-flattening it.
+struct DdsAdminRevokeVouchResult
+{
+    bool        success;
+    std::string responseBody;   // raw JSON, forwarded to the console
+    std::string errorMessage;
+};
+
 // Result of GET /v1/session/challenge or /v1/admin/challenge
 struct DdsChallengeResult
 {
@@ -179,6 +189,7 @@ public:
     //
     // Admin vouches for an enrolled user via FIDO2 assertion proof.
     DdsAdminVouchResult PostAdminVouch(const std::string& vouchJson);
+    DdsAdminRevokeVouchResult PostAdminRevokeVouch(const std::string& json);
 
     // GET /v1/session/challenge
     //

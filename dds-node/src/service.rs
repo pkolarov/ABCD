@@ -125,6 +125,78 @@ pub struct AdminVouchResult {
     pub vouch_jti: String,
     pub subject_urn: String,
     pub admin_urn: String,
+    /// CBOR of the signed Vouch token so the HTTP layer can gossip it
+    /// via [`crate::node::PublishCommand`] — approvals must replicate
+    /// to peer nodes, not just live in this node's store.
+    pub token_cbor: Vec<u8>,
+}
+
+/// Request for an admin to revoke its previously-issued vouches for a
+/// subject (user/admin offboarding). Carries the same FIDO2 UV
+/// assertion ceremony as [`AdminVouchRequest`].
+#[derive(Debug, Clone)]
+pub struct AdminRevokeVouchRequest {
+    pub subject_urn: String,
+    pub credential_id: String,
+    /// Server-issued challenge ID from `GET /v1/admin/challenge`.
+    pub challenge_id: String,
+    pub client_data_hash: Vec<u8>,
+    pub client_data_json: Option<Vec<u8>>,
+    pub authenticator_data: Vec<u8>,
+    pub signature: Vec<u8>,
+    /// Restrict revocation to vouches carrying this purpose.
+    /// `None` revokes every active vouch this admin issued for the
+    /// subject.
+    pub purpose: Option<String>,
+}
+
+/// One vouch revoked by [`LocalService::admin_revoke_vouch`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RevokedVouchInfo {
+    /// JTI of the newly-minted Revoke token (probe this on peers to
+    /// confirm replication).
+    pub revoke_jti: String,
+    /// JTI of the vouch that was revoked.
+    pub target_jti: String,
+    pub purpose: Option<String>,
+}
+
+/// An active vouch for the subject that THIS admin cannot revoke
+/// (H-1: only the issuing admin can). Surfaced so the offboarding
+/// wizard can tell the operator which admin must also act.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ForeignVouchInfo {
+    pub target_jti: String,
+    pub issuer: String,
+    pub purpose: Option<String>,
+}
+
+/// Result of an admin revoke-vouch (offboarding) operation.
+#[derive(Debug)]
+pub struct AdminRevokeVouchResult {
+    pub subject_urn: String,
+    pub admin_urn: String,
+    pub revoked: Vec<RevokedVouchInfo>,
+    pub foreign: Vec<ForeignVouchInfo>,
+    /// True when the subject was also removed from this node's
+    /// `trusted_roots` (a `dds:admin` vouch was among the revoked).
+    pub demoted_from_trusted_roots: bool,
+    /// The signed Revoke tokens, for the HTTP layer to gossip via
+    /// [`crate::node::PublishCommand`] so peers apply the revocations.
+    pub revoke_tokens: Vec<dds_core::token::Token>,
+}
+
+/// One trusted-root entry for `GET /v1/admin/roots`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AdminRootInfo {
+    pub urn: String,
+    pub is_bootstrap: bool,
+    /// Display name from the admin's enrollment attestation, when one
+    /// is in the graph.
+    pub display_name: Option<String>,
+    /// Whether a live (non-revoked, non-expired) `dds:admin` vouch for
+    /// this root exists in the graph. The bootstrap admin needs none.
+    pub has_active_admin_vouch: bool,
 }
 
 /// Internal output of the shared FIDO2 assertion verifier.
@@ -172,6 +244,14 @@ pub struct EnrolledUser {
     pub credential_id: String,
     #[serde(default)]
     pub vouched: bool,
+    /// True when the subject HAD at least one vouch and every vouch is
+    /// now revoked — i.e. the user was offboarded (distinct from a
+    /// pending user who was never approved). Offboarded users are
+    /// excluded from the listing by default so Credential Provider
+    /// logon tiles disappear without a bridge change; the console asks
+    /// for them explicitly with `?include_revoked=1`.
+    #[serde(default)]
+    pub revoked: bool,
 }
 
 /// Request to issue a session.
@@ -2237,6 +2317,13 @@ impl<
         &mut self,
         req: AssertionSessionRequest,
     ) -> Result<SessionResult, ServiceError> {
+        // Fold in replicated admin promotions/demotions before the
+        // `purposes_for` chain walk below evaluates against
+        // `trusted_roots` — an offboarded admin's grants must stop
+        // minting sessions here even if no admin ceremony ever runs on
+        // this node.
+        self.reconcile_trusted_roots();
+
         let out = self.verify_assertion_common(
             &req.credential_id,
             &req.challenge_id,
@@ -2276,6 +2363,7 @@ impl<
     pub fn list_enrolled_users(
         &self,
         _device_urn: &str,
+        include_revoked: bool,
     ) -> Result<Vec<EnrolledUser>, ServiceError> {
         let g = self
             .trust_graph
@@ -2294,11 +2382,21 @@ impl<
             let vouched = !g
                 .purposes_for(&token.payload.sub, &self.trusted_roots)
                 .is_empty();
+            // Offboarded = HAD a vouch, and no live one remains. A
+            // never-vouched (pending) user has an empty summary list
+            // and stays visible so the approval flow can find them.
+            let summaries = g.vouch_summaries_for_subject(&token.payload.sub);
+            let revoked = !summaries.is_empty()
+                && summaries.iter().all(|s| s.revoked || s.expired);
+            if revoked && !include_revoked {
+                continue;
+            }
             users.push(EnrolledUser {
                 subject_urn: token.payload.sub.clone(),
                 display_name: doc.user_display_name.clone(),
                 credential_id: doc.credential_id.clone(),
                 vouched,
+                revoked,
             });
         }
         Ok(users)
@@ -2685,6 +2783,10 @@ impl<
         &mut self,
         req: AdminVouchRequest,
     ) -> Result<AdminVouchResult, ServiceError> {
+        // Fold in any admin promotions/demotions that arrived via
+        // gossip/sync since the last admin ceremony on this node.
+        self.reconcile_trusted_roots();
+
         // 1–6. Shared assertion verifier: credential lookup, crypto, UP flag,
         //      RP-ID binding, challenge freshness, sign-count monotonicity.
         let out = self.verify_assertion_common(
@@ -2830,7 +2932,7 @@ impl<
         }
 
         // Z-3 Phase A.1: admin vouches are policy-relevant events.
-        self.emit_local_audit("admin.vouch", vouch_cbor, None);
+        self.emit_local_audit("admin.vouch", vouch_cbor.clone(), None);
 
         // **H-8 (security review)**: if the purpose is `dds:admin`,
         // promote the subject into `trusted_roots` and persist so the
@@ -2874,7 +2976,359 @@ impl<
             vouch_jti,
             subject_urn: req.subject_urn,
             admin_urn,
+            token_cbor: vouch_cbor,
         })
+    }
+
+    /// Revoke the vouches THIS admin previously issued for a subject —
+    /// the offboarding primitive for users and (via `dds:admin`
+    /// purpose) sub-admins.
+    ///
+    /// Design constraints this leans on:
+    /// - **H-1** (trust.rs): a Revoke is only accepted when revoker ==
+    ///   issuer of the target token. Admin keys are the only persisted
+    ///   signing keys on a node, and vouches are the only trust edges
+    ///   admins issue — so "revoke my own vouches" is exactly the
+    ///   maximal offboarding power the trust model permits. Vouches
+    ///   issued by a DIFFERENT admin are returned in `foreign` so the
+    ///   wizard can name who else must act.
+    /// - The minted Revoke tokens replicate to peers under the
+    ///   *existing* wire rules (peers already ingest Revoke tokens via
+    ///   gossip + sync and re-check H-1 themselves), so offboarding
+    ///   works against older nodes.
+    /// - Sessions are stateless bearer tokens (≤24 h); revocation
+    ///   blocks NEW session issuance (`purposes_for` skips revoked
+    ///   vouches) but cannot recall already-issued sessions. Callers
+    ///   must surface that window.
+    ///
+    /// Requires the same FIDO2 UV assertion ceremony as `admin_vouch`
+    /// (AUDIT-2026-06-12 R2 applies equally: this mints durable trust
+    /// material — negative trust material, but durable and gossiped).
+    pub fn admin_revoke_vouch(
+        &mut self,
+        req: AdminRevokeVouchRequest,
+    ) -> Result<AdminRevokeVouchResult, ServiceError> {
+        // Fold in any admin promotions/demotions that arrived via
+        // gossip/sync since the last admin ceremony on this node.
+        self.reconcile_trusted_roots();
+
+        let out = self.verify_assertion_common(
+            &req.credential_id,
+            &req.challenge_id,
+            &req.client_data_hash,
+            req.client_data_json.as_deref(),
+            &req.authenticator_data,
+            &req.signature,
+        )?;
+        if !out.user_verified {
+            return Err(ServiceError::Fido2(
+                "admin revoke-vouch requires a user-verified (UV) assertion: \
+                 user_verified flag not set — presence-only (UP) is \
+                 insufficient for privileged step-up"
+                    .into(),
+            ));
+        }
+        let admin_urn = out.subject_urn;
+
+        if !self.trusted_roots.contains(&admin_urn) {
+            return Err(ServiceError::Trust(format!(
+                "identity '{}' is not a trusted root",
+                admin_urn
+            )));
+        }
+
+        // The bootstrap admin is the domain's trust anchor: it holds no
+        // vouch (admin_setup inserts it directly into trusted_roots), so
+        // there is nothing to revoke — and allowing a "revoke everything
+        // for the bootstrap admin" call to half-succeed would only
+        // mislead operators into thinking the anchor was offboarded.
+        if self
+            .bootstrap_admin_urn
+            .as_deref()
+            .map(|b| b == req.subject_urn)
+            .unwrap_or(false)
+        {
+            return Err(ServiceError::Trust(
+                "the bootstrap admin cannot be offboarded via revoke-vouch; \
+                 its authority comes from trusted_roots, not from a vouch. \
+                 Decommission or re-bootstrap the domain to rotate the anchor."
+                    .to_string(),
+            ));
+        }
+
+        // Snapshot the subject's live vouches and split them into ones
+        // this admin issued (revocable here) vs. foreign ones.
+        let summaries = {
+            let g = self
+                .trust_graph
+                .read()
+                .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+            g.vouch_summaries_for_subject(&req.subject_urn)
+        };
+        let purpose_matches = |p: &Option<String>| match req.purpose.as_deref() {
+            Some(filter) => p.as_deref() == Some(filter),
+            None => true,
+        };
+        let live: Vec<_> = summaries
+            .into_iter()
+            .filter(|s| !s.revoked && purpose_matches(&s.purpose))
+            .collect();
+        if live.is_empty() {
+            return Err(ServiceError::Trust(format!(
+                "no active vouches found for subject '{}'{} — nothing to revoke",
+                req.subject_urn,
+                match req.purpose.as_deref() {
+                    Some(p) => format!(" with purpose '{p}'"),
+                    None => String::new(),
+                }
+            )));
+        }
+        let (mine, foreign_raw): (Vec<_>, Vec<_>) =
+            live.into_iter().partition(|s| s.issuer == admin_urn);
+        let foreign: Vec<ForeignVouchInfo> = foreign_raw
+            .into_iter()
+            .map(|s| ForeignVouchInfo {
+                target_jti: s.jti,
+                issuer: s.issuer,
+                purpose: s.purpose,
+            })
+            .collect();
+
+        let mut revoked = Vec::new();
+        let mut revoke_tokens = Vec::new();
+        let mut admin_vouch_revoked = false;
+
+        if !mine.is_empty() {
+            let admin_signing_key = self.load_admin_key(&admin_urn)?;
+            let admin_public_key = dds_core::crypto::PublicKeyBundle {
+                scheme: dds_core::crypto::SchemeId::Ed25519,
+                bytes: admin_signing_key.verifying_key().to_bytes().to_vec(),
+            };
+            for s in &mine {
+                let revoke_jti = format!("revoke-{}", Uuid::new_v4().simple());
+                let payload = TokenPayload {
+                    iss: admin_urn.clone(),
+                    iss_key: admin_public_key.clone(),
+                    jti: revoke_jti.clone(),
+                    sub: req.subject_urn.clone(),
+                    kind: TokenKind::Revoke,
+                    purpose: s.purpose.clone(),
+                    vch_iss: None,
+                    vch_sum: None,
+                    revokes: Some(s.jti.clone()),
+                    iat: now_epoch(),
+                    exp: None,
+                    body_type: None,
+                    body_cbor: None,
+                };
+                let token = Token::sign(payload, &admin_signing_key)
+                    .map_err(|e| ServiceError::Token(e.to_string()))?;
+                let cbor = token
+                    .to_cbor()
+                    .map_err(|e| ServiceError::Token(e.to_string()))?;
+                // Same graph→store sequence as the sync ingest path:
+                // the graph enforces H-1, then the store persists the
+                // token and the revocation mark.
+                {
+                    let mut g = self.trust_graph.write().map_err(|e| {
+                        ServiceError::Trust(format!("trust_graph poisoned: {e}"))
+                    })?;
+                    g.add_token(token.clone())
+                        .map_err(|e| ServiceError::Trust(format!("revoke rejected: {e}")))?;
+                }
+                self.store
+                    .put_token(&token)
+                    .map_err(|e| ServiceError::Store(e.to_string()))?;
+                self.store
+                    .revoke(&s.jti)
+                    .map_err(|e| ServiceError::Store(e.to_string()))?;
+                self.emit_local_audit("admin.revoke_vouch", cbor, None);
+                if s.purpose.as_deref() == Some(dds_core::token::purpose::ADMIN) {
+                    admin_vouch_revoked = true;
+                }
+                revoked.push(RevokedVouchInfo {
+                    revoke_jti,
+                    target_jti: s.jti.clone(),
+                    purpose: s.purpose.clone(),
+                });
+                revoke_tokens.push(token);
+            }
+            drop(admin_signing_key);
+        }
+
+        // Demote: a subject whose `dds:admin` vouch was just revoked must
+        // not remain a local trusted root — UNLESS another admin's
+        // `dds:admin` vouch for the subject is still live. Demoting on
+        // *any* revoked admin-vouch (ignoring surviving co-vouches) would
+        // drop a still-valid admin from trusted_roots + node.toml and
+        // return demoted_from_trusted_roots=true incorrectly; it also
+        // disagrees with the ingest-side (`reconcile_roots_after_token`,
+        // node.rs) and reconcile paths, which both gate on a surviving
+        // vouch. Delegate to the same reconcile so all three agree.
+        let mut demoted = false;
+        if admin_vouch_revoked {
+            let was_root = self.trusted_roots.contains(&req.subject_urn);
+            self.reconcile_trusted_roots();
+            demoted = was_root && !self.trusted_roots.contains(&req.subject_urn);
+        }
+
+        tracing::info!(
+            admin = %admin_urn,
+            subject = %req.subject_urn,
+            revoked = revoked.len(),
+            foreign = foreign.len(),
+            demoted,
+            "admin revoked vouches for subject"
+        );
+
+        Ok(AdminRevokeVouchResult {
+            subject_urn: req.subject_urn,
+            admin_urn,
+            revoked,
+            foreign,
+            demoted_from_trusted_roots: demoted,
+            revoke_tokens,
+        })
+    }
+
+    /// Reconcile `trusted_roots` against the (replicated) trust graph
+    /// so admin promotion and demotion work across nodes:
+    ///
+    /// - **Promote**: a subject holding a live `dds:admin` vouch issued
+    ///   by a current root becomes a root here too. Before identity
+    ///   tokens replicated, promotion only happened on the node where
+    ///   the vouching ceremony ran; every other node needed a manual
+    ///   `trusted_roots` config edit.
+    /// - **Demote**: a *promoted* root (one that has a `dds:admin` vouch
+    ///   in the graph, i.e. it was not hand-added to config) is removed
+    ///   when it no longer has a live `dds:admin` vouch **from a current
+    ///   trusted root** — the exact inverse of the promotion rule. This
+    ///   makes demotion transitive: offboarding admin R also demotes the
+    ///   sub-admin S that R promoted, because once R leaves the root set,
+    ///   S's vouch-from-R stops counting. Burned roots are demoted
+    ///   unconditionally.
+    /// - Roots with NO `dds:admin` vouch in the graph at all are left
+    ///   alone: they are config-managed (hand-edited node.toml or the
+    ///   bootstrap admin), and the graph has no evidence to overrule the
+    ///   operator.
+    ///
+    /// Iterates to a fixpoint so a single call fully cascades a
+    /// multi-level demotion. Called lazily from the admin ceremonies, the
+    /// admin/user listing surfaces, and session issuance — cheap (a
+    /// handful of indexed graph lookups) and idempotent. Persists on change.
+    pub fn reconcile_trusted_roots(&mut self) {
+        let admin_purpose = dds_core::token::purpose::ADMIN;
+        let mut changed_any = false;
+        // Bounded fixpoint: each round can only shrink-or-grow the root set,
+        // and the delegation graph is finite; the cap is a belt-and-braces
+        // guard against a pathological cycle in the vouch graph.
+        for _ in 0..64 {
+            let (to_add, to_remove) = {
+                let g = match self.trust_graph.read() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                // A subject is *root-eligible* iff it holds a live
+                // `dds:admin` vouch issued by a CURRENT trusted root.
+                let eligible = |sub: &str| -> bool {
+                    g.vouch_summaries_for_subject(sub).iter().any(|s| {
+                        s.purpose.as_deref() == Some(admin_purpose)
+                            && !s.revoked
+                            && !s.expired
+                            && self.trusted_roots.contains(&s.issuer)
+                    })
+                };
+                // Promotion candidates: subjects of any dds:admin vouch.
+                let mut candidates: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                for v in g.vouches_iter() {
+                    if v.payload.purpose.as_deref() == Some(admin_purpose) {
+                        candidates.insert(v.payload.sub.clone());
+                    }
+                }
+                let mut to_add: Vec<String> = Vec::new();
+                for sub in candidates {
+                    if self.trusted_roots.contains(&sub) || g.is_burned(&sub) {
+                        continue;
+                    }
+                    if eligible(&sub) {
+                        to_add.push(sub);
+                    }
+                }
+                // Demotion: a promoted root (has ≥1 dds:admin vouch) that is
+                // no longer eligible, or is burned.
+                let mut to_remove: Vec<String> = Vec::new();
+                for root in self.trusted_roots.iter() {
+                    if self.bootstrap_admin_urn.as_deref() == Some(root.as_str()) {
+                        continue;
+                    }
+                    if g.is_burned(root) {
+                        to_remove.push(root.clone());
+                        continue;
+                    }
+                    let has_any_admin_vouch = g
+                        .vouch_summaries_for_subject(root)
+                        .iter()
+                        .any(|s| s.purpose.as_deref() == Some(admin_purpose));
+                    if has_any_admin_vouch && !eligible(root) {
+                        to_remove.push(root.clone());
+                    }
+                }
+                (to_add, to_remove)
+            };
+            if to_add.is_empty() && to_remove.is_empty() {
+                break;
+            }
+            for urn in &to_add {
+                self.trusted_roots.insert(urn.clone());
+                tracing::info!(subject = %urn, "reconcile: promoted to trusted_roots (replicated dds:admin vouch)");
+            }
+            for urn in &to_remove {
+                self.trusted_roots.remove(urn);
+                tracing::info!(subject = %urn, "reconcile: demoted from trusted_roots (no live dds:admin vouch from a current root)");
+            }
+            changed_any = true;
+        }
+        if changed_any {
+            if let Err(e) = self.persist_trusted_roots() {
+                tracing::warn!(error = %e, "reconcile: failed to persist trusted_roots (in-memory update still applies)");
+            }
+        }
+    }
+
+    /// List this node's trusted roots (admins) with display names and
+    /// vouch status — the read surface for the console's admin page.
+    pub fn list_admin_roots(
+        &mut self,
+    ) -> Result<(Vec<AdminRootInfo>, Option<String>), ServiceError> {
+        self.reconcile_trusted_roots();
+        let g = self
+            .trust_graph
+            .read()
+            .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+        let mut roots = Vec::new();
+        for urn in &self.trusted_roots {
+            let display_name = g
+                .attestations_iter()
+                .find(|t| t.payload.sub == *urn)
+                .and_then(|t| UserAuthAttestation::extract(&t.payload).ok().flatten())
+                .map(|d| d.user_display_name);
+            let has_active_admin_vouch = g
+                .vouch_summaries_for_subject(urn)
+                .iter()
+                .any(|s| {
+                    !s.revoked
+                        && !s.expired
+                        && s.purpose.as_deref() == Some(dds_core::token::purpose::ADMIN)
+                });
+            roots.push(AdminRootInfo {
+                urn: urn.clone(),
+                is_bootstrap: self.bootstrap_admin_urn.as_deref() == Some(urn.as_str()),
+                display_name,
+                has_active_admin_vouch,
+            });
+        }
+        Ok((roots, self.bootstrap_admin_urn.clone()))
     }
 
     // ---- admin key persistence ----
@@ -5353,6 +5807,375 @@ mod platform_applier_tests {
             .expect("UV-set assertion must mint the vouch");
         assert_eq!(ok.subject_urn, subject_urn);
         assert_eq!(ok.admin_urn, admin_urn);
+    }
+
+    /// End-to-end offboarding: an admin vouches a user (dds:session),
+    /// then revokes that vouch via `admin_revoke_vouch`. After revoke,
+    /// the user must show as `revoked` in the enrolled-users listing and
+    /// be hidden from the default (Credential-Provider) view.
+    #[test]
+    fn admin_revoke_vouch_offboards_user() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use dds_domain::fido2::{build_assertion_auth_data, build_packed_self_attestation};
+        use dds_domain::DomainDocument;
+        use ed25519_dalek::{Signer, SigningKey};
+        use sha2::Digest;
+
+        let (mut svc, _, _) = setup();
+        svc.set_verify_fido2(true);
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        svc.set_data_dir(data_dir.path().to_path_buf());
+
+        // Bootstrap admin: build the attestation self-signed by the SAME
+        // identity whose key we persist, so vouches this admin mints
+        // pass `verify_issuer_binding` and actually land in the graph.
+        // (enroll_user hides its ephemeral key, so a persisted-key admin
+        // must be constructed by hand.) The FIDO2 credential (cred_sk)
+        // is separate — it authenticates the ceremony assertion.
+        let rp_id = "dds.local";
+        let admin_ident = Identity::generate("offboard-admin", &mut OsRng);
+        let admin_urn = admin_ident.id.to_urn();
+        let cred_sk = SigningKey::generate(&mut OsRng);
+        let cred_bytes = b"cred-offboard-admin";
+        let attestation = build_packed_self_attestation(rp_id, cred_bytes, &cred_sk, &[0u8; 32]);
+        let cred_id_b64 = URL_SAFE_NO_PAD.encode(cred_bytes);
+        let admin_doc = UserAuthAttestation {
+            credential_id: cred_id_b64.clone(),
+            attestation_object: attestation,
+            client_data_hash: vec![0u8; 32],
+            rp_id: rp_id.into(),
+            user_display_name: "Offboard Admin".into(),
+            authenticator_type: "platform".into(),
+        };
+        let mut admin_payload = svc.make_attest_payload(&admin_ident);
+        admin_doc.embed(&mut admin_payload).unwrap();
+        let admin_attest = Token::sign(admin_payload, &admin_ident.signing_key).unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(admin_attest)
+            .expect("admin attestation");
+        svc.trusted_roots.insert(admin_urn.clone());
+        svc.set_bootstrap_admin_urn(Some(admin_urn.clone()));
+        svc.store_admin_key(&admin_urn, &admin_ident.signing_key)
+            .expect("persist admin key");
+
+        // Enroll the user as a real FIDO2 user so its attestation embeds
+        // a UserAuthAttestation (list_enrolled_users skips plain attests).
+        let user_cred_sk = SigningKey::generate(&mut OsRng);
+        let user_cred_bytes = b"cred-offboard-user";
+        let user_attestation =
+            build_packed_self_attestation(rp_id, user_cred_bytes, &user_cred_sk, &[0u8; 32]);
+        let subject_urn = svc
+            .enroll_user(EnrollUserRequest {
+                label: "offboard-user".into(),
+                credential_id: URL_SAFE_NO_PAD.encode(user_cred_bytes),
+                attestation_object: user_attestation,
+                client_data_hash: vec![0u8; 32],
+                rp_id: rp_id.into(),
+                display_name: "Offboard User".into(),
+                authenticator_type: "platform".into(),
+                challenge_id: None,
+                client_data_json: None,
+            })
+            .expect("user enroll")
+            .urn;
+
+        // Assertion builder — fresh challenge + valid signature each call.
+        let mut n = 0u8;
+        let mut assertion = |svc: &mut LocalService<MemoryBackend>| {
+            n += 1;
+            let ch_id = format!("ch-offb-{n}");
+            let ch_bytes = [0x30 + n; 32];
+            svc.store_mut()
+                .put_challenge(&ch_id, &ch_bytes, now_epoch() + 600)
+                .unwrap();
+            let ch_b64 = URL_SAFE_NO_PAD.encode(ch_bytes);
+            let cdj = format!(
+                r#"{{"type":"webauthn.get","challenge":"{ch_b64}","origin":"https://{rp_id}"}}"#
+            );
+            let cdh = sha2::Sha256::digest(cdj.as_bytes());
+            let auth_data = build_assertion_auth_data(rp_id, n as u32); // flags 0x05 = UP|UV
+            let mut signed = Vec::new();
+            signed.extend_from_slice(&auth_data);
+            signed.extend_from_slice(&cdh);
+            let sig = cred_sk.sign(&signed);
+            (ch_id, cdh.to_vec(), cdj.into_bytes(), auth_data, sig.to_bytes().to_vec())
+        };
+
+        // Approve the user.
+        let (ch_id, cdh, cdj, auth_data, sig) = assertion(&mut svc);
+        svc.admin_vouch(AdminVouchRequest {
+            subject_urn: subject_urn.clone(),
+            credential_id: cred_id_b64.clone(),
+            challenge_id: ch_id,
+            client_data_hash: cdh,
+            client_data_json: Some(cdj),
+            authenticator_data: auth_data,
+            signature: sig,
+            purpose: None, // dds:session
+        })
+        .expect("vouch");
+
+        // User is now visible + vouched, not revoked.
+        let listed = svc.list_enrolled_users("", false).unwrap();
+        let u = listed.iter().find(|u| u.subject_urn == subject_urn).unwrap();
+        assert!(
+            u.vouched && !u.revoked,
+            "user approved and active (vouched={}, revoked={})",
+            u.vouched,
+            u.revoked
+        );
+
+        // Offboard: revoke the admin's vouches for the subject.
+        let (ch_id, cdh, cdj, auth_data, sig) = assertion(&mut svc);
+        let r = svc
+            .admin_revoke_vouch(AdminRevokeVouchRequest {
+                subject_urn: subject_urn.clone(),
+                credential_id: cred_id_b64.clone(),
+                challenge_id: ch_id,
+                client_data_hash: cdh,
+                client_data_json: Some(cdj),
+                authenticator_data: auth_data,
+                signature: sig,
+                purpose: None,
+            })
+            .expect("revoke-vouch");
+        assert_eq!(r.revoked.len(), 1, "one vouch revoked");
+        assert!(r.foreign.is_empty(), "no foreign vouches");
+        assert!(!r.revoke_tokens.is_empty(), "revoke token minted for gossip");
+
+        // Default listing hides the offboarded user; include_revoked shows it.
+        let default_list = svc.list_enrolled_users("", false).unwrap();
+        assert!(
+            !default_list.iter().any(|u| u.subject_urn == subject_urn),
+            "offboarded user hidden from CP tile view"
+        );
+        let full_list = svc.list_enrolled_users("", true).unwrap();
+        let u = full_list
+            .iter()
+            .find(|u| u.subject_urn == subject_urn)
+            .expect("visible with include_revoked");
+        assert!(u.revoked && !u.vouched, "shows as offboarded");
+
+        // Idempotency: a second revoke finds nothing live to revoke.
+        let (ch_id, cdh, cdj, auth_data, sig) = assertion(&mut svc);
+        let err = svc.admin_revoke_vouch(AdminRevokeVouchRequest {
+            subject_urn: subject_urn.clone(),
+            credential_id: cred_id_b64,
+            challenge_id: ch_id,
+            client_data_hash: cdh,
+            client_data_json: Some(cdj),
+            authenticator_data: auth_data,
+            signature: sig,
+            purpose: None,
+        });
+        assert!(err.is_err(), "nothing left to revoke → error, not a double-revoke");
+    }
+
+    /// `reconcile_trusted_roots` promotes a subject holding a live
+    /// `dds:admin` vouch from a root, and demotes a root whose only
+    /// `dds:admin` vouch was revoked — the cross-node admin
+    /// promotion/demotion propagation the offboarding relies on.
+    #[test]
+    fn reconcile_trusted_roots_promotes_and_demotes() {
+        let (mut svc, admin, _) = setup();
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        svc.set_data_dir(data_dir.path().to_path_buf());
+        svc.set_bootstrap_admin_urn(Some(admin.id.to_urn()));
+
+        // A second identity gets a dds:admin vouch from the bootstrap admin.
+        let admin2 = Identity::generate("admin2", &mut OsRng);
+        let admin2_attest = make_attest_for_publisher_setup(&admin2);
+        let admin2_hash = admin2_attest.payload_hash();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(admin2_attest)
+            .unwrap();
+        let admin_vouch = Token::sign(
+            TokenPayload {
+                iss: admin.id.to_urn(),
+                iss_key: admin.public_key.clone(),
+                jti: "vouch-admin2".into(),
+                sub: admin2.id.to_urn(),
+                kind: TokenKind::Vouch,
+                purpose: Some(dds_core::token::purpose::ADMIN.to_string()),
+                vch_iss: Some(admin2.id.to_urn()),
+                vch_sum: Some(admin2_hash),
+                revokes: None,
+                iat: now_epoch(),
+                exp: Some(now_epoch() + 365 * 86400),
+                body_type: None,
+                body_cbor: None,
+            },
+            &admin.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(admin_vouch)
+            .unwrap();
+
+        assert!(!svc.trusted_roots.contains(&admin2.id.to_urn()));
+        svc.reconcile_trusted_roots();
+        assert!(
+            svc.trusted_roots.contains(&admin2.id.to_urn()),
+            "live dds:admin vouch from a root promotes the subject"
+        );
+
+        // Revoke the dds:admin vouch → reconcile demotes admin2.
+        let revoke = Token::sign(
+            TokenPayload {
+                iss: admin.id.to_urn(),
+                iss_key: admin.public_key.clone(),
+                jti: "revoke-admin2".into(),
+                sub: admin2.id.to_urn(),
+                kind: TokenKind::Revoke,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: Some("vouch-admin2".into()),
+                iat: now_epoch(),
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &admin.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph.write().unwrap().add_token(revoke).unwrap();
+        svc.reconcile_trusted_roots();
+        assert!(
+            !svc.trusted_roots.contains(&admin2.id.to_urn()),
+            "revoked dds:admin vouch demotes the subject"
+        );
+        // The bootstrap admin (no vouch, config-anchored) is never demoted.
+        assert!(svc.trusted_roots.contains(&admin.id.to_urn()));
+    }
+
+    /// Demotion must be **transitive** and must respect **surviving
+    /// co-vouches**: (a) offboarding an admin R also demotes the sub-admin
+    /// S that R promoted (once R leaves the root set, S's vouch-from-R stops
+    /// counting); (b) if a second still-root admin also vouched S, S stays.
+    #[test]
+    fn reconcile_trusted_roots_demotion_is_transitive_and_covouch_aware() {
+        let (mut svc, boot, _) = setup();
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        svc.set_data_dir(data_dir.path().to_path_buf());
+        svc.set_bootstrap_admin_urn(Some(boot.id.to_urn()));
+
+        // Helper: enroll `who` (attestation) + a dds:admin vouch from `by`.
+        let admin_purpose = dds_core::token::purpose::ADMIN;
+        let mut mk_admin_vouch = |svc: &mut LocalService<MemoryBackend>,
+                                  who: &Identity,
+                                  by: &Identity,
+                                  jti: &str,
+                                  enroll: bool| {
+            if enroll {
+                let att = make_attest_for_publisher_setup(who);
+                svc.trust_graph.write().unwrap().add_token(att).unwrap();
+            }
+            let hash = svc
+                .trust_graph
+                .read()
+                .unwrap()
+                .attestations_iter()
+                .find(|t| t.payload.sub == who.id.to_urn())
+                .map(|t| t.payload_hash())
+                .unwrap();
+            let v = Token::sign(
+                TokenPayload {
+                    iss: by.id.to_urn(),
+                    iss_key: by.public_key.clone(),
+                    jti: jti.into(),
+                    sub: who.id.to_urn(),
+                    kind: TokenKind::Vouch,
+                    purpose: Some(admin_purpose.to_string()),
+                    vch_iss: Some(who.id.to_urn()),
+                    vch_sum: Some(hash),
+                    revokes: None,
+                    iat: now_epoch(),
+                    exp: Some(now_epoch() + 365 * 86400),
+                    body_type: None,
+                    body_cbor: None,
+                },
+                &by.signing_key,
+            )
+            .unwrap();
+            svc.trust_graph.write().unwrap().add_token(v).unwrap();
+        };
+
+        // boot → R → S (chain of promotions).
+        let r = Identity::generate("admin-r", &mut OsRng);
+        let s = Identity::generate("admin-s", &mut OsRng);
+        mk_admin_vouch(&mut svc, &r, &boot, "vouch-boot-r", true);
+        svc.reconcile_trusted_roots();
+        assert!(svc.trusted_roots.contains(&r.id.to_urn()), "R promoted by boot");
+        mk_admin_vouch(&mut svc, &s, &r, "vouch-r-s", true);
+        svc.reconcile_trusted_roots();
+        assert!(svc.trusted_roots.contains(&s.id.to_urn()), "S promoted by R");
+
+        // Offboard R: revoke boot's vouch of R. A single reconcile must
+        // cascade — R demoted, and then S demoted (its only vouch was from R).
+        let revoke_r = Token::sign(
+            TokenPayload {
+                iss: boot.id.to_urn(),
+                iss_key: boot.public_key.clone(),
+                jti: "revoke-boot-r".into(),
+                sub: r.id.to_urn(),
+                kind: TokenKind::Revoke,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: Some("vouch-boot-r".into()),
+                iat: now_epoch(),
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &boot.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph.write().unwrap().add_token(revoke_r).unwrap();
+        svc.reconcile_trusted_roots();
+        assert!(!svc.trusted_roots.contains(&r.id.to_urn()), "R demoted");
+        assert!(
+            !svc.trusted_roots.contains(&s.id.to_urn()),
+            "S demoted transitively once R left the root set"
+        );
+
+        // Co-vouch case: boot ALSO vouches S directly, then R's vouch of S
+        // is revoked. S must remain a root (boot's live vouch survives).
+        mk_admin_vouch(&mut svc, &s, &boot, "vouch-boot-s", false);
+        svc.reconcile_trusted_roots();
+        assert!(svc.trusted_roots.contains(&s.id.to_urn()), "S re-promoted by boot");
+        let revoke_rs = Token::sign(
+            TokenPayload {
+                iss: r.id.to_urn(),
+                iss_key: r.public_key.clone(),
+                jti: "revoke-r-s".into(),
+                sub: s.id.to_urn(),
+                kind: TokenKind::Revoke,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: Some("vouch-r-s".into()),
+                iat: now_epoch(),
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &r.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph.write().unwrap().add_token(revoke_rs).unwrap();
+        svc.reconcile_trusted_roots();
+        assert!(
+            svc.trusted_roots.contains(&s.id.to_urn()),
+            "S stays a root: boot's co-vouch is still live"
+        );
     }
 
     #[test]

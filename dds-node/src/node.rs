@@ -151,6 +151,79 @@ pub struct PublishCommand {
     pub respond: tokio::sync::oneshot::Sender<Result<usize, String>>,
 }
 
+/// A request from the HTTP API task asking the swarm event loop to
+/// confirm, against currently-connected admitted peers, that specific
+/// tokens (by JTI) have replicated.
+///
+/// **Replication probe (lifecycle wizards).** The probe rides the
+/// existing anti-entropy sync protocol with no wire change: we send
+/// each queried peer a [`SyncRequest`] whose `known_op_ids` is our full
+/// DAG set *minus* the synthetic op ids of the probed JTIs
+/// (`op-<jti>`, see [`synthetic_op_for_token`]). A responder that has
+/// the token returns its payload (it believes we're missing it); a
+/// responder that doesn't, doesn't. Works against peers running older
+/// builds because the responder side is untouched.
+pub struct ProbeCommand {
+    /// Token JTIs to confirm on peers.
+    pub jtis: Vec<String>,
+    /// Result channel. `ProbeReport` is returned even when no peer is
+    /// reachable (`peers_queried` empty) so callers can distinguish
+    /// "confirmed", "denied", and "nobody to ask".
+    pub respond: tokio::sync::oneshot::Sender<ProbeReport>,
+}
+
+/// Outcome of a replication probe against the currently-connected
+/// admitted peers.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProbeReport {
+    /// Number of peers currently connected AND admitted.
+    pub admitted_connected: usize,
+    /// Per-peer probe outcomes (up to [`PROBE_MAX_PEERS`] peers).
+    pub results: Vec<PeerProbeResult>,
+}
+
+/// One peer's answer to a replication probe.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerProbeResult {
+    /// Stringified libp2p PeerId of the queried peer.
+    pub peer_id: String,
+    /// JTIs (of those probed) this peer proved it has.
+    pub present_jtis: Vec<String>,
+    /// The responder's `complete` flag. When `false` the response was
+    /// truncated by the H-11 caps, so a probed JTI missing from
+    /// `present_jtis` is *inconclusive* rather than absent.
+    pub complete: bool,
+    /// Set when the request failed outright (outbound failure or
+    /// timeout) — `present_jtis` is meaningless in that case.
+    pub error: Option<String>,
+}
+
+/// In-flight aggregation state for one [`ProbeCommand`].
+struct ProbeAgg {
+    /// JTIs being probed.
+    targets: Vec<String>,
+    /// Outstanding request count (drops to 0 → respond).
+    outstanding: usize,
+    /// Accumulated per-peer results.
+    results: Vec<PeerProbeResult>,
+    /// Snapshot of admitted+connected peer count at launch.
+    admitted_connected: usize,
+    /// Response channel (Some until consumed).
+    respond: Option<tokio::sync::oneshot::Sender<ProbeReport>>,
+    /// Give-up deadline; expired probes respond with what they have.
+    deadline: std::time::Instant,
+}
+
+/// Max peers queried per replication probe. Confirmation from one
+/// independent peer is the product requirement; three bounds the fan-out
+/// while tolerating one slow/stale peer.
+const PROBE_MAX_PEERS: usize = 3;
+
+/// Per-probe give-up deadline. Sync request-response round trips are
+/// sub-second on a LAN; 8s tolerates a WAN peer without making the
+/// console wizard feel hung.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// The running DDS node state.
 ///
 /// `trust_graph` is shared (`Arc<RwLock<TrustGraph>>`) so the swarm event
@@ -325,6 +398,22 @@ pub struct DdsNode {
     /// `POST /v1/policy/publish` and are applied + gossiped by
     /// [`Self::apply_local_publish`].
     publish_rx: tokio::sync::mpsc::Receiver<PublishCommand>,
+    /// **Replication probe** — sender side of the [`ProbeCommand`]
+    /// channel. Retained (like `publish_tx`) so the `run()` arm never
+    /// sees a closed channel.
+    probe_tx: tokio::sync::mpsc::Sender<ProbeCommand>,
+    /// Receiver side of the [`ProbeCommand`] channel, drained in `run()`.
+    /// `GET /v1/replication/confirm` lands here.
+    probe_rx: tokio::sync::mpsc::Receiver<ProbeCommand>,
+    /// In-flight probe requests: sync-protocol outbound request id →
+    /// (probe sequence number, queried peer). Consulted by
+    /// [`Self::handle_sync_event`]'s Response/OutboundFailure arms to
+    /// divert probe traffic away from the normal anti-entropy apply path.
+    probe_pending: BTreeMap<libp2p::request_response::OutboundRequestId, (u64, PeerId)>,
+    /// In-flight probe aggregations, keyed by probe sequence number.
+    probes: BTreeMap<u64, ProbeAgg>,
+    /// Monotonic probe sequence counter.
+    probe_seq: u64,
     /// **NET-REDIAL-1**: parsed bootstrap peer addresses (peer_id +
     /// multiaddr with /p2p/ suffix) retained so the periodic redial
     /// timer can call `swarm.dial()` without re-parsing the config
@@ -492,7 +581,7 @@ impl DdsNode {
 
         // Verify the admission certificate before doing anything else.
         let admission_path = config.admission_path();
-        let cert = crate::domain_store::load_admission_cert(&admission_path).map_err(|e| {
+        let mut cert = crate::domain_store::load_admission_cert(&admission_path).map_err(|e| {
             format!(
                 "failed to load admission cert from {}: {e} — \
                  a node cannot join a domain without an admission cert signed by the domain key",
@@ -618,6 +707,56 @@ impl DdsNode {
         // non-zero from the first Prometheus scrape after init.
         crate::telemetry::record_pq_epoch_id(epoch_keys.my_current_epoch().0);
 
+        // **PQ-DEFAULT-2 self-repair** — when `enc-v3` is active every
+        // peer encrypts gossip/sync under its epoch key, and epoch keys
+        // are released to us encapsulated to OUR cert's `pq_kem_pubkey`.
+        // If the cert's KEM pubkey is ABSENT (cert issued without
+        // `--kem-pubkey`) or STALE (the epoch-key store was regenerated
+        // — e.g. `epoch_keys.cbor` lost/restored — so our live keypair
+        // no longer matches what the cert advertises), peers encapsulate
+        // to a key we can't decap and this node silently drops 100% of
+        // inbound encrypted traffic. `pq_kem_pubkey` is advertised
+        // transport material outside the signed `AdmissionBody`, so the
+        // node can (re)attach its own live KEM pubkey without the domain
+        // key — the domain signatures stay valid. Persist so the repair
+        // survives restarts; peers pick it up on their next H-12
+        // handshake.
+        //
+        // The trigger is `enc-v3` capability, NOT domain hybrid-ness:
+        // `capabilities` defaults to `["enc-v3"]` (PQ-by-default), so a
+        // legacy NON-hybrid domain (no `pq_pubkey`, Ed25519-only signing)
+        // still encrypts gossip and still needs a cert KEM pubkey — the
+        // per-node epoch KEM keypair exists regardless of the domain
+        // signing key. Gating on `is_hybrid()` missed exactly this case
+        // (observed on `acme.corp`: non-hybrid domain, enc-v3 on by
+        // default, certs minted without a KEM pubkey). Operators who
+        // want plaintext gossip set `capabilities = []` explicitly, which
+        // turns this off.
+        if domain.has_capability(dds_domain::domain::CAPABILITY_ENC_V3) {
+            let live_kem = epoch_keys.kem_public().to_bytes();
+            let cert_matches = cert.pq_kem_pubkey.as_deref() == Some(live_kem.as_slice());
+            if !cert_matches {
+                let was_absent = cert.pq_kem_pubkey.is_none();
+                cert.pq_kem_pubkey = Some(live_kem);
+                match crate::domain_store::save_admission_cert(&admission_path, &cert) {
+                    Ok(()) => info!(
+                        path = %admission_path.display(),
+                        was_absent,
+                        hybrid = domain.is_hybrid(),
+                        "admission cert pq_kem_pubkey was missing or stale while enc-v3 is \
+                         active — attached our live KEM pubkey so peers can deliver epoch keys \
+                         (effective at their next handshake)"
+                    ),
+                    Err(e) => warn!(
+                        path = %admission_path.display(),
+                        error = %e,
+                        "failed to persist admission cert with attached pq_kem_pubkey — \
+                         repair applies to this run only"
+                    ),
+                }
+            }
+        }
+
         // **Z-2 / Phase A2/A4** — load or create the admission key using the
         // backend selected by `config.network.admission_key_backend`.
         // Software backend: Ed25519 key at `<data_dir>/admission_key.bin`.
@@ -682,6 +821,9 @@ impl DdsNode {
         // so the channel stays open for the lifetime of the node.
         let (publish_tx, publish_rx) = tokio::sync::mpsc::channel::<PublishCommand>(64);
 
+        // Replication-probe command channel (same sizing rationale).
+        let (probe_tx, probe_rx) = tokio::sync::mpsc::channel::<ProbeCommand>(64);
+
         // Create topics for the (domain, org) pair.
         let topics = DdsTopic::for_domain_org(&domain_id.protocol_tag(), &config.org_hash);
 
@@ -744,6 +886,11 @@ impl DdsNode {
             manual_rotate: Arc::new(tokio::sync::Notify::new()),
             publish_tx,
             publish_rx,
+            probe_tx,
+            probe_rx,
+            probe_pending: BTreeMap::new(),
+            probes: BTreeMap::new(),
+            probe_seq: 0,
             bootstrap_addrs,
             p2p_signing_key,
             admission_key_provider,
@@ -880,6 +1027,10 @@ impl DdsNode {
         bootstrap_redial.tick().await; // consume the immediate tick — start first fire after interval
 
         loop {
+            // Snapshot the earliest probe deadline before select! so the
+            // deadline arm doesn't borrow `self` inside the coroutine
+            // (the swarm arm holds the mutable borrow).
+            let probe_deadline = self.earliest_probe_deadline();
             tokio::select! {
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event);
@@ -964,6 +1115,27 @@ impl DdsNode {
                 Some(cmd) = self.publish_rx.recv() => {
                     let result = self.apply_local_publish(cmd.tokens);
                     let _ = cmd.respond.send(result);
+                }
+                // **Replication probe** — `GET /v1/replication/confirm`
+                // queued a probe. Fan a targeted sync request out to up
+                // to PROBE_MAX_PEERS connected admitted peers; responses
+                // are collected in `handle_sync_event`'s probe diversion.
+                Some(cmd) = self.probe_rx.recv() => {
+                    self.start_probe(cmd);
+                }
+                // Probe give-up deadline: like the revocation-rotation
+                // arm, converts the earliest pending probe deadline into
+                // a lazy sleep. Expired probes respond with the partial
+                // results collected so far (missing peers marked timeout).
+                _ = async {
+                    match probe_deadline {
+                        Some(deadline) => tokio::time::sleep_until(
+                            tokio::time::Instant::from_std(deadline)
+                        ).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.expire_probes();
                 }
                 // **NET-REDIAL-1**: re-dial bootstrap peers when orphaned.
                 // Fires every BOOTSTRAP_REDIAL_INTERVAL; is a no-op when
@@ -1470,6 +1642,15 @@ impl DdsNode {
                     &peer_id,
                     epoch_key_releases_from_response,
                 );
+                // **PQ-DEFAULT-2 / B.5 follow-up** — the H-12
+                // piggy-back only covers the responder side, and on a
+                // first-ever mutual handshake both responders race to
+                // "no cached cert → empty releases". Now that this
+                // peer's cert is verified and cached, deterministically
+                // push our current epoch-key release to them and pull
+                // theirs if we don't hold one — one round on the
+                // existing B.9 wire.
+                self.exchange_epoch_keys_after_admission(peer_id);
                 // Now that we've verified the peer belongs to our
                 // domain, kick off an opportunistic sync.
                 self.try_sync_with(peer_id);
@@ -1967,6 +2148,14 @@ impl DdsNode {
         self.publish_tx.clone()
     }
 
+    /// Hand out a [`ProbeCommand`] sender clone for the HTTP API task,
+    /// mirroring [`Self::publish_sender`]. `main.rs` clones this before
+    /// spawning `http::serve` so `GET /v1/replication/confirm` can ask
+    /// the swarm-owning `run()` loop to probe peers.
+    pub fn probe_sender(&self) -> tokio::sync::mpsc::Sender<ProbeCommand> {
+        self.probe_tx.clone()
+    }
+
     /// Apply a batch of locally-authored, already-signed tokens to the
     /// shared trust graph + store and gossip each on the Operations topic.
     ///
@@ -2024,6 +2213,9 @@ impl DdsNode {
         if let Err(e) = self.store.put_token(&token) {
             error!("local publish: store put_token error: {e}");
         }
+        // Graph accepted the token — fold any dds:admin promotion or
+        // demotion into the swarm task's trusted_roots copy.
+        self.reconcile_roots_after_token(&token);
         let op = synthetic_op_for_token(&token);
         let op_id = op.id.clone();
         let op_for_cache = op.clone();
@@ -2081,6 +2273,77 @@ impl DdsNode {
             true
         } else {
             false
+        }
+    }
+
+    /// Track replicated admin promotion/demotion in the swarm task's
+    /// own `trusted_roots` copy (which gates C-3 publisher-capability
+    /// checks). In-memory only: durable persistence of `trusted_roots`
+    /// is owned by `LocalService::reconcile_trusted_roots`, which runs
+    /// the same rules against the shared graph on the API side — two
+    /// writers to node.toml would race.
+    ///
+    /// Called with every token the trust graph ACCEPTED (gossip ingest,
+    /// anti-entropy sync, and local publish), so the H-1/duplicate
+    /// gates already ran.
+    fn reconcile_roots_after_token(&mut self, token: &Token) {
+        let admin_purpose = dds_core::token::purpose::ADMIN;
+        match token.payload.kind {
+            TokenKind::Vouch => {
+                if token.payload.purpose.as_deref() == Some(admin_purpose)
+                    && self.trusted_roots.contains(&token.payload.iss)
+                    && self.trusted_roots.insert(token.payload.sub.clone())
+                {
+                    info!(
+                        subject = %token.payload.sub,
+                        voucher = %token.payload.iss,
+                        "ingest: promoted dds:admin vouch subject to trusted_roots (in-memory)"
+                    );
+                }
+            }
+            TokenKind::Revoke => {
+                let Some(target_jti) = token.payload.revokes.as_deref() else {
+                    return;
+                };
+                let demote: Option<String> = {
+                    let g = self.trust_graph.read().expect("trust_graph poisoned");
+                    match g.vouch_by_jti(target_jti) {
+                        Some(v) if v.payload.purpose.as_deref() == Some(admin_purpose) => {
+                            let sub = v.payload.sub.clone();
+                            // Only demote when NO live dds:admin vouch
+                            // remains for the subject, and never demote
+                            // the config-anchored bootstrap admin.
+                            let is_bootstrap = self
+                                .config
+                                .bootstrap_admin_urn
+                                .as_deref()
+                                .map(|b| b == sub)
+                                .unwrap_or(false);
+                            let still_vouched =
+                                g.vouch_summaries_for_subject(&sub).iter().any(|s| {
+                                    s.purpose.as_deref() == Some(admin_purpose)
+                                        && !s.revoked
+                                        && !s.expired
+                                });
+                            if !is_bootstrap && !still_vouched {
+                                Some(sub)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(sub) = demote {
+                    if self.trusted_roots.remove(&sub) {
+                        info!(
+                            subject = %sub,
+                            "ingest: demoted subject from trusted_roots (dds:admin vouch revoked, in-memory)"
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2177,6 +2440,9 @@ impl DdsNode {
         if let Err(e) = self.store.put_token(&token) {
             error!("store error: {e}");
         }
+        // Graph accepted the token — fold any dds:admin promotion or
+        // demotion into the swarm task's trusted_roots copy.
+        self.reconcile_roots_after_token(&token);
         let op_id = op.id.clone();
         let op_for_cache = op.clone();
         match self.dag.insert(op) {
@@ -2501,7 +2767,74 @@ impl DdsNode {
             self.cache_sync_payload(&id, &op, &token_bytes);
         }
 
+        // **Divergence repair.** Older builds' anti-entropy path stored
+        // the token but never persisted its operation, so a token that
+        // arrived via sync had no entry in `operation_ids` — the DAG
+        // rebuild above missed it while the trust graph (rehydrated from
+        // tokens) held it, and the node re-requested that op every
+        // anti-entropy round forever (err_count=1 loop). Reconcile here
+        // from LOCAL trusted store state only: for every stored token
+        // whose canonical `op-<jti>` is absent from the DAG, synthesize
+        // + insert + persist it. This uses no peer input and never runs
+        // the R5 self-update quorum path, so it cannot re-credit a
+        // self-update. Current builds also persist sync-accepted ops, so
+        // this is a one-time heal for state left by prior versions.
+        self.reconcile_missing_operations();
+
         info!(seeded = self.dag.len(), "seeded DAG from operation store");
+    }
+
+    /// Ensure every stored token has its canonical `op-<jti>` operation
+    /// materialized in the DAG and persisted. See the call site in
+    /// [`Self::seed_dag_from_store`] for the divergence this repairs.
+    fn reconcile_missing_operations(&mut self) {
+        let jtis = match self.store.list_tokens(None) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!("reconcile_missing_operations: list_tokens: {e}");
+                return;
+            }
+        };
+        let mut repaired = 0usize;
+        for jti in jtis {
+            let op_id = format!("op-{jti}");
+            if self.dag.get(&op_id).is_some() {
+                continue;
+            }
+            let token = match self.store.get_token(&jti) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("reconcile_missing_operations: get_token {jti}: {e}");
+                    continue;
+                }
+            };
+            let op = synthetic_op_for_token(&token);
+            let token_bytes = match token.to_cbor() {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("reconcile_missing_operations: to_cbor {jti}: {e}");
+                    continue;
+                }
+            };
+            match self.dag.insert(op.clone()) {
+                Ok(true) => {
+                    if let Err(e) = self.store.put_operation(&op) {
+                        warn!("reconcile_missing_operations: put_operation {op_id}: {e}");
+                    }
+                    self.cache_sync_payload(&op_id, &op, &token_bytes);
+                    repaired += 1;
+                }
+                Ok(false) => {}
+                Err(e) => warn!("reconcile_missing_operations: dag insert {op_id}: {e}"),
+            }
+        }
+        if repaired > 0 {
+            info!(
+                repaired,
+                "reconciled stored tokens whose operation was missing from the DAG \
+                 (older-build sync divergence)"
+            );
+        }
     }
 
     fn ingest_revocation(&mut self, token_bytes: &[u8]) {
@@ -2936,6 +3269,203 @@ impl DdsNode {
         }
     }
 
+    // ---------- replication probe (lifecycle wizards) ----------
+
+    /// Launch a replication probe: ask up to [`PROBE_MAX_PEERS`]
+    /// connected admitted peers whether they hold the probed JTIs, by
+    /// sending each a [`SyncRequest`] that omits the corresponding
+    /// synthetic op ids from `known_op_ids`. A peer that has a probed
+    /// token offers its payload back; the offer is the confirmation.
+    ///
+    /// Responds immediately with an empty report when no admitted peer
+    /// is connected — the caller distinguishes "no peer visible" from
+    /// "peer denied" via `admitted_connected`.
+    fn start_probe(&mut self, cmd: ProbeCommand) {
+        let peers: Vec<PeerId> = self
+            .swarm
+            .connected_peers()
+            .copied()
+            .filter(|p| self.admitted_peers.contains(p))
+            .collect();
+        let admitted_connected = peers.len();
+        if peers.is_empty() {
+            let _ = cmd.respond.send(ProbeReport {
+                admitted_connected: 0,
+                results: Vec::new(),
+            });
+            return;
+        }
+        let target_op_ids: BTreeSet<String> = cmd
+            .jtis
+            .iter()
+            .map(|jti| format!("op-{jti}"))
+            .collect();
+        // Advertise everything we have EXCEPT the probed ops. Do NOT
+        // touch `sync_last_outbound` — probes must neither consume nor
+        // reset the anti-entropy cooldown.
+        let known: BTreeSet<String> = self
+            .dag
+            .operation_ids()
+            .into_iter()
+            .filter(|id| !target_op_ids.contains(id))
+            .collect();
+        let seq = self.probe_seq;
+        self.probe_seq += 1;
+        let mut outstanding = 0usize;
+        for peer in peers.into_iter().take(PROBE_MAX_PEERS) {
+            let req = SyncRequest {
+                known_op_ids: known.clone(),
+                heads: self.dag.heads().clone(),
+            };
+            let req_id = self.swarm.behaviour_mut().sync.send_request(&peer, req);
+            self.probe_pending.insert(req_id, (seq, peer));
+            outstanding += 1;
+        }
+        debug!(seq, outstanding, targets = ?cmd.jtis, "replication probe launched");
+        self.probes.insert(
+            seq,
+            ProbeAgg {
+                targets: cmd.jtis,
+                outstanding,
+                results: Vec::new(),
+                admitted_connected,
+                respond: Some(cmd.respond),
+                deadline: std::time::Instant::now() + PROBE_TIMEOUT,
+            },
+        );
+    }
+
+    /// Consume a sync response that belongs to a pending probe.
+    /// Deliberately does NOT feed the payloads through the anti-entropy
+    /// apply path: we already hold every probed token, and re-applying
+    /// would tick the B-1 duplicate-JTI replay counters on every wizard
+    /// confirmation.
+    fn handle_probe_response(
+        &mut self,
+        peer: PeerId,
+        request_id: libp2p::request_response::OutboundRequestId,
+        resp: SyncResponse,
+    ) {
+        let Some((seq, _)) = self.probe_pending.remove(&request_id) else {
+            return;
+        };
+        let complete = resp.complete;
+        let (payloads, dropped) = self.decrypt_sync_payloads(peer, resp);
+        let mut present: BTreeSet<String> = BTreeSet::new();
+        for p in &payloads {
+            if let Ok(token) = Token::from_cbor(&p.token_bytes) {
+                present.insert(token.payload.jti.clone());
+            }
+        }
+        if let Some(agg) = self.probes.get_mut(&seq) {
+            let result = probe_result_from_response(
+                &peer.to_string(),
+                &agg.targets,
+                &present,
+                dropped,
+                complete,
+            );
+            if let Some(err) = result.error.as_deref() {
+                warn!(%peer, dropped, err, "replication probe: inconclusive peer response");
+            }
+            agg.results.push(result);
+            agg.outstanding = agg.outstanding.saturating_sub(1);
+        }
+        self.maybe_finish_probe(seq);
+    }
+
+    /// Record an outbound failure against a pending probe request.
+    /// Returns `true` when the request id belonged to a probe.
+    fn probe_note_failure(
+        &mut self,
+        request_id: libp2p::request_response::OutboundRequestId,
+        peer: PeerId,
+        error: String,
+    ) -> bool {
+        let Some((seq, _)) = self.probe_pending.remove(&request_id) else {
+            return false;
+        };
+        if let Some(agg) = self.probes.get_mut(&seq) {
+            agg.results.push(PeerProbeResult {
+                peer_id: peer.to_string(),
+                present_jtis: Vec::new(),
+                complete: false,
+                error: Some(error),
+            });
+            agg.outstanding = agg.outstanding.saturating_sub(1);
+        }
+        self.maybe_finish_probe(seq);
+        true
+    }
+
+    /// Respond and drop a probe whose outstanding count reached zero.
+    fn maybe_finish_probe(&mut self, seq: u64) {
+        let done = self
+            .probes
+            .get(&seq)
+            .map(|a| a.outstanding == 0)
+            .unwrap_or(false);
+        if !done {
+            return;
+        }
+        if let Some(mut agg) = self.probes.remove(&seq) {
+            if let Some(tx) = agg.respond.take() {
+                let _ = tx.send(ProbeReport {
+                    admitted_connected: agg.admitted_connected,
+                    results: agg.results,
+                });
+            }
+        }
+    }
+
+    /// Earliest give-up deadline across in-flight probes, for the
+    /// `run()` loop's lazy sleep arm. `None` when no probe is pending.
+    fn earliest_probe_deadline(&self) -> Option<std::time::Instant> {
+        self.probes.values().map(|a| a.deadline).min()
+    }
+
+    /// Respond (with whatever arrived) for every probe past its
+    /// deadline, marking still-outstanding peers as timed out.
+    fn expire_probes(&mut self) {
+        let now = std::time::Instant::now();
+        let expired: Vec<u64> = self
+            .probes
+            .iter()
+            .filter(|(_, a)| a.deadline <= now)
+            .map(|(s, _)| *s)
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        let mut timed_out: Vec<(u64, PeerId)> = Vec::new();
+        self.probe_pending.retain(|_, (s, p)| {
+            if expired.contains(s) {
+                timed_out.push((*s, *p));
+                false
+            } else {
+                true
+            }
+        });
+        for seq in expired {
+            if let Some(mut agg) = self.probes.remove(&seq) {
+                for (_, peer) in timed_out.iter().filter(|(s, _)| *s == seq) {
+                    agg.results.push(PeerProbeResult {
+                        peer_id: peer.to_string(),
+                        present_jtis: Vec::new(),
+                        complete: false,
+                        error: Some("timeout".to_string()),
+                    });
+                }
+                if let Some(tx) = agg.respond.take() {
+                    let _ = tx.send(ProbeReport {
+                        admitted_connected: agg.admitted_connected,
+                        results: agg.results,
+                    });
+                }
+            }
+        }
+    }
+
     /// Send a sync request to a peer, respecting the per-peer cooldown.
     /// No-op if the peer was contacted within `SYNC_PER_PEER_COOLDOWN`.
     fn try_sync_with(&mut self, peer: PeerId) {
@@ -3018,6 +3548,57 @@ impl DdsNode {
             .insert(publisher_id.to_string(), now);
         crate::telemetry::record_pq_release_request("sent");
         debug!(publisher = %publisher_id, "epoch-key request: sent late-join recovery request");
+    }
+
+    /// **PQ-DEFAULT-2 / B.5 follow-up** — deterministic bidirectional
+    /// epoch-key establishment right after we admit a peer:
+    ///
+    /// - *push*: mint our current epoch-key release for the peer
+    ///   (their freshly-cached cert supplies the KEM pubkey) and ship
+    ///   it in `outbound_releases` (the B.9 rotation fan-out wire);
+    /// - *pull*: list the peer in `publishers` when we don't hold a
+    ///   release from them yet.
+    ///
+    /// This closes the mutual-first-contact race in the H-12
+    /// piggy-back, where both responders answer before caching the
+    /// requester's cert and ship empty releases: previously one (or
+    /// both) directions stayed dark until a payload was dropped and
+    /// the late-join recovery happened to fire. The request may be
+    /// dropped by a peer that hasn't admitted us yet — harmless,
+    /// because that peer sends its own exchange once it admits us, and
+    /// a single surviving exchange establishes both directions.
+    fn exchange_epoch_keys_after_admission(&mut self, peer: PeerId) {
+        let peer_str = peer.to_string();
+        let outbound_releases = self.epoch_key_releases_for_admission_response(&peer);
+        let need_pull = !self.epoch_keys.has_peer_release(&peer_str);
+        if outbound_releases.is_empty() && !need_pull {
+            return;
+        }
+        let publishers = if need_pull {
+            vec![peer_str.clone()]
+        } else {
+            Vec::new()
+        };
+        let req = EpochKeyRequest {
+            publishers,
+            outbound_releases,
+        };
+        self.swarm.behaviour_mut().epoch_keys.send_request(&peer, req);
+        // Only stamp the pull cooldown when we actually asked for the
+        // peer's key. A push-only exchange (need_pull == false) must not
+        // arm the 30s cooldown, or a subsequent no-key drop's late-join
+        // recovery (`try_epoch_key_request`) would be needlessly
+        // suppressed. If this request is dropped (peer hasn't admitted
+        // us yet), the epoch-keys OutboundFailure arm clears the stamp
+        // so recovery can fire immediately.
+        if need_pull {
+            self.epoch_key_request_last.insert(peer_str, Instant::now());
+        }
+        debug!(
+            %peer,
+            pulled = need_pull,
+            "post-admission epoch-key exchange sent"
+        );
     }
 
     /// **Z-1 Phase B.9** — rotate the local epoch key and fan out new
@@ -3168,10 +3749,42 @@ impl DdsNode {
     /// unchanged when `enc_payloads` is absent (non-`enc-v3` peers,
     /// mixed-fleet window per §4.7).
     fn handle_sync_response(&mut self, peer: PeerId, resp: SyncResponse) {
-        // Resolve the effective payload list.  If `enc_payloads` is
-        // non-empty we decrypt; otherwise fall through to `payloads`.
-        let resp_payloads: Vec<SyncPayload> = if !resp.enc_payloads.is_empty() {
+        let complete = resp.complete;
+        let (resp_payloads, _dropped) = self.decrypt_sync_payloads(peer, resp);
+
+        if resp_payloads.is_empty() {
+            debug!(%peer, "sync: peer reported no diff");
+            return;
+        }
+
+        // Shadow `resp` so the existing pipeline below is unchanged.
+        let resp = SyncResponse {
+            payloads: resp_payloads,
+            complete,
+            enc_payloads: Vec::new(),
+        };
+        self.apply_decrypted_sync_response(peer, resp);
+    }
+
+    /// Resolve a sync response's effective payload list. If
+    /// `enc_payloads` is non-empty (enc-v3 domains) each envelope is
+    /// AEAD-decrypted under the responder's cached epoch key; otherwise
+    /// the plaintext `payloads` pass through. Shared by the anti-entropy
+    /// pull path and the replication probe.
+    ///
+    /// Returns `(payloads, dropped)` where `dropped` counts encrypted
+    /// entries that could not be decoded/decrypted (usually: we don't
+    /// hold the responder's epoch key yet). The probe path uses the
+    /// count to report "inconclusive" instead of a false "peer doesn't
+    /// have it".
+    fn decrypt_sync_payloads(
+        &mut self,
+        peer: PeerId,
+        resp: SyncResponse,
+    ) -> (Vec<SyncPayload>, usize) {
+        if !resp.enc_payloads.is_empty() {
             let responder_str = peer.to_string();
+            let total = resp.enc_payloads.len();
             let mut decrypted: Vec<SyncPayload> = Vec::with_capacity(resp.enc_payloads.len());
             for blob in &resp.enc_payloads {
                 let env = match SyncEnvelopeV3::from_cbor(blob) {
@@ -3228,23 +3841,18 @@ impl DdsNode {
                     }
                 }
             }
-            decrypted
+            let dropped = total - decrypted.len();
+            (decrypted, dropped)
         } else {
-            resp.payloads
-        };
-
-        if resp_payloads.is_empty() {
-            debug!(%peer, "sync: peer reported no diff");
-            return;
+            (resp.payloads, 0)
         }
+    }
 
-        // Shadow `resp` so the existing pipeline below is unchanged.
-        let resp = SyncResponse {
-            payloads: resp_payloads,
-            complete: resp.complete,
-            enc_payloads: Vec::new(),
-        };
-
+    /// Apply a plaintext sync response through the C-3 capability filter
+    /// and the graph-backed apply pipeline. Split from
+    /// [`Self::handle_sync_response`] so the decrypt step is reusable by
+    /// the replication probe.
+    fn apply_decrypted_sync_response(&mut self, peer: PeerId, resp: SyncResponse) {
         if resp.payloads.is_empty() {
             debug!(%peer, "sync: peer reported no diff");
             return;
@@ -3443,6 +4051,10 @@ impl DdsNode {
                     {
                         self.check_self_update_quorum_and_maybe_apply(&token);
                     }
+                    // Same roots bookkeeping as the gossip ingest path:
+                    // a dds:admin vouch/revoke that arrived purely via
+                    // anti-entropy must also promote/demote here.
+                    self.reconcile_roots_after_token(&token);
                 }
             }
         }
@@ -3475,6 +4087,19 @@ impl DdsNode {
             err_count = result.errors.len(),
             "sync: applied response"
         );
+        // A bare err_count is undiagnosable from logs (a payload that
+        // fails apply every anti-entropy round shows as an eternal
+        // err_count=1 with no cause). Surface the first few actual
+        // errors at warn.
+        if !result.errors.is_empty() {
+            let sample: Vec<&str> = result
+                .errors
+                .iter()
+                .take(3)
+                .map(|e| e.as_str())
+                .collect();
+            warn!(%peer, errors = ?sample, "sync: payload apply errors (first 3)");
+        }
     }
 
     /// Handle one libp2p `request_response` event for the sync protocol.
@@ -3495,7 +4120,11 @@ impl DdsNode {
                         return;
                     }
                     let response = self.build_sync_response(&request);
+                    // On enc-v3 domains the payloads ride
+                    // `enc_payloads`; log both counts so a served
+                    // encrypted diff doesn't read as "served nothing".
                     let payload_count = response.payloads.len();
+                    let enc_count = response.enc_payloads.len();
                     if self
                         .swarm
                         .behaviour_mut()
@@ -3506,25 +4135,46 @@ impl DdsNode {
                         warn!(%peer, "sync: failed to send response (channel closed)");
                         crate::telemetry::record_sync_serve("channel_closed");
                     } else {
-                        debug!(%peer, payload_count, "sync: served request");
+                        debug!(%peer, payload_count, enc_count, "sync: served request");
                         crate::telemetry::record_sync_serve("ok");
                     }
                 }
-                RrMessage::Response { response, .. } => {
+                RrMessage::Response {
+                    request_id,
+                    response,
+                } => {
                     // H-12: ignore sync responses from unadmitted
                     // peers — their payloads could carry unauthorised
                     // state. Without admission we can't trust the
-                    // peer belongs to our domain.
+                    // peer belongs to our domain. A pending probe row
+                    // for such a peer is resolved by the probe timeout.
                     if !self.admitted_peers.contains(&peer) {
                         debug!(%peer, "H-12: dropping sync response from unadmitted peer");
                         crate::telemetry::record_sync_pull("fail");
+                        return;
+                    }
+                    // Replication-probe diversion: a probe's response
+                    // must not enter the anti-entropy apply path (we
+                    // already hold the probed tokens; re-applying would
+                    // tick the B-1 replay counters).
+                    if self.probe_pending.contains_key(&request_id) {
+                        self.handle_probe_response(peer, request_id, response);
                         return;
                     }
                     self.handle_sync_response(peer, response);
                     crate::telemetry::record_sync_pull("ok");
                 }
             },
-            RrEvent::OutboundFailure { peer, error, .. } => {
+            RrEvent::OutboundFailure {
+                peer,
+                error,
+                request_id,
+                ..
+            } => {
+                if self.probe_note_failure(request_id, peer, error.to_string()) {
+                    debug!(%peer, %error, "replication probe: outbound failure");
+                    return;
+                }
                 debug!(%peer, %error, "sync: outbound failure");
                 crate::telemetry::record_sync_pull("fail");
             }
@@ -3617,6 +4267,12 @@ impl DdsNode {
                 }
             },
             RrEvent::OutboundFailure { peer, error, .. } => {
+                // Clear any pull cooldown we stamped for this peer: the
+                // request didn't land (e.g. the peer hasn't admitted us
+                // yet, so it dropped our epoch-key channel), and holding
+                // the 30s stamp would suppress the next no-key-driven
+                // late-join recovery (`try_epoch_key_request`).
+                self.epoch_key_request_last.remove(&peer.to_string());
                 debug!(%peer, %error, "Phase B.5: epoch-key outbound failure");
             }
             RrEvent::InboundFailure { peer, error, .. } => {
@@ -3683,7 +4339,7 @@ impl DdsNode {
             Some(bytes) => match dds_core::crypto::kem::HybridKemPublicKey::from_bytes(bytes) {
                 Ok(pk) => pk,
                 Err(_) => {
-                    debug!(
+                    warn!(
                         peer = %requester,
                         "Phase B.7: cached requester KEM pubkey is malformed — empty response"
                     );
@@ -3692,9 +4348,15 @@ impl DdsNode {
                 }
             },
             None => {
-                debug!(
+                // warn, not debug: the requester explicitly asked for
+                // our epoch key and we can't honor it — usually their
+                // admission cert was issued without `--kem-pubkey`
+                // (their node self-repairs the cert at next start, but
+                // the operator should know why coverage is 0% now).
+                warn!(
                     peer = %requester,
-                    "Phase B.7: requester has no cached KEM pubkey — empty response"
+                    "Phase B.7: requester has no cached KEM pubkey (cert issued without \
+                     --kem-pubkey?) — empty response"
                 );
                 crate::telemetry::record_pq_releases_emitted("no_kem_pk");
                 return EpochKeyResponse::default();
@@ -4411,6 +5073,47 @@ fn rejected_action_for(kind: &TokenKind) -> &'static str {
 /// the token's JTI ensures the publisher and any relay node compute
 /// the same cache key, so the responder's `known_op_ids` filter
 /// correctly dedupes when the requester already has the token.
+/// Build one peer's [`PeerProbeResult`] from a decrypted probe
+/// response. Pure so the decision table is unit-testable without a
+/// libp2p session.
+///
+/// Honesty rule (PQ-DEFAULT-2 follow-up): a probed JTI counts as
+/// *present* only on positive evidence (its token decrypted and
+/// decoded). Absence is *definitive* only when every returned payload
+/// was readable (`dropped == 0`) and the response wasn't truncated.
+/// When payloads were dropped (usually: the responder's epoch key
+/// isn't cached yet) and not every target was proven present, the
+/// result carries an `error` so callers treat it as inconclusive and
+/// retry — never as "the peer doesn't have it".
+fn probe_result_from_response(
+    peer_id: &str,
+    targets: &[String],
+    present: &BTreeSet<String>,
+    dropped: usize,
+    complete: bool,
+) -> PeerProbeResult {
+    let present_jtis: Vec<String> = targets
+        .iter()
+        .filter(|j| present.contains(j.as_str()))
+        .cloned()
+        .collect();
+    let all_present = present_jtis.len() == targets.len();
+    let error = if dropped > 0 && !all_present {
+        Some(format!(
+            "{dropped} sync payload(s) from this peer could not be decrypted \
+             (epoch key not yet exchanged) — absence is inconclusive, retry shortly"
+        ))
+    } else {
+        None
+    };
+    PeerProbeResult {
+        peer_id: peer_id.to_string(),
+        present_jtis,
+        complete: complete && dropped == 0,
+        error,
+    }
+}
+
 fn synthetic_op_for_token(token: &Token) -> Operation {
     Operation {
         id: format!("op-{}", token.payload.jti),
@@ -6163,5 +6866,129 @@ mod r5_sync_quorum_replay_tests {
                  credited toward quorum (AUDIT-2026-06-12 R5)"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod probe_honesty_and_kem_repair_tests {
+    //! **PQ-DEFAULT-2 follow-up** — regression coverage for the two
+    //! defects behind the `/v1/replication/confirm` false negative:
+    //!
+    //! 1. `probe_result_from_response` must never convert an
+    //!    undecryptable sync payload into a definitive "peer doesn't
+    //!    hold the token" (the enc-v3 epoch-key gap made every probe
+    //!    against a not-yet-keyed peer report `complete=true` with an
+    //!    empty `present_jtis`).
+    //! 2. Attaching a node's own KEM pubkey to an admission cert that
+    //!    was issued without `--kem-pubkey` must keep the domain
+    //!    signatures valid — `pq_kem_pubkey` lives outside the signed
+    //!    `AdmissionBody`, which is what makes the startup self-repair
+    //!    possible without the domain key.
+
+    use super::*;
+    use rand::rngs::OsRng;
+
+    fn targets(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn present(v: &[&str]) -> BTreeSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn probe_present_without_drops_confirms_and_keeps_complete() {
+        let r = probe_result_from_response("p1", &targets(&["a"]), &present(&["a"]), 0, true);
+        assert_eq!(r.present_jtis, vec!["a".to_string()]);
+        assert!(r.complete);
+        assert!(r.error.is_none());
+    }
+
+    #[test]
+    fn probe_absent_without_drops_is_definitive() {
+        // Every payload was readable and the target still wasn't
+        // offered: that IS evidence of absence — no error.
+        let r = probe_result_from_response("p1", &targets(&["a"]), &present(&[]), 0, true);
+        assert!(r.present_jtis.is_empty());
+        assert!(r.complete);
+        assert!(r.error.is_none());
+    }
+
+    #[test]
+    fn probe_absent_with_drops_is_inconclusive_not_definitive() {
+        // The exact loopback failure: the peer returned the probed
+        // token but we couldn't decrypt it (no epoch key cached).
+        let r = probe_result_from_response("p1", &targets(&["a"]), &present(&[]), 1, true);
+        assert!(r.present_jtis.is_empty());
+        assert!(!r.complete, "dropped payloads must clear `complete`");
+        assert!(
+            r.error.is_some(),
+            "absence with undecryptable payloads must be inconclusive"
+        );
+    }
+
+    #[test]
+    fn probe_all_present_with_drops_still_confirms() {
+        // Positive evidence stands on its own; the dropped entries can
+        // only have been NON-target payloads.
+        let r = probe_result_from_response("p1", &targets(&["a"]), &present(&["a"]), 2, true);
+        assert_eq!(r.present_jtis, vec!["a".to_string()]);
+        assert!(!r.complete);
+        assert!(r.error.is_none());
+    }
+
+    #[test]
+    fn probe_partial_present_with_drops_keeps_positives_and_flags_rest() {
+        let r = probe_result_from_response(
+            "p1",
+            &targets(&["a", "b"]),
+            &present(&["a"]),
+            1,
+            true,
+        );
+        assert_eq!(r.present_jtis, vec!["a".to_string()]);
+        assert!(r.error.is_some(), "missing 'b' may be among the drops");
+    }
+
+    #[test]
+    fn kem_pubkey_attach_preserves_cert_signatures() {
+        let key = dds_domain::DomainKey::generate_hybrid("kemfix.test", &mut OsRng);
+        let domain = key.domain();
+        let mut cert = key.issue_admission_with_kem("peer-kemfix".into(), 0, None, None);
+        assert!(cert.pq_kem_pubkey.is_none());
+        cert.verify_with_domain(&domain, "peer-kemfix", 1)
+            .expect("cert without kem pubkey must verify");
+
+        // The startup self-repair: attach a KEM pubkey after issuance.
+        cert.pq_kem_pubkey = Some(vec![7u8; dds_domain::HYBRID_KEM_PUBKEY_LEN]);
+        cert.verify_with_domain(&domain, "peer-kemfix", 1)
+            .expect("attaching pq_kem_pubkey must not invalidate the domain signatures");
+    }
+
+    #[test]
+    fn non_hybrid_enc_v3_domain_triggers_kem_repair_and_keeps_signatures() {
+        // The acme.corp case: a NON-hybrid (Ed25519-only) domain whose
+        // `capabilities` defaulted to ["enc-v3"]. The self-repair must
+        // key off enc-v3 capability, not is_hybrid() — and attaching a
+        // KEM pubkey to a non-hybrid cert must keep its signature valid.
+        let key = dds_domain::DomainKey::generate("legacy-encv3.test", &mut OsRng);
+        let mut domain = key.domain();
+        assert!(!domain.is_hybrid(), "test setup: domain must be non-hybrid");
+        domain
+            .capabilities
+            .push(dds_domain::domain::CAPABILITY_ENC_V3.to_string());
+        // The exact guard the startup self-repair now uses.
+        assert!(
+            domain.has_capability(dds_domain::domain::CAPABILITY_ENC_V3),
+            "enc-v3 capability must gate the repair even on a non-hybrid domain"
+        );
+
+        let mut cert = key.issue_admission("peer-legacy".into(), 0, None);
+        assert!(cert.pq_kem_pubkey.is_none());
+        cert.verify_with_domain(&domain, "peer-legacy", 1)
+            .expect("baseline non-hybrid cert must verify");
+        cert.pq_kem_pubkey = Some(vec![9u8; dds_domain::HYBRID_KEM_PUBKEY_LEN]);
+        cert.verify_with_domain(&domain, "peer-legacy", 1)
+            .expect("attaching pq_kem_pubkey to a non-hybrid cert must keep signatures valid");
     }
 }

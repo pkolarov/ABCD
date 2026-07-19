@@ -466,6 +466,15 @@ pub fn apply_sync_payloads_with_graph(
         let graph_accepted = match trust_graph.add_token(token.clone()) {
             Ok(()) => true,
             Err(e) => {
+                // A DuplicateJti here means the graph already holds the
+                // token. We deliberately do NOT merge its op on this
+                // path: doing so would let a re-delivered self-update
+                // token re-enter `merged_op_ids` and re-credit the R5
+                // self-update quorum (AUDIT-2026-06-12 R5). The eternal
+                // err_count=1 re-request loop it used to cause is fixed
+                // at the source instead — accepted ops are now PERSISTED
+                // (see the merge loop below) so a restart rebuilds them
+                // into the DAG and the node stops re-requesting them.
                 result.record_reject(classify_trust_error(&e), format!("trust graph add: {e}"));
                 false
             }
@@ -543,6 +552,18 @@ pub fn apply_sync_payloads_with_graph(
                 Ok(true) => {
                     result.ops_merged += 1;
                     result.merged_op_ids.push(op.id.clone());
+                    // Persist the operation, mirroring the gossip-ingest
+                    // path (node.rs put_operation on ingest). Without
+                    // this the sync path stored the token but never the
+                    // op, so after a restart the DAG (rebuilt from
+                    // `operation_ids`) lost the op while the trust graph
+                    // kept the token — and anti-entropy re-requested that
+                    // op every round forever (eternal err_count=1 loop),
+                    // since each re-delivery hit DuplicateJti. A store
+                    // failure is non-fatal for the in-memory DAG.
+                    if let Err(e) = store.put_operation(op) {
+                        result.errors.push(format!("op store {}: {e}", op.id));
+                    }
                     progress = true;
                 }
                 Ok(false) => {}
@@ -568,7 +589,7 @@ mod tests {
     use dds_core::identity::Identity;
     use dds_core::token::{Token, TokenKind, TokenPayload};
     use dds_store::MemoryBackend;
-    use dds_store::traits::{RevocationStore, TokenStore};
+    use dds_store::traits::{OperationStore, RevocationStore, TokenStore};
     use rand::rngs::OsRng;
 
     fn make_identity(label: &str) -> Identity {
@@ -1007,6 +1028,74 @@ mod tests {
         let on_disk = store.get_token(&original_jti).unwrap();
         assert_eq!(on_disk.payload.iss, alice.id.to_urn());
         assert_eq!(on_disk.payload.sub, alice.id.to_urn());
+    }
+
+    /// Root-cause fix for the eternal `err_count=1` anti-entropy loop:
+    /// an op accepted via sync must be PERSISTED to the store (like the
+    /// gossip path), so a restart that rebuilds the DAG from
+    /// `operation_ids` re-materializes it and the node stops
+    /// re-requesting it. Previously the token was stored but the op was
+    /// not, so post-restart the DAG lost the op while the graph kept the
+    /// token, and every re-delivery hit DuplicateJti forever.
+    ///
+    /// Critically this must NOT be achieved by merging duplicate-JTI
+    /// ops (that reopens the AUDIT-2026-06-12 R5 self-update quorum
+    /// replay): a genuine duplicate stays rejected and does not re-enter
+    /// `merged_op_ids`.
+    #[test]
+    fn sync_accepted_op_is_persisted_and_duplicate_is_not_recredited() {
+        let alice = make_identity("alice");
+        let token = make_attest_token(&alice);
+        let jti = token.payload.jti.clone();
+        let canonical_op = format!("op-{jti}");
+        let token_bytes = token.to_cbor().unwrap();
+
+        let mut dag = CausalDag::new();
+        let mut store = MemoryBackend::new();
+        let mut graph = TrustGraph::new();
+
+        // First delivery: novel token → op merges AND is persisted.
+        let first = apply_sync_payloads_with_graph(
+            &[SyncPayload {
+                op_bytes: serialize_op(&make_op(&canonical_op, vec![])),
+                token_bytes: token_bytes.clone(),
+            }],
+            &mut dag,
+            &mut store,
+            &mut graph,
+        );
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert_eq!(first.ops_merged, 1);
+        assert!(
+            store.has_operation(&canonical_op),
+            "accepted op must be persisted so a restart rebuilds it"
+        );
+
+        // Simulate the restart-reload divergence directly: a fresh DAG
+        // that was rebuilt from the store already contains the op, so a
+        // re-delivery is a clean Ok(false) no-op — NOT re-merged, NOT
+        // re-credited to merged_op_ids (R5 stays closed).
+        let mut restarted_dag = CausalDag::new();
+        for id in store.operation_ids().unwrap() {
+            restarted_dag.insert(store.get_operation(&id).unwrap()).unwrap();
+        }
+        let again = apply_sync_payloads_with_graph(
+            &[SyncPayload {
+                op_bytes: serialize_op(&make_op(&canonical_op, vec![])),
+                token_bytes,
+            }],
+            &mut restarted_dag,
+            &mut store,
+            &mut graph,
+        );
+        assert_eq!(
+            again.ops_merged, 0,
+            "a duplicate token must never re-merge its op (R5 replay guard)"
+        );
+        assert!(
+            again.merged_op_ids.is_empty(),
+            "duplicate must not re-enter merged_op_ids"
+        );
     }
 
     /// **B-1**: an unauthorized revoke (signed by someone other than

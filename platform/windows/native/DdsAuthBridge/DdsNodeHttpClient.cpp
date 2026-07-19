@@ -611,6 +611,49 @@ DdsAdminVouchResult CDdsNodeHttpClient::PostAdminVouch(const std::string& vouchJ
 }
 
 // ============================================================================
+// POST /v1/admin/revoke-vouch (user / admin offboarding)
+// ============================================================================
+
+DdsAdminRevokeVouchResult CDdsNodeHttpClient::PostAdminRevokeVouch(const std::string& json)
+{
+    DdsAdminRevokeVouchResult result = {};
+    result.success = false;
+
+    FileLog::Writef("DdsNodeHttpClient: POST /v1/admin/revoke-vouch (bodyLen=%zu)\n",
+                    json.size());
+
+    std::string responseBody;
+    DWORD httpStatus = SendRequest(L"POST", L"/v1/admin/revoke-vouch",
+                                   &json, responseBody);
+
+    if (httpStatus == 0)
+    {
+        result.errorMessage = "Connection to dds-node failed (is it running?)";
+        return result;
+    }
+
+    FileLog::Writef("DdsNodeHttpClient: POST /v1/admin/revoke-vouch -> HTTP %lu\n", httpStatus);
+
+    if (httpStatus == 200)
+    {
+        result.success = true;
+        result.responseBody = responseBody;   // console parses the arrays
+    }
+    else
+    {
+        result.errorMessage = JsonGetString(responseBody, "error");
+        if (result.errorMessage.empty())
+        {
+            char buf[64];
+            sprintf_s(buf, "dds-node returned HTTP %lu", httpStatus);
+            result.errorMessage = buf;
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
 // GET /v1/session/challenge and GET /v1/admin/challenge
 // ============================================================================
 

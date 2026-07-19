@@ -594,6 +594,8 @@ function Resolve-InitialPage {
         </GroupBox>
         <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0">
           <Button x:Name="BtnUsersPolicy" Content="Users &amp; Policy..." Padding="14,4" Margin="4"/>
+          <Button x:Name="BtnManage" Content="Manage people &amp; admins..." Padding="14,4" Margin="4"/>
+          <Button x:Name="BtnDecommission" Content="Leave domain..." Padding="14,4" Margin="4"/>
           <Button x:Name="BtnRefresh" Content="Refresh now" Padding="14,4" Margin="4"/>
           <Button x:Name="BtnTray"    Content="Open Tray Agent" Padding="14,4" Margin="4"/>
           <Button x:Name="BtnStartAll" Content="Start all services" Padding="14,4" Margin="4"/>
@@ -780,6 +782,117 @@ function Resolve-InitialPage {
         </GroupBox>
       </Grid>
 
+      <!-- ============ Manage people & admins ============ -->
+      <Grid x:Name="PageManage" Visibility="Collapsed">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="*"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0">
+          <TextBlock FontSize="16" FontWeight="SemiBold" Text="Manage people &amp; administrators"/>
+          <TextBlock Foreground="#555555" Margin="0,4,0,8" TextWrapping="Wrap"
+                     Text="Approve or remove people's access, and add or remove administrators. Every change is signed with an ADMIN security key and then confirmed to have replicated to another node before it's reported as done."/>
+        </StackPanel>
+
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+          <StackPanel>
+            <!-- People -->
+            <GroupBox Header="People on this domain" Padding="10" Margin="0,0,0,10">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="260"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0" Margin="0,0,10,0">
+                  <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                    <Button x:Name="BtnMgRefreshUsers" Content="Refresh" Padding="10,3"/>
+                    <CheckBox x:Name="CbMgShowRevoked" Content="Show removed (offboarded) people"
+                              VerticalAlignment="Center" Margin="12,0,0,0"/>
+                  </StackPanel>
+                  <ListBox x:Name="LbMgUsers" Height="150" FontFamily="Consolas" FontSize="11"/>
+                </StackPanel>
+                <StackPanel Grid.Column="1">
+                  <TextBlock Text="Selected person" FontWeight="SemiBold"/>
+                  <TextBlock x:Name="TbMgUserDetail" Foreground="#555555" FontSize="11"
+                             TextWrapping="Wrap" Margin="0,2,0,8" Text="(pick a person on the left)"/>
+                  <Button x:Name="BtnMgOffboard" Content="Remove access (offboard)…" IsEnabled="False"
+                          Padding="10,5" Margin="0,0,0,6"/>
+                  <Button x:Name="BtnMgMakeAdmin" Content="Make this person an admin…" IsEnabled="False"
+                          Padding="10,5"/>
+                </StackPanel>
+              </Grid>
+            </GroupBox>
+
+            <!-- Admins -->
+            <GroupBox Header="Administrators (trusted roots)" Padding="10" Margin="0,0,0,10">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="260"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0" Margin="0,0,10,0">
+                  <Button x:Name="BtnMgRefreshAdmins" Content="Refresh" Padding="10,3" HorizontalAlignment="Left" Margin="0,0,0,4"/>
+                  <ListBox x:Name="LbMgAdmins" Height="110" FontFamily="Consolas" FontSize="11"/>
+                </StackPanel>
+                <StackPanel Grid.Column="1">
+                  <TextBlock Text="Selected admin" FontWeight="SemiBold"/>
+                  <TextBlock x:Name="TbMgAdminDetail" Foreground="#555555" FontSize="11"
+                             TextWrapping="Wrap" Margin="0,2,0,8" Text="(pick an admin on the left)"/>
+                  <Button x:Name="BtnMgRemoveAdmin" Content="Remove admin rights…" IsEnabled="False"
+                          Padding="10,5"/>
+                  <TextBlock Foreground="#888888" FontSize="10" TextWrapping="Wrap" Margin="0,6,0,0"
+                             Text="The founding (bootstrap) admin can't be removed here — its authority is anchored in each node's config, not a vouch."/>
+                </StackPanel>
+              </Grid>
+            </GroupBox>
+
+            <!-- Replication confirmation -->
+            <Border Background="#EAF3FB" BorderBrush="#B9D6EE" BorderThickness="1" CornerRadius="3" Padding="8">
+              <TextBlock x:Name="TbMgReplStatus" Foreground="#264a63" TextWrapping="Wrap"
+                         Text="Replication status of the last change appears here."/>
+            </Border>
+          </StackPanel>
+        </ScrollViewer>
+
+        <GroupBox Grid.Row="2" Header="Output" Margin="0,8,0,0">
+          <TextBox x:Name="TbMgLog" Height="90" IsReadOnly="True" FontFamily="Consolas" FontSize="11"
+                   VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                   TextWrapping="NoWrap" Background="#1e1e1e" Foreground="#dcdcdc"/>
+        </GroupBox>
+      </Grid>
+
+      <!-- ============ Decommission / leave domain ============ -->
+      <Grid x:Name="PageDecommission" Visibility="Collapsed">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+        <TextBlock Grid.Row="0" FontSize="16" FontWeight="SemiBold" Foreground="#B33A00"
+                   Text="Remove DDS / leave the domain on this machine"/>
+        <TextBlock Grid.Row="1" Foreground="#555555" Margin="0,6,0,10" TextWrapping="Wrap"
+                   Text="This wipes this machine's DDS domain identity (node key, domain files, admission cert) and stops the services, returning the machine to an un-provisioned state. Windows accounts already created on this PC are NOT deleted. Use this before uninstalling, or to re-join a different domain."/>
+        <StackPanel Grid.Row="2">
+          <CheckBox x:Name="CbDecomRevoke" Margin="0,0,0,6"
+                    Content="Also revoke this machine's admission so peers stop trusting it (recommended)"/>
+          <TextBlock Foreground="#888888" FontSize="11" TextWrapping="Wrap" Margin="20,0,0,10"
+                     Text="Requires the domain key on THIS machine. If the domain key lives elsewhere, leave this off and run 'dds-node revoke-admission' from the machine that has it. Without revocation, other nodes keep trusting this machine's peer id until its admission cert expires."/>
+          <CheckBox x:Name="CbDecomConfirm" Margin="0,0,0,10"
+                    Content="I understand this wipes DDS provisioning state on this machine."/>
+          <StackPanel Orientation="Horizontal">
+            <Button x:Name="BtnDecomRun" Content="Leave domain / wipe state" IsEnabled="False"
+                    Padding="14,6" Margin="0,0,10,0" Background="#F3D6C6"/>
+            <TextBlock x:Name="TbDecomStatus" VerticalAlignment="Center" Foreground="#555555"/>
+          </StackPanel>
+        </StackPanel>
+        <TextBox Grid.Row="3" x:Name="TbDecomLog" IsReadOnly="True" FontFamily="Consolas" FontSize="11"
+                 Margin="0,10,0,0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                 TextWrapping="NoWrap" Background="#1e1e1e" Foreground="#dcdcdc"/>
+      </Grid>
+
       <!-- ============ Error ============ -->
       <Grid x:Name="PageError" Visibility="Collapsed">
         <Grid.RowDefinitions>
@@ -826,7 +939,11 @@ $names = @(
     'PageNewDomain_Identity','PageNewDomain_KeyProtection','PageNewDomain_Run','PageNewDomain_Done',
     'PageJoinDomain_Bundle','PageJoinDomain_Confirm','PageJoinDomain_DeviceEnroll','PageJoinDomain_Done',
     'PageEnrollUser_Explainer','PageEnrollUser_Password','PageEnrollUser_Touch','PageEnrollUser_AwaitingApproval',
-    'PageHealth','PagePolicy','PageError',
+    'PageHealth','PagePolicy','PageManage','PageDecommission','PageError',
+    'BtnManage','BtnMgRefreshUsers','CbMgShowRevoked','LbMgUsers','TbMgUserDetail',
+    'BtnMgOffboard','BtnMgMakeAdmin','BtnMgRefreshAdmins','LbMgAdmins','TbMgAdminDetail',
+    'BtnMgRemoveAdmin','TbMgReplStatus','TbMgLog',
+    'CbDecomRevoke','CbDecomConfirm','BtnDecomRun','TbDecomStatus','TbDecomLog','BtnDecommission',
     'PubBanner','TbPubStatus','BtnPubCheck','BtnPubCopyGrant','BtnPubAuthorize',
     'BtnEnrollNewPerson','TbEnrollNpStatus','CbClaimSubject','BtnLoadUsers','TbClaimSubject','TbAcctUser','TbAcctFullName','TbAcctGroups',
     'RbAcctAllDevices','RbAcctDevice','TbAcctDeviceUrn','CbAcctPwNever','BtnCreateAccount',
@@ -862,7 +979,7 @@ $AllPages = @(
     'PageNewDomain_Identity','PageNewDomain_KeyProtection','PageNewDomain_Run','PageNewDomain_Done',
     'PageJoinDomain_Bundle','PageJoinDomain_Confirm','PageJoinDomain_DeviceEnroll','PageJoinDomain_Done',
     'PageEnrollUser_Explainer','PageEnrollUser_Password','PageEnrollUser_Touch','PageEnrollUser_AwaitingApproval',
-    'PageHealth','PagePolicy','PageError'
+    'PageHealth','PagePolicy','PageManage','PageDecommission','PageError'
 )
 
 function Show-Page {
@@ -973,6 +1090,19 @@ function Update-NavForPage {
             # Refresh live state on entry (publisher authorization + user list).
             Enter-PolicyPage
         }
+        'PageManage' {
+            $el.HdrSubtitle.Text = 'Manage people & admins'
+            $el.BtnNext.Visibility = 'Hidden'
+            $el.BtnBack.IsEnabled = ($script:pageStack.Count -gt 0)
+            $el.BtnCancel.Content = 'Close'
+            Enter-ManagePage
+        }
+        'PageDecommission' {
+            $el.HdrSubtitle.Text = 'Leave domain'
+            $el.BtnNext.Visibility = 'Hidden'
+            $el.BtnBack.IsEnabled = ($script:pageStack.Count -gt 0)
+            $el.BtnCancel.Content = 'Close'
+        }
         'PageError' {
             $el.HdrSubtitle.Text = 'Error'
             $el.BtnNext.Visibility = 'Hidden'
@@ -1032,6 +1162,121 @@ function Set-Error     {
     $el.TbErrorMsg.Text = $Message
     $el.TbErrorLog.Text = $Detail
     Show-Page -Name 'PageError'
+}
+
+# ── Wizard journal (bulletproofing) ───────────────────────────────
+# Every multi-step lifecycle flow writes a small JSON journal to
+# $DataRoot\wizard-journal\<flow>.json recording the step it reached and
+# the identifiers (URNs, JTIs) it produced. Two things fall out of this:
+#   1. If the console crashes or is closed mid-flow, the NEXT launch can
+#      detect the half-finished journal and offer to resume/verify rather
+#      than leaving the operator guessing.
+#   2. Each flow re-reads its journal before acting, so a repeated action
+#      is idempotent (e.g. "already approved this subject — skip the
+#      touch, go straight to confirm").
+$JournalDir = Join-Path $DataRoot 'wizard-journal'
+
+function Get-JournalPath { param([string]$Flow) Join-Path $JournalDir ("{0}.json" -f $Flow) }
+
+function Write-Journal {
+    param([string]$Flow, [hashtable]$State)
+    try {
+        if (-not (Test-Path $JournalDir)) { New-Item -ItemType Directory -Force -Path $JournalDir | Out-Null }
+        $State['flow']       = $Flow
+        $State['updated_at'] = (Get-Date).ToString('o')
+        $path = Get-JournalPath $Flow
+        # Write to a temp sibling then move, so a crash mid-write can't
+        # leave a truncated journal that fails to parse on resume.
+        $tmp = "$path.tmp"
+        ($State | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $tmp -Encoding UTF8
+        Move-Item -LiteralPath $tmp -Destination $path -Force
+    } catch {
+        # Journaling is best-effort telemetry, never fail the flow on it.
+        Write-Host "journal write failed ($Flow): $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+}
+
+function Read-Journal {
+    param([string]$Flow)
+    $path = Get-JournalPath $Flow
+    if (-not (Test-Path $path)) { return $null }
+    try { return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json) } catch { return $null }
+}
+
+function Clear-Journal {
+    param([string]$Flow)
+    $path = Get-JournalPath $Flow
+    if (Test-Path $path) { try { Remove-Item -Force -LiteralPath $path } catch { } }
+}
+
+# ── Peer replication confirmation ─────────────────────────────────
+# After any publish (create account, approve, offboard, add/remove
+# admin), confirm the change actually replicated by asking a connected
+# peer whether it holds the token(s) we just minted. Rides the node's
+# GET /v1/replication/confirm endpoint (which probes peers over the
+# existing anti-entropy sync protocol). Returns a pscustomobject:
+#   Reached   = [bool] the endpoint answered
+#   Peers     = [int]  admitted+connected peers the node could ask
+#   Confirmed = [string[]] JTIs proven present on >=1 peer
+#   Pending   = [string[]] JTIs asked-about but not yet confirmed
+#   Message   = human summary for the UI
+# NOTE: runs synchronously on the WPF UI thread (like the other ceremony
+# steps), so the window is unresponsive while it polls. The node's probe
+# endpoint self-caps at ~8-12s per call, and the retry defaults are kept
+# low so an explicit admin action blocks for at most a few seconds in the
+# common (LAN, sub-second sync) case. Callers on a hot path (page-open
+# resume) pass -Retries 1 to bound it to a single probe.
+function Confirm-Replication {
+    param([string[]]$Jtis, [int]$Retries = 3, [int]$DelayMs = 1000)
+    $jtis = @($Jtis | Where-Object { $_ }) | Select-Object -Unique
+    if (-not $jtis -or $jtis.Count -eq 0) {
+        return [pscustomobject]@{ Reached=$false; Peers=0; Confirmed=@(); Pending=@(); Message='(nothing to confirm)' }
+    }
+    $query = ($jtis -join ',')
+    $lastPeers = 0
+    for ($attempt = 1; $attempt -le [Math]::Max(1,$Retries); $attempt++) {
+        try {
+            $body = Invoke-DdsNodeGet -Path ("/v1/replication/confirm?jtis={0}" -f $query)
+            $obj  = $body | ConvertFrom-Json
+            # A non-200 (503 channel-closed, 504 timeout, 400) returns a
+            # JSON error body with no admitted_connected field. Under
+            # Set-StrictMode -Version Latest, reading the missing property
+            # would throw and be misreported as "endpoint unreachable", so
+            # detect the error shape explicitly (mirrors Refresh-PublisherStatus).
+            $props = @($obj.PSObject.Properties.Name)
+            if ($props -notcontains 'admitted_connected') {
+                $why = if ($props -contains 'error') { [string]$obj.error } else { 'unexpected response' }
+                # A node error is not a transport failure; report it and
+                # stop (retrying won't change a shutting-down/starved node).
+                return [pscustomobject]@{ Reached=$true; Peers=0; Confirmed=@(); Pending=$jtis;
+                    Message=("The node could not run the replication check ({0}). The change is saved on THIS node; it will still replicate to peers." -f $why) }
+            }
+            $peers = [int]$obj.admitted_connected
+            $lastPeers = $peers
+            $confirmed = @(); if ($props -contains 'confirmed_jtis' -and $obj.confirmed_jtis) { $confirmed = @($obj.confirmed_jtis) }
+            $pending = @($jtis | Where-Object { $confirmed -notcontains $_ })
+            if ($peers -eq 0) {
+                return [pscustomobject]@{ Reached=$true; Peers=0; Confirmed=@(); Pending=$jtis;
+                    Message='No other nodes are connected right now, so replication could not be confirmed. The change is saved on THIS node and will sync when a peer connects.' }
+            }
+            if ($pending.Count -eq 0) {
+                return [pscustomobject]@{ Reached=$true; Peers=$peers; Confirmed=$confirmed; Pending=@();
+                    Message=("Confirmed replicated to {0} peer node(s)." -f $peers) }
+            }
+            # Some still pending — peers are online but haven't caught up
+            # yet; wait a beat and re-probe (sync fires within ~60s but is
+            # usually far faster).
+            if ($attempt -lt $Retries) { Start-Sleep -Milliseconds $DelayMs }
+        } catch {
+            if ($attempt -lt $Retries) { Start-Sleep -Milliseconds $DelayMs }
+            else {
+                return [pscustomobject]@{ Reached=$false; Peers=0; Confirmed=@(); Pending=$jtis;
+                    Message=("Could not reach the replication-confirm endpoint: {0}" -f $_.Exception.Message) }
+            }
+        }
+    }
+    return [pscustomobject]@{ Reached=$true; Peers=$lastPeers; Confirmed=@(); Pending=$jtis;
+        Message=("Peers are connected but have not confirmed the change yet (still replicating). It should converge within a minute.") }
 }
 
 # ── Branch A: bootstrap orchestration ─────────────────────────────
@@ -2206,6 +2451,7 @@ $script:apTimer     = $null
 $script:apLog       = ''
 $script:apPos       = 0
 $script:apOk        = $false
+$script:apVouchJti  = ''   # jti of the approval vouch (for peer replication-confirm)
 $script:apSubject   = ''   # subject URN captured at approve LAUNCH (bind success to this)
 $script:approvedUrn = ''   # URN approved (or known-approved) for the current subject
 
@@ -2242,7 +2488,7 @@ function Read-ApLog {
                 switch ($obj.phase) {
                     'touch_prompt' { $el.TbApproveNpStatus.Text = "Touch the ADMIN security key now..." }
                     'asserted'     { $el.TbApproveNpStatus.Text = "Admin key verified; submitting approval..." }
-                    'vouched'      { $script:apOk = $true; Append-Log $el.TbPolicyLog "[approve] approved by $($obj.admin_urn)" }
+                    'vouched'      { $script:apOk = $true; $script:apVouchJti = [string]$obj.jti; Append-Log $el.TbPolicyLog "[approve] approved by $($obj.admin_urn)" }
                     'error'        { Append-Log $el.TbPolicyLog "[approve] error: $($obj.message)"; $el.TbApproveNpStatus.Text = "Approval failed: $($obj.message)" }
                 }
             }
@@ -2299,8 +2545,18 @@ function Tick-ApproveNewPerson {
             # change during the touch, but be explicit): the person we vouched.
             $script:approvedUrn = $script:apSubject
             $u = ([string]$el.TbAcctUser.Text).Trim()
-            $el.TbApproveNpStatus.Text = if ($u) { "Approved. Now do step 5: 'Publish -- create this account'." } else { "Approved. Enter a Windows username in step 1, then do step 5 (Create)." }
             Append-Log $el.TbPolicyLog "[approve] DONE -- $($script:approvedUrn) is approved."
+            # Confirm the approval vouch actually replicated to a peer
+            # before telling the operator it's done (bulletproofing: the
+            # approval must reach the machine the person will sign in on).
+            if ($script:apVouchJti) {
+                $el.TbApproveNpStatus.Text = "Approved. Confirming replication to peers..."
+                $conf = Confirm-Replication -Jtis @($script:apVouchJti)
+                Append-Log $el.TbPolicyLog "[approve] $($conf.Message)"
+                $el.TbApproveNpStatus.Text = if ($u) { "Approved ($($conf.Message)). Now do step 5: 'Publish -- create this account'." } else { "Approved ($($conf.Message)). Enter a Windows username in step 1, then do step 5 (Create)." }
+            } else {
+                $el.TbApproveNpStatus.Text = if ($u) { "Approved. Now do step 5: 'Publish -- create this account'." } else { "Approved. Enter a Windows username in step 1, then do step 5 (Create)." }
+            }
             Load-EnrolledUsers | Out-Null
         } elseif (-not ($el.TbApproveNpStatus.Text -match 'failed')) {
             $code = $script:apProc.ExitCode
@@ -2312,7 +2568,377 @@ function Tick-ApproveNewPerson {
     }
 }
 
+# ── Manage people & admins page ───────────────────────────────────
+# All actions here are admin ceremonies (touch the ADMIN key) followed
+# by a peer replication-confirm so nothing is reported "done" until it
+# has actually propagated (or we've told the operator no peer was online
+# to confirm against). Each ceremony writes a journal so a crash mid-
+# flow is recoverable on next launch (see Resume-PendingJournals).
+$script:mgUsers   = @()   # last-loaded enrolled users (objects)
+$script:mgAdmins  = @()   # last-loaded admin roots (objects)
+$script:mgProc    = $null # in-flight offboard/admin ceremony process
+$script:mgTimer   = $null
+$script:mgLog     = ''
+$script:mgPos     = 0
+$script:mgResult  = $null # parsed 'revoked'/'vouched' body from the ceremony
+$script:mgFlow    = ''    # journal flow name of the in-flight ceremony
+
+function Enter-ManagePage {
+    Resume-PendingLifecycleJournals
+    Load-ManageUsers
+    Load-ManageAdmins
+}
+
+# Bulletproofing: on entry, detect any lifecycle ceremony that was
+# interrupted (the console crashed/closed between the admin touch and
+# the confirm/clear). For a journal that reached 'published' we already
+# have the token JTIs, so re-run the peer-confirm and clear it. For one
+# that only reached 'started', warn the operator that the action may not
+# have completed so they can verify (re-running it is safe — offboard is
+# idempotent, re-approve is a no-op).
+function Resume-PendingLifecycleJournals {
+    foreach ($flow in @('offboard','make-admin','remove-admin')) {
+        $j = Read-Journal -Flow $flow
+        if (-not $j) { continue }
+        if ($j.status -eq 'published' -and $j.jtis) {
+            Append-Log $el.TbMgLog "[resume] a previous '$flow' completed but wasn't confirmed; re-checking replication..."
+            # Single quick probe on the page-open hot path so the UI isn't
+            # frozen by the full retry loop (this runs on the dispatcher thread).
+            $conf = Confirm-Replication -Jtis @($j.jtis) -Retries 1
+            $el.TbMgReplStatus.Text = "Recovered '$flow': $($conf.Message)"
+            Append-Log $el.TbMgLog "[resume] $($conf.Message)"
+            Clear-Journal -Flow $flow
+        } elseif ($j.status -eq 'started') {
+            Append-Log $el.TbMgLog "[resume] a previous '$flow' for '$($j.label)' was interrupted before it finished. Verify the person's status below and re-run if needed (it's safe to repeat)."
+            Clear-Journal -Flow $flow
+        } else {
+            Clear-Journal -Flow $flow
+        }
+    }
+}
+
+function Get-SelectedMgUser  { if ($el.LbMgUsers.SelectedIndex -ge 0 -and $el.LbMgUsers.SelectedIndex -lt $script:mgUsers.Count) { return $script:mgUsers[$el.LbMgUsers.SelectedIndex] } return $null }
+function Get-SelectedMgAdmin { if ($el.LbMgAdmins.SelectedIndex -ge 0 -and $el.LbMgAdmins.SelectedIndex -lt $script:mgAdmins.Count) { return $script:mgAdmins[$el.LbMgAdmins.SelectedIndex] } return $null }
+
+function Load-ManageUsers {
+    try {
+        $inc = if ($el.CbMgShowRevoked.IsChecked) { '1' } else { '0' }
+        $body = Invoke-DdsNodeGet -Path ("/v1/enrolled-users?device_urn=&include_revoked={0}" -f $inc)
+        $data = $body | ConvertFrom-Json
+        $script:mgUsers = @()
+        $el.LbMgUsers.Items.Clear()
+        if ($data -and $data.users) {
+            foreach ($u in $data.users) {
+                $status = if ($u.revoked) { 'REMOVED' } elseif ($u.vouched) { 'active' } else { 'pending approval' }
+                $script:mgUsers += $u
+                [void]$el.LbMgUsers.Items.Add(("[{0,-16}] {1}  {2}" -f $status, $u.display_name, $u.subject_urn))
+            }
+        }
+        Append-Log $el.TbMgLog ("[people] loaded {0} user(s)" -f $script:mgUsers.Count)
+    } catch {
+        Append-Log $el.TbMgLog "[people] load failed: $($_.Exception.Message)"
+    }
+    Update-ManageButtons
+}
+
+function Load-ManageAdmins {
+    try {
+        $body = Invoke-DdsNodeGet -Path '/v1/admin/roots'
+        $data = $body | ConvertFrom-Json
+        $script:mgAdmins = @()
+        $el.LbMgAdmins.Items.Clear()
+        if ($data -and $data.roots) {
+            foreach ($r in $data.roots) {
+                $tag = if ($r.is_bootstrap) { 'founding admin' } else { 'admin' }
+                $nm  = if ($r.display_name) { $r.display_name } else { '(unnamed)' }
+                $script:mgAdmins += $r
+                [void]$el.LbMgAdmins.Items.Add(("[{0,-14}] {1}  {2}" -f $tag, $nm, $r.urn))
+            }
+        }
+        Append-Log $el.TbMgLog ("[admins] loaded {0} administrator(s)" -f $script:mgAdmins.Count)
+    } catch {
+        Append-Log $el.TbMgLog "[admins] load failed: $($_.Exception.Message)"
+    }
+    Update-ManageButtons
+}
+
+function Update-ManageButtons {
+    $busy = ($script:mgProc -and -not $script:mgProc.HasExited)
+    $u = Get-SelectedMgUser
+    $a = Get-SelectedMgAdmin
+    if ($el.BtnMgOffboard)    { $el.BtnMgOffboard.IsEnabled    = (-not $busy) -and ($null -ne $u) -and (-not $u.revoked) }
+    # Promote is only meaningful for an approved (vouched) person who is
+    # not already an admin.
+    $uIsAdmin = $false
+    if ($u) { $uIsAdmin = @($script:mgAdmins | Where-Object { $_.urn -eq $u.subject_urn }).Count -gt 0 }
+    if ($el.BtnMgMakeAdmin)   { $el.BtnMgMakeAdmin.IsEnabled   = (-not $busy) -and ($null -ne $u) -and ($u.vouched) -and (-not $u.revoked) -and (-not $uIsAdmin) }
+    if ($el.BtnMgRemoveAdmin) { $el.BtnMgRemoveAdmin.IsEnabled = (-not $busy) -and ($null -ne $a) -and (-not $a.is_bootstrap) }
+    if ($el.BtnMgRefreshUsers)  { $el.BtnMgRefreshUsers.IsEnabled  = (-not $busy) }
+    if ($el.BtnMgRefreshAdmins) { $el.BtnMgRefreshAdmins.IsEnabled = (-not $busy) }
+    if ($el.LbMgUsers)  { $el.LbMgUsers.IsEnabled  = (-not $busy) }
+    if ($el.LbMgAdmins) { $el.LbMgAdmins.IsEnabled = (-not $busy) }
+}
+
+# Run an admin ceremony (offboard = revoke-vouch, promote/remove admin =
+# vouch/revoke-vouch with purpose dds:admin) via dds-enroll-user.exe,
+# tail its NDJSON, then confirm replication of the resulting token(s).
+# $Kind: 'offboard' | 'make-admin' | 'remove-admin'
+function Start-ManageCeremony {
+    param([string]$Kind, [string]$SubjectUrn, [string]$Label)
+    if ($script:mgProc -and -not $script:mgProc.HasExited) { return }
+    if (-not (Test-Path $EnrollUserBin)) { Append-Log $el.TbMgLog "dds-enroll-user.exe not found -- reinstall the MSI."; return }
+    if (-not $SubjectUrn) { Append-Log $el.TbMgLog "no subject selected."; return }
+
+    $script:mgFlow   = "$Kind"
+    $script:mgResult = $null
+    $script:mgLog = Join-Path $env:TEMP ("dds-manage-{0:yyyyMMdd-HHmmss-fff}.log" -f (Get-Date))
+    $script:mgPos = 0
+
+    # Build the journal up front so a crash after the touch but before
+    # confirm is recoverable.
+    Write-Journal -Flow $Kind -State @{ status='started'; kind=$Kind; subject_urn=$SubjectUrn; label=$Label }
+
+    switch ($Kind) {
+        'offboard'     { $argLine = "--revoke-vouch --subject-urn `"$SubjectUrn`"" ; $verb = 'Removing access for' }
+        'make-admin'   { $argLine = "--vouch --subject-urn `"$SubjectUrn`" --purpose `"dds:admin`"" ; $verb = 'Granting admin to' }
+        'remove-admin' { $argLine = "--revoke-vouch --subject-urn `"$SubjectUrn`" --purpose `"dds:admin`"" ; $verb = 'Removing admin from' }
+        default        { Append-Log $el.TbMgLog "unknown ceremony '$Kind'"; return }
+    }
+    $el.TbMgReplStatus.Text = "$verb $Label -- touch the ADMIN security key when the Windows prompt appears..."
+    Append-Log $el.TbMgLog "[$Kind] $verb $Label ($SubjectUrn) -- waiting for admin key touch..."
+    try {
+        $script:mgProc = Start-Process -FilePath $EnrollUserBin -ArgumentList $argLine `
+            -RedirectStandardOutput $script:mgLog -NoNewWindow -PassThru
+        try { $null = $script:mgProc.Handle } catch { }  # PS 5.1 ExitCode quirk
+    } catch {
+        Append-Log $el.TbMgLog "[$Kind] could not start: $($_.Exception.Message)"
+        Clear-Journal -Flow $Kind
+        return
+    }
+    Update-ManageButtons
+    $script:mgTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:mgTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+    $script:mgTimer.Add_Tick({ Tick-ManageCeremony })
+    $script:mgTimer.Start()
+}
+
+function Read-MgLog {
+    if (-not ($script:mgLog -and (Test-Path $script:mgLog))) { return }
+    try {
+        $fs = [IO.File]::Open($script:mgLog, 'Open', 'Read', 'ReadWrite')
+        try {
+            $fs.Seek($script:mgPos, 'Begin') | Out-Null
+            $sr = New-Object IO.StreamReader($fs)
+            while ($null -ne ($line = $sr.ReadLine())) {
+                $script:mgPos = $fs.Position
+                if (-not $line.Trim()) { continue }
+                try { $obj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                switch ($obj.phase) {
+                    'touch_prompt' { $el.TbMgReplStatus.Text = "Touch the ADMIN security key now..." }
+                    'asserted'     { $el.TbMgReplStatus.Text = "Admin key verified; submitting..." }
+                    'vouched'      { $script:mgResult = $obj; Append-Log $el.TbMgLog "[$($script:mgFlow)] server accepted (jti $($obj.jti))" }
+                    'revoked'      {
+                        # 'body' carries the raw server JSON (revoked[], foreign[], demoted, published).
+                        try { $script:mgResult = ($obj.body | ConvertFrom-Json) } catch { $script:mgResult = $null }
+                        Append-Log $el.TbMgLog "[$($script:mgFlow)] server accepted revocation"
+                    }
+                    'error'        { Append-Log $el.TbMgLog "[$($script:mgFlow)] error: $($obj.message)"; $el.TbMgReplStatus.Text = "Failed: $($obj.message)" }
+                }
+            }
+        } finally { $fs.Close() }
+    } catch { }
+}
+
+function Tick-ManageCeremony {
+    Read-MgLog
+    if ($script:mgTimer -and $script:mgProc -and $script:mgProc.HasExited) {
+        Read-MgLog   # final drain (helper flushes terminal line then exits)
+        $script:mgTimer.Stop(); $script:mgTimer = $null
+        Complete-ManageCeremony
+        Update-ManageButtons
+        if ($script:mgLog -and (Test-Path $script:mgLog)) { Remove-Item -Force -ErrorAction SilentlyContinue $script:mgLog }
+    }
+}
+
+# After the ceremony process exits: judge success from the drained
+# result (not ExitCode -- PS 5.1 redirected-PassThru quirk), collect the
+# token JTIs to confirm, run the peer replication-confirm, update the
+# journal, and refresh the lists.
+function Complete-ManageCeremony {
+    $flow = $script:mgFlow
+    $res  = $script:mgResult
+    if (-not $res) {
+        $code = if ($script:mgProc) { $script:mgProc.ExitCode } else { $null }
+        $suffix = if ($null -ne $code) { " (exit $code)" } else { "" }
+        $el.TbMgReplStatus.Text = "Did not complete$suffix. See the Output box."
+        Write-Journal -Flow $flow -State @{ status='failed' }
+        return
+    }
+
+    # Collect the JTIs to confirm on peers.
+    $jtis = @()
+    $summary = ''
+    if ($flow -eq 'offboard' -or $flow -eq 'remove-admin') {
+        if ($res.revoked) { $jtis = @($res.revoked | ForEach-Object { $_.revoke_jti }) }
+        $foreignCount = if ($res.foreign) { @($res.foreign).Count } else { 0 }
+        $summary = ("Revoked {0} grant(s)." -f (@($res.revoked).Count))
+        if ($res.demoted_from_trusted_roots) { $summary += " Admin rights removed." }
+        if ($foreignCount -gt 0) {
+            $summary += (" NOTE: {0} grant(s) were issued by a DIFFERENT admin and must be revoked by THAT admin to fully complete removal." -f $foreignCount)
+            foreach ($f in $res.foreign) { Append-Log $el.TbMgLog ("[$flow] still-active grant from other admin {0} (purpose {1})" -f $f.issuer, $f.purpose) }
+        }
+    } elseif ($flow -eq 'make-admin') {
+        if ($res.jti) { $jtis = @($res.jti) }
+        $summary = "Admin rights granted."
+    }
+
+    Write-Journal -Flow $flow -State @{ status='published'; jtis=$jtis; summary=$summary }
+
+    # Confirm replication against a peer.
+    $el.TbMgReplStatus.Text = "$summary  Confirming replication to peers..."
+    $conf = Confirm-Replication -Jtis $jtis
+    $el.TbMgReplStatus.Text = "$summary  $($conf.Message)"
+    Append-Log $el.TbMgLog "[$flow] $($conf.Message)"
+
+    # The change is durably committed locally either way; the journal is
+    # cleared once we've reported (peer-confirmed or peer-unavailable),
+    # since there is nothing left for a resume to finish.
+    Clear-Journal -Flow $flow
+
+    # Refresh so the lists reflect the new state.
+    Load-ManageUsers
+    Load-ManageAdmins
+}
+
+$el.BtnMgRefreshUsers.add_Click({ Load-ManageUsers })
+$el.BtnMgRefreshAdmins.add_Click({ Load-ManageAdmins })
+$el.CbMgShowRevoked.add_Click({ Load-ManageUsers })
+$el.LbMgUsers.add_SelectionChanged({
+    $u = Get-SelectedMgUser
+    if ($u) {
+        $st = if ($u.revoked) { 'Removed (offboarded)' } elseif ($u.vouched) { 'Active' } else { 'Pending approval' }
+        $el.TbMgUserDetail.Text = "$($u.display_name)`nStatus: $st`n$($u.subject_urn)"
+    } else { $el.TbMgUserDetail.Text = '(pick a person on the left)' }
+    Update-ManageButtons
+})
+$el.LbMgAdmins.add_SelectionChanged({
+    $a = Get-SelectedMgAdmin
+    if ($a) {
+        $nm = if ($a.display_name) { $a.display_name } else { '(unnamed)' }
+        $kind = if ($a.is_bootstrap) { 'Founding admin (cannot be removed here)' } else { 'Administrator' }
+        $el.TbMgAdminDetail.Text = "$nm`n$kind`n$($a.urn)"
+    } else { $el.TbMgAdminDetail.Text = '(pick an admin on the left)' }
+    Update-ManageButtons
+})
+$el.BtnMgOffboard.add_Click({
+    $u = Get-SelectedMgUser
+    if (-not $u) { return }
+    $r = [Windows.MessageBox]::Show(
+        "Remove all access for '$($u.display_name)'? Their security-key sign-in stops on new logons across the domain. Windows accounts already created are not deleted. Already-issued sessions remain valid until they expire (up to 24h).",
+        "Confirm offboarding", 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+    Start-ManageCeremony -Kind 'offboard' -SubjectUrn $u.subject_urn -Label $u.display_name
+})
+$el.BtnMgMakeAdmin.add_Click({
+    $u = Get-SelectedMgUser
+    if (-not $u) { return }
+    $r = [Windows.MessageBox]::Show(
+        "Make '$($u.display_name)' a domain administrator? They will be able to approve, offboard, and publish policy.",
+        "Confirm add admin", 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+    Start-ManageCeremony -Kind 'make-admin' -SubjectUrn $u.subject_urn -Label $u.display_name
+})
+$el.BtnMgRemoveAdmin.add_Click({
+    $a = Get-SelectedMgAdmin
+    if (-not $a) { return }
+    if ($a.is_bootstrap) { Append-Log $el.TbMgLog "[remove-admin] the founding admin can't be removed here."; return }
+    $nm = if ($a.display_name) { $a.display_name } else { $a.urn }
+    $r = [Windows.MessageBox]::Show(
+        "Remove admin rights from '$nm'? They keep their own sign-in but can no longer approve/offboard others or publish policy. This revokes the dds:admin grant YOU issued; if another admin also granted it, that admin must revoke theirs too.",
+        "Confirm remove admin", 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+    Start-ManageCeremony -Kind 'remove-admin' -SubjectUrn $a.urn -Label $nm
+})
+
+# ── Decommission / leave domain page ──────────────────────────────
+function Update-DecomButton {
+    $el.BtnDecomRun.IsEnabled = [bool]$el.CbDecomConfirm.IsChecked
+}
+$el.CbDecomConfirm.add_Click({ Update-DecomButton })
+$el.BtnDecomRun.add_Click({
+    if (-not $el.CbDecomConfirm.IsChecked) { return }
+    $el.BtnDecomRun.IsEnabled = $false
+    $el.TbDecomLog.Clear()
+
+    # Optionally revoke this machine's admission first (best-effort;
+    # requires the domain key on THIS machine). We record the intent in a
+    # journal so a crash between revoke and wipe is visible on next launch.
+    Write-Journal -Flow 'decommission' -State @{ status='started'; revoke=[bool]$el.CbDecomRevoke.IsChecked }
+
+    if ($el.CbDecomRevoke.IsChecked) {
+        $el.TbDecomStatus.Text = "Revoking this machine's admission..."
+        Append-Log $el.TbDecomLog "[decom] attempting: dds-node revoke-admission (needs the domain key on this machine)"
+        try {
+            $peerId = ''
+            try {
+                $info = Invoke-DdsNodeGet -Path '/v1/node/info' | ConvertFrom-Json
+                $peerId = [string]$info.peer_id
+            } catch { }
+            $domainKey = Join-Path $NodeData 'domain_key.bin'
+            $domainToml = Join-Path $NodeData 'domain.toml'
+            if (-not ((Test-Path $domainKey) -and (Test-Path $domainToml) -and $peerId)) {
+                Append-Log $el.TbDecomLog "[decom] skipping revocation: domain key not on this machine or peer id unknown. Run 'dds-node revoke-admission' from the machine that holds the domain key."
+            } else {
+                # dds-node revoke-admission --domain-key <f> --domain <f> --peer-id <id> --out <f>
+                $args2 = @('revoke-admission','--domain-key',$domainKey,'--domain',$domainToml,'--peer-id',$peerId,'--out',(Join-Path $NodeData 'self-revocation.cbor'))
+                $p = Start-Process -FilePath $NodeBin -ArgumentList $args2 -NoNewWindow -PassThru -Wait
+                if ($p.ExitCode -eq 0) {
+                    Append-Log $el.TbDecomLog "[decom] admission revoked; importing so it fans out to peers before we stop..."
+                    $imp = @('import-revocation','--file',(Join-Path $NodeData 'self-revocation.cbor'))
+                    Start-Process -FilePath $NodeBin -ArgumentList $imp -NoNewWindow -PassThru -Wait | Out-Null
+                    # Give gossip a moment to fan the revocation out.
+                    Start-Sleep -Seconds 2
+                } else {
+                    Append-Log $el.TbDecomLog "[decom] revoke-admission exited $($p.ExitCode); continuing with local wipe."
+                }
+            }
+        } catch {
+            Append-Log $el.TbDecomLog "[decom] revocation step failed: $($_.Exception.Message). Continuing with local wipe."
+        }
+    }
+
+    # Wipe local provisioning state via the existing Reset script (-Force).
+    if (-not (Test-Path $ResetScript)) {
+        Append-Log $el.TbDecomLog "[decom] Reset-DdsBootstrap.ps1 not found -- reinstall the MSI."
+        $el.TbDecomStatus.Text = "Reset script missing."
+        Clear-Journal -Flow 'decommission'
+        $el.BtnDecomRun.IsEnabled = $true
+        return
+    }
+    $el.TbDecomStatus.Text = "Wiping DDS state..."
+    Append-Log $el.TbDecomLog "[decom] running Reset-DdsBootstrap.ps1 -Force ..."
+    try {
+        $p = Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$ResetScript`"",'-Force') `
+            -NoNewWindow -PassThru -Wait
+        if ($p.ExitCode -eq 0) {
+            Append-Log $el.TbDecomLog "[decom] DONE. This machine has left the domain. You can now uninstall DDS or join a different domain."
+            $el.TbDecomStatus.Text = "Done -- machine left the domain."
+        } else {
+            Append-Log $el.TbDecomLog "[decom] Reset exited $($p.ExitCode)."
+            $el.TbDecomStatus.Text = "Reset failed (exit $($p.ExitCode))."
+        }
+    } catch {
+        Append-Log $el.TbDecomLog "[decom] wipe failed: $($_.Exception.Message)"
+        $el.TbDecomStatus.Text = "Wipe failed."
+    }
+    Clear-Journal -Flow 'decommission'
+    $el.BtnDecomRun.IsEnabled = $true
+})
+
 $el.BtnUsersPolicy.add_Click({ Show-Page -Name 'PagePolicy' })
+$el.BtnManage.add_Click({ Show-Page -Name 'PageManage' })
+$el.BtnDecommission.add_Click({ Show-Page -Name 'PageDecommission' })
 $el.BtnEnrollNewPerson.add_Click({ Start-EnrollNewPerson })
 $el.BtnApproveNewPerson.add_Click({ Start-ApproveNewPerson })
 $el.BtnPubAuthorize.add_Click({ Start-AuthorizeMachine })
@@ -2408,8 +3034,13 @@ $el.BtnNext.add_Click({
 })
 
 $window.add_Closed({
-    foreach ($t in @($script:bootstrapTimer, $script:joinTimer, $script:deviceEnrollTimer, $script:enrollTimer, $script:enrollPollTimer, $script:npTimer, $script:authTimer, $healthTimer)) {
+    foreach ($t in @($script:bootstrapTimer, $script:joinTimer, $script:deviceEnrollTimer, $script:enrollTimer, $script:enrollPollTimer, $script:npTimer, $script:authTimer, $script:apTimer, $script:mgTimer, $healthTimer)) {
         try { if ($t) { $t.Stop() } } catch { }
+    }
+    # Don't orphan an in-flight FIDO2 ceremony helper (and its WebAuthn
+    # prompt) if the operator closes the window mid-ceremony.
+    foreach ($p in @($script:mgProc, $script:apProc, $script:npProc, $script:authProc)) {
+        try { if ($p -and -not $p.HasExited) { $p.Kill() } } catch { }
     }
     # Defensive: scrub any leftover password temp file.
     if ($script:enrollPwTempPath -and (Test-Path $script:enrollPwTempPath)) {
