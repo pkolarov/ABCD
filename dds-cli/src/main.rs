@@ -3302,7 +3302,9 @@ mod admin_vouch_contract_tests {
     //! server struct, so a future field drift on either side fails here
     //! instead of at runtime.
 
-    use super::{AdminRevokeVouchRequest, AdminVouchRequest, EnrollUserRequest, SessionAssertRequest};
+    use super::{
+        AdminRevokeVouchRequest, AdminVouchRequest, EnrollUserRequest, SessionAssertRequest,
+    };
     use dds_node::http::{
         AdminRevokeVouchRequestJson, AdminVouchRequestJson, AssertionSessionRequestJson,
         EnrollUserRequestJson,
@@ -3589,7 +3591,10 @@ mod policy_version_json_tests {
             enforcement: "Enforce".into(),
         };
         let value = serde_json::to_value(&flat).unwrap();
-        assert!(value.get("document").is_none(), "output must be flat, not nested");
+        assert!(
+            value.get("document").is_none(),
+            "output must be flat, not nested"
+        );
         assert_eq!(value["policy_id"], "accounts/engineering-laptops");
         assert_eq!(value["version"], 3);
     }
@@ -3602,26 +3607,26 @@ mod policy_version_json_tests {
     /// side changes.
     #[test]
     fn macos_account_create_example_matches_real_schema() {
-        let raw = include_str!(
-            "../../platform/macos/packaging/examples/account-create.json"
-        );
+        let raw = include_str!("../../platform/macos/packaging/examples/account-create.json");
         let doc: MacOsPolicyDocument =
             serde_json::from_str(raw).expect("example must deserialize as MacOsPolicyDocument");
         assert_eq!(doc.policy_id, "accounts/engineering-laptops");
-        let macos = doc.macos.expect("example must set the macos directive block");
+        let macos = doc
+            .macos
+            .expect("example must set the macos directive block");
         assert_eq!(macos.local_accounts.len(), 1);
         assert_eq!(macos.local_accounts[0].username, "jsmith");
     }
 
     #[test]
     fn linux_account_create_example_matches_real_schema() {
-        let raw = include_str!(
-            "../../platform/linux/packaging/examples/account-create.json"
-        );
+        let raw = include_str!("../../platform/linux/packaging/examples/account-create.json");
         let doc: LinuxPolicyDocument =
             serde_json::from_str(raw).expect("example must deserialize as LinuxPolicyDocument");
         assert_eq!(doc.policy_id, "accounts/engineering-workstations");
-        let linux = doc.linux.expect("example must set the linux directive block");
+        let linux = doc
+            .linux
+            .expect("example must set the linux directive block");
         assert_eq!(linux.local_users.len(), 1);
         assert_eq!(linux.local_users[0].username, "jsmith");
         assert_eq!(linux.local_users[0].groups, vec!["sudo".to_string()]);

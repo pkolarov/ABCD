@@ -130,9 +130,10 @@ async fn main() {
         .unwrap_or_else(store::default_store_path);
 
     let result = match cli.command {
-        Command::NewUser { label, display_name } => {
-            cmd_new_user(&cli.node_url, &cli.rp_id, &label, &display_name).await
-        }
+        Command::NewUser {
+            label,
+            display_name,
+        } => cmd_new_user(&cli.node_url, &cli.rp_id, &label, &display_name).await,
         Command::AdminSetup { label, force } => {
             cmd_admin_setup(&cli.node_url, &cli.rp_id, &store_path, &label, force).await
         }
@@ -243,7 +244,13 @@ async fn cmd_admin_setup(
 
     let credential_id_b64url = fido2::b64url(&outcome.credential_id);
     let mut cred_store = store::load(store_path)?;
-    store::add(&mut cred_store, label, &credential_id_b64url, now_epoch(), force)?;
+    store::add(
+        &mut cred_store,
+        label,
+        &credential_id_b64url,
+        now_epoch(),
+        force,
+    )?;
     store::save(store_path, &cred_store)?;
 
     println!("Admin created.");
@@ -342,7 +349,10 @@ async fn cmd_revoke_vouch(
 fn cmd_list_admins(store_path: &Path) -> Result<(), String> {
     let store = store::load(store_path)?;
     if store.admins.is_empty() {
-        println!("No admin credentials stored on this box ({}).", store_path.display());
+        println!(
+            "No admin credentials stored on this box ({}).",
+            store_path.display()
+        );
         return Ok(());
     }
     println!("Admin credentials stored at {}:", store_path.display());
@@ -393,7 +403,12 @@ async fn run_admin_assertion_ceremony(
     let challenge: api::ChallengeResponse = api::get_json(node_url, "/v1/admin/challenge").await?;
 
     println!("Touch your FIDO2 key to {action_verb}...");
-    let assertion = device.get_assertion(rp_id, &credential_id_bytes, &challenge.challenge_b64url, pin_ref)?;
+    let assertion = device.get_assertion(
+        rp_id,
+        &credential_id_bytes,
+        &challenge.challenge_b64url,
+        pin_ref,
+    )?;
 
     Ok(AssertionCeremony {
         credential_id_b64url,
@@ -409,7 +424,10 @@ async fn run_admin_assertion_ceremony(
 /// PIN set (the server would just reject the resulting non-UV
 /// assertion with a confusing error) — points the operator at
 /// `admin-setup` instead, which offers to set one.
-fn acquire_pin(pin_stdin: bool, device: &fido2::Device) -> Result<Option<Zeroizing<String>>, String> {
+fn acquire_pin(
+    pin_stdin: bool,
+    device: &fido2::Device,
+) -> Result<Option<Zeroizing<String>>, String> {
     match device.pin_status()? {
         fido2::PinStatus::Unsupported => {
             eprintln!(

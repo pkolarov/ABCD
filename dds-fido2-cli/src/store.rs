@@ -65,7 +65,8 @@ fn atomic_write_owner_only(path: &Path, buf: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "path has no parent".to_string())?;
-    std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
     let tmp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|e| format!("tempfile in {}: {e}", parent.display()))?;
     std::fs::write(tmp.path(), buf).map_err(|e| format!("tempfile write: {e}"))?;

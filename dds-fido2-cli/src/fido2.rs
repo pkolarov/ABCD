@@ -125,11 +125,8 @@ impl Device {
         display_name: &str,
     ) -> Result<EnrollmentOutcome, String> {
         let challenge = verifier::create_challenge();
-        let user_entity = PublicKeyCredentialUserEntity::new(
-            Some(user_id),
-            Some(user_name),
-            Some(display_name),
-        );
+        let user_entity =
+            PublicKeyCredentialUserEntity::new(Some(user_id), Some(user_name), Some(display_name));
         let args = MakeCredentialArgsBuilder::new(rp_id, &challenge)
             .user_entity(&user_entity)
             .without_pin_and_uv()
@@ -178,12 +175,14 @@ impl Device {
         // the exact field order in `verify_assertion_common`
         // (dds-node/src/service.rs) byte for byte — this JSON's SHA-256
         // is what the authenticator ultimately signs over.
-        let client_data_json =
-            format!(r#"{{"type":"webauthn.get","challenge":"{challenge_b64url}","origin":"https://{rp_id}"}}"#);
+        let client_data_json = format!(
+            r#"{{"type":"webauthn.get","challenge":"{challenge_b64url}","origin":"https://{rp_id}"}}"#
+        );
         let cdj_bytes = client_data_json.as_bytes();
         let client_data_hash = Sha256::digest(cdj_bytes).to_vec();
 
-        let mut builder = GetAssertionArgsBuilder::new(rp_id, cdj_bytes).credential_id(credential_id);
+        let mut builder =
+            GetAssertionArgsBuilder::new(rp_id, cdj_bytes).credential_id(credential_id);
         builder = match pin {
             Some(p) => builder.pin(p),
             None => builder.without_pin_and_uv(),
