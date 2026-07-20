@@ -1,0 +1,36 @@
+[package]
+name = "dds-fido2-cli"
+description = "Production FIDO2 ceremony tool for macOS/Linux admin operations against dds-node (enroll, admin-setup, vouch, revoke-vouch)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dds-fido2"
+path = "src/main.rs"
+
+[dependencies]
+ctap-hid-fido2 = "3.5"
+# UDS transport (macOS/Linux `dds-node` defaults `network.api_addr` to
+# `unix:/.../dds.sock`, and both platforms set `trust_loopback_tcp_admin =
+# false` — a plain reqwest TCP client cannot reach a real node). Mirrors
+# the proven pattern in dds-cli/src/client.rs's `uds_request`, trimmed to
+# drop the Windows named-pipe branch (out of scope — Windows keeps its
+# own native DdsEnrollUser.exe).
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "net", "time"] }
+clap = { workspace = true }
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true }
+toml = { workspace = true }
+base64 = "0.22"
+sha2 = { workspace = true }
+rand = { workspace = true }
+rpassword = "7"
+zeroize = { workspace = true }
+tempfile = "3"

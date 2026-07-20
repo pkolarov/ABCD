@@ -376,6 +376,30 @@ enum AdminAction {
         #[arg(long)]
         purpose: Option<String>,
     },
+    /// Admin revokes vouches for a subject via FIDO2 assertion
+    /// (POST /v1/admin/revoke-vouch). Same two-step ceremony and UV
+    /// requirement as `vouch`. Omit `--purpose` to revoke every vouch
+    /// this admin issued for the subject (full offboarding); pass
+    /// `--purpose dds:admin` to demote a sub-admin.
+    RevokeVouch {
+        #[arg(long)]
+        subject_urn: String,
+        #[arg(long)]
+        credential_id: String,
+        /// Server-issued challenge ID from `dds admin challenge`.
+        #[arg(long)]
+        challenge_id: String,
+        #[arg(long)]
+        authenticator_data: String,
+        #[arg(long)]
+        client_data_hash: String,
+        #[arg(long)]
+        client_data_json: Option<String>,
+        #[arg(long)]
+        signature: String,
+        #[arg(long)]
+        purpose: Option<String>,
+    },
     /// Fetch a fresh FIDO2 challenge for an admin ceremony (GET /v1/admin/challenge).
     /// Returns the challenge_id and challenge_b64url needed as inputs to `admin vouch`.
     Challenge,
@@ -517,6 +541,18 @@ enum MacosAction {
     Policies {
         #[arg(long)]
         device_urn: String,
+        /// Emit each policy's `policy_id`/`version`/`display_name`/
+        /// `enforcement` as a JSON array (in addition to jti/issuer/iat)
+        /// instead of the default one-line-per-policy summary. Lets a
+        /// caller discover the current published version of a
+        /// `policy_id` before republishing — the server does NOT
+        /// enforce version monotonicity itself (a republish with a
+        /// version <= the current one silently gossips but never takes
+        /// effect), so this is the only way to check before publishing.
+        /// Scope-matched to the queried `device_urn`, same as the
+        /// underlying endpoint.
+        #[arg(long)]
+        json: bool,
     },
     /// GET /v1/macos/software?device_urn=...
     Software {
@@ -536,6 +572,10 @@ enum LinuxAction {
     Policies {
         #[arg(long)]
         device_urn: String,
+        /// See `dds platform macos policies --help` — same `--json`
+        /// version-discovery output, for Linux policy documents.
+        #[arg(long)]
+        json: bool,
     },
     /// GET /v1/linux/software?device_urn=...
     Software {
@@ -1100,6 +1140,48 @@ async fn handle_admin(action: AdminAction, node_url: &str) {
             println!("  Vouch JTI:   {}", r.vouch_jti);
             println!("  Subject URN: {}", r.subject_urn);
             println!("  Admin URN:   {}", r.admin_urn);
+        }
+        AdminAction::RevokeVouch {
+            subject_urn,
+            credential_id,
+            challenge_id,
+            authenticator_data,
+            client_data_hash,
+            client_data_json,
+            signature,
+            purpose,
+        } => {
+            let req = AdminRevokeVouchRequest {
+                subject_urn,
+                credential_id,
+                challenge_id,
+                authenticator_data,
+                client_data_hash,
+                client_data_json_b64: client_data_json,
+                signature,
+                purpose,
+            };
+            let r: AdminRevokeVouchResponse =
+                post_json(node_url, "/v1/admin/revoke-vouch", &req).await;
+            println!("Admin revoke-vouch result:");
+            println!("  Subject URN: {}", r.subject_urn);
+            println!("  Admin URN:   {}", r.admin_urn);
+            for rv in &r.revoked {
+                println!(
+                    "  Revoked jti={} target={} purpose={:?}",
+                    rv.revoke_jti, rv.target_jti, rv.purpose
+                );
+            }
+            for fv in &r.foreign {
+                println!(
+                    "  Foreign (needs {} to revoke): target={} purpose={:?}",
+                    fv.issuer, fv.target_jti, fv.purpose
+                );
+            }
+            println!(
+                "  Demoted from trusted_roots: {}",
+                r.demoted_from_trusted_roots
+            );
         }
         AdminAction::Challenge => {
             let r: ChallengeResponseJson = get_json(node_url, "/v1/admin/challenge", &[]).await;
@@ -1773,7 +1855,7 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
             }
         },
         PlatformAction::Macos { action } => match action {
-            MacosAction::Policies { device_urn } => {
+            MacosAction::Policies { device_urn, json } => {
                 let env: dds_core::envelope::SignedPolicyEnvelope = get_json(
                     node_url,
                     "/v1/macos/policies",
@@ -1781,6 +1863,10 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
                 )
                 .await;
                 let bytes = unwrap_envelope(env, dds_core::envelope::kind::MACOS_POLICIES);
+                if json {
+                    print_policy_versions_json(&bytes, "macos/policies");
+                    return;
+                }
                 let r: MacosPoliciesPayload = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                     eprintln!("Error: failed to parse macos/policies payload: {e}");
                     std::process::exit(1);
@@ -1814,7 +1900,7 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
             }
         },
         PlatformAction::Linux { action } => match action {
-            LinuxAction::Policies { device_urn } => {
+            LinuxAction::Policies { device_urn, json } => {
                 let env: dds_core::envelope::SignedPolicyEnvelope = get_json(
                     node_url,
                     "/v1/linux/policies",
@@ -1822,6 +1908,10 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
                 )
                 .await;
                 let bytes = unwrap_envelope(env, dds_core::envelope::kind::LINUX_POLICIES);
+                if json {
+                    print_policy_versions_json(&bytes, "linux/policies");
+                    return;
+                }
                 let r: LinuxPoliciesPayload = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                     eprintln!("Error: failed to parse linux/policies payload: {e}");
                     std::process::exit(1);
@@ -2811,6 +2901,46 @@ struct AdminVouchResponse {
     admin_urn: String,
 }
 
+/// Wire-compatible with `dds_node::http::AdminRevokeVouchRequestJson` —
+/// identical FIDO2 ceremony fields to `AdminVouchRequest`; `purpose`
+/// restricts which of the admin's vouches for the subject are revoked
+/// (`None` revokes all of them).
+#[derive(Serialize)]
+struct AdminRevokeVouchRequest {
+    subject_urn: String,
+    credential_id: String,
+    challenge_id: String,
+    authenticator_data: String,
+    client_data_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_data_json_b64: Option<String>,
+    signature: String,
+    purpose: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RevokedVouchInfo {
+    revoke_jti: String,
+    target_jti: String,
+    purpose: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ForeignVouchInfo {
+    target_jti: String,
+    issuer: String,
+    purpose: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AdminRevokeVouchResponse {
+    subject_urn: String,
+    admin_urn: String,
+    revoked: Vec<RevokedVouchInfo>,
+    foreign: Vec<ForeignVouchInfo>,
+    demoted_from_trusted_roots: bool,
+}
+
 #[derive(Serialize)]
 struct PolicyRequest {
     subject_urn: String,
@@ -2982,6 +3112,85 @@ struct LinuxSoftwarePayload {
     software: Vec<ApplicablePolicyJson>,
 }
 
+/// Deliberately separate from `ApplicablePolicyJson` (used by BOTH the
+/// policies and software payloads above) rather than adding a `document`
+/// field to that shared type: the software payload's `document` is a
+/// `SoftwareAssignment`, whose `version` is a `String` and which has no
+/// `policy_id` at all — the two document shapes are incompatible, and
+/// reusing one struct across both risks a subtle deserialization
+/// footgun. This type is only ever parsed out of a `*Policies` payload.
+#[derive(Deserialize)]
+struct PolicyDocumentSummary {
+    policy_id: String,
+    display_name: String,
+    version: u64,
+    /// Bare-string enum representation (`"Enforce"`/`"Audit"`/etc.) —
+    /// read as a plain `String` here since this CLI only displays it,
+    /// it doesn't need `dds_domain::Enforcement`'s own type.
+    enforcement: String,
+}
+
+#[derive(Deserialize)]
+struct ApplicablePolicyDetailJson {
+    jti: String,
+    issuer: String,
+    iat: u64,
+    document: PolicyDocumentSummary,
+}
+
+#[derive(Deserialize)]
+struct PoliciesDetailPayload {
+    policies: Vec<ApplicablePolicyDetailJson>,
+}
+
+/// Flat (non-nested) shape for `--json` output — easy to `jq` without
+/// reaching into `.document`: `dds platform macos policies --json |
+/// jq '.[] | select(.policy_id=="...") | .version'`.
+#[derive(Serialize)]
+struct PolicyVersionJson {
+    jti: String,
+    issuer: String,
+    iat: u64,
+    policy_id: String,
+    display_name: String,
+    version: u64,
+    enforcement: String,
+}
+
+/// Parse already-envelope-unwrapped `bytes` as a `*PoliciesDetailPayload`
+/// and print the flattened `PolicyVersionJson` array to stdout. Shared by
+/// `platform macos policies --json` and `platform linux policies --json`
+/// — both wrap the same `{policies: [{jti, issuer, iat, document}]}`
+/// shape, just with a different nested document type server-side; since
+/// this reads it as `PolicyDocumentSummary` (the four fields common to
+/// every platform's policy document), one parser serves both.
+fn print_policy_versions_json(bytes: &[u8], context: &str) {
+    let payload: PoliciesDetailPayload = serde_json::from_slice(bytes).unwrap_or_else(|e| {
+        eprintln!("Error: failed to parse {context} payload: {e}");
+        std::process::exit(1);
+    });
+    let out: Vec<PolicyVersionJson> = payload
+        .policies
+        .into_iter()
+        .map(|p| PolicyVersionJson {
+            jti: p.jti,
+            issuer: p.issuer,
+            iat: p.iat,
+            policy_id: p.document.policy_id,
+            display_name: p.document.display_name,
+            version: p.document.version,
+            enforcement: p.document.enforcement,
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string(&out).unwrap_or_else(|e| {
+            eprintln!("Error: failed to serialize policy version list: {e}");
+            std::process::exit(1);
+        })
+    );
+}
+
 /// **H-2 / H-3 (security review)**: policy/software endpoints now
 /// return a `SignedPolicyEnvelope`. The CLI is a diagnostic tool so
 /// it only parses — real enforcement happens in the Policy Agents,
@@ -3087,9 +3296,10 @@ mod admin_vouch_contract_tests {
     //! server struct, so a future field drift on either side fails here
     //! instead of at runtime.
 
-    use super::{AdminVouchRequest, EnrollUserRequest, SessionAssertRequest};
+    use super::{AdminRevokeVouchRequest, AdminVouchRequest, EnrollUserRequest, SessionAssertRequest};
     use dds_node::http::{
-        AdminVouchRequestJson, AssertionSessionRequestJson, EnrollUserRequestJson,
+        AdminRevokeVouchRequestJson, AdminVouchRequestJson, AssertionSessionRequestJson,
+        EnrollUserRequestJson,
     };
 
     fn sample(client_data_json_b64: Option<String>) -> AdminVouchRequest {
@@ -3150,6 +3360,51 @@ mod admin_vouch_contract_tests {
             serde_json::from_value::<AdminVouchRequestJson>(value).is_err(),
             "challenge_id is a required server field; its absence was the pre-1.4.1 422"
         );
+    }
+
+    fn revoke_sample(purpose: Option<String>) -> AdminRevokeVouchRequest {
+        AdminRevokeVouchRequest {
+            subject_urn: "urn:vouchsafe:bob.7k3mf9".into(),
+            credential_id: "Y3JlZA".into(),
+            challenge_id: "chal-123".into(),
+            authenticator_data: "YXV0aA".into(),
+            client_data_hash: "aGFzaA".into(),
+            client_data_json_b64: Some("e30".into()),
+            signature: "c2ln".into(),
+            purpose,
+        }
+    }
+
+    #[test]
+    fn admin_revoke_vouch_request_matches_server_contract() {
+        let value = serde_json::to_value(revoke_sample(Some("dds:admin".into())))
+            .expect("CLI request serializes");
+        let server: AdminRevokeVouchRequestJson =
+            serde_json::from_value(value).expect("server must accept the CLI's request shape");
+        assert_eq!(server.subject_urn, "urn:vouchsafe:bob.7k3mf9");
+        assert_eq!(server.credential_id, "Y3JlZA");
+        assert_eq!(server.challenge_id, "chal-123");
+        assert_eq!(server.authenticator_data, "YXV0aA");
+        assert_eq!(server.client_data_hash, "aGFzaA");
+        assert_eq!(server.client_data_json_b64.as_deref(), Some("e30"));
+        assert_eq!(server.signature, "c2ln");
+        assert_eq!(server.purpose.as_deref(), Some("dds:admin"));
+    }
+
+    #[test]
+    fn admin_revoke_vouch_null_purpose_means_revoke_all() {
+        // `purpose: None` is meaningful (not merely absent) — it means
+        // "revoke every vouch this admin issued for the subject", so it
+        // must serialize as JSON `null`, not be omitted like
+        // `client_data_json_b64` is.
+        let value = serde_json::to_value(revoke_sample(None)).expect("CLI request serializes");
+        assert!(
+            value.get("purpose").is_some_and(|v| v.is_null()),
+            "purpose: None must serialize as JSON null, not be omitted"
+        );
+        let server: AdminRevokeVouchRequestJson =
+            serde_json::from_value(value).expect("server must accept the CLI's request shape");
+        assert!(server.purpose.is_none());
     }
 
     fn session_sample(client_data_json_b64: Option<String>) -> SessionAssertRequest {
@@ -3263,5 +3518,106 @@ mod admin_vouch_contract_tests {
             .expect("server must accept the legacy no-challenge shape");
         assert!(server.client_data_json_b64.is_none());
         assert!(server.challenge_id.is_none());
+    }
+}
+
+#[cfg(test)]
+mod policy_version_json_tests {
+    //! Proves `PolicyDocumentSummary`/`ApplicablePolicyDetailJson` (hand
+    //! -written to avoid pulling `dds_domain`'s full policy-document
+    //! type graph into the CLI's `--json` path) actually deserialize
+    //! the server's real wire shape — constructed here from the actual
+    //! `dds_node::service::ApplicableMacOsPolicy` /
+    //! `dds_domain::MacOsPolicyDocument` types, not hand-typed JSON.
+    use super::{PoliciesDetailPayload, PolicyVersionJson};
+    use dds_domain::{Enforcement, LinuxPolicyDocument, MacOsPolicyDocument, PolicyScope};
+    use dds_node::service::ApplicableMacOsPolicy;
+
+    #[test]
+    fn policies_detail_payload_matches_real_server_type() {
+        let applicable = ApplicableMacOsPolicy {
+            jti: "jti-abc".into(),
+            issuer: "urn:vouchsafe:admin.xyz".into(),
+            iat: 1_700_000_000,
+            document: MacOsPolicyDocument {
+                policy_id: "accounts/engineering-laptops".into(),
+                display_name: "Engineering laptop local accounts".into(),
+                version: 3,
+                scope: PolicyScope {
+                    device_tags: vec!["mac-eng".into()],
+                    org_units: vec![],
+                    identity_urns: vec![],
+                },
+                settings: vec![],
+                enforcement: Enforcement::Enforce,
+                macos: None,
+            },
+        };
+        let wire = serde_json::json!({ "policies": [applicable] });
+
+        let payload: PoliciesDetailPayload =
+            serde_json::from_value(wire).expect("CLI must parse the real server payload shape");
+        assert_eq!(payload.policies.len(), 1);
+        let p = &payload.policies[0];
+        assert_eq!(p.jti, "jti-abc");
+        assert_eq!(p.issuer, "urn:vouchsafe:admin.xyz");
+        assert_eq!(p.iat, 1_700_000_000);
+        assert_eq!(p.document.policy_id, "accounts/engineering-laptops");
+        assert_eq!(p.document.display_name, "Engineering laptop local accounts");
+        assert_eq!(p.document.version, 3);
+        assert_eq!(p.document.enforcement, "Enforce");
+    }
+
+    #[test]
+    fn policy_version_json_flattens_document_fields() {
+        // The --json output is deliberately flat (no `.document` nesting)
+        // so `jq '.[] | select(.policy_id=="...") | .version'` works
+        // without reaching into a sub-object.
+        let flat = PolicyVersionJson {
+            jti: "jti-abc".into(),
+            issuer: "urn:vouchsafe:admin.xyz".into(),
+            iat: 1_700_000_000,
+            policy_id: "accounts/engineering-laptops".into(),
+            display_name: "Engineering laptop local accounts".into(),
+            version: 3,
+            enforcement: "Enforce".into(),
+        };
+        let value = serde_json::to_value(&flat).unwrap();
+        assert!(value.get("document").is_none(), "output must be flat, not nested");
+        assert_eq!(value["policy_id"], "accounts/engineering-laptops");
+        assert_eq!(value["version"], 3);
+    }
+
+    /// The Phase-9 account-create example files are the first
+    /// macOS/Linux policy-publish JSON examples in the repo — nothing
+    /// enforced they actually match `MacOsPolicyDocument`/
+    /// `LinuxPolicyDocument`'s real schema until this test. Catches
+    /// schema drift (a renamed field, a type change) the moment either
+    /// side changes.
+    #[test]
+    fn macos_account_create_example_matches_real_schema() {
+        let raw = include_str!(
+            "../../platform/macos/packaging/examples/account-create.json"
+        );
+        let doc: MacOsPolicyDocument =
+            serde_json::from_str(raw).expect("example must deserialize as MacOsPolicyDocument");
+        assert_eq!(doc.policy_id, "accounts/engineering-laptops");
+        let macos = doc.macos.expect("example must set the macos directive block");
+        assert_eq!(macos.local_accounts.len(), 1);
+        assert_eq!(macos.local_accounts[0].username, "jsmith");
+    }
+
+    #[test]
+    fn linux_account_create_example_matches_real_schema() {
+        let raw = include_str!(
+            "../../platform/linux/packaging/examples/account-create.json"
+        );
+        let doc: LinuxPolicyDocument =
+            serde_json::from_str(raw).expect("example must deserialize as LinuxPolicyDocument");
+        assert_eq!(doc.policy_id, "accounts/engineering-workstations");
+        let linux = doc.linux.expect("example must set the linux directive block");
+        assert_eq!(linux.local_users.len(), 1);
+        assert_eq!(linux.local_users[0].username, "jsmith");
+        assert_eq!(linux.local_users[0].groups, vec!["sudo".to_string()]);
     }
 }

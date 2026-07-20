@@ -61,9 +61,10 @@ pkg: product-pkg
 
 rust-binaries:
 	@echo "[1/4] Building Rust binaries ($(BUILD_MODE), $(RUST_TARGET))..."
-	cd "$(REPO_ROOT)" && cargo build $(CARGO_FLAGS) -p dds-node --features fido2 -p dds-cli -p dds-fido2-test
-	@echo "  dds-node: $(CARGO_OUT)/dds-node"
-	@echo "  dds:      $(CARGO_OUT)/dds"
+	cd "$(REPO_ROOT)" && cargo build $(CARGO_FLAGS) -p dds-node --features fido2 -p dds-cli -p dds-fido2-test -p dds-fido2-cli
+	@echo "  dds-node:  $(CARGO_OUT)/dds-node"
+	@echo "  dds:       $(CARGO_OUT)/dds"
+	@echo "  dds-fido2: $(CARGO_OUT)/dds-fido2"
 
 dotnet-agent:
 	@echo "[2/4] Publishing .NET agent (self-contained, $(DOTNET_RID))..."
@@ -90,6 +91,7 @@ pkg-payload: rust-binaries dotnet-agent
 	cp "$(CARGO_OUT)/dds-node" "$(PAYLOAD_DIR)/usr/local/bin/"
 	cp "$(CARGO_OUT)/dds" "$(PAYLOAD_DIR)/usr/local/bin/"
 	cp "$(CARGO_OUT)/dds-fido2-test" "$(PAYLOAD_DIR)/usr/local/bin/"
+	cp "$(CARGO_OUT)/dds-fido2" "$(PAYLOAD_DIR)/usr/local/bin/"
 
 	# Bootstrap + admin scripts
 	cp "$(PKG_DIR)/dds-bootstrap-domain.sh" "$(PAYLOAD_DIR)/usr/local/bin/dds-bootstrap-domain"
@@ -98,6 +100,18 @@ pkg-payload: rust-binaries dotnet-agent
 	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-bootstrap-domain"
 	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-enroll-admin"
 	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-admit-node"
+
+	# CRUD wizard entry points (domain/user/account) + uninstall
+	cp "$(PKG_DIR)/dds-domain.sh" "$(PAYLOAD_DIR)/usr/local/bin/dds-domain"
+	cp "$(PKG_DIR)/dds-user.sh" "$(PAYLOAD_DIR)/usr/local/bin/dds-user"
+	cp "$(PKG_DIR)/dds-account.sh" "$(PAYLOAD_DIR)/usr/local/bin/dds-account"
+	cp "$(PKG_DIR)/dds-uninstall.sh" "$(PAYLOAD_DIR)/usr/local/bin/dds-uninstall"
+	cp "$(PKG_DIR)/dds-verify-replication.sh" "$(PAYLOAD_DIR)/usr/local/bin/dds-verify-replication"
+	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-domain"
+	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-user"
+	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-account"
+	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-uninstall"
+	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-verify-replication"
 
 	# Sealed-passphrase helpers (System Keychain integration).
 	# `dds-node provision` auto-detects /usr/local/sbin/dds-keychain-{seal,unseal}
@@ -121,6 +135,10 @@ pkg-payload: rust-binaries dotnet-agent
 
 	# Config template
 	cp "$(PKG_DIR)/dds.toml.template" "$(PAYLOAD_DIR)/Library/Application Support/DDS/"
+
+	# Example policy-publish JSON (referenced by dds-account's usage text)
+	mkdir -p "$(PAYLOAD_DIR)/usr/local/share/doc/dds/examples"
+	cp "$(PKG_DIR)/examples/account-create.json" "$(PAYLOAD_DIR)/usr/local/share/doc/dds/examples/"
 
 	@echo "  Payload assembled at $(PAYLOAD_DIR)"
 

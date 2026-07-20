@@ -1,15 +1,16 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # DDS Admit Node — issue an admission certificate for a second node.
 #
-# Run on the bootstrap (macOS) machine:
+# Linux port of platform/macos/packaging/dds-admit-node.sh. Run on the
+# bootstrap (Linux) machine:
 #   sudo dds-admit-node
 #
 # Then copy the admission.cbor and domain.toml to the second node.
 set -euo pipefail
 
-DDS_ROOT="/Library/Application Support/DDS"
-NODE_DATA="${DDS_ROOT}/node-data"
-NODE_BIN="/usr/local/bin/dds-node"
+DATA_DIR="/var/lib/dds"
+NODE_DATA="${DATA_DIR}/node"
+NODE_BIN="/usr/bin/dds-node"
 
 # ---- Preflight ----
 if [[ $EUID -ne 0 ]]; then
@@ -31,47 +32,37 @@ echo "  dds-node gen-node-key --data-dir <DATA_DIR>"
 echo ""
 
 printf "Peer ID of the new node (12D3KooW...): "
-read PEER_ID
+read -r PEER_ID
 [[ -n "${PEER_ID}" ]] || { echo "Peer ID required" >&2; exit 1; }
 
-# Validate format
 [[ "${PEER_ID}" == 12D3KooW* ]] || echo "Warning: Peer ID doesn't start with 12D3KooW — are you sure?"
 
 # PQ-DEFAULT-2: on a hybrid domain, the new node's own `gen-node-key` run
 # also printed a `kem_pubkey_hex:` line alongside peer_id. Without it here,
 # this admission cert can't carry a KEM pubkey and encrypted-gossip
 # (enc-v3) peers can never deliver epoch-key releases to the new node
-# until it self-repairs at first start (see the same PQ-DEFAULT-2 fix in
-# dds-bootstrap-domain). Optional — leave blank on a non-hybrid domain.
+# until it self-repairs at first start. Optional — leave blank on a
+# non-hybrid domain.
 printf "KEM pubkey hex from the new node's gen-node-key output (blank if none): "
-read KEM_HEX
+read -r KEM_HEX
 
 printf "Validity in days [365]: "
-read TTL_DAYS
-[[ -n "${TTL_DAYS}" ]] || TTL_DAYS="365"
+read -r TTL_DAYS
+TTL_DAYS="${TTL_DAYS:-365}"
 
-OUT_FILE="${DDS_ROOT}/admission-${PEER_ID:0:12}.cbor"
+OUT_FILE="${DATA_DIR}/admission-${PEER_ID:0:12}.cbor"
 printf "Output file [${OUT_FILE}]: "
-read USER_OUT
+read -r USER_OUT
 [[ -n "${USER_OUT}" ]] && OUT_FILE="${USER_OUT}"
 
 echo ""
-# Check if domain key is FIDO2-protected (version 3) by checking file header
-# If FIDO2-protected, no passphrase needed — just touch the key
-DOMAIN_KEY_VERSION="$(python3 -c "
-import sys
-with open('${NODE_DATA}/domain_key.bin', 'rb') as f:
-    data = f.read(20)
-# Look for CBOR map with 'v' key = 3 (FIDO2)
-# Simple heuristic: if file contains 'credential_id' it's FIDO2
-print('fido2' if b'credential_id' in open('${NODE_DATA}/domain_key.bin','rb').read() else 'passphrase')
-" 2>/dev/null || echo "passphrase")"
-
-if [[ "${DOMAIN_KEY_VERSION}" == "fido2" ]]; then
+# Check if domain key is FIDO2-protected by checking file contents
+# (same heuristic as the macOS script — "credential_id" substring).
+if grep -q "credential_id" "${NODE_DATA}/domain_key.bin" 2>/dev/null; then
   echo "Domain key is FIDO2-protected — you will need to touch your key."
 else
-  echo "Domain key passphrase:"
-  read -s DOMAIN_PASSPHRASE
+  printf "Domain key passphrase: "
+  read -rs DOMAIN_PASSPHRASE
   echo ""
   export DDS_DOMAIN_PASSPHRASE="${DOMAIN_PASSPHRASE}"
 fi
@@ -88,9 +79,6 @@ ADMIT_ARGS=(
 [[ -n "${KEM_HEX}" ]] && ADMIT_ARGS+=(--kem-pubkey "${KEM_HEX}")
 "${NODE_BIN}" "${ADMIT_ARGS[@]}"
 
-# Get this node's info for bootstrap peer
-source "${DDS_ROOT}/bootstrap.env" 2>/dev/null || true
-
 echo ""
 echo "============================================================"
 echo "  Admission Certificate Issued"
@@ -106,12 +94,4 @@ echo "    2. ${OUT_FILE}"
 echo ""
 echo "  Nodes on the same LAN will auto-discover each other via mDNS."
 echo "  No manual address configuration needed."
-echo ""
-echo "  Windows quick-start:"
-echo "    1. Copy domain.toml → C:\\ProgramData\\DDS\\node-data\\"
-echo "    2. Copy admission cert → C:\\ProgramData\\DDS\\node-data\\admission.cbor"
-echo "    3. Edit C:\\ProgramData\\DDS\\dds.toml with domain info from domain.toml"
-echo "    4. Start DdsNode service"
-echo "    5. Wait ~60s for mDNS discovery + gossip sync"
-echo "    6. Check: curl http://localhost:5551/v1/enrolled-users"
 echo ""

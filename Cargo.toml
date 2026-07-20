@@ -10,6 +10,7 @@ members = [
     "dds-cli",
     "dds-loadtest",
     "dds-fido2-test",
+    "dds-fido2-cli",
     "platform/linux/pam_dds",
 ]
 

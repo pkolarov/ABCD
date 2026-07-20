@@ -11,6 +11,9 @@ Required:
   --agent-dir PATH   Path to published DdsPolicyAgent.Linux directory
 
 Optional:
+  --fido2 PATH       Path to built dds-fido2 binary (dds-fido2-cli crate).
+                    Enables dds-bootstrap-domain/dds-enroll-admin's admin
+                    ceremony; omit to package without it.
   --version VERSION  Package version (default: 0.1.0)
   --arch ARCH        Debian architecture, e.g. arm64 or amd64
                     (default: dpkg --print-architecture)
@@ -41,6 +44,7 @@ arch=""
 out_dir="$script_dir/dist"
 node_bin=""
 cli_bin=""
+fido2_bin=""
 agent_dir=""
 framework_dependent=0
 
@@ -64,6 +68,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cli)
       cli_bin="${2:?missing --cli value}"
+      shift 2
+      ;;
+    --fido2)
+      fido2_bin="${2:?missing --fido2 value}"
       shift 2
       ;;
     --agent-dir)
@@ -99,10 +107,16 @@ node_bin="$(cd "$(dirname "$node_bin")" && pwd)/$(basename "$node_bin")"
 cli_bin="$(cd "$(dirname "$cli_bin")" && pwd)/$(basename "$cli_bin")"
 agent_dir="$(cd "$agent_dir" && pwd)"
 out_dir="$(mkdir -p "$out_dir" && cd "$out_dir" && pwd)"
+if [[ -n "$fido2_bin" ]]; then
+  fido2_bin="$(cd "$(dirname "$fido2_bin")" && pwd)/$(basename "$fido2_bin")"
+fi
 
 [[ -x "$node_bin" ]] || { echo "dds-node is missing or not executable: $node_bin" >&2; exit 1; }
 [[ -x "$cli_bin" ]] || { echo "dds-cli is missing or not executable: $cli_bin" >&2; exit 1; }
 [[ -d "$agent_dir" ]] || { echo "agent directory is missing: $agent_dir" >&2; exit 1; }
+if [[ -n "$fido2_bin" ]]; then
+  [[ -x "$fido2_bin" ]] || { echo "dds-fido2 is missing or not executable: $fido2_bin" >&2; exit 1; }
+fi
 
 pkg="dds-linux"
 work="$(mktemp -d)"
@@ -120,10 +134,33 @@ install -d -m 0755 "$root/usr/share/doc/dds-linux/examples"
 
 install -m 0755 "$node_bin" "$root/usr/bin/dds-node"
 install -m 0755 "$cli_bin" "$root/usr/bin/dds-cli"
+if [[ -n "$fido2_bin" ]]; then
+  install -m 0755 "$fido2_bin" "$root/usr/bin/dds-fido2"
+fi
 install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-tpm-seal.sh" \
   "$root/usr/local/sbin/dds-tpm-seal"
 install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-tpm-unseal.sh" \
   "$root/usr/local/sbin/dds-tpm-unseal"
+# Bootstrap/admit/enroll scripts — Linux port of the macOS packaging
+# scripts. dds-enroll-admin needs --fido2 to have been supplied (it
+# shells out to /usr/bin/dds-fido2 admin-setup).
+install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-bootstrap-domain.sh" \
+  "$root/usr/bin/dds-bootstrap-domain"
+install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-admit-node.sh" \
+  "$root/usr/bin/dds-admit-node"
+install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-enroll-admin.sh" \
+  "$root/usr/bin/dds-enroll-admin"
+# CRUD wizard entry points (domain/user/account).
+install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-domain.sh" \
+  "$root/usr/bin/dds-domain"
+install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-user.sh" \
+  "$root/usr/bin/dds-user"
+install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-account.sh" \
+  "$root/usr/bin/dds-account"
+install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-purge-node-identity.sh" \
+  "$root/usr/local/sbin/dds-purge-node-identity"
+install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-verify-replication.sh" \
+  "$root/usr/bin/dds-verify-replication"
 cp -R "$agent_dir"/. "$root/usr/local/lib/dds/DdsPolicyAgent.Linux/"
 find "$root/usr/local/lib/dds/DdsPolicyAgent.Linux" -type d -exec chmod 0755 {} +
 find "$root/usr/local/lib/dds/DdsPolicyAgent.Linux" -type f -exec chmod 0644 {} +
@@ -148,6 +185,8 @@ install -m 0644 "$repo_root/platform/linux/packaging/config/node.member.toml" \
   "$root/usr/share/doc/dds-linux/examples/node.member.toml"
 install -m 0644 "$repo_root/platform/linux/packaging/config/policy-agent.json" \
   "$root/usr/share/doc/dds-linux/examples/policy-agent.json"
+install -m 0644 "$repo_root/platform/linux/packaging/examples/account-create.json" \
+  "$root/usr/share/doc/dds-linux/examples/account-create.json"
 install -m 0644 "$repo_root/platform/linux/packaging/debian/README.Debian" \
   "$root/usr/share/doc/dds-linux/README.Debian"
 

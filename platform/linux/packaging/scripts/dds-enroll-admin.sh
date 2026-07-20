@@ -1,7 +1,8 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # DDS Admin Enrollment — bootstrap the first admin with a FIDO2 key.
 #
-# Run after dds-bootstrap-domain:
+# Linux port of platform/macos/packaging/dds-enroll-admin.sh. Run after
+# dds-bootstrap-domain:
 #   sudo dds-enroll-admin
 #
 # Prerequisites:
@@ -12,17 +13,13 @@
 # performs the real vouch/admin-setup ceremony (POST /v1/admin/setup,
 # gated by dds-node's C-2 `.bootstrap` sentinel) — the same mechanism
 # the Windows console's "Admin Setup" flow uses. Trust is established
-# server-side by the ceremony itself; no config edit or node restart is
-# needed (earlier versions of this script hacked around the vouch model
-# by directly regex-editing `trusted_roots` in dds.toml — that produced
-# an admin with no vouch JTI, which the offboard/"remove admin"
-# ceremonies in `dds-user` have nothing to revoke).
+# server-side by the ceremony itself; no config edit or service restart
+# is needed.
 set -euo pipefail
 
-DDS_ROOT="/Library/Application Support/DDS"
-# **SC-2** — Local API talks UDS only.
-API_SOCK="${DDS_ROOT}/dds.sock"
-FIDO2_CLI="/usr/local/bin/dds-fido2"
+DATA_DIR="/var/lib/dds"
+API_SOCK="${DATA_DIR}/dds.sock"
+FIDO2_CLI="/usr/bin/dds-fido2"
 
 # ---- Preflight ----
 if [[ $EUID -ne 0 ]]; then
@@ -30,7 +27,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-[[ -f "${DDS_ROOT}/dds.toml" ]] || { echo "Error: run dds-bootstrap-domain first" >&2; exit 1; }
+[[ -f "${DATA_DIR}/dds.toml" ]] || { echo "Error: run dds-bootstrap-domain first" >&2; exit 1; }
 curl -sf --unix-socket "${API_SOCK}" "http://localhost/v1/status" > /dev/null 2>&1 || { echo "Error: dds-node not running" >&2; exit 1; }
 
 echo ""
@@ -43,7 +40,7 @@ echo "approving other people)."
 echo ""
 
 printf "Admin label (e.g., peter): "
-read ADMIN_LABEL
+read -r ADMIN_LABEL
 [[ -n "${ADMIN_LABEL}" ]] || { echo "Label required" >&2; exit 1; }
 
 echo ""
@@ -81,8 +78,7 @@ echo "  To add another node:"
 echo "    sudo dds-admit-node"
 echo ""
 
-# Save admin info
-cat >> "${DDS_ROOT}/bootstrap.env" <<EOF
+cat >> "${DATA_DIR}/bootstrap.env" <<EOF
 ADMIN_URN=${ADMIN_URN}
 ADMIN_LABEL=${ADMIN_LABEL}
 EOF

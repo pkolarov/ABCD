@@ -1,0 +1,24 @@
+{
+  "policy_id": "accounts/engineering-workstations",
+  "display_name": "Engineering workstation local accounts",
+  "version": 1,
+  "scope": {
+    "device_tags": ["linux-eng"],
+    "org_units": [],
+    "identity_urns": []
+  },
+  "settings": [],
+  "enforcement": "Enforce",
+  "linux": {
+    "local_users": [
+      {
+        "username": "jsmith",
+        "action": "Create",
+        "uid": null,
+        "shell": "/bin/bash",
+        "groups": ["sudo"],
+        "full_name": "Jane Smith"
+      }
+    ]
+  }
+}

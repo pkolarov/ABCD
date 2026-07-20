@@ -1,0 +1,24 @@
+{
+  "policy_id": "accounts/engineering-laptops",
+  "display_name": "Engineering laptop local accounts",
+  "version": 1,
+  "scope": {
+    "device_tags": ["mac-eng"],
+    "org_units": [],
+    "identity_urns": []
+  },
+  "settings": [],
+  "enforcement": "Enforce",
+  "macos": {
+    "local_accounts": [
+      {
+        "username": "jsmith",
+        "action": "Create",
+        "full_name": "Jane Smith",
+        "shell": "/bin/zsh",
+        "admin": false,
+        "hidden": false
+      }
+    ]
+  }
+}
