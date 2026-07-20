@@ -730,6 +730,7 @@ async fn http_request_observer_middleware(
 /// `device_binding` — shared device-caller binding store (M-8).
 /// When `None` the binding check is a no-op — intended for unit
 /// tests; `main.rs` always supplies a real store.
+#[allow(clippy::too_many_arguments)]
 pub fn router<S>(
     svc: SharedService<S>,
     info: NodeInfo,
@@ -784,10 +785,7 @@ where
         // Local policy authoring (Users & Policy console). Admin-gated:
         // publishing managed policy is a privileged mutation.
         .route("/v1/policy/publish", post(publish_policy::<S>))
-        .route(
-            "/v1/policy/publisher-status",
-            get(publisher_status::<S>),
-        )
+        .route("/v1/policy/publisher-status", get(publisher_status::<S>))
         .route("/v1/policy/publisher-init", post(publisher_init::<S>))
         .route_layer(axum::middleware::from_fn_with_state(
             admin_policy.clone(),
@@ -1294,7 +1292,7 @@ where
     // Replicate: hand the enrollment attestation to the swarm task so
     // peers learn this user exists. Without this the user could only
     // ever authenticate against THIS node.
-    let published = publish_identity_tokens(&state, &[r.token_cbor.clone()]).await;
+    let published = publish_identity_tokens(&state, std::slice::from_ref(&r.token_cbor)).await;
     Ok(Json(EnrollmentResponse {
         urn: r.urn,
         jti: r.jti,
@@ -1331,7 +1329,7 @@ where
         let mut svc = state.svc.lock().await;
         svc.enroll_device(internal)?
     };
-    let published = publish_identity_tokens(&state, &[r.token_cbor.clone()]).await;
+    let published = publish_identity_tokens(&state, std::slice::from_ref(&r.token_cbor)).await;
     Ok(Json(EnrollmentResponse {
         urn: r.urn,
         jti: r.jti,
@@ -1363,6 +1361,28 @@ where
         + Sync
         + 'static,
 {
+    publish_identity_tokens_seeding_roots(state, token_cbors, &[]).await
+}
+
+/// As [`publish_identity_tokens`], but also seeds `seed_roots` into the
+/// swarm task's `trusted_roots` copy (see [`crate::node::PublishCommand::seed_roots`]).
+/// Used by `admin_setup` to propagate the newly-established bootstrap
+/// admin to the swarm without waiting for a node restart.
+async fn publish_identity_tokens_seeding_roots<S>(
+    state: &AppState<S>,
+    token_cbors: &[Vec<u8>],
+    seed_roots: &[String],
+) -> bool
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
     let Some(tx) = state.publish_tx.clone() else {
         return false;
     };
@@ -1380,6 +1400,7 @@ where
     if tx
         .send(crate::node::PublishCommand {
             tokens,
+            seed_roots: seed_roots.to_vec(),
             respond: otx,
         })
         .await
@@ -1842,7 +1863,20 @@ where
     // Replicate: the bootstrap admin's attestation must reach peers or
     // no other node can ever compute `vouched` for the users this
     // admin approves.
-    let published = publish_identity_tokens(&state, &[r.token_cbor.clone()]).await;
+    //
+    // Also seed `r.urn` (the newly-established bootstrap admin) into the
+    // swarm task's `trusted_roots` copy. `admin_setup` only updated
+    // `LocalService`'s copy; without this the swarm task — which gates
+    // policy publishes via C-3 `publisher_capability_ok` against its own
+    // copy — stays empty until a restart, so every policy publish 500s
+    // on a fresh domain. See `PublishCommand::seed_roots`.
+    let published =
+        publish_identity_tokens_seeding_roots(
+            &state,
+            std::slice::from_ref(&r.token_cbor),
+            std::slice::from_ref(&r.urn),
+        )
+            .await;
     Ok(Json(EnrollmentResponse {
         urn: r.urn,
         jti: r.jti,
@@ -1886,7 +1920,7 @@ where
     // Replicate: the approval (vouch) must reach peers so the user can
     // authenticate on machines other than the one where the admin
     // happened to run the ceremony.
-    let published = publish_identity_tokens(&state, &[r.token_cbor.clone()]).await;
+    let published = publish_identity_tokens(&state, std::slice::from_ref(&r.token_cbor)).await;
     Ok(Json(AdminVouchResponseJson {
         vouch_jti: r.vouch_jti,
         subject_urn: r.subject_urn,
@@ -2610,24 +2644,24 @@ where
         let svc = state.svc.lock().await;
         let (policy_token, policy_id) = match req.platform.to_ascii_lowercase().as_str() {
             "windows" => {
-                let doc: dds_domain::WindowsPolicyDocument =
-                    serde_json::from_value(req.document).map_err(|e| {
-                        HttpError::bad_request(format!("invalid windows policy document: {e}"))
-                    })?;
+                let doc: dds_domain::WindowsPolicyDocument = serde_json::from_value(req.document)
+                    .map_err(|e| {
+                    HttpError::bad_request(format!("invalid windows policy document: {e}"))
+                })?;
                 let pid = doc.policy_id.clone();
                 (svc.build_policy_attestation(&doc)?, pid)
             }
             "macos" => {
-                let doc: dds_domain::MacOsPolicyDocument =
-                    serde_json::from_value(req.document).map_err(|e| {
+                let doc: dds_domain::MacOsPolicyDocument = serde_json::from_value(req.document)
+                    .map_err(|e| {
                         HttpError::bad_request(format!("invalid macos policy document: {e}"))
                     })?;
                 let pid = doc.policy_id.clone();
                 (svc.build_policy_attestation(&doc)?, pid)
             }
             "linux" => {
-                let doc: dds_domain::LinuxPolicyDocument =
-                    serde_json::from_value(req.document).map_err(|e| {
+                let doc: dds_domain::LinuxPolicyDocument = serde_json::from_value(req.document)
+                    .map_err(|e| {
                         HttpError::bad_request(format!("invalid linux policy document: {e}"))
                     })?;
                 let pid = doc.policy_id.clone();
@@ -2663,6 +2697,7 @@ where
     publish_tx
         .send(crate::node::PublishCommand {
             tokens,
+            seed_roots: Vec::new(),
             respond: respond_tx,
         })
         .await
@@ -2748,6 +2783,7 @@ where
         publish_tx
             .send(crate::node::PublishCommand {
                 tokens: vec![attest],
+                seed_roots: Vec::new(),
                 respond: respond_tx,
             })
             .await
@@ -2763,7 +2799,11 @@ where
                     message: msg,
                 });
             }
-            Err(_) => return Err(HttpError::internal("publisher-init response channel dropped")),
+            Err(_) => {
+                return Err(HttpError::internal(
+                    "publisher-init response channel dropped",
+                ));
+            }
         }
         jti
     } else {
@@ -2841,6 +2881,7 @@ where
 /// - anything else — legacy loopback TCP (e.g. `127.0.0.1:5551`).
 ///   Callers are treated as [`CallerIdentity::Anonymous`] and fall
 ///   back to [`AdminPolicy::trust_loopback_tcp_admin`].
+#[allow(clippy::too_many_arguments)]
 pub async fn serve<S>(
     addr: &str,
     svc: SharedService<S>,
@@ -2967,6 +3008,7 @@ where
 /// credentials as a request extension and (b) delegates to the axum
 /// router. One task per connection; router is cheaply `Clone`.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 async fn serve_unix<S>(
     path: &Path,
     svc: SharedService<S>,
@@ -3091,6 +3133,7 @@ where
 /// `pipe_spec` is either a bare name (e.g. `dds-api`, expanded to
 /// `\\.\pipe\dds-api`) or a full pipe path (`\\.\pipe\...`).
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 async fn serve_pipe<S>(
     pipe_spec: &str,
     svc: SharedService<S>,
@@ -5954,7 +5997,8 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None, None);
+        let app =
+            router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -6015,9 +6059,11 @@ mod tests {
         });
         let base = format!("http://{}", addr);
 
-        let resp = reqwest::get(format!("{base}/v1/policy/publisher-status?platform=windows"))
-            .await
-            .unwrap();
+        let resp = reqwest::get(format!(
+            "{base}/v1/policy/publisher-status?platform=windows"
+        ))
+        .await
+        .unwrap();
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["node_urn"], node_urn);
@@ -6128,8 +6174,16 @@ mod tests {
         let svc = state.svc.clone();
         let info = state.info.clone();
         let key = test_mac_key();
-        let app =
-            router::<MemoryBackend>(svc, info, tcp_trust_policy(), Some(key.clone()), None, None, None, None);
+        let app = router::<MemoryBackend>(
+            svc,
+            info,
+            tcp_trust_policy(),
+            Some(key.clone()),
+            None,
+            None,
+            None,
+            None,
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -6155,7 +6209,8 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None, None);
+        let app =
+            router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -6337,8 +6392,16 @@ mod tests {
         let svc = state.svc.clone();
         let info = state.info.clone();
         let key = test_mac_key();
-        let app =
-            router::<MemoryBackend>(svc, info, strict_policy(), Some(key.clone()), None, None, None, None);
+        let app = router::<MemoryBackend>(
+            svc,
+            info,
+            strict_policy(),
+            Some(key.clone()),
+            None,
+            None,
+            None,
+            None,
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -6434,7 +6497,7 @@ mod tests {
 
             let server = tokio::spawn(async move {
                 let _ = super::super::serve::<MemoryBackend>(
-                    &addr, svc, info, policy, None, None, None,
+                    &addr, svc, info, policy, None, None, None, None, None,
                 )
                 .await;
             });
@@ -6485,7 +6548,7 @@ mod tests {
 
             let server = tokio::spawn(async move {
                 let _ = super::super::serve::<MemoryBackend>(
-                    &addr, svc, info, policy, None, None, None,
+                    &addr, svc, info, policy, None, None, None, None, None,
                 )
                 .await;
             });
@@ -6531,7 +6594,7 @@ mod tests {
 
             let server = tokio::spawn(async move {
                 let _ = super::super::serve::<MemoryBackend>(
-                    &addr, svc, info, policy, None, None, None,
+                    &addr, svc, info, policy, None, None, None, None, None,
                 )
                 .await;
             });
@@ -6572,7 +6635,7 @@ mod tests {
 
             let server = tokio::spawn(async move {
                 let _ = super::super::serve::<MemoryBackend>(
-                    &addr, svc, info, policy, None, None, None,
+                    &addr, svc, info, policy, None, None, None, None, None,
                 )
                 .await;
             });
@@ -6717,7 +6780,8 @@ mod tests {
         let state = make_state();
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None, None);
+        let app =
+            router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -6762,7 +6826,8 @@ mod tests {
         }
         let svc = state.svc.clone();
         let info = state.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None, None);
+        let app =
+            router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -6871,7 +6936,8 @@ mod tests {
         }
         let svc = state2.svc.clone();
         let info = state2.info.clone();
-        let app = router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None, None);
+        let app =
+            router::<MemoryBackend>(svc, info, tcp_trust_policy(), None, None, None, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

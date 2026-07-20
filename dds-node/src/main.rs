@@ -1737,7 +1737,10 @@ fn remove_credential_provider_residue() {
     use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
 
     const CLSID: &str = "{a7f3b2c1-9d4e-4f8a-b6c5-2e1d0a3f7b9c}";
-    reg_delete_tree_best_effort(HKEY_LOCAL_MACHINE, &format!(r"SOFTWARE\Classes\CLSID\{CLSID}"));
+    reg_delete_tree_best_effort(
+        HKEY_LOCAL_MACHINE,
+        &format!(r"SOFTWARE\Classes\CLSID\{CLSID}"),
+    );
     reg_delete_tree_best_effort(
         HKEY_LOCAL_MACHINE,
         &format!(
@@ -1830,7 +1833,10 @@ fn remove_dir_best_effort(path: &Path, label: &str) {
     }
     match std::fs::remove_dir_all(path) {
         Ok(()) => println!("  Removed {label}: {}", path.display()),
-        Err(e) => println!("  WARNING: failed to remove {label} {}: {e}", path.display()),
+        Err(e) => println!(
+            "  WARNING: failed to remove {label} {}: {e}",
+            path.display()
+        ),
     }
 }
 

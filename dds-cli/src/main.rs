@@ -850,8 +850,12 @@ async fn handle_policy(action: PolicyAction, node_url: &str) {
             publish_policy(node_url, "linux", &from_file).await
         }
         PolicyAction::PublisherStatus { platform } => {
-            let s: PublisherStatusJson =
-                get_json(node_url, "/v1/policy/publisher-status", &[("platform", &platform)]).await;
+            let s: PublisherStatusJson = get_json(
+                node_url,
+                "/v1/policy/publisher-status",
+                &[("platform", &platform)],
+            )
+            .await;
             println!("Publisher status ({}):", s.purpose);
             println!("  Node URN:        {}", s.node_urn);
             println!("  Trusted root:    {}", s.is_trusted_root);
@@ -876,7 +880,9 @@ async fn handle_policy(action: PolicyAction, node_url: &str) {
                 if !r.attestation_jti.is_empty() {
                     println!("  Attestation JTI: {}", r.attestation_jti);
                 }
-                println!("\nNext, an admin grants publish rights once (needs an admin security key):");
+                println!(
+                    "\nNext, an admin grants publish rights once (needs an admin security key):"
+                );
                 println!("  {}", r.grant_command);
             }
         }
