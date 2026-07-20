@@ -1896,8 +1896,16 @@ fn cmd_create_bundle(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     let dir = PathBuf::from(require_flag(args, "--dir")?);
     let org = require_flag(args, "--org")?;
     let out = PathBuf::from(flag(args, "--out").unwrap_or("provision.dds"));
+    // **C-4** — optional trust-anchor seed. Pass the domain's bootstrap
+    // admin URN (e.g. read back from node.toml's `bootstrap_admin_urn`
+    // after `admin_setup` has run) so nodes provisioned from this
+    // bundle start with a working `trusted_roots` instead of the
+    // permanent `[]` every node used to get regardless of bundle
+    // contents. Omit when no admin exists yet — re-run this command
+    // with the flag once one does, if you intend to onboard more nodes.
+    let bootstrap_admin_urn = flag(args, "--bootstrap-admin-urn");
 
-    provision::create_bundle(&dir, org, &out)?;
+    provision::create_bundle(&dir, org, &out, bootstrap_admin_urn)?;
     println!("Provision bundle created:");
     println!("  file: {}", out.display());
     println!("  Copy to USB stick, then on a new machine:");

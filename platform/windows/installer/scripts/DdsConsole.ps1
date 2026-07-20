@@ -1464,6 +1464,7 @@ function Run-Bootstrap {
     }
 
     Stop-AdminSetupWait
+    $script:provisionBundleSeeded = $false
     Show-Page -Name 'PageNewDomain_Run'
     $el.TbLog.Clear()
     Reset-Steps
@@ -1496,11 +1497,38 @@ function Run-Bootstrap {
     $script:bootstrapTimer.Start()
 }
 
-function Run-NewDomainSaveBundle {
-    if (-not (Test-Path $ProvisionBundle)) {
-        $el.TbDoneBundleStatus.Text = "Bundle missing — bootstrap may not have completed."
-        return
-    }
+# **CRITICAL (security review)** — several flows below build an
+# -EncodedCommand payload by splicing values into single-quoted
+# PowerShell string literals with naive text substitution
+# (`-replace '__X__', $value`), then execute that payload as a brand
+# NEW, separately-elevated powershell.exe process (this wizard
+# self-elevates at launch, so the child inherits Administrator). A
+# single-quoted PowerShell literal has exactly one escape rule --
+# doubling an embedded `'` -- and nothing else is special inside it
+# (no `$`, no backtick). An UNESCAPED `'` in a spliced value breaks out
+# of the literal, and whatever follows is parsed and RUN as PowerShell
+# code in that elevated process. Confirmed exploitable: setting the
+# free-typed org-tag textbox to something like `foo'; <cmd>;#` executes
+# `<cmd>` as Administrator. A plain apostrophe (e.g. an org named
+# "O'Reilly Corp") also just breaks the payload's quoting outright.
+# Every value spliced into one of these payloads MUST go through this
+# first — it is the ONLY correct way to embed arbitrary text inside a
+# PowerShell single-quoted literal.
+function ConvertTo-SingleQuotedLiteral {
+    param([string]$Value)
+    return $Value -replace "'", "''"
+}
+
+function Save-ProvisionBundleCopy {
+    # **C-4 round 2 (security review)** — $WarningPrefix carries forward
+    # a caller's failure context (e.g. "bundle regeneration failed, this
+    # is the pre-admin bundle") into the FINAL status message instead of
+    # a bare "Saved to X" success message unconditionally overwriting
+    # it the instant Copy-Item succeeds. Without this, an operator who
+    # sees the regeneration failure warning for a split second before
+    # it flips to green "Saved" has no lasting indication the exported
+    # bundle still lacks the C-4 trust-anchor seed.
+    param([string]$WarningPrefix = '')
     $dlg = New-Object Microsoft.Win32.SaveFileDialog
     $dlg.Title = "Save DDS provision bundle"
     $dlg.FileName = "provision.dds"
@@ -1509,12 +1537,103 @@ function Run-NewDomainSaveBundle {
     if (-not $dlg.ShowDialog($window)) { return }
     try {
         Copy-Item -LiteralPath $ProvisionBundle -Destination $dlg.FileName -Force
-        $el.TbDoneBundleStatus.Text = "Saved to $($dlg.FileName)"
-        $el.TbDoneBundleStatus.Foreground = [Windows.Media.Brushes]::DarkGreen
+        if ($WarningPrefix) {
+            $el.TbDoneBundleStatus.Text = "$WarningPrefix Saved (WITHOUT the admin seed) to $($dlg.FileName)"
+            $el.TbDoneBundleStatus.Foreground = [Windows.Media.Brushes]::DarkRed
+        } else {
+            $el.TbDoneBundleStatus.Text = "Saved to $($dlg.FileName)"
+            $el.TbDoneBundleStatus.Foreground = [Windows.Media.Brushes]::DarkGreen
+        }
     } catch {
         $el.TbDoneBundleStatus.Text = "Save failed: $($_.Exception.Message)"
         $el.TbDoneBundleStatus.Foreground = [Windows.Media.Brushes]::DarkRed
     }
+}
+
+# **C-4** — tracks whether $ProvisionBundle already carries the current
+# bootstrap_admin_urn seed, so clicking "Save provision bundle..." more
+# than once in a session doesn't re-prompt for the domain key every time.
+$script:provisionBundleSeeded = $false
+$script:saveBundleProcess     = $null
+$script:saveBundleTimer       = $null
+
+function Run-NewDomainSaveBundle {
+    if (-not (Test-Path $ProvisionBundle)) {
+        $el.TbDoneBundleStatus.Text = "Bundle missing — bootstrap may not have completed."
+        return
+    }
+
+    # **C-4** — a bundle created before admin_setup ran (the normal
+    # case: Bootstrap-DdsDomain.ps1 creates it in step 2, long before
+    # any admin exists) permanently seeded every node that later joined
+    # from it with trusted_roots = [] -- no amount of gossip ever fixed
+    # that, because the bootstrap admin's own trust anchor is
+    # established purely locally and is never itself gossip-replicable
+    # by design. If an admin now exists (this wizard's automatic Admin
+    # Setup step above, or the tray icon's Admin Setup run later),
+    # regenerate the bundle with that URN embedded BEFORE handing it
+    # out, so nodes joining from THIS bundle actually get a working
+    # trust anchor. Costs one more FIDO2/passphrase touch to re-sign
+    # with the domain key -- paid only when an operator actually
+    # exports a bundle, not on every bootstrap.
+    $adminUrn = $null
+    if (Test-Path $NodeConfigFile) {
+        $cfgText = Get-Content $NodeConfigFile -Raw
+        if ($cfgText -match '(?m)^\s*bootstrap_admin_urn\s*=\s*"([^"]+)"') {
+            $adminUrn = $Matches[1]
+        }
+    }
+    $domainKeyPath = Join-Path $NodeData "domain_key.bin"
+    if (-not $adminUrn -or $script:provisionBundleSeeded -or -not (Test-Path $domainKeyPath)) {
+        # No admin yet, already seeded this session, or the domain key
+        # isn't on this box anymore (e.g. deliberately moved off after
+        # bootstrap) -- save whatever bundle already exists, unchanged.
+        Save-ProvisionBundleCopy
+        return
+    }
+
+    $el.BtnDoneSaveBundle.IsEnabled = $false
+    $el.TbDoneBundleStatus.Text = "Updating bundle with the admin seed - touch your FIDO2 key (or enter the domain passphrase) in the new window..."
+    $el.TbDoneBundleStatus.Foreground = [Windows.Media.Brushes]::Black
+
+    # Same -EncodedCommand pattern as Run-JoinUnseal: a visible console
+    # window is required for libfido2 to treat stdin as interactive,
+    # and -Command mangles a multi-line quoted payload.
+    $payload = @'
+& '__NODEBIN__' create-provision-bundle --dir '__DIR__' --org '__ORG__' --out '__OUT__' --bootstrap-admin-urn '__URN__'
+$code = $LASTEXITCODE
+Write-Host ''
+if ($code -eq 0) { Write-Host '=== Bundle Updated ===' -ForegroundColor Green }
+else             { Write-Host "=== Bundle Update FAILED (exit $code) ===" -ForegroundColor Red }
+Read-Host 'Press Enter to close'
+exit $code
+'@ -replace '__NODEBIN__', (ConvertTo-SingleQuotedLiteral $NodeBin) `
+   -replace '__DIR__', (ConvertTo-SingleQuotedLiteral $NodeData) `
+   -replace '__ORG__', (ConvertTo-SingleQuotedLiteral $el.TbOrg.Text.Trim()) `
+   -replace '__OUT__', (ConvertTo-SingleQuotedLiteral $ProvisionBundle) `
+   -replace '__URN__', (ConvertTo-SingleQuotedLiteral $adminUrn)
+    $cmd = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
+    $script:saveBundleProcess = Start-Process `
+        -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand', $cmd) `
+        -PassThru
+
+    $script:saveBundleTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:saveBundleTimer.Interval = [TimeSpan]::FromMilliseconds(700)
+    $script:saveBundleTimer.Add_Tick({
+        if ($script:saveBundleTimer -and $script:saveBundleProcess.HasExited) {
+            $script:saveBundleTimer.Stop(); $script:saveBundleTimer = $null
+            $el.BtnDoneSaveBundle.IsEnabled = $true
+            $code = $script:saveBundleProcess.ExitCode
+            if ($code -eq 0) {
+                $script:provisionBundleSeeded = $true
+                Save-ProvisionBundleCopy
+            } else {
+                Save-ProvisionBundleCopy -WarningPrefix "Bundle update failed (exit $code) -"
+            }
+        }
+    })
+    $script:saveBundleTimer.Start()
 }
 
 # ── Branch B: Join domain ─────────────────────────────────────────
@@ -1585,7 +1704,8 @@ if ($code -eq 0) { Write-Host '=== Provision Complete ===' -ForegroundColor Gree
 else             { Write-Host "=== Provision FAILED (exit $code) ===" -ForegroundColor Red }
 Read-Host 'Press Enter to close'
 exit $code
-'@ -replace '__NODEBIN__', $NodeBin -replace '__BUNDLE__', $script:joinBundlePath
+'@ -replace '__NODEBIN__', (ConvertTo-SingleQuotedLiteral $NodeBin) `
+   -replace '__BUNDLE__', (ConvertTo-SingleQuotedLiteral $script:joinBundlePath)
     $cmd = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
     $script:joinStdoutPath = Join-Path $env:TEMP ("dds-join-{0:yyyyMMdd-HHmmss-fff}.log" -f (Get-Date))
     $script:joinStdoutPos  = 0
@@ -3133,12 +3253,12 @@ $el.BtnNext.add_Click({
 })
 
 $window.add_Closed({
-    foreach ($t in @($script:bootstrapTimer, $script:adminSetupTimer, $script:joinTimer, $script:deviceEnrollTimer, $script:enrollTimer, $script:enrollPollTimer, $script:npTimer, $script:authTimer, $script:apTimer, $script:mgTimer, $healthTimer)) {
+    foreach ($t in @($script:bootstrapTimer, $script:adminSetupTimer, $script:saveBundleTimer, $script:joinTimer, $script:deviceEnrollTimer, $script:enrollTimer, $script:enrollPollTimer, $script:npTimer, $script:authTimer, $script:apTimer, $script:mgTimer, $healthTimer)) {
         try { if ($t) { $t.Stop() } } catch { }
     }
     # Don't orphan an in-flight FIDO2 ceremony helper (and its WebAuthn
     # prompt) if the operator closes the window mid-ceremony.
-    foreach ($p in @($script:mgProc, $script:apProc, $script:npProc, $script:authProc, $script:adminSetupProc)) {
+    foreach ($p in @($script:mgProc, $script:apProc, $script:npProc, $script:authProc, $script:adminSetupProc, $script:saveBundleProcess)) {
         try { if ($p -and -not $p.HasExited) { $p.Kill() } } catch { }
     }
     # Defensive: scrub any leftover password temp file.

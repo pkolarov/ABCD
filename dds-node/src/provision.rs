@@ -32,10 +32,18 @@ use crate::{domain_store, identity_store, p2p_identity};
 /// against the embedded `domain_pubkey`. v4 (**SC-1 / Z-1 Phase A
 /// follow-up**) extends the signed payload with the optional
 /// `domain_pq_pubkey` (hex-encoded ML-DSA-65 public key) so a v2-hybrid
-/// domain survives the bundle round-trip; the writer picks v3 vs. v4
-/// based on whether `domain_pq_pubkey` is populated, so a v1 fleet
-/// keeps emitting byte-identical v3 bundles.
-const BUNDLE_VERSION: u64 = 4;
+/// domain survives the bundle round-trip. v5 (**C-4 / trust-bootstrap
+/// propagation**) further extends it with the optional
+/// `bootstrap_admin_urn` — the domain's first admin, established by a
+/// local `admin_setup` ceremony that (by design) never emits a
+/// gossip-replicable `dds:admin` vouch, so a node that joins after the
+/// fact previously had no way to ever learn it and every vouch that
+/// admin issued looked unverifiable there (see the doc comment on
+/// [`ProvisionBundle::bootstrap_admin_urn`]). The writer picks the
+/// lowest version the bundle's populated fields require, so a plain
+/// Ed25519 domain bootstrapped before any admin exists still emits a
+/// byte-identical v3 bundle.
+const BUNDLE_VERSION: u64 = 5;
 /// Minimum supported bundle version for read. v1 had no integrity
 /// metadata; v2 carried a SHA-256 fingerprint but no signature; we
 /// still read both but emit a warning because neither prevents a
@@ -101,22 +109,55 @@ pub struct ProvisionBundle {
     pub listen_port: u16,
     pub api_port: u16,
     pub mdns_enabled: bool,
+    /// **C-4** — the domain's bootstrap admin URN, when known at bundle
+    /// creation time. `admin_setup` (the C-2-gated ceremony that
+    /// establishes a domain's first admin) inserts straight into the
+    /// bootstrapping node's local `trusted_roots` — it does not mint a
+    /// `dds:admin` vouch token, so there is nothing for
+    /// `reconcile_trusted_roots` on any OTHER node to ever observe via
+    /// gossip (this is intentional: trust in the very first admin can't
+    /// come from a peer's say-so, only from an out-of-band channel).
+    /// Every node that joins the domain after admin_setup has run
+    /// previously started with `trusted_roots = []` permanently — no
+    /// amount of replication ever seeded it, so every vouch that admin
+    /// issued looked unverifiable (`vouched: false`) on that node
+    /// forever. Embedding the URN here — signed, same as every other
+    /// bundle field — lets `run_provision` seed the new node's
+    /// `trusted_roots` + `bootstrap_admin_urn` at join time, closing the
+    /// gap the same way `domain_pq_pubkey` closes the v2-hybrid one.
+    /// `None` when the bundle was created before any admin exists (the
+    /// common case — `create-provision-bundle` normally runs during
+    /// initial domain bootstrap, before admin_setup); operators should
+    /// re-run `create-provision-bundle --bootstrap-admin-urn <urn>`
+    /// once an admin is established if they intend to onboard more
+    /// nodes, so those nodes ship with a live seed. `Some` only ever
+    /// carries the ONE bootstrap admin — additional admins promoted via
+    /// `dds:admin` vouches self-propagate through the normal
+    /// `reconcile_trusted_roots` gossip path once this one seed is in
+    /// place, so there is no need (and no attempt) to carry the full
+    /// `trusted_roots` set here.
+    pub bootstrap_admin_urn: Option<String>,
     /// SHA-256 fingerprint of the integrity-bound metadata fields
     /// (domain_id + domain_pubkey + org_hash + ports + domain_key_blob,
-    /// plus `domain_pq_pubkey` for v4). Populated on load for v2+
-    /// bundles. Operators MUST confirm this fingerprint OUT-OF-BAND
-    /// before importing; the in-bundle signature (v3+) catches the
-    /// common tamper case where the metadata is altered without
-    /// re-deriving a new domain key.
+    /// plus `domain_pq_pubkey` for v4+ and `bootstrap_admin_urn` for
+    /// v5+). Populated on load for v2+ bundles. Operators MUST confirm
+    /// this fingerprint OUT-OF-BAND before importing; the in-bundle
+    /// signature (v3+) catches the common tamper case where the
+    /// metadata is altered without re-deriving a new domain key.
     pub fingerprint: String,
 }
 
-/// Pick the on-disk wire version for a bundle. v4 is used when (and
-/// only when) the bundle carries `domain_pq_pubkey` (v2-hybrid
-/// domain); v3 stays the default for legacy Ed25519-only domains so
-/// existing fleets keep emitting byte-identical bundles.
+/// Pick the on-disk wire version for a bundle: the lowest version that
+/// covers every populated field. v5 when `bootstrap_admin_urn` is
+/// carried (regardless of `domain_pq_pubkey` — v5 is a strict
+/// superset of v4's signed fields, see `signing_bytes`), else v4 when
+/// (and only when) `domain_pq_pubkey` is carried (v2-hybrid domain),
+/// else v3 for legacy Ed25519-only domains with no bootstrap admin
+/// seed — so existing fleets keep emitting byte-identical bundles.
 fn wire_version(bundle: &ProvisionBundle) -> u64 {
-    if bundle.domain_pq_pubkey.is_some() {
+    if bundle.bootstrap_admin_urn.is_some() {
+        5
+    } else if bundle.domain_pq_pubkey.is_some() {
         4
     } else {
         3
@@ -126,16 +167,22 @@ fn wire_version(bundle: &ProvisionBundle) -> u64 {
 /// Canonical bytes covered by the bundle's signature and fingerprint.
 /// Order is fixed; any field added in a future version must go AFTER
 /// the existing fields. The version-distinct prefix
-/// (`dds-bundle-v3|` vs. `dds-bundle-v4|`) prevents cross-version
-/// signature replay — a v3 signature does not validate a v4 message
-/// and vice versa. v4 appends the optional `domain_pq_pubkey` hex
+/// (`dds-bundle-v3|` / `v4|` / `v5|`) prevents cross-version signature
+/// replay — a v3 signature does not validate a v4 or v5 message and
+/// vice versa. v4 appends the optional `domain_pq_pubkey` hex
 /// (length-prefixed so an empty string and an absent field can never
-/// collide). Includes `domain_key_blob` so a MITM swapping the
-/// encrypted key for one they control invalidates the signature.
+/// collide); v5 further appends the optional `bootstrap_admin_urn`
+/// (same length-prefixed scheme — **C-4**: this is the field that
+/// authenticates a domain's trust anchor to a joining node, so it MUST
+/// be covered by the signature same as everything else here, or a
+/// tampered bundle could inject an arbitrary trusted root). Includes
+/// `domain_key_blob` so a MITM swapping the encrypted key for one they
+/// control invalidates the signature.
 fn signing_bytes(bundle: &ProvisionBundle) -> Vec<u8> {
     let version = wire_version(bundle);
     let mut h = Sha256::new();
     match version {
+        5 => h.update(b"dds-bundle-v5|"),
         4 => h.update(b"dds-bundle-v4|"),
         _ => h.update(b"dds-bundle-v3|"),
     }
@@ -158,6 +205,12 @@ fn signing_bytes(bundle: &ProvisionBundle) -> Vec<u8> {
         let pq_hex = bundle.domain_pq_pubkey.as_deref().unwrap_or("");
         h.update((pq_hex.len() as u64).to_be_bytes());
         h.update(pq_hex.as_bytes());
+    }
+    if version >= 5 {
+        h.update(b"|");
+        let admin_urn = bundle.bootstrap_admin_urn.as_deref().unwrap_or("");
+        h.update((admin_urn.len() as u64).to_be_bytes());
+        h.update(admin_urn.as_bytes());
     }
     h.finalize().to_vec()
 }
@@ -293,6 +346,15 @@ pub fn save_bundle(
             CborValue::Text(pq_hex.clone()),
         ));
     }
+    // **C-4** — v5 carries the bootstrap admin URN so a joining node can
+    // seed `trusted_roots` and correctly resolve `vouched` for that
+    // admin's vouches without ever restarting into a stale state.
+    if let Some(urn) = &bundle.bootstrap_admin_urn {
+        map.push((
+            CborValue::Text("bootstrap_admin_urn".into()),
+            CborValue::Text(urn.clone()),
+        ));
+    }
     let mut buf = Vec::new();
     ciborium::into_writer(&CborValue::Map(map), &mut buf)
         .map_err(|e| ProvisionError::Cbor(e.to_string()))?;
@@ -308,6 +370,77 @@ pub fn save_bundle(
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// **C-4 (security review round 2)** — `bootstrap_admin_urn` gets
+/// string-interpolated verbatim into a generated TOML file
+/// (`run_provision`'s `trusted_roots = ["{urn}"]` /
+/// `bootstrap_admin_urn = "{urn}"` lines), and that same text is later
+/// re-extracted and spliced into a PowerShell `-replace` call by
+/// `Enroll-DdsDevice.ps1`'s join-path patcher. The bundle signature
+/// protects the value from tampering in transit, but says nothing
+/// about whether it's safe for either of those TWO separate downstream
+/// consumers. An earlier version of this function used a denylist
+/// (reject `"`, `\`, CR, LF) and an independent security review found
+/// it insufficient THREE separate ways: a `]` truncates
+/// Enroll-DdsDevice.ps1's non-quote-aware extraction regex, a `$`
+/// (e.g. `$1`, `$_`, `$&`) gets reinterpreted as a substitution token
+/// by that same script's `-replace` REPLACEMENT argument, and raw C0
+/// control characters (vertical tab, NUL, DEL) are accepted by TOML's
+/// grammar at write time but make the file fail to re-parse the next
+/// time this node's own service starts. A denylist that needs a new
+/// character added every review cycle is the wrong shape for a field
+/// that has exactly one legitimate structure — switch to an
+/// ALLOWLIST matching the real Vouchsafe URN grammar
+/// (`urn:<label>.<base32-hash>`, see `VouchsafeId::to_urn` in
+/// dds-core/src/identity.rs): `urn:` followed only by ASCII
+/// alphanumerics, `:`, `.`, `-`, `_`. This closes every character
+/// class above (and any the next reviewer would have found) in one
+/// check instead of accumulating exceptions. Called at both the point
+/// a URN is accepted into a bundle (`create_bundle`) and the point
+/// it's about to be written to disk (`run_provision`), so this can
+/// never be reached through either the CLI or a hand-crafted bundle.
+fn validate_bootstrap_admin_urn(urn: &str) -> Result<(), ProvisionError> {
+    if urn.is_empty() {
+        return Err(ProvisionError::Format(
+            "bootstrap_admin_urn must not be empty".into(),
+        ));
+    }
+    if !urn.starts_with("urn:")
+        || !urn[4..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_'))
+    {
+        return Err(ProvisionError::Format(
+            "bootstrap_admin_urn must be \"urn:\" followed only by ASCII letters, digits, \
+             ':', '.', '-', or '_' (the real Vouchsafe URN shape) — refusing to embed \
+             anything else in the generated TOML config or the join-path PowerShell patcher \
+             that later re-extracts it"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// **C-4 round 2** — `org_hash` and `domain_name` are interpolated
+/// into the exact same TOML template `bootstrap_admin_urn` is (see
+/// `run_provision`'s `config_content`), but unlike that field they're
+/// free-form human text (an org tag, a domain display name) rather
+/// than a rigid URN shape, so a full allowlist would be too strict.
+/// Apply the narrower guard instead: reject only what's provably
+/// dangerous for TOML embedding — `"`, `\`, and any C0 control
+/// character (which includes CR/LF; TOML basic strings require ALL of
+/// 0x00-0x1F and 0x7F to be escaped, not just CR/LF). Called at both
+/// bundle-creation time (`create_bundle`) and consumption time
+/// (`run_provision`), mirroring `validate_bootstrap_admin_urn`.
+fn validate_toml_safe_string(value: &str, field_name: &str) -> Result<(), ProvisionError> {
+    if value.contains(['"', '\\']) || value.chars().any(|c| c.is_control()) {
+        return Err(ProvisionError::Format(format!(
+            "{field_name} contains a '\"', '\\\\', or control character that would break \
+             out of the generated TOML string — refusing to embed it"
+        )));
     }
     Ok(())
 }
@@ -424,11 +557,35 @@ pub fn load_bundle(path: &Path) -> Result<ProvisionBundle, ProvisionError> {
         )));
     }
 
+    // **C-4** — same downgrade guard as `domain_pq_pubkey` above: a
+    // forged bundle claiming a lower version hashes under that
+    // version's prefix (which excludes `bootstrap_admin_urn`), so the
+    // field is discarded on load; this additionally refuses to import
+    // a bundle that bolts the field onto an older version wrapper.
+    let stored_bootstrap_admin_urn: Option<String> = map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some("bootstrap_admin_urn") {
+            v.as_text().map(|s| s.to_string())
+        } else {
+            None
+        }
+    });
+    if version < 5 && stored_bootstrap_admin_urn.is_some() {
+        return Err(ProvisionError::Format(format!(
+            "v{version} bundle carries `bootstrap_admin_urn` — only v5+ may include \
+             a trust-anchor seed, refuse to import to prevent silent downgrade"
+        )));
+    }
+
     let bundle = ProvisionBundle {
         domain_name: get_text("domain_name")?,
         domain_id: get_text("domain_id")?,
         domain_pubkey: get_text("domain_pubkey")?,
         domain_pq_pubkey: if version >= 4 { stored_pq_pubkey } else { None },
+        bootstrap_admin_urn: if version >= 5 {
+            stored_bootstrap_admin_urn
+        } else {
+            None
+        },
         domain_key_blob: get_bytes("domain_key")?,
         org_hash: get_text("org_hash")?,
         listen_port: {
@@ -455,14 +612,15 @@ pub fn load_bundle(path: &Path) -> Result<ProvisionBundle, ProvisionError> {
     let computed_fingerprint = compute_fingerprint(&bundle);
 
     match version {
-        4 | 3 => {
-            // **H-10 (security review)**: v3 / v4 MUST carry a
+        3..=5 => {
+            // **H-10 (security review)**: v3 / v4 / v5 MUST carry a
             // signature and MUST carry the fingerprint. Both are
             // verified here; the caller then prints the fingerprint
             // for operator OOB confirmation. **SC-1**: v4 also folds
             // the optional `domain_pq_pubkey` into both the signed
             // bytes and the fingerprint via the bumped `dds-bundle-v4|`
-            // prefix in [`signing_bytes`].
+            // prefix in [`signing_bytes`]. **C-4**: v5 further folds in
+            // the optional `bootstrap_admin_urn` via `dds-bundle-v5|`.
             let sig_bytes = stored_signature.ok_or_else(|| {
                 ProvisionError::Format(format!(
                     "v{version} bundle missing signature field — refuse to import"
@@ -561,15 +719,30 @@ pub fn load_bundle(path: &Path) -> Result<ProvisionBundle, ProvisionError> {
 /// bundle body per H-10. If the operator cannot unwrap the key here,
 /// the fallback is out of scope — they cannot create a v3 bundle
 /// without access to the signing key.
+///
+/// **C-4** — `bootstrap_admin_urn`: pass the domain's bootstrap admin
+/// URN (e.g. read back from `node.toml` after `admin_setup` has run)
+/// to seed it into the bundle so nodes that join via THIS bundle start
+/// with a working trust anchor. `None` when no admin exists yet (the
+/// bundle created during initial domain bootstrap, before admin_setup
+/// runs) — callers should re-invoke this once an admin is established
+/// if they intend to onboard more nodes.
 pub fn create_bundle(
     domain_dir: &Path,
     org_hash: &str,
     out_path: &Path,
+    bootstrap_admin_urn: Option<&str>,
 ) -> Result<(), ProvisionError> {
     let domain_toml = domain_dir.join("domain.toml");
     let domain_key_bin = domain_dir.join("domain_key.bin");
 
+    if let Some(urn) = bootstrap_admin_urn {
+        validate_bootstrap_admin_urn(urn)?;
+    }
+    validate_toml_safe_string(org_hash, "org_hash")?;
+
     let domain = domain_store::load_domain_file(&domain_toml)?;
+    validate_toml_safe_string(&domain.name, "domain_name")?;
     let key_blob = std::fs::read(&domain_key_bin).map_err(|e| ProvisionError::Io(e.to_string()))?;
     // Unwrap the signing key (may prompt for passphrase / FIDO2 touch).
     let signer = domain_store::load_domain_key_from_bytes(&key_blob)?;
@@ -583,6 +756,7 @@ pub fn create_bundle(
         domain_id: domain.id.to_string(),
         domain_pubkey: to_hex(&domain.pubkey),
         domain_pq_pubkey,
+        bootstrap_admin_urn: bootstrap_admin_urn.map(str::to_string),
         domain_key_blob: key_blob,
         org_hash: org_hash.to_string(),
         listen_port: 4001,
@@ -602,6 +776,17 @@ pub fn create_bundle(
     let fp = compute_fingerprint(&bundle);
     println!("Bundle integrity fingerprint: {fp}");
     println!("  Confirm this fingerprint on the importing host BEFORE provisioning.");
+    // **C-4**: make it obvious at creation time whether this bundle can
+    // seed a joining node's trust anchor, so a stale (pre-admin) bundle
+    // isn't handed out by mistake once an admin exists.
+    match &bundle.bootstrap_admin_urn {
+        Some(urn) => println!("  Bootstrap admin seed: {urn}"),
+        None => println!(
+            "  Bootstrap admin seed: none (no admin exists yet, or none was passed). \
+             Nodes provisioned from this bundle will need `trusted_roots` seeded \
+             manually until it is re-created with --bootstrap-admin-urn."
+        ),
+    }
     Ok(())
 }
 
@@ -1021,6 +1206,29 @@ pub fn run_provision(
         Some(hex) if !hex.is_empty() => format!("pq_pubkey = \"{hex}\"\n"),
         _ => String::new(),
     };
+    // **C-4 round 2** — same TOML-injection guard as bootstrap_admin_urn
+    // below, for the bundle's two OTHER free-form fields that land in
+    // this exact template. Re-validated here (not just at
+    // create_bundle time) so a bundle that reached this point some
+    // other way — hand-crafted and independently signed, an
+    // older/different tool — still can't smuggle a TOML-breaking
+    // org_hash or domain_name into the joining node's config.
+    validate_toml_safe_string(&bundle.org_hash, "org_hash")?;
+    validate_toml_safe_string(&bundle.domain_name, "domain_name")?;
+    // **C-4** — seed `trusted_roots` (and `bootstrap_admin_urn`, so
+    // `reconcile_trusted_roots` never demotes it and `DdsNode::init`
+    // seeds the swarm-task copy too, see node.rs) from the bundle when
+    // the bootstrap admin was known at bundle-creation time. Absent a
+    // seed this stays the pre-C-4 hardcoded `trusted_roots = []` — a
+    // node provisioned from a pre-admin bundle is no worse off than
+    // before; it just still needs the manual/tray-icon path to catch up.
+    let trusted_roots_lines = match bundle.bootstrap_admin_urn.as_deref() {
+        Some(urn) if !urn.is_empty() => {
+            validate_bootstrap_admin_urn(urn)?;
+            format!("trusted_roots = [\"{urn}\"]\nbootstrap_admin_urn = \"{urn}\"")
+        }
+        _ => "trusted_roots = []".to_string(),
+    };
     // **Windows path escaping** — `data_dir` and `admission_path`
     // can be Windows-style (`C:\Users\...`) and TOML basic strings
     // (double-quoted) interpret backslashes as escape sequences, so
@@ -1033,7 +1241,7 @@ pub fn run_provision(
         r#"# DDS Node Configuration — provisioned from bundle
 data_dir = '{data_dir}'
 org_hash = "{org_hash}"
-trusted_roots = []
+{trusted_roots_lines}
 
 [network]
 listen_addr = "/ip4/0.0.0.0/tcp/{listen_port}"
@@ -1052,6 +1260,7 @@ audit_log_enabled = false
 {api_auth_block}"#,
         data_dir = data_dir.display(),
         org_hash = bundle.org_hash,
+        trusted_roots_lines = trusted_roots_lines,
         listen_port = bundle.listen_port,
         mdns = bundle.mdns_enabled,
         api_addr = api_addr_for_config,
@@ -1064,6 +1273,15 @@ audit_log_enabled = false
     );
     std::fs::write(&config_path, &config_content).map_err(|e| ProvisionError::Io(e.to_string()))?;
     println!("  Config: {}", config_path.display());
+    match bundle.bootstrap_admin_urn.as_deref() {
+        Some(urn) => println!("  Trust anchor seeded from bundle: {urn}"),
+        None => println!(
+            "  Trust anchor: none in bundle — this node will not resolve `vouched` \
+             for the domain's existing admin until trusted_roots is seeded \
+             (re-provision from a bundle created with --bootstrap-admin-urn, \
+             or set it manually in node.toml and restart)."
+        ),
+    }
 
     // Verify no domain_key.bin leaked to data_dir
     assert!(
@@ -1585,6 +1803,7 @@ mod tests {
             domain_id: domain.id.to_string(),
             domain_pubkey: to_hex(&domain.pubkey),
             domain_pq_pubkey: None,
+            bootstrap_admin_urn: None,
             domain_key_blob: vec![1, 2, 3, 4],
             org_hash: "test-org".into(),
             listen_port: 4001,
@@ -1646,6 +1865,7 @@ mod tests {
             domain_id: domain.id.to_string(),
             domain_pubkey: to_hex(&domain.pubkey),
             domain_pq_pubkey: None,
+            bootstrap_admin_urn: None,
             domain_key_blob: vec![1, 2, 3, 4],
             org_hash: "test-org".into(),
             listen_port: 4001,
@@ -1672,6 +1892,7 @@ mod tests {
             domain_id: domain.id.to_string(),
             domain_pubkey: to_hex(&domain.pubkey),
             domain_pq_pubkey: None,
+            bootstrap_admin_urn: None,
             domain_key_blob: vec![1, 2, 3, 4],
             org_hash: "test-org".into(),
             listen_port: 4001,
@@ -1719,6 +1940,7 @@ mod tests {
             domain_id: legit.id().to_string(),
             domain_pubkey: to_hex(&legit.pubkey()),
             domain_pq_pubkey: None,
+            bootstrap_admin_urn: None,
             domain_key_blob: vec![1, 2, 3],
             org_hash: "org".into(),
             listen_port: 4001,
@@ -1844,7 +2066,7 @@ mod tests {
 
         // Create bundle
         let bundle_path = dir.path().join("test.dds");
-        create_bundle(&domain_dir, "test-org", &bundle_path).unwrap();
+        create_bundle(&domain_dir, "test-org", &bundle_path, None).unwrap();
         assert!(bundle_path.exists());
 
         // Provision (no start, no enrollment)
@@ -1863,6 +2085,59 @@ mod tests {
         let config = std::fs::read_to_string(&result.config_path).unwrap();
         assert!(config.contains("provision-test"));
         assert!(config.contains("test-org"));
+        // **C-4** — no seed was passed to create_bundle, so this stays
+        // the pre-C-4 behavior: empty trusted_roots, no bootstrap_admin_urn.
+        let parsed = crate::config::NodeConfig::from_str(&config).unwrap();
+        assert!(
+            parsed.trusted_roots.is_empty(),
+            "no bundle seed => trusted_roots stays empty"
+        );
+        assert!(
+            parsed.bootstrap_admin_urn.is_none(),
+            "no bundle seed => bootstrap_admin_urn stays unset"
+        );
+    }
+
+    /// **C-4 end-to-end**: a bundle created WITH `--bootstrap-admin-urn`
+    /// (i.e. `create_bundle(..., Some(urn))`) seeds the provisioned
+    /// node's `trusted_roots` + `bootstrap_admin_urn` — closing the gap
+    /// where a node joining a domain after its first admin was
+    /// established could never resolve `vouched` for that admin's
+    /// vouches, no matter how much gossip replicated.
+    #[test]
+    fn provision_with_bootstrap_admin_urn_seeds_trusted_roots() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = TempDir::new().unwrap();
+        let domain_dir = dir.path().join("domain");
+        std::fs::create_dir_all(&domain_dir).unwrap();
+
+        unsafe { std::env::set_var("DDS_DOMAIN_PASSPHRASE", "") };
+        unsafe { std::env::remove_var("DDS_REQUIRE_ENCRYPTED_KEYS") };
+        let key = DomainKey::generate("c4-provision-test", &mut OsRng);
+        let domain = key.domain();
+        domain_store::save_domain_file(&domain_dir.join("domain.toml"), &domain).unwrap();
+        domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
+
+        let admin_urn = "urn:vouchsafe:admin.c4test".to_string();
+        let bundle_path = dir.path().join("c4-test.dds");
+        create_bundle(&domain_dir, "c4-test-org", &bundle_path, Some(&admin_urn)).unwrap();
+
+        let data_dir = dir.path().join("node-data");
+        let result = run_provision(&bundle_path, Some(&data_dir), false).unwrap();
+
+        let config = std::fs::read_to_string(&result.config_path).unwrap();
+        let parsed = crate::config::NodeConfig::from_str(&config).unwrap();
+        assert_eq!(
+            parsed.trusted_roots,
+            vec![admin_urn.clone()],
+            "bundle seed must land in trusted_roots; got config:\n{config}"
+        );
+        assert_eq!(
+            parsed.bootstrap_admin_urn.as_deref(),
+            Some(admin_urn.as_str()),
+            "bundle seed must also land in bootstrap_admin_urn (so reconcile_trusted_roots \
+             never demotes it and DdsNode::init seeds the swarm-task copy too); got config:\n{config}"
+        );
     }
 
     /// **SC-2** — single-file provisioning emits UDS-first defaults
@@ -1893,7 +2168,7 @@ mod tests {
         domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
 
         let bundle_path = dir.path().join("test.dds");
-        create_bundle(&domain_dir, "sc2-org", &bundle_path).unwrap();
+        create_bundle(&domain_dir, "sc2-org", &bundle_path, None).unwrap();
 
         let data_dir = dir.path().join("node-data");
         let result = run_provision(&bundle_path, Some(&data_dir), false).unwrap();
@@ -1968,7 +2243,7 @@ mod tests {
         domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
 
         let bundle_path = dir.path().join("test.dds");
-        create_bundle(&domain_dir, "org", &bundle_path).unwrap();
+        create_bundle(&domain_dir, "org", &bundle_path, None).unwrap();
 
         let data_dir = dir.path().join("node-data");
         run_provision(&bundle_path, Some(&data_dir), false).unwrap();
@@ -2005,6 +2280,7 @@ mod tests {
             domain_id: domain.id.to_string(),
             domain_pubkey: to_hex(&domain.pubkey),
             domain_pq_pubkey: Some(pq_hex.clone()),
+            bootstrap_admin_urn: None,
             domain_key_blob: vec![1, 2, 3, 4],
             org_hash: "hybrid-org".into(),
             listen_port: 4001,
@@ -2067,6 +2343,323 @@ mod tests {
         );
     }
 
+    /// **C-4**: a bundle carrying `bootstrap_admin_urn` round-trips it,
+    /// the on-disk version is v5, and tampering with the embedded URN
+    /// (leaving the signature alone) is caught — the whole point of
+    /// signing this field is that a joining node can trust it exactly
+    /// as much as it trusts the rest of the bundle.
+    #[test]
+    fn bundle_roundtrip_preserves_bootstrap_admin_urn() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c4.dds");
+        let key = DomainKey::generate("c4.local", &mut OsRng);
+        let domain = key.domain();
+        let admin_urn = "urn:vouchsafe:admin.deadbeef".to_string();
+
+        let bundle = ProvisionBundle {
+            domain_name: domain.name.clone(),
+            domain_id: domain.id.to_string(),
+            domain_pubkey: to_hex(&domain.pubkey),
+            domain_pq_pubkey: None,
+            bootstrap_admin_urn: Some(admin_urn.clone()),
+            domain_key_blob: vec![1, 2, 3, 4],
+            org_hash: "c4-org".into(),
+            listen_port: 4001,
+            api_port: 5551,
+            mdns_enabled: true,
+            fingerprint: String::new(),
+        };
+
+        save_bundle(&path, &bundle, &key).unwrap();
+
+        // On-disk version is v5 (writer picks v5 when bootstrap_admin_urn is set).
+        let raw = std::fs::read(&path).unwrap();
+        let cbor: CborValue = ciborium::from_reader(&raw[..]).unwrap();
+        let v = cbor
+            .as_map()
+            .unwrap()
+            .iter()
+            .find_map(|(k, v)| {
+                if k.as_text() == Some("version") {
+                    v.as_integer().and_then(|i| u64::try_from(i).ok())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(v, 5, "bundle with bootstrap_admin_urn uses v5 wire");
+
+        let loaded = load_bundle(&path).unwrap();
+        assert_eq!(
+            loaded.bootstrap_admin_urn.as_deref(),
+            Some(admin_urn.as_str())
+        );
+
+        // Tamper with the stored URN but keep the original signature;
+        // v5 includes it in the signed bytes so verify must fail — a
+        // bundle in flight can't have its trust anchor silently swapped.
+        let mut map = cbor.into_map().unwrap();
+        for (k, v) in map.iter_mut() {
+            if k.as_text() == Some("bootstrap_admin_urn") {
+                if let CborValue::Text(s) = v {
+                    *s = "urn:vouchsafe:attacker.evil".to_string();
+                }
+            }
+        }
+        let mut buf = Vec::new();
+        ciborium::into_writer(&CborValue::Map(map), &mut buf).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+        let err = load_bundle(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("signature does not verify")
+                || err.to_string().contains("fingerprint mismatch"),
+            "expected v5 to detect bootstrap_admin_urn tamper, got: {err}"
+        );
+    }
+
+    /// **C-4**: an attacker tries the same silent-downgrade trick SC-1
+    /// defends against for `domain_pq_pubkey` — forge a v4 bundle that
+    /// bolts a `bootstrap_admin_urn` field onto the CBOR map. The v4
+    /// prefix in `signing_bytes` excludes it, so signature verification
+    /// would still pass; `load_bundle` must refuse the bundle outright
+    /// rather than let a joining node pick up an unauthenticated trust
+    /// anchor.
+    #[test]
+    fn bundle_rejects_v4_with_bootstrap_admin_urn_field() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c4-smuggled.dds");
+        let key = DomainKey::generate_hybrid("c4-smuggle", &mut OsRng);
+        let domain = key.domain();
+        let pq_hex = to_hex(domain.pq_pubkey.as_ref().expect("hybrid domain"));
+
+        // Build a legitimate v4 bundle (hybrid, no bootstrap_admin_urn),
+        // then bolt on `bootstrap_admin_urn`.
+        let bundle = ProvisionBundle {
+            domain_name: domain.name.clone(),
+            domain_id: domain.id.to_string(),
+            domain_pubkey: to_hex(&domain.pubkey),
+            domain_pq_pubkey: Some(pq_hex),
+            bootstrap_admin_urn: None,
+            domain_key_blob: vec![9, 8, 7],
+            org_hash: "c4-org".into(),
+            listen_port: 4001,
+            api_port: 5551,
+            mdns_enabled: true,
+            fingerprint: String::new(),
+        };
+        save_bundle(&path, &bundle, &key).unwrap();
+
+        let raw = std::fs::read(&path).unwrap();
+        let cbor: CborValue = ciborium::from_reader(&raw[..]).unwrap();
+        let mut map = cbor.into_map().unwrap();
+        map.push((
+            CborValue::Text("bootstrap_admin_urn".into()),
+            CborValue::Text("urn:vouchsafe:smuggled.admin".into()),
+        ));
+        let mut buf = Vec::new();
+        ciborium::into_writer(&CborValue::Map(map), &mut buf).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+
+        let err = load_bundle(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("only v5+ may include"),
+            "expected silent-downgrade rejection, got: {err}"
+        );
+    }
+
+    /// **C-4**: `bootstrap_admin_urn` gets string-interpolated verbatim
+    /// into a TOML basic string in `run_provision`. `create_bundle`
+    /// must refuse a value containing a quote (which would break out
+    /// of `trusted_roots = ["{urn}"]` and let the rest be interpreted
+    /// as new TOML) before it ever touches the domain key / FIDO2
+    /// prompt.
+    #[test]
+    fn create_bundle_rejects_malformed_bootstrap_admin_urn() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = TempDir::new().unwrap();
+        let domain_dir = dir.path().join("domain");
+        std::fs::create_dir_all(&domain_dir).unwrap();
+        unsafe { std::env::set_var("DDS_DOMAIN_PASSPHRASE", "") };
+        unsafe { std::env::remove_var("DDS_REQUIRE_ENCRYPTED_KEYS") };
+        let key = DomainKey::generate("c4-validate", &mut OsRng);
+        let domain = key.domain();
+        domain_store::save_domain_file(&domain_dir.join("domain.toml"), &domain).unwrap();
+        domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
+
+        let bundle_path = dir.path().join("c4-validate.dds");
+        let malicious = "urn:vouchsafe:admin.x\"]\ntrusted_roots = [\"pwned";
+        let err = create_bundle(&domain_dir, "org", &bundle_path, Some(malicious)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must be \"urn:\" followed only by"),
+            "expected the allowlist guard to reject the URN, got: {err}"
+        );
+        assert!(
+            !bundle_path.exists(),
+            "no bundle should be written on rejection"
+        );
+    }
+
+    /// **C-4**: even if a malformed `bootstrap_admin_urn` reached
+    /// `run_provision` some other way (bundle hand-crafted and signed
+    /// outside `create_bundle`, an older/different tool, etc.),
+    /// `run_provision` re-validates before writing it into the
+    /// generated TOML — defense in depth, not just a `create_bundle`
+    /// gate.
+    #[test]
+    fn run_provision_rejects_malformed_bootstrap_admin_urn_in_bundle() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = TempDir::new().unwrap();
+        let domain_dir = dir.path().join("domain");
+        std::fs::create_dir_all(&domain_dir).unwrap();
+        unsafe { std::env::set_var("DDS_DOMAIN_PASSPHRASE", "") };
+        unsafe { std::env::remove_var("DDS_REQUIRE_ENCRYPTED_KEYS") };
+        let key = DomainKey::generate("c4-consume-validate", &mut OsRng);
+        let domain = key.domain();
+        domain_store::save_domain_file(&domain_dir.join("domain.toml"), &domain).unwrap();
+        domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
+        // A REAL encrypted key blob -- must reach `run_provision`'s
+        // TOML-injection check, not fail earlier at key decryption.
+        let key_blob = std::fs::read(domain_dir.join("domain_key.bin")).unwrap();
+        let malicious = "urn:vouchsafe:admin.x\"]\ntrusted_roots = [\"pwned";
+
+        // Bypass create_bundle's validation on purpose -- this proves
+        // run_provision has its OWN check, not just create_bundle's.
+        let bundle = ProvisionBundle {
+            domain_name: domain.name.clone(),
+            domain_id: domain.id.to_string(),
+            domain_pubkey: to_hex(&domain.pubkey),
+            domain_pq_pubkey: None,
+            bootstrap_admin_urn: Some(malicious.to_string()),
+            domain_key_blob: key_blob,
+            org_hash: "org".into(),
+            listen_port: 4001,
+            api_port: 5551,
+            mdns_enabled: true,
+            fingerprint: String::new(),
+        };
+        let bundle_path = dir.path().join("c4-consume-validate.dds");
+        save_bundle(&bundle_path, &bundle, &key).unwrap();
+
+        let data_dir = dir.path().join("node-data");
+        let err = run_provision(&bundle_path, Some(&data_dir), false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must be \"urn:\" followed only by"),
+            "expected the allowlist guard to reject the URN, got: {err}"
+        );
+        // The check runs late (just before dds.toml is built, after
+        // admission.cbor/domain.toml/node_key.bin are already written)
+        // -- confirm it still fails BEFORE the malformed value ever
+        // reaches disk in a config file.
+        let config_dir = data_dir.parent().unwrap();
+        assert!(
+            !config_dir.join("dds.toml").exists(),
+            "must fail before the malformed URN is written into dds.toml"
+        );
+    }
+
+    /// **C-4 round 2 regression**: a `]` inside the URN doesn't break a
+    /// TOML string on its own, but it truncates
+    /// `Enroll-DdsDevice.ps1`'s non-quote-aware extraction regex
+    /// (`trusted_roots\s*=\s*\[.*?\]`) at the wrong bracket, splicing
+    /// an unterminated array into the joining node's node.toml. The
+    /// old denylist (`"`, `\`, CR, LF) didn't catch this; the allowlist
+    /// does, structurally.
+    #[test]
+    fn validate_bootstrap_admin_urn_rejects_bracket() {
+        assert!(validate_bootstrap_admin_urn("urn:vouchsafe:ab]cd.hash").is_err());
+    }
+
+    /// **C-4 round 2 regression**: a `$`-token sequence (`$1`, `$_`,
+    /// `$&`, ...) inside the URN is invisible to a TOML parser but
+    /// gets reinterpreted as a substitution token when
+    /// `Enroll-DdsDevice.ps1` splices the extracted text into the
+    /// REPLACEMENT argument of PowerShell's `-replace` operator,
+    /// silently corrupting what's actually written to node.toml.
+    #[test]
+    fn validate_bootstrap_admin_urn_rejects_dollar_sign() {
+        assert!(validate_bootstrap_admin_urn("urn:vouchsafe:admin$1").is_err());
+        assert!(validate_bootstrap_admin_urn("urn:vouchsafe:admin$_").is_err());
+    }
+
+    /// **C-4 round 2 regression**: raw C0 control characters (e.g.
+    /// vertical tab) are accepted by TOML's grammar at WRITE time
+    /// (`std::fs::write` doesn't care), but the `toml` crate rejects
+    /// them on the next READ — so a node provisioned with one reports
+    /// success and then fails to parse its own node.toml the next time
+    /// the service starts. The old denylist only checked `\r`/`\n`.
+    #[test]
+    fn validate_bootstrap_admin_urn_rejects_control_char() {
+        assert!(validate_bootstrap_admin_urn("urn:vouchsafe:admin\u{000B}evil").is_err());
+        assert!(validate_bootstrap_admin_urn("urn:vouchsafe:admin\u{0000}evil").is_err());
+    }
+
+    /// **C-4 round 2**: `org_hash` lands in the exact same
+    /// hand-formatted TOML template as `bootstrap_admin_urn` but
+    /// wasn't guarded — `create_bundle` must reject a value that would
+    /// break out of the generated `dds.toml`'s `org_hash = "..."` line,
+    /// the same way it already rejects a malformed
+    /// `bootstrap_admin_urn`.
+    #[test]
+    fn create_bundle_rejects_malformed_org_hash() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = TempDir::new().unwrap();
+        let domain_dir = dir.path().join("domain");
+        std::fs::create_dir_all(&domain_dir).unwrap();
+        unsafe { std::env::set_var("DDS_DOMAIN_PASSPHRASE", "") };
+        unsafe { std::env::remove_var("DDS_REQUIRE_ENCRYPTED_KEYS") };
+        let key = DomainKey::generate("c4-org-validate", &mut OsRng);
+        let domain = key.domain();
+        domain_store::save_domain_file(&domain_dir.join("domain.toml"), &domain).unwrap();
+        domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
+
+        let bundle_path = dir.path().join("c4-org-validate.dds");
+        let malicious_org = "evil\"]\ntrusted_roots = [\"pwned";
+        let err = create_bundle(&domain_dir, malicious_org, &bundle_path, None).unwrap_err();
+        assert!(
+            err.to_string().contains("org_hash contains"),
+            "expected org_hash TOML-injection guard to fire, got: {err}"
+        );
+        assert!(
+            !bundle_path.exists(),
+            "no bundle should be written on rejection"
+        );
+    }
+
+    /// **C-4 round 2**: same guard for `domain_name` — sourced from
+    /// `domain.toml` (itself safely written by the real `toml` crate,
+    /// so an operator-chosen name round-trips there without issue) but
+    /// re-embedded into `dds.toml` via the same hand-formatted
+    /// template as `bootstrap_admin_urn` and `org_hash`.
+    #[test]
+    fn create_bundle_rejects_malformed_domain_name() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = TempDir::new().unwrap();
+        let domain_dir = dir.path().join("domain");
+        std::fs::create_dir_all(&domain_dir).unwrap();
+        unsafe { std::env::set_var("DDS_DOMAIN_PASSPHRASE", "") };
+        unsafe { std::env::remove_var("DDS_REQUIRE_ENCRYPTED_KEYS") };
+        let key = DomainKey::generate("evil\"]\ntrusted_roots = [\"pwned", &mut OsRng);
+        let domain = key.domain();
+        // save_domain_file uses the real `toml` crate, so this write
+        // itself is safe -- the danger is purely in create_bundle's own
+        // hand-formatted dds.toml template, which is what we're testing.
+        domain_store::save_domain_file(&domain_dir.join("domain.toml"), &domain).unwrap();
+        domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
+
+        let bundle_path = dir.path().join("c4-name-validate.dds");
+        let err = create_bundle(&domain_dir, "org", &bundle_path, None).unwrap_err();
+        assert!(
+            err.to_string().contains("domain_name contains"),
+            "expected domain_name TOML-injection guard to fire, got: {err}"
+        );
+        assert!(
+            !bundle_path.exists(),
+            "no bundle should be written on rejection"
+        );
+    }
+
     /// **SC-1**: an attacker tries the silent downgrade by forging a
     /// v3 bundle that bolts a `domain_pq_pubkey` field onto the CBOR
     /// map. The v3 prefix in `signing_bytes` excludes pq, so
@@ -2085,6 +2678,7 @@ mod tests {
             domain_id: domain.id.to_string(),
             domain_pubkey: to_hex(&domain.pubkey),
             domain_pq_pubkey: None,
+            bootstrap_admin_urn: None,
             domain_key_blob: vec![9, 8, 7],
             org_hash: "org".into(),
             listen_port: 4001,
@@ -2130,6 +2724,7 @@ mod tests {
             domain_id: domain.id.to_string(),
             domain_pubkey: to_hex(&domain.pubkey),
             domain_pq_pubkey: None,
+            bootstrap_admin_urn: None,
             domain_key_blob: vec![1],
             org_hash: "org".into(),
             listen_port: 4001,
@@ -2152,6 +2747,7 @@ mod tests {
             domain_id: plain_dom.id.to_string(),
             domain_pubkey: to_hex(&plain_dom.pubkey),
             domain_pq_pubkey: Some(bogus_pq),
+            bootstrap_admin_urn: None,
             domain_key_blob: vec![1],
             org_hash: "org".into(),
             listen_port: 4001,
@@ -2191,7 +2787,7 @@ mod tests {
         domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
 
         let bundle_path = dir.path().join("hybrid.dds");
-        create_bundle(&domain_dir, "hybrid-org", &bundle_path).unwrap();
+        create_bundle(&domain_dir, "hybrid-org", &bundle_path, None).unwrap();
 
         // The created bundle must be v4 and carry the same pq_pubkey.
         let loaded = load_bundle(&bundle_path).unwrap();
@@ -2558,7 +3154,7 @@ mod tests {
         domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
 
         let bundle_path = dir.path().join("pqd2.dds");
-        create_bundle(&domain_dir, "pqd2-org", &bundle_path).unwrap();
+        create_bundle(&domain_dir, "pqd2-org", &bundle_path, None).unwrap();
 
         let data_dir = dir.path().join("node-data");
         let result = run_provision(&bundle_path, Some(&data_dir), false).unwrap();
@@ -2607,7 +3203,7 @@ mod tests {
         domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
 
         let bundle_path = dir.path().join("pqd2-legacy.dds");
-        create_bundle(&domain_dir, "pqd2-legacy-org", &bundle_path).unwrap();
+        create_bundle(&domain_dir, "pqd2-legacy-org", &bundle_path, None).unwrap();
 
         let data_dir = dir.path().join("node-data");
         run_provision(&bundle_path, Some(&data_dir), false).unwrap();

@@ -141,11 +141,39 @@ if ($nText -notmatch '\[domain\]') {
     }
     $domainBlock = $Matches[1].Trim()
 
-    # Insert org_hash + trusted_roots = [] before [network] if absent.
+    # Insert org_hash + trusted_roots (and bootstrap_admin_urn, when the
+    # bundle carried a C-4 trust-anchor seed) before [network] if absent.
+    # **C-4**: copied VERBATIM from the provisioned dds.toml -- not
+    # hardcoded -- so a bundle created with `--bootstrap-admin-urn`
+    # actually seeds this node's trust anchor. Without this, every
+    # joined node permanently started with trusted_roots = [] regardless
+    # of bundle contents, and could never resolve `vouched` for the
+    # domain's existing admin no matter how much gossip replicated (the
+    # admin's own trust anchor is established purely locally by
+    # admin_setup and is never itself gossip-replicable, by design).
     if ($nText -notmatch '(?m)^\s*org_hash\s*=') {
         if ($pText -match '(?m)^(org_hash\s*=\s*"[^"]+")') {
             $orgHashLine = $Matches[1]
-            $nText = $nText -replace '(?m)^(\[network\])', "$orgHashLine`ntrusted_roots = []`n`n`$1"
+            if ($pText -match '(?ms)^(trusted_roots\s*=\s*\[.*?\](?:\r?\n^bootstrap_admin_urn\s*=\s*"[^"]+")?)') {
+                $trustedRootsLines = $Matches[1]
+            } else {
+                $trustedRootsLines = 'trusted_roots = []'
+            }
+            # **C-4 round 2 (security review)**: the -replace REPLACEMENT
+            # argument (the 2nd argument, below) is scanned by .NET for
+            # $1/$&/$_/$`/$'/${name}/$$ substitution tokens -- the
+            # trailing literal `$1` in the same call relies on exactly
+            # this to reinsert the matched [network] line. A URN
+            # containing e.g. "$1" or "$_" would otherwise get silently
+            # reinterpreted here and corrupt what's actually written to
+            # node.toml, even though it passed dds-node's own
+            # TOML-injection guard (which only cares about breaking a
+            # TOML string, not PowerShell's replacement-string syntax).
+            # Escape literal '$' -> '$$' in both interpolated blocks so
+            # they're inserted verbatim.
+            $orgHashLineSafe      = $orgHashLine.Replace('$', '$$')
+            $trustedRootsLinesSafe = $trustedRootsLines.Replace('$', '$$')
+            $nText = $nText -replace '(?m)^(\[network\])', "$orgHashLineSafe`n$trustedRootsLinesSafe`n`n`$1"
         }
     }
     # Append the [domain] block.
