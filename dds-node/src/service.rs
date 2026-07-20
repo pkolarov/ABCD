@@ -1307,7 +1307,7 @@ impl<
         let mut payload = TokenPayload {
             iss: self.node_identity.id.to_urn(),
             iss_key: self.node_identity.public_key.clone(),
-            jti: format!("session-{}", &session_id),
+            jti: format!("session-{}", session_id),
             sub: req.subject_urn,
             kind: TokenKind::Attest,
             purpose: Some("dds:session".to_string()),
@@ -1388,7 +1388,11 @@ impl<
     /// publish that policy class right now without bootstrapping.
     pub fn node_has_publisher_capability(&self, purpose: &str) -> bool {
         let g = self.trust_graph.read().expect("trust_graph poisoned");
-        g.has_purpose(&self.node_identity.id.to_urn(), purpose, &self.trusted_roots)
+        g.has_purpose(
+            &self.node_identity.id.to_urn(),
+            purpose,
+            &self.trusted_roots,
+        )
     }
 
     /// Report the node's publish authorization for `purpose`.
@@ -2386,8 +2390,7 @@ impl<
             // never-vouched (pending) user has an empty summary list
             // and stays visible so the approval flow can find them.
             let summaries = g.vouch_summaries_for_subject(&token.payload.sub);
-            let revoked = !summaries.is_empty()
-                && summaries.iter().all(|s| s.revoked || s.expired);
+            let revoked = !summaries.is_empty() && summaries.iter().all(|s| s.revoked || s.expired);
             if revoked && !include_revoked {
                 continue;
             }
@@ -3130,9 +3133,10 @@ impl<
                 // the graph enforces H-1, then the store persists the
                 // token and the revocation mark.
                 {
-                    let mut g = self.trust_graph.write().map_err(|e| {
-                        ServiceError::Trust(format!("trust_graph poisoned: {e}"))
-                    })?;
+                    let mut g = self
+                        .trust_graph
+                        .write()
+                        .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
                     g.add_token(token.clone())
                         .map_err(|e| ServiceError::Trust(format!("revoke rejected: {e}")))?;
                 }
@@ -3313,14 +3317,11 @@ impl<
                 .find(|t| t.payload.sub == *urn)
                 .and_then(|t| UserAuthAttestation::extract(&t.payload).ok().flatten())
                 .map(|d| d.user_display_name);
-            let has_active_admin_vouch = g
-                .vouch_summaries_for_subject(urn)
-                .iter()
-                .any(|s| {
-                    !s.revoked
-                        && !s.expired
-                        && s.purpose.as_deref() == Some(dds_core::token::purpose::ADMIN)
-                });
+            let has_active_admin_vouch = g.vouch_summaries_for_subject(urn).iter().any(|s| {
+                !s.revoked
+                    && !s.expired
+                    && s.purpose.as_deref() == Some(dds_core::token::purpose::ADMIN)
+            });
             roots.push(AdminRootInfo {
                 urn: urn.clone(),
                 is_bootstrap: self.bootstrap_admin_urn.as_deref() == Some(urn.as_str()),
@@ -4248,7 +4249,10 @@ mod platform_applier_tests {
         assert_eq!(doc.scope.identity_urns, vec!["urn:vouchsafe:pc1.def"]);
         let a = &doc.windows.unwrap().local_accounts[0];
         assert!(matches!(a.action, AccountAction::Create));
-        assert_eq!(a.claim_subject_urn.as_deref(), Some("urn:vouchsafe:bob.abc"));
+        assert_eq!(
+            a.claim_subject_urn.as_deref(),
+            Some("urn:vouchsafe:bob.abc")
+        );
         assert_eq!(a.groups, vec!["Users", "Remote Desktop Users"]);
         assert_eq!(a.password_never_expires, Some(true));
     }
@@ -4274,7 +4278,10 @@ mod platform_applier_tests {
         let d: WindowsPolicyDocument = serde_json::from_str(svc).unwrap();
         let s = &d.windows.unwrap().services[0];
         assert_eq!(s.name, "RemoteRegistry");
-        assert!(matches!(s.start_type, Some(dds_domain::ServiceStartType::Disabled)));
+        assert!(matches!(
+            s.start_type,
+            Some(dds_domain::ServiceStartType::Disabled)
+        ));
         assert!(matches!(s.action, dds_domain::ServiceAction::Stop));
 
         // Password policy template.
@@ -5816,8 +5823,8 @@ mod platform_applier_tests {
     #[test]
     fn admin_revoke_vouch_offboards_user() {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use dds_domain::fido2::{build_assertion_auth_data, build_packed_self_attestation};
         use dds_domain::DomainDocument;
+        use dds_domain::fido2::{build_assertion_auth_data, build_packed_self_attestation};
         use ed25519_dalek::{Signer, SigningKey};
         use sha2::Digest;
 
@@ -5900,7 +5907,13 @@ mod platform_applier_tests {
             signed.extend_from_slice(&auth_data);
             signed.extend_from_slice(&cdh);
             let sig = cred_sk.sign(&signed);
-            (ch_id, cdh.to_vec(), cdj.into_bytes(), auth_data, sig.to_bytes().to_vec())
+            (
+                ch_id,
+                cdh.to_vec(),
+                cdj.into_bytes(),
+                auth_data,
+                sig.to_bytes().to_vec(),
+            )
         };
 
         // Approve the user.
@@ -5919,7 +5932,10 @@ mod platform_applier_tests {
 
         // User is now visible + vouched, not revoked.
         let listed = svc.list_enrolled_users("", false).unwrap();
-        let u = listed.iter().find(|u| u.subject_urn == subject_urn).unwrap();
+        let u = listed
+            .iter()
+            .find(|u| u.subject_urn == subject_urn)
+            .unwrap();
         assert!(
             u.vouched && !u.revoked,
             "user approved and active (vouched={}, revoked={})",
@@ -5943,7 +5959,10 @@ mod platform_applier_tests {
             .expect("revoke-vouch");
         assert_eq!(r.revoked.len(), 1, "one vouch revoked");
         assert!(r.foreign.is_empty(), "no foreign vouches");
-        assert!(!r.revoke_tokens.is_empty(), "revoke token minted for gossip");
+        assert!(
+            !r.revoke_tokens.is_empty(),
+            "revoke token minted for gossip"
+        );
 
         // Default listing hides the offboarded user; include_revoked shows it.
         let default_list = svc.list_enrolled_users("", false).unwrap();
@@ -5970,7 +5989,10 @@ mod platform_applier_tests {
             signature: sig,
             purpose: None,
         });
-        assert!(err.is_err(), "nothing left to revoke → error, not a double-revoke");
+        assert!(
+            err.is_err(),
+            "nothing left to revoke → error, not a double-revoke"
+        );
     }
 
     /// `reconcile_trusted_roots` promotes a subject holding a live
@@ -6068,11 +6090,11 @@ mod platform_applier_tests {
 
         // Helper: enroll `who` (attestation) + a dds:admin vouch from `by`.
         let admin_purpose = dds_core::token::purpose::ADMIN;
-        let mut mk_admin_vouch = |svc: &mut LocalService<MemoryBackend>,
-                                  who: &Identity,
-                                  by: &Identity,
-                                  jti: &str,
-                                  enroll: bool| {
+        let mk_admin_vouch = |svc: &mut LocalService<MemoryBackend>,
+                              who: &Identity,
+                              by: &Identity,
+                              jti: &str,
+                              enroll: bool| {
             if enroll {
                 let att = make_attest_for_publisher_setup(who);
                 svc.trust_graph.write().unwrap().add_token(att).unwrap();
@@ -6112,10 +6134,16 @@ mod platform_applier_tests {
         let s = Identity::generate("admin-s", &mut OsRng);
         mk_admin_vouch(&mut svc, &r, &boot, "vouch-boot-r", true);
         svc.reconcile_trusted_roots();
-        assert!(svc.trusted_roots.contains(&r.id.to_urn()), "R promoted by boot");
+        assert!(
+            svc.trusted_roots.contains(&r.id.to_urn()),
+            "R promoted by boot"
+        );
         mk_admin_vouch(&mut svc, &s, &r, "vouch-r-s", true);
         svc.reconcile_trusted_roots();
-        assert!(svc.trusted_roots.contains(&s.id.to_urn()), "S promoted by R");
+        assert!(
+            svc.trusted_roots.contains(&s.id.to_urn()),
+            "S promoted by R"
+        );
 
         // Offboard R: revoke boot's vouch of R. A single reconcile must
         // cascade — R demoted, and then S demoted (its only vouch was from R).
@@ -6138,7 +6166,11 @@ mod platform_applier_tests {
             &boot.signing_key,
         )
         .unwrap();
-        svc.trust_graph.write().unwrap().add_token(revoke_r).unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(revoke_r)
+            .unwrap();
         svc.reconcile_trusted_roots();
         assert!(!svc.trusted_roots.contains(&r.id.to_urn()), "R demoted");
         assert!(
@@ -6150,7 +6182,10 @@ mod platform_applier_tests {
         // is revoked. S must remain a root (boot's live vouch survives).
         mk_admin_vouch(&mut svc, &s, &boot, "vouch-boot-s", false);
         svc.reconcile_trusted_roots();
-        assert!(svc.trusted_roots.contains(&s.id.to_urn()), "S re-promoted by boot");
+        assert!(
+            svc.trusted_roots.contains(&s.id.to_urn()),
+            "S re-promoted by boot"
+        );
         let revoke_rs = Token::sign(
             TokenPayload {
                 iss: r.id.to_urn(),
@@ -6170,7 +6205,11 @@ mod platform_applier_tests {
             &r.signing_key,
         )
         .unwrap();
-        svc.trust_graph.write().unwrap().add_token(revoke_rs).unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(revoke_rs)
+            .unwrap();
         svc.reconcile_trusted_roots();
         assert!(
             svc.trusted_roots.contains(&s.id.to_urn()),

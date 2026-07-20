@@ -304,7 +304,7 @@ async fn run_installer(path: &Path) -> Result<(), String> {
                 "self-update: msiexec exited with non-zero status ({status})"
             ));
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "macos")]
     {

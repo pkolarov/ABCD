@@ -1077,7 +1077,9 @@ mod tests {
         // re-credited to merged_op_ids (R5 stays closed).
         let mut restarted_dag = CausalDag::new();
         for id in store.operation_ids().unwrap() {
-            restarted_dag.insert(store.get_operation(&id).unwrap()).unwrap();
+            restarted_dag
+                .insert(store.get_operation(&id).unwrap())
+                .unwrap();
         }
         let again = apply_sync_payloads_with_graph(
             &[SyncPayload {

@@ -145,6 +145,24 @@ pub struct PublishCommand {
     /// self-attestation before the self-vouch that pins it, before the
     /// policy attestation that needs the capability).
     pub tokens: Vec<Token>,
+    /// URNs to add to the swarm task's `trusted_roots` copy **before**
+    /// applying `tokens`. Non-empty only for `admin_setup`, which passes
+    /// the newly-established bootstrap admin URN.
+    ///
+    /// This closes a divergence between the two `trusted_roots` copies:
+    /// `LocalService.trusted_roots` learns the bootstrap admin from
+    /// `admin_setup` (and `bootstrap_admin_urn`), but the swarm task's
+    /// copy — the one that gates C-3 `publisher_capability_ok` at apply
+    /// time — is seeded only from `config.trusted_roots` at startup and
+    /// otherwise chain-promotes from an *existing* root. On a fresh
+    /// bootstrap the service starts with `node.toml trusted_roots = []`
+    /// (before `admin_setup` runs), so without this the swarm copy stays
+    /// empty until a restart and every policy publish 500s
+    /// ("issuer lacks the required publisher capability") even though
+    /// `publisher-status` reports `can_publish: true`. Approvals/vouches
+    /// are unaffected because that gate only applies to policy
+    /// attestations.
+    pub seed_roots: Vec<String>,
     /// Result channel: `Ok(count)` = tokens applied and gossip attempted;
     /// `Err(msg)` = a token failed validation or the publisher-capability
     /// gate (nothing after the failing token is applied).
@@ -812,8 +830,18 @@ impl DdsNode {
             "admission key provider loaded"
         );
 
-        // Build trusted roots set
-        let trusted_roots: BTreeSet<String> = config.trusted_roots.iter().cloned().collect();
+        // Build trusted roots set. Seed from `config.trusted_roots` AND
+        // the config-anchored `bootstrap_admin_urn`: `persist_trusted_roots`
+        // writes both to node.toml, so they normally agree, but seeding
+        // the bootstrap admin explicitly is a cheap belt-and-suspenders
+        // guard against a node.toml that carries `bootstrap_admin_urn`
+        // without the matching `trusted_roots` entry. The runtime path
+        // (`admin_setup` → `PublishCommand::seed_roots`) covers the
+        // fresh-bootstrap race where neither is set yet at startup.
+        let mut trusted_roots: BTreeSet<String> = config.trusted_roots.iter().cloned().collect();
+        if let Some(urn) = config.bootstrap_admin_urn.as_ref() {
+            trusted_roots.insert(urn.clone());
+        }
 
         // Local policy-publish command channel. Bounded so a runaway HTTP
         // caller can't grow an unbounded backlog; 64 comfortably absorbs
@@ -1113,8 +1141,7 @@ impl DdsNode {
                 // node retains its own `publish_tx`, so this arm never
                 // becomes permanently disabled by a closed channel.
                 Some(cmd) = self.publish_rx.recv() => {
-                    let result = self.apply_local_publish(cmd.tokens);
-                    let _ = cmd.respond.send(result);
+                    self.handle_publish_command(cmd);
                 }
                 // **Replication probe** — `GET /v1/replication/confirm`
                 // queued a probe. Fan a targeted sync request out to up
@@ -2171,6 +2198,27 @@ impl DdsNode {
     /// their batches so a partial apply is still coherent — e.g.
     /// `[self_attest, self_vouch, policy]`). A duplicate JTI (token already
     /// present in the graph) is treated as idempotent success.
+    /// Handle one [`PublishCommand`] from the HTTP API task: seed any
+    /// authoritative trusted roots (the bootstrap admin from
+    /// `admin_setup`) into this swarm task's `trusted_roots` copy
+    /// **before** applying `tokens` — so a policy publish (even one
+    /// batched into this same command) passes the C-3
+    /// `publisher_capability_ok` gate — then apply + gossip the tokens
+    /// and report the outcome on the command's response channel. See
+    /// [`PublishCommand::seed_roots`].
+    fn handle_publish_command(&mut self, cmd: PublishCommand) {
+        for urn in &cmd.seed_roots {
+            if self.trusted_roots.insert(urn.clone()) {
+                info!(
+                    root = %urn,
+                    "seeded trusted root into swarm task (bootstrap admin established at runtime)"
+                );
+            }
+        }
+        let result = self.apply_local_publish(cmd.tokens);
+        let _ = cmd.respond.send(result);
+    }
+
     fn apply_local_publish(&mut self, tokens: Vec<Token>) -> Result<usize, String> {
         let mut applied = 0usize;
         for token in tokens {
@@ -2207,9 +2255,7 @@ impl DdsNode {
                 }
             }
         }
-        let token_bytes = token
-            .to_cbor()
-            .map_err(|e| format!("token encode: {e}"))?;
+        let token_bytes = token.to_cbor().map_err(|e| format!("token encode: {e}"))?;
         if let Err(e) = self.store.put_token(&token) {
             error!("local publish: store put_token error: {e}");
         }
@@ -3295,11 +3341,8 @@ impl DdsNode {
             });
             return;
         }
-        let target_op_ids: BTreeSet<String> = cmd
-            .jtis
-            .iter()
-            .map(|jti| format!("op-{jti}"))
-            .collect();
+        let target_op_ids: BTreeSet<String> =
+            cmd.jtis.iter().map(|jti| format!("op-{jti}")).collect();
         // Advertise everything we have EXCEPT the probed ops. Do NOT
         // touch `sync_last_outbound` — probes must neither consume nor
         // reset the anti-entropy cooldown.
@@ -3583,7 +3626,10 @@ impl DdsNode {
             publishers,
             outbound_releases,
         };
-        self.swarm.behaviour_mut().epoch_keys.send_request(&peer, req);
+        self.swarm
+            .behaviour_mut()
+            .epoch_keys
+            .send_request(&peer, req);
         // Only stamp the pull cooldown when we actually asked for the
         // peer's key. A push-only exchange (need_pull == false) must not
         // arm the 30s cooldown, or a subsequent no-key drop's late-join
@@ -4092,12 +4138,7 @@ impl DdsNode {
         // err_count=1 with no cause). Surface the first few actual
         // errors at warn.
         if !result.errors.is_empty() {
-            let sample: Vec<&str> = result
-                .errors
-                .iter()
-                .take(3)
-                .map(|e| e.as_str())
-                .collect();
+            let sample: Vec<&str> = result.errors.iter().take(3).map(|e| e.as_str()).collect();
             warn!(%peer, errors = ?sample, "sync: payload apply errors (first 3)");
         }
     }
@@ -4747,6 +4788,21 @@ impl DdsNode {
         };
         let mut g = self.trust_graph.write().expect("trust_graph poisoned");
         crate::expiry::sweep_once(&mut g, &mut self.store, now)
+    }
+
+    /// **Test hook** — drive [`Self::handle_publish_command`] (the swarm
+    /// run loop's `PublishCommand` arm: seed roots, then apply + gossip)
+    /// without a live event loop.
+    #[doc(hidden)]
+    pub fn handle_publish_command_for_tests(&mut self, cmd: PublishCommand) {
+        self.handle_publish_command(cmd);
+    }
+
+    /// **Test hook** — read the swarm task's `trusted_roots` copy (the
+    /// set that gates C-3 `publisher_capability_ok` at apply time).
+    #[doc(hidden)]
+    pub fn trusted_roots_for_tests(&self) -> &BTreeSet<String> {
+        &self.trusted_roots
     }
 
     /// Prune audit log entries based on retention config.
@@ -6939,13 +6995,7 @@ mod probe_honesty_and_kem_repair_tests {
 
     #[test]
     fn probe_partial_present_with_drops_keeps_positives_and_flags_rest() {
-        let r = probe_result_from_response(
-            "p1",
-            &targets(&["a", "b"]),
-            &present(&["a"]),
-            1,
-            true,
-        );
+        let r = probe_result_from_response("p1", &targets(&["a", "b"]), &present(&["a"]), 1, true);
         assert_eq!(r.present_jtis, vec!["a".to_string()]);
         assert!(r.error.is_some(), "missing 'b' may be among the drops");
     }
@@ -6990,5 +7040,271 @@ mod probe_honesty_and_kem_repair_tests {
         cert.pq_kem_pubkey = Some(vec![9u8; dds_domain::HYBRID_KEM_PUBKEY_LEN]);
         cert.verify_with_domain(&domain, "peer-legacy", 1)
             .expect("attaching pq_kem_pubkey to a non-hybrid cert must keep signatures valid");
+    }
+}
+
+#[cfg(test)]
+mod publish_seed_roots_tests {
+    //! **swarm trusted_roots bootstrap gap** — regression coverage for the
+    //! fresh-domain policy-publish 500. The swarm task's `trusted_roots`
+    //! copy (which gates C-3 `publisher_capability_ok` at apply time) is
+    //! seeded from `config.trusted_roots` + `config.bootstrap_admin_urn`
+    //! at startup and, at runtime, from `PublishCommand::seed_roots`
+    //! (sent by `admin_setup`). Without the latter, a domain bootstrapped
+    //! while `node.toml trusted_roots = []` leaves the swarm copy empty
+    //! until a restart, and every policy publish 500s even though
+    //! `publisher-status` reports `can_publish: true`.
+
+    use super::*;
+    use crate::config::{DomainConfig, NetworkConfig, NodeConfig};
+    use dds_core::token::{TokenPayload, purpose};
+    use dds_domain::{
+        AccountAction, AccountDirective, DomainDocument, Enforcement, PolicyScope,
+        WindowsPolicyDocument, WindowsSettings, body_types,
+    };
+    use rand::rngs::OsRng;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn build_node(
+        trusted_roots: Vec<String>,
+        bootstrap_admin_urn: Option<String>,
+    ) -> (DdsNode, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let domain_key = dds_domain::DomainKey::generate("seedroots.test", &mut OsRng);
+        let domain = domain_key.domain();
+        let p2p_kp = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = libp2p::PeerId::from(p2p_kp.public());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let cert = domain_key.issue_admission(peer_id.to_string(), now, None);
+        crate::domain_store::save_admission_cert(&data_dir.join("admission.cbor"), &cert).unwrap();
+        let cfg = NodeConfig {
+            data_dir,
+            network: NetworkConfig {
+                listen_addr: "/ip4/127.0.0.1/tcp/0".to_string(),
+                bootstrap_peers: Vec::new(),
+                mdns_enabled: false,
+                heartbeat_secs: 1,
+                idle_timeout_secs: 60,
+                api_addr: "127.0.0.1:0".to_string(),
+                api_auth: Default::default(),
+                allow_legacy_v1_tokens: false,
+                metrics_addr: None,
+                allow_v1_certs: true,
+                admission_key_backend: Default::default(),
+            },
+            org_hash: "test-org".to_string(),
+            domain: DomainConfig {
+                name: domain.name.clone(),
+                id: domain.id.to_string(),
+                pubkey: dds_domain::domain::to_hex(&domain.pubkey),
+                pq_pubkey: None,
+                capabilities: Vec::new(),
+                admission_path: None,
+                audit_log_enabled: false,
+                max_delegation_depth: 5,
+                audit_log_max_entries: 0,
+                audit_log_retention_days: 0,
+                enforce_device_scope_vouch: false,
+                allow_unattested_credentials: false,
+                fido2_allowed_aaguids: Vec::new(),
+                fido2_attestation_roots: Vec::new(),
+                epoch_rotation_secs: 86_400,
+            },
+            trusted_roots,
+            bootstrap_admin_urn,
+            identity_path: None,
+            expiry_scan_interval_secs: 60,
+            self_update_apply: false,
+        };
+        unsafe { std::env::remove_var(crate::identity_store::REQUIRE_ENCRYPTED_KEYS_ENV) };
+        let node = DdsNode::init(cfg, p2p_kp).expect("init node");
+        (node, dir)
+    }
+
+    fn oneshot_publish(
+        node: &mut DdsNode,
+        tokens: Vec<Token>,
+        seed_roots: Vec<String>,
+    ) -> Result<usize, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.handle_publish_command_for_tests(PublishCommand {
+            tokens,
+            seed_roots,
+            respond: tx,
+        });
+        rx.blocking_recv().expect("publish command must respond")
+    }
+
+    fn make_attest(ident: &Identity, jti: &str) -> Token {
+        let payload = TokenPayload {
+            iss: ident.id.to_urn(),
+            iss_key: ident.public_key.clone(),
+            jti: jti.to_string(),
+            sub: ident.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: Some("dds:directory-entry".to_string()),
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1000,
+            exp: Some(4102444800),
+            body_type: None,
+            body_cbor: None,
+        };
+        Token::sign(payload, &ident.signing_key).unwrap()
+    }
+
+    fn make_vouch(
+        voucher: &Identity,
+        target: &Identity,
+        target_token: &Token,
+        purpose: &str,
+        jti: &str,
+    ) -> Token {
+        let payload = TokenPayload {
+            iss: voucher.id.to_urn(),
+            iss_key: voucher.public_key.clone(),
+            jti: jti.to_string(),
+            sub: target.id.to_urn(),
+            kind: TokenKind::Vouch,
+            purpose: Some(purpose.to_string()),
+            vch_iss: Some(target.id.to_urn()),
+            vch_sum: Some(target_token.payload_hash()),
+            revokes: None,
+            iat: 1000,
+            exp: Some(4102444800),
+            body_type: None,
+            body_cbor: None,
+        };
+        Token::sign(payload, &voucher.signing_key).unwrap()
+    }
+
+    fn make_windows_policy(publisher: &Identity, jti: &str) -> Token {
+        let doc = WindowsPolicyDocument {
+            policy_id: "windows/claim/test".to_string(),
+            display_name: "New account: test".to_string(),
+            version: 1,
+            scope: PolicyScope {
+                device_tags: vec![],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            settings: vec![],
+            enforcement: Enforcement::Enforce,
+            windows: Some(WindowsSettings {
+                local_accounts: vec![AccountDirective {
+                    username: "test".to_string(),
+                    action: AccountAction::Create,
+                    claim_subject_urn: Some("urn:vouchsafe:test.deadbeef".to_string()),
+                    full_name: Some("Tester".to_string()),
+                    description: None,
+                    groups: vec![],
+                    password_never_expires: None,
+                }],
+                ..Default::default()
+            }),
+        };
+        let mut payload = TokenPayload {
+            iss: publisher.id.to_urn(),
+            iss_key: publisher.public_key.clone(),
+            jti: jti.to_string(),
+            sub: publisher.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1000,
+            exp: Some(4102444800),
+            body_type: None,
+            body_cbor: None,
+        };
+        doc.embed(&mut payload).unwrap();
+        assert_eq!(
+            payload.body_type.as_deref(),
+            Some(body_types::WINDOWS_POLICY)
+        );
+        Token::sign(payload, &publisher.signing_key).unwrap()
+    }
+
+    #[test]
+    fn publish_command_seed_roots_populates_swarm_trusted_roots() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut node, _dir) = build_node(vec![], None);
+        assert!(node.trusted_roots_for_tests().is_empty());
+        let admin_urn = "urn:vouchsafe:admin.abcd".to_string();
+        let _ = oneshot_publish(&mut node, vec![], vec![admin_urn.clone()]);
+        assert!(
+            node.trusted_roots_for_tests().contains(&admin_urn),
+            "seed_roots must add the bootstrap admin to the swarm trusted_roots copy"
+        );
+    }
+
+    #[test]
+    fn init_seeds_bootstrap_admin_urn_into_swarm_trusted_roots() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let admin_urn = "urn:vouchsafe:admin.efgh".to_string();
+        let (node, _dir) = build_node(vec![], Some(admin_urn.clone()));
+        assert!(
+            node.trusted_roots_for_tests().contains(&admin_urn),
+            "init must seed bootstrap_admin_urn into the swarm trusted_roots copy"
+        );
+    }
+
+    #[test]
+    fn policy_publish_denied_without_seed_but_succeeds_with_seed() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let admin = Identity::generate("admin", &mut OsRng);
+        let publisher = Identity::generate("pubnode", &mut OsRng);
+        let admin_urn = admin.id.to_urn();
+
+        let pub_attest = make_attest(&publisher, "attest-pub-1");
+        let cap_vouch = make_vouch(
+            &admin,
+            &publisher,
+            &pub_attest,
+            purpose::POLICY_PUBLISHER_WINDOWS,
+            "vouch-pub-cap-1",
+        );
+
+        // --- No seed_roots: reproduces the 500 (empty swarm roots) ---
+        {
+            let (mut node, _dir) = build_node(vec![], None);
+            let policy = make_windows_policy(&publisher, "attest-winpolicy-a");
+            let res = oneshot_publish(
+                &mut node,
+                vec![pub_attest.clone(), cap_vouch.clone(), policy],
+                vec![],
+            );
+            assert!(
+                res.is_err(),
+                "policy publish must FAIL when the swarm has no trusted root (the bug)"
+            );
+            assert!(
+                res.unwrap_err().contains("publisher capability"),
+                "failure must be the C-3 capability gate"
+            );
+        }
+
+        // --- With seed_roots=[admin]: the fix ---
+        {
+            let (mut node, _dir) = build_node(vec![], None);
+            let policy = make_windows_policy(&publisher, "attest-winpolicy-b");
+            let res = oneshot_publish(
+                &mut node,
+                vec![pub_attest, cap_vouch, policy],
+                vec![admin_urn.clone()],
+            );
+            assert_eq!(
+                res.expect("policy publish must SUCCEED once the bootstrap admin is seeded"),
+                3,
+                "all three tokens (attest + cap vouch + policy) apply"
+            );
+        }
     }
 }
