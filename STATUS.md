@@ -1,5 +1,27 @@
 # DDS Implementation Status
 
+## fix(node): fresh-domain policy publish 500 (swarm trusted_roots bootstrap gap) — 2026-07-20
+
+The New-account wizard's final "Publish" step returned HTTP 500 on a freshly-bootstrapped
+domain even though enroll/approve succeeded and `publisher-status` reported `can_publish: true`.
+Confirmed by a live A/B test (identical publish 500s before a DdsNode restart, 200s after).
+
+**Root cause:** two `trusted_roots` copies. `LocalService.trusted_roots` learns the bootstrap
+admin (via `admin_setup` + `bootstrap_admin_urn`), but the **swarm task's** copy — the one that
+gates C-3 `publisher_capability_ok` at policy-apply time — seeds only from `config.trusted_roots`
+at startup and otherwise chain-promotes from an *existing* root; it never learns
+`bootstrap_admin_urn`. A fresh bootstrap starts the service with `node.toml trusted_roots = []`
+(admin setup runs later), so the swarm copy stays empty until a restart and the policy
+attestation is denied → `apply_one_local` `Err` → 500. Vouches/approvals are unaffected (that
+gate only applies to policy attestations).
+
+**Fix:** `PublishCommand` gains `seed_roots`; the swarm run loop seeds them before applying, and
+`admin_setup` passes the new bootstrap admin URN so the swarm learns the root live — no restart.
+`DdsNode::init` also seeds `config.bootstrap_admin_urn` (belt-and-suspenders). Regression tests
+prove the C-3 gate flips denied→success. Also folded in pending CI hygiene (fmt, clippy
+`too_many_arguments` allows, `from_ref`, `serve()` test call-sites, unused `mut`) that had left
+`main` red since the lifecycle commit grew `serve()` past clippy's arg threshold.
+
 ## feat(installer): native Windows uninstall now fully cleans up DDS — 2026-07-19
 
 ### Summary — "Uninstall" from Windows Settings now does what it should
