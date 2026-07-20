@@ -18,4 +18,15 @@ ignore = [
     # peer-discovery use case (no NSEC3 signed zones involved).
     # Remove once upstream confirms a fix or libp2p drops hickory-mdns.
     "RUSTSEC-2026-0118",
+
+    # RUSTSEC-2026-0204: invalid pointer dereference in crossbeam-epoch's
+    # `fmt::Pointer` impl for `Atomic`/`Shared` when the underlying pointer
+    # is invalid. crossbeam-epoch is a DEV/BENCH-only transitive dependency
+    # (criterion -> rayon -> crossbeam-deque -> crossbeam-epoch); it is not
+    # in any shipped binary, and we never `{:p}`-format an `Atomic`/`Shared`.
+    # Bumping to the patched 0.9.20 would introduce an unvetted version
+    # (cargo-vet regression) for a dev-only dep, so we ignore instead.
+    # Remove once criterion/rayon pull crossbeam-epoch >= 0.9.19 and it is
+    # vetted.
+    "RUSTSEC-2026-0204",
 ]

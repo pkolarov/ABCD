@@ -258,7 +258,7 @@ async fn main() {
         attestation_object_b64: b64(&attestation_object),
         client_data_hash_b64: b64(cdh_create),
         rp_id: RP_ID.to_string(),
-        display_name: format!("FIDO2 Test User ({})", &user_name),
+        display_name: format!("FIDO2 Test User ({})", user_name),
         authenticator_type: "cross-platform".to_string(),
     };
 
