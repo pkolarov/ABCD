@@ -1307,7 +1307,7 @@ impl<
         let mut payload = TokenPayload {
             iss: self.node_identity.id.to_urn(),
             iss_key: self.node_identity.public_key.clone(),
-            jti: format!("session-{}", &session_id),
+            jti: format!("session-{}", session_id),
             sub: req.subject_urn,
             kind: TokenKind::Attest,
             purpose: Some("dds:session".to_string()),

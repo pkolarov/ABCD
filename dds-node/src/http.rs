@@ -1870,13 +1870,12 @@ where
     // policy publishes via C-3 `publisher_capability_ok` against its own
     // copy — stays empty until a restart, so every policy publish 500s
     // on a fresh domain. See `PublishCommand::seed_roots`.
-    let published =
-        publish_identity_tokens_seeding_roots(
-            &state,
-            std::slice::from_ref(&r.token_cbor),
-            std::slice::from_ref(&r.urn),
-        )
-            .await;
+    let published = publish_identity_tokens_seeding_roots(
+        &state,
+        std::slice::from_ref(&r.token_cbor),
+        std::slice::from_ref(&r.urn),
+    )
+    .await;
     Ok(Json(EnrollmentResponse {
         urn: r.urn,
         jti: r.jti,
