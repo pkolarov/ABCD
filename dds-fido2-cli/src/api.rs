@@ -14,12 +14,22 @@
 //! out of scope here, Windows keeps its own native `DdsEnrollUser.exe`.
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::client::conn::http1;
-use hyper_util::rt::TokioIo;
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+// UDS transport pulls in hyper + tokio's UnixStream — Unix-only. This
+// crate is macOS/Linux-only in practice (Windows keeps its own native
+// DdsEnrollUser.exe), but it's still a workspace member that Windows CI
+// type-checks, so the function must exist with the same signature on
+// every platform — mirrors dds-cli/src/client.rs's identical split.
+#[cfg(unix)]
+use http_body_util::{BodyExt, Full};
+#[cfg(unix)]
+use hyper::client::conn::http1;
+#[cfg(unix)]
+use hyper_util::rt::TokioIo;
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 pub const DEFAULT_NODE_URL: &str = "http://127.0.0.1:5551";
@@ -31,41 +41,49 @@ async fn uds_request(
     body: Bytes,
     content_type: Option<&str>,
 ) -> Result<(StatusCode, Bytes), String> {
-    let stream = UnixStream::connect(sock_path)
-        .await
-        .map_err(|e| format!("cannot reach dds-node at unix:{sock_path}: {e}"))?;
-    let io = TokioIo::new(stream);
-    let (mut sender, conn) = http1::handshake::<_, Full<Bytes>>(io)
-        .await
-        .map_err(|e| format!("HTTP handshake over UDS failed: {e}"))?;
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
+    #[cfg(unix)]
+    {
+        let stream = UnixStream::connect(sock_path)
+            .await
+            .map_err(|e| format!("cannot reach dds-node at unix:{sock_path}: {e}"))?;
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = http1::handshake::<_, Full<Bytes>>(io)
+            .await
+            .map_err(|e| format!("HTTP handshake over UDS failed: {e}"))?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
 
-    let mut req = hyper::Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", "localhost");
-    if let Some(ct) = content_type {
-        req = req.header("content-type", ct);
+        let mut req = hyper::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "localhost");
+        if let Some(ct) = content_type {
+            req = req.header("content-type", ct);
+        }
+        req = req.header("content-length", body.len().to_string());
+        let req = req
+            .body(Full::new(body))
+            .map_err(|e| format!("build request: {e}"))?;
+
+        let resp = sender
+            .send_request(req)
+            .await
+            .map_err(|e| format!("cannot reach dds-node at unix:{sock_path}: {e}"))?;
+        let status = StatusCode::from_u16(resp.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let collected = resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| format!("read response body: {e}"))?;
+        Ok((status, collected.to_bytes()))
     }
-    req = req.header("content-length", body.len().to_string());
-    let req = req
-        .body(Full::new(body))
-        .map_err(|e| format!("build request: {e}"))?;
-
-    let resp = sender
-        .send_request(req)
-        .await
-        .map_err(|e| format!("cannot reach dds-node at unix:{sock_path}: {e}"))?;
-    let status =
-        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let collected = resp
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| format!("read response body: {e}"))?;
-    Ok((status, collected.to_bytes()))
+    #[cfg(not(unix))]
+    {
+        let _ = (sock_path, method, path, body, content_type);
+        Err("UDS transport is only supported on Unix platforms".to_string())
+    }
 }
 
 #[derive(Deserialize)]

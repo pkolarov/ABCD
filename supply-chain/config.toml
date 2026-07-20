@@ -1295,8 +1295,16 @@ criteria = "safe-to-deploy"
 version = "0.17.14"
 criteria = "safe-to-deploy"
 
+[[exemptions.rpassword]]
+version = "7.5.4"
+criteria = "safe-to-deploy"
+
 [[exemptions.rtnetlink]]
 version = "0.20.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.rtoolbox]]
+version = "0.0.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustc-hash]]
@@ -1711,12 +1719,12 @@ criteria = "safe-to-deploy"
 version = "0.244.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.wasmparser]]
-version = "0.244.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.wasm-streams]]
 version = "0.4.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.wasmparser]]
+version = "0.244.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.web-sys]]
@@ -1821,6 +1829,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.windows-sys]]
 version = "0.52.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows-sys]]
+version = "0.59.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.windows-sys]]
