@@ -2152,7 +2152,14 @@ mod tests {
 
         let admin_urn = "urn:vouchsafe:admin.c4test".to_string();
         let bundle_path = dir.path().join("c4-test.dds");
-        create_bundle(&domain_dir, "c4-test-org", &bundle_path, Some(&admin_urn), None).unwrap();
+        create_bundle(
+            &domain_dir,
+            "c4-test-org",
+            &bundle_path,
+            Some(&admin_urn),
+            None,
+        )
+        .unwrap();
 
         let data_dir = dir.path().join("node-data");
         let result = run_provision(&bundle_path, Some(&data_dir), false).unwrap();
@@ -2520,7 +2527,8 @@ mod tests {
 
         let bundle_path = dir.path().join("c4-validate.dds");
         let malicious = "urn:vouchsafe:admin.x\"]\ntrusted_roots = [\"pwned";
-        let err = create_bundle(&domain_dir, "org", &bundle_path, Some(malicious), None).unwrap_err();
+        let err =
+            create_bundle(&domain_dir, "org", &bundle_path, Some(malicious), None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("must be \"urn:\" followed only by"),

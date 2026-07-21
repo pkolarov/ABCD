@@ -297,8 +297,7 @@ fn create_provision_bundle_config_seeds_bootstrap_admin_urn() {
 
     // Authoritative check: load the sealed bundle back and assert the
     // embedded URN matches what --config supplied.
-    let bundle =
-        dds_node::provision::load_bundle(&bundle_path).expect("sealed bundle must load");
+    let bundle = dds_node::provision::load_bundle(&bundle_path).expect("sealed bundle must load");
     assert_eq!(
         bundle.bootstrap_admin_urn.as_deref(),
         Some(ADMIN_URN),

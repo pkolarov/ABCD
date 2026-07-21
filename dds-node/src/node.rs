@@ -5855,10 +5855,7 @@ mod admission_retry_tests {
         // Under the cap but the last send was within the cooldown => Skip.
         let now = Instant::now();
         let last = now - Duration::from_secs(30); // 30s < 60s cooldown
-        assert_eq!(
-            decide(2, Some(last), now, MAX, COOLDOWN),
-            RetryAction::Skip
-        );
+        assert_eq!(decide(2, Some(last), now, MAX, COOLDOWN), RetryAction::Skip);
     }
 
     #[test]
@@ -5867,10 +5864,7 @@ mod admission_retry_tests {
         // comparison is `< cooldown`, not `<=`), so we Send.
         let now = Instant::now();
         let last = now - COOLDOWN; // duration_since == cooldown, not < cooldown
-        assert_eq!(
-            decide(2, Some(last), now, MAX, COOLDOWN),
-            RetryAction::Send
-        );
+        assert_eq!(decide(2, Some(last), now, MAX, COOLDOWN), RetryAction::Send);
     }
 
     #[test]
@@ -5879,10 +5873,7 @@ mod admission_retry_tests {
         // cooldown => Send.
         let now = Instant::now();
         let last = now - Duration::from_secs(120); // 120s > 60s cooldown
-        assert_eq!(
-            decide(2, Some(last), now, MAX, COOLDOWN),
-            RetryAction::Send
-        );
+        assert_eq!(decide(2, Some(last), now, MAX, COOLDOWN), RetryAction::Send);
     }
 
     #[test]

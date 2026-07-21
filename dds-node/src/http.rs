@@ -1491,7 +1491,12 @@ where
         .as_ref()
         .map(|pc| pc.admitted.load(std::sync::atomic::Ordering::Relaxed) as usize)
         .unwrap_or(0);
-    let mut s = svc.status(&state.info.peer_id, connected_peers, admitted_peers, dag_ops)?;
+    let mut s = svc.status(
+        &state.info.peer_id,
+        connected_peers,
+        admitted_peers,
+        dag_ops,
+    )?;
     // observability-plan.md Phase F closure for the deferred `dds-cli stats`
     // store-bytes row: read the same per-table snapshot the
     // `dds_store_bytes{table=...}` Prometheus gauge reads, owned-string
