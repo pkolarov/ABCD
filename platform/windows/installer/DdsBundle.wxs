@@ -384,8 +384,8 @@
     <!-- and the freshly-created node_key.bin inherits the protected  -->
     <!-- DACL applied above by CA_RestrictDataDirAcl.                 -->
     <!-- ============================================================ -->
-    <!-- --data-dir must match data_dir in the shipped node.toml (config\node.toml,
-         "...DDS\node-data") — that's the directory dds-node actually reads/writes
+    <!-- The data-dir argument below must match data_dir in the shipped node.toml
+         (config\node.toml, "...DDS\node-data") — that's the directory dds-node actually reads/writes
          node_key.bin from at runtime. It used to point at %ProgramData%\DDS (the
          bare root), which is not read by the service; on a fresh install or a
          repair that found the pin field emptied, that mismatch could derive a
