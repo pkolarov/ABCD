@@ -41,6 +41,42 @@ const ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(60);
 /// Throttles the on-connect storm when libp2p reconnects flap.
 const SYNC_PER_PEER_COOLDOWN: Duration = Duration::from_secs(15);
 
+/// **Watchdog plan Step 6**: minimum gap between two admission-retry
+/// `AdmissionRequest`s to the same still-connected-but-unadmitted peer.
+/// `request_peer_admission` is otherwise only invoked once, from
+/// `ConnectionEstablished` — if that one-shot handshake is dropped or
+/// times out (the root cause identified by the watchdog investigation),
+/// nothing ever retries it. The anti-entropy tick (`ANTI_ENTROPY_INTERVAL`)
+/// already bounds the retry cadence to once per minute; this cooldown is
+/// defense in depth against hammering a peer if that interval is ever
+/// shortened.
+const ADMISSION_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// **FIX 1 (watchdog remediation)**: hard cap on the number of
+/// `AdmissionRequest`s we send to a single still-connected-but-unadmitted
+/// peer before giving up, disconnecting it, and denylisting it. 5 sends at
+/// the `ADMISSION_RETRY_COOLDOWN` (60s) cadence ⇒ we disconnect at ~+5 min,
+/// a 3× margin under the watchdog's 15-min (3-poll) restart trigger. A
+/// dropped one-shot `ConnectionEstablished` handshake self-heals on send #2
+/// (~+60s), so a legitimately slow peer keeps its full headroom; only a
+/// peer that never completes admission exhausts the budget.
+const MAX_ADMISSION_ATTEMPTS: u32 = 5;
+
+/// **FIX 1 (watchdog remediation)**: how long a peer stays on the
+/// admission denylist after we give up on it (attempt cap reached) or it
+/// proves it speaks none of our protocols. Rate-limits reconnect-flap DoS
+/// from a peer that can never be admitted, but *expires* so a peer whose
+/// cert is later repaired re-admits on its own without operator action.
+const ADMISSION_DENY_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// **FIX 1 (watchdog remediation)**: memory backstop on the admission
+/// denylist. PeerIds are public-key hashes, so a hostile peer churning
+/// identities could otherwise grow `admission_denied_until` without bound;
+/// once it exceeds this, `retry_unadmitted_peers` evicts the
+/// soonest-to-expire entries. Sized well above any realistic legitimate
+/// mesh fan-out.
+const ADMISSION_DENYLIST_MAX: usize = 4096;
+
 /// **H-11 (security review)**: hard cap on the number of payloads
 /// returned in a single `SyncResponse`. Prevents an attacker (or any
 /// admitted peer with an empty `known_op_ids`) from forcing the
@@ -278,6 +314,31 @@ pub struct DdsNode {
     sync_payloads: BTreeMap<String, SyncPayload>,
     /// Per-peer "last outbound sync" timestamp for the cooldown throttle.
     sync_last_outbound: BTreeMap<PeerId, Instant>,
+    /// **Watchdog plan Step 6 + FIX 1**: per-peer admission-retry state,
+    /// `(attempts, last_send)`. `.0` counts the `AdmissionRequest`s sent to
+    /// this peer in the current connection lifecycle (bumped in
+    /// [`Self::request_peer_admission`]); `.1` is the last-send instant.
+    /// Guards [`Self::retry_unadmitted_peers`], called from the
+    /// anti-entropy tick: a peer that stays connected but never completes
+    /// the H-12 handshake gets a fresh `AdmissionRequest` at most once per
+    /// `ADMISSION_RETRY_COOLDOWN`, and after `MAX_ADMISSION_ATTEMPTS` is
+    /// disconnected + denylisted instead of being retried forever. Cleared
+    /// on admission success and evicted on `ConnectionClosed` so a fresh
+    /// reconnect starts a clean attempt cycle.
+    admission_retry_last_outbound: BTreeMap<PeerId, (u32, Instant)>,
+    /// **FIX 1 (watchdog remediation)**: peers we've given up admitting,
+    /// mapped to the [`Instant`] at which their denylist entry expires
+    /// (`inserted_at + ADMISSION_DENY_COOLDOWN`). A peer lands here when it
+    /// exhausts [`MAX_ADMISSION_ATTEMPTS`] or its transport reports it
+    /// speaks none of our protocols (`OutboundFailure::UnsupportedProtocols`).
+    /// While an entry is live, `ConnectionEstablished` drops the peer
+    /// immediately instead of restarting the doomed handshake. Entries are
+    /// time-bounded (so a repaired peer re-admits), pruned lazily in
+    /// [`Self::retry_unadmitted_peers`], and capped at
+    /// [`ADMISSION_DENYLIST_MAX`]. Deliberately *not* cleared on
+    /// `ConnectionClosed` — that is exactly the reconnect-flap we're
+    /// rate-limiting — but is cleared on a late-but-valid admission success.
+    admission_denied_until: BTreeMap<PeerId, Instant>,
     /// **M-4 (security review)**: sliding-window counter for newly
     /// accepted mDNS peers. `(window_start, count)`: if `now -
     /// window_start >= 60s`, reset and start a fresh window; else
@@ -895,6 +956,8 @@ impl DdsNode {
             config,
             sync_payloads: BTreeMap::new(),
             sync_last_outbound: BTreeMap::new(),
+            admission_retry_last_outbound: BTreeMap::new(),
+            admission_denied_until: BTreeMap::new(),
             admission_cert: cert,
             domain,
             mdns_rate: (Instant::now(), 0),
@@ -1096,6 +1159,13 @@ impl DdsNode {
                     for peer in peers {
                         self.try_sync_with(peer);
                     }
+                    // Watchdog plan Step 6: retry the H-12 admission
+                    // handshake for any peer that is still connected but
+                    // never completed admission — otherwise a dropped or
+                    // timed-out one-shot `AdmissionRequest` leaves the
+                    // peer permanently unadmitted with nothing to recover
+                    // it short of a full connection drop/reconnect.
+                    self.retry_unadmitted_peers();
                 }
                 _ = admission_recheck.tick() => {
                     if let Err(e) = self.verify_admission_still_valid() {
@@ -1284,6 +1354,23 @@ impl DdsNode {
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 info!(%peer_id, "connection established");
+                // FIX 1: if this peer is on the admission denylist and the
+                // cooldown has not yet expired, drop the connection at once
+                // without starting (another) doomed admission handshake —
+                // this is the reconnect-flap rate-limit. An expired entry is
+                // removed and we fall through to normal admission so a
+                // peer whose cert was repaired re-admits on its own.
+                match self.admission_denied_until.get(&peer_id).copied() {
+                    Some(until) if denylist_active(Instant::now(), until) => {
+                        debug!(%peer_id, "FIX 1: rejecting connection from denylisted peer");
+                        let _ = self.swarm.disconnect_peer_id(peer_id);
+                        return;
+                    }
+                    Some(_) => {
+                        self.admission_denied_until.remove(&peer_id);
+                    }
+                    None => {}
+                }
                 // observability-plan.md Phase D.2 — sticky readiness
                 // signal for `/readyz`. Set on every event because the
                 // store is cheap and Relaxed; only the first transition
@@ -1307,6 +1394,11 @@ impl DdsNode {
                 // Drop the cooldown so a fresh reconnect immediately
                 // re-syncs without waiting out the throttle.
                 self.sync_last_outbound.remove(&peer_id);
+                // Watchdog plan Step 6: same reasoning — a fresh
+                // reconnect should get an immediate admission retry
+                // rather than waiting out a cooldown left over from
+                // the previous connection lifecycle.
+                self.admission_retry_last_outbound.remove(&peer_id);
                 // H-12: a reconnected peer must present its cert
                 // afresh — we don't trust a stale admission across
                 // connection lifecycles.
@@ -1334,6 +1426,20 @@ impl DdsNode {
     /// stash the nonce in `pending_challenges` so `verify_peer_admission`
     /// can check the signature when the response arrives.
     fn request_peer_admission(&mut self, peer_id: PeerId) {
+        // FIX 1: record this send against the per-peer attempt counter.
+        // This is the single choke point through which *every*
+        // `AdmissionRequest` flows (the `ConnectionEstablished` first
+        // handshake and every `retry_unadmitted_peers` retry), so counting
+        // here gives `retry_unadmitted_peers` the exact number of sends and
+        // the last-send instant it needs to enforce `MAX_ADMISSION_ATTEMPTS`
+        // and `ADMISSION_RETRY_COOLDOWN`. `.0` = attempts this connection
+        // lifecycle, `.1` = last-send instant.
+        let e = self
+            .admission_retry_last_outbound
+            .entry(peer_id)
+            .or_insert((0, Instant::now()));
+        e.0 += 1;
+        e.1 = Instant::now();
         use rand::RngCore;
         let mut challenge = vec![0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut challenge);
@@ -1345,6 +1451,111 @@ impl DdsNode {
             },
         );
         debug!(%peer_id, "H-12: sent admission request with challenge");
+    }
+
+    /// **Watchdog plan Step 6**: re-issue an `AdmissionRequest` for every
+    /// currently-connected peer that has not (yet) presented a valid
+    /// admission cert. `ConnectionEstablished` only calls
+    /// `request_peer_admission` once, on the initial handshake; if that
+    /// request or its response is dropped, or the peer's process was
+    /// mid-restart and missed it, the peer stays connected but
+    /// permanently unadmitted — its gossip and sync traffic silently
+    /// dropped by the H-12 gate — with nothing to recover it short of a
+    /// full connection drop/reconnect. Called from the anti-entropy tick
+    /// (`ANTI_ENTROPY_INTERVAL`, currently 60s) so this is also the retry
+    /// cadence; each peer is additionally gated by
+    /// `admission_retry_last_outbound` / `ADMISSION_RETRY_COOLDOWN` so a
+    /// stuck peer isn't re-challenged more often than that even if the
+    /// tick interval changes.
+    ///
+    /// `request_peer_admission` is safe to call repeatedly: it only
+    /// `insert`s into `pending_challenges` (a plain overwrite — see that
+    /// map's doc comment), and is the same function `ConnectionEstablished`
+    /// already invokes, so no new admission state or wire behaviour is
+    /// introduced here.
+    ///
+    /// **FIX 1** — the retry is now *bounded*. Each stuck peer's decision is
+    /// delegated to the pure [`decide`] helper: keep sending while under
+    /// [`MAX_ADMISSION_ATTEMPTS`] (respecting the per-send cooldown), and
+    /// once the budget is exhausted disconnect the peer and place it on the
+    /// time-bounded admission denylist so a peer that can never be admitted
+    /// stops consuming a live connection slot and stops flapping. This bounds
+    /// the "connected but never admitted" state the watchdog was firing on.
+    fn retry_unadmitted_peers(&mut self) {
+        let now = Instant::now();
+        // FIX 1: prune expired denylist entries so repaired peers can
+        // re-admit, then enforce the memory backstop by evicting the
+        // soonest-to-expire entries if churn has grown the map past its cap.
+        self.admission_denied_until.retain(|_, until| now < *until);
+        while self.admission_denied_until.len() > ADMISSION_DENYLIST_MAX {
+            let soonest = self
+                .admission_denied_until
+                .iter()
+                .min_by_key(|(_, until)| **until)
+                .map(|(peer, _)| *peer);
+            match soonest {
+                Some(peer) => {
+                    self.admission_denied_until.remove(&peer);
+                }
+                None => break,
+            }
+        }
+        let stuck: Vec<PeerId> = self
+            .swarm
+            .connected_peers()
+            .filter(|peer| !self.admitted_peers.contains(peer))
+            .copied()
+            .collect();
+        for peer in stuck {
+            let (attempts, last) = match self.admission_retry_last_outbound.get(&peer) {
+                Some((a, t)) => (*a, Some(*t)),
+                None => (0, None),
+            };
+            match decide(
+                attempts,
+                last,
+                now,
+                MAX_ADMISSION_ATTEMPTS,
+                ADMISSION_RETRY_COOLDOWN,
+            ) {
+                RetryAction::Disconnect => {
+                    warn!(
+                        %peer, attempts,
+                        "FIX 1: peer never completed admission after max attempts — \
+                         disconnecting and denylisting"
+                    );
+                    self.deny_and_disconnect(peer, now);
+                }
+                RetryAction::Send => {
+                    debug!(
+                        %peer,
+                        "watchdog: retrying admission handshake for connected-but-unadmitted peer"
+                    );
+                    self.request_peer_admission(peer);
+                }
+                RetryAction::Skip => {}
+            }
+        }
+    }
+
+    /// **FIX 1** — `&mut self` shell: disconnect a connected-but-unadmitted
+    /// peer and place it on the time-bounded admission denylist. Shared by
+    /// the [`Self::retry_unadmitted_peers`] attempt-cap path and the
+    /// `OutboundFailure::UnsupportedProtocols` transport fast-path in
+    /// [`Self::handle_admission_event`]. Not unit-tested — the decision
+    /// logic lives in the pure [`decide`] / [`denylist_active`] helpers;
+    /// this only performs the map mutation + swarm call. `now` is passed so
+    /// the denylist expiry is computed against the caller's clock read.
+    ///
+    /// Disconnecting never *admits* a peer and never bypasses any admission
+    /// check — it only stops retrying one that has failed to be admitted.
+    fn deny_and_disconnect(&mut self, peer_id: PeerId, now: Instant) {
+        let _ = self.swarm.disconnect_peer_id(peer_id);
+        self.admission_denied_until
+            .insert(peer_id, now + ADMISSION_DENY_COOLDOWN);
+        // Drop the retry counter — on any future reconnect this peer starts a
+        // fresh attempt cycle (gated first by the denylist check above).
+        self.admission_retry_last_outbound.remove(&peer_id);
     }
 
     /// Handle admission-protocol events (H-12). Serves our own cert
@@ -1422,6 +1633,24 @@ impl DdsNode {
             },
             RrEvent::OutboundFailure { peer, error, .. } => {
                 debug!(%peer, %error, "H-12: admission outbound failure");
+                // FIX 1 transport fast-path: a peer whose transport reports
+                // it supports *none* of our protocols can never complete the
+                // admission handshake (it does not speak `/dds/admission/…`),
+                // and is the prime foreign-mDNS DoS vector. Disconnect and
+                // denylist it immediately rather than burning the full
+                // `MAX_ADMISSION_ATTEMPTS` budget on it. All other failure
+                // kinds (dial / timeout / connection-closed) are transient
+                // and left to the attempt counter in
+                // `retry_unadmitted_peers`. This keys strictly on
+                // `UnsupportedProtocols`; it does not weaken any admission
+                // verification, only who we keep retrying.
+                if matches!(
+                    error,
+                    libp2p::request_response::OutboundFailure::UnsupportedProtocols
+                ) {
+                    warn!(%peer, "FIX 1: peer speaks none of our protocols — disconnecting and denylisting");
+                    self.deny_and_disconnect(peer, Instant::now());
+                }
             }
             RrEvent::InboundFailure { peer, error, .. } => {
                 debug!(%peer, %error, "H-12: admission inbound failure");
@@ -1649,6 +1878,13 @@ impl DdsNode {
 
                 info!(%peer_id, "H-12: peer admitted to domain");
                 self.admitted_peers.insert(peer_id);
+                // FIX 1: admission succeeded — clear the retry counter and,
+                // crucially, any denylist entry. A late-but-valid response
+                // (e.g. the peer's cert was just repaired, or a slow reply
+                // landed after we'd given up) un-denylists the peer here so a
+                // genuine peer is never permanently blocked.
+                self.admission_retry_last_outbound.remove(&peer_id);
+                self.admission_denied_until.remove(&peer_id);
                 crate::telemetry::record_admission_handshake("ok");
                 self.refresh_peer_count_gauges();
                 // **Z-1 Phase B.3 / §4.6.2** — cache the freshly-verified
@@ -5398,6 +5634,62 @@ fn verify_admission_challenge(
     }
 }
 
+/// **FIX 1 (watchdog remediation)** — outcome of evaluating one
+/// still-connected-but-unadmitted peer on the admission-retry tick. Kept a
+/// plain three-way enum so the decision is a pure, exhaustively-tested
+/// function ([`decide`]) with no swarm or map access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryAction {
+    /// Send another `AdmissionRequest` (under the attempt cap, cooldown
+    /// elapsed).
+    Send,
+    /// Do nothing this tick (still inside the per-send cooldown).
+    Skip,
+    /// Give up: disconnect the peer and denylist it (attempt cap reached).
+    Disconnect,
+}
+
+/// **FIX 1** — pure decision for one stuck peer, extracted from
+/// [`DdsNode::retry_unadmitted_peers`] so the branch logic is unit-testable
+/// without a live swarm.
+///
+/// * `attempts` — how many `AdmissionRequest`s we have already sent this
+///   peer in the current connection lifecycle.
+/// * `last_outbound` — when we last sent one; `None` means we never have
+///   (treated as "cooldown elapsed").
+/// * `now` — the tick's clock read.
+/// * `max` / `cooldown` — [`MAX_ADMISSION_ATTEMPTS`] /
+///   [`ADMISSION_RETRY_COOLDOWN`] in production; parameters here purely so
+///   the tests can pin small values.
+///
+/// The attempt cap is checked **first**, so a peer that has exhausted its
+/// budget is disconnected even if it is still inside the per-send cooldown.
+fn decide(
+    attempts: u32,
+    last_outbound: Option<Instant>,
+    now: Instant,
+    max: u32,
+    cooldown: Duration,
+) -> RetryAction {
+    if attempts >= max {
+        return RetryAction::Disconnect;
+    }
+    if let Some(last) = last_outbound {
+        if now.duration_since(last) < cooldown {
+            return RetryAction::Skip;
+        }
+    }
+    RetryAction::Send
+}
+
+/// **FIX 1** — pure predicate: is a denylist entry still in force at `now`?
+/// Expiry is exclusive: exactly at `until` the entry is considered expired
+/// (re-admission allowed), matching the pruning in
+/// [`DdsNode::retry_unadmitted_peers`] (`retain(|_, until| now < *until)`).
+fn denylist_active(now: Instant, until: Instant) -> bool {
+    now < until
+}
+
 #[cfg(test)]
 mod admission_challenge_tests {
     //! Phase A2 — unit coverage for [`verify_admission_challenge`].
@@ -5498,6 +5790,120 @@ mod admission_challenge_tests {
         let pubkey = AdmissionPublicKey::EcdsaP256(vec![0u8; 33]); // all-zero is invalid
         let sig = vec![0u8; 64];
         assert!(verify_admission_challenge(&pubkey, b"challenge", &sig).is_err());
+    }
+}
+
+#[cfg(test)]
+mod admission_retry_tests {
+    //! **FIX 1 (watchdog remediation)** — unit coverage for the pure
+    //! admission-retry decision helpers [`decide`] and [`denylist_active`].
+    //!
+    //! These exercise the exact branch logic that
+    //! [`DdsNode::retry_unadmitted_peers`] and the `ConnectionEstablished`
+    //! denylist gate delegate to, without needing a live swarm. The `&mut
+    //! self` shell that mutates the maps and calls `disconnect_peer_id` is
+    //! deliberately left out of scope — it has no logic beyond wiring these
+    //! decisions to side effects.
+
+    use super::*;
+
+    // Small, explicit values so the boundaries are unambiguous.
+    const MAX: u32 = 5;
+    const COOLDOWN: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn decide_under_cap_with_cooldown_elapsed_sends() {
+        // attempts == MAX - 1 (still under the cap) and no prior send
+        // (cooldown vacuously elapsed) => Send.
+        let now = Instant::now();
+        assert_eq!(decide(MAX - 1, None, now, MAX, COOLDOWN), RetryAction::Send);
+    }
+
+    #[test]
+    fn decide_at_cap_disconnects() {
+        // attempts == MAX => Disconnect, regardless of cooldown state.
+        let now = Instant::now();
+        assert_eq!(
+            decide(MAX, None, now, MAX, COOLDOWN),
+            RetryAction::Disconnect
+        );
+    }
+
+    #[test]
+    fn decide_at_cap_disconnects_even_inside_cooldown() {
+        // The attempt cap is checked first: an exhausted peer is
+        // disconnected even though its last send was just now.
+        let now = Instant::now();
+        assert_eq!(
+            decide(MAX, Some(now), now, MAX, COOLDOWN),
+            RetryAction::Disconnect
+        );
+    }
+
+    #[test]
+    fn decide_over_cap_disconnects() {
+        // Defensive: attempts strictly greater than MAX still disconnects.
+        let now = Instant::now();
+        assert_eq!(
+            decide(MAX + 3, None, now, MAX, COOLDOWN),
+            RetryAction::Disconnect
+        );
+    }
+
+    #[test]
+    fn decide_cooldown_live_skips() {
+        // Under the cap but the last send was within the cooldown => Skip.
+        let now = Instant::now();
+        let last = now - Duration::from_secs(30); // 30s < 60s cooldown
+        assert_eq!(
+            decide(2, Some(last), now, MAX, COOLDOWN),
+            RetryAction::Skip
+        );
+    }
+
+    #[test]
+    fn decide_cooldown_boundary_exclusive_sends() {
+        // Exactly at the cooldown boundary is treated as elapsed (the
+        // comparison is `< cooldown`, not `<=`), so we Send.
+        let now = Instant::now();
+        let last = now - COOLDOWN; // duration_since == cooldown, not < cooldown
+        assert_eq!(
+            decide(2, Some(last), now, MAX, COOLDOWN),
+            RetryAction::Send
+        );
+    }
+
+    #[test]
+    fn decide_cooldown_expired_sends() {
+        // Under the cap and the last send is comfortably older than the
+        // cooldown => Send.
+        let now = Instant::now();
+        let last = now - Duration::from_secs(120); // 120s > 60s cooldown
+        assert_eq!(
+            decide(2, Some(last), now, MAX, COOLDOWN),
+            RetryAction::Send
+        );
+    }
+
+    #[test]
+    fn denylist_active_before_expiry_true() {
+        let now = Instant::now();
+        let until = now + Duration::from_secs(1);
+        assert!(denylist_active(now, until));
+    }
+
+    #[test]
+    fn denylist_active_at_expiry_false() {
+        // Exclusive expiry: at exactly `until` the entry is expired.
+        let now = Instant::now();
+        assert!(!denylist_active(now, now));
+    }
+
+    #[test]
+    fn denylist_active_after_expiry_false() {
+        let now = Instant::now();
+        let until = now - Duration::from_secs(1);
+        assert!(!denylist_active(now, until));
     }
 }
 

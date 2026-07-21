@@ -93,6 +93,11 @@
     <Feature Id="F_Core" Title="DDS Node" Description="Core P2P directory service daemon" Level="1">
       <ComponentGroupRef Id="CG_DdsNode" />
       <ComponentGroupRef Id="CG_AppData" />
+      <!-- Watchdog plan Step 7: bundled with core (not the optional
+           F_Shortcuts feature) since it's a reliability mechanism for
+           the always-installed DdsNode service, not an operator
+           convenience. -->
+      <ComponentGroupRef Id="CG_Watchdog" />
     </Feature>
 
     <!-- ============================================================ -->
@@ -434,6 +439,67 @@
                   Return="ignore" />
 
     <!-- ============================================================ -->
+    <!-- Watchdog plan Step 7: register the external Scheduled-Task   -->
+    <!-- backstop (Watchdog-DdsNode.ps1, staged into DIR_BIN by       -->
+    <!-- CG_Watchdog below). Every 5 minutes it polls the node's own  -->
+    <!-- /v1/status (via "dds.exe stats" with format=json, over the   -->
+    <!-- pipe transport — no new client plumbing) and force-restarts  -->
+    <!-- the DdsNode service if connected_peers stays greater than     -->
+    <!-- admitted_peers for 3 consecutive polls (~15 minutes).        -->
+    <!--                                                               -->
+    <!-- This is a deliberately separate backstop, not a substitute    -->
+    <!-- for the in-process fix: DdsNode::retry_unadmitted_peers       -->
+    <!-- (node.rs, called from the ~60s anti-entropy tick) already     -->
+    <!-- re-issues the H-12 AdmissionRequest for any still-connected-  -->
+    <!-- but-unadmitted peer. This Task only ever fires after that     -->
+    <!-- in-process retry has had ample time to work and failed to.   -->
+    <!--                                                               -->
+    <!-- Chosen over SCM restart-on-exit (util:ServiceConfig /         -->
+    <!-- FirstFailureActionType) specifically to avoid pulling in      -->
+    <!-- WixToolset.Util.wixext — SCM restart-on-exit is completely    -->
+    <!-- unconfigured today, so adding it would mean more installer/   -->
+    <!-- build surface (a new -ext flag in Build-Msi.ps1 plus new WiX  -->
+    <!-- elements here) than this standalone, independently tunable/   -->
+    <!-- disableable Scheduled Task requires. schtasks.exe (System32)  -->
+    <!-- needs no extension either, same reasoning as CA_SetNgcSvcAuto -->
+    <!-- above using sc.exe directly.                                  -->
+    <!--                                                               -->
+    <!-- /F on /Create makes registration idempotent across upgrades   -->
+    <!-- (overwrites the existing task definition instead of erroring  -->
+    <!-- on "already exists"). The powershell.exe path resolved via    -->
+    <!-- [System64Folder] never contains a space, so only the -File    -->
+    <!-- script path needs its own embedded, backslash-escaped quotes  -->
+    <!-- inside the outer /TR value — avoids a second, fragile level   -->
+    <!-- of nested quoting.                                            -->
+    <!--                                                               -->
+    <!-- Return="ignore": Task Scheduler being disabled/unavailable    -->
+    <!-- (rare hardened images) must not fail the whole product        -->
+    <!-- install over what is, by design, only a backstop.             -->
+    <!-- ============================================================ -->
+    <CustomAction Id="CA_RegisterWatchdogTask"
+                  Directory="DIR_BIN"
+                  ExeCommand='"[System64Folder]schtasks.exe" /Create /TN "DDS Node Watchdog" /TR "[System64Folder]WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"[DIR_BIN]Watchdog-DdsNode.ps1\"" /SC MINUTE /MO 5 /RU SYSTEM /RL HIGHEST /F'
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <!-- Uninstall-only unregistration of the Scheduled Task above.    -->
+    <!-- Same REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE gate as the    -->
+    <!-- native-uninstall pair below: an upgrade's internal            -->
+    <!-- RemoveExistingProducts pass also sets REMOVE="ALL" on the OLD -->
+    <!-- product, and without excluding UPGRADINGPRODUCTCODE this      -->
+    <!-- would delete the task the NEW product's own                   -->
+    <!-- CA_RegisterWatchdogTask (above) just (re-)created. Return=    -->
+    <!-- "ignore": must never fail an uninstall the user asked for.    -->
+    <!-- ============================================================ -->
+    <CustomAction Id="CA_UnregisterWatchdogTask"
+                  Directory="TARGETDIR"
+                  ExeCommand='"[System64Folder]schtasks.exe" /Delete /TN "DDS Node Watchdog" /F'
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <!-- ============================================================ -->
     <!-- Native-uninstall wiring — see Uninstall-Dds.ps1's own header  -->
     <!-- comment for the full inventory this is closing the gap on.   -->
     <!-- Before this pair of custom actions, clicking "Uninstall" in   -->
@@ -568,6 +634,13 @@
            LogonUI invokes our credential provider. Sequenced last among
            the deferred CAs so it shares the same elevated phase. -->
       <Custom Action="CA_SetNgcSvcAuto" After="CA_StampAgentPubkey" Condition="NOT REMOVE" />
+      <!-- Watchdog plan Step 7: register the polling Scheduled Task
+           once Watchdog-DdsNode.ps1 exists on disk (CG_Watchdog, part
+           of the same InstallFiles pass as everything else here) and
+           the DdsNode service itself is about to (or already does)
+           exist. Sequenced last among the deferred install-time CAs,
+           same rationale as CA_SetNgcSvcAuto immediately above. -->
+      <Custom Action="CA_RegisterWatchdogTask" After="CA_SetNgcSvcAuto" Condition="NOT REMOVE" />
 
       <!-- Native-uninstall wiring (see the CA_UninstallCleanup /
            CA_UninstallRemoveInstallDir definitions above for the full
@@ -578,6 +651,17 @@
            RemoveRegistryValues already has a lower standard sequence
            number than RemoveFiles, so this naturally lands after it too
            without needing a second constraint. -->
+      <!-- Watchdog plan Step 7: unregister the Scheduled Task on a
+           real uninstall only (REMOVE="ALL" AND NOT
+           UPGRADINGPRODUCTCODE — see CA_UnregisterWatchdogTask's own
+           comment above for why the UPGRADINGPRODUCTCODE exclusion
+           matters here too). Ordered immediately before
+           CA_UninstallCleanup purely to keep the two "real uninstall
+           only" actions adjacent; unlike CA_UninstallCleanup this one
+           has no dds-node.exe FileRef dependency forcing it before
+           RemoveFiles, but running it there is harmless. -->
+      <Custom Action="CA_UnregisterWatchdogTask" Before="CA_UninstallCleanup"
+              Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
       <Custom Action="CA_UninstallCleanup" Before="RemoveFiles"
               Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
       <!-- Runs Before InstallFinalize — i.e. dead last, after RemoveFiles
@@ -745,6 +829,23 @@
     <ComponentGroup Id="CG_AppData" Directory="DIR_APPDATA_DDS">
       <Component Id="C_AppDataDir" Guid="66666666-6666-6666-6666-666666666666">
         <CreateFolder />
+      </Component>
+    </ComponentGroup>
+
+    <!-- ============================================================ -->
+    <!-- Component: Watchdog-DdsNode.ps1 (watchdog plan Step 7).       -->
+    <!-- Staged into DIR_BIN by Build-Msi.ps1's generic *.ps1 copy     -->
+    <!-- loop (same as every script in CG_BootstrapScript below) so no -->
+    <!-- build-script change was needed — only this WiX reference.    -->
+    <!-- Registered as a SYSTEM Scheduled Task by CA_RegisterWatchdog- -->
+    <!-- Task / unregistered by CA_UnregisterWatchdogTask (both        -->
+    <!-- defined above, in InstallExecuteSequence below).              -->
+    <!-- ============================================================ -->
+    <ComponentGroup Id="CG_Watchdog" Directory="DIR_BIN">
+      <Component Id="C_WatchdogScript" Guid="F4F4F4F4-F4F4-F4F4-F4F4-F4F4F4F4F4F4">
+        <File Id="watchdog_script_ps1"
+              Source="$(var.BuildDir)\Watchdog-DdsNode.ps1"
+              KeyPath="yes" />
       </Component>
     </ComponentGroup>
 

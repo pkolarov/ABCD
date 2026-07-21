@@ -286,6 +286,14 @@ pub struct SessionResult {
 pub struct NodeStatus {
     pub peer_id: String,
     pub connected_peers: usize,
+    /// Count of `connected_peers` that have completed the H-12 admission
+    /// handshake, i.e. the same snapshot backing the `dds_peers_admitted`
+    /// Prometheus gauge (mirrors [`crate::node::NodePeerCounts::admitted`]).
+    /// Always `<= connected_peers`; callers compute the unadmitted share
+    /// as `connected_peers - admitted_peers`. Lets an external watchdog
+    /// (no in-process visibility of its own) detect peers that are
+    /// connected but stuck pre-admission by polling `/v1/status` alone.
+    pub admitted_peers: usize,
     pub dag_operations: usize,
     pub trust_graph_tokens: usize,
     pub trusted_roots: usize,
@@ -2410,6 +2418,7 @@ impl<
         &self,
         peer_id: &str,
         connected_peers: usize,
+        admitted_peers: usize,
         dag_ops: usize,
     ) -> Result<NodeStatus, ServiceError> {
         let trust_graph_tokens = self
@@ -2420,6 +2429,7 @@ impl<
         Ok(NodeStatus {
             peer_id: peer_id.to_string(),
             connected_peers,
+            admitted_peers,
             dag_operations: dag_ops,
             trust_graph_tokens,
             trusted_roots: self.trusted_roots.len(),

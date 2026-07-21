@@ -809,9 +809,10 @@ fn test_policy_evaluation() {
 #[test]
 fn test_node_status() {
     let (_root, svc) = make_service();
-    let status = svc.status("12D3KooWTest", 3, 42).unwrap();
+    let status = svc.status("12D3KooWTest", 3, 2, 42).unwrap();
     assert_eq!(status.peer_id, "12D3KooWTest");
     assert_eq!(status.connected_peers, 3);
+    assert_eq!(status.admitted_peers, 2);
     assert_eq!(status.dag_operations, 42);
     assert!(status.trust_graph_tokens > 0); // at least root attestation
     assert_eq!(status.trusted_roots, 1);

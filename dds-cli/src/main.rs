@@ -1003,6 +1003,7 @@ fn print_status(s: &NodeStatusJson) {
     println!("  Peer ID:          {}", s.peer_id);
     println!("  Uptime (secs):    {}", s.uptime_secs);
     println!("  Connected peers:  {}", s.connected_peers);
+    println!("  Admitted peers:   {}", s.admitted_peers);
     println!("  DAG operations:   {}", s.dag_operations);
     println!("  Trust tokens:     {}", s.trust_graph_tokens);
     println!("  Trusted roots:    {}", s.trusted_roots);
@@ -1674,6 +1675,7 @@ async fn handle_stats(node_url: &str, format: &str) {
                     "peer_id": status.peer_id,
                     "uptime_secs": status.uptime_secs,
                     "connected_peers": status.connected_peers,
+                    "admitted_peers": status.admitted_peers,
                 },
                 "trust_graph": {
                     "tokens": status.trust_graph_tokens,
@@ -1696,6 +1698,7 @@ async fn handle_stats(node_url: &str, format: &str) {
             println!("  Peer ID:          {}", status.peer_id);
             println!("  Uptime:           {}s", status.uptime_secs);
             println!("  Connected peers:  {}", status.connected_peers);
+            println!("  Admitted peers:   {}", status.admitted_peers);
             println!("  Trust graph:");
             println!("    Tokens:         {}", status.trust_graph_tokens);
             println!("    Trusted roots:  {}", status.trusted_roots);
@@ -2997,6 +3000,14 @@ struct PublisherInitResponse {
 struct NodeStatusJson {
     peer_id: String,
     connected_peers: usize,
+    /// Count of `connected_peers` that have completed the H-12
+    /// admission handshake. Absent (deserialised via `#[serde(default)]`
+    /// as `0`) on older nodes that predate the field — indistinguishable
+    /// from a genuine zero, but those are also nodes with no
+    /// `admitted_peers` reporting at all, so callers already treat `0`
+    /// as "unknown/none" for this field.
+    #[serde(default)]
+    admitted_peers: usize,
     dag_operations: usize,
     trust_graph_tokens: usize,
     trusted_roots: usize,

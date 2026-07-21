@@ -1479,7 +1479,19 @@ where
         .as_ref()
         .map(|pc| pc.dag_ops.load(std::sync::atomic::Ordering::Relaxed) as usize)
         .unwrap_or(0);
-    let mut s = svc.status(&state.info.peer_id, connected_peers, dag_ops)?;
+    // Read the same `admitted` snapshot the Prometheus
+    // `dds_peers_admitted` gauge reads — refreshed by
+    // `refresh_peer_count_gauges` after every connection lifecycle event
+    // and successful H-12 admission handshake. Falls back to `0` when
+    // the handler is invoked without a populated `peer_counts` (test
+    // fixtures, bare routers), matching `connected_peers` above.
+    let admitted_peers = state
+        .info
+        .peer_counts
+        .as_ref()
+        .map(|pc| pc.admitted.load(std::sync::atomic::Ordering::Relaxed) as usize)
+        .unwrap_or(0);
+    let mut s = svc.status(&state.info.peer_id, connected_peers, admitted_peers, dag_ops)?;
     // observability-plan.md Phase F closure for the deferred `dds-cli stats`
     // store-bytes row: read the same per-table snapshot the
     // `dds_store_bytes{table=...}` Prometheus gauge reads, owned-string
@@ -3729,6 +3741,33 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: NodeStatus = resp.json().await.unwrap();
         assert_eq!(body.dag_operations, 42);
+    }
+
+    /// `/v1/status.admitted_peers` reports whatever the swarm task has
+    /// stored into the shared `NodePeerCounts.admitted` atomic — the
+    /// same snapshot the `dds_peers_admitted` Prometheus gauge reads.
+    /// Lets an external watchdog detect peers that are connected but
+    /// stuck pre-admission (`connected_peers > admitted_peers`) by
+    /// polling `/v1/status` alone.
+    #[tokio::test]
+    async fn status_endpoint_reports_admitted_peers_when_peer_counts_supplied() {
+        use crate::node::NodePeerCounts;
+        use std::sync::atomic::Ordering;
+
+        let mut state = make_state();
+        let counts = NodePeerCounts::default();
+        // Simulate five connected peers, only three of which completed
+        // the H-12 admission handshake.
+        counts.connected.store(5, Ordering::Relaxed);
+        counts.admitted.store(3, Ordering::Relaxed);
+        state.info.peer_counts = Some(counts);
+
+        let base = spawn_server(state).await;
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: NodeStatus = resp.json().await.unwrap();
+        assert_eq!(body.connected_peers, 5);
+        assert_eq!(body.admitted_peers, 3);
     }
 
     /// observability-plan.md Phase F closure for the deferred
