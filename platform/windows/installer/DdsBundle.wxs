@@ -384,16 +384,24 @@
     <!-- and the freshly-created node_key.bin inherits the protected  -->
     <!-- DACL applied above by CA_RestrictDataDirAcl.                 -->
     <!-- ============================================================ -->
-    <!-- The keep-existing flag makes this CA idempotent on UPGRADE/repair: if
+    <!-- --data-dir must match data_dir in the shipped node.toml (config\node.toml,
+         "...DDS\node-data") — that's the directory dds-node actually reads/writes
+         node_key.bin from at runtime. It used to point at %ProgramData%\DDS (the
+         bare root), which is not read by the service; on a fresh install or a
+         repair that found the pin field emptied, that mismatch could derive a
+         key from the wrong (possibly nonexistent, freshly-fabricated) location
+         and stamp a value unrelated to the node's real identity. Keeping this
+         path aligned with node.toml's data_dir is what makes the derived pin
+         correct in the first place.
+
+         The keep-existing flag makes this CA idempotent on UPGRADE/repair: if
          PinnedNodePubkeyB64 is already populated the CA is a field-level no-op
-         and does NOT re-derive from node_key.bin (which can drift between
-         %ProgramData%\DDS and the node-data subdir and stamp a WRONG key into
-         the preserved appsettings.json). A fresh install ships the field empty,
+         and does not re-derive at all. A fresh install ships the field empty,
          so the stamp still runs there; a repair that finds it emptied
          re-populates it. Mirrors the gen-hmac-secret keep-existing flag. -->
     <CustomAction Id="CA_StampAgentPubkey"
                   FileRef="dds_node_exe"
-                  ExeCommand='stamp-agent-pubkey --keep-existing --data-dir "[CommonAppDataFolder]DDS" --config-dir "[INSTALLFOLDER]config"'
+                  ExeCommand='stamp-agent-pubkey --keep-existing --data-dir "[CommonAppDataFolder]DDS\node-data" --config-dir "[INSTALLFOLDER]config"'
                   Execute="deferred"
                   Impersonate="no"
                   Return="check" />
