@@ -632,13 +632,36 @@ Write-Host "  Config:     $NodeToml"
 Write-Host ""
 Write-Host "  Provision bundle: $ProvisionBundle"
 Write-Host "  (Copy to a USB stick to add a sibling node.)"
-Write-Host "  NOTE: this bundle was created before an admin exists, so nodes"
-Write-Host "        provisioned from it will start with an empty trust anchor"
-Write-Host "        (trusted_roots) and won't resolve 'vouched' for the admin"
-Write-Host "        you're about to set up. Once Admin Setup has run, re-create"
-Write-Host "        it with the admin seeded (one line -- a trailing backslash is"
-Write-Host "        NOT a line continuation in PowerShell or cmd.exe):"
-Write-Host "          dds-node create-provision-bundle --dir `"$NodeData`" --org `"$OrgHash`" --out `"$ProvisionBundle`" --bootstrap-admin-urn <urn-from-node.toml>"
+# **C-4** — this bundle was created (step 2, above) before any admin
+# exists, so it permanently seeds joining nodes with an empty trust
+# anchor (trusted_roots = []) unless re-created once an admin is
+# established. bootstrap_admin_urn only ever lands in $NodeToml via a
+# separate Admin Setup ceremony (tray icon menu, or DdsConsole's
+# automatic post-bootstrap step) that runs AFTER this script has
+# already written node.toml and exited its main flow -- it is not
+# something this script performs itself. Check for it here anyway
+# (idempotent, cheap) so any invocation path where it's already present
+# gets the bundle regenerated automatically instead of silently shipping
+# a stale one; create-provision-bundle now supports --config (reads
+# bootstrap_admin_urn back out of node.toml), so the previously-required
+# manual --bootstrap-admin-urn <urn> copy/paste is no longer needed
+# either way.
+$nodeTomlContent = Get-Content $NodeToml -Raw
+if ($nodeTomlContent -match '(?m)^\s*bootstrap_admin_urn\s*=\s*"[^"]+"') {
+    Write-Host "  Admin already established -- regenerating bundle with the trust-anchor seed..." -ForegroundColor Green
+    & $NodeBin create-provision-bundle --dir $NodeData --org $OrgHash --out $ProvisionBundle --config $NodeToml
+    if ($LASTEXITCODE -ne 0) { throw "create-provision-bundle (re-seed) failed" }
+    Write-Host "  Bundle re-created with the admin seed: $ProvisionBundle"
+} else {
+    Write-Host "  NOTE: this bundle was created before an admin exists, so nodes"
+    Write-Host "        provisioned from it will start with an empty trust anchor"
+    Write-Host "        (trusted_roots) and won't resolve 'vouched' for the admin"
+    Write-Host "        you're about to set up. Once Admin Setup has run, re-create"
+    Write-Host "        it so nodes onboarded afterward get a working trust anchor"
+    Write-Host "        (one line -- a trailing backslash is NOT a line"
+    Write-Host "        continuation in PowerShell or cmd.exe):"
+    Write-Host "          dds-node create-provision-bundle --dir `"$NodeData`" --org `"$OrgHash`" --out `"$ProvisionBundle`" --config `"$NodeToml`""
+}
 Write-Host ""
 Write-Host "  Service status:"
 Get-Service Dds* | Format-Table Name, Status, StartType -AutoSize | Out-String | Write-Host

@@ -1408,6 +1408,28 @@ function Tick-AdminSetupWait {
     Stop-AdminSetupWait
     if ($script:adminSetupOk) {
         Set-Status "Bootstrap and admin setup completed successfully." '#107C10'
+        # **C-4 / FIX 2** — admin_setup has just persisted bootstrap_admin_urn
+        # into node.toml (dds-node service.rs persist_trusted_roots). Re-seal
+        # the provision bundle NOW, while the operator is still present from
+        # the admin-setup touch, so any node that later joins from this bundle
+        # gets a working trust anchor instead of trusted_roots = []. The reseed
+        # reads the URN straight out of node.toml via --config, so nothing here
+        # parses it. On exit 0 it sets $script:provisionBundleSeeded, so the
+        # later "Save provision bundle..." step won't prompt for the domain key
+        # again. Guarded so it fires at most once and only while the domain
+        # signing key is still on this box.
+        $domainKeyPath = Join-Path $NodeData "domain_key.bin"
+        if (-not $script:provisionBundleSeeded -and (Test-Path $domainKeyPath)) {
+            Append-Log $el.TbLog "[Console] Re-sealing the provision bundle with the admin trust anchor - touch your FIDO2 key (or enter the domain passphrase) in the new window..."
+            Invoke-ProvisionBundleReseed -OnDone {
+                param($code)
+                if ($code -eq 0) {
+                    Append-Log $el.TbLog "[Console] Provision bundle re-sealed with the admin trust anchor."
+                } else {
+                    Append-Log $el.TbLog "[Console] Provision bundle re-seal failed (exit $code); the Save provision bundle step will retry when you export it."
+                }
+            }
+        }
     } elseif (-not ($el.TbStatus.Text -match 'error')) {
         $code = $script:adminSetupProc.ExitCode
         $suffix = if ($null -ne $code) { " (exit $code)" } else { "" }
@@ -1556,6 +1578,70 @@ function Save-ProvisionBundleCopy {
 $script:provisionBundleSeeded = $false
 $script:saveBundleProcess     = $null
 $script:saveBundleTimer       = $null
+# Completion callback for the in-flight Invoke-ProvisionBundleReseed run.
+# Held at $script: scope because the DispatcherTimer tick fires AFTER
+# Invoke-ProvisionBundleReseed has already returned, so that function's
+# local scope (and any $OnDone parameter living in it) is gone by then —
+# the handler can only reach $script:/global-scoped state (like $el).
+$script:saveBundleOnDone      = $null
+
+# **C-4 / FIX 2** — Re-seal $ProvisionBundle so it embeds the domain's
+# bootstrap_admin_urn trust anchor, then invoke $OnDone with the child's
+# exit code. Shared by two call sites:
+#   (1) Tick-AdminSetupWait, automatically, the instant admin_setup writes
+#       the URN into node.toml (best UX: the operator is still present from
+#       the admin-setup touch); and
+#   (2) Run-NewDomainSaveBundle, lazily, if an operator exports a bundle
+#       before that automatic reseed has run.
+# The bundle is re-created with --config <node.toml> (NOT
+# --bootstrap-admin-urn): dds-node's create_bundle reads bootstrap_admin_urn
+# straight back out of the node's own config, which admin_setup has already
+# populated, so the console never has to parse or forward the URN itself.
+# Unwrapping the domain key to re-sign costs one FIDO2 touch / domain
+# passphrase, so both callers gate this behind -not $provisionBundleSeeded
+# and a domain_key.bin presence check. On exit 0 sets
+# $script:provisionBundleSeeded = $true so the other call site skips its
+# own prompt.
+function Invoke-ProvisionBundleReseed {
+    param([scriptblock]$OnDone)
+    $script:saveBundleOnDone = $OnDone
+
+    # Same -EncodedCommand pattern as Run-JoinUnseal / the previous inline
+    # block: a visible console window is required for libfido2 to treat
+    # stdin as interactive, and -Command mangles a multi-line quoted payload.
+    $payload = @'
+& '__NODEBIN__' create-provision-bundle --dir '__DIR__' --org '__ORG__' --out '__OUT__' --config '__CFG__'
+$code = $LASTEXITCODE
+Write-Host ''
+if ($code -eq 0) { Write-Host '=== Bundle Updated ===' -ForegroundColor Green }
+else             { Write-Host "=== Bundle Update FAILED (exit $code) ===" -ForegroundColor Red }
+Read-Host 'Press Enter to close'
+exit $code
+'@ -replace '__NODEBIN__', (ConvertTo-SingleQuotedLiteral $NodeBin) `
+   -replace '__DIR__', (ConvertTo-SingleQuotedLiteral $NodeData) `
+   -replace '__ORG__', (ConvertTo-SingleQuotedLiteral $el.TbOrg.Text.Trim()) `
+   -replace '__OUT__', (ConvertTo-SingleQuotedLiteral $ProvisionBundle) `
+   -replace '__CFG__', (ConvertTo-SingleQuotedLiteral $NodeConfigFile)
+    $cmd = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
+    $script:saveBundleProcess = Start-Process `
+        -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand', $cmd) `
+        -PassThru
+
+    $script:saveBundleTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:saveBundleTimer.Interval = [TimeSpan]::FromMilliseconds(700)
+    $script:saveBundleTimer.Add_Tick({
+        if ($script:saveBundleTimer -and $script:saveBundleProcess.HasExited) {
+            $script:saveBundleTimer.Stop(); $script:saveBundleTimer = $null
+            $code = $script:saveBundleProcess.ExitCode
+            if ($code -eq 0) { $script:provisionBundleSeeded = $true }
+            $cb = $script:saveBundleOnDone
+            $script:saveBundleOnDone = $null
+            if ($cb) { & $cb $code }
+        }
+    })
+    $script:saveBundleTimer.Start()
+}
 
 function Run-NewDomainSaveBundle {
     if (-not (Test-Path $ProvisionBundle)) {
@@ -1596,44 +1682,20 @@ function Run-NewDomainSaveBundle {
     $el.TbDoneBundleStatus.Text = "Updating bundle with the admin seed - touch your FIDO2 key (or enter the domain passphrase) in the new window..."
     $el.TbDoneBundleStatus.Foreground = [Windows.Media.Brushes]::Black
 
-    # Same -EncodedCommand pattern as Run-JoinUnseal: a visible console
-    # window is required for libfido2 to treat stdin as interactive,
-    # and -Command mangles a multi-line quoted payload.
-    $payload = @'
-& '__NODEBIN__' create-provision-bundle --dir '__DIR__' --org '__ORG__' --out '__OUT__' --bootstrap-admin-urn '__URN__'
-$code = $LASTEXITCODE
-Write-Host ''
-if ($code -eq 0) { Write-Host '=== Bundle Updated ===' -ForegroundColor Green }
-else             { Write-Host "=== Bundle Update FAILED (exit $code) ===" -ForegroundColor Red }
-Read-Host 'Press Enter to close'
-exit $code
-'@ -replace '__NODEBIN__', (ConvertTo-SingleQuotedLiteral $NodeBin) `
-   -replace '__DIR__', (ConvertTo-SingleQuotedLiteral $NodeData) `
-   -replace '__ORG__', (ConvertTo-SingleQuotedLiteral $el.TbOrg.Text.Trim()) `
-   -replace '__OUT__', (ConvertTo-SingleQuotedLiteral $ProvisionBundle) `
-   -replace '__URN__', (ConvertTo-SingleQuotedLiteral $adminUrn)
-    $cmd = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
-    $script:saveBundleProcess = Start-Process `
-        -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" `
-        -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand', $cmd) `
-        -PassThru
-
-    $script:saveBundleTimer = New-Object System.Windows.Threading.DispatcherTimer
-    $script:saveBundleTimer.Interval = [TimeSpan]::FromMilliseconds(700)
-    $script:saveBundleTimer.Add_Tick({
-        if ($script:saveBundleTimer -and $script:saveBundleProcess.HasExited) {
-            $script:saveBundleTimer.Stop(); $script:saveBundleTimer = $null
-            $el.BtnDoneSaveBundle.IsEnabled = $true
-            $code = $script:saveBundleProcess.ExitCode
-            if ($code -eq 0) {
-                $script:provisionBundleSeeded = $true
-                Save-ProvisionBundleCopy
-            } else {
-                Save-ProvisionBundleCopy -WarningPrefix "Bundle update failed (exit $code) -"
-            }
+    # The reseed itself (payload, subprocess, exit handling, seeded flag) is
+    # shared with the automatic post-admin-setup reseed — see
+    # Invoke-ProvisionBundleReseed. On completion re-enable the button and
+    # save whatever bundle now exists (seeded on exit 0; on failure the
+    # pre-admin one, flagged via -WarningPrefix so the operator knows).
+    Invoke-ProvisionBundleReseed -OnDone {
+        param($code)
+        $el.BtnDoneSaveBundle.IsEnabled = $true
+        if ($code -eq 0) {
+            Save-ProvisionBundleCopy
+        } else {
+            Save-ProvisionBundleCopy -WarningPrefix "Bundle update failed (exit $code) -"
         }
-    })
-    $script:saveBundleTimer.Start()
+    }
 }
 
 # ── Branch B: Join domain ─────────────────────────────────────────

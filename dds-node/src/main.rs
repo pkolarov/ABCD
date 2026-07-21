@@ -235,7 +235,7 @@ fn print_usage() {
   dds-node import-revocation --data-dir <DIR> --in <FILE> [--config <PATH>]
   dds-node list-revocations --data-dir <DIR> [--json] [--config <PATH>]
   dds-node restrict-data-dir-acl --data-dir <DIR>
-  dds-node create-provision-bundle --dir <DIR> --org <ORG> [--out <FILE>]
+  dds-node create-provision-bundle --dir <DIR> --org <ORG> [--out <FILE>] [--bootstrap-admin-urn <URN> | --config <PATH>]
   dds-node provision <BUNDLE.dds> [--data-dir <DIR>] [--no-start]
   dds-node provision-admission-key --data-dir <DIR> [--backend software|secure-enclave|tpm2(pending)]
   dds-node rotate-admission-key --data-dir <DIR> [--no-backup]
@@ -1904,8 +1904,13 @@ fn cmd_create_bundle(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     // contents. Omit when no admin exists yet — re-run this command
     // with the flag once one does, if you intend to onboard more nodes.
     let bootstrap_admin_urn = flag(args, "--bootstrap-admin-urn");
+    // **C-4 / config fallback** — when --bootstrap-admin-urn isn't passed
+    // explicitly, --config <PATH> lets create_bundle read it back out of
+    // the node's own config file (populated by `admin_setup`), mirroring
+    // `load_revocation_config`'s --config handling.
+    let config_path = flag(args, "--config").map(Path::new);
 
-    provision::create_bundle(&dir, org, &out, bootstrap_admin_urn)?;
+    provision::create_bundle(&dir, org, &out, bootstrap_admin_urn, config_path)?;
     println!("Provision bundle created:");
     println!("  file: {}", out.display());
     println!("  Copy to USB stick, then on a new machine:");

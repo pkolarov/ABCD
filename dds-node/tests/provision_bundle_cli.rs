@@ -12,6 +12,7 @@
 //!  - create-provision-bundle: --dir is required
 //!  - create-provision-bundle: --org is required
 //!  - create-provision-bundle: fails when domain dir has no domain.toml
+//!  - create-provision-bundle: --config seeds bootstrap_admin_urn into the bundle
 //!  - provision: happy path writes expected files and prints domain + peer_id
 //!  - provision: refuses double-provision on the same data_dir
 //!  - provision: requires a positional bundle path
@@ -234,6 +235,74 @@ fn create_provision_bundle_fails_on_missing_domain_toml() {
     assert!(
         !bundle_path.exists(),
         "bundle file must not be created when domain.toml is absent"
+    );
+}
+
+#[test]
+fn create_provision_bundle_config_seeds_bootstrap_admin_urn() {
+    // **C-4 / FIX 2** — `--config <node.toml>` seeds the bundle's
+    // bootstrap_admin_urn by reading it back out of the node's own config
+    // (exactly what `admin_setup` persists), so the DdsConsole reseed step
+    // can re-seal the bundle without the operator ever handling the URN.
+    // This mirrors the precise CLI the console now runs:
+    //   create-provision-bundle --dir <d> --org test-org --out b.dds --config <node.toml>
+    // A legacy empty-passphrase domain keeps it deterministic (no FIDO2).
+    let tmp = tempfile::tempdir().unwrap();
+    let domain_dir = tmp.path().join("domain");
+    std::fs::create_dir_all(&domain_dir).unwrap();
+    init_legacy_domain(&domain_dir, "seed-cfg.local");
+
+    // node.toml as admin_setup leaves it: a parseable [domain] section plus
+    // the bootstrap_admin_urn the ceremony persisted. (The bundle's domain
+    // itself comes from domain_dir/domain.toml; this [domain] only needs to
+    // satisfy NodeConfig parsing — bootstrap_admin_urn is the field read.)
+    const ADMIN_URN: &str = "urn:vouchsafe:seed-cfg-admin.deadbeef";
+    let node_toml = tmp.path().join("node.toml");
+    std::fs::write(
+        &node_toml,
+        format!(
+            "org_hash = \"test-org\"\n\
+             bootstrap_admin_urn = \"{ADMIN_URN}\"\n\
+             \n\
+             [domain]\n\
+             name = \"seed-cfg.local\"\n\
+             id = \"dds-dom:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\
+             pubkey = \"0000000000000000000000000000000000000000000000000000000000000000\"\n"
+        ),
+    )
+    .unwrap();
+
+    let bundle_path = tmp.path().join("b.dds");
+    let (ok, stdout, stderr) = run_capture(dds_node_bin().env("DDS_DOMAIN_PASSPHRASE", "").args([
+        "create-provision-bundle",
+        "--dir",
+        domain_dir.to_str().unwrap(),
+        "--org",
+        "test-org",
+        "--out",
+        bundle_path.to_str().unwrap(),
+        "--config",
+        node_toml.to_str().unwrap(),
+    ]));
+    assert!(
+        ok,
+        "create-provision-bundle --config should succeed; stderr={stderr}"
+    );
+
+    // create_bundle echoes the resolved seed at creation time.
+    assert!(
+        stdout.contains(&format!("Bootstrap admin seed: {ADMIN_URN}")),
+        "stdout must report the seed resolved from --config; got: {stdout}"
+    );
+
+    // Authoritative check: load the sealed bundle back and assert the
+    // embedded URN matches what --config supplied.
+    let bundle =
+        dds_node::provision::load_bundle(&bundle_path).expect("sealed bundle must load");
+    assert_eq!(
+        bundle.bootstrap_admin_urn.as_deref(),
+        Some(ADMIN_URN),
+        "the bundle must embed the bootstrap_admin_urn read back from --config"
     );
 }
 

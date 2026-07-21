@@ -129,8 +129,10 @@ pub struct ProvisionBundle {
     /// common case — `create-provision-bundle` normally runs during
     /// initial domain bootstrap, before admin_setup); operators should
     /// re-run `create-provision-bundle --bootstrap-admin-urn <urn>`
-    /// once an admin is established if they intend to onboard more
-    /// nodes, so those nodes ship with a live seed. `Some` only ever
+    /// (or `--config <node.toml>` to have it read the URN back out of
+    /// the node's own config once `admin_setup` has populated it) once
+    /// an admin is established if they intend to onboard more nodes, so
+    /// those nodes ship with a live seed. `Some` only ever
     /// carries the ONE bootstrap admin — additional admins promoted via
     /// `dds:admin` vouches self-propagate through the normal
     /// `reconcile_trusted_roots` gossip path once this one seed is in
@@ -727,16 +729,46 @@ pub fn load_bundle(path: &Path) -> Result<ProvisionBundle, ProvisionError> {
 /// bundle created during initial domain bootstrap, before admin_setup
 /// runs) — callers should re-invoke this once an admin is established
 /// if they intend to onboard more nodes.
+///
+/// `config_path`: when `bootstrap_admin_urn` is `None`, this is used as
+/// a fallback — the node's `node.toml` (loaded via
+/// [`crate::config::NodeConfig::from_file`]) is read for its own
+/// `bootstrap_admin_urn`, which `admin_setup` populates. This lets a
+/// caller that only knows the config path (not the URN itself) still
+/// pick up the trust anchor automatically, e.g. when re-creating a
+/// bundle right after admin setup completes. Ignored if
+/// `bootstrap_admin_urn` is already `Some`. The resolved URN (from
+/// either source) is validated identically before being sealed into
+/// the bundle.
 pub fn create_bundle(
     domain_dir: &Path,
     org_hash: &str,
     out_path: &Path,
     bootstrap_admin_urn: Option<&str>,
+    config_path: Option<&Path>,
 ) -> Result<(), ProvisionError> {
     let domain_toml = domain_dir.join("domain.toml");
     let domain_key_bin = domain_dir.join("domain_key.bin");
 
-    if let Some(urn) = bootstrap_admin_urn {
+    // **C-4 / re-bundle-after-admin-setup** — when the caller didn't pass
+    // an explicit `--bootstrap-admin-urn`, fall back to reading it back
+    // out of the node's own config file (populated by `admin_setup`), so
+    // re-running bundle creation after admin setup picks up the trust
+    // anchor automatically instead of silently emitting another bundle
+    // with no seed.
+    let resolved_bootstrap_admin_urn: Option<String> = match bootstrap_admin_urn {
+        Some(urn) => Some(urn.to_string()),
+        None => match config_path {
+            Some(path) => {
+                let config = crate::config::NodeConfig::from_file(path)
+                    .map_err(|e| ProvisionError::Io(e.to_string()))?;
+                config.bootstrap_admin_urn
+            }
+            None => None,
+        },
+    };
+
+    if let Some(urn) = &resolved_bootstrap_admin_urn {
         validate_bootstrap_admin_urn(urn)?;
     }
     validate_toml_safe_string(org_hash, "org_hash")?;
@@ -756,7 +788,7 @@ pub fn create_bundle(
         domain_id: domain.id.to_string(),
         domain_pubkey: to_hex(&domain.pubkey),
         domain_pq_pubkey,
-        bootstrap_admin_urn: bootstrap_admin_urn.map(str::to_string),
+        bootstrap_admin_urn: resolved_bootstrap_admin_urn,
         domain_key_blob: key_blob,
         org_hash: org_hash.to_string(),
         listen_port: 4001,
@@ -2066,7 +2098,7 @@ mod tests {
 
         // Create bundle
         let bundle_path = dir.path().join("test.dds");
-        create_bundle(&domain_dir, "test-org", &bundle_path, None).unwrap();
+        create_bundle(&domain_dir, "test-org", &bundle_path, None, None).unwrap();
         assert!(bundle_path.exists());
 
         // Provision (no start, no enrollment)
@@ -2120,7 +2152,7 @@ mod tests {
 
         let admin_urn = "urn:vouchsafe:admin.c4test".to_string();
         let bundle_path = dir.path().join("c4-test.dds");
-        create_bundle(&domain_dir, "c4-test-org", &bundle_path, Some(&admin_urn)).unwrap();
+        create_bundle(&domain_dir, "c4-test-org", &bundle_path, Some(&admin_urn), None).unwrap();
 
         let data_dir = dir.path().join("node-data");
         let result = run_provision(&bundle_path, Some(&data_dir), false).unwrap();
@@ -2168,7 +2200,7 @@ mod tests {
         domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
 
         let bundle_path = dir.path().join("test.dds");
-        create_bundle(&domain_dir, "sc2-org", &bundle_path, None).unwrap();
+        create_bundle(&domain_dir, "sc2-org", &bundle_path, None, None).unwrap();
 
         let data_dir = dir.path().join("node-data");
         let result = run_provision(&bundle_path, Some(&data_dir), false).unwrap();
@@ -2243,7 +2275,7 @@ mod tests {
         domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
 
         let bundle_path = dir.path().join("test.dds");
-        create_bundle(&domain_dir, "org", &bundle_path, None).unwrap();
+        create_bundle(&domain_dir, "org", &bundle_path, None, None).unwrap();
 
         let data_dir = dir.path().join("node-data");
         run_provision(&bundle_path, Some(&data_dir), false).unwrap();
@@ -2488,7 +2520,7 @@ mod tests {
 
         let bundle_path = dir.path().join("c4-validate.dds");
         let malicious = "urn:vouchsafe:admin.x\"]\ntrusted_roots = [\"pwned";
-        let err = create_bundle(&domain_dir, "org", &bundle_path, Some(malicious)).unwrap_err();
+        let err = create_bundle(&domain_dir, "org", &bundle_path, Some(malicious), None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("must be \"urn:\" followed only by"),
@@ -2616,7 +2648,7 @@ mod tests {
 
         let bundle_path = dir.path().join("c4-org-validate.dds");
         let malicious_org = "evil\"]\ntrusted_roots = [\"pwned";
-        let err = create_bundle(&domain_dir, malicious_org, &bundle_path, None).unwrap_err();
+        let err = create_bundle(&domain_dir, malicious_org, &bundle_path, None, None).unwrap_err();
         assert!(
             err.to_string().contains("org_hash contains"),
             "expected org_hash TOML-injection guard to fire, got: {err}"
@@ -2649,7 +2681,7 @@ mod tests {
         domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
 
         let bundle_path = dir.path().join("c4-name-validate.dds");
-        let err = create_bundle(&domain_dir, "org", &bundle_path, None).unwrap_err();
+        let err = create_bundle(&domain_dir, "org", &bundle_path, None, None).unwrap_err();
         assert!(
             err.to_string().contains("domain_name contains"),
             "expected domain_name TOML-injection guard to fire, got: {err}"
@@ -2787,7 +2819,7 @@ mod tests {
         domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
 
         let bundle_path = dir.path().join("hybrid.dds");
-        create_bundle(&domain_dir, "hybrid-org", &bundle_path, None).unwrap();
+        create_bundle(&domain_dir, "hybrid-org", &bundle_path, None, None).unwrap();
 
         // The created bundle must be v4 and carry the same pq_pubkey.
         let loaded = load_bundle(&bundle_path).unwrap();
@@ -3154,7 +3186,7 @@ mod tests {
         domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
 
         let bundle_path = dir.path().join("pqd2.dds");
-        create_bundle(&domain_dir, "pqd2-org", &bundle_path, None).unwrap();
+        create_bundle(&domain_dir, "pqd2-org", &bundle_path, None, None).unwrap();
 
         let data_dir = dir.path().join("node-data");
         let result = run_provision(&bundle_path, Some(&data_dir), false).unwrap();
@@ -3203,7 +3235,7 @@ mod tests {
         domain_store::save_domain_key(&domain_dir.join("domain_key.bin"), &key).unwrap();
 
         let bundle_path = dir.path().join("pqd2-legacy.dds");
-        create_bundle(&domain_dir, "pqd2-legacy-org", &bundle_path, None).unwrap();
+        create_bundle(&domain_dir, "pqd2-legacy-org", &bundle_path, None, None).unwrap();
 
         let data_dir = dir.path().join("node-data");
         run_provision(&bundle_path, Some(&data_dir), false).unwrap();
