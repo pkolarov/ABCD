@@ -164,6 +164,35 @@ public class AccountEnforcerTests
         Assert.True(_ops.UserExists("wg"));
     }
 
+    [Fact]
+    public async Task Refuses_on_unknown_join_state_without_claiming_domain_joined()
+    {
+        // Fail-closed on Unknown is intentional, but the recorded reason
+        // must say the state was undetermined — a workgroup machine with
+        // a failing probe was previously reported as "domain-joined",
+        // which sent operators chasing a nonexistent AD join.
+        _joinState.Current = JoinState.Unknown;
+        var dir = Parse("""[{"username":"alice","action":"Create"}]""");
+        var r = await _enforcer.ApplyAsync(dir, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Skipped, r.Status);
+        Assert.Contains("could not be determined", r.Error);
+        Assert.DoesNotContain("domain-joined", r.Error);
+        Assert.False(_ops.UserExists("alice"));
+    }
+
+    [Fact]
+    public async Task Allows_on_entra_only_joined_machine()
+    {
+        // EntraOnlyJoined is not AD — account mutation stays in scope,
+        // matching the pre-change RefuseOnHostState() set (AdJoined,
+        // HybridJoined, Unknown).
+        _joinState.Current = JoinState.EntraOnlyJoined;
+        var dir = Parse("""[{"username":"eo","action":"Create"}]""");
+        var r = await _enforcer.ApplyAsync(dir, EnforcementMode.Enforce);
+        Assert.Equal(EnforcementStatus.Ok, r.Status);
+        Assert.True(_ops.UserExists("eo"));
+    }
+
     // --- Multiple directives ---
 
     [Fact]

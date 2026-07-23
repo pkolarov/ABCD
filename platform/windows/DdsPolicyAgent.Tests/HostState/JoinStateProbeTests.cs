@@ -61,3 +61,97 @@ public class JoinStateProbeTests
         Assert.Equal(JoinState.Workgroup, new InMemoryJoinStateProbe().Detect());
     }
 }
+
+/// <summary>
+/// Spec §2.2 classification contract for the
+/// <c>NetGetAadJoinInformation</c> result, exercised through the pure
+/// <see cref="WindowsJoinStateProbe.ClassifyAadJoinResult"/> seam. The
+/// native probe (DdsAuthBridge/JoinState.cpp) mirrors this table and must
+/// be kept in lockstep.
+/// </summary>
+#pragma warning disable CA1416 // ClassifyAadJoinResult is a pure static; no Windows API is touched.
+public class AadJoinResultClassificationTests
+{
+    private const int S_OK = 0;
+    private const int S_FALSE = 1;
+    private const int E_FAIL = unchecked((int)0x80004005);
+    private const int E_ACCESSDENIED = unchecked((int)0x80070005);
+
+    [Theory]
+    // Success + no join info = "device has no Entra record". S_FALSE is
+    // the shape observed in the field on a never-Entra-registered
+    // workgroup machine (spec §2.2 edge case 2).
+    [InlineData(S_OK)]
+    [InlineData(S_FALSE)]
+    public void Success_with_null_info_is_no_signal(int hr)
+    {
+        Assert.Equal(
+            WindowsJoinStateProbe.EntraSignal.None,
+            WindowsJoinStateProbe.ClassifyAadJoinResult(hr, joinType: null));
+    }
+
+    [Fact]
+    public void Device_not_joined_hresult_is_no_signal()
+    {
+        // Spec §2.2 edge case 6.
+        Assert.Equal(
+            WindowsJoinStateProbe.EntraSignal.None,
+            WindowsJoinStateProbe.ClassifyAadJoinResult(
+                WindowsJoinStateProbe.DsregEDeviceNotJoined, joinType: null));
+    }
+
+    [Theory]
+    // Spec §2.2 edge case 7: unexpected failures stay fail-closed.
+    [InlineData(E_FAIL)]
+    [InlineData(E_ACCESSDENIED)]
+    public void Unexpected_failure_hresult_is_probe_failed(int hr)
+    {
+        Assert.Equal(
+            WindowsJoinStateProbe.EntraSignal.ProbeFailed,
+            WindowsJoinStateProbe.ClassifyAadJoinResult(hr, joinType: null));
+    }
+
+    [Theory]
+    // Any success code with join info honors joinType — including
+    // S_FALSE, deliberately: a probe that produced a join record has
+    // not failed, whatever its success code (spec §2.2 signal rows).
+    [InlineData(S_OK)]
+    [InlineData(S_FALSE)]
+    public void Device_join_type_is_device_joined(int hr)
+    {
+        Assert.Equal(
+            WindowsJoinStateProbe.EntraSignal.DeviceJoined,
+            WindowsJoinStateProbe.ClassifyAadJoinResult(
+                hr, WindowsJoinStateProbe.DSREG_JOIN_TYPE.DSREG_DEVICE_JOIN));
+    }
+
+    [Fact]
+    public void Workplace_join_type_is_workplace_joined()
+    {
+        Assert.Equal(
+            WindowsJoinStateProbe.EntraSignal.WorkplaceJoined,
+            WindowsJoinStateProbe.ClassifyAadJoinResult(
+                S_OK, WindowsJoinStateProbe.DSREG_JOIN_TYPE.DSREG_WORKPLACE_JOIN));
+    }
+
+    [Fact]
+    public void Unknown_join_type_is_probe_failed()
+    {
+        // Spec §2.2 edge case 4.
+        Assert.Equal(
+            WindowsJoinStateProbe.EntraSignal.ProbeFailed,
+            WindowsJoinStateProbe.ClassifyAadJoinResult(
+                S_OK, WindowsJoinStateProbe.DSREG_JOIN_TYPE.DSREG_UNKNOWN_JOIN));
+    }
+
+    [Fact]
+    public void Unrecognized_join_type_is_no_signal()
+    {
+        // Forward-compatible: a new DSREG_JOIN_TYPE value must not brick
+        // the host into Unknown.
+        Assert.Equal(
+            WindowsJoinStateProbe.EntraSignal.None,
+            WindowsJoinStateProbe.ClassifyAadJoinResult(
+                S_OK, (WindowsJoinStateProbe.DSREG_JOIN_TYPE)99));
+    }
+}

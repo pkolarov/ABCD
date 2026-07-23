@@ -68,7 +68,8 @@ cl.exe /nologo ^
     "%~dp0test_main.cpp" ^
     "%~dp0..\DdsBridgeIPC\ipc_protocol.cpp" ^
     "%~dp0..\DdsAuthBridge\JoinState.cpp" ^
-    /link netapi32.lib
+    "%~dp0..\DdsAuthBridge\FileLog.cpp" ^
+    /link netapi32.lib shell32.lib
 
 if errorlevel 1 (
     echo.

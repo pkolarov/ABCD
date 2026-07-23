@@ -40,6 +40,11 @@ class CDdsCredential : public ICredentialProviderCredential
     }
 
   public:
+    // True when this tile is bound to an enrolled DDS user (non-empty
+    // subject URN) — false for the "connect authenticator" placeholder
+    // tile, which must never be a target for provider-level auto-logon.
+    bool HasSubjectUrn() const { return _pszSubjectUrn && _pszSubjectUrn[0] != L'\0'; }
+
     // ICredentialProviderCredential
     IFACEMETHODIMP Advise(ICredentialProviderCredentialEvents* pcpce);
     IFACEMETHODIMP UnAdvise();

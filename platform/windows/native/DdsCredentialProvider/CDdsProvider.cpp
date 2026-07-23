@@ -588,18 +588,44 @@ HRESULT CDdsProvider::GetCredentialCount(
           (unsigned long)*pdwCount, (unsigned long)_dwNumCreds, g_ddsUsers.count);
     if (*pdwCount > 0)
     {
+        // Default tile: the SetSerialization tile when one is pending
+        // (RDP / NLA hand-off), else the sole DDS tile, else NO default.
+        // A forced default of 0 made the device-connect auto-logon below
+        // serialize tile 0 (the first enrolled user) even when the user
+        // had selected a different user's tile, hijacking multi-user
+        // logons — the selected tile's ceremony was cancelled and the
+        // first user's ceremony ran against the inserted key.
         if (_dwSetSerializationCred != CREDENTIAL_PROVIDER_NO_DEFAULT)
+        {
+            *pdwDefault = _dwSetSerializationCred;
+        }
+        else if (_dwNumCreds == 1)
         {
             *pdwDefault = 0;
         }
         else
         {
-            *pdwDefault = 0;
+            *pdwDefault = CREDENTIAL_PROVIDER_NO_DEFAULT;
         }
+
         // ---- One-shot auto-logon on device connect ----
+        // Only fire when the default tile is unambiguous (exactly one
+        // DDS *user* tile, no pending SetSerialization). With several
+        // enrolled users the tile choice belongs to the human; their
+        // click still auto-starts that tile's ceremony via SetSelected.
+        // HasSubjectUrn() excludes the "connect authenticator"
+        // placeholder that _EnumerateCredentials creates when every
+        // enrolled user was admin-filtered — auto-firing it would greet
+        // a just-inserted key with "authenticator not connected".
         LONG armed = InterlockedExchange(&_bPendingAutoLogon, 0L);
-        bool haveDdsUser = (g_ddsUsers.count > 0);
-        *pbAutoLogonWithDefault = (armed && haveDdsUser) ? TRUE : FALSE;
+        bool soleDdsTile = (g_ddsUsers.count > 0) && (_dwNumCreds == 1) &&
+                           (_dwSetSerializationCred == CREDENTIAL_PROVIDER_NO_DEFAULT) &&
+                           (_rgpCredentials[0] != NULL) &&
+                           _rgpCredentials[0]->HasSubjectUrn();
+        *pbAutoLogonWithDefault = (armed && soleDdsTile) ? TRUE : FALSE;
+        if (armed && !soleDdsTile)
+            CPLog("GetCredentialCount: auto-logon suppressed — %lu tiles, user picks",
+                  (unsigned long)_dwNumCreds);
         if (*pbAutoLogonWithDefault)
             CPLog("GetCredentialCount: AUTO-LOGON armed — LogonUI will call GetSerialization immediately");
     }

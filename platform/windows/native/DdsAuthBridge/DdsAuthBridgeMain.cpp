@@ -1045,8 +1045,13 @@ BOOL CDdsAuthBridgeMain::HandleDdsStartAuth(
         LeaveCriticalSection(&m_csAuth);
         FileLog::Writef("DdsStartAuth: refusing — JoinState=%ls\n",
                         dds::JoinStateName(joinState));
+        // §4.4 canonical strings: Unknown gets its own text — a workgroup
+        // box with a transiently failing probe must not be told it is
+        // Entra-joined.
         SendAuthError(pClientCtx, seqId, IPC_ERROR::UNSUPPORTED_HOST,
-            L"DDS sign-in is not yet supported on Entra-joined machines.");
+            (joinState == dds::JoinState::Unknown)
+                ? L"DDS could not classify this machine. Please retry after the DDS services have been able to detect the host state."
+                : L"DDS sign-in is not yet supported on Entra-joined machines.");
         return TRUE;
     }
 
@@ -2045,10 +2050,13 @@ BOOL CDdsAuthBridgeMain::HandleDdsListUsers(
     {
         FileLog::Writef("DdsListUsers: refusing — JoinState=%ls\n",
                         dds::JoinStateName(joinState));
+        // §4.4: same Unknown / Entra-only split as HandleDdsStartAuth.
         return SendDdsUserListResponse(
             m_pipeServer, pClientCtx, seqId,
             IPC_ERROR::UNSUPPORTED_HOST,
-            L"DDS sign-in is not yet supported on Entra-joined machines.",
+            (joinState == dds::JoinState::Unknown)
+                ? L"DDS could not classify this machine. Please retry after the DDS services have been able to detect the host state."
+                : L"DDS sign-in is not yet supported on Entra-joined machines.",
             {});
     }
 

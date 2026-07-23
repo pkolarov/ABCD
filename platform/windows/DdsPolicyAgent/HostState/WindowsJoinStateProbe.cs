@@ -145,7 +145,44 @@ public sealed class WindowsJoinStateProbe : IJoinStateProbe, IDisposable
         }
     }
 
-    private enum EntraSignal { None, DeviceJoined, WorkplaceJoined, ProbeFailed }
+    internal enum EntraSignal { None, DeviceJoined, WorkplaceJoined, ProbeFailed }
+
+    /// <summary>
+    /// <c>DSREG_E_DEVICE_NOT_JOINED</c>: the documented "this device has no
+    /// AAD/Entra device record" result of <c>NetGetAadJoinInformation</c>.
+    /// </summary>
+    internal const int DsregEDeviceNotJoined = unchecked((int)0x801C001D);
+
+    /// <summary>
+    /// Pure classification of a <c>NetGetAadJoinInformation</c> result.
+    /// Spec §2.2: the only failure modes that classify as
+    /// <see cref="EntraSignal.ProbeFailed"/> (and therefore
+    /// <see cref="JoinState.Unknown"/>) are unexpected error HRESULTs and
+    /// <c>DSREG_UNKNOWN_JOIN</c>. "This device has no Entra record" is a
+    /// normal answer, not a malfunction, in all of its wire shapes:
+    /// <c>DSREG_E_DEVICE_NOT_JOINED</c>, or any success code — S_OK, and
+    /// S_FALSE as observed in the field on never-Entra-registered
+    /// workgroup machines — with NULL join info.
+    /// <paramref name="joinType"/> is null when the API returned no join
+    /// info structure.
+    /// </summary>
+    internal static EntraSignal ClassifyAadJoinResult(int hr, DSREG_JOIN_TYPE? joinType)
+    {
+        if (hr < 0 /* FAILED */)
+        {
+            return hr == DsregEDeviceNotJoined
+                ? EntraSignal.None
+                : EntraSignal.ProbeFailed;
+        }
+        return joinType switch
+        {
+            null => EntraSignal.None,
+            DSREG_JOIN_TYPE.DSREG_DEVICE_JOIN => EntraSignal.DeviceJoined,
+            DSREG_JOIN_TYPE.DSREG_WORKPLACE_JOIN => EntraSignal.WorkplaceJoined,
+            DSREG_JOIN_TYPE.DSREG_UNKNOWN_JOIN => EntraSignal.ProbeFailed,
+            _ => EntraSignal.None,
+        };
+    }
 
     private EntraSignal ProbeEntraSignal()
     {
@@ -153,25 +190,21 @@ public sealed class WindowsJoinStateProbe : IJoinStateProbe, IDisposable
         try
         {
             int hr = NetGetAadJoinInformation(null, out info);
-            if (hr != 0 /* S_OK */)
+            DSREG_JOIN_TYPE? joinType = null;
+            if (hr >= 0 && info != IntPtr.Zero)
             {
-                _log?.LogDebug("NetGetAadJoinInformation hr=0x{Hr:X8}", hr);
-                return EntraSignal.ProbeFailed;
+                joinType = Marshal.PtrToStructure<DSREG_JOIN_INFO>(info).joinType;
             }
-            if (info == IntPtr.Zero)
+            var signal = ClassifyAadJoinResult(hr, joinType);
+            if (signal == EntraSignal.ProbeFailed)
             {
-                // S_OK with NULL info = no Entra signal, not failure.
-                return EntraSignal.None;
+                // `host_state_probe_failed` is the token the operator
+                // runbook (windows-ad-enrollment.md §2.4) greps for.
+                _log?.LogWarning(
+                    "host_state_probe_failed: NetGetAadJoinInformation hr=0x{Hr:X8} joinType={JoinType}",
+                    hr, joinType);
             }
-
-            var joinInfo = Marshal.PtrToStructure<DSREG_JOIN_INFO>(info);
-            return joinInfo.joinType switch
-            {
-                DSREG_JOIN_TYPE.DSREG_DEVICE_JOIN => EntraSignal.DeviceJoined,
-                DSREG_JOIN_TYPE.DSREG_WORKPLACE_JOIN => EntraSignal.WorkplaceJoined,
-                DSREG_JOIN_TYPE.DSREG_UNKNOWN_JOIN => EntraSignal.ProbeFailed,
-                _ => EntraSignal.None,
-            };
+            return signal;
         }
         catch (EntryPointNotFoundException)
         {
@@ -185,7 +218,7 @@ public sealed class WindowsJoinStateProbe : IJoinStateProbe, IDisposable
         }
         catch (Exception ex)
         {
-            _log?.LogWarning(ex, "NetGetAadJoinInformation threw");
+            _log?.LogWarning(ex, "host_state_probe_failed: NetGetAadJoinInformation threw");
             return EntraSignal.ProbeFailed;
         }
         finally
@@ -206,7 +239,7 @@ public sealed class WindowsJoinStateProbe : IJoinStateProbe, IDisposable
         NetSetupDomainName,
     }
 
-    private enum DSREG_JOIN_TYPE
+    internal enum DSREG_JOIN_TYPE
     {
         DSREG_UNKNOWN_JOIN = 0,
         DSREG_DEVICE_JOIN = 1,

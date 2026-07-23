@@ -40,10 +40,22 @@ public sealed class AccountEnforcer : IEnforcer
         _log = log;
     }
 
-    private bool RefuseOnHostState() =>
-        _joinState.Detect() is JoinState.AdJoined
-                            or JoinState.HybridJoined
-                            or JoinState.Unknown;
+    /// <summary>
+    /// Refusal reason when the host state forbids account mutation, or
+    /// null when enforcement may proceed. Distinguishes "genuinely
+    /// domain-joined" from "join state could not be determined" so the
+    /// audit trail and event log do not report a workgroup machine with
+    /// a failing probe as domain-joined.
+    /// </summary>
+    private string? HostStateRefusalReason() =>
+        _joinState.Detect() switch
+        {
+            JoinState.AdJoined or JoinState.HybridJoined =>
+                "domain-joined machines are out of scope for v1",
+            JoinState.Unknown =>
+                "host join state could not be determined; refusing account changes (fail-closed)",
+            _ => null,
+        };
 
     public Task<EnforcementOutcome> ApplyAsync(
         JsonElement directive, EnforcementMode mode, CancellationToken ct = default)
@@ -52,12 +64,11 @@ public sealed class AccountEnforcer : IEnforcer
             return Task.FromResult(new EnforcementOutcome(EnforcementStatus.Skipped));
 
         // Domain-join guard (v1 scope decision)
-        if (RefuseOnHostState())
+        if (HostStateRefusalReason() is string refusal)
         {
-            _log.LogWarning("Account enforcer refused: machine is domain-joined (v1 out of scope)");
+            _log.LogWarning("Account enforcer refused: {Reason}", refusal);
             return Task.FromResult(new EnforcementOutcome(
-                EnforcementStatus.Skipped,
-                "domain-joined machines are out of scope for v1"));
+                EnforcementStatus.Skipped, refusal));
         }
 
         var changes = new List<string>();
@@ -235,7 +246,7 @@ public sealed class AccountEnforcer : IEnforcer
     public List<string> ReconcileStaleAccounts(
         IReadOnlySet<string> staleUsernames, EnforcementMode mode)
     {
-        if (RefuseOnHostState()) return [];
+        if (HostStateRefusalReason() is not null) return [];
 
         var changes = new List<string>();
         foreach (var username in staleUsernames)
@@ -283,7 +294,7 @@ public sealed class AccountEnforcer : IEnforcer
     public List<string> ReconcileStaleGroups(
         IReadOnlySet<string> staleGroupKeys, EnforcementMode mode)
     {
-        if (RefuseOnHostState()) return [];
+        if (HostStateRefusalReason() is not null) return [];
 
         var changes = new List<string>();
         foreach (var key in staleGroupKeys)

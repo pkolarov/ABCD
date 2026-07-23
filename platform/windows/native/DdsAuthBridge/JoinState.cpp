@@ -5,6 +5,7 @@
 // classification on every box.
 
 #include "JoinState.h"
+#include "FileLog.h"
 
 #include <lm.h>      // NetGetJoinInformation, NET_API_STATUS, NERR_Success
 #include <lmjoin.h>  // DSREG_JOIN_INFO, NetGetAadJoinInformation
@@ -82,18 +83,32 @@ EntraSignal ProbeEntraSignal()
     PDSREG_JOIN_INFO pInfo = nullptr;
     HRESULT hr = api.pGet(nullptr, &pInfo);
 
-    if (hr != S_OK)
+    // Classification contract (spec §2.2, mirrored in
+    // WindowsJoinStateProbe.ClassifyAadJoinResult): "device has no
+    // Entra record" is a normal answer, not a malfunction, in all of
+    // its wire shapes — DSREG_E_DEVICE_NOT_JOINED, or any success
+    // code (S_OK, and S_FALSE as observed in the field on
+    // never-Entra-registered workgroup machines) with NULL info.
+    // Every other error HRESULT is a genuine probe failure and must
+    // classify Unknown, fail-closed.
+    if (FAILED(hr))
     {
-        // S_OK is the only success — anything else is no signal /
-        // failure. Per the spec, treat as no Entra signal so a real
-        // workgroup box without an AAD device record classifies as
-        // Workgroup, not Unknown.
         if (pInfo && api.pFree) api.pFree(pInfo);
-        return EntraSignal::None;
+        constexpr HRESULT kDsregEDeviceNotJoined =
+            static_cast<HRESULT>(0x801C001DL);
+        if (hr == kDsregEDeviceNotJoined)
+            return EntraSignal::None;
+        // ProbeFailed classifies the host Unknown, and AD-08 refuses
+        // auth on Unknown — log the hr so a refusal is diagnosable from
+        // authbridge.log. `host_state_probe_failed` is the token the
+        // operator runbook (windows-ad-enrollment.md §2.4) greps for.
+        FileLog::Writef("JoinState: host_state_probe_failed NetGetAadJoinInformation hr=0x%08lX\n",
+                        static_cast<unsigned long>(hr));
+        return EntraSignal::ProbeFailed;
     }
     if (!pInfo)
     {
-        // S_OK with NULL info = no Entra signal.
+        // Success (S_OK / S_FALSE) with NULL info = no Entra signal.
         return EntraSignal::None;
     }
 
@@ -169,7 +184,12 @@ JoinState GetCachedJoinState()
     if (!g_cachePrimed)
     {
         g_cached = DetectJoinState();
-        g_cachePrimed = true;
+        // Do not latch Unknown: a transient dsreg/netapi hiccup at first
+        // probe (often during early boot) must not refuse DDS sign-in for
+        // the rest of the service lifetime. Leaving the cache unprimed
+        // makes the next request re-probe; a classifiable result primes
+        // the cache as before.
+        g_cachePrimed = (g_cached != JoinState::Unknown);
     }
     return g_cached;
 }
@@ -182,7 +202,8 @@ void RefreshJoinState()
     if (g_testOverride) return;  // tests pin a value; refresh does nothing
 #endif
     g_cached = fresh;
-    g_cachePrimed = true;
+    // Same no-latch rule as GetCachedJoinState.
+    g_cachePrimed = (fresh != JoinState::Unknown);
 }
 
 #ifdef DDS_TESTING

@@ -64,13 +64,14 @@ unavailable.
 | Signal | Outcome |
 |---|---|
 | `NetGetJoinInformation` → `NetSetupDomainName` | `AdJoined` (refined to `HybridJoined` if Entra signal also present) |
-| `NetGetAadJoinInformation(NULL, &info)` returns `S_OK`, `info != NULL`, and `info->joinType == DSREG_DEVICE_JOIN` | Device Entra join signal |
-| `NetGetAadJoinInformation(NULL, &info)` returns `S_OK`, `info != NULL`, and `info->joinType == DSREG_WORKPLACE_JOIN` | Workplace registration signal |
+| `NetGetAadJoinInformation(NULL, &info)` returns a success code (`SUCCEEDED(hr)` — `S_OK` or `S_FALSE`), `info != NULL`, and `info->joinType == DSREG_DEVICE_JOIN` | Device Entra join signal |
+| `NetGetAadJoinInformation(NULL, &info)` returns a success code (`SUCCEEDED(hr)`), `info != NULL`, and `info->joinType == DSREG_WORKPLACE_JOIN` | Workplace registration signal |
 | AD signal + device Entra join or workplace registration signal | `HybridJoined` |
 | Workgroup signal + device Entra join signal | `EntraOnlyJoined` |
 | Workgroup signal + workplace registration signal only | `Workgroup`, with an informational log (`workplace_registered_only`) |
 | `NetGetJoinInformation` → `NetSetupWorkgroupName` AND no Entra/workplace signal | `Workgroup` |
-| Either probe throws / fails / returns `NetSetupUnknownStatus` | `Unknown` |
+| Either probe throws / fails unexpectedly / returns `NetSetupUnknownStatus` | `Unknown` |
+| `NetGetAadJoinInformation` reports "device has no Entra record" in any of its wire shapes (see edge cases 1, 2, 6) | no Entra signal — NOT `Unknown` |
 
 `NetGetAadJoinInformation` does **not** expose an `IsJoined` Boolean. The
 implementation must inspect `DSREG_JOIN_INFO.joinType` and must free non-null
@@ -91,12 +92,26 @@ fallback is overruled here.
 **Edge cases that must behave identically in both probes:**
 1. `NetGetAadJoinInformation` symbol missing on the host: treat as "no Entra
    signal", not `Unknown`.
-2. `NetGetAadJoinInformation` returns `S_OK` with `info == NULL`: treat as "no
-   Entra signal".
+2. `NetGetAadJoinInformation` returns any **success** code with `info == NULL`:
+   treat as "no Entra signal". This includes `S_FALSE` — observed in the field
+   (2026-07, Windows 11 ARM64 26200, never-Entra-registered workgroup machine):
+   the API returned `hr=0x00000001` with NULL join info. A strict `hr == S_OK`
+   check misclassifies such hosts as `Unknown`, which cascades into AD-08
+   refusing auth and the account enforcer refusing `local_accounts` — on a
+   plain workgroup box.
 3. `DSREG_DEVICE_JOIN` with empty `pszTenantId`: still treat as Entra device
    joined; tenant metadata is not required for host safety.
 4. `DSREG_UNKNOWN_JOIN`: `Unknown`.
 5. Domain name non-empty but `joinStatus == NetSetupUnknownStatus`: `Unknown`.
+6. `NetGetAadJoinInformation` returns `DSREG_E_DEVICE_NOT_JOINED`
+   (`0x801C001D`): treat as "no Entra signal" — it is the API's documented
+   way of answering "this device has no Entra record", not a malfunction.
+7. `NetGetAadJoinInformation` returns any **other** failure `HRESULT`: treat
+   as `Unknown`, fail-closed, and log the `hr` at warning level (managed
+   probe) / to `authbridge.log` (native probe) so an AD-08 auth refusal on
+   such a host is diagnosable. Blanket-mapping unknown errors to "no Entra
+   signal" is forbidden — it would let a malfunctioning probe silently
+   classify an Entra-joined host as `Workgroup` and defeat the AD-08 gate.
 
 ### 2.3 Caching and Re-probe
 
