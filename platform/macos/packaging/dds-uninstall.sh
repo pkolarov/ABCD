@@ -34,17 +34,17 @@ DDS_ROOT="/Library/Application Support/DDS"
 PKG_ID="com.dds.platform"
 BINARIES=(dds-node dds dds-fido2-test dds-fido2 dds-bootstrap-domain dds-enroll-admin \
           dds-admit-node dds-domain dds-user dds-account dds-uninstall)
-SBIN_HELPERS=(dds-keychain-seal dds-keychain-unseal dds-launchd-wrapper)
+SBIN_HELPERS=(dds-keychain-seal dds-keychain-unseal dds-launchd-wrapper dds-watchdog)
 KEYCHAIN_SERVICE="DDS Node Passphrase"
 KEYCHAIN_ACCOUNT="$(hostname -s)"
 
 echo ""
 echo "=== DDS Uninstall ==="
 echo ""
-echo "Will stop and unload: com.dds.node, com.dds.policyagent"
+echo "Will stop and unload: com.dds.node, com.dds.policyagent, com.dds.watchdog"
 echo "Will remove: /usr/local/bin/{${(j:, :)BINARIES}}"
 echo "Will remove: /usr/local/sbin/{${(j:, :)SBIN_HELPERS}}"
-echo "Will remove: /usr/local/lib/dds, /Library/LaunchDaemons/com.dds.{node,policyagent}.plist"
+echo "Will remove: /usr/local/lib/dds, /Library/LaunchDaemons/com.dds.{node,policyagent,watchdog}.plist"
 echo "Will remove pkg receipt: ${PKG_ID}"
 echo "Will remove System Keychain item: \"${KEYCHAIN_SERVICE}\" (account ${KEYCHAIN_ACCOUNT})"
 if [[ ${KEEP_DATA} -eq 0 ]]; then
@@ -65,11 +65,12 @@ fi
 
 echo ""
 echo "Stopping services..."
+launchctl bootout system/com.dds.watchdog 2>/dev/null || true
 launchctl bootout system/com.dds.policyagent 2>/dev/null || true
 launchctl bootout system/com.dds.node 2>/dev/null || true
 
 echo "Removing LaunchDaemons..."
-rm -f /Library/LaunchDaemons/com.dds.node.plist /Library/LaunchDaemons/com.dds.policyagent.plist
+rm -f /Library/LaunchDaemons/com.dds.node.plist /Library/LaunchDaemons/com.dds.policyagent.plist /Library/LaunchDaemons/com.dds.watchdog.plist
 
 echo "Removing binaries..."
 for b in "${BINARIES[@]}"; do
@@ -102,6 +103,7 @@ echo ""
 LEFT_SERVICES=0
 launchctl print system/com.dds.node >/dev/null 2>&1 && LEFT_SERVICES=1
 launchctl print system/com.dds.policyagent >/dev/null 2>&1 && LEFT_SERVICES=1
+launchctl print system/com.dds.watchdog >/dev/null 2>&1 && LEFT_SERVICES=1
 LEFT_DATA=0
 [[ ${KEEP_DATA} -eq 0 && -d "${DDS_ROOT}" ]] && LEFT_DATA=1
 

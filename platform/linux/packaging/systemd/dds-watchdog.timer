@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the DDS Node Watchdog every 5 minutes
+# External backstop for stuck peer admission — Linux port of the
+# Windows "DDS Node Watchdog" Scheduled Task (5-minute cadence).
+# The watchdog only restarts dds-node after connected_peers >
+# admitted_peers persists ~15 min (3 polls), capped at 3 restarts per
+# rolling 24h. Enabled by dds-bootstrap-domain alongside dds-node.
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

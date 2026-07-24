@@ -56,12 +56,13 @@ fi
 
 echo ""
 echo "Stopping services..."
+systemctl stop dds-watchdog.timer 2>/dev/null || true
 systemctl stop dds-policy-agent.service 2>/dev/null || true
 systemctl stop dds-node.service 2>/dev/null || true
 
 echo "Wiping node identity..."
 rm -rf "${NODE_DATA}"
-rm -f "${DATA_DIR}/dds.toml" "${DATA_DIR}/bootstrap.env" "${DATA_DIR}/provision.dds" "${DATA_DIR}/dds.sock"
+rm -f "${DATA_DIR}/dds.toml" "${DATA_DIR}/bootstrap.env" "${DATA_DIR}/provision.dds" "${DATA_DIR}/dds.sock" "${DATA_DIR}/watchdog-state.json"
 
 echo ""
 echo "Node identity purged. Re-bootstrap with: sudo dds-bootstrap-domain"

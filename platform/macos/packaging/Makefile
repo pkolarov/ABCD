@@ -121,9 +121,11 @@ pkg-payload: rust-binaries dotnet-agent
 	cp "$(PKG_DIR)/helpers/dds-keychain-seal.sh"   "$(PAYLOAD_DIR)/usr/local/sbin/dds-keychain-seal"
 	cp "$(PKG_DIR)/helpers/dds-keychain-unseal.sh" "$(PAYLOAD_DIR)/usr/local/sbin/dds-keychain-unseal"
 	cp "$(PKG_DIR)/helpers/dds-launchd-wrapper.sh" "$(PAYLOAD_DIR)/usr/local/sbin/dds-launchd-wrapper"
+	cp "$(PKG_DIR)/helpers/dds-watchdog.sh"        "$(PAYLOAD_DIR)/usr/local/sbin/dds-watchdog"
 	chmod +x "$(PAYLOAD_DIR)/usr/local/sbin/dds-keychain-seal"
 	chmod +x "$(PAYLOAD_DIR)/usr/local/sbin/dds-keychain-unseal"
 	chmod +x "$(PAYLOAD_DIR)/usr/local/sbin/dds-launchd-wrapper"
+	chmod +x "$(PAYLOAD_DIR)/usr/local/sbin/dds-watchdog"
 
 	# .NET agent (self-contained single binary)
 	cp "$(BUILD_DIR)/agent/DdsPolicyAgent.MacOS" "$(PAYLOAD_DIR)/usr/local/lib/dds/"
@@ -132,6 +134,7 @@ pkg-payload: rust-binaries dotnet-agent
 	# LaunchDaemons (disabled by default)
 	cp "$(PKG_DIR)/com.dds.node.plist" "$(PAYLOAD_DIR)/Library/LaunchDaemons/"
 	cp "$(PKG_DIR)/com.dds.policyagent.plist" "$(PAYLOAD_DIR)/Library/LaunchDaemons/"
+	cp "$(PKG_DIR)/com.dds.watchdog.plist" "$(PAYLOAD_DIR)/Library/LaunchDaemons/"
 
 	# Config template
 	cp "$(PKG_DIR)/dds.toml.template" "$(PAYLOAD_DIR)/Library/Application Support/DDS/"

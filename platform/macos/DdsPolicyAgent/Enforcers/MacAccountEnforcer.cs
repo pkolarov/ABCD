@@ -7,6 +7,22 @@ using Microsoft.Extensions.Logging;
 
 namespace DDS.PolicyAgent.MacOS.Enforcers;
 
+/// <summary>
+/// Tri-state answer from the directory-binding probe. Port of the
+/// Windows agent's S2.2 join-state contract (2c53707): a probe that
+/// ERRORS is a different answer than a probe that cleanly reports "not
+/// bound" — collapsing the two into a bool silently defeated the
+/// fail-closed gate whenever the probe itself failed.
+/// </summary>
+public enum DirectoryBindingState
+{
+    NotBound,
+    Bound,
+    /// <summary>Probe failed — binding state could not be determined.
+    /// The enforcer must refuse (fail-closed), never treat as NotBound.</summary>
+    Unknown,
+}
+
 public interface IMacAccountOperations
 {
     bool UserExists(string username);
@@ -24,7 +40,7 @@ public interface IMacAccountOperations
     bool IsInGroup(string username, string group);
     void AddToGroup(string username, string group);
     void RemoveFromGroup(string username, string group);
-    bool IsDirectoryBound();
+    DirectoryBindingState GetDirectoryBindingState();
 }
 
 public sealed class InMemoryMacAccountOperations : IMacAccountOperations
@@ -41,7 +57,7 @@ public sealed class InMemoryMacAccountOperations : IMacAccountOperations
     }
 
     private readonly Dictionary<string, AccountState> _accounts = new(StringComparer.OrdinalIgnoreCase);
-    public bool SimulateDirectoryBound { get; set; }
+    public DirectoryBindingState SimulateDirectoryBinding { get; set; } = DirectoryBindingState.NotBound;
 
     public bool UserExists(string username) => _accounts.ContainsKey(username);
 
@@ -81,7 +97,7 @@ public sealed class InMemoryMacAccountOperations : IMacAccountOperations
         if (_accounts.TryGetValue(username, out var a))
             a.Groups.Remove(group);
     }
-    public bool IsDirectoryBound() => SimulateDirectoryBound;
+    public DirectoryBindingState GetDirectoryBindingState() => SimulateDirectoryBinding;
 
     public AccountState? Peek(string username)
         => _accounts.TryGetValue(username, out var a) ? a : null;
@@ -248,19 +264,37 @@ public sealed class HostMacAccountOperations : IMacAccountOperations
             ["-o", "edit", "-n", ".", "-d", username, "-t", "user", group]);
     }
 
-    public bool IsDirectoryBound()
+    public DirectoryBindingState GetDirectoryBindingState()
     {
+        // Fast-path positive: an AD bind reported by dsconfigad is
+        // conclusive. On a never-bound host `dsconfigad -show` exits 0
+        // with empty output — a clean "no AD signal", not a probe
+        // failure — so an error here is simply not conclusive either
+        // way and falls through to the authoritative probe below.
         var ad = _runner.Run("/usr/sbin/dsconfigad", ["-show"]);
         if (ad.Succeeded && !string.IsNullOrWhiteSpace(ad.StandardOutput))
-            return true;
+            return DirectoryBindingState.Bound;
 
+        // Authoritative: the DS search path lists every external node
+        // (Active Directory AND LDAPv3), so a successful read is
+        // conclusive in both directions — including when dsconfigad
+        // errored above.
         var search = _runner.Run("/usr/bin/dscl", ["/Search", "-read", "/", "CSPSearchPath"]);
-        if (!search.Succeeded)
-            return false;
+        if (search.Succeeded)
+        {
+            var output = search.StandardOutput;
+            return output.Contains("/Active Directory/", StringComparison.OrdinalIgnoreCase)
+                || output.Contains("/LDAPv3/", StringComparison.OrdinalIgnoreCase)
+                ? DirectoryBindingState.Bound
+                : DirectoryBindingState.NotBound;
+        }
 
-        var output = search.StandardOutput;
-        return output.Contains("/Active Directory/", StringComparison.OrdinalIgnoreCase)
-            || output.Contains("/LDAPv3/", StringComparison.OrdinalIgnoreCase);
+        // S2.2 contract (macOS port of 2c53707): a probe that ERRORS is
+        // not a "not bound" answer. The previous bool version mapped
+        // this to false, silently defeating the fail-closed gate — the
+        // enforcer would mutate local accounts on a host whose binding
+        // state was simply unreadable (opendirectoryd hiccup, etc.).
+        return DirectoryBindingState.Unknown;
     }
 
     private string? ReadSingleAttribute(string username, string attribute)
@@ -309,7 +343,10 @@ public sealed class HostMacAccountOperations : IMacAccountOperations
 /// <summary>
 /// Applies <c>MacOsSettings.local_accounts</c> directives against
 /// local macOS account operations. Directory-bound hosts are refused
-/// in v1 to avoid conflicting with external identity sources.
+/// in v1 to avoid conflicting with external identity sources; a host
+/// whose binding state cannot be determined (probe failure) is also
+/// refused, fail-closed, with a distinct reason (S2.2 contract,
+/// 2c53707 port).
 ///
 /// Input safety: <c>username</c> is validated against the macOS short-name
 /// allowlist before any operation is attempted (ASCII letters, digits, <c>.</c>,
@@ -340,12 +377,25 @@ public sealed class MacAccountEnforcer : IEnforcer
         if (directive.ValueKind != JsonValueKind.Array)
             return Task.FromResult(new EnforcementOutcome(EnforcementStatus.Skipped));
 
-        if (_ops.IsDirectoryBound())
+        switch (_ops.GetDirectoryBindingState())
         {
-            _log.LogWarning("Account enforcer refused: host is bound to an external directory source");
-            return Task.FromResult(new EnforcementOutcome(
-                EnforcementStatus.Skipped,
-                "directory-bound hosts are out of scope for v1"));
+            case DirectoryBindingState.Bound:
+                _log.LogWarning("Account enforcer refused: host is bound to an external directory source");
+                return Task.FromResult(new EnforcementOutcome(
+                    EnforcementStatus.Skipped,
+                    "directory-bound hosts are out of scope for v1"));
+            case DirectoryBindingState.Unknown:
+                // S2.2 contract (2c53707 port): Unknown is refused
+                // fail-closed with its own reason — never claim the
+                // host is directory-bound when the truth is the probe
+                // failed. `host_state_probe_failed` is the
+                // runbook-documented log token shared with the Windows
+                // agent.
+                _log.LogError(
+                    "host_state_probe_failed: directory-binding state could not be determined; refusing account changes (fail-closed)");
+                return Task.FromResult(new EnforcementOutcome(
+                    EnforcementStatus.Skipped,
+                    "host directory-binding state could not be determined; refusing account changes (fail-closed)"));
         }
 
         var changes = new List<string>();

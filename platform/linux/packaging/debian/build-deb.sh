@@ -161,6 +161,9 @@ install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-purge-node-iden
   "$root/usr/local/sbin/dds-purge-node-identity"
 install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-verify-replication.sh" \
   "$root/usr/bin/dds-verify-replication"
+# Admission watchdog (0c41536 port) — timer-driven external backstop.
+install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-watchdog.sh" \
+  "$root/usr/bin/dds-watchdog"
 cp -R "$agent_dir"/. "$root/usr/local/lib/dds/DdsPolicyAgent.Linux/"
 find "$root/usr/local/lib/dds/DdsPolicyAgent.Linux" -type d -exec chmod 0755 {} +
 find "$root/usr/local/lib/dds/DdsPolicyAgent.Linux" -type f -exec chmod 0644 {} +
@@ -172,6 +175,10 @@ install -m 0644 "$repo_root/platform/linux/packaging/systemd/dds-node.service" \
   "$root/lib/systemd/system/dds-node.service"
 install -m 0644 "$repo_root/platform/linux/packaging/systemd/dds-policy-agent.service" \
   "$root/lib/systemd/system/dds-policy-agent.service"
+install -m 0644 "$repo_root/platform/linux/packaging/systemd/dds-watchdog.service" \
+  "$root/lib/systemd/system/dds-watchdog.service"
+install -m 0644 "$repo_root/platform/linux/packaging/systemd/dds-watchdog.timer" \
+  "$root/lib/systemd/system/dds-watchdog.timer"
 sed -i 's#ExecStart=/usr/local/bin/dds-node run /var/lib/dds/dds.toml#ExecStart=/usr/bin/dds-node run /var/lib/dds/dds.toml#' \
   "$root/lib/systemd/system/dds-node.service"
 if [[ "$framework_dependent" -eq 0 ]]; then
@@ -246,6 +253,7 @@ set -e
 
 if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
   if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop dds-watchdog.timer >/dev/null 2>&1 || true
     systemctl stop dds-policy-agent.service >/dev/null 2>&1 || true
     systemctl stop dds-node.service >/dev/null 2>&1 || true
   fi

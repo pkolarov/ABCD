@@ -1,0 +1,10 @@
+[Unit]
+Description=DDS Node Watchdog (stuck peer admission backstop)
+Documentation=file:/usr/bin/dds-watchdog
+After=dds-node.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/dds-watchdog

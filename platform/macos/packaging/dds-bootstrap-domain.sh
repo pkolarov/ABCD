@@ -230,6 +230,12 @@ echo "[7/7] Starting policy agent..."
 launchctl enable system/com.dds.policyagent 2>/dev/null || true
 launchctl bootstrap system /Library/LaunchDaemons/com.dds.policyagent.plist 2>/dev/null || true
 
+# Admission watchdog (0c41536 port) — external backstop that restarts
+# the node if peers stay connected-but-unadmitted for ~15 min. Enabled
+# alongside the node; 5-minute cadence via StartInterval.
+launchctl enable system/com.dds.watchdog 2>/dev/null || true
+launchctl bootstrap system /Library/LaunchDaemons/com.dds.watchdog.plist 2>/dev/null || true
+
 # dds-node's C-2 security gate refuses every POST /v1/admin/setup call
 # until this out-of-band sentinel exists (blocks a local unprivileged
 # process from self-enrolling as admin). It's checked live on each
@@ -254,6 +260,12 @@ echo "  Domain key: ${NODE_DATA}/domain_key.bin (KEEP SAFE)"
 echo "  Config:     ${DDS_ROOT}/dds.toml"
 echo ""
 echo "  Provision bundle: ${DDS_ROOT}/provision.dds"
+echo "  NOTE: this bundle was created before an admin exists, so nodes"
+echo "        provisioned from it would start with an empty trust anchor."
+echo "        'sudo dds-enroll-admin' re-creates it automatically with the"
+echo "        admin seeded once Admin Setup completes; only distribute the"
+echo "        bundle after that. (Manual equivalent, if ever needed:"
+echo "        dds-node create-provision-bundle --dir \"${NODE_DATA}\" --org \"${ORG_HASH}\" --out \"${DDS_ROOT}/provision.dds\" --config \"${DDS_ROOT}/dds.toml\")"
 echo ""
 echo "  Next steps:"
 echo "    1. Enroll an admin:  sudo dds-enroll-admin"

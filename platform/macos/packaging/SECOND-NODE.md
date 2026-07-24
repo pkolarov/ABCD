@@ -73,6 +73,12 @@ sudo cp admission-XXXX.cbor "/Library/Application Support/DDS/node-data/admissio
 # Edit dds.toml — set bootstrap_peers to point to the first node
 sudo nano "/Library/Application Support/DDS/dds.toml"
 # Set: bootstrap_peers = ["/ip4/192.168.1.10/tcp/4001/p2p/12D3KooWXXXXXX"]
+# ALSO copy trusted_roots and bootstrap_admin_urn verbatim from the
+# FIRST node's dds.toml — they do NOT sync via gossip (the bootstrap
+# admin's trust anchor comes from a local-only ceremony), and a node
+# left at trusted_roots = [] never resolves "vouched" for that admin.
+# (The provision-bundle join path seeds these automatically; only this
+# manual path needs the copy.)
 
 # Start node
 sudo launchctl enable system/com.dds.node
@@ -92,7 +98,16 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.dds.node.plist
    ```toml
    data_dir = "C:\\ProgramData\\DDS\\node-data"
    org_hash = "acme"  # same as first node
-   trusted_roots = []  # synced via gossip
+   # Copy BOTH lines below verbatim from the FIRST node's config. They
+   # do NOT sync via gossip: the bootstrap admin's trust anchor is
+   # established by a local-only ceremony (admin_setup) that never
+   # emits a replicable vouch, so a joining node that starts with
+   # trusted_roots = [] stays that way forever and every vouch that
+   # admin issued shows "vouched": false here. (The provision-bundle
+   # join path seeds these automatically; only this manual path needs
+   # the copy.)
+   trusted_roots = ["urn:vouchsafe:..."]        # from first node's config
+   bootstrap_admin_urn = "urn:vouchsafe:..."    # from first node's config
 
    [network]
    listen_addr = "/ip4/0.0.0.0/tcp/4001"

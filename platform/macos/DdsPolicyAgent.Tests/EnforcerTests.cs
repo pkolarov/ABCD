@@ -65,6 +65,94 @@ public class EnforcerTests
     }
 
     [Fact]
+    public async Task MacAccountEnforcer_refuses_on_directory_bound_host()
+    {
+        var ops = new InMemoryMacAccountOperations
+        {
+            SimulateDirectoryBinding = DirectoryBindingState.Bound,
+        };
+        var enforcer = new MacAccountEnforcer(ops, NullLogger<MacAccountEnforcer>.Instance);
+        var directive = JsonDocument.Parse("""
+        [
+          {"username":"alice","action":"Create"}
+        ]
+        """).RootElement;
+
+        var outcome = await enforcer.ApplyAsync(directive, EnforcementMode.Enforce);
+
+        Assert.Equal(EnforcementStatus.Skipped, outcome.Status);
+        Assert.Contains("out of scope", outcome.Error);
+        Assert.False(ops.UserExists("alice"));
+    }
+
+    [Fact]
+    public async Task MacAccountEnforcer_refuses_fail_closed_when_binding_state_unknown()
+    {
+        // S2.2 contract (2c53707 port): a failed probe must refuse with
+        // its own "could not be determined" reason — never proceed as
+        // if NotBound (the old bool defect), never claim the host is
+        // directory-bound when the truth is the probe failed.
+        var ops = new InMemoryMacAccountOperations
+        {
+            SimulateDirectoryBinding = DirectoryBindingState.Unknown,
+        };
+        var enforcer = new MacAccountEnforcer(ops, NullLogger<MacAccountEnforcer>.Instance);
+        var directive = JsonDocument.Parse("""
+        [
+          {"username":"alice","action":"Create"}
+        ]
+        """).RootElement;
+
+        var outcome = await enforcer.ApplyAsync(directive, EnforcementMode.Enforce);
+
+        Assert.Equal(EnforcementStatus.Skipped, outcome.Status);
+        Assert.Contains("could not be determined", outcome.Error);
+        Assert.Contains("fail-closed", outcome.Error);
+        Assert.DoesNotContain("out of scope", outcome.Error);
+        Assert.False(ops.UserExists("alice"));
+    }
+
+    public static readonly TheoryData<bool, int, string, int, string, DirectoryBindingState>
+        DirectoryBindingProbeTruthTable = new()
+    {
+        // (adOk, adExit, adStdout, dsclExit, dsclStdout, expected)
+        // dsconfigad reports an AD bind -> Bound, dscl never consulted.
+        { true, 0, "Active Directory Forest = example.com", 0, "", DirectoryBindingState.Bound },
+        // Clean never-bound host: dsconfigad exits 0 with empty output
+        // (a "no AD signal" answer, NOT a failure), dscl shows only
+        // local nodes.
+        { true, 0, "", 0, "CSPSearchPath: /Local/Default /BSD/local", DirectoryBindingState.NotBound },
+        // dscl search path carries an external node -> Bound.
+        { true, 0, "", 0, "CSPSearchPath: /Local/Default /LDAPv3/ldap.example.com", DirectoryBindingState.Bound },
+        // dsconfigad ERRORS but dscl answers conclusively -> its answer wins.
+        { false, 1, "", 0, "CSPSearchPath: /Local/Default", DirectoryBindingState.NotBound },
+        { false, 1, "", 0, "CSPSearchPath: /Local/Default /Active Directory/EXAMPLE", DirectoryBindingState.Bound },
+        // The defect 2c53707 fixed: authoritative probe FAILS -> Unknown,
+        // not NotBound (old bool version returned false here, silently
+        // defeating the fail-closed gate).
+        { true, 0, "", 1, "", DirectoryBindingState.Unknown },
+        { false, 1, "", 1, "", DirectoryBindingState.Unknown },
+    };
+
+    [Theory]
+    [MemberData(nameof(DirectoryBindingProbeTruthTable))]
+    public void HostMacAccountOperations_binding_probe_truth_table(
+        bool adOk, int adExit, string adStdout, int dsclExit, string dsclStdout,
+        DirectoryBindingState expected)
+    {
+        _ = adOk; // readability alias for the table; exit code is authoritative
+        var runner = new RecordingCommandRunner((file, args, _) => file switch
+        {
+            "/usr/sbin/dsconfigad" => new CommandResult(adExit, adStdout, adExit == 0 ? "" : "error"),
+            "/usr/bin/dscl" => new CommandResult(dsclExit, dsclStdout, dsclExit == 0 ? "" : "error"),
+            _ => throw new InvalidOperationException($"unexpected command {file} {string.Join(' ', args)}"),
+        });
+        var ops = new HostMacAccountOperations(runner);
+
+        Assert.Equal(expected, ops.GetDirectoryBindingState());
+    }
+
+    [Fact]
     public async Task LaunchdEnforcer_configures_and_loads_job()
     {
         var ops = new InMemoryLaunchdOperations();

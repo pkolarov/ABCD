@@ -57,6 +57,38 @@ if [[ -z "${ADMIN_URN}" ]]; then
   exit 1
 fi
 
+# **C-4 (55812b6 port)** — the provision bundle created by
+# dds-bootstrap-domain predates this admin, so it seeds joining nodes
+# with an empty trust anchor (trusted_roots = []) and no amount of
+# gossip ever fixes that (admin_setup deliberately never emits a
+# replicable dds:admin vouch). Now that the node has persisted
+# bootstrap_admin_urn into dds.toml, regenerate the bundle with the
+# admin seeded (`create-provision-bundle --config` reads it back out).
+# Mirrors DdsConsole.ps1's Tick-AdminSetupWait reseed point. Signing
+# the bundle unwraps the domain key — one more FIDO2 touch (or
+# passphrase) is expected here.
+NODE_DATA="${DATA_DIR}/node"
+if grep -qE '^\s*bootstrap_admin_urn\s*=\s*"[^"]+"' "${DATA_DIR}/dds.toml" 2>/dev/null; then
+  ORG_HASH="$(source "${DATA_DIR}/bootstrap.env" 2>/dev/null && echo "${ORG_HASH:-}")"
+  if [[ -n "${ORG_HASH}" ]]; then
+    echo ""
+    echo "Regenerating provision bundle with the admin trust anchor seeded..."
+    echo "(this signs the bundle — touch your FIDO2 key / enter the domain"
+    echo " passphrase when prompted)"
+    /usr/bin/dds-node create-provision-bundle \
+      --dir "${NODE_DATA}" \
+      --org "${ORG_HASH}" \
+      --out "${DATA_DIR}/provision.dds" \
+      --config "${DATA_DIR}/dds.toml" \
+      || echo "WARN: bundle reseed failed — nodes provisioned from the old bundle will start with an empty trust anchor. Re-run: dds-node create-provision-bundle --dir \"${NODE_DATA}\" --org <org> --out \"${DATA_DIR}/provision.dds\" --config \"${DATA_DIR}/dds.toml\"" >&2
+  else
+    echo "WARN: could not read ORG_HASH from bootstrap.env — provision bundle NOT reseeded." >&2
+    echo "      Nodes provisioned from the existing bundle will start with an empty trust anchor." >&2
+  fi
+else
+  echo "WARN: bootstrap_admin_urn not found in dds.toml after admin-setup — provision bundle NOT reseeded." >&2
+fi
+
 echo ""
 echo "============================================================"
 echo "  Admin Enrollment Complete"

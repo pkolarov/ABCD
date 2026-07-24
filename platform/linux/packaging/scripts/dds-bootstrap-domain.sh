@@ -155,6 +155,10 @@ echo ""
 echo "[5/7] Starting dds-node..."
 systemctl daemon-reload
 systemctl restart dds-node.service
+# Admission watchdog (0c41536 port) — external backstop that restarts
+# the node if peers stay connected-but-unadmitted for ~15 min. Enabled
+# alongside the node; 5-minute cadence via the systemd timer.
+systemctl enable --now dds-watchdog.timer 2>/dev/null || true
 
 printf "  Waiting for node..."
 for _ in $(seq 1 30); do
@@ -239,6 +243,12 @@ echo "  Domain key: ${NODE_DATA}/domain_key.bin (KEEP SAFE)"
 echo "  Config:     ${NODE_TOML}"
 echo ""
 echo "  Provision bundle: ${DATA_DIR}/provision.dds"
+echo "  NOTE: this bundle was created before an admin exists, so nodes"
+echo "        provisioned from it would start with an empty trust anchor."
+echo "        'sudo dds-enroll-admin' re-creates it automatically with the"
+echo "        admin seeded once Admin Setup completes; only distribute the"
+echo "        bundle after that. (Manual equivalent, if ever needed:"
+echo "        dds-node create-provision-bundle --dir \"${NODE_DATA}\" --org \"${ORG_HASH}\" --out \"${DATA_DIR}/provision.dds\" --config \"${DATA_DIR}/dds.toml\")"
 echo ""
 echo "  Next steps:"
 echo "    1. Enroll an admin:  sudo dds-enroll-admin"

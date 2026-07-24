@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dds.watchdog</string>
+  <!--
+    External backstop for stuck peer admission — macOS port of the
+    Windows "DDS Node Watchdog" Scheduled Task (5-minute cadence).
+    Polls /v1/status and restarts com.dds.node only after
+    connected_peers > admitted_peers persists ~15 min, capped at 3
+    restarts per rolling 24h. See helpers/dds-watchdog.sh.
+    Ships Disabled like the other DDS daemons; dds-bootstrap-domain
+    enables it alongside com.dds.node.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/sbin/dds-watchdog</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>Disabled</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/var/log/dds/dds-watchdog.out</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/dds/dds-watchdog.err</string>
+</dict>
+</plist>
