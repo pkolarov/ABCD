@@ -1220,6 +1220,29 @@ HMAC from the *live* logon assertion. See
 remaining prerequisites (a `dds:session` vouch, a published claim policy,
 and a Workgroup-joined host).
 
+#### How `dds-fido2` picks a User-Verification route
+
+Admin vouches require UV (see the note under
+[Admin Bootstrap](#admin-bootstrap)), and CTAP2 offers two routes to it.
+`dds-fido2` reads `authenticatorGetInfo`'s `options` map (no touch
+needed) and uses whichever the key actually offers:
+
+| Key reports | Route used | Prompt |
+|---|---|---|
+| `uv = true` (e.g. `bioEnroll` fingerprint keys) | on-authenticator UV — **no PIN involved** | "verify on your key" |
+| `clientPin = true` | PIN protocol | asks for the PIN |
+| `clientPin = false`, no `uv` | — | offers to set a PIN first |
+| neither | none available | warns that vouches will be rejected |
+
+The `uv` option is checked **first**, because some biometric keys do not
+implement `clientPin` at all — reading only `clientPin` would wrongly
+conclude such a key cannot do UV. This rests on a CTAP2 subtlety worth
+knowing when reading the client code: requesting built-in UV means
+leaving the request's `uv: true` in place, whereas supplying a PIN
+*replaces* it. The two routes are mutually exclusive per ceremony, so
+asking for a PIN on a biometric-only key forfeits UV entirely — and the
+resulting vouch is rejected server-side.
+
 ---
 
 ## Guided lifecycle management (DDS Console)

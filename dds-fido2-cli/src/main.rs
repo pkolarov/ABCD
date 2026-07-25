@@ -188,7 +188,16 @@ async fn cmd_new_user(
     // whose credential vault is sealed with the assertion-time HMAC output.
     // It cannot be added to the credential afterwards. See
     // `fido2::Device::make_credential`.
-    let outcome = device.make_credential(rp_id, label.as_bytes(), label, display_name, true)?;
+    // Registration needs no UV server-side, so don't demand it here — a
+    // plain touch keeps enrollment working on any authenticator.
+    let outcome = device.make_credential(
+        rp_id,
+        label.as_bytes(),
+        label,
+        display_name,
+        true,
+        fido2::UvMethod::None,
+    )?;
 
     let req = api::EnrollUserRequest {
         label: label.to_string(),
@@ -228,13 +237,31 @@ async fn cmd_admin_setup(
     }
 
     let device = fido2::Device::open()?;
-    ensure_pin_configured(&device)?;
+    ensure_uv_available(&device)?;
 
-    println!("Touch your FIDO2 key to create the admin credential...");
+    // Register the admin credential AS user-verified where the key can do
+    // it, mirroring Windows' AdminFlow (`requireUserVerification=true`):
+    // the later vouch assertions require UV, so proving the key can supply
+    // it now avoids minting an admin that can never actually vouch.
+    let cap = device.uv_capability()?;
+    let pin = acquire_pin_if_needed(cap, false)?;
+    let uv = uv_method(cap, pin.as_ref().map(|z| z.as_str()));
+    match cap {
+        fido2::UvCapability::BuiltIn => println!(
+            "Verify on your FIDO2 key (fingerprint / on-device) to create the admin credential..."
+        ),
+        _ => println!("Touch your FIDO2 key to create the admin credential..."),
+    }
     // hmac-secret = false: admins vouch, they never unseal a credential
     // vault. Mirrors DdsTrayAgent/AdminFlow.cpp:186.
-    let outcome =
-        device.make_credential(rp_id, label.as_bytes(), label, "DDS Administrator", false)?;
+    let outcome = device.make_credential(
+        rp_id,
+        label.as_bytes(),
+        label,
+        "DDS Administrator",
+        false,
+        uv,
+    )?;
 
     let req = api::EnrollUserRequest {
         label: "admin".to_string(),
@@ -404,18 +431,21 @@ async fn run_admin_assertion_ceremony(
     let credential_id_bytes = fido2::b64url_decode(&credential_id_b64url)?;
 
     let device = fido2::Device::open()?;
-    let pin = acquire_pin(auth.pin_stdin, &device)?;
-    let pin_ref: Option<&str> = pin.as_ref().map(|z| z.as_str());
+    let cap = device.uv_capability()?;
+    // `pin` must outlive `uv`, which borrows it.
+    let pin = acquire_pin_if_needed(cap, auth.pin_stdin)?;
+    let uv = uv_method(cap, pin.as_ref().map(|z| z.as_str()));
 
     let challenge: api::ChallengeResponse = api::get_json(node_url, "/v1/admin/challenge").await?;
 
-    println!("Touch your FIDO2 key to {action_verb}...");
-    let assertion = device.get_assertion(
-        rp_id,
-        &credential_id_bytes,
-        &challenge.challenge_b64url,
-        pin_ref,
-    )?;
+    match cap {
+        fido2::UvCapability::BuiltIn => {
+            println!("Verify on your FIDO2 key (fingerprint / on-device) to {action_verb}...")
+        }
+        _ => println!("Touch your FIDO2 key to {action_verb}..."),
+    }
+    let assertion =
+        device.get_assertion(rp_id, &credential_id_bytes, &challenge.challenge_b64url, uv)?;
 
     Ok(AssertionCeremony {
         credential_id_b64url,
@@ -426,30 +456,32 @@ async fn run_admin_assertion_ceremony(
     })
 }
 
-/// Acquire the PIN needed for a UV-required assertion. Refuses to
-/// proceed silently on an authenticator that has PIN capability but no
-/// PIN set (the server would just reject the resulting non-UV
-/// assertion with a confusing error) — points the operator at
-/// `admin-setup` instead, which offers to set one.
-fn acquire_pin(
+/// Read a PIN only when the PIN protocol is the UV route we'll actually
+/// use. A `BuiltIn` (biometric/on-device) authenticator needs no secret
+/// from us, so prompting would be wrong — and on keys that implement no
+/// `clientPin` at all there is nothing to prompt for.
+fn acquire_pin_if_needed(
+    cap: fido2::UvCapability,
     pin_stdin: bool,
-    device: &fido2::Device,
 ) -> Result<Option<Zeroizing<String>>, String> {
-    match device.pin_status()? {
-        fido2::PinStatus::Unsupported => {
+    match cap {
+        // The authenticator verifies the user itself — nothing to collect.
+        fido2::UvCapability::BuiltIn => Ok(None),
+        fido2::UvCapability::Unavailable => {
             eprintln!(
-                "WARN: this authenticator has no PIN capability; the resulting assertion \
-                 will lack User Verification and the server will reject it."
+                "WARN: this authenticator reports neither built-in User Verification \
+                 (`uv`) nor a client PIN; the assertion will lack UV and the server \
+                 will reject the vouch."
             );
             Ok(None)
         }
-        fido2::PinStatus::NotSet => Err(
-            "this authenticator has PIN capability but no PIN is set — run \
-             `dds-fido2 admin-setup` again (it offers to set one), or otherwise set a \
-             PIN before vouching"
+        fido2::UvCapability::PinNotSet => Err(
+            "this authenticator supports a PIN but none is set, and it offers no \
+             built-in User Verification — run `dds-fido2 admin-setup` (it offers to \
+             set one), or set a PIN before vouching"
                 .to_string(),
         ),
-        fido2::PinStatus::Set => {
+        fido2::UvCapability::Pin => {
             if pin_stdin {
                 let mut line = String::new();
                 std::io::stdin()
@@ -467,21 +499,37 @@ fn acquire_pin(
     }
 }
 
-/// Offer to set a PIN on a fresh authenticator during `admin-setup` —
-/// without one, `vouch`/`revoke-vouch` (which require UV) could never
-/// work for this admin. Registration itself doesn't require UV, so
-/// this is advisory, not a hard gate.
-fn ensure_pin_configured(device: &fido2::Device) -> Result<(), String> {
-    match device.pin_status()? {
-        fido2::PinStatus::Set => Ok(()),
-        fido2::PinStatus::Unsupported => {
+/// Pair a detected capability with the PIN we may have collected to get
+/// the concrete route for one ceremony.
+fn uv_method<'a>(cap: fido2::UvCapability, pin: Option<&'a str>) -> fido2::UvMethod<'a> {
+    match (cap, pin) {
+        (fido2::UvCapability::BuiltIn, _) => fido2::UvMethod::BuiltIn,
+        (fido2::UvCapability::Pin, Some(p)) => fido2::UvMethod::Pin(p),
+        _ => fido2::UvMethod::None,
+    }
+}
+
+/// Make sure this authenticator can reach User Verification before we
+/// mint an admin credential on it — without UV, `vouch`/`revoke-vouch`
+/// could never work for that admin. Registration itself doesn't require
+/// UV, so this is advisory rather than a hard gate.
+fn ensure_uv_available(device: &fido2::Device) -> Result<(), String> {
+    match device.uv_capability()? {
+        // Biometric / on-device UV: nothing to configure.
+        fido2::UvCapability::BuiltIn => {
+            println!("Authenticator provides built-in User Verification (no PIN needed).");
+            Ok(())
+        }
+        fido2::UvCapability::Pin => Ok(()),
+        fido2::UvCapability::Unavailable => {
             eprintln!(
-                "WARN: this authenticator has no PIN capability; vouch/revoke-vouch \
-                 (which require User Verification) will not work with it."
+                "WARN: this authenticator reports neither built-in User Verification \
+                 (`uv`) nor a client PIN; vouch/revoke-vouch (which require UV) will \
+                 not work with it."
             );
             Ok(())
         }
-        fido2::PinStatus::NotSet => {
+        fido2::UvCapability::PinNotSet => {
             eprintln!("This authenticator has no PIN set yet.");
             eprintln!("A PIN is required for future admin approvals (vouch/revoke-vouch).");
             print!("Set a PIN now? [Y/n]: ");

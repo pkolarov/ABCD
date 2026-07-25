@@ -1,5 +1,30 @@
 # DDS Implementation Status
 
+## fix(fido2-cli): biometric authenticators could never vouch (UV misdetection) — 2026-07-25
+
+`dds-fido2 admin-setup` warned *"this authenticator has no PIN capability; vouch/revoke-vouch
+will not work with it"* on a Crayonic KeyVault — a key that verifies users perfectly well, just
+biometrically. Any biometric-only authenticator was effectively locked out of every admin
+ceremony.
+
+**Root cause:** the capability probe read only CTAP2's `clientPin` option and mapped "absent" to
+"no UV possible". But `authenticatorGetInfo` on that key reports `uv = true`, `bioEnroll = true`
+and **no `clientPin` at all** — UV happens on-device via the fingerprint sensor, with no PIN in
+the picture. Worse, the code then took `ctap-hid-fido2`'s `.without_pin_and_uv()` path, and both
+that *and* `.pin()` reset the request's `uv` field to `None` (a fresh builder starts at
+`uv: Some(true)`). So the built-in-UV route was unreachable by construction: every assertion went
+out with the UV flag clear and was rejected by `admin_vouch`'s UV gate — which is exactly what
+the pre-existing Admin Guide note already described as valid ("PIN **or biometric**"). The docs
+were right; the client was wrong.
+
+**Fix:** `PinStatus` → `UvCapability { BuiltIn, Pin, PinNotSet, Unavailable }`, checking `uv`
+**before** `clientPin`, plus a `UvMethod` that expresses the built-in route as "call neither
+builder method". No PIN is prompted for on a biometric key. `admin-setup` now also registers the
+admin credential as user-verified where the key supports it (mirroring Windows' AdminFlow
+`requireUserVerification=true`), so an admin that could never vouch can't be minted in the first
+place. Verified against the real device: the new logic yields `BuiltIn` where the old yielded
+`Unsupported`.
+
 ## fix(fido2-cli): macOS/Linux-registered keys could never log in to Windows — 2026-07-25
 
 A user enrolled with `dds-fido2 new-user` on macOS/Linux replicated correctly and got a

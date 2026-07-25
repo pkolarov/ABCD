@@ -38,11 +38,44 @@ pub fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("invalid base64url: {e}"))
 }
 
+/// How (or whether) this authenticator can achieve **User Verification**.
+///
+/// The server requires UV for `admin_vouch` / `admin_revoke_vouch`
+/// (`service.rs`, AUDIT-2026-06-12 R2), and CTAP2 offers two routes to it.
+/// Reading only `clientPin` gets biometric keys wrong: e.g. a Crayonic
+/// KeyVault reports `uv = true` + `bioEnroll = true` with `clientPin`
+/// **absent** — it has no PIN at all and verifies on-device instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PinStatus {
-    Set,
-    NotSet,
-    Unsupported,
+pub enum UvCapability {
+    /// `options.uv == true` — the authenticator verifies the user itself
+    /// (fingerprint / on-device). Request `uv: true`; no PIN is involved.
+    /// Preferred when offered, since it needs no secret from us.
+    BuiltIn,
+    /// `clientPin` present and `true` — a PIN is set; UV via the PIN
+    /// protocol.
+    Pin,
+    /// `clientPin` present and `false` — the authenticator supports a PIN
+    /// but none has been set yet, and it offers no built-in UV.
+    PinNotSet,
+    /// Neither route available — this authenticator cannot reach UV, so
+    /// vouch ceremonies will be rejected server-side.
+    Unavailable,
+}
+
+/// Which UV route to actually exercise for one ceremony.
+///
+/// Maps onto the `ctap-hid-fido2` builders, whose defaults are easy to get
+/// wrong: a fresh builder already carries `uv: Some(true)`, and **both**
+/// `.pin()` and `.without_pin_and_uv()` reset it to `None`. So the
+/// built-in-UV route is expressed by calling *neither*.
+pub enum UvMethod<'a> {
+    /// Leave the builder's `uv: Some(true)` in place.
+    BuiltIn,
+    /// PIN-protocol UV.
+    Pin(&'a str),
+    /// Explicitly no UV (`without_pin_and_uv`). Registration-only; a
+    /// vouch assertion made this way is rejected by the server.
+    None,
 }
 
 pub struct Device {
@@ -86,40 +119,48 @@ impl Device {
         Ok(Self { inner })
     }
 
-    /// CTAP2 `authenticatorGetInfo`'s `clientPin` option, three-valued:
-    /// the key is present-and-true (PIN set, UV via PIN available),
-    /// present-and-false (PIN capability exists but none set yet — can
-    /// call `set_new_pin`), or absent entirely (no PIN capability at
-    /// all, e.g. some resident-key-only or biometric-only devices —
-    /// `set_new_pin` will fail on these).
-    pub fn pin_status(&self) -> Result<PinStatus, String> {
+    /// Determine how this authenticator can achieve User Verification, by
+    /// reading `authenticatorGetInfo`'s `options` map (no touch required).
+    ///
+    /// `uv == true` is checked **first**: an authenticator that verifies
+    /// on-device (biometric) needs no PIN from us, and some such keys do
+    /// not implement `clientPin` at all. Only if built-in UV is absent do
+    /// we fall back to interpreting `clientPin`.
+    pub fn uv_capability(&self) -> Result<UvCapability, String> {
         let info = self
             .inner
             .get_info()
             .map_err(|e| format!("GetInfo failed: {e}"))?;
+        let builtin_uv = info.options.iter().any(|(k, v)| k == "uv" && *v);
+        if builtin_uv {
+            return Ok(UvCapability::BuiltIn);
+        }
         Ok(match info.options.iter().find(|(k, _)| k == "clientPin") {
-            Some((_, true)) => PinStatus::Set,
-            Some((_, false)) => PinStatus::NotSet,
-            None => PinStatus::Unsupported,
+            Some((_, true)) => UvCapability::Pin,
+            Some((_, false)) => UvCapability::PinNotSet,
+            None => UvCapability::Unavailable,
         })
     }
 
     /// Set a PIN on an authenticator that doesn't have one yet. Without
-    /// this, a fresh security key could never produce a UV-capable
-    /// assertion, permanently blocking `vouch`/`revoke-vouch` for that
-    /// admin. Only valid when `pin_status()` returned `NotSet` — calling
-    /// this on a key that already has a PIN set fails; use `change_pin`
-    /// instead (not exposed here — out of scope, changing an existing
-    /// PIN isn't part of any ceremony this tool drives).
+    /// this, such a key could never produce a UV-capable assertion,
+    /// permanently blocking `vouch`/`revoke-vouch` for that admin. Only
+    /// valid when `uv_capability()` returned `PinNotSet` — calling this on
+    /// a key that already has a PIN set fails; use `change_pin` instead
+    /// (not exposed here — out of scope, changing an existing PIN isn't
+    /// part of any ceremony this tool drives). Not needed at all on a
+    /// `BuiltIn` (biometric) authenticator.
     pub fn set_new_pin(&self, pin: &str) -> Result<(), String> {
         self.inner
             .set_new_pin(pin)
             .map_err(|e| format!("failed to set a new PIN on the authenticator: {e}"))
     }
 
-    /// Registration ceremony. No PIN/UV required — the server does not
-    /// gate `enroll_user`/`admin_setup` on UV, only on the credential
-    /// existing at all.
+    /// Registration ceremony. The server does not gate
+    /// `enroll_user`/`admin_setup` on UV, so `uv` may be
+    /// [`UvMethod::None`]; pass a real method on a UV-capable key so the
+    /// resulting credential is registered as user-verified (this is what
+    /// Windows' admin flow does with `requireUserVerification=true`).
     ///
     /// `request_hmac_secret` mirrors the Windows enrollment flow's
     /// `hmacSecret` argument (`platform/windows/native/DdsTrayAgent/
@@ -149,13 +190,19 @@ impl Device {
         user_name: &str,
         display_name: &str,
         request_hmac_secret: bool,
+        uv: UvMethod<'_>,
     ) -> Result<EnrollmentOutcome, String> {
         let challenge = verifier::create_challenge();
         let user_entity =
             PublicKeyCredentialUserEntity::new(Some(user_id), Some(user_name), Some(display_name));
-        let mut builder = MakeCredentialArgsBuilder::new(rp_id, &challenge)
-            .user_entity(&user_entity)
-            .without_pin_and_uv();
+        let mut builder =
+            MakeCredentialArgsBuilder::new(rp_id, &challenge).user_entity(&user_entity);
+        // The builder starts at `uv: Some(true)`; BuiltIn means "leave it".
+        builder = match uv {
+            UvMethod::BuiltIn => builder,
+            UvMethod::Pin(p) => builder.pin(p),
+            UvMethod::None => builder.without_pin_and_uv(),
+        };
         if request_hmac_secret {
             // Encodes as `{"hmac-secret": true}` in the CTAP2 extensions
             // map. Must be `Some(_)` — the crate unwraps it.
@@ -187,20 +234,18 @@ impl Device {
         })
     }
 
-    /// Authentication ceremony with User Verification. `pin` MUST be
-    /// `Some` for the resulting assertion to carry the UV flag the
-    /// server requires for `admin_vouch`/`admin_revoke_vouch`; `None`
-    /// only makes sense against an authenticator with no PIN capability
-    /// at all (`has_pin_configured` returned `Ok(false)` with no
-    /// `clientPin` option present), where the server will simply reject
-    /// the resulting assertion — a real hardware limitation, not a bug
-    /// in this tool.
+    /// Authentication ceremony. `uv` must be [`UvMethod::BuiltIn`] or
+    /// [`UvMethod::Pin`] for the assertion to carry the UV flag that
+    /// `admin_vouch`/`admin_revoke_vouch` require; [`UvMethod::None`]
+    /// only makes sense on an authenticator that reports neither route
+    /// ([`UvCapability::Unavailable`]), where the server will reject the
+    /// result — a real hardware limitation, not a bug in this tool.
     pub fn get_assertion(
         &self,
         rp_id: &str,
         credential_id: &[u8],
         challenge_b64url: &str,
-        pin: Option<&str>,
+        uv: UvMethod<'_>,
     ) -> Result<AssertionOutcome, String> {
         // Must match `expected_origin = format!("https://{rp_id}")` and
         // the exact field order in `verify_assertion_common`
@@ -214,9 +259,12 @@ impl Device {
 
         let mut builder =
             GetAssertionArgsBuilder::new(rp_id, cdj_bytes).credential_id(credential_id);
-        builder = match pin {
-            Some(p) => builder.pin(p),
-            None => builder.without_pin_and_uv(),
+        // The builder starts at `uv: Some(true)`; BuiltIn means "leave it"
+        // so the authenticator performs UV itself (fingerprint/on-device).
+        builder = match uv {
+            UvMethod::BuiltIn => builder,
+            UvMethod::Pin(p) => builder.pin(p),
+            UvMethod::None => builder.without_pin_and_uv(),
         };
         let args = builder.build();
 
