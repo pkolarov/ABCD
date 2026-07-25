@@ -1,5 +1,28 @@
 # DDS Implementation Status
 
+## fix(fido2-cli): revert UV-lockout gate (false positive); fall back on UV timeout — 2026-07-25
+
+The `uv_retries == 0` check added earlier the same day was **wrong** and blocked a working key.
+Re-probing the Crayonic KeyVault showed `uv_retries = 0` **permanently** — unchanged by a power
+cycle — while the same key had completed a UV ceremony minutes earlier. The same device reports
+`pin_retries = 8` despite exposing no `clientPin` at all, so its retry counters are simply not
+implemented; `0` is a constant, not a lockout signal. Gating on it turned a usable authenticator
+into a hard failure, which is worse than the confusing timeout it was meant to explain.
+
+**Reverted** that gate. In its place:
+
+- `timeout_hint()` annotates `CTAP2_ERR_USER_ACTION_TIMEOUT` *after the fact* with the plausible
+  causes (finger not recognised, key never lit, power-cycle, no fingerprint enrolled). Guidance
+  without pre-emptively refusing to try.
+- `admin-setup` now treats registering the admin credential as user-verified as a *preference*
+  rather than a requirement: the server never gates `admin_setup` on UV, so on a UV timeout it
+  retries with a plain touch and warns clearly that vouching will still need UV. An admin that
+  exists but must prove UV later beats being unable to create one at all.
+
+Lesson recorded for the capability-probing code: CTAP2 `options` and the retry counters are
+advisory and vendor-inconsistent. Prefer attempting a ceremony and interpreting the failure over
+predicting capability and refusing up front.
+
 ## fix(fido2-cli): report built-in-UV lockout instead of a bogus timeout — 2026-07-25
 
 A ceremony on a biometric key failed with `CTAP2_ERR_USER_ACTION_TIMEOUT — Timeout waiting for

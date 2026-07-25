@@ -51,14 +51,6 @@ pub enum UvCapability {
     /// (fingerprint / on-device). Request `uv: true`; no PIN is involved.
     /// Preferred when offered, since it needs no secret from us.
     BuiltIn,
-    /// Built-in UV exists but its retry counter is exhausted
-    /// (`uv_retries == 0`). The authenticator will not perform UV until
-    /// it is reset, and — critically — it does not report this as an
-    /// error: the ceremony simply waits and then fails with
-    /// `CTAP2_ERR_USER_ACTION_TIMEOUT`, which looks like the operator
-    /// was too slow. Detecting it up front turns that into something
-    /// actionable.
-    BuiltInLockedOut,
     /// `clientPin` present and `true` — a PIN is set; UV via the PIN
     /// protocol.
     Pin,
@@ -88,6 +80,28 @@ pub enum UvMethod<'a> {
 
 pub struct Device {
     inner: FidoKeyHid,
+}
+
+/// Attach guidance to a CTAP error when it is the "authenticator waited
+/// for the user and gave up" case. That error is reported identically
+/// whether the operator was slow, the finger wasn't recognised, or the
+/// key is refusing to verify at all, so the raw message ("Timeout waiting
+/// for user interaction") consistently misleads.
+fn timeout_hint(err: &str) -> String {
+    if err.contains("CTAP2_ERR_USER_ACTION_TIMEOUT") || err.contains("0x2F") {
+        format!(
+            "{err}\n\
+             The authenticator waited for user verification and gave up. Common causes:\n\
+             - the fingerprint wasn't recognised — place an enrolled finger flat on the \
+               sensor and hold it, rather than tapping;\n\
+             - the key never lit up: unplug it, plug it back in, and retry;\n\
+             - repeated unrecognised reads can make a key refuse to verify until it is \
+               power-cycled;\n\
+             - no fingerprint enrolled — check with the vendor's tool."
+        )
+    } else {
+        err.to_string()
+    }
 }
 
 /// Result of a successful `MakeCredential` ceremony.
@@ -141,16 +155,18 @@ impl Device {
             .map_err(|e| format!("GetInfo failed: {e}"))?;
         let builtin_uv = info.options.iter().any(|(k, v)| k == "uv" && *v);
         if builtin_uv {
-            // `uv = true` only says built-in UV is *configured*; it does
-            // not say the retry budget is intact. A key whose counter has
-            // been exhausted by failed fingerprint reads still advertises
-            // `uv = true` and then silently times out every ceremony.
-            // Keys that don't implement the counter return an error here,
-            // which is not a failure — assume UV is usable.
-            return Ok(match self.inner.get_uv_retries() {
-                Ok(n) if n <= 0 => UvCapability::BuiltInLockedOut,
-                _ => UvCapability::BuiltIn,
-            });
+            // NB: do *not* gate this on `get_uv_retries()`. It is tempting
+            // to read a `0` as "UV locked out", but the counter is
+            // unreliable in practice — a Crayonic KeyVault reports
+            // `uv_retries = 0` permanently (unchanged by a power cycle)
+            // while performing UV perfectly well, and simultaneously
+            // reports `pin_retries = 8` despite exposing no `clientPin` at
+            // all. Blocking on that reading locks out a working key, which
+            // is a far worse failure than the timeout it was meant to
+            // explain. If UV genuinely can't proceed the ceremony returns
+            // CTAP2_ERR_USER_ACTION_TIMEOUT, and `timeout_hint()` turns
+            // that into guidance after the fact.
+            return Ok(UvCapability::BuiltIn);
         }
         Ok(match info.options.iter().find(|(k, _)| k == "clientPin") {
             Some((_, true)) => UvCapability::Pin,
@@ -230,7 +246,7 @@ impl Device {
         let attestation = self
             .inner
             .make_credential_with_args(&args)
-            .map_err(|e| format!("makeCredential failed: {e}"))?;
+            .map_err(|e| timeout_hint(&format!("makeCredential failed: {e}")))?;
 
         let verify_result = verifier::verify_attestation(rp_id, &challenge, &attestation);
         if !verify_result.is_success {
@@ -289,7 +305,7 @@ impl Device {
         let assertions = self
             .inner
             .get_assertion_with_args(&args)
-            .map_err(|e| format!("getAssertion failed: {e}"))?;
+            .map_err(|e| timeout_hint(&format!("getAssertion failed: {e}")))?;
         let assertion = assertions
             .into_iter()
             .next()

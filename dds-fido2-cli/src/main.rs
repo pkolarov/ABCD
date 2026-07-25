@@ -239,29 +239,60 @@ async fn cmd_admin_setup(
     let device = fido2::Device::open()?;
     ensure_uv_available(&device)?;
 
-    // Register the admin credential AS user-verified where the key can do
-    // it, mirroring Windows' AdminFlow (`requireUserVerification=true`):
-    // the later vouch assertions require UV, so proving the key can supply
-    // it now avoids minting an admin that can never actually vouch.
+    // Prefer registering the admin credential AS user-verified, mirroring
+    // Windows' AdminFlow (`requireUserVerification=true`): the later vouch
+    // assertions require UV, so exercising it now surfaces a key that
+    // can't supply it before we mint an admin that could never vouch.
+    //
+    // But this is a *preference*, not a requirement — the server does not
+    // gate `admin_setup` on UV at all. Biometric UV can fail for reasons
+    // that have nothing to do with the key's capabilities (an
+    // unrecognised finger, a sensor that never lights up), and the
+    // authenticator reports all of them as the same opaque timeout. So on
+    // timeout, fall back to a plain touch rather than leaving the operator
+    // stuck: an admin that exists but must prove UV later beats no admin
+    // at all.
+    // hmac-secret = false: admins vouch, they never unseal a credential
+    // vault. Mirrors DdsTrayAgent/AdminFlow.cpp:186.
     let cap = device.uv_capability()?;
     let pin = acquire_pin_if_needed(cap, false)?;
     let uv = uv_method(cap, pin.as_ref().map(|z| z.as_str()));
+    let uv_attempted = !matches!(uv, fido2::UvMethod::None);
     match cap {
         fido2::UvCapability::BuiltIn => println!(
             "Verify on your FIDO2 key (fingerprint / on-device) to create the admin credential..."
         ),
         _ => println!("Touch your FIDO2 key to create the admin credential..."),
     }
-    // hmac-secret = false: admins vouch, they never unseal a credential
-    // vault. Mirrors DdsTrayAgent/AdminFlow.cpp:186.
-    let outcome = device.make_credential(
+    let outcome = match device.make_credential(
         rp_id,
         label.as_bytes(),
         label,
         "DDS Administrator",
         false,
         uv,
-    )?;
+    ) {
+        Ok(o) => o,
+        Err(e) if uv_attempted && e.contains("CTAP2_ERR_USER_ACTION_TIMEOUT") => {
+            eprintln!("\n{e}\n");
+            eprintln!(
+                "User verification did not complete. Retrying WITHOUT it — registration \
+                 does not require UV.\n\
+                 NOTE: vouching later DOES require UV, so if that step also fails, this \
+                 key cannot currently act as an admin.\n"
+            );
+            println!("Touch your FIDO2 key (a plain touch this time)...");
+            device.make_credential(
+                rp_id,
+                label.as_bytes(),
+                label,
+                "DDS Administrator",
+                false,
+                fido2::UvMethod::None,
+            )?
+        }
+        Err(e) => return Err(e),
+    };
 
     let req = api::EnrollUserRequest {
         label: "admin".to_string(),
@@ -456,20 +487,6 @@ async fn run_admin_assertion_ceremony(
     })
 }
 
-/// Shown when the authenticator's built-in-UV retry counter is spent.
-/// Without this the ceremony just times out, which reads as "you were
-/// too slow" rather than "the key refuses to verify".
-const UV_LOCKED_OUT_HELP: &str = "\
-this authenticator's built-in User Verification is locked out \
-(uv_retries = 0), usually after several unrecognised fingerprint reads. \
-It will not verify again until the counter resets, and it reports that \
-as a silent timeout rather than an error.\n\
-  Try: unplug the key and plug it back in, then re-run. A power cycle \
-restores the retry budget on most authenticators.\n\
-  If it stays locked out, verify a fingerprint is still enrolled using \
-the vendor's tool (this key exposes no PIN, so the PIN-based unlock path \
-is unavailable).";
-
 /// Read a PIN only when the PIN protocol is the UV route we'll actually
 /// use. A `BuiltIn` (biometric/on-device) authenticator needs no secret
 /// from us, so prompting would be wrong — and on keys that implement no
@@ -481,7 +498,6 @@ fn acquire_pin_if_needed(
     match cap {
         // The authenticator verifies the user itself — nothing to collect.
         fido2::UvCapability::BuiltIn => Ok(None),
-        fido2::UvCapability::BuiltInLockedOut => Err(UV_LOCKED_OUT_HELP.to_string()),
         fido2::UvCapability::Unavailable => {
             eprintln!(
                 "WARN: this authenticator reports neither built-in User Verification \
@@ -535,9 +551,6 @@ fn ensure_uv_available(device: &fido2::Device) -> Result<(), String> {
             println!("Authenticator provides built-in User Verification (no PIN needed).");
             Ok(())
         }
-        // Hard stop: minting an admin here would produce one that cannot
-        // vouch, and the ceremony would fail with a misleading timeout.
-        fido2::UvCapability::BuiltInLockedOut => Err(UV_LOCKED_OUT_HELP.to_string()),
         fido2::UvCapability::Pin => Ok(()),
         fido2::UvCapability::Unavailable => {
             eprintln!(
