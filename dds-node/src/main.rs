@@ -1119,12 +1119,14 @@ fn cmd_gen_hmac_secret(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     tmp.write_all(&secret)?;
     tmp.flush()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600))?;
-    }
+    // **M-4 (pre-prod review 2026-07-24)** — same Unix-only gap as the
+    // provision bundle: `--out` is an operator-chosen path (it has to be
+    // readable by the Windows Auth Bridge service, so it frequently
+    // lives outside `%ProgramData%\DDS`), and this file is a raw 32-byte
+    // HMAC secret. Harden on both platforms.
+    dds_node::file_acl::restrict_to_owner(tmp.path());
     tmp.persist(&out)?;
+    dds_node::file_acl::restrict_to_owner(&out);
 
     println!("Wrote 32-byte HMAC secret to {}", out.display());
     println!("Configure dds-node's network.api_auth.node_hmac_secret_path");

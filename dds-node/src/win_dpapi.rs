@@ -86,6 +86,23 @@ pub fn unseal(ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     }
     let plaintext =
         unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec();
-    unsafe { LocalFree(output.pbData as *mut _) };
+
+    // **L-13 (pre-prod review 2026-07-24)** — wipe DPAPI's own buffer
+    // before handing it back to the heap.
+    //
+    // `CryptUnprotectData` allocates `output.pbData` with `LocalAlloc`
+    // and it holds the decrypted node passphrase. We copy it out into a
+    // `Zeroizing<Vec<u8>>` (which the caller's drop wipes) but the
+    // *original* was released un-scrubbed, leaving the passphrase in
+    // freed process memory where a crash dump, a page-file write, or a
+    // later heap read could recover it. `LocalFree` does not scrub.
+    //
+    // Zeroing through the raw pointer rather than a `&mut` slice keeps
+    // this honest about aliasing; the region is exclusively ours between
+    // the copy above and the free below.
+    unsafe {
+        std::ptr::write_bytes(output.pbData, 0u8, output.cbData as usize);
+        LocalFree(output.pbData as *mut _)
+    };
     Ok(Zeroizing::new(plaintext))
 }

@@ -201,10 +201,51 @@ public sealed class RegistryEnforcer : IEnforcer
     }
 
     /// <summary>
+    /// Prefix marking a managed key as <i>key-level</i> (the directive
+    /// carried no <c>name</c>, so the whole registry key is managed).
+    /// </summary>
+    /// <remarks>
+    /// <b>L-15 (pre-prod review 2026-07-24)</b>. See
+    /// <see cref="ExtractManagedKey"/>.
+    /// </remarks>
+    internal const string KeyLevelPrefix = "K:";
+
+    /// <summary>
+    /// Prefix marking a managed key as <i>value-level</i> (the last
+    /// backslash-separated segment is the value name).
+    /// </summary>
+    internal const string ValueLevelPrefix = "V:";
+
+    /// <summary>
     /// Extract the managed-item key for a directive (used by Worker
     /// to build the desired managed set).
-    /// Format: <c>hive\key\valueName</c> or <c>hive\key</c> for
-    /// key-level operations.
+    ///
+    /// <para>
+    /// Format: <c>V:hive\key\valueName</c> for a value-level directive,
+    /// <c>K:hive\key</c> for a key-level one.
+    /// </para>
+    ///
+    /// <para>
+    /// <b>L-15 (pre-prod review 2026-07-24)</b>: the encoding used to be
+    /// a bare <c>hive\key[\valueName]</c> with no discriminator, and
+    /// <see cref="ParseManagedKey"/> guessed — it always treated the last
+    /// segment as a value name whenever the remainder contained a
+    /// backslash. Registry key paths essentially always contain
+    /// backslashes (<c>SOFTWARE\Policies\DDS\Foo</c>), so a *key-level*
+    /// managed item round-tripped as
+    /// <c>(SOFTWARE\Policies\DDS, value "Foo")</c>. Reconcile then looked
+    /// for a value that does not exist, found nothing, and deleted
+    /// nothing: a retracted key-level directive was never actually
+    /// reverted, so the policy stayed in force on the host after being
+    /// pulled from the domain.
+    /// </para>
+    ///
+    /// <para>
+    /// The prefix removes the guess. <see cref="ParseManagedKey"/> still
+    /// accepts the legacy unprefixed form so managed sets persisted by an
+    /// earlier agent build keep reconciling across the upgrade (with the
+    /// old, lossy heuristic — the state is genuinely ambiguous).
+    /// </para>
     /// </summary>
     public static string? ExtractManagedKey(JsonElement item)
     {
@@ -217,7 +258,9 @@ public sealed class RegistryEnforcer : IEnforcer
         var name = item.TryGetProperty("name", out var n) && n.ValueKind != JsonValueKind.Null
             ? n.GetString()
             : null;
-        return name is not null ? $@"{hive}\{key}\{name}" : $@"{hive}\{key}";
+        return name is not null
+            ? $@"{ValueLevelPrefix}{hive}\{key}\{name}"
+            : $@"{KeyLevelPrefix}{hive}\{key}";
     }
 
     /// <summary>
@@ -286,39 +329,88 @@ public sealed class RegistryEnforcer : IEnforcer
     }
 
     /// <summary>
-    /// Parse a managed key string back into hive, subKey, and optional valueName.
+    /// The <c>hive\key[\valueName]</c> body of a managed key, with any
+    /// <see cref="KeyLevelPrefix"/> / <see cref="ValueLevelPrefix"/>
+    /// discriminator removed.
+    ///
+    /// <para>
+    /// <b>L-15 upgrade safety.</b> Reconciliation computes
+    /// <c>stale = previouslyManaged − desired</c> by string set
+    /// difference. On the first poll after an agent upgrade the
+    /// persisted set still holds legacy unprefixed strings while the
+    /// freshly-built desired set holds prefixed ones, so a raw string
+    /// diff would classify *every* still-desired registry item as stale
+    /// and delete it. Diffing on this prefix-free body makes the two
+    /// encodings compare equal, so the upgrade is a no-op and the
+    /// persisted set is quietly rewritten in the new form.
+    /// </para>
+    /// </summary>
+    internal static string ManagedKeyBody(string managedKey) =>
+        managedKey.StartsWith(KeyLevelPrefix, StringComparison.Ordinal)
+            ? managedKey[KeyLevelPrefix.Length..]
+            : managedKey.StartsWith(ValueLevelPrefix, StringComparison.Ordinal)
+                ? managedKey[ValueLevelPrefix.Length..]
+                : managedKey;
+
+    /// <summary>
+    /// Parse a managed key string back into hive, subKey, and optional
+    /// valueName.
+    ///
+    /// <para>
+    /// <b>L-15 (pre-prod review 2026-07-24)</b>: prefers the explicit
+    /// <see cref="KeyLevelPrefix"/> / <see cref="ValueLevelPrefix"/>
+    /// discriminator written by <see cref="ExtractManagedKey"/>. An
+    /// unprefixed string is managed state persisted by an older agent
+    /// build; it is genuinely ambiguous, so it falls back to the legacy
+    /// "last segment is the value name" heuristic. That fallback is
+    /// wrong for key-level items — which is the bug — but it is what the
+    /// old state means, and it stops applying as soon as the current
+    /// policy is re-applied and the managed set is rewritten with
+    /// prefixes.
+    /// </para>
     /// </summary>
     internal static (string Hive, string Key, string? ValueName)? ParseManagedKey(string managedKey)
     {
-        // Format: "hive\key[\valueName]"
-        // Hive is the first segment (e.g. "LocalMachine")
+        if (managedKey.StartsWith(KeyLevelPrefix, StringComparison.Ordinal))
+        {
+            var body = managedKey[KeyLevelPrefix.Length..];
+            var sep = body.IndexOf('\\');
+            if (sep < 0) return null;
+            var h = body[..sep];
+            var k = body[(sep + 1)..];
+            if (h.Length == 0 || k.Length == 0) return null;
+            return (h, k, null);
+        }
+
+        if (managedKey.StartsWith(ValueLevelPrefix, StringComparison.Ordinal))
+        {
+            var body = managedKey[ValueLevelPrefix.Length..];
+            var sep = body.IndexOf('\\');
+            if (sep < 0) return null;
+            var h = body[..sep];
+            var rest = body[(sep + 1)..];
+            // Value name is the final segment; the key is everything
+            // before it. A value-level item must therefore have at least
+            // one more separator.
+            var lastSep = rest.LastIndexOf('\\');
+            if (lastSep < 0) return null;
+            var k = rest[..lastSep];
+            var v = rest[(lastSep + 1)..];
+            if (h.Length == 0 || k.Length == 0) return null;
+            return (h, k, v);
+        }
+
+        // --- Legacy, unprefixed: "hive\key[\valueName]" ---------------
         var firstSep = managedKey.IndexOf('\\');
         if (firstSep < 0) return null;
 
         var hive = managedKey[..firstSep];
-        var rest = managedKey[(firstSep + 1)..];
+        var legacyRest = managedKey[(firstSep + 1)..];
+        var legacyLastSep = legacyRest.LastIndexOf('\\');
+        if (legacyLastSep < 0)
+            return (hive, legacyRest, null); // Single-segment key, no value
 
-        // Check if there's a value name by looking at the AllowedPrefixes pattern.
-        // The key path is everything after the hive up to the value name.
-        // We use a heuristic: if the last segment doesn't contain a backslash
-        // after the key prefix, it's a value name.
-        // Actually, we need a better approach. During extraction in ExtractManagedKey,
-        // we encode "hive\key\valueName". The key always contains backslashes
-        // (e.g. SOFTWARE\Policies\DDS\Test), and the valueName is the last component
-        // ONLY if the directive had a "name" property.
-        //
-        // Since we can't distinguish reliably here, we store an explicit separator.
-        // But for backwards compatibility, we use the simpler approach: try to find
-        // the value in the registry. If the full path is a key, treat it as key-level.
-        // Otherwise, split the last component as valueName.
-
-        // Try as a full key path first
-        // If not a key, the last component is the value name
-        var lastSep = rest.LastIndexOf('\\');
-        if (lastSep < 0)
-            return (hive, rest, null); // Just a single-segment key, no value
-
-        return (hive, rest[..lastSep], rest[(lastSep + 1)..]);
+        return (hive, legacyRest[..legacyLastSep], legacyRest[(legacyLastSep + 1)..]);
     }
 
     private static string DescribeDirective(JsonElement item)

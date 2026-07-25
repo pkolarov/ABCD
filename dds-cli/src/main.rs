@@ -1509,13 +1509,14 @@ async fn run_audit_export(
             // audit dump exposes node URNs, action labels, base64-encoded
             // signed token CBOR, and the chain hashes that anchor the
             // append-only log — sensitive forensic material that should
-            // not be world-readable. Set 0o600 on Unix; Windows inherits
-            // the parent dir DACL applied by the data-dir hardening.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-            }
+            // not be world-readable.
+            //
+            // **M-4 (pre-prod review 2026-07-24)**: was `#[cfg(unix)]`
+            // only. `--out` is an operator-chosen path, so "Windows
+            // inherits the data-dir DACL" does not hold — the file
+            // normally lands somewhere with no DDS hardening at all.
+            // `restrict_to_owner` covers both platforms.
+            dds_node::file_acl::restrict_to_owner(path);
             println!(
                 "Exported {emitted} audit entr{} to {}",
                 if emitted == 1 { "y" } else { "ies" },
@@ -2384,11 +2385,10 @@ fn handle_export(data_dir: &Path, out: &Path, encrypt_to: Option<&str>) {
         std::process::exit(1);
     });
     // L-5 (security review): restrict dump file to owner-only read.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(out, std::fs::Permissions::from_mode(0o600));
-    }
+    // **M-4 (pre-prod review 2026-07-24)**: extended from the Unix-only
+    // chmod to the cross-platform helper — `--out` is operator-chosen
+    // and typically outside any DDS-hardened directory on Windows.
+    dds_node::file_acl::restrict_to_owner(out);
 
     println!("Exported dump to {}", out.display());
     println!("  Domain:     {domain_id}");

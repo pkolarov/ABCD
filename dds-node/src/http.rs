@@ -59,6 +59,50 @@ use dds_store::traits::{
     AuditStore, ChallengeStore, CredentialStateStore, RevocationStore, TokenStore,
 };
 
+/// **L-3 (pre-prod review 2026-07-24)** — maximum characters of an
+/// untrusted identifier that reach the log. Real Vouchsafe URNs are
+/// ~70 chars; anything longer is either a mistake or an attempt to push
+/// context out of a fixed-size log buffer.
+const LOG_IDENT_MAX: usize = 256;
+
+/// **L-3 (pre-prod review 2026-07-24)** — render a caller-supplied
+/// identifier safely for a line-oriented log.
+///
+/// `device_urn` and enrollment labels arrive straight off the wire and
+/// are written into a `tracing` subscriber whose output is one record
+/// per line. A value containing a newline therefore *forges* audit-log
+/// lines: `…&device_urn=x%0A2026-07-24T00:00:00Z%20INFO%20admin_setup…`
+/// produces a second line an operator (or a log shipper's parser) reads
+/// as a genuine record. Carriage returns and ANSI escapes can likewise
+/// rewrite what a terminal shows.
+///
+/// Escaping is deliberately blunt — every C0/C1 control character and
+/// backslash becomes a visible `\xNN` / `\\` escape, and the result is
+/// truncated. The value stays diagnosable while losing every character
+/// that can affect log structure.
+fn log_safe(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().min(LOG_IDENT_MAX) + 8);
+    let mut truncated = false;
+    for ch in value.chars() {
+        if out.len() >= LOG_IDENT_MAX {
+            truncated = true;
+            break;
+        }
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            // C0 controls (incl. CR/LF/TAB/ESC), DEL, and C1 controls.
+            c if c.is_control() => {
+                out.push_str(&format!("\\x{:02x}", c as u32 & 0xff));
+            }
+            c => out.push(c),
+        }
+    }
+    if truncated {
+        out.push_str("…[truncated]");
+    }
+    out
+}
+
 /// **H-7 (security review)** — caller identity derived from the
 /// transport layer. Populated per-connection by the listener; absent
 /// on loopback TCP (the current production transport), in which case
@@ -305,10 +349,13 @@ fn tofu_device_binding(
     let Some(principal) = CallerPrincipal::from_caller(caller) else {
         return Ok(());
     };
+    // L-3: `device_urn` is caller-supplied; escape before it reaches the
+    // line-oriented subscriber so it cannot forge log records.
+    let safe_urn = log_safe(device_urn);
     let outcome = store
         .tofu_bind(device_urn, principal.clone())
         .map_err(|e| {
-            tracing::error!(error = %e, device_urn, "failed to persist device binding");
+            tracing::error!(error = %e, device_urn = %safe_urn, "failed to persist device binding");
             HttpError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 message: "internal_error".to_owned(),
@@ -317,7 +364,7 @@ fn tofu_device_binding(
     match outcome {
         BindingOutcome::Established => {
             tracing::info!(
-                device_urn,
+                device_urn = %safe_urn,
                 ?principal,
                 "M-8: device binding established (TOFU)"
             );
@@ -326,7 +373,7 @@ fn tofu_device_binding(
         BindingOutcome::Matched => Ok(()),
         BindingOutcome::Mismatch { stored } => {
             tracing::warn!(
-                device_urn,
+                device_urn = %safe_urn,
                 ?principal,
                 ?stored,
                 "M-8: TOFU-bound device_urn rejected a different caller"
@@ -715,6 +762,71 @@ async fn http_request_observer_middleware(
     response
 }
 
+/// **L-12 (pre-prod review 2026-07-24)** — reject requests whose `Host`
+/// header is not a loopback authority.
+///
+/// The attack this closes is DNS rebinding. A browser will happily send
+/// a cross-origin request to `http://evil.example/…` after that name has
+/// been rebound to `127.0.0.1`; the Same-Origin Policy stops the
+/// *attacker page* reading the response, but the request itself still
+/// executes, which is enough for every state-changing endpoint here. The
+/// browser cannot forge `Host` — it always sends the name it dialled —
+/// so requiring a literal loopback authority is a complete defence for
+/// the browser-driven case, and it is the standard mitigation for
+/// localhost daemons.
+///
+/// Requests with no `Host` at all are allowed: HTTP/1.0 and the UDS /
+/// named-pipe clients omit it, and those transports are not
+/// browser-reachable in the first place.
+fn host_header_is_loopback(host: &str) -> bool {
+    // Strip an optional `:port`. IPv6 literals are bracketed, so find
+    // the port separator after the closing bracket.
+    let authority = host.trim();
+    let hostname = if let Some(rest) = authority.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inner, _)) => inner,
+            None => return false, // malformed IPv6 literal
+        }
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+
+    if hostname.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match hostname.parse::<std::net::IpAddr>() {
+        // Covers the whole 127.0.0.0/8 block and ::1.
+        Ok(ip) => ip.is_loopback(),
+        // Any non-literal name other than `localhost` is a rebinding
+        // candidate — refuse it.
+        Err(_) => false,
+    }
+}
+
+/// Middleware form of [`host_header_is_loopback`]. Installed only on the
+/// TCP listener; UDS and named-pipe listeners are unreachable from a
+/// browser and skip it.
+async fn dns_rebinding_guard_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(host) = req.headers().get(axum::http::header::HOST) {
+        let ok = host.to_str().map(host_header_is_loopback).unwrap_or(false);
+        if !ok {
+            tracing::warn!(
+                host = ?host,
+                "L-12: rejecting request with non-loopback Host header (possible DNS rebinding)"
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                "Host header must be a loopback authority",
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
 /// Build the axum router for the local API.
 ///
 /// `admin_policy` governs which callers may reach admin-gated
@@ -787,6 +899,16 @@ where
         .route("/v1/policy/publish", post(publish_policy::<S>))
         .route("/v1/policy/publisher-status", get(publisher_status::<S>))
         .route("/v1/policy/publisher-init", post(publisher_init::<S>))
+        // **L-1 (pre-prod review 2026-07-24)** — moved out of
+        // `public_routes`. It was an unauthenticated allow/deny oracle:
+        // any local caller could probe the effective policy for an
+        // arbitrary `subject_urn`/resource/action without proving
+        // anything. Read-only and low-value on its own, but it belongs
+        // behind the same gate as `/v1/admin/roots` — the endpoint that
+        // supplies the subject URNs you would want to probe — so the two
+        // are consistent. `dds policy check --remote` is an operator
+        // tool and reaches it through the same admin transport.
+        .route("/v1/policy/evaluate", post(evaluate_policy::<S>))
         .route_layer(axum::middleware::from_fn_with_state(
             admin_policy.clone(),
             require_admin_middleware,
@@ -804,7 +926,7 @@ where
         // still available for use by `issue_session_from_assertion`.
         .route("/v1/session/challenge", get(issue_session_challenge::<S>))
         .route("/v1/session/assert", post(issue_session_assert::<S>))
-        .route("/v1/policy/evaluate", post(evaluate_policy::<S>))
+        // L-1: `/v1/policy/evaluate` moved to `admin_routes` above.
         .route("/v1/status", get(status::<S>))
         .route("/v1/node/info", get(node_info::<S>))
         // observability-plan.md Phase D — orchestrator-friendly probes.
@@ -2140,7 +2262,7 @@ where
         state.device_binding.as_deref(),
         &q.device_urn,
     )?;
-    tracing::info!(device_urn = %q.device_urn, "list_windows_policies");
+    tracing::info!(device_urn = %log_safe(&q.device_urn), "list_windows_policies"); // L-3: escape untrusted identifier
     let svc = state.svc.lock().await;
     let policies = svc.list_applicable_windows_policies(&q.device_urn)?;
     let payload = WindowsPoliciesResponse { policies };
@@ -2180,7 +2302,7 @@ where
         state.device_binding.as_deref(),
         &q.device_urn,
     )?;
-    tracing::info!(device_urn = %q.device_urn, "list_windows_software");
+    tracing::info!(device_urn = %log_safe(&q.device_urn), "list_windows_software"); // L-3: escape untrusted identifier
     let svc = state.svc.lock().await;
     let software = svc.list_applicable_software(&q.device_urn)?;
     let payload = WindowsSoftwareResponse { software };
@@ -2291,7 +2413,7 @@ where
         state.device_binding.as_deref(),
         &q.device_urn,
     )?;
-    tracing::info!(device_urn = %q.device_urn, "list_macos_policies");
+    tracing::info!(device_urn = %log_safe(&q.device_urn), "list_macos_policies"); // L-3: escape untrusted identifier
     let svc = state.svc.lock().await;
     let policies = svc.list_applicable_macos_policies(&q.device_urn)?;
     let payload = MacOsPoliciesResponse { policies };
@@ -2331,7 +2453,7 @@ where
         state.device_binding.as_deref(),
         &q.device_urn,
     )?;
-    tracing::info!(device_urn = %q.device_urn, "list_macos_software");
+    tracing::info!(device_urn = %log_safe(&q.device_urn), "list_macos_software"); // L-3: escape untrusted identifier
     let svc = state.svc.lock().await;
     let software = svc.list_applicable_software(&q.device_urn)?;
     let payload = MacOsSoftwareResponse { software };
@@ -2394,7 +2516,7 @@ where
         state.device_binding.as_deref(),
         &q.device_urn,
     )?;
-    tracing::info!(device_urn = %q.device_urn, "list_linux_policies");
+    tracing::info!(device_urn = %log_safe(&q.device_urn), "list_linux_policies"); // L-3: escape untrusted identifier
     let svc = state.svc.lock().await;
     let policies = svc.list_applicable_linux_policies(&q.device_urn)?;
     let payload = LinuxPoliciesResponse { policies };
@@ -2431,7 +2553,7 @@ where
         state.device_binding.as_deref(),
         &q.device_urn,
     )?;
-    tracing::info!(device_urn = %q.device_urn, "list_linux_software");
+    tracing::info!(device_urn = %log_safe(&q.device_urn), "list_linux_software"); // L-3: escape untrusted identifier
     let svc = state.svc.lock().await;
     let software = svc.list_applicable_software(&q.device_urn)?;
     let payload = LinuxSoftwareResponse { software };
@@ -2997,22 +3119,45 @@ where
     // extension is inserted here. `require_admin_middleware` will treat
     // callers as `CallerIdentity::Anonymous` and fall back to
     // `trust_loopback_tcp_admin`.
-    axum::serve(
-        listener,
-        router(
-            svc,
-            info,
-            admin_policy,
-            response_mac_key,
-            device_binding,
-            manual_rotate,
-            publish_tx,
-            probe_tx,
-        ),
+    //
+    // **L-12**: the TCP listener is the only browser-reachable transport,
+    // so it is the one that gets the `Host` allowlist. UDS / named pipe
+    // cannot be addressed by a browser at all.
+    let app = router(
+        svc,
+        info,
+        admin_policy,
+        response_mac_key,
+        device_binding,
+        manual_rotate,
+        publish_tx,
+        probe_tx,
     )
-    .await?;
+    .layer(axum::middleware::from_fn(dns_rebinding_guard_middleware));
+    axum::serve(listener, app).await?;
     Ok(())
 }
+
+/// **L-4 (pre-prod review 2026-07-24)** — how long a single local-API
+/// connection may stay open without completing a request.
+///
+/// The UDS / named-pipe accept loops spawn one unbounded task per
+/// connection with no read or idle deadline, so a client that connects
+/// and then sends nothing (slow loris, or simply a leaked handle) pinned
+/// a task and its buffers indefinitely. These are *local* transports
+/// guarded by filesystem/pipe ACLs, which is why this is low severity —
+/// but "a local process can pile up connections until the node stops
+/// answering" is still a availability bug with no ceiling on it.
+const LOCAL_API_CONNECTION_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// **L-4** — maximum concurrently-served local-API connections.
+///
+/// Sized far above any real client population (the credential provider,
+/// the auth bridge, the policy agent, the tray app and an operator CLI
+/// amount to a handful of concurrent connections) while still being a
+/// hard ceiling. Excess connections wait on the semaphore rather than
+/// being dropped, so a burst is throttled instead of failing.
+const LOCAL_API_MAX_CONNECTIONS: usize = 256;
 
 /// UDS serve loop for H-7 step-2.
 ///
@@ -3089,7 +3234,19 @@ where
         probe_tx,
     );
 
+    // **L-4 (pre-prod review 2026-07-24)** — bound concurrent connections.
+    // Each accepted connection takes a permit for its whole lifetime, so
+    // the accept loop naturally back-pressures instead of spawning an
+    // unbounded number of per-connection tasks.
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(LOCAL_API_MAX_CONNECTIONS));
+
     loop {
+        // Acquire *before* accepting so a pile-up parks in the kernel
+        // backlog rather than in our task pool.
+        let permit = match conn_limit.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // semaphore closed — shutting down
+        };
         let (stream, _) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
@@ -3112,6 +3269,8 @@ where
         };
         let app = app.clone();
         tokio::spawn(async move {
+            // Permit is released when this task ends, however it ends.
+            let _permit = permit;
             let io = TokioIo::new(stream);
             let svc_fn = hyper::service::service_fn({
                 let app = app.clone();
@@ -3131,8 +3290,22 @@ where
                     }
                 }
             });
-            if let Err(e) = http1::Builder::new().serve_connection(io, svc_fn).await {
-                tracing::debug!(error = %e, "UDS connection closed");
+            // **L-4** — whole-connection deadline. A client that opens a
+            // socket and never finishes a request (slow loris, leaked
+            // handle) is cut loose instead of holding its task and
+            // permit forever.
+            let served = tokio::time::timeout(
+                LOCAL_API_CONNECTION_TIMEOUT,
+                http1::Builder::new().serve_connection(io, svc_fn),
+            )
+            .await;
+            match served {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::debug!(error = %e, "UDS connection closed"),
+                Err(_) => tracing::debug!(
+                    timeout_secs = LOCAL_API_CONNECTION_TIMEOUT.as_secs(),
+                    "L-4: UDS connection exceeded its deadline — dropping"
+                ),
             }
         });
     }
@@ -3201,7 +3374,15 @@ where
         .create(&pipe_path)
         .map_err(|e| format!("failed to create named pipe {pipe_path}: {e}"))?;
 
+    // **L-4 (pre-prod review 2026-07-24)** — bound concurrent
+    // connections; see `serve_unix` for the rationale.
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(LOCAL_API_MAX_CONNECTIONS));
+
     loop {
+        let permit = match conn_limit.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // semaphore closed — shutting down
+        };
         if let Err(e) = server.connect().await {
             tracing::error!(error = %e, "named-pipe connect failed");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3228,6 +3409,8 @@ where
 
         let app = app.clone();
         tokio::spawn(async move {
+            // Permit is released when this task ends, however it ends.
+            let _permit = permit;
             let io = TokioIo::new(connected);
             let svc_fn = hyper::service::service_fn({
                 let app = app.clone();
@@ -3247,8 +3430,19 @@ where
                     }
                 }
             });
-            if let Err(e) = http1::Builder::new().serve_connection(io, svc_fn).await {
-                tracing::debug!(error = %e, "named-pipe connection closed");
+            // **L-4** — whole-connection deadline; see `serve_unix`.
+            let served = tokio::time::timeout(
+                LOCAL_API_CONNECTION_TIMEOUT,
+                http1::Builder::new().serve_connection(io, svc_fn),
+            )
+            .await;
+            match served {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::debug!(error = %e, "named-pipe connection closed"),
+                Err(_) => tracing::debug!(
+                    timeout_secs = LOCAL_API_CONNECTION_TIMEOUT.as_secs(),
+                    "L-4: named-pipe connection exceeded its deadline — dropping"
+                ),
             }
         });
     }
@@ -7092,5 +7286,122 @@ mod tests {
         };
         assert_eq!(classify_caller_identity(&caller), "pipe");
         assert!(caller.is_admin(&policy));
+    }
+
+    // ---- L-12: DNS-rebinding Host allowlist -------------------------
+
+    /// Only literal loopback authorities are accepted. A rebound
+    /// hostname resolves to 127.0.0.1 but the browser still sends the
+    /// *name* in `Host`, which is what makes this check work.
+    #[test]
+    fn l12_host_allowlist_accepts_only_loopback_authorities() {
+        for good in [
+            "127.0.0.1",
+            "127.0.0.1:5551",
+            "127.1.2.3",
+            "localhost",
+            "localhost:5551",
+            "LOCALHOST:5551",
+            "[::1]",
+            "[::1]:5551",
+        ] {
+            assert!(
+                host_header_is_loopback(good),
+                "expected {good:?} to be accepted"
+            );
+        }
+
+        for bad in [
+            // Classic rebinding names.
+            "evil.example",
+            "evil.example:5551",
+            "dds.localtest.me",
+            // `localhost` as a *suffix* must not pass.
+            "notlocalhost",
+            "attacker-localhost.example",
+            "localhost.evil.example",
+            // Non-loopback literals.
+            "10.0.0.5",
+            "0.0.0.0",
+            "[2001:db8::1]:5551",
+            // Malformed.
+            "[::1",
+            "",
+        ] {
+            assert!(
+                !host_header_is_loopback(bad),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    // ---- L-3: log injection via untrusted identifiers ---------------
+
+    /// A `device_urn` carrying a newline must not be able to forge a
+    /// second log record in the line-oriented subscriber.
+    #[test]
+    fn l3_log_safe_neutralises_record_forgery() {
+        let forged = "urn:dev.abc\n2026-07-24T00:00:00Z  INFO admin_setup: bootstrap admin set";
+        let escaped = log_safe(forged);
+        assert!(
+            !escaped.contains('\n'),
+            "newline must not survive: {escaped:?}"
+        );
+        assert!(
+            escaped.contains("\\x0a"),
+            "newline must be visible as an escape"
+        );
+        // The legitimate prefix is still readable for diagnosis.
+        assert!(escaped.starts_with("urn:dev.abc"));
+    }
+
+    #[test]
+    fn l3_log_safe_escapes_cr_tab_and_ansi() {
+        let escaped = log_safe("a\rb\tc\x1b[31md\x7fe");
+        for raw in ['\r', '\t', '\x1b', '\x7f'] {
+            assert!(
+                !escaped.contains(raw),
+                "raw control {raw:?} must not survive: {escaped:?}"
+            );
+        }
+        assert!(escaped.contains("\\x0d"));
+        assert!(escaped.contains("\\x09"));
+        assert!(escaped.contains("\\x1b"));
+        assert!(escaped.contains("\\x7f"));
+    }
+
+    #[test]
+    fn l3_log_safe_escapes_backslash_so_escapes_are_unambiguous() {
+        // Without this, a literal `\x0a` in the input would be
+        // indistinguishable from an escaped newline.
+        assert_eq!(log_safe(r"a\x0ab"), r"a\\x0ab");
+    }
+
+    #[test]
+    fn l3_log_safe_truncates_oversized_identifiers() {
+        let escaped = log_safe(&"A".repeat(LOG_IDENT_MAX * 4));
+        assert!(escaped.ends_with("…[truncated]"));
+        assert!(escaped.len() < LOG_IDENT_MAX * 2);
+    }
+
+    #[test]
+    fn l3_log_safe_leaves_a_real_urn_untouched() {
+        let urn = "urn:dds-device.abcdefghijklmnopqrstuvwxyz234567";
+        assert_eq!(log_safe(urn), urn);
+    }
+
+    // ---- L-4: local-API connection bounds ---------------------------
+
+    // The point of this test is precisely to pin constant values, so a
+    // future edit that zeroes or shrinks them fails loudly.
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn l4_connection_bounds_are_finite() {
+        assert!(LOCAL_API_MAX_CONNECTIONS > 0);
+        assert!(LOCAL_API_CONNECTION_TIMEOUT > Duration::from_secs(0));
+        // Well above the handful of real local clients (credential
+        // provider, auth bridge, policy agent, tray, CLI) so the cap
+        // never bites in normal operation.
+        assert!(LOCAL_API_MAX_CONNECTIONS >= 64);
     }
 }

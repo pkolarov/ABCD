@@ -418,10 +418,26 @@ public sealed class Worker : BackgroundService
         var reconcileChanges = new List<string>();
         var effectiveMode = auditMode ? EnforcementMode.Audit : EnforcementMode.Enforce;
 
-        // Registry reconciliation
+        // Registry reconciliation.
+        //
+        // **L-15 (pre-prod review 2026-07-24)**: diff on the prefix-free
+        // body, not the raw string. Managed registry keys now carry an
+        // explicit `K:` / `V:` discriminator; a raw set difference across
+        // the upgrade boundary would see every legacy-encoded previous
+        // entry as absent from the newly-prefixed desired set and delete
+        // still-wanted registry state on the first poll after upgrade.
+        // Comparing bodies makes the two encodings equal; the *original*
+        // previous string is what gets handed to the reconciler, so
+        // `ParseManagedKey` still applies precise semantics to prefixed
+        // entries and the legacy heuristic to old ones.
         var prevRegistry = _stateStore.GetManagedItems("registry");
-        var staleRegistry = new HashSet<string>(prevRegistry, StringComparer.OrdinalIgnoreCase);
-        staleRegistry.ExceptWith(desiredRegistry);
+        var desiredRegistryBodies = new HashSet<string>(
+            desiredRegistry.Select(RegistryEnforcer.ManagedKeyBody),
+            StringComparer.OrdinalIgnoreCase);
+        var staleRegistry = new HashSet<string>(
+            prevRegistry.Where(p =>
+                !desiredRegistryBodies.Contains(RegistryEnforcer.ManagedKeyBody(p))),
+            StringComparer.OrdinalIgnoreCase);
         if (staleRegistry.Count > 0 && !auditMode)
         {
             // AD-05: only invoke the destructive reconciler in workgroup

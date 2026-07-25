@@ -981,6 +981,9 @@ async fn spawn_node(org: &str) -> Result<(DdsNode, TempDir), Box<dyn std::error:
             metrics_addr: None,
             allow_v1_certs: true,
             admission_key_backend: Default::default(),
+            // M-1 / H-1: connection caps, unadmitted-peer deadline, and the
+            // per-peer gossip budget all take their production defaults here.
+            ..Default::default()
         },
         org_hash: org.to_string(),
         domain: dds_node::config::DomainConfig {

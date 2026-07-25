@@ -296,13 +296,19 @@ pub fn apply_sync_payloads(
         items.push((op, token));
     }
 
-    // Phase 2: Process tokens (revocations/burns first for safety)
-    // Sort: Burns first, then Revocations, then everything else
+    // Phase 2: Process tokens.
+    //
+    // **L-6 (pre-prod review 2026-07-24)** — Burns, then Attests, then
+    // Vouches, then Revocations. Same ordering (and same reasoning) as
+    // [`apply_sync_payloads_with_graph`]: a `Revoke` names its target by
+    // `jti`, so it must run after anything in this batch it might name,
+    // or a revocation delivered alongside its target is silently
+    // discarded. See that function for the full rationale.
     items.sort_by_key(|(_, t)| match t.payload.kind {
         TokenKind::Burn => 0,
-        TokenKind::Revoke => 1,
-        TokenKind::Attest => 2,
-        TokenKind::Vouch => 3,
+        TokenKind::Attest => 1,
+        TokenKind::Vouch => 2,
+        TokenKind::Revoke => 3,
     });
 
     for (op, token) in &items {
@@ -444,14 +450,35 @@ pub fn apply_sync_payloads_with_graph(
         items.push((op, token));
     }
 
-    // Sort: Burns first, then Revocations, then Attests, then Vouches.
+    // Ordering: Burns, then Attests, then Vouches, then Revocations.
+    //
     // Vouches must come after their target attestations to satisfy
-    // vch_sum verification on insert.
+    // `vch_sum` verification on insert — that constraint is unchanged.
+    //
+    // **L-6 (pre-prod review 2026-07-24)** — revocations moved from
+    // second to LAST.
+    //
+    // A `Revoke` names its target by `jti`. The trust graph can only
+    // authorize and apply a revocation whose target it already holds, so
+    // when a revocation arrived in the same anti-entropy batch as the
+    // vouch it revokes — which is exactly what happens when a node has
+    // been offline across an offboarding, the case anti-entropy exists
+    // to repair — the old ordering fed the revocation to a graph that
+    // had not yet seen its target. The revocation was rejected, the
+    // target was then inserted un-revoked, and the batch completed
+    // "successfully" with a revoked admin's vouch live on that node
+    // until some later sync happened to redeliver the revocation alone.
+    //
+    // Applying targets first makes the same batch self-consistent: by
+    // the time a `Revoke` is processed, everything it could name from
+    // this batch is already in the graph. Burns stay first because they
+    // invalidate an issuer wholesale and should suppress that issuer's
+    // tokens in the same batch.
     items.sort_by_key(|(_, t)| match t.payload.kind {
         TokenKind::Burn => 0,
-        TokenKind::Revoke => 1,
-        TokenKind::Attest => 2,
-        TokenKind::Vouch => 3,
+        TokenKind::Attest => 1,
+        TokenKind::Vouch => 2,
+        TokenKind::Revoke => 3,
     });
 
     // Ops whose backing token the trust graph accepted; only these are merged
@@ -1371,6 +1398,109 @@ mod tests {
     /// An unauthorized revoke (signed by someone other than the
     /// target's issuer) trips `TrustError::Unauthorized` — a non-`DuplicateJti`
     /// graph rejection — and must surface as `SyncRejectReason::Graph`.
+    /// **L-6 regression (pre-prod review 2026-07-24)** — a revocation
+    /// delivered in the SAME anti-entropy batch as the token it revokes
+    /// must be applied, not silently dropped.
+    ///
+    /// This is the offboarding-across-an-outage case: a node that was
+    /// offline when an admin was revoked pulls both the target token and
+    /// its revocation in one sync round. The old ordering processed
+    /// revocations *before* their targets, so the trust graph saw a
+    /// `Revoke` naming a `jti` it had never heard of, rejected it, then
+    /// inserted the target un-revoked — and the batch reported success
+    /// while leaving the revoked token live on that node.
+    #[test]
+    fn l6_revocation_in_same_batch_as_its_target_is_applied() {
+        let alice = make_identity("alice");
+        let attest = make_attest_token(&alice);
+        let attest_jti = attest.payload.jti.clone();
+
+        // Self-revocation: the issuer revoking its own token is
+        // unambiguously authorized, so the only thing under test is
+        // ordering.
+        let revoke = Token::sign(
+            TokenPayload {
+                iss: alice.id.to_urn(),
+                iss_key: alice.public_key.clone(),
+                jti: "revoke-same-batch".to_string(),
+                sub: alice.id.to_urn(),
+                kind: TokenKind::Revoke,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: Some(attest_jti.clone()),
+                iat: 2000,
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &alice.signing_key,
+        )
+        .unwrap();
+
+        // Deliberately place the revocation FIRST in the payload list —
+        // wire order must not matter; the apply-side sort is what
+        // guarantees the target is in the graph before the revocation
+        // referencing it runs.
+        let payloads = vec![
+            SyncPayload {
+                op_bytes: serialize_op(&make_op("op-revoke", vec![])),
+                token_bytes: revoke.to_cbor().unwrap(),
+            },
+            SyncPayload {
+                op_bytes: serialize_op(&make_op("op-attest", vec![])),
+                token_bytes: attest.to_cbor().unwrap(),
+            },
+        ];
+
+        let mut dag = CausalDag::new();
+        let mut store = MemoryBackend::new();
+        let mut graph = TrustGraph::new();
+        let result = apply_sync_payloads_with_graph(&payloads, &mut dag, &mut store, &mut graph);
+
+        assert_eq!(
+            result.revocations_applied, 1,
+            "L-6: the same-batch revocation must be applied, got {:?} / rejected {:?}",
+            result.revocations_applied, result.rejected_by_reason
+        );
+        assert!(
+            store.is_revoked(&attest_jti),
+            "L-6: the target token must be marked revoked in the store"
+        );
+        assert_eq!(
+            result
+                .rejected_by_reason
+                .get(&SyncRejectReason::Graph)
+                .copied(),
+            None,
+            "L-6: the revocation must not be graph-rejected for a missing target"
+        );
+    }
+
+    /// **L-6** — pin the ordering itself, independent of any particular
+    /// graph outcome: targets (Attest, Vouch) must be applied before the
+    /// Revocations that can name them, with Burns still first.
+    #[test]
+    fn l6_apply_order_places_revocations_after_their_targets() {
+        // Mirrors the `sort_by_key` in both apply functions. If someone
+        // moves `Revoke` back ahead of `Attest`/`Vouch`, this fails.
+        let rank = |k: TokenKind| match k {
+            TokenKind::Burn => 0,
+            TokenKind::Attest => 1,
+            TokenKind::Vouch => 2,
+            TokenKind::Revoke => 3,
+        };
+        assert!(rank(TokenKind::Burn) < rank(TokenKind::Attest));
+        assert!(
+            rank(TokenKind::Attest) < rank(TokenKind::Vouch),
+            "vouches must follow their target attestations (vch_sum verification)"
+        );
+        assert!(
+            rank(TokenKind::Vouch) < rank(TokenKind::Revoke),
+            "L-6: revocations must run last so same-batch targets already exist"
+        );
+    }
+
     #[test]
     fn rejected_by_reason_records_graph_for_unauthorized_revoke() {
         let alice = make_identity("alice");

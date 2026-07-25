@@ -612,15 +612,38 @@ fn derive_key(
     salt: &[u8],
     p: KdfParams,
 ) -> Result<[u8; 32], IdentityStoreError> {
-    let params = Params::new(p.m_cost_kib, p.t_cost, p.p_cost, Some(32))
-        .map_err(|e| IdentityStoreError::Crypto(e.to_string()))?;
+    derive_argon2id_key(passphrase, salt, p.m_cost_kib, p.t_cost, p.p_cost)
+        .map_err(IdentityStoreError::Crypto)
+}
+
+/// **M-3 (pre-prod review 2026-07-24)** — shared Argon2id KDF so every
+/// encrypted-at-rest key blob in the node derives its wrapping key the
+/// same way.
+///
+/// `epoch_key_store` was the one secret store still written in
+/// plaintext; giving it its own copy of these parameters would have let
+/// the two drift. Exposed here rather than duplicated so a future
+/// parameter bump is a single edit.
+pub(crate) fn derive_argon2id_key(
+    passphrase: &[u8],
+    salt: &[u8],
+    m_cost_kib: u32,
+    t_cost: u32,
+    p_cost: u32,
+) -> Result<[u8; 32], String> {
+    let params = Params::new(m_cost_kib, t_cost, p_cost, Some(32)).map_err(|e| e.to_string())?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = [0u8; 32];
     argon
         .hash_password_into(passphrase, salt, &mut out)
-        .map_err(|e| IdentityStoreError::Crypto(e.to_string()))?;
+        .map_err(|e| e.to_string())?;
     Ok(out)
 }
+
+/// **M-3** — the v=3 Argon2id parameters, re-exported for other stores
+/// that adopt the same encrypted-at-rest envelope. See
+/// [`V3_M_COST_KIB`] / [`V3_T_COST`] / [`V3_P_COST`] for the rationale.
+pub(crate) const SHARED_KDF_PARAMS: (u32, u32, u32) = (V3_M_COST_KIB, V3_T_COST, V3_P_COST);
 
 #[cfg(test)]
 mod tests {

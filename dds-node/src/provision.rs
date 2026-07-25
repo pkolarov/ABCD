@@ -365,14 +365,19 @@ pub fn save_bundle(
     // passphrase- or FIDO2-wrapped `domain_key_blob`, the domain pubkey,
     // org_hash, and an integrity signature — all sensitive provisioning
     // material, even though the key blob itself is encrypted. Restrict
-    // the file to owner-only on Unix so a co-tenant can't read it and
-    // attempt offline unwrap. Mirrors the same idiom applied to
-    // `dds-cli export` and `dds-cli audit export --out`.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
+    // the file to owner-only so a co-tenant can't read it and attempt
+    // offline unwrap.
+    //
+    // **M-4 (pre-prod review 2026-07-24)**: this used to be a
+    // `#[cfg(unix)]` chmod, leaving Windows entirely uncovered. The
+    // bundle is written to an operator-chosen `--out` path that is
+    // typically *outside* `%ProgramData%\DDS`, so it inherits whatever
+    // DACL the parent directory grants — commonly `Users:Read` under a
+    // user profile or on removable media. A co-tenant could copy it and
+    // brute-force a weak `DDS_DOMAIN_PASSPHRASE` offline to recover the
+    // domain root key. `restrict_to_owner` applies `0o600` on Unix and a
+    // protected `D:PAI(A;;FA;;;SY)(A;;FA;;;BA)` DACL on Windows.
+    crate::file_acl::restrict_to_owner(path);
     Ok(())
 }
 
@@ -1155,8 +1160,19 @@ pub fn run_provision(
     // 5. Write files
     println!("[4/6] Writing configuration...");
 
-    // admission.cbor
-    domain_store::save_admission_cert(&admission_path, &cert)?;
+    // **L-9 (pre-prod review 2026-07-24)** — `admission.cbor` is written
+    // LAST, not first.
+    //
+    // Its existence is the `AlreadyProvisioned` sentinel checked at the
+    // top of this function. When it was written first, a crash (or a
+    // power loss, or a Ctrl-C) anywhere between it and the `dds.toml`
+    // write left the node in a state that was neither provisioned nor
+    // re-provisionable: no config to run from, and every retry bounced
+    // with `AlreadyProvisioned`, recoverable only by hand-deleting the
+    // file. Writing it after every other artifact makes the sentinel
+    // mean what it claims — "provisioning got far enough to be usable" —
+    // so any earlier crash simply leaves a partial tree that the next
+    // run overwrites. See the `save_admission_cert` call below.
 
     // domain.toml
     let pk_bytes = from_hex(&bundle.domain_pubkey)
@@ -1231,9 +1247,27 @@ pub fn run_provision(
          strict_device_binding = true\n"
             .to_string(),
     );
+    // **L-12 (pre-prod review 2026-07-24)** — the binary default for
+    // `trust_loopback_tcp_admin` is now `false` (fail closed), so the
+    // Windows branch has to state its requirement explicitly instead of
+    // inheriting it. Behaviour is unchanged from before the flip: this
+    // path deliberately provisions a loopback-TCP admin API, because
+    // single-file provisioning has no pipe-first layout yet. Writing it
+    // into the file is strictly better than depending on an implicit
+    // default — an operator reading `dds.toml` can now see that this
+    // node grants admin to any local caller, and the DNS-rebinding Host
+    // allowlist added in the same review guards the listener either way.
     #[cfg(not(unix))]
-    let (api_addr_for_config, api_auth_block) =
-        (format!("127.0.0.1:{}", bundle.api_port), String::new());
+    let (api_addr_for_config, api_auth_block) = (
+        format!("127.0.0.1:{}", bundle.api_port),
+        "\n[network.api_auth]\n\
+         # L-12: stated explicitly — the binary default is now false.\n\
+         # Windows single-file provisioning serves the admin API over\n\
+         # loopback TCP, which carries no peer credentials. Prefer\n\
+         # `api_addr = \"pipe:dds-api\"` where the MSI layout allows it.\n\
+         trust_loopback_tcp_admin = true\n"
+            .to_string(),
+    );
     let pq_pubkey_line = match bundle.domain_pq_pubkey.as_deref() {
         Some(hex) if !hex.is_empty() => format!("pq_pubkey = \"{hex}\"\n"),
         _ => String::new(),
@@ -1305,6 +1339,16 @@ audit_log_enabled = false
     );
     std::fs::write(&config_path, &config_content).map_err(|e| ProvisionError::Io(e.to_string()))?;
     println!("  Config: {}", config_path.display());
+
+    // **L-9** — commit point. Every other artifact (domain.toml,
+    // p2p_key.bin, node_key.bin, epoch_keys.cbor, dds.toml) is now on
+    // disk, so writing the admission cert both completes provisioning
+    // and arms the `AlreadyProvisioned` guard at the same instant. A
+    // crash before this line leaves a re-provisionable tree; a crash
+    // after it leaves a node that can actually start.
+    domain_store::save_admission_cert(&admission_path, &cert)?;
+    println!("  Admission cert: {}", admission_path.display());
+
     match bundle.bootstrap_admin_urn.as_deref() {
         Some(urn) => println!("  Trust anchor seeded from bundle: {urn}"),
         None => println!(
@@ -2256,9 +2300,19 @@ mod tests {
                 "Windows provisioning keeps trust_loopback_tcp_admin = true \
                  until single-file provisioning grows pipe-first defaults"
             );
+            // **L-12 (pre-prod review 2026-07-24)**: the binary default
+            // is now `false` (fail closed), so this branch must state
+            // the requirement in the emitted config rather than relying
+            // on an implicit default. Behaviour is unchanged; the
+            // difference is that it is now visible in `dds.toml`.
             assert!(
-                !cfg.contains("[network.api_auth]"),
-                "Windows provisioning must not emit [network.api_auth] block; got:\n{cfg}"
+                cfg.contains("[network.api_auth]"),
+                "Windows provisioning must emit [network.api_auth] with an explicit \
+                 trust_loopback_tcp_admin now that the default fails closed; got:\n{cfg}"
+            );
+            assert!(
+                cfg.contains("trust_loopback_tcp_admin = true"),
+                "the loopback-TCP admin grant must be explicit; got:\n{cfg}"
             );
         }
 

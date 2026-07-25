@@ -161,7 +161,8 @@ public class EnforcerStubTests
         """).RootElement;
 
         var key = RegistryEnforcer.ExtractManagedKey(item);
-        Assert.Equal(@"LocalMachine\SOFTWARE\Policies\Test\Enabled", key);
+        // L-15: value-level items carry the `V:` discriminator.
+        Assert.Equal(@"V:LocalMachine\SOFTWARE\Policies\Test\Enabled", key);
     }
 
     [Fact]
@@ -172,7 +173,96 @@ public class EnforcerStubTests
         """).RootElement;
 
         var key = RegistryEnforcer.ExtractManagedKey(item);
-        Assert.Equal(@"LocalMachine\SOFTWARE\Policies\Test", key);
+        // L-15: key-level items carry the `K:` discriminator, which is
+        // what lets reconcile tell them apart from a value-level item
+        // whose key path happens to end in the same segment.
+        Assert.Equal(@"K:LocalMachine\SOFTWARE\Policies\Test", key);
+    }
+
+    /// <summary>
+    /// <b>L-15 regression</b> — a key-level managed item must round-trip
+    /// as key-level.
+    ///
+    /// Before the discriminator existed, <c>ExtractManagedKey</c> emitted
+    /// a bare <c>LocalMachine\SOFTWARE\Policies\Test</c> and
+    /// <c>ParseManagedKey</c> read it back as
+    /// <c>(LocalMachine, SOFTWARE\Policies, value "Test")</c> — because
+    /// the heuristic always treated the last segment as a value name and
+    /// real key paths always contain backslashes. Reconcile then hunted
+    /// for a registry *value* that never existed, deleted nothing, and a
+    /// retracted key-level policy stayed in force on the host forever.
+    /// </summary>
+    [Fact]
+    public void RegistryEnforcer_ManagedKey_roundtrips_key_level_item()
+    {
+        var item = JsonDocument.Parse("""
+        {"hive":"LocalMachine","key":"SOFTWARE\\Policies\\Test","action":"Delete"}
+        """).RootElement;
+
+        var encoded = RegistryEnforcer.ExtractManagedKey(item);
+        Assert.NotNull(encoded);
+        var parsed = RegistryEnforcer.ParseManagedKey(encoded!);
+        Assert.NotNull(parsed);
+        Assert.Equal("LocalMachine", parsed!.Value.Hive);
+        Assert.Equal(@"SOFTWARE\Policies\Test", parsed.Value.Key);
+        Assert.Null(parsed.Value.ValueName);
+    }
+
+    /// <summary>
+    /// <b>L-15 regression</b> — a value-level managed item must round-trip
+    /// as value-level, with the key path intact.
+    /// </summary>
+    [Fact]
+    public void RegistryEnforcer_ManagedKey_roundtrips_value_level_item()
+    {
+        var item = JsonDocument.Parse("""
+        {"hive":"LocalMachine","key":"SOFTWARE\\Policies\\Test","name":"Enabled","value":{"Dword":1},"action":"Set"}
+        """).RootElement;
+
+        var encoded = RegistryEnforcer.ExtractManagedKey(item);
+        Assert.NotNull(encoded);
+        var parsed = RegistryEnforcer.ParseManagedKey(encoded!);
+        Assert.NotNull(parsed);
+        Assert.Equal("LocalMachine", parsed!.Value.Hive);
+        Assert.Equal(@"SOFTWARE\Policies\Test", parsed.Value.Key);
+        Assert.Equal("Enabled", parsed.Value.ValueName);
+    }
+
+    /// <summary>
+    /// <b>L-15</b> — managed sets persisted by an older agent build (no
+    /// discriminator) must still parse, using the legacy heuristic, so an
+    /// upgrade does not strand old state as unparseable.
+    /// </summary>
+    [Fact]
+    public void RegistryEnforcer_ParseManagedKey_accepts_legacy_unprefixed()
+    {
+        var parsed = RegistryEnforcer.ParseManagedKey(@"LocalMachine\SOFTWARE\Policies\Test\Enabled");
+        Assert.NotNull(parsed);
+        Assert.Equal("LocalMachine", parsed!.Value.Hive);
+        Assert.Equal(@"SOFTWARE\Policies\Test", parsed.Value.Key);
+        Assert.Equal("Enabled", parsed.Value.ValueName);
+    }
+
+    /// <summary>
+    /// <b>L-15 upgrade safety</b> — the prefixed and legacy encodings of
+    /// the same item must compare equal for reconciliation purposes, or
+    /// the first poll after an agent upgrade would treat every managed
+    /// registry entry as stale and delete it.
+    /// </summary>
+    [Fact]
+    public void RegistryEnforcer_ManagedKeyBody_matches_across_encodings()
+    {
+        const string legacy = @"LocalMachine\SOFTWARE\Policies\DDS\Setting";
+        const string prefixed = @"V:LocalMachine\SOFTWARE\Policies\DDS\Setting";
+        Assert.Equal(
+            RegistryEnforcer.ManagedKeyBody(legacy),
+            RegistryEnforcer.ManagedKeyBody(prefixed));
+
+        const string legacyKeyLevel = @"LocalMachine\SOFTWARE\Policies\DDS";
+        const string prefixedKeyLevel = @"K:LocalMachine\SOFTWARE\Policies\DDS";
+        Assert.Equal(
+            RegistryEnforcer.ManagedKeyBody(legacyKeyLevel),
+            RegistryEnforcer.ManagedKeyBody(prefixedKeyLevel));
     }
 
     [Fact]
