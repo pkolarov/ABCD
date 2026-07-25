@@ -276,10 +276,18 @@ async fn main() {
         &attestation.attstmt_x5c,
     );
 
-    // The challenge IS the client data hash for this simplified flow.
-    // (In a real WebAuthn flow, clientDataHash = SHA-256(clientDataJSON),
-    // but ctap-hid-fido2 uses the raw challenge as the hash.)
-    let cdh_create = &challenge_create;
+    // The clientDataHash is SHA-256(challenge) — NOT the raw challenge.
+    // `ctap-hid-fido2` hashes it for us on the way into the CTAP2 command
+    // (`Params::new` -> `util::create_clientdata_hash`), so the
+    // authenticator signs over `authData || SHA-256(challenge)`. dds-node
+    // uses whatever we send here verbatim as the hash (`verify_packed`
+    // computes `signed = auth_data || client_data_hash`), so sending the
+    // raw challenge makes full attestation fail with "bad attestation
+    // signature". The crate's *own* verifier takes the raw challenge and
+    // hashes internally, so local verification passes either way — which
+    // is what hid this.
+    let cdh_create = Sha256::digest(challenge_create).to_vec();
+    let cdh_create = &cdh_create[..];
 
     // Step 3: Enroll in dds-node
     println!();

@@ -1,5 +1,34 @@
 # DDS Implementation Status
 
+## fix(fido2-cli,fido2-test): send SHA-256(challenge) as clientDataHash — 2026-07-25
+
+`admin-setup` still returned HTTP 401 `auth_failed` after the x5c fix, with the node logging the
+same `fido2 error: bad attestation signature`. The x5c chain was not the (only) cause.
+
+**Root cause:** we sent the **raw challenge** as `client_data_hash_b64`. `ctap-hid-fido2` hashes
+the challenge on the way into the CTAP2 command (`Params::new` →
+`util::create_clientdata_hash` → SHA-256), so the authenticator signs over
+`authData ‖ SHA-256(challenge)`. dds-node uses the bytes we send **verbatim** as the hash —
+`verify_packed` computes `signed = auth_data ‖ client_data_hash`, and nothing on the path from
+`b64_decode(client_data_hash_b64)` through `verify_attestation_observed` re-hashes. Raw challenge
+in, signature mismatch out.
+
+What made this hard to see: the crate's *own* verifier (`verifier::verify_attestation`) takes the
+**raw challenge** and hashes internally, so the local check we run immediately after
+`make_credential` passed while the server rejected the very same material. A comment in
+`dds-fido2-test` asserted "ctap-hid-fido2 uses the raw challenge as the hash" — the opposite of
+what `util::create_clientdata_hash` does — and `dds-fido2-cli` inherited both the belief and the
+bug.
+
+**Fix:** send `SHA-256(challenge)` in `dds-fido2-cli` and `dds-fido2-test`; correct the misleading
+comment; and fix the same mistake in `bin/probe.rs`, which passed the raw challenge to
+`dds_domain::fido2::verify_attestation` and would therefore have mis-reported this exact failure
+had it been used to diagnose it.
+
+Unrelated: CI's `cargo test` failed once on `cp_fido2_p256_assertion` with "timed out waiting for
+http://127.0.0.1:.../v1/status" — a node-startup race in a test file this work never touched, on a
+commit that changed only `Cargo.lock`. Passed 3/3 locally; treated as flaky, not a regression.
+
 ## fix(fido2-cli): revert UV-lockout gate (false positive); fall back on UV timeout — 2026-07-25
 
 The `uv_retries == 0` check added earlier the same day was **wrong** and blocked a working key.

@@ -158,7 +158,11 @@ fn main() {
     // case the authenticator emits it (real authenticators usually
     // emit `packed` with `x5c`, but we don't want the probe to fail
     // before reaching the diagnostic prints below).
-    let parsed = match dds_domain::fido2::verify_attestation(&attobj, &chal, true) {
+    // SHA-256(challenge), not the raw challenge: ctap-hid-fido2 hashed it
+    // on the way into the CTAP2 command, so that is what the authenticator
+    // signed over, and this verifier uses the value verbatim as the hash.
+    let chal_hash = Sha256::digest(chal).to_vec();
+    let parsed = match dds_domain::fido2::verify_attestation(&attobj, &chal_hash, true) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("dds_domain verify_attestation FAILED: {e}");

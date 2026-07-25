@@ -109,14 +109,22 @@ pub struct EnrollmentOutcome {
     pub credential_id: Vec<u8>,
     /// CBOR attestation object, ready for `attestation_object_b64`.
     pub attestation_object: Vec<u8>,
-    /// Raw challenge bytes used directly as `client_data_hash_b64` —
-    /// matches `dds-fido2-test`'s proven approach: `ctap-hid-fido2`'s
-    /// MakeCredential API takes the raw challenge and hashes it
-    /// internally before wiring it into the CTAP2 command, so there is
-    /// no real WebAuthn clientDataJSON to reconstruct here (unlike the
-    /// GetAssertion path below, where the caller controls what bytes
-    /// get hashed). The server's legacy (no `client_data_json_b64`)
-    /// verification path accepts this.
+    /// The value to send as `client_data_hash_b64`: **`SHA-256(challenge)`,
+    /// not the challenge itself**.
+    ///
+    /// `ctap-hid-fido2` hashes the challenge for us before putting it in
+    /// the CTAP2 command (`Params::new` →
+    /// `util::create_clientdata_hash` → `SHA256`), so the authenticator
+    /// signs over `authData ‖ SHA-256(challenge)`. The server treats the
+    /// bytes we send as the hash *verbatim* — `verify_packed` computes
+    /// `signed = auth_data ‖ client_data_hash` with no re-hashing — so
+    /// sending the raw challenge makes every full attestation fail with
+    /// `bad attestation signature` (surfacing as HTTP 401 `auth_failed`).
+    ///
+    /// Note this differs from the crate's *own* verifier
+    /// (`verifier::verify_attestation`), which takes the raw challenge
+    /// and hashes internally — so local verification passes while the
+    /// server rejects, which is what made this confusing to track down.
     pub client_data_hash: Vec<u8>,
 }
 
@@ -264,7 +272,9 @@ impl Device {
         Ok(EnrollmentOutcome {
             credential_id: verify_result.credential_id,
             attestation_object,
-            client_data_hash: challenge.to_vec(),
+            // SHA-256, matching what the crate actually put in the CTAP2
+            // command — see the field docs on `client_data_hash`.
+            client_data_hash: Sha256::digest(challenge).to_vec(),
         })
     }
 
