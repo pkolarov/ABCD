@@ -275,8 +275,22 @@ impl GossipEnvelopeV3 {
     }
 
     /// Decode from CBOR bytes.
+    ///
+    /// **L-17 (pre-prod review 2026-07-24)** — routes through
+    /// [`dds_core::cbor_bounded::from_reader`] rather than calling
+    /// `ciborium` directly.
+    ///
+    /// This is a consistency fix, not a live DoS fix: `ciborium` already
+    /// self-caps recursion at depth 256, which the I-6 notes call
+    /// "generally safe", so the previous code was not exploitable for
+    /// stack exhaustion. But this is an untrusted network boundary and
+    /// every *other* untrusted decode in the tree (`apply_sync_payloads`,
+    /// the H-12 piggy-back, token ingest) goes through the bounded
+    /// reader. Having one boundary that does not is the kind of
+    /// inconsistency that turns into a real gap the next time the
+    /// project's depth budget is tightened below ciborium's default.
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, ciborium::de::Error<std::io::Error>> {
-        ciborium::from_reader(bytes)
+        dds_core::cbor_bounded::from_reader(bytes)
     }
 }
 
@@ -288,9 +302,10 @@ impl SyncEnvelopeV3 {
         Ok(buf)
     }
 
-    /// Decode from CBOR bytes.
+    /// Decode from CBOR bytes. **L-17** — depth-bounded; see
+    /// [`GossipEnvelopeV3::from_cbor`].
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, ciborium::de::Error<std::io::Error>> {
-        ciborium::from_reader(bytes)
+        dds_core::cbor_bounded::from_reader(bytes)
     }
 }
 

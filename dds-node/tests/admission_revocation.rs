@@ -48,6 +48,9 @@ fn build_node_dir(secret: [u8; 32]) -> (TempDir, NodeConfig, libp2p::identity::K
             metrics_addr: None,
             allow_v1_certs: true,
             admission_key_backend: Default::default(),
+            // M-1 / H-1: connection caps, unadmitted-peer deadline, and the
+            // per-peer gossip budget all take their production defaults here.
+            ..Default::default()
         },
         org_hash: "org.test".to_string(),
         domain: DomainConfig {

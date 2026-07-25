@@ -165,6 +165,54 @@ const EPOCH_KEY_FANOUT_CONCURRENCY: usize = 10;
 /// needing mDNS (which is disabled by default in the member config template).
 const BOOTSTRAP_REDIAL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// **M-1 (pre-prod review 2026-07-24)** — cadence of the fast guard tick
+/// in [`DdsNode::run`], which enforces the unadmitted-peer connection
+/// deadline.
+///
+/// 5 s rather than riding the 60 s anti-entropy tick: the sweep is
+/// purely in-memory (a scan of a small map, no network I/O), and its
+/// whole value is the *width* of the window in which an unadmitted peer
+/// still holds resources. It also bounds the deadline overshoot to one
+/// tick.
+const GUARD_TICK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// **M-5 (pre-prod review 2026-07-24)** — cadence of the expiry-aware
+/// `trusted_roots` reconcile in [`DdsNode::run`].
+///
+/// Deliberately slower than [`GUARD_TICK_INTERVAL`]: the reconcile walks
+/// every vouch in the trust graph to build its candidate set, so it is
+/// O(vouches) rather than O(connections), and vouch expiry is a
+/// wall-clock event that does not need five-second granularity. A minute
+/// still turns "stale until the process restarts" — which could be weeks
+/// on a long-running node — into a bounded, short window.
+const ROOT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// **L-5 (pre-prod review 2026-07-24)** — how long an mDNS-discovered
+/// peer may occupy a peer-table slot without completing the H-12
+/// admission handshake before it becomes evictable.
+///
+/// Sits comfortably above a real admission round-trip (dial + Noise +
+/// one CBOR request/response) so a genuine peer mid-handshake is never
+/// reclaimed, while keeping a spoofing host's hold on the table to
+/// seconds rather than "until the node restarts".
+const MDNS_UNADMITTED_GRACE: Duration = Duration::from_secs(30);
+
+/// **L-5** — how many never-admitted mDNS entries one eviction sweep may
+/// reclaim. Bounded so a single discovery event cannot cause an
+/// unbounded amount of work, but large enough that a table filled with
+/// spoofed IDs drains within a few announcements.
+const MDNS_EVICTION_BATCH: usize = 32;
+
+/// **L-11 (pre-prod review 2026-07-24)** — cap on outstanding admission
+/// challenge nonces.
+///
+/// Now that challenges are keyed per outbound request rather than per
+/// peer, a peer that never answers no longer overwrites its own entry,
+/// so the map needs an explicit ceiling. Generous relative to the
+/// connection caps (each peer has at most a couple of in-flight
+/// requests), and each entry is only a `PeerId` plus 32 bytes.
+const PENDING_CHALLENGES_MAX: usize = 4096;
+
 /// A request from the HTTP API task ([`LocalService`]) asking the swarm
 /// event loop to publish one or more locally-authored, already-signed
 /// tokens into the domain: apply them to the shared trust graph + store
@@ -344,11 +392,18 @@ pub struct DdsNode {
     /// window_start >= 60s`, reset and start a fresh window; else
     /// increment and reject once `count >= MDNS_NEW_PEER_ACCEPT_PER_MINUTE`.
     mdns_rate: (Instant, u32),
-    /// **M-4 (security review)**: set of peer-IDs we've added via
-    /// mDNS since startup (and not yet expired). Used to enforce the
-    /// hard ceiling and to de-duplicate Discovered events for the
-    /// same peer within a short window.
-    mdns_known_peers: BTreeSet<PeerId>,
+    /// **M-4 (security review)**: peer-IDs we've added via mDNS since
+    /// startup (and not yet expired), mapped to the [`Instant`] they
+    /// were first accepted. Used to enforce the hard ceiling and to
+    /// de-duplicate Discovered events for the same peer.
+    ///
+    /// **L-5 (pre-prod review 2026-07-24)**: was a bare
+    /// `BTreeSet<PeerId>`. The insertion instant is what makes eviction
+    /// possible — see [`DdsNode::evict_stale_mdns_peers`]. Without it
+    /// the table was fill-once/never-drain and a single LAN host
+    /// advertising `MDNS_PEER_TABLE_MAX` spoofed IDs permanently locked
+    /// out every genuine peer.
+    mdns_known_peers: BTreeMap<PeerId, Instant>,
     /// **H-12 (security review)**: peers that have presented a valid
     /// admission cert via the `/dds/admission/1.0.0/<domain>` handshake
     /// since the connection was established. Membership is the
@@ -358,6 +413,24 @@ pub struct DdsNode {
     /// Cleared on `ConnectionClosed` so a reconnected peer must
     /// present its cert afresh.
     admitted_peers: BTreeSet<PeerId>,
+    /// **M-1 (pre-prod review 2026-07-24)**: wall-clock instant at which
+    /// each currently-connected peer's connection was established, used
+    /// to enforce [`NetworkConfig::unadmitted_peer_timeout_secs`]. An
+    /// entry is removed the moment the peer is admitted (it has cleared
+    /// the gate and is no longer on a deadline) or on `ConnectionClosed`.
+    /// Peers still present past the deadline are disconnected and
+    /// denylisted, which bounds the resources an attacker can pin by
+    /// rotating keypairs — the PeerId denylist alone never bites on a
+    /// fresh keypair, but a short deadline does.
+    unadmitted_since: BTreeMap<PeerId, Instant>,
+    /// **H-1 (pre-prod review 2026-07-24)**: per-peer inbound gossip
+    /// counter, `(window_start, count)`. Same sliding-window shape as
+    /// [`Self::mdns_rate`] but keyed per peer, because the resource
+    /// being protected (signature verification + AEAD decrypt + trust
+    /// graph insert on every inbound message) is charged per sender.
+    /// Enforced in [`Self::classify_gossip_message`]; entries for
+    /// disconnected peers are dropped on `ConnectionClosed`.
+    gossip_rate: BTreeMap<PeerId, (Instant, u32)>,
     /// **Threat-model §1 — admission cert revocation list (open
     /// item #4)**: domain-signed list of peer ids that are no longer
     /// welcome. Loaded once at startup from
@@ -516,14 +589,29 @@ pub struct DdsNode {
     ///
     /// See `docs/hardware-bound-admission-plan.md` §5 and §7.
     pub admission_key_provider: Box<dyn dds_core::key_provider::KeyProvider>,
-    /// **Phase A2** — per-peer challenge nonces we generated when sending an
-    /// `AdmissionRequest`. On response receipt the nonce is consumed and the
-    /// `challenge_signature` in the response is verified against the peer's
-    /// `cert.body.admission_pubkey`. Entries are inserted in
-    /// `send_admission_request` and removed (with verification) in
-    /// `verify_peer_admission`. A stale entry (peer disconnected before
-    /// responding) is evicted on `ConnectionClosed`.
-    pending_challenges: BTreeMap<PeerId, Vec<u8>>,
+    /// **Phase A2** — challenge nonces we generated when sending an
+    /// `AdmissionRequest`, keyed by the outbound request they belong to.
+    /// On response receipt the nonce is consumed and the
+    /// `challenge_signature` in the response is verified against the
+    /// peer's `cert.body.admission_pubkey`. Entries are inserted in
+    /// [`DdsNode::request_peer_admission`] and removed (with
+    /// verification) in [`DdsNode::verify_peer_admission`]. Stale entries
+    /// (peer disconnected before responding) are evicted on
+    /// `ConnectionClosed`.
+    ///
+    /// **L-11 (pre-prod review 2026-07-24)**: was keyed by `PeerId`, so
+    /// a second in-flight `AdmissionRequest` to the same peer simply
+    /// overwrote the first one's nonce. libp2p dials TCP *and* QUIC
+    /// concurrently, and the watchdog retry can fire while a request is
+    /// still outstanding, so two requests to one peer is routine — not
+    /// an edge case. Whichever response arrived first would then be
+    /// checked against the *other* request's nonce, fail the Phase A2
+    /// signature check, and leave a perfectly genuine peer unadmitted
+    /// until a later retry happened to land unopposed. Keying by
+    /// `OutboundRequestId` makes each challenge match exactly the
+    /// response it was issued for. The value carries the `PeerId` so
+    /// disconnect eviction can still sweep by peer.
+    pending_challenges: BTreeMap<libp2p::request_response::OutboundRequestId, (PeerId, Vec<u8>)>,
     /// **Phase A2** — when `false`, peers presenting a v1 cert (no
     /// `admission_pubkey`) are rejected outright. Default `true` during the
     /// migration window; operators flip to `false` after every node has been
@@ -655,6 +743,9 @@ impl DdsNode {
             domain_tag: domain_id.protocol_tag(),
             idle_timeout: Duration::from_secs(config.network.idle_timeout_secs),
             mdns_enabled: config.network.mdns_enabled,
+            // **M-1 (pre-prod review 2026-07-24)** — swarm-layer inbound
+            // connection ceilings; see `ConnectionLimitsConfig`.
+            connection_caps: config.network.connection_limits.into(),
         };
         let (swarm, peer_id) = dds_net::transport::build_swarm(swarm_config, keypair)?;
 
@@ -961,8 +1052,10 @@ impl DdsNode {
             admission_cert: cert,
             domain,
             mdns_rate: (Instant::now(), 0),
-            mdns_known_peers: BTreeSet::new(),
+            mdns_known_peers: BTreeMap::new(),
             admitted_peers: BTreeSet::new(),
+            unadmitted_since: BTreeMap::new(),
+            gossip_rate: BTreeMap::new(),
             admission_revocations,
             admission_revocations_path: revocations_path,
             peer_certs,
@@ -1117,6 +1210,24 @@ impl DdsNode {
         let mut bootstrap_redial = tokio::time::interval(BOOTSTRAP_REDIAL_INTERVAL);
         bootstrap_redial.tick().await; // consume the immediate tick — start first fire after interval
 
+        // **M-1 (pre-prod review 2026-07-24)** — fast guard tick.
+        // Deliberately separate from (and much faster than) the 60 s
+        // anti-entropy tick: it disconnects peers that have held a
+        // connection past the admission deadline without completing the
+        // H-12 handshake, and the whole value of that control is how
+        // narrow the window is. Purely in-memory; no network I/O.
+        let mut guard_tick = tokio::time::interval(GUARD_TICK_INTERVAL);
+        guard_tick.tick().await; // consume the immediate tick
+
+        // **M-5 (pre-prod review 2026-07-24)** — expiry-aware
+        // `trusted_roots` reconcile, so an admin whose promoting
+        // `dds:admin` vouch *expired* (rather than being explicitly
+        // revoked) is demoted on the swarm ingest gate without waiting
+        // for a process restart. Slower than the guard tick because it
+        // walks the whole vouch set; see `ROOT_RECONCILE_INTERVAL`.
+        let mut root_reconcile = tokio::time::interval(ROOT_RECONCILE_INTERVAL);
+        root_reconcile.tick().await; // consume the immediate tick
+
         loop {
             // Snapshot the earliest probe deadline before select! so the
             // deadline arm doesn't borrow `self` inside the coroutine
@@ -1240,6 +1351,15 @@ impl DdsNode {
                 _ = bootstrap_redial.tick() => {
                     self.try_bootstrap_redial();
                 }
+                // **M-1** — tear down connections that never completed
+                // admission within the deadline.
+                _ = guard_tick.tick() => {
+                    self.disconnect_stale_unadmitted_peers(Instant::now());
+                }
+                // **M-5** — demote admins whose promoting vouch lapsed.
+                _ = root_reconcile.tick() => {
+                    self.reconcile_roots_by_expiry();
+                }
             }
         }
     }
@@ -1292,26 +1412,31 @@ impl DdsNode {
             SwarmEvent::Behaviour(DdsBehaviourEvent::Gossipsub(
                 libp2p::gossipsub::Event::Message {
                     propagation_source,
+                    message_id,
                     message,
-                    ..
                 },
             )) => {
-                // H-12: gate gossip ingest on the relayer being
-                // admitted. The gossipsub signer (`message.source`) is
-                // whoever originally published; `propagation_source`
-                // is the peer that actually handed us this envelope.
-                // An unadmitted peer should not be able to inject into
-                // our ingest pipeline regardless of whom it claims to
-                // be relaying for.
-                if !self.admitted_peers.contains(&propagation_source) {
-                    debug!(
-                        peer = %propagation_source,
-                        "H-12: dropping gossip from unadmitted peer"
-                    );
-                    crate::telemetry::record_gossip_messages_dropped("unadmitted");
-                    return;
-                }
-                self.handle_gossip_message(&message.topic, &message.data);
+                // **H-1 (pre-prod review 2026-07-24)** — the swarm is
+                // built with `validate_messages()`, so libp2p is holding
+                // this message in its cache and will NOT forward it to
+                // our mesh peers until we report a verdict. That is the
+                // whole point: before this change the relay had already
+                // happened by the time the H-12 gate below ran, so the
+                // gate only suppressed *local* ingest while the node
+                // still amplified an unadmitted peer's traffic to the
+                // entire domain.
+                //
+                // Every path out of `classify_gossip_message` returns an
+                // acceptance, and we report exactly once here. Adding an
+                // early `return` inside that function without returning
+                // an acceptance would strand the message in gossipsub's
+                // cache until its TTL expires — hence the classify /
+                // report split rather than in-line reporting.
+                let acceptance = self.classify_gossip_message(&propagation_source, &message);
+                self.swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .report_message_validation_result(&message_id, &propagation_source, acceptance);
             }
             SwarmEvent::Behaviour(DdsBehaviourEvent::Mdns(libp2p::mdns::Event::Discovered(
                 peers,
@@ -1383,6 +1508,16 @@ impl DdsNode {
                 // AdmissionRequest — we'll answer by returning our
                 // own cert in the Message::Request handler.
                 self.request_peer_admission(peer_id);
+                // **M-1 (pre-prod review 2026-07-24)**: start the
+                // wall-clock admission deadline. `entry` (not `insert`)
+                // so a second connection to the same peer — TCP and QUIC
+                // race on every dial — does not extend a deadline that
+                // is already running.
+                if !self.admitted_peers.contains(&peer_id) {
+                    self.unadmitted_since
+                        .entry(peer_id)
+                        .or_insert(Instant::now());
+                }
                 // NOTE: sync is *not* kicked off here any more. We
                 // want peers to be admitted before we burn sync-state
                 // transfer on them. The admission-success path fires
@@ -1405,8 +1540,18 @@ impl DdsNode {
                 self.admitted_peers.remove(&peer_id);
                 // Phase A2: evict any pending challenge so we don't
                 // accumulate stale entries for peers that disconnected
-                // before answering.
-                self.pending_challenges.remove(&peer_id);
+                // before answering. **L-11**: the map is keyed by
+                // request id now, so sweep every entry issued to this
+                // peer rather than removing a single peer-keyed slot.
+                self.pending_challenges
+                    .retain(|_, (challenged_peer, _)| *challenged_peer != peer_id);
+                // **M-1 / H-1**: drop the per-connection deadline and
+                // rate-limit window. Both are scoped to a connection
+                // lifecycle: a reconnecting peer gets a fresh admission
+                // deadline and a fresh gossip budget, and neither map
+                // grows with churn from peers that have gone away.
+                self.unadmitted_since.remove(&peer_id);
+                self.gossip_rate.remove(&peer_id);
                 self.refresh_peer_count_gauges();
             }
             _ => {}
@@ -1443,14 +1588,41 @@ impl DdsNode {
         use rand::RngCore;
         let mut challenge = vec![0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut challenge);
-        self.pending_challenges.insert(peer_id, challenge.clone());
-        let _id = self.swarm.behaviour_mut().admission.send_request(
+        // **L-11**: key the nonce by the request it was sent on, not by
+        // the peer. Concurrent TCP + QUIC dials (and a watchdog retry
+        // overlapping an in-flight request) mean several requests to the
+        // same peer are normal; a peer-keyed map silently clobbered the
+        // earlier nonce and made the first response fail Phase A2
+        // verification against the wrong challenge.
+        let request_id = self.swarm.behaviour_mut().admission.send_request(
             &peer_id,
             AdmissionRequest {
-                challenge: Some(challenge),
+                challenge: Some(challenge.clone()),
             },
         );
-        debug!(%peer_id, "H-12: sent admission request with challenge");
+        self.pending_challenges
+            .insert(request_id, (peer_id, challenge));
+        // Backstop against unbounded growth if responses never arrive
+        // for some peers (the per-peer eviction on `ConnectionClosed`
+        // handles the normal case).
+        self.prune_pending_challenges();
+        debug!(%peer_id, ?request_id, "H-12: sent admission request with challenge");
+    }
+
+    /// **L-11** — bound [`Self::pending_challenges`].
+    ///
+    /// Entries are normally consumed on response or evicted on
+    /// `ConnectionClosed`. This is the belt-and-braces path for a peer
+    /// that neither answers nor disconnects: drop the oldest entries
+    /// (request ids are monotonically increasing, so `BTreeMap` order is
+    /// issue order) once the map exceeds its cap.
+    fn prune_pending_challenges(&mut self) {
+        while self.pending_challenges.len() > PENDING_CHALLENGES_MAX {
+            let Some(oldest) = self.pending_challenges.keys().next().copied() else {
+                break;
+            };
+            self.pending_challenges.remove(&oldest);
+        }
     }
 
     /// **Watchdog plan Step 6**: re-issue an `AdmissionRequest` for every
@@ -1549,6 +1721,64 @@ impl DdsNode {
     ///
     /// Disconnecting never *admits* a peer and never bypasses any admission
     /// check — it only stops retrying one that has failed to be admitted.
+    /// **M-1 (pre-prod review 2026-07-24)**: disconnect and denylist any
+    /// peer that has held a connection past
+    /// [`NetworkConfig::unadmitted_peer_timeout_secs`] without
+    /// completing the H-12 admission handshake.
+    ///
+    /// [`Self::retry_unadmitted_peers`] already bounds *retries*, but it
+    /// runs on the 60 s anti-entropy tick and spends
+    /// [`MAX_ADMISSION_ATTEMPTS`] before giving up, so an unadmitted
+    /// peer previously held a live connection — and its Noise session
+    /// state and pending challenge — for roughly five minutes. An
+    /// attacker rotating keypairs never trips the PeerId denylist, so
+    /// that hold time multiplied by the connection cap was the real
+    /// ceiling on pinned resources. This deadline collapses it.
+    ///
+    /// Returns the number of peers disconnected (for tests / telemetry).
+    fn disconnect_stale_unadmitted_peers(&mut self, now: Instant) -> usize {
+        let timeout_secs = self.config.network.unadmitted_peer_timeout_secs;
+        if timeout_secs == 0 {
+            return 0;
+        }
+        let timeout = Duration::from_secs(timeout_secs);
+        let stale: Vec<PeerId> = self
+            .unadmitted_since
+            .iter()
+            .filter(|(peer, since)| {
+                !self.admitted_peers.contains(*peer) && now.duration_since(**since) >= timeout
+            })
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in &stale {
+            warn!(
+                %peer,
+                timeout_secs,
+                "M-1: peer never completed admission within the deadline — disconnecting and denylisting"
+            );
+            self.unadmitted_since.remove(peer);
+            self.deny_and_disconnect(*peer, now);
+        }
+        if !stale.is_empty() {
+            self.refresh_peer_count_gauges();
+        }
+        stale.len()
+    }
+
+    /// **M-1 test hook.** Drive the unadmitted-peer deadline sweep
+    /// directly, without waiting on the real timer.
+    #[doc(hidden)]
+    pub fn disconnect_stale_unadmitted_peers_for_tests(&mut self, now: Instant) -> usize {
+        self.disconnect_stale_unadmitted_peers(now)
+    }
+
+    /// **M-1 test hook.** Seed the unadmitted-connection deadline clock
+    /// for a peer, standing in for a `ConnectionEstablished` event.
+    #[doc(hidden)]
+    pub fn mark_unadmitted_since_for_tests(&mut self, peer: PeerId, since: Instant) {
+        self.unadmitted_since.insert(peer, since);
+    }
+
     fn deny_and_disconnect(&mut self, peer_id: PeerId, now: Instant) {
         let _ = self.swarm.disconnect_peer_id(peer_id);
         self.admission_denied_until
@@ -1627,8 +1857,14 @@ impl DdsNode {
                         warn!(%peer, "H-12: failed to send admission response (channel closed)");
                     }
                 }
-                RrMessage::Response { response, .. } => {
-                    self.verify_peer_admission(peer, response);
+                // **L-11**: thread the `request_id` through so the
+                // challenge nonce consumed below is the one issued for
+                // *this* request, not whichever was written last.
+                RrMessage::Response {
+                    request_id,
+                    response,
+                } => {
+                    self.verify_peer_admission(peer, request_id, response);
                 }
             },
             RrEvent::OutboundFailure { peer, error, .. } => {
@@ -1787,10 +2023,33 @@ impl DdsNode {
     /// hand us a freshly-issued revocation we should honour. Newly-
     /// merged entries are persisted atomically so the next start-up
     /// applies them at `init`.
-    fn verify_peer_admission(&mut self, peer_id: PeerId, response: AdmissionResponse) {
-        // Consume the pending challenge for this peer (if any). Used below
-        // for Phase A2 challenge-response verification.
-        let our_challenge = self.pending_challenges.remove(&peer_id);
+    fn verify_peer_admission(
+        &mut self,
+        peer_id: PeerId,
+        request_id: libp2p::request_response::OutboundRequestId,
+        response: AdmissionResponse,
+    ) {
+        // Consume the pending challenge for THIS request (if any). Used
+        // below for Phase A2 challenge-response verification.
+        //
+        // **L-11**: keyed by `request_id`. The entry also records the
+        // peer it was issued to; a mismatch would mean libp2p delivered
+        // a response under a request id we sent to someone else, which
+        // cannot happen — assert it defensively rather than verify a
+        // signature against another peer's nonce.
+        let our_challenge = match self.pending_challenges.remove(&request_id) {
+            Some((expected_peer, nonce)) if expected_peer == peer_id => Some(nonce),
+            Some((expected_peer, _)) => {
+                warn!(
+                    %peer_id,
+                    %expected_peer,
+                    ?request_id,
+                    "H-12: admission response peer does not match the request's peer — ignoring"
+                );
+                return;
+            }
+            None => None,
+        };
 
         // Process piggy-backed revocations first. We do this even if
         // the cert later fails to verify — the revocations carry
@@ -1885,6 +2144,9 @@ impl DdsNode {
                 // genuine peer is never permanently blocked.
                 self.admission_retry_last_outbound.remove(&peer_id);
                 self.admission_denied_until.remove(&peer_id);
+                // **M-1**: the peer cleared the gate — stop its
+                // wall-clock admission deadline.
+                self.unadmitted_since.remove(&peer_id);
                 crate::telemetry::record_admission_handshake("ok");
                 self.refresh_peer_count_gauges();
                 // **Z-1 Phase B.3 / §4.6.2** — cache the freshly-verified
@@ -2223,18 +2485,40 @@ impl DdsNode {
     /// resource cost to re-announce, and returning `true` would
     /// let an attacker inflate the per-minute counter with re-runs.
     fn mdns_accept_peer(&mut self, peer_id: &PeerId) -> bool {
-        if self.mdns_known_peers.contains(peer_id) {
-            return false;
-        }
-        if self.mdns_known_peers.len() >= MDNS_PEER_TABLE_MAX {
-            warn!(
-                known = self.mdns_known_peers.len(),
-                cap = MDNS_PEER_TABLE_MAX,
-                "mDNS peer-table ceiling hit; dropping new peer"
-            );
+        if self.mdns_known_peers.contains_key(peer_id) {
             return false;
         }
         let now = Instant::now();
+        if self.mdns_known_peers.len() >= MDNS_PEER_TABLE_MAX {
+            // **L-5 (pre-prod review 2026-07-24)** — the ceiling used to
+            // be terminal: the table counted every *announcement*, which
+            // is pre-Noise and therefore entirely unauthenticated, and
+            // nothing ever evicted. One LAN host advertising 256 spoofed
+            // PeerIds filled it permanently and locked out every real
+            // peer thereafter — with no recovery short of a restart.
+            // That matters most in exactly the topology DDS ships for
+            // zero-config LAN meshes, where mDNS is the only discovery
+            // path.
+            //
+            // Evict the oldest entries that never got admitted before
+            // giving up. An admitted peer has cleared the H-12 handshake
+            // and is never evicted; an unadmitted entry is at most a
+            // claim, so reclaiming it costs nothing but a re-announce.
+            let evicted = self.evict_stale_mdns_peers(now);
+            if evicted == 0 {
+                warn!(
+                    known = self.mdns_known_peers.len(),
+                    cap = MDNS_PEER_TABLE_MAX,
+                    "mDNS peer-table ceiling hit and every entry is admitted; dropping new peer"
+                );
+                return false;
+            }
+            debug!(
+                evicted,
+                remaining = self.mdns_known_peers.len(),
+                "L-5: evicted never-admitted mDNS entries to make room"
+            );
+        }
         if now.duration_since(self.mdns_rate.0) >= Duration::from_secs(60) {
             self.mdns_rate = (now, 0);
         }
@@ -2247,17 +2531,179 @@ impl DdsNode {
             return false;
         }
         self.mdns_rate.1 += 1;
-        self.mdns_known_peers.insert(*peer_id);
+        self.mdns_known_peers.insert(*peer_id, now);
         true
     }
 
-    fn handle_gossip_message(&mut self, topic_hash: &libp2p::gossipsub::TopicHash, data: &[u8]) {
+    /// **L-5 (pre-prod review 2026-07-24)** — reclaim mDNS peer-table
+    /// slots held by entries that never completed the H-12 admission
+    /// handshake.
+    ///
+    /// An mDNS announcement is unauthenticated: it happens before Noise,
+    /// so anything in this table is at most a *claim* to be a peer.
+    /// Admitted peers (present in [`Self::admitted_peers`]) have proved
+    /// domain membership and are never evicted. Everything else is
+    /// evictable once it has had [`MDNS_UNADMITTED_GRACE`] to complete
+    /// admission — long enough that a genuine peer mid-handshake is
+    /// never reclaimed, short enough that a spoofing host cannot hold
+    /// the table.
+    ///
+    /// Evicts oldest-first, up to [`MDNS_EVICTION_BATCH`] entries.
+    /// Returns how many were removed.
+    fn evict_stale_mdns_peers(&mut self, now: Instant) -> usize {
+        let mut candidates: Vec<(Instant, PeerId)> = self
+            .mdns_known_peers
+            .iter()
+            .filter(|(peer, added)| {
+                !self.admitted_peers.contains(*peer)
+                    && now.duration_since(**added) >= MDNS_UNADMITTED_GRACE
+            })
+            .map(|(peer, added)| (*added, *peer))
+            .collect();
+        // Oldest first — the least likely to still be mid-handshake.
+        candidates.sort_unstable();
+
+        let mut removed = 0usize;
+        for (_, peer) in candidates.into_iter().take(MDNS_EVICTION_BATCH) {
+            self.mdns_known_peers.remove(&peer);
+            dds_net::discovery::remove_mdns_peer(&mut self.swarm, peer);
+            removed += 1;
+        }
+        removed
+    }
+
+    /// **L-5 test hook.** Drive the mDNS eviction sweep directly.
+    #[doc(hidden)]
+    pub fn evict_stale_mdns_peers_for_tests(&mut self, now: Instant) -> usize {
+        self.evict_stale_mdns_peers(now)
+    }
+
+    /// **L-5 test hook.** Seed an mDNS table entry with an explicit
+    /// insertion instant, standing in for a discovery event.
+    #[doc(hidden)]
+    pub fn insert_mdns_peer_for_tests(&mut self, peer: PeerId, added: Instant) {
+        self.mdns_known_peers.insert(peer, added);
+    }
+
+    /// **L-5 test hook.** Current mDNS table size.
+    #[doc(hidden)]
+    pub fn mdns_known_peer_count(&self) -> usize {
+        self.mdns_known_peers.len()
+    }
+
+    /// **L-5 test hook.** Run the real admission decision.
+    #[doc(hidden)]
+    pub fn mdns_accept_peer_for_tests(&mut self, peer: &PeerId) -> bool {
+        self.mdns_accept_peer(peer)
+    }
+
+    /// **H-1 (pre-prod review 2026-07-24)** — decide what gossipsub
+    /// should do with an inbound message, running local ingest as a side
+    /// effect when the message is accepted.
+    ///
+    /// The returned [`MessageAcceptance`] is what stops (or permits)
+    /// relay to the rest of the mesh:
+    ///
+    /// - `Accept` — validated; ingest locally and forward to mesh peers.
+    /// - `Ignore` — do not forward, do not penalise the relayer. Used
+    ///   where we cannot attribute fault to the peer that handed us the
+    ///   message (unadmitted relayer, our own rate cap, an AEAD failure
+    ///   that may be the *publisher's* doing).
+    /// - `Reject` — do not forward, and charge the relayer a P4
+    ///   invalid-message penalty via peer scoring. Used only for
+    ///   unambiguous protocol violations that the relayer itself could
+    ///   have caught (unknown topic, undecodable payload, plaintext on
+    ///   an `enc-v3` domain, topic/kind mismatch).
+    ///
+    /// An `enc-v3` envelope we hold no key for is `Accept`ed: we cannot
+    /// validate it, but the relayer *was* admitted and other mesh
+    /// members may hold the publisher's epoch key, so dropping it would
+    /// partition late-joining nodes. The token signature + trust-graph
+    /// checks inside the ingest functions remain the integrity anchor.
+    fn classify_gossip_message(
+        &mut self,
+        propagation_source: &PeerId,
+        message: &libp2p::gossipsub::Message,
+    ) -> libp2p::gossipsub::MessageAcceptance {
+        use libp2p::gossipsub::MessageAcceptance;
+
+        // H-12: gate gossip on the relayer being admitted. The
+        // gossipsub signer (`message.source`) is whoever originally
+        // published; `propagation_source` is the peer that actually
+        // handed us this envelope. An unadmitted peer must not be able
+        // to inject into our ingest pipeline — nor, since H-1, to use us
+        // as a relay into the mesh — regardless of whom it claims to be
+        // relaying for.
+        if !self.admitted_peers.contains(propagation_source) {
+            debug!(
+                peer = %propagation_source,
+                "H-12: dropping gossip from unadmitted peer (not relayed)"
+            );
+            crate::telemetry::record_gossip_messages_dropped("unadmitted");
+            // An unadmitted peer that keeps publishing is the
+            // amplification-flood shape from H-1. Charge it against the
+            // per-peer budget and cut it loose if it blows through.
+            if !self.gossip_rate_ok(propagation_source) {
+                warn!(
+                    peer = %propagation_source,
+                    "H-1: unadmitted peer exceeded inbound gossip budget — disconnecting and denylisting"
+                );
+                self.deny_and_disconnect(*propagation_source, Instant::now());
+            }
+            return MessageAcceptance::Ignore;
+        }
+
+        // H-1: per-peer inbound budget. Applies to admitted peers too —
+        // admission proves domain membership, not good behaviour, and
+        // every inbound message costs a signature verify plus (on
+        // `enc-v3` domains) an AEAD open and a trust-graph insert.
+        if !self.gossip_rate_ok(propagation_source) {
+            warn!(
+                peer = %propagation_source,
+                "H-1: admitted peer exceeded inbound gossip budget — dropping message"
+            );
+            crate::telemetry::record_gossip_messages_dropped("rate_limited");
+            return MessageAcceptance::Ignore;
+        }
+
+        self.handle_gossip_message(&message.topic, &message.data)
+    }
+
+    /// **H-1** — per-peer sliding-window gossip budget. Returns `true`
+    /// while the peer is within [`NetworkConfig::gossip_inbound_max_per_window`]
+    /// for the current [`NetworkConfig::gossip_rate_window_secs`] window.
+    /// A configured max of `0` disables the cap.
+    fn gossip_rate_ok(&mut self, peer: &PeerId) -> bool {
+        let max = self.config.network.gossip_inbound_max_per_window;
+        if max == 0 {
+            return true;
+        }
+        let window = Duration::from_secs(self.config.network.gossip_rate_window_secs.max(1));
+        let now = Instant::now();
+        let entry = self.gossip_rate.entry(*peer).or_insert((now, 0));
+        if now.duration_since(entry.0) >= window {
+            *entry = (now, 0);
+        }
+        if entry.1 >= max {
+            return false;
+        }
+        entry.1 += 1;
+        true
+    }
+
+    fn handle_gossip_message(
+        &mut self,
+        topic_hash: &libp2p::gossipsub::TopicHash,
+        data: &[u8],
+    ) -> libp2p::gossipsub::MessageAcceptance {
+        use libp2p::gossipsub::MessageAcceptance;
+
         let topic = match self.topics.identify_topic(topic_hash) {
             Some(t) => t,
             None => {
                 warn!(?topic_hash, "received message on unknown topic");
                 crate::telemetry::record_gossip_messages_dropped("unknown_topic");
-                return;
+                return MessageAcceptance::Reject;
             }
         };
 
@@ -2285,7 +2731,14 @@ impl DdsNode {
                     // request is throttled by EPOCH_KEY_REQUEST_COOLDOWN
                     // so rapid successive drops don't flood the publisher.
                     self.try_epoch_key_request(&env.publisher);
-                    return;
+                    // **H-1**: `Accept` even though we cannot read it.
+                    // The relayer is admitted and other mesh members may
+                    // hold this publisher's epoch key — refusing to
+                    // forward would partition every node that joined
+                    // after the publisher's last rotation, which is
+                    // exactly the state this branch exists to recover
+                    // from. Nothing is ingested locally.
+                    return MessageAcceptance::Accept;
                 }
                 Some(epoch_key) => {
                     match dds_core::crypto::epoch_key::decrypt_payload(
@@ -2305,7 +2758,13 @@ impl DdsNode {
                             );
                             crate::telemetry::record_pq_envelope_decrypt("aead_fail");
                             crate::telemetry::record_gossip_messages_dropped("enc_v3_aead_fail");
-                            return;
+                            // **H-1**: `Ignore`, not `Reject` — we hold
+                            // the key and it still failed to open, so
+                            // the envelope is forged or corrupt, but the
+                            // fault belongs to whoever produced it and
+                            // we cannot attribute that to the relayer.
+                            // Do not forward; do not penalise.
+                            return MessageAcceptance::Ignore;
                         }
                     }
                 }
@@ -2318,7 +2777,10 @@ impl DdsNode {
             {
                 warn!("received plaintext gossip on enc-v3 domain — dropping");
                 crate::telemetry::record_gossip_messages_dropped("enc_v3_plaintext_rejected");
-                return;
+                // Unambiguous protocol violation on an enc-v3 domain:
+                // every admitted member knows plaintext is refused here,
+                // so the relayer should never have propagated it.
+                return MessageAcceptance::Reject;
             }
             std::borrow::Cow::Borrowed(data)
         };
@@ -2328,7 +2790,7 @@ impl DdsNode {
             Err(e) => {
                 warn!("invalid gossip message: {e}");
                 crate::telemetry::record_gossip_messages_dropped("decode_error");
-                return;
+                return MessageAcceptance::Reject;
             }
         };
 
@@ -2342,22 +2804,27 @@ impl DdsNode {
             ) => {
                 crate::telemetry::record_gossip_message("op");
                 self.ingest_operation(&op_bytes, &token_bytes);
+                MessageAcceptance::Accept
             }
             (DdsTopic::Revocations(..), GossipMessage::Revocation { token_bytes }) => {
                 crate::telemetry::record_gossip_message("revocation");
                 self.ingest_revocation(&token_bytes);
+                MessageAcceptance::Accept
             }
             (DdsTopic::Burns(..), GossipMessage::Burn { token_bytes }) => {
                 crate::telemetry::record_gossip_message("burn");
                 self.ingest_burn(&token_bytes);
+                MessageAcceptance::Accept
             }
             (DdsTopic::AuditLog(..), GossipMessage::AuditLog { entry_bytes }) => {
                 crate::telemetry::record_gossip_message("audit");
                 self.ingest_audit(&entry_bytes);
+                MessageAcceptance::Accept
             }
             _ => {
                 warn!("message type mismatch for topic");
                 crate::telemetry::record_gossip_messages_dropped("topic_kind_mismatch");
+                MessageAcceptance::Reject
             }
         }
     }
@@ -2558,6 +3025,63 @@ impl DdsNode {
         }
     }
 
+    /// **M-5 (pre-prod review 2026-07-24)** — run the authoritative
+    /// trusted-root reconcile against the shared trust graph.
+    ///
+    /// [`Self::reconcile_roots_after_token`] handles the *token-driven*
+    /// transitions (a fresh `Vouch` promotes, a `Revoke` demotes), but
+    /// nothing was expiry-driven: every `dds:admin` vouch carries a
+    /// finite 1-year expiry, and when one simply lapsed the swarm task
+    /// kept treating the subject — and everyone that subject vouched for
+    /// — as a fully authoritative trust root until the process
+    /// restarted. `LocalService` got this right; the swarm's ingest gate
+    /// did not, so expiry-based de-authorization silently failed on the
+    /// path that actually gates C-3 publisher capability.
+    ///
+    /// Called from the periodic guard tick. Shares its implementation
+    /// with `LocalService::reconcile_trusted_roots`
+    /// ([`crate::service::reconcile_roots_against_graph`]) so the two
+    /// copies cannot drift again. In-memory only — durable persistence
+    /// of `trusted_roots` stays owned by the `LocalService` side, since
+    /// two writers to node.toml would race.
+    ///
+    /// Returns `true` when the root set changed.
+    fn reconcile_roots_by_expiry(&mut self) -> bool {
+        let g = match self.trust_graph.read() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(error = %e, "M-5: trust_graph poisoned — skipping expiry reconcile");
+                return false;
+            }
+        };
+        let changed = crate::service::reconcile_roots_against_graph(
+            &g,
+            &mut self.trusted_roots,
+            self.config.bootstrap_admin_urn.as_deref(),
+        );
+        drop(g);
+        if changed {
+            info!(
+                roots = self.trusted_roots.len(),
+                "M-5: swarm trusted_roots reconciled against vouch expiry"
+            );
+        }
+        changed
+    }
+
+    /// **M-5 test hook.** Drive the expiry-aware reconcile directly.
+    #[doc(hidden)]
+    pub fn reconcile_roots_by_expiry_for_tests(&mut self) -> bool {
+        self.reconcile_roots_by_expiry()
+    }
+
+    /// **M-5 test hook.** Seed the swarm task's `trusted_roots` copy,
+    /// standing in for config anchoring or a prior in-memory promotion.
+    #[doc(hidden)]
+    pub fn seed_trusted_root_for_tests(&mut self, urn: String) {
+        self.trusted_roots.insert(urn);
+    }
+
     /// Track replicated admin promotion/demotion in the swarm task's
     /// own `trusted_roots` copy (which gates C-3 publisher-capability
     /// checks). In-memory only: durable persistence of `trusted_roots`
@@ -2568,6 +3092,10 @@ impl DdsNode {
     /// Called with every token the trust graph ACCEPTED (gossip ingest,
     /// anti-entropy sync, and local publish), so the H-1/duplicate
     /// gates already ran.
+    ///
+    /// **M-5**: this handles only the token-driven edges. Expiry-driven
+    /// demotion rides [`Self::reconcile_roots_by_expiry`] on the guard
+    /// tick, because a vouch lapsing produces no token to react to.
     fn reconcile_roots_after_token(&mut self, token: &Token) {
         let admin_purpose = dds_core::token::purpose::ADMIN;
         match token.payload.kind {
@@ -3628,13 +4156,48 @@ impl DdsNode {
         let Some((seq, _)) = self.probe_pending.remove(&request_id) else {
             return;
         };
+        // **L-10**: clamp BEFORE reading `complete`. Truncation clears
+        // the flag, and the probe's "definitively absent" verdict is
+        // gated on it — reading `complete` first would let a peer that
+        // over-sent claim a complete answer we only partly examined.
+        let resp = truncate_sync_response(peer, resp);
         let complete = resp.complete;
-        let (payloads, dropped) = self.decrypt_sync_payloads(peer, resp);
+        let (payloads, mut dropped) = self.decrypt_sync_payloads(peer, resp);
         let mut present: BTreeSet<String> = BTreeSet::new();
         for p in &payloads {
-            if let Ok(token) = Token::from_cbor(&p.token_bytes) {
-                present.insert(token.payload.jti.clone());
+            let Ok(token) = Token::from_cbor(&p.token_bytes) else {
+                continue;
+            };
+            // **L-7 (pre-prod review 2026-07-24)** — verify the token
+            // before counting its `jti` as present.
+            //
+            // A `jti` is just a string field inside the payload. Without
+            // this check an *admitted* peer could answer a probe with a
+            // token it synthesised carrying the target `jti` and be
+            // counted as holding replication it does not have. The
+            // result drives an operator-facing confirmation display
+            // (`GET /v1/replication/confirm`), not node state — the
+            // payloads are deliberately not applied here — so the impact
+            // is a misleading "replicated" verdict rather than a state
+            // compromise. Still: a confirmation that can be lied to is
+            // not a confirmation.
+            //
+            // `Token::validate()` checks the self-signature against the
+            // embedded issuer key, so a forged `jti` requires actually
+            // possessing a key that signs it. A token that fails is
+            // counted as `dropped`, which makes the probe report
+            // "inconclusive" rather than silently "absent".
+            if let Err(e) = token.validate() {
+                warn!(
+                    %peer,
+                    jti = %token.payload.jti,
+                    error = %e,
+                    "L-7: probe response carried an invalid token — not counting it as present"
+                );
+                dropped = dropped.saturating_add(1);
+                continue;
             }
+            present.insert(token.payload.jti.clone());
         }
         if let Some(agg) = self.probes.get_mut(&seq) {
             let result = probe_result_from_response(
@@ -4031,6 +4594,10 @@ impl DdsNode {
     /// unchanged when `enc_payloads` is absent (non-`enc-v3` peers,
     /// mixed-fleet window per §4.7).
     fn handle_sync_response(&mut self, peer: PeerId, resp: SyncResponse) {
+        // **L-10**: clamp BEFORE reading `complete` — see
+        // `handle_probe_response`. A truncated response is not the whole
+        // diff, so anti-entropy must keep pulling.
+        let resp = truncate_sync_response(peer, resp);
         let complete = resp.complete;
         let (resp_payloads, _dropped) = self.decrypt_sync_payloads(peer, resp);
 
@@ -4064,6 +4631,14 @@ impl DdsNode {
         peer: PeerId,
         resp: SyncResponse,
     ) -> (Vec<SyncPayload>, usize) {
+        // **L-10 (pre-prod review 2026-07-24)** — the payload-count cap
+        // is applied by the two callers via `truncate_sync_response`,
+        // *before* they snapshot `resp.complete`, because truncation has
+        // to clear that flag. Belt-and-braces re-clamp here so a future
+        // third caller cannot bypass the ceiling; it is a no-op for the
+        // existing two.
+        let resp = truncate_sync_response(peer, resp);
+
         if !resp.enc_payloads.is_empty() {
             let responder_str = peer.to_string();
             let total = resp.enc_payloads.len();
@@ -4976,13 +5551,43 @@ impl DdsNode {
     /// synthetic hash that `identify_topic` will match. The `data`
     /// bytes may be a plaintext CBOR `GossipMessage` or a CBOR-encoded
     /// `GossipEnvelopeV3` depending on which path the test is exercising.
+    ///
+    /// **H-1**: the inner function now returns the
+    /// [`libp2p::gossipsub::MessageAcceptance`] that decides whether the
+    /// message is relayed to the mesh. This hook discards it to keep the
+    /// existing call sites unchanged; use
+    /// [`Self::classify_gossip_message_for_tests`] to assert on the
+    /// relay decision itself.
     #[doc(hidden)]
     pub fn handle_gossip_message_for_tests(
         &mut self,
         topic_hash: &libp2p::gossipsub::TopicHash,
         data: &[u8],
     ) {
-        self.handle_gossip_message(topic_hash, data);
+        let _ = self.handle_gossip_message(topic_hash, data);
+    }
+
+    /// **H-1 test hook.** Run the full inbound-gossip classification —
+    /// H-12 admission gate, per-peer rate budget, payload validation —
+    /// and return the verdict that `run()` would hand to
+    /// `report_message_validation_result`. `Accept` means "relay to the
+    /// mesh"; anything else means the message stops here.
+    #[doc(hidden)]
+    pub fn classify_gossip_message_for_tests(
+        &mut self,
+        propagation_source: &PeerId,
+        message: &libp2p::gossipsub::Message,
+    ) -> libp2p::gossipsub::MessageAcceptance {
+        self.classify_gossip_message(propagation_source, message)
+    }
+
+    /// **H-12 test hook.** Mark a peer as admitted without running the
+    /// full handshake, so H-1 relay-gate tests can exercise the
+    /// admitted-peer branch of [`Self::classify_gossip_message`].
+    #[doc(hidden)]
+    pub fn admit_peer_for_tests(&mut self, peer: PeerId) {
+        self.admitted_peers.insert(peer);
+        self.unadmitted_since.remove(&peer);
     }
 
     /// **Z-1 Phase B.7 test hook.** Mutably borrow the epoch-key store
@@ -5377,6 +5982,42 @@ fn rejected_action_for(kind: &TokenKind) -> &'static str {
 /// isn't cached yet) and not every target was proven present, the
 /// result carries an `error` so callers treat it as inconclusive and
 /// retry — never as "the peer doesn't have it".
+/// **L-10 (pre-prod review 2026-07-24)** — clamp an inbound
+/// [`SyncResponse`] to [`SYNC_MAX_RESPONSE_ENTRIES`] entries per list.
+///
+/// Mirrors the cap the serving side already applies to its own
+/// responses, so this is a no-op against any well-behaved peer and a
+/// hard ceiling against one that decides to answer a one-line
+/// `SyncRequest` with a hundred thousand payloads. Truncation is logged
+/// at `warn` rather than silently applied — a legitimate peer hitting it
+/// would be a protocol bug worth seeing.
+fn truncate_sync_response(peer: PeerId, mut resp: SyncResponse) -> SyncResponse {
+    if resp.payloads.len() > SYNC_MAX_RESPONSE_ENTRIES {
+        warn!(
+            %peer,
+            received = resp.payloads.len(),
+            cap = SYNC_MAX_RESPONSE_ENTRIES,
+            "L-10: truncating oversized sync response (plaintext payloads)"
+        );
+        resp.payloads.truncate(SYNC_MAX_RESPONSE_ENTRIES);
+        // A truncated response is by definition not the whole diff;
+        // clearing `complete` keeps anti-entropy pulling and stops the
+        // probe path treating a missing JTI as definitively absent.
+        resp.complete = false;
+    }
+    if resp.enc_payloads.len() > SYNC_MAX_RESPONSE_ENTRIES {
+        warn!(
+            %peer,
+            received = resp.enc_payloads.len(),
+            cap = SYNC_MAX_RESPONSE_ENTRIES,
+            "L-10: truncating oversized sync response (encrypted payloads)"
+        );
+        resp.enc_payloads.truncate(SYNC_MAX_RESPONSE_ENTRIES);
+        resp.complete = false;
+    }
+    resp
+}
+
 fn probe_result_from_response(
     peer_id: &str,
     targets: &[String],
@@ -5688,6 +6329,96 @@ fn decide(
 /// [`DdsNode::retry_unadmitted_peers`] (`retain(|_, until| now < *until)`).
 fn denylist_active(now: Instant, until: Instant) -> bool {
     now < until
+}
+
+#[cfg(test)]
+mod prod_review_2026_07_24_tests {
+    //! Unit coverage for the 2026-07-24 pre-production review fixes that
+    //! live in free functions rather than on `DdsNode`.
+
+    use super::*;
+
+    fn payload(n: usize) -> Vec<SyncPayload> {
+        (0..n)
+            .map(|i| SyncPayload {
+                op_bytes: vec![i as u8],
+                token_bytes: vec![i as u8],
+            })
+            .collect()
+    }
+
+    /// **L-10** — an oversized plaintext payload list is clamped to the
+    /// same ceiling the serving side enforces on its own responses.
+    ///
+    /// Every entry costs a CBOR decode, a signature verify and a trust
+    /// graph insert, so an admitted peer answering one cheap
+    /// `SyncRequest` with an unbounded list was CPU amplification.
+    #[test]
+    fn l10_truncates_oversized_plaintext_payloads() {
+        let peer = PeerId::random();
+        let resp = SyncResponse {
+            payloads: payload(SYNC_MAX_RESPONSE_ENTRIES + 500),
+            complete: true,
+            enc_payloads: Vec::new(),
+        };
+        let clamped = truncate_sync_response(peer, resp);
+        assert_eq!(clamped.payloads.len(), SYNC_MAX_RESPONSE_ENTRIES);
+        assert!(
+            !clamped.complete,
+            "L-10: a truncated response is not the whole diff — `complete` must be cleared so \
+             anti-entropy keeps pulling and the probe cannot report a definitive absence"
+        );
+    }
+
+    /// **L-10** — the same ceiling applies to the `enc-v3` list, which
+    /// additionally costs an AEAD open per entry.
+    #[test]
+    fn l10_truncates_oversized_encrypted_payloads() {
+        let peer = PeerId::random();
+        let resp = SyncResponse {
+            payloads: Vec::new(),
+            complete: true,
+            enc_payloads: (0..SYNC_MAX_RESPONSE_ENTRIES + 10)
+                .map(|i| vec![i as u8])
+                .collect(),
+        };
+        let clamped = truncate_sync_response(peer, resp);
+        assert_eq!(clamped.enc_payloads.len(), SYNC_MAX_RESPONSE_ENTRIES);
+        assert!(!clamped.complete);
+    }
+
+    /// **L-10** — a well-behaved peer is untouched, including its
+    /// `complete` flag. Without this the clamp would silently break
+    /// anti-entropy's convergence signal on every normal response.
+    #[test]
+    fn l10_leaves_a_well_behaved_response_untouched() {
+        let peer = PeerId::random();
+        let resp = SyncResponse {
+            payloads: payload(10),
+            complete: true,
+            enc_payloads: Vec::new(),
+        };
+        let clamped = truncate_sync_response(peer, resp);
+        assert_eq!(clamped.payloads.len(), 10);
+        assert!(
+            clamped.complete,
+            "an in-bounds response must keep `complete` — the flag drives convergence"
+        );
+    }
+
+    /// **L-10** — exactly at the cap is in-bounds, not truncated.
+    #[test]
+    fn l10_boundary_at_the_cap_is_not_truncated() {
+        let peer = PeerId::random();
+        let resp = SyncResponse {
+            payloads: payload(SYNC_MAX_RESPONSE_ENTRIES),
+            complete: true,
+            enc_payloads: Vec::new(),
+        };
+        let clamped = truncate_sync_response(peer, resp);
+        assert_eq!(clamped.payloads.len(), SYNC_MAX_RESPONSE_ENTRIES);
+        assert!(clamped.complete);
+    }
 }
 
 #[cfg(test)]
@@ -6576,6 +7307,9 @@ mod admission_cert_revocation_epoch_rotation_tests {
                 metrics_addr: None,
                 allow_v1_certs: true,
                 admission_key_backend: Default::default(),
+                // M-1 / H-1: connection caps, unadmitted-peer deadline, and the
+                // per-peer gossip budget all take their production defaults here.
+                ..Default::default()
             },
             org_hash: "test-org".to_string(),
             domain: DomainConfig {
@@ -6827,6 +7561,9 @@ mod timing_config_validation_tests {
                 metrics_addr: None,
                 allow_v1_certs: true,
                 admission_key_backend: Default::default(),
+                // M-1 / H-1: connection caps, unadmitted-peer deadline, and the
+                // per-peer gossip budget all take their production defaults here.
+                ..Default::default()
             },
             org_hash: "test-org".to_string(),
             domain: DomainConfig {
@@ -6969,6 +7706,9 @@ mod r5_sync_quorum_replay_tests {
                 metrics_addr: None,
                 allow_v1_certs: true,
                 admission_key_backend: Default::default(),
+                // M-1 / H-1: connection caps, unadmitted-peer deadline, and the
+                // per-peer gossip budget all take their production defaults here.
+                ..Default::default()
             },
             org_hash: "test-org".to_string(),
             domain: DomainConfig {
@@ -7493,6 +8233,9 @@ mod publish_seed_roots_tests {
                 metrics_addr: None,
                 allow_v1_certs: true,
                 admission_key_backend: Default::default(),
+                // M-1 / H-1: connection caps, unadmitted-peer deadline, and the
+                // per-peer gossip budget all take their production defaults here.
+                ..Default::default()
             },
             org_hash: "test-org".to_string(),
             domain: DomainConfig {

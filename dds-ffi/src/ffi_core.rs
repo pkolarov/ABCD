@@ -39,7 +39,29 @@ pub const DDS_ERR_INTERNAL: i32 = -99;
 const FFI_MAX_RULES: usize = 10_000;
 const FFI_MAX_TOKENS: usize = 100_000;
 
-fn read_cstr(ptr: *const c_char) -> Result<&'static str, i32> {
+/// Borrow a caller-owned C string as a `&str`.
+///
+/// **L-16 (pre-prod review 2026-07-24)** — the return type used to be
+/// `Result<&'static str, i32>`, which is unsound.
+///
+/// The pointer belongs to the *caller* (a Python / C# / Swift / Kotlin
+/// binding), whose buffer typically lives only for the duration of the
+/// call — a GC'd string that gets collected, or a stack buffer that goes
+/// out of scope the moment the FFI function returns. Claiming `'static`
+/// told the borrow checker that borrow outlives the process, so nothing
+/// stopped a future edit from stashing the `&str` in a global, a thread,
+/// or a returned value and reading freed memory. Today's call sites all
+/// happen to use the borrow within the call, so this is latent
+/// unsoundness rather than a live bug — but it is exactly the kind of
+/// invariant that holds until someone adds one line.
+///
+/// # Safety
+///
+/// `ptr` must be null or a valid NUL-terminated C string that stays
+/// alive and unmodified for at least `'a`. Callers bind `'a` to the
+/// enclosing `extern "C"` function body, which is the real lifetime of
+/// the caller's buffer.
+unsafe fn read_cstr<'a>(ptr: *const c_char) -> Result<&'a str, i32> {
     if ptr.is_null() {
         return Err(DDS_ERR_INVALID_INPUT);
     }
@@ -91,7 +113,7 @@ fn write_str(out: *mut *mut c_char, s: &str) -> i32 {
 /// to a `*mut c_char` location that this function may write to.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dds_identity_create(label: *const c_char, out: *mut *mut c_char) -> i32 {
-    let label = match read_cstr(label) {
+    let label = match unsafe { read_cstr(label) } {
         Ok(s) => s,
         Err(e) => return e,
     };
@@ -117,7 +139,7 @@ pub unsafe extern "C" fn dds_identity_create_hybrid(
     label: *const c_char,
     out: *mut *mut c_char,
 ) -> i32 {
-    let label = match read_cstr(label) {
+    let label = match unsafe { read_cstr(label) } {
         Ok(s) => s,
         Err(e) => return e,
     };
@@ -139,7 +161,7 @@ pub unsafe extern "C" fn dds_identity_create_hybrid(
 /// pointer to a `*mut c_char` location.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dds_identity_parse_urn(urn: *const c_char, out: *mut *mut c_char) -> i32 {
-    let urn_str = match read_cstr(urn) {
+    let urn_str = match unsafe { read_cstr(urn) } {
         Ok(s) => s,
         Err(e) => return e,
     };
@@ -173,7 +195,7 @@ pub unsafe extern "C" fn dds_token_create_attest(
     config_json: *const c_char,
     out: *mut *mut c_char,
 ) -> i32 {
-    let config_str = match read_cstr(config_json) {
+    let config_str = match unsafe { read_cstr(config_json) } {
         Ok(s) => s,
         Err(e) => return e,
     };
@@ -230,7 +252,7 @@ pub unsafe extern "C" fn dds_token_validate(
     token_hex: *const c_char,
     out: *mut *mut c_char,
 ) -> i32 {
-    let hex_str = match read_cstr(token_hex) {
+    let hex_str = match unsafe { read_cstr(token_hex) } {
         Ok(s) => s,
         Err(e) => return e,
     };
@@ -270,7 +292,7 @@ pub unsafe extern "C" fn dds_policy_evaluate(
     config_json: *const c_char,
     out: *mut *mut c_char,
 ) -> i32 {
-    let config_str = match read_cstr(config_json) {
+    let config_str = match unsafe { read_cstr(config_json) } {
         Ok(s) => s,
         Err(e) => return e,
     };

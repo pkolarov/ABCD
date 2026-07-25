@@ -301,6 +301,9 @@ async fn spawn_node(
             metrics_addr: None,
             allow_v1_certs: true,
             admission_key_backend: Default::default(),
+            // M-1 / H-1: connection caps, unadmitted-peer deadline, and the
+            // per-peer gossip budget all take their production defaults here.
+            ..Default::default()
         },
         // Same org_hash on every node — gossipsub topics are derived
         // from (domain_tag, org_hash), so giving each node a different

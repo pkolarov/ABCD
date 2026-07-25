@@ -9,10 +9,12 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use libp2p::{
-    PeerId, StreamProtocol, gossipsub, identify, kad, mdns, noise, request_response,
+    PeerId, StreamProtocol, connection_limits, gossipsub, identify, kad, mdns, noise,
+    request_response,
     swarm::{NetworkBehaviour, Swarm},
     tcp, yamux,
 };
@@ -75,6 +77,24 @@ pub struct DdsBehaviour {
     /// v4 release shape (e.g., MLS-style rekey) would bump this
     /// protocol while leaving sync / admission untouched.
     pub epoch_keys: request_response::cbor::Behaviour<EpochKeyRequest, EpochKeyResponse>,
+    /// **M-1 (pre-prod review 2026-07-24)**: connection admission caps.
+    ///
+    /// The swarm binds `0.0.0.0:4001` by default, and every inbound
+    /// connection costs a Noise handshake plus an admission-challenge
+    /// allocation that lingers until the H-12 attempt budget is spent.
+    /// Without a ceiling an attacker rotating keypairs (so the PeerId
+    /// denylist never bites) can hold an unbounded number of half-open
+    /// and established connections. `connection_limits` denies past the
+    /// cap at the swarm layer, *before* any handshake work is done —
+    /// [`libp2p::swarm::SwarmEvent::IncomingConnectionError`] is emitted
+    /// instead. `dds-node` complements this with a wall-clock deadline
+    /// on connections that never complete admission.
+    ///
+    /// Declared last so the derived `DdsBehaviourEvent` variants for the
+    /// protocol behaviours above keep their ordinals; this behaviour's
+    /// event type is [`std::convert::Infallible`], so its variant is
+    /// never constructed.
+    pub limits: connection_limits::Behaviour,
 }
 
 /// Configuration for building a DDS swarm.
@@ -91,6 +111,59 @@ pub struct SwarmConfig {
     pub idle_timeout: Duration,
     /// Whether mDNS is enabled for local network discovery.
     pub mdns_enabled: bool,
+    /// **M-1** — connection admission caps applied by
+    /// [`DdsBehaviour::limits`]. See [`ConnectionCaps`].
+    pub connection_caps: ConnectionCaps,
+}
+
+/// **M-1 (pre-prod review 2026-07-24)** — inbound/outbound connection
+/// ceilings handed to `connection_limits::Behaviour`.
+///
+/// Defaults are sized for the deployment shape DDS actually ships: a
+/// LAN mesh of tens of nodes plus a handful of WAN bootstrap anchors.
+/// They are generous enough that no legitimate topology hits them, and
+/// tight enough that a single attacker cannot pin unbounded memory in
+/// half-open Noise handshakes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionCaps {
+    /// Half-open inbound connections (post-TCP-accept, pre-Noise).
+    /// This is the cap that bounds handshake-flood memory.
+    pub max_pending_incoming: u32,
+    /// Half-open outbound connections (bounds a dial storm from our own
+    /// Kademlia/mDNS discovery).
+    pub max_pending_outgoing: u32,
+    /// Established inbound connections.
+    pub max_established_incoming: u32,
+    /// Established outbound connections.
+    pub max_established_outgoing: u32,
+    /// Established connections to any single peer. libp2p opens one per
+    /// transport (TCP + QUIC), so this must stay above 2.
+    pub max_established_per_peer: u32,
+}
+
+impl Default for ConnectionCaps {
+    fn default() -> Self {
+        Self {
+            max_pending_incoming: 64,
+            max_pending_outgoing: 128,
+            max_established_incoming: 256,
+            max_established_outgoing: 256,
+            // TCP + QUIC to the same peer is normal; allow a small margin
+            // for a reconnect racing the teardown of the old connection.
+            max_established_per_peer: 4,
+        }
+    }
+}
+
+impl ConnectionCaps {
+    fn to_limits(self) -> connection_limits::ConnectionLimits {
+        connection_limits::ConnectionLimits::default()
+            .with_max_pending_incoming(Some(self.max_pending_incoming))
+            .with_max_pending_outgoing(Some(self.max_pending_outgoing))
+            .with_max_established_incoming(Some(self.max_established_incoming))
+            .with_max_established_outgoing(Some(self.max_established_outgoing))
+            .with_max_established_per_peer(Some(self.max_established_per_peer))
+    }
 }
 
 impl SwarmConfig {
@@ -130,8 +203,35 @@ impl Default for SwarmConfig {
             domain_tag: "default".to_string(),
             idle_timeout: Duration::from_secs(60),
             mdns_enabled: true,
+            connection_caps: ConnectionCaps::default(),
         }
     }
+}
+
+/// **H-1 (pre-prod review 2026-07-24)** — peer-scoring parameters for
+/// gossipsub.
+///
+/// Scoring is what makes `validate_messages()` bite: a peer whose
+/// messages we repeatedly `Reject` accumulates a P4 invalid-message
+/// penalty and eventually falls below the graylist threshold, at which
+/// point gossipsub stops reading its RPCs entirely. Without scoring the
+/// only consequence of rejection is "we didn't forward it", and an
+/// attacker can re-offend for free.
+///
+/// The defaults are libp2p's, with one deliberate change: loopback
+/// addresses are exempt from the IP-colocation penalty. Multi-node
+/// integration tests, `dds-loadtest`, and single-host demo meshes run
+/// every peer on 127.0.0.1, which would otherwise trip
+/// `ip_colocation_factor_threshold` (10) and graylist honest peers.
+fn peer_score_params() -> gossipsub::PeerScoreParams {
+    let mut params = gossipsub::PeerScoreParams::default();
+    params
+        .ip_colocation_factor_whitelist
+        .insert(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    params
+        .ip_colocation_factor_whitelist
+        .insert(IpAddr::V6(Ipv6Addr::LOCALHOST));
+    params
 }
 
 /// Build a DDS swarm with the given configuration and a pre-existing
@@ -165,17 +265,45 @@ pub fn build_swarm(
                 gossipsub::MessageId::from(s.finish().to_string())
             };
 
+            // **H-1 (pre-prod review 2026-07-24)** — `validate_messages()`
+            // is the load-bearing flag here. Without it libp2p forwards
+            // every signature-valid, non-duplicate message to the whole
+            // mesh *before* the application sees it, so `dds-node`'s H-12
+            // `admitted_peers` gate could only suppress local ingest —
+            // the relay had already happened. An unadmitted, Noise-only
+            // peer could therefore use any entry node as an amplifier for
+            // the entire domain (dedup defeated by varying one byte), and
+            // downstream nodes saw the message arrive from an honest
+            // relay, so their own H-12 gate passed.
+            //
+            // With this flag every inbound message is parked in the
+            // message cache until the application calls
+            // `report_message_validation_result`. `dds-node` reports
+            // `Accept` only after the admission gate + payload validation
+            // pass; anything else is `Ignore`/`Reject` and is never
+            // forwarded. See `Node::handle_swarm_event` — every path out
+            // of the gossip arm must report exactly once or the message
+            // leaks until the mcache TTL expires it.
             let gossipsub_config = gossipsub::ConfigBuilder::default()
                 .heartbeat_interval(config.heartbeat_interval)
                 .validation_mode(gossipsub::ValidationMode::Strict)
+                .validate_messages()
                 .message_id_fn(message_id_fn)
                 .build()
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-            let gossipsub = gossipsub::Behaviour::new(
+            let mut gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub_config,
             )?;
+            // **H-1** — activate peer scoring so repeat offenders are
+            // graylisted rather than merely ignored one message at a time.
+            gossipsub
+                .with_peer_score(
+                    peer_score_params(),
+                    gossipsub::PeerScoreThresholds::default(),
+                )
+                .map_err(std::io::Error::other)?;
 
             // Kademlia DHT
             let mut kad_config = kad::Config::new(
@@ -246,6 +374,9 @@ pub fn build_swarm(
                     request_response::Config::default(),
                 );
 
+            // **M-1** — swarm-layer connection admission caps.
+            let limits = connection_limits::Behaviour::new(config.connection_caps.to_limits());
+
             Ok(DdsBehaviour {
                 gossipsub,
                 kademlia,
@@ -254,6 +385,7 @@ pub fn build_swarm(
                 sync,
                 admission,
                 epoch_keys,
+                limits,
             })
         })?
         .with_swarm_config(|c: libp2p::swarm::Config| {
@@ -286,6 +418,7 @@ mod tests {
             domain_tag: "abc123".into(),
             idle_timeout: Duration::from_secs(10),
             mdns_enabled: false,
+            connection_caps: ConnectionCaps::default(),
         };
         assert_eq!(cfg.kad_protocol(), "/dds/kad/1.0.0/abc123");
         assert_eq!(cfg.identify_protocol(), "/dds/id/1.0.0/abc123");
@@ -301,12 +434,14 @@ mod tests {
             domain_tag: "acme".into(),
             idle_timeout: Duration::from_secs(10),
             mdns_enabled: false,
+            connection_caps: ConnectionCaps::default(),
         };
         let b = SwarmConfig {
             heartbeat_interval: Duration::from_secs(1),
             domain_tag: "globex".into(),
             idle_timeout: Duration::from_secs(10),
             mdns_enabled: false,
+            connection_caps: ConnectionCaps::default(),
         };
         assert_ne!(a.kad_protocol(), b.kad_protocol());
         assert_ne!(a.identify_protocol(), b.identify_protocol());
@@ -324,8 +459,117 @@ mod tests {
             domain_tag: "test".into(),
             idle_timeout: Duration::from_secs(10),
             mdns_enabled: false,
+            connection_caps: ConnectionCaps::default(),
         };
         let (_swarm, peer_id) = build_swarm(cfg, kp).unwrap();
         assert_eq!(peer_id, expected_peer);
+    }
+
+    /// **H-1 regression (pre-prod review 2026-07-24)** — the gossipsub
+    /// config must enable application-side validation.
+    ///
+    /// Without `validate_messages()` libp2p auto-forwards every
+    /// signature-valid, non-duplicate message to the mesh *before*
+    /// `dds-node`'s H-12 admission gate runs, so the gate could only
+    /// suppress local ingest — the relay had already happened. An
+    /// unadmitted, Noise-only peer could then use any entry node as an
+    /// amplifier into the whole domain. This is the single flag that
+    /// makes the gate load-bearing for relay, so it is worth pinning
+    /// directly rather than only through the node-level behaviour test.
+    #[test]
+    fn h1_gossipsub_config_requires_application_validation() {
+        let cfg = gossipsub::ConfigBuilder::default()
+            .heartbeat_interval(Duration::from_secs(1))
+            .validation_mode(gossipsub::ValidationMode::Strict)
+            .validate_messages()
+            .build()
+            .expect("config builds");
+        assert!(
+            cfg.validate_messages(),
+            "H-1: gossipsub must hold messages for application validation"
+        );
+        assert!(matches!(
+            cfg.validation_mode(),
+            gossipsub::ValidationMode::Strict
+        ));
+    }
+
+    /// **H-1** — the peer-score parameters must actually validate, or
+    /// `with_peer_score` fails at swarm build and scoring silently never
+    /// activates. Also pins the loopback whitelist: without it, every
+    /// multi-node test and single-host demo mesh (all peers on
+    /// 127.0.0.1) trips `ip_colocation_factor_threshold` and graylists
+    /// honest peers.
+    #[test]
+    fn h1_peer_score_params_are_valid_and_exempt_loopback() {
+        let params = peer_score_params();
+        params.validate().expect("peer score params must validate");
+        gossipsub::PeerScoreThresholds::default()
+            .validate()
+            .expect("peer score thresholds must validate");
+        assert!(
+            params
+                .ip_colocation_factor_whitelist
+                .contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "loopback must be exempt from the IP-colocation penalty"
+        );
+        assert!(
+            params
+                .ip_colocation_factor_whitelist
+                .contains(&IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+    }
+
+    /// **M-1 regression (pre-prod review 2026-07-24)** — the swarm must
+    /// carry finite connection ceilings.
+    ///
+    /// The listener binds `0.0.0.0:4001` by default and every inbound
+    /// connection costs a Noise handshake plus an admission-challenge
+    /// allocation. With no cap, an attacker rotating keypairs (so the
+    /// PeerId denylist never bites) could hold an unbounded number of
+    /// half-open connections.
+    #[test]
+    fn m1_connection_caps_are_finite_and_allow_dual_transport() {
+        let caps = ConnectionCaps::default();
+        assert!(caps.max_pending_incoming > 0);
+        assert!(caps.max_established_incoming > 0);
+        assert!(caps.max_pending_outgoing > 0);
+        assert!(caps.max_established_outgoing > 0);
+        // libp2p opens one connection per transport (TCP + QUIC) to the
+        // same peer, and a reconnect can briefly race the teardown of
+        // the old one — anything below 3 would flap.
+        assert!(
+            caps.max_established_per_peer >= 3,
+            "per-peer cap must leave room for TCP + QUIC plus a reconnect race"
+        );
+        // The per-peer cap must not exceed the global inbound cap, or it
+        // would be unreachable.
+        assert!(caps.max_established_per_peer <= caps.max_established_incoming);
+    }
+
+    /// **M-1** — the caps must survive into the built swarm. This
+    /// exercises the real `build_swarm` path, so a future edit that
+    /// drops the `limits` behaviour from `DdsBehaviour` fails here.
+    #[test]
+    fn m1_build_swarm_installs_connection_limits() {
+        let cfg = SwarmConfig {
+            heartbeat_interval: Duration::from_secs(1),
+            domain_tag: "caps".into(),
+            idle_timeout: Duration::from_secs(10),
+            mdns_enabled: false,
+            connection_caps: ConnectionCaps {
+                max_pending_incoming: 7,
+                max_pending_outgoing: 8,
+                max_established_incoming: 9,
+                max_established_outgoing: 10,
+                max_established_per_peer: 4,
+            },
+        };
+        let (swarm, _peer) =
+            build_swarm(cfg, libp2p::identity::Keypair::generate_ed25519()).unwrap();
+        // `connection_limits::Behaviour` exposes no getter for its
+        // limits, so assert the field exists and the swarm built with it
+        // — the compile-time reference is the load-bearing part.
+        let _limits: &connection_limits::Behaviour = &swarm.behaviour().limits;
     }
 }

@@ -289,6 +289,87 @@ pub struct NetworkConfig {
     /// See `docs/hardware-bound-admission-plan.md §7`.
     #[serde(default)]
     pub admission_key_backend: AdmissionKeyBackend,
+
+    /// **M-1 (pre-prod review 2026-07-24)** — swarm connection admission
+    /// caps. The listener binds `0.0.0.0:4001` by default and every
+    /// inbound connection costs a Noise handshake plus an
+    /// admission-challenge allocation, so an unbounded swarm is a cheap
+    /// resource-exhaustion target. Defaults are sized well above any
+    /// legitimate LAN-mesh or bootstrap-anchor topology; operators on
+    /// very large fleets can raise them.
+    #[serde(default)]
+    pub connection_limits: ConnectionLimitsConfig,
+
+    /// **M-1 (pre-prod review 2026-07-24)** — wall-clock budget, in
+    /// seconds, for a connected peer to complete the H-12 admission
+    /// handshake. Peers still unadmitted after this are disconnected and
+    /// placed on the admission denylist. Without it, an unadmitted peer
+    /// held a live connection for `MAX_ADMISSION_ATTEMPTS` (5) rounds of
+    /// the 60 s anti-entropy tick — roughly five minutes per keypair,
+    /// and the attacker rotates keypairs so the PeerId denylist never
+    /// bites. Set to `0` to disable the deadline (not recommended).
+    #[serde(default = "default_unadmitted_timeout_secs")]
+    pub unadmitted_peer_timeout_secs: u64,
+
+    /// **H-1 (pre-prod review 2026-07-24)** — per-peer inbound gossip
+    /// message budget per [`Self::gossip_rate_window_secs`]. Messages
+    /// past the budget are neither ingested nor relayed; an *unadmitted*
+    /// peer that blows the budget is disconnected and denylisted
+    /// outright. Set to `0` to disable the cap (not recommended).
+    #[serde(default = "default_gossip_rate_max")]
+    pub gossip_inbound_max_per_window: u32,
+
+    /// **H-1** — window length, in seconds, for
+    /// [`Self::gossip_inbound_max_per_window`].
+    #[serde(default = "default_gossip_rate_window_secs")]
+    pub gossip_rate_window_secs: u64,
+}
+
+/// **M-1 (pre-prod review 2026-07-24)** — TOML surface for
+/// [`dds_net::transport::ConnectionCaps`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionLimitsConfig {
+    /// Half-open inbound connections (post-accept, pre-Noise).
+    #[serde(default = "default_max_pending_incoming")]
+    pub max_pending_incoming: u32,
+    /// Half-open outbound connections.
+    #[serde(default = "default_max_pending_outgoing")]
+    pub max_pending_outgoing: u32,
+    /// Established inbound connections.
+    #[serde(default = "default_max_established_incoming")]
+    pub max_established_incoming: u32,
+    /// Established outbound connections.
+    #[serde(default = "default_max_established_outgoing")]
+    pub max_established_outgoing: u32,
+    /// Established connections to any one peer. libp2p opens one per
+    /// transport (TCP + QUIC), so values below 3 will flap.
+    #[serde(default = "default_max_established_per_peer")]
+    pub max_established_per_peer: u32,
+}
+
+impl Default for ConnectionLimitsConfig {
+    fn default() -> Self {
+        let caps = dds_net::transport::ConnectionCaps::default();
+        Self {
+            max_pending_incoming: caps.max_pending_incoming,
+            max_pending_outgoing: caps.max_pending_outgoing,
+            max_established_incoming: caps.max_established_incoming,
+            max_established_outgoing: caps.max_established_outgoing,
+            max_established_per_peer: caps.max_established_per_peer,
+        }
+    }
+}
+
+impl From<ConnectionLimitsConfig> for dds_net::transport::ConnectionCaps {
+    fn from(c: ConnectionLimitsConfig) -> Self {
+        Self {
+            max_pending_incoming: c.max_pending_incoming,
+            max_pending_outgoing: c.max_pending_outgoing,
+            max_established_incoming: c.max_established_incoming,
+            max_established_outgoing: c.max_established_outgoing,
+            max_established_per_peer: c.max_established_per_peer,
+        }
+    }
 }
 
 impl Default for NetworkConfig {
@@ -305,6 +386,10 @@ impl Default for NetworkConfig {
             metrics_addr: None,
             allow_v1_certs: true,
             admission_key_backend: AdmissionKeyBackend::Software,
+            connection_limits: ConnectionLimitsConfig::default(),
+            unadmitted_peer_timeout_secs: default_unadmitted_timeout_secs(),
+            gossip_inbound_max_per_window: default_gossip_rate_max(),
+            gossip_rate_window_secs: default_gossip_rate_window_secs(),
         }
     }
 }
@@ -320,18 +405,35 @@ impl Default for NetworkConfig {
 /// admits only callers whose `uid` is in `unix_admin_uids` (or `0`)
 /// or whose `sid` is in `windows_admin_sids`.
 ///
-/// `trust_loopback_tcp_admin` is the migration escape hatch. While
-/// it's `true` (current default), callers whose identity is
-/// `Anonymous` — i.e. loopback TCP — are still admitted to admin
-/// endpoints so existing deployments keep working. G1-S5 flips this
-/// to `false`; G1-S6 removes the TCP listener entirely.
+/// `trust_loopback_tcp_admin` was the migration escape hatch. While it
+/// is `true`, callers whose identity is `Anonymous` — i.e. loopback TCP
+/// — are admitted to admin endpoints. **L-12 (pre-prod review
+/// 2026-07-24) completes G1-S5 and flips the default to `false`.**
+/// G1-S6 removes the TCP listener entirely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiAuthConfig {
     /// When `true`, callers whose `CallerIdentity` is `Anonymous`
     /// (loopback TCP with no peer creds) are admitted to admin
-    /// endpoints. Default `true` for backward compatibility during
-    /// the transport migration.
-    #[serde(default = "default_true")]
+    /// endpoints.
+    ///
+    /// **L-12 (pre-prod review 2026-07-24)** — now defaults to `false`.
+    ///
+    /// The binary's own defaults were `api_addr = 127.0.0.1:5551` plus
+    /// this flag `true`, which means an out-of-the-box `dds-node` served
+    /// its full admin API to any local process with no authentication at
+    /// all — and, absent `Host` validation, to any web page the user
+    /// visited that could resolve a hostname to 127.0.0.1 (DNS
+    /// rebinding; the browser's SOP does not stop the request being
+    /// *sent*). Shipped packaging already provisions a UDS (Unix) or
+    /// named pipe (Windows), which browsers cannot reach and which carry
+    /// real peer credentials — so this default only ever protected the
+    /// raw-binary path, and now it fails closed there too.
+    ///
+    /// **Compatibility:** a deployment that genuinely relies on
+    /// unauthenticated loopback-TCP admin must now set this to `true`
+    /// explicitly in `[network.api_auth]`. Prefer moving to
+    /// `api_addr = "unix:/…"` or `"pipe:…"` instead.
+    #[serde(default = "default_false")]
     pub trust_loopback_tcp_admin: bool,
 
     /// Additional UIDs permitted on admin endpoints over UDS. `0`
@@ -388,10 +490,17 @@ pub struct ApiAuthConfig {
     pub strict_device_binding: bool,
 }
 
+// L-12: every field now happens to be its type's `Default`, so clippy
+// suggests deriving. Kept explicit on purpose — `trust_loopback_tcp_admin`
+// is a security-relevant default that was recently flipped, and spelling
+// it out here means a future edit to it is a visible diff rather than an
+// invisible consequence of a derive.
+#[allow(clippy::derivable_impls)]
 impl Default for ApiAuthConfig {
     fn default() -> Self {
         Self {
-            trust_loopback_tcp_admin: true,
+            // L-12: fail closed. See the field docs above.
+            trust_loopback_tcp_admin: false,
             unix_admin_uids: Vec::new(),
             windows_admin_sids: Vec::new(),
             node_hmac_secret_path: None,
@@ -445,6 +554,49 @@ fn default_heartbeat() -> u64 {
 
 fn default_idle_timeout() -> u64 {
     60
+}
+
+/// **M-1** — see [`NetworkConfig::unadmitted_peer_timeout_secs`]. 45 s is
+/// comfortably above a worst-case admission round-trip (two CBOR
+/// request/responses over an already-established Noise channel) while
+/// keeping an attacker's per-keypair connection hold-time an order of
+/// magnitude below the previous ~5 minutes.
+fn default_unadmitted_timeout_secs() -> u64 {
+    45
+}
+
+/// **H-1** — see [`NetworkConfig::gossip_inbound_max_per_window`]. 1200
+/// messages per 60 s window is 20/s sustained from a *single* peer,
+/// which is far above steady-state directory churn and above the burst
+/// a legitimate peer produces when it catches up after a rejoin
+/// (catch-up rides anti-entropy sync, not gossip).
+fn default_gossip_rate_max() -> u32 {
+    1200
+}
+
+/// **H-1** — see [`NetworkConfig::gossip_rate_window_secs`].
+fn default_gossip_rate_window_secs() -> u64 {
+    60
+}
+
+fn default_max_pending_incoming() -> u32 {
+    dds_net::transport::ConnectionCaps::default().max_pending_incoming
+}
+
+fn default_max_pending_outgoing() -> u32 {
+    dds_net::transport::ConnectionCaps::default().max_pending_outgoing
+}
+
+fn default_max_established_incoming() -> u32 {
+    dds_net::transport::ConnectionCaps::default().max_established_incoming
+}
+
+fn default_max_established_outgoing() -> u32 {
+    dds_net::transport::ConnectionCaps::default().max_established_outgoing
+}
+
+fn default_max_established_per_peer() -> u32 {
+    dds_net::transport::ConnectionCaps::default().max_established_per_peer
 }
 
 impl NodeConfig {
@@ -677,16 +829,45 @@ pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
         assert_eq!(config.domain.audit_log_retention_days, 0);
     }
 
-    /// H-7: the default `ApiAuthConfig` preserves existing TCP
-    /// deployments (trust loopback) while the transport migration
-    /// is in flight.
+    /// **L-12 (pre-prod review 2026-07-24)** — the default
+    /// `ApiAuthConfig` now fails closed.
+    ///
+    /// This completes G1-S5. The binary's own defaults used to be
+    /// `api_addr = 127.0.0.1:5551` *plus* `trust_loopback_tcp_admin =
+    /// true`, so an out-of-the-box `dds-node` served its full admin API
+    /// to any local process with no authentication — and, absent Host
+    /// validation, to any web page that could rebind a name to
+    /// 127.0.0.1. Shipped packaging provisions UDS / named pipe (which
+    /// browsers cannot reach and which carry peer credentials), so this
+    /// default only ever mattered for the raw-binary path.
+    ///
+    /// A deployment that genuinely needs unauthenticated loopback-TCP
+    /// admin must now say so explicitly — as `run_provision` does on
+    /// Windows.
     #[test]
-    fn test_api_auth_defaults() {
+    fn test_api_auth_defaults_fail_closed() {
         let toml = format!(r#"org_hash = "abc123"{DOMAIN_TOML}"#);
         let config = NodeConfig::from_str(&toml).unwrap();
-        assert!(config.network.api_auth.trust_loopback_tcp_admin);
+        assert!(
+            !config.network.api_auth.trust_loopback_tcp_admin,
+            "L-12: an omitted [network.api_auth] must NOT grant admin to anonymous TCP callers"
+        );
         assert!(config.network.api_auth.unix_admin_uids.is_empty());
         assert!(config.network.api_auth.windows_admin_sids.is_empty());
+    }
+
+    /// **L-12** — the flag still round-trips when set explicitly, so
+    /// operators (and `run_provision`) can opt back in.
+    #[test]
+    fn test_api_auth_trust_loopback_opt_in_round_trips() {
+        let toml = format!(
+            r#"org_hash = "abc123"{DOMAIN_TOML}
+[network.api_auth]
+trust_loopback_tcp_admin = true
+"#
+        );
+        let config = NodeConfig::from_str(&toml).unwrap();
+        assert!(config.network.api_auth.trust_loopback_tcp_admin);
     }
 
     /// **M-1 / M-2 downgrade guard (security review)** — legacy v1

@@ -492,8 +492,14 @@ public class WorkerTests
         Assert.NotNull(registryOps.Peek("LocalMachine", @"SOFTWARE\Policies\DDS", "Setting"));
 
         // The managed set must still contain the entry.
+        //
+        // **L-15**: the seeded store above uses the *legacy* unprefixed
+        // encoding, so this case doubles as the upgrade-safety
+        // regression — the reconciler must recognise the legacy entry as
+        // matching the newly-prefixed desired entry and leave the value
+        // alone, then rewrite the set in the new `V:` form.
         Assert.True(store.RecordCalls.ContainsKey("registry"));
-        Assert.Contains(@"LocalMachine\SOFTWARE\Policies\DDS\Setting",
+        Assert.Contains(@"V:LocalMachine\SOFTWARE\Policies\DDS\Setting",
             store.RecordCalls["registry"], StringComparer.OrdinalIgnoreCase);
     }
 

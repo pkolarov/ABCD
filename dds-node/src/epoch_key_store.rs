@@ -55,11 +55,23 @@
 //! receiver's connection to us drops on restart, gossipsub flushes,
 //! and the next message it sees is keyed to our *new* epoch).
 //!
-//! Plaintext on disk today (same posture as the Phase A
-//! `domain_store` / `peer_cert_store`); the eventual encrypted-at-rest
-//! tier rides the Z-4 plan. Atomic write via
-//! `tempfile::NamedTempFile::new_in(parent)` + `tmp.persist(path)`
-//! with `0o600` on Unix — mirrors the L-3 follow-on posture used by
+//! **M-3 (pre-prod review 2026-07-24)** — the record above is the
+//! *inner* payload. When `DDS_NODE_PASSPHRASE` is set it is wrapped in
+//! a `v=2` envelope:
+//!
+//! ```text
+//! {
+//!   v:      2,
+//!   salt:   16 B,   // Argon2id salt
+//!   nonce:  12 B,   // ChaCha20-Poly1305 nonce
+//!   m_cost: u32, t_cost: u32, p_cost: u32,
+//!   blob:   ciphertext over the CBOR-encoded v=1 record
+//! }
+//! ```
+//!
+//! Atomic write via `tempfile::NamedTempFile::new_in(parent)` +
+//! `tmp.persist(path)` with `0o600` on Unix and an owner-only DACL on
+//! Windows — mirrors the L-3 follow-on posture used by
 //! `admission_revocation_store::save` and `peer_cert_store::save`.
 //!
 //! ## Threat-model footnote
@@ -67,10 +79,22 @@
 //! The KEM secret key is the load-bearing secret here: an attacker
 //! with read access to `epoch_keys.cbor` can decap every
 //! `EpochKeyRelease` ever sent to this node and recover every peer's
-//! epoch key for the recorded epochs. The `0o600` posture +
-//! `<data_dir>` umask defended by the L-3 tightening defends the
-//! file at rest under OS ACLs only; the Z-4 encryption tier is what
-//! makes this file rotate-safe under disk-image exfiltration.
+//! epoch key for the recorded epochs.
+//!
+//! Until M-3 this file was the *only* node secret store written in the
+//! clear: `identity_store` and `domain_store` both honour
+//! `DDS_NODE_PASSPHRASE` / `DDS_DOMAIN_PASSPHRASE` and
+//! `DDS_REQUIRE_ENCRYPTED_KEYS`, while this one serialized `kem_x_sk`,
+//! `kem_mlkem_seed`, `my_epoch_key` and every cached peer epoch key as
+//! raw CBOR byte strings. The owner-only DACL blocks a live co-tenant
+//! read, so the residual exposure was an offline one — a stolen disk
+//! image, a backup, or a VSS snapshot, where every *other* key file was
+//! encrypted and this one was not. It now rides the same Argon2id +
+//! ChaCha20-Poly1305 envelope, and honours `DDS_REQUIRE_ENCRYPTED_KEYS`
+//! by failing closed rather than silently writing plaintext.
+//!
+//! Legacy plaintext (`v=1`) files still load, and the next `save()`
+//! with a passphrase set transparently rewrites them as `v=2`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -84,12 +108,16 @@ use dds_core::crypto::kem::{
 };
 use dds_net::pq_envelope::{EPOCH_KEY_GRACE_SECS, EPOCH_RELEASE_REPLAY_WINDOW_SECS};
 use rand_core::CryptoRngCore;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 #[derive(Debug)]
 pub enum EpochKeyStoreError {
     Io(String),
     Cbor(String),
     Format(String),
+    /// **M-3** — passphrase / AEAD failure, or a refusal to write
+    /// plaintext under `DDS_REQUIRE_ENCRYPTED_KEYS`.
+    Crypto(String),
 }
 
 impl std::fmt::Display for EpochKeyStoreError {
@@ -98,13 +126,19 @@ impl std::fmt::Display for EpochKeyStoreError {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Cbor(e) => write!(f, "cbor: {e}"),
             Self::Format(e) => write!(f, "format: {e}"),
+            Self::Crypto(e) => write!(f, "crypto: {e}"),
         }
     }
 }
 
 impl std::error::Error for EpochKeyStoreError {}
 
+/// Plaintext record (legacy; still readable).
 const VERSION_V1: i64 = 1;
+
+/// **M-3** — passphrase-encrypted envelope wrapping a `VERSION_V1`
+/// record. Written whenever `DDS_NODE_PASSPHRASE` is non-empty.
+const VERSION_V2_ENCRYPTED: i64 = 2;
 
 /// Cached release for a single publisher: the last-known current
 /// `(epoch_id, key)` plus the publisher-asserted `expires_at`. The
@@ -159,6 +193,40 @@ pub struct EpochKeyStore {
     /// `prune_grace(now)` past [`EPOCH_KEY_GRACE_SECS`].
     peer_grace: BTreeMap<(String, u64), ([u8; EPOCH_KEY_LEN], Instant)>,
 }
+
+/// **L-14 (pre-prod review 2026-07-24)** — wipe every secret this store
+/// holds when it goes out of scope.
+///
+/// Cloning the store (it is `Clone`, and the node clones it into the
+/// epoch-key fan-out path) previously left copies of the hybrid-KEM
+/// secret, the local epoch key, and every cached peer epoch key sitting
+/// in freed heap. `HybridKemSecretKey` and the `[u8; 32]` epoch keys are
+/// plain byte arrays with no drop glue of their own, so this has to be
+/// explicit.
+///
+/// `ZeroizeOnDrop` is derived from this manual `Drop` rather than the
+/// derive macro because `BTreeMap` keys (`String`, `(String, u64)`) and
+/// `Instant` are not `Zeroize`; only the key material is wiped, which is
+/// the material that matters — the publisher URNs and timestamps are not
+/// secret.
+impl Drop for EpochKeyStore {
+    fn drop(&mut self) {
+        self.kem_secret.x_sk.zeroize();
+        self.kem_secret.mlkem_seed.zeroize();
+        self.my_epoch.1.zeroize();
+        if let Some((_, ref mut key, _)) = self.previous_my_epoch {
+            key.zeroize();
+        }
+        for entry in self.peer_releases.values_mut() {
+            entry.key.zeroize();
+        }
+        for (key, _) in self.peer_grace.values_mut() {
+            key.zeroize();
+        }
+    }
+}
+
+impl ZeroizeOnDrop for EpochKeyStore {}
 
 impl EpochKeyStore {
     /// Construct a fresh store: generate a new hybrid KEM keypair and
@@ -385,6 +453,222 @@ pub fn is_release_within_replay_window(issued_at: u64, now_unix: u64) -> bool {
     now_unix - issued_at <= EPOCH_RELEASE_REPLAY_WINDOW_SECS
 }
 
+/// **M-3 (pre-prod review 2026-07-24)** — path of the sticky
+/// "this store was once encrypted" marker.
+///
+/// Same shape and rationale as `identity_store`'s M-14 marker: once a
+/// `v=2` blob has been written, an attacker with filesystem write who
+/// clears `DDS_NODE_PASSPHRASE` must not be able to make the next save
+/// silently roll the hybrid-KEM secret back to plaintext. A side file
+/// rather than a field inside the record, because the invariant has to
+/// be checkable *without* first parsing (and therefore trusting) a file
+/// an attacker may have swapped in.
+fn encrypted_marker_path(key_path: &Path) -> std::path::PathBuf {
+    let mut p = key_path.as_os_str().to_os_string();
+    p.push(".encrypted-marker");
+    std::path::PathBuf::from(p)
+}
+
+/// **M-3** — wrap `inner` (the CBOR `v=1` record) in the `v=2`
+/// passphrase envelope when `DDS_NODE_PASSPHRASE` is set; otherwise
+/// return it unchanged.
+///
+/// Fails closed — rather than writing plaintext — when
+/// `DDS_REQUIRE_ENCRYPTED_KEYS` is on but no passphrase is available, or
+/// when a previous save already produced an encrypted blob (the sticky
+/// marker) and no explicit downgrade override is set. This is the gate
+/// the store previously lacked entirely.
+fn seal_payload(path: &Path, inner: &[u8]) -> Result<(Vec<u8>, bool), EpochKeyStoreError> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+    use rand::RngCore;
+    use rand::rngs::OsRng;
+
+    let passphrase = std::env::var(crate::identity_store::PASSPHRASE_ENV).map(Zeroizing::new);
+    let will_be_plaintext = !matches!(&passphrase, Ok(p) if !p.is_empty());
+
+    if will_be_plaintext && crate::identity_store::require_encrypted_keys() {
+        return Err(EpochKeyStoreError::Crypto(format!(
+            "refusing to write plaintext epoch-key store at {} — {} is set but {} is empty. \
+             This file holds the hybrid-KEM secret that decapsulates every EpochKeyRelease \
+             sent to this node.",
+            path.display(),
+            crate::identity_store::REQUIRE_ENCRYPTED_KEYS_ENV,
+            crate::identity_store::PASSPHRASE_ENV,
+        )));
+    }
+
+    if will_be_plaintext && encrypted_marker_path(path).exists() {
+        let allow_downgrade = std::env::var(crate::identity_store::ALLOW_PLAINTEXT_DOWNGRADE_ENV)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !allow_downgrade {
+            return Err(EpochKeyStoreError::Crypto(format!(
+                "refusing to overwrite encrypted epoch-key store at {} with plaintext \
+                 ({} is empty but an encrypted-marker is present). If this is intentional, \
+                 set {}=1 to override.",
+                path.display(),
+                crate::identity_store::PASSPHRASE_ENV,
+                crate::identity_store::ALLOW_PLAINTEXT_DOWNGRADE_ENV,
+            )));
+        }
+        tracing::warn!(
+            "plaintext downgrade of encrypted epoch-key store at {} permitted by {}",
+            path.display(),
+            crate::identity_store::ALLOW_PLAINTEXT_DOWNGRADE_ENV,
+        );
+    }
+
+    let Ok(pass) = passphrase else {
+        tracing::info!(
+            "epoch-key store written unencrypted at {} ({} unset). Set a passphrase — and \
+             {} — to encrypt the hybrid-KEM secret at rest.",
+            path.display(),
+            crate::identity_store::PASSPHRASE_ENV,
+            crate::identity_store::REQUIRE_ENCRYPTED_KEYS_ENV,
+        );
+        return Ok((inner.to_vec(), false));
+    };
+    if pass.is_empty() {
+        return Ok((inner.to_vec(), false));
+    }
+
+    let (m_cost_kib, t_cost, p_cost) = crate::identity_store::SHARED_KDF_PARAMS;
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+
+    let mut key = crate::identity_store::derive_argon2id_key(
+        pass.as_bytes(),
+        &salt,
+        m_cost_kib,
+        t_cost,
+        p_cost,
+    )
+    .map_err(EpochKeyStoreError::Crypto)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), inner)
+        .map_err(|e| EpochKeyStoreError::Crypto(format!("encrypt: {e}")))?;
+    key.zeroize();
+
+    let envelope = CborValue::Map(vec![
+        (
+            CborValue::Text("v".into()),
+            CborValue::Integer(VERSION_V2_ENCRYPTED.into()),
+        ),
+        (
+            CborValue::Text("salt".into()),
+            CborValue::Bytes(salt.to_vec()),
+        ),
+        (
+            CborValue::Text("nonce".into()),
+            CborValue::Bytes(nonce_bytes.to_vec()),
+        ),
+        (
+            CborValue::Text("m_cost".into()),
+            CborValue::Integer(m_cost_kib.into()),
+        ),
+        (
+            CborValue::Text("t_cost".into()),
+            CborValue::Integer(t_cost.into()),
+        ),
+        (
+            CborValue::Text("p_cost".into()),
+            CborValue::Integer(p_cost.into()),
+        ),
+        (CborValue::Text("blob".into()), CborValue::Bytes(ct)),
+    ]);
+    let mut out = Vec::new();
+    ciborium::into_writer(&envelope, &mut out)
+        .map_err(|e| EpochKeyStoreError::Cbor(e.to_string()))?;
+    Ok((out, true))
+}
+
+/// **M-3** — unwrap a `v=2` envelope. Returns the inner `v=1` CBOR
+/// record. `v=1` files pass straight through so existing deployments
+/// keep loading; they are rewritten as `v=2` on the next save that has a
+/// passphrase available.
+fn unseal_payload(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, EpochKeyStoreError> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+
+    let value: CborValue =
+        ciborium::from_reader(bytes).map_err(|e| EpochKeyStoreError::Cbor(e.to_string()))?;
+    let map = value
+        .as_map()
+        .ok_or_else(|| EpochKeyStoreError::Format("not a map".into()))?;
+
+    let version = map
+        .iter()
+        .find(|(k, _)| k.as_text() == Some("v"))
+        .and_then(|(_, v)| v.as_integer())
+        .and_then(|i| i64::try_from(i).ok())
+        .ok_or_else(|| EpochKeyStoreError::Format("missing v".into()))?;
+
+    if version != VERSION_V2_ENCRYPTED {
+        // v=1 (or anything else) — hand the original bytes to the
+        // plaintext parser, which validates the version properly.
+        return Ok(Zeroizing::new(bytes.to_vec()));
+    }
+
+    let field_bytes = |name: &str| -> Option<Vec<u8>> {
+        map.iter()
+            .find(|(k, _)| k.as_text() == Some(name))
+            .and_then(|(_, v)| v.as_bytes().cloned())
+    };
+    let field_u32 = |name: &str| -> Option<u32> {
+        map.iter()
+            .find(|(k, _)| k.as_text() == Some(name))
+            .and_then(|(_, v)| v.as_integer())
+            .and_then(|i| i128::from(i).try_into().ok())
+    };
+
+    let salt =
+        field_bytes("salt").ok_or_else(|| EpochKeyStoreError::Format("missing salt".into()))?;
+    let nonce =
+        field_bytes("nonce").ok_or_else(|| EpochKeyStoreError::Format("missing nonce".into()))?;
+    if nonce.len() != 12 {
+        return Err(EpochKeyStoreError::Format(format!(
+            "nonce: expected 12 bytes, got {}",
+            nonce.len()
+        )));
+    }
+    let ct =
+        field_bytes("blob").ok_or_else(|| EpochKeyStoreError::Format("missing blob".into()))?;
+    // KDF parameters ride in the blob so a future bump needs no new
+    // version — same design as `identity_store`'s v=3.
+    let (dm, dt, dp) = crate::identity_store::SHARED_KDF_PARAMS;
+    let m_cost_kib = field_u32("m_cost").unwrap_or(dm);
+    let t_cost = field_u32("t_cost").unwrap_or(dt);
+    let p_cost = field_u32("p_cost").unwrap_or(dp);
+
+    let pass = std::env::var(crate::identity_store::PASSPHRASE_ENV)
+        .map(Zeroizing::new)
+        .map_err(|_| {
+            EpochKeyStoreError::Crypto(format!(
+                "epoch-key store is encrypted but {} is not set",
+                crate::identity_store::PASSPHRASE_ENV
+            ))
+        })?;
+
+    let mut key = crate::identity_store::derive_argon2id_key(
+        pass.as_bytes(),
+        &salt,
+        m_cost_kib,
+        t_cost,
+        p_cost,
+    )
+    .map_err(EpochKeyStoreError::Crypto)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&nonce), ct.as_ref())
+        .map_err(|e| EpochKeyStoreError::Crypto(format!("decrypt: {e}")))?;
+    key.zeroize();
+    Ok(Zeroizing::new(plaintext))
+}
+
 fn save(path: &Path, store: &EpochKeyStore) -> Result<(), EpochKeyStoreError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -429,9 +713,17 @@ fn save(path: &Path, store: &EpochKeyStore) -> Result<(), EpochKeyStoreError> {
         ),
     ]);
 
-    let mut buf = Vec::new();
-    ciborium::into_writer(&payload, &mut buf)
+    // **M-3** — the plaintext record above is the *inner* payload. It is
+    // wrapped below whenever a passphrase is available, and never
+    // touches disk in this form when one is.
+    let mut inner = Vec::new();
+    ciborium::into_writer(&payload, &mut inner)
         .map_err(|e| EpochKeyStoreError::Cbor(e.to_string()))?;
+    let mut inner = Zeroizing::new(inner);
+
+    // `was_encrypted` drives the sticky-marker write below.
+    let (buf, was_encrypted) = seal_payload(path, &inner)?;
+    inner.zeroize();
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     use std::io::Write as _;
@@ -459,6 +751,17 @@ fn save(path: &Path, store: &EpochKeyStore) -> Result<(), EpochKeyStoreError> {
     // on Unix, but mirror identity_store/domain_store which harden the
     // post-rename path too (defensive on platforms where persist resets).
     crate::file_acl::restrict_to_owner(path);
+
+    // **M-3** — drop the sticky marker once an encrypted blob is on
+    // disk, so a later save with the passphrase cleared cannot silently
+    // downgrade this file to plaintext. Only ever created, never removed.
+    if was_encrypted {
+        let marker = encrypted_marker_path(path);
+        if !marker.exists() {
+            let _ = std::fs::write(&marker, []);
+            crate::file_acl::restrict_to_owner(&marker);
+        }
+    }
     Ok(())
 }
 
@@ -467,6 +770,9 @@ fn load(path: &Path) -> Result<EpochKeyStore, EpochKeyStoreError> {
     if bytes.is_empty() {
         return Err(EpochKeyStoreError::Format("empty file".into()));
     }
+    // **M-3** — transparently unwrap the v=2 passphrase envelope; v=1
+    // plaintext records pass through unchanged.
+    let bytes = unseal_payload(&bytes)?;
     let value: CborValue =
         ciborium::from_reader(&bytes[..]).map_err(|e| EpochKeyStoreError::Cbor(e.to_string()))?;
     let map = value
@@ -733,6 +1039,13 @@ mod tests {
 
     #[test]
     fn save_then_load_roundtrip_preserves_kem_and_releases() {
+        // M-3: save/load now consult `DDS_NODE_PASSPHRASE` and
+        // `DDS_REQUIRE_ENCRYPTED_KEYS`, which are process-global. Take
+        // the shared env lock (and start from a clean slate) so a
+        // concurrently-running encryption test can't leak a passphrase
+        // into this plaintext round-trip.
+        let _g = env_guard();
+        clear_env();
         let mut rng = OsRng;
         let dir = tempdir().unwrap();
         let path = dir.path().join("epoch_keys.cbor");
@@ -784,6 +1097,8 @@ mod tests {
 
     #[test]
     fn load_rejects_garbage_bytes() {
+        let _g = env_guard();
+        clear_env();
         let dir = tempdir().unwrap();
         let path = dir.path().join("epoch_keys.cbor");
         std::fs::write(&path, b"not cbor at all").unwrap();
@@ -797,6 +1112,8 @@ mod tests {
 
     #[test]
     fn load_rejects_unknown_version() {
+        let _g = env_guard();
+        clear_env();
         let dir = tempdir().unwrap();
         let path = dir.path().join("epoch_keys.cbor");
         let payload = CborValue::Map(vec![
@@ -832,6 +1149,8 @@ mod tests {
 
     #[test]
     fn load_rejects_wrong_length_kem_secret() {
+        let _g = env_guard();
+        clear_env();
         let dir = tempdir().unwrap();
         let path = dir.path().join("epoch_keys.cbor");
         let payload = CborValue::Map(vec![
@@ -870,6 +1189,8 @@ mod tests {
     #[test]
     fn save_writes_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;
+        let _g = env_guard();
+        clear_env();
         let mut rng = OsRng;
         let dir = tempdir().unwrap();
         let path = dir.path().join("epoch_keys.cbor");
@@ -927,5 +1248,197 @@ mod tests {
             dds_core::crypto::kem::encap(&mut rng, store.kem_public(), binding).unwrap();
         let ss_recv = dds_core::crypto::kem::decap(store.kem_secret(), &ct, binding).unwrap();
         assert_eq!(ss_send, ss_recv);
+    }
+
+    // ---- M-3: encrypted-at-rest -------------------------------------
+
+    use crate::identity_store::{
+        ALLOW_PLAINTEXT_DOWNGRADE_ENV, PASSPHRASE_ENV, REQUIRE_ENCRYPTED_KEYS_ENV,
+    };
+
+    /// Every test below mutates process-wide env vars, so they share the
+    /// crate-wide lock with `identity_store` / `domain_store`.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn clear_env() {
+        unsafe {
+            std::env::remove_var(PASSPHRASE_ENV);
+            std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV);
+            std::env::remove_var(ALLOW_PLAINTEXT_DOWNGRADE_ENV);
+        }
+    }
+
+    /// **M-3** — with a passphrase set, the KEM secret and every epoch
+    /// key must be absent from the on-disk bytes, and the file must
+    /// still round-trip.
+    #[test]
+    fn m3_encrypted_roundtrip_hides_key_material() {
+        let _g = env_guard();
+        clear_env();
+        unsafe { std::env::set_var(PASSPHRASE_ENV, "correct horse battery staple") };
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("epoch_keys.cbor");
+        let mut rng = OsRng;
+        let mut store = EpochKeyStore::new(&mut rng);
+        let peer_key = fresh_key();
+        store.install_peer_release("peer-a", 7, peer_key, u64::MAX);
+
+        let (my_epoch_id, my_key) = {
+            let (i, k) = store.my_current_epoch();
+            (i, *k)
+        };
+        let x_sk = store.kem_secret().x_sk;
+        let mlkem_seed = store.kem_secret().mlkem_seed;
+        store.save(&path).expect("encrypted save");
+
+        let raw = std::fs::read(&path).unwrap();
+        let contains = |needle: &[u8]| raw.windows(needle.len()).any(|w| w == needle);
+        assert!(
+            !contains(&x_sk),
+            "X25519 secret scalar must not appear in the ciphertext file"
+        );
+        assert!(
+            !contains(&mlkem_seed),
+            "ML-KEM seed must not appear in the ciphertext file"
+        );
+        assert!(
+            !contains(&my_key),
+            "local epoch key must not appear in the ciphertext file"
+        );
+        assert!(
+            !contains(&peer_key),
+            "cached peer epoch key must not appear in the ciphertext file"
+        );
+
+        let loaded = load(&path).expect("decrypt + parse");
+        assert_eq!(loaded.my_current_epoch().0, my_epoch_id);
+        assert_eq!(*loaded.my_current_epoch().1, my_key);
+        assert_eq!(loaded.kem_secret().x_sk, x_sk);
+        assert_eq!(loaded.kem_secret().mlkem_seed, mlkem_seed);
+        assert_eq!(loaded.peer_epoch_key("peer-a", 7), Some(&peer_key));
+
+        clear_env();
+    }
+
+    /// **M-3** — the wrong passphrase must fail loudly rather than
+    /// yielding a garbage store.
+    #[test]
+    fn m3_wrong_passphrase_fails_closed() {
+        let _g = env_guard();
+        clear_env();
+        unsafe { std::env::set_var(PASSPHRASE_ENV, "right") };
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("epoch_keys.cbor");
+        let mut rng = OsRng;
+        EpochKeyStore::new(&mut rng).save(&path).unwrap();
+
+        unsafe { std::env::set_var(PASSPHRASE_ENV, "wrong") };
+        assert!(matches!(load(&path), Err(EpochKeyStoreError::Crypto(_))));
+
+        // And with no passphrase at all.
+        unsafe { std::env::remove_var(PASSPHRASE_ENV) };
+        assert!(matches!(load(&path), Err(EpochKeyStoreError::Crypto(_))));
+
+        clear_env();
+    }
+
+    /// **M-3** — `DDS_REQUIRE_ENCRYPTED_KEYS` must make a passphrase-less
+    /// save fail instead of silently writing the hybrid-KEM secret in
+    /// the clear. This is the gate the store had no notion of before.
+    #[test]
+    fn m3_require_encrypted_keys_refuses_plaintext_save() {
+        let _g = env_guard();
+        clear_env();
+        unsafe { std::env::set_var(REQUIRE_ENCRYPTED_KEYS_ENV, "1") };
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("epoch_keys.cbor");
+        let mut rng = OsRng;
+        let store = EpochKeyStore::new(&mut rng);
+        let err = store
+            .save(&path)
+            .expect_err("plaintext save must be refused");
+        assert!(matches!(err, EpochKeyStoreError::Crypto(_)), "got {err:?}");
+        assert!(!path.exists(), "no file may be left behind on refusal");
+
+        // With a passphrase the same save proceeds.
+        unsafe { std::env::set_var(PASSPHRASE_ENV, "pass") };
+        store
+            .save(&path)
+            .expect("encrypted save satisfies the gate");
+        assert!(path.exists());
+
+        clear_env();
+    }
+
+    /// **M-3** — a legacy plaintext (`v=1`) file still loads, and the
+    /// next save with a passphrase transparently upgrades it to `v=2`.
+    #[test]
+    fn m3_legacy_plaintext_upgrades_on_next_save() {
+        let _g = env_guard();
+        clear_env();
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("epoch_keys.cbor");
+        let mut rng = OsRng;
+        let store = EpochKeyStore::new(&mut rng);
+        let x_sk = store.kem_secret().x_sk;
+        // No passphrase → v=1 plaintext, as before this change.
+        store.save(&path).expect("plaintext save");
+        let raw_v1 = std::fs::read(&path).unwrap();
+        assert!(
+            raw_v1.windows(x_sk.len()).any(|w| w == x_sk),
+            "sanity: the legacy format really is plaintext"
+        );
+
+        // Legacy file loads without a passphrase.
+        let loaded = load(&path).expect("v=1 load");
+        assert_eq!(loaded.kem_secret().x_sk, x_sk);
+
+        // Save again with a passphrase → upgraded to v=2.
+        unsafe { std::env::set_var(PASSPHRASE_ENV, "upgrade") };
+        loaded.save(&path).expect("upgrade save");
+        let raw_v2 = std::fs::read(&path).unwrap();
+        assert!(
+            !raw_v2.windows(x_sk.len()).any(|w| w == x_sk),
+            "after upgrade the secret must no longer be on disk in the clear"
+        );
+        assert_eq!(load(&path).unwrap().kem_secret().x_sk, x_sk);
+
+        clear_env();
+    }
+
+    /// **M-3** — once encrypted, clearing the passphrase must not
+    /// silently roll the file back to plaintext.
+    #[test]
+    fn m3_sticky_marker_blocks_silent_plaintext_downgrade() {
+        let _g = env_guard();
+        clear_env();
+        unsafe { std::env::set_var(PASSPHRASE_ENV, "sticky") };
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("epoch_keys.cbor");
+        let mut rng = OsRng;
+        let store = EpochKeyStore::new(&mut rng);
+        store.save(&path).unwrap();
+        assert!(encrypted_marker_path(&path).exists(), "marker must be set");
+
+        unsafe { std::env::remove_var(PASSPHRASE_ENV) };
+        let err = store
+            .save(&path)
+            .expect_err("plaintext downgrade must be refused");
+        assert!(matches!(err, EpochKeyStoreError::Crypto(_)), "got {err:?}");
+
+        // Explicit operator override still works.
+        unsafe { std::env::set_var(ALLOW_PLAINTEXT_DOWNGRADE_ENV, "1") };
+        store.save(&path).expect("explicit downgrade is permitted");
+
+        clear_env();
     }
 }

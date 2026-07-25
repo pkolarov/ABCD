@@ -296,6 +296,18 @@ CDdsProvider::CDdsProvider():
 CDdsProvider::~CDdsProvider()
 {
     OutputDebugString(L"~CDdsProvider()\n");
+
+    // L-2 (pre-prod review 2026-07-24): scrub and free the
+    // SetSerialization blob. `_CleanupSetSerialization` has always
+    // existed but was never called from anywhere, so the
+    // KERB_INTERACTIVE_UNLOCK_LOGON handed to us by LogonUI — which
+    // carries the user's cleartext password on the RDP/NLA path — was
+    // left un-zeroed in the LogonUI (SYSTEM) process heap for the
+    // lifetime of the process. Recovering it still requires existing
+    // SYSTEM-level memory access, which is why this is low severity, but
+    // there is no reason to leave it lying there.
+    _CleanupSetSerialization();
+
     for (size_t i = 0; i < _dwNumCreds; i++)
     {
         if (_rgpCredentials[i] != NULL)
@@ -352,6 +364,11 @@ void CDdsProvider::OnConnectStatusChanged()
     }
 }
 
+// L-2 (pre-prod review 2026-07-24): scrub-then-free the
+// SetSerialization blob. Nulls the member itself so the function is
+// idempotent — it is now called from two places (the replace site in
+// SetSerialization and the destructor) and a double call must not
+// double-free.
 void CDdsProvider::_CleanupSetSerialization()
 {
     OutputDebugString(L"_CleanupSetSerialization()\n");
@@ -364,6 +381,7 @@ void CDdsProvider::_CleanupSetSerialization()
                          pkil->UserName.MaximumLength +
                          pkil->Password.MaximumLength);
         HeapFree(GetProcessHeap(), 0, _pkiulSetSerialization);
+        _pkiulSetSerialization = NULL;
     }
 }
 
@@ -467,7 +485,15 @@ STDMETHODIMP CDdsProvider::SetSerialization(
 
                         if (_pkiulSetSerialization)
                         {
-                            HeapFree(GetProcessHeap(), 0, _pkiulSetSerialization);
+                            // L-2 (pre-prod review 2026-07-24): the
+                            // previous blob holds the cleartext password
+                            // from the caller's KERB_INTERACTIVE_LOGON.
+                            // A bare HeapFree returns those pages to the
+                            // heap with the password still in them —
+                            // scrub first. `_CleanupSetSerialization`
+                            // does the SecureZeroMemory + HeapFree pair
+                            // and nulls the member.
+                            _CleanupSetSerialization();
 
                             if (_dwSetSerializationCred != CREDENTIAL_PROVIDER_NO_DEFAULT && _dwSetSerializationCred == _dwNumCreds - 1)
                             {

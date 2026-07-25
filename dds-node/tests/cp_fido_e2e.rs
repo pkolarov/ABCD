@@ -186,11 +186,21 @@ fn write_node_fixture(
             heartbeat_secs: 1,
             idle_timeout_secs: 60,
             api_addr: api_addr.clone(),
-            api_auth: Default::default(),
+            // **L-12 (pre-prod review 2026-07-24)**: the default is now
+            // fail-closed, so this fixture — which drives the admin-gated
+            // enroll endpoints over loopback TCP — must opt in explicitly,
+            // exactly as a real loopback-TCP deployment now has to.
+            api_auth: dds_node::config::ApiAuthConfig {
+                trust_loopback_tcp_admin: true,
+                ..Default::default()
+            },
             allow_legacy_v1_tokens: false,
             metrics_addr: None,
             allow_v1_certs: true,
             admission_key_backend: Default::default(),
+            // M-1 / H-1: connection caps, unadmitted-peer deadline, and the
+            // per-peer gossip budget all take their production defaults here.
+            ..Default::default()
         },
         org_hash: "cp-e2e-org".to_string(),
         domain: DomainConfig {

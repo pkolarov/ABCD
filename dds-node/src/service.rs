@@ -945,8 +945,39 @@ impl<
             }
         }
 
-        std::fs::write(config_path, doc.to_string())
-            .map_err(|e| ServiceError::Store(format!("write config: {e}")))?;
+        // **L-8 (pre-prod review 2026-07-24)** — write-temp-then-rename.
+        //
+        // This rewrites the *live* node config in place on every admin
+        // ceremony (`admin_setup`, `admin_vouch`, `revoke-vouch`, and
+        // every `reconcile_trusted_roots` that changes the root set). A
+        // crash, power loss, or full disk partway through `fs::write`
+        // left a truncated `dds.toml`, and the node refuses to start on
+        // a config it cannot parse — i.e. the host is bricked until an
+        // operator hand-repairs the file. That is the same failure shape
+        // as the known MSI-upgrade config reset, reached without an
+        // upgrade.
+        //
+        // `NamedTempFile` in the *same directory* keeps the final step a
+        // same-filesystem rename, which is atomic: readers see either
+        // the old config or the new one, never a partial write. Matches
+        // the L-3 posture already used by `identity_store::save` and the
+        // other durable stores.
+        let parent = config_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let tmp = tempfile::NamedTempFile::new_in(&parent)
+            .map_err(|e| ServiceError::Store(format!("config tempfile: {e}")))?;
+        std::fs::write(tmp.path(), doc.to_string())
+            .map_err(|e| ServiceError::Store(format!("write config tempfile: {e}")))?;
+        // Flush the contents to disk *before* the rename so a crash
+        // immediately after the rename cannot expose an empty file.
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| ServiceError::Store(format!("sync config tempfile: {e}")))?;
+        tmp.persist(config_path)
+            .map_err(|e| ServiceError::Store(format!("rename config: {e}")))?;
 
         tracing::info!(
             count = roots.len(),
@@ -3231,83 +3262,28 @@ impl<
     /// admin/user listing surfaces, and session issuance — cheap (a
     /// handful of indexed graph lookups) and idempotent. Persists on change.
     pub fn reconcile_trusted_roots(&mut self) {
-        let admin_purpose = dds_core::token::purpose::ADMIN;
-        let mut changed_any = false;
-        // Bounded fixpoint: each round can only shrink-or-grow the root set,
-        // and the delegation graph is finite; the cap is a belt-and-braces
-        // guard against a pathological cycle in the vouch graph.
-        for _ in 0..64 {
-            let (to_add, to_remove) = {
-                let g = match self.trust_graph.read() {
-                    Ok(g) => g,
-                    Err(_) => return,
-                };
-                // A subject is *root-eligible* iff it holds a live
-                // `dds:admin` vouch issued by a CURRENT trusted root.
-                let eligible = |sub: &str| -> bool {
-                    g.vouch_summaries_for_subject(sub).iter().any(|s| {
-                        s.purpose.as_deref() == Some(admin_purpose)
-                            && !s.revoked
-                            && !s.expired
-                            && self.trusted_roots.contains(&s.issuer)
-                    })
-                };
-                // Promotion candidates: subjects of any dds:admin vouch.
-                let mut candidates: std::collections::BTreeSet<String> =
-                    std::collections::BTreeSet::new();
-                for v in g.vouches_iter() {
-                    if v.payload.purpose.as_deref() == Some(admin_purpose) {
-                        candidates.insert(v.payload.sub.clone());
-                    }
-                }
-                let mut to_add: Vec<String> = Vec::new();
-                for sub in candidates {
-                    if self.trusted_roots.contains(&sub) || g.is_burned(&sub) {
-                        continue;
-                    }
-                    if eligible(&sub) {
-                        to_add.push(sub);
-                    }
-                }
-                // Demotion: a promoted root (has ≥1 dds:admin vouch) that is
-                // no longer eligible, or is burned.
-                let mut to_remove: Vec<String> = Vec::new();
-                for root in self.trusted_roots.iter() {
-                    if self.bootstrap_admin_urn.as_deref() == Some(root.as_str()) {
-                        continue;
-                    }
-                    if g.is_burned(root) {
-                        to_remove.push(root.clone());
-                        continue;
-                    }
-                    let has_any_admin_vouch = g
-                        .vouch_summaries_for_subject(root)
-                        .iter()
-                        .any(|s| s.purpose.as_deref() == Some(admin_purpose));
-                    if has_any_admin_vouch && !eligible(root) {
-                        to_remove.push(root.clone());
-                    }
-                }
-                (to_add, to_remove)
-            };
-            if to_add.is_empty() && to_remove.is_empty() {
-                break;
-            }
-            for urn in &to_add {
-                self.trusted_roots.insert(urn.clone());
-                tracing::info!(subject = %urn, "reconcile: promoted to trusted_roots (replicated dds:admin vouch)");
-            }
-            for urn in &to_remove {
-                self.trusted_roots.remove(urn);
-                tracing::info!(subject = %urn, "reconcile: demoted from trusted_roots (no live dds:admin vouch from a current root)");
-            }
-            changed_any = true;
-        }
+        let g = match self.trust_graph.read() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let changed_any = reconcile_roots_against_graph(
+            &g,
+            &mut self.trusted_roots,
+            self.bootstrap_admin_urn.as_deref(),
+        );
+        drop(g);
         if changed_any {
             if let Err(e) = self.persist_trusted_roots() {
                 tracing::warn!(error = %e, "reconcile: failed to persist trusted_roots (in-memory update still applies)");
             }
         }
+    }
+
+    /// **M-5 test hook.** Read the current in-memory root set so tests
+    /// can compare the `LocalService` and swarm-task copies converge.
+    #[doc(hidden)]
+    pub fn trusted_roots_for_tests(&self) -> &BTreeSet<String> {
+        &self.trusted_roots
     }
 
     /// List this node's trusted roots (admins) with display names and
@@ -3432,13 +3408,16 @@ impl<
             .map_err(|e| ServiceError::Store(format!("admin key tempfile: {e}")))?;
         std::fs::write(tmp.path(), &blob)
             .map_err(|e| ServiceError::Store(format!("admin key tempfile write: {e}")))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600));
-        }
+        // **M-4 (pre-prod review 2026-07-24)** — extended from the
+        // Unix-only chmod to the cross-platform helper. This blob is an
+        // admin Ed25519 signing key; it normally sits inside the
+        // MSI-hardened data dir, but the per-file DACL is the
+        // defense-in-depth that covers non-MSI installs and files that
+        // pre-date the data-dir hardening.
+        crate::file_acl::restrict_to_owner(tmp.path());
         tmp.persist(&path)
             .map_err(|e| ServiceError::Store(format!("admin key persist: {e}")))?;
+        crate::file_acl::restrict_to_owner(&path);
 
         tracing::debug!(path = %path.display(), "persisted admin signing key");
         Ok(())
@@ -4065,6 +4044,108 @@ fn device_targeting_facts(g: &TrustGraph, device_urn: &str) -> (Vec<String>, Opt
         }
     }
     (Vec::new(), None)
+}
+
+/// **M-5 (pre-prod review 2026-07-24)** — the trusted-root reconcile
+/// rules, factored out so the two independent copies of `trusted_roots`
+/// cannot drift apart.
+///
+/// Before this existed, [`LocalService::reconcile_trusted_roots`] ran a
+/// full eligibility recomputation (expiry-aware, transitive, burn-aware)
+/// while the swarm task's copy in `DdsNode::reconcile_roots_after_token`
+/// demoted **only** on an explicit `Revoke` token. Since every
+/// `dds:admin` vouch carries a finite (1-year) expiry, a delegated
+/// sub-admin whose promoting vouch simply *lapsed* stayed a fully
+/// authoritative trust root on the swarm ingest gate until the process
+/// restarted — expiry-based de-authorization silently failed on exactly
+/// the path that gates C-3 publisher capability. Both callers now run
+/// this same function.
+///
+/// Rules (unchanged in substance):
+///
+/// - **Promote**: a subject holding a live `dds:admin` vouch issued by a
+///   current root becomes a root.
+/// - **Demote**: a *promoted* root (one with a `dds:admin` vouch in the
+///   graph) is removed once it has no live `dds:admin` vouch from a
+///   current root — making demotion transitive. Burned roots go
+///   unconditionally.
+/// - Roots with no `dds:admin` vouch at all are config-managed and left
+///   alone, as is `bootstrap_admin_urn`.
+///
+/// Iterates to a fixpoint (bounded at 64 rounds against a pathological
+/// vouch cycle). Returns `true` if the set changed, so callers that
+/// persist can skip a no-op write.
+pub(crate) fn reconcile_roots_against_graph(
+    g: &TrustGraph,
+    roots: &mut BTreeSet<String>,
+    bootstrap_admin_urn: Option<&str>,
+) -> bool {
+    let admin_purpose = dds_core::token::purpose::ADMIN;
+    let mut changed_any = false;
+    for _ in 0..64 {
+        // A subject is *root-eligible* iff it holds a live `dds:admin`
+        // vouch issued by a CURRENT trusted root. `!s.expired` is the
+        // clause that M-5 was missing on the swarm side.
+        let eligible = |sub: &str, roots: &BTreeSet<String>| -> bool {
+            g.vouch_summaries_for_subject(sub).iter().any(|s| {
+                s.purpose.as_deref() == Some(admin_purpose)
+                    && !s.revoked
+                    && !s.expired
+                    && roots.contains(&s.issuer)
+            })
+        };
+
+        // Promotion candidates: subjects of any dds:admin vouch.
+        let mut candidates: BTreeSet<String> = BTreeSet::new();
+        for v in g.vouches_iter() {
+            if v.payload.purpose.as_deref() == Some(admin_purpose) {
+                candidates.insert(v.payload.sub.clone());
+            }
+        }
+        let mut to_add: Vec<String> = Vec::new();
+        for sub in candidates {
+            if roots.contains(&sub) || g.is_burned(&sub) {
+                continue;
+            }
+            if eligible(&sub, roots) {
+                to_add.push(sub);
+            }
+        }
+
+        // Demotion: a promoted root (has ≥1 dds:admin vouch) that is no
+        // longer eligible, or is burned.
+        let mut to_remove: Vec<String> = Vec::new();
+        for root in roots.iter() {
+            if bootstrap_admin_urn == Some(root.as_str()) {
+                continue;
+            }
+            if g.is_burned(root) {
+                to_remove.push(root.clone());
+                continue;
+            }
+            let has_any_admin_vouch = g
+                .vouch_summaries_for_subject(root)
+                .iter()
+                .any(|s| s.purpose.as_deref() == Some(admin_purpose));
+            if has_any_admin_vouch && !eligible(root, roots) {
+                to_remove.push(root.clone());
+            }
+        }
+
+        if to_add.is_empty() && to_remove.is_empty() {
+            break;
+        }
+        for urn in &to_add {
+            roots.insert(urn.clone());
+            tracing::info!(subject = %urn, "reconcile: promoted to trusted_roots (replicated dds:admin vouch)");
+        }
+        for urn in &to_remove {
+            roots.remove(urn);
+            tracing::info!(subject = %urn, "reconcile: demoted from trusted_roots (no live dds:admin vouch from a current root)");
+        }
+        changed_any = true;
+    }
+    changed_any
 }
 
 /// Does this `PolicyScope` match the given device's facts?
