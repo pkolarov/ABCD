@@ -61,6 +61,13 @@ heartbeat_secs = 1
 idle_timeout_secs = 60
 api_addr = "127.0.0.1:${API_PORT}"
 
+# L-12 (pre-prod review 2026-07-24): trust_loopback_tcp_admin now
+# defaults to false. This e2e harness drives admin-gated endpoints over
+# loopback TCP, so it opts in explicitly. Shipped packaging does NOT do
+# this — it serves the API over a unix socket with the flag false.
+[network.api_auth]
+trust_loopback_tcp_admin = true
+
 [domain]
 name = "${DOMAIN_NAME}"
 id = "${DOMAIN_ID}"

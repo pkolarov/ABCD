@@ -141,6 +141,15 @@ mdns_enabled = false
 heartbeat_secs = 5
 idle_timeout_secs = 60
 
+# L-12 (pre-prod review 2026-07-24): trust_loopback_tcp_admin now
+# defaults to false, so credential-less loopback-TCP callers are refused
+# on admin endpoints. This smoke test talks to the local API over
+# loopback TCP, so it opts in explicitly. Shipped packaging does NOT do
+# this — the MSI serves the API over the dds-api named pipe with the
+# flag false.
+[network.api_auth]
+trust_loopback_tcp_admin = true
+
 [domain]
 name = "e2e-smoke.local"
 id = "placeholder"

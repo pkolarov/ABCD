@@ -32,6 +32,16 @@ fn now_epoch() -> u64 {
 /// Build a node on a fresh domain. Mirrors the fixture in
 /// `h12_admission.rs` but without the deliberately-broken-cert branch.
 fn spawn_node(domain_key: &dds_domain::DomainKey) -> (DdsNode, TempDir) {
+    spawn_node_with(domain_key, |_| {})
+}
+
+/// [`spawn_node`] with a hook to adjust `NetworkConfig` before the node
+/// is built — used by the rate-budget test to pin a small, deterministic
+/// budget instead of depending on production defaults and wall clock.
+fn spawn_node_with(
+    domain_key: &dds_domain::DomainKey,
+    tune: impl FnOnce(&mut NetworkConfig),
+) -> (DdsNode, TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().to_path_buf();
     let domain = domain_key.domain();
@@ -41,15 +51,18 @@ fn spawn_node(domain_key: &dds_domain::DomainKey) -> (DdsNode, TempDir) {
     let cert = domain_key.issue_admission(peer_id.to_string(), now_epoch(), None);
     dds_node::domain_store::save_admission_cert(&data_dir.join("admission.cbor"), &cert).unwrap();
 
+    let mut network = NetworkConfig {
+        listen_addr: "/ip4/127.0.0.1/tcp/0".to_string(),
+        mdns_enabled: false,
+        heartbeat_secs: 1,
+        api_addr: "127.0.0.1:0".to_string(),
+        ..Default::default()
+    };
+    tune(&mut network);
+
     let cfg = NodeConfig {
         data_dir,
-        network: NetworkConfig {
-            listen_addr: "/ip4/127.0.0.1/tcp/0".to_string(),
-            mdns_enabled: false,
-            heartbeat_secs: 1,
-            api_addr: "127.0.0.1:0".to_string(),
-            ..Default::default()
-        },
+        network,
         org_hash: "prod-review-org".to_string(),
         domain: dds_node::config::DomainConfig {
             name: domain.name.clone(),
@@ -204,20 +217,35 @@ fn h1_malformed_gossip_from_admitted_peer_is_rejected() {
 /// Admission proves domain membership, not good behaviour, and every
 /// inbound message costs a signature verify plus a trust-graph insert.
 /// Past the budget the node must stop both ingesting and relaying.
+///
+/// The budget and window are pinned small/long here rather than taken
+/// from the production defaults. Driving the real 1200-per-60s default
+/// meant minting 1200 signed messages inside the window, which a slow CI
+/// runner cannot do — the window rolled over mid-loop, the budget never
+/// exhausted, and the test failed for a reason that had nothing to do
+/// with the behaviour under test. `h1_default_gossip_budget_is_finite`
+/// keeps coverage of the shipped values.
 #[test]
 fn h1_admitted_peer_inbound_gossip_budget_is_enforced() {
+    const BUDGET: u32 = 5;
     let domain_key = dds_domain::DomainKey::generate("h1-domain-rate", &mut OsRng);
-    let (mut node, _dir) = spawn_node(&domain_key);
+    let (mut node, _dir) = spawn_node_with(&domain_key, |net| {
+        net.gossip_inbound_max_per_window = BUDGET;
+        // Long enough that the window cannot roll over mid-test on any
+        // runner, so this asserts the budget and not the clock.
+        net.gossip_rate_window_secs = 3600;
+    });
     let peer = libp2p::PeerId::random();
     node.admit_peer_for_tests(peer);
 
-    let budget = NetworkConfig::default().gossip_inbound_max_per_window;
-    assert!(budget > 0, "the default build must ship a finite budget");
-
-    // Spend the whole budget.
-    for _ in 0..budget {
+    // Spend exactly the budget — every one of these must be accepted.
+    for i in 0..BUDGET {
         let msg = operations_message(&node);
-        let _ = node.classify_gossip_message_for_tests(&peer, &msg);
+        let verdict = node.classify_gossip_message_for_tests(&peer, &msg);
+        assert!(
+            matches!(verdict, MessageAcceptance::Accept),
+            "message {i} is inside the budget and must be accepted"
+        );
     }
 
     // The next message is over budget: not ingested, not relayed.
@@ -226,6 +254,22 @@ fn h1_admitted_peer_inbound_gossip_budget_is_enforced() {
     assert!(
         matches!(verdict, MessageAcceptance::Ignore),
         "H-1: past the per-peer budget the message must be dropped without relay"
+    );
+}
+
+/// **H-1** — the shipped defaults must still be a finite budget over a
+/// finite window. Separated from the behavioural test above so the
+/// latter does not depend on how fast the host can mint 1200 tokens.
+#[test]
+fn h1_default_gossip_budget_is_finite() {
+    let net = NetworkConfig::default();
+    assert!(
+        net.gossip_inbound_max_per_window > 0,
+        "the default build must ship a finite per-peer gossip budget"
+    );
+    assert!(
+        net.gossip_rate_window_secs > 0,
+        "the budget window must be non-zero or the cap never resets"
     );
 }
 

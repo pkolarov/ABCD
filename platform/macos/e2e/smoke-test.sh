@@ -151,6 +151,15 @@ heartbeat_secs = 1
 idle_timeout_secs = 60
 api_addr = "127.0.0.1:${API_PORT}"
 
+# L-12 (pre-prod review 2026-07-24): trust_loopback_tcp_admin now
+# defaults to false, so a credential-less loopback-TCP caller is refused
+# on admin endpoints. This smoke test drives the admin-gated enroll API
+# over loopback TCP on purpose, so it opts in explicitly — exactly as a
+# real loopback-TCP deployment now must. Shipped packaging does NOT do
+# this: it serves the API over a unix socket with the flag false.
+[network.api_auth]
+trust_loopback_tcp_admin = true
+
 [domain]
 name = "${DOMAIN_NAME}"
 id = "${DOMAIN_ID}"
