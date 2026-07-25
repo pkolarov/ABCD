@@ -184,7 +184,11 @@ async fn cmd_new_user(
 ) -> Result<(), String> {
     let device = fido2::Device::open()?;
     println!("Touch your FIDO2 key to register {label}...");
-    let outcome = device.make_credential(rp_id, label.as_bytes(), label, display_name)?;
+    // hmac-secret = true: this person may later log in to a Windows node,
+    // whose credential vault is sealed with the assertion-time HMAC output.
+    // It cannot be added to the credential afterwards. See
+    // `fido2::Device::make_credential`.
+    let outcome = device.make_credential(rp_id, label.as_bytes(), label, display_name, true)?;
 
     let req = api::EnrollUserRequest {
         label: label.to_string(),
@@ -227,7 +231,10 @@ async fn cmd_admin_setup(
     ensure_pin_configured(&device)?;
 
     println!("Touch your FIDO2 key to create the admin credential...");
-    let outcome = device.make_credential(rp_id, label.as_bytes(), label, "DDS Administrator")?;
+    // hmac-secret = false: admins vouch, they never unseal a credential
+    // vault. Mirrors DdsTrayAgent/AdminFlow.cpp:186.
+    let outcome =
+        device.make_credential(rp_id, label.as_bytes(), label, "DDS Administrator", false)?;
 
     let req = api::EnrollUserRequest {
         label: "admin".to_string(),

@@ -32,8 +32,25 @@ if [[ ! -S "${API_SOCK}" ]]; then
   exit 1
 fi
 
+# The data dir is 0700 root:root, so a non-root run cannot stat the
+# admission cert. Warn once up front rather than emitting confusing
+# "not joined to a domain?" findings below.
+if [[ $EUID -ne 0 ]]; then
+  echo "NOTE: not running as root — checks that read ${DATA_DIR}/node will be skipped."
+  echo "      Re-run with sudo for the full report."
+  echo ""
+fi
+
 echo "=== DDS node health ($(hostname -s)) ==="
-NODE_VER="$(/usr/bin/dds-node --version 2>/dev/null | head -1 || echo unknown)"
+# dds-node has no --version flag; fall back to the binary's mtime rather
+# than printing a bogus "unknown".
+# `|| true`: grep exits 1 when the binary prints no version string, and
+# under `set -euo pipefail` a failing substitution in an assignment
+# aborts the whole script.
+NODE_VER="$(/usr/bin/dds-node 2>&1 | grep -oE 'dds-node [0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+if [[ -z "${NODE_VER}" ]]; then
+  NODE_VER="built $(date -r /usr/bin/dds-node '+%Y-%m-%d %H:%M' 2>/dev/null || echo unknown)"
+fi
 echo "  dds-node       : ${NODE_VER}"
 curl -sf --unix-socket "${API_SOCK}" "http://localhost/v1/status" | python3 -c "
 import sys, json
@@ -47,7 +64,9 @@ CONNECTED_PEERS="$(curl -sf --unix-socket "${API_SOCK}" "http://localhost/v1/sta
 
 echo ""
 echo "=== enc-v3 KEM self-repair ==="
-if [[ -f "${ADMISSION_CERT}" ]]; then
+if [[ ! -r "${ADMISSION_CERT}" && $EUID -ne 0 ]]; then
+  echo "  skipped (needs root to read ${DATA_DIR}/node)"
+elif [[ -f "${ADMISSION_CERT}" ]]; then
   if grep -a -q "pq_kem_pubkey" "${ADMISSION_CERT}"; then
     echo "  admission.cbor carries pq_kem_pubkey  [OK]"
   else

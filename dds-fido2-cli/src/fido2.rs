@@ -15,7 +15,10 @@
 use base64::Engine;
 use ctap_hid_fido2::{
     Cfg, FidoKeyHid, FidoKeyHidFactory,
-    fidokey::{GetAssertionArgsBuilder, MakeCredentialArgsBuilder},
+    fidokey::{
+        GetAssertionArgsBuilder, MakeCredentialArgsBuilder,
+        make_credential::make_credential_params::Extension as MakeCredentialExtension,
+    },
     public_key_credential_user_entity::PublicKeyCredentialUserEntity,
     verifier,
 };
@@ -117,20 +120,48 @@ impl Device {
     /// Registration ceremony. No PIN/UV required — the server does not
     /// gate `enroll_user`/`admin_setup` on UV, only on the credential
     /// existing at all.
+    ///
+    /// `request_hmac_secret` mirrors the Windows enrollment flow's
+    /// `hmacSecret` argument (`platform/windows/native/DdsTrayAgent/
+    /// EnrollmentFlow.cpp:372` — "must be enabled at create time"):
+    ///
+    /// - **`true` for people who will log in to a machine.** The CTAP2
+    ///   `hmac-secret` extension makes the authenticator derive a
+    ///   per-credential `CredRandom` *at registration*, and the Windows
+    ///   logon path uses the assertion-time HMAC output as the raw
+    ///   AES-256-GCM key for the credential vault
+    ///   (`DdsAuthBridge/CredentialVault.cpp` — the 32-byte output is
+    ///   the key, no KDF). It cannot be retrofitted onto an existing
+    ///   credential: without it the Auth Bridge hard-rejects the logon
+    ///   with "Authenticator did not return hmac-secret output"
+    ///   (`DdsAuthBridgeMain.cpp:1688`), *after* DDS-level
+    ///   authentication already succeeded — so the failure looks like a
+    ///   Windows bug rather than a registration mistake. Requesting it
+    ///   here is what lets a key registered on macOS complete a
+    ///   first-logon account claim on a Windows node.
+    /// - **`false` for admin credentials.** Matches
+    ///   `DdsTrayAgent/AdminFlow.cpp:186` (`false /*no hmac-secret*/`):
+    ///   admins vouch, they never unseal a vault.
     pub fn make_credential(
         &self,
         rp_id: &str,
         user_id: &[u8],
         user_name: &str,
         display_name: &str,
+        request_hmac_secret: bool,
     ) -> Result<EnrollmentOutcome, String> {
         let challenge = verifier::create_challenge();
         let user_entity =
             PublicKeyCredentialUserEntity::new(Some(user_id), Some(user_name), Some(display_name));
-        let args = MakeCredentialArgsBuilder::new(rp_id, &challenge)
+        let mut builder = MakeCredentialArgsBuilder::new(rp_id, &challenge)
             .user_entity(&user_entity)
-            .without_pin_and_uv()
-            .build();
+            .without_pin_and_uv();
+        if request_hmac_secret {
+            // Encodes as `{"hmac-secret": true}` in the CTAP2 extensions
+            // map. Must be `Some(_)` — the crate unwraps it.
+            builder = builder.extensions(&[MakeCredentialExtension::HmacSecret(Some(true))]);
+        }
+        let args = builder.build();
 
         let attestation = self
             .inner

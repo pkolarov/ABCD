@@ -1,5 +1,44 @@
 # DDS Implementation Status
 
+## fix(fido2-cli): macOS/Linux-registered keys could never log in to Windows — 2026-07-25
+
+A user enrolled with `dds-fido2 new-user` on macOS/Linux replicated correctly and got a
+Windows logon tile, but the logon always failed at the touch — **after**
+`/v1/session/assert` had already succeeded, so it presented as a Windows fault rather than
+a registration problem.
+
+**Root cause:** `dds-fido2-cli` built credentials with no CTAP2 extensions at all. Windows
+logon needs a real password for LSA, so it keeps one in a per-machine vault
+(`C:\ProgramData\DDS\vault.dat`, DPAPI machine-scope, never replicated) sealed with
+AES-256-GCM whose key is the authenticator's `hmac-secret` output used *directly, no KDF*
+(`DdsAuthBridge/CredentialVault.cpp:258`). That extension makes the authenticator mint a
+per-credential `CredRandom` during `MakeCredential` and **there is no CTAP command to add
+it afterwards** — so the credential was structurally unusable, not misconfigured. The Auth
+Bridge rejects on `hmac_secret_len != 32` (`DdsAuthBridgeMain.cpp:1688`). Windows' own
+enrollment always requested it (`DdsTrayAgent/EnrollmentFlow.cpp:372` —
+`true /*hmacSecret - must be enabled at create time*/`); only the new cross-platform tool
+did not.
+
+**Fix:** `make_credential` takes `request_hmac_secret`; `new-user` passes `true`,
+`admin-setup` passes `false` (mirrors `AdminFlow.cpp:186` — admins vouch, they never unseal
+a vault). Beyond un-breaking logon this makes the **first-logon claim path** work with no
+Windows-side enrollment at all: in claim mode the bridge generates the password, creates the
+account via `NetUserAdd`, and seals the vault with the HMAC from the *live* logon assertion
+(`DdsAuthBridgeMain.cpp:1823`).
+
+Also fixed three bugs in `dds-verify-replication` (both platforms) surfaced while
+diagnosing this: a false negative reporting `admission.cbor not found (node not joined to a
+domain?)` on any non-root run (the data dir is `0700 root:root`); a bogus `dds-node:
+unknown` from probing a `--version` flag that does not exist; and a `set -euo pipefail`
+abort where `grep` exiting 1 inside a `NODE_VER=$(…)` assignment killed the script mid-run.
+
+**Docs:** `DDS-Admin-Guide.md` gains "Cross-platform enrollment and the `hmac-secret`
+requirement", a prerequisite checklist under "Windows First Account Claim", and "Where
+admins can vouch from (machine-bound signing keys)" — the last documenting that admin
+signing keys are sealed under `SHA256(node's own key ‖ "admin-key-wrap")` and therefore
+cannot be copied between machines, that only `admin_setup` ever mints one, and how
+`reconcile_trusted_roots` auto-promotes `dds:admin` holders.
+
 ## fix(node): fresh-domain policy publish 500 (swarm trusted_roots bootstrap gap) — 2026-07-20
 
 The New-account wizard's final "Publish" step returned HTTP 500 on a freshly-bootstrapped

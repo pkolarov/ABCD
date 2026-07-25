@@ -1180,6 +1180,46 @@ On Windows with the DDS Credential Provider installed:
 
 A user can enroll additional FIDO2 credentials (e.g. a backup key). Each enrollment creates a separate attestation. Both credentials remain valid for authentication.
 
+### Cross-platform enrollment and the `hmac-secret` requirement
+
+A user can be enrolled from **any** node — including macOS/Linux via
+`dds-fido2 new-user` — and the resulting `UserAuthAttestation` replicates
+to every peer, so they will appear on a Windows logon screen. But whether
+they can actually *log in* to Windows depends on a property of the
+credential that is fixed **at registration time and can never be added
+afterwards**: the CTAP2 `hmac-secret` extension.
+
+Why it matters: Windows logon needs a real password for LSA, so DDS keeps
+the account password in a per-machine vault
+(`C:\ProgramData\DDS\vault.dat`, DPAPI machine-scope, never replicated)
+sealed with AES-256-GCM whose key is the authenticator's `hmac-secret`
+output used **directly, with no KDF** (`DdsAuthBridge/CredentialVault.cpp`).
+The extension makes the authenticator mint a per-credential `CredRandom`
+during `MakeCredential`; there is no CTAP command to add it later.
+
+Consequences:
+
+- A credential registered **without** `hmac-secret` yields no HMAC output
+  at assertion time, and the Auth Bridge rejects the logon with
+  *"Authenticator did not return hmac-secret output"* — **after**
+  `/v1/session/assert` has already succeeded. DDS-level auth passes and
+  Windows still refuses, which looks like a Windows fault rather than a
+  registration mistake. The only remedy is registering a **new**
+  credential on the same key.
+- Therefore `dds-fido2 new-user` requests `hmac-secret`, matching the
+  Windows enrollment path (`DdsTrayAgent/EnrollmentFlow.cpp`:
+  `true /*hmacSecret - must be enabled at create time*/`).
+- `dds-fido2 admin-setup` deliberately does **not** request it (mirroring
+  `AdminFlow.cpp`) — admins mint vouches, they never unseal a vault.
+
+With `hmac-secret` present, no Windows-side enrollment is needed at all:
+in first-logon **claim mode** the Auth Bridge generates the password,
+creates the local account (`NetUserAdd`), and seals the vault using the
+HMAC from the *live* logon assertion. See
+[Windows First Account Claim](#windows-first-account-claim) for the
+remaining prerequisites (a `dds:session` vouch, a published claim policy,
+and a Workgroup-joined host).
+
 ---
 
 ## Guided lifecycle management (DDS Console)
@@ -1389,6 +1429,62 @@ that signed it. `admin vouch` is the right CLI for any “admin adds this
 person to a group” workflow; `dds group vouch` (below) bypasses FIDO2
 entirely and is intended for offline / scripted flows against a local
 store.
+
+### Where admins can vouch from (machine-bound signing keys)
+
+Vouching needs **two** things, and only one of them travels:
+
+| Requirement | Where it lives | Portable? |
+|---|---|---|
+| Admin URN present in `trusted_roots` | `dds.toml`, or auto-promoted (below) | ✅ yes |
+| Admin's Ed25519 **signing key** | `<data_dir>/admin_keys/<sha256(urn)>.key`, AES-256-GCM sealed under `SHA256(that node's own signing key ‖ "admin-key-wrap")` | ❌ **no** |
+
+Because the wrap key is derived from the node's own identity key, an
+admin-key blob is decryptable *only by the node that wrote it* — copying
+the file to another machine cannot work. And the only code path that ever
+writes one is `admin_setup`. A person who merely holds a `dds:admin`
+vouch is therefore **recognised** as a root everywhere but can only
+**issue** vouches from a node where an `admin_setup` ceremony minted a
+signing key for them.
+
+> **TODO(security) / M-22:** the wrap key is not yet bound to OS-backed
+> storage (DPAPI / Keychain / TPM), so compromise of a node's key file
+> also exposes that node's admin keys.
+
+**Automatic root promotion.** `reconcile_trusted_roots` promotes any
+subject holding a live `dds:admin` vouch issued by a *current* trusted
+root, and demotes it when that vouch is revoked, expires, or the issuer
+is itself demoted (transitively, and co-vouch aware). Promotion is
+local-but-deterministic: the vouch replicates by gossip and each node
+reaches the same conclusion. The config-anchored `bootstrap_admin_urn` is
+never demoted.
+
+**Making a second node able to vouch** (e.g. driving the domain from a
+macOS node when the bootstrap admin lives on Windows):
+
+```bash
+# On the new node — the C-2 gate needs an empty trusted_roots AND the
+# out-of-band sentinel. The provision/join path deliberately does not
+# create the sentinel (joining ≠ bootstrapping), so create it by hand.
+sudo touch "<data_dir>/.bootstrap"
+sudo dds-fido2 admin-setup --node-url "unix:<...>/dds.sock" --label <name>
+# Note the printed URN.
+
+# On the node holding the EXISTING admin's signing key:
+dds-enroll-user.exe --vouch --subject-urn <new-admin-urn> --purpose dds:admin
+```
+
+That vouch gossips and every node auto-promotes the new admin, which now
+has both the trust anchor *and* a local signing key.
+
+Note the asymmetry this creates: `admin_setup` sets the new node's
+`trusted_roots` to *its own* admin only, so it will not trust the
+original admin until you also add that URN to its `dds.toml` (see
+[Node Configuration Reference](#node-configuration-reference)). For
+read-only trust — resolving another admin's vouches and accepting policy
+they published, without gaining the ability to vouch — copying
+`trusted_roots` + `bootstrap_admin_urn` into the config is sufficient on
+its own and needs no ceremony.
 
 ---
 
@@ -1757,6 +1853,30 @@ Notes:
 - Conflicting claim mappings are rejected by `dds-node`.
 - The current implementation refuses first-account claim on
   domain-joined Windows machines.
+- **The credential must carry the CTAP2 `hmac-secret` extension**, which
+  is only settable at registration (step 5 seals the vault with it).
+  Credentials minted by `DdsEnrollUser.exe` or by `dds-fido2 new-user`
+  do; one registered by other means may not, and the claim then fails at
+  the touch with *"Authenticator did not return hmac-secret output"*
+  **after** `/v1/session/assert` already succeeded. See
+  [Cross-platform enrollment and the `hmac-secret` requirement](#cross-platform-enrollment-and-the-hmac-secret-requirement).
+- The subject also needs a live vouch (purpose `dds:session`) chaining to
+  a trusted root, or step 3 fails with *"subject has no granted
+  purposes"*.
+
+### Prerequisite checklist
+
+| # | Requirement | Where it must be true |
+|---|---|---|
+| 1 | `UserAuthAttestation` replicated | that Windows node's local trust graph |
+| 2 | Credential has `hmac-secret` | fixed at registration — cannot be retrofitted |
+| 3 | Live `dds:session` vouch from a trusted root | that node's `trusted_roots` view |
+| 4 | Claim policy: `action: Create` + matching `claim_subject_urn`, scope matches device, issuer holds `dds:policy-publisher-windows` | published + replicated |
+| 5 | Host is Workgroup-joined; Auth Bridge has `DeviceUrn` configured | that machine |
+
+The vault is per-machine, so steps 4–5 apply to **each** Windows host the
+user should be able to log in to; the account and vault are created
+independently on each at its own first logon.
 
 ### macOS Policy (MDM Equivalent)
 
