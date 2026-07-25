@@ -1,5 +1,24 @@
 # DDS Implementation Status
 
+## fix(fido2-cli): report built-in-UV lockout instead of a bogus timeout — 2026-07-25
+
+A ceremony on a biometric key failed with `CTAP2_ERR_USER_ACTION_TIMEOUT — Timeout waiting for
+user interaction`, which reads as "the operator was too slow". It wasn't: probing the device
+showed `uv_retries = 0`. Several unrecognised fingerprint reads had exhausted the built-in-UV
+retry budget, after which the authenticator refuses to verify — and signals that by *silently
+waiting* rather than returning an error. The same ceremony had succeeded minutes earlier, so the
+failure looked nondeterministic.
+
+`options.uv == true` only reports that built-in UV is *configured*; it says nothing about the
+retry budget, so the capability probe happily selected a route the key could no longer perform.
+
+**Fix:** `uv_capability()` now also reads `get_uv_retries()` and returns a distinct
+`BuiltInLockedOut` when the counter is spent. Both ceremony entry points refuse up front with the
+remedy (power-cycle the key; note that a key exposing no `clientPin` has no PIN-based unlock
+path). Authenticators that don't implement the counter return an error there, which is treated as
+"unknown, proceed" rather than a failure. Verified against the affected device: the tool now
+fails in under a second with an actionable message instead of hanging.
+
 ## fix(fido2-cli,fido2-test): full attestation rejected — x5c chain dropped — 2026-07-25
 
 `dds-fido2 admin-setup` failed with HTTP 401 `auth_failed` against a Crayonic KeyVault. The

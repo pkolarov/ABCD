@@ -456,6 +456,20 @@ async fn run_admin_assertion_ceremony(
     })
 }
 
+/// Shown when the authenticator's built-in-UV retry counter is spent.
+/// Without this the ceremony just times out, which reads as "you were
+/// too slow" rather than "the key refuses to verify".
+const UV_LOCKED_OUT_HELP: &str = "\
+this authenticator's built-in User Verification is locked out \
+(uv_retries = 0), usually after several unrecognised fingerprint reads. \
+It will not verify again until the counter resets, and it reports that \
+as a silent timeout rather than an error.\n\
+  Try: unplug the key and plug it back in, then re-run. A power cycle \
+restores the retry budget on most authenticators.\n\
+  If it stays locked out, verify a fingerprint is still enrolled using \
+the vendor's tool (this key exposes no PIN, so the PIN-based unlock path \
+is unavailable).";
+
 /// Read a PIN only when the PIN protocol is the UV route we'll actually
 /// use. A `BuiltIn` (biometric/on-device) authenticator needs no secret
 /// from us, so prompting would be wrong — and on keys that implement no
@@ -467,6 +481,7 @@ fn acquire_pin_if_needed(
     match cap {
         // The authenticator verifies the user itself — nothing to collect.
         fido2::UvCapability::BuiltIn => Ok(None),
+        fido2::UvCapability::BuiltInLockedOut => Err(UV_LOCKED_OUT_HELP.to_string()),
         fido2::UvCapability::Unavailable => {
             eprintln!(
                 "WARN: this authenticator reports neither built-in User Verification \
@@ -520,6 +535,9 @@ fn ensure_uv_available(device: &fido2::Device) -> Result<(), String> {
             println!("Authenticator provides built-in User Verification (no PIN needed).");
             Ok(())
         }
+        // Hard stop: minting an admin here would produce one that cannot
+        // vouch, and the ceremony would fail with a misleading timeout.
+        fido2::UvCapability::BuiltInLockedOut => Err(UV_LOCKED_OUT_HELP.to_string()),
         fido2::UvCapability::Pin => Ok(()),
         fido2::UvCapability::Unavailable => {
             eprintln!(

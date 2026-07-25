@@ -51,6 +51,14 @@ pub enum UvCapability {
     /// (fingerprint / on-device). Request `uv: true`; no PIN is involved.
     /// Preferred when offered, since it needs no secret from us.
     BuiltIn,
+    /// Built-in UV exists but its retry counter is exhausted
+    /// (`uv_retries == 0`). The authenticator will not perform UV until
+    /// it is reset, and — critically — it does not report this as an
+    /// error: the ceremony simply waits and then fails with
+    /// `CTAP2_ERR_USER_ACTION_TIMEOUT`, which looks like the operator
+    /// was too slow. Detecting it up front turns that into something
+    /// actionable.
+    BuiltInLockedOut,
     /// `clientPin` present and `true` — a PIN is set; UV via the PIN
     /// protocol.
     Pin,
@@ -133,7 +141,16 @@ impl Device {
             .map_err(|e| format!("GetInfo failed: {e}"))?;
         let builtin_uv = info.options.iter().any(|(k, v)| k == "uv" && *v);
         if builtin_uv {
-            return Ok(UvCapability::BuiltIn);
+            // `uv = true` only says built-in UV is *configured*; it does
+            // not say the retry budget is intact. A key whose counter has
+            // been exhausted by failed fingerprint reads still advertises
+            // `uv = true` and then silently times out every ceremony.
+            // Keys that don't implement the counter return an error here,
+            // which is not a failure — assume UV is usable.
+            return Ok(match self.inner.get_uv_retries() {
+                Ok(n) if n <= 0 => UvCapability::BuiltInLockedOut,
+                _ => UvCapability::BuiltIn,
+            });
         }
         Ok(match info.options.iter().find(|(k, _)| k == "clientPin") {
             Some((_, true)) => UvCapability::Pin,
