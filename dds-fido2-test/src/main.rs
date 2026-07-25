@@ -37,11 +37,22 @@ fn b64url(data: &[u8]) -> String {
 }
 
 /// Rebuild a CBOR attestation object from the parsed Attestation struct.
+/// Rebuild the CBOR attestation object.
+///
+/// `attstmt_x5c` must be carried through: `packed` attestation has two
+/// sub-modes and `dds_domain::fido2::verify_packed` picks between them by
+/// the presence of `x5c` — with a chain it verifies `sig` against the
+/// **leaf certificate's** key, without one it assumes self-attestation and
+/// uses the *credential* key. Dropping the chain therefore makes the
+/// server reject a valid full attestation with "bad attestation
+/// signature". Matches the working implementations in `bin/probe.rs` and
+/// `bin/multinode.rs`, which this function previously diverged from.
 fn rebuild_attestation_cbor(
     fmt: &str,
     auth_data: &[u8],
     attstmt_alg: i32,
     attstmt_sig: &[u8],
+    attstmt_x5c: &[Vec<u8>],
 ) -> Vec<u8> {
     let mut out = Vec::new();
 
@@ -55,17 +66,40 @@ fn rebuild_attestation_cbor(
     if fmt == "none" || attstmt_sig.is_empty() {
         out.push(0xa0); // empty map
     } else {
-        out.push(0xa2); // map(2): alg + sig
+        if attstmt_x5c.is_empty() {
+            out.push(0xa2); // map(2): alg + sig  (self-attestation)
+        } else {
+            out.push(0xa3); // map(3): alg + sig + x5c  (full attestation)
+        }
         cbor_text(&mut out, "alg");
         cbor_int(&mut out, attstmt_alg as i64);
         cbor_text(&mut out, "sig");
         cbor_bytes(&mut out, attstmt_sig);
+        if !attstmt_x5c.is_empty() {
+            cbor_text(&mut out, "x5c");
+            cbor_array_header(&mut out, attstmt_x5c.len());
+            for cert in attstmt_x5c {
+                cbor_bytes(&mut out, cert);
+            }
+        }
     }
 
     cbor_text(&mut out, "authData");
     cbor_bytes(&mut out, auth_data);
 
     out
+}
+
+fn cbor_array_header(out: &mut Vec<u8>, len: usize) {
+    if len < 24 {
+        out.push(0x80 | len as u8);
+    } else if len < 256 {
+        out.push(0x98);
+        out.push(len as u8);
+    } else {
+        out.push(0x99);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+    }
 }
 
 fn cbor_text(out: &mut Vec<u8>, s: &str) {
@@ -239,6 +273,7 @@ async fn main() {
         &attestation.auth_data,
         attestation.attstmt_alg,
         &attestation.attstmt_sig,
+        &attestation.attstmt_x5c,
     );
 
     // The challenge IS the client data hash for this simplified flow.

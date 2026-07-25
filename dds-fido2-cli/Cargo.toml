@@ -34,3 +34,8 @@ rand = { workspace = true }
 rpassword = "7"
 zeroize = { workspace = true }
 tempfile = "3"
+
+[dev-dependencies]
+# Used to re-parse our hand-rolled attestation CBOR in tests, so the
+# encoder is checked against a real decoder rather than by eye.
+ciborium = { workspace = true }

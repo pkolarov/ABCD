@@ -225,6 +225,7 @@ impl Device {
             &attestation.auth_data,
             attestation.attstmt_alg,
             &attestation.attstmt_sig,
+            &attestation.attstmt_x5c,
         );
 
         Ok(EnrollmentOutcome {
@@ -286,16 +287,30 @@ impl Device {
 }
 
 /// Rebuild a CBOR attestation object (`{fmt, attStmt, authData}`) from
-/// the parsed `Attestation` struct — verbatim from `dds-fido2-test`,
-/// which this server-verification path is already proven against.
+/// the parsed `Attestation` struct, so it can be posted to the node.
+///
+/// **`x5c` must be carried through when the authenticator supplies it.**
+/// `packed` attestation has two sub-modes and the server picks between
+/// them by presence of `x5c` (`dds-domain/src/fido2.rs`, `verify_packed`):
+/// with a chain it verifies `sig` against the **leaf certificate's**
+/// public key; without one it treats the statement as self-attestation
+/// and verifies against the *credential* key. Dropping the chain
+/// therefore doesn't merely lose metadata — it sends the server down the
+/// wrong branch, and a perfectly valid full attestation is rejected as
+/// `bad attestation signature` (surfacing to the client as HTTP 401
+/// `auth_failed`). Any authenticator doing full attestation — e.g. a
+/// Crayonic KeyVault — hits this.
+///
+/// The server's parser matches map keys by name, so key order is free.
 fn rebuild_attestation_cbor(
     fmt: &str,
     auth_data: &[u8],
     attstmt_alg: i32,
     attstmt_sig: &[u8],
+    attstmt_x5c: &[Vec<u8>],
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    out.push(0xa3); // map(3)
+    out.push(0xa3); // map(3): fmt, attStmt, authData
 
     cbor_text(&mut out, "fmt");
     cbor_text(&mut out, fmt);
@@ -304,17 +319,42 @@ fn rebuild_attestation_cbor(
     if fmt == "none" || attstmt_sig.is_empty() {
         out.push(0xa0); // empty map
     } else {
-        out.push(0xa2); // map(2): alg + sig
+        if attstmt_x5c.is_empty() {
+            out.push(0xa2); // map(2): alg, sig  (self-attestation)
+        } else {
+            out.push(0xa3); // map(3): alg, sig, x5c  (full attestation)
+        }
         cbor_text(&mut out, "alg");
         cbor_int(&mut out, attstmt_alg as i64);
         cbor_text(&mut out, "sig");
         cbor_bytes(&mut out, attstmt_sig);
+        if !attstmt_x5c.is_empty() {
+            cbor_text(&mut out, "x5c");
+            cbor_array_header(&mut out, attstmt_x5c.len());
+            for cert in attstmt_x5c {
+                cbor_bytes(&mut out, cert);
+            }
+        }
     }
 
     cbor_text(&mut out, "authData");
     cbor_bytes(&mut out, auth_data);
 
     out
+}
+
+/// CBOR array header (major type 4). Certificate chains are short, but
+/// individual certs are not — the element encoder handles their length.
+fn cbor_array_header(out: &mut Vec<u8>, len: usize) {
+    if len < 24 {
+        out.push(0x80 | len as u8);
+    } else if len < 256 {
+        out.push(0x98);
+        out.push(len as u8);
+    } else {
+        out.push(0x99);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+    }
 }
 
 fn cbor_text(out: &mut Vec<u8>, s: &str) {
@@ -368,5 +408,92 @@ fn cbor_int(out: &mut Vec<u8>, val: i64) {
             out.push(0x39);
             out.extend_from_slice(&(v as u16).to_be_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The attestation object is hand-rolled CBOR, so these decode it
+    //! back with a real CBOR reader rather than trusting the byte
+    //! arithmetic by eye. The `x5c` case is a regression guard: dropping
+    //! that field made the node verify a full attestation against the
+    //! credential key instead of the leaf cert, rejecting valid keys with
+    //! "bad attestation signature" (HTTP 401 `auth_failed`).
+    use super::*;
+    use ciborium::value::Value;
+
+    fn decode(bytes: &[u8]) -> Value {
+        ciborium::de::from_reader(bytes).expect("rebuilt attestation must be valid CBOR")
+    }
+
+    fn get<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
+        v.as_map()?
+            .iter()
+            .find(|(k, _)| k.as_text() == Some(key))
+            .map(|(_, val)| val)
+    }
+
+    #[test]
+    fn packed_with_x5c_preserves_the_certificate_chain() {
+        let leaf = vec![0xAAu8; 300]; // cert-sized: exercises the 16-bit length path
+        let intermediate = vec![0xBBu8; 20]; // and the short path
+        let obj = rebuild_attestation_cbor(
+            "packed",
+            &[0x01, 0x02, 0x03],
+            -7,
+            &[0x99; 64],
+            &[leaf.clone(), intermediate.clone()],
+        );
+
+        let v = decode(&obj);
+        assert_eq!(get(&v, "fmt").unwrap().as_text(), Some("packed"));
+
+        let att = get(&v, "attStmt").expect("attStmt present");
+        assert_eq!(
+            att.as_map().unwrap().len(),
+            3,
+            "attStmt must carry alg, sig AND x5c"
+        );
+        assert_eq!(
+            get(att, "alg").unwrap().as_integer().unwrap(),
+            (-7i64).into()
+        );
+        assert_eq!(get(att, "sig").unwrap().as_bytes().unwrap().len(), 64);
+
+        let x5c = get(att, "x5c").expect("x5c must survive the rebuild");
+        let arr = x5c.as_array().expect("x5c is an array");
+        assert_eq!(arr.len(), 2, "both chain elements present, in order");
+        assert_eq!(arr[0].as_bytes().unwrap(), &leaf);
+        assert_eq!(arr[1].as_bytes().unwrap(), &intermediate);
+    }
+
+    #[test]
+    fn packed_self_attestation_omits_x5c() {
+        // No chain supplied => self-attestation sub-mode; emitting an
+        // empty x5c array would flip the server to the leaf-cert branch
+        // and fail, so the key must be absent entirely.
+        let obj = rebuild_attestation_cbor("packed", &[0x01], -7, &[0x42; 64], &[]);
+        let v = decode(&obj);
+        let att = get(&v, "attStmt").unwrap();
+        assert_eq!(att.as_map().unwrap().len(), 2);
+        assert!(get(att, "x5c").is_none(), "must not emit an empty x5c");
+    }
+
+    #[test]
+    fn fmt_none_has_empty_attstmt() {
+        let obj = rebuild_attestation_cbor("none", &[0x01], -7, &[], &[]);
+        let v = decode(&obj);
+        assert_eq!(get(&v, "fmt").unwrap().as_text(), Some("none"));
+        assert!(get(&v, "attStmt").unwrap().as_map().unwrap().is_empty());
+    }
+
+    #[test]
+    fn auth_data_round_trips_verbatim() {
+        // authData carries the credential public key and the UV flag the
+        // server checks — any corruption here breaks enrollment silently.
+        let auth: Vec<u8> = (0..=255u8).cycle().take(500).collect();
+        let obj = rebuild_attestation_cbor("packed", &auth, -7, &[0x11; 64], &[]);
+        let v = decode(&obj);
+        assert_eq!(get(&v, "authData").unwrap().as_bytes().unwrap(), &auth);
     }
 }

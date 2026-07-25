@@ -1,5 +1,30 @@
 # DDS Implementation Status
 
+## fix(fido2-cli,fido2-test): full attestation rejected — x5c chain dropped — 2026-07-25
+
+`dds-fido2 admin-setup` failed with HTTP 401 `auth_failed` against a Crayonic KeyVault. The
+node log gave the real reason: `fido2 error: bad attestation signature`. Local
+(`ctap-hid-fido2`) verification passed, so the mismatch was purely in what we sent.
+
+**Root cause:** `rebuild_attestation_cbor` re-encoded the attestation statement as `{alg, sig}`
+and silently discarded `attstmt_x5c`. `packed` attestation has two sub-modes and
+`dds_domain::fido2::verify_packed` selects between them **by presence of `x5c`**: with a chain
+it verifies `sig` against the **leaf certificate's** public key; without one it assumes
+self-attestation and verifies against the *credential* key. Dropping the chain therefore didn't
+just lose metadata — it sent the server down the wrong branch, so a valid full attestation could
+never verify. Any authenticator doing full attestation is affected.
+
+Notably `bin/probe.rs` and `bin/multinode.rs` in the same crate already had this right
+(probe.rs even notes "real authenticators usually emit `packed` with `x5c`"); only
+`dds-fido2-test/src/main.rs` was wrong, and `dds-fido2-cli` inherited the defect by copying it.
+
+**Fix:** emit `{alg, sig, x5c}` when a chain is present (`map(3)`), `{alg, sig}` when not, in
+both crates — now byte-identical to probe.rs's proven encoder. Four unit tests decode the output
+with a real CBOR reader rather than trusting the hand-rolled byte arithmetic: chain preserved in
+order (exercising both the short and 16-bit length paths), no empty `x5c` emitted in
+self-attestation mode (which would wrongly flip the server to the leaf-cert branch),
+`fmt = "none"` stays an empty map, and authData round-trips verbatim.
+
 ## fix(fido2-cli): biometric authenticators could never vouch (UV misdetection) — 2026-07-25
 
 `dds-fido2 admin-setup` warned *"this authenticator has no PIN capability; vouch/revoke-vouch
