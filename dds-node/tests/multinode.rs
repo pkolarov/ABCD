@@ -219,9 +219,29 @@ fn handle_event(node: &mut DdsNode, event: SwarmEvent<dds_net::transport::DdsBeh
     use dds_net::transport::DdsBehaviourEvent;
     match event {
         SwarmEvent::Behaviour(DdsBehaviourEvent::Gossipsub(
-            libp2p::gossipsub::Event::Message { message, .. },
+            libp2p::gossipsub::Event::Message {
+                propagation_source,
+                message_id,
+                message,
+            },
         )) => {
             ingest_gossip(node, &message.topic, &message.data);
+            // **H-1 (pre-prod review 2026-07-24)** — the swarm is built
+            // with `validate_messages()`, so libp2p parks each inbound
+            // message until the application reports a verdict. This
+            // harness deliberately bypasses the H-12 admission gate (see
+            // the module docs), but it must still report, or nothing it
+            // receives is ever forwarded — which is precisely what broke
+            // `relay_revocation_propagates_via_sync_after_originator_drops`:
+            // the relay node ingested locally and C received nothing.
+            node.swarm
+                .behaviour_mut()
+                .gossipsub
+                .report_message_validation_result(
+                    &message_id,
+                    &propagation_source,
+                    libp2p::gossipsub::MessageAcceptance::Accept,
+                );
         }
         SwarmEvent::NewListenAddr { address, .. } => {
             node.config.network.listen_addr = address.to_string();

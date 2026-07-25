@@ -851,9 +851,34 @@ fn handle_swarm_event(
     use dds_net::transport::DdsBehaviourEvent;
     match event {
         SwarmEvent::Behaviour(DdsBehaviourEvent::Gossipsub(
-            libp2p::gossipsub::Event::Message { message, .. },
+            libp2p::gossipsub::Event::Message {
+                propagation_source,
+                message_id,
+                message,
+            },
         )) => {
             ingest_gossip(nodes, idx, &message.topic, &message.data, metrics, probes);
+            // **H-1 (pre-prod review 2026-07-24)** — the swarm is now
+            // built with `validate_messages()`, so libp2p holds every
+            // inbound message until the application reports a verdict.
+            // Without this call the harness would ingest locally but
+            // never *relay*, so anything beyond a fully-meshed handful
+            // of nodes would silently fail to converge — and the message
+            // cache would grow until its TTL expired each entry.
+            //
+            // The harness deliberately runs without the H-12 admission
+            // gate (it drives synthetic load against nodes it created
+            // itself), so it accepts unconditionally rather than
+            // duplicating `DdsNode::classify_gossip_message`.
+            nodes[idx]
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .report_message_validation_result(
+                    &message_id,
+                    &propagation_source,
+                    libp2p::gossipsub::MessageAcceptance::Accept,
+                );
         }
         SwarmEvent::NewListenAddr { address, .. } => {
             nodes[idx].config.network.listen_addr = address.to_string();
