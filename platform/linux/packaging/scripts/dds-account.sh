@@ -67,6 +67,89 @@ ensure_publisher_authorized() {
   echo ""
 }
 
+# Device URNs are long, opaque, and — critically — a wrong one produces a
+# policy that publishes successfully and is then silently never applied.
+# So offer a numbered pick-list from the domain's own device inventory
+# instead of asking the operator to transcribe URNs between machines.
+DEVICE_URNS=()
+DEVICE_LABELS=()
+
+load_devices() {
+  DEVICE_URNS=()
+  DEVICE_LABELS=()
+  local json
+  json="$("${DDS_CLI}" --node-url "${NODE_URL}" platform devices --json 2>/dev/null || true)"
+  [[ -n "${json}" ]] || return 1
+  while IFS=$'\t' read -r urn label; do
+    [[ -n "${urn}" ]] || continue
+    DEVICE_URNS+=("${urn}")
+    DEVICE_LABELS+=("${label}")
+  done < <(printf '%s' "${json}" | python3 -c "
+import json, sys
+try:
+    items = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for d in items:
+    bits = [d.get('hostname') or '?', d.get('os') or '?', d.get('os_version') or '']
+    tags = d.get('tags') or []
+    if tags:
+        bits.append('tags: ' + ','.join(tags))
+    print('%s\t%s' % (d.get('device_urn', ''), ' '.join(b for b in bits if b)))
+" 2>/dev/null)
+  [[ ${#DEVICE_URNS[@]} -gt 0 ]]
+}
+
+# Prints the chosen URN(s) as a comma-separated list on stdout. Prompts
+# go to stderr so callers can capture the result with $(...).
+pick_devices() {
+  local multi="${1:-single}"
+  if ! load_devices; then
+    echo "  (no device inventory available — falling back to manual entry)" >&2
+    printf "  Enter device URN(s) manually (comma-separated, blank to skip): " >&2
+    local manual
+    read -r manual
+    printf '%s' "${manual}"
+    return 0
+  fi
+
+  echo "" >&2
+  echo "  Devices enrolled in this domain:" >&2
+  local i
+  for i in "${!DEVICE_URNS[@]}"; do
+    printf "   %2d) %s\n" "$((i + 1))" "${DEVICE_LABELS[$i]}" >&2
+    printf "       %s\n" "${DEVICE_URNS[$i]}" >&2
+  done
+  echo "" >&2
+  if [[ "${multi}" == "multi" ]]; then
+    printf "  Select device number(s) (comma-separated, blank for none): " >&2
+  else
+    printf "  Select device number (blank to skip): " >&2
+  fi
+  local sel
+  read -r sel
+  [[ -n "${sel}" ]] || return 0
+
+  local out="" n
+  IFS=',' read -r -a _picks <<< "${sel}"
+  for n in "${_picks[@]}"; do
+    n="${n// /}"
+    [[ -n "${n}" ]] || continue
+    if ! [[ "${n}" =~ ^[0-9]+$ ]]; then
+      echo "  Ignoring non-numeric '${n}'." >&2
+      continue
+    fi
+    if (( n < 1 || n > ${#DEVICE_URNS[@]} )); then
+      echo "  Ignoring out-of-range '${n}'." >&2
+      continue
+    fi
+    [[ -n "${out}" ]] && out="${out},"
+    out="${out}${DEVICE_URNS[$((n - 1))]}"
+    [[ "${multi}" == "multi" ]] || break
+  done
+  printf '%s' "${out}"
+}
+
 split_csv_to_json_array() {
   python3 -c "
 import json, sys
@@ -112,8 +195,18 @@ printf "Device tags (comma-separated, e.g. linux-eng): "
 read -r DEVICE_TAGS
 printf "Org units (comma-separated): "
 read -r ORG_UNITS
-printf "Identity URNs (comma-separated): "
-read -r IDENTITY_URNS
+echo ""
+echo "Device URNs (targets one or more specific machines)."
+printf "Pick from the enrolled device list? [Y/n]: "
+read -r PICK_RESP
+PICK_RESP="${PICK_RESP:-Y}"
+if [[ "${PICK_RESP}" =~ ^[Yy] ]]; then
+  IDENTITY_URNS="$(pick_devices multi)"
+  [[ -n "${IDENTITY_URNS}" ]] && echo "  Selected: ${IDENTITY_URNS}"
+else
+  printf "Identity URNs (comma-separated): "
+  read -r IDENTITY_URNS
+fi
 
 echo ""
 echo "--- Policy identity ---"
@@ -128,8 +221,16 @@ echo ""
 echo "--- Version ---"
 echo "The server does NOT enforce version ordering — republishing with a"
 echo "version <= the current one silently gossips but never takes effect."
-printf "Representative already-enrolled device URN to check the current version against (optional): "
-read -r CHECK_DEVICE_URN
+echo "Pick a representative already-enrolled device to check the current"
+echo "version against (any device the policy is visible to will do)."
+CHECK_DEVICE_URN=""
+# If the scope already names devices, the first one is the obvious probe.
+if [[ -n "${IDENTITY_URNS}" ]]; then
+  CHECK_DEVICE_URN="${IDENTITY_URNS%%,*}"
+  echo "  Using the first scoped device: ${CHECK_DEVICE_URN}"
+else
+  CHECK_DEVICE_URN="$(pick_devices single)"
+fi
 
 CURRENT_VERSION=""
 if [[ -n "${CHECK_DEVICE_URN}" ]]; then

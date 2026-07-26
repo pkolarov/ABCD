@@ -884,6 +884,10 @@ where
         .route("/v1/enroll/device", post(enroll_device::<S>))
         .route("/v1/enroll/challenge", get(issue_enroll_challenge::<S>))
         .route("/v1/enrolled-users", get(list_enrolled_users::<S>))
+        // Device inventory, so operators can discover the `device_urn`
+        // values policy scoping needs rather than reading them off each
+        // machine by hand.
+        .route("/v1/devices", get(list_devices::<S>))
         .route("/v1/admin/challenge", get(issue_admin_challenge::<S>))
         .route("/v1/admin/setup", post(admin_setup::<S>))
         .route("/v1/admin/vouch", post(admin_vouch::<S>))
@@ -1188,6 +1192,12 @@ pub struct ReplicationConfirmResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EnrolledUsersResponse {
     pub users: Vec<EnrolledUser>,
+}
+
+/// Response for `GET /v1/devices`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DevicesResponse {
+    pub devices: Vec<crate::service::EnrolledDevice>,
 }
 
 // ---------- Windows applier types (Phase 3 items 9–10) ----------
@@ -1960,6 +1970,30 @@ where
     let include_revoked = q.include_revoked.unwrap_or(0) != 0;
     let users = svc.list_enrolled_users(&q.device_urn, include_revoked)?;
     Ok(Json(EnrolledUsersResponse { users }))
+}
+
+/// `GET /v1/devices` — inventory of every device enrolled in the domain.
+///
+/// Lets an operator look up the `device_urn` they need when scoping
+/// policy at specific machines, instead of reading it off each box by
+/// hand. Read-only; admin-gated alongside `/v1/admin/roots` because it
+/// is the same class of operator inventory.
+async fn list_devices<S>(
+    State(state): State<AppState<S>>,
+) -> Result<Json<DevicesResponse>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    let svc = state.svc.lock().await;
+    let devices = svc.list_devices()?;
+    Ok(Json(DevicesResponse { devices }))
 }
 
 // ---------- Admin enrollment + vouch handlers ----------
@@ -3742,6 +3776,7 @@ mod tests {
             )
             .route("/v1/status", get(status::<MemoryBackend>))
             .route("/v1/admin/roots", get(admin_roots::<MemoryBackend>))
+            .route("/v1/devices", get(list_devices::<MemoryBackend>))
             .route(
                 "/v1/replication/confirm",
                 get(replication_confirm::<MemoryBackend>),

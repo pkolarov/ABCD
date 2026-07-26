@@ -254,6 +254,33 @@ pub struct EnrolledUser {
     pub revoked: bool,
 }
 
+/// One enrolled device, for `GET /v1/devices`.
+///
+/// Exists so operators can *discover* the `device_urn` values they need
+/// when targeting policy at specific machines (a `PolicyScope`'s
+/// `identity_urns`). Before this, the URN had to be read off each
+/// machine by hand — from `appsettings.json` or the registry — which is
+/// error-prone precisely where a mistake fails silently: a claim policy
+/// scoped to a URN that doesn't match any device publishes successfully
+/// and is simply never applied.
+///
+/// Read-only and derived entirely from replicated `DeviceJoinDocument`
+/// attestations, so any node can answer for the whole domain. Note the
+/// self-attested caveat that applies to device facts generally: `tags`
+/// and `org_unit` are claimed by the device itself.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EnrolledDevice {
+    pub device_urn: String,
+    pub device_id: String,
+    pub hostname: String,
+    pub os: String,
+    pub os_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
 /// Request to issue a session.
 #[derive(Debug, Clone)]
 pub struct SessionRequest {
@@ -2444,6 +2471,64 @@ impl<
         Ok(users)
     }
 
+    /// List every device enrolled in the domain, newest-visible-first is
+    /// *not* guaranteed — order follows the trust graph's iteration.
+    ///
+    /// Mirrors [`Self::list_enrolled_users`]: same revoked/burned skip
+    /// rules, same "derive from replicated attestations" approach, so a
+    /// device enrolled on any node is listed by every node once gossip
+    /// has caught up.
+    pub fn list_devices(&self) -> Result<Vec<EnrolledDevice>, ServiceError> {
+        let g = self
+            .trust_graph
+            .read()
+            .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+
+        // Keyed by device_urn so a device that re-published its join
+        // document (re-provision, OS upgrade) is listed once, at its
+        // newest `iat`, rather than once per historical token.
+        let mut devices: std::collections::HashMap<String, (u64, EnrolledDevice)> =
+            std::collections::HashMap::new();
+        for token in g.attestations_iter() {
+            if g.is_revoked(&token.payload.jti) || g.is_burned(&token.payload.iss) {
+                continue;
+            }
+            // A device-join document is *self*-attested (see
+            // `device_targeting_facts`, which resolves targeting facts by
+            // `iss == device_urn`). Requiring iss == sub here keeps this
+            // listing agreeing with what policy scoping will actually
+            // match, instead of surfacing a URN no scope can ever hit.
+            if token.payload.iss != token.payload.sub {
+                continue;
+            }
+            let doc = match DeviceJoinDocument::extract(&token.payload) {
+                Ok(Some(d)) => d,
+                _ => continue,
+            };
+            let urn = token.payload.sub.clone();
+            let iat = token.payload.iat;
+            let entry = EnrolledDevice {
+                device_urn: urn.clone(),
+                device_id: doc.device_id,
+                hostname: doc.hostname,
+                os: doc.os,
+                os_version: doc.os_version,
+                org_unit: doc.org_unit,
+                tags: doc.tags,
+            };
+            match devices.get(&urn) {
+                Some((seen_iat, _)) if *seen_iat >= iat => {}
+                _ => {
+                    devices.insert(urn, (iat, entry));
+                }
+            }
+        }
+        let mut out: Vec<EnrolledDevice> = devices.into_values().map(|(_, d)| d).collect();
+        // Stable output so scripts and diffs don't churn on HashMap order.
+        out.sort_by(|a, b| a.device_urn.cmp(&b.device_urn));
+        Ok(out)
+    }
+
     /// Get node status.
     pub fn status(
         &self,
@@ -4582,6 +4667,71 @@ mod platform_applier_tests {
             settings: vec![],
             linux: None,
         }
+    }
+
+    /// `list_devices` is what `dds platform devices` reads, and its whole
+    /// point is that the URNs it prints are the ones policy scoping will
+    /// actually match. So: every enrolled device, self-attestations only,
+    /// deduped, sorted.
+    #[test]
+    fn list_devices_returns_every_enrolled_device_once() {
+        let (mut svc, admin, _) = setup();
+        let a = enroll_device(&mut svc, "ws-a", vec!["workstation".into()], None);
+        let b = enroll_device(&mut svc, "ws-b", vec![], Some("engineering".into()));
+
+        let devices = svc.list_devices().unwrap();
+        assert_eq!(devices.len(), 2, "both devices listed: {devices:?}");
+        // Sorted by URN, so the ordering assertion below is meaningful.
+        let urns: Vec<&str> = devices.iter().map(|d| d.device_urn.as_str()).collect();
+        let mut expected = vec![a.as_str(), b.as_str()];
+        expected.sort();
+        assert_eq!(urns, expected);
+
+        let dev_a = devices.iter().find(|d| d.device_urn == a).unwrap();
+        assert_eq!(dev_a.hostname, "ws-a");
+        assert_eq!(dev_a.os, "Windows 10");
+        assert_eq!(dev_a.tags, vec!["workstation".to_string()]);
+        let dev_b = devices.iter().find(|d| d.device_urn == b).unwrap();
+        assert_eq!(dev_b.org_unit.as_deref(), Some("engineering"));
+
+        // A device-join document attesting to a *different* subject is not
+        // a device: `device_targeting_facts` resolves targeting facts by
+        // `iss == device_urn`, so listing the `sub` here would print a URN
+        // that publishes fine in a policy scope and then never matches.
+        let doc = DeviceJoinDocument {
+            device_id: "hw-impostor".into(),
+            hostname: "impostor".into(),
+            os: "Windows 11".into(),
+            os_version: "24H2".into(),
+            tpm_ek_hash: None,
+            org_unit: None,
+            tags: vec![],
+        };
+        let mut payload = TokenPayload {
+            iss: admin.id.to_urn(),
+            iss_key: admin.public_key.clone(),
+            jti: "impostor-device".to_string(),
+            sub: "urn:vouchsafe:impostor.notadevice".to_string(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1_700_000_000,
+            exp: Some(4_102_444_800),
+            body_type: None,
+            body_cbor: None,
+        };
+        doc.embed(&mut payload).unwrap();
+        let token = Token::sign(payload, &admin.signing_key).unwrap();
+        svc.trust_graph.write().unwrap().add_token(token).unwrap();
+
+        let devices = svc.list_devices().unwrap();
+        assert_eq!(
+            devices.len(),
+            2,
+            "a device-join attesting to someone else must not be listed: {devices:?}"
+        );
     }
 
     #[test]

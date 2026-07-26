@@ -505,6 +505,17 @@ enum PlatformAction {
         #[command(subcommand)]
         action: LinuxAction,
     },
+    /// List every device enrolled in the domain (GET /v1/devices).
+    ///
+    /// Use this to find the `device_urn` values that policy scoping
+    /// needs, instead of reading them off each machine by hand. A URN
+    /// that matches no device produces a policy that publishes fine and
+    /// is then never applied, so copying it correctly matters.
+    Devices {
+        /// Emit JSON instead of a table (for scripting).
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1966,7 +1977,59 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
                 println!("Applied report accepted.");
             }
         },
+        PlatformAction::Devices { json } => {
+            let r: DevicesResponseJson = get_json(node_url, "/v1/devices", &[]).await;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&r.devices).unwrap_or_else(|_| "[]".to_string())
+                );
+                return;
+            }
+            if r.devices.is_empty() {
+                println!("No devices enrolled in this domain yet.");
+                return;
+            }
+            println!("Enrolled devices ({}):", r.devices.len());
+            for d in &r.devices {
+                println!("  {}", d.device_urn);
+                print!("      {} — {}", d.hostname, d.os);
+                if !d.os_version.is_empty() {
+                    print!(" {}", d.os_version);
+                }
+                println!();
+                if let Some(ou) = &d.org_unit {
+                    println!("      org unit: {ou}");
+                }
+                if !d.tags.is_empty() {
+                    println!("      tags: {}", d.tags.join(", "));
+                }
+            }
+        }
     }
+}
+
+/// Mirrors `dds_node::http::DevicesResponse` / `service::EnrolledDevice`.
+#[derive(Deserialize)]
+struct DevicesResponseJson {
+    devices: Vec<EnrolledDeviceJson>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct EnrolledDeviceJson {
+    device_urn: String,
+    #[serde(default)]
+    device_id: String,
+    #[serde(default)]
+    hostname: String,
+    #[serde(default)]
+    os: String,
+    #[serde(default)]
+    os_version: String,
+    #[serde(default)]
+    org_unit: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 fn load_applied_report(path: &Path) -> serde_json::Value {

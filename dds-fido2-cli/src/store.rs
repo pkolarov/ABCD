@@ -21,6 +21,18 @@ pub struct AdminCredential {
     pub label: String,
     pub credential_id: String,
     pub created_at: u64,
+    /// The admin identity URN `admin-setup` minted for this credential.
+    ///
+    /// Recorded so a wizard can answer "is the admin on this machine
+    /// trusted by the domain yet?" without the operator keeping the URN
+    /// in a terminal scrollback: the on-disk signing key is named by
+    /// `SHA256(urn)` and so can't be reversed, and an untrusted admin
+    /// doesn't appear in `/v1/admin/roots` to be discovered from there.
+    ///
+    /// `#[serde(default)]` because stores written before this field
+    /// existed have no value for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urn: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -101,6 +113,7 @@ pub fn add(
     label: &str,
     credential_id: &str,
     created_at: u64,
+    urn: Option<&str>,
     force: bool,
 ) -> Result<(), String> {
     if let Some(pos) = store.admins.iter().position(|a| a.label == label) {
@@ -115,6 +128,7 @@ pub fn add(
         label: label.to_string(),
         credential_id: credential_id.to_string(),
         created_at,
+        urn: urn.map(str::to_string),
     });
     Ok(())
 }

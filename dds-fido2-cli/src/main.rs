@@ -116,9 +116,15 @@ enum Command {
         pin_stdin: bool,
     },
 
-    /// List admin credentials stored on this box (human inspection
-    /// only — labels, truncated credential_id, created_at).
-    ListAdmins,
+    /// List admin credentials stored on this box (labels, truncated
+    /// credential_id, created_at, admin URN).
+    ListAdmins {
+        /// Emit JSON. Use this instead of parsing the TOML store
+        /// directly — the store's on-disk shape is not a stable
+        /// interface, this output is.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -167,7 +173,7 @@ async fn main() {
             };
             cmd_revoke_vouch(&cli.node_url, &cli.rp_id, auth, &subject_urn, purpose).await
         }
-        Command::ListAdmins => cmd_list_admins(&store_path),
+        Command::ListAdmins { json } => cmd_list_admins(&store_path, json),
     };
 
     if let Err(e) = result {
@@ -260,6 +266,7 @@ async fn cmd_admin_setup(
         label,
         &credential_id_b64url,
         now_epoch(),
+        Some(resp.urn.as_str()),
         force,
     )?;
     store::save(store_path, &cred_store)?;
@@ -357,8 +364,14 @@ async fn cmd_revoke_vouch(
     Ok(())
 }
 
-fn cmd_list_admins(store_path: &Path) -> Result<(), String> {
+fn cmd_list_admins(store_path: &Path, json: bool) -> Result<(), String> {
     let store = store::load(store_path)?;
+    if json {
+        let out = serde_json::to_string_pretty(&store.admins)
+            .map_err(|e| format!("serialize admins: {e}"))?;
+        println!("{out}");
+        return Ok(());
+    }
     if store.admins.is_empty() {
         println!(
             "No admin credentials stored on this box ({}).",
@@ -377,6 +390,13 @@ fn cmd_list_admins(store_path: &Path) -> Result<(), String> {
             "  {:<16} credential_id={short} created_at={}",
             a.label, a.created_at
         );
+        match &a.urn {
+            Some(urn) => println!("  {:<16} urn={urn}", ""),
+            // Pre-dates the store's `urn` field. Harmless — the credential
+            // still works for vouching; only the wizard's "is this admin
+            // trusted yet?" check needs the URN.
+            None => println!("  {:<16} urn=(not recorded — set up before v0.1.1)", ""),
+        }
     }
     Ok(())
 }

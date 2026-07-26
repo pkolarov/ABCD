@@ -1,5 +1,59 @@
 # DDS Implementation Status
 
+## feat: device-URN discovery + one guided flow to make a machine an approver — 2026-07-26
+
+Two ergonomics fixes for the rough edges `docs/DDS-Start-Here.md` §7 called out by name.
+
+**1. Device URNs no longer have to be transcribed by hand.** New `GET /v1/devices`
+(`LocalService::list_devices`, admin-gated alongside `/v1/enrolled-users`) and
+`dds platform devices [--json]`. `dds-account` (macOS + Linux) now offers a numbered pick-list for
+policy scoping and reuses the first selection as the version-discovery probe device.
+
+This matters more than convenience: a scope naming a URN that matches no device **publishes
+successfully and is then silently never applied**. Hand-copying a URN between machines is exactly
+where that failure comes from.
+
+`list_devices` filters to `iss == sub` — a device-join document is self-attested, and
+`device_targeting_facts` resolves targeting facts by `iss == device_urn`, so listing a `sub` from
+someone else's attestation would print a URN no scope can ever match. It also dedupes by
+`device_urn` keeping the newest `iat` (a re-provisioned machine publishes a second join document)
+and sorts, so scripted output doesn't churn. Covered by
+`list_devices_returns_every_enrolled_device_once`.
+
+Not done: the Windows console's account wizard still takes the device URN as free text
+(`TbAcctDeviceUrn`, `DdsConsole.ps1`). `/v1/devices` is the piece it needs; wiring a picker into
+the WPF form is untested-here work and left for someone on Windows.
+
+**2. `dds-user` → "Make THIS machine able to approve things"** replaces the two-steps-on-two-machines
+dance. It detects which of three states you're in rather than asking:
+
+- The domain already trusts an admin whose signing key is here → says so, does nothing. The check
+  is exact: admin keys are stored at `admin_keys/SHA256(urn).key`, so for each root in
+  `/v1/admin/roots` it hashes forward and tests for the file.
+- A local admin exists but hasn't been promoted → prints the cross-vouch command and offers to
+  poll `/v1/admin/roots` until it lands.
+- Neither → runs `admin-setup`, then the above.
+
+The C-2 gate (`admin_setup` requires an empty `trusted_roots`) is **closed on every node that
+joined via a provision bundle**, so the clear→setup→restore dance is the normal path for a second
+machine, not an edge case. The flow does it with a config backup, `dds debug config` validation,
+revert-on-invalid, and restore-even-if-setup-failed — and states plainly what the window costs
+before asking. Productized from the scratchpad script used to make this Mac an admin.
+
+Supporting change: `admin-setup` now records the minted admin URN in the credential store
+(`AdminCredential.urn`, `#[serde(default)]` for older stores), and `list-admins` gained `--json`.
+Without it the "half done" state above is undiscoverable — the on-disk key is named by
+`SHA256(urn)` so it can't be reversed, and an unpromoted admin doesn't appear in
+`/v1/admin/roots` to be read from there.
+
+**Doc correction.** `DDS-Start-Here.md` claimed admin-key machine-binding was "not a policy choice."
+That conflated two things. *Needing* a software signing key is unavoidable (FIDO2 cannot sign
+arbitrary tokens; `admin_vouch` loads an Ed25519 key and `Token::sign`s with it — the security key
+only unlocks permission to use it). *Being stuck on one machine* is a current implementation
+choice: the wrap key is `SHA256(node_identity.signing_key ‖ "admin-key-wrap")`, with
+`TODO(security)`/M-22 tracking a move to Keychain/DPAPI/TPM. Corrected, and the guide's honest
+complexity section now distinguishes the two.
+
 ## fix(fido2-cli,fido2-test): send SHA-256(challenge) as clientDataHash — 2026-07-25
 
 `admin-setup` still returned HTTP 401 `auth_failed` after the x5c fix, with the node logging the

@@ -37,14 +37,23 @@ This is the part that confuses everyone, including the person who wrote
 the tooling. It comes down to **two independent questions**:
 
 **Q1: Does this machine hold an admin's signing key?**
-Approving anything requires signing it. That signing key is created by
-`admin-setup` **on one specific machine**, and it is encrypted with that
-machine's own node key — so it **cannot be copied elsewhere**. Not a
-policy choice; the file is undecryptable off-box.
+Approving anything means *signing* a statement, and a security key can't
+sign arbitrary statements — it only proves you're present. So each admin
+also has an Ed25519 signing key on disk, minted by `admin-setup`. Your
+security-key touch is what unlocks permission to use it.
 
-> Consequence: *the machine where you ran admin-setup is the only machine
-> that admin can approve things from.* If you want to approve from your
-> laptop too, that laptop needs its **own** admin (see recipe 7).
+Today that key is encrypted with the node's own identity key, so it is
+undecryptable on any other machine. Two consequences worth separating:
+
+- *Needing* a software signing key is unavoidable — FIDO2 can't do this.
+- *Being stuck on one machine* is a current implementation choice, not a
+  law of the design. Moving it to OS-backed storage (Keychain / DPAPI /
+  TPM) with a portable export path is tracked as `TODO(security)` / M-22.
+
+> Consequence for now: *the machine where you ran admin-setup is the only
+> machine that admin can approve things from.* To approve from your laptop
+> too, that laptop needs its **own** admin — recipe 7, which is one guided
+> flow.
 
 **Q2: Does the *target* machine trust that admin?**
 Each node has a list of admins it trusts (`trusted_roots`). A vouch
@@ -81,6 +90,13 @@ admin, create accounts, publish policy.
 | `dds-user` | enrol / approve / promote / demote / offboard people |
 | `dds-account` | create-modify-delete local OS accounts via policy |
 | `dds-verify-replication` | health check; is this node in sync? |
+
+Handy one-liner when you need a device's URN (for policy scoping, or to
+check what actually joined):
+
+```bash
+sudo dds --node-url "unix:/Library/Application Support/DDS/dds.sock" platform devices
+```
 
 Underneath: `dds-fido2` does security-key ceremonies, `dds` (dds-cli) is
 the raw API client. Reach for those when a wizard can't express what you
@@ -142,11 +158,21 @@ need their **own** signing key on whatever machine they'll approve from
 (back to Q1).
 
 ### 7. Let a second machine approve things
-Two steps, and both are needed:
-1. On that machine: create an admin there (`dds-fido2 admin-setup`, or
-   `dds-enroll-admin`). This mints the local signing key.
-2. On a machine that already has a trusted admin: promote the new admin
-   (recipe 6), so the rest of the domain accepts their signatures.
+```
+On that machine:  sudo dds-user  → "Make THIS machine able to approve things"
+```
+One flow. It works out where you already are and only asks for what's
+missing: mints a local admin signing key (your key touch), then prints the
+exact cross-vouch command to run on a machine that already has a trusted
+admin, and offers to wait until the promotion arrives.
+
+Two things it will tell you about rather than hide:
+- On a node that joined via a provision bundle, the anti-escalation gate
+  (`admin_setup` requires an empty trusted-root list) is already closed.
+  The flow offers to briefly clear the list and put it back — a real edit
+  to `dds.toml`, backed up first, and it asks before doing it.
+- Step 2 needs the *other* admin's security key, not yours. Nobody can
+  self-promote.
 
 ### 8. Give someone a Windows account that doesn't exist yet
 DDS can create the local Windows account at their first logon.
@@ -182,7 +208,8 @@ Health check on any node: `sudo dds-verify-replication`.
 1. **A vouch is what grants access, not enrolment.** Enrolling only says
    who someone is.
 2. **Admin power is tied to a machine, not just a person.** Their signing
-   key lives on one box and cannot be moved.
+   key lives on one box and cannot be moved (today — see §2 Q1). Fix it
+   per machine with recipe 7.
 3. **An admin can only revoke their own approvals.**
 4. **Security keys must be registered with `hmac-secret` for Windows
    logon**, and that can only be set when the credential is created —
@@ -209,16 +236,22 @@ compromise.
 But some of it is just rough edges, and worth knowing they're rough
 rather than assuming you misunderstood:
 
-- **Setting up a second approving machine takes two steps on two
-  machines** (recipe 7). It could plausibly be one guided flow.
+- **Admin signing keys are stuck on one machine.** A design choice, not a
+  requirement — see §2 Q1 and M-22.
 - **macOS/Linux have menu scripts where Windows has a real console.**
   Same capabilities, worse ergonomics.
 - **Failures often surface one layer away from the cause** — a logon
   rejected for a missing approval, a policy published successfully and
   then ignored for a version number. The error table above exists
   because those messages don't say what to do.
-- **Device URNs must be copied by hand** when targeting policy at
-  specific machines.
+- **Nothing enforces policy version ordering server-side.** The wizards
+  look the current version up and warn you, but that's tooling papering
+  over a missing server check.
+
+Two rough edges called out in earlier drafts of this guide are now fixed:
+setting up a second approving machine is one guided flow (recipe 7), and
+device URNs are picked from a list rather than copied by hand
+(`dds platform devices`, and the pick-list in `dds-account`).
 
 If a task feels harder than it should, it may well be. Worth reporting
 rather than working around.
