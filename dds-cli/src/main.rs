@@ -513,6 +513,14 @@ enum WindowsAction {
     Policies {
         #[arg(long)]
         device_urn: String,
+        /// See `dds platform macos policies --help` — same `--json`
+        /// version-discovery output, for Windows policy documents.
+        /// Needed to look up a `policy_id`'s current version before
+        /// republishing: the server does not enforce monotonicity, so a
+        /// republish at a version <= the current one gossips fine and
+        /// then never takes effect on any device.
+        #[arg(long)]
+        json: bool,
     },
     /// GET /v1/windows/software?device_urn=...
     Software {
@@ -1794,7 +1802,7 @@ fn decode_audit_entry(raw: &AuditEntry) -> Option<dds_core::audit::AuditLogEntry
 async fn handle_platform(action: PlatformAction, node_url: &str) {
     match action {
         PlatformAction::Windows { action } => match action {
-            WindowsAction::Policies { device_urn } => {
+            WindowsAction::Policies { device_urn, json } => {
                 let env: dds_core::envelope::SignedPolicyEnvelope = get_json(
                     node_url,
                     "/v1/windows/policies",
@@ -1802,6 +1810,10 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
                 )
                 .await;
                 let bytes = unwrap_envelope(env, dds_core::envelope::kind::WINDOWS_POLICIES);
+                if json {
+                    print_policy_versions_json(&bytes, "windows/policies");
+                    return;
+                }
                 let r: WindowsPoliciesPayload =
                     serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                         eprintln!("Error: failed to parse windows/policies payload: {e}");
