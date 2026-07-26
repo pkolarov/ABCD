@@ -98,7 +98,8 @@ void CPLog(const char* fmt, ...)
 // DDS user entry — simplified replacement for SmartcardCredentialStruct
 // ============================================================================
 #define MAX_DDS_STRING_LENGTH 256
-#define MAX_DDS_USERS 5
+// MAX_DDS_USERS lives in CDdsProvider.h so MAX_CREDENTIALS can be derived from
+// it — see the tile-capacity comment there.
 
 struct DdsUserEntry {
     wchar_t subjectUrn[MAX_DDS_STRING_LENGTH];
@@ -837,12 +838,14 @@ HRESULT CDdsProvider::_EnumerateCredentials()
         DWORD credIdx = 0;
         for (int i = 0; i < g_ddsUsers.count; i++) {
             // AUDIT-2026-06-11 #7 / AUDIT-2026-06-12 R1 follow-up:
-            // _rgpCredentials holds only MAX_CREDENTIALS (3) slots, but
-            // g_ddsUsers can carry up to MAX_DDS_USERS (5). Stop enumerating
-            // once the array is full. The bound is _dwNumCreds (the dense
-            // append cursor _EnumerateOneCredential actually writes at), not
-            // credIdx — the two diverge when an Initialize fails, and credIdx
-            // is only a log label.
+            // never write past _rgpCredentials. MAX_CREDENTIALS is now derived
+            // from MAX_DDS_USERS (+1 for the SetSerialization tile), so a full
+            // user cache always fits and this guard no longer silently drops
+            // enrolled users the way the old 3-slot array did — it stays as the
+            // structural backstop. The bound is _dwNumCreds (the dense append
+            // cursor _EnumerateOneCredential actually writes at), not credIdx —
+            // the two diverge when an Initialize fails, and credIdx is only a
+            // log label.
             if (_dwNumCreds >= MAX_CREDENTIALS)
                 break;
             // Skip admin accounts — they don't log into Windows

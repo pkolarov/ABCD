@@ -12,7 +12,15 @@
 #include "CDdsCredential.h"
 #include <helpers.h>
 
-#define MAX_CREDENTIALS 3
+// Tile capacity. MAX_CREDENTIALS was 3 while the user cache (MAX_DDS_USERS)
+// held 5, so on a machine with more enrolled users than tile slots the tail of
+// the bridge's list silently got no tile at all and those users could not sign
+// in — observed live on a workgroup ARM64 box where the bridge returned 5
+// enrolled users and LogonUI rendered 3 tiles. Derive the tile count from the
+// user cache so the two can never drift again; the +1 is the SetSerialization
+// tile, which is appended to the same array after a full user enumeration.
+#define MAX_DDS_USERS   16                      // matches IPC_MAX_USERS
+#define MAX_CREDENTIALS (MAX_DDS_USERS + 1)
 #define MAX_DWORD   0xffffffff
 
 std::function<void(void)> onDdsStatusChangeCallback;
