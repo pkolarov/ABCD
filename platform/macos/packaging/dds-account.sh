@@ -90,11 +90,19 @@ try:
     items = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
+import datetime
 for d in items:
     bits = [d.get('hostname') or '?', d.get('os') or '?', d.get('os_version') or '']
+    # Enrollment date and the self-marker are what let you tell cloned
+    # VMs and stale re-provisioned identities apart -- hostname cannot.
+    iat = d.get('enrolled_at') or 0
+    if iat:
+        bits.append(datetime.datetime.fromtimestamp(iat, datetime.timezone.utc).strftime('(%Y-%m-%d)'))
     tags = d.get('tags') or []
     if tags:
         bits.append('tags: ' + ','.join(tags))
+    if d.get('is_self'):
+        bits.append('<- THIS MACHINE')
     print('%s\t%s' % (d.get('device_urn', ''), ' '.join(b for b in bits if b)))
 " 2>/dev/null)
   [[ ${#DEVICE_URNS[@]} -gt 0 ]]

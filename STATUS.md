@@ -1,5 +1,53 @@
 # DDS Implementation Status
 
+## fix(devices): hostname does not identify a machine — add enrolled_at + is_self — 2026-07-26
+
+Verifying `/v1/devices` against the real LAB domain immediately falsified an assumption the
+feature was built on. Six devices came back, and **four of them share the hostname
+`WIN-1AR6F84PFJ0`** — for what is physically two VMs:
+
+```
+WIN-1AR6F84PFJ0 ... tags: bootstrap-node     <- tjni7yff...
+WIN-1AR6F84PFJ0 ... tags: joined-node        <- 5btfbqbv...
+WIN-1AR6F84PFJ0 ... tags: joined-node        <- cndj6tuw...
+WIN-1AR6F84PFJ0 ... tags: joined-node        <- ujkcyla7...
+WIN-1AR6F84PFJ0 ... tags: replication-test   <- repltest-c599fe (a throwaway from an earlier test)
+```
+
+Two causes, both permanent: the VMs are clones so they share a hostname, and **re-provisioning
+mints a new `device_urn` while the old identity stays in the trust graph forever** (nothing revokes
+it). The dedupe added earlier only collapses *identical* URNs, so it cannot help here — these are
+genuinely distinct identities.
+
+This made the pick-list actively misleading rather than merely unhelpful: it presented five
+indistinguishable "WIN-1AR6F84PFJ0" rows for a two-machine domain, and picking wrong yields a
+policy that publishes cleanly and is never applied — the exact silent failure the feature exists to
+prevent.
+
+Fix: `EnrolledDevice` gains `enrolled_at` (the join document's `iat`) and `is_self`. Sorting is now
+hostname, then newest-first within a hostname, so a re-provisioned machine's live identity leads
+and stale ones fall below it. The table marks `<- THIS MACHINE` and, when any hostname is shared,
+prints how to resolve the ambiguity authoritatively: ask each machine for its own `node_urn` via
+`/v1/node/info`. Both `dds-account` pick-lists show the date and self-marker too.
+
+`is_self` is the only URN a listing can identify with certainty; everything else needs confirming
+on the machine itself. Saying so beats implying the list is authoritative.
+
+Two things caught during this work, both my errors:
+
+- The printed remediation was `dds --node-url <socket> node info` — **there is no `node`
+  subcommand**. Checked `dds --help` rather than shipping a command that would have failed for the
+  next reader; replaced with the per-platform `curl /v1/node/info` invocations.
+- `format_epoch` (hand-rolled to avoid a date dependency for one display field) is correct, but two
+  of my expected values in its test were guessed epochs, not computed ones. Verified all cases
+  against Python's `datetime` and corrected the test — including 2100-02-28 → 2100-03-01, the
+  century-rule case a naive `/4` leap test gets wrong.
+
+Back-compat: both new fields are `#[serde(default)]` and the CLI degrades to omitting the date, so
+a new CLI against an older node still works — covered by
+`devices_response_tolerates_older_server_without_new_fields`. This is not hypothetical; it is
+exactly what happened here (new CLI, Jul-24 node, HTTP 404).
+
 ## feat: device-URN discovery + one guided flow to make a machine an approver — 2026-07-26
 
 Two ergonomics fixes for the rough edges `docs/DDS-Start-Here.md` §7 called out by name.

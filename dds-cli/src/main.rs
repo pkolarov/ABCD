@@ -1991,22 +1991,77 @@ async fn handle_platform(action: PlatformAction, node_url: &str) {
                 return;
             }
             println!("Enrolled devices ({}):", r.devices.len());
+            // Count identities per hostname so shared-hostname cases can be
+            // called out inline rather than left for the reader to notice.
+            let mut per_host: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
             for d in &r.devices {
-                println!("  {}", d.device_urn);
+                *per_host.entry(d.hostname.as_str()).or_default() += 1;
+            }
+            let mut shared_hostnames = false;
+            for d in &r.devices {
+                let dup = per_host.get(d.hostname.as_str()).copied().unwrap_or(1) > 1;
+                shared_hostnames |= dup;
+                println!(
+                    "  {}{}",
+                    d.device_urn,
+                    if d.is_self { "   <- THIS MACHINE" } else { "" }
+                );
                 print!("      {} — {}", d.hostname, d.os);
                 if !d.os_version.is_empty() {
                     print!(" {}", d.os_version);
                 }
+                if d.enrolled_at > 0 {
+                    print!("   enrolled {}", format_epoch(d.enrolled_at));
+                }
                 println!();
                 if let Some(ou) = &d.org_unit {
-                    println!("      org unit: {ou}");
+                    print!("      org unit: {ou}");
+                } else {
+                    print!("      ");
                 }
                 if !d.tags.is_empty() {
-                    println!("      tags: {}", d.tags.join(", "));
+                    print!("  tags: {}", d.tags.join(", "));
                 }
+                println!();
+            }
+            if shared_hostnames {
+                println!();
+                println!("Note: more than one identity shares a hostname above. A hostname does");
+                println!("not identify a machine — cloned VMs share one, and re-provisioning");
+                println!("mints a new device URN while keeping the old one in the graph. Confirm");
+                println!("which URN is which by asking the machine itself — run ON that machine:");
+                println!("  Windows:  curl.exe http://127.0.0.1:5551/v1/node/info");
+                println!("  macOS:    sudo curl -s --unix-socket \\");
+                println!("              '/Library/Application Support/DDS/dds.sock' \\");
+                println!("              http://localhost/v1/node/info");
+                println!("  Linux:    sudo curl -s --unix-socket /var/lib/dds/dds.sock \\");
+                println!("              http://localhost/v1/node/info");
+                println!("The `node_urn` it reports is that machine's own identity.");
             }
         }
     }
+}
+
+/// Format a Unix timestamp as `YYYY-MM-DD` (UTC).
+///
+/// Hand-rolled rather than pulling in a date crate for one cosmetic
+/// field. Howard Hinnant's `civil_from_days`: shift the epoch to
+/// 0000-03-01 so leap days land at the end of the 400-year era and the
+/// month arithmetic stays branch-free.
+fn format_epoch(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11], March-based
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// Mirrors `dds_node::http::DevicesResponse` / `service::EnrolledDevice`.
@@ -2030,6 +2085,10 @@ struct EnrolledDeviceJson {
     org_unit: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    enrolled_at: u64,
+    #[serde(default)]
+    is_self: bool,
 }
 
 fn load_applied_report(path: &Path) -> serde_json::Value {
@@ -3612,6 +3671,51 @@ mod admin_vouch_contract_tests {
             .expect("server must accept the legacy no-challenge shape");
         assert!(server.client_data_json_b64.is_none());
         assert!(server.challenge_id.is_none());
+    }
+}
+
+#[cfg(test)]
+mod device_listing_tests {
+    //! `format_epoch` is hand-rolled to avoid adding a date dependency for
+    //! one display field, so it gets its own checks — including the leap
+    //! cases the March-shifted algorithm exists to handle.
+    use super::{DevicesResponseJson, format_epoch};
+
+    #[test]
+    fn format_epoch_matches_known_dates() {
+        assert_eq!(format_epoch(0), "1970-01-01");
+        assert_eq!(format_epoch(86_399), "1970-01-01");
+        assert_eq!(format_epoch(86_400), "1970-01-02");
+        // 2000-02-29 — a leap year divisible by 400.
+        assert_eq!(format_epoch(951_782_400), "2000-02-29");
+        // 2100 is NOT a leap year (divisible by 100, not 400), so Feb 28
+        // is followed directly by Mar 1 — the case the century rule exists
+        // for, and the one a naive /4 leap test gets wrong.
+        assert_eq!(format_epoch(4_107_456_000), "2100-02-28");
+        assert_eq!(format_epoch(4_107_542_400), "2100-03-01");
+        // The timestamps this actually renders: device join `iat` values.
+        assert_eq!(format_epoch(1_700_000_000), "2023-11-14");
+        assert_eq!(format_epoch(1_785_000_000), "2026-07-25");
+    }
+
+    /// The listing must tolerate a server that predates `enrolled_at` /
+    /// `is_self` — a mixed-version domain is normal during a rollout, and
+    /// the CLI degrading to "no date shown" beats failing to parse.
+    #[test]
+    fn devices_response_tolerates_older_server_without_new_fields() {
+        let json = r#"{"devices":[{
+            "device_urn":"urn:vouchsafe:WIN-1.abc",
+            "device_id":"DDS-WIN-1",
+            "hostname":"WIN-1",
+            "os":"Windows",
+            "os_version":"10.0.26200"
+        }]}"#;
+        let r: DevicesResponseJson = serde_json::from_str(json).unwrap();
+        assert_eq!(r.devices.len(), 1);
+        assert_eq!(r.devices[0].enrolled_at, 0);
+        assert!(!r.devices[0].is_self);
+        assert!(r.devices[0].tags.is_empty());
+        assert!(r.devices[0].org_unit.is_none());
     }
 }
 

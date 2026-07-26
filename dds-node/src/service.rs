@@ -279,6 +279,22 @@ pub struct EnrolledDevice {
     pub org_unit: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// `iat` of the join document, i.e. when this identity enrolled.
+    ///
+    /// Load-bearing for picking the right device, not decoration.
+    /// Hostnames do not identify a machine: cloned VMs share one, and a
+    /// re-provisioned machine mints a **new** `device_urn` while keeping
+    /// its hostname — so a two-machine domain can show four identities
+    /// under one name, only some of them live. The enrollment date is
+    /// what distinguishes them.
+    #[serde(default)]
+    pub enrolled_at: u64,
+    /// True for the node answering this request.
+    ///
+    /// The one URN a listing can identify with certainty. Everything else
+    /// has to be confirmed on the machine itself (`/v1/node/info`).
+    #[serde(default)]
+    pub is_self: bool,
 }
 
 /// Request to issue a session.
@@ -2489,6 +2505,7 @@ impl<
         // newest `iat`, rather than once per historical token.
         let mut devices: std::collections::HashMap<String, (u64, EnrolledDevice)> =
             std::collections::HashMap::new();
+        let self_urn = self.node_urn();
         for token in g.attestations_iter() {
             if g.is_revoked(&token.payload.jti) || g.is_burned(&token.payload.iss) {
                 continue;
@@ -2508,6 +2525,7 @@ impl<
             let urn = token.payload.sub.clone();
             let iat = token.payload.iat;
             let entry = EnrolledDevice {
+                is_self: urn == self_urn,
                 device_urn: urn.clone(),
                 device_id: doc.device_id,
                 hostname: doc.hostname,
@@ -2515,6 +2533,7 @@ impl<
                 os_version: doc.os_version,
                 org_unit: doc.org_unit,
                 tags: doc.tags,
+                enrolled_at: iat,
             };
             match devices.get(&urn) {
                 Some((seen_iat, _)) if *seen_iat >= iat => {}
@@ -2524,8 +2543,16 @@ impl<
             }
         }
         let mut out: Vec<EnrolledDevice> = devices.into_values().map(|(_, d)| d).collect();
-        // Stable output so scripts and diffs don't churn on HashMap order.
-        out.sort_by(|a, b| a.device_urn.cmp(&b.device_urn));
+        // Group by hostname (cloned VMs share one), then newest first
+        // within a hostname so the live identity of a re-provisioned
+        // machine leads and stale ones sort below it. URN breaks ties so
+        // the order is total and scripts don't churn on HashMap order.
+        out.sort_by(|a, b| {
+            a.hostname
+                .cmp(&b.hostname)
+                .then(b.enrolled_at.cmp(&a.enrolled_at))
+                .then(a.device_urn.cmp(&b.device_urn))
+        });
         Ok(out)
     }
 
@@ -4681,11 +4708,19 @@ mod platform_applier_tests {
 
         let devices = svc.list_devices().unwrap();
         assert_eq!(devices.len(), 2, "both devices listed: {devices:?}");
-        // Sorted by URN, so the ordering assertion below is meaningful.
+        // Grouped by hostname; "ws-a" < "ws-b" and the two hostnames are
+        // distinct, so hostname alone fixes the order here.
         let urns: Vec<&str> = devices.iter().map(|d| d.device_urn.as_str()).collect();
-        let mut expected = vec![a.as_str(), b.as_str()];
-        expected.sort();
-        assert_eq!(urns, expected);
+        assert_eq!(urns, vec![a.as_str(), b.as_str()]);
+        assert!(
+            devices.iter().all(|d| d.enrolled_at > 0),
+            "enrolled_at must be populated — it's what distinguishes cloned \
+             hostnames and stale re-provisioned identities: {devices:?}"
+        );
+        assert!(
+            devices.iter().all(|d| !d.is_self),
+            "no enrolled device is this node in the test fixture"
+        );
 
         let dev_a = devices.iter().find(|d| d.device_urn == a).unwrap();
         assert_eq!(dev_a.hostname, "ws-a");
