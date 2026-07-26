@@ -48,7 +48,8 @@ See [DDS Admin Guide — Windows Deployment](docs/DDS-Admin-Guide.md#windows-dep
 
 | Document | Audience | Description |
 |---|---|---|
-| **[DDS Admin Guide](docs/DDS-Admin-Guide.md)** | Administrators | Domain setup, node deployment, user enrollment, policy, monitoring |
+| **[Start Here](docs/DDS-Start-Here.md)** | **New operators — read first** | Plain-language guide: the four concepts, what you can do from *which machine* and why, recipes for the ~8 everyday tasks, error→fix table |
+| **[DDS Admin Guide](docs/DDS-Admin-Guide.md)** | Administrators | Reference (look things up, don't read front-to-back): domain setup, node deployment, user enrollment, policy, monitoring |
 | **[DDS Developer Guide](docs/DDS-Developer-Guide.md)** | Developers | End-to-end walkthrough of how DDS works under the hood |
 | **[Design Document](docs/DDS-Design-Document.md)** | Architects | Formal specification (§1–§14): identity, CRDTs, P2P, tokens, policy, trust |
 | **[Implementation Whitepaper](docs/DDS-Implementation-Whitepaper.md)** | Engineers | Technical deep-dive on implementation choices and performance budgets |
