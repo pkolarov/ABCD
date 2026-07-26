@@ -183,21 +183,11 @@ async fn cmd_new_user(
     display_name: &str,
 ) -> Result<(), String> {
     let device = fido2::Device::open()?;
-    println!("Touch your FIDO2 key to register {label}...");
     // hmac-secret = true: this person may later log in to a Windows node,
     // whose credential vault is sealed with the assertion-time HMAC output.
     // It cannot be added to the credential afterwards. See
     // `fido2::Device::make_credential`.
-    // Registration needs no UV server-side, so don't demand it here — a
-    // plain touch keeps enrollment working on any authenticator.
-    let outcome = device.make_credential(
-        rp_id,
-        label.as_bytes(),
-        label,
-        display_name,
-        true,
-        fido2::UvMethod::None,
-    )?;
+    let outcome = register_credential(&device, rp_id, label.as_bytes(), label, display_name, true)?;
 
     let req = api::EnrollUserRequest {
         label: label.to_string(),
@@ -239,60 +229,16 @@ async fn cmd_admin_setup(
     let device = fido2::Device::open()?;
     ensure_uv_available(&device)?;
 
-    // Prefer registering the admin credential AS user-verified, mirroring
-    // Windows' AdminFlow (`requireUserVerification=true`): the later vouch
-    // assertions require UV, so exercising it now surfaces a key that
-    // can't supply it before we mint an admin that could never vouch.
-    //
-    // But this is a *preference*, not a requirement — the server does not
-    // gate `admin_setup` on UV at all. Biometric UV can fail for reasons
-    // that have nothing to do with the key's capabilities (an
-    // unrecognised finger, a sensor that never lights up), and the
-    // authenticator reports all of them as the same opaque timeout. So on
-    // timeout, fall back to a plain touch rather than leaving the operator
-    // stuck: an admin that exists but must prove UV later beats no admin
-    // at all.
     // hmac-secret = false: admins vouch, they never unseal a credential
     // vault. Mirrors DdsTrayAgent/AdminFlow.cpp:186.
-    let cap = device.uv_capability()?;
-    let pin = acquire_pin_if_needed(cap, false)?;
-    let uv = uv_method(cap, pin.as_ref().map(|z| z.as_str()));
-    let uv_attempted = !matches!(uv, fido2::UvMethod::None);
-    match cap {
-        fido2::UvCapability::BuiltIn => println!(
-            "Verify on your FIDO2 key (fingerprint / on-device) to create the admin credential..."
-        ),
-        _ => println!("Touch your FIDO2 key to create the admin credential..."),
-    }
-    let outcome = match device.make_credential(
+    let outcome = register_credential(
+        &device,
         rp_id,
         label.as_bytes(),
         label,
         "DDS Administrator",
         false,
-        uv,
-    ) {
-        Ok(o) => o,
-        Err(e) if uv_attempted && e.contains("CTAP2_ERR_USER_ACTION_TIMEOUT") => {
-            eprintln!("\n{e}\n");
-            eprintln!(
-                "User verification did not complete. Retrying WITHOUT it — registration \
-                 does not require UV.\n\
-                 NOTE: vouching later DOES require UV, so if that step also fails, this \
-                 key cannot currently act as an admin.\n"
-            );
-            println!("Touch your FIDO2 key (a plain touch this time)...");
-            device.make_credential(
-                rp_id,
-                label.as_bytes(),
-                label,
-                "DDS Administrator",
-                false,
-                fido2::UvMethod::None,
-            )?
-        }
-        Err(e) => return Err(e),
-    };
+    )?;
 
     let req = api::EnrollUserRequest {
         label: "admin".to_string(),
@@ -485,6 +431,74 @@ async fn run_admin_assertion_ceremony(
         client_data_hash_b64: fido2::b64(&assertion.client_data_hash),
         signature_b64: fido2::b64(&assertion.signature),
     })
+}
+
+/// Run a registration ceremony, preferring User Verification when the
+/// authenticator offers it and falling back to a plain touch if that
+/// times out.
+///
+/// The server requires UV for neither `enroll_user` nor `admin_setup`, so
+/// asking for it may look gratuitous. Two reasons it is not:
+///
+/// 1. **Some authenticators cooperate only when it is requested.** On a
+///    Crayonic KeyVault, `MakeCredential` *without* `uv` times out waiting
+///    for a touch, while the same call *with* `uv` completes on a
+///    fingerprint. On a touch-type biometric sensor the plain
+///    user-presence gesture is evidently not what the device is waiting
+///    for.
+/// 2. **For admins it is diagnostic.** Vouching later *does* require UV
+///    (`admin_vouch`, AUDIT-2026-06-12 R2), so exercising it during
+///    registration surfaces a key that cannot supply it before an admin
+///    is minted that could never vouch — mirroring Windows' AdminFlow
+///    (`requireUserVerification=true`).
+///
+/// The fallback matters because biometric UV fails for reasons unrelated
+/// to capability (an unrecognised finger, a sensor that never lights up)
+/// and the authenticator reports every one of them as the same opaque
+/// timeout. Getting a credential registered beats leaving the operator
+/// stuck on a retry loop.
+fn register_credential(
+    device: &fido2::Device,
+    rp_id: &str,
+    user_id: &[u8],
+    label: &str,
+    display_name: &str,
+    request_hmac_secret: bool,
+) -> Result<fido2::EnrollmentOutcome, String> {
+    let cap = device.uv_capability()?;
+    // `pin` must outlive `uv`, which borrows from it.
+    let pin = acquire_pin_if_needed(cap, false)?;
+    let uv = uv_method(cap, pin.as_ref().map(|z| z.as_str()));
+    let uv_attempted = !matches!(uv, fido2::UvMethod::None);
+
+    if uv_attempted {
+        println!("Verify on your FIDO2 key (fingerprint / on-device) to register {label}...");
+    } else {
+        println!("Touch your FIDO2 key to register {label}...");
+    }
+
+    match device.make_credential(rp_id, user_id, label, display_name, request_hmac_secret, uv) {
+        Ok(o) => Ok(o),
+        Err(e) if uv_attempted && e.contains("CTAP2_ERR_USER_ACTION_TIMEOUT") => {
+            eprintln!("\n{e}\n");
+            eprintln!(
+                "User verification did not complete. Retrying WITHOUT it — registration \
+                 does not require UV.\n\
+                 NOTE: admin vouching later DOES require UV, so if that step also fails, \
+                 this key cannot currently act as an admin.\n"
+            );
+            println!("Touch your FIDO2 key (a plain touch this time)...");
+            device.make_credential(
+                rp_id,
+                user_id,
+                label,
+                display_name,
+                request_hmac_secret,
+                fido2::UvMethod::None,
+            )
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Read a PIN only when the PIN protocol is the UV route we'll actually
