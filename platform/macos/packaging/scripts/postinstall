@@ -19,9 +19,13 @@ mkdir -p /var/log/dds
 chown -R root:wheel "${DDS_ROOT}"
 chmod 750 "${DDS_ROOT}"
 
-# Copy config template if no config exists yet
+# Copy config template if no config exists yet. The destination is
+# dds.toml, not the template again — copying the template onto itself
+# left a fresh install with no dds.toml at all, and the `2>/dev/null ||
+# true` hid it. The `! -f` guard is what protects an existing config on
+# upgrade, so this must never overwrite one.
 if [[ ! -f "${DDS_ROOT}/dds.toml" ]]; then
-  cp "${DDS_ROOT}/dds.toml.template" "${DDS_ROOT}/dds.toml.template" 2>/dev/null || true
+  cp "${DDS_ROOT}/dds.toml.template" "${DDS_ROOT}/dds.toml" 2>/dev/null || true
 fi
 
 # Copy production appsettings if not present
