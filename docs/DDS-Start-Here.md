@@ -127,6 +127,37 @@ One file, one command, one security-key touch.
 > fixes it — you'd have to edit config by hand. The scripts regenerate
 > the bundle automatically after admin setup for exactly this reason.
 
+**What joining gives you, and what it doesn't.** Everything in the trust
+graph replicates, so the new machine immediately knows every user, every
+approval, who the admins are, and every published policy. Nobody has to
+re-enrol anyone.
+
+It does **not** create OS accounts. Those exist only where a policy says
+so, and whether your existing policies reach the new machine depends
+entirely on how they were scoped:
+
+| Policy scoped by | Reaches a newly joined machine? |
+|---|---|
+| nothing (all dimensions empty) | yes — an empty scope matches every device |
+| `device_tags` | yes, if the machine self-attests that tag |
+| `org_units` | yes, if it self-attests that org unit |
+| `identity_urns` (specific machines) | **no — and silently** |
+
+Joining self-attests a tag for you: `auto-provisioned` via `dds-node
+provision`, `joined-node` via the Windows enrol script, `bootstrap-node`
+on the machine that started the domain. So scoping a policy by tag or org
+unit is what makes it apply to machines that don't exist yet. Scoping by
+`identity_urns` is a deliberate choice to target *only* the machines you
+name — useful, but it will never grow.
+
+Then one more platform split, once a policy does match:
+
+- **macOS / Linux** — the account is created on the next policy poll, no
+  logon needed, with a locally generated password.
+- **Windows** — the account is created at that person's **first logon** on
+  that machine. No admin action, but somebody has to log in once per
+  machine before the account exists (see rule 5 below).
+
 ### 3. Add a person
 ```
 sudo dds-user     → "Enrol a new person"
@@ -217,11 +248,16 @@ Health check on any node: `sudo dds-verify-replication`.
 5. **Windows passwords never travel.** Each machine generates and stores
    its own, sealed to the user's key. So the same person needs a first
    logon on each machine.
-6. **Policy versions must increase.** Republishing at the same or lower
+6. **A policy scoped to specific machines never covers new ones.** Joining
+   a machine replicates every user and approval to it automatically, but
+   accounts come from policy, and an `identity_urns` scope only ever
+   matches the machines you listed. Scope by tag or org unit for anything
+   meant to apply going forward.
+7. **Policy versions must increase.** Republishing at the same or lower
    version is accepted and then silently ignored by every device. The
    wizards look up the current version for you.
-7. **Windows account creation needs Workgroup**, not domain-joined.
-8. **Nothing is instant.** Changes gossip in seconds normally, up to ~60s
+8. **Windows account creation needs Workgroup**, not domain-joined.
+9. **Nothing is instant.** Changes gossip in seconds normally, up to ~60s
    worst case.
 
 ---
