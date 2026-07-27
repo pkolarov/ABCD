@@ -3728,7 +3728,10 @@ mod policy_version_json_tests {
     //! `dds_node::service::ApplicableMacOsPolicy` /
     //! `dds_domain::MacOsPolicyDocument` types, not hand-typed JSON.
     use super::{PoliciesDetailPayload, PolicyVersionJson};
-    use dds_domain::{Enforcement, LinuxPolicyDocument, MacOsPolicyDocument, PolicyScope};
+    use dds_domain::{
+        AccountAction, Enforcement, LinuxPolicyDocument, MacOsPolicyDocument, PolicyScope,
+        WindowsPolicyDocument,
+    };
     use dds_node::service::ApplicableMacOsPolicy;
 
     #[test]
@@ -3820,5 +3823,50 @@ mod policy_version_json_tests {
         assert_eq!(linux.local_users.len(), 1);
         assert_eq!(linux.local_users[0].username, "jsmith");
         assert_eq!(linux.local_users[0].groups, vec!["sudo".to_string()]);
+    }
+
+    /// The tag-scoped Windows claim example from the Start-Here guide's
+    /// "grows by itself" recipe. Two things worth pinning:
+    ///
+    /// 1. It carries a `_comment` array explaining the scope choice.
+    ///    That only works because the policy types don't
+    ///    `deny_unknown_fields`; if that ever changes, this example
+    ///    becomes a file that fails to publish, and the guide would be
+    ///    telling people to run something broken.
+    /// 2. The scope must stay **tag**-based with `identity_urns` empty —
+    ///    that is the entire point of the recipe. A well-meaning edit to
+    ///    "just pin it to our machines" silently breaks the property the
+    ///    example exists to demonstrate.
+    #[test]
+    fn windows_tag_scoped_claim_example_matches_real_schema() {
+        let raw = include_str!("../../platform/windows/examples/account-claim-by-tag.json");
+        let doc: WindowsPolicyDocument =
+            serde_json::from_str(raw).expect("example must deserialize as WindowsPolicyDocument");
+        assert_eq!(doc.policy_id, "accounts/staff");
+        assert!(
+            doc.scope.identity_urns.is_empty(),
+            "the example must stay tag-scoped — pinning device URNs would \
+             stop it covering machines that join later, which is the point"
+        );
+        assert!(
+            doc.scope.device_tags.iter().any(|t| t == "joined-node"),
+            "must match the tag Enroll-DdsDevice.ps1 self-attests"
+        );
+        assert!(
+            doc.scope
+                .device_tags
+                .iter()
+                .any(|t| t == "auto-provisioned"),
+            "must match the tag `dds-node provision` self-attests"
+        );
+        let win = doc
+            .windows
+            .expect("example must set the windows directive block");
+        assert_eq!(win.local_accounts.len(), 1);
+        assert_eq!(win.local_accounts[0].action, AccountAction::Create);
+        assert!(
+            win.local_accounts[0].claim_subject_urn.is_some(),
+            "a first-logon claim is identified by claim_subject_urn"
+        );
     }
 }

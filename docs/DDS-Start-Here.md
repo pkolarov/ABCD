@@ -180,6 +180,9 @@ Revokes every vouch **you** issued for them. If another admin also
 vouched for them, that admin must revoke theirs too — DDS will tell you
 who. One admin cannot undo another's approvals.
 
+This blocks their logon everywhere. It does **not** remove their OS
+accounts — that is a separate job, recipe 10.
+
 ### 6. Promote / demote an admin
 ```
 sudo dds-user     → "Promote a person to admin" / "Demote an admin"
@@ -214,6 +217,105 @@ Requirements, all of them:
 
 Easiest path is the Windows console's account wizard. From macOS/Linux
 it's `dds-account`, which handles authorising the node to publish first.
+
+---
+
+### 9. A domain where new machines get accounts by themselves
+The full worked example. Do the first three steps **once**; after that,
+adding a machine is one command and the accounts follow.
+
+**1. Start the domain and become an admin** (recipes 1 and 2's prep).
+```
+sudo dds-bootstrap-domain
+sudo dds-enroll-admin
+```
+
+**2. Enrol and approve your people** — once each, ever, for the whole
+domain. Not per machine.
+```
+sudo dds-user   → "Enrol a new person"              (they touch their key)
+sudo dds-user   → "Approve a person for session login"   (you touch yours)
+```
+Note each person's subject URN; step 3 needs it.
+
+**3. Publish an account policy scoped by TAG, not by machine.** This is
+the step that decides whether the domain grows by itself.
+```
+sudo dds-account   → "Create/modify/... a local account"
+   Device tags:   joined-node, auto-provisioned
+   Org units:     (blank)
+   Device URNs:   (skip — answer "n" to the pick-list)
+```
+Or publish the file directly — a complete, tested example lives at
+[`platform/windows/examples/account-claim-by-tag.json`](../platform/windows/examples/account-claim-by-tag.json):
+```
+sudo dds --node-url "unix:/Library/Application Support/DDS/dds.sock" \
+     policy publish-windows --from-file account-claim-by-tag.json
+```
+The key line is the scope:
+```json
+"scope": {
+  "device_tags": ["joined-node", "auto-provisioned"],
+  "org_units": [],
+  "identity_urns": []
+}
+```
+Those two tags are self-attested by the join itself — `joined-node` by
+the Windows enrol script, `auto-provisioned` by `dds-node provision`. So
+the policy matches every machine that ever joins, including ones that
+don't exist yet. Put device URNs in `identity_urns` and you get the
+opposite: only those machines, forever, silently.
+
+For macOS/Linux accounts the shape is the same with a `macos`/`linux`
+block instead — see the `examples/account-create.json` in each platform's
+packaging directory.
+
+**4. Now add machines.** Each one, forever, is:
+```
+sudo dds-node provision /path/to/provision.dds
+```
+
+**What happens on its own from here:** the new machine learns every user
+and every approval by gossip within ~60s, matches the tag-scoped policy
+because it tagged itself at join, and then:
+- **macOS/Linux** — creates the accounts on the next policy poll. Nobody
+  has to log in first.
+- **Windows** — creates each account at that person's first logon on that
+  machine. No admin action, but somebody must sign in once per machine.
+
+**To add a person later**, do step 2 and add one directive to the step-3
+policy with a bumped `version`. No machine is touched.
+
+---
+
+### 10. Delete the OS accounts of someone you offboarded
+Offboarding (recipe 5) revokes their vouches, so **they can no longer log
+in anywhere** — session issuance fails with "subject has no granted
+purposes".
+
+It does **not** touch their OS accounts. The policy agent never consults
+vouches; account lifecycle is driven only by policy directives. So after
+offboarding, on every machine they ever signed into:
+
+- the local account still exists, enabled
+- their profile and files are still there
+- the sealed credential vault is still on disk
+
+They can't get in via DDS, and they never knew the password — it is
+generated on the machine and never displayed. But it is a real local
+account that a local administrator could reset.
+
+**To actually remove the accounts**, publish a policy directive with
+`"action": "Delete"` (or `"Disable"` to keep the profile) for that
+username, scoped the same way the Create was, and bump the version:
+```
+sudo dds-account   → choose Delete, same scope as the create policy
+```
+Then confirm it applied, rather than assuming — a version that didn't
+increase publishes cleanly and is ignored.
+
+> Treat "offboard" and "delete the account" as two separate jobs. Doing
+> only the first leaves a dormant local account on every machine.
 
 ---
 
@@ -253,11 +355,14 @@ Health check on any node: `sudo dds-verify-replication`.
    accounts come from policy, and an `identity_urns` scope only ever
    matches the machines you listed. Scope by tag or org unit for anything
    meant to apply going forward.
-7. **Policy versions must increase.** Republishing at the same or lower
+7. **Offboarding does not delete accounts.** Revoking vouches blocks
+   logon; the OS account, profile and vault stay on every machine the
+   person used. Account lifecycle is policy-only — recipe 10.
+8. **Policy versions must increase.** Republishing at the same or lower
    version is accepted and then silently ignored by every device. The
    wizards look up the current version for you.
-8. **Windows account creation needs Workgroup**, not domain-joined.
-9. **Nothing is instant.** Changes gossip in seconds normally, up to ~60s
+9. **Windows account creation needs Workgroup**, not domain-joined.
+10. **Nothing is instant.** Changes gossip in seconds normally, up to ~60s
    worst case.
 
 ---

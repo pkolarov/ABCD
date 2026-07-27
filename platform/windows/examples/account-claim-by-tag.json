@@ -1,0 +1,45 @@
+{
+  "_comment": [
+    "Windows first-logon account claim, scoped BY TAG rather than by device.",
+    "",
+    "The scope is what decides whether machines that don't exist yet are",
+    "covered. `joined-node` is self-attested by Enroll-DdsDevice.ps1, and",
+    "`auto-provisioned` by `dds-node provision`, so every machine that joins",
+    "from here on matches this policy with no republish. Listing device URNs",
+    "in `identity_urns` instead would pin the policy to exactly the machines",
+    "named, and a machine added later would silently never match.",
+    "",
+    "`claim_subject_urn` is the PERSON (their enrolled identity URN), not the",
+    "machine. One directive per person. On each machine they log in to, the",
+    "account is created at their first logon — Windows passwords never travel,",
+    "so each machine seals its own.",
+    "",
+    "Publish with:",
+    "  dds --node-url <socket> policy publish-windows --from-file <this file>",
+    "and bump `version` on every republish — the server does not enforce",
+    "ordering, so a stale version publishes fine and is then ignored."
+  ],
+  "policy_id": "accounts/staff",
+  "display_name": "Staff local accounts on every joined Windows machine",
+  "version": 1,
+  "scope": {
+    "device_tags": ["joined-node", "auto-provisioned"],
+    "org_units": [],
+    "identity_urns": []
+  },
+  "settings": [],
+  "enforcement": "Enforce",
+  "windows": {
+    "local_accounts": [
+      {
+        "username": "alice",
+        "action": "Create",
+        "claim_subject_urn": "urn:vouchsafe:REPLACE-WITH-ALICES-SUBJECT-URN",
+        "full_name": "Alice Example",
+        "description": "Created by DDS at first logon",
+        "groups": ["Users"],
+        "password_never_expires": true
+      }
+    ]
+  }
+}
