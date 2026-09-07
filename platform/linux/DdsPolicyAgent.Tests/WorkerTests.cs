@@ -3,6 +3,7 @@
 using System.Text.Json;
 using DDS.PolicyAgent.Linux.Client;
 using DDS.PolicyAgent.Linux.Config;
+using DDS.PolicyAgent.Linux.Enforcers;
 using DDS.PolicyAgent.Linux.Runtime;
 using DDS.PolicyAgent.Linux.State;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -57,8 +58,8 @@ sealed class ThrowingReportClient : IDdsNodeClient
 /// hitting an unexpected failure so the worker's per-policy catch runs.
 sealed class ThrowingCommandRunner : ICommandRunner
 {
-    public Task<CommandResult> RunAsync(string fileName, string arguments, CancellationToken ct = default)
-        => throw new InvalidOperationException($"simulated failure running {fileName} {arguments}");
+    public Task<CommandResult> RunAsync(string fileName, IReadOnlyList<string> arguments, CancellationToken ct = default)
+        => throw new InvalidOperationException($"simulated failure running {fileName} {string.Join(" ", arguments)}");
 }
 
 sealed class TestAppliedStateStore : IAppliedStateStore
@@ -359,7 +360,7 @@ public sealed class WorkerTests
     public async Task ProcessCommandRunnerRunsCommand()
     {
         var runner = new ProcessCommandRunner();
-        var result = await runner.RunAsync("echo", "hello");
+        var result = await runner.RunAsync("echo", ["hello"]);
         Assert.Equal(0, result.ExitCode);
         Assert.Contains("hello", result.Stdout);
     }
@@ -368,10 +369,54 @@ public sealed class WorkerTests
     public void NullCommandRunnerRecordsInvocations()
     {
         var runner = new NullCommandRunner();
-        runner.RunAsync("useradd", "-m alice");
+        runner.RunAsync("useradd", ["-m", "alice"]);
         Assert.Single(runner.Invocations);
         Assert.Equal("useradd", runner.Invocations[0].FileName);
+        Assert.Equal(new[] { "-m", "alice" }, runner.Invocations[0].Argv);
         Assert.Equal("-m alice", runner.Invocations[0].Arguments);
+    }
+
+    // Regression for the argv-injection fix: a DDS-managed user's full_name (GECOS)
+    // is attacker-influenced free text. Under the old single-string ProcessStartInfo
+    // path it was joined into the command line and re-split on whitespace by the
+    // process launcher, so a crafted full_name like "Ada -G sudo -u 0" could smuggle
+    // extra useradd/usermod flags (add the account to group `sudo`, or set uid 0).
+    // With ArgumentList the whole value must arrive as ONE argv element and can never
+    // be reinterpreted as flags. See docs/linux-agent-argv-injection-2026-08-07.md.
+    [Theory]
+    [InlineData("Create", "useradd")]
+    [InlineData("Modify", "usermod")]
+    public async Task UserFullName_WithEmbeddedFlags_ReachesRunnerAsSingleArgvElement(
+        string action, string expectedCmd)
+    {
+        const string maliciousFullName = "Ada -G sudo -u 0";
+
+        var runner = new NullCommandRunner();
+        // Make `id -u` report the user as absent so the Create path runs useradd.
+        runner.ExitCodeOverrides["id"] = 1;
+        var enforcer = new UserEnforcer(runner, auditOnly: false, NullLogger.Instance);
+
+        await enforcer.ApplyAsync(
+            [JsonDocument.Parse(
+                $$"""{"username":"alice","action":"{{action}}","full_name":"Ada -G sudo -u 0"}""")
+                .RootElement],
+            new HashSet<string>(), default);
+
+        var invocation = runner.Invocations.Single(i => i.FileName == expectedCmd);
+        var argv = invocation.Argv;
+
+        // The full_name is a single argv element sitting immediately after `-c`.
+        Assert.Contains("-c", argv);
+        var gecos = argv[argv.ToList().IndexOf("-c") + 1];
+        Assert.Equal(maliciousFullName, gecos);
+
+        // None of the tokens inside the full_name leaked out as their own argv
+        // elements — which is exactly what whitespace re-splitting would have done,
+        // and what would have turned them into real useradd/usermod flags.
+        Assert.DoesNotContain("-G", argv);
+        Assert.DoesNotContain("-u", argv);
+        Assert.DoesNotContain("sudo", argv);
+        Assert.DoesNotContain("0", argv);
     }
 
     [Fact]

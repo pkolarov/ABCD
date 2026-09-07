@@ -103,7 +103,7 @@ public sealed class SudoersEnforcer
             await File.WriteAllTextAsync(tmp, content, Encoding.ASCII, ct).ConfigureAwait(false);
             File.SetUnixFileMode(tmp, UnixFileMode.UserRead | UnixFileMode.GroupRead);
 
-            var check = await _runner.RunAsync("visudo", $"-cf {tmp}", ct).ConfigureAwait(false);
+            var check = await _runner.RunAsync("visudo", ["-cf", tmp], ct).ConfigureAwait(false);
             if (!check.Success)
             {
                 _log.LogWarning(

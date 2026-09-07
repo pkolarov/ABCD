@@ -186,7 +186,7 @@ public sealed class FileEnforcer
             else
             {
                 var result = await _runner
-                    .RunAsync("chown", $"{ownerVal} {path}", ct)
+                    .RunAsync("chown", [ownerVal, path], ct)
                     .ConfigureAwait(false);
                 if (!result.Success)
                     _log.LogWarning("chown failed for {P}: {Err}", path, result.Stderr);
@@ -203,7 +203,7 @@ public sealed class FileEnforcer
             else
             {
                 var result = await _runner
-                    .RunAsync("chmod", $"{modeVal} {path}", ct)
+                    .RunAsync("chmod", [modeVal, path], ct)
                     .ConfigureAwait(false);
                 if (!result.Success)
                     _log.LogWarning("chmod failed for {P}: {Err}", path, result.Stderr);

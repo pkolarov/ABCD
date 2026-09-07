@@ -172,7 +172,7 @@ public sealed class SysctlEnforcer
             return;
         }
 
-        var result = await _runner.RunAsync("sysctl", "--system", ct).ConfigureAwait(false);
+        var result = await _runner.RunAsync("sysctl", ["--system"], ct).ConfigureAwait(false);
         if (!result.Success)
             _log.LogWarning("sysctl --system exited {Code}: {Err}",
                 result.ExitCode, result.Stderr);

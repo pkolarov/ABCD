@@ -203,11 +203,11 @@ public sealed class SshdEnforcer
         }
 
         // Try "sshd" first; fall back to "ssh" for distros that use that unit name.
-        var result = await _runner.RunAsync("systemctl", "reload sshd", ct).ConfigureAwait(false);
+        var result = await _runner.RunAsync("systemctl", ["reload", "sshd"], ct).ConfigureAwait(false);
         if (!result.Success)
         {
             _log.LogDebug("systemctl reload sshd failed ({Code}); trying ssh unit", result.ExitCode);
-            result = await _runner.RunAsync("systemctl", "reload ssh", ct).ConfigureAwait(false);
+            result = await _runner.RunAsync("systemctl", ["reload", "ssh"], ct).ConfigureAwait(false);
             if (!result.Success)
                 _log.LogWarning("systemctl reload ssh exited {Code}: {Err}",
                     result.ExitCode, result.Stderr);

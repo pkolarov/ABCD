@@ -244,20 +244,21 @@ public sealed class SystemdEnforcer
         return Task.FromResult<string?>(stem);
     }
 
-    private async Task RunCtlOrLogAsync(string subcommand, string args, CancellationToken ct)
+    private async Task RunCtlOrLogAsync(string subcommand, string unit, CancellationToken ct)
     {
-        var fullArgs = string.IsNullOrEmpty(args) ? subcommand : $"{subcommand} {args}";
+        // `unit` is a single validated argv element (or empty for daemon-reload).
+        string[] argv = string.IsNullOrEmpty(unit) ? [subcommand] : [subcommand, unit];
 
         if (_auditOnly)
         {
-            _log.LogInformation("[AUDIT] would run: systemctl {Args}", fullArgs);
+            _log.LogInformation("[AUDIT] would run: systemctl {Args}", string.Join(" ", argv));
             return;
         }
 
-        var result = await _runner.RunAsync("systemctl", fullArgs, ct).ConfigureAwait(false);
+        var result = await _runner.RunAsync("systemctl", argv, ct).ConfigureAwait(false);
         if (!result.Success)
             _log.LogWarning("systemctl {Args} exited {Code}: {Err}",
-                fullArgs, result.ExitCode, result.Stderr);
+                string.Join(" ", argv), result.ExitCode, result.Stderr);
     }
 
     internal static bool IsSafeUnitName(string name)

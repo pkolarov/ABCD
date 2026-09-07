@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+using System.Globalization;
 using System.Text.Json;
 using DDS.PolicyAgent.Linux.Runtime;
 
@@ -76,15 +77,15 @@ public sealed class UserEnforcer
                         _log.LogWarning("UserEnforcer: {U} not DDS-managed; refusing Delete", username);
                         continue;
                     }
-                    await RunOrLogAsync("userdel", $"-r {username}", ct).ConfigureAwait(false);
+                    await RunOrLogAsync("userdel", ["-r", username], ct).ConfigureAwait(false);
                     break;
 
                 case "Disable":
-                    await RunOrLogAsync("passwd", $"-l {username}", ct).ConfigureAwait(false);
+                    await RunOrLogAsync("passwd", ["-l", username], ct).ConfigureAwait(false);
                     break;
 
                 case "Enable":
-                    await RunOrLogAsync("passwd", $"-u {username}", ct).ConfigureAwait(false);
+                    await RunOrLogAsync("passwd", ["-u", username], ct).ConfigureAwait(false);
                     break;
 
                 case "Modify":
@@ -124,7 +125,7 @@ public sealed class UserEnforcer
 
     private async Task ApplyModifyAsync(string username, JsonElement d, CancellationToken ct)
     {
-        var parts = new List<string>();
+        var args = new List<string>();
 
         if (d.TryGetProperty("shell", out var shell) && shell.ValueKind == JsonValueKind.String)
         {
@@ -132,14 +133,25 @@ public sealed class UserEnforcer
             if (!IsSafeShellPath(shellVal))
                 _log.LogWarning("UserEnforcer: unsafe shell value {S} for {U}; skipping -s", shellVal, username);
             else
-                parts.Add($"-s {shellVal}");
+            {
+                args.Add("-s");
+                args.Add(shellVal);
+            }
         }
 
+        // full_name (GECOS) is passed as its own argv element — no shell quoting.
+        // ArgumentList delivers it verbatim, so spaces/dashes cannot inject flags.
         if (d.TryGetProperty("full_name", out var fn) && fn.ValueKind == JsonValueKind.String)
-            parts.Add($"-c {ShellEscape(fn.GetString()!)}");
+        {
+            args.Add("-c");
+            args.Add(fn.GetString()!);
+        }
 
-        if (parts.Count > 0)
-            await RunOrLogAsync("usermod", $"{string.Join(" ", parts)} {username}", ct).ConfigureAwait(false);
+        if (args.Count > 0)
+        {
+            args.Add(username);
+            await RunOrLogAsync("usermod", args, ct).ConfigureAwait(false);
+        }
 
         await ApplyGroupsAsync(username, d, ct).ConfigureAwait(false);
     }
@@ -159,16 +171,19 @@ public sealed class UserEnforcer
                 _log.LogWarning("UserEnforcer: unsafe group name {G} for {U}; skipping", gname, username);
                 continue;
             }
-            await RunOrLogAsync("usermod", $"-aG {gname} {username}", ct).ConfigureAwait(false);
+            await RunOrLogAsync("usermod", ["-aG", gname, username], ct).ConfigureAwait(false);
         }
     }
 
-    private string? BuildUseraddArgs(string username, JsonElement d, uint? uid)
+    private List<string>? BuildUseraddArgs(string username, JsonElement d, uint? uid)
     {
-        var parts = new List<string> { "-m" };
+        var args = new List<string> { "-m" };
 
         if (uid.HasValue)
-            parts.Add($"-u {uid.Value}");
+        {
+            args.Add("-u");
+            args.Add(uid.Value.ToString(CultureInfo.InvariantCulture));
+        }
 
         if (d.TryGetProperty("shell", out var shell) && shell.ValueKind == JsonValueKind.String)
         {
@@ -178,34 +193,41 @@ public sealed class UserEnforcer
                 _log.LogWarning("UserEnforcer: unsafe shell value {S} for {U}; skipping Create", shellVal, username);
                 return null;
             }
-            parts.Add($"-s {shellVal}");
+            args.Add("-s");
+            args.Add(shellVal);
         }
 
+        // full_name (GECOS) is passed as its own argv element — no shell quoting.
+        // ArgumentList delivers it verbatim, so spaces/dashes cannot inject flags.
         if (d.TryGetProperty("full_name", out var fn) && fn.ValueKind == JsonValueKind.String)
-            parts.Add($"-c {ShellEscape(fn.GetString()!)}");
+        {
+            args.Add("-c");
+            args.Add(fn.GetString()!);
+        }
 
-        parts.Add(username);
-        return string.Join(" ", parts);
+        args.Add(username);
+        return args;
     }
 
     private async Task<bool> UserExistsAsync(string username, CancellationToken ct)
     {
         if (_auditOnly) return false;
-        var result = await _runner.RunAsync("id", $"-u {username}", ct).ConfigureAwait(false);
+        var result = await _runner.RunAsync("id", ["-u", username], ct).ConfigureAwait(false);
         return result.Success;
     }
 
-    private async Task RunOrLogAsync(string cmd, string args, CancellationToken ct)
+    private async Task RunOrLogAsync(string cmd, IReadOnlyList<string> args, CancellationToken ct)
     {
         if (_auditOnly)
         {
-            _log.LogInformation("[AUDIT] would run: {Cmd} {Args}", cmd, args);
+            _log.LogInformation("[AUDIT] would run: {Cmd} {Args}", cmd, string.Join(" ", args));
             return;
         }
 
         var result = await _runner.RunAsync(cmd, args, ct).ConfigureAwait(false);
         if (!result.Success)
-            _log.LogWarning("{Cmd} {Args} exited {Code}: {Err}", cmd, args, result.ExitCode, result.Stderr);
+            _log.LogWarning("{Cmd} {Args} exited {Code}: {Err}",
+                cmd, string.Join(" ", args), result.ExitCode, result.Stderr);
     }
 
     /// Locks each stale DDS-managed user account with `passwd -l` (disable, not delete,
@@ -228,7 +250,7 @@ public sealed class UserEnforcer
                 continue;
             }
             _log.LogInformation("Reconciliation: disabling stale DDS-managed user {U}", username);
-            await RunOrLogAsync("passwd", $"-l {username}", ct).ConfigureAwait(false);
+            await RunOrLogAsync("passwd", ["-l", username], ct).ConfigureAwait(false);
             applied.Add($"user:disable:{username}");
         }
         return applied;
@@ -291,7 +313,7 @@ public sealed class UserEnforcer
                 continue;
             }
 
-            var result = await _runner.RunAsync("gpasswd", $"-d {username} {group}", ct).ConfigureAwait(false);
+            var result = await _runner.RunAsync("gpasswd", ["-d", username, group], ct).ConfigureAwait(false);
             if (result.Success)
             {
                 _log.LogInformation("Reconciliation: removed {User} from group {Group}", username, group);
@@ -342,7 +364,4 @@ public sealed class UserEnforcer
         }
         return true;
     }
-
-    private static string ShellEscape(string s)
-        => $"'{s.Replace("'", "'\\''")}'";
 }
