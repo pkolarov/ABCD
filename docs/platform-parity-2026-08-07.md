@@ -36,7 +36,7 @@ is already cross-platform and strong; the gap was in the platform layer.
 | # | Platform | Fix |
 |---|----------|-----|
 | 4 | macOS + Linux | **New `dds-status` command** — the cross-platform answer to the Windows Health tab. One glance shows: service states (node/policy-agent/watchdog), API-socket state, node URN + peer id, **peers (connected / admitted, with a "connected but NOT admitted" flag)**, trusted-root count, token counts, uptime, last-admission-failure, `/readyz` readiness, on-disk state inventory, and a recent error-loop log signal. `--watch [secs]` refreshes live (Windows' 2 s auto-refresh); `--json` for scripting. Packaged in the `.deb` and the macOS `.pkg`, surfaced in the bootstrap "next steps", and referenced from `dds-domain`'s status menu and `SECOND-NODE.md`. |
-| 5 | all | Added a real version probe: **`dds-node version`** and **`dds --version`**. Neither binary had one; `dds-verify-replication` was running *bare* `dds-node` to read a version, which defaults to the `run` subcommand and **starts a node** — hanging the script or fighting the live node for its socket. Both verify-replication scripts now call `dds-node version`. |
+| 5 | all | Added a real version probe: **`dds-node version`** and **`dds --version`** (both print the release from the root `VERSION` file, not the 0.1.0 workspace Cargo version). Neither binary had one; `dds-verify-replication` was running *bare* `dds-node` to read a version, which defaults to the `run` subcommand and **starts a node** — hanging the script or fighting the live node for its socket. Both verify-replication scripts now call `dds-node version`. |
 
 ### Security / correctness in the platform scripts
 
@@ -81,20 +81,26 @@ because they change subtle cross-platform enforcement semantics that need
 integration testing on real hosts (which CI cannot provide), or are
 out of the Linux/macOS scope, or belong to a separate security pass.
 
+**Update 2026-09-07.** The first three enforcement-semantics items and the
+Windows `pq_pubkey` omission were finished the same afternoon in follow-up
+worktrees and have since landed as separate commits (see the STATUS.md
+entry of that date). They stay listed here for the record, marked
+*fixed*; the Windows items still need a run on a Windows host.
+
 ### Policy-agent enforcement semantics (needs real-host integration tests)
 
-- **Audit-mode reconcile still mutates managed state** — macOS
+- **Audit-mode reconcile still mutates managed state** — *fixed 2026-09-07* — macOS
   (`Worker.cs:281`) drops stale items from the managed inventory during an
   *audit* reconcile (orphaning them), and Linux (`Worker.cs:362`) removes
   managed-resource entries during an `AuditOnly` reconcile — and
   `AuditOnly=true` is the shipped Linux default. Windows
   (`Worker.cs:182`) reconciliation ignores document-level `Audit` and can
   delete host state DDS never wrote.
-- **Per-document `enforcement` ignored on Linux** (`Worker.cs:117`): Linux
+- **Per-document `enforcement` ignored on Linux** (`Worker.cs:117`) — *fixed 2026-09-07*: Linux
   enforcers are wired to the agent-global `AuditOnly` and ignore a
   policy's own `Audit`/`Enforce` field; macOS/Windows honor it per
   document.
-- **Linux command runner argument splitting** (`Runtime/CommandRunner.cs:22`):
+- **Linux command runner argument splitting** (`Runtime/CommandRunner.cs:22`) — *fixed 2026-09-07*, record in [linux-agent-argv-injection-2026-08-07.md](linux-agent-argv-injection-2026-08-07.md):
   passes a single joined argument string, defeating `UserEnforcer`'s POSIX
   single-quote escaping — a `full_name` could inject `useradd`/`usermod`
   flags. Needs the runner to take `argv` as a list.
@@ -105,7 +111,7 @@ out of the Linux/macOS scope, or belong to a separate security pass.
 
 ### Out of Linux/macOS scope (flagged, not changed here)
 
-- **Windows bootstrap has the same `pq_pubkey` omission** (#2) —
+- **Windows bootstrap has the same `pq_pubkey` omission** (#2) — *fixed 2026-09-07, pending a Windows-host run* —
   `Bootstrap-DdsDomain.ps1` writes only `pubkey`. Same silent PQ
   downgrade; unfixed here because it is a PowerShell change untestable
   from this environment.

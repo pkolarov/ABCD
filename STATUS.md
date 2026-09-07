@@ -1,5 +1,44 @@
 # DDS Implementation Status
 
+## fix(agents,windows-bootstrap,deps): fold in the 2026-08-07 follow-up worktrees — 2026-09-07
+
+The parity pass below deferred four items; all four were finished the same
+afternoon in separate worktrees but never committed. Folded in as isolated
+commits, one per platform concern, so each can be tested or reverted on its
+own (the original worktree patches are kept under
+`.tmp/worktree-patches-2026-08-07/`, gitignored):
+
+- **Windows bootstrap `pq_pubkey`** — `Bootstrap-DdsDomain.ps1` now carries the
+  domain's `pq_pubkey` into `node.toml`, so a hybrid domain's founding node
+  keeps ML-DSA verification (nodes provisioned from its bundle already had
+  it). Only affects fresh bootstraps; the generated file is byte-identical on
+  FIDO2/legacy domains. **Not yet run on a Windows host.**
+- **Linux agent argv injection** — `ICommandRunner` takes an argv list and the
+  runner uses `ProcessStartInfo.ArgumentList`; a managed user's `full_name`
+  such as `Ada -G sudo -u 0` can no longer inject `useradd`/`usermod` flags.
+  Record: [docs/linux-agent-argv-injection-2026-08-07.md](docs/linux-agent-argv-injection-2026-08-07.md).
+- **Audit mode is a dry run** on all three agents — dry-run applies are no
+  longer recorded as DDS-managed, and audit reconciles no longer drop stale
+  items from the inventory (which orphaned them and poisoned the safe-delete
+  gate; on the shipped Linux default `AuditOnly=true` *every* apply did this).
+  Linux now honors a document's own `enforcement` field like macOS/Windows.
+  Windows: a document-level Audit policy freezes the reconcile pass even on a
+  workgroup host (new reason `audit_due_to_document_enforcement`). **Behavior
+  change for mixed Audit/Enforce policy sets on Windows workgroup hosts —
+  verify on the Windows box before release.**
+- **Version probes** — `dds-node version` / `dds --version` print the release
+  from the root `VERSION` file (1.6.2), not the 0.1.0 workspace Cargo version;
+  dds-cli gained a `build.rs` for it. `dds-status` and `dds-verify-replication`
+  rely on this.
+- **Deps** — h2 0.4.14 → 0.4.19 for RUSTSEC-2026-0258 (h2 is not compiled into
+  any DDS binary; it sits in the lockfile via an optional hyper feature) plus a
+  cargo-vet publisher trust entry, so the `audit` and `vet` CI jobs stay green.
+
+Verification: `cargo test --workspace --all-features` 1277 pass, clippy
+`-D warnings` clean, fmt clean, cargo audit and cargo vet clean; Linux agent
+376 pass, macOS agent 183 pass, Windows agent 305 pass on net8.0 and net9.0
+(run on macOS — the Windows semantics change still needs a Windows-box run).
+
 ## feat(linux,macos): setup-wizard + mesh-monitoring parity with the Windows console — 2026-08-07
 
 A six-lens map of the three platforms against the Windows console's parity bar
