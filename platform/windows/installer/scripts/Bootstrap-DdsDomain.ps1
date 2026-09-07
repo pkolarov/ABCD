@@ -298,6 +298,24 @@ $domainPubkey = if ($domainToml -match '(?m)^pubkey\s*=\s*"([^"]+)"') { $Matches
 if (-not $domainId -or -not $domainPubkey) {
     throw "Could not parse domain id/pubkey from $NodeData\domain.toml"
 }
+# Z-1 Phase A / SC-1 parity: init-domain defaults to a HYBRID domain
+# (Ed25519 + ML-DSA-65) and writes the optional `pq_pubkey` (hex-encoded
+# ML-DSA-65 public key) into domain.toml. dds-node treats a MISSING
+# [domain].pq_pubkey as a legacy Ed25519-only domain and silently skips
+# ML-DSA verification of admission certs + revocations (dds-node/src/node.rs
+# ~703; dds_domain::verify_with_domain) — a post-quantum verification
+# downgrade on any hybrid (passphrase-protected) domain. Propagate the
+# field into node.toml when present so a hybrid domain keeps its PQ
+# verification. Absent (FIDO2 v3 / --legacy Ed25519-only domains) ⇒ empty
+# line ⇒ byte-identical to the pre-fix config. Mirrors run_provision's
+# pq_pubkey_line in dds-node/src/provision.rs. NOTE: the `^pubkey` regex
+# above cannot match `pq_pubkey` (different leading token), so the two
+# parses don't collide.
+$domainPq = if ($domainToml -match '(?m)^pq_pubkey\s*=\s*"([^"]+)"') { $Matches[1] } else { $null }
+$domainPqLine = if ($domainPq) { "pq_pubkey = `"$domainPq`"`n" } else { "" }
+if ($domainPq) {
+    Write-Host "  pq_pubkey: present ($([int]($domainPq.Length / 2)) bytes ML-DSA-65) — hybrid domain, PQ verification retained"
+}
 Write-Host "  domain_id: $domainId"
 
 # ── 2. provision bundle ────────────────────────────────────────────
@@ -416,7 +434,7 @@ windows_admin_sids = ["$operatorSid"]
 name = "$Name"
 id = "$domainId"
 pubkey = "$domainPubkey"
-admission_path = '$NodeData\admission.cbor'
+${domainPqLine}admission_path = '$NodeData\admission.cbor'
 audit_log_enabled = false
 "@
 # BOM-less UTF-8 (see step 8 for rationale — applies equally here).
