@@ -269,6 +269,16 @@ public sealed class Worker : BackgroundService
     {
         var reconcileChanges = new List<string>();
 
+        // Audit-mode reconcile is a dry run: the enforcers below already
+        // no-op and emit [AUDIT] directives, but the managed-item inventory
+        // must ALSO be left untouched. Rebuilding it from the desired set
+        // (SetManagedItems) while nothing was actually removed would drop the
+        // stale items from tracking — orphaning them (never cleaned up once
+        // the mode flips back to Enforce) and corrupting the safe-delete gate.
+        // The cost is that a standing [AUDIT] stale finding re-reports every
+        // cycle instead of once; that is the correct behavior for a dry run.
+        var audit = mode == EnforcementMode.Audit;
+
         // Preferences reconciliation
         var prevPreferences = _stateStore.GetManagedItems("preferences");
         var stalePreferences = new HashSet<string>(prevPreferences, StringComparer.Ordinal);
@@ -278,7 +288,7 @@ public sealed class Worker : BackgroundService
             _log.LogInformation("Reconciliation: {Count} stale preference values to clean up", stalePreferences.Count);
             reconcileChanges.AddRange(_preferenceEnforcer.ReconcileStaleItems(stalePreferences, mode));
         }
-        _stateStore.SetManagedItems("preferences", desiredPreferences);
+        if (!audit) _stateStore.SetManagedItems("preferences", desiredPreferences);
 
         // Account reconciliation
         var prevAccounts = _stateStore.GetManagedItems("accounts");
@@ -289,7 +299,7 @@ public sealed class Worker : BackgroundService
             _log.LogInformation("Reconciliation: {Count} stale accounts to disable", staleAccounts.Count);
             reconcileChanges.AddRange(_accountEnforcer.ReconcileStaleAccounts(staleAccounts, mode));
         }
-        _stateStore.SetManagedItems("accounts", desiredAccounts);
+        if (!audit) _stateStore.SetManagedItems("accounts", desiredAccounts);
 
         // Group membership reconciliation
         var prevGroups = _stateStore.GetManagedItems("account_groups");
@@ -300,7 +310,7 @@ public sealed class Worker : BackgroundService
             _log.LogInformation("Reconciliation: {Count} stale group memberships to remove", staleGroups.Count);
             reconcileChanges.AddRange(_accountEnforcer.ReconcileStaleGroups(staleGroups, mode));
         }
-        _stateStore.SetManagedItems("account_groups", desiredGroups);
+        if (!audit) _stateStore.SetManagedItems("account_groups", desiredGroups);
 
         // Launchd reconciliation
         var prevLaunchd = _stateStore.GetManagedItems("launchd");
@@ -311,7 +321,7 @@ public sealed class Worker : BackgroundService
             _log.LogInformation("Reconciliation: {Count} stale launchd jobs to unload", staleLaunchd.Count);
             reconcileChanges.AddRange(_launchdEnforcer.ReconcileStaleItems(staleLaunchd, mode));
         }
-        _stateStore.SetManagedItems("launchd", desiredLaunchd);
+        if (!audit) _stateStore.SetManagedItems("launchd", desiredLaunchd);
 
         // Profile reconciliation
         var prevProfiles = _stateStore.GetManagedItems("profiles");
@@ -322,7 +332,7 @@ public sealed class Worker : BackgroundService
             _log.LogInformation("Reconciliation: {Count} stale profiles to remove", staleProfiles.Count);
             reconcileChanges.AddRange(_profileEnforcer.ReconcileStaleProfiles(staleProfiles, mode));
         }
-        _stateStore.SetManagedItems("profiles", desiredProfiles);
+        if (!audit) _stateStore.SetManagedItems("profiles", desiredProfiles);
 
         // Software reconciliation
         var prevSoftware = _stateStore.GetManagedItems("software_managed");
@@ -333,7 +343,7 @@ public sealed class Worker : BackgroundService
             _log.LogInformation("Reconciliation: {Count} stale software packages (manual uninstall required)", staleSoftware.Count);
             reconcileChanges.AddRange(_softwareInstaller.ReconcileStalePackages(staleSoftware, mode));
         }
-        _stateStore.SetManagedItems("software_managed", desiredSoftware);
+        if (!audit) _stateStore.SetManagedItems("software_managed", desiredSoftware);
 
         if (reconcileChanges.Count > 0)
         {

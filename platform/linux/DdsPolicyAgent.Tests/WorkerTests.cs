@@ -109,7 +109,13 @@ sealed class TrackingAppliedStateStore : IAppliedStateStore
 
     public AppliedState Load() => _state;
     public bool HasChanged(string _, string __) => true;
-    public void RecordApplied(string _, string __, string ___, string ____) { }
+
+    /// Per-policy applied-state (hash/status) records — distinct from the managed
+    /// inventory. This state SHOULD update even in audit mode so a processed
+    /// policy is not re-evaluated needlessly.
+    public List<(string TargetId, string Version, string Hash, string Status)> AppliedRecords { get; } = [];
+    public void RecordApplied(string targetId, string version, string hash, string status)
+        => AppliedRecords.Add((targetId, version, hash, status));
 
     public List<IEnumerable<string>> SetGroupsCalls { get; } = [];
 
@@ -536,9 +542,12 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        // Audit mode: no commands, but state must still be updated so the
-        // stale item is not re-reported on every cycle.
-        Assert.Contains("bob", store.RemovedUsernames);
+        // Audit mode is a dry run: no commands, and the managed inventory must be
+        // left intact. "bob" was not actually disabled, so dropping it from the
+        // managed set would orphan the account (never reconciled once the agent
+        // returns to enforce) and corrupt the safe-delete gate. It stays tracked;
+        // the [AUDIT] finding re-reports each cycle (asserted below).
+        Assert.DoesNotContain("bob", store.RemovedUsernames);
         Assert.Empty(runner.Invocations);
 
         // Reconciliation report must carry the [AUDIT] prefix so operators
@@ -652,8 +661,10 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        // State is updated so the item is not re-reported every cycle.
-        Assert.Contains("/etc/dds/stale.conf", store.RemovedPaths);
+        // Dry run: the managed inventory is left intact (the file was not
+        // actually deleted, so forgetting it would orphan it). The [AUDIT]
+        // finding re-reports each cycle instead.
+        Assert.DoesNotContain("/etc/dds/stale.conf", store.RemovedPaths);
         // Reconciliation report must carry the [AUDIT] prefix.
         var reconciliation = client.ReceivedReports
             .SingleOrDefault(r => r.TargetId == "_reconciliation");
@@ -716,8 +727,9 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        // State is updated so the item is not re-reported every cycle.
-        Assert.Contains("ntp", store.RemovedPackages);
+        // Dry run: the managed inventory is left intact (the package was not
+        // actually removed). The [AUDIT] finding re-reports each cycle instead.
+        Assert.DoesNotContain("ntp", store.RemovedPackages);
         // Audit mode: package manager must NOT be invoked.
         Assert.Empty(runner.Invocations);
         // Reconciliation report must carry the [AUDIT] prefix.
@@ -1269,9 +1281,10 @@ public sealed class WorkerTests
     }
 
     [Fact]
-    public async Task SudoersSet_RecordsManagedFilename()
+    public async Task SudoersSet_AuditMode_DoesNotRecordManagedFilename()
     {
-        // Applying a sudoers directive with non-empty content should record the filename.
+        // In audit mode a sudoers Set is a dry run: the drop-in is not written, so the
+        // filename must NOT be recorded as managed.
         var store = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
         var client = new TestDdsNodeClient
         {
@@ -1293,7 +1306,7 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        Assert.Contains("dds-ops", store.AddedSudoersFilenames);
+        Assert.DoesNotContain("dds-ops", store.AddedSudoersFilenames);
     }
 
     [Fact]
@@ -1400,9 +1413,10 @@ public sealed class WorkerTests
     }
 
     [Fact]
-    public async Task SystemdConfigureDropin_RecordsManagedDropin()
+    public async Task SystemdConfigureDropin_AuditMode_DoesNotRecordManagedDropin()
     {
-        // Applying a ConfigureDropin directive should record the "unit/stem" key.
+        // In audit mode a ConfigureDropin is a dry run: the drop-in is not written, so
+        // the "unit/stem" key must NOT be recorded as managed.
         var store  = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
         var client = new TestDdsNodeClient
         {
@@ -1424,7 +1438,7 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        Assert.Contains("sshd.service/hardening", store.AddedSystemdDropinKeys);
+        Assert.DoesNotContain("sshd.service/hardening", store.AddedSystemdDropinKeys);
     }
 
     [Fact]
@@ -1482,7 +1496,9 @@ public sealed class WorkerTests
             {
                 DeviceUrn = "urn:dds:device:test",
                 PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
-                AuditOnly = true,
+                // Enforce mode: the desired group set is persisted. (In audit mode it
+                // is NOT — nothing was applied — so this must run under enforce.)
+                AuditOnly = false,
             },
             client, store);
 
@@ -1554,7 +1570,9 @@ public sealed class WorkerTests
             {
                 DeviceUrn = "urn:dds:device:test",
                 PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
-                AuditOnly = true,
+                // Enforce mode: a real Create records the managed username. (Audit
+                // is a dry run and must NOT record — see Apply_CreateUser_AuditOnly.)
+                AuditOnly = false,
             },
             client, store);
 
@@ -1564,9 +1582,10 @@ public sealed class WorkerTests
     }
 
     [Fact]
-    public async Task SetFile_RecordsManagedPath()
+    public async Task SetFile_AuditMode_DoesNotRecordManagedPath()
     {
-        // A Set file directive that succeeds should register the path in the managed set.
+        // In audit mode a Set directive is a dry run: the file is not written, so the
+        // path must NOT be recorded as managed (recording it would poison the safe-delete gate).
         var store = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
         var contentB64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("# managed by dds"));
         var client = new TestDdsNodeClient
@@ -1589,13 +1608,14 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        Assert.Contains("/etc/dds/test.conf", store.AddedPaths);
+        Assert.DoesNotContain("/etc/dds/test.conf", store.AddedPaths);
     }
 
     [Fact]
-    public async Task EnsureDir_RecordsManagedPath()
+    public async Task EnsureDir_AuditMode_DoesNotRecordManagedPath()
     {
-        // An EnsureDir file directive should register the path in the managed set.
+        // In audit mode an EnsureDir directive is a dry run: the directory is not
+        // created, so the path must NOT be recorded as managed.
         var store = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
         var client = new TestDdsNodeClient
         {
@@ -1617,7 +1637,7 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        Assert.Contains("/etc/dds/conf.d", store.AddedPaths);
+        Assert.DoesNotContain("/etc/dds/conf.d", store.AddedPaths);
     }
 
     [Fact]
@@ -1639,7 +1659,9 @@ public sealed class WorkerTests
             {
                 DeviceUrn = "urn:dds:device:test",
                 PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
-                AuditOnly = true,
+                // Enforce mode: a real Install records the managed package. (Audit
+                // is a dry run and must NOT record — see Apply_InstallPackage_AuditOnly.)
+                AuditOnly = false,
             },
             client, store);
 
@@ -1670,7 +1692,9 @@ public sealed class WorkerTests
             {
                 DeviceUrn = "urn:dds:device:test",
                 PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
-                AuditOnly = true,
+                // Enforce mode: a real Remove drops the package from the managed set.
+                // (Audit is a dry run and must NOT mutate the inventory.)
+                AuditOnly = false,
             },
             client, store);
 
@@ -1682,7 +1706,7 @@ public sealed class WorkerTests
     }
 
     [Fact]
-    public async Task DeleteSudoers_RemovesFromManagedSet()
+    public async Task DeleteSudoers_AuditMode_DoesNotRemoveFromManagedSet()
     {
         // Pre-populate the managed set with "dds-ops" to reflect a realistic prior cycle.
         var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
@@ -1710,13 +1734,14 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        // The delete directive must trigger RemoveManagedSudoersFilename, not RecordManagedSudoersFilename.
-        Assert.Contains("dds-ops", store.RemovedSudoersFilenames);
+        // In audit mode the delete is a dry run: the drop-in is not removed, so the
+        // managed inventory must be left intact (no RemoveManagedSudoersFilename).
+        Assert.DoesNotContain("dds-ops", store.RemovedSudoersFilenames);
         Assert.DoesNotContain("dds-ops", store.AddedSudoersFilenames);
     }
 
     [Fact]
-    public async Task RemoveDropin_RemovesFromManagedSet()
+    public async Task RemoveDropin_AuditMode_DoesNotRemoveFromManagedSet()
     {
         // Pre-populate the managed set with the dropin key to reflect a realistic prior cycle.
         var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
@@ -1743,8 +1768,9 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        // The RemoveDropin directive must trigger RemoveManagedSystemdDropin, not RecordManagedSystemdDropin.
-        Assert.Contains("sshd.service/dds-limits", store.RemovedSystemdDropinKeys);
+        // In audit mode the RemoveDropin is a dry run: nothing is removed, so the
+        // managed inventory must be left intact (no RemoveManagedSystemdDropin).
+        Assert.DoesNotContain("sshd.service/dds-limits", store.RemovedSystemdDropinKeys);
         Assert.DoesNotContain("sshd.service/dds-limits", store.AddedSystemdDropinKeys);
     }
 
@@ -1781,8 +1807,10 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        // Managed state must be updated so future Remove directives pass the guard.
-        Assert.Contains("alice", store.AddedUsernames);
+        // Dry run: the managed inventory must NOT record a resource that was
+        // never actually created. Recording it here (the old behavior) fabricated
+        // a managed entry and poisoned the safe-delete gate.
+        Assert.DoesNotContain("alice", store.AddedUsernames);
 
         // The policy report directive must carry [AUDIT] so operators can
         // distinguish dry-run entries from actual mutations.
@@ -1815,7 +1843,8 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        Assert.Contains("ntp", store.AddedPackages);
+        // Dry run: an install that never happened must not be recorded as managed.
+        Assert.DoesNotContain("ntp", store.AddedPackages);
 
         var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "policy-audit-install-pkg");
         Assert.NotNull(report);
@@ -1847,7 +1876,8 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        Assert.Contains("/etc/dds/audit.conf", store.AddedPaths);
+        // Dry run: a file that was never written must not be recorded as managed.
+        Assert.DoesNotContain("/etc/dds/audit.conf", store.AddedPaths);
 
         var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "policy-audit-set-file");
         Assert.NotNull(report);
@@ -1878,8 +1908,8 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        // Managed state must be updated so stale-sudoers reconciliation detects the drop-in.
-        Assert.Contains("dds-ops", store.AddedSudoersFilenames);
+        // Dry run: a drop-in that was never written must not be recorded as managed.
+        Assert.DoesNotContain("dds-ops", store.AddedSudoersFilenames);
 
         // The policy report directive must carry [AUDIT] so operators can
         // distinguish dry-run entries from actual mutations.
@@ -1940,8 +1970,8 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        // Managed state must be updated so stale-dropin reconciliation detects the drop-in.
-        Assert.Contains("sshd.service/hardening", store.AddedSystemdDropinKeys);
+        // Dry run: a drop-in that was never written must not be recorded as managed.
+        Assert.DoesNotContain("sshd.service/hardening", store.AddedSystemdDropinKeys);
 
         // The policy report directive must carry [AUDIT].
         var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "policy-audit-systemd");
@@ -2000,8 +2030,9 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        // State tracking must still remove the filename so the item is not re-reported every cycle.
-        Assert.Contains("dds-ops", store.RemovedSudoersFilenames);
+        // Dry run: the managed inventory is left intact (the drop-in was not
+        // actually deleted). The [AUDIT] finding re-reports each cycle instead.
+        Assert.DoesNotContain("dds-ops", store.RemovedSudoersFilenames);
         // No filesystem calls — visudo/delete must not be invoked.
         Assert.Empty(runner.Invocations);
 
@@ -2034,8 +2065,9 @@ public sealed class WorkerTests
 
         await worker.PollOnceAsync(CancellationToken.None);
 
-        // State tracking must still remove the key so the item is not re-reported every cycle.
-        Assert.Contains("sshd.service/hardening", store.RemovedSystemdDropinKeys);
+        // Dry run: the managed inventory is left intact (the drop-in was not
+        // actually removed). The [AUDIT] finding re-reports each cycle instead.
+        Assert.DoesNotContain("sshd.service/hardening", store.RemovedSystemdDropinKeys);
         // daemon-reload and file-delete must not be invoked.
         Assert.DoesNotContain(runner.Invocations, i => i.FileName == "systemctl");
 
@@ -2070,9 +2102,10 @@ public sealed class WorkerTests
 
         // gpasswd must not be invoked in audit mode.
         Assert.DoesNotContain(runner.Invocations, i => i.FileName == "gpasswd");
-        // SetManagedGroups is always called with the empty desired set.
-        Assert.Single(store.SetGroupsCalls);
-        Assert.Empty(store.SetGroupsCalls[0]);
+        // Dry run: the managed group set must be left intact — SetManagedGroups
+        // must NOT be called, or the still-present "alice:sudo" membership would
+        // be dropped from tracking even though it was never actually removed.
+        Assert.Empty(store.SetGroupsCalls);
 
         var reconciliation = client.ReceivedReports
             .SingleOrDefault(r => r.TargetId == "_reconciliation");
@@ -2115,5 +2148,141 @@ public sealed class WorkerTests
         Assert.NotNull(reconciliation);
         Assert.Contains("user:leave-group:alice:sudo", reconciliation.Directives);
         Assert.DoesNotContain("[AUDIT]", string.Join(",", reconciliation.Directives));
+    }
+
+    // =========================================================
+    // Per-document enforcement mode (per-document `enforcement` field)
+    //
+    // A document's own `enforcement` field must override the agent-global
+    // AuditOnly default in either direction, matching macOS/Windows. An
+    // absent field falls back to the agent-global default.
+    // =========================================================
+
+    [Fact]
+    public async Task PerDocumentAudit_IsDryRun_UnderEnforceAgent()
+    {
+        // Agent default is ENFORCE, but the policy is authored enforcement:"Audit".
+        // The document's field wins: the Create is a dry run — no command runner
+        // call, an [AUDIT]-prefixed report directive, and (critically) the user is
+        // NOT recorded as managed, so the safe-delete gate is not poisoned. The
+        // applied-state hash record IS still updated so the policy isn't re-run.
+        var store  = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-doc-audit",
+                    """{"policy_id":"policy-doc-audit","version":1,"enforcement":"Audit","linux":{"local_users":[{"username":"dave","action":"Create","shell":"/bin/bash"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,   // agent default is ENFORCE
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // Dry run: no host mutation and nothing recorded as managed.
+        Assert.Empty(runner.Invocations);
+        Assert.DoesNotContain("dave", store.AddedUsernames);
+
+        // Report directive carries [AUDIT].
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "policy-doc-audit");
+        Assert.NotNull(report);
+        Assert.Contains("[AUDIT] user:create:dave", report.Directives);
+
+        // Applied-state (hash/status) IS updated even though nothing was applied.
+        Assert.Contains(store.AppliedRecords, r => r.TargetId == "policy-doc-audit");
+    }
+
+    [Fact]
+    public async Task PerDocumentEnforce_IsEnforced_UnderAuditAgent()
+    {
+        // Vice-versa: the agent default is AUDIT, but the policy is authored
+        // enforcement:"Enforce". The document's field wins: the Create runs for
+        // real (command runner invoked), the report directive is un-prefixed, and
+        // the user is recorded as managed.
+        var store  = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-doc-enforce",
+                    """{"policy_id":"policy-doc-enforce","version":1,"enforcement":"Enforce","linux":{"local_users":[{"username":"carol","action":"Create","shell":"/bin/bash"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = true,   // agent default is AUDIT
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // Enforced: the command runner was invoked (at minimum the existence probe).
+        Assert.NotEmpty(runner.Invocations);
+        // Recorded as managed so a future Delete is authorized.
+        Assert.Contains("carol", store.AddedUsernames);
+
+        // Report directive is NOT [AUDIT]-prefixed.
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "policy-doc-enforce");
+        Assert.NotNull(report);
+        Assert.Contains("user:create:carol", report.Directives);
+        Assert.DoesNotContain(report.Directives, d => d.Contains("[AUDIT]"));
+    }
+
+    [Fact]
+    public async Task PerDocumentEnforcement_IsIndependentPerPolicy_InOneCycle()
+    {
+        // One cycle, two documents: an Enforce policy creating "keeper" and an
+        // Audit policy creating "ghost". Each is resolved independently — keeper
+        // is applied and tracked, ghost is a dry run and not tracked.
+        var store  = new TrackingAppliedStateStore(new DDS.PolicyAgent.Linux.State.AppliedState());
+        var runner = new NullCommandRunner();
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "p-enforce",
+                    """{"policy_id":"p-enforce","version":1,"enforcement":"Enforce","linux":{"local_users":[{"username":"keeper","action":"Create","shell":"/bin/bash"}]}}"""),
+                WorkerFactory.MakePolicy(
+                    "p-audit",
+                    """{"policy_id":"p-audit","version":1,"enforcement":"Audit","linux":{"local_users":[{"username":"ghost","action":"Create","shell":"/bin/bash"}]}}"""),
+            ],
+        };
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client, store, runner);
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // Enforce document tracked its user; audit document did not.
+        Assert.Contains("keeper", store.AddedUsernames);
+        Assert.DoesNotContain("ghost", store.AddedUsernames);
+
+        var enforceReport = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "p-enforce");
+        Assert.NotNull(enforceReport);
+        Assert.Contains("user:create:keeper", enforceReport.Directives);
+
+        var auditReport = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "p-audit");
+        Assert.NotNull(auditReport);
+        Assert.Contains("[AUDIT] user:create:ghost", auditReport.Directives);
     }
 }

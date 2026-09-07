@@ -177,8 +177,12 @@ public class WorkerTests
     public async Task Reconciliation_StaleAccount_AuditMode_DoesNotDisable()
     {
         // When the active policy enforces Audit mode, stale accounts must NOT be
-        // disabled — only an [AUDIT] log entry is emitted.  State must still be
-        // updated so the stale item is not re-reported on every cycle.
+        // disabled — only an [AUDIT] log entry is emitted. Crucially the managed
+        // inventory must NOT be mutated: because nothing was actually disabled,
+        // dropping "dds-kiosk" from tracking would orphan it (it would never be
+        // reconciled once the mode flips back to Enforce) and corrupt the
+        // safe-delete gate. The trade-off is that the [AUDIT] stale finding
+        // re-reports every cycle rather than once — correct for a dry run.
         var accountOps = new InMemoryMacAccountOperations();
         accountOps.CreateUser("dds-kiosk", null, null, false, false);
 
@@ -206,9 +210,11 @@ public class WorkerTests
         // Audit mode: DisableUser must NOT have been called.
         Assert.True(accountOps.IsEnabled("dds-kiosk"));
 
-        // State must still be cleared so the item is not re-reported next cycle.
-        Assert.True(store.SetCalls.ContainsKey("accounts"));
-        Assert.Empty(store.SetCalls["accounts"]);
+        // The managed inventory must be left intact — no SetManagedItems write
+        // for "accounts" in audit mode, and "dds-kiosk" is still tracked so a
+        // later Enforce cycle can act on it.
+        Assert.False(store.SetCalls.ContainsKey("accounts"));
+        Assert.Contains("dds-kiosk", store.GetManagedItems("accounts"));
 
         // Reconciliation report must carry the [AUDIT] prefix so operators
         // can distinguish dry-run entries from actual changes.
@@ -217,6 +223,80 @@ public class WorkerTests
         Assert.NotNull(reconciliation);
         Assert.Contains(reconciliation.Directives,
             d => d.Contains("[AUDIT]") && d.Contains("dds-kiosk"));
+    }
+
+    [Fact]
+    public async Task Reconciliation_StalePreference_AuditMode_RetainsInventory()
+    {
+        // Parity with the account case for a *destructive* enforcer (preferences
+        // are actually deleted in Enforce mode). In Audit mode the value must
+        // survive AND stay tracked so it is not orphaned.
+        var prefOps = new InMemoryMacPreferenceOperations();
+        prefOps.SetValueJson("com.apple.dock", "autohide", PreferenceScope.System, "true");
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["preferences"] = ["System:com.apple.dock:autohide"],
+        });
+
+        var policyDoc = JsonDocument.Parse(
+            """{"policy_id":"p1","version":1,"enforcement":"Audit","macos":{}}""");
+        var client = new TestMacDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableMacOsPolicy { Jti = "jti-1", Document = policyDoc.RootElement },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, prefOps: prefOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Dry run: the value must still be present on the host.
+        Assert.Equal("true",
+            prefOps.GetValueJson("com.apple.dock", "autohide", PreferenceScope.System));
+
+        // Inventory untouched and the item still tracked.
+        Assert.False(store.SetCalls.ContainsKey("preferences"));
+        Assert.Contains("System:com.apple.dock:autohide", store.GetManagedItems("preferences"));
+    }
+
+    [Fact]
+    public async Task PerDocumentAudit_IsDryRun_WhileSiblingEnforceApplies()
+    {
+        // Two policies in one cycle: an Enforce policy that creates "keeper" and
+        // an Audit policy that would create "ghost". macOS resolves enforcement
+        // per document, so the enforce account is created while the audit
+        // account is a no-op dry run (its directive carries the [AUDIT] prefix).
+        var accountOps = new InMemoryMacAccountOperations();
+        var store = new TrackingAppliedStateStore();
+
+        var enforceDoc = JsonDocument.Parse(
+            """{"policy_id":"p-enforce","version":1,"enforcement":"Enforce","macos":{"local_accounts":[{"username":"keeper","action":"Create"}]}}""");
+        var auditDoc = JsonDocument.Parse(
+            """{"policy_id":"p-audit","version":1,"enforcement":"Audit","macos":{"local_accounts":[{"username":"ghost","action":"Create"}]}}""");
+
+        var client = new TestMacDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableMacOsPolicy { Jti = "jti-enf", Document = enforceDoc.RootElement },
+                new ApplicableMacOsPolicy { Jti = "jti-aud", Document = auditDoc.RootElement },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, accountOps: accountOps);
+        await worker.PollAndApplyAsync(CancellationToken.None);
+
+        // Enforce document actually created its account…
+        Assert.True(accountOps.UserExists("keeper"));
+        // …while the Audit document did not touch the host.
+        Assert.False(accountOps.UserExists("ghost"));
+
+        // The audit document's report directive must be prefixed [AUDIT].
+        var auditReport = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "p-audit");
+        Assert.NotNull(auditReport);
+        Assert.Contains(auditReport.Directives, d => d.Contains("[AUDIT]"));
     }
 
     [Fact]

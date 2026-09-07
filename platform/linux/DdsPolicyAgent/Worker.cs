@@ -114,13 +114,12 @@ public sealed class Worker : BackgroundService
         var desiredGroups             = new HashSet<string>(StringComparer.Ordinal);
         var hasSshPolicy              = false;
 
-        var userEnforcer    = new UserEnforcer   (_runner, _config.AuditOnly, _log);
-        var sudoersEnforcer = new SudoersEnforcer(_runner, _config.AuditOnly, _log, _sudoersDir);
-        var fileEnforcer    = new FileEnforcer   (_runner, _config.AuditOnly, _log);
-        var systemdEnforcer = new SystemdEnforcer(_runner, _config.AuditOnly, _log, _systemdDropinBase);
-        var pkgEnforcer     = new PackageEnforcer(_runner, _config.AuditOnly, _log);
-        var sysctlEnforcer  = new SysctlEnforcer (_runner, _config.AuditOnly, _log, _sysctlDropinPath);
-        var sshdEnforcer    = new SshdEnforcer   (_runner, _config.AuditOnly, _log, _sshdDropinPath);
+        // Each policy's enforcers are built per document (below) so a
+        // per-document `enforcement` field can flip that policy between dry-run
+        // and enforce independently of the agent-global default. `sawAuditPolicy`
+        // records whether any applicable policy resolved to audit so the
+        // cross-policy reconciliation pass can freeze accordingly.
+        var sawAuditPolicy = false;
 
         foreach (var p in policies)
         {
@@ -149,6 +148,15 @@ public sealed class Worker : BackgroundService
                     hasSshPolicy = true;
             }
 
+            // Resolve this document's enforcement mode. A per-document
+            // `enforcement` field ("Audit"/"Enforce") overrides the agent-global
+            // default in either direction; an absent/unknown value falls back to
+            // `_config.AuditOnly` so existing unmarked policies behave as before.
+            // Tracked for every applicable policy (even unchanged ones) so the
+            // reconcile pass knows an audit policy is active on this device.
+            var docAudit = ResolveDocAuditMode(p.Document);
+            if (docAudit) sawAuditPolicy = true;
+
             if (!_stateStore.HasChanged(policyId, hash))
             {
                 _log.LogDebug("Policy {Id} v{Version} unchanged; skip", policyId, version);
@@ -172,6 +180,8 @@ public sealed class Worker : BackgroundService
                 continue;
             }
 
+            var enf = BuildEnforcers(docAudit);
+
             var allDirectives = new List<string>();
             string? errorMsg  = null;
 
@@ -179,8 +189,8 @@ public sealed class Worker : BackgroundService
             {
                 allDirectives.AddRange(await ApplyLinuxSectionAsync(
                     linux, policyId, version,
-                    userEnforcer, sudoersEnforcer, fileEnforcer, systemdEnforcer, pkgEnforcer,
-                    sysctlEnforcer, sshdEnforcer,
+                    enf.User, enf.Sudoers, enf.File, enf.Systemd, enf.Package,
+                    enf.Sysctl, enf.Sshd,
                     managedUsernames, managedPaths, managedPackages,
                     ct).ConfigureAwait(false));
             }
@@ -218,12 +228,59 @@ public sealed class Worker : BackgroundService
         // Reconciliation pass: disable stale users, delete stale files, remove stale packages,
         // remove stale sysctl keys, remove stale sudoers drop-ins, remove stale systemd drop-ins,
         // remove stale group memberships, and remove the sshd drop-in if no policy declares ssh.
+        //
+        // Reconciliation is a cross-policy cleanup, so it runs in audit (dry-run)
+        // mode when the agent-global default is audit OR any applicable policy
+        // this cycle is authored Audit — matching the macOS agent's conservative
+        // "any audit ⇒ freeze reconcile" rule. In audit mode the enforcers dry-run
+        // AND the managed inventory is left untouched (see ReconcileLinuxAsync).
+        var reconcileAudit = _config.AuditOnly || sawAuditPolicy;
+        var recEnf = BuildEnforcers(reconcileAudit);
         await ReconcileLinuxAsync(
             desiredUsernames, desiredPaths, desiredPackages, desiredSysctlKeys,
             desiredSudoersFilenames, desiredSystemdDropinKeys, desiredGroups, hasSshPolicy,
-            userEnforcer, fileEnforcer, pkgEnforcer, sysctlEnforcer, sudoersEnforcer,
-            systemdEnforcer, sshdEnforcer,
-            ct).ConfigureAwait(false);
+            recEnf.User, recEnf.File, recEnf.Package, recEnf.Sysctl, recEnf.Sudoers,
+            recEnf.Systemd, recEnf.Sshd,
+            reconcileAudit, ct).ConfigureAwait(false);
+    }
+
+    /// Bundle of the seven Linux enforcers, all sharing one audit-mode setting.
+    private readonly record struct EnforcerSet(
+        UserEnforcer    User,
+        SudoersEnforcer Sudoers,
+        FileEnforcer    File,
+        SystemdEnforcer Systemd,
+        PackageEnforcer Package,
+        SysctlEnforcer  Sysctl,
+        SshdEnforcer    Sshd);
+
+    /// Construct a fresh set of enforcers wired to <paramref name="auditOnly"/>.
+    /// Cheap (no I/O in any constructor); built per policy so per-document
+    /// enforcement can differ from the agent-global default, and once more for
+    /// the reconciliation pass.
+    private EnforcerSet BuildEnforcers(bool auditOnly) => new(
+        new UserEnforcer   (_runner, auditOnly, _log),
+        new SudoersEnforcer(_runner, auditOnly, _log, _sudoersDir),
+        new FileEnforcer   (_runner, auditOnly, _log),
+        new SystemdEnforcer(_runner, auditOnly, _log, _systemdDropinBase),
+        new PackageEnforcer(_runner, auditOnly, _log),
+        new SysctlEnforcer (_runner, auditOnly, _log, _sysctlDropinPath),
+        new SshdEnforcer   (_runner, auditOnly, _log, _sshdDropinPath));
+
+    /// Resolve a policy document's audit mode. A per-document `enforcement`
+    /// field of "Audit" or "Enforce" overrides the agent-global default in
+    /// either direction; anything else (absent/unrecognized) falls back to
+    /// <see cref="AgentConfig.AuditOnly"/> so unmarked policies are unchanged.
+    private bool ResolveDocAuditMode(JsonElement doc)
+    {
+        if (doc.TryGetProperty("enforcement", out var e)
+            && e.ValueKind == JsonValueKind.String)
+        {
+            var s = e.GetString();
+            if (string.Equals(s, "Audit", StringComparison.Ordinal)) return true;
+            if (string.Equals(s, "Enforce", StringComparison.Ordinal)) return false;
+        }
+        return _config.AuditOnly;
     }
 
     /// Extracts the set of DDS-managed resource keys declared in a linux policy section.
@@ -351,10 +408,18 @@ public sealed class Worker : BackgroundService
         SudoersEnforcer sudoersEnforcer,
         SystemdEnforcer systemdEnforcer,
         SshdEnforcer sshdEnforcer,
+        bool auditMode,
         CancellationToken ct)
     {
         var currentState = _stateStore.Load();
         var allChanges = new List<string>();
+
+        // In audit mode the enforcers below dry-run (emitting [AUDIT] directives
+        // for the report) and the managed inventory must be left untouched: the
+        // stale items were not actually removed, so forgetting them would orphan
+        // them (never reconciled once the agent returns to enforce) and corrupt
+        // the safe-delete gate. Every _stateStore mutation here is gated on
+        // !auditMode for exactly that reason.
 
         var staleUsers = new HashSet<string>(currentState.ManagedUsernames, StringComparer.Ordinal);
         staleUsers.ExceptWith(desiredUsernames);
@@ -365,7 +430,8 @@ public sealed class Worker : BackgroundService
                 .ReconcileStaleUsersAsync(staleUsers, ct)
                 .ConfigureAwait(false);
             allChanges.AddRange(changes);
-            foreach (var u in staleUsers) _stateStore.RemoveManagedUsername(u);
+            if (!auditMode)
+                foreach (var u in staleUsers) _stateStore.RemoveManagedUsername(u);
         }
 
         var stalePaths = new HashSet<string>(currentState.ManagedPaths, StringComparer.Ordinal);
@@ -375,7 +441,8 @@ public sealed class Worker : BackgroundService
             _log.LogInformation("Reconciliation: {Count} stale file(s) to delete", stalePaths.Count);
             var changes = fileEnforcer.ReconcileStaleFiles(stalePaths);
             allChanges.AddRange(changes);
-            foreach (var p in stalePaths) _stateStore.RemoveManagedPath(p);
+            if (!auditMode)
+                foreach (var p in stalePaths) _stateStore.RemoveManagedPath(p);
         }
 
         var stalePackages = new HashSet<string>(currentState.ManagedPackages, StringComparer.Ordinal);
@@ -387,7 +454,8 @@ public sealed class Worker : BackgroundService
                 .ReconcileStalePackagesAsync(stalePackages, ct)
                 .ConfigureAwait(false);
             allChanges.AddRange(changes);
-            foreach (var n in stalePackages) _stateStore.RemoveManagedPackage(n);
+            if (!auditMode)
+                foreach (var n in stalePackages) _stateStore.RemoveManagedPackage(n);
         }
 
         // Sysctl: remove keys no longer declared in any current policy.
@@ -408,7 +476,8 @@ public sealed class Worker : BackgroundService
                 .ReconcileStaleSudoersAsync(staleSudoers, ct)
                 .ConfigureAwait(false);
             allChanges.AddRange(changes);
-            foreach (var f in staleSudoers) _stateStore.RemoveManagedSudoersFilename(f);
+            if (!auditMode)
+                foreach (var f in staleSudoers) _stateStore.RemoveManagedSudoersFilename(f);
         }
 
         // Systemd drop-ins: delete drop-in files no longer declared in any current policy.
@@ -423,7 +492,8 @@ public sealed class Worker : BackgroundService
                 .ReconcileStaleDropinsAsync(staleSystemdDropins, ct)
                 .ConfigureAwait(false);
             allChanges.AddRange(changes);
-            foreach (var k in staleSystemdDropins) _stateStore.RemoveManagedSystemdDropin(k);
+            if (!auditMode)
+                foreach (var k in staleSystemdDropins) _stateStore.RemoveManagedSystemdDropin(k);
         }
 
         // Group memberships: remove memberships no longer declared in any current policy.
@@ -437,8 +507,11 @@ public sealed class Worker : BackgroundService
                 .ConfigureAwait(false);
             allChanges.AddRange(changes);
         }
-        // Always persist the full desired group set so removals from policy are detected next cycle.
-        _stateStore.SetManagedGroups(desiredGroups);
+        // Persist the full desired group set so removals from policy are detected
+        // next cycle — but not in audit mode, where nothing was actually changed
+        // and overwriting the managed set would drop still-present memberships.
+        if (!auditMode)
+            _stateStore.SetManagedGroups(desiredGroups);
 
         // Sshd: remove the drop-in when no current policy declares an ssh field.
         if (!hasSshPolicy)
@@ -538,19 +611,25 @@ public sealed class Worker : BackgroundService
         return [];
     }
 
-    // Parse directive tags emitted by enforcers (e.g. "user:create:alice" or
-    // "[AUDIT] user:create:alice") and register the affected resource in the
-    // applied state store so that future Delete / Remove operations pass the
-    // DDS-managed safety check.
+    // Parse directive tags emitted by enforcers (e.g. "user:create:alice") and
+    // register the affected resource in the applied state store so that future
+    // Delete / Remove operations pass the DDS-managed safety check.
+    //
+    // Directives carrying the "[AUDIT] " prefix are dry-run reports: the enforcer
+    // did NOT touch the host, so they must NOT be recorded as DDS-managed.
+    // Recording them (the previous behavior stripped the prefix and recorded)
+    // fabricated managed entries — poisoning the safe-delete authorization gate
+    // so DDS could later delete host state it never created. On the shipped
+    // Linux default (AuditOnly=true) *every* apply is a dry run, so this poisoned
+    // the entire inventory.
     private void RecordManagedResources(IEnumerable<string> directives)
     {
         const string AuditPrefix = "[AUDIT] ";
         foreach (var raw in directives)
         {
-            var tag = raw.StartsWith(AuditPrefix, StringComparison.Ordinal)
-                ? raw[AuditPrefix.Length..]
-                : raw;
-            var parts = tag.Split(':', 3);
+            if (raw.StartsWith(AuditPrefix, StringComparison.Ordinal))
+                continue;
+            var parts = raw.Split(':', 3);
             if (parts.Length != 3) continue;
             var (category, action, id) = (parts[0], parts[1], parts[2]);
 
