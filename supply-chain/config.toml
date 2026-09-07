@@ -567,10 +567,6 @@ criteria = "safe-to-deploy"
 version = "0.13.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.h2]]
-version = "0.4.14"
-criteria = "safe-to-deploy"
-
 [[exemptions.half]]
 version = "2.7.1"
 criteria = "safe-to-deploy"

@@ -8,6 +8,13 @@ user-id = 5946
 user-login = "jrmuizel"
 user-name = "Jeff Muizelaar"
 
+[[publisher.h2]]
+version = "0.4.19"
+when = "2026-08-24"
+user-id = 359
+user-login = "seanmonstar"
+user-name = "Sean McArthur"
+
 [[publisher.unicode-width]]
 version = "0.1.14"
 when = "2024-09-19"
