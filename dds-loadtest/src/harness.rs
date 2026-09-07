@@ -1026,6 +1026,7 @@ async fn spawn_node(org: &str) -> Result<(DdsNode, TempDir), Box<dyn std::error:
             // A-1 step-1: loadtest harness uses synthetic enrollment
             // and does not exercise the attestation gate.
             allow_unattested_credentials: true,
+            require_user_verification_for_account_claim: false,
             fido2_allowed_aaguids: Vec::new(),
             fido2_attestation_roots: Vec::new(),
             epoch_rotation_secs: 86_400,

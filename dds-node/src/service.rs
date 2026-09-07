@@ -650,6 +650,10 @@ pub struct LocalService<
     /// via `DomainConfig.allow_unattested_credentials`. Packed
     /// attestation (with or without `x5c`) is verified regardless.
     allow_unattested_credentials: bool,
+    /// **2026-09-07 review (UV policy)**: refuse a Windows account claim
+    /// unless the session was minted with `mfa_verified` (the
+    /// authenticator reported user verification). Default `false`.
+    require_uv_for_account_claim: bool,
     /// **M-7 (security review)**: when true, only honor self-attested
     /// device tags/org_unit if the device has a vouch from a trusted
     /// root with purpose `dds:device-scope`. Set from
@@ -714,6 +718,7 @@ impl<
             boot_wall_time: SystemTime::now(),
             verify_fido2: true,
             allow_unattested_credentials: false,
+            require_uv_for_account_claim: false,
             enforce_device_scope_vouch: false,
             fido2_allowed_aaguids: BTreeSet::new(),
             fido2_attestation_roots: BTreeMap::new(),
@@ -810,6 +815,12 @@ impl<
     /// `NodeConfig.domain.allow_unattested_credentials`.
     pub fn set_allow_unattested_credentials(&mut self, allow: bool) {
         self.allow_unattested_credentials = allow;
+    }
+
+    /// 2026-09-07 review: require user verification (PIN / biometric) on
+    /// the session behind a Windows account claim.
+    pub fn set_require_uv_for_account_claim(&mut self, require: bool) {
+        self.require_uv_for_account_claim = require;
     }
 
     /// FIDO2 AAGUID allow-list (Phase 1 of
@@ -2015,7 +2026,7 @@ impl<
     /// session token so localhost callers cannot claim accounts by
     /// presenting an arbitrary `subject_urn`.
     pub fn resolve_windows_account_claim(
-        &self,
+        &mut self,
         device_urn: &str,
         session_token_cbor: &[u8],
     ) -> Result<WindowsAccountClaim, ServiceError> {
@@ -2025,7 +2036,20 @@ impl<
             ));
         }
 
+        // **F3 (2026-09-07 security review)**: fold replicated admin
+        // promotions/demotions in first, so a demoted voucher's chain no
+        // longer validates during the live grant re-check below (mirrors
+        // `issue_session_from_assertion`).
+        self.reconcile_trusted_roots();
+
         let session = self.validate_local_session_token(session_token_cbor)?;
+        if self.require_uv_for_account_claim && !session.mfa_verified {
+            return Err(ServiceError::Trust(format!(
+                "windows account claim for subject '{}' requires user verification \
+                 (PIN / biometric); the session was minted from a presence-only assertion",
+                session.subject_urn
+            )));
+        }
         let subject_urn = session.subject_urn;
 
         let policies = self.list_applicable_windows_policies(device_urn)?;
@@ -3685,6 +3709,14 @@ impl<
     /// Validate a session token issued by this node and extract its
     /// `SessionDocument` body for privileged localhost follow-on flows
     /// such as Windows account claim.
+    ///
+    /// **F3 (2026-09-07 security review)**: a session token is a bearer
+    /// credential that outlives the grants it was minted from. Beyond the
+    /// structural checks, the subject is re-evaluated against the *current*
+    /// trust graph: a burned identity, or one whose vouches have since been
+    /// revoked or expired, is refused even though the token itself is still
+    /// unexpired. Staleness is therefore bounded by replication delay, not
+    /// by the 24 h session cap.
     fn validate_local_session_token(
         &self,
         session_token_cbor: &[u8],
@@ -3717,6 +3749,28 @@ impl<
             return Err(ServiceError::Token(
                 "session token subject does not match embedded SessionDocument".into(),
             ));
+        }
+
+        // F3: live re-check of the subject's authorization.
+        {
+            let g = self
+                .trust_graph
+                .read()
+                .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+            if g.is_burned(&session.subject_urn) {
+                return Err(ServiceError::Trust(format!(
+                    "session subject '{}' has been burned; refusing",
+                    session.subject_urn
+                )));
+            }
+            if g.purposes_for(&session.subject_urn, &self.trusted_roots)
+                .is_empty()
+            {
+                return Err(ServiceError::Trust(format!(
+                    "session subject '{}' no longer holds any active grant; refusing",
+                    session.subject_urn
+                )));
+            }
         }
 
         Ok(session)
@@ -5785,6 +5839,7 @@ mod platform_applier_tests {
         use dds_domain::fido2::{build_assertion_auth_data, build_packed_self_attestation};
         use ed25519_dalek::{Signer, SigningKey};
         use sha2::Digest;
+        let _tel_guard = TELEMETRY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let handle = crate::telemetry::install();
 
         // Enroll a user with an Ed25519 packed self-attestation so the
@@ -8182,6 +8237,7 @@ mod platform_applier_tests {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use dds_domain::fido2::build_packed_self_attestation;
         use ed25519_dalek::SigningKey;
+        let _tel_guard = TELEMETRY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let (mut svc, admin, _roots) = setup();
         svc.set_verify_fido2(true);
         let rp_id = "dds.local";
@@ -8319,6 +8375,7 @@ mod platform_applier_tests {
     fn unvouched_second_attestation_cannot_borrow_the_vouched_enrollments_grants() {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use ed25519_dalek::SigningKey;
+        let _tel_guard = TELEMETRY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let (mut svc, admin, _roots) = setup();
         svc.set_verify_fido2(true);
         let rp_id = "dds.local";
@@ -8380,6 +8437,195 @@ mod platform_applier_tests {
         let req = signed_assertion_request(&mut svc, rp_id, &cred1, "alice-vouched", &sk1, 1);
         svc.issue_session_from_assertion(req)
             .expect("the vouched enrollment authenticates");
+    }
+
+    // ---------- F3 (2026-09-07 security review): sessions vs. live authorization ----------
+
+    /// A vouched user, a device, and a claimable Windows account policy
+    /// for that user. Returns the device URN and the user identity.
+    fn claimable_account_fixture(
+        svc: &mut LocalService<MemoryBackend>,
+        admin: &Identity,
+        tag: &str,
+    ) -> (String, Identity) {
+        let device_urn = enroll_device(svc, &format!("ws-{tag}"), vec!["workstation".into()], None);
+        let user = Identity::generate(&format!("user-{tag}"), &mut OsRng);
+        let user_attest = make_attest_for_publisher_setup(&user);
+        let user_hash = user_attest.payload_hash();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(user_attest)
+            .unwrap();
+        let vouch = Token::sign(
+            TokenPayload {
+                iss: admin.id.to_urn(),
+                iss_key: admin.public_key.clone(),
+                jti: format!("vouch-{tag}"),
+                sub: user.id.to_urn(),
+                kind: TokenKind::Vouch,
+                purpose: Some("dds:group:employees".into()),
+                vch_iss: Some(user.id.to_urn()),
+                vch_sum: Some(user_hash),
+                revokes: None,
+                iat: 1_700_000_000,
+                exp: Some(4_102_444_800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &admin.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph.write().unwrap().add_token(vouch).unwrap();
+        let policy = WindowsPolicyDocument {
+            policy_id: format!("p:claim-{tag}"),
+            display_name: "Claim".into(),
+            version: 1,
+            enforcement: Enforcement::Enforce,
+            scope: PolicyScope {
+                device_tags: vec!["workstation".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            settings: vec![],
+            windows: Some(WindowsSettings {
+                local_accounts: vec![AccountDirective {
+                    username: format!("{tag}-local"),
+                    action: AccountAction::Create,
+                    claim_subject_urn: Some(user.id.to_urn()),
+                    full_name: None,
+                    description: None,
+                    groups: vec![],
+                    password_never_expires: None,
+                }],
+                ..Default::default()
+            }),
+        };
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(admin, &format!("p-claim-{tag}"), &policy))
+            .unwrap();
+        (device_urn, user)
+    }
+
+    fn local_session_for(
+        svc: &mut LocalService<MemoryBackend>,
+        user: &Identity,
+        mfa_verified: bool,
+    ) -> SessionResult {
+        svc.issue_session(SessionRequest {
+            subject_urn: user.id.to_urn(),
+            device_urn: None,
+            requested_resources: vec![],
+            duration_secs: 300,
+            mfa_verified,
+            tls_binding: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn account_claim_is_refused_once_the_users_vouch_is_revoked() {
+        let _tel_guard = TELEMETRY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut svc, admin, _) = setup();
+        let (device_urn, user) = claimable_account_fixture(&mut svc, &admin, "revoked");
+        let session = local_session_for(&mut svc, &user, true);
+        svc.resolve_windows_account_claim(&device_urn, &session.token_cbor)
+            .expect("claim resolves while the vouch is live");
+
+        // The admin revokes the user's vouch. The still-unexpired session
+        // must stop authorizing the claim even though the directive stays.
+        let revoke = Token::sign(
+            TokenPayload {
+                iss: admin.id.to_urn(),
+                iss_key: admin.public_key.clone(),
+                jti: "revoke-vouch-revoked".into(),
+                sub: admin.id.to_urn(),
+                kind: TokenKind::Revoke,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: Some("vouch-revoked".into()),
+                iat: now_epoch(),
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &admin.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph.write().unwrap().add_token(revoke).unwrap();
+
+        let err = svc
+            .resolve_windows_account_claim(&device_urn, &session.token_cbor)
+            .expect_err("a revoked user must not claim with an unexpired session");
+        assert!(
+            format!("{err:?}").contains("no longer holds any active grant"),
+            "{err:?}"
+        );
+        assert_eq!(
+            svc.list_applicable_windows_policies(&device_urn)
+                .unwrap()
+                .len(),
+            1,
+            "the refusal comes from the live grant check, not from the policy"
+        );
+    }
+
+    #[test]
+    fn account_claim_is_refused_once_the_identity_is_burned() {
+        let _tel_guard = TELEMETRY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut svc, admin, _) = setup();
+        let (device_urn, user) = claimable_account_fixture(&mut svc, &admin, "burned");
+        let session = local_session_for(&mut svc, &user, true);
+        svc.resolve_windows_account_claim(&device_urn, &session.token_cbor)
+            .expect("claim resolves before the burn");
+        let burn = Token::sign(
+            TokenPayload {
+                iss: user.id.to_urn(),
+                iss_key: user.public_key.clone(),
+                jti: "burn-user-burned".into(),
+                sub: user.id.to_urn(),
+                kind: TokenKind::Burn,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat: now_epoch(),
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &user.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph.write().unwrap().add_token(burn).unwrap();
+        let err = svc
+            .resolve_windows_account_claim(&device_urn, &session.token_cbor)
+            .expect_err("a burned identity must not claim with an unexpired session");
+        assert!(format!("{err:?}").contains("burned"), "{err:?}");
+    }
+
+    #[test]
+    fn account_claim_requires_user_verification_only_when_configured() {
+        let _tel_guard = TELEMETRY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut svc, admin, _) = setup();
+        let (device_urn, user) = claimable_account_fixture(&mut svc, &admin, "uv");
+        let presence_only = local_session_for(&mut svc, &user, false);
+        let verified = local_session_for(&mut svc, &user, true);
+
+        // Default policy: a presence-only session may claim.
+        svc.resolve_windows_account_claim(&device_urn, &presence_only.token_cbor)
+            .expect("default policy accepts presence-only sessions");
+
+        svc.set_require_uv_for_account_claim(true);
+        let err = svc
+            .resolve_windows_account_claim(&device_urn, &presence_only.token_cbor)
+            .expect_err("presence-only session must not claim when UV is required");
+        assert!(format!("{err:?}").contains("user verification"), "{err:?}");
+        svc.resolve_windows_account_claim(&device_urn, &verified.token_cbor)
+            .expect("a user-verified session still claims");
     }
 }
 

@@ -142,6 +142,16 @@ pub struct DomainConfig {
     #[serde(default)]
     pub allow_unattested_credentials: bool,
 
+    /// **2026-09-07 review (UV policy)**: when `true`, a Windows account
+    /// claim (`POST /v1/windows/claim-account`) requires the session to
+    /// have been minted from an assertion whose authenticator reported
+    /// user verification (PIN / biometric). The Credential Provider asks
+    /// for UV as *discouraged*, so touch-only credentials satisfy the
+    /// default `false`; deployments that mandate MFA at logon flip this
+    /// on. Enrollment and hmac-secret behaviour are unaffected.
+    #[serde(default)]
+    pub require_user_verification_for_account_claim: bool,
+
     /// FIDO2 AAGUID allow-list (Phase 1 of
     /// [`docs/fido2-attestation-allowlist.md`](../../docs/fido2-attestation-allowlist.md)).
     /// Each entry is a canonical UUID string

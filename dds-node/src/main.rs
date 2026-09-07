@@ -2072,6 +2072,8 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // operator set the flag explicitly in node.toml. Default is
     // `false` so production deployments require real attestation.
     svc.set_allow_unattested_credentials(config.domain.allow_unattested_credentials);
+    // 2026-09-07 review: optional server-side UV policy for account claims.
+    svc.set_require_uv_for_account_claim(config.domain.require_user_verification_for_account_claim);
     // FIDO2 AAGUID allow-list (Phase 1 of
     // docs/fido2-attestation-allowlist.md). Refuse to start when the
     // operator wrote unparseable entries — silent fallback to "any

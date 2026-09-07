@@ -328,6 +328,7 @@ async fn spawn_node(
             // YubiKey hardware produces packed-with-x5c; this flag is
             // belt-and-braces.
             allow_unattested_credentials: true,
+            require_user_verification_for_account_claim: false,
             fido2_allowed_aaguids: Vec::new(),
             fido2_attestation_roots: Vec::new(),
             epoch_rotation_secs: 86_400,

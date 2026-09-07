@@ -216,6 +216,7 @@ fn write_node_fixture(
             audit_log_retention_days: 0,
             enforce_device_scope_vouch: false,
             allow_unattested_credentials: false,
+            require_user_verification_for_account_claim: false,
             fido2_allowed_aaguids: Vec::new(),
             fido2_attestation_roots: Vec::new(),
             epoch_rotation_secs: 86_400,

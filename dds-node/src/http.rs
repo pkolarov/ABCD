@@ -2401,7 +2401,7 @@ where
         &req.device_urn,
     )?;
     let session_token_cbor = b64_decode(&req.session_token_cbor_b64, "session_token_cbor_b64")?;
-    let svc = state.svc.lock().await;
+    let mut svc = state.svc.lock().await;
     let claim = match svc.resolve_windows_account_claim(&req.device_urn, &session_token_cbor) {
         Ok(claim) => claim,
         Err(ServiceError::Policy(e) | ServiceError::Trust(e)) => {
