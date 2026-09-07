@@ -597,6 +597,15 @@ pub struct LinuxUserDirective {
     /// GECOS comment / full name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_name: Option<String>,
+    /// **F4 (2026-09-07 security review).** DDS subject URN allowed to
+    /// authenticate as this Unix account through `pam_dds`. The node's
+    /// `POST /v1/linux/account/authorize` resolves the tuple
+    /// (device, session subject, username) against applicable policies
+    /// and refuses everything else, so a valid DDS credential can never
+    /// satisfy PAM for an account it was not explicitly mapped to.
+    /// Mirrors `AccountDirective::claim_subject_urn` on Windows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_subject_urn: Option<String>,
 }
 
 /// A DDS-managed sudoers drop-in file.

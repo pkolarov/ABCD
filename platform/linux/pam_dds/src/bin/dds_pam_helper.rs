@@ -37,6 +37,8 @@
 //!   --node-sock <PATH>       dds-node Unix socket [default: /var/lib/dds/dds.sock]
 //!   --user <USERNAME>        Local POSIX username to authenticate
 //!   --assertion-json <PATH>  Read pre-computed assertion from file ('-' = stdin)
+//!   --device-urn <URN>       Device URN for the node's account-authorization
+//!                            check (default: DeviceUrn from /etc/dds/policy-agent.json)
 //!   --credential-id <B64>    Credential ID (base64url) — required with --assertion-json
 //!   --duration-secs <N>      Requested session duration in seconds [default: 28800]
 //! ```
@@ -81,8 +83,42 @@ struct SessionResponse {
     session_id: String,
     #[allow(dead_code)]
     expires_at: u64,
-    #[allow(dead_code)]
     token_cbor_b64: String,
+}
+
+/// `GET /v1/linux/account/login-options` response (F4).
+#[derive(Debug, Deserialize)]
+struct LoginOptionsResponse {
+    #[allow(dead_code)]
+    username: String,
+    candidates: Vec<LoginCandidate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginCandidate {
+    #[allow(dead_code)]
+    subject_urn: String,
+    credential_id: String,
+    rp_id: String,
+    #[allow(dead_code)]
+    display_name: String,
+}
+
+/// `POST /v1/linux/account/authorize` request / response (F4).
+#[derive(Debug, Serialize)]
+struct AuthorizeRequest {
+    device_urn: String,
+    session_token_cbor_b64: String,
+    username: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthorizeResponse {
+    #[allow(dead_code)]
+    subject_urn: String,
+    username: String,
+    #[allow(dead_code)]
+    policy_id: String,
 }
 
 // ─── Pre-computed assertion JSON (for --assertion-json mode) ──────────────────
@@ -109,6 +145,7 @@ struct Args {
     user: Option<String>,
     assertion_json: Option<String>,
     duration_secs: u64,
+    device_urn: Option<String>,
 }
 
 impl Default for Args {
@@ -118,6 +155,7 @@ impl Default for Args {
             user: None,
             assertion_json: None,
             duration_secs: 28800,
+            device_urn: None,
         }
     }
 }
@@ -146,6 +184,12 @@ fn parse_args() -> Args {
                     args.assertion_json = Some(v.clone());
                 }
             }
+            "--device-urn" => {
+                i += 1;
+                if let Some(v) = argv.get(i) {
+                    args.device_urn = Some(v.clone());
+                }
+            }
             "--duration-secs" => {
                 i += 1;
                 if let Some(v) = argv.get(i) {
@@ -157,7 +201,7 @@ fn parse_args() -> Args {
             "--help" | "-h" => {
                 eprintln!(
                     "Usage: dds-pam-helper [--node-sock PATH] [--user USER] \
-                    [--assertion-json FILE|-] [--duration-secs N]"
+                    [--assertion-json FILE|-] [--duration-secs N] [--device-urn URN]"
                 );
                 process::exit(0);
             }
@@ -290,45 +334,139 @@ fn read_assertion_json(path: &str) -> Result<PrecomputedAssertion, String> {
     serde_json::from_str(&content).map_err(|e| format!("parse assertion JSON: {e}"))
 }
 
-/// Attempt to collect a FIDO2 assertion using the `fido2-assert` tool from
-/// the `libfido2-tools` package.
+/// Default path to the Linux policy agent's config, whose `DeviceUrn` is
+/// the device URN the node scopes Linux policies (and therefore account
+/// authorizations) by.
+const AGENT_CONFIG_PATH: &str = "/etc/dds/policy-agent.json";
+
+/// Extract `DeviceUrn` from the policy agent's JSON config.
+fn device_urn_from_agent_config_json(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.get("DeviceUrn")
+        .and_then(|d| d.as_str())
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_owned)
+}
+
+/// Parse `fido2-token -L` output: one authenticator per line,
+/// `<device path>: vendor=0x…, product=0x… (<product name>)`.
+fn parse_fido2_token_devices(out: &str) -> Vec<String> {
+    out.lines()
+        .filter_map(|l| l.split_once(':').map(|(p, _)| p.trim()))
+        .filter(|p| !p.is_empty() && p.starts_with('/'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Parsed `fido2-assert -G` output. Per the libfido2 manual the tool
+/// prints, one per line: client data hash (base64), relying party id,
+/// authenticator data (base64), assertion signature (base64), and the
+/// credential id (base64) when the credential is not resident.
+#[derive(Debug, PartialEq, Eq)]
+struct Fido2AssertOutput {
+    client_data_hash_b64: String,
+    rp_id: String,
+    authenticator_data_b64: String,
+    signature_b64: String,
+    credential_id_b64: Option<String>,
+}
+
+fn parse_fido2_assert_output(out: &str) -> Result<Fido2AssertOutput, String> {
+    let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+    let client_data_hash_b64 = lines
+        .next()
+        .ok_or("fido2-assert: missing client data hash")?
+        .to_owned();
+    let rp_id = lines
+        .next()
+        .ok_or("fido2-assert: missing relying party id")?
+        .to_owned();
+    let authenticator_data_b64 = lines
+        .next()
+        .ok_or("fido2-assert: missing authenticator data")?
+        .to_owned();
+    let signature_b64 = lines
+        .next()
+        .ok_or("fido2-assert: missing signature")?
+        .to_owned();
+    let credential_id_b64 = lines.next().map(str::to_owned);
+    Ok(Fido2AssertOutput {
+        client_data_hash_b64,
+        rp_id,
+        authenticator_data_b64,
+        signature_b64,
+        credential_id_b64,
+    })
+}
+
+/// Collect a FIDO2 assertion for one enrolled credential with the
+/// `fido2-assert` tool from `libfido2-tools`, following the libfido2
+/// manual (`fido2-assert -G [-bdhpruv] [-t option] [-i input_file]
+/// [-o output_file] device`):
 ///
-/// The tool is invoked as:
-/// ```text
-/// fido2-assert -G -h <rp_id> -u <user> /dev/hidraw0 < challenge_b64
-/// ```
+/// * the device is a path from `fido2-token -L`, not a relying party id;
+/// * stdin carries the client data hash (base64), the relying party id
+///   and the credential id (base64), each on its own line;
+/// * stdout is parsed by [`parse_fido2_assert_output`].
 ///
-/// This is an optional path — if `fido2-assert` is not on `PATH`, or the
-/// user has no registered authenticator, this returns an error and the
-/// caller falls back to other strategies.
+/// The client data hash is `SHA-256(clientDataJSON)` for the JSON this
+/// helper builds around the node's challenge, so the node can verify the
+/// hash, the challenge and the origin exactly as it does for the Windows
+/// Credential Provider. `-p` asks for user presence (the node requires
+/// the UP flag). This path has been written against the manual and unit
+/// tests; it still needs a run against real hardware.
 fn try_fido2_assert_tool(
     challenge_b64url: &str,
     rp_id: &str,
+    credential_id_b64url: &str,
 ) -> Result<PrecomputedAssertion, String> {
-    // Attempt to locate `fido2-assert` in PATH.
-    let which_output = std::process::Command::new("which")
-        .arg("fido2-assert")
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use sha2::Digest;
+
+    let which = |tool: &str| -> Result<String, String> {
+        let out = std::process::Command::new("which")
+            .arg(tool)
+            .output()
+            .map_err(|e| format!("which {tool}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("{tool} not found on PATH"));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    };
+    let assert_tool = which("fido2-assert")?;
+    let token_tool = which("fido2-token")?;
+
+    let listed = std::process::Command::new(&token_tool)
+        .arg("-L")
         .output()
-        .map_err(|e| format!("which fido2-assert: {e}"))?;
-    if !which_output.status.success() {
-        return Err("fido2-assert not found on PATH".to_owned());
-    }
-    let tool_path = String::from_utf8_lossy(&which_output.stdout)
-        .trim()
-        .to_owned();
+        .map_err(|e| format!("run fido2-token -L: {e}"))?;
+    let devices = parse_fido2_token_devices(&String::from_utf8_lossy(&listed.stdout));
+    let device = devices
+        .first()
+        .cloned()
+        .ok_or("no FIDO2 authenticator found (fido2-token -L listed none)")?;
 
-    // Convert base64url to raw bytes then re-encode as base64-standard for
-    // the fido2-assert tool which expects standard base64 on stdin.
-    let b64_engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let challenge_bytes = b64_engine
-        .decode(challenge_b64url)
-        .map_err(|e| format!("decode challenge: {e}"))?;
-    let challenge_b64std = base64::engine::general_purpose::STANDARD.encode(&challenge_bytes);
+    // clientDataJSON around the node's challenge; the node re-derives the
+    // hash from this JSON and checks challenge + origin.
+    let client_data_json = format!(
+        r#"{{"type":"webauthn.get","challenge":"{challenge_b64url}","origin":"https://{rp_id}"}}"#
+    );
+    let client_data_hash = sha2::Sha256::digest(client_data_json.as_bytes());
+    let credential_id_bytes = URL_SAFE_NO_PAD
+        .decode(credential_id_b64url)
+        .or_else(|_| STANDARD.decode(credential_id_b64url))
+        .map_err(|e| format!("decode credential id: {e}"))?;
+    let stdin_payload = format!(
+        "{}\n{}\n{}\n",
+        STANDARD.encode(client_data_hash),
+        rp_id,
+        STANDARD.encode(&credential_id_bytes)
+    );
 
-    // Prompt the user (on the terminal via stderr) then invoke the tool.
     eprintln!("[dds-pam-helper] Touch your FIDO2 authenticator to log in…");
-    let output = std::process::Command::new(&tool_path)
-        .args(["-G", "-h", rp_id])
+    let output = std::process::Command::new(&assert_tool)
+        .args(["-G", "-p", &device])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -336,62 +474,33 @@ fn try_fido2_assert_tool(
         .and_then(|mut child| {
             use std::io::Write;
             if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(challenge_b64std.as_bytes());
+                let _ = stdin.write_all(stdin_payload.as_bytes());
             }
             child.wait_with_output()
         })
         .map_err(|e| format!("run fido2-assert: {e}"))?;
-
     if !output.status.success() {
         return Err(format!(
             "fido2-assert exited {}",
             output.status.code().unwrap_or(-1)
         ));
     }
+    let parsed = parse_fido2_assert_output(&String::from_utf8_lossy(&output.stdout))?;
 
-    // `fido2-assert` prints assertion fields one per line:
-    // <credential_id_b64url>
-    // <authenticator_data_b64url>
-    // <signature_b64url>
-    // <user_id_b64url>  (optional)
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut lines = stdout.lines();
-    let credential_id = lines
-        .next()
-        .ok_or("fido2-assert: missing credential_id")?
-        .to_owned();
-    let authenticator_data = lines
-        .next()
-        .ok_or("fido2-assert: missing authenticator_data")?
-        .to_owned();
-    let signature = lines
-        .next()
-        .ok_or("fido2-assert: missing signature")?
-        .to_owned();
-
-    // Build a synthetic clientDataHash (SHA-256 of {"type":"webauthn.get",
-    // "challenge":"<b64url>","origin":"https://<rp_id>"}).
-    use std::collections::BTreeMap;
-    let mut client_data: BTreeMap<&str, &str> = BTreeMap::new();
-    client_data.insert("type", "webauthn.get");
-    client_data.insert("challenge", challenge_b64url);
-    let origin = format!("https://{rp_id}");
-    client_data.insert("origin", &origin);
-    let client_data_json =
-        serde_json::to_string(&client_data).map_err(|e| format!("serialize clientData: {e}"))?;
-    let client_data_json_b64 =
-        base64::engine::general_purpose::STANDARD.encode(client_data_json.as_bytes());
-
-    use sha2::Digest;
-    let hash = sha2::Sha256::digest(client_data_json.as_bytes());
-    let client_data_hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash.as_slice());
-
+    // Transcode the tool's standard base64 to the base64url the node's
+    // API accepts everywhere else.
+    let to_url = |b64: &str, what: &str| -> Result<String, String> {
+        let bytes = STANDARD
+            .decode(b64)
+            .map_err(|e| format!("fido2-assert: {what} is not base64: {e}"))?;
+        Ok(URL_SAFE_NO_PAD.encode(bytes))
+    };
     Ok(PrecomputedAssertion {
-        credential_id,
-        authenticator_data,
-        client_data_hash,
-        signature,
-        client_data_json_b64: Some(client_data_json_b64),
+        credential_id: credential_id_b64url.to_owned(),
+        authenticator_data: to_url(&parsed.authenticator_data_b64, "authenticator data")?,
+        client_data_hash: URL_SAFE_NO_PAD.encode(client_data_hash),
+        signature: to_url(&parsed.signature_b64, "signature")?,
+        client_data_json_b64: Some(STANDARD.encode(client_data_json.as_bytes())),
         subject_urn: None,
     })
 }
@@ -414,6 +523,7 @@ fn emit_error(msg: impl Into<String>) -> ! {
         ok: false,
         session_id: None,
         error: Some(msg.into()),
+        authorized_user: None,
     });
 }
 
@@ -434,20 +544,58 @@ async fn main() {
     let challenge_resp: ChallengeResponse = serde_json::from_slice(&challenge_bytes)
         .unwrap_or_else(|e| emit_error(format!("parse challenge response: {e}")));
 
-    // 2. Collect the FIDO2 assertion.
+    // 2. Resolve the device URN the node scopes account authorization by.
+    let device_urn = args.device_urn.clone().or_else(|| {
+        std::fs::read_to_string(AGENT_CONFIG_PATH)
+            .ok()
+            .and_then(|j| device_urn_from_agent_config_json(&j))
+    });
+    let device_urn = device_urn.unwrap_or_else(|| {
+        emit_error(format!(
+            "device URN unknown: pass --device-urn or set DeviceUrn in {AGENT_CONFIG_PATH}"
+        ))
+    });
+
+    // 3. Collect the FIDO2 assertion — only for credentials the node says
+    //    are mapped to this Unix account on this device (F4).
     let assertion = if let Some(ref path) = args.assertion_json {
         read_assertion_json(path).unwrap_or_else(|e| emit_error(e))
     } else {
-        // Default RP-ID is the hostname of this machine.
-        let rp_id = hostname::get_rp_id();
-        try_fido2_assert_tool(&challenge_resp.challenge_b64url, &rp_id)
-            .unwrap_or_else(|e| emit_error(format!("FIDO2 assertion: {e}")))
+        let query = format!(
+            "/v1/linux/account/login-options?device_urn={}&username={}",
+            urlencode(&device_urn),
+            urlencode(&user)
+        );
+        let options_bytes = uds_get(&args.node_sock, &query)
+            .await
+            .unwrap_or_else(|e| emit_error(format!("fetch login options: {e}")));
+        let options: LoginOptionsResponse = serde_json::from_slice(&options_bytes)
+            .unwrap_or_else(|e| emit_error(format!("parse login options: {e}")));
+        if options.candidates.is_empty() {
+            emit_error(format!(
+                "no enrolled DDS user is authorized to log in as '{user}' on this device"
+            ));
+        }
+        let mut last_err = String::from("no candidate credential produced an assertion");
+        let mut found = None;
+        for cand in &options.candidates {
+            match try_fido2_assert_tool(
+                &challenge_resp.challenge_b64url,
+                &cand.rp_id,
+                &cand.credential_id,
+            ) {
+                Ok(a) => {
+                    found = Some(a);
+                    break;
+                }
+                Err(e) => last_err = e,
+            }
+        }
+        found.unwrap_or_else(|| emit_error(format!("FIDO2 assertion: {last_err}")))
     };
 
-    // 3. Submit the assertion to dds-node.
-    // Prefer the credential-embedded subject URN; fall back to
-    // synthesising a local-user hint so dds-node can include the
-    // POSIX username in its audit log.
+    // 4. Submit the assertion to dds-node. The subject hint is audit-only;
+    //    the node binds the session to the credential owner.
     let subject_urn = assertion
         .subject_urn
         .or_else(|| Some(format!("dds:local:{user}")));
@@ -469,12 +617,48 @@ async fn main() {
     let session: SessionResponse = serde_json::from_slice(&session_bytes)
         .unwrap_or_else(|e| emit_error(format!("parse session response: {e}")));
 
-    // 4. Emit a success outcome and exit 0.
+    // 5. Ask the node whether this DDS subject may log in as `user` on
+    //    this device (F4). A valid credential for some other user, or a
+    //    user not mapped to this account, fails here.
+    let authorize = AuthorizeRequest {
+        device_urn: device_urn.clone(),
+        session_token_cbor_b64: session.token_cbor_b64.clone(),
+        username: user.clone(),
+    };
+    let auth_bytes = uds_post_json(&args.node_sock, "/v1/linux/account/authorize", &authorize)
+        .await
+        .unwrap_or_else(|e| emit_error(format!("account authorization refused: {e}")));
+    let auth: AuthorizeResponse = serde_json::from_slice(&auth_bytes)
+        .unwrap_or_else(|e| emit_error(format!("parse authorization response: {e}")));
+    if auth.username != user {
+        emit_error(format!(
+            "node authorized account '{}' but PAM asked for '{user}'",
+            auth.username
+        ));
+    }
+
+    // 6. Emit a success outcome and exit 0.
     emit_outcome(&HelperOutcome {
         ok: true,
         session_id: Some(session.session_id),
         error: None,
+        authorized_user: Some(auth.username),
     });
+}
+
+/// Minimal percent-encoding for query values (URNs contain ':' and
+/// usernames may contain '@' or '.').
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(not(unix))]
@@ -485,6 +669,7 @@ fn main() {
 
 // ─── hostname helper ──────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 mod hostname {
     /// Return the hostname-derived RP ID to use for WebAuthn.
     ///
@@ -582,10 +767,73 @@ mod tests {
             ok: true,
             session_id: Some("sess-xyz".to_owned()),
             error: None,
+            authorized_user: None,
         };
         let json = serde_json::to_string(&o).unwrap();
         let back = HelperOutcome::from_stdout(json.as_bytes()).unwrap();
         assert!(back.ok);
         assert_eq!(back.session_id.as_deref(), Some("sess-xyz"));
+    }
+
+    #[test]
+    fn device_urn_from_agent_config() {
+        let j = r#"{"DeviceUrn":"urn:vouchsafe:device.abc","NodeSock":"/x"}"#;
+        assert_eq!(
+            device_urn_from_agent_config_json(j).as_deref(),
+            Some("urn:vouchsafe:device.abc")
+        );
+        assert!(device_urn_from_agent_config_json(r#"{"DeviceUrn":""}"#).is_none());
+        assert!(device_urn_from_agent_config_json("{}").is_none());
+        assert!(device_urn_from_agent_config_json("nope").is_none());
+    }
+
+    #[test]
+    fn parse_args_device_urn() {
+        let a = Args::default();
+        assert!(a.device_urn.is_none());
+    }
+
+    #[test]
+    fn fido2_token_device_list_parses_paths() {
+        let out = "/dev/hidraw2: vendor=0x1050, product=0x0407 (Yubico YubiKey OTP+FIDO+CCID)\n\
+                   /dev/hidraw5: vendor=0x32a3, product=0x3201 (Feitian ePass)\n";
+        assert_eq!(
+            parse_fido2_token_devices(out),
+            vec!["/dev/hidraw2".to_owned(), "/dev/hidraw5".to_owned()]
+        );
+        assert!(parse_fido2_token_devices("").is_empty());
+    }
+
+    #[test]
+    fn fido2_assert_output_parses_manual_layout() {
+        // client data hash, rp id, authenticator data, signature, credential id
+        let out = "AAAA\ndds.local\nBBBB\nCCCC\nDDDD\n";
+        let p = parse_fido2_assert_output(out).unwrap();
+        assert_eq!(p.client_data_hash_b64, "AAAA");
+        assert_eq!(p.rp_id, "dds.local");
+        assert_eq!(p.authenticator_data_b64, "BBBB");
+        assert_eq!(p.signature_b64, "CCCC");
+        assert_eq!(p.credential_id_b64.as_deref(), Some("DDDD"));
+        // resident credential: no trailing credential id line
+        let p = parse_fido2_assert_output("AAAA\ndds.local\nBBBB\nCCCC\n").unwrap();
+        assert!(p.credential_id_b64.is_none());
+        assert!(parse_fido2_assert_output("AAAA\ndds.local\n").is_err());
+    }
+
+    #[test]
+    fn urlencode_escapes_reserved_characters() {
+        assert_eq!(
+            urlencode("urn:vouchsafe:device.abc"),
+            "urn%3Avouchsafe%3Adevice.abc"
+        );
+        assert_eq!(urlencode("alice@corp"), "alice%40corp");
+    }
+
+    #[test]
+    fn login_options_response_deserialises() {
+        let j = r#"{"username":"alice","candidates":[{"subject_urn":"urn:vouchsafe:a","credential_id":"Y3JlZA","rp_id":"dds.local","display_name":"Alice"}]}"#;
+        let o: LoginOptionsResponse = serde_json::from_str(j).unwrap();
+        assert_eq!(o.candidates.len(), 1);
+        assert_eq!(o.candidates[0].rp_id, "dds.local");
     }
 }

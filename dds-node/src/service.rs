@@ -490,6 +490,32 @@ pub struct ApplicableLinuxPolicy {
 }
 
 /// One `SoftwareAssignment` packaged for the agent.
+/// **F4 (2026-09-07 security review).** Outcome of
+/// `POST /v1/linux/account/authorize`: the session subject is allowed to
+/// authenticate as `username` on the device, by `policy_id`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct LinuxAccountAuthorization {
+    pub subject_urn: String,
+    pub username: String,
+    pub policy_id: String,
+}
+
+/// One enrolled credential the PAM helper may offer for a Unix account.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct LinuxLoginCandidate {
+    pub subject_urn: String,
+    pub credential_id: String,
+    pub rp_id: String,
+    pub display_name: String,
+}
+
+/// **F4.** Response of `GET /v1/linux/account/login-options`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct LinuxAccountLoginOptions {
+    pub username: String,
+    pub candidates: Vec<LinuxLoginCandidate>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ApplicableSoftware {
     pub jti: String,
@@ -2097,6 +2123,131 @@ impl<
             groups: claim.groups,
             password_never_expires: claim.password_never_expires,
         })
+    }
+
+    /// **F4 (2026-09-07 security review).** Subjects an applicable Linux
+    /// policy authorizes to log in as `username` on `device_urn`, paired
+    /// with the policy id. The mapping is the directive's explicit
+    /// `claim_subject_urn`; `Delete` / `Disable` directives never
+    /// authorize a login.
+    fn linux_account_subjects(
+        &self,
+        device_urn: &str,
+        username: &str,
+    ) -> Result<Vec<(String, String)>, ServiceError> {
+        use dds_domain::LinuxUserAction;
+        let mut out = Vec::new();
+        for policy in self.list_applicable_linux_policies(device_urn)? {
+            let Some(linux) = policy.document.linux.as_ref() else {
+                continue;
+            };
+            for d in &linux.local_users {
+                if d.username != username
+                    || !matches!(
+                        d.action,
+                        LinuxUserAction::Create | LinuxUserAction::Modify | LinuxUserAction::Enable
+                    )
+                {
+                    continue;
+                }
+                if let Some(subject) = d.claim_subject_urn.as_deref().map(str::trim) {
+                    if !subject.is_empty() {
+                        out.push((subject.to_owned(), policy.document.policy_id.clone()));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// **F4.** Enrolled, vouched credentials whose subject an applicable
+    /// Linux policy maps to `username` on `device_urn`. The PAM helper
+    /// offers exactly these to the authenticator, so a key that belongs
+    /// to an unrelated user is never even prompted for.
+    pub fn linux_account_login_options(
+        &self,
+        device_urn: &str,
+        username: &str,
+    ) -> Result<LinuxAccountLoginOptions, ServiceError> {
+        if device_urn.trim().is_empty() || username.trim().is_empty() {
+            return Err(ServiceError::Domain(
+                "device_urn and username are required".into(),
+            ));
+        }
+        let subjects = self.linux_account_subjects(device_urn, username)?;
+        let g = self
+            .trust_graph
+            .read()
+            .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+        let mut candidates = Vec::new();
+        for token in g.attestations_iter() {
+            if g.is_revoked(&token.payload.jti) || g.is_burned(&token.payload.iss) {
+                continue;
+            }
+            if !dds_domain::user_auth_attestation_is_self_issued(&token.payload) {
+                continue;
+            }
+            if !subjects.iter().any(|(s, _)| *s == token.payload.sub) {
+                continue;
+            }
+            let doc = match UserAuthAttestation::extract(&token.payload) {
+                Ok(Some(d)) => d,
+                _ => continue,
+            };
+            if g.purposes_for(&token.payload.sub, &self.trusted_roots)
+                .is_empty()
+            {
+                continue;
+            }
+            candidates.push(LinuxLoginCandidate {
+                subject_urn: token.payload.sub.clone(),
+                credential_id: doc.credential_id,
+                rp_id: doc.rp_id,
+                display_name: doc.user_display_name,
+            });
+        }
+        Ok(LinuxAccountLoginOptions {
+            username: username.to_owned(),
+            candidates,
+        })
+    }
+
+    /// **F4.** Authorize a freshly minted local session to log in as
+    /// `username` on `device_urn`. Runs the same live grant re-check as the
+    /// Windows account claim (F3) and then requires an applicable Linux
+    /// policy whose directive for `username` names the session subject.
+    pub fn authorize_linux_account(
+        &mut self,
+        device_urn: &str,
+        session_token_cbor: &[u8],
+        username: &str,
+    ) -> Result<LinuxAccountAuthorization, ServiceError> {
+        if device_urn.trim().is_empty() || username.trim().is_empty() {
+            return Err(ServiceError::Domain(
+                "device_urn and username are required".into(),
+            ));
+        }
+        self.reconcile_trusted_roots();
+        let session = self.validate_local_session_token(session_token_cbor)?;
+        if self.require_uv_for_account_claim && !session.mfa_verified {
+            return Err(ServiceError::Trust(format!(
+                "login as '{username}' for subject '{}' requires user verification \
+                 (PIN / biometric); the session was minted from a presence-only assertion",
+                session.subject_urn
+            )));
+        }
+        let subject_urn = session.subject_urn;
+        let subjects = self.linux_account_subjects(device_urn, username)?;
+        match subjects.into_iter().find(|(s, _)| *s == subject_urn) {
+            Some((_, policy_id)) => Ok(LinuxAccountAuthorization {
+                subject_urn,
+                username: username.to_owned(),
+                policy_id,
+            }),
+            None => Err(ServiceError::Policy(format!(
+                "subject '{subject_urn}' is not authorized to log in as '{username}' on device '{device_urn}'"
+            ))),
+        }
     }
 
     /// Record a `DdsPolicyAgent` apply outcome. v1: this writes a
@@ -8034,6 +8185,7 @@ mod platform_applier_tests {
                     shell: Some("/bin/bash".into()),
                     groups: vec!["sudo".into()],
                     full_name: Some("DDS Service Account".into()),
+                    claim_subject_urn: None,
                 }],
                 files: vec![LinuxFileDirective {
                     path: "/etc/dds/agent.conf".into(),
@@ -8626,6 +8778,178 @@ mod platform_applier_tests {
         assert!(format!("{err:?}").contains("user verification"), "{err:?}");
         svc.resolve_windows_account_claim(&device_urn, &verified.token_cbor)
             .expect("a user-verified session still claims");
+    }
+
+    // ---------- F4 (2026-09-07 security review): PAM account authorization ----------
+
+    /// A Linux device, a vouched user with a FIDO2 credential, and a Linux
+    /// policy mapping that user to the Unix account `tag-login`.
+    fn linux_login_fixture(
+        svc: &mut LocalService<MemoryBackend>,
+        admin: &Identity,
+        tag: &str,
+    ) -> (String, Identity, String) {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let device_urn = enroll_device(svc, &format!("linux-{tag}"), vec!["linux".into()], None);
+        let user = Identity::generate(&format!("pam-{tag}"), &mut OsRng);
+        let cred_sk = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let cred = format!("cred-pam-{tag}");
+        let attest = self_issued_user_attestation(
+            &user,
+            &format!("attest-pam-{tag}"),
+            "dds.local",
+            cred.as_bytes(),
+            &cred_sk,
+        );
+        svc.trust_graph.write().unwrap().add_token(attest).unwrap();
+        vouch_subject(
+            svc,
+            admin,
+            &user.id.to_urn(),
+            "dds:group:employees",
+            &format!("vouch-pam-{tag}"),
+        );
+        let policy = LinuxPolicyDocument {
+            policy_id: format!("p:linux-login-{tag}"),
+            display_name: "Linux login".into(),
+            version: 1,
+            scope: PolicyScope {
+                device_tags: vec!["linux".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            settings: vec![],
+            enforcement: Enforcement::Enforce,
+            linux: Some(LinuxSettings {
+                local_users: vec![
+                    LinuxUserDirective {
+                        username: format!("{tag}-login"),
+                        action: LinuxUserAction::Create,
+                        uid: None,
+                        shell: Some("/bin/bash".into()),
+                        groups: vec![],
+                        full_name: None,
+                        claim_subject_urn: Some(user.id.to_urn()),
+                    },
+                    // A disabled account mapped to the same user must not authorize.
+                    LinuxUserDirective {
+                        username: format!("{tag}-locked"),
+                        action: LinuxUserAction::Disable,
+                        uid: None,
+                        shell: None,
+                        groups: vec![],
+                        full_name: None,
+                        claim_subject_urn: Some(user.id.to_urn()),
+                    },
+                ],
+                ..Default::default()
+            }),
+        };
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(
+                admin,
+                &format!("p-linux-login-{tag}"),
+                &policy,
+            ))
+            .unwrap();
+        (device_urn, user, URL_SAFE_NO_PAD.encode(cred.as_bytes()))
+    }
+
+    #[test]
+    fn linux_login_authorizes_only_the_mapped_subject_and_account() {
+        let _tel_guard = TELEMETRY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut svc, admin, _) = setup();
+        let (device_urn, user, cred_b64) = linux_login_fixture(&mut svc, &admin, "auth");
+        let session = local_session_for(&mut svc, &user, true);
+
+        let ok = svc
+            .authorize_linux_account(&device_urn, &session.token_cbor, "auth-login")
+            .expect("mapped subject authorizes for its account");
+        assert_eq!(ok.subject_urn, user.id.to_urn());
+        assert_eq!(ok.username, "auth-login");
+        assert_eq!(ok.policy_id, "p:linux-login-auth");
+
+        // Another account on the same device: refused.
+        let err = svc
+            .authorize_linux_account(&device_urn, &session.token_cbor, "root")
+            .expect_err("an unmapped account must be refused");
+        assert!(
+            format!("{err:?}").contains("not authorized to log in as 'root'"),
+            "{err:?}"
+        );
+        // A disabled directive never authorizes.
+        svc.authorize_linux_account(&device_urn, &session.token_cbor, "auth-locked")
+            .expect_err("a Disable directive must not authorize a login");
+        // Another vouched user with a valid session: refused for this account.
+        let (_other_device, other, _) = linux_login_fixture(&mut svc, &admin, "other");
+        let other_session = local_session_for(&mut svc, &other, true);
+        svc.authorize_linux_account(&device_urn, &other_session.token_cbor, "auth-login")
+            .expect_err("a different DDS user must not authenticate as this account");
+        // A device the policy does not target: refused.
+        let elsewhere = enroll_device(&mut svc, "untargeted", vec!["macos".into()], None);
+        svc.authorize_linux_account(&elsewhere, &session.token_cbor, "auth-login")
+            .expect_err("a device outside the policy scope must be refused");
+
+        // Login options list exactly the mapped user's credential.
+        let opts = svc
+            .linux_account_login_options(&device_urn, "auth-login")
+            .unwrap();
+        assert_eq!(opts.candidates.len(), 1);
+        assert_eq!(opts.candidates[0].subject_urn, user.id.to_urn());
+        assert_eq!(opts.candidates[0].credential_id, cred_b64);
+        assert_eq!(opts.candidates[0].rp_id, "dds.local");
+        assert!(
+            svc.linux_account_login_options(&device_urn, "root")
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn linux_login_is_refused_once_the_users_vouch_is_revoked() {
+        let _tel_guard = TELEMETRY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut svc, admin, _) = setup();
+        let (device_urn, user, _) = linux_login_fixture(&mut svc, &admin, "revoke");
+        let session = local_session_for(&mut svc, &user, true);
+        svc.authorize_linux_account(&device_urn, &session.token_cbor, "revoke-login")
+            .expect("authorizes while vouched");
+        let revoke = Token::sign(
+            TokenPayload {
+                iss: admin.id.to_urn(),
+                iss_key: admin.public_key.clone(),
+                jti: "revoke-vouch-pam-revoke".into(),
+                sub: admin.id.to_urn(),
+                kind: TokenKind::Revoke,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: Some("vouch-pam-revoke".into()),
+                iat: now_epoch(),
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &admin.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph.write().unwrap().add_token(revoke).unwrap();
+        let err = svc
+            .authorize_linux_account(&device_urn, &session.token_cbor, "revoke-login")
+            .expect_err("a revoked user must not authenticate with an unexpired session");
+        assert!(
+            format!("{err:?}").contains("no longer holds any active grant"),
+            "{err:?}"
+        );
+        assert!(
+            svc.linux_account_login_options(&device_urn, "revoke-login")
+                .unwrap()
+                .candidates
+                .is_empty(),
+            "a revoked user's credential is no longer offered"
+        );
     }
 }
 

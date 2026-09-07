@@ -953,7 +953,16 @@ where
         .route("/v1/macos/applied", post(record_macos_applied::<S>))
         .route("/v1/linux/policies", get(list_linux_policies::<S>))
         .route("/v1/linux/software", get(list_linux_software::<S>))
-        .route("/v1/linux/applied", post(record_linux_applied::<S>));
+        .route("/v1/linux/applied", post(record_linux_applied::<S>))
+        // F4 (2026-09-07 review): PAM account authorization.
+        .route(
+            "/v1/linux/account/login-options",
+            get(linux_account_login_options::<S>),
+        )
+        .route(
+            "/v1/linux/account/authorize",
+            post(linux_account_authorize::<S>),
+        );
 
     let mut app = admin_routes
         .merge(public_routes)
@@ -1278,6 +1287,21 @@ pub struct AdminDeviceBindingResponse {
     /// `"established"` for a new binding, `"unchanged"` when the same
     /// principal was already bound.
     pub outcome: String,
+}
+
+/// `GET /v1/linux/account/login-options?device_urn=&username=` (F4).
+#[derive(Debug, Deserialize)]
+pub struct LinuxLoginOptionsQuery {
+    pub device_urn: String,
+    pub username: String,
+}
+
+/// `POST /v1/linux/account/authorize` (F4).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LinuxAuthorizeAccountRequestJson {
+    pub device_urn: String,
+    pub session_token_cbor_b64: String,
+    pub username: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2529,6 +2553,75 @@ where
         groups: claim.groups,
         password_never_expires: claim.password_never_expires,
     }))
+}
+
+/// `GET /v1/linux/account/login-options` (F4, 2026-09-07 review): the
+/// enrolled credentials the PAM helper may offer for a Unix account on
+/// this device. Device-scoped like the policy reads.
+async fn linux_account_login_options<S>(
+    State(state): State<AppState<S>>,
+    caller: CallerIdentity,
+    Query(q): Query<LinuxLoginOptionsQuery>,
+) -> Result<Json<crate::service::LinuxAccountLoginOptions>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    check_device_binding_read(
+        &caller,
+        &state.admin_policy,
+        state.device_binding.as_deref(),
+        &q.device_urn,
+    )?;
+    let svc = state.svc.lock().await;
+    match svc.linux_account_login_options(&q.device_urn, &q.username) {
+        Ok(opts) => Ok(Json(opts)),
+        Err(ServiceError::Domain(e)) => Err(HttpError::bad_request(e)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `POST /v1/linux/account/authorize` (F4, 2026-09-07 review): bind a
+/// freshly minted session to a Unix account on this device. `pam_dds`
+/// returns `PAM_SUCCESS` only after this succeeds for `PAM_USER`.
+async fn linux_account_authorize<S>(
+    State(state): State<AppState<S>>,
+    caller: CallerIdentity,
+    Json(req): Json<LinuxAuthorizeAccountRequestJson>,
+) -> Result<Json<crate::service::LinuxAccountAuthorization>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    check_device_binding_read(
+        &caller,
+        &state.admin_policy,
+        state.device_binding.as_deref(),
+        &req.device_urn,
+    )?;
+    let session_token_cbor = b64_decode(&req.session_token_cbor_b64, "session_token_cbor_b64")?;
+    let mut svc = state.svc.lock().await;
+    match svc.authorize_linux_account(&req.device_urn, &session_token_cbor, &req.username) {
+        Ok(auth) => Ok(Json(auth)),
+        Err(ServiceError::Policy(e) | ServiceError::Trust(e)) => Err(HttpError {
+            status: StatusCode::FORBIDDEN,
+            message: e,
+        }),
+        Err(ServiceError::Domain(e) | ServiceError::Token(e)) => Err(HttpError::bad_request(e)),
+        Err(e) => Err(e.into()),
+    }
 }
 
 async fn list_macos_policies<S>(
@@ -5436,6 +5529,7 @@ mod tests {
                     shell: Some("/bin/bash".into()),
                     groups: vec![],
                     full_name: None,
+                    claim_subject_urn: None,
                 }],
                 ..Default::default()
             }),

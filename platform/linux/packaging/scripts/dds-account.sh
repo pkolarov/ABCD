@@ -322,6 +322,9 @@ GROUPS_CSV=""
 if [[ "${ACCOUNT_ACTION}" == "Create" || "${ACCOUNT_ACTION}" == "Modify" ]]; then
   printf "Full name (GECOS): "
   read -r FULL_NAME
+  echo "DDS user allowed to log in as this account through pam_dds (optional)."
+  printf "Claim subject URN (urn:vouchsafe:..., blank = no PAM login): "
+  read -r CLAIM_SUBJECT_URN
   printf "Shell [/bin/bash]: "
   read -r SHELL_PATH
   SHELL_PATH="${SHELL_PATH:-/bin/bash}"
@@ -347,6 +350,7 @@ POLICY_ID="${POLICY_ID}" DISPLAY_NAME="${DISPLAY_NAME}" NEW_VERSION="${NEW_VERSI
 ENFORCEMENT="${ENFORCEMENT}" DEVICE_TAGS_JSON="${DEVICE_TAGS_JSON}" ORG_UNITS_JSON="${ORG_UNITS_JSON}" \
 IDENTITY_URNS_JSON="${IDENTITY_URNS_JSON}" USERNAME="${USERNAME}" ACCOUNT_ACTION="${ACCOUNT_ACTION}" \
 FULL_NAME="${FULL_NAME}" SHELL_PATH="${SHELL_PATH}" UID_VALUE="${UID_VALUE}" GROUPS_JSON="${GROUPS_JSON}" \
+CLAIM_SUBJECT_URN="${CLAIM_SUBJECT_URN:-}" \
 python3 -c "
 import json, os
 
@@ -371,6 +375,9 @@ doc = {
             'shell': os.environ['SHELL_PATH'] or None,
             'groups': json.loads(os.environ['GROUPS_JSON']),
             'full_name': os.environ['FULL_NAME'] or None,
+            # F4 (2026-09-07 review): the DDS subject pam_dds may authenticate
+            # as this account; the node refuses every other subject.
+            'claim_subject_urn': os.environ.get('CLAIM_SUBJECT_URN') or None,
         }]
     }
 }

@@ -27,6 +27,7 @@
 //! |---|---|---|
 //! | `node_sock=PATH` | `/var/lib/dds/dds.sock` | Path to the dds-node Unix socket |
 //! | `helper=PATH` | auto-detected | Path to `dds-pam-helper` binary |
+//! | `device_urn=URN` | `DeviceUrn` from `/etc/dds/policy-agent.json` | Device URN for the node's account-authorization check (F4) |
 //! | `debug` | off | Log debug information via `syslog(3)` |
 
 #[cfg(target_os = "linux")]
@@ -62,6 +63,8 @@ pub fn parse_module_args(args: &[&str]) -> ModuleArgs {
             out.node_sock = v.to_owned();
         } else if let Some(v) = arg.strip_prefix("helper=") {
             out.helper_path = Some(v.to_owned());
+        } else if let Some(v) = arg.strip_prefix("device_urn=") {
+            out.device_urn = Some(v.to_owned());
         } else if *arg == "debug" {
             out.debug = true;
         }
@@ -76,6 +79,10 @@ pub struct ModuleArgs {
     pub node_sock: String,
     /// Explicit path to `dds-pam-helper`, or `None` to auto-detect.
     pub helper_path: Option<String>,
+    /// **F4 (2026-09-07 security review)**: device URN the node
+    /// authorizes the (subject, account) tuple against. When unset the
+    /// helper reads `DeviceUrn` from `/etc/dds/policy-agent.json`.
+    pub device_urn: Option<String>,
     /// Whether verbose debug logging is enabled.
     pub debug: bool,
 }
@@ -116,6 +123,12 @@ pub struct HelperOutcome {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// **F4 (2026-09-07 security review)**: the Unix account the node
+    /// authorized the authenticated DDS subject for. The PAM module
+    /// returns `PAM_SUCCESS` only when this equals `PAM_USER`; a helper
+    /// outcome without it is treated as a failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorized_user: Option<String>,
 }
 
 impl HelperOutcome {
@@ -143,6 +156,23 @@ mod tests {
         let a = parse_module_args(&["node_sock=/tmp/test.sock"]);
         assert_eq!(a.node_sock, "/tmp/test.sock");
         assert_eq!(a.resolved_node_sock(), "/tmp/test.sock");
+    }
+
+    #[test]
+    fn parse_args_device_urn() {
+        let a = parse_module_args(&["device_urn=urn:vouchsafe:device.abc"]);
+        assert_eq!(a.device_urn.as_deref(), Some("urn:vouchsafe:device.abc"));
+    }
+
+    #[test]
+    fn helper_outcome_carries_authorized_user() {
+        let json = r#"{"ok":true,"session_id":"sess-1","authorized_user":"alice"}"#;
+        let out = HelperOutcome::from_stdout(json.as_bytes()).unwrap();
+        assert_eq!(out.authorized_user.as_deref(), Some("alice"));
+        // An older helper without the field parses, but carries no authorization.
+        let legacy = HelperOutcome::from_stdout(br#"{"ok":true,"session_id":"sess-1"}"#).unwrap();
+        assert!(legacy.ok);
+        assert!(legacy.authorized_user.is_none());
     }
 
     #[test]

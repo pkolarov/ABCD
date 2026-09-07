@@ -80,7 +80,10 @@ unsafe fn collect_pam_args(argc: c_int, argv: *const *const c_char) -> Vec<Strin
 ///    a fixed search path list).
 /// 3. Invoke the helper with `--node-sock` and `--user` arguments.
 /// 4. Parse the helper's stdout as [`HelperOutcome`] JSON.
-/// 5. Return `PAM_SUCCESS` when `ok == true`, `PAM_AUTH_ERR` otherwise.
+/// 5. Return `PAM_SUCCESS` only when `ok == true` **and** the helper's
+///    `authorized_user` equals `PAM_USER` (F4, 2026-09-07 review: the node
+///    authorized this DDS subject for exactly this Unix account);
+///    `PAM_AUTH_ERR` otherwise.
 #[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // PAM ABI: extern "C" entry points cannot be unsafe fn
 pub extern "C" fn pam_sm_authenticate(
@@ -106,16 +109,19 @@ pub extern "C" fn pam_sm_authenticate(
         }
     };
 
-    let result = std::process::Command::new(&helper)
-        .arg("--node-sock")
+    let mut cmd = std::process::Command::new(&helper);
+    cmd.arg("--node-sock")
         .arg(module_args.resolved_node_sock())
         .arg("--user")
-        .arg(&username)
-        .output();
+        .arg(&username);
+    if let Some(device_urn) = &module_args.device_urn {
+        cmd.arg("--device-urn").arg(device_urn);
+    }
+    let result = cmd.output();
 
     match result {
         Ok(out) if out.status.success() => match HelperOutcome::from_stdout(&out.stdout) {
-            Some(outcome) if outcome.ok => PAM_SUCCESS,
+            Some(outcome) if outcome_authorizes(&outcome, &username) => PAM_SUCCESS,
             _ => PAM_AUTH_ERR,
         },
         _ => PAM_AUTH_ERR,
@@ -150,4 +156,34 @@ pub extern "C" fn pam_sm_acct_mgmt(
     _argv: *const *const c_char,
 ) -> c_int {
     PAM_SUCCESS
+}
+
+/// **F4 (2026-09-07 security review).** A helper outcome authenticates
+/// `pam_user` only when the helper succeeded *and* the node authorized the
+/// DDS subject for exactly that Unix account. A success without an
+/// `authorized_user`, or for a different account, is a failure.
+pub fn outcome_authorizes(outcome: &HelperOutcome, pam_user: &str) -> bool {
+    outcome.ok && outcome.authorized_user.as_deref() == Some(pam_user)
+}
+
+#[cfg(test)]
+mod authz_tests {
+    use super::*;
+
+    fn outcome(ok: bool, user: Option<&str>) -> HelperOutcome {
+        HelperOutcome {
+            ok,
+            session_id: Some("sess-1".into()),
+            error: None,
+            authorized_user: user.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn success_requires_the_requested_account() {
+        assert!(outcome_authorizes(&outcome(true, Some("alice")), "alice"));
+        assert!(!outcome_authorizes(&outcome(true, Some("alice")), "root"));
+        assert!(!outcome_authorizes(&outcome(true, None), "alice"));
+        assert!(!outcome_authorizes(&outcome(false, Some("alice")), "alice"));
+    }
 }

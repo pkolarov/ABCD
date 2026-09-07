@@ -884,6 +884,7 @@ fn test_linux_user_directive_roundtrip() {
         shell: Some("/bin/bash".into()),
         groups: vec!["sudo".into(), "docker".into()],
         full_name: Some("Alice Example".into()),
+        claim_subject_urn: None,
     };
     let mut buf = Vec::new();
     ciborium::into_writer(&directive, &mut buf).unwrap();
@@ -1024,6 +1025,7 @@ fn test_linux_policy_with_typed_bundle_roundtrip() {
                 shell: Some("/bin/bash".into()),
                 groups: vec!["sudo".into()],
                 full_name: None,
+                claim_subject_urn: None,
             }],
             sudoers: vec![LinuxSudoersDirective {
                 filename: "dds-ops".into(),
