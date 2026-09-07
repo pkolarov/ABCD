@@ -1,5 +1,56 @@
 # DDS Implementation Status
 
+## fix(security): remediate the 2026-09-07 external security review (F1–F4) — 2026-09-07
+
+An external source review of v1.6.3 reported four findings and two additional
+risks. Every finding was verified against the source before anything changed
+(all cited lines held; F1 was worse than written, F2 narrower on packaged
+installs) and each was fixed in its own commit. Full record with verdicts:
+[docs/security-review-2026-09-07.md](docs/security-review-2026-09-07.md).
+
+- **F1 (High) — forged credential mapping.** A replicated user-auth attestation
+  with `iss != sub` let whoever signed it authenticate as `sub` with their own
+  authenticator, from the Windows logon screen included, and the account claim
+  then reset the victim's local password. Now refused on gossip, anti-entropy
+  sync, local publish and store rehydration (`dds_domain::user_auth_attestation_is_self_issued`),
+  skipped by the credential lookup and the tile listing, never pinned by
+  `admin_vouch`; the session path additionally requires the authenticating
+  attestation to be the exact enrollment an effective vouch pins through
+  `vch_sum` (`TrustGraph::attestation_is_vouched`).
+- **F3 (Medium) — sessions outlived revocation.** `validate_local_session_token`
+  re-checks the subject's live grants (burn, revoked or expired vouches) and the
+  claim path reconciles trusted roots first, so staleness is bounded by
+  replication delay rather than the 24 h session cap. New `[domain]
+  require_user_verification_for_account_claim` (default off) enforces UV
+  server-side where MFA at logon is mandatory.
+- **F2 (Medium) — first-caller device binding.** No more trust-on-first-use:
+  a non-admin caller must match the binding an administrator provisioned via
+  `POST /v1/admin/device-binding` (409 on conflict); an unbound URN is 403 on
+  reads and writes alike. `DeviceBindingStore::tofu_bind` is now `bind`.
+- **F4 (High, conditional) — PAM not bound to PAM_USER.** `LinuxUserDirective`
+  gains `claim_subject_urn`; the node authorizes the (device, session subject,
+  account) tuple through `POST /v1/linux/account/authorize` and lists only the
+  mapped, vouched credentials via `GET /v1/linux/account/login-options`; the
+  helper follows the libfido2 manual for `fido2-assert`, and the module returns
+  `PAM_SUCCESS` only when `authorized_user == PAM_USER`. The Linux account
+  wizard prompts for the claim subject. `pam_dds` stays unpackaged and the
+  fido2-assert path still needs a hardware run.
+
+Adding a `[domain]` field touched every exhaustive `DomainConfig` literal in
+the test and harness crates; telemetry-counter tests now serialize on the
+existing mutex so the new session and assertion tests cannot perturb them.
+
+Verification: `cargo test --workspace --all-features` 1297 pass across 54 test
+binaries (20 new), clippy `-D warnings` clean, fmt clean, cargo audit 0
+vulnerabilities, cargo vet passing, `x86_64-pc-windows-gnu` cross-check clean
+under `-D warnings`, Linux policy-agent suite 376 pass, every platform shell
+script syntax-checks. Not exercised here: a hardware authenticator for the PAM
+helper and a Windows host for the logon path.
+
+Windows: F1 and F3 change the logon path (session issuance and account claim).
+Exercise a normal logon, a fresh claim on a second PC, and a revoked user on
+the Windows box before release; the pipe DACL item from the review remains open.
+
 ## fix(agents,windows-bootstrap,deps): fold in the 2026-08-07 follow-up worktrees — 2026-09-07
 
 The parity pass below deferred four items; all four were finished the same

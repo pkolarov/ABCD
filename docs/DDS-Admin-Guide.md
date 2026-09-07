@@ -1023,6 +1023,7 @@ A matching client knob lives in the Policy Agent's
 | `max_delegation_depth` | int | `5` | Maximum vouch chain depth (root → admin → sub-admin → user = depth 3). Bounds trust graph traversal; chains longer than this are rejected. |
 | `enforce_device_scope_vouch` | bool | `false` | (M-7) When `true`, a device's self-attested `tags` / `org_unit` are only honoured for policy or software scoping if a trusted root has also vouched for the device with purpose `dds:device-scope`. Flip on once all enrolled devices have been vouched. |
 | `allow_unattested_credentials` | bool | `false` | Accept FIDO2 credentials with `fmt = "none"` (no attestation). **Dev/test only** — each unattested enrollment is logged at WARN. Do not set in production. |
+| `require_user_verification_for_account_claim` | bool | `false` | Refuse a Windows account claim (`POST /v1/windows/claim-account`) and a Linux PAM account authorization unless the session was minted from an assertion whose authenticator reported user verification (PIN / biometric). The Credential Provider requests UV as *discouraged*, so touch-only keys satisfy the default; flip on where MFA at logon is mandatory. Added for the 2026-09-07 security review. |
 | `epoch_rotation_secs` | int | `86400` (24 h) | Phase B PQC epoch key rotation interval in seconds. The node rolls a new 32-byte AEAD epoch key and re-emits `EpochKeyRelease` to admitted peers on this cadence. Shorter values increase rekeying overhead; longer values widen the window if an epoch key is compromised. Must be > 0. |
 | `fido2_allowed_aaguids` | list of UUID strings | `[]` (any AAGUID accepted) | Phase 1 of [`fido2-attestation-allowlist.md`](fido2-attestation-allowlist.md). When non-empty, enrollment rejects any FIDO2 credential whose AAGUID is not in the list. Each entry is a canonical UUID or a 32-char bare hex string. Unparseable entries make the node refuse to start. |
 | `fido2_attestation_roots` | array of tables `{ aaguid, ca_pem_path }` | `[]` (no per-AAGUID strict mode) | Phase 2 of [`fido2-attestation-allowlist.md`](fido2-attestation-allowlist.md). Per-AAGUID PEM trust roots. For any listed AAGUID, enrollment requires `attStmt.x5c` and validates the chain to one of the certs in `ca_pem_path`. The leaf's `id-fido-gen-ce-aaguid` extension must match the authData AAGUID. Use `[[domain.fido2_attestation_roots]]` table-array entries in TOML. |
@@ -2162,22 +2163,42 @@ binary (`dds-pam-helper`) that together extend FIDO2-backed authentication to:
 
 The v1 design is intentionally conservative: DDS authenticates and authorises
 **existing local accounts** only — it does not synthesise NSS users on the fly.
-A DDS policy document maps a DDS identity URN to one or more local POSIX
-accounts.
+A Linux policy document maps a DDS subject to a local POSIX account through
+the `local_users` directive's `claim_subject_urn` (F4 of the 2026-09-07
+security review): the node authorises the tuple *(device, authenticated DDS
+subject, requested Unix account)* and refuses everything else, so a valid DDS
+credential can never satisfy PAM for an account it was not explicitly mapped
+to. The `dds-account` wizard prompts for the claim subject when it creates or
+modifies an account.
+
+> **Status:** `pam_dds` is built by the workspace but is not yet shipped by
+> any installer, and the `fido2-assert` path below has been written against
+> the libfido2 manual and unit tests without a hardware run. Validate on a
+> real authenticator before enabling it on a production PAM stack.
 
 #### How it works
 
 1. The PAM framework calls `pam_sm_authenticate` in `pam_dds.so`.
-2. The module reads the username from the PAM stack and spawns `dds-pam-helper`.
+2. The module reads the username from the PAM stack and spawns `dds-pam-helper`
+   with `--user` and, when configured, `--device-urn`. Without it the helper
+   reads `DeviceUrn` from `/etc/dds/policy-agent.json`.
 3. The helper fetches a FIDO2 challenge from the local `dds-node` via
    `GET /v1/session/challenge` (Unix socket at `/run/dds/api.sock`).
-4. The helper collects an authenticator assertion — either from a FIDO2
-   hardware key via `fido2-assert` (from `libfido2-tools`), or from a
-   pre-computed assertion JSON file for scripted / CI workflows.
-5. The assertion is submitted to `POST /v1/session/assert`; `dds-node`
-   evaluates trust and policy locally.
-6. On success the helper exits 0 and writes a JSON result to stdout;
-   the module returns `PAM_SUCCESS`.  On failure it returns `PAM_AUTH_ERR`.
+4. The helper asks `GET /v1/linux/account/login-options?device_urn=&username=`
+   which enrolled, vouched credentials are mapped to that account on this
+   device, and collects an assertion for one of them — from a FIDO2 hardware
+   key via `fido2-assert` (device from `fido2-token -L`; client-data hash,
+   relying-party id and credential id on stdin, per the libfido2 manual) or
+   from a pre-computed assertion JSON file for scripted / CI workflows.
+5. The assertion is submitted to `POST /v1/session/assert`; `dds-node` binds
+   the session to the credential's owner.
+6. The helper posts the session to `POST /v1/linux/account/authorize` with
+   the device URN and the requested username. The node re-checks the
+   subject's live grants and requires an applicable Linux policy whose
+   directive for that account names the subject in `claim_subject_urn`.
+7. On success the helper exits 0 and writes a JSON result carrying
+   `authorized_user`; the module returns `PAM_SUCCESS` only when that equals
+   the PAM user. Anything else returns `PAM_AUTH_ERR`.
 
 `pam_dds.so` is stateless and lightweight — it never parses trust-graph data
 itself.  All policy decisions remain inside `dds-node`.
@@ -2211,6 +2232,7 @@ FIDO2 key is unavailable.  Use `required` to mandate DDS authentication.
 |---|---|---|
 | `node_sock=PATH` | `/run/dds/api.sock` | Unix socket path for `dds-node` |
 | `helper=PATH` | auto-detected | Explicit path to `dds-pam-helper` |
+| `device_urn=URN` | `DeviceUrn` from `/etc/dds/policy-agent.json` | Device URN the node authorises the account mapping against |
 | `debug` | off | Enable verbose syslog output |
 
 The helper is located automatically in `/usr/lib/dds/`, `/usr/local/lib/dds/`,
@@ -2224,8 +2246,13 @@ pre-computed assertion JSON file:
 ```bash
 dds-pam-helper --node-sock /run/dds/api.sock \
                --user alice \
+               --device-urn urn:vouchsafe:device.xxx \
                --assertion-json ./assertion.json
 ```
+
+The pre-computed assertion still goes through the account authorisation
+step: the helper succeeds only if an applicable Linux policy maps the
+credential's subject to `alice` on that device.
 
 The JSON schema:
 
