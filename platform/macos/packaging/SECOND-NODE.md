@@ -138,19 +138,28 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.dds.node.plist
 
 ### Check gossip sync (both nodes)
 
+A packaged node serves its API over a peer-cred **Unix socket** (macOS/Linux)
+or a **named pipe** (Windows), *not* loopback TCP — so `curl http://127.0.0.1:5551`
+will not connect on an installed node. Use the platform tools instead:
+
+**macOS / Linux:**
+
 ```bash
-curl http://127.0.0.1:5551/v1/status
-# connected_peers should be >= 1
+sudo dds-status
+# services, api socket, peers (connected/admitted), readiness, state files
 ```
 
-### Check enrolled users synced
+`connected_peers` should be `>= 1` once the second node is up. `dds-status --watch`
+refreshes it live; `dds-verify-replication --enroll-test` proves a token actually
+replicates to a peer.
 
-```bash
-curl "http://127.0.0.1:5551/v1/enrolled-users?device_urn="
-# Should show the admin user enrolled on the first node
-```
+**Windows:** open the DDS console and use the **Health** tab (service status,
+pipe state, peers, log tail).
 
-On Windows, this may take up to 60 seconds (anti-entropy sync interval).
+> Only the manual Option-B config above, which sets `api_addr = "127.0.0.1:5551"`,
+> exposes loopback TCP; the packaged installs deliberately do not.
+
+On any platform this may take up to 60 seconds (anti-entropy sync interval).
 
 ### Windows logon screen
 

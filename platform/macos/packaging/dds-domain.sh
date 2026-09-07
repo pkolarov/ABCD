@@ -17,20 +17,25 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 show_status() {
-  if ! curl -sf --unix-socket "${API_SOCK}" "http://localhost/v1/status" > /tmp/dds-domain-status.json 2>/dev/null; then
+  # Pipe the response straight to python over stdin — never through a
+  # fixed /tmp path (root writer + world-writable dir = symlink-clobber).
+  # `status` is a read-only special in zsh, so use `resp`.
+  local resp
+  resp="$(curl -sf --unix-socket "${API_SOCK}" "http://localhost/v1/status" 2>/dev/null || true)"
+  if [[ -z "${resp}" ]]; then
     echo "dds-node is not running or not yet bootstrapped."
     return
   fi
   echo ""
-  python3 -c "
-import json
-with open('/tmp/dds-domain-status.json') as f:
-    s = json.load(f)
+  printf '%s' "${resp}" | python3 -c "
+import json, sys
+s = json.load(sys.stdin)
 print(f\"  trust_graph_tokens: {s.get('trust_graph_tokens')}\")
 print(f\"  store_tokens:       {s.get('store_tokens')}\")
 print(f\"  trusted_roots:      {s.get('trusted_roots')}\")
 print(f\"  connected_peers:    {s.get('connected_peers')}\")
 "
+  echo "  (full health + mesh view: sudo dds-status)"
   echo ""
 }
 

@@ -39,12 +39,13 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 echo "=== DDS node health ($(hostname -s)) ==="
-# dds-node has no --version flag; take the version from the Mach-O
-# binary's own build info instead of printing a bogus "unknown".
-# `|| true`: grep exits 1 when the binary prints no version string, and
-# under `set -euo pipefail` a failing substitution in an assignment
-# aborts the whole script.
-NODE_VER="$(/usr/local/bin/dds-node 2>&1 | grep -oE 'dds-node [0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+# Use the dedicated `dds-node version` subcommand. NEVER run bare
+# `dds-node` for this: with no subcommand it defaults to `run` and tries
+# to start a node, which hangs the script or fights the live node for its
+# API socket. `|| true` keeps `set -euo pipefail` from aborting on the
+# grep miss; fall back to the binary's build time for older nodes that
+# predate the version subcommand.
+NODE_VER="$(/usr/local/bin/dds-node version 2>/dev/null | grep -oE 'dds-node [0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
 if [[ -z "${NODE_VER}" ]]; then
   NODE_VER="$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' /usr/local/bin/dds-node 2>/dev/null || echo unknown)"
   NODE_VER="built ${NODE_VER}"

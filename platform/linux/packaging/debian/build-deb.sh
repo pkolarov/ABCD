@@ -161,6 +161,8 @@ install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-purge-node-iden
   "$root/usr/local/sbin/dds-purge-node-identity"
 install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-verify-replication.sh" \
   "$root/usr/bin/dds-verify-replication"
+install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-status.sh" \
+  "$root/usr/bin/dds-status"
 # Admission watchdog (0c41536 port) — timer-driven external backstop.
 install -m 0755 "$repo_root/platform/linux/packaging/scripts/dds-watchdog.sh" \
   "$root/usr/bin/dds-watchdog"
@@ -197,7 +199,12 @@ install -m 0644 "$repo_root/platform/linux/packaging/examples/account-create.jso
 install -m 0644 "$repo_root/platform/linux/packaging/debian/README.Debian" \
   "$root/usr/share/doc/dds-linux/README.Debian"
 
-depends="systemd, ca-certificates"
+# curl + python3 are hard runtime deps, not optional: every operator
+# script (dds-bootstrap-domain, dds-user, dds-account, dds-verify-replication)
+# and the dds-watchdog service shell out to `curl --unix-socket` for the
+# node API and to `python3` for JSON parsing. Without them the wizards fail
+# with a bare "command not found" on a minimal/server install.
+depends="systemd, ca-certificates, curl, python3"
 if [[ "$framework_dependent" -eq 1 ]]; then
   depends="$depends, dotnet-runtime-9.0"
 fi
@@ -212,11 +219,13 @@ Architecture: $arch
 Maintainer: DDS Maintainers <maintainers@example.invalid>
 Depends: $depends
 Installed-Size: $installed_size
-Description: DDS Linux node and no-op policy agent
- L-1 Linux runtime package for DDS. Installs dds-node, dds-cli, the
- no-op Linux policy agent, systemd units, and example configuration.
- Services are not enabled or started automatically because domain
- bootstrap values and admission certificates must be provisioned first.
+Description: DDS Linux node and policy agent
+ Linux runtime package for DDS. Installs dds-node, dds-cli, the Linux
+ policy agent (users/groups, sudoers, files, systemd, packages, sysctl
+ and sshd enforcers), systemd units, operator wizards, and example
+ configuration. Services are not enabled or started automatically because
+ domain bootstrap values and admission certificates must be provisioned
+ first (run dds-bootstrap-domain).
 CONTROL
 
 cat > "$debian/postinst" <<'POSTINST'

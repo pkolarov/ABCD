@@ -248,14 +248,15 @@ fi
 
 CURRENT_VERSION=""
 if [[ -n "${CHECK_DEVICE_URN}" ]]; then
-  CURRENT_VERSION="$("${DDS_CLI}" --node-url "${NODE_URL}" platform macos policies --device-urn "${CHECK_DEVICE_URN}" --json 2>/dev/null | python3 -c "
-import json, sys
+  CURRENT_VERSION="$("${DDS_CLI}" --node-url "${NODE_URL}" platform macos policies --device-urn "${CHECK_DEVICE_URN}" --json 2>/dev/null | POLICY_ID="${POLICY_ID}" python3 -c "
+import json, os, sys
+want = os.environ['POLICY_ID']   # via env, never string-interpolated into source
 try:
     items = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
 for p in items:
-    if p.get('policy_id') == '${POLICY_ID}':
+    if p.get('policy_id') == want:
         print(p.get('version', ''))
         break
 " 2>/dev/null || true)"
@@ -334,7 +335,11 @@ DEVICE_TAGS_JSON="$(split_csv_to_json_array "${DEVICE_TAGS}")"
 ORG_UNITS_JSON="$(split_csv_to_json_array "${ORG_UNITS}")"
 IDENTITY_URNS_JSON="$(split_csv_to_json_array "${IDENTITY_URNS}")"
 
-TMP_JSON="$(mktemp /tmp/dds-account-XXXXXX.json)"
+# Trailing X's only: a template like `dds-account-XXXXXX.json` is NOT
+# substituted by BSD mktemp (it creates that literal, predictable name — a
+# symlink-clobber vector) and is rejected outright by busybox mktemp
+# (Alpine). This form randomizes correctly on BSD, GNU, and busybox.
+TMP_JSON="$(mktemp "${TMPDIR:-/tmp}/dds-account.XXXXXX")"
 trap 'rm -f "${TMP_JSON}"' EXIT
 
 POLICY_ID="${POLICY_ID}" DISPLAY_NAME="${DISPLAY_NAME}" NEW_VERSION="${NEW_VERSION}" \

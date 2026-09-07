@@ -167,7 +167,7 @@ public sealed class Worker : BackgroundService
                     Directives = [],
                     AppliedAt  = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
                 };
-                await _client.ReportAppliedAsync(skipReport, ct).ConfigureAwait(false);
+                await SafeReportAsync(skipReport, ct).ConfigureAwait(false);
                 _stateStore.RecordApplied(policyId, version, hash, "skipped");
                 continue;
             }
@@ -193,7 +193,13 @@ public sealed class Worker : BackgroundService
             if (errorMsg is null)
                 RecordManagedResources(allDirectives);
 
-            var status = errorMsg is null ? "ok" : "error";
+            // Must be one of the node's AppliedStatus variants ("ok" /
+            // "failed" / "skipped"); an out-of-vocabulary value such as
+            // "error" fails serde deserialization on the node and the
+            // POST is rejected — which, before SafeReportAsync wrapped
+            // the send, aborted the whole poll cycle (reconciliation
+            // included). macOS/Windows already report "failed".
+            var status = errorMsg is null ? "ok" : "failed";
             var report = new AppliedReport
             {
                 DeviceUrn  = _config.DeviceUrn,
@@ -205,7 +211,7 @@ public sealed class Worker : BackgroundService
                 Error      = errorMsg,
                 AppliedAt  = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
             };
-            await _client.ReportAppliedAsync(report, ct).ConfigureAwait(false);
+            await SafeReportAsync(report, ct).ConfigureAwait(false);
             _stateStore.RecordApplied(policyId, version, hash, status);
         }
 
@@ -454,7 +460,31 @@ public sealed class Worker : BackgroundService
                 Directives = allChanges,
                 AppliedAt  = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
             };
+            await SafeReportAsync(report, ct).ConfigureAwait(false);
+        }
+    }
+
+    /// Post an applied report without letting a transient node-side
+    /// failure (network blip, HTTP non-2xx, rejected payload) abort the
+    /// rest of the poll cycle. `IDdsNodeClient.ReportAppliedAsync` calls
+    /// `EnsureSuccessStatusCode`, which throws on any non-2xx; before
+    /// this wrapper existed a single rejected report propagated out of
+    /// `PollOnceAsync` and skipped every remaining policy plus the
+    /// reconciliation pass. Mirrors the macOS agent's `ReportAsync`.
+    /// Cancellation is allowed to propagate so shutdown stays prompt.
+    private async Task SafeReportAsync(AppliedReport report, CancellationToken ct)
+    {
+        try
+        {
             await _client.ReportAppliedAsync(report, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Failed to report applied status for {Target}", report.TargetId);
         }
     }
 

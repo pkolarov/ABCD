@@ -1,5 +1,64 @@
 # DDS Implementation Status
 
+## feat(linux,macos): setup-wizard + mesh-monitoring parity with the Windows console — 2026-08-07
+
+A six-lens map of the three platforms against the Windows console's parity bar
+(onboarding-state detection, guided wizards, live Health tab) found the Linux/macOS
+gap was not the wizards' *coverage* — those are solid — but a handful of defects
+that made a bootstrapped node fragile, plus the absence of a single health/mesh
+view. Every finding below was re-verified by direct read before it was touched.
+Full record + deferred backlog: [docs/platform-parity-2026-08-07.md](docs/platform-parity-2026-08-07.md).
+
+**Setup wizards.** Three High-severity bootstrap defects, all verified against the
+node's own behavior:
+
+- Linux `dds-bootstrap-domain` only `restart`ed the services, never `systemctl
+  enable`d them — the units carry `WantedBy=multi-user.target`, so **the node did
+  not survive a reboot** (macOS already did the equivalent `launchctl enable`). Now
+  enables `dds-node` and `dds-policy-agent`.
+- macOS **and** Linux bootstrap omitted `pq_pubkey` from the generated `dds.toml`.
+  `init-domain` defaults to hybrid (Ed25519 + ML-DSA-65); dds-node reads
+  `[domain].pq_pubkey` (`node.rs:703`) and, when absent, treats a hybrid domain as
+  **legacy Ed25519-only** — silently skipping ML-DSA verification of admission
+  certs/revocations. Both scripts now carry it through. (Windows has the same bug;
+  flagged for a Windows-tested follow-up.)
+- The `.deb` declared no dependency on `curl`/`python3`, which every wizard and the
+  watchdog need — added, plus corrected the stale "no-op policy agent" description.
+
+**Mesh monitoring.** New cross-platform **`dds-status`** (macOS + Linux) — the
+answer to the Windows Health tab: services, API socket, node identity, peers
+(connected/admitted, with a stuck-peer flag), trusted roots, tokens, uptime,
+`/readyz`, on-disk state inventory, and log signals, with `--watch` and `--json`.
+Packaged in both installers and surfaced from the bootstrap next-steps and
+`dds-domain`. Added real `dds-node version` / `dds --version` probes and fixed
+`dds-verify-replication`, which was running *bare* `dds-node` (defaults to `run`)
+just to read a version — hanging the script or hijacking the live node's socket.
+
+**Platform-script security.** `dds-enroll-admin` no longer round-trips the admin
+URN through a fixed world-writable `/tmp` log (symlink-clobber + injection into
+`bootstrap.env`); `dds-account`'s `mktemp` template used non-trailing X's
+(unsubstituted/predictable on BSD, rejected on busybox) and interpolated
+`POLICY_ID` into python source; `dds-domain`'s status wrote a fixed `/tmp` file.
+All fixed on both platforms.
+
+**Linux policy agent (Critical).** `Worker.cs` reported status `"error"` on an
+enforcer exception — not one of the node's `ok`/`failed`/`skipped` variants, so the
+report was rejected (422) and, with no isolation around the send, **aborted the
+entire poll cycle (reconciliation included) on every future cycle.** Now reports
+`"failed"` and wraps every send in `SafeReportAsync`. Locked in by two new tests
+(Linux agent suite: 371 pass).
+
+**CI.** New `shell-lint` job syntax-checks every `platform/**/*.sh` under its
+shebang interpreter (the wizards had zero CI coverage) with an advisory shellcheck
+pass. `cargo test --workspace --all-features`, clippy, fmt, and all three .NET agent
+suites remain green.
+
+Deferred with rationale (need real-host integration tests or are out of the
+Linux/macOS scope): audit-mode reconcile still mutating managed state on all three
+agents, Linux ignoring per-document `enforcement`, the Linux command-runner argv
+split, Windows `pq_pubkey`, `pam_dds` packaging, and the open Rust-core sync-ingest
+findings (M-2/L-1) — see the parity doc.
+
 ## fix(devices): hostname does not identify a machine — add enrolled_at + is_self — 2026-07-26
 
 Verifying `/v1/devices` against the real LAB domain immediately falsified an assumption the

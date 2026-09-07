@@ -44,16 +44,32 @@ read -r ADMIN_LABEL
 [[ -n "${ADMIN_LABEL}" ]] || { echo "Label required" >&2; exit 1; }
 
 echo ""
+# Capture setup output in a private root-owned temp under the 0700 node
+# state dir — never world-writable /tmp. A fixed /tmp path let a local
+# user symlink-clobber the file (root is the writer) or pre-inject a bogus
+# `urn:` line that we then read back as ADMIN_URN — which flows into
+# bootstrap.env, sourced as shell by other root scripts. mktemp (trailing
+# X's, so it also works on busybox) plus a strict URN check close both.
+SETUP_LOG="$(mktemp "${DATA_DIR}/node/enroll-admin-XXXXXX")"
+chmod 600 "${SETUP_LOG}"
+trap 'rm -f "${SETUP_LOG}"' EXIT
 "${FIDO2_CLI}" admin-setup \
   --node-url "unix:${API_SOCK}" \
   --label "${ADMIN_LABEL}" \
-  | tee /tmp/dds-enroll-admin.log
+  | tee "${SETUP_LOG}"
 
-ADMIN_URN="$(awk '/urn:/ { print $2 }' /tmp/dds-enroll-admin.log | tail -n 1)"
+ADMIN_URN="$(awk '/urn:/ { print $2 }' "${SETUP_LOG}" | tail -n 1)"
 if [[ -z "${ADMIN_URN}" ]]; then
   echo ""
-  echo "Error: could not extract admin URN from dds-fido2 admin-setup output." >&2
-  echo "Check /tmp/dds-enroll-admin.log for details." >&2
+  echo "Error: could not extract admin URN from dds-fido2 admin-setup output" >&2
+  echo "(the full output is shown above)." >&2
+  exit 1
+fi
+# Reject anything that is not a well-formed vouchsafe URN before it reaches
+# bootstrap.env. Blocks shell metacharacters / command injection via a
+# tampered setup log.
+if [[ ! "${ADMIN_URN}" =~ ^urn:vouchsafe:[A-Za-z0-9._:-]+$ ]]; then
+  echo "Error: admin-setup produced an unexpected admin URN: '${ADMIN_URN}'" >&2
   exit 1
 fi
 

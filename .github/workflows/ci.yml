@@ -306,3 +306,36 @@ jobs:
         run: dotnet build platform/macos/DdsPolicyAgent/DdsPolicyAgent.MacOS.csproj -c Debug
       - name: Test macOS DdsPolicyAgent
         run: dotnet test platform/macos/DdsPolicyAgent.Tests/DdsPolicyAgent.MacOS.Tests.csproj -c Debug --logger "console;verbosity=normal"
+
+  shell-lint:
+    # The operator wizards and mesh-monitoring scripts (dds-bootstrap-domain,
+    # dds-enroll-admin, dds-status, dds-verify-replication, ...) had no CI
+    # coverage. Syntax-check every platform *.sh with the interpreter its
+    # shebang names (macOS scripts are zsh, Linux scripts are bash) so a
+    # broken wizard can't ship. Also runs shellcheck on the bash scripts as
+    # an advisory pass (never fails the build — zsh isn't shellcheck-able).
+    name: platform script lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install zsh + shellcheck
+        run: sudo apt-get update && sudo apt-get install -y zsh shellcheck
+      - name: Syntax-check platform shell scripts
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            case "$(head -1 "$f")" in
+              *zsh*)  zsh  -n "$f" || { echo "SYNTAX FAIL (zsh):  $f"; fail=1; } ;;
+              *bash*) bash -n "$f" || { echo "SYNTAX FAIL (bash): $f"; fail=1; } ;;
+              *sh*)   bash -n "$f" || { echo "SYNTAX FAIL (sh):   $f"; fail=1; } ;;
+            esac
+          done < <(find platform -type f -name '*.sh' -not -path '*/bin/*' -not -path '*/obj/*')
+          if [ "$fail" -eq 0 ]; then echo "All platform shell scripts: syntax OK"; fi
+          exit "$fail"
+      - name: Shellcheck bash scripts (advisory)
+        run: |
+          while IFS= read -r f; do
+            case "$(head -1 "$f")" in
+              *bash*|*/sh) echo "== $f =="; shellcheck -S warning "$f" || true ;;
+            esac
+          done < <(find platform -type f -name '*.sh' -not -path '*/bin/*' -not -path '*/obj/*')

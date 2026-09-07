@@ -107,11 +107,13 @@ pkg-payload: rust-binaries dotnet-agent
 	cp "$(PKG_DIR)/dds-account.sh" "$(PAYLOAD_DIR)/usr/local/bin/dds-account"
 	cp "$(PKG_DIR)/dds-uninstall.sh" "$(PAYLOAD_DIR)/usr/local/bin/dds-uninstall"
 	cp "$(PKG_DIR)/dds-verify-replication.sh" "$(PAYLOAD_DIR)/usr/local/bin/dds-verify-replication"
+	cp "$(PKG_DIR)/dds-status.sh" "$(PAYLOAD_DIR)/usr/local/bin/dds-status"
 	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-domain"
 	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-user"
 	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-account"
 	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-uninstall"
 	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-verify-replication"
+	chmod +x "$(PAYLOAD_DIR)/usr/local/bin/dds-status"
 
 	# Sealed-passphrase helpers (System Keychain integration).
 	# `dds-node provision` auto-detects /usr/local/sbin/dds-keychain-{seal,unseal}

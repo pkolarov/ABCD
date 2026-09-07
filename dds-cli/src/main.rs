@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "dds", about = "Decentralized Directory Service CLI")]
+#[command(name = "dds", version = env!("DDS_VERSION"), about = "Decentralized Directory Service CLI")]
 struct Cli {
     /// Path to the local storage directory (used by offline subcommands).
     #[arg(long, global = true, default_value = ".dds")]

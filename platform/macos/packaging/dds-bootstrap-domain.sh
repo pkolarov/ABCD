@@ -88,7 +88,19 @@ echo "  Bundle: ${DDS_ROOT}/provision.dds"
 # Parse domain info from domain.toml
 DOMAIN_ID="$(awk -F'= ' '/^id = / { gsub(/"/, "", $2); print $2 }' "${NODE_DATA}/domain.toml")"
 DOMAIN_PUBKEY="$(awk -F'= ' '/^pubkey = / { gsub(/"/, "", $2); print $2 }' "${NODE_DATA}/domain.toml")"
+# init-domain defaults to HYBRID (Ed25519 + ML-DSA-65), writing a pq_pubkey
+# into domain.toml. It MUST be carried into dds.toml's [domain] block:
+# dds-node treats a missing [domain].pq_pubkey as a legacy Ed25519-only
+# domain and silently skips ML-DSA verification of admission certs /
+# revocations (a PQ downgrade) even on a hybrid domain. Empty on
+# --legacy / FIDO2-v3 domains, where no line is emitted.
+DOMAIN_PQ_PUBKEY="$(awk -F'= ' '/^pq_pubkey = / { gsub(/"/, "", $2); print $2 }' "${NODE_DATA}/domain.toml")"
+DOMAIN_PQ_LINE=""
+if [[ -n "${DOMAIN_PQ_PUBKEY}" ]]; then
+  DOMAIN_PQ_LINE="pq_pubkey = \"${DOMAIN_PQ_PUBKEY}\""
+fi
 echo "  domain_id: ${DOMAIN_ID}"
+[[ -n "${DOMAIN_PQ_PUBKEY}" ]] && echo "  domain is hybrid (pq_pubkey present) — carrying it into node config"
 
 echo ""
 echo "[2/7] Generating node P2P identity..."
@@ -150,6 +162,7 @@ strict_device_binding = true
 name = "${DOMAIN_NAME}"
 id = "${DOMAIN_ID}"
 pubkey = "${DOMAIN_PUBKEY}"
+${DOMAIN_PQ_LINE}
 admission_path = "${NODE_DATA}/admission.cbor"
 audit_log_enabled = false
 EOF
@@ -271,6 +284,7 @@ echo "  Next steps:"
 echo "    1. Enroll an admin:  sudo dds-enroll-admin"
 echo "    2. Add another node: copy provision.dds to USB, then on new machine:"
 echo "       sudo dds-node provision /path/to/provision.dds"
+echo "    3. Check health/mesh at any time:  sudo dds-status   (add --watch to follow live)"
 echo ""
 echo "  Nodes on the same LAN auto-discover each other via mDNS."
 echo ""

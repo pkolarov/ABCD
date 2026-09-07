@@ -33,7 +33,8 @@ fi
 DDS_ROOT="/Library/Application Support/DDS"
 PKG_ID="com.dds.platform"
 BINARIES=(dds-node dds dds-fido2-test dds-fido2 dds-bootstrap-domain dds-enroll-admin \
-          dds-admit-node dds-domain dds-user dds-account dds-uninstall)
+          dds-admit-node dds-domain dds-user dds-account dds-verify-replication \
+          dds-status dds-uninstall)
 SBIN_HELPERS=(dds-keychain-seal dds-keychain-unseal dds-launchd-wrapper dds-watchdog)
 KEYCHAIN_SERVICE="DDS Node Passphrase"
 KEYCHAIN_ACCOUNT="$(hostname -s)"
@@ -95,6 +96,8 @@ pkgutil --forget "${PKG_ID}" 2>/dev/null || true
 if [[ ${KEEP_DATA} -eq 0 ]]; then
   echo "Removing ${DDS_ROOT}..."
   rm -rf "${DDS_ROOT}"
+  echo "Removing logs (/var/log/dds)..."
+  rm -rf /var/log/dds
 else
   echo "Preserving ${DDS_ROOT} (--keep-data)."
 fi

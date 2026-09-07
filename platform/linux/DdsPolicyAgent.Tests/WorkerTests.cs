@@ -33,6 +33,34 @@ sealed class TestDdsNodeClient : IDdsNodeClient
     }
 }
 
+/// Node client whose ReportAppliedAsync always throws — models the node
+/// rejecting a report (e.g. HTTP non-2xx via EnsureSuccessStatusCode) or a
+/// transient network error. Counts attempts so tests can prove the poll
+/// cycle kept going after a rejected report instead of aborting.
+sealed class ThrowingReportClient : IDdsNodeClient
+{
+    public List<ApplicableLinuxPolicy> NextPolicies { get; set; } = [];
+    public int ReportAttempts { get; private set; }
+
+    public Task<List<ApplicableLinuxPolicy>> GetPoliciesAsync(
+        string deviceUrn, CancellationToken ct = default)
+        => Task.FromResult(NextPolicies);
+
+    public Task ReportAppliedAsync(AppliedReport report, CancellationToken ct = default)
+    {
+        ReportAttempts++;
+        throw new HttpRequestException("simulated node rejection (422)");
+    }
+}
+
+/// Command runner that throws on every invocation — models an enforcer
+/// hitting an unexpected failure so the worker's per-policy catch runs.
+sealed class ThrowingCommandRunner : ICommandRunner
+{
+    public Task<CommandResult> RunAsync(string fileName, string arguments, CancellationToken ct = default)
+        => throw new InvalidOperationException($"simulated failure running {fileName} {arguments}");
+}
+
 sealed class TestAppliedStateStore : IAppliedStateStore
 {
     private readonly Dictionary<string, (string Version, string Hash, string Status)> _entries = new();
@@ -252,6 +280,79 @@ public sealed class WorkerTests
 
         Assert.Single(client.ReceivedReports);
         Assert.Equal("ok", client.ReceivedReports[0].Status);
+    }
+
+    [Fact]
+    public async Task EnforcerException_ReportsFailedStatus_NotError()
+    {
+        // Regression: the Linux agent used to report status "error", which is
+        // not a valid node-side AppliedStatus ("ok"/"failed"/"skipped"), so
+        // the POST was rejected. A thrown enforcer must surface as "failed".
+        var client = new TestDdsNodeClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-boom",
+                    """{"policy_id":"policy-boom","version":1,"linux":{"local_users":[{"username":"alice","action":"Create","shell":"/bin/bash"}]}}"""),
+            ],
+        };
+
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,   // enforce → the enforcer invokes the (throwing) runner
+            },
+            client,
+            runner: new ThrowingCommandRunner());
+
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        var report = client.ReceivedReports.SingleOrDefault(r => r.TargetId == "policy-boom");
+        Assert.NotNull(report);
+        Assert.Equal("failed", report.Status);
+        Assert.NotNull(report.Error);
+    }
+
+    [Fact]
+    public async Task RejectedReport_DoesNotAbortPollCycle()
+    {
+        // A report that the node rejects (ReportAppliedAsync throws) must not
+        // propagate out of PollOnceAsync and skip the rest of the cycle. With
+        // one policy plus a stale managed item, both the policy report and the
+        // reconciliation report must be attempted (2), and no exception escapes.
+        var initialState = new DDS.PolicyAgent.Linux.State.AppliedState();
+        initialState.ManagedUsernames.Add("stale-user");   // → reconciliation report
+        var store = new TrackingAppliedStateStore(initialState);
+
+        var client = new ThrowingReportClient
+        {
+            NextPolicies =
+            [
+                WorkerFactory.MakePolicy(
+                    "policy-ok",
+                    """{"policy_id":"policy-ok","version":1,"linux":{}}"""),
+            ],
+        };
+
+        var worker = WorkerFactory.Create(
+            new AgentConfig
+            {
+                DeviceUrn = "urn:dds:device:test",
+                PinnedNodePubkeyB64 = Convert.ToBase64String(new byte[32]),
+                AuditOnly = false,
+            },
+            client,
+            store);
+
+        // Must complete without throwing despite every report being rejected.
+        await worker.PollOnceAsync(CancellationToken.None);
+
+        // Both the policy apply report AND the reconciliation report were attempted;
+        // without cycle isolation the first throw would abort before reconciliation.
+        Assert.Equal(2, client.ReportAttempts);
     }
 
     [Fact]

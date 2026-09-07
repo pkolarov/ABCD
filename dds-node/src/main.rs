@@ -180,6 +180,13 @@ async fn async_main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
     let sub = args.first().map(|s| s.as_str()).unwrap_or("run");
 
     match sub {
+        // A real version probe, so tooling never has to launch the node
+        // (bare `dds-node` defaults to `run` — running it just to read a
+        // version would hang or fight the live node for its socket).
+        "--version" | "-V" | "version" => {
+            println!("dds-node {}", env!("DDS_VERSION"));
+            Ok(())
+        }
         "init-domain" => cmd_init_domain(&args[1..]),
         "gen-node-key" => cmd_gen_node_key(&args[1..]),
         "self-admit" => cmd_self_admit(&args[1..]),

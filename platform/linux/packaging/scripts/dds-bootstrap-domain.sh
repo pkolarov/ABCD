@@ -89,7 +89,21 @@ echo "  Bundle: ${DATA_DIR}/provision.dds"
 # Parse domain info from domain.toml
 DOMAIN_ID="$(awk -F'= ' '/^id = / { gsub(/"/, "", $2); print $2 }' "${NODE_DATA}/domain.toml")"
 DOMAIN_PUBKEY="$(awk -F'= ' '/^pubkey = / { gsub(/"/, "", $2); print $2 }' "${NODE_DATA}/domain.toml")"
+# init-domain defaults to HYBRID (Ed25519 + ML-DSA-65), which writes a
+# pq_pubkey into domain.toml. It MUST be carried into node.toml's
+# [domain] block: dds-node treats a missing [domain].pq_pubkey as a
+# legacy Ed25519-only domain and silently skips ML-DSA verification of
+# admission certs / revocations (a PQ downgrade) even though the domain
+# is hybrid. Absent on --legacy / FIDO2-v3 domains, where it stays empty.
+DOMAIN_PQ_PUBKEY="$(awk -F'= ' '/^pq_pubkey = / { gsub(/"/, "", $2); print $2 }' "${NODE_DATA}/domain.toml")"
 echo "  domain_id: ${DOMAIN_ID}"
+# Rendered into node.toml below. Empty string on legacy/FIDO2-v3 domains
+# (no line emitted); a full `pq_pubkey = "..."` line on hybrid domains.
+DOMAIN_PQ_LINE=""
+if [[ -n "${DOMAIN_PQ_PUBKEY}" ]]; then
+  DOMAIN_PQ_LINE="pq_pubkey = \"${DOMAIN_PQ_PUBKEY}\""
+  echo "  domain is hybrid (pq_pubkey present) — carrying it into node config"
+fi
 
 echo ""
 echo "[2/7] Generating node P2P identity..."
@@ -146,6 +160,7 @@ strict_device_binding = true
 name = "${DOMAIN_NAME}"
 id = "${DOMAIN_ID}"
 pubkey = "${DOMAIN_PUBKEY}"
+${DOMAIN_PQ_LINE}
 admission_path = "${NODE_DATA}/admission.cbor"
 audit_log_enabled = false
 EOF
@@ -154,6 +169,11 @@ echo "  Written: ${NODE_TOML}"
 echo ""
 echo "[5/7] Starting dds-node..."
 systemctl daemon-reload
+# `enable` creates the WantedBy=multi-user.target boot symlink so the node
+# comes back after a reboot; the separate `restart` then loads the config
+# we just wrote (a running-but-not-enabled node would vanish on reboot —
+# the macOS bootstrap does the equivalent `launchctl enable`).
+systemctl enable dds-node.service 2>/dev/null || true
 systemctl restart dds-node.service
 # Admission watchdog (0c41536 port) — external backstop that restarts
 # the node if peers stay connected-but-unadmitted for ~15 min. Enabled
@@ -211,6 +231,8 @@ with open('${POLICY_AGENT_CFG}', 'w') as f:
     f.write('\n')
 "
   echo "  Updated ${POLICY_AGENT_CFG} with device URN + pinned node pubkey"
+  # enable for boot (parity with dds-node above), then restart to load config.
+  systemctl enable dds-policy-agent.service 2>/dev/null || true
   systemctl restart dds-policy-agent.service 2>/dev/null || true
 else
   echo "  ${POLICY_AGENT_CFG} not present — copy the example from"
@@ -254,6 +276,7 @@ echo "  Next steps:"
 echo "    1. Enroll an admin:  sudo dds-enroll-admin"
 echo "    2. Add another node: copy provision.dds, then on new machine:"
 echo "       sudo dds-node provision /path/to/provision.dds"
+echo "    3. Check health/mesh at any time:  sudo dds-status   (add --watch to follow live)"
 echo ""
 echo "  Nodes on the same LAN auto-discover each other via mDNS."
 echo ""
