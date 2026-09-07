@@ -2939,6 +2939,15 @@ impl DdsNode {
         // the inbound gossip path. A policy attestation whose issuer lacks
         // the matching `dds:policy-publisher-*` capability is refused here
         // so we never gossip a token our own peers would reject at ingest.
+        // **F1 (2026-09-07 security review)**: same self-issuance rule as
+        // the gossip and sync gates, for tokens published through the
+        // local API.
+        if !dds_domain::user_auth_attestation_is_self_issued(&token.payload) {
+            return Err(format!(
+                "user-auth attestation '{}' is not self-issued (iss '{}' != sub '{}')",
+                token.payload.jti, token.payload.iss, token.payload.sub
+            ));
+        }
         if !publisher_capability_ok(&token, &self.trust_graph, &self.trusted_roots) {
             return Err(format!(
                 "issuer '{}' lacks the required publisher capability for body_type {:?}",
@@ -3199,6 +3208,26 @@ impl DdsNode {
         // token into the graph, letting it propagate to peers whose
         // filters or agents might be older/patched differently.
         // Ingest-side reject is the authoritative gate.
+        // **F1 (2026-09-07 security review)**: a user-auth attestation
+        // whose issuer is not its subject is a forged credential mapping:
+        // whoever signed it could authenticate as `sub` with their own
+        // authenticator. Legitimate enrollments are always self-issued.
+        // Refuse at ingest so the token never enters the trust graph or
+        // the store; the sync pre-filter applies the same rule.
+        if !dds_domain::user_auth_attestation_is_self_issued(&token.payload) {
+            warn!(
+                jti = %token.payload.jti,
+                issuer = %token.payload.iss,
+                subject = %token.payload.sub,
+                "rejecting inbound token: user-auth attestation is not self-issued (iss != sub)"
+            );
+            self.emit_audit_from_ingest(
+                rejected_action_for(&token.payload.kind),
+                token_bytes.to_vec(),
+                Some("user-auth-attestation-not-self-issued".to_string()),
+            );
+            return;
+        }
         if !publisher_capability_ok(&token, &self.trust_graph, &self.trusted_roots) {
             warn!(
                 jti = %token.payload.jti,
@@ -4743,6 +4772,20 @@ impl DdsNode {
                         "sync: dropping legacy v1 token (allow_legacy_v1_tokens=false)"
                     );
                     crate::telemetry::record_sync_payloads_rejected("legacy_v1");
+                    return false;
+                }
+                // **F1 (2026-09-07 security review)**: mirror of the gossip
+                // gate — every inbound-token guard must run on both
+                // replication paths.
+                if !dds_domain::user_auth_attestation_is_self_issued(&token.payload) {
+                    warn!(
+                        %peer,
+                        jti = %token.payload.jti,
+                        issuer = %token.payload.iss,
+                        subject = %token.payload.sub,
+                        "sync: dropping user-auth attestation that is not self-issued (iss != sub)"
+                    );
+                    crate::telemetry::record_sync_payloads_rejected("user_auth_not_self_issued");
                     return false;
                 }
                 if !publisher_capability_ok(&token, &self.trust_graph, &self.trusted_roots) {
@@ -7906,6 +7949,101 @@ mod r5_sync_quorum_replay_tests {
     /// Positive path (guards against over-tightening): K publisher tokens
     /// delivered across TWO separate sync batches still reach quorum — each
     /// token's op merges as novel in its own batch, so each is counted.
+    /// A user-auth attestation token whose issuer may differ from its
+    /// subject (F1, 2026-09-07 review). The body is irrelevant to the
+    /// ingest gates, which only look at `body_type`, `iss` and `sub`.
+    fn user_auth_attestation_token(issuer: &Identity, subject_urn: &str, jti: &str) -> Token {
+        let iat = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let payload = TokenPayload {
+            iss: issuer.id.to_urn(),
+            iss_key: issuer.public_key.clone(),
+            jti: jti.to_string(),
+            sub: subject_urn.to_string(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat,
+            exp: Some(4102444800),
+            body_type: Some(body_types::USER_AUTH_ATTESTATION.to_string()),
+            body_cbor: Some(Vec::new()),
+        };
+        Token::sign(payload, &issuer.signing_key).expect("sign")
+    }
+
+    #[test]
+    fn every_ingest_path_drops_user_auth_attestation_that_is_not_self_issued() {
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("f1-forged.local", [9u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            let attacker = Identity::generate("mallory", &mut OsRng);
+            let victim = Identity::generate("victim", &mut OsRng);
+            let victim_urn = victim.id.to_urn();
+            let has = |node: &DdsNode, jti: &str| {
+                node.trust_graph
+                    .read()
+                    .unwrap()
+                    .attestations_iter()
+                    .any(|t| t.payload.jti == jti)
+            };
+
+            // Anti-entropy sync: the forged mapping is dropped by the
+            // pre-filter, the legitimate self-issued one is admitted.
+            let forged = user_auth_attestation_token(&attacker, &victim_urn, "attest-forged-sync");
+            let legit = user_auth_attestation_token(&victim, &victim_urn, "attest-legit-sync");
+            assert!(forged.validate().is_ok(), "forged token is otherwise valid");
+            node.apply_decrypted_sync_response(
+                PeerId::random(),
+                sync_response(vec![
+                    sync_payload("op-forged-sync", &forged),
+                    sync_payload("op-legit-sync", &legit),
+                ]),
+            );
+            assert!(
+                !has(&node, "attest-forged-sync"),
+                "sync must drop iss != sub"
+            );
+            assert!(
+                has(&node, "attest-legit-sync"),
+                "sync must admit iss == sub"
+            );
+
+            // Gossip: same rule.
+            let forged =
+                user_auth_attestation_token(&attacker, &victim_urn, "attest-forged-gossip");
+            let legit = user_auth_attestation_token(&victim, &victim_urn, "attest-legit-gossip");
+            let p = sync_payload("op-forged-gossip", &forged);
+            node.ingest_operation(&p.op_bytes, &p.token_bytes);
+            let p = sync_payload("op-legit-gossip", &legit);
+            node.ingest_operation(&p.op_bytes, &p.token_bytes);
+            assert!(
+                !has(&node, "attest-forged-gossip"),
+                "gossip must drop iss != sub"
+            );
+            assert!(
+                has(&node, "attest-legit-gossip"),
+                "gossip must admit iss == sub"
+            );
+
+            // Local publish: refused with an explicit error.
+            let forged = user_auth_attestation_token(&attacker, &victim_urn, "attest-forged-local");
+            let err = node
+                .apply_one_local(forged)
+                .expect_err("local publish must refuse iss != sub");
+            assert!(err.contains("not self-issued"), "{err}");
+            assert!(!has(&node, "attest-forged-local"));
+        });
+    }
+
     #[test]
     fn k_tokens_across_two_sync_batches_reach_quorum() {
         run_with_time(|| {

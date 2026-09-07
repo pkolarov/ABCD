@@ -579,6 +579,46 @@ impl TrustGraph {
     ///
     /// **B-2 (security review):** see [`has_purpose`] — every grant
     /// in the returned set is backed by a live target attestation.
+    /// Shared effectiveness test for a vouch on `subject_urn`: not
+    /// revoked, not expired, pins an active attestation the subject
+    /// issued (`vch_sum`), chains to a trusted root, and, for a
+    /// privileged capability, was granted by a voucher authorized to
+    /// grant it. Used by [`Self::purposes_for`] and
+    /// [`Self::attestation_is_vouched`] so both agree on which vouches
+    /// count.
+    fn vouch_is_effective(
+        &self,
+        t: &Token,
+        subject_urn: &str,
+        trusted_roots: &BTreeSet<String>,
+    ) -> bool {
+        if self.is_revoked(&t.payload.jti) || Self::is_expired(t) {
+            return false;
+        }
+        if self
+            .active_attestation_for_iss(subject_urn, t.payload.vch_sum.as_deref())
+            .is_none()
+        {
+            return false;
+        }
+        if self.validate_chain(&t.payload.iss, trusted_roots).is_err() {
+            return false;
+        }
+        // **AUDIT-2026-06-11 #3**: don't surface a privileged capability
+        // unless the voucher was authorized to grant it (trusted root or
+        // holds it itself), matching `has_purpose`.
+        if let Some(p) = t.payload.purpose.as_deref() {
+            if Self::is_privileged_capability(p) {
+                let voucher = &t.payload.iss;
+                if !trusted_roots.contains(voucher) && !self.has_purpose(voucher, p, trusted_roots)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     pub fn purposes_for(
         &self,
         subject_urn: &str,
@@ -588,36 +628,37 @@ impl TrustGraph {
             return BTreeSet::new();
         }
         self.vouches_for_subject(subject_urn)
-            .filter(|t| {
-                if self.is_revoked(&t.payload.jti) || Self::is_expired(t) {
-                    return false;
-                }
-                if self
-                    .active_attestation_for_iss(subject_urn, t.payload.vch_sum.as_deref())
-                    .is_none()
-                {
-                    return false;
-                }
-                if self.validate_chain(&t.payload.iss, trusted_roots).is_err() {
-                    return false;
-                }
-                // **AUDIT-2026-06-11 #3**: don't surface a privileged capability
-                // unless the voucher was authorized to grant it (trusted root or
-                // holds it itself), matching `has_purpose`.
-                if let Some(p) = t.payload.purpose.as_deref() {
-                    if Self::is_privileged_capability(p) {
-                        let voucher = &t.payload.iss;
-                        if !trusted_roots.contains(voucher)
-                            && !self.has_purpose(voucher, p, trusted_roots)
-                        {
-                            return false;
-                        }
-                    }
-                }
-                true
-            })
+            .filter(|t| self.vouch_is_effective(t, subject_urn, trusted_roots))
             .filter_map(|t| t.payload.purpose.clone())
             .collect()
+    }
+
+    /// **F1 (2026-09-07 security review).** Whether the attestation with
+    /// payload hash `attest_hash` is the one an effective vouch for
+    /// `subject_urn` pins through `vch_sum`. The FIDO2 session path uses
+    /// this to refuse a credential attestation that is not the enrollment
+    /// an administrator actually vouched for, so a second self-issued
+    /// attestation under the same URN cannot borrow the vouched one's
+    /// grants. Constant-time on the hash comparison, like the rest of the
+    /// `vch_sum` handling.
+    pub fn attestation_is_vouched(
+        &self,
+        subject_urn: &str,
+        attest_hash: &str,
+        trusted_roots: &BTreeSet<String>,
+    ) -> bool {
+        if self.burned.contains(subject_urn) {
+            return false;
+        }
+        self.vouches_for_subject(subject_urn)
+            .filter(|t| self.vouch_is_effective(t, subject_urn, trusted_roots))
+            .any(|t| {
+                t.payload
+                    .vch_sum
+                    .as_deref()
+                    .map(|pinned| payload_hash_eq(pinned, attest_hash))
+                    .unwrap_or(false)
+            })
     }
 
     /// Remove a token from the trust graph by JTI.
@@ -2007,5 +2048,67 @@ mod tests {
             0,
             "revoked vouch must not count toward holder total"
         );
+    }
+
+    #[test]
+    fn attestation_is_vouched_only_for_the_pinned_enrollment() {
+        // F1 (2026-09-07 review): a vouch pins one attestation by hash; a
+        // second self-issued attestation under the same URN must not count
+        // as vouched, and a revoked vouch withdraws the pinning.
+        let root = Identity::generate("root", &mut OsRng);
+        let alice = Identity::generate("alice", &mut OsRng);
+        let mut g = TrustGraph::new();
+        g.add_token(make_attest(&root)).unwrap();
+        let pinned = make_attest(&alice);
+        let pinned_hash = pinned.payload_hash();
+        g.add_token(pinned.clone()).unwrap();
+        let other = Token::sign(
+            TokenPayload {
+                iss: alice.id.to_urn(),
+                iss_key: alice.public_key.clone(),
+                jti: "attest-alice-second".into(),
+                sub: alice.id.to_urn(),
+                kind: TokenKind::Attest,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat: 1000,
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &alice.signing_key,
+        )
+        .unwrap();
+        let other_hash = other.payload_hash();
+        g.add_token(other).unwrap();
+        let roots = roots_with(&root.id.to_urn());
+
+        assert!(
+            !g.attestation_is_vouched(&alice.id.to_urn(), &pinned_hash, &roots),
+            "no vouch yet: nothing is vouched"
+        );
+        g.add_token(make_vouch(
+            &root,
+            &alice,
+            &pinned,
+            "dds:session",
+            "vouch-alice",
+        ))
+        .unwrap();
+        assert!(g.attestation_is_vouched(&alice.id.to_urn(), &pinned_hash, &roots));
+        assert!(
+            !g.attestation_is_vouched(&alice.id.to_urn(), &other_hash, &roots),
+            "an attestation no vouch pins must not be treated as vouched"
+        );
+        assert!(!g.attestation_is_vouched("urn:vouchsafe:nobody", &pinned_hash, &roots));
+
+        g.add_token(make_revoke(&root, "vouch-alice")).unwrap();
+        assert!(
+            !g.attestation_is_vouched(&alice.id.to_urn(), &pinned_hash, &roots),
+            "a revoked vouch no longer pins the enrollment"
+        );
+        assert!(g.purposes_for(&alice.id.to_urn(), &roots).is_empty());
     }
 }

@@ -204,6 +204,10 @@ pub struct AdminRootInfo {
 struct CommonAssertionOutput {
     subject_urn: String,
     user_verified: bool,
+    /// Payload hash of the (self-issued) attestation that carried the
+    /// authenticating credential; the session path checks it against the
+    /// `vch_sum` an effective vouch pins (F1, 2026-09-07 review).
+    attestation_hash: String,
 }
 
 /// Drop-guard that funnels every exit branch of
@@ -769,6 +773,17 @@ impl<
             // inserts are a no-op. We log and skip on rejection rather
             // than failing the whole rehydrate — bad tokens in the store
             // would also have failed the old per-query rebuild.
+            // F1: quarantine a forged credential mapping that a pre-fix
+            // node may have stored; it must never re-enter the graph.
+            if !dds_domain::user_auth_attestation_is_self_issued(&token.payload) {
+                tracing::warn!(
+                    jti = %token.payload.jti,
+                    issuer = %token.payload.iss,
+                    subject = %token.payload.sub,
+                    "rehydrate_from_store: skipping user-auth attestation that is not self-issued (iss != sub)"
+                );
+                continue;
+            }
             if let Err(e) = g.add_token(token) {
                 tracing::warn!("rehydrate_from_store: skipping token: {e}");
                 continue;
@@ -2172,15 +2187,30 @@ impl<
         }
 
         // 1. Look up the credential's public key and enrolled RP-ID from the trust graph.
-        let (subject_urn, public_key, enrolled_rp_id) = {
+        let (subject_urn, public_key, enrolled_rp_id, attestation_hash) = {
             let g = self
                 .trust_graph
                 .read()
                 .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
 
-            let mut found: Option<(String, Vec<u8>, String)> = None;
+            let mut found: Option<(String, Vec<u8>, String, String)> = None;
             for token in g.attestations_iter() {
                 if g.is_revoked(&token.payload.jti) || g.is_burned(&token.payload.iss) {
+                    continue;
+                }
+                // **F1 (2026-09-07 security review)**: only a self-issued
+                // attestation may map a credential to `sub`. A replicated
+                // token with `iss != sub` is a forged mapping; ingest now
+                // refuses it, but skip it here too so a store written
+                // before the fix (or rehydration) can never authenticate
+                // as the victim.
+                if !dds_domain::user_auth_attestation_is_self_issued(&token.payload) {
+                    tracing::warn!(
+                        jti = %token.payload.jti,
+                        issuer = %token.payload.iss,
+                        subject = %token.payload.sub,
+                        "ignoring user-auth attestation that is not self-issued (iss != sub) during credential lookup"
+                    );
                     continue;
                 }
                 let doc = match UserAuthAttestation::extract(&token.payload) {
@@ -2211,19 +2241,20 @@ impl<
                         token.payload.sub.clone(),
                         cose_bytes.to_vec(),
                         doc.rp_id.clone(),
+                        token.payload_hash(),
                     ));
                     break;
                 }
             }
 
-            let (sub, cose_bytes, rp_id) = found.ok_or_else(|| {
+            let (sub, cose_bytes, rp_id, attest_hash) = found.ok_or_else(|| {
                 ServiceError::Fido2(format!(
                     "credential_id '{credential_id}' not found in trust graph"
                 ))
             })?;
             let pk = cose_to_credential_public_key(&cose_bytes)
                 .map_err(|e| ServiceError::Fido2(format!("COSE key parse: {e}")))?;
-            (sub, pk, rp_id)
+            (sub, pk, rp_id, attest_hash)
         };
 
         // 2. Cryptographic signature verification.
@@ -2392,6 +2423,7 @@ impl<
         Ok(CommonAssertionOutput {
             subject_urn,
             user_verified: parsed.user_verified,
+            attestation_hash,
         })
     }
 
@@ -2418,6 +2450,32 @@ impl<
             &req.authenticator_data,
             &req.signature,
         )?;
+
+        // **F1 (2026-09-07 security review)**: the credential that just
+        // authenticated must be the enrollment an effective vouch pins
+        // (`vch_sum`). `verify_assertion_common` already refuses
+        // non-self-issued mappings; this closes the remaining gap where a
+        // second self-issued attestation under the same URN would inherit
+        // the vouched one's grants. Trusted roots without a vouch cannot
+        // mint sessions anyway (`issue_session_inner` requires a grant), so
+        // this adds no new restriction for them.
+        {
+            let g = self
+                .trust_graph
+                .read()
+                .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
+            if !g.attestation_is_vouched(
+                &out.subject_urn,
+                &out.attestation_hash,
+                &self.trusted_roots,
+            ) {
+                return Err(ServiceError::Trust(format!(
+                    "credential attestation for subject '{}' is not the enrollment \
+                     referenced by any active vouch; refusing session",
+                    out.subject_urn
+                )));
+            }
+        }
 
         // Issue a session bound to the enrolled subject URN. The caller's
         // subject_urn is IGNORED — the session is always bound to the credential
@@ -2459,6 +2517,11 @@ impl<
         let mut users = Vec::new();
         for token in g.attestations_iter() {
             if g.is_revoked(&token.payload.jti) || g.is_burned(&token.payload.iss) {
+                continue;
+            }
+            // F1: a non-self-issued user-auth attestation is a forged
+            // credential mapping; never surface it as a logon tile.
+            if !dds_domain::user_auth_attestation_is_self_issued(&token.payload) {
                 continue;
             }
             let doc = match UserAuthAttestation::extract(&token.payload) {
@@ -3034,7 +3097,11 @@ impl<
 
             let mut found: Option<(String, String)> = None;
             for token in g.attestations_iter() {
-                if token.payload.sub == req.subject_urn {
+                // F1: never pin a vouch to a forged (non-self-issued)
+                // user-auth attestation; see verify_assertion_common.
+                if token.payload.sub == req.subject_urn
+                    && dds_domain::user_auth_attestation_is_self_issued(&token.payload)
+                {
                     found = Some((token.payload.iss.clone(), token.payload_hash()));
                     break;
                 }
@@ -7992,6 +8059,328 @@ mod platform_applier_tests {
     // exercised in this module.
     #[allow(dead_code)]
     fn _used(_: DeviceJoinDocument) {}
+    // ---------- F1 (2026-09-07 security review): forged credential mappings ----------
+
+    /// Sign a WebAuthn `get` assertion over a fresh server challenge with
+    /// `signing_sk`, the way an authenticator holding `credential_id` would.
+    fn signed_assertion_request(
+        svc: &mut LocalService<MemoryBackend>,
+        rp_id: &str,
+        credential_id: &str,
+        challenge_tag: &str,
+        signing_sk: &ed25519_dalek::SigningKey,
+        sign_count: u32,
+    ) -> AssertionSessionRequest {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use dds_domain::fido2::build_assertion_auth_data;
+        use ed25519_dalek::Signer;
+        use sha2::Digest;
+        let challenge_id = format!("ch-f1-{challenge_tag}");
+        let challenge_bytes: [u8; 32] = sha2::Sha256::digest(challenge_tag.as_bytes()).into();
+        svc.store_mut()
+            .put_challenge(&challenge_id, &challenge_bytes, now_epoch() + 600)
+            .expect("put_challenge");
+        let challenge_b64url = URL_SAFE_NO_PAD.encode(challenge_bytes);
+        let cdj = format!(
+            r#"{{"type":"webauthn.get","challenge":"{challenge_b64url}","origin":"https://{rp_id}"}}"#
+        );
+        let cdh = sha2::Sha256::digest(cdj.as_bytes());
+        let auth_data = build_assertion_auth_data(rp_id, sign_count);
+        let mut signed_msg = auth_data.clone();
+        signed_msg.extend_from_slice(&cdh);
+        let sig = signing_sk.sign(&signed_msg);
+        AssertionSessionRequest {
+            subject_urn: None,
+            credential_id: credential_id.to_string(),
+            challenge_id,
+            client_data_hash: cdh.to_vec(),
+            client_data_json: Some(cdj.into_bytes()),
+            authenticator_data: auth_data,
+            signature: sig.to_bytes().to_vec(),
+            duration_secs: None,
+        }
+    }
+
+    /// Vouch `subject_urn` for `purpose` from the trusted root `admin`,
+    /// pinning the subject's self-issued attestation the way `admin_vouch`
+    /// does.
+    fn vouch_subject(
+        svc: &mut LocalService<MemoryBackend>,
+        admin: &Identity,
+        subject_urn: &str,
+        purpose: &str,
+        jti: &str,
+    ) {
+        let (attest_iss, attest_hash) = {
+            let g = svc.trust_graph.read().unwrap();
+            g.attestations_iter()
+                .find(|t| t.payload.sub == subject_urn && t.payload.iss == subject_urn)
+                .map(|t| (t.payload.iss.clone(), t.payload_hash()))
+                .expect("subject must have a self-issued attestation")
+        };
+        let vouch = Token::sign(
+            TokenPayload {
+                iss: admin.id.to_urn(),
+                iss_key: admin.public_key.clone(),
+                jti: jti.into(),
+                sub: subject_urn.into(),
+                kind: TokenKind::Vouch,
+                purpose: Some(purpose.into()),
+                vch_iss: Some(attest_iss),
+                vch_sum: Some(attest_hash),
+                revokes: None,
+                iat: 1_700_000_000,
+                exp: Some(4_102_444_800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &admin.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph.write().unwrap().add_token(vouch).unwrap();
+    }
+
+    /// A self-issued user-auth attestation for `owner` carrying `cred`.
+    fn self_issued_user_attestation(
+        owner: &Identity,
+        jti: &str,
+        rp_id: &str,
+        cred: &[u8],
+        cred_sk: &ed25519_dalek::SigningKey,
+    ) -> Token {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use dds_domain::fido2::build_packed_self_attestation;
+        let doc = UserAuthAttestation {
+            credential_id: URL_SAFE_NO_PAD.encode(cred),
+            attestation_object: build_packed_self_attestation(rp_id, cred, cred_sk, &[0u8; 32]),
+            client_data_hash: vec![0u8; 32],
+            rp_id: rp_id.into(),
+            user_display_name: owner.id.label().to_string(),
+            authenticator_type: "cross-platform".into(),
+        };
+        let mut payload = TokenPayload {
+            iss: owner.id.to_urn(),
+            iss_key: owner.public_key.clone(),
+            jti: jti.into(),
+            sub: owner.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: now_epoch(),
+            exp: Some(now_epoch() + 365 * 86400),
+            body_type: None,
+            body_cbor: None,
+        };
+        doc.embed(&mut payload).unwrap();
+        Token::sign(payload, &owner.signing_key).unwrap()
+    }
+
+    #[test]
+    fn forged_user_auth_attestation_cannot_authenticate_as_victim() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use dds_domain::fido2::build_packed_self_attestation;
+        use ed25519_dalek::SigningKey;
+        let (mut svc, admin, _roots) = setup();
+        svc.set_verify_fido2(true);
+        let rp_id = "dds.local";
+
+        // The victim enrolls legitimately (self-issued attestation) and is vouched.
+        let victim_sk = SigningKey::generate(&mut OsRng);
+        let victim_cred = b"cred-victim";
+        let victim_cred_b64 = URL_SAFE_NO_PAD.encode(victim_cred);
+        let enrolled = svc
+            .enroll_user(EnrollUserRequest {
+                label: "victim".into(),
+                credential_id: victim_cred_b64.clone(),
+                attestation_object: build_packed_self_attestation(
+                    rp_id,
+                    victim_cred,
+                    &victim_sk,
+                    &[0u8; 32],
+                ),
+                client_data_hash: vec![0u8; 32],
+                rp_id: rp_id.into(),
+                display_name: "Victim".into(),
+                authenticator_type: "cross-platform".into(),
+                challenge_id: None,
+                client_data_json: None,
+            })
+            .expect("victim enrollment");
+        let victim_urn = enrolled.urn.clone();
+        vouch_subject(
+            &mut svc,
+            &admin,
+            &victim_urn,
+            "dds:group:employees",
+            "vouch-victim",
+        );
+
+        // Sanity: the victim's own credential mints a session.
+        let req =
+            signed_assertion_request(&mut svc, rp_id, &victim_cred_b64, "victim-1", &victim_sk, 1);
+        svc.issue_session_from_assertion(req)
+            .expect("the victim's own credential must authenticate");
+
+        // The attacker forges a mapping: iss = attacker, sub = victim, body =
+        // the attacker's own credential. It is signature- and shape-valid.
+        let attacker = Identity::generate("mallory", &mut OsRng);
+        let attacker_sk = SigningKey::generate(&mut OsRng);
+        let attacker_cred = b"cred-mallory";
+        let attacker_cred_b64 = URL_SAFE_NO_PAD.encode(attacker_cred);
+        let doc = UserAuthAttestation {
+            credential_id: attacker_cred_b64.clone(),
+            attestation_object: build_packed_self_attestation(
+                rp_id,
+                attacker_cred,
+                &attacker_sk,
+                &[0u8; 32],
+            ),
+            client_data_hash: vec![0u8; 32],
+            rp_id: rp_id.into(),
+            user_display_name: "Victim".into(),
+            authenticator_type: "cross-platform".into(),
+        };
+        let mut payload = TokenPayload {
+            iss: attacker.id.to_urn(),
+            iss_key: attacker.public_key.clone(),
+            jti: "attest-forged-victim".into(),
+            sub: victim_urn.clone(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: now_epoch(),
+            exp: Some(now_epoch() + 365 * 86400),
+            body_type: None,
+            body_cbor: None,
+        };
+        doc.embed(&mut payload).unwrap();
+        let forged = Token::sign(payload, &attacker.signing_key).unwrap();
+        assert!(
+            forged.validate().is_ok(),
+            "forged token passes generic validation"
+        );
+        assert!(!dds_domain::user_auth_attestation_is_self_issued(
+            &forged.payload
+        ));
+
+        // Simulate a pre-fix node that replicated it straight into graph and store.
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(forged.clone())
+            .unwrap();
+        svc.store_mut().put_token(&forged).unwrap();
+
+        // A valid assertion with the attacker's credential must not mint a victim session.
+        let req = signed_assertion_request(
+            &mut svc,
+            rp_id,
+            &attacker_cred_b64,
+            "mallory-1",
+            &attacker_sk,
+            1,
+        );
+        let err = svc
+            .issue_session_from_assertion(req)
+            .expect_err("a forged mapping must not authenticate as the victim");
+        assert!(
+            format!("{err:?}").contains("not found in trust graph"),
+            "the forged attestation must be invisible to the credential lookup: {err:?}"
+        );
+
+        // The forged credential is never offered as a logon tile.
+        let users = svc.list_enrolled_users("urn:device:any", true).unwrap();
+        assert!(users.iter().any(|u| u.credential_id == victim_cred_b64));
+        assert!(!users.iter().any(|u| u.credential_id == attacker_cred_b64));
+
+        // The victim still authenticates.
+        let req =
+            signed_assertion_request(&mut svc, rp_id, &victim_cred_b64, "victim-2", &victim_sk, 2);
+        svc.issue_session_from_assertion(req)
+            .expect("the victim still authenticates");
+
+        // Rehydrating from a store that already holds the forged token must
+        // quarantine it while readmitting the legitimate enrollment.
+        *svc.trust_graph.write().unwrap() = TrustGraph::new();
+        svc.rehydrate_from_store().expect("rehydrate");
+        let g = svc.trust_graph.read().unwrap();
+        assert!(
+            !g.attestations_iter()
+                .any(|t| t.payload.jti == "attest-forged-victim")
+        );
+        assert!(g.attestations_iter().any(|t| t.payload.jti == enrolled.jti));
+    }
+
+    #[test]
+    fn unvouched_second_attestation_cannot_borrow_the_vouched_enrollments_grants() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use ed25519_dalek::SigningKey;
+        let (mut svc, admin, _roots) = setup();
+        svc.set_verify_fido2(true);
+        let rp_id = "dds.local";
+        let alice = Identity::generate("alice", &mut OsRng);
+        let sk1 = SigningKey::generate(&mut OsRng);
+        let sk2 = SigningKey::generate(&mut OsRng);
+        let t1 = self_issued_user_attestation(
+            &alice,
+            "attest-alice-vouched",
+            rp_id,
+            b"cred-alice-1",
+            &sk1,
+        );
+        let t2 = self_issued_user_attestation(
+            &alice,
+            "attest-alice-extra",
+            rp_id,
+            b"cred-alice-2",
+            &sk2,
+        );
+        let t1_hash = t1.payload_hash();
+        {
+            let mut g = svc.trust_graph.write().unwrap();
+            g.add_token(t1).unwrap();
+            g.add_token(t2).unwrap();
+        }
+        // The vouch pins t1 only.
+        let vouch = Token::sign(
+            TokenPayload {
+                iss: admin.id.to_urn(),
+                iss_key: admin.public_key.clone(),
+                jti: "vouch-alice".into(),
+                sub: alice.id.to_urn(),
+                kind: TokenKind::Vouch,
+                purpose: Some("dds:group:employees".into()),
+                vch_iss: Some(alice.id.to_urn()),
+                vch_sum: Some(t1_hash),
+                revokes: None,
+                iat: 1_700_000_000,
+                exp: Some(4_102_444_800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &admin.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph.write().unwrap().add_token(vouch).unwrap();
+
+        let cred1 = URL_SAFE_NO_PAD.encode(b"cred-alice-1");
+        let cred2 = URL_SAFE_NO_PAD.encode(b"cred-alice-2");
+        let req = signed_assertion_request(&mut svc, rp_id, &cred2, "alice-extra", &sk2, 1);
+        let err = svc
+            .issue_session_from_assertion(req)
+            .expect_err("the credential of an attestation no vouch pins must not mint a session");
+        assert!(
+            format!("{err:?}").contains("not the enrollment referenced by any active vouch"),
+            "{err:?}"
+        );
+        let req = signed_assertion_request(&mut svc, rp_id, &cred1, "alice-vouched", &sk1, 1);
+        svc.issue_session_from_assertion(req)
+            .expect("the vouched enrollment authenticates");
+    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,24 @@ impl DomainDocument for UserAuthAttestation {
     const BODY_TYPE: &'static str = body_types::USER_AUTH_ATTESTATION;
 }
 
+/// **F1 (2026-09-07 security review).** A [`UserAuthAttestation`] binds a
+/// FIDO2 credential to the token's `sub`. The only party entitled to make
+/// that binding is the subject itself, so a legitimate enrollment is always
+/// *self-issued* (`iss == sub`; see `LocalService::enroll_user`). A token
+/// whose issuer differs from its subject is a forged credential mapping:
+/// whoever signed it could authenticate as `sub` with their own
+/// authenticator. Returns `true` for every token that is not a user-auth
+/// attestation, so callers can apply it unconditionally on ingest.
+pub fn user_auth_attestation_is_self_issued(payload: &dds_core::token::TokenPayload) -> bool {
+    if payload.kind != dds_core::token::TokenKind::Attest {
+        return true;
+    }
+    match payload.body_type.as_deref() {
+        Some(body_types::USER_AUTH_ATTESTATION) => payload.iss == payload.sub,
+        _ => true,
+    }
+}
+
 // ============================================================
 // 2. DeviceJoinDocument — device enrollment
 // ============================================================
@@ -1898,5 +1916,41 @@ mod tests {
             doc.evaluate(b"peer1", "jti-1", None),
             RolloutDecision::ApplyNow
         );
+    }
+
+    #[test]
+    fn user_auth_attestation_must_be_self_issued() {
+        use dds_core::crypto::{PublicKeyBundle, SchemeId};
+        use dds_core::token::{TokenKind, TokenPayload};
+        let mut payload = TokenPayload {
+            iss: "urn:vouchsafe:alice".into(),
+            iss_key: PublicKeyBundle {
+                scheme: SchemeId::Ed25519,
+                bytes: vec![0u8; 32],
+            },
+            jti: "attest-1".into(),
+            sub: "urn:vouchsafe:alice".into(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: 1,
+            exp: None,
+            body_type: Some(body_types::USER_AUTH_ATTESTATION.to_string()),
+            body_cbor: None,
+        };
+        assert!(user_auth_attestation_is_self_issued(&payload));
+        payload.sub = "urn:vouchsafe:victim".into();
+        assert!(
+            !user_auth_attestation_is_self_issued(&payload),
+            "iss != sub on a user-auth attestation is a forged credential mapping"
+        );
+        // Other body types and token kinds are not subject to the rule.
+        payload.body_type = Some(body_types::WINDOWS_POLICY.to_string());
+        assert!(user_auth_attestation_is_self_issued(&payload));
+        payload.body_type = Some(body_types::USER_AUTH_ATTESTATION.to_string());
+        payload.kind = TokenKind::Vouch;
+        assert!(user_auth_attestation_is_self_issued(&payload));
     }
 }
