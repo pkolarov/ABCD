@@ -457,6 +457,52 @@ public class WorkerTests
     }
 
     [Fact]
+    public async Task Reconciliation_DocumentAudit_OnWorkgroupHost_DoesNotDelete()
+    {
+        // Regression: the reconcile pass derived its audit flag from host join-state
+        // only, ignoring document-level Audit. On a WORKGROUP host (host state does
+        // not force audit), a policy authored enforcement:"Audit" must still freeze
+        // the cross-policy cleanup — otherwise a stale item is destructively removed
+        // even though an audit-authored document might legitimately own it, deleting
+        // host state DDS never actually wrote.
+        var registryOps = new InMemoryRegistryOperations();
+        registryOps.SetValue("LocalMachine", @"SOFTWARE\Policies\DDS", "OldSetting", (uint)1, RegValueKind.Dword);
+
+        var store = new TrackingAppliedStateStore(new()
+        {
+            ["registry"] = [@"LocalMachine\SOFTWARE\Policies\DDS\OldSetting"],
+        });
+
+        // An audit-authored policy is applicable this cycle. Its mere presence must
+        // freeze the reconcile pass (it need not touch the stale key itself).
+        var policyDoc = JsonDocument.Parse(
+            """{"policy_id":"p-audit","version":1,"enforcement":"Audit","windows":{}}""");
+        var client = new TestWindowsDdsNodeClient
+        {
+            NextPolicies =
+            [
+                new ApplicableWindowsPolicy
+                {
+                    Jti = "jti-audit",
+                    Issuer = "dds:test",
+                    Iat = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    Document = policyDoc.RootElement,
+                },
+            ],
+        };
+
+        var worker = MakeWorker(client, store, registryOps: registryOps);
+        await worker.PollAndApplyAsync(JoinState.Workgroup, CancellationToken.None);
+
+        // The stale value must NOT have been deleted — reconcile froze because a
+        // document-level Audit policy is active, even on a workgroup host.
+        Assert.NotNull(registryOps.Peek("LocalMachine", @"SOFTWARE\Policies\DDS", "OldSetting"));
+
+        // No destructive reconciliation report should have been produced.
+        Assert.DoesNotContain(client.ReceivedReports, r => r.TargetId == "_reconciliation");
+    }
+
+    [Fact]
     public async Task Reconciliation_DesiredRegistryEntry_IsKept()
     {
         // A registry value is both managed AND present in the current policy

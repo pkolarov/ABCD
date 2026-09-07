@@ -179,8 +179,13 @@ public sealed class Worker : BackgroundService
 
     internal async Task PollAndApplyAsync(JoinState hostState, CancellationToken ct)
     {
-        var auditMode = EffectiveMode(EnforcementMode.Enforce, hostState) == EnforcementMode.Audit;
+        // Host-state-forced audit: AD/Hybrid/Unknown hosts always freeze. A
+        // document authored enforcement:"Audit" must ALSO freeze the reconcile
+        // pass even on a workgroup host — tracked in sawAuditDocument below and
+        // combined into reconcileAudit before the reconciliation call.
+        var hostForcedAudit = EffectiveMode(EnforcementMode.Enforce, hostState) == EnforcementMode.Audit;
         var modeReason = EffectiveModeReason(hostState);
+        var sawAuditDocument = false;
         var transitionDetected = _previousJoinState is not null
                                  && _previousJoinState.Value != hostState;
         if (transitionDetected)
@@ -218,6 +223,7 @@ public sealed class Worker : BackgroundService
                 ? ParseMode(e.GetString())
                 : EnforcementMode.Enforce;
             var effective = EffectiveMode(requestedEnforcement, hostState);
+            if (effective == EnforcementMode.Audit) sawAuditDocument = true;
 
             // Always extract desired items for reconciliation, even if unchanged
             if (p.Document.TryGetProperty("windows", out var win)
@@ -294,6 +300,7 @@ public sealed class Worker : BackgroundService
                 ? ParseMode(swE.GetString())
                 : EnforcementMode.Enforce;
             var effectiveSoftware = EffectiveMode(requestedSoftware, hostState);
+            if (effectiveSoftware == EnforcementMode.Audit) sawAuditDocument = true;
             var outcome = await _softwareInstaller
                 .ApplyAsync(s.Document, effectiveSoftware, ct)
                 .ConfigureAwait(false);
@@ -310,10 +317,17 @@ public sealed class Worker : BackgroundService
         }
 
         // --- reconciliation pass ---
+        // Freeze the reconcile pass when the host forces audit OR any applicable
+        // document this cycle was authored enforcement:"Audit". Without the
+        // latter, a workgroup host would destructively reconcile items that an
+        // audit document only ever dry-ran — deleting host state DDS never wrote.
+        var reconcileAudit = hostForcedAudit || sawAuditDocument;
+        var reconcileReason = modeReason
+            ?? (sawAuditDocument ? AppliedReason.AuditDueToDocumentEnforcement : null);
         await ReconcileAsync(
             desiredRegistryKeys, desiredAccounts, desiredGroups,
             desiredSoftware, desiredServices, desiredPasswordPolicy,
-            hostState, auditMode, modeReason, ct).ConfigureAwait(false);
+            hostState, reconcileAudit, reconcileReason, ct).ConfigureAwait(false);
 
         _previousJoinState = hostState;
     }

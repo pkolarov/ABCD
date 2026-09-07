@@ -33,6 +33,15 @@ public static class AppliedReason
     public const string AuditDueToUnknownHostState = "audit_due_to_unknown_host_state";
 
     /// <summary>
+    /// Reconciliation ran in Audit (freeze) mode because at least one applicable
+    /// document this cycle was authored with <c>enforcement: "Audit"</c>, even
+    /// though the host itself is in a workgroup (enforce) state. Prevents the
+    /// cross-policy cleanup from removing host state that an audit-authored
+    /// document only ever dry-ran.
+    /// </summary>
+    public const string AuditDueToDocumentEnforcement = "audit_due_to_document_enforcement";
+
+    /// <summary>
     /// Heartbeat report emitted once per poll cycle on Entra-only hosts.
     /// The worker short-circuits before any directive evaluation —
     /// applied-state contains a single <c>_host_state</c> record per cycle
