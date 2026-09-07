@@ -244,7 +244,9 @@ impl AdminPolicy {
 /// - the caller is [`CallerIdentity::Anonymous`] (loopback TCP; the
 ///   transport cannot supply peer credentials yet — existing
 ///   deployments keep working), or
-/// - the stored binding equals the caller's principal.
+/// - the stored binding, provisioned by an administrator through
+///   `POST /v1/admin/device-binding` (F2, 2026-09-07 review), equals the
+///   caller's principal.
 ///
 /// Otherwise returns 403.
 fn check_device_binding_read(
@@ -303,7 +305,7 @@ fn check_device_binding_read(
             tracing::warn!(
                 device_urn,
                 ?caller,
-                "M-8: read against unbound device_urn — the device's agent must POST /applied first"
+                "M-8: read against unbound device_urn — an administrator must provision the binding via POST /v1/admin/device-binding"
             );
             Err(HttpError {
                 status: StatusCode::FORBIDDEN,
@@ -313,12 +315,20 @@ fn check_device_binding_read(
     }
 }
 
-/// Write-side helper for M-8. Called from
-/// `POST /v1/{windows,macos}/applied` handlers: admits admin callers,
-/// passes through for `Anonymous` (TCP back-compat), TOFU-binds
-/// the first concrete caller for a given `device_urn`, and returns
-/// 403 on a principal mismatch.
-fn tofu_device_binding(
+/// Write-side check for M-8, revised for **F2 (2026-09-07 security
+/// review)**. Called from `POST /v1/{windows,macos,linux}/applied`
+/// handlers: admits admin callers, passes through `Anonymous` (TCP
+/// back-compat, refused under `strict_device_binding`), and otherwise
+/// requires the caller's principal to equal the binding an administrator
+/// provisioned for `device_urn` through `POST /v1/admin/device-binding`.
+///
+/// Before this revision the first concrete caller to report for an
+/// unbound device URN was bound to it on trust-on-first-use, so any
+/// non-admin process that could reach the socket could claim a device it
+/// had no relationship with, then read its policies and submit compliance
+/// reports under its name. Bindings are never created from report content
+/// any more: an unbound device URN is a 403 for every non-admin caller.
+fn check_device_binding_write(
     caller: &CallerIdentity,
     admin_policy: &AdminPolicy,
     binding: Option<&DeviceBindingStore>,
@@ -329,8 +339,8 @@ fn tofu_device_binding(
     }
     if matches!(caller, CallerIdentity::Anonymous) {
         // **M-8 step-2**: same rationale as `check_device_binding_read`.
-        // On strict deployments, TCP callers cannot TOFU-bind a device
-        // URN because we have no principal to bind them to.
+        // On strict deployments, TCP callers cannot act on a device URN
+        // because we have no principal to compare against a binding.
         if admin_policy.strict_device_binding {
             tracing::warn!(
                 device_urn,
@@ -352,31 +362,25 @@ fn tofu_device_binding(
     // L-3: `device_urn` is caller-supplied; escape before it reaches the
     // line-oriented subscriber so it cannot forge log records.
     let safe_urn = log_safe(device_urn);
-    let outcome = store
-        .tofu_bind(device_urn, principal.clone())
-        .map_err(|e| {
-            tracing::error!(error = %e, device_urn = %safe_urn, "failed to persist device binding");
-            HttpError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: "internal_error".to_owned(),
-            }
-        })?;
-    match outcome {
-        BindingOutcome::Established => {
-            tracing::info!(
-                device_urn = %safe_urn,
-                ?principal,
-                "M-8: device binding established (TOFU)"
-            );
-            Ok(())
-        }
-        BindingOutcome::Matched => Ok(()),
-        BindingOutcome::Mismatch { stored } => {
+    match store.get(device_urn) {
+        Some(stored) if stored == principal => Ok(()),
+        Some(stored) => {
             tracing::warn!(
                 device_urn = %safe_urn,
                 ?principal,
                 ?stored,
-                "M-8: TOFU-bound device_urn rejected a different caller"
+                "M-8: device-caller binding mismatch on write"
+            );
+            Err(HttpError {
+                status: StatusCode::FORBIDDEN,
+                message: "not_authorized".to_owned(),
+            })
+        }
+        None => {
+            tracing::warn!(
+                device_urn = %safe_urn,
+                ?principal,
+                "F2: write against unbound device_urn by a non-admin caller; bindings are provisioned by an administrator via POST /v1/admin/device-binding"
             );
             Err(HttpError {
                 status: StatusCode::FORBIDDEN,
@@ -895,6 +899,7 @@ where
         // admin enumeration, and peer replication confirmation.
         .route("/v1/admin/revoke-vouch", post(admin_revoke_vouch::<S>))
         .route("/v1/admin/roots", get(admin_roots::<S>))
+        .route("/v1/admin/device-binding", post(admin_bind_device::<S>))
         .route("/v1/replication/confirm", get(replication_confirm::<S>))
         .route("/v1/audit/entries", get(list_audit_entries::<S>))
         .route("/v1/pq/rotate", post(pq_rotate::<S>))
@@ -1252,6 +1257,29 @@ pub struct WindowsClaimAccountRequestJson {
 }
 
 /// Response describing the local account the caller may claim.
+/// `POST /v1/admin/device-binding` — administrator-provisioned
+/// device⇄principal binding (F2, 2026-09-07 review). Exactly one of
+/// `uid` (Unix-socket callers) or `sid` (Windows named-pipe callers)
+/// names the principal allowed to act for `device_urn` on the
+/// device-scoped endpoints.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdminDeviceBindingRequest {
+    pub device_urn: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdminDeviceBindingResponse {
+    pub device_urn: String,
+    pub principal: CallerPrincipal,
+    /// `"established"` for a new binding, `"unchanged"` when the same
+    /// principal was already bound.
+    pub outcome: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WindowsClaimAccountResponse {
     pub subject_urn: String,
@@ -2182,6 +2210,82 @@ where
     }))
 }
 
+/// `POST /v1/admin/device-binding` (F2, 2026-09-07 review): bind a
+/// device URN to the principal of the agent that reports for it. Admin
+/// callers only; replaces the former trust-on-first-use binding.
+async fn admin_bind_device<S>(
+    State(state): State<AppState<S>>,
+    caller: CallerIdentity,
+    Json(req): Json<AdminDeviceBindingRequest>,
+) -> Result<Json<AdminDeviceBindingResponse>, HttpError>
+where
+    S: TokenStore
+        + RevocationStore
+        + AuditStore
+        + ChallengeStore
+        + CredentialStateStore
+        + Send
+        + Sync
+        + 'static,
+{
+    if !caller.is_admin(&state.admin_policy) {
+        return Err(HttpError {
+            status: StatusCode::FORBIDDEN,
+            message: "not_authorized".to_owned(),
+        });
+    }
+    let device_urn = req.device_urn.trim();
+    if device_urn.is_empty() {
+        return Err(HttpError::bad_request("device_urn is required"));
+    }
+    let principal = match (req.uid, req.sid.as_deref().map(str::trim)) {
+        (Some(uid), None) => CallerPrincipal::UnixUid { uid },
+        (None, Some(sid)) if !sid.is_empty() => CallerPrincipal::WindowsSid {
+            sid: sid.to_owned(),
+        },
+        _ => {
+            return Err(HttpError::bad_request(
+                "exactly one of uid or sid must name the principal",
+            ));
+        }
+    };
+    let Some(store) = state.device_binding.as_deref() else {
+        return Err(HttpError::bad_request(
+            "device binding store is not configured on this node",
+        ));
+    };
+    let safe_urn = log_safe(device_urn);
+    let outcome = store.bind(device_urn, principal.clone()).map_err(|e| {
+        tracing::error!(error = %e, device_urn = %safe_urn, "failed to persist device binding");
+        HttpError::internal("failed to persist device binding")
+    })?;
+    let outcome = match outcome {
+        BindingOutcome::Established => {
+            tracing::info!(
+                device_urn = %safe_urn,
+                ?principal,
+                ?caller,
+                "F2: device binding provisioned by administrator"
+            );
+            "established"
+        }
+        BindingOutcome::Matched => "unchanged",
+        BindingOutcome::Mismatch { stored } => {
+            return Err(HttpError {
+                status: StatusCode::CONFLICT,
+                message: format!(
+                    "device_urn is already bound to a different principal ({stored:?})"
+                ),
+            });
+        }
+    };
+    Ok(Json(AdminDeviceBindingResponse {
+        device_urn: device_urn.to_owned(),
+        principal,
+        outcome: outcome.to_owned(),
+    }))
+}
+
 /// `GET /v1/replication/confirm?jtis=a,b,c` — ask connected admitted
 /// peers whether they hold the given tokens. This is the lifecycle
 /// wizards' "did it actually replicate?" check: `admitted_connected ==
@@ -2367,8 +2471,9 @@ where
         + Sync
         + 'static,
 {
-    // M-8: TOFU-bind `(caller, device_urn)` on first applied-report.
-    tofu_device_binding(
+    // M-8 / F2: the caller must match the administrator-provisioned
+    // binding for `device_urn` (no trust-on-first-use).
+    check_device_binding_write(
         &caller,
         &state.admin_policy,
         state.device_binding.as_deref(),
@@ -2518,7 +2623,7 @@ where
         + Sync
         + 'static,
 {
-    tofu_device_binding(
+    check_device_binding_write(
         &caller,
         &state.admin_policy,
         state.device_binding.as_deref(),
@@ -2618,7 +2723,7 @@ where
         + Sync
         + 'static,
 {
-    tofu_device_binding(
+    check_device_binding_write(
         &caller,
         &state.admin_policy,
         state.device_binding.as_deref(),
@@ -6539,29 +6644,61 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn uds_caller_tofu_binds_then_reads_succeed() {
+    fn uds_caller_cannot_claim_an_unbound_urn() {
+        // F2: no trust-on-first-use. A non-admin caller reporting for an
+        // unbound device URN is refused and leaves the store untouched.
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
         let caller = uds_caller(1000);
-        let res = tofu_device_binding(&caller, &strict_policy(), Some(&store), "urn:device:x");
-        assert!(res.is_ok());
+        let res =
+            check_device_binding_write(&caller, &strict_policy(), Some(&store), "urn:device:x");
+        assert_eq!(
+            res.expect_err("unbound URN must not be claimable").status,
+            StatusCode::FORBIDDEN
+        );
+        assert!(
+            store.get("urn:device:x").is_none(),
+            "no binding may be created from report content"
+        );
         let res =
             check_device_binding_read(&caller, &strict_policy(), Some(&store), "urn:device:x");
-        assert!(res.is_ok());
+        assert!(res.is_err());
     }
 
     #[cfg(unix)]
     #[test]
-    fn uds_caller_mismatch_rejected_after_tofu() {
+    fn admin_provisioned_binding_admits_only_the_bound_principal() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        assert_eq!(
+            store
+                .bind("urn:device:x", CallerPrincipal::UnixUid { uid: 1000 })
+                .unwrap(),
+            BindingOutcome::Established
+        );
         let good = uds_caller(1000);
+        assert!(
+            check_device_binding_write(&good, &strict_policy(), Some(&store), "urn:device:x")
+                .is_ok()
+        );
+        assert!(
+            check_device_binding_read(&good, &strict_policy(), Some(&store), "urn:device:x")
+                .is_ok()
+        );
         let bad = uds_caller(9999);
-        assert!(tofu_device_binding(&good, &strict_policy(), Some(&store), "urn:device:x").is_ok());
-        let res = check_device_binding_read(&bad, &strict_policy(), Some(&store), "urn:device:x");
-        assert!(res.is_err());
-        let res = tofu_device_binding(&bad, &strict_policy(), Some(&store), "urn:device:x");
-        assert!(res.is_err());
+        assert!(
+            check_device_binding_read(&bad, &strict_policy(), Some(&store), "urn:device:x")
+                .is_err()
+        );
+        assert!(
+            check_device_binding_write(&bad, &strict_policy(), Some(&store), "urn:device:x")
+                .is_err()
+        );
+        assert_eq!(
+            store.get("urn:device:x"),
+            Some(CallerPrincipal::UnixUid { uid: 1000 }),
+            "a mismatching caller must not overwrite the binding"
+        );
     }
 
     #[cfg(unix)]
@@ -6569,14 +6706,119 @@ mod tests {
     fn admin_caller_bypasses_binding() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
-        let other = uds_caller(1000);
-        assert!(
-            tofu_device_binding(&other, &strict_policy(), Some(&store), "urn:device:x").is_ok()
-        );
-        // uid=0 passes the admin check even under strict_policy().
+        // uid=0 passes the admin check even under strict_policy(), on both
+        // sides, and creates no binding as a side effect.
         let admin = uds_caller(0);
-        let res = check_device_binding_read(&admin, &strict_policy(), Some(&store), "urn:device:x");
-        assert!(res.is_ok());
+        assert!(
+            check_device_binding_write(&admin, &strict_policy(), Some(&store), "urn:device:x")
+                .is_ok()
+        );
+        assert!(
+            check_device_binding_read(&admin, &strict_policy(), Some(&store), "urn:device:x")
+                .is_ok()
+        );
+        assert!(store.get("urn:device:x").is_none());
+    }
+
+    async fn post_device_binding(base: &str, body: &str) -> (u16, String) {
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/admin/device-binding"))
+            .header("content-type", "application/json")
+            .body(body.to_owned())
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        (status, resp.text().await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn admin_device_binding_endpoint_provisions_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let state = make_state();
+        // tcp_trust_policy(): the Anonymous TCP caller is an admin.
+        let app = router::<MemoryBackend>(
+            state.svc.clone(),
+            state.info.clone(),
+            tcp_trust_policy(),
+            None,
+            Some(store.clone()),
+            None,
+            None,
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+
+        let (status, body) =
+            post_device_binding(&base, r#"{"device_urn":"urn:device:x","uid":1000}"#).await;
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["outcome"], "established");
+        assert_eq!(
+            store.get("urn:device:x"),
+            Some(CallerPrincipal::UnixUid { uid: 1000 })
+        );
+
+        let (status, body) =
+            post_device_binding(&base, r#"{"device_urn":"urn:device:x","uid":1000}"#).await;
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["outcome"], "unchanged");
+
+        let (status, _) =
+            post_device_binding(&base, r#"{"device_urn":"urn:device:x","uid":2000}"#).await;
+        assert_eq!(
+            status, 409,
+            "a different principal must not silently replace the binding"
+        );
+        assert_eq!(
+            store.get("urn:device:x"),
+            Some(CallerPrincipal::UnixUid { uid: 1000 })
+        );
+
+        let (status, _) = post_device_binding(&base, r#"{"device_urn":"urn:device:y"}"#).await;
+        assert_eq!(status, 400, "a principal is required");
+        let (status, _) = post_device_binding(
+            &base,
+            r#"{"device_urn":"urn:device:y","uid":5,"sid":"S-1-5-21-1"}"#,
+        )
+        .await;
+        assert_eq!(status, 400, "exactly one principal form is accepted");
+    }
+
+    #[tokio::test]
+    async fn admin_device_binding_endpoint_refuses_non_admin_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
+        let state = make_state();
+        // strict_policy(): trust_loopback_tcp_admin is false, so the
+        // Anonymous TCP caller is not an admin.
+        let app = router::<MemoryBackend>(
+            state.svc.clone(),
+            state.info.clone(),
+            strict_policy(),
+            None,
+            Some(store.clone()),
+            None,
+            None,
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+        let (status, _) =
+            post_device_binding(&base, r#"{"device_urn":"urn:device:x","uid":1000}"#).await;
+        assert_eq!(status, 403);
+        assert!(store.get("urn:device:x").is_none());
     }
 
     // ---------- M-8 step-2: strict_device_binding Anonymous gate ----------
@@ -6617,7 +6859,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
         let caller = CallerIdentity::Anonymous;
-        let res = tofu_device_binding(
+        let res = check_device_binding_write(
             &caller,
             &strict_device_binding_policy(),
             Some(&store),
@@ -6632,7 +6874,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap());
         let caller = CallerIdentity::Anonymous;
-        let res = tofu_device_binding(&caller, &strict_policy(), Some(&store), "urn:device:any");
+        let res =
+            check_device_binding_write(&caller, &strict_policy(), Some(&store), "urn:device:any");
         assert!(res.is_ok());
     }
 

@@ -118,16 +118,15 @@ impl DeviceBindingStore {
         g.bindings.get(device_urn).cloned()
     }
 
-    /// TOFU-bind `device_urn → principal`. On conflict the returned
+    /// Bind `device_urn → principal`. **F2 (2026-09-07 security
+    /// review)**: bindings are provisioned by an administrator
+    /// (`POST /v1/admin/device-binding`), never inferred from the first
+    /// caller that reports for a device. On conflict the returned
     /// [`BindingOutcome::Mismatch`] carries the previously stored
     /// principal so the caller can audit.
     ///
     /// Persists atomically (tempfile + rename) on `Established`.
-    pub fn tofu_bind(
-        &self,
-        device_urn: &str,
-        principal: CallerPrincipal,
-    ) -> io::Result<BindingOutcome> {
+    pub fn bind(&self, device_urn: &str, principal: CallerPrincipal) -> io::Result<BindingOutcome> {
         let mut g = self.inner.lock().expect("device-binding lock poisoned");
         match g.bindings.get(device_urn) {
             Some(existing) if *existing == principal => Ok(BindingOutcome::Matched),
@@ -182,34 +181,29 @@ mod tests {
     }
 
     #[test]
-    fn tofu_establish_then_match() {
+    fn bind_establish_then_match() {
         let dir = TempDir::new().unwrap();
         let store = DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap();
         let p = uid_principal(1000);
         assert_eq!(
-            store.tofu_bind("urn:device:x", p.clone()).unwrap(),
+            store.bind("urn:device:x", p.clone()).unwrap(),
             BindingOutcome::Established
         );
         assert_eq!(
-            store.tofu_bind("urn:device:x", p).unwrap(),
+            store.bind("urn:device:x", p).unwrap(),
             BindingOutcome::Matched
         );
     }
 
     #[test]
-    fn tofu_mismatch_returns_stored_principal() {
+    fn bind_mismatch_returns_stored_principal() {
         let dir = TempDir::new().unwrap();
         let store = DeviceBindingStore::load_or_empty(dir.path().join("b.json")).unwrap();
         assert_eq!(
-            store
-                .tofu_bind("urn:device:x", uid_principal(1000))
-                .unwrap(),
+            store.bind("urn:device:x", uid_principal(1000)).unwrap(),
             BindingOutcome::Established
         );
-        match store
-            .tofu_bind("urn:device:x", uid_principal(2000))
-            .unwrap()
-        {
+        match store.bind("urn:device:x", uid_principal(2000)).unwrap() {
             BindingOutcome::Mismatch { stored } => {
                 assert_eq!(stored, uid_principal(1000))
             }
@@ -223,7 +217,7 @@ mod tests {
         let path = dir.path().join("b.json");
         {
             let store = DeviceBindingStore::load_or_empty(path.clone()).unwrap();
-            store.tofu_bind("urn:device:x", uid_principal(42)).unwrap();
+            store.bind("urn:device:x", uid_principal(42)).unwrap();
         }
         let reopened = DeviceBindingStore::load_or_empty(path).unwrap();
         assert_eq!(reopened.get("urn:device:x"), Some(uid_principal(42)));
@@ -234,7 +228,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("b.json");
         let store = DeviceBindingStore::load_or_empty(path.clone()).unwrap();
-        store.tofu_bind("urn:device:x", uid_principal(1)).unwrap();
+        store.bind("urn:device:x", uid_principal(1)).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -270,9 +264,7 @@ mod tests {
         let path = dir.path().join("b.json");
         let store = DeviceBindingStore::load_or_empty(path.clone()).unwrap();
 
-        store
-            .tofu_bind("urn:device:a", uid_principal(1000))
-            .unwrap();
+        store.bind("urn:device:a", uid_principal(1000)).unwrap();
 
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -291,9 +283,7 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
 
-        store
-            .tofu_bind("urn:device:b", uid_principal(2000))
-            .unwrap();
+        store.bind("urn:device:b", uid_principal(2000)).unwrap();
 
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()

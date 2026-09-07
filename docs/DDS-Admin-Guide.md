@@ -910,8 +910,13 @@ The `dds.toml` file controls all node behavior.
 
 The UDS / named-pipe paths expose a concrete `CallerIdentity` to the
 admin middleware and the device-binding helper, so admin endpoints can
-be gated on uid / SID and `/v1/*/policies` + `/v1/*/software` bind
-TOFU to the caller's principal.
+be gated on uid / SID and the device-scoped endpoints (`/v1/*/policies`,
+`/v1/*/software`, `/v1/*/applied`, `/v1/windows/claim-account`) admit only
+the principal an administrator bound to the device URN through
+`POST /v1/admin/device-binding` (F2 of the 2026-09-07 security review; the
+earlier trust-on-first-use binding is gone). Agents running as root /
+LocalSystem, or as a UID / SID listed in `unix_admin_uids` /
+`windows_admin_sids`, are admin callers and need no binding.
 
 **Windows MSI deployments** ship pipe-first by default since **A-2
 (2026-04-25)**: `node.toml` is generated with `api_addr = 'pipe:dds-api'`
@@ -941,7 +946,25 @@ elsewhere. The CLI accepts all three schemes — `http://`, `https://`,
 | `unix_admin_uids` | uint[] | `[]` | Additional UIDs admitted on admin endpoints over UDS (`0` and the service UID are always admitted). |
 | `windows_admin_sids` | string[] | `[]` | Primary user SIDs admitted on admin endpoints over the named pipe. `S-1-5-18` (LocalSystem) is always admitted. |
 | `node_hmac_secret_path` | path | _unset_ | Per-install HMAC secret used to sign every HTTP response body with `X-DDS-Body-MAC`. The Windows Auth Bridge verifies this to defeat the H-6 challenge-substitution attack. See **Provisioning the response-MAC secret** below. |
-| `strict_device_binding` | bool | `false` | Refuse `Anonymous` (TCP) callers on device-scoped reads. Flip on alongside `trust_loopback_tcp_admin = false`. |
+| `strict_device_binding` | bool | `false` | Refuse `Anonymous` (TCP) callers on device-scoped reads and writes. Flip on alongside `trust_loopback_tcp_admin = false`. |
+
+##### Provisioning a device binding (F2)
+
+A policy agent that does not run as an admin caller must be bound to its
+device URN by an administrator before it can read device-scoped policy or
+post applied reports. Nothing binds a device automatically any more.
+
+```bash
+# Linux / macOS (over the peer-cred socket, as root)
+curl -sf --unix-socket /var/lib/dds/dds.sock -H 'content-type: application/json' \
+  -d '{"device_urn":"urn:dds:device:...","uid":998}' \
+  http://localhost/v1/admin/device-binding
+# Windows: same body with {"sid":"S-1-5-21-..."} over the named pipe.
+```
+
+`200` returns `{"outcome":"established"}` (or `"unchanged"` when the same
+principal was already bound); `409` means the URN is bound to a different
+principal, which is never replaced silently.
 
 ##### Provisioning the response-MAC secret
 
