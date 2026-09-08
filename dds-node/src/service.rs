@@ -2462,7 +2462,63 @@ impl<
                 .read()
                 .map_err(|e| ServiceError::Trust(format!("trust_graph poisoned: {e}")))?;
 
-            let mut found: Option<(String, Vec<u8>, String, String)> = None;
+            // **S3 (2026-09-08 follow-up review)**: `attestations_iter`
+            // walks the trust graph's `BTreeMap<String, Token>` keyed by
+            // `jti`, so iteration order is jti-string sort order — NOT
+            // enrollment/vouch order. A malicious admitted peer can
+            // self-issue (iss == sub, so it clears the F1 self-issuance
+            // gate above) its own user-auth attestation whose
+            // `credential_id` equals a victim's real, vouched credential's
+            // id (public and replicable from the victim's own attestation
+            // already in the graph), and pick a jti that sorts before the
+            // victim's. Taking the first match and `break`ing selects the
+            // attacker's unvouched duplicate over the victim's real,
+            // vouched one — the victim's own valid assertion then fails
+            // (wrong key, or the vouch-pin check downstream rejects the
+            // wrongly-selected attestation): a targeted denial of service,
+            // no impersonation. Fix: collect every self-issued,
+            // non-revoked/non-burned candidate whose credential_id
+            // matches, then prefer one that `attestation_is_vouched` right
+            // now — the legitimate, vouched enrollment wins over an
+            // unvouched impostor regardless of jti ordering. If more than
+            // one candidate is currently vouched (should not normally
+            // happen), pick deterministically by smallest jti rather than
+            // panic. If none are vouched, fall back to the original
+            // first-match behavior — that path authorizes nothing either
+            // way, so it introduces no new DoS surface.
+            // Candidate collection and selection below are deliberately
+            // CHEAP — no attestation-object parsing. **S3 hardening**: an
+            // earlier version of this fix called
+            // `dds_domain::fido2::verify_attestation` (a real CBOR decode
+            // + attestation-statement signature verification) inside this
+            // loop for every credential_id match, before knowing which
+            // candidate would even be selected. Since any admitted peer
+            // can self-issue an unlimited number of user-auth attestations
+            // for an arbitrary credential_id (this body type carries no
+            // publisher-capability gate — see `publisher_capability_ok`),
+            // that made every assertion attempt against a targeted
+            // credential_id cost one expensive re-parse per attacker-
+            // published duplicate — an unbounded CPU-amplification DoS the
+            // attacker fully controls the size of. Worse, `verify_attestation`
+            // failing on a single MALFORMED decoy (trivial for a self-issuing
+            // attacker to publish) propagated via `?` and hard-failed the
+            // whole lookup, even when a legitimate vouched candidate also
+            // matched — turning a would-be shadow attempt into an outright
+            // denial of service. Both are avoided by keeping this phase to
+            // cheap trust-graph lookups only (self-issuance check,
+            // credential_id byte comparison, `attestation_is_vouched` —
+            // itself just BTreeMap lookups over already-verified tokens, no
+            // new crypto) and deferring the one real `verify_attestation`
+            // call to after the winner is chosen, below.
+            struct Candidate {
+                jti: String,
+                sub: String,
+                attestation_object: Vec<u8>,
+                client_data_hash: Vec<u8>,
+                rp_id: String,
+                attest_hash: String,
+            }
+            let mut candidates: Vec<Candidate> = Vec::new();
             for token in g.attestations_iter() {
                 if g.is_revoked(&token.payload.jti) || g.is_burned(&token.payload.iss) {
                     continue;
@@ -2492,36 +2548,59 @@ impl<
                 // standard vs base64url, with or without padding;
                 // decoding normalizes any of those representations.
                 if credential_ids_eq(&doc.credential_id, credential_id) {
-                    // A-1 step-1: re-parse for credential lookup ONLY.
-                    // Trust was already established at original
-                    // enrollment time; pass `true` so the re-parse
-                    // doesn't reject already-stored unattested
-                    // credentials retroactively.
-                    let parsed = dds_domain::fido2::verify_attestation(
-                        &doc.attestation_object,
-                        &doc.client_data_hash,
-                        true,
-                    )
-                    .map_err(|e| ServiceError::Fido2(format!("re-parse attestation: {e}")))?;
-                    let auth_data = &parsed.auth_data;
-                    let p = 37 + 16 + 2 + parsed.credential_id.len();
-                    let cose_bytes = &auth_data[p..];
-                    found = Some((
-                        token.payload.sub.clone(),
-                        cose_bytes.to_vec(),
-                        doc.rp_id.clone(),
-                        token.payload_hash(),
-                    ));
-                    break;
+                    candidates.push(Candidate {
+                        jti: token.payload.jti.clone(),
+                        sub: token.payload.sub.clone(),
+                        attestation_object: doc.attestation_object.clone(),
+                        client_data_hash: doc.client_data_hash.clone(),
+                        rp_id: doc.rp_id.clone(),
+                        attest_hash: token.payload_hash(),
+                    });
+                    // No `break` here: a duplicate, unvouched credential_id
+                    // published by another self-issuing peer must not be
+                    // able to shadow the legitimate one just by sorting
+                    // first — see the S3 selection logic below.
                 }
             }
 
-            let (sub, cose_bytes, rp_id, attest_hash) = found.ok_or_else(|| {
-                ServiceError::Fido2(format!(
-                    "credential_id '{credential_id}' not found in trust graph"
-                ))
-            })?;
-            let pk = cose_to_credential_public_key(&cose_bytes)
+            // **S3 (2026-09-08 follow-up review)**: among the candidates,
+            // prefer whichever is currently vouched over the (possibly
+            // earlier-sorting) first match.
+            let mut vouched: Vec<&Candidate> = candidates
+                .iter()
+                .filter(|c| g.attestation_is_vouched(&c.sub, &c.attest_hash, &self.trusted_roots))
+                .collect();
+            vouched.sort_by(|a, b| a.jti.cmp(&b.jti));
+            let winner = vouched.into_iter().next().or(candidates.first());
+
+            let (sub, rp_id, attest_hash, attestation_object, client_data_hash) = winner
+                .map(|c| {
+                    (
+                        c.sub.clone(),
+                        c.rp_id.clone(),
+                        c.attest_hash.clone(),
+                        c.attestation_object.clone(),
+                        c.client_data_hash.clone(),
+                    )
+                })
+                .ok_or_else(|| {
+                    ServiceError::Fido2(format!(
+                        "credential_id '{credential_id}' not found in trust graph"
+                    ))
+                })?;
+
+            // A-1 step-1: re-parse for credential lookup ONLY, and only
+            // for the SELECTED winner (see the cost/DoS rationale above).
+            // Trust was already established at original enrollment time;
+            // pass `true` so the re-parse doesn't reject already-stored
+            // unattested credentials retroactively.
+            let parsed =
+                dds_domain::fido2::verify_attestation(&attestation_object, &client_data_hash, true)
+                    .map_err(|e| ServiceError::Fido2(format!("re-parse attestation: {e}")))?;
+            let auth_data = &parsed.auth_data;
+            let p = 37 + 16 + 2 + parsed.credential_id.len();
+            let cose_bytes = &auth_data[p..];
+            let pk = cose_to_credential_public_key(cose_bytes)
                 .map_err(|e| ServiceError::Fido2(format!("COSE key parse: {e}")))?;
             (sub, pk, rp_id, attest_hash)
         };
@@ -8962,6 +9041,245 @@ mod platform_applier_tests {
         let req = signed_assertion_request(&mut svc, rp_id, &cred1, "alice-vouched", &sk1, 1);
         svc.issue_session_from_assertion(req)
             .expect("the vouched enrollment authenticates");
+    }
+
+    /// **S3 (2026-09-08 follow-up review)**: `attestations_iter` walks a
+    /// `BTreeMap<String, Token>` keyed by `jti`, so lookup order is
+    /// jti-string sort order, not enrollment order. Before the fix, a
+    /// second self-issuer publishing an unvouched attestation with the
+    /// SAME `credential_id` bytes as a real, vouched victim credential —
+    /// and a jti that sorts first — would shadow the victim's real
+    /// attestation in `verify_assertion_common`'s first-match loop,
+    /// locking the victim out even though no impersonation occurs (the F1
+    /// vouch-pin check still blocks the attacker's own session). This test
+    /// pins jti ordering explicitly, then proves the legitimate vouched
+    /// enrollment wins regardless of it.
+    #[test]
+    fn earlier_sorting_unvouched_duplicate_credential_id_cannot_shadow_the_vouched_owner() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use ed25519_dalek::SigningKey;
+        let _tel_guard = TELEMETRY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut svc, admin, _roots) = setup();
+        svc.set_verify_fido2(true);
+        let rp_id = "dds.local";
+
+        let victim_jti = "attest-victim-legit-shadow";
+        let mallory_jti = "attest-a-mallory-shadow";
+        // Pin the ordering the finding depends on: BTreeMap<String, Token>
+        // iterates in jti-string sort order, so mallory's token (which
+        // must NOT win) has to sort strictly before the victim's.
+        assert!(
+            mallory_jti < victim_jti,
+            "test fixture invariant broken: {mallory_jti:?} must sort before {victim_jti:?}"
+        );
+
+        let shared_cred = b"cred-shadow-target";
+        let shared_cred_b64 = URL_SAFE_NO_PAD.encode(shared_cred);
+
+        // The victim enrolls legitimately (self-issued attestation) and is
+        // vouched by the trusted admin.
+        let victim = Identity::generate("victim-shadow", &mut OsRng);
+        let victim_sk = SigningKey::generate(&mut OsRng);
+        let victim_attest =
+            self_issued_user_attestation(&victim, victim_jti, rp_id, shared_cred, &victim_sk);
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(victim_attest)
+            .unwrap();
+        vouch_subject(
+            &mut svc,
+            &admin,
+            &victim.id.to_urn(),
+            "dds:group:employees",
+            "vouch-victim-shadow",
+        );
+
+        // A different, admitted peer self-issues its OWN attestation (iss
+        // == sub == mallory, so it clears the F1 self-issuance gate) that
+        // claims the SAME credential_id bytes, signed with a DIFFERENT
+        // key, under a jti that sorts first. It is never vouched.
+        let mallory = Identity::generate("mallory-shadow", &mut OsRng);
+        let mallory_sk = SigningKey::generate(&mut OsRng);
+        let mallory_attest =
+            self_issued_user_attestation(&mallory, mallory_jti, rp_id, shared_cred, &mallory_sk);
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(mallory_attest)
+            .unwrap();
+
+        // The victim's own valid assertion over the shared credential_id
+        // must succeed and bind to the victim's subject_urn. Before the
+        // fix, the first-match loop would have selected mallory's
+        // earlier-sorting, unvouched attestation instead, so the victim's
+        // (correctly-signed, but now-mismatched-key) assertion would fail
+        // signature verification and lock the victim out.
+        let req = signed_assertion_request(
+            &mut svc,
+            rp_id,
+            &shared_cred_b64,
+            "victim-shadow-1",
+            &victim_sk,
+            1,
+        );
+        let result = svc
+            .issue_session_from_assertion(req)
+            .expect("the legitimate, vouched enrollment must win over an unvouched duplicate");
+        let bound = Token::from_cbor(&result.token_cbor)
+            .expect("session token decodes")
+            .payload
+            .sub;
+        assert_eq!(
+            bound,
+            victim.id.to_urn(),
+            "session must bind to the vouched victim, not the duplicate credential_id owner"
+        );
+
+        // A second victim login over the same shared credential_id keeps
+        // authenticating the victim, never mallory.
+        let req = signed_assertion_request(
+            &mut svc,
+            rp_id,
+            &shared_cred_b64,
+            "victim-shadow-2",
+            &victim_sk,
+            2,
+        );
+        let result = svc
+            .issue_session_from_assertion(req)
+            .expect("the vouched enrollment keeps authenticating");
+        let bound = Token::from_cbor(&result.token_cbor)
+            .expect("session token decodes")
+            .payload
+            .sub;
+        assert_eq!(bound, victim.id.to_urn());
+
+        // Mallory cannot borrow a session either: with the victim's
+        // attestation now selected (it is the vouched one), an assertion
+        // signed with mallory's own key over the same credential_id fails
+        // signature verification against the victim's public key — the
+        // shadow duplicate grants the attacker nothing.
+        let req = signed_assertion_request(
+            &mut svc,
+            rp_id,
+            &shared_cred_b64,
+            "mallory-shadow-1",
+            &mallory_sk,
+            1,
+        );
+        let err = svc
+            .issue_session_from_assertion(req)
+            .expect_err("mallory's key must not authenticate the shared credential_id");
+        assert!(
+            format!("{err:?}").to_lowercase().contains("signature"),
+            "{err:?}"
+        );
+    }
+
+    /// **S3 hardening (2026-09-08 follow-up)**: a malformed, unvouched
+    /// decoy sharing a victim's credential_id must not be able to hard-fail
+    /// the whole lookup. An earlier version of the S3 fix called
+    /// `verify_attestation` (via `?`) on every credential_id-matching
+    /// candidate while collecting them, before any vouch-based selection
+    /// ran — so a single self-issued attestation whose `attestation_object`
+    /// doesn't even parse would propagate an error out of
+    /// `verify_assertion_common` regardless of whether a legitimate,
+    /// vouched candidate also matched. The fix defers the expensive
+    /// re-parse to only the selected winner (chosen by cheap
+    /// `attestation_is_vouched` lookups), so a malformed non-winning
+    /// candidate is never parsed at all.
+    #[test]
+    fn malformed_unvouched_decoy_credential_cannot_deny_service_to_the_vouched_owner() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use ed25519_dalek::SigningKey;
+        let _tel_guard = TELEMETRY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut svc, admin, _roots) = setup();
+        svc.set_verify_fido2(true);
+        let rp_id = "dds.local";
+
+        let victim_jti = "attest-victim-legit-malformed-decoy";
+        let decoy_jti = "attest-a-mallory-malformed-decoy";
+        assert!(
+            decoy_jti < victim_jti,
+            "fixture invariant: decoy must sort first"
+        );
+
+        let shared_cred = b"cred-malformed-decoy-target";
+        let shared_cred_b64 = URL_SAFE_NO_PAD.encode(shared_cred);
+
+        let victim = Identity::generate("victim-malformed-decoy", &mut OsRng);
+        let victim_sk = SigningKey::generate(&mut OsRng);
+        let victim_attest =
+            self_issued_user_attestation(&victim, victim_jti, rp_id, shared_cred, &victim_sk);
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(victim_attest)
+            .unwrap();
+        vouch_subject(
+            &mut svc,
+            &admin,
+            &victim.id.to_urn(),
+            "dds:group:employees",
+            "vouch-victim-malformed-decoy",
+        );
+
+        // A self-issued decoy sharing the victim's credential_id, but with
+        // an attestation_object that is NOT valid CBOR/packed-attestation —
+        // trivial for any admitted, self-issuing peer to publish. It is
+        // never vouched, and sorts before the victim's jti.
+        let decoy = Identity::generate("mallory-malformed-decoy", &mut OsRng);
+        let decoy_doc = UserAuthAttestation {
+            credential_id: shared_cred_b64.clone(),
+            attestation_object: b"not a valid packed attestation object".to_vec(),
+            client_data_hash: vec![0u8; 32],
+            rp_id: rp_id.into(),
+            user_display_name: "decoy".into(),
+            authenticator_type: "cross-platform".into(),
+        };
+        let mut decoy_payload = TokenPayload {
+            iss: decoy.id.to_urn(),
+            iss_key: decoy.public_key.clone(),
+            jti: decoy_jti.into(),
+            sub: decoy.id.to_urn(),
+            kind: TokenKind::Attest,
+            purpose: None,
+            vch_iss: None,
+            vch_sum: None,
+            revokes: None,
+            iat: now_epoch(),
+            exp: Some(now_epoch() + 365 * 86400),
+            body_type: None,
+            body_cbor: None,
+        };
+        decoy_doc.embed(&mut decoy_payload).unwrap();
+        let decoy_token = Token::sign(decoy_payload, &decoy.signing_key).unwrap();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(decoy_token)
+            .unwrap();
+
+        // The victim's real, correctly-signed assertion must still succeed
+        // — the malformed decoy is never selected (the victim's is vouched)
+        // and therefore never parsed, so it cannot hard-fail this call.
+        let req = signed_assertion_request(
+            &mut svc,
+            rp_id,
+            &shared_cred_b64,
+            "victim-malformed-decoy-1",
+            &victim_sk,
+            1,
+        );
+        let result = svc
+            .issue_session_from_assertion(req)
+            .expect("a malformed unvouched decoy must not deny service to the vouched owner");
+        let bound = Token::from_cbor(&result.token_cbor)
+            .expect("session token decodes")
+            .payload
+            .sub;
+        assert_eq!(bound, victim.id.to_urn());
     }
 
     // ---------- F3 (2026-09-07 security review): sessions vs. live authorization ----------
