@@ -966,6 +966,15 @@ curl -sf --unix-socket /var/lib/dds/dds.sock -H 'content-type: application/json'
 principal was already bound); `409` means the URN is bound to a different
 principal, which is never replaced silently.
 
+**S4 (2026-09-08 follow-up review):** upgrading a node from a pre-S4 build
+makes every binding that already existed on disk non-authoritative — those
+entries may have been established by the old trust-on-first-use behavior
+(potentially by an attacker, not an administrator) and are no longer
+trusted for read/write authorization. An administrator must re-provision
+each device via the same `POST /v1/admin/device-binding` call above; doing
+so cleanly replaces the stale/legacy entry (`"established"`) rather than
+returning `409`.
+
 ##### Provisioning the response-MAC secret
 
 The MSI installer runs a `CA_GenHmacSecret` custom action that generates
