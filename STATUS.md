@@ -1,5 +1,68 @@
 # DDS Implementation Status
 
+## fix(security): remediate the 2026-09-08 follow-up security review (S1-S4, R1) — 2026-09-08
+
+A follow-up review of the 2026-09-07 remediation (commit 4ed0f4a) found all four original
+findings genuinely fixed, plus four residual/newly-introduced issues and one PAM
+interoperability defect in the fix code itself. Full record with verdicts:
+[docs/security-followup-2026-09-08.md](docs/security-followup-2026-09-08.md).
+
+- **S1/S2 (Medium) — a Disabled/narrowed/Audit policy revision could leave an older one
+  authoritative.** `list_applicable_{windows,macos,linux}_policies` filtered on
+  `Enforcement::Disabled` and `scope_matches` *before* `supersede_*_policies` picked the
+  current revision per `policy_id`, so a newer Disabled or rescoped revision could be
+  filtered out before it ever got the chance to retire an older Enforce/in-scope one — a
+  published "disable this policy" or "narrow its scope" update could silently fail to take
+  effect. Fixed by moving Disabled/scope filtering to run on the post-supersession winner,
+  not the pre-supersession candidates, on all three platforms.
+  `linux_account_subjects` and `resolve_windows_account_claim` (the latter found
+  independently, not named in the review — its result is handed straight to `NetUserAdd`
+  with no other enforcement gate) also granted logins/claims from Audit-mode mappings, since
+  Audit-mode documents are intentionally still visible from the listing functions for
+  agent-side dry-run logging. Both now require `Enforcement::Enforce`.
+- **S3 (Medium) — an unvouched duplicate credential could shadow the legitimate one.**
+  `verify_assertion_common`'s credential lookup took the first self-issued attestation
+  matching a requested `credential_id` in jti-sort order and broke; an admitted peer could
+  publish its own self-issued duplicate of a victim's public credential_id under an
+  earlier-sorting jti and lock the victim out (no impersonation — F1's vouch-pin check still
+  held). Fixed by collecting every matching candidate and preferring one that
+  `TrustGraph::attestation_is_vouched` confirms is currently vouched. Hardened further during
+  integration after an adversarial verify pass flagged that the first draft re-parsed every
+  candidate's attestation object (expensive CBOR decode + signature verification) before
+  selection ran — an attacker-sized CPU-amplification cost, and a single malformed decoy
+  could hard-fail the whole lookup via `?` even with a legitimate vouched candidate present.
+  The one real re-parse now runs only on the already-selected winner.
+- **S4 (Medium) — pre-fix device bindings survived the F2 upgrade with full authority.**
+  `DeviceBindingStore` gained per-entry provenance (`StoredBinding.admin_provisioned`); a
+  binding loaded from a pre-S4 (schema version 1) file is quarantined — invisible to the
+  read/write authorization checks — until an administrator explicitly re-provisions it via
+  `POST /v1/admin/device-binding`, which now replaces a legacy entry unconditionally instead
+  of 409ing. Backward-compatible loading (raw-JSON version sniff, falling back to the old
+  bare-`CallerPrincipal` shape) so existing binding-store files keep loading.
+- **R1 (Medium, availability) — the PAM helper forwarded CBOR-wrapped authenticator data as
+  raw bytes.** Per the libfido2 manual, `fido2-assert -G`'s authenticator-data output line is
+  CBOR-encoded; the helper only base64-transcoded it, corrupting every byte offset the node's
+  verifier reads — a real hardware authenticator's assertion could never pass verification.
+  Fixed with a small bounded CBOR byte-string-header decoder (no new crate dependency, per
+  `pam_dds`'s deliberately lightweight `Cargo.toml`).
+
+**Method.** All four fixes were implemented in parallel, each in its own isolated git
+worktree, then each independently reviewed by a second, adversarial agent instructed to try
+to refute the fix rather than confirm it — this is what caught the S3 CPU-amplification gap
+before it was integrated. Two macOS-parity regression tests for S2 were added during
+integration (`list_applicable_macos_policies` got the identical restructuring but initially
+lacked the Windows/Linux pair's direct supersession-ordering tests).
+
+Verification (run fresh against the final integrated tree, commit 34ad894):
+`cargo test --workspace --all-features` 1322 pass across 54 test binaries (0 failed), clippy
+`-D warnings` clean, fmt clean, cargo audit 0 new vulnerabilities, cargo vet passing,
+`x86_64-pc-windows-gnu` cross-check clean under `-D warnings`, Linux policy-agent suite 376
+pass, every platform shell script syntax-checks.
+
+Windows: this pass does not touch the Windows-native logon path beyond
+`resolve_windows_account_claim`'s new Enforce requirement (unit-tested only, on macOS).
+`pam_dds`'s corrected fido2-assert path (R1) still has no hardware-authenticator run.
+
 ## fix(security): remediate the 2026-09-07 external security review (F1–F4) — 2026-09-07
 
 An external source review of v1.6.3 reported four findings and two additional
