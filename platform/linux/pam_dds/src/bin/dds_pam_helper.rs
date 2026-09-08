@@ -361,15 +361,24 @@ fn parse_fido2_token_devices(out: &str) -> Vec<String> {
 
 /// Parsed `fido2-assert -G` output. Per the libfido2 manual the tool
 /// prints, one per line: client data hash (base64), relying party id,
-/// authenticator data (base64), assertion signature (base64), and the
-/// credential id (base64) when the credential is not resident.
+/// authenticator data (base64), assertion signature (base64), and — only
+/// when the credential is resident — the resident credential's *user id*
+/// (base64), not a credential id (see `resident_user_id_b64` below; **R1
+/// (2026-09-08 follow-up review)**).
 #[derive(Debug, PartialEq, Eq)]
 struct Fido2AssertOutput {
     client_data_hash_b64: String,
     rp_id: String,
     authenticator_data_b64: String,
     signature_b64: String,
-    credential_id_b64: Option<String>,
+    /// Line 5 of `fido2-assert -G` output, present only for a resident
+    /// credential: the FIDO2 *user id* the credential is bound to, base64
+    /// encoded (NOT a credential id, despite the field's former name).
+    /// Currently unused: `try_fido2_assert_tool` returns the
+    /// caller-supplied credential id, never this value. Kept (rather than
+    /// removed) so a future caller that needs the resident user id doesn't
+    /// have to re-add the parsing.
+    resident_user_id_b64: Option<String>,
 }
 
 fn parse_fido2_assert_output(out: &str) -> Result<Fido2AssertOutput, String> {
@@ -390,14 +399,93 @@ fn parse_fido2_assert_output(out: &str) -> Result<Fido2AssertOutput, String> {
         .next()
         .ok_or("fido2-assert: missing signature")?
         .to_owned();
-    let credential_id_b64 = lines.next().map(str::to_owned);
+    let resident_user_id_b64 = lines.next().map(str::to_owned);
     Ok(Fido2AssertOutput {
         client_data_hash_b64,
         rp_id,
         authenticator_data_b64,
         signature_b64,
-        credential_id_b64,
+        resident_user_id_b64,
     })
+}
+
+/// Maximum plausible length of the raw `authenticatorData` byte string
+/// unwrapped from `fido2-assert`'s CBOR-encoded line 3. A plain assertion
+/// (no attested credential data, no extensions) is always 37 bytes
+/// (rpIdHash(32) + flags(1) + signCount(4)); even with extensions it stays
+/// well under this. 1024 is a generous bound that rejects a malformed or
+/// hostile `fido2-assert` output before it can drive an oversized slice or
+/// allocation, while comfortably covering any assertion this helper
+/// actually requests (we never pass `-h` or request a largeBlobKey).
+const MAX_CBOR_BSTR_LEN: usize = 1024;
+
+/// Unwrap a CBOR byte-string (major type 2, a "bstr") header from `bytes`,
+/// returning the raw contents after the header.
+///
+/// Per the libfido2 manual, `fido2-assert -G` line 3 ("CBOR encoded
+/// authenticator data") is a CBOR byte string *wrapping* the raw WebAuthn
+/// `authenticatorData` — not the raw bytes themselves. The node's verifier
+/// reads `rpIdHash`/`flags`/`signCount` at fixed offsets from byte 0 of the
+/// raw bytes, so this header must be stripped before the value is
+/// forwarded, or a real authenticator's assertion fails verification at
+/// the node. **R1 (2026-09-08 follow-up review)**.
+///
+/// Only the definite-length forms actually needed here are supported: the
+/// 5 low bits of the initial byte are the length directly (0-23), or `24`
+/// (length in the next 1 byte) or `25` (length in the next 2 bytes,
+/// big-endian). The 4-/8-byte-length forms (26/27) and indefinite-length
+/// byte strings are rejected — a plain assertion's authenticatorData is
+/// always well under 256 bytes, so these forms never occur in legitimate
+/// output and are not worth supporting.
+fn unwrap_cbor_bstr(bytes: &[u8]) -> Result<&[u8], String> {
+    let &first = bytes.first().ok_or("CBOR byte string: empty input")?;
+    let major_type = first >> 5;
+    if major_type != 2 {
+        return Err(format!(
+            "CBOR byte string: expected major type 2 (byte string), got {major_type}"
+        ));
+    }
+    let additional = first & 0x1f;
+    let (len, header_len): (usize, usize) = match additional {
+        0..=23 => (additional as usize, 1),
+        24 => {
+            let b = *bytes
+                .get(1)
+                .ok_or("CBOR byte string: truncated 1-byte length")?;
+            (b as usize, 2)
+        }
+        25 => {
+            let b0 = *bytes
+                .get(1)
+                .ok_or("CBOR byte string: truncated 2-byte length")?;
+            let b1 = *bytes
+                .get(2)
+                .ok_or("CBOR byte string: truncated 2-byte length")?;
+            (u16::from_be_bytes([b0, b1]) as usize, 3)
+        }
+        26 | 27 => {
+            return Err(format!(
+                "CBOR byte string: unsupported 4-/8-byte length encoding ({additional})"
+            ));
+        }
+        31 => return Err("CBOR byte string: indefinite-length form is not supported".to_owned()),
+        _ => {
+            return Err(format!(
+                "CBOR byte string: reserved/invalid length encoding ({additional})"
+            ));
+        }
+    };
+    if len > MAX_CBOR_BSTR_LEN {
+        return Err(format!(
+            "CBOR byte string: declared length {len} exceeds bound {MAX_CBOR_BSTR_LEN}"
+        ));
+    }
+    let end = header_len
+        .checked_add(len)
+        .ok_or("CBOR byte string: length overflow")?;
+    bytes
+        .get(header_len..end)
+        .ok_or_else(|| "CBOR byte string: declared length exceeds remaining input".to_owned())
 }
 
 /// Collect a FIDO2 assertion for one enrolled credential with the
@@ -495,9 +583,23 @@ fn try_fido2_assert_tool(
             .map_err(|e| format!("fido2-assert: {what} is not base64: {e}"))?;
         Ok(URL_SAFE_NO_PAD.encode(bytes))
     };
+    // **R1 (2026-09-08 follow-up review)**: line 3 of `fido2-assert -G`
+    // output is CBOR-encoded (a CBOR byte string wrapping the raw
+    // authenticatorData), per the libfido2 manual. Unwrap the CBOR
+    // byte-string header BETWEEN the base64 decode and the base64url
+    // re-encode, so the value forwarded to the node is the raw
+    // authenticatorData its verifier expects at fixed byte offsets — not
+    // the CBOR-wrapped bytes, which would shift every offset and corrupt
+    // what's actually signed over, making a real authenticator's
+    // assertion unverifiable.
+    let authenticator_data_cbor = STANDARD
+        .decode(&parsed.authenticator_data_b64)
+        .map_err(|e| format!("fido2-assert: authenticator data is not base64: {e}"))?;
+    let authenticator_data_raw = unwrap_cbor_bstr(&authenticator_data_cbor)
+        .map_err(|e| format!("fido2-assert: authenticator data: {e}"))?;
     Ok(PrecomputedAssertion {
         credential_id: credential_id_b64url.to_owned(),
-        authenticator_data: to_url(&parsed.authenticator_data_b64, "authenticator data")?,
+        authenticator_data: URL_SAFE_NO_PAD.encode(authenticator_data_raw),
         client_data_hash: URL_SAFE_NO_PAD.encode(client_data_hash),
         signature: to_url(&parsed.signature_b64, "signature")?,
         client_data_json_b64: Some(STANDARD.encode(client_data_json.as_bytes())),
@@ -806,18 +908,156 @@ mod tests {
 
     #[test]
     fn fido2_assert_output_parses_manual_layout() {
-        // client data hash, rp id, authenticator data, signature, credential id
+        // client data hash, rp id, authenticator data, signature, resident user id
         let out = "AAAA\ndds.local\nBBBB\nCCCC\nDDDD\n";
         let p = parse_fido2_assert_output(out).unwrap();
         assert_eq!(p.client_data_hash_b64, "AAAA");
         assert_eq!(p.rp_id, "dds.local");
         assert_eq!(p.authenticator_data_b64, "BBBB");
         assert_eq!(p.signature_b64, "CCCC");
-        assert_eq!(p.credential_id_b64.as_deref(), Some("DDDD"));
-        // resident credential: no trailing credential id line
+        assert_eq!(p.resident_user_id_b64.as_deref(), Some("DDDD"));
+        // non-resident credential: no trailing resident-user-id line
         let p = parse_fido2_assert_output("AAAA\ndds.local\nBBBB\nCCCC\n").unwrap();
-        assert!(p.credential_id_b64.is_none());
+        assert!(p.resident_user_id_b64.is_none());
         assert!(parse_fido2_assert_output("AAAA\ndds.local\n").is_err());
+    }
+
+    // ─── R1 (2026-09-08 follow-up review): CBOR byte-string unwrap ────────────
+
+    /// Build a raw 37-byte authenticatorData fixture (rpIdHash(32) ||
+    /// flags(1) || signCount(4)); only the *length* matters for these
+    /// tests, so the content is arbitrary but fixed for reproducibility.
+    fn raw_auth_data_fixture() -> [u8; 37] {
+        let mut b = [0u8; 37];
+        for (i, v) in b.iter_mut().enumerate().take(32) {
+            *v = i as u8; // rpIdHash: arbitrary
+        }
+        b[32] = 0x01; // flags: UP bit set
+        b[33..37].copy_from_slice(&1u32.to_be_bytes()); // signCount = 1
+        b
+    }
+
+    #[test]
+    fn unwrap_cbor_bstr_1_byte_length_follows_form() {
+        let raw = raw_auth_data_fixture();
+        assert_eq!(raw.len(), 37);
+        // additional-info 24 ("1 byte length follows") is required once
+        // the length no longer fits in the 5 low bits (0-23): 37 >= 24.
+        // 0x25 == 2*16 + 5 == 37 decimal — confirm the arithmetic here
+        // rather than trusting the magic number.
+        assert_eq!(0x25u8, 37);
+        let mut wrapped = vec![0x58u8, 0x25u8]; // major type 2, additional 24, len byte
+        wrapped.extend_from_slice(&raw);
+        assert_eq!(wrapped.len(), 39);
+
+        let unwrapped = unwrap_cbor_bstr(&wrapped).unwrap();
+        assert_eq!(unwrapped, &raw[..]);
+    }
+
+    #[test]
+    fn unwrap_cbor_bstr_short_form_under_24_bytes() {
+        let raw: [u8; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        // additional-info == length directly: major type 2 (0x40) | 10.
+        let mut wrapped = vec![0x40u8 + 10];
+        wrapped.extend_from_slice(&raw);
+
+        let unwrapped = unwrap_cbor_bstr(&wrapped).unwrap();
+        assert_eq!(unwrapped, &raw[..]);
+    }
+
+    #[test]
+    fn unwrap_cbor_bstr_rejects_wrong_major_type() {
+        // 0x65 == major type 3 (text string), additional 5 — not a byte
+        // string.
+        let bytes = [0x65u8, b'h', b'e', b'l', b'l', b'o'];
+        let err = unwrap_cbor_bstr(&bytes).unwrap_err();
+        assert!(err.contains("major type 2"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn unwrap_cbor_bstr_rejects_length_exceeding_input() {
+        // Header claims 37 bytes follow, but only 5 are actually present.
+        let bytes = [0x58u8, 0x25u8, 1, 2, 3, 4, 5];
+        let err = unwrap_cbor_bstr(&bytes).unwrap_err();
+        assert!(
+            err.contains("exceeds remaining input"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn unwrap_cbor_bstr_rejects_4_and_8_byte_length_forms() {
+        // additional-info 26 ("4-byte length follows").
+        let bytes26 = [0x5au8, 0, 0, 0, 10, 1, 2, 3];
+        let err = unwrap_cbor_bstr(&bytes26).unwrap_err();
+        assert!(err.contains("unsupported"), "unexpected error: {err}");
+
+        // additional-info 27 ("8-byte length follows").
+        let bytes27 = [0x5bu8, 0, 0, 0, 0, 0, 0, 0, 10];
+        let err = unwrap_cbor_bstr(&bytes27).unwrap_err();
+        assert!(err.contains("unsupported"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn unwrap_cbor_bstr_rejects_indefinite_length_and_empty_input() {
+        // additional-info 31: indefinite-length byte string.
+        let bytes = [0x5fu8, 1, 2, 3];
+        assert!(unwrap_cbor_bstr(&bytes).is_err());
+
+        assert!(unwrap_cbor_bstr(&[]).is_err());
+    }
+
+    #[test]
+    fn unwrap_cbor_bstr_rejects_declared_length_over_bound() {
+        // additional-info 25 ("2-byte length follows"), declaring a
+        // length well past MAX_CBOR_BSTR_LEN.
+        let bytes = [0x59u8, 0xffu8, 0xffu8]; // len = 65535, no payload at all
+        let err = unwrap_cbor_bstr(&bytes).unwrap_err();
+        assert!(err.contains("exceeds bound"), "unexpected error: {err}");
+    }
+
+    /// End-to-end-ish: a synthetic `fido2-assert`-shaped output whose
+    /// authenticator-data line is the CBOR-wrapped-then-base64-encoded raw
+    /// 37-byte fixture (39 wrapped bytes). This is the test that most
+    /// directly proves the fix: it confirms the value that would actually
+    /// be forwarded to dds-node is the raw 37-byte authenticatorData, not
+    /// the 39-byte CBOR-wrapped value.
+    #[test]
+    fn parse_and_unwrap_authenticator_data_matches_raw_fixture() {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+
+        let raw = raw_auth_data_fixture();
+        let mut wrapped = vec![0x58u8, 0x25u8];
+        wrapped.extend_from_slice(&raw);
+        assert_eq!(wrapped.len(), 39);
+
+        let auth_data_line_b64 = STANDARD.encode(&wrapped);
+        let out = format!(
+            "{}\n{}\n{}\n{}\n",
+            "Y2xpZW50ZGF0YWhhc2g=", // arbitrary client data hash
+            "dds.local",
+            auth_data_line_b64,
+            "c2lnbmF0dXJl", // arbitrary signature
+        );
+
+        let parsed = parse_fido2_assert_output(&out).unwrap();
+        let decoded_cbor = STANDARD.decode(&parsed.authenticator_data_b64).unwrap();
+        assert_eq!(
+            decoded_cbor, wrapped,
+            "sanity: line 3 decodes to the CBOR-wrapped bytes"
+        );
+
+        let raw_unwrapped = unwrap_cbor_bstr(&decoded_cbor).unwrap();
+        assert_eq!(raw_unwrapped, &raw[..]);
+
+        // Simulate the outgoing base64url re-encode exactly as
+        // `try_fido2_assert_tool` does, and confirm decoding it back
+        // yields the original raw fixture (37 bytes) — not the
+        // CBOR-wrapped value (39 bytes).
+        let authenticator_data_out = URL_SAFE_NO_PAD.encode(raw_unwrapped);
+        let round_tripped = URL_SAFE_NO_PAD.decode(&authenticator_data_out).unwrap();
+        assert_eq!(round_tripped.len(), 37);
+        assert_eq!(round_tripped, raw.to_vec());
     }
 
     #[test]
