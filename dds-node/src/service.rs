@@ -1807,9 +1807,6 @@ impl<
                     continue;
                 }
             };
-            if matches!(doc.enforcement, Enforcement::Disabled) {
-                continue;
-            }
             // C-3 (security review): the issuer of an attestation that
             // embeds a WindowsPolicyDocument must hold the
             // `dds:policy-publisher-windows` capability via a vouch
@@ -1818,6 +1815,11 @@ impl<
             // gossip a self-signed token containing arbitrary policy
             // (registry edits, account creation) and have it served to
             // every Policy Agent in the domain.
+            //
+            // This check (and the revoked/burned-issuer check above) must
+            // stay HERE, before a token is even considered a supersession
+            // candidate: an unauthorized publisher's token must never be
+            // able to compete for "current revision" status.
             if !self.has_purpose_observed(
                 &g,
                 &token.payload.iss,
@@ -1830,9 +1832,19 @@ impl<
                 );
                 continue;
             }
-            if !scope_matches(&doc.scope, device_urn, &device_tags, device_ou.as_deref()) {
-                continue;
-            }
+            // **S2 (2026-09-08 follow-up review)**: do NOT filter on
+            // `Enforcement::Disabled` or `scope_matches` here. Every
+            // token that clears the revoked/burned + publisher-capability
+            // gates above is pushed into `out` so that
+            // `supersede_windows_policies` below sees the FULL revision
+            // history per `policy_id` and can pick the true current
+            // revision (highest version, then newest iat, then
+            // lex-smallest jti as a tiebreak). Filtering out a Disabled
+            // or out-of-scope revision here, before supersession runs,
+            // let a stale/superseded revision "win" simply because the
+            // real current revision had been filtered out of the
+            // candidate set first. Disabled- and scope-filtering now
+            // happen AFTER supersession, below.
             out.push(ApplicableWindowsPolicy {
                 jti: token.payload.jti.clone(),
                 issuer: token.payload.iss.clone(),
@@ -1843,6 +1855,25 @@ impl<
         // B-4: collapse duplicates by `policy_id`, keep the winner,
         // emit in stable (policy_id-sorted) order.
         let out = supersede_windows_policies(out);
+        // **S2 (2026-09-08 follow-up review)**: only now, after the true
+        // current revision per `policy_id` has been picked, drop winners
+        // that are `Disabled` or that don't target this device. Doing
+        // this filtering before supersession let an old Enforce/in-scope
+        // revision keep applying after a newer Disabled or out-of-scope
+        // revision of the same `policy_id` was published, because the
+        // newer revision never reached supersession to displace it.
+        let out: Vec<ApplicableWindowsPolicy> = out
+            .into_iter()
+            .filter(|p| !matches!(p.document.enforcement, Enforcement::Disabled))
+            .filter(|p| {
+                scope_matches(
+                    &p.document.scope,
+                    device_urn,
+                    &device_tags,
+                    device_ou.as_deref(),
+                )
+            })
+            .collect();
         Ok(out)
     }
 
@@ -1878,10 +1909,10 @@ impl<
                     continue;
                 }
             };
-            if matches!(doc.enforcement, Enforcement::Disabled) {
-                continue;
-            }
             // C-3: same publisher capability gate as Windows policies.
+            // This check (and the revoked/burned-issuer check above) must
+            // stay HERE, before a token is even considered a supersession
+            // candidate — see **S2 (2026-09-08 follow-up review)** below.
             if !self.has_purpose_observed(
                 &g,
                 &token.payload.iss,
@@ -1894,9 +1925,13 @@ impl<
                 );
                 continue;
             }
-            if !scope_matches(&doc.scope, device_urn, &device_tags, device_ou.as_deref()) {
-                continue;
-            }
+            // **S2 (2026-09-08 follow-up review)**: do not filter on
+            // `Enforcement::Disabled` or `scope_matches` here — see the
+            // matching comment in `list_applicable_windows_policies` for
+            // the full rationale. Push every token that clears the gates
+            // above so `supersede_macos_policies` sees the full revision
+            // history per `policy_id`; Disabled/scope filtering now
+            // happens AFTER supersession, below.
             out.push(ApplicableMacOsPolicy {
                 jti: token.payload.jti.clone(),
                 issuer: token.payload.iss.clone(),
@@ -1905,6 +1940,20 @@ impl<
             });
         }
         let out = supersede_macos_policies(out);
+        // **S2 (2026-09-08 follow-up review)**: filter the picked winners
+        // — not the pre-supersession candidates — for Disabled and scope.
+        let out: Vec<ApplicableMacOsPolicy> = out
+            .into_iter()
+            .filter(|p| !matches!(p.document.enforcement, Enforcement::Disabled))
+            .filter(|p| {
+                scope_matches(
+                    &p.document.scope,
+                    device_urn,
+                    &device_tags,
+                    device_ou.as_deref(),
+                )
+            })
+            .collect();
         Ok(out)
     }
 
@@ -1936,9 +1985,10 @@ impl<
                     continue;
                 }
             };
-            if matches!(doc.enforcement, Enforcement::Disabled) {
-                continue;
-            }
+            // C-3: same publisher capability gate as Windows policies.
+            // This check (and the revoked/burned-issuer check above) must
+            // stay HERE, before a token is even considered a supersession
+            // candidate — see **S2 (2026-09-08 follow-up review)** below.
             if !self.has_purpose_observed(
                 &g,
                 &token.payload.iss,
@@ -1951,9 +2001,13 @@ impl<
                 );
                 continue;
             }
-            if !scope_matches(&doc.scope, device_urn, &device_tags, device_ou.as_deref()) {
-                continue;
-            }
+            // **S2 (2026-09-08 follow-up review)**: do not filter on
+            // `Enforcement::Disabled` or `scope_matches` here — see the
+            // matching comment in `list_applicable_windows_policies` for
+            // the full rationale. Push every token that clears the gates
+            // above so `supersede_linux_policies` sees the full revision
+            // history per `policy_id`; Disabled/scope filtering now
+            // happens AFTER supersession, below.
             out.push(ApplicableLinuxPolicy {
                 jti: token.payload.jti.clone(),
                 issuer: token.payload.iss.clone(),
@@ -1962,6 +2016,20 @@ impl<
             });
         }
         let out = supersede_linux_policies(out);
+        // **S2 (2026-09-08 follow-up review)**: filter the picked winners
+        // — not the pre-supersession candidates — for Disabled and scope.
+        let out: Vec<ApplicableLinuxPolicy> = out
+            .into_iter()
+            .filter(|p| !matches!(p.document.enforcement, Enforcement::Disabled))
+            .filter(|p| {
+                scope_matches(
+                    &p.document.scope,
+                    device_urn,
+                    &device_tags,
+                    device_ou.as_deref(),
+                )
+            })
+            .collect();
         Ok(out)
     }
 
@@ -2081,6 +2149,18 @@ impl<
         let policies = self.list_applicable_windows_policies(device_urn)?;
         let mut matches: Vec<AccountDirective> = Vec::new();
         for policy in policies {
+            // **S1 (2026-09-08 follow-up review)**: `list_applicable_windows_policies`
+            // intentionally still returns Audit-mode documents for
+            // listing purposes (S2's fix upstream already excludes
+            // Disabled winners). But this function's result is handed
+            // straight to the Windows Auth Bridge to call NetUserAdd and
+            // set a real password on a real local account — there is no
+            // separate "policy agent decided not to apply it" gate on
+            // this path. An Audit-mode account-claim directive must
+            // therefore never resolve; require `Enforcement::Enforce`.
+            if !matches!(policy.document.enforcement, Enforcement::Enforce) {
+                continue;
+            }
             let Some(bundle) = policy.document.windows else {
                 continue;
             };
@@ -2138,6 +2218,20 @@ impl<
         use dds_domain::LinuxUserAction;
         let mut out = Vec::new();
         for policy in self.list_applicable_linux_policies(device_urn)? {
+            // **S1 (2026-09-08 follow-up review)**: `list_applicable_linux_policies`
+            // intentionally still returns Audit-mode documents (they must
+            // reach the agent so it can log instead of enforce). But
+            // "Audit" means "log violations but don't enforce" — the
+            // Linux policy agent never actually creates/modifies the
+            // account for an Audit-mode directive, so it must not grant a
+            // real PAM login either. Require `Enforcement::Enforce`
+            // specifically (not just "not Disabled" — S2's fix upstream
+            // already excludes Disabled from the result set, but Audit
+            // must also be excluded here, even though it stays visible
+            // for listing purposes elsewhere).
+            if !matches!(policy.document.enforcement, Enforcement::Enforce) {
+                continue;
+            }
             let Some(linux) = policy.document.linux.as_ref() else {
                 continue;
             };
@@ -5182,6 +5276,285 @@ mod platform_applier_tests {
         let hits = svc.list_applicable_windows_policies(&dev).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(matches!(hits[0].document.enforcement, Enforcement::Audit));
+    }
+
+    // ---------- S2 (2026-09-08 follow-up review): supersession must run
+    // before Disabled/scope filtering, not after ----------
+
+    #[test]
+    fn windows_policy_disabled_v2_supersedes_and_retires_enforced_v1() {
+        // The review's own suggested test: a higher-version Disabled
+        // revision of the same policy_id must retire the older Enforce
+        // revision. Before the fix, v2 was filtered out (Disabled) before
+        // supersession ever saw it, so v1 — an already-superseded, dead
+        // revision — was returned as if it were still current.
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "ws-s2-dis", vec!["workstation".into()], None);
+        let v1 = baseline_policy(
+            "p:s2-dis",
+            PolicyScope {
+                device_tags: vec!["workstation".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-s2-dis-v1", &v1))
+            .unwrap();
+
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.enforcement = Enforcement::Disabled;
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-s2-dis-v2", &v2))
+            .unwrap();
+
+        assert_eq!(
+            svc.list_applicable_windows_policies(&dev).unwrap().len(),
+            0,
+            "a higher-version Disabled revision must supersede and retire v1, \
+             not leave the stale v1 as the current revision"
+        );
+    }
+
+    #[test]
+    fn windows_policy_narrowed_scope_v2_supersedes_and_retires_v1_on_the_old_device() {
+        // v2 raises the version and narrows scope away from the device
+        // that matched v1. v2 is current; it does not target this
+        // device, so the device must get zero results — not v1's stale
+        // match. Before the fix, v2 was filtered out by scope before
+        // supersession could see it, so v1 kept "applying" on the device
+        // v2 no longer targets.
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "ws-s2-scope", vec!["workstation".into()], None);
+        let v1 = baseline_policy(
+            "p:s2-scope",
+            PolicyScope {
+                device_tags: vec!["workstation".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-s2-scope-v1", &v1))
+            .unwrap();
+
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.scope = PolicyScope {
+            device_tags: vec!["server-only".into()],
+            org_units: vec![],
+            identity_urns: vec![],
+        };
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-s2-scope-v2", &v2))
+            .unwrap();
+
+        assert_eq!(
+            svc.list_applicable_windows_policies(&dev).unwrap().len(),
+            0,
+            "v2 is the current revision and does not target this device; \
+             v1's stale scope match must not be returned"
+        );
+    }
+
+    #[test]
+    fn windows_policy_supersession_still_applies_normal_in_scope_enforced_winner() {
+        // Sanity check: when the winning (highest-version) revision IS
+        // Enforce and in scope, it is returned as before — the S2
+        // restructuring must not change the ordinary case.
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "ws-s2-normal", vec!["workstation".into()], None);
+        let v1 = baseline_policy(
+            "p:s2-normal",
+            PolicyScope {
+                device_tags: vec!["workstation".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-s2-normal-v1", &v1))
+            .unwrap();
+
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.display_name = "Test v2".into();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-s2-normal-v2", &v2))
+            .unwrap();
+
+        let hits = svc.list_applicable_windows_policies(&dev).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].document.version, 2);
+        assert_eq!(hits[0].document.display_name, "Test v2");
+        assert!(matches!(hits[0].document.enforcement, Enforcement::Enforce));
+    }
+
+    /// **S2 macOS parity (2026-09-08 follow-up, added during integration)**:
+    /// `list_applicable_macos_policies` received the identical restructuring
+    /// as the Windows/Linux functions; these two tests give it the same
+    /// direct regression coverage the Windows/Linux paths already have,
+    /// closing a gap both the implementer and the adversarial verifier
+    /// flagged as a non-blocking but worth-closing coverage hole.
+    #[test]
+    fn macos_policy_disabled_v2_supersedes_and_retires_enforced_v1() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "mac-s2-dis", vec!["workstation".into()], None);
+        let v1 = baseline_macos_policy(
+            "p:s2-mac-dis",
+            PolicyScope {
+                device_tags: vec!["workstation".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-s2-mac-dis-v1", &v1))
+            .unwrap();
+
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.enforcement = Enforcement::Disabled;
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-s2-mac-dis-v2", &v2))
+            .unwrap();
+
+        assert_eq!(
+            svc.list_applicable_macos_policies(&dev).unwrap().len(),
+            0,
+            "a higher-version Disabled revision must supersede and retire v1 on macOS too"
+        );
+    }
+
+    #[test]
+    fn macos_policy_narrowed_scope_v2_supersedes_and_retires_v1_on_the_old_device() {
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "mac-s2-scope", vec!["workstation".into()], None);
+        let v1 = baseline_macos_policy(
+            "p:s2-mac-scope",
+            PolicyScope {
+                device_tags: vec!["workstation".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-s2-mac-scope-v1", &v1))
+            .unwrap();
+
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.scope = PolicyScope {
+            device_tags: vec!["server-only".into()],
+            org_units: vec![],
+            identity_urns: vec![],
+        };
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-s2-mac-scope-v2", &v2))
+            .unwrap();
+
+        assert_eq!(
+            svc.list_applicable_macos_policies(&dev).unwrap().len(),
+            0,
+            "v2 is the current macOS revision and does not target this device; \
+             v1's stale scope match must not be returned"
+        );
+    }
+
+    #[test]
+    fn linux_policy_disabled_v2_supersedes_and_retires_enforced_v1() {
+        // Linux equivalent of `windows_policy_disabled_v2_supersedes_and_retires_enforced_v1`
+        // — S1's fix builds on this same S2 ordering for the Linux path.
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "linux-s2-dis", vec!["linux".into()], None);
+        let v1 = baseline_linux_policy(
+            "p:s2-linux-dis",
+            PolicyScope {
+                device_tags: vec!["linux".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-s2-linux-dis-v1", &v1))
+            .unwrap();
+
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.enforcement = Enforcement::Disabled;
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-s2-linux-dis-v2", &v2))
+            .unwrap();
+
+        assert_eq!(
+            svc.list_applicable_linux_policies(&dev).unwrap().len(),
+            0,
+            "a higher-version Disabled revision must supersede and retire v1"
+        );
+    }
+
+    #[test]
+    fn linux_policy_narrowed_scope_v2_supersedes_and_retires_v1_on_the_old_device() {
+        // Linux equivalent of `windows_policy_narrowed_scope_v2_supersedes_and_retires_v1_on_the_old_device`.
+        let (mut svc, admin, _) = setup();
+        let dev = enroll_device(&mut svc, "linux-s2-scope", vec!["linux".into()], None);
+        let v1 = baseline_linux_policy(
+            "p:s2-linux-scope",
+            PolicyScope {
+                device_tags: vec!["linux".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+        );
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-s2-linux-scope-v1", &v1))
+            .unwrap();
+
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.scope = PolicyScope {
+            device_tags: vec!["server-only".into()],
+            org_units: vec![],
+            identity_urns: vec![],
+        };
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(&admin, "p-s2-linux-scope-v2", &v2))
+            .unwrap();
+
+        assert_eq!(
+            svc.list_applicable_linux_policies(&dev).unwrap().len(),
+            0,
+            "v2 is the current revision and does not target this device"
+        );
     }
 
     #[test]
@@ -8780,6 +9153,114 @@ mod platform_applier_tests {
             .expect("a user-verified session still claims");
     }
 
+    /// Like `claimable_account_fixture` but lets the test choose the
+    /// policy's `enforcement` value, for S1 Audit-vs-Enforce coverage.
+    fn claimable_account_fixture_with_enforcement(
+        svc: &mut LocalService<MemoryBackend>,
+        admin: &Identity,
+        tag: &str,
+        enforcement: Enforcement,
+    ) -> (String, Identity) {
+        let device_urn = enroll_device(svc, &format!("ws-{tag}"), vec!["workstation".into()], None);
+        let user = Identity::generate(&format!("user-{tag}"), &mut OsRng);
+        let user_attest = make_attest_for_publisher_setup(&user);
+        let user_hash = user_attest.payload_hash();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(user_attest)
+            .unwrap();
+        let vouch = Token::sign(
+            TokenPayload {
+                iss: admin.id.to_urn(),
+                iss_key: admin.public_key.clone(),
+                jti: format!("vouch-{tag}"),
+                sub: user.id.to_urn(),
+                kind: TokenKind::Vouch,
+                purpose: Some("dds:group:employees".into()),
+                vch_iss: Some(user.id.to_urn()),
+                vch_sum: Some(user_hash),
+                revokes: None,
+                iat: 1_700_000_000,
+                exp: Some(4_102_444_800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &admin.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph.write().unwrap().add_token(vouch).unwrap();
+        let policy = WindowsPolicyDocument {
+            policy_id: format!("p:claim-{tag}"),
+            display_name: "Claim".into(),
+            version: 1,
+            enforcement,
+            scope: PolicyScope {
+                device_tags: vec!["workstation".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            settings: vec![],
+            windows: Some(WindowsSettings {
+                local_accounts: vec![AccountDirective {
+                    username: format!("{tag}-local"),
+                    action: AccountAction::Create,
+                    claim_subject_urn: Some(user.id.to_urn()),
+                    full_name: None,
+                    description: None,
+                    groups: vec![],
+                    password_never_expires: None,
+                }],
+                ..Default::default()
+            }),
+        };
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(admin, &format!("p-claim-{tag}"), &policy))
+            .unwrap();
+        (device_urn, user)
+    }
+
+    #[test]
+    fn windows_account_claim_audit_mode_directive_does_not_resolve_enforce_mode_does() {
+        // S1 (2026-09-08 follow-up review): `resolve_windows_account_claim`
+        // hands its result straight to the Windows Auth Bridge to call
+        // NetUserAdd and set a real password on a real local account —
+        // there is no separate "policy agent decided not to apply it"
+        // gate on this path. An Audit-mode policy's account-claim
+        // directive must therefore never resolve, even though
+        // `list_applicable_windows_policies` (correctly) still returns
+        // Audit-mode documents for listing purposes.
+        let _tel_guard = TELEMETRY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut svc, admin, _) = setup();
+
+        let (audit_device, audit_user) = claimable_account_fixture_with_enforcement(
+            &mut svc,
+            &admin,
+            "s1-win-audit",
+            Enforcement::Audit,
+        );
+        let audit_session = local_session_for(&mut svc, &audit_user, true);
+        let err = svc
+            .resolve_windows_account_claim(&audit_device, &audit_session.token_cbor)
+            .expect_err("an Audit-mode account-claim directive must not resolve");
+        assert!(
+            format!("{err:?}").contains("no claimable windows account"),
+            "{err:?}"
+        );
+
+        let (enforce_device, enforce_user) = claimable_account_fixture_with_enforcement(
+            &mut svc,
+            &admin,
+            "s1-win-enforce",
+            Enforcement::Enforce,
+        );
+        let enforce_session = local_session_for(&mut svc, &enforce_user, true);
+        svc.resolve_windows_account_claim(&enforce_device, &enforce_session.token_cbor)
+            .expect("the identical directive authored Enforce resolves");
+    }
+
     // ---------- F4 (2026-09-07 security review): PAM account authorization ----------
 
     /// A Linux device, a vouched user with a FIDO2 credential, and a Linux
@@ -8950,6 +9431,123 @@ mod platform_applier_tests {
                 .is_empty(),
             "a revoked user's credential is no longer offered"
         );
+    }
+
+    /// Like `linux_login_fixture` but lets the test choose the policy's
+    /// `enforcement` value, for S1 Audit-vs-Enforce coverage.
+    fn linux_login_fixture_with_enforcement(
+        svc: &mut LocalService<MemoryBackend>,
+        admin: &Identity,
+        tag: &str,
+        enforcement: Enforcement,
+    ) -> (String, Identity, String) {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use dds_domain::LinuxUserAction;
+        let device_urn = enroll_device(svc, &format!("linux-{tag}"), vec!["linux".into()], None);
+        let user = Identity::generate(&format!("pam-{tag}"), &mut OsRng);
+        let cred_sk = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let cred = format!("cred-pam-{tag}");
+        let attest = self_issued_user_attestation(
+            &user,
+            &format!("attest-pam-{tag}"),
+            "dds.local",
+            cred.as_bytes(),
+            &cred_sk,
+        );
+        svc.trust_graph.write().unwrap().add_token(attest).unwrap();
+        vouch_subject(
+            svc,
+            admin,
+            &user.id.to_urn(),
+            "dds:group:employees",
+            &format!("vouch-pam-{tag}"),
+        );
+        let policy = LinuxPolicyDocument {
+            policy_id: format!("p:linux-login-{tag}"),
+            display_name: "Linux login".into(),
+            version: 1,
+            scope: PolicyScope {
+                device_tags: vec!["linux".into()],
+                org_units: vec![],
+                identity_urns: vec![],
+            },
+            settings: vec![],
+            enforcement,
+            linux: Some(LinuxSettings {
+                local_users: vec![LinuxUserDirective {
+                    username: format!("{tag}-login"),
+                    action: LinuxUserAction::Create,
+                    uid: None,
+                    shell: Some("/bin/bash".into()),
+                    groups: vec![],
+                    full_name: None,
+                    claim_subject_urn: Some(user.id.to_urn()),
+                }],
+                ..Default::default()
+            }),
+        };
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(attest_with_body(
+                admin,
+                &format!("p-linux-login-{tag}"),
+                &policy,
+            ))
+            .unwrap();
+        (device_urn, user, URL_SAFE_NO_PAD.encode(cred.as_bytes()))
+    }
+
+    #[test]
+    fn linux_login_audit_mode_directive_does_not_authorize_enforce_mode_does() {
+        // S1 (2026-09-08 follow-up review): `linux_account_subjects` fed
+        // straight into `authorize_linux_account` used to grant a real
+        // PAM login off an Audit-mode directive, even though "Audit"
+        // means "log violations but don't enforce" and the Linux policy
+        // agent never actually creates/modifies the account for one.
+        // Confirm the fail-then-succeed pair the review asked for.
+        let _tel_guard = TELEMETRY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut svc, admin, _) = setup();
+
+        let (audit_device, audit_user, _) = linux_login_fixture_with_enforcement(
+            &mut svc,
+            &admin,
+            "s1-lin-audit",
+            Enforcement::Audit,
+        );
+        let audit_session = local_session_for(&mut svc, &audit_user, true);
+        let err = svc
+            .authorize_linux_account(
+                &audit_device,
+                &audit_session.token_cbor,
+                "s1-lin-audit-login",
+            )
+            .expect_err("an Audit-mode local_users directive must not authorize a login");
+        assert!(
+            format!("{err:?}").contains("not authorized to log in as"),
+            "{err:?}"
+        );
+        assert!(
+            svc.linux_account_login_options(&audit_device, "s1-lin-audit-login")
+                .unwrap()
+                .candidates
+                .is_empty(),
+            "an Audit-mode mapping must not be offered as a login option either"
+        );
+
+        let (enforce_device, enforce_user, _) = linux_login_fixture_with_enforcement(
+            &mut svc,
+            &admin,
+            "s1-lin-enforce",
+            Enforcement::Enforce,
+        );
+        let enforce_session = local_session_for(&mut svc, &enforce_user, true);
+        svc.authorize_linux_account(
+            &enforce_device,
+            &enforce_session.token_cbor,
+            "s1-lin-enforce-login",
+        )
+        .expect("the identical directive authored Enforce authorizes");
     }
 }
 
