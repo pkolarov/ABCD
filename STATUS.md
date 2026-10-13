@@ -1,5 +1,37 @@
 # DDS Implementation Status
 
+## fix(mesh): v1.8.0 follow-up review — revocations survive pruning, token-volume quotas, root-demotion gate, exact sync cache — 2026-10-13
+
+A second review of the v1.8.0 commits reproduced four issues with local tests against the
+ingestion and pruning code. All four were confirmed and fixed; each fix carries a regression
+test that fails on v1.8.0. Full record:
+[docs/security-review-2026-10-13-single-node.md](docs/security-review-2026-10-13-single-node.md)
+("Follow-up review of v1.8.0").
+
+- **F1 (High) — pruning undid revocation.** Removing a pruned token also dropped its
+  revocation record, so a replayed copy came back live. The pruner now keeps revocation
+  records (`TrustGraph::remove_token_keep_revocation`), and both ingest paths refuse any
+  token whose JTI is revoked in the graph or marked revoked in the store.
+- **F2 (High) — a throw-away `dds:admin` vouch plus its revocation demoted a configured
+  root** on the token-driven path (`reconcile_roots_after_token`), which N1 had not covered;
+  nothing restored it afterwards. The Revoke branch now applies the periodic pass's gate: only
+  a root the graph shows was promoted by a current root or the bootstrap admin is demotable.
+- **F3 (High) — flood protection bounded identities, not tokens.** A known identity
+  published without limit and, by issuing continuously, postponed its own pruning. Each
+  source is now also charged for every token from an unanchored issuer against a per-day
+  token count (`[network] unanchored_token_budget_per_day`, default 5000) and byte total
+  (`unanchored_token_bytes_per_day`, default 16 MiB), with the same quarantine / throttle
+  outcomes as the identity budget; the unanchored clock starts at the identity's first token.
+- **F4 (Medium) — a rejected duplicate-JTI twin overwrote the accepted payload's sync-cache
+  entry** because the cache was repopulated by op id. `SyncResult::merged_payloads` now names
+  the exact accepted payloads and only those are cached.
+
+Verification (fresh against the final tree): `cargo test` for dds-core / dds-store /
+dds-net / dds-node — 1082 pass across 40 test binaries (1 ignored, 1 failed — see below); clippy `-D warnings` clean on those crates plus
+dds-loadtest, fmt clean. The one local lib failure
+(`http::tests::uds_listener::admin_endpoint_rejects_unknown_uid_caller`) is pre-existing
+and only reproduces when the suite runs as root.
+
 ## fix(mesh): single-node compromise review, identity-flood budget and unanchored-identity pruning — 2026-10-13
 
 An in-depth review of what one admitted-but-hostile node can do to the rest of the mesh
