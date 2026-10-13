@@ -75,6 +75,7 @@ fn build_node_dir(secret: [u8; 32]) -> (TempDir, NodeConfig, libp2p::identity::K
         bootstrap_admin_urn: None,
         identity_path: None,
         expiry_scan_interval_secs: 60,
+        unanchored_identity_ttl_days: 0,
         self_update_apply: true,
     };
 

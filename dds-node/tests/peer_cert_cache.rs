@@ -103,6 +103,7 @@ fn spawn_node(domain_key: &DomainKey, org: &str) -> (DdsNode, tempfile::TempDir)
         bootstrap_admin_urn: None,
         identity_path: None,
         expiry_scan_interval_secs: 60,
+        unanchored_identity_ttl_days: 0,
         self_update_apply: true,
     };
     let node = DdsNode::init(cfg, p2p_keypair).expect("init node");

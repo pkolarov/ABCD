@@ -46,6 +46,24 @@ pub struct NodeConfig {
     #[serde(default = "default_expiry_scan_interval")]
     pub expiry_scan_interval_secs: u64,
 
+    /// **R1 (single-node review 2026-10-13)** — days an identity may stay
+    /// *unanchored* before its tokens are pruned from this node. An
+    /// identity is unanchored when nobody with a chain to a trusted root
+    /// has an effective vouch for it: a self-enrolled user nobody ever
+    /// vouched, an offboarded user whose vouch was revoked or expired, a
+    /// throw-away identity minted by a hostile peer. The clock starts at
+    /// the identity's newest token or at the revocation / expiry of its
+    /// last vouch, so a legitimately offboarded user keeps their record
+    /// for the full period after the offboarding. Trusted roots, the
+    /// bootstrap admin, this node's own identity, device-join identities
+    /// and identities carrying any document other than a plain or
+    /// user-auth attestation are never pruned. Tokens older than this
+    /// from an issuer no node has vouched are also refused at ingest, so
+    /// pruned material does not return through anti-entropy. `0`
+    /// disables pruning and the ingest rule. Default 30.
+    #[serde(default = "default_unanchored_identity_ttl_days")]
+    pub unanchored_identity_ttl_days: u64,
+
     /// **Phase D.6 (supply-chain-plan.md)** — whether this node should
     /// attempt to apply inbound `DdsSelfUpdateDocument` tokens. When
     /// `true` (the default), a node that receives a self-update manifest
@@ -62,6 +80,10 @@ pub struct NodeConfig {
 
 fn default_expiry_scan_interval() -> u64 {
     60
+}
+
+fn default_unanchored_identity_ttl_days() -> u64 {
+    30
 }
 
 /// Domain identity for this node. The `name` is a display label; the `id`
@@ -333,6 +355,36 @@ pub struct NetworkConfig {
     /// [`Self::gossip_inbound_max_per_window`].
     #[serde(default = "default_gossip_rate_window_secs")]
     pub gossip_rate_window_secs: u64,
+
+    /// **R1 (single-node review 2026-10-13) — identity-flood budget.**
+    /// How many *fresh* identities (issuers this node has never seen a
+    /// token from) one peer may introduce per 24 h that are still
+    /// unanchored — no effective vouch from anyone with a chain to a
+    /// trusted root — after [`Self::fresh_identity_grace_secs`]. A
+    /// legitimate onboarding anchors its identities within minutes, so
+    /// they stop counting; throw-away identities never anchor. Past the
+    /// budget: a gossip *publisher* is quarantined for 24 h (disconnected,
+    /// refused admission, its messages dropped and not relayed) and a
+    /// sync *responder* is throttled (further fresh identities from it
+    /// are dropped until the window resets — never disconnected, because
+    /// an honest node may be relaying material it accepted before the
+    /// flood was caught). `0` disables. Default 1000.
+    #[serde(default = "default_fresh_identity_budget_per_day")]
+    pub fresh_identity_budget_per_day: u32,
+
+    /// **R1** — seconds a fresh identity has to become anchored before it
+    /// counts against [`Self::fresh_identity_budget_per_day`]. Default
+    /// 3600.
+    #[serde(default = "default_fresh_identity_grace_secs")]
+    pub fresh_identity_grace_secs: u64,
+
+    /// **R1** — hard ceiling on fresh identities (anchored or not) one
+    /// peer may introduce per 24 h; beyond it further fresh identities
+    /// from that peer are dropped and a gossip publisher is quarantined.
+    /// Sized above any realistic bulk onboarding; raise it before a very
+    /// large import. `0` disables. Default 50 000.
+    #[serde(default = "default_fresh_identity_hard_cap_per_day")]
+    pub fresh_identity_hard_cap_per_day: u32,
 }
 
 /// **M-1 (pre-prod review 2026-07-24)** — TOML surface for
@@ -400,6 +452,9 @@ impl Default for NetworkConfig {
             unadmitted_peer_timeout_secs: default_unadmitted_timeout_secs(),
             gossip_inbound_max_per_window: default_gossip_rate_max(),
             gossip_rate_window_secs: default_gossip_rate_window_secs(),
+            fresh_identity_budget_per_day: default_fresh_identity_budget_per_day(),
+            fresh_identity_grace_secs: default_fresh_identity_grace_secs(),
+            fresh_identity_hard_cap_per_day: default_fresh_identity_hard_cap_per_day(),
         }
     }
 }
@@ -587,6 +642,21 @@ fn default_gossip_rate_max() -> u32 {
 /// **H-1** — see [`NetworkConfig::gossip_rate_window_secs`].
 fn default_gossip_rate_window_secs() -> u64 {
     60
+}
+
+/// **R1** — see [`NetworkConfig::fresh_identity_budget_per_day`].
+fn default_fresh_identity_budget_per_day() -> u32 {
+    1000
+}
+
+/// **R1** — see [`NetworkConfig::fresh_identity_grace_secs`].
+fn default_fresh_identity_grace_secs() -> u64 {
+    3600
+}
+
+/// **R1** — see [`NetworkConfig::fresh_identity_hard_cap_per_day`].
+fn default_fresh_identity_hard_cap_per_day() -> u32 {
+    50_000
 }
 
 fn default_max_pending_incoming() -> u32 {

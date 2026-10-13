@@ -191,6 +191,12 @@ impl OperationStore for MemoryBackend {
         self.operations.contains_key(id)
     }
 
+    fn delete_operation(&mut self, id: &str) -> StoreResult<()> {
+        self.operations.remove(id);
+        self.record_write_ok();
+        Ok(())
+    }
+
     fn operation_ids(&self) -> StoreResult<BTreeSet<String>> {
         Ok(self.operations.keys().cloned().collect())
     }

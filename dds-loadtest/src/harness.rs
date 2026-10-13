@@ -1006,6 +1006,10 @@ async fn spawn_node(org: &str) -> Result<(DdsNode, TempDir), Box<dyn std::error:
             metrics_addr: None,
             allow_v1_certs: true,
             admission_key_backend: Default::default(),
+            // R1: the harness mints synthetic identities nobody vouches, which
+            // is exactly the shape the fresh-identity budget exists to stop.
+            fresh_identity_budget_per_day: 0,
+            fresh_identity_hard_cap_per_day: 0,
             // M-1 / H-1: connection caps, unadmitted-peer deadline, and the
             // per-peer gossip budget all take their production defaults here.
             ..Default::default()
@@ -1035,6 +1039,7 @@ async fn spawn_node(org: &str) -> Result<(DdsNode, TempDir), Box<dyn std::error:
         bootstrap_admin_urn: None,
         identity_path: None,
         expiry_scan_interval_secs: 60,
+        unanchored_identity_ttl_days: 30,
         self_update_apply: true,
     };
     let mut node = DdsNode::init(cfg, p2p_keypair)?;

@@ -417,6 +417,27 @@ impl OperationStore for RedbBackend {
         self.get_operation(id).is_ok()
     }
 
+    fn delete_operation(&mut self, id: &str) -> StoreResult<()> {
+        self.instrumented_write(|| {
+            let write_txn = self
+                .db
+                .begin_write()
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            {
+                let mut table = write_txn
+                    .open_table(OPERATIONS)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+                table
+                    .remove(id)
+                    .map_err(|e| StoreError::Io(e.to_string()))?;
+            }
+            write_txn
+                .commit()
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     fn operation_ids(&self) -> StoreResult<BTreeSet<String>> {
         let read_txn = self
             .db

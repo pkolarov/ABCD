@@ -81,6 +81,27 @@ impl CausalDag {
         self.ops.get(id)
     }
 
+    /// Remove an operation by id. Returns `true` when it was present.
+    ///
+    /// Used by the unanchored-identity pruner (dds-node `expiry`) to
+    /// drop the op of a token that has been deleted from the store, so
+    /// `operation_ids()` — and therefore the anti-entropy `known_op_ids`
+    /// set — stays consistent with persisted state. The directory op-log
+    /// is flat (every producer emits `deps = []`), so removal only has to
+    /// clear the id from `ops` and `heads`; an op that other ops depend
+    /// on is left in place to keep the DAG invariant.
+    pub fn remove(&mut self, id: &str) -> bool {
+        if !self.ops.contains_key(id) {
+            return false;
+        }
+        if self.ops.values().any(|o| o.deps.iter().any(|d| d == id)) {
+            return false;
+        }
+        self.ops.remove(id);
+        self.heads.remove(id);
+        true
+    }
+
     /// Check if the DAG contains an operation.
     pub fn contains(&self, id: &str) -> bool {
         self.ops.contains_key(id)
@@ -244,6 +265,20 @@ mod tests {
         assert!(dag.is_empty());
         assert_eq!(dag.len(), 0);
         assert!(dag.heads().is_empty());
+    }
+
+    #[test]
+    fn remove_drops_op_and_head_but_keeps_depended_on_ops() {
+        let mut dag = CausalDag::new();
+        dag.insert(op("a", vec![])).unwrap();
+        dag.insert(op("b", vec!["a"])).unwrap();
+        dag.insert(op("c", vec![])).unwrap();
+        assert!(!dag.remove("a"), "a is a dependency of b and must stay");
+        assert!(dag.remove("c"));
+        assert!(!dag.contains("c"));
+        assert!(!dag.heads().contains("c"));
+        assert!(!dag.remove("c"), "second removal is a no-op");
+        assert_eq!(dag.len(), 2);
     }
 
     #[test]

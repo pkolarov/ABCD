@@ -337,6 +337,7 @@ async fn spawn_node(
         bootstrap_admin_urn: None,
         identity_path: None,
         expiry_scan_interval_secs: 60,
+        unanchored_identity_ttl_days: 30,
         self_update_apply: true,
     };
 

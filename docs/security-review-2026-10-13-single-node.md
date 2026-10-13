@@ -84,6 +84,40 @@ peer was found.
   it held) is the response; after N1–N5 that revocation leaves no persistent damage other
   than the token volume in R1.
 
+## Follow-up (same day): R1 mitigations landed
+
+R1 is now bounded by two mechanisms, both configurable (see the Admin Guide config
+reference):
+
+- **Fresh-identity budget per source** (`[network] fresh_identity_budget_per_day`,
+  `fresh_identity_grace_secs`, `fresh_identity_hard_cap_per_day`;
+  `dds-node/src/identity_flood.rs`). Every node charges the signed gossip publisher,
+  or the sync responder, for each identity it introduces that nobody has vouched. An
+  identity stops counting the moment someone with a chain to a trusted root signs for
+  it, so a bulk onboarding never trips the budget. A publisher whose identities stay
+  unanchored past the grace period in numbers beyond the budget is quarantined for the
+  rest of the day by every node that saw the flood (disconnected, refused admission,
+  messages dropped and not relayed), with an audit entry and a log line naming the
+  `revoke-admission` command. A sync responder over budget is only throttled, since an
+  honest node may be relaying a flood it accepted before the publisher was caught. The
+  storage impact of a flood is therefore bounded to roughly the budget per hostile
+  node per day, instead of the gossip rate.
+- **Unanchored-identity pruning** (`unanchored_identity_ttl_days`, default 30;
+  `dds-node/src/expiry.rs::prune_unanchored_once`). Hourly, each node removes the
+  tokens of identities that have had no effective vouch for longer than the TTL —
+  measured from the identity's newest token or from the revocation / expiry of its
+  last vouch, so offboarded users keep their record for the full period after
+  offboarding. Trusted roots, the bootstrap admin, the node's own identity,
+  device-join identities and identities carrying any document type other than a plain
+  or user-auth attestation are never pruned. The matching ingest rule refuses tokens
+  older than the TTL from an issuer no vouch claims (a vouch in the same sync batch
+  counts), so pruned material does not come back through anti-entropy from a lagging
+  peer.
+
+Remaining in R1: identities carrying a device-join document are exempt from pruning
+(devices are legitimately unvouched unless `enforce_device_scope_vouch` is on), so a
+flood of device-join attestations is bounded only by the budget, not reclaimed.
+
 ## Operational note
 
 If a node is suspected compromised: `dds-node revoke-admission` for its PeerId (the

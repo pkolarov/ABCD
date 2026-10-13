@@ -30,6 +30,7 @@ use dds_domain::{DomainId, domain::from_hex};
 use crate::admission_revocation_store::{self, AdmissionRevocationStore};
 use crate::config::NodeConfig;
 use crate::epoch_key_store::{EpochKeyStore, InstallOutcome, is_release_within_replay_window};
+use crate::identity_flood::{IdentityLedger, Limits, Refusal};
 use crate::peer_cert_store::{self, PeerCertStore};
 
 /// How often we proactively sync against every connected peer as a
@@ -104,6 +105,48 @@ const SYNC_PAYLOAD_CACHE_CAP: usize = 10_000;
 const SYNC_MAX_TOKEN_BYTES: usize = 64 * 1024;
 const SYNC_MAX_OP_BYTES: usize = 4 * 1024;
 
+/// **R1 (single-node review 2026-10-13)** — how long a gossip publisher
+/// stays quarantined after an identity flood: the rest of the budget
+/// window. Operators revoke its admission for anything longer.
+const IDENTITY_FLOOD_QUARANTINE: Duration = crate::identity_flood::WINDOW;
+
+/// **R1** — cadence of the unanchored-identity prune
+/// (`crate::expiry::prune_unanchored_once`), driven from the expiry tick.
+/// Hourly: the TTL is measured in days and the pass walks every issuer.
+const UNANCHORED_PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Outcome of ingesting one gossip `DirectoryOp` / `Burn`, used to decide
+/// whether gossipsub may relay the message.
+///
+/// Before this existed every message reached `MessageAcceptance::Accept`
+/// once it decoded, so a token every node rejects (bad signature, aliased
+/// op id, forged user-auth mapping, identity flood) was still relayed to
+/// the whole mesh and cost every node a signature verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestOutcome {
+    /// Novel, accepted, persisted: relay.
+    Accepted,
+    /// Already held (duplicate JTI / op): nothing to relay.
+    Duplicate,
+    /// Refused for a reason every honest node would refuse too (decode,
+    /// signature, shape, binding, flood, stale): do not relay.
+    RejectedTerminal,
+    /// Refused for a reason that depends on this node's own view (its
+    /// trusted-root set, its legacy-token setting): relay, other nodes
+    /// may legitimately accept it.
+    RejectedPolicy,
+}
+
+impl IngestOutcome {
+    fn acceptance(self) -> libp2p::gossipsub::MessageAcceptance {
+        use libp2p::gossipsub::MessageAcceptance;
+        match self {
+            IngestOutcome::Accepted | IngestOutcome::RejectedPolicy => MessageAcceptance::Accept,
+            IngestOutcome::Duplicate | IngestOutcome::RejectedTerminal => MessageAcceptance::Ignore,
+        }
+    }
+}
+
 /// **Single-node review 2026-10-13** — insertion-ordered sync payload
 /// cache.
 ///
@@ -162,6 +205,17 @@ impl SyncPayloadCache {
         let (_, id) = self.order.pop_first()?;
         self.by_id.remove(&id);
         Some(id)
+    }
+
+    /// Remove one entry by op id. Returns `true` when it was present.
+    fn remove(&mut self, op_id: &str) -> bool {
+        match self.by_id.remove(op_id) {
+            Some((seq, _)) => {
+                self.order.remove(&seq);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Entries in insertion order, oldest first.
@@ -528,6 +582,26 @@ pub struct DdsNode {
     /// `ConnectionClosed` — that is exactly the reconnect-flap we're
     /// rate-limiting — but is cleared on a late-but-valid admission success.
     admission_denied_until: BTreeMap<PeerId, Instant>,
+    /// **R1 (single-node review 2026-10-13)** — fresh-identity ledger:
+    /// charges each source (gossip publisher / sync responder) for the
+    /// identities it introduces that nobody anchors. See
+    /// [`crate::identity_flood`].
+    identity_ledger: IdentityLedger<PeerId>,
+    /// **R1** — gossip publishers caught flooding identities, with the
+    /// instant their quarantine ends. While quarantined a peer is refused
+    /// admission, disconnected on connect, and its messages are dropped
+    /// without relay. Distinct from `admission_denied_until`, which a
+    /// late-but-valid handshake clears.
+    identity_flood_quarantine: BTreeMap<PeerId, Instant>,
+    /// **R1** — when the unanchored-identity prune last ran.
+    last_unanchored_prune: Instant,
+    /// Sync requests this node answered with a response (the
+    /// `record_sync_serve("ok")` path). A peer sends its first
+    /// anti-entropy request only after it has admitted us, so the
+    /// counter going non-zero is the earliest proof visible to a
+    /// publisher that the mesh will accept what it gossips. Read by the
+    /// macOS end-to-end tool.
+    sync_requests_served: u64,
     /// **M-4 (security review)**: sliding-window counter for newly
     /// accepted mDNS peers. `(window_start, count)`: if `now -
     /// window_start >= 60s`, reset and start a fresh window; else
@@ -1172,6 +1246,11 @@ impl DdsNode {
 
         // Extract before `config` is moved into the struct.
         let allow_v1_certs = config.network.allow_v1_certs;
+        let identity_limits = Limits {
+            budget: config.network.fresh_identity_budget_per_day,
+            grace: Duration::from_secs(config.network.fresh_identity_grace_secs),
+            hard_cap: config.network.fresh_identity_hard_cap_per_day,
+        };
 
         Ok(Self {
             swarm,
@@ -1190,6 +1269,10 @@ impl DdsNode {
             sync_last_outbound: BTreeMap::new(),
             admission_retry_last_outbound: BTreeMap::new(),
             admission_denied_until: BTreeMap::new(),
+            identity_ledger: IdentityLedger::new(identity_limits),
+            identity_flood_quarantine: BTreeMap::new(),
+            last_unanchored_prune: Instant::now(),
+            sync_requests_served: 0,
             admission_cert: cert,
             domain,
             mdns_rate: (Instant::now(), 0),
@@ -1388,6 +1471,12 @@ impl DdsNode {
                     }
                     if !expired.is_empty() {
                         info!(count = expired.len(), "swept expired tokens");
+                    }
+                    // **R1** — hourly unanchored-identity prune.
+                    if self.config.unanchored_identity_ttl_days > 0
+                        && self.last_unanchored_prune.elapsed() >= UNANCHORED_PRUNE_INTERVAL
+                    {
+                        self.prune_unanchored_identities();
                     }
 
                     // Audit log pruning (only if audit log is enabled)
@@ -1637,6 +1726,14 @@ impl DdsNode {
                     }
                     None => {}
                 }
+                // **R1** — a publisher quarantined for an identity flood
+                // does not get a connection at all for the rest of its
+                // window.
+                if self.is_identity_flood_quarantined(&peer_id, Instant::now()) {
+                    debug!(%peer_id, "R1: rejecting connection from identity-flood-quarantined peer");
+                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                    return;
+                }
                 // observability-plan.md Phase D.2 — sticky readiness
                 // signal for `/readyz`. Set on every event because the
                 // store is cheap and Relaxed; only the first transition
@@ -1800,6 +1897,10 @@ impl DdsNode {
         // re-admit, then enforce the memory backstop by evicting the
         // soonest-to-expire entries if churn has grown the map past its cap.
         self.admission_denied_until.retain(|_, until| now < *until);
+        // **R1** — expire identity-flood quarantines and quiet ledger windows.
+        self.identity_flood_quarantine
+            .retain(|_, until| now < *until);
+        self.identity_ledger.sweep(now);
         while self.admission_denied_until.len() > ADMISSION_DENYLIST_MAX {
             let soonest = self
                 .admission_denied_until
@@ -2199,6 +2300,13 @@ impl DdsNode {
         let epoch_key_releases_from_response = response.epoch_key_releases;
         self.merge_piggybacked_revocations(&peer_id, response.revocations);
 
+        // **R1** — no admission for a publisher quarantined for an
+        // identity flood, cert or no cert.
+        if self.is_identity_flood_quarantined(&peer_id, Instant::now()) {
+            warn!(%peer_id, "R1: peer is quarantined for an identity flood — refusing to admit");
+            crate::telemetry::record_admission_handshake("quarantined");
+            return;
+        }
         let peer_str = peer_id.to_string();
         if self.admission_revocations.is_revoked(&peer_str) {
             warn!(
@@ -2794,6 +2902,17 @@ impl DdsNode {
             return MessageAcceptance::Ignore;
         }
 
+        // **R1** — drop, without relaying and without blaming the
+        // relayer, anything published by a source quarantined for an
+        // identity flood. `message.source` is the signed original
+        // publisher (Strict validation), not the hop that handed it to us.
+        if let Some(source) = message.source {
+            if self.is_identity_flood_quarantined(&source, Instant::now()) {
+                crate::telemetry::record_gossip_messages_dropped("identity_flood");
+                return MessageAcceptance::Ignore;
+            }
+        }
+
         // H-1: per-peer inbound budget. Applies to admitted peers too —
         // admission proves domain membership, not good behaviour, and
         // every inbound message costs a signature verify plus (on
@@ -2807,7 +2926,11 @@ impl DdsNode {
             return MessageAcceptance::Ignore;
         }
 
-        self.handle_gossip_message(&message.topic, &message.data)
+        // The signed publisher is the party charged for fresh identities;
+        // fall back to the relayer only if gossipsub ever hands us an
+        // unsigned message (it cannot under Strict validation).
+        let origin = message.source.or(Some(*propagation_source));
+        self.handle_gossip_message(&message.topic, &message.data, origin)
     }
 
     /// **H-1** — per-peer sliding-window gossip budget. Returns `true`
@@ -2836,6 +2959,7 @@ impl DdsNode {
         &mut self,
         topic_hash: &libp2p::gossipsub::TopicHash,
         data: &[u8],
+        origin: Option<PeerId>,
     ) -> libp2p::gossipsub::MessageAcceptance {
         use libp2p::gossipsub::MessageAcceptance;
 
@@ -2944,8 +3068,8 @@ impl DdsNode {
                 },
             ) => {
                 crate::telemetry::record_gossip_message("op");
-                self.ingest_operation(&op_bytes, &token_bytes);
-                MessageAcceptance::Accept
+                self.ingest_operation(&op_bytes, &token_bytes, origin)
+                    .acceptance()
             }
             (DdsTopic::Revocations(..), GossipMessage::Revocation { token_bytes }) => {
                 crate::telemetry::record_gossip_message("revocation");
@@ -2954,8 +3078,7 @@ impl DdsNode {
             }
             (DdsTopic::Burns(..), GossipMessage::Burn { token_bytes }) => {
                 crate::telemetry::record_gossip_message("burn");
-                self.ingest_burn(&token_bytes);
-                MessageAcceptance::Accept
+                self.ingest_burn(&token_bytes, origin).acceptance()
             }
             (DdsTopic::AuditLog(..), GossipMessage::AuditLog { entry_bytes }) => {
                 crate::telemetry::record_gossip_message("audit");
@@ -3248,6 +3371,21 @@ impl DdsNode {
     /// tick, because a vouch lapsing produces no token to react to.
     fn reconcile_roots_after_token(&mut self, token: &Token) {
         let admin_purpose = dds_core::token::purpose::ADMIN;
+        // **R1** — a vouch that anchors its subject refunds the
+        // fresh-identity charge for it: real onboarding stops counting the
+        // moment someone with a chain to a root signs for the identity.
+        if token.payload.kind == TokenKind::Vouch {
+            if let Some(sub) = token.payload.vch_iss.as_deref() {
+                let anchored = self
+                    .trust_graph
+                    .read()
+                    .map(|g| g.has_effective_vouch(sub, &self.trusted_roots))
+                    .unwrap_or(false);
+                if anchored {
+                    self.identity_ledger.anchored(sub);
+                }
+            }
+        }
         match token.payload.kind {
             TokenKind::Vouch => {
                 if token.payload.purpose.as_deref() == Some(admin_purpose)
@@ -3312,21 +3450,26 @@ impl DdsNode {
         }
     }
 
-    fn ingest_operation(&mut self, op_bytes: &[u8], token_bytes: &[u8]) {
+    fn ingest_operation(
+        &mut self,
+        op_bytes: &[u8],
+        token_bytes: &[u8],
+        origin: Option<PeerId>,
+    ) -> IngestOutcome {
         // Bounded depth: op_bytes are peer-supplied. Security review I-6.
         let op: dds_core::crdt::causal_dag::Operation =
             match dds_core::cbor_bounded::from_reader(op_bytes) {
                 Ok(op) => op,
                 Err(e) => {
                     error!("op deserialize: {e}");
-                    return;
+                    return IngestOutcome::RejectedTerminal;
                 }
             };
         let token = match Token::from_cbor(token_bytes) {
             Ok(t) => t,
             Err(e) => {
                 error!("token deserialize: {e}");
-                return;
+                return IngestOutcome::RejectedTerminal;
             }
         };
         if self.legacy_token_refused(&token, "gossip-op") {
@@ -3335,7 +3478,7 @@ impl DdsNode {
                 token_bytes.to_vec(),
                 Some("legacy-v1-refused".to_string()),
             );
-            return;
+            return IngestOutcome::RejectedPolicy;
         }
         if let Err(e) = token.validate() {
             warn!("token validation failed: {e}");
@@ -3344,7 +3487,7 @@ impl DdsNode {
                 token_bytes.to_vec(),
                 Some(format!("validation-failed: {e}")),
             );
-            return;
+            return IngestOutcome::RejectedTerminal;
         }
         // **Single-node review 2026-10-13 — op/token binding.** The op
         // must be the canonical operation for this token (see
@@ -3362,7 +3505,7 @@ impl DdsNode {
                 token_bytes.to_vec(),
                 Some(format!("op-binding: {e}")),
             );
-            return;
+            return IngestOutcome::RejectedTerminal;
         }
         // **C-3 (security review)**: before admitting the token to the
         // trust graph, reject attestations that embed a policy or
@@ -3390,7 +3533,7 @@ impl DdsNode {
                 token_bytes.to_vec(),
                 Some("user-auth-attestation-not-self-issued".to_string()),
             );
-            return;
+            return IngestOutcome::RejectedTerminal;
         }
         if !publisher_capability_ok(&token, &self.trust_graph, &self.trusted_roots) {
             warn!(
@@ -3404,7 +3547,7 @@ impl DdsNode {
                 token_bytes.to_vec(),
                 Some("publisher-capability-missing".to_string()),
             );
-            return;
+            return IngestOutcome::RejectedPolicy;
         }
         // **SC-5 Phase B.1 follow-on**: same authoritative-ingest-gate
         // pattern as C-3, but for `SoftwareAssignment::publisher_identity`.
@@ -3425,7 +3568,33 @@ impl DdsNode {
                 token_bytes.to_vec(),
                 Some("publisher-identity-invalid".to_string()),
             );
-            return;
+            return IngestOutcome::RejectedTerminal;
+        }
+        // **R1 (single-node review 2026-10-13)** — a token older than the
+        // unanchored-identity TTL from an issuer no vouch claims is what
+        // the pruner just removed, or never-vouched material a lagging
+        // peer is re-gossiping; refuse it so pruned identities stay gone.
+        if self.stale_unanchored(&token, &BTreeSet::new()) {
+            warn!(
+                jti = %token.payload.jti,
+                issuer = %token.payload.iss,
+                iat = token.payload.iat,
+                "rejecting inbound token: older than the unanchored-identity TTL and unvouched"
+            );
+            crate::telemetry::record_gossip_messages_dropped("stale_unanchored");
+            self.emit_audit_from_ingest(
+                rejected_action_for(&token.payload.kind),
+                token_bytes.to_vec(),
+                Some("stale-unanchored".to_string()),
+            );
+            return IngestOutcome::RejectedTerminal;
+        }
+        // **R1** — fresh-identity budget, charged to the signed publisher.
+        if let Some(source) = origin {
+            if let Err(refusal) = self.charge_fresh_identity(&source, &token) {
+                self.quarantine_identity_flood(source, refusal, &token, token_bytes);
+                return IngestOutcome::RejectedTerminal;
+            }
         }
         let graph_err = {
             let mut g = self.trust_graph.write().expect("trust_graph poisoned");
@@ -3433,12 +3602,17 @@ impl DdsNode {
         };
         if let Some(e) = graph_err {
             warn!("trust graph rejected token: {e}");
+            let outcome = if matches!(e, dds_core::trust::TrustError::DuplicateJti(_)) {
+                IngestOutcome::Duplicate
+            } else {
+                IngestOutcome::RejectedTerminal
+            };
             self.emit_audit_from_ingest(
                 rejected_action_for(&token.payload.kind),
                 token_bytes.to_vec(),
                 Some(format!("trust-graph-rejected: {e}")),
             );
-            return;
+            return outcome;
         }
         if let Err(e) = self.store.put_token(&token) {
             error!("store error: {e}");
@@ -3472,9 +3646,13 @@ impl DdsNode {
                 {
                     self.check_self_update_quorum_and_maybe_apply(&token);
                 }
+                IngestOutcome::Accepted
             }
-            Ok(false) => {} // duplicate
-            Err(e) => warn!("DAG insert failed: {e}"),
+            Ok(false) => IngestOutcome::Duplicate,
+            Err(e) => {
+                warn!("DAG insert failed: {e}");
+                IngestOutcome::Accepted
+            }
         }
     }
 
@@ -3945,12 +4123,12 @@ impl DdsNode {
         }
     }
 
-    fn ingest_burn(&mut self, token_bytes: &[u8]) {
+    fn ingest_burn(&mut self, token_bytes: &[u8], origin: Option<PeerId>) -> IngestOutcome {
         let token = match Token::from_cbor(token_bytes) {
             Ok(t) => t,
             Err(e) => {
                 error!("burn token deserialize: {e}");
-                return;
+                return IngestOutcome::RejectedTerminal;
             }
         };
         if self.legacy_token_refused(&token, "gossip-burn") {
@@ -3959,7 +4137,7 @@ impl DdsNode {
                 token_bytes.to_vec(),
                 Some("legacy-v1-refused".to_string()),
             );
-            return;
+            return IngestOutcome::RejectedPolicy;
         }
         if let Err(e) = token.validate() {
             warn!("burn validation failed: {e}");
@@ -3968,7 +4146,7 @@ impl DdsNode {
                 token_bytes.to_vec(),
                 Some(format!("validation-failed: {e}")),
             );
-            return;
+            return IngestOutcome::RejectedTerminal;
         }
         // M-9: same replay window applies to burn tokens.
         if !revocation_within_replay_window(token.payload.iat) {
@@ -3982,7 +4160,15 @@ impl DdsNode {
                 token_bytes.to_vec(),
                 Some("iat-outside-replay-window".to_string()),
             );
-            return;
+            return IngestOutcome::RejectedTerminal;
+        }
+        // **R1** — a burn of an identity nobody has seen is a fresh
+        // identity too (it grows the burned set forever); charge it.
+        if let Some(source) = origin {
+            if let Err(refusal) = self.charge_fresh_identity(&source, &token) {
+                self.quarantine_identity_flood(source, refusal, &token, token_bytes);
+                return IngestOutcome::RejectedTerminal;
+            }
         }
         let graph_err = {
             let mut g = self.trust_graph.write().expect("trust_graph poisoned");
@@ -3990,12 +4176,17 @@ impl DdsNode {
         };
         if let Some(e) = graph_err {
             warn!("trust graph rejected burn: {e}");
+            let outcome = if matches!(e, dds_core::trust::TrustError::DuplicateJti(_)) {
+                IngestOutcome::Duplicate
+            } else {
+                IngestOutcome::RejectedTerminal
+            };
             self.emit_audit_from_ingest(
                 "burn.rejected",
                 token_bytes.to_vec(),
                 Some(format!("trust-graph-rejected: {e}")),
             );
-            return;
+            return outcome;
         }
         if let Err(e) = self.store.put_token(&token) {
             error!("store error: {e}");
@@ -4014,6 +4205,253 @@ impl DdsNode {
         if let Err(e) = self.store.put_operation(&op) {
             warn!("put_operation (burn) store error: {e}");
         }
+        IngestOutcome::Accepted
+    }
+
+    // ---------- R1: identity flood + unanchored-identity pruning ----------
+
+    /// Whether `peer` is currently quarantined for an identity flood.
+    /// Expired entries are dropped on the way.
+    fn is_identity_flood_quarantined(&mut self, peer: &PeerId, now: Instant) -> bool {
+        match self.identity_flood_quarantine.get(peer).copied() {
+            Some(until) if now < until => true,
+            Some(_) => {
+                self.identity_flood_quarantine.remove(peer);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Charge `source` for `token` if its issuer is an identity this node
+    /// has never seen a token from. Trusted roots and already-known
+    /// issuers are free; an issuer that already holds an effective vouch
+    /// counts only toward the hard cap.
+    fn charge_fresh_identity(&mut self, source: &PeerId, token: &Token) -> Result<(), Refusal> {
+        if self.identity_ledger.limits().disabled() {
+            return Ok(());
+        }
+        if !matches!(
+            token.payload.kind,
+            TokenKind::Attest | TokenKind::Vouch | TokenKind::Burn
+        ) {
+            return Ok(());
+        }
+        let iss = token.payload.iss.as_str();
+        if self.trusted_roots.contains(iss) {
+            return Ok(());
+        }
+        let (known, anchored) = {
+            let g = self.trust_graph.read().expect("trust_graph poisoned");
+            (
+                g.knows_issuer(iss),
+                g.has_effective_vouch(iss, &self.trusted_roots),
+            )
+        };
+        if known {
+            return Ok(());
+        }
+        self.identity_ledger
+            .charge(source, iss, anchored, Instant::now())
+    }
+
+    /// A gossip publisher blew the fresh-identity budget: quarantine it
+    /// for the rest of the window, drop its live connection, and leave an
+    /// audit entry naming it so an operator can revoke its admission.
+    fn quarantine_identity_flood(
+        &mut self,
+        source: PeerId,
+        refusal: Refusal,
+        token: &Token,
+        token_bytes: &[u8],
+    ) {
+        let now = Instant::now();
+        let newly = self
+            .identity_flood_quarantine
+            .insert(source, now + IDENTITY_FLOOD_QUARANTINE)
+            .is_none();
+        crate::telemetry::record_gossip_messages_dropped("identity_flood");
+        if self.admitted_peers.remove(&source) || self.swarm.is_connected(&source) {
+            let _ = self.swarm.disconnect_peer_id(source);
+            self.unadmitted_since.remove(&source);
+            self.refresh_peer_count_gauges();
+        }
+        if newly {
+            warn!(
+                peer = %source,
+                ?refusal,
+                introduced = self.identity_ledger.total(&source),
+                jti = %token.payload.jti,
+                issuer = %token.payload.iss,
+                "R1: identity flood — publisher quarantined for 24 h; to remove it from the \
+                 domain run `dds-node revoke-admission --peer-id {source}`"
+            );
+            self.emit_audit_from_ingest(
+                "peer.identity-flood",
+                token_bytes.to_vec(),
+                Some(format!("{refusal:?} source={source}")),
+            );
+        }
+    }
+
+    /// **R1** — whether `token` is older than the unanchored-identity TTL
+    /// and comes from an issuer that no vouch in the graph (or in
+    /// `batch_vouched`, the subjects vouched in the same sync batch)
+    /// claims. Only prunable token kinds are judged (see
+    /// [`crate::expiry::is_prunable_token`]); trusted roots are exempt.
+    fn stale_unanchored(&self, token: &Token, batch_vouched: &BTreeSet<String>) -> bool {
+        let ttl_days = self.config.unanchored_identity_ttl_days;
+        if ttl_days == 0 || !crate::expiry::is_prunable_token(token) {
+            return false;
+        }
+        let iss = token.payload.iss.as_str();
+        if self.trusted_roots.contains(iss) || batch_vouched.contains(iss) {
+            return false;
+        }
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(_) => return false,
+        };
+        if now <= token.payload.iat.saturating_add(ttl_days * 86_400) {
+            return false;
+        }
+        let g = self.trust_graph.read().expect("trust_graph poisoned");
+        !g.has_any_vouch_for(iss)
+    }
+
+    /// **R1** — the identity gates for an anti-entropy batch from `peer`:
+    /// drop tokens that are stale-unanchored (vouches in the same batch
+    /// count as anchoring) and fresh identities beyond the responder's
+    /// budget. A responder over budget is *throttled*, never quarantined:
+    /// it may be an honest node relaying what it accepted before the
+    /// flood was caught, and anti-entropy from it keeps working for
+    /// everything that is not a fresh identity.
+    fn apply_identity_gates(
+        &mut self,
+        peer: PeerId,
+        payloads: Vec<SyncPayload>,
+    ) -> Vec<SyncPayload> {
+        let mut batch_vouched: BTreeSet<String> = BTreeSet::new();
+        let mut decoded: Vec<(SyncPayload, Option<Token>)> = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let token = Token::from_cbor(&payload.token_bytes).ok();
+            if let Some(t) = token.as_ref() {
+                if t.payload.kind == TokenKind::Vouch {
+                    if let Some(sub) = t.payload.vch_iss.as_deref() {
+                        batch_vouched.insert(sub.to_string());
+                    }
+                }
+            }
+            decoded.push((payload, token));
+        }
+        let mut kept = Vec::with_capacity(decoded.len());
+        let mut stale = 0usize;
+        let mut flooded = 0usize;
+        for (payload, token) in decoded {
+            let Some(token) = token else {
+                kept.push(payload); // apply surfaces the decode error
+                continue;
+            };
+            if self.stale_unanchored(&token, &batch_vouched) {
+                stale += 1;
+                crate::telemetry::record_sync_payloads_rejected("stale_unanchored");
+                continue;
+            }
+            if self.charge_fresh_identity(&peer, &token).is_err() {
+                flooded += 1;
+                crate::telemetry::record_sync_payloads_rejected("identity_flood");
+                continue;
+            }
+            kept.push(payload);
+        }
+        if stale > 0 {
+            debug!(%peer, stale, "sync: dropped stale unvouched tokens (unanchored-identity TTL)");
+        }
+        if flooded > 0 {
+            warn!(
+                %peer,
+                dropped = flooded,
+                introduced = self.identity_ledger.total(&peer),
+                "R1: responder over the fresh-identity budget — further fresh identities \
+                 from it are dropped until its window resets (not disconnected: it may be \
+                 relaying a flood it accepted earlier). If this peer is the origin, run \
+                 `dds-node revoke-admission --peer-id {peer}`"
+            );
+        }
+        kept
+    }
+
+    /// **R1** — run one unanchored-identity prune pass against the shared
+    /// graph and the store, then drop the pruned ops from the in-memory
+    /// DAG and the sync cache. Trusted roots, the bootstrap admin and
+    /// this node's own identity are protected.
+    fn prune_unanchored_identities(&mut self) -> crate::expiry::PruneStats {
+        let ttl_days = self.config.unanchored_identity_ttl_days;
+        if ttl_days == 0 {
+            return crate::expiry::PruneStats::default();
+        }
+        self.last_unanchored_prune = Instant::now();
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(e) => {
+                warn!("system clock error, skipping unanchored-identity prune: {e}");
+                return crate::expiry::PruneStats::default();
+            }
+        };
+        let mut protected: BTreeSet<String> = BTreeSet::new();
+        if let Some(urn) = self.config.bootstrap_admin_urn.as_ref() {
+            protected.insert(urn.clone());
+        }
+        if let Some(id) = self.node_identity.as_ref() {
+            protected.insert(id.id.to_urn());
+        }
+        let stats = {
+            let mut g = self.trust_graph.write().expect("trust_graph poisoned");
+            crate::expiry::prune_unanchored_once(
+                &mut g,
+                &mut self.store,
+                &self.trusted_roots,
+                &protected,
+                now,
+                ttl_days * 86_400,
+            )
+        };
+        for jti in &stats.pruned_jtis {
+            let op_id = dds_net::sync::canonical_op_id(jti);
+            self.dag.remove(&op_id);
+            self.sync_payloads.remove(&op_id);
+        }
+        if stats.identities_pruned > 0 {
+            info!(
+                identities = stats.identities_pruned,
+                tokens = stats.pruned_jtis.len(),
+                ttl_days,
+                "R1: pruned unanchored identities"
+            );
+            self.emit_audit_from_ingest(
+                "identity.pruned",
+                Vec::new(),
+                Some(format!(
+                    "identities={} tokens={} ttl_days={ttl_days}",
+                    stats.identities_pruned,
+                    stats.pruned_jtis.len()
+                )),
+            );
+            self.refresh_peer_count_gauges();
+        }
+        stats
+    }
+
+    /// **R1 test hook** — run the prune pass now, ignoring the hourly cadence.
+    #[doc(hidden)]
+    pub fn prune_unanchored_identities_for_tests(&mut self) -> crate::expiry::PruneStats {
+        self.prune_unanchored_identities()
+    }
+
+    /// **R1 test hook** — whether `peer` is quarantined for an identity flood.
+    #[doc(hidden)]
+    pub fn identity_flood_quarantined_for_tests(&mut self, peer: &PeerId) -> bool {
+        self.is_identity_flood_quarantined(peer, Instant::now())
     }
 
     fn ingest_audit(&mut self, entry_bytes: &[u8]) {
@@ -5047,6 +5485,8 @@ impl DdsNode {
                 true
             })
             .collect();
+        // **R1** — stale-unanchored and fresh-identity-budget gates.
+        let payloads = self.apply_identity_gates(peer, payloads);
         if payloads.is_empty() {
             debug!(%peer, "sync: all payloads rejected by publisher capability filter");
             return;
@@ -5251,6 +5691,7 @@ impl DdsNode {
                     } else {
                         debug!(%peer, payload_count, enc_count, "sync: served request");
                         crate::telemetry::record_sync_serve("ok");
+                        self.sync_requests_served = self.sync_requests_served.saturating_add(1);
                     }
                 }
                 RrMessage::Response {
@@ -5826,7 +6267,7 @@ impl DdsNode {
         topic_hash: &libp2p::gossipsub::TopicHash,
         data: &[u8],
     ) {
-        let _ = self.handle_gossip_message(topic_hash, data);
+        let _ = self.handle_gossip_message(topic_hash, data, None);
     }
 
     /// **H-1 test hook.** Run the full inbound-gossip classification —
@@ -5942,6 +6383,13 @@ impl DdsNode {
     /// Get the number of connected peers.
     pub fn connected_peers(&self) -> usize {
         self.swarm.connected_peers().count()
+    }
+
+    /// Number of sync (anti-entropy) requests this node has answered.
+    /// See the field doc: non-zero means at least one admitted peer has
+    /// completed its side of the handshake and is pulling from us.
+    pub fn sync_requests_served(&self) -> u64 {
+        self.sync_requests_served
     }
 
     /// Get the number of operations in the DAG.
@@ -7615,6 +8063,7 @@ mod admission_cert_revocation_epoch_rotation_tests {
             bootstrap_admin_urn: None,
             identity_path: None,
             expiry_scan_interval_secs: 60,
+            unanchored_identity_ttl_days: 0,
             self_update_apply: true,
         };
         let node = DdsNode::init(cfg, p2p_kp).expect("init node");
@@ -7870,6 +8319,7 @@ mod timing_config_validation_tests {
             bootstrap_admin_urn: None,
             identity_path: None,
             expiry_scan_interval_secs: 60,
+            unanchored_identity_ttl_days: 0,
             self_update_apply: true,
         }
     }
@@ -8016,6 +8466,7 @@ mod r5_sync_quorum_replay_tests {
             bootstrap_admin_urn: None,
             identity_path: None,
             expiry_scan_interval_secs: 60,
+            unanchored_identity_ttl_days: 0,
             self_update_apply: false,
         };
         let node = DdsNode::init(cfg, p2p_kp).expect("init node");
@@ -8266,9 +8717,9 @@ mod r5_sync_quorum_replay_tests {
                 user_auth_attestation_token(&attacker, &victim_urn, "attest-forged-gossip");
             let legit = user_auth_attestation_token(&victim, &victim_urn, "attest-legit-gossip");
             let p = canonical_payload(&forged);
-            node.ingest_operation(&p.op_bytes, &p.token_bytes);
+            node.ingest_operation(&p.op_bytes, &p.token_bytes, None);
             let p = canonical_payload(&legit);
-            node.ingest_operation(&p.op_bytes, &p.token_bytes);
+            node.ingest_operation(&p.op_bytes, &p.token_bytes, None);
             assert!(
                 !has(&node, "attest-forged-gossip"),
                 "gossip must drop iss != sub"
@@ -8362,10 +8813,10 @@ mod r5_sync_quorum_replay_tests {
             let carol_tok = make_attest(&carol);
             let carol_jti = carol_tok.payload.jti.clone();
             let p = sync_payload("op-not-carol", &carol_tok);
-            node.ingest_operation(&p.op_bytes, &p.token_bytes);
+            node.ingest_operation(&p.op_bytes, &p.token_bytes, None);
             assert!(!has(&node, &carol_jti), "gossip must drop an aliased op id");
             let p = canonical_payload(&carol_tok);
-            node.ingest_operation(&p.op_bytes, &p.token_bytes);
+            node.ingest_operation(&p.op_bytes, &p.token_bytes, None);
             assert!(has(&node, &carol_jti));
         });
     }
@@ -8602,6 +9053,283 @@ mod r5_sync_quorum_replay_tests {
             );
         });
     }
+
+    // ---------- R1: identity flood + unanchored-identity pruning ----------
+
+    fn attest_at(ident: &Identity, iat: u64) -> Token {
+        Token::sign(
+            TokenPayload {
+                iss: ident.id.to_urn(),
+                iss_key: ident.public_key.clone(),
+                jti: format!("attest-{}-{}", ident.id.label(), uuid::Uuid::new_v4()),
+                sub: ident.id.to_urn(),
+                kind: TokenKind::Attest,
+                purpose: Some("dds:directory-entry".into()),
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat,
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &ident.signing_key,
+        )
+        .unwrap()
+    }
+
+    fn now_unix() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn knows(node: &DdsNode, urn: &str) -> bool {
+        node.trust_graph.read().unwrap().knows_issuer(urn)
+    }
+
+    /// **R1.** A sync responder that introduces more unanchored fresh
+    /// identities than the budget is throttled — later fresh identities
+    /// from it are dropped — but stays admitted, and a root vouch for one
+    /// of its identities refunds the charge.
+    #[test]
+    fn sync_responder_over_identity_budget_is_throttled_not_quarantined() {
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("flood-sync.local", [21u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            node.identity_ledger = IdentityLedger::new(Limits {
+                budget: 2,
+                grace: Duration::from_secs(0),
+                hard_cap: 0,
+            });
+            let peer = PeerId::random();
+            node.admit_peer_for_tests(peer);
+
+            let ids: Vec<Identity> = (0..5)
+                .map(|i| Identity::generate(&format!("u{i}"), &mut OsRng))
+                .collect();
+            let toks: Vec<Token> = ids.iter().map(|id| attest_at(id, now_unix())).collect();
+            node.apply_decrypted_sync_response(
+                peer,
+                sync_response(toks.iter().map(canonical_payload).collect()),
+            );
+            let accepted = ids
+                .iter()
+                .filter(|id| knows(&node, &id.id.to_urn()))
+                .count();
+            assert_eq!(
+                accepted, 3,
+                "budget 2 ⇒ the first three land, the rest are dropped"
+            );
+            assert!(
+                !node.identity_flood_quarantined_for_tests(&peer),
+                "a sync responder is throttled, never quarantined"
+            );
+            assert!(node.admitted_peers().contains(&peer));
+
+            // The root vouches the first identity: it stops counting, so
+            // one more fresh identity fits.
+            let vouch = make_vouch(&root, &ids[0], &toks[0], "dds:session", "v-u0");
+            node.apply_decrypted_sync_response(
+                peer,
+                sync_response(vec![canonical_payload(&vouch)]),
+            );
+            let late = Identity::generate("late", &mut OsRng);
+            node.apply_decrypted_sync_response(
+                peer,
+                sync_response(vec![canonical_payload(&attest_at(&late, now_unix()))]),
+            );
+            assert!(knows(&node, &late.id.to_urn()), "refund after anchoring");
+        });
+    }
+
+    /// **R1.** A gossip publisher that blows the budget is quarantined:
+    /// the offending token is refused and not relayed, the publisher is
+    /// dropped from the admitted set, and its further tokens are refused.
+    #[test]
+    fn gossip_publisher_over_identity_budget_is_quarantined() {
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("flood-gossip.local", [22u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            node.identity_ledger = IdentityLedger::new(Limits {
+                budget: 2,
+                grace: Duration::from_secs(0),
+                hard_cap: 0,
+            });
+            let publisher = PeerId::random();
+            node.admit_peer_for_tests(publisher);
+
+            let mut outcomes = Vec::new();
+            for i in 0..4 {
+                let id = Identity::generate(&format!("g{i}"), &mut OsRng);
+                let p = canonical_payload(&attest_at(&id, now_unix()));
+                outcomes.push(node.ingest_operation(&p.op_bytes, &p.token_bytes, Some(publisher)));
+            }
+            assert_eq!(
+                outcomes,
+                vec![
+                    IngestOutcome::Accepted,
+                    IngestOutcome::Accepted,
+                    IngestOutcome::Accepted,
+                    IngestOutcome::RejectedTerminal
+                ]
+            );
+            assert!(node.identity_flood_quarantined_for_tests(&publisher));
+            assert!(
+                !node.admitted_peers().contains(&publisher),
+                "quarantine drops the live admission"
+            );
+            // The root's own first token is never charged.
+            let p = canonical_payload(&attest_at(&root, now_unix()));
+            assert_eq!(
+                node.ingest_operation(&p.op_bytes, &p.token_bytes, Some(PeerId::random())),
+                IngestOutcome::Accepted
+            );
+        });
+    }
+
+    /// **R1.** Tokens older than the unanchored-identity TTL from an
+    /// issuer no vouch claims are refused on both paths; a vouch in the
+    /// same sync batch, a vouch already in the graph, or being a trusted
+    /// root makes them acceptable again.
+    #[test]
+    fn stale_unanchored_tokens_are_refused_unless_vouched() {
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("stale.local", [23u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            node.config.unanchored_identity_ttl_days = 30;
+            let peer = PeerId::random();
+            let old = now_unix() - 40 * 86_400;
+
+            // Alone: refused on sync and on gossip.
+            let ghost = Identity::generate("ghost", &mut OsRng);
+            let ghost_tok = attest_at(&ghost, old);
+            node.apply_decrypted_sync_response(
+                peer,
+                sync_response(vec![canonical_payload(&ghost_tok)]),
+            );
+            assert!(!knows(&node, &ghost.id.to_urn()));
+            let p = canonical_payload(&ghost_tok);
+            assert_eq!(
+                node.ingest_operation(&p.op_bytes, &p.token_bytes, Some(peer)),
+                IngestOutcome::RejectedTerminal
+            );
+
+            // With its vouch in the same batch: accepted.
+            let user = Identity::generate("user", &mut OsRng);
+            let user_tok = attest_at(&user, old);
+            let vouch = make_vouch(&root, &user, &user_tok, "dds:session", "v-old-user");
+            node.apply_decrypted_sync_response(
+                peer,
+                sync_response(vec![
+                    canonical_payload(&user_tok),
+                    canonical_payload(&vouch),
+                ]),
+            );
+            assert!(knows(&node, &user.id.to_urn()));
+
+            // The root's own old token is exempt.
+            let p = canonical_payload(&attest_at(&root, old));
+            assert_eq!(
+                node.ingest_operation(&p.op_bytes, &p.token_bytes, Some(peer)),
+                IngestOutcome::Accepted
+            );
+
+            // Disabled TTL accepts the ghost.
+            node.config.unanchored_identity_ttl_days = 0;
+            let p = canonical_payload(&ghost_tok);
+            assert_eq!(
+                node.ingest_operation(&p.op_bytes, &p.token_bytes, Some(peer)),
+                IngestOutcome::Accepted
+            );
+        });
+    }
+
+    /// **R1.** The prune pass removes an identity nobody vouched after
+    /// the TTL from the graph, the store, the DAG and the sync cache, and
+    /// leaves vouched identities and the root alone.
+    #[test]
+    fn prune_removes_unanchored_identity_everywhere() {
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("prune.local", [24u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            let old = now_unix() - 40 * 86_400;
+
+            // Land everything with pruning off (the ingest gate would
+            // refuse the old ghost otherwise), then switch it on.
+            let ghost = Identity::generate("ghost", &mut OsRng);
+            let ghost_tok = attest_at(&ghost, old);
+            let user = Identity::generate("user", &mut OsRng);
+            let user_tok = attest_at(&user, old);
+            let vouch = make_vouch(&root, &user, &user_tok, "dds:session", "v-prune-user");
+            let root_tok = attest_at(&root, old);
+            let peer = PeerId::random();
+            node.apply_decrypted_sync_response(
+                peer,
+                sync_response(vec![
+                    canonical_payload(&ghost_tok),
+                    canonical_payload(&user_tok),
+                    canonical_payload(&vouch),
+                    canonical_payload(&root_tok),
+                ]),
+            );
+            assert!(knows(&node, &ghost.id.to_urn()));
+            node.config.unanchored_identity_ttl_days = 30;
+
+            let stats = node.prune_unanchored_identities_for_tests();
+            assert_eq!(stats.identities_pruned, 1, "{stats:?}");
+            assert_eq!(stats.pruned_jtis, vec![ghost_tok.payload.jti.clone()]);
+            assert!(!knows(&node, &ghost.id.to_urn()));
+            assert!(!node.store.has_token(&ghost_tok.payload.jti));
+            let ghost_op = format!("op-{}", ghost_tok.payload.jti);
+            assert!(node.dag.get(&ghost_op).is_none());
+            assert!(!node.store.has_operation(&ghost_op));
+            let served = node.build_sync_response_for_tests(&SyncRequest {
+                known_op_ids: BTreeSet::new(),
+                heads: BTreeSet::new(),
+            });
+            let served_ids: Vec<String> = served
+                .payloads
+                .iter()
+                .filter_map(|p| {
+                    ciborium::from_reader::<Operation, _>(p.op_bytes.as_slice())
+                        .ok()
+                        .map(|o| o.id)
+                })
+                .collect();
+            assert!(!served_ids.contains(&ghost_op));
+            assert!(served_ids.contains(&format!("op-{}", user_tok.payload.jti)));
+            assert!(knows(&node, &user.id.to_urn()), "vouched identity survives");
+            assert!(knows(&node, &root.id.to_urn()), "root survives");
+            // Idempotent.
+            assert_eq!(
+                node.prune_unanchored_identities_for_tests()
+                    .identities_pruned,
+                0
+            );
+        });
+    }
 }
 
 #[cfg(test)]
@@ -8802,6 +9530,7 @@ mod publish_seed_roots_tests {
             bootstrap_admin_urn,
             identity_path: None,
             expiry_scan_interval_secs: 60,
+            unanchored_identity_ttl_days: 0,
             self_update_apply: false,
         };
         unsafe { std::env::remove_var(crate::identity_store::REQUIRE_ENCRYPTED_KEYS_ENV) };

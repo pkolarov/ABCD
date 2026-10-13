@@ -373,6 +373,7 @@ async fn publish_fixture(
         bootstrap_admin_urn: None,
         identity_path: None,
         expiry_scan_interval_secs: 60,
+        unanchored_identity_ttl_days: 30,
         self_update_apply: true,
     };
 
@@ -623,6 +624,11 @@ fn publish_operation(node: &mut DdsNode, token: &Token) -> Result<(), Box<dyn st
     let token_bytes = token
         .to_cbor()
         .map_err(|e| format!("encode token cbor: {e}"))?;
+    // Serve the op on anti-entropy too. Gossipsub de-duplicates by
+    // message id, so an op the target dropped (for instance because it
+    // had not admitted us yet) can never be re-gossiped; the target's
+    // next sync request is the only path that recovers it.
+    node.cache_sync_payload(&op.id, &op, &token_bytes);
     // **PQ-B7-WIRE-1**: use `publish_gossip_op` so enc-v3 wrapping is
     // applied transparently when the domain has the capability.
     let msg = GossipMessage::DirectoryOp {
@@ -640,20 +646,28 @@ async fn wait_for_mesh(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // H-12: it's not enough to have a TCP connection; the remote peer
     // must also be in `admitted_peers` (i.e. its admission cert has
-    // verified) before any gossip we emit will be accepted. Return
-    // only after both conditions hold.
+    // verified) before any gossip we emit will be accepted. Admission is
+    // per direction, though: *we* admitting the target says nothing
+    // about whether the target has admitted *us* yet, and gossip it
+    // receives before it has is dropped unrecoverably (gossipsub never
+    // re-delivers a message id). The target's first anti-entropy request
+    // to us is sent only once it has admitted us, so wait for that too.
     let deadline = Instant::now() + timeout;
     loop {
-        if node.swarm.connected_peers().count() > 0 && !node.admitted_peers().is_empty() {
+        if node.swarm.connected_peers().count() > 0
+            && !node.admitted_peers().is_empty()
+            && node.sync_requests_served() > 0
+        {
             return Ok(());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(format!(
-                "timed out waiting for publisher to be admitted \
-                 (connected={}, admitted={})",
+                "timed out waiting for mutual admission \
+                 (connected={}, admitted={}, sync_requests_served={})",
                 node.swarm.connected_peers().count(),
                 node.admitted_peers().len(),
+                node.sync_requests_served(),
             )
             .into());
         }

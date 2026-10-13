@@ -98,6 +98,11 @@ pub trait OperationStore {
     /// Check if an operation exists.
     fn has_operation(&self, id: &str) -> bool;
 
+    /// Delete an operation by id. Deleting an absent id is not an error.
+    /// Used by the unanchored-identity pruner together with
+    /// [`TokenStore::delete_token`].
+    fn delete_operation(&mut self, id: &str) -> StoreResult<()>;
+
     /// List all operation IDs.
     fn operation_ids(&self) -> StoreResult<BTreeSet<String>>;
 

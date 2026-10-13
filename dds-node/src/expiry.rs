@@ -5,10 +5,12 @@
 //! in the store. Runs as a tokio task at a configurable interval
 //! (`NodeConfig::expiry_scan_interval_secs`).
 
+use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use dds_core::token::TokenKind;
 use dds_core::trust::TrustGraph;
-use dds_store::traits::{RevocationStore, TokenStore};
+use dds_store::traits::{OperationStore, RevocationStore, TokenStore};
 use tracing::{debug, info, warn};
 
 /// Result of one sweep pass.
@@ -54,6 +56,122 @@ where
             scanned = stats.scanned,
             expired = stats.expired,
             "expiry sweep completed"
+        );
+    }
+    stats
+}
+
+/// Result of one unanchored-identity prune pass.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PruneStats {
+    /// Issuers examined.
+    pub identities_scanned: usize,
+    /// Issuers whose tokens were removed.
+    pub identities_pruned: usize,
+    /// JTIs removed from the graph and the store (their canonical
+    /// `op-<jti>` operations were removed from the store as well). The
+    /// caller drops them from its in-memory DAG and sync cache.
+    pub pruned_jtis: Vec<String>,
+}
+
+/// Whether an identity's token set is of the kind the pruner may remove:
+/// plain attestations, user-auth attestations and vouches. Any other
+/// document type (device join, policy, software, account bindings, SSO
+/// links, service principals, sessions, self-update) marks an identity
+/// the pruner leaves alone — those are legitimately unvouched or are
+/// gated elsewhere.
+pub fn is_prunable_token(token: &dds_core::token::Token) -> bool {
+    match token.payload.kind {
+        TokenKind::Vouch => true,
+        TokenKind::Attest => matches!(
+            token.payload.body_type.as_deref(),
+            None | Some(dds_domain::body_types::USER_AUTH_ATTESTATION)
+        ),
+        TokenKind::Revoke | TokenKind::Burn => false,
+    }
+}
+
+/// **R1 (single-node review 2026-10-13)** — remove identities that have
+/// been *unanchored* for longer than `ttl_secs`.
+///
+/// An identity is unanchored when it has no effective vouch — nobody with
+/// a chain to a trusted root currently signs for it. That is the state a
+/// throw-away identity minted by a hostile peer is in forever, and the
+/// state a legitimately offboarded user enters when their vouch is
+/// revoked or expires. The clock starts at
+/// [`TrustGraph::unanchored_since`] (newest own token, or the loss of the
+/// last vouch), so an offboarded user keeps their record for the full
+/// `ttl_secs` after the offboarding.
+///
+/// Never pruned: `trusted_roots`, anything in `protected` (the bootstrap
+/// admin and this node's own identity), identities that are not purely
+/// made of prunable tokens (see [`is_prunable_token`] — device-join
+/// identities in particular), and identities with an effective vouch.
+/// Burned identities lose their tokens like any other but stay in the
+/// graph's burned set.
+///
+/// Every node evaluates the same rule on the same replicated data, so
+/// nodes prune at (about) the same time; the matching ingest rule in
+/// `dds-node::node` refuses tokens older than the TTL from an issuer no
+/// vouch claims, so pruned material cannot return through anti-entropy
+/// from a lagging peer.
+pub fn prune_unanchored_once<S>(
+    graph: &mut TrustGraph,
+    store: &mut S,
+    trusted_roots: &BTreeSet<String>,
+    protected: &BTreeSet<String>,
+    now: u64,
+    ttl_secs: u64,
+) -> PruneStats
+where
+    S: TokenStore + OperationStore,
+{
+    let mut stats = PruneStats::default();
+    if ttl_secs == 0 {
+        return stats;
+    }
+    let issuers = graph.issuers();
+    stats.identities_scanned = issuers.len();
+    for urn in issuers {
+        if trusted_roots.contains(&urn) || protected.contains(&urn) {
+            continue;
+        }
+        if graph.has_effective_vouch(&urn, trusted_roots) {
+            continue;
+        }
+        let jtis: Vec<String> = {
+            let tokens = graph.tokens_issued_by(&urn);
+            if tokens.is_empty() || !tokens.iter().all(|t| is_prunable_token(t)) {
+                continue;
+            }
+            tokens.iter().map(|t| t.payload.jti.clone()).collect()
+        };
+        let Some(since) = graph.unanchored_since(&urn) else {
+            continue;
+        };
+        if now <= since.saturating_add(ttl_secs) {
+            continue;
+        }
+        for jti in jtis {
+            graph.remove_token(&jti);
+            if let Err(e) = store.delete_token(&jti) {
+                warn!(jti = %jti, "prune: delete_token failed: {e}");
+            }
+            let op_id = dds_net::sync::canonical_op_id(&jti);
+            if let Err(e) = store.delete_operation(&op_id) {
+                warn!(op_id = %op_id, "prune: delete_operation failed: {e}");
+            }
+            stats.pruned_jtis.push(jti);
+        }
+        stats.identities_pruned += 1;
+        debug!(identity = %urn, unanchored_since = since, "pruned unanchored identity");
+    }
+    if stats.identities_pruned > 0 {
+        info!(
+            scanned = stats.identities_scanned,
+            identities = stats.identities_pruned,
+            tokens = stats.pruned_jtis.len(),
+            "unanchored-identity prune completed"
         );
     }
     stats
@@ -175,6 +293,280 @@ mod tests {
         let s = sweep_once(&mut graph, &mut store, 100);
         assert_eq!(s.expired, 0);
         assert_eq!(s.scanned, 1);
+    }
+
+    // ---------- R1: unanchored-identity pruning ----------
+
+    use dds_store::traits::OperationStore;
+    use std::collections::BTreeSet;
+
+    fn attest_at(id: &Identity, jti: &str, iat: u64, body_type: Option<&str>) -> Token {
+        Token::sign(
+            TokenPayload {
+                iss: id.id.to_urn(),
+                iss_key: id.public_key.clone(),
+                jti: jti.into(),
+                sub: id.id.to_urn(),
+                kind: TokenKind::Attest,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat,
+                exp: None,
+                body_type: body_type.map(String::from),
+                body_cbor: body_type.map(|_| vec![0xa0]),
+            },
+            &id.signing_key,
+        )
+        .unwrap()
+    }
+
+    fn vouch_at(
+        voucher: &Identity,
+        target: &Identity,
+        target_tok: &Token,
+        jti: &str,
+        iat: u64,
+    ) -> Token {
+        Token::sign(
+            TokenPayload {
+                iss: voucher.id.to_urn(),
+                iss_key: voucher.public_key.clone(),
+                jti: jti.into(),
+                sub: target.id.to_urn(),
+                kind: TokenKind::Vouch,
+                purpose: Some("dds:session".into()),
+                vch_iss: Some(target.id.to_urn()),
+                vch_sum: Some(target_tok.payload_hash()),
+                revokes: None,
+                iat,
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &voucher.signing_key,
+        )
+        .unwrap()
+    }
+
+    fn revoke_at(revoker: &Identity, target_jti: &str, jti: &str, iat: u64) -> Token {
+        Token::sign(
+            TokenPayload {
+                iss: revoker.id.to_urn(),
+                iss_key: revoker.public_key.clone(),
+                jti: jti.into(),
+                sub: revoker.id.to_urn(),
+                kind: TokenKind::Revoke,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: Some(target_jti.into()),
+                iat,
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &revoker.signing_key,
+        )
+        .unwrap()
+    }
+
+    /// Put a token in both the graph and the store, with its canonical op.
+    fn land(graph: &mut TrustGraph, store: &mut MemoryBackend, t: &Token) {
+        graph.add_token(t.clone()).unwrap();
+        store.put_token(t).unwrap();
+        store
+            .put_operation(&dds_core::crdt::causal_dag::Operation {
+                id: dds_net::sync::canonical_op_id(&t.payload.jti),
+                author: t.payload.iss.clone(),
+                deps: vec![],
+                data: vec![],
+                timestamp: 0,
+            })
+            .unwrap();
+    }
+
+    const DAY: u64 = 86_400;
+
+    #[test]
+    fn prune_removes_only_old_unanchored_identities() {
+        let mut graph = TrustGraph::new();
+        let mut store = MemoryBackend::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let roots: BTreeSet<String> = [root.id.to_urn()].into_iter().collect();
+        let protected: BTreeSet<String> = BTreeSet::new();
+
+        let ghost = Identity::generate("ghost", &mut OsRng); // never vouched, old
+        let fresh = Identity::generate("fresh", &mut OsRng); // never vouched, recent
+        let user = Identity::generate("user", &mut OsRng); // vouched by root
+        let device = Identity::generate("device", &mut OsRng); // device-join, never vouched
+
+        let t0 = 1_000_000u64;
+        land(
+            &mut graph,
+            &mut store,
+            &attest_at(&ghost, "a-ghost", t0, None),
+        );
+        land(
+            &mut graph,
+            &mut store,
+            &attest_at(&fresh, "a-fresh", t0 + 40 * DAY, None),
+        );
+        let user_tok = attest_at(&user, "a-user", t0, None);
+        land(&mut graph, &mut store, &user_tok);
+        land(
+            &mut graph,
+            &mut store,
+            &vouch_at(&root, &user, &user_tok, "v-user", t0),
+        );
+        land(
+            &mut graph,
+            &mut store,
+            &attest_at(
+                &device,
+                "a-device",
+                t0,
+                Some(dds_domain::body_types::DEVICE_JOIN),
+            ),
+        );
+        // The root's own attestation is config-anchored, never pruned.
+        land(
+            &mut graph,
+            &mut store,
+            &attest_at(&root, "a-root", t0, None),
+        );
+
+        let now = t0 + 45 * DAY;
+        let stats =
+            prune_unanchored_once(&mut graph, &mut store, &roots, &protected, now, 30 * DAY);
+        assert_eq!(stats.identities_pruned, 1, "{stats:?}");
+        assert_eq!(stats.pruned_jtis, vec!["a-ghost".to_string()]);
+        assert!(!graph.knows_issuer(&ghost.id.to_urn()));
+        assert!(!store.has_token("a-ghost"));
+        assert!(!store.has_operation("op-a-ghost"));
+        for kept in ["a-fresh", "a-user", "v-user", "a-device", "a-root"] {
+            assert!(store.has_token(kept), "{kept} must survive");
+        }
+        assert!(graph.knows_issuer(&fresh.id.to_urn()));
+        assert!(graph.knows_issuer(&device.id.to_urn()));
+
+        // Disabled TTL is a no-op.
+        let off = prune_unanchored_once(&mut graph, &mut store, &roots, &protected, now + DAY, 0);
+        assert_eq!(off, PruneStats::default());
+    }
+
+    #[test]
+    fn offboarded_user_is_kept_for_ttl_after_the_revocation_then_pruned() {
+        let mut graph = TrustGraph::new();
+        let mut store = MemoryBackend::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let roots: BTreeSet<String> = [root.id.to_urn()].into_iter().collect();
+        let protected = BTreeSet::new();
+        let user = Identity::generate("user", &mut OsRng);
+        let t0 = 1_000_000u64;
+        let user_tok = attest_at(&user, "a-user", t0, None);
+        land(&mut graph, &mut store, &user_tok);
+        land(
+            &mut graph,
+            &mut store,
+            &vouch_at(&root, &user, &user_tok, "v-user", t0),
+        );
+        // Offboarded a year later.
+        let t_revoke = t0 + 365 * DAY;
+        land(
+            &mut graph,
+            &mut store,
+            &revoke_at(&root, "v-user", "r-user", t_revoke),
+        );
+
+        // 20 days after revocation: inside the TTL measured from the
+        // revocation, even though the enrollment is >1 year old.
+        let s = prune_unanchored_once(
+            &mut graph,
+            &mut store,
+            &roots,
+            &protected,
+            t_revoke + 20 * DAY,
+            30 * DAY,
+        );
+        assert_eq!(s.identities_pruned, 0);
+        assert!(store.has_token("a-user"));
+
+        // 31 days after: pruned. The root's revoke token is not an
+        // issuer token of the user and stays.
+        let s = prune_unanchored_once(
+            &mut graph,
+            &mut store,
+            &roots,
+            &protected,
+            t_revoke + 31 * DAY,
+            30 * DAY,
+        );
+        assert_eq!(s.identities_pruned, 1);
+        assert!(!store.has_token("a-user"));
+        assert!(store.has_token("r-user"));
+    }
+
+    #[test]
+    fn protected_identities_and_burned_set_survive_pruning() {
+        let mut graph = TrustGraph::new();
+        let mut store = MemoryBackend::new();
+        let roots: BTreeSet<String> = BTreeSet::new();
+        let node_id = Identity::generate("node", &mut OsRng);
+        let protected: BTreeSet<String> = [node_id.id.to_urn()].into_iter().collect();
+        let burned = Identity::generate("burned", &mut OsRng);
+        let t0 = 1_000_000u64;
+        land(
+            &mut graph,
+            &mut store,
+            &attest_at(&node_id, "a-node", t0, None),
+        );
+        land(
+            &mut graph,
+            &mut store,
+            &attest_at(&burned, "a-burned", t0, None),
+        );
+        let burn = Token::sign(
+            TokenPayload {
+                iss: burned.id.to_urn(),
+                iss_key: burned.public_key.clone(),
+                jti: "b-burned".into(),
+                sub: burned.id.to_urn(),
+                kind: TokenKind::Burn,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat: t0 + 1,
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &burned.signing_key,
+        )
+        .unwrap();
+        graph.add_token(burn.clone()).unwrap();
+        store.put_token(&burn).unwrap();
+
+        let s = prune_unanchored_once(
+            &mut graph,
+            &mut store,
+            &roots,
+            &protected,
+            t0 + 60 * DAY,
+            30 * DAY,
+        );
+        assert_eq!(s.identities_pruned, 1);
+        assert!(
+            store.has_token("a-node"),
+            "protected node identity survives"
+        );
+        assert!(
+            !store.has_token("a-burned"),
+            "burned identity's tokens are pruned"
+        );
+        assert!(graph.is_burned(&burned.id.to_urn()), "…but it stays burned");
     }
 
     #[tokio::test(start_paused = true)]

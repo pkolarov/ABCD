@@ -91,6 +91,7 @@ async fn spawn_node_with_bootstrap(org: &str, bootstrap_peers: Vec<String>) -> (
         bootstrap_admin_urn: None,
         identity_path: None,
         expiry_scan_interval_secs: 60,
+        unanchored_identity_ttl_days: 0,
         self_update_apply: true,
     };
     let mut node = DdsNode::init(cfg, p2p_keypair).expect("init node");
@@ -165,6 +166,7 @@ async fn spawn_node(org: &str) -> (DdsNode, TempDir) {
         bootstrap_admin_urn: None,
         identity_path: None,
         expiry_scan_interval_secs: 60,
+        unanchored_identity_ttl_days: 0,
         self_update_apply: true,
     };
     let mut node = DdsNode::init(cfg, p2p_keypair).expect("init node");

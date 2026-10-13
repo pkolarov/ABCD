@@ -18,6 +18,7 @@ pub mod expiry;
 // binary can apply the owner-only restriction to the DPAPI seal blob.
 pub mod file_acl;
 pub mod http;
+pub mod identity_flood;
 pub mod identity_store;
 pub mod key_provider;
 pub mod node;

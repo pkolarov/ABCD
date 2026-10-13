@@ -88,6 +88,7 @@ fn spawn_node_with(
         bootstrap_admin_urn: None,
         identity_path: None,
         expiry_scan_interval_secs: 60,
+        unanchored_identity_ttl_days: 0,
         self_update_apply: true,
     };
     let mut node = DdsNode::init(cfg, p2p_keypair).expect("init node");
@@ -120,11 +121,16 @@ fn operations_message(node: &DdsNode) -> libp2p::gossipsub::Message {
         &ident.signing_key,
     )
     .unwrap();
+    // The op must be the token's canonical operation (`op-<jti>`, same
+    // author, no deps, tiny data): ingest refuses any other binding
+    // (single-node review 2026-10-13, N2), and since R1 the gossip
+    // verdict follows the ingest outcome, so a non-canonical fixture
+    // would read as "not relayed" for the wrong reason.
     let op = dds_core::crdt::causal_dag::Operation {
-        id: format!("op-{}", uuid::Uuid::new_v4()),
+        id: format!("op-{}", token.payload.jti),
         author: ident.id.to_urn(),
         deps: vec![],
-        data: token.to_cbor().unwrap(),
+        data: vec![0],
         timestamp: now_epoch(),
     };
     let mut op_bytes = Vec::new();

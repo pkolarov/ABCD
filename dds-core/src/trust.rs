@@ -33,6 +33,10 @@ pub struct TrustGraph {
     vouches: BTreeMap<String, Token>,
     /// Map of revoked JTI -> issuer URN of the revoker.
     revocations: BTreeMap<String, String>,
+    /// Revoked JTI -> `iat` of the revoke (or burn) token that revoked
+    /// it. Lets the unanchored-identity pruner date the moment a subject
+    /// lost its vouch (single-node review 2026-10-13, R1).
+    revoked_at: BTreeMap<String, u64>,
     /// Set of burned identity URNs.
     burned: BTreeSet<String>,
     /// Maximum chain depth for trust evaluation.
@@ -60,6 +64,7 @@ impl TrustGraph {
             attestations: BTreeMap::new(),
             vouches: BTreeMap::new(),
             revocations: BTreeMap::new(),
+            revoked_at: BTreeMap::new(),
             burned: BTreeSet::new(),
             max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             vouches_by_subject: BTreeMap::new(),
@@ -146,6 +151,8 @@ impl TrustGraph {
                         .or_else(|| self.vouches.get(target_jti));
                     match target {
                         Some(t) if t.payload.iss == revoker_iss => {
+                            self.revoked_at
+                                .insert(target_jti.clone(), token.payload.iat);
                             self.revocations.insert(target_jti.clone(), revoker_iss);
                         }
                         Some(_) => {
@@ -177,6 +184,7 @@ impl TrustGraph {
                     .map(|jtis| jtis.iter().cloned().collect())
                     .unwrap_or_default();
                 for jti in to_revoke {
+                    self.revoked_at.insert(jti.clone(), token.payload.iat);
                     self.revocations.insert(jti, iss_owned.clone());
                 }
             }
@@ -688,6 +696,7 @@ impl TrustGraph {
         if self.revocations.remove(jti).is_some() {
             removed = true;
         }
+        self.revoked_at.remove(jti);
         removed
     }
 
@@ -786,6 +795,100 @@ impl TrustGraph {
     /// demotes its subject from the trusted roots).
     pub fn vouch_by_jti(&self, jti: &str) -> Option<&Token> {
         self.vouches.get(jti)
+    }
+
+    // ---- identity-level queries (single-node review 2026-10-13, R1) ----
+
+    /// Whether the graph holds any token (attestation or vouch) issued by
+    /// `urn`. A token from an issuer this returns `false` for is a *fresh
+    /// identity* as far as this node is concerned — the unit the
+    /// identity-flood budget in `dds-node` counts.
+    pub fn knows_issuer(&self, urn: &str) -> bool {
+        self.attestations_by_iss.contains_key(urn) || self.vouches_by_issuer.contains_key(urn)
+    }
+
+    /// Whether any vouch targets `subject`, live or not. Cheap evidence
+    /// that *someone* has claimed the identity; see
+    /// [`Self::has_effective_vouch`] for the authoritative check.
+    pub fn has_any_vouch_for(&self, subject: &str) -> bool {
+        self.vouches_by_subject
+            .get(subject)
+            .is_some_and(|s| !s.is_empty())
+    }
+
+    /// Whether `subject` holds at least one effective vouch (not revoked,
+    /// not expired, pinning an active attestation, issued by a voucher
+    /// that chains to a trusted root, and — for a privileged capability —
+    /// by a voucher authorized to grant it). An identity with an
+    /// effective vouch is *anchored*: somebody with a chain to a root has
+    /// signed for it, which an attacker holding only self-made identities
+    /// cannot produce.
+    pub fn has_effective_vouch(&self, subject: &str, trusted_roots: &BTreeSet<String>) -> bool {
+        if self.burned.contains(subject) {
+            return false;
+        }
+        self.vouches_for_subject(subject)
+            .any(|t| self.vouch_is_effective(t, subject, trusted_roots))
+    }
+
+    /// Every issuer URN with at least one attestation or vouch in the
+    /// graph.
+    pub fn issuers(&self) -> BTreeSet<String> {
+        self.attestations_by_iss
+            .keys()
+            .chain(self.vouches_by_issuer.keys())
+            .cloned()
+            .collect()
+    }
+
+    /// All tokens issued by `urn`: its attestations, then its vouches.
+    pub fn tokens_issued_by(&self, urn: &str) -> Vec<&Token> {
+        let mut out: Vec<&Token> = Vec::new();
+        if let Some(jtis) = self.attestations_by_iss.get(urn) {
+            out.extend(jtis.iter().filter_map(|j| self.attestations.get(j)));
+        }
+        if let Some(jtis) = self.vouches_by_issuer.get(urn) {
+            out.extend(jtis.iter().filter_map(|j| self.vouches.get(j)));
+        }
+        out
+    }
+
+    /// `iat` of the revoke/burn token that revoked `jti`, when known.
+    pub fn revoked_at(&self, jti: &str) -> Option<u64> {
+        self.revoked_at.get(jti).copied()
+    }
+
+    /// The last moment the graph has evidence of `urn` being claimed:
+    /// the newest `iat` among the tokens it issued, the `exp` of any
+    /// expired vouch for it, and the revocation time of any revoked vouch
+    /// for it. A live vouch that is *not* effective (voucher without a
+    /// chain) contributes its `iat`. `None` when the graph holds no token
+    /// issued by `urn`. The unanchored-identity pruner removes an
+    /// identity once `now > unanchored_since + ttl` and it still has no
+    /// effective vouch, so a user whose vouch was revoked or expired is
+    /// kept for the full grace period after that event, not after their
+    /// enrollment.
+    pub fn unanchored_since(&self, urn: &str) -> Option<u64> {
+        let own_newest = self
+            .tokens_issued_by(urn)
+            .iter()
+            .map(|t| t.payload.iat)
+            .max()?;
+        let vouch_evidence = self
+            .vouches_for_subject(urn)
+            .map(|v| {
+                let jti = &v.payload.jti;
+                if self.is_revoked(jti) {
+                    self.revoked_at(jti).unwrap_or(v.payload.iat)
+                } else if Self::is_expired(v) {
+                    v.payload.exp.unwrap_or(v.payload.iat)
+                } else {
+                    v.payload.iat
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        Some(own_newest.max(vouch_evidence))
     }
 }
 
@@ -1245,6 +1348,56 @@ mod tests {
                 String::from("zz-root-mid")
             ]),
         );
+    }
+
+    /// **R1 (single-node review 2026-10-13).** Identity-level queries the
+    /// unanchored-identity pruner and the fresh-identity budget rely on.
+    #[test]
+    fn identity_queries_report_anchoring_and_unanchored_since() {
+        let mut g = TrustGraph::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let user = Identity::generate("user", &mut OsRng);
+        let nobody = Identity::generate("nobody", &mut OsRng);
+        let roots = roots_with(&root.id.to_urn());
+
+        assert!(!g.knows_issuer(&user.id.to_urn()));
+        assert_eq!(g.unanchored_since(&user.id.to_urn()), None);
+
+        let user_attest = make_attest(&user); // iat 1000
+        g.add_token(user_attest.clone()).unwrap();
+        assert!(g.knows_issuer(&user.id.to_urn()));
+        assert!(!g.has_any_vouch_for(&user.id.to_urn()));
+        assert!(!g.has_effective_vouch(&user.id.to_urn(), &roots));
+        assert_eq!(g.unanchored_since(&user.id.to_urn()), Some(1000));
+        assert!(g.issuers().contains(&user.id.to_urn()));
+
+        // A vouch from a non-root nobody claims the identity but does not
+        // anchor it; it only moves `unanchored_since` to its own iat.
+        g.add_token(make_attest(&nobody)).unwrap();
+        g.add_token(make_vouch(
+            &nobody,
+            &user,
+            &user_attest,
+            "group:x",
+            "v-nobody",
+        ))
+        .unwrap();
+        assert!(g.has_any_vouch_for(&user.id.to_urn()));
+        assert!(!g.has_effective_vouch(&user.id.to_urn(), &roots));
+        assert_eq!(g.unanchored_since(&user.id.to_urn()), Some(1000));
+
+        // A root vouch anchors.
+        g.add_token(make_vouch(&root, &user, &user_attest, "group:x", "v-root"))
+            .unwrap();
+        assert!(g.has_effective_vouch(&user.id.to_urn(), &roots));
+
+        // Revoking it (revoke iat 2000, from `make_revoke`) un-anchors and
+        // dates the loss of the vouch at the revocation, not at enrollment.
+        g.add_token(make_revoke(&root, "v-root")).unwrap();
+        assert!(!g.has_effective_vouch(&user.id.to_urn(), &roots));
+        assert_eq!(g.revoked_at("v-root"), Some(2000));
+        assert_eq!(g.unanchored_since(&user.id.to_urn()), Some(2000));
+        assert_eq!(g.tokens_issued_by(&user.id.to_urn()).len(), 1);
     }
 
     /// A burn revokes exactly the burned identity's own vouches (served from
