@@ -1,5 +1,63 @@
 # DDS Implementation Status
 
+## fix(mesh): single-node compromise review, identity-flood budget and unanchored-identity pruning — 2026-10-13
+
+An in-depth review of what one admitted-but-hostile node can do to the rest of the mesh
+found ten ways the replication machinery itself could be turned against every other node
+and keep working after the hostile node was revoked. Full record with verdicts and the
+residual design items: [docs/security-review-2026-10-13-single-node.md](docs/security-review-2026-10-13-single-node.md).
+
+- **N1 (Critical) — any throw-away identity could demote a configured trust root on every
+  node.** A `dds:admin` vouch signed by an unknown identity against a config-anchored root
+  made `reconcile_roots_against_graph` treat the root as "promoted through the graph", find
+  no live vouch from a current root, demote it and persist the demotion. A root now counts as
+  promoted only on a vouch issued by a current root, a root at the start of the pass, or the
+  bootstrap admin (service and swarm copies alike).
+- **N2–N3 (High) — attacker-chosen operation ids.** The `Operation` paired with a token was
+  whatever the sender said; one token under two ids left peers re-requesting each other's id
+  every anti-entropy round forever, and the sync payload cache evicted by smallest key so
+  chosen JTIs could own it. Ops must now be the token's canonical `op-<jti>` (same author, no
+  deps, ≤64 B data) on gossip and sync, and the cache is insertion-ordered.
+- **N4 (High) — six decoy identities vetoed a genuine one-hop trust chain** because
+  `walk_chain` returned `ChainTooDeep` for the whole query when any branch exceeded the depth
+  cap. `validate_chain` is a breadth-first search now.
+- **N5–N10 (Medium/Low)** — graph-rejected sync payloads were cached for onward serving;
+  the sync path applied the 7-day gossip window to revoke/burn so a node offline for a week
+  never learned them; no per-entry size bound on sync payloads; Burn scanned every vouch;
+  `SyncRequest` silently exceeded libp2p's 1 MiB request cap at ~15–20k ops (now 8 MiB via a
+  byte-compatible bounded CBOR codec); two peer-byte CBOR decodes were not depth-bounded.
+
+**R1 follow-up — fresh-identity budget and unanchored-identity pruning** (the residual
+"unlimited self-signed identities" item). Each node charges the signed gossip publisher (or
+sync responder) for every identity it introduces that nobody has vouched; an identity stops
+counting as soon as someone with a chain to a trusted root signs for it, so bulk onboarding
+never trips the budget. A publisher over `[network] fresh_identity_budget_per_day` (default
+1000, after a `fresh_identity_grace_secs` grace) is quarantined for 24 h — disconnected,
+refused admission, its messages dropped and not relayed — with a `peer.identity-flood` audit
+entry naming the `revoke-admission` command; a sync responder over budget is only throttled,
+since it may be relaying a flood it accepted before the publisher was caught. Hourly,
+identities with no effective vouch for longer than `unanchored_identity_ttl_days` (default
+30, measured from their newest token or the revocation/expiry of their last vouch) are pruned
+from the graph, store, DAG and sync cache; roots, the bootstrap admin, the node's own
+identity, device-join identities and identities holding any other document type are never
+pruned, and ingest refuses stale unvouched tokens so pruned material does not come back
+through anti-entropy. Gossip now relays only what the node accepted (or rejected for a
+view-dependent reason), so a token every honest node refuses is no longer forwarded.
+
+**Dependencies.** `cargo audit` on v1.7.0 failed on six advisories published since the last
+main build, all reachable by any peer that can open a QUIC connection: quinn-proto
+0.11.15 → 0.11.18 (RUSTSEC-2026-0338/0339/0340/0341/0342) and rustls 0.23.40 → 0.23.45
+(RUSTSEC-2026-0285). Exemptions in `supply-chain/config.toml` follow the bumped versions.
+
+Verification (fresh against the final tree): `cargo test` for dds-core / dds-store /
+dds-net / dds-node — 1073 pass across 40 test binaries (1 ignored, 1 failed — see below); clippy `-D warnings` clean on those crates plus
+dds-loadtest, fmt clean, cargo audit 0 vulnerabilities (11 pre-existing allowed warnings),
+cargo vet passing. The one local lib failure
+(`http::tests::uds_listener::admin_endpoint_rejects_unknown_uid_caller`) is pre-existing and
+only reproduces when the suite runs as root. The v1.7.0 "macOS Installer" smoke failure was
+a race in the e2e tool itself (publishing before the target had admitted the publisher);
+the tool now waits for the target's first sync request and seeds its sync cache.
+
 ## fix(security): remediate the 2026-09-08 follow-up security review (S1-S4, R1) — 2026-09-08
 
 A follow-up review of the 2026-09-07 remediation (commit 4ed0f4a) found all four original
