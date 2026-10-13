@@ -18,6 +18,17 @@
 //! a sync responder is only throttled, because an honest node may be
 //! relaying material it accepted before the flood was caught.
 //!
+//! **Follow-up review (2026-10-13), finding 3.** Counting identities
+//! alone did not bound *volume*: once an identity was known it could
+//! publish without limit, and by issuing continuously it postponed its
+//! own pruning. The ledger therefore also charges each source for every
+//! token it delivers from an **unanchored** issuer — a per-window token
+//! count and a byte total ([`Limits::token_budget`],
+//! [`Limits::byte_budget`]). Anchored issuers are not charged: someone
+//! with a chain to a root signs for them, so they are accountable through
+//! revocation, and a legitimate catch-up batch is almost entirely
+//! anchored material.
+//!
 //! Pure data structure: no clock access, no I/O. `now` is injected so the
 //! unit tests can drive the window and grace boundaries exactly.
 
@@ -37,20 +48,32 @@ pub enum Refusal {
     /// More fresh identities (anchored or not) from this source in the
     /// window than the hard cap allows.
     HardCapExceeded,
+    /// More tokens from unanchored issuers delivered by this source in
+    /// the window than the token budget allows.
+    TokenBudgetExceeded,
+    /// More bytes of tokens from unanchored issuers delivered by this
+    /// source in the window than the byte budget allows.
+    ByteBudgetExceeded,
 }
 
-/// Budget parameters. `budget == 0` disables the budget, `hard_cap == 0`
-/// disables the hard cap; with both zero the ledger accepts everything.
+/// Budget parameters. A zero disables the limit it belongs to; with all
+/// four zero the ledger accepts everything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
+    /// Unanchored fresh identities past grace per source per window.
     pub budget: u32,
     pub grace: Duration,
+    /// Fresh identities, anchored or not, per source per window.
     pub hard_cap: u32,
+    /// Tokens from unanchored issuers per source per window.
+    pub token_budget: u32,
+    /// Bytes of tokens from unanchored issuers per source per window.
+    pub byte_budget: u64,
 }
 
 impl Limits {
     pub fn disabled(&self) -> bool {
-        self.budget == 0 && self.hard_cap == 0
+        self.budget == 0 && self.hard_cap == 0 && self.token_budget == 0 && self.byte_budget == 0
     }
 }
 
@@ -65,6 +88,10 @@ struct SourceLedger {
     young: VecDeque<(Instant, String)>,
     /// Identities past the grace period that are still unanchored.
     aged: BTreeSet<String>,
+    /// Tokens from unanchored issuers delivered in the window.
+    tokens: u32,
+    /// Bytes of those tokens.
+    bytes: u64,
 }
 
 impl SourceLedger {
@@ -74,6 +101,8 @@ impl SourceLedger {
             total: 0,
             young: VecDeque::new(),
             aged: BTreeSet::new(),
+            tokens: 0,
+            bytes: 0,
         }
     }
 }
@@ -200,6 +229,43 @@ impl<S: Ord + Clone> IdentityLedger<S> {
         Ok(())
     }
 
+    /// Charge `source` for delivering one token of `len` bytes from an
+    /// issuer that is not anchored. Independent of the identity budget:
+    /// a token from a long-known but never-vouched identity is charged
+    /// here and nowhere else. Over either quota the token is refused and
+    /// nothing is recorded, so a source stays exactly at the quota until
+    /// its window rolls over.
+    pub fn charge_token(&mut self, source: &S, len: usize, now: Instant) -> Result<(), Refusal> {
+        let token_budget = self.limits.token_budget;
+        let byte_budget = self.limits.byte_budget;
+        if token_budget == 0 && byte_budget == 0 {
+            return Ok(());
+        }
+        self.roll_window(source, now);
+        let l = self
+            .sources
+            .entry(source.clone())
+            .or_insert_with(|| SourceLedger::new(now));
+        if token_budget != 0 && l.tokens >= token_budget {
+            return Err(Refusal::TokenBudgetExceeded);
+        }
+        let bytes = l.bytes.saturating_add(len as u64);
+        if byte_budget != 0 && bytes > byte_budget {
+            return Err(Refusal::ByteBudgetExceeded);
+        }
+        l.tokens += 1;
+        l.bytes = bytes;
+        Ok(())
+    }
+
+    /// Tokens from unanchored issuers `source` delivered in its current
+    /// window, and their byte total.
+    pub fn volume(&self, source: &S) -> (u32, u64) {
+        self.sources
+            .get(source)
+            .map_or((0, 0), |l| (l.tokens, l.bytes))
+    }
+
     /// The identity `urn` became anchored: stop counting it against
     /// whichever source introduced it. Returns that source.
     pub fn anchored(&mut self, urn: &str) -> Option<S> {
@@ -247,6 +313,18 @@ mod tests {
             budget,
             grace: Duration::from_secs(grace_secs),
             hard_cap,
+            token_budget: 0,
+            byte_budget: 0,
+        }
+    }
+
+    fn volume_limits(token_budget: u32, byte_budget: u64) -> Limits {
+        Limits {
+            budget: 0,
+            grace: Duration::from_secs(0),
+            hard_cap: 0,
+            token_budget,
+            byte_budget,
         }
     }
 
@@ -341,5 +419,68 @@ mod tests {
             assert_eq!(off.charge(&"src", &format!("urn:{i}"), false, t0), Ok(()));
         }
         assert!(!off.over_budget(&"src", t0 + WINDOW));
+        assert!(off.limits().disabled());
+        assert!(!volume_limits(1, 0).disabled());
+    }
+
+    /// Follow-up review finding 3: a known identity's tokens are bounded
+    /// by the per-source token count and byte quotas, which the identity
+    /// budget never touched.
+    #[test]
+    fn token_and_byte_quotas_bound_volume_per_source_and_window() {
+        let t0 = Instant::now();
+        let mut l = IdentityLedger::new(volume_limits(3, 0));
+        for _ in 0..3 {
+            assert_eq!(l.charge_token(&"src", 100, t0), Ok(()));
+        }
+        assert_eq!(
+            l.charge_token(&"src", 100, t0),
+            Err(Refusal::TokenBudgetExceeded)
+        );
+        assert_eq!(
+            l.volume(&"src"),
+            (3, 300),
+            "a refused token is not recorded"
+        );
+        assert_eq!(l.charge_token(&"other", 100, t0), Ok(()), "per source");
+        assert_eq!(
+            l.charge_token(&"src", 100, t0 + WINDOW),
+            Ok(()),
+            "window rolled over"
+        );
+        assert_eq!(l.volume(&"src"), (1, 100));
+
+        let mut b = IdentityLedger::new(volume_limits(0, 250));
+        assert_eq!(b.charge_token(&"src", 100, t0), Ok(()));
+        assert_eq!(b.charge_token(&"src", 100, t0), Ok(()));
+        assert_eq!(
+            b.charge_token(&"src", 100, t0),
+            Err(Refusal::ByteBudgetExceeded)
+        );
+        assert_eq!(
+            b.charge_token(&"src", 50, t0),
+            Ok(()),
+            "a smaller token still fits"
+        );
+        assert_eq!(b.volume(&"src"), (3, 250));
+
+        // The identity budget is untouched by volume charges and vice
+        // versa.
+        let mut both = IdentityLedger::new(Limits {
+            budget: 1,
+            grace: Duration::from_secs(0),
+            hard_cap: 0,
+            token_budget: 2,
+            byte_budget: 0,
+        });
+        assert_eq!(both.charge(&"src", "urn:a", false, t0), Ok(()));
+        assert_eq!(both.charge_token(&"src", 10, t0), Ok(()));
+        assert_eq!(both.charge_token(&"src", 10, t0), Ok(()));
+        assert_eq!(
+            both.charge_token(&"src", 10, t0),
+            Err(Refusal::TokenBudgetExceeded)
+        );
+        assert_eq!(both.total(&"src"), 1);
+        assert_eq!(both.aged_count(&"src", t0 + Duration::from_secs(1)), 1);
     }
 }

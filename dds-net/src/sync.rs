@@ -278,6 +278,14 @@ pub struct SyncResult {
     /// otherwise credit those replays toward fire-once side effects a
     /// second time.
     pub merged_op_ids: Vec<String>,
+    /// Index into the input `payloads` slice of every payload whose
+    /// operation NEWLY merged — the exact bytes the DAG and trust graph
+    /// accepted. **Follow-up review (2026-10-13), finding 4**: two
+    /// payloads of one batch can carry the same op id (same JTI,
+    /// different token bytes; the second is a `DuplicateJti` reject), so
+    /// anything that re-serves accepted payloads onward must key on this,
+    /// never on `merged_op_ids` matched back against the whole batch.
+    pub merged_payloads: Vec<usize>,
 }
 
 impl SyncResult {
@@ -324,8 +332,8 @@ pub fn apply_sync_payloads(
     let mut result = SyncResult::default();
 
     // Phase 1: Deserialize all payloads
-    let mut items: Vec<(Operation, Token)> = Vec::new();
-    for payload in payloads {
+    let mut items: Vec<(usize, Operation, Token)> = Vec::new();
+    for (idx, payload) in payloads.iter().enumerate() {
         // Bounded depth: op_bytes are peer-supplied. Security review I-6.
         let op: Operation = match dds_core::cbor_bounded::from_reader(payload.op_bytes.as_slice()) {
             Ok(op) => op,
@@ -351,7 +359,7 @@ pub fn apply_sync_payloads(
             continue;
         }
 
-        items.push((op, token));
+        items.push((idx, op, token));
     }
 
     // Phase 2: Process tokens.
@@ -362,14 +370,14 @@ pub fn apply_sync_payloads(
     // `jti`, so it must run after anything in this batch it might name,
     // or a revocation delivered alongside its target is silently
     // discarded. See that function for the full rationale.
-    items.sort_by_key(|(_, t)| match t.payload.kind {
+    items.sort_by_key(|(_, _, t)| match t.payload.kind {
         TokenKind::Burn => 0,
         TokenKind::Attest => 1,
         TokenKind::Vouch => 2,
         TokenKind::Revoke => 3,
     });
 
-    for (op, token) in &items {
+    for (idx, op, token) in &items {
         // **B-1**: store the token put-if-absent. Without a trust graph
         // to consult, the store cannot tell whether a same-JTI token
         // is a benign re-delivery or a malicious overwrite, so the
@@ -415,6 +423,7 @@ pub fn apply_sync_payloads(
             Ok(true) => {
                 result.ops_merged += 1;
                 result.merged_op_ids.push(op.id.clone());
+                result.merged_payloads.push(*idx);
             }
             Ok(false) => {} // duplicate, skip
             Err(DagError::MissingDependency(_)) => {
@@ -425,25 +434,26 @@ pub fn apply_sync_payloads(
 
     // Phase 3: Retry any operations that failed due to missing deps
     // (they may now be satisfied after other ops were inserted)
-    let mut retry: Vec<&Operation> = items
+    let mut retry: Vec<(usize, &Operation)> = items
         .iter()
-        .filter(|(op, _)| !dag.contains(&op.id))
-        .map(|(op, _)| op)
+        .filter(|(_, op, _)| !dag.contains(&op.id))
+        .map(|(idx, op, _)| (*idx, op))
         .collect();
 
     let mut progress = true;
     while progress && !retry.is_empty() {
         progress = false;
         let mut remaining = Vec::new();
-        for op in retry {
+        for (idx, op) in retry {
             match dag.insert(op.clone()) {
                 Ok(true) => {
                     result.ops_merged += 1;
                     result.merged_op_ids.push(op.id.clone());
+                    result.merged_payloads.push(idx);
                     progress = true;
                 }
                 Ok(false) => {}
-                Err(_) => remaining.push(op),
+                Err(_) => remaining.push((idx, op)),
             }
         }
         retry = remaining;
@@ -481,8 +491,8 @@ pub fn apply_sync_payloads_with_graph(
 ) -> SyncResult {
     let mut result = SyncResult::default();
 
-    let mut items: Vec<(Operation, Token)> = Vec::new();
-    for payload in payloads {
+    let mut items: Vec<(usize, Operation, Token)> = Vec::new();
+    for (idx, payload) in payloads.iter().enumerate() {
         // Bounded depth: op_bytes are peer-supplied. Security review I-6.
         let op: Operation = match dds_core::cbor_bounded::from_reader(payload.op_bytes.as_slice()) {
             Ok(op) => op,
@@ -505,7 +515,7 @@ pub fn apply_sync_payloads_with_graph(
             );
             continue;
         }
-        items.push((op, token));
+        items.push((idx, op, token));
     }
 
     // Ordering: Burns, then Attests, then Vouches, then Revocations.
@@ -532,7 +542,7 @@ pub fn apply_sync_payloads_with_graph(
     // this batch is already in the graph. Burns stay first because they
     // invalidate an issuer wholesale and should suppress that issuer's
     // tokens in the same batch.
-    items.sort_by_key(|(_, t)| match t.payload.kind {
+    items.sort_by_key(|(_, _, t)| match t.payload.kind {
         TokenKind::Burn => 0,
         TokenKind::Attest => 1,
         TokenKind::Vouch => 2,
@@ -541,8 +551,8 @@ pub fn apply_sync_payloads_with_graph(
 
     // Ops whose backing token the trust graph accepted; only these are merged
     // into the DAG (AUDIT-2026-06-11 #4).
-    let mut accepted: Vec<&Operation> = Vec::new();
-    for (op, token) in &items {
+    let mut accepted: Vec<(usize, &Operation)> = Vec::new();
+    for (idx, op, token) in &items {
         // **B-1**: feed the trust graph FIRST. If it rejects (duplicate
         // JTI, unauthorized revocation, bad signature, …), skip the
         // store write and any revoke/burn side effects so a malicious
@@ -621,22 +631,23 @@ pub fn apply_sync_payloads_with_graph(
             // targeted eclipse that suppresses revocations/burns/policy.
             // Collect accepted ops and merge them (with the dependency-retry
             // fixpoint) below, so rejected-token ops never reach the DAG.
-            accepted.push(op);
+            accepted.push((*idx, op));
         }
     }
 
     // Merge graph-accepted ops into the DAG with a fixpoint retry so ops whose
     // dependencies land later in the same batch still merge.
-    let mut retry: Vec<&Operation> = accepted;
+    let mut retry: Vec<(usize, &Operation)> = accepted;
     let mut progress = true;
     while progress && !retry.is_empty() {
         progress = false;
         let mut remaining = Vec::new();
-        for op in retry {
+        for (idx, op) in retry {
             match dag.insert(op.clone()) {
                 Ok(true) => {
                     result.ops_merged += 1;
                     result.merged_op_ids.push(op.id.clone());
+                    result.merged_payloads.push(idx);
                     // Persist the operation, mirroring the gossip-ingest
                     // path (node.rs put_operation on ingest). Without
                     // this the sync path stored the token but never the
@@ -652,7 +663,7 @@ pub fn apply_sync_payloads_with_graph(
                     progress = true;
                 }
                 Ok(false) => {}
-                Err(_) => remaining.push(op),
+                Err(_) => remaining.push((idx, op)),
             }
         }
         retry = remaining;
@@ -1168,6 +1179,82 @@ mod tests {
         let on_disk = store.get_token(&original_jti).unwrap();
         assert_eq!(on_disk.payload.iss, alice.id.to_urn());
         assert_eq!(on_disk.payload.sub, alice.id.to_urn());
+    }
+
+    /// **Follow-up review (2026-10-13), finding 4.** When two payloads of
+    /// one batch share an op id (same JTI, different token bytes), the
+    /// result names the accepted payload by index so the caller can
+    /// re-serve exactly those bytes; matching `merged_op_ids` back
+    /// against the batch would also match the rejected twin.
+    #[test]
+    fn merged_payloads_names_the_accepted_payload_not_its_duplicate_jti_twin() {
+        let alice = make_identity("alice");
+        let mallory = make_identity("mallory");
+        let original = make_attest_token(&alice);
+        let twin = Token::sign(
+            TokenPayload {
+                iss: mallory.id.to_urn(),
+                iss_key: mallory.public_key.clone(),
+                jti: original.payload.jti.clone(),
+                sub: mallory.id.to_urn(),
+                kind: TokenKind::Attest,
+                purpose: Some("test".to_string()),
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat: 1000,
+                exp: Some(4102444800),
+                body_type: None,
+                body_cbor: None,
+            },
+            &mallory.signing_key,
+        )
+        .unwrap();
+        let op_id = format!("op-{}", original.payload.jti);
+        let batch = [
+            SyncPayload {
+                op_bytes: serialize_op(&make_op(&op_id, vec![])),
+                token_bytes: original.to_cbor().unwrap(),
+            },
+            SyncPayload {
+                op_bytes: serialize_op(&make_op(&op_id, vec![])),
+                token_bytes: twin.to_cbor().unwrap(),
+            },
+        ];
+
+        let mut dag = CausalDag::new();
+        let mut store = MemoryBackend::new();
+        let mut graph = TrustGraph::new();
+        let result = apply_sync_payloads_with_graph(&batch, &mut dag, &mut store, &mut graph);
+
+        assert_eq!(result.merged_op_ids, vec![op_id.clone()]);
+        assert_eq!(
+            result.merged_payloads,
+            vec![0],
+            "only the accepted payload's index"
+        );
+        assert_eq!(
+            result
+                .rejected_by_reason
+                .get(&SyncRejectReason::DuplicateJti),
+            Some(&1)
+        );
+        assert_eq!(
+            store.get_token(&original.payload.jti).unwrap().payload.iss,
+            alice.id.to_urn()
+        );
+
+        // Same batch, twin first: the index follows whichever was accepted.
+        let mut dag = CausalDag::new();
+        let mut store = MemoryBackend::new();
+        let mut graph = TrustGraph::new();
+        let reversed = [batch[1].clone(), batch[0].clone()];
+        let result = apply_sync_payloads_with_graph(&reversed, &mut dag, &mut store, &mut graph);
+        assert_eq!(result.merged_payloads, vec![0]);
+        assert_eq!(
+            store.get_token(&original.payload.jti).unwrap().payload.iss,
+            mallory.id.to_urn()
+        );
     }
 
     /// Root-cause fix for the eternal `err_count=1` anti-entropy loop:

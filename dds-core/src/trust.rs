@@ -679,8 +679,34 @@ impl TrustGraph {
     /// Returns `true` if a token (attestation or vouch) with the given
     /// JTI was found and removed, `false` otherwise. Also clears any
     /// revocation entry under that JTI. Used by the expiry sweeper to
-    /// drop expired tokens. Maintains the secondary indices.
+    /// drop expired tokens — an expired token fails validation if it is
+    /// ever replayed, so its revocation record has nothing left to
+    /// protect. Maintains the secondary indices. For tokens that are
+    /// still valid use [`Self::remove_token_keep_revocation`].
     pub fn remove_token(&mut self, jti: &str) -> bool {
+        let mut removed = self.remove_token_keep_revocation(jti);
+        if self.revocations.remove(jti).is_some() {
+            removed = true;
+        }
+        self.revoked_at.remove(jti);
+        removed
+    }
+
+    /// Remove a token like [`Self::remove_token`] but **keep** its
+    /// revocation record (`revocations` / `revoked_at`).
+    ///
+    /// **Follow-up review (2026-10-13), finding 1.** The unanchored-
+    /// identity pruner removes tokens that are still *valid*. If it
+    /// dropped their revocation records too, a copy of a revoked token
+    /// replayed by a lagging or hostile peer after the prune would
+    /// re-enter the graph as a live token — the revocation would have
+    /// been undone by housekeeping. With the record kept the JTI stays
+    /// revoked ([`Self::is_revoked`] treats a record without its target
+    /// as a pending revocation, and re-adding the target makes it an
+    /// applied one), and the ingest gates refuse the replay outright via
+    /// [`Self::has_revocation_record`]. Returns `true` if an attestation
+    /// or vouch was removed.
+    pub fn remove_token_keep_revocation(&mut self, jti: &str) -> bool {
         let mut removed = false;
         if let Some(t) = self.attestations.remove(jti) {
             self.unindex_attestation(&t.payload.iss, jti);
@@ -693,11 +719,16 @@ impl TrustGraph {
             self.unindex_vouch_issuer(&t.payload.iss, jti);
             removed = true;
         }
-        if self.revocations.remove(jti).is_some() {
-            removed = true;
-        }
-        self.revoked_at.remove(jti);
         removed
+    }
+
+    /// Whether the graph holds an authorized revocation record for
+    /// `jti`, whether or not the target token is (still) present. Unlike
+    /// [`Self::is_revoked`] this is a plain lookup with no issuer
+    /// re-check, meant for ingest gates that must refuse a token whose
+    /// JTI was revoked before it was pruned.
+    pub fn has_revocation_record(&self, jti: &str) -> bool {
+        self.revocations.contains_key(jti)
     }
 
     fn unindex_attestation(&mut self, iss: &str, jti: &str) {
@@ -858,22 +889,28 @@ impl TrustGraph {
         self.revoked_at.get(jti).copied()
     }
 
-    /// The last moment the graph has evidence of `urn` being claimed:
-    /// the newest `iat` among the tokens it issued, the `exp` of any
-    /// expired vouch for it, and the revocation time of any revoked vouch
-    /// for it. A live vouch that is *not* effective (voucher without a
-    /// chain) contributes its `iat`. `None` when the graph holds no token
-    /// issued by `urn`. The unanchored-identity pruner removes an
-    /// identity once `now > unanchored_since + ttl` and it still has no
-    /// effective vouch, so a user whose vouch was revoked or expired is
-    /// kept for the full grace period after that event, not after their
-    /// enrollment.
+    /// The moment `urn` last had a claim on the graph other than its own
+    /// signature: the later of its **first** own token's `iat` and the
+    /// latest vouch evidence for it — the `exp` of an expired vouch, the
+    /// revocation time of a revoked vouch, or the `iat` of a live vouch
+    /// that is not effective (voucher without a chain). `None` when the
+    /// graph holds no token issued by `urn`. The unanchored-identity
+    /// pruner removes an identity once `now > unanchored_since + ttl`
+    /// and it still has no effective vouch, so a user whose vouch was
+    /// revoked or expired is kept for the full grace period after that
+    /// event, not after their enrollment.
+    ///
+    /// **Follow-up review (2026-10-13), finding 3.** The clock used to
+    /// start at the identity's *newest* own token, so an identity that
+    /// kept issuing never aged and was never pruned. An identity nobody
+    /// has ever vouched is judged from its first appearance: it either
+    /// gets anchored within the TTL or it goes.
     pub fn unanchored_since(&self, urn: &str) -> Option<u64> {
-        let own_newest = self
+        let own_first = self
             .tokens_issued_by(urn)
             .iter()
             .map(|t| t.payload.iat)
-            .max()?;
+            .min()?;
         let vouch_evidence = self
             .vouches_for_subject(urn)
             .map(|v| {
@@ -888,7 +925,7 @@ impl TrustGraph {
             })
             .max()
             .unwrap_or(0);
-        Some(own_newest.max(vouch_evidence))
+        Some(own_first.max(vouch_evidence))
     }
 }
 
@@ -1398,6 +1435,71 @@ mod tests {
         assert_eq!(g.revoked_at("v-root"), Some(2000));
         assert_eq!(g.unanchored_since(&user.id.to_urn()), Some(2000));
         assert_eq!(g.tokens_issued_by(&user.id.to_urn()).len(), 1);
+    }
+
+    /// **Follow-up review (2026-10-13), findings 1 and 3.** The unanchored
+    /// clock starts at an identity's FIRST own token, so issuing more
+    /// tokens cannot postpone pruning; and removing a token with
+    /// `remove_token_keep_revocation` leaves its JTI revoked, so a
+    /// replayed copy comes back revoked instead of live.
+    #[test]
+    fn unanchored_clock_uses_first_own_token_and_prune_keeps_revocations() {
+        let mut g = TrustGraph::new();
+        let user = Identity::generate("user", &mut OsRng);
+        let roots = roots_with("urn:dds:nobody");
+
+        let first = make_attest(&user); // iat 1000
+        let later = Token::sign(
+            TokenPayload {
+                iss: user.id.to_urn(),
+                iss_key: user.public_key.clone(),
+                jti: String::from("attest-user-later"),
+                sub: user.id.to_urn(),
+                kind: TokenKind::Attest,
+                purpose: Some(String::from("test")),
+                vch_iss: None,
+                vch_sum: None,
+                revokes: None,
+                iat: 9000,
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &user.signing_key,
+        )
+        .unwrap();
+        let first_jti = first.payload.jti.clone();
+        g.add_token(first.clone()).unwrap();
+        g.add_token(later).unwrap();
+        assert_eq!(
+            g.unanchored_since(&user.id.to_urn()),
+            Some(1000),
+            "a newer own token must not reset the unanchored clock"
+        );
+
+        // The user revokes its first attestation (authorized: same issuer).
+        g.add_token(make_revoke(&user, &first_jti)).unwrap();
+        assert!(g.is_revoked(&first_jti));
+
+        // Pruned, but the revocation record stays.
+        assert!(g.remove_token_keep_revocation(&first_jti));
+        assert!(!g.remove_token_keep_revocation(&first_jti));
+        assert!(g.has_revocation_record(&first_jti));
+        assert!(
+            g.is_revoked(&first_jti),
+            "pending revocation survives the prune"
+        );
+        assert!(!g.has_purpose(&user.id.to_urn(), "test", &roots));
+
+        // A replayed copy re-enters revoked, never live.
+        g.add_token(first).unwrap();
+        assert!(g.is_revoked(&first_jti));
+        assert!(g.has_revocation_record(&first_jti));
+
+        // `remove_token` (expiry sweeper) is the one that drops the record.
+        assert!(g.remove_token(&first_jti));
+        assert!(!g.has_revocation_record(&first_jti));
+        assert!(!g.is_revoked(&first_jti));
     }
 
     /// A burn revokes exactly the burned identity's own vouches (served from

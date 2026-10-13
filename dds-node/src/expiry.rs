@@ -99,9 +99,11 @@ pub fn is_prunable_token(token: &dds_core::token::Token) -> bool {
 /// throw-away identity minted by a hostile peer is in forever, and the
 /// state a legitimately offboarded user enters when their vouch is
 /// revoked or expires. The clock starts at
-/// [`TrustGraph::unanchored_since`] (newest own token, or the loss of the
-/// last vouch), so an offboarded user keeps their record for the full
-/// `ttl_secs` after the offboarding.
+/// [`TrustGraph::unanchored_since`] (the identity's first own token, or
+/// the loss of its last vouch, whichever is later), so an offboarded user
+/// keeps their record for the full `ttl_secs` after the offboarding,
+/// while an identity nobody ever vouched cannot postpone its own pruning
+/// by issuing more tokens.
 ///
 /// Never pruned: `trusted_roots`, anything in `protected` (the bootstrap
 /// admin and this node's own identity), identities that are not purely
@@ -153,7 +155,12 @@ where
             continue;
         }
         for jti in jtis {
-            graph.remove_token(&jti);
+            // Keep the revocation record (follow-up review 2026-10-13,
+            // finding 1): a pruned token that had been revoked must stay
+            // revoked, or a replayed copy would come back live. The
+            // store keeps its revoked mark across `delete_token` for the
+            // same reason, and both ingest paths refuse a revoked JTI.
+            graph.remove_token_keep_revocation(&jti);
             if let Err(e) = store.delete_token(&jti) {
                 warn!(jti = %jti, "prune: delete_token failed: {e}");
             }
@@ -506,6 +513,86 @@ mod tests {
         assert_eq!(s.identities_pruned, 1);
         assert!(!store.has_token("a-user"));
         assert!(store.has_token("r-user"));
+    }
+
+    /// **Follow-up review (2026-10-13), finding 1.** Pruning a revoked
+    /// token must not undo its revocation: the graph keeps the record,
+    /// the store keeps its mark, and a replayed copy re-enters revoked.
+    #[test]
+    fn prune_keeps_revocation_records_so_a_replayed_token_stays_revoked() {
+        let mut graph = TrustGraph::new();
+        let mut store = MemoryBackend::new();
+        let roots: BTreeSet<String> = BTreeSet::new();
+        let protected = BTreeSet::new();
+        let user = Identity::generate("user", &mut OsRng);
+        let t0 = 1_000_000u64;
+        let user_tok = attest_at(&user, "a-user", t0, None);
+        land(&mut graph, &mut store, &user_tok);
+        // The user revokes its own attestation (the only authorized
+        // revoker); the node's apply path also marks the store.
+        land(
+            &mut graph,
+            &mut store,
+            &revoke_at(&user, "a-user", "r-user", t0 + DAY),
+        );
+        store.revoke("a-user").unwrap();
+        assert!(graph.is_revoked("a-user"));
+
+        let s = prune_unanchored_once(
+            &mut graph,
+            &mut store,
+            &roots,
+            &protected,
+            t0 + 31 * DAY,
+            30 * DAY,
+        );
+        assert_eq!(s.identities_pruned, 1);
+        assert_eq!(s.pruned_jtis, vec!["a-user".to_string()]);
+        assert!(!store.has_token("a-user"));
+        assert!(
+            graph.has_revocation_record("a-user"),
+            "record survives the prune"
+        );
+        assert!(graph.is_revoked("a-user"));
+        assert!(
+            store.is_revoked("a-user"),
+            "store mark survives delete_token"
+        );
+
+        // Replay: the graph takes the token back only as a revoked one.
+        graph.add_token(user_tok).unwrap();
+        assert!(graph.is_revoked("a-user"));
+    }
+
+    /// **Follow-up review (2026-10-13), finding 3.** An identity nobody
+    /// vouches cannot keep itself alive by issuing a new token every day:
+    /// the clock runs from its first token.
+    #[test]
+    fn continuous_issuance_does_not_postpone_pruning() {
+        let mut graph = TrustGraph::new();
+        let mut store = MemoryBackend::new();
+        let roots: BTreeSet<String> = BTreeSet::new();
+        let protected = BTreeSet::new();
+        let ghost = Identity::generate("ghost", &mut OsRng);
+        let t0 = 1_000_000u64;
+        for day in 0..40u64 {
+            land(
+                &mut graph,
+                &mut store,
+                &attest_at(&ghost, &format!("a-ghost-{day}"), t0 + day * DAY, None),
+            );
+        }
+        let s = prune_unanchored_once(
+            &mut graph,
+            &mut store,
+            &roots,
+            &protected,
+            t0 + 40 * DAY,
+            30 * DAY,
+        );
+        assert_eq!(s.identities_pruned, 1, "{s:?}");
+        assert_eq!(s.pruned_jtis.len(), 40);
+        assert!(!graph.knows_issuer(&ghost.id.to_urn()));
     }
 
     #[test]

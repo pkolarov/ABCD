@@ -105,9 +105,11 @@ reference):
 - **Unanchored-identity pruning** (`unanchored_identity_ttl_days`, default 30;
   `dds-node/src/expiry.rs::prune_unanchored_once`). Hourly, each node removes the
   tokens of identities that have had no effective vouch for longer than the TTL —
-  measured from the identity's newest token or from the revocation / expiry of its
-  last vouch, so offboarded users keep their record for the full period after
-  offboarding. Trusted roots, the bootstrap admin, the node's own identity,
+  measured from the identity's first token or from the revocation / expiry of its
+  last vouch, whichever is later, so offboarded users keep their record for the full
+  period after offboarding and a never-vouched identity cannot postpone its pruning by
+  issuing more tokens (follow-up finding 3 below). Revocation records of pruned tokens
+  are kept (follow-up finding 1 below). Trusted roots, the bootstrap admin, the node's own identity,
   device-join identities and identities carrying any document type other than a plain
   or user-auth attestation are never pruned. The matching ingest rule refuses tokens
   older than the TTL from an issuer no vouch claims (a vouch in the same sync batch
@@ -117,6 +119,25 @@ reference):
 Remaining in R1: identities carrying a device-join document are exempt from pruning
 (devices are legitimately unvouched unless `enforce_device_scope_vouch` is on), so a
 flood of device-join attestations is bounded only by the budget, not reclaimed.
+
+## Follow-up review of v1.8.0 (2026-10-13): four findings
+
+A second review of the five commits through `b66e077` (v1.8.0) reproduced four issues
+with local Rust tests against the ingestion and pruning code. All four were confirmed
+against the source and fixed in the next release; each fix carries a regression test
+that fails on v1.8.0.
+
+| # | Severity | Finding (as reported) | Verdict and fix |
+|---|---|---|---|
+| F1 | High | **Pruning can undo revocation.** Removing an old attestation also cleared its revocation from the trust graph (`remove_token` drops the `revocations` / `revoked_at` entries). Replaying the token afterwards restored it live, even though the store still marked it revoked. | Confirmed. The pruner now removes tokens with `TrustGraph::remove_token_keep_revocation`, which leaves the revocation record in place (the record without its target reads as a pending revocation, and a re-added target is immediately revoked). Both ingest paths additionally refuse any token whose JTI has a revocation record in the graph or a revoked mark in the store (`DdsNode::jti_revoked`), so a replayed copy never re-enters the store or the DAG. `remove_token` keeps its old semantics for the expiry sweeper, where an expired token cannot be replayed anyway. Tests: `unanchored_clock_uses_first_own_token_and_prune_keeps_revocations` (dds-core), `prune_keeps_revocation_records_so_a_replayed_token_stays_revoked` (expiry), `revoked_then_pruned_token_is_refused_on_replay` (node). |
+| F2 | High | **Root-demotion fix incomplete.** An untrusted identity could issue a `dds:admin` vouch targeting a configured root, then revoke it; `reconcile_roots_after_token` demoted the root from the swarm's in-memory set, and the periodic reconcile never restored it. | Confirmed. N1 fixed the periodic pass but not the token-driven path. The Revoke branch now applies the same gate as `reconcile_roots_against_graph`: a root is demotable only if the graph shows it was promoted — it holds a `dds:admin` vouch (live or not) signed by a current root or the bootstrap admin. A config-anchored root nobody authorised ever vouched is left alone; a genuine promotion is still undone when its promoter revokes it. Test: `throwaway_admin_vouch_then_revoke_does_not_demote_a_config_root`. |
+| F3 | High | **Flood protection does not bound token volume.** A known identity bypassed further accounting: 32 distinct tokens were accepted with an identity hard cap of 1 and no quarantine. Continued issuance also moved `unanchored_since` forward, delaying pruning indefinitely. | Confirmed. The ledger now also charges each source for every token from an *unanchored* issuer — a per-window token count (`[network] unanchored_token_budget_per_day`, default 5000) and byte total (`unanchored_token_bytes_per_day`, default 16 MiB) — with the same outcomes as the identity budget (publisher quarantined, responder throttled). Anchored issuers are not charged: someone with a chain to a root signs for them and a catch-up batch is almost entirely anchored material. `unanchored_since` now starts at the identity's *first* own token (or the later loss of its last vouch), so issuing more tokens cannot postpone pruning. Tests: `token_and_byte_quotas_bound_volume_per_source_and_window`, `known_unanchored_identity_cannot_flood_tokens`, `continuous_issuance_does_not_postpone_pruning`. |
+| F4 | Medium | **Rejected duplicates can poison onward sync.** Two tokens sharing one op id (same JTI, different bytes): the accepted one entered the store, but the sync-cache repopulation matched `merged_op_ids` back against the whole batch, so the rejected twin overwrote the accepted entry and was served onward. | Confirmed. `SyncResult` now reports `merged_payloads`, the batch indexes of exactly the payloads whose op newly merged, and the node caches only those bytes. Tests: `merged_payloads_names_the_accepted_payload_not_its_duplicate_jti_twin` (dds-net), `sync_cache_serves_the_accepted_payload_not_its_duplicate_jti_twin` (node). |
+
+What stays as designed: anchored identities are not subject to the token quota (their
+volume is bounded by the per-peer gossip rate limit and accountable through revocation
+of their vouch), and a sync responder over any budget is throttled rather than
+disconnected.
 
 ## Operational note
 

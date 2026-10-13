@@ -52,9 +52,12 @@ pub struct NodeConfig {
     /// has an effective vouch for it: a self-enrolled user nobody ever
     /// vouched, an offboarded user whose vouch was revoked or expired, a
     /// throw-away identity minted by a hostile peer. The clock starts at
-    /// the identity's newest token or at the revocation / expiry of its
-    /// last vouch, so a legitimately offboarded user keeps their record
-    /// for the full period after the offboarding. Trusted roots, the
+    /// the identity's first token or at the revocation / expiry of its
+    /// last vouch, whichever is later, so a legitimately offboarded user
+    /// keeps their record for the full period after the offboarding while
+    /// a never-vouched identity cannot postpone its pruning by issuing
+    /// more tokens. Revocation records of pruned tokens are kept, so a
+    /// replayed copy is refused rather than restored. Trusted roots, the
     /// bootstrap admin, this node's own identity, device-join identities
     /// and identities carrying any document other than a plain or
     /// user-auth attestation are never pruned. Tokens older than this
@@ -385,6 +388,28 @@ pub struct NetworkConfig {
     /// large import. `0` disables. Default 50 000.
     #[serde(default = "default_fresh_identity_hard_cap_per_day")]
     pub fresh_identity_hard_cap_per_day: u32,
+
+    /// **R1 follow-up (2026-10-13 review, finding 3) — unanchored token
+    /// quota.** How many tokens from *unanchored* issuers (identities
+    /// with no effective vouch from anyone with a chain to a trusted
+    /// root) one peer may deliver per 24 h, counted per gossip publisher
+    /// or sync responder. The identity budget bounds how many throw-away
+    /// identities a peer can introduce; this bounds how much each of
+    /// them can publish, which the identity budget alone did not (a
+    /// known identity was free). Legitimate unanchored traffic is a
+    /// handful of self-enrollment tokens per new user, so the default is
+    /// generous for honest nodes and small for a flood. Over the quota a
+    /// gossip publisher is quarantined and a sync responder throttled,
+    /// exactly as for the identity budget. `0` disables. Default 5000.
+    #[serde(default = "default_unanchored_token_budget_per_day")]
+    pub unanchored_token_budget_per_day: u32,
+
+    /// **R1 follow-up** — bytes of tokens from unanchored issuers one peer
+    /// may deliver per 24 h (same accounting as
+    /// [`Self::unanchored_token_budget_per_day`]). `0` disables. Default
+    /// 16 MiB.
+    #[serde(default = "default_unanchored_token_bytes_per_day")]
+    pub unanchored_token_bytes_per_day: u64,
 }
 
 /// **M-1 (pre-prod review 2026-07-24)** — TOML surface for
@@ -455,6 +480,8 @@ impl Default for NetworkConfig {
             fresh_identity_budget_per_day: default_fresh_identity_budget_per_day(),
             fresh_identity_grace_secs: default_fresh_identity_grace_secs(),
             fresh_identity_hard_cap_per_day: default_fresh_identity_hard_cap_per_day(),
+            unanchored_token_budget_per_day: default_unanchored_token_budget_per_day(),
+            unanchored_token_bytes_per_day: default_unanchored_token_bytes_per_day(),
         }
     }
 }
@@ -657,6 +684,16 @@ fn default_fresh_identity_grace_secs() -> u64 {
 /// **R1** — see [`NetworkConfig::fresh_identity_hard_cap_per_day`].
 fn default_fresh_identity_hard_cap_per_day() -> u32 {
     50_000
+}
+
+/// **R1 follow-up** — see [`NetworkConfig::unanchored_token_budget_per_day`].
+fn default_unanchored_token_budget_per_day() -> u32 {
+    5000
+}
+
+/// **R1 follow-up** — see [`NetworkConfig::unanchored_token_bytes_per_day`].
+fn default_unanchored_token_bytes_per_day() -> u64 {
+    16 * 1024 * 1024
 }
 
 fn default_max_pending_incoming() -> u32 {
