@@ -16,6 +16,10 @@ tracing = { workspace = true }
 serde = { workspace = true, features = ["std"] }
 serde_bytes = { workspace = true }
 ciborium = { workspace = true }
+# Bounded sync codec (transport.rs): same encoder libp2p's stock `cbor`
+# request-response codec uses, so the wire stays byte-compatible.
+cbor4ii = { version = "0.3", features = ["serde1", "use_std"] }
+async-trait = "0.1"
 
 [dev-dependencies]
 rand = { workspace = true }

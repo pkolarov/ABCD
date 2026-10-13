@@ -9,8 +9,14 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io;
+use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
+
+use async_trait::async_trait;
+use futures::prelude::*;
+use serde::{Serialize, de::DeserializeOwned};
 
 use libp2p::{
     PeerId, StreamProtocol, connection_limits, gossipsub, identify, kad, mdns, noise,
@@ -41,7 +47,7 @@ pub struct DdsBehaviour {
     /// `dds_net::sync`; the wire format is CBOR via the built-in codec.
     /// Resolves B6 (the gossipsub-only delivery gap surfaced by the
     /// 2026-04-09 chaos soak).
-    pub sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
+    pub sync: request_response::Behaviour<BoundedCborCodec<SyncRequest, SyncResponse>>,
     /// **H-12 (security review)**: per-peer admission handshake.
     /// Immediately after Noise completes, each side asks the other
     /// for its admission cert over `/dds/admission/1.0.0/<domain>`
@@ -95,6 +101,129 @@ pub struct DdsBehaviour {
     /// event type is [`std::convert::Infallible`], so its variant is
     /// never constructed.
     pub limits: connection_limits::Behaviour,
+}
+
+/// **Single-node review 2026-10-13** — wire size caps for the anti-entropy
+/// sync protocol.
+///
+/// A [`SyncRequest`] carries the requester's *complete* set of known op
+/// ids (≈ 50–80 bytes each), so its size grows linearly with the
+/// directory. libp2p's stock CBOR codec caps requests at 1 MiB, i.e.
+/// roughly 15 000–20 000 ops: past that every sync request in the domain
+/// is refused by the responder's codec and anti-entropy silently stops
+/// for everyone — a cliff an admitted peer can also *cause* by publishing
+/// that many self-signed tokens. 8 MiB moves the cliff to ~150 000 ops.
+/// The honest fix is a digest/range-based sync request that does not
+/// scale with the directory; until then this is the operational ceiling
+/// and the responder buffers at most this much per inbound request
+/// (bounded by the connection caps in [`ConnectionCaps`]).
+pub const SYNC_REQUEST_SIZE_MAXIMUM: u64 = 8 * 1024 * 1024;
+/// Response cap: libp2p's default. The node already limits what it puts
+/// in one response (`SYNC_MAX_RESPONSE_ENTRIES` / `SYNC_MAX_RESPONSE_BYTES`
+/// in `dds-node`), and the requester clamps what it accepts.
+pub const SYNC_RESPONSE_SIZE_MAXIMUM: u64 = 10 * 1024 * 1024;
+
+/// CBOR `request_response` codec with explicit request / response size
+/// caps.
+///
+/// Byte-for-byte compatible with libp2p's built-in
+/// `request_response::cbor` codec (same `cbor4ii` serde encoding, same
+/// `take(limit).read_to_end` framing), whose size setters exist but whose
+/// type is private in the libp2p release this workspace pins, so it
+/// cannot be constructed with non-default limits. A frame beyond the cap
+/// is truncated by `take` and fails to decode as `InvalidData`; it is
+/// never a panic.
+pub struct BoundedCborCodec<Req, Resp> {
+    request_size_maximum: u64,
+    response_size_maximum: u64,
+    _types: PhantomData<(Req, Resp)>,
+}
+
+impl<Req, Resp> BoundedCborCodec<Req, Resp> {
+    pub fn new(request_size_maximum: u64, response_size_maximum: u64) -> Self {
+        Self {
+            request_size_maximum,
+            response_size_maximum,
+            _types: PhantomData,
+        }
+    }
+}
+
+impl<Req, Resp> Clone for BoundedCborCodec<Req, Resp> {
+    fn clone(&self) -> Self {
+        Self::new(self.request_size_maximum, self.response_size_maximum)
+    }
+}
+
+impl<Req, Resp> Default for BoundedCborCodec<Req, Resp> {
+    fn default() -> Self {
+        Self::new(SYNC_REQUEST_SIZE_MAXIMUM, SYNC_RESPONSE_SIZE_MAXIMUM)
+    }
+}
+
+fn cbor_decode_error(e: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
+#[async_trait]
+impl<Req, Resp> request_response::Codec for BoundedCborCodec<Req, Resp>
+where
+    Req: Send + Serialize + DeserializeOwned,
+    Resp: Send + Serialize + DeserializeOwned,
+{
+    type Protocol = StreamProtocol;
+    type Request = Req;
+    type Response = Resp;
+
+    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Req>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut buf = Vec::new();
+        io.take(self.request_size_maximum)
+            .read_to_end(&mut buf)
+            .await?;
+        cbor4ii::serde::from_slice(buf.as_slice()).map_err(cbor_decode_error)
+    }
+
+    async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Resp>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut buf = Vec::new();
+        io.take(self.response_size_maximum)
+            .read_to_end(&mut buf)
+            .await?;
+        cbor4ii::serde::from_slice(buf.as_slice()).map_err(cbor_decode_error)
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        req: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let data: Vec<u8> = cbor4ii::serde::to_vec(Vec::new(), &req).map_err(cbor_decode_error)?;
+        io.write_all(data.as_ref()).await?;
+        Ok(())
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        resp: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let data: Vec<u8> = cbor4ii::serde::to_vec(Vec::new(), &resp).map_err(cbor_decode_error)?;
+        io.write_all(data.as_ref()).await?;
+        Ok(())
+    }
 }
 
 /// Configuration for building a DDS swarm.
@@ -333,7 +462,16 @@ pub fn build_swarm(
             // Anti-entropy sync (request_response over CBOR). Both sides
             // are full participants — every node can serve a sync
             // request from any other node in its domain.
-            let sync = request_response::cbor::Behaviour::<SyncRequest, SyncResponse>::new(
+            //
+            // **Single-node review 2026-10-13**: built on
+            // [`BoundedCborCodec`] rather than the stock `cbor` codec so the
+            // request cap can exceed libp2p's 1 MiB default — see
+            // [`SYNC_REQUEST_SIZE_MAXIMUM`].
+            let sync = request_response::Behaviour::with_codec(
+                BoundedCborCodec::<SyncRequest, SyncResponse>::new(
+                    SYNC_REQUEST_SIZE_MAXIMUM,
+                    SYNC_RESPONSE_SIZE_MAXIMUM,
+                ),
                 [(
                     StreamProtocol::try_from_owned(sync_protocol.clone())
                         .map_err(|e| std::io::Error::other(format!("invalid protocol: {e}")))?,
@@ -518,6 +656,57 @@ mod tests {
                 .ip_colocation_factor_whitelist
                 .contains(&IpAddr::V6(Ipv6Addr::LOCALHOST))
         );
+    }
+
+    /// **Single-node review 2026-10-13** — the bounded codec must (a)
+    /// round-trip a `SyncRequest` through the same bytes the stock libp2p
+    /// CBOR codec would have produced (interop with peers on older builds),
+    /// (b) refuse a frame over its cap with an error rather than a panic,
+    /// and (c) carry a request larger than libp2p's 1 MiB default.
+    #[test]
+    fn bounded_cbor_codec_roundtrips_and_caps() {
+        use futures::executor::block_on;
+        use libp2p::request_response::Codec as _;
+        use std::collections::BTreeSet;
+
+        let proto = StreamProtocol::new("/dds/sync/1.0.0/test");
+        // 30 000 ids × ~47 bytes ≈ 1.4 MiB: over the stock cap, under ours.
+        let known_op_ids: BTreeSet<String> = (0..30_000)
+            .map(|i| format!("op-0123456789abcdef-0123456789abcdef-{i:08}"))
+            .collect();
+        let req = SyncRequest {
+            known_op_ids: known_op_ids.clone(),
+            heads: BTreeSet::new(),
+        };
+
+        let mut codec = BoundedCborCodec::<SyncRequest, SyncResponse>::default();
+        let mut wire: Vec<u8> = Vec::new();
+        block_on(codec.write_request(&proto, &mut wire, req)).unwrap();
+        assert!(
+            wire.len() > 1024 * 1024,
+            "fixture must exceed libp2p's 1 MiB default (got {})",
+            wire.len()
+        );
+        // Same bytes the stock codec encodes (both are cbor4ii serde).
+        let stock: Vec<u8> = cbor4ii::serde::to_vec(
+            Vec::new(),
+            &SyncRequest {
+                known_op_ids: known_op_ids.clone(),
+                heads: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(wire, stock);
+
+        let mut cursor = futures::io::Cursor::new(wire.clone());
+        let decoded = block_on(codec.read_request(&proto, &mut cursor)).unwrap();
+        assert_eq!(decoded.known_op_ids.len(), 30_000);
+
+        // A tight cap truncates the frame and fails the decode cleanly.
+        let mut tight = BoundedCborCodec::<SyncRequest, SyncResponse>::new(1024, 1024);
+        let mut cursor = futures::io::Cursor::new(wire);
+        let err = block_on(tight.read_request(&proto, &mut cursor)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     /// **M-1 regression (pre-prod review 2026-07-24)** — the swarm must

@@ -45,6 +45,12 @@ pub struct TrustGraph {
     /// for that issuer. Used to look up the target attestation token for
     /// `vch_sum` verification without scanning every attestation.
     attestations_by_iss: BTreeMap<String, BTreeSet<String>>,
+    /// Secondary index: vouch issuer URN → set of vouch JTIs that issuer
+    /// signed. Makes `Burn` O(vouches-by-this-issuer) instead of a scan
+    /// of every vouch in the graph — an admitted peer can mint burns for
+    /// unlimited fresh identities, so the per-burn cost must not grow
+    /// with the size of the graph (single-node review 2026-10-13).
+    vouches_by_issuer: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl TrustGraph {
@@ -58,6 +64,7 @@ impl TrustGraph {
             max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             vouches_by_subject: BTreeMap::new(),
             attestations_by_iss: BTreeMap::new(),
+            vouches_by_issuer: BTreeMap::new(),
         }
     }
 
@@ -119,6 +126,10 @@ impl TrustGraph {
                         .or_default()
                         .insert(jti.clone());
                 }
+                self.vouches_by_issuer
+                    .entry(token.payload.iss.clone())
+                    .or_default()
+                    .insert(jti.clone());
                 self.vouches.insert(jti, token);
             }
             TokenKind::Revoke => {
@@ -155,14 +166,16 @@ impl TrustGraph {
             TokenKind::Burn => {
                 // Burn the issuer's identity
                 self.burned.insert(iss.clone());
-                // Also revoke all tokens issued by this identity
+                // Also revoke all vouches issued by this identity. Walk the
+                // issuer index rather than every vouch in the graph: burns
+                // are self-signed and unlimited, so this path must stay
+                // O(k) in the burned identity's own vouch count.
                 let iss_owned = iss.clone();
                 let to_revoke: Vec<String> = self
-                    .vouches
-                    .iter()
-                    .filter(|(_, t)| t.payload.iss == iss_owned)
-                    .map(|(jti, _)| jti.clone())
-                    .collect();
+                    .vouches_by_issuer
+                    .get(&iss_owned)
+                    .map(|jtis| jtis.iter().cloned().collect())
+                    .unwrap_or_default();
                 for jti in to_revoke {
                     self.revocations.insert(jti, iss_owned.clone());
                 }
@@ -240,6 +253,7 @@ impl TrustGraph {
                 if let Some(ref subject) = t.payload.vch_iss {
                     self.unindex_vouch(subject, jti);
                 }
+                self.unindex_vouch_issuer(&t.payload.iss, jti);
             }
         }
 
@@ -250,118 +264,109 @@ impl TrustGraph {
 
     /// Validate a trust chain from a subject back to a trusted root.
     ///
-    /// Returns `Ok(chain)` with the chain of vouch JTIs from leaf to root,
-    /// or an error if no valid chain exists.
+    /// Returns `Ok(chain)` with the vouch JTIs from the subject's own vouch
+    /// up to the vouch issued by the trusted root (leaf → root), or an
+    /// error if no valid chain exists within `max_chain_depth` hops.
+    ///
+    /// **Single-node review 2026-10-13.** This is a breadth-first search
+    /// over effective vouches, not the earlier depth-first walk. The DFS
+    /// treated `ChainTooDeep` as fatal for the *whole* query the moment
+    /// any one branch exceeded the depth cap, and marked a URN "visited"
+    /// at whatever depth it was first reached. Any admitted peer can mint
+    /// vouches from throw-away identities, so an attacker could attach a
+    /// six-hop decoy chain to a legitimately vouched subject (or to one of
+    /// its vouchers) with a vouch JTI that sorts first and veto the real
+    /// one-hop chain for everyone — a domain-wide lockout of every grant
+    /// that passes through a non-root voucher. BFS finds the shortest
+    /// chain, so a decoy branch can never shadow a shorter genuine one, and
+    /// the first visit of a URN is always at its minimal depth, so the
+    /// visited set is correct under the depth bound. Cost is
+    /// O(reachable vouches) — the same bound the cycle guard already gave
+    /// the DFS (AUDIT-2026-06-11 #30).
     pub fn validate_chain(
         &self,
         subject_urn: &str,
         trusted_roots: &BTreeSet<String>,
     ) -> Result<Vec<String>, TrustError> {
-        let mut chain = Vec::new();
-        let mut visited = BTreeSet::new();
-        self.walk_chain(subject_urn, trusted_roots, &mut chain, 0, &mut visited)
-            .map(|_| chain)
+        use alloc::collections::VecDeque;
+
+        if self.burned.contains(subject_urn) {
+            return Err(TrustError::IdentityBurned(String::from(subject_urn)));
+        }
+        // A trusted root needs no chain.
+        if trusted_roots.contains(subject_urn) {
+            return Ok(Vec::new());
+        }
+
+        // `parent` maps each discovered voucher URN to the vouch (JTI)
+        // through which it was first reached and the URN that vouch
+        // targets, so the chain can be rebuilt once a root is found. It
+        // doubles as the visited set.
+        let mut parent: BTreeMap<String, (String, String)> = BTreeMap::new();
+        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+        queue.push_back((String::from(subject_urn), 0));
+        // Set when a branch had further effective vouches past the depth
+        // cap, so the caller can tell "no chain at all" from "a chain
+        // exists but exceeds `max_chain_depth`".
+        let mut truncated = false;
+
+        while let Some((current, depth)) = queue.pop_front() {
+            for vouch in self.effective_vouches_for_subject(&current) {
+                let voucher = &vouch.payload.iss;
+                // A burned voucher's vouches are revoked on burn, so this
+                // is only reachable through an ordering race; never follow
+                // a burned identity.
+                if self.burned.contains(voucher) {
+                    continue;
+                }
+                if depth >= self.max_chain_depth {
+                    truncated = true;
+                    break;
+                }
+                if voucher == subject_urn || parent.contains_key(voucher) {
+                    // Already reached at an equal or shallower depth.
+                    continue;
+                }
+                parent.insert(
+                    voucher.clone(),
+                    (vouch.payload.jti.clone(), current.clone()),
+                );
+                if trusted_roots.contains(voucher) {
+                    let mut chain = Vec::new();
+                    let mut cursor = voucher.clone();
+                    while let Some((jti, target)) = parent.get(&cursor) {
+                        chain.push(jti.clone());
+                        cursor = target.clone();
+                    }
+                    chain.reverse();
+                    return Ok(chain);
+                }
+                queue.push_back((voucher.clone(), depth + 1));
+            }
+        }
+
+        if truncated {
+            Err(TrustError::ChainTooDeep(self.max_chain_depth))
+        } else {
+            Err(TrustError::NoValidChain)
+        }
     }
 
-    fn walk_chain(
-        &self,
-        current_urn: &str,
-        trusted_roots: &BTreeSet<String>,
-        chain: &mut Vec<String>,
-        depth: usize,
-        visited: &mut BTreeSet<String>,
-    ) -> Result<(), TrustError> {
-        if depth > self.max_chain_depth {
-            return Err(TrustError::ChainTooDeep(self.max_chain_depth));
-        }
-
-        if self.burned.contains(current_urn) {
-            return Err(TrustError::IdentityBurned(String::from(current_urn)));
-        }
-
-        // If this identity is a trusted root, chain is valid
-        if trusted_roots.contains(current_urn) {
-            return Ok(());
-        }
-
-        // **AUDIT-2026-06-11 #30**: cycle / diamond guard. A URN's reachability
-        // to a trusted root is path-independent, so once we begin exploring a
-        // URN we never need to explore it again. Without this, a crafted vouch
-        // graph with shared sub-paths fans out exponentially on this hot auth
-        // path (and on the self-update ingest path via `count_purpose_holders`)
-        // — a cheap CPU-DoS by any party who can publish vouches.
-        if !visited.insert(current_urn.to_string()) {
-            return Err(TrustError::NoValidChain);
-        }
-
-        // Find vouches that vouch for this identity via the secondary
-        // index — O(vouches-for-this-subject) instead of O(total-vouches).
-        let vouches_for_current: Vec<&Token> = self
-            .vouches_for_subject(current_urn)
-            .filter(|t| !self.is_revoked(&t.payload.jti) && !Self::is_expired(t))
-            .collect();
-
-        if vouches_for_current.is_empty() {
-            return Err(TrustError::NoValidChain);
-        }
-
-        // Try each vouch — if any leads to a trusted root, the chain is valid.
-        //
-        // **B-2 (security review):** require an *active* target
-        // attestation for the current URN. `active_attestation_for_iss`
-        // skips attestations that are revoked, expired, or whose
-        // issuer is burned. When the vouch carries `vch_sum`, the
-        // active attestation must hash to that value exactly; when
-        // `vch_sum` is absent, any active attestation suffices
-        // (legacy compat for vouches predating M-1).
-        let mut last_err = TrustError::NoValidChain;
-        for vouch in vouches_for_current {
-            let target_token =
-                self.active_attestation_for_iss(current_urn, vouch.payload.vch_sum.as_deref());
-
-            if let Some(ref expected_hash) = vouch.payload.vch_sum {
-                match target_token {
-                    Some(target) => {
-                        // Defensive: active_attestation_for_iss already
-                        // matched the hash; surface a clearer error if
-                        // it somehow drifted.
-                        let actual_hash = target.payload_hash();
-                        if !payload_hash_eq(expected_hash, &actual_hash) {
-                            last_err = TrustError::VouchHashMismatch {
-                                expected: expected_hash.clone(),
-                                got: actual_hash,
-                            };
-                            continue;
-                        }
-                    }
-                    None => {
-                        // No active attestation matches the embedded
-                        // hash — either revoked, expired, burned, or
-                        // never seen. Skip this vouch.
-                        continue;
-                    }
-                }
-            } else if target_token.is_none() {
-                // No active attestation at all for this issuer —
-                // refuse to grant any purpose through this vouch.
-                continue;
-            }
-
-            let voucher_urn = &vouch.payload.iss;
-            chain.push(vouch.payload.jti.clone());
-
-            match self.walk_chain(voucher_urn, trusted_roots, chain, depth + 1, visited) {
-                Ok(()) => return Ok(()),
-                Err(e @ TrustError::ChainTooDeep(_)) => return Err(e),
-                Err(e @ TrustError::IdentityBurned(_)) => return Err(e),
-                Err(e) => {
-                    last_err = e;
-                    chain.pop(); // backtrack
-                }
-            }
-        }
-
-        Err(last_err)
+    /// Vouches targeting `subject_urn` that currently count: not revoked,
+    /// not expired, and pinning an active attestation the subject issued
+    /// (**B-2**: exact `vch_sum` match when present; any active
+    /// attestation for legacy vouches without one).
+    fn effective_vouches_for_subject<'a>(
+        &'a self,
+        subject_urn: &'a str,
+    ) -> impl Iterator<Item = &'a Token> + 'a {
+        self.vouches_for_subject(subject_urn).filter(move |t| {
+            !self.is_revoked(&t.payload.jti)
+                && !Self::is_expired(t)
+                && self
+                    .active_attestation_for_iss(subject_urn, t.payload.vch_sum.as_deref())
+                    .is_some()
+        })
     }
 
     /// Iterate over all vouches whose `vch_iss` equals `subject_urn`.
@@ -677,6 +682,7 @@ impl TrustGraph {
             if let Some(ref subject) = t.payload.vch_iss {
                 self.unindex_vouch(subject, jti);
             }
+            self.unindex_vouch_issuer(&t.payload.iss, jti);
             removed = true;
         }
         if self.revocations.remove(jti).is_some() {
@@ -699,6 +705,15 @@ impl TrustGraph {
             set.remove(jti);
             if set.is_empty() {
                 self.vouches_by_subject.remove(subject);
+            }
+        }
+    }
+
+    fn unindex_vouch_issuer(&mut self, issuer: &str, jti: &str) {
+        if let Some(set) = self.vouches_by_issuer.get_mut(issuer) {
+            set.remove(jti);
+            if set.is_empty() {
+                self.vouches_by_issuer.remove(issuer);
             }
         }
     }
@@ -1087,6 +1102,196 @@ mod tests {
         let roots = roots_with("urn:vouchsafe:root.fakehash");
         let result = g.validate_chain("urn:vouchsafe:unknown.hash", &roots);
         assert_eq!(result, Err(TrustError::NoValidChain));
+    }
+
+    /// **Single-node review 2026-10-13.** A decoy chain deeper than
+    /// `max_chain_depth`, attached to a legitimately vouched subject with a
+    /// vouch JTI that sorts before the genuine one, must not veto the
+    /// genuine one-hop chain. The old depth-first walk returned
+    /// `ChainTooDeep` for the whole query as soon as the decoy branch hit
+    /// the cap, so any admitted peer could lock out every subject (or every
+    /// grant through any non-root voucher) with six throw-away identities.
+    #[test]
+    fn deep_decoy_chain_cannot_veto_direct_root_vouch() {
+        let mut g = TrustGraph::new(); // default depth 5
+        let root = Identity::generate("root", &mut OsRng);
+        let user = Identity::generate("user", &mut OsRng);
+        let user_token = make_attest(&user);
+        g.add_token(user_token.clone()).unwrap();
+        // Genuine: root vouches the user directly. JTI chosen to sort LAST.
+        g.add_token(make_vouch(
+            &root,
+            &user,
+            &user_token,
+            "group:dev",
+            "zz-legit",
+        ))
+        .unwrap();
+
+        // Decoy: b1 -> b2 -> ... -> b6 -> user, six hops, nobody at the
+        // top is a root. Every identity is throw-away.
+        let decoys: Vec<Identity> = (0..6)
+            .map(|i| Identity::generate(&format!("decoy{i}"), &mut OsRng))
+            .collect();
+        for d in &decoys {
+            g.add_token(make_attest(d)).unwrap();
+        }
+        // b6 vouches the user with a JTI that sorts FIRST ("!" < "z").
+        let b6_attest = make_attest(&decoys[5]);
+        g.add_token(make_vouch(
+            &decoys[5],
+            &user,
+            &user_token,
+            "group:dev",
+            "!decoy-6",
+        ))
+        .unwrap();
+        let _ = b6_attest;
+        // b(i) vouches b(i+1) up the chain.
+        for i in (0..5).rev() {
+            let target = &decoys[i + 1];
+            let target_attest = make_attest(target);
+            g.add_token(make_vouch(
+                &decoys[i],
+                target,
+                &target_attest,
+                "group:dev",
+                &format!("!decoy-{i}"),
+            ))
+            .unwrap();
+        }
+
+        let roots = roots_with(&root.id.to_urn());
+        assert_eq!(
+            g.validate_chain(&user.id.to_urn(), &roots),
+            Ok(vec![String::from("zz-legit")]),
+            "the genuine one-hop chain must win over the deep decoy"
+        );
+        assert!(g.has_purpose(&user.id.to_urn(), "group:dev", &roots));
+
+        // Sanity: with the genuine vouch gone, the decoy alone is not a
+        // chain (too deep / no root at the top).
+        assert!(g.remove_token("zz-legit"));
+        assert!(g.validate_chain(&user.id.to_urn(), &roots).is_err());
+    }
+
+    /// **Single-node review 2026-10-13.** A legitimate intermediate voucher
+    /// reached first through a deep decoy path must still be explored at
+    /// its real (shallow) depth. The DFS marked it visited at the deep
+    /// depth, hit the cap one hop later, and failed the whole query.
+    #[test]
+    fn intermediate_reached_via_decoy_is_still_found_at_its_real_depth() {
+        let mut g = TrustGraph::new(); // default depth 5
+        let root = Identity::generate("root", &mut OsRng);
+        let mid = Identity::generate("mid", &mut OsRng);
+        let user = Identity::generate("user", &mut OsRng);
+        let mid_attest = make_attest(&mid);
+        let user_attest = make_attest(&user);
+        g.add_token(mid_attest.clone()).unwrap();
+        g.add_token(user_attest.clone()).unwrap();
+        // Genuine 2-hop chain: root -> mid -> user (JTIs sort last).
+        g.add_token(make_vouch(
+            &root,
+            &mid,
+            &mid_attest,
+            "group:dev",
+            "zz-root-mid",
+        ))
+        .unwrap();
+        g.add_token(make_vouch(
+            &mid,
+            &user,
+            &user_attest,
+            "group:dev",
+            "zz-mid-user",
+        ))
+        .unwrap();
+        // Decoy: mid -> b1 -> b2 -> b3 -> b4 -> user. `mid` sits at depth
+        // 5 on this path, so root would be at depth 6 (> 5).
+        let decoys: Vec<Identity> = (0..4)
+            .map(|i| Identity::generate(&format!("decoy{i}"), &mut OsRng))
+            .collect();
+        for d in &decoys {
+            g.add_token(make_attest(d)).unwrap();
+        }
+        g.add_token(make_vouch(
+            &decoys[3],
+            &user,
+            &user_attest,
+            "group:dev",
+            "!d3-user",
+        ))
+        .unwrap();
+        for i in (0..3).rev() {
+            let t = make_attest(&decoys[i + 1]);
+            g.add_token(make_vouch(
+                &decoys[i],
+                &decoys[i + 1],
+                &t,
+                "group:dev",
+                &format!("!d{i}"),
+            ))
+            .unwrap();
+        }
+        let d0 = make_attest(&decoys[0]);
+        g.add_token(make_vouch(&mid, &decoys[0], &d0, "group:dev", "!mid-d0"))
+            .unwrap();
+
+        let roots = roots_with(&root.id.to_urn());
+        assert_eq!(
+            g.validate_chain(&user.id.to_urn(), &roots),
+            Ok(vec![
+                String::from("zz-mid-user"),
+                String::from("zz-root-mid")
+            ]),
+        );
+    }
+
+    /// A burn revokes exactly the burned identity's own vouches (served from
+    /// the issuer index), leaving another voucher's chain intact.
+    #[test]
+    fn burn_revokes_only_the_burned_issuers_vouches() {
+        let mut g = TrustGraph::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let other = Identity::generate("other", &mut OsRng);
+        let user = Identity::generate("user", &mut OsRng);
+        let other_attest = make_attest(&other);
+        let user_attest = make_attest(&user);
+        g.add_token(other_attest.clone()).unwrap();
+        g.add_token(user_attest.clone()).unwrap();
+        g.add_token(make_vouch(
+            &root,
+            &other,
+            &other_attest,
+            "admin",
+            "v-root-other",
+        ))
+        .unwrap();
+        g.add_token(make_vouch(
+            &other,
+            &user,
+            &user_attest,
+            "group:dev",
+            "v-other-user",
+        ))
+        .unwrap();
+        g.add_token(make_vouch(
+            &root,
+            &user,
+            &user_attest,
+            "group:dev",
+            "v-root-user",
+        ))
+        .unwrap();
+        g.add_token(make_burn(&other)).unwrap();
+        assert!(g.is_revoked("v-other-user"));
+        assert!(!g.is_revoked("v-root-user"));
+        assert!(!g.is_revoked("v-root-other"));
+        let roots = roots_with(&root.id.to_urn());
+        assert_eq!(
+            g.validate_chain(&user.id.to_urn(), &roots),
+            Ok(vec![String::from("v-root-user")])
+        );
     }
 
     #[test]

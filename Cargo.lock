@@ -1108,6 +1108,8 @@ dependencies = [
 name = "dds-net"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "cbor4ii",
  "ciborium",
  "dds-core",
  "dds-store",

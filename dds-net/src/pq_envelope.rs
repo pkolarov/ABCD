@@ -387,14 +387,14 @@ impl EpochKeyRelease {
         Ok(buf)
     }
 
-    /// CBOR-decode an opaque blob. Caller must apply the
-    /// `dds-core::cbor_bounded` depth cap (security review I-6) when
-    /// the bytes originate from an untrusted peer over the wire —
-    /// dds-net doesn't take a dep on dds-core, so the bounded decode
-    /// happens at the dds-node ingest site (mirrors how
-    /// [`dds_domain::AdmissionRevocation::from_cbor`] is wired).
+    /// CBOR-decode an opaque blob with the `dds_core::cbor_bounded`
+    /// depth cap (security review I-6), like the envelope decoders above.
+    /// The production ingest sites in `dds-node` already decode through
+    /// the bounded reader directly; bounding this helper too means a
+    /// future caller cannot reintroduce an unbounded decode of
+    /// peer-supplied bytes (single-node review 2026-10-13).
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, ciborium::de::Error<std::io::Error>> {
-        ciborium::from_reader(bytes)
+        dds_core::cbor_bounded::from_reader(bytes)
     }
 
     /// **Z-1 Phase B.4 schema-layer gate.** Run after [`Self::from_cbor`]

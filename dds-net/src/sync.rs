@@ -114,6 +114,64 @@ impl SyncMessage {
     }
 }
 
+/// Upper bound on `Operation::data` bytes accepted from a peer. The
+/// directory op-log carries no payload in `data` (every producer in the
+/// workspace writes zero or one byte); the token is the payload. Without
+/// a bound every admitted peer could attach the gossipsub maximum (~64 KiB)
+/// of opaque bytes to each op and have every node persist it.
+pub const MAX_OP_DATA_BYTES: usize = 64;
+
+/// Canonical operation id for a token: `op-<jti>`. Every producer in the
+/// workspace (local publish, revocation/burn side channels, the load and
+/// e2e harnesses, the DAG rebuild on restart) derives op ids this way.
+pub fn canonical_op_id(jti: &str) -> String {
+    format!("op-{jti}")
+}
+
+/// **Single-node review 2026-10-13 — op/token binding.** Check that a
+/// peer-supplied [`Operation`] is the canonical operation for the token it
+/// arrived with. Enforced on both replication paths (gossip ingest and
+/// anti-entropy sync) before the token reaches the trust graph.
+///
+/// Before this gate an admitted peer chose `op.id` freely. Delivering one
+/// valid token under two different op ids to two different peers left them
+/// permanently divergent: each re-requested the other's id every
+/// anti-entropy round, the re-delivery was rejected as a duplicate JTI, and
+/// the op never entered the DAG — so it was re-requested again, forever.
+/// Ten thousand such pairs filled every response (`SYNC_MAX_RESPONSE_ENTRIES`)
+/// with perpetually-rejected entries and starved genuine catch-up, and the
+/// state survived the attacker's revocation. Binding the op id to the
+/// token's JTI removes the degree of freedom entirely: a token has exactly
+/// one op id, so a re-delivery is a no-op on every node.
+pub fn validate_op_binding(op: &Operation, token: &Token) -> Result<(), String> {
+    let expected = canonical_op_id(&token.payload.jti);
+    if op.id != expected {
+        return Err(format!(
+            "op id '{}' is not the canonical id for token jti '{}'",
+            op.id, token.payload.jti
+        ));
+    }
+    if op.author != token.payload.iss {
+        return Err(format!(
+            "op author '{}' does not match token issuer '{}'",
+            op.author, token.payload.iss
+        ));
+    }
+    if !op.deps.is_empty() {
+        return Err(format!(
+            "op carries {} dependency edge(s); the directory op-log is flat",
+            op.deps.len()
+        ));
+    }
+    if op.data.len() > MAX_OP_DATA_BYTES {
+        return Err(format!(
+            "op data is {} bytes (max {MAX_OP_DATA_BYTES})",
+            op.data.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Build a state summary from the local store and DAG.
 pub fn build_summary(
     dag: &CausalDag,
@@ -659,6 +717,61 @@ mod tests {
         let mut buf = Vec::new();
         ciborium::into_writer(op, &mut buf).unwrap();
         buf
+    }
+
+    // ---------- op/token binding (single-node review 2026-10-13) ----------
+
+    fn canonical_op_for(token: &Token, data: Vec<u8>) -> Operation {
+        Operation {
+            id: canonical_op_id(&token.payload.jti),
+            author: token.payload.iss.clone(),
+            deps: Vec::new(),
+            data,
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn op_binding_accepts_canonical_op() {
+        let ident = make_identity("alice");
+        let token = make_attest_token(&ident);
+        assert_eq!(
+            validate_op_binding(&canonical_op_for(&token, vec![]), &token),
+            Ok(())
+        );
+        // The harnesses write a one-byte marker; that stays acceptable.
+        assert_eq!(
+            validate_op_binding(&canonical_op_for(&token, vec![0]), &token),
+            Ok(())
+        );
+        assert_eq!(
+            validate_op_binding(
+                &canonical_op_for(&token, vec![0; MAX_OP_DATA_BYTES]),
+                &token
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn op_binding_rejects_aliased_id_foreign_author_deps_and_oversized_data() {
+        let ident = make_identity("alice");
+        let token = make_attest_token(&ident);
+
+        let mut aliased = canonical_op_for(&token, vec![]);
+        aliased.id = "op-somebody-else".to_string();
+        assert!(validate_op_binding(&aliased, &token).is_err());
+
+        let mut foreign = canonical_op_for(&token, vec![]);
+        foreign.author = "urn:vouchsafe:mallory.x".to_string();
+        assert!(validate_op_binding(&foreign, &token).is_err());
+
+        let mut with_deps = canonical_op_for(&token, vec![]);
+        with_deps.deps.push("op-other".to_string());
+        assert!(validate_op_binding(&with_deps, &token).is_err());
+
+        let fat = canonical_op_for(&token, vec![0; MAX_OP_DATA_BYTES + 1]);
+        assert!(validate_op_binding(&fat, &token).is_err());
     }
 
     #[test]

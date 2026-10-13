@@ -60,6 +60,7 @@ See [DDS Admin Guide — Windows Deployment](docs/DDS-Admin-Guide.md#windows-dep
 | **[STATUS.md](STATUS.md)** | Contributors | Module-by-module implementation tracker with test counts |
 | **[Claude_sec_review.md](Claude_sec_review.md)** | Security reviewers | Source-validated security review with per-finding remediation status (latest pass 2026-04-21 — all Critical + High findings closed; 2026-04-26 zero-trust audit added Z-1..Z-5 open items) |
 | **[Threat Model Review](docs/threat-model-review.md)** | Architects | Narrative threat model with resolved / open items per subsystem |
+| **[Single-Node Compromise Review](docs/security-review-2026-10-13-single-node.md)** | Security reviewers | What one hostile *admitted* node can do to the whole mesh: ten findings fixed in-tree (forged-vouch root demotion, op/token binding, sync-cache starvation, decoy-chain veto, …) and the residual design items (unbounded self-signed token volume, O(N) sync requests) |
 
 ### Platform-Specific
 

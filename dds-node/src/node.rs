@@ -95,6 +95,147 @@ const SYNC_MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 /// embed UUIDv7-ish prefixes and are roughly time-ordered.
 const SYNC_PAYLOAD_CACHE_CAP: usize = 10_000;
 
+/// **Single-node review 2026-10-13** — per-entry size bounds on an inbound
+/// sync payload. Gossip already caps a token at the gossipsub transmit
+/// size (64 KiB); the sync path only had the whole-response budget
+/// (`SYNC_MAX_RESPONSE_BYTES`), so one admitted peer could ship a single
+/// 5 MiB token and have it persisted and re-served. The op is a fixed
+/// shape (`op-<jti>`, no deps, ≤ 64 data bytes) and never needs 4 KiB.
+const SYNC_MAX_TOKEN_BYTES: usize = 64 * 1024;
+const SYNC_MAX_OP_BYTES: usize = 4 * 1024;
+
+/// **Single-node review 2026-10-13** — insertion-ordered sync payload
+/// cache.
+///
+/// The previous `BTreeMap<op_id, SyncPayload>` evicted with `pop_first`
+/// (the lexicographically *smallest* key, not the oldest entry — the
+/// "roughly time-ordered ids" assumption behind M-5 does not hold for
+/// peer-chosen JTIs) and `build_sync_response` served entries in key
+/// order. Ten thousand self-signed tokens whose JTIs sort last evicted
+/// every genuine entry and then kept the cache 100 % attacker-owned —
+/// each new genuine op evicted the previous genuine op — so the node
+/// could never again serve anti-entropy catch-up, and the state was
+/// rebuilt from the store on restart. Ids sorting first instead filled
+/// every response's `SYNC_MAX_RESPONSE_ENTRIES` slots ahead of genuine
+/// ops. Keying eviction and serving order on an insertion sequence
+/// removes the attacker's control over both.
+struct SyncPayloadCache {
+    /// op id → (insertion sequence, payload).
+    by_id: BTreeMap<String, (u64, SyncPayload)>,
+    /// insertion sequence → op id; FIFO eviction and oldest-first serving.
+    order: BTreeMap<u64, String>,
+    next_seq: u64,
+}
+
+impl SyncPayloadCache {
+    fn new() -> Self {
+        Self {
+            by_id: BTreeMap::new(),
+            order: BTreeMap::new(),
+            next_seq: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    fn contains_key(&self, op_id: &str) -> bool {
+        self.by_id.contains_key(op_id)
+    }
+
+    /// Insert, or replace the payload of an existing entry in place (the
+    /// entry keeps its original position).
+    fn insert(&mut self, op_id: String, payload: SyncPayload) {
+        if let Some((_, slot)) = self.by_id.get_mut(&op_id) {
+            *slot = payload;
+            return;
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.order.insert(seq, op_id.clone());
+        self.by_id.insert(op_id, (seq, payload));
+    }
+
+    /// Evict the entry inserted longest ago. Returns its op id.
+    fn evict_oldest(&mut self) -> Option<String> {
+        let (_, id) = self.order.pop_first()?;
+        self.by_id.remove(&id);
+        Some(id)
+    }
+
+    /// Entries in insertion order, oldest first.
+    fn iter_oldest_first(&self) -> impl Iterator<Item = (&String, &SyncPayload)> {
+        self.order
+            .values()
+            .filter_map(move |id| self.by_id.get(id).map(|(_, p)| (id, p)))
+    }
+}
+
+#[cfg(test)]
+mod sync_payload_cache_tests {
+    use super::*;
+
+    fn payload(tag: u8) -> SyncPayload {
+        SyncPayload {
+            op_bytes: vec![tag],
+            token_bytes: vec![tag],
+        }
+    }
+
+    /// Eviction is by insertion age, not by key order: an entry whose id
+    /// sorts last but was inserted first goes first.
+    #[test]
+    fn evicts_oldest_insertion_not_smallest_key() {
+        let mut c = SyncPayloadCache::new();
+        c.insert("op-zzz".into(), payload(1));
+        c.insert("op-aaa".into(), payload(2));
+        c.insert("op-mmm".into(), payload(3));
+        assert_eq!(c.evict_oldest().as_deref(), Some("op-zzz"));
+        assert!(!c.contains_key("op-zzz"));
+        assert_eq!(c.len(), 2);
+        let order: Vec<&str> = c.iter_oldest_first().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(order, vec!["op-aaa", "op-mmm"], "served oldest first");
+    }
+
+    /// Attacker ids that sort LAST cannot push genuine entries out ahead
+    /// of their time, and ids that sort FIRST cannot jump the serving
+    /// queue: both are purely a function of insertion order.
+    #[test]
+    fn key_order_has_no_influence_on_eviction_or_serving() {
+        let mut c = SyncPayloadCache::new();
+        for i in 0..5 {
+            c.insert(format!("op-~attacker-{i}"), payload(0));
+        }
+        c.insert("op-genuine".into(), payload(9));
+        for i in 0..5 {
+            c.insert(format!("op-!attacker-{i}"), payload(0));
+        }
+        // Evict five: exactly the five oldest (the "~" batch) go.
+        for _ in 0..5 {
+            let id = c.evict_oldest().unwrap();
+            assert!(id.starts_with("op-~attacker-"), "{id}");
+        }
+        assert!(c.contains_key("op-genuine"));
+        let first = c.iter_oldest_first().next().map(|(id, _)| id.clone());
+        assert_eq!(first.as_deref(), Some("op-genuine"));
+    }
+
+    #[test]
+    fn reinsert_keeps_position_and_replaces_payload() {
+        let mut c = SyncPayloadCache::new();
+        c.insert("a".into(), payload(1));
+        c.insert("b".into(), payload(2));
+        c.insert("a".into(), payload(7));
+        assert_eq!(c.len(), 2);
+        let order: Vec<(&str, u8)> = c
+            .iter_oldest_first()
+            .map(|(id, p)| (id.as_str(), p.op_bytes[0]))
+            .collect();
+        assert_eq!(order, vec![("a", 7), ("b", 2)]);
+    }
+}
+
 /// **M-6 (security review)**: how often to re-verify the admission
 /// cert after startup. An expired cert will trigger a clean shutdown
 /// — the node stops publishing and returns from `run()`. Set to
@@ -359,7 +500,7 @@ pub struct DdsNode {
     /// Built up at gossip-ingest time so the anti-entropy responder can
     /// reply without re-deriving op→token mapping at lookup time.
     /// Resolves B6 (the gossip-only delivery gap from the chaos soak).
-    sync_payloads: BTreeMap<String, SyncPayload>,
+    sync_payloads: SyncPayloadCache,
     /// Per-peer "last outbound sync" timestamp for the cooldown throttle.
     sync_last_outbound: BTreeMap<PeerId, Instant>,
     /// **Watchdog plan Step 6 + FIX 1**: per-peer admission-retry state,
@@ -1045,7 +1186,7 @@ impl DdsNode {
             trusted_roots,
             topics,
             config,
-            sync_payloads: BTreeMap::new(),
+            sync_payloads: SyncPayloadCache::new(),
             sync_last_outbound: BTreeMap::new(),
             admission_retry_last_outbound: BTreeMap::new(),
             admission_denied_until: BTreeMap::new(),
@@ -3138,11 +3279,16 @@ impl DdsNode {
                                 .as_deref()
                                 .map(|b| b == sub)
                                 .unwrap_or(false);
+                            // Only a vouch from a current root keeps the
+                            // subject a root — any admitted peer can plant
+                            // a dds:admin vouch from a throw-away identity
+                            // (single-node review 2026-10-13).
                             let still_vouched =
                                 g.vouch_summaries_for_subject(&sub).iter().any(|s| {
                                     s.purpose.as_deref() == Some(admin_purpose)
                                         && !s.revoked
                                         && !s.expired
+                                        && self.trusted_roots.contains(&s.issuer)
                                 });
                             if !is_bootstrap && !still_vouched {
                                 Some(sub)
@@ -3197,6 +3343,24 @@ impl DdsNode {
                 rejected_action_for(&token.payload.kind),
                 token_bytes.to_vec(),
                 Some(format!("validation-failed: {e}")),
+            );
+            return;
+        }
+        // **Single-node review 2026-10-13 — op/token binding.** The op
+        // must be the canonical operation for this token (see
+        // `dds_net::sync::validate_op_binding`). Checked before the trust
+        // graph so an attacker-chosen op id is never persisted or relayed.
+        if let Err(e) = dds_net::sync::validate_op_binding(&op, &token) {
+            warn!(
+                jti = %token.payload.jti,
+                op_id = %op.id,
+                "rejecting inbound token: {e}"
+            );
+            crate::telemetry::record_gossip_messages_dropped("op_binding");
+            self.emit_audit_from_ingest(
+                rejected_action_for(&token.payload.kind),
+                token_bytes.to_vec(),
+                Some(format!("op-binding: {e}")),
             );
             return;
         }
@@ -3505,11 +3669,12 @@ impl DdsNode {
             return;
         }
         // M-5: enforce a hard cap with FIFO eviction so the cache can't
-        // grow unbounded under steady-state op traffic.
+        // grow unbounded under steady-state op traffic. Eviction is by
+        // insertion age (see `SyncPayloadCache`), never by key order.
         while self.sync_payloads.len() >= SYNC_PAYLOAD_CACHE_CAP
             && !self.sync_payloads.contains_key(op_id)
         {
-            self.sync_payloads.pop_first();
+            self.sync_payloads.evict_oldest();
         }
         self.sync_payloads.insert(
             op_id.to_string(),
@@ -4028,7 +4193,7 @@ impl DdsNode {
             Vec::with_capacity(SYNC_MAX_RESPONSE_ENTRIES.min(self.sync_payloads.len()));
         let mut bytes_acc: usize = 0;
         let mut complete = true;
-        for (id, payload) in &self.sync_payloads {
+        for (id, payload) in self.sync_payloads.iter_oldest_first() {
             if req.known_op_ids.contains(id.as_str()) {
                 continue;
             }
@@ -4710,7 +4875,11 @@ impl DdsNode {
                 ) {
                     Ok(plaintext) => {
                         crate::telemetry::record_pq_envelope_decrypt("ok");
-                        match ciborium::from_reader::<SyncPayload, _>(plaintext.as_slice()) {
+                        // Bounded depth: the responder controls this
+                        // plaintext end to end (I-6 / L-17).
+                        match dds_core::cbor_bounded::from_reader::<SyncPayload, _>(
+                            plaintext.as_slice(),
+                        ) {
                             Ok(p) => decrypted.push(p),
                             Err(e) => {
                                 warn!(%peer, error = %e, "B.8: decrypted sync payload CBOR decode failed — dropping entry");
@@ -4754,10 +4923,42 @@ impl DdsNode {
             .payloads
             .into_iter()
             .filter(|payload| {
+                // **Single-node review 2026-10-13** — per-entry size bound
+                // (see `SYNC_MAX_TOKEN_BYTES`).
+                if payload.token_bytes.len() > SYNC_MAX_TOKEN_BYTES
+                    || payload.op_bytes.len() > SYNC_MAX_OP_BYTES
+                {
+                    warn!(
+                        %peer,
+                        token_bytes = payload.token_bytes.len(),
+                        op_bytes = payload.op_bytes.len(),
+                        "sync: dropping oversized payload"
+                    );
+                    crate::telemetry::record_sync_payloads_rejected("oversized");
+                    return false;
+                }
                 let token = match Token::from_cbor(&payload.token_bytes) {
                     Ok(t) => t,
                     Err(_) => return true, // let apply_sync_payloads surface the error
                 };
+                // **Single-node review 2026-10-13 — op/token binding**: the
+                // same gate `ingest_operation` runs on gossip. An op that
+                // fails to decode is left for `apply_sync_payloads_with_graph`
+                // to report. Bounded depth: peer-supplied (I-6).
+                if let Ok(op) = dds_core::cbor_bounded::from_reader::<Operation, _>(
+                    payload.op_bytes.as_slice(),
+                ) {
+                    if let Err(e) = dds_net::sync::validate_op_binding(&op, &token) {
+                        warn!(
+                            %peer,
+                            jti = %token.payload.jti,
+                            op_id = %op.id,
+                            "sync: dropping payload: {e}"
+                        );
+                        crate::telemetry::record_sync_payloads_rejected("op_binding");
+                        return false;
+                    }
+                }
                 // **M-1 / M-2 downgrade guard**: same cutoff as the
                 // gossip path. Persisted v1 on this node's disk is
                 // fine; fresh ingest from a peer is not, unless the
@@ -4816,21 +5017,29 @@ impl DdsNode {
                     crate::telemetry::record_sync_payloads_rejected("publisher_identity");
                     return false;
                 }
-                // **M-9 (security review)**: the live gossip ingest path
-                // runs `revocation_within_replay_window` on
-                // revoke/burn tokens. The sync path has to run the
-                // same check — otherwise an attacker who can push to
-                // a peer's sync protocol can replay old revocations
-                // that gossip would reject.
+                // **M-9 (security review) / single-node review 2026-10-13.**
+                // The live gossip path refuses revoke/burn tokens older
+                // than `REVOCATION_REPLAY_WINDOW_SECS`. Anti-entropy sync
+                // exists precisely to deliver what a node missed while it
+                // was away, and a revocation is idempotent and permanent:
+                // one the graph already holds is refused as a duplicate
+                // JTI, one whose target is gone is refused by H-1, and a
+                // forged one fails its signature — so an old-but-genuine
+                // revocation can only ever *add* a revocation this node
+                // should have. Applying the 7-day window here instead
+                // meant a node offline for more than a week never learned
+                // the revocations issued during the outage (and
+                // re-requested them every round forever). Only the
+                // forward clock-skew half of M-9 applies on this path.
                 if matches!(token.payload.kind, TokenKind::Revoke | TokenKind::Burn)
-                    && !revocation_within_replay_window(token.payload.iat)
+                    && !revocation_iat_not_from_future(token.payload.iat)
                 {
                     warn!(
                         %peer,
                         jti = %token.payload.jti,
                         iat = token.payload.iat,
                         kind = ?token.payload.kind,
-                        "sync: dropping revoke/burn payload: iat outside replay window"
+                        "sync: dropping revoke/burn payload: iat is in the future"
                     );
                     crate::telemetry::record_sync_payloads_rejected("replay_window");
                     return false;
@@ -4879,12 +5088,22 @@ impl DdsNode {
         // some other peer can serve these payloads onward. **M-5
         // (security review)**: route through `cache_sync_payload` so
         // the FIFO cap applies — the previous raw `insert` here
-        // bypassed the bound.
+        // bypassed the bound. **Single-node review 2026-10-13**: only
+        // payloads whose op NEWLY merged are cached. Caching every entry
+        // of the batch — including ones the graph rejected (bad
+        // signature, duplicate JTI, unauthorized revoke) — made this
+        // node a relay for a hostile responder's junk and let that junk
+        // evict genuine entries under the cache cap.
+        let merged_for_cache: std::collections::HashSet<&str> =
+            result.merged_op_ids.iter().map(String::as_str).collect();
         for payload in &payloads {
             // Bounded depth: peer-supplied. Security review I-6.
             if let Ok(op) =
                 dds_core::cbor_bounded::from_reader::<Operation, _>(payload.op_bytes.as_slice())
             {
+                if !merged_for_cache.contains(op.id.as_str()) {
+                    continue;
+                }
                 let id = op.id.clone();
                 self.cache_sync_payload(&id, &op, &payload.token_bytes);
             }
@@ -5963,11 +6182,30 @@ fn revocation_within_replay_window(iat: u64) -> bool {
     };
     // Permit small forward clock skew (up to 1 hour) but reject
     // anything beyond the replay window backwards.
-    const FORWARD_SKEW_SECS: u64 = 3600;
-    if iat > now.saturating_add(FORWARD_SKEW_SECS) {
+    if iat > now.saturating_add(REVOCATION_FORWARD_SKEW_SECS) {
         return false;
     }
     now.saturating_sub(iat) <= REVOCATION_REPLAY_WINDOW_SECS
+}
+
+/// Forward clock-skew tolerance shared by [`revocation_within_replay_window`]
+/// and [`revocation_iat_not_from_future`].
+const REVOCATION_FORWARD_SKEW_SECS: u64 = 3600;
+
+/// **Single-node review 2026-10-13** — the forward-skew half of M-9 only:
+/// `true` unless the revoke/burn `iat` is more than an hour in the future.
+/// Used by the anti-entropy sync path, where an *old* genuine revocation
+/// is exactly what a node that was offline needs to receive (see the
+/// call site in `apply_decrypted_sync_response`).
+fn revocation_iat_not_from_future(iat: u64) -> bool {
+    if iat == 0 {
+        return true;
+    }
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => return true,
+    };
+    iat <= now.saturating_add(REVOCATION_FORWARD_SKEW_SECS)
 }
 
 /// **AUDIT-2026-06-11 C1 (defense-in-depth)** — a `DdsSelfUpdateDocument`
@@ -7902,6 +8140,12 @@ mod r5_sync_quorum_replay_tests {
         }
     }
 
+    /// The canonical `(op, token)` pair for a token — what every honest
+    /// producer emits and what the op/token binding gate requires.
+    fn canonical_payload(token: &Token) -> SyncPayload {
+        sync_payload(&format!("op-{}", token.payload.jti), token)
+    }
+
     fn sync_response(payloads: Vec<SyncPayload>) -> SyncResponse {
         SyncResponse {
             payloads,
@@ -8006,10 +8250,7 @@ mod r5_sync_quorum_replay_tests {
             assert!(forged.validate().is_ok(), "forged token is otherwise valid");
             node.apply_decrypted_sync_response(
                 PeerId::random(),
-                sync_response(vec![
-                    sync_payload("op-forged-sync", &forged),
-                    sync_payload("op-legit-sync", &legit),
-                ]),
+                sync_response(vec![canonical_payload(&forged), canonical_payload(&legit)]),
             );
             assert!(
                 !has(&node, "attest-forged-sync"),
@@ -8024,9 +8265,9 @@ mod r5_sync_quorum_replay_tests {
             let forged =
                 user_auth_attestation_token(&attacker, &victim_urn, "attest-forged-gossip");
             let legit = user_auth_attestation_token(&victim, &victim_urn, "attest-legit-gossip");
-            let p = sync_payload("op-forged-gossip", &forged);
+            let p = canonical_payload(&forged);
             node.ingest_operation(&p.op_bytes, &p.token_bytes);
-            let p = sync_payload("op-legit-gossip", &legit);
+            let p = canonical_payload(&legit);
             node.ingest_operation(&p.op_bytes, &p.token_bytes);
             assert!(
                 !has(&node, "attest-forged-gossip"),
@@ -8047,6 +8288,163 @@ mod r5_sync_quorum_replay_tests {
         });
     }
 
+    /// **Single-node review 2026-10-13 — op/token binding.** On both
+    /// replication paths an op that is not the canonical `op-<jti>` for
+    /// its token is dropped before the trust graph, a canonical payload
+    /// in the same sync batch is still admitted, and the dropped payload
+    /// is NOT cached for onward serving to other peers.
+    #[test]
+    fn aliased_op_ids_are_rejected_on_both_replication_paths_and_not_relayed() {
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("op-binding.local", [11u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            let has = |node: &DdsNode, jti: &str| {
+                node.trust_graph
+                    .read()
+                    .unwrap()
+                    .attestations_iter()
+                    .any(|t| t.payload.jti == jti)
+            };
+            let served_ids = |node: &DdsNode| -> Vec<String> {
+                node.build_sync_response_for_tests(&SyncRequest {
+                    known_op_ids: BTreeSet::new(),
+                    heads: BTreeSet::new(),
+                })
+                .payloads
+                .iter()
+                .filter_map(|p| {
+                    ciborium::from_reader::<Operation, _>(p.op_bytes.as_slice())
+                        .ok()
+                        .map(|o| o.id)
+                })
+                .collect()
+            };
+
+            // Sync: aliased op id dropped, canonical sibling admitted.
+            let alice = Identity::generate("alice", &mut OsRng);
+            let bob = Identity::generate("bob", &mut OsRng);
+            let alice_tok = make_attest(&alice);
+            let bob_tok = make_attest(&bob);
+            let alice_jti = alice_tok.payload.jti.clone();
+            let bob_jti = bob_tok.payload.jti.clone();
+            node.apply_decrypted_sync_response(
+                PeerId::random(),
+                sync_response(vec![
+                    sync_payload("op-not-alice", &alice_tok),
+                    canonical_payload(&bob_tok),
+                ]),
+            );
+            assert!(!has(&node, &alice_jti), "aliased op id must be dropped");
+            assert!(
+                has(&node, &bob_jti),
+                "canonical payload in the same batch is admitted"
+            );
+            let ids = served_ids(&node);
+            assert!(ids.contains(&format!("op-{bob_jti}")), "{ids:?}");
+            assert!(!ids.iter().any(|id| id == "op-not-alice"), "{ids:?}");
+
+            // A graph-rejected payload (duplicate JTI under its own
+            // canonical id) must not be re-cached either.
+            let before = served_ids(&node).len();
+            node.apply_decrypted_sync_response(
+                PeerId::random(),
+                sync_response(vec![canonical_payload(&bob_tok)]),
+            );
+            assert_eq!(served_ids(&node).len(), before);
+
+            // Gossip: same rule.
+            let carol = Identity::generate("carol", &mut OsRng);
+            let carol_tok = make_attest(&carol);
+            let carol_jti = carol_tok.payload.jti.clone();
+            let p = sync_payload("op-not-carol", &carol_tok);
+            node.ingest_operation(&p.op_bytes, &p.token_bytes);
+            assert!(!has(&node, &carol_jti), "gossip must drop an aliased op id");
+            let p = canonical_payload(&carol_tok);
+            node.ingest_operation(&p.op_bytes, &p.token_bytes);
+            assert!(has(&node, &carol_jti));
+        });
+    }
+
+    /// **Single-node review 2026-10-13.** A genuine revocation older than
+    /// the 7-day gossip replay window — the shape a node sees when it
+    /// returns from a long outage — is applied via anti-entropy sync. A
+    /// revocation stamped in the future is still refused.
+    #[test]
+    fn sync_applies_old_genuine_revocation_but_refuses_future_stamped_one() {
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("old-revoke.local", [12u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let revoke_for = |issuer: &Identity, target_jti: &str, jti: &str, iat: u64| {
+                Token::sign(
+                    TokenPayload {
+                        iss: issuer.id.to_urn(),
+                        iss_key: issuer.public_key.clone(),
+                        jti: jti.to_string(),
+                        sub: issuer.id.to_urn(),
+                        kind: TokenKind::Revoke,
+                        purpose: None,
+                        vch_iss: None,
+                        vch_sum: None,
+                        revokes: Some(target_jti.to_string()),
+                        iat,
+                        exp: None,
+                        body_type: None,
+                        body_cbor: None,
+                    },
+                    &issuer.signing_key,
+                )
+                .unwrap()
+            };
+
+            let alice = Identity::generate("alice", &mut OsRng);
+            let a_tok = make_attest(&alice);
+            let a_jti = a_tok.payload.jti.clone();
+            // 30 days old: well outside the gossip replay window.
+            let old_revoke = revoke_for(&alice, &a_jti, "revoke-old", now - 30 * 86_400);
+            node.apply_decrypted_sync_response(
+                PeerId::random(),
+                sync_response(vec![
+                    canonical_payload(&a_tok),
+                    canonical_payload(&old_revoke),
+                ]),
+            );
+            assert!(
+                node.trust_graph.read().unwrap().is_revoked(&a_jti),
+                "an old genuine revocation delivered by anti-entropy must apply"
+            );
+
+            let bob = Identity::generate("bob", &mut OsRng);
+            let b_tok = make_attest(&bob);
+            let b_jti = b_tok.payload.jti.clone();
+            let future_revoke = revoke_for(&bob, &b_jti, "revoke-future", now + 2 * 86_400);
+            node.apply_decrypted_sync_response(
+                PeerId::random(),
+                sync_response(vec![
+                    canonical_payload(&b_tok),
+                    canonical_payload(&future_revoke),
+                ]),
+            );
+            assert!(
+                !node.trust_graph.read().unwrap().is_revoked(&b_jti),
+                "a future-stamped revocation is still refused on sync"
+            );
+        });
+    }
+
     #[test]
     fn k_tokens_across_two_sync_batches_reach_quorum() {
         run_with_time(|| {
@@ -8063,7 +8461,7 @@ mod r5_sync_quorum_replay_tests {
             // Batch 1: first publisher signature — counted, below quorum.
             node.handle_sync_response_for_tests(
                 peer,
-                sync_response(vec![sync_payload("r5-op-su-1", &tok1)]),
+                sync_response(vec![canonical_payload(&tok1)]),
             );
             let pending = node.pending_self_updates_for_tests();
             assert_eq!(
@@ -8081,7 +8479,7 @@ mod r5_sync_quorum_replay_tests {
             // the accumulator entry is removed.
             node.handle_sync_response_for_tests(
                 peer,
-                sync_response(vec![sync_payload("r5-op-su-2", &tok2)]),
+                sync_response(vec![canonical_payload(&tok2)]),
             );
             assert!(
                 node.pending_self_updates_for_tests().is_empty(),
@@ -8109,8 +8507,8 @@ mod r5_sync_quorum_replay_tests {
 
             let tok1 = self_update_token(&pub1, "r5-su-pub1");
             let tok2 = self_update_token(&pub2, "r5-su-pub2");
-            let payload1 = sync_payload("r5-op-su-1", &tok1);
-            let payload2 = sync_payload("r5-op-su-2", &tok2);
+            let payload1 = canonical_payload(&tok1);
+            let payload2 = canonical_payload(&tok2);
 
             // Reach quorum once (same flow the positive test pins).
             node.handle_sync_response_for_tests(peer, sync_response(vec![payload1.clone()]));
@@ -8125,7 +8523,7 @@ mod r5_sync_quorum_replay_tests {
             // plus a novel benign op (a fresh identity attestation) that
             // opens the old batch-level gate.
             let benign = Identity::generate("benign", &mut OsRng);
-            let benign_payload = sync_payload("r5-op-benign", &make_attest(&benign));
+            let benign_payload = canonical_payload(&make_attest(&benign));
             node.handle_sync_response_for_tests(
                 peer,
                 sync_response(vec![payload1, benign_payload]),
@@ -8172,11 +8570,11 @@ mod r5_sync_quorum_replay_tests {
             // Reach quorum once; the accumulator empties.
             node.handle_sync_response_for_tests(
                 peer,
-                sync_response(vec![sync_payload("r5-op-su-1", &tok1)]),
+                sync_response(vec![canonical_payload(&tok1)]),
             );
             node.handle_sync_response_for_tests(
                 peer,
-                sync_response(vec![sync_payload("r5-op-su-2", &tok2)]),
+                sync_response(vec![canonical_payload(&tok2)]),
             );
             assert!(
                 node.pending_self_updates_for_tests().is_empty(),
@@ -8185,7 +8583,10 @@ mod r5_sync_quorum_replay_tests {
 
             // The alias batch: a novel attacker token merges op id
             // "r5-op-alias"; the replayed publisher token rides the same
-            // op id in a second payload.
+            // op id in a second payload. (Since the op/token binding gate
+            // of 2026-10-13 both payloads are already refused before the
+            // apply step; the R5 occurrence check stays as defense in
+            // depth and this test pins the end-to-end outcome.)
             let attacker = Identity::generate("alias-attacker", &mut OsRng);
             node.handle_sync_response_for_tests(
                 peer,

@@ -3772,9 +3772,12 @@ impl<
     ///   the vouching ceremony ran; every other node needed a manual
     ///   `trusted_roots` config edit.
     /// - **Demote**: a *promoted* root (one that has a `dds:admin` vouch
-    ///   in the graph, i.e. it was not hand-added to config) is removed
-    ///   when it no longer has a live `dds:admin` vouch **from a current
-    ///   trusted root** — the exact inverse of the promotion rule. This
+    ///   in the graph **issued by a trusted root**, i.e. it was not
+    ///   hand-added to config) is removed when it no longer has a live
+    ///   `dds:admin` vouch **from a current trusted root** — the exact
+    ///   inverse of the promotion rule. A `dds:admin` vouch signed by a
+    ///   non-root is not evidence of promotion: any admitted peer can
+    ///   mint one (single-node review 2026-10-13). This
     ///   makes demotion transitive: offboarding admin R also demotes the
     ///   sub-admin S that R promoted, because once R leaves the root set,
     ///   S's vouch-from-R stops counting. Burned roots are demoted
@@ -4639,6 +4642,10 @@ pub(crate) fn reconcile_roots_against_graph(
 ) -> bool {
     let admin_purpose = dds_core::token::purpose::ADMIN;
     let mut changed_any = false;
+    // Roots as of the start of this pass. A root demoted during the pass
+    // (its own promotion lapsed) must still count as the promoter of the
+    // sub-admins it vouched, so their demotion cascades in the same pass.
+    let initial_roots: BTreeSet<String> = roots.clone();
     for _ in 0..64 {
         // A subject is *root-eligible* iff it holds a live `dds:admin`
         // vouch issued by a CURRENT trusted root. `!s.expired` is the
@@ -4649,6 +4656,29 @@ pub(crate) fn reconcile_roots_against_graph(
                     && !s.revoked
                     && !s.expired
                     && roots.contains(&s.issuer)
+            })
+        };
+        // **Single-node review 2026-10-13.** A root is *demotable* only if
+        // the graph shows it was promoted through the graph: it holds at
+        // least one `dds:admin` vouch (live or not) issued by an identity
+        // that is a trusted root now, was one when this pass started, or
+        // is the bootstrap admin. The previous rule counted ANY
+        // `dds:admin` vouch targeting the root as proof of promotion.
+        // Vouches are accepted into the replicated graph on signature
+        // alone, so an admitted peer could sign one from a throw-away
+        // identity against a config-anchored root (any `trusted_roots`
+        // entry other than `bootstrap_admin_urn` — on member nodes that
+        // is every root the provisioning bundle seeded), and every node
+        // demoted that root and persisted the demotion to node.toml:
+        // a domain-wide, restart-surviving loss of all grants that
+        // chain through it, from one hostile node. Only a signature by
+        // a real root can now mark a root as promoted.
+        let promoted_through_graph = |root: &str, roots: &BTreeSet<String>| -> bool {
+            g.vouch_summaries_for_subject(root).iter().any(|s| {
+                s.purpose.as_deref() == Some(admin_purpose)
+                    && (roots.contains(&s.issuer)
+                        || initial_roots.contains(&s.issuer)
+                        || bootstrap_admin_urn == Some(s.issuer.as_str()))
             })
         };
 
@@ -4680,11 +4710,7 @@ pub(crate) fn reconcile_roots_against_graph(
                 to_remove.push(root.clone());
                 continue;
             }
-            let has_any_admin_vouch = g
-                .vouch_summaries_for_subject(root)
-                .iter()
-                .any(|s| s.purpose.as_deref() == Some(admin_purpose));
-            if has_any_admin_vouch && !eligible(root, roots) {
+            if promoted_through_graph(root, roots) && !eligible(root, roots) {
                 to_remove.push(root.clone());
             }
         }
@@ -6994,6 +7020,156 @@ mod platform_applier_tests {
             err.is_err(),
             "nothing left to revoke → error, not a double-revoke"
         );
+    }
+
+    /// **Single-node review 2026-10-13.** A `dds:admin` vouch signed by an
+    /// identity that is NOT a trusted root — which any admitted peer can
+    /// put into the replicated graph — must not demote a config-anchored
+    /// root. Before the fix the demotion branch treated any such vouch as
+    /// evidence the root had been "promoted" and, finding no live vouch
+    /// from a current root, dropped it from `trusted_roots` on every node
+    /// (and persisted that to node.toml).
+    #[test]
+    fn forged_admin_vouch_from_non_root_cannot_demote_config_anchored_root() {
+        let (mut svc, admin, _) = setup();
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        svc.set_data_dir(data_dir.path().to_path_buf());
+        svc.set_bootstrap_admin_urn(Some(admin.id.to_urn()));
+
+        // A second root anchored purely by config (the shape every
+        // provisioning-bundle-seeded member node has for the founding
+        // admin, and every hand-edited `trusted_roots` entry).
+        let anchored = Identity::generate("anchored-root", &mut OsRng);
+        let anchored_attest = make_attest_for_publisher_setup(&anchored);
+        let anchored_hash = anchored_attest.payload_hash();
+        svc.trust_graph
+            .write()
+            .unwrap()
+            .add_token(anchored_attest)
+            .unwrap();
+        svc.trusted_roots.insert(anchored.id.to_urn());
+
+        // Mallory is nobody: a fresh identity with no chain to any root.
+        let mallory = Identity::generate("mallory", &mut OsRng);
+        let forged = Token::sign(
+            TokenPayload {
+                iss: mallory.id.to_urn(),
+                iss_key: mallory.public_key.clone(),
+                jti: "forged-admin-vouch".into(),
+                sub: anchored.id.to_urn(),
+                kind: TokenKind::Vouch,
+                purpose: Some(dds_core::token::purpose::ADMIN.to_string()),
+                vch_iss: Some(anchored.id.to_urn()),
+                vch_sum: Some(anchored_hash),
+                revokes: None,
+                iat: now_epoch(),
+                exp: Some(now_epoch() + 365 * 86400),
+                body_type: None,
+                body_cbor: None,
+            },
+            &mallory.signing_key,
+        )
+        .unwrap();
+        // The graph accepts it: signature-valid, shape-valid. That is the
+        // whole point — ingest does not (and cannot) require vouches to
+        // chain to a root, so the reconcile rule has to be robust to it.
+        svc.trust_graph.write().unwrap().add_token(forged).unwrap();
+
+        svc.reconcile_trusted_roots();
+        assert!(
+            svc.trusted_roots.contains(&anchored.id.to_urn()),
+            "a dds:admin vouch from a non-root must not demote a config-anchored root"
+        );
+        assert!(
+            svc.trusted_roots.contains(&admin.id.to_urn()),
+            "the bootstrap admin is untouched"
+        );
+        assert!(
+            !svc.trusted_roots.contains(&mallory.id.to_urn()),
+            "and the forger certainly does not get promoted"
+        );
+    }
+
+    /// Demotion still cascades: revoking the bootstrap admin's `dds:admin`
+    /// vouch for R2 demotes R2 *and* the sub-admin R3 that R2 promoted,
+    /// in one reconcile pass, even though R2's vouch for R3 is unrevoked.
+    #[test]
+    fn demotion_cascades_through_sub_admins_in_one_pass() {
+        let (mut svc, admin, _) = setup();
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        svc.set_data_dir(data_dir.path().to_path_buf());
+        svc.set_bootstrap_admin_urn(Some(admin.id.to_urn()));
+
+        let r2 = Identity::generate("r2", &mut OsRng);
+        let r3 = Identity::generate("r3", &mut OsRng);
+        let r2_attest = make_attest_for_publisher_setup(&r2);
+        let r3_attest = make_attest_for_publisher_setup(&r3);
+        let r2_hash = r2_attest.payload_hash();
+        let r3_hash = r3_attest.payload_hash();
+        let admin_vouch = |voucher: &Identity, subject: &Identity, hash: String, jti: &str| {
+            Token::sign(
+                TokenPayload {
+                    iss: voucher.id.to_urn(),
+                    iss_key: voucher.public_key.clone(),
+                    jti: jti.into(),
+                    sub: subject.id.to_urn(),
+                    kind: TokenKind::Vouch,
+                    purpose: Some(dds_core::token::purpose::ADMIN.to_string()),
+                    vch_iss: Some(subject.id.to_urn()),
+                    vch_sum: Some(hash),
+                    revokes: None,
+                    iat: now_epoch(),
+                    exp: Some(now_epoch() + 365 * 86400),
+                    body_type: None,
+                    body_cbor: None,
+                },
+                &voucher.signing_key,
+            )
+            .unwrap()
+        };
+        {
+            let mut g = svc.trust_graph.write().unwrap();
+            g.add_token(r2_attest).unwrap();
+            g.add_token(r3_attest).unwrap();
+            g.add_token(admin_vouch(&admin, &r2, r2_hash, "vouch-r2"))
+                .unwrap();
+            g.add_token(admin_vouch(&r2, &r3, r3_hash, "vouch-r3"))
+                .unwrap();
+        }
+        svc.reconcile_trusted_roots();
+        assert!(svc.trusted_roots.contains(&r2.id.to_urn()));
+        assert!(
+            svc.trusted_roots.contains(&r3.id.to_urn()),
+            "r3 promoted via r2"
+        );
+
+        let revoke = Token::sign(
+            TokenPayload {
+                iss: admin.id.to_urn(),
+                iss_key: admin.public_key.clone(),
+                jti: "revoke-r2".into(),
+                sub: r2.id.to_urn(),
+                kind: TokenKind::Revoke,
+                purpose: None,
+                vch_iss: None,
+                vch_sum: None,
+                revokes: Some("vouch-r2".into()),
+                iat: now_epoch(),
+                exp: None,
+                body_type: None,
+                body_cbor: None,
+            },
+            &admin.signing_key,
+        )
+        .unwrap();
+        svc.trust_graph.write().unwrap().add_token(revoke).unwrap();
+        svc.reconcile_trusted_roots();
+        assert!(!svc.trusted_roots.contains(&r2.id.to_urn()), "r2 demoted");
+        assert!(
+            !svc.trusted_roots.contains(&r3.id.to_urn()),
+            "r3's promoter lost root status in the same pass, so r3 is demoted too"
+        );
+        assert!(svc.trusted_roots.contains(&admin.id.to_urn()));
     }
 
     /// `reconcile_trusted_roots` promotes a subject holding a live
