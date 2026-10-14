@@ -1,5 +1,29 @@
 # DDS Implementation Status
 
+## fix(mesh): v1.8.1 re-review — quota on revocation gossip, delegated-admin demotion cascades — 2026-10-14
+
+A re-review of v1.8.1 confirmed the four earlier follow-up fixes and reproduced two remaining
+issues. Both were confirmed and fixed; each fix carries a regression test that fails on v1.8.1.
+Full record: [docs/security-review-2026-10-13-single-node.md](docs/security-review-2026-10-13-single-node.md)
+("Second round").
+
+- **G1 (High) — revocation gossip bypassed the quotas.** `ingest_revocation` never charged
+  the publisher, so the revocations topic stored unlimited revocations from a publisher whose
+  unanchored-token quota was spent. It now runs the same charge as the ops and burns topics
+  before persisting, quarantines on refusal and does not relay refused revocations. Revocations
+  from roots and anchored issuers stay free.
+- **G2 (High) — revoking a delegated admin left its sub-admins as roots.** The token-driven
+  root update demoted only the revoked vouch's subject, after which the periodic pass could no
+  longer see that the sub-admins were promoted through the graph. It now runs the shared
+  cascading reconcile on the pre-demotion root set, so `root → A → B → C` loses A, B and C
+  together; the revocations topic triggers the same update.
+
+Verification (fresh against the final tree): `cargo test` for dds-core / dds-store /
+dds-net / dds-node — 1084 pass across 40 test binaries (1 ignored, 1 failed — see below); both new regression tests were also run against v1.8.1 and fail there on the reported behaviour; clippy `-D warnings` clean on those crates plus
+dds-loadtest, fmt clean. The one local lib failure
+(`http::tests::uds_listener::admin_endpoint_rejects_unknown_uid_caller`) is pre-existing
+and only reproduces when the suite runs as root.
+
 ## fix(mesh): v1.8.0 follow-up review — revocations survive pruning, token-volume quotas, root-demotion gate, exact sync cache — 2026-10-13
 
 A second review of the v1.8.0 commits reproduced four issues with local tests against the
