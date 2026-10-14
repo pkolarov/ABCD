@@ -3075,8 +3075,7 @@ impl DdsNode {
             }
             (DdsTopic::Revocations(..), GossipMessage::Revocation { token_bytes }) => {
                 crate::telemetry::record_gossip_message("revocation");
-                self.ingest_revocation(&token_bytes);
-                MessageAcceptance::Accept
+                self.ingest_revocation(&token_bytes, origin).acceptance()
             }
             (DdsTopic::Burns(..), GossipMessage::Burn { token_bytes }) => {
                 crate::telemetry::record_gossip_message("burn");
@@ -3405,65 +3404,47 @@ impl DdsNode {
                 let Some(target_jti) = token.payload.revokes.as_deref() else {
                     return;
                 };
-                let demote: Option<String> = {
+                // Only a revoked dds:admin vouch whose subject is a current
+                // root can change the root set; anything else is skipped
+                // without the full pass below.
+                let affects_a_root = {
                     let g = self.trust_graph.read().expect("trust_graph poisoned");
-                    match g.vouch_by_jti(target_jti) {
-                        Some(v) if v.payload.purpose.as_deref() == Some(admin_purpose) => {
-                            let sub = v.payload.sub.clone();
-                            // Only demote when NO live dds:admin vouch
-                            // remains for the subject, and never demote
-                            // the config-anchored bootstrap admin.
-                            let is_bootstrap = self
-                                .config
-                                .bootstrap_admin_urn
-                                .as_deref()
-                                .map(|b| b == sub)
-                                .unwrap_or(false);
-                            // Only a vouch from a current root keeps the
-                            // subject a root — any admitted peer can plant
-                            // a dds:admin vouch from a throw-away identity
-                            // (single-node review 2026-10-13).
-                            let summaries = g.vouch_summaries_for_subject(&sub);
-                            let still_vouched = summaries.iter().any(|s| {
-                                s.purpose.as_deref() == Some(admin_purpose)
-                                    && !s.revoked
-                                    && !s.expired
-                                    && self.trusted_roots.contains(&s.issuer)
-                            });
-                            // **Follow-up review (2026-10-13), finding 2** —
-                            // the same gate `reconcile_roots_against_graph`
-                            // applies: only a root the graph shows was
-                            // PROMOTED (a dds:admin vouch for it, live or
-                            // not, signed by a current root or the bootstrap
-                            // admin) is demotable here. A config-anchored
-                            // root nobody authorised ever vouched is left
-                            // alone — otherwise an admitted peer could vouch
-                            // dds:admin for it from a throw-away identity,
-                            // revoke that vouch, and have every node drop
-                            // the root from its in-memory set with nothing
-                            // to put it back.
-                            let bootstrap = self.config.bootstrap_admin_urn.as_deref();
-                            let promoted_through_graph = summaries.iter().any(|s| {
-                                s.purpose.as_deref() == Some(admin_purpose)
-                                    && (self.trusted_roots.contains(&s.issuer)
-                                        || bootstrap == Some(s.issuer.as_str()))
-                            });
-                            if !is_bootstrap && promoted_through_graph && !still_vouched {
-                                Some(sub)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    }
+                    g.vouch_by_jti(target_jti).is_some_and(|v| {
+                        v.payload.purpose.as_deref() == Some(admin_purpose)
+                            && self.trusted_roots.contains(&v.payload.sub)
+                    })
                 };
-                if let Some(sub) = demote {
-                    if self.trusted_roots.remove(&sub) {
-                        info!(
-                            subject = %sub,
-                            "ingest: demoted subject from trusted_roots (dds:admin vouch revoked, in-memory)"
-                        );
-                    }
+                if !affects_a_root {
+                    return;
+                }
+                // **Follow-up review (2026-10-13, second round), finding 2** —
+                // run the shared reconcile (`reconcile_roots_against_graph`)
+                // on the root set as it stands BEFORE any demotion, instead
+                // of removing only the revoked vouch's subject. With
+                // `root → A → B`, demoting A alone left B a root, and the
+                // periodic pass could not fix it afterwards: it treats a
+                // root as demotable only if a current or start-of-pass root
+                // vouched it, and A was already gone. The shared pass
+                // demotes A and cascades to every sub-admin A promoted in
+                // the same call, and keeps the F2 rule (a root nobody
+                // authorised ever vouched is never demoted) because it is
+                // the same function the API side and the guard tick run.
+                let before = self.trusted_roots.len();
+                let changed = {
+                    let g = self.trust_graph.read().expect("trust_graph poisoned");
+                    crate::service::reconcile_roots_against_graph(
+                        &g,
+                        &mut self.trusted_roots,
+                        self.config.bootstrap_admin_urn.as_deref(),
+                    )
+                };
+                if changed {
+                    info!(
+                        target_jti = %target_jti,
+                        roots_before = before,
+                        roots_after = self.trusted_roots.len(),
+                        "ingest: dds:admin vouch revoked — trusted_roots reconciled (in-memory)"
+                    );
                 }
             }
             _ => {}
@@ -4056,12 +4037,12 @@ impl DdsNode {
         }
     }
 
-    fn ingest_revocation(&mut self, token_bytes: &[u8]) {
+    fn ingest_revocation(&mut self, token_bytes: &[u8], origin: Option<PeerId>) -> IngestOutcome {
         let token = match Token::from_cbor(token_bytes) {
             Ok(t) => t,
             Err(e) => {
                 error!("revoke token deserialize: {e}");
-                return;
+                return IngestOutcome::RejectedTerminal;
             }
         };
         if self.legacy_token_refused(&token, "gossip-revocation") {
@@ -4070,7 +4051,7 @@ impl DdsNode {
                 token_bytes.to_vec(),
                 Some("legacy-v1-refused".to_string()),
             );
-            return;
+            return IngestOutcome::RejectedPolicy;
         }
         if let Err(e) = token.validate() {
             warn!("revocation validation failed: {e}");
@@ -4079,7 +4060,7 @@ impl DdsNode {
                 token_bytes.to_vec(),
                 Some(format!("validation-failed: {e}")),
             );
-            return;
+            return IngestOutcome::RejectedTerminal;
         }
         // **M-9 (security review)**: reject replays of old revocations.
         // A revocation's `iat` must be within REVOCATION_REPLAY_WINDOW_SECS
@@ -4099,7 +4080,21 @@ impl DdsNode {
                 token_bytes.to_vec(),
                 Some("iat-outside-replay-window".to_string()),
             );
-            return;
+            return IngestOutcome::RejectedTerminal;
+        }
+        // **Follow-up review (2026-10-13, second round), finding 1** — the
+        // same per-publisher accounting as `ingest_operation` and
+        // `ingest_burn`, before anything is persisted. Without it the
+        // revocations topic was a quota-free channel: a publisher that had
+        // exhausted its unanchored-token quota kept storing revocations
+        // (each one a new token, op and sync-cache entry) and was never
+        // quarantined. Revocations from roots and anchored issuers stay
+        // free, so offboarding is never throttled.
+        if let Some(source) = origin {
+            if let Err(refusal) = self.charge_fresh_identity(&source, &token, token_bytes.len()) {
+                self.quarantine_identity_flood(source, refusal, &token, token_bytes);
+                return IngestOutcome::RejectedTerminal;
+            }
         }
         let graph_err = {
             let mut g = self.trust_graph.write().expect("trust_graph poisoned");
@@ -4112,7 +4107,7 @@ impl DdsNode {
                 token_bytes.to_vec(),
                 Some(format!("trust-graph-rejected: {e}")),
             );
-            return;
+            return IngestOutcome::RejectedTerminal;
         }
         if let Err(e) = self.store.put_token(&token) {
             error!("store error: {e}");
@@ -4125,6 +4120,10 @@ impl DdsNode {
         }
         // Z-3 Phase A.1: revocation accepted — record on local chain.
         self.emit_audit_from_ingest("revoke", token_bytes.to_vec(), None);
+        // A dds:admin vouch revoked on this topic demotes (and cascades)
+        // on the swarm's root copy right away, as on the ops topic and the
+        // sync path, instead of waiting for the next guard tick.
+        self.reconcile_roots_after_token(&token);
         // Seed the sync-payload cache so a peer that reconnects (or
         // joins fresh) AFTER this revoke landed via gossip can still
         // pull it from us via the request_response sync protocol.
@@ -4158,6 +4157,7 @@ impl DdsNode {
             self.pending_revocation_rotation =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(jitter_secs));
         }
+        IngestOutcome::Accepted
     }
 
     fn ingest_burn(&mut self, token_bytes: &[u8], origin: Option<PeerId>) -> IngestOutcome {
@@ -9744,6 +9744,239 @@ mod r5_sync_quorum_replay_tests {
                 cached[0].token_bytes, original_bytes,
                 "the cache must hold the accepted token, not the rejected twin"
             );
+        });
+    }
+
+    // ---------- follow-up review (2026-10-13), second round ----------
+
+    fn revocation_gossip(node: &DdsNode, token: &Token) -> (libp2p::gossipsub::TopicHash, Vec<u8>) {
+        let msg = GossipMessage::Revocation {
+            token_bytes: token.to_cbor().unwrap(),
+        };
+        (
+            node.topics.revocations.to_ident_topic().hash(),
+            msg.to_cbor().unwrap(),
+        )
+    }
+
+    /// **Second round, finding 1.** Revocations on the revocations topic
+    /// are charged against the same per-publisher quota as everything
+    /// else: once a publisher's unanchored-token quota is spent, further
+    /// revocations are not stored, not relayed, and the publisher is
+    /// quarantined. Revocations from a root are never charged.
+    #[test]
+    fn revocation_gossip_is_charged_against_the_unanchored_token_quota() {
+        use libp2p::gossipsub::MessageAcceptance;
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("revoke-quota.local", [29u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            let quota = |token_budget: u32| {
+                IdentityLedger::new(Limits {
+                    budget: 0,
+                    grace: Duration::from_secs(0),
+                    hard_cap: 0,
+                    token_budget,
+                    byte_budget: 0,
+                })
+            };
+
+            // A known, unanchored identity with 17 tokens it may revoke.
+            node.identity_ledger = quota(0);
+            let ghost = Identity::generate("ghost", &mut OsRng);
+            let targets: Vec<Token> = (0..17).map(|_| attest_at(&ghost, now_unix())).collect();
+            node.apply_decrypted_sync_response(
+                PeerId::random(),
+                sync_response(targets.iter().map(canonical_payload).collect()),
+            );
+            assert_eq!(
+                node.trust_graph
+                    .read()
+                    .unwrap()
+                    .tokens_issued_by(&ghost.id.to_urn())
+                    .len(),
+                17
+            );
+
+            node.identity_ledger = quota(1);
+            let publisher = PeerId::random();
+            node.admit_peer_for_tests(publisher);
+            let mut verdicts = Vec::new();
+            for t in &targets {
+                let rev = revoke_at(&ghost, &t.payload.jti, now_unix());
+                let (topic, data) = revocation_gossip(&node, &rev);
+                verdicts.push(node.handle_gossip_message(&topic, &data, Some(publisher)));
+            }
+            assert!(matches!(verdicts[0], MessageAcceptance::Accept));
+            assert!(
+                verdicts[1..]
+                    .iter()
+                    .all(|v| matches!(v, MessageAcceptance::Ignore)),
+                "over quota: not relayed"
+            );
+            assert!(node.identity_flood_quarantined_for_tests(&publisher));
+            assert!(!node.admitted_peers().contains(&publisher));
+            let first = &targets[0].payload.jti;
+            assert!(node.trust_graph.read().unwrap().is_revoked(first));
+            assert!(node.store.has_token(&format!("revoke-{first}")));
+            for t in &targets[1..] {
+                let jti = &t.payload.jti;
+                assert!(!node.trust_graph.read().unwrap().is_revoked(jti));
+                assert!(!node.store.is_revoked(jti), "not persisted");
+                assert!(!node.store.has_token(&format!("revoke-{jti}")));
+                assert!(!node.store.has_operation(&format!("op-revoke-{jti}")));
+            }
+
+            // Control: a root's revocations are free.
+            node.identity_ledger = quota(0);
+            let users: Vec<(Identity, Token)> = (0..3)
+                .map(|i| {
+                    let u = Identity::generate(&format!("u{i}"), &mut OsRng);
+                    let t = attest_at(&u, now_unix());
+                    (u, t)
+                })
+                .collect();
+            let mut batch = Vec::new();
+            for (i, (u, t)) in users.iter().enumerate() {
+                batch.push(canonical_payload(t));
+                batch.push(canonical_payload(&make_vouch(
+                    &root,
+                    u,
+                    t,
+                    "dds:session",
+                    &format!("v-root-u{i}"),
+                )));
+            }
+            node.apply_decrypted_sync_response(PeerId::random(), sync_response(batch));
+            node.identity_ledger = quota(1);
+            let root_publisher = PeerId::random();
+            node.admit_peer_for_tests(root_publisher);
+            for i in 0..3 {
+                let rev = revoke_at(&root, &format!("v-root-u{i}"), now_unix());
+                let (topic, data) = revocation_gossip(&node, &rev);
+                assert!(matches!(
+                    node.handle_gossip_message(&topic, &data, Some(root_publisher)),
+                    MessageAcceptance::Accept
+                ));
+                assert!(
+                    node.trust_graph
+                        .read()
+                        .unwrap()
+                        .is_revoked(&format!("v-root-u{i}"))
+                );
+            }
+            assert!(!node.identity_flood_quarantined_for_tests(&root_publisher));
+        });
+    }
+
+    /// **Second round, finding 2.** Revoking the vouch that promoted a
+    /// delegated admin demotes the whole chain it promoted, on the
+    /// token-driven path and after the periodic pass, whether the
+    /// revocation arrives by anti-entropy or on the revocations topic;
+    /// a demoted sub-admin can no longer grant a publisher capability.
+    #[test]
+    fn revoking_a_delegated_admin_cascades_through_its_sub_admins() {
+        use dds_core::token::purpose;
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            for via_gossip in [false, true] {
+                let root = Identity::generate("root", &mut OsRng);
+                let dkey = dds_domain::DomainKey::from_secret_bytes(
+                    "admin-cascade.local",
+                    [30u8 + via_gossip as u8; 32],
+                );
+                let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+                let now = now_unix();
+                let a = Identity::generate("admin-a", &mut OsRng);
+                let b = Identity::generate("admin-b", &mut OsRng);
+                let c = Identity::generate("admin-c", &mut OsRng);
+                let p = Identity::generate("publisher", &mut OsRng);
+                let (a_tok, b_tok, c_tok, p_tok) = (
+                    attest_at(&a, now),
+                    attest_at(&b, now),
+                    attest_at(&c, now),
+                    attest_at(&p, now),
+                );
+                let peer = PeerId::random();
+                // One promotion per batch so each lands after its promoter.
+                for batch in [
+                    vec![
+                        canonical_payload(&attest_at(&root, now)),
+                        canonical_payload(&a_tok),
+                        canonical_payload(&make_vouch(&root, &a, &a_tok, purpose::ADMIN, "v-r-a")),
+                    ],
+                    vec![
+                        canonical_payload(&b_tok),
+                        canonical_payload(&make_vouch(&a, &b, &b_tok, purpose::ADMIN, "v-a-b")),
+                    ],
+                    vec![
+                        canonical_payload(&c_tok),
+                        canonical_payload(&make_vouch(&b, &c, &c_tok, purpose::ADMIN, "v-b-c")),
+                        canonical_payload(&p_tok),
+                        canonical_payload(&make_vouch(
+                            &b,
+                            &p,
+                            &p_tok,
+                            purpose::POLICY_PUBLISHER_WINDOWS,
+                            "v-b-p",
+                        )),
+                    ],
+                ] {
+                    node.apply_decrypted_sync_response(peer, sync_response(batch));
+                }
+                let urns = [a.id.to_urn(), b.id.to_urn(), c.id.to_urn()];
+                for urn in &urns {
+                    assert!(
+                        node.trusted_roots.contains(urn),
+                        "test setup: {urn} promoted"
+                    );
+                }
+                let can_publish = |node: &DdsNode| {
+                    node.trust_graph.read().unwrap().has_purpose(
+                        &p.id.to_urn(),
+                        purpose::POLICY_PUBLISHER_WINDOWS,
+                        &node.trusted_roots,
+                    )
+                };
+                assert!(
+                    can_publish(&node),
+                    "test setup: B, a root, can grant the capability"
+                );
+
+                let rev = revoke_at(&root, "v-r-a", now);
+                if via_gossip {
+                    let (topic, data) = revocation_gossip(&node, &rev);
+                    let _ = node.handle_gossip_message(&topic, &data, Some(peer));
+                } else {
+                    node.apply_decrypted_sync_response(
+                        peer,
+                        sync_response(vec![canonical_payload(&rev)]),
+                    );
+                }
+                assert!(node.trust_graph.read().unwrap().is_revoked("v-r-a"));
+                for urn in &urns {
+                    assert!(
+                        !node.trusted_roots.contains(urn),
+                        "via_gossip={via_gossip}: {urn} must be demoted with its promoter"
+                    );
+                }
+                assert!(node.trusted_roots.contains(&root.id.to_urn()));
+                node.reconcile_roots_by_expiry_for_tests();
+                for urn in &urns {
+                    assert!(!node.trusted_roots.contains(urn), "periodic pass agrees");
+                }
+                assert!(
+                    !can_publish(&node),
+                    "via_gossip={via_gossip}: a demoted sub-admin's grant confers nothing"
+                );
+            }
         });
     }
 }

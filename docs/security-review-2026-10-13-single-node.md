@@ -139,6 +139,17 @@ volume is bounded by the per-peer gossip rate limit and accountable through revo
 of their vouch), and a sync responder over any budget is throttled rather than
 disconnected.
 
+### Second round (2026-10-14): two further findings
+
+A re-review of v1.8.1 (`bcdddc4`) confirmed the four fixes above with independent
+regressions and reproduced two remaining issues. Both were confirmed against the
+source and fixed in v1.8.2.
+
+| # | Severity | Finding (as reported) | Verdict and fix |
+|---|---|---|---|
+| G1 | High | **Revocation gossip bypasses the quotas.** After a publisher's one-token quota was spent, 16 further encrypted revocation messages were delivered and stored without quarantine; `ingest_revocation` skipped the new accounting. | Confirmed. The revocations topic (plaintext and enc-v3 alike, both dispatch to `ingest_revocation`) now runs the same per-publisher charge as the ops and burns topics before anything is persisted, quarantines the publisher on refusal, and returns an `IngestOutcome` so a refused revocation is not relayed. Revocations from trusted roots and anchored issuers stay free, so offboarding is never throttled. The anti-entropy path already charged revocations. Test: `revocation_gossip_is_charged_against_the_unanchored_token_quota`. |
+| G2 | High | **Delegated-admin revocation does not cascade.** With `root → A → B`, revoking A's promotion removed A but left B in the swarm's root set, even after the periodic reconcile; B could then grant a publisher capability. | Confirmed. The token-driven path demoted only the revoked vouch's subject. That erased the evidence the periodic pass needs: it treats a root as demotable only when a current or start-of-pass root vouched for it, and A was already gone, so B looked config-anchored. On a revoked `dds:admin` vouch whose subject is a current root, the token path now runs the shared `reconcile_roots_against_graph` on the root set as it stood before any demotion, which demotes A and every sub-admin A promoted in the same call and keeps the F2 rule from the first follow-up round (a root nobody authorised ever vouched is never demoted). The revocations topic now triggers the same update, instead of waiting for the next guard tick. Test: `revoking_a_delegated_admin_cascades_through_its_sub_admins` (three-level chain, delivered by sync and by revocation gossip). |
+
 ## Operational note
 
 If a node is suspected compromised: `dds-node revoke-admission` for its PeerId (the
