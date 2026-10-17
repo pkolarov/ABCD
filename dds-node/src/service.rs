@@ -4679,9 +4679,9 @@ pub(crate) fn reconcile_roots_against_graph(
     // demotes and cascades in one computation.
     let mut closure: BTreeSet<String> = BTreeSet::new();
     for r in &initial_roots {
-        if bootstrap_admin_urn == Some(r.as_str()) {
-            closure.insert(r.clone());
-        } else if !g.is_burned(r) && !promoted_through_graph(r) {
+        let anchored = bootstrap_admin_urn == Some(r.as_str())
+            || (!g.is_burned(r) && !promoted_through_graph(r));
+        if anchored {
             closure.insert(r.clone());
         }
     }
