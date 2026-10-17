@@ -1,5 +1,38 @@
 # DDS Implementation Status
 
+## fix(mesh): third review round — dead sync payloads, topic kinds, gossip charging, grounded root closure — 2026-10-17
+
+A final review of v1.8.2, combining two independent read-only passes (ingest-path
+accounting; root and trust-chain logic) with a lifecycle review of pruning, revocation and
+the sync cache. Every finding was checked against the source. Full record:
+[docs/security-review-2026-10-13-single-node.md](docs/security-review-2026-10-13-single-node.md)
+("Third review round").
+
+- **H1 — dead payloads stalled anti-entropy for fresh nodes.** Expired tokens (every 5-minute
+  session among them) and the revocations of pruned tokens stayed in the store and the sync
+  cache and were served to peers that must refuse them; past 1000 of them a new node's
+  catch-up stopped for good. They are now retired by the expiry tick, the pruner and startup.
+- **H2 — wrong-kind tokens on the revocations and burns topics skipped the ingest gates**
+  (F1, C-3, SC-5, op binding). Each topic now accepts only its own kind.
+- **H3 — R1 budgets were charged to an attacker-chosen gossip source key.** Only a known
+  member is charged as source; otherwise the admitted relayer pays.
+- **H4 — a revoked delegated admin kept itself a root** with a self-vouch or a mutual vouch.
+  Root status is now a grounded closure from the anchored roots.
+- **M1–M6, L1** — batch-order promotion through a revoked admin vouch; revocation replays;
+  forward-dated `iat` and made-up body types evading pruning; uncapped rejection audits and an
+  O(n) audit chain head; epoch-key releases under foreign publisher ids; gossip budget reset
+  on reconnect; unverified audit-topic relay.
+
+Residual (documented, not fixed): relay of enc-v3 envelopes without a local key, per-peer
+rate limits on inbound request serving, gossip audit entries as chain genesis, volume of
+anchored identities.
+
+Verification (fresh against the final tree): `cargo test` for dds-core / dds-store /
+dds-net / dds-node — 1095 pass across 40 test binaries (1 ignored, 1 failed — see below); clippy `-D warnings` clean on those crates plus
+dds-loadtest, fmt clean. The one local lib failure
+(`http::tests::uds_listener::admin_endpoint_rejects_unknown_uid_caller`) is pre-existing
+and only reproduces when the suite runs as root.
+
 ## fix(mesh): v1.8.1 re-review — quota on revocation gossip, delegated-admin demotion cascades — 2026-10-14
 
 A re-review of v1.8.1 confirmed the four earlier follow-up fixes and reproduced two remaining
