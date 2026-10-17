@@ -1,5 +1,12 @@
 # DDS Implementation Status
 
+## chore(deps): rustls 0.23.46 — 2026-10-17
+
+v1.8.3's `cargo audit` job failed on four rustls advisories published after the v1.8.2
+build (RUSTSEC-2026-0346/0347/0348/0349); every build and test job of that run passed.
+v1.8.4 is v1.8.3 with rustls 0.23.45 → 0.23.46, the minimum fixed version. cargo audit:
+0 vulnerabilities; cargo vet passing.
+
 ## fix(mesh): third review round — dead sync payloads, topic kinds, gossip charging, grounded root closure — 2026-10-17
 
 A final review of v1.8.2, combining two independent read-only passes (ingest-path
