@@ -37,6 +37,13 @@ pub struct TrustGraph {
     /// it. Lets the unanchored-identity pruner date the moment a subject
     /// lost its vouch (single-node review 2026-10-13, R1).
     revoked_at: BTreeMap<String, u64>,
+    /// Target JTI → JTIs of the authorized revocation tokens that revoked
+    /// it. **Third review round (2026-10-17)**: when a target token leaves
+    /// the node (expired, or pruned as unanchored), the revocations that
+    /// name it must leave too — a peer that never held the target can
+    /// never merge them, so they would be re-served to it every
+    /// anti-entropy round forever. This index is how the node finds them.
+    revocation_tokens: BTreeMap<String, BTreeSet<String>>,
     /// Set of burned identity URNs.
     burned: BTreeSet<String>,
     /// Maximum chain depth for trust evaluation.
@@ -65,6 +72,7 @@ impl TrustGraph {
             vouches: BTreeMap::new(),
             revocations: BTreeMap::new(),
             revoked_at: BTreeMap::new(),
+            revocation_tokens: BTreeMap::new(),
             burned: BTreeSet::new(),
             max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             vouches_by_subject: BTreeMap::new(),
@@ -154,6 +162,10 @@ impl TrustGraph {
                             self.revoked_at
                                 .insert(target_jti.clone(), token.payload.iat);
                             self.revocations.insert(target_jti.clone(), revoker_iss);
+                            self.revocation_tokens
+                                .entry(target_jti.clone())
+                                .or_default()
+                                .insert(token.payload.jti.clone());
                         }
                         Some(_) => {
                             return Err(TrustError::Unauthorized(
@@ -689,7 +701,44 @@ impl TrustGraph {
             removed = true;
         }
         self.revoked_at.remove(jti);
+        self.revocation_tokens.remove(jti);
         removed
+    }
+
+    /// JTIs of the authorized revocation tokens that revoked `target`
+    /// (normally one; a revoker may have issued more than one).
+    pub fn revocation_token_jtis(&self, target: &str) -> Vec<String> {
+        self.revocation_tokens
+            .get(target)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Drop the revocation-token index entry for `target` once the node
+    /// has retired those revocation tokens. The revocation *record*
+    /// (`is_revoked` / `has_revocation_record`) is untouched.
+    pub fn forget_revocation_tokens(&mut self, target: &str) {
+        self.revocation_tokens.remove(target);
+    }
+
+    /// Whether some vouch that is neither revoked nor expired pins
+    /// `token` through `vch_sum` (any issuer). Such a vouch could make
+    /// the token count again if it were replayed somewhere its
+    /// revocation is unknown, so the unanchored-identity pruner keeps a
+    /// revoked token that is pinned like this — together with its
+    /// revocation — instead of removing both. Third review round
+    /// (2026-10-17).
+    pub fn attestation_is_pinned(&self, token: &Token) -> bool {
+        let hash = token.payload_hash();
+        self.vouches_for_subject(&token.payload.iss).any(|v| {
+            !self.is_revoked(&v.payload.jti)
+                && !Self::is_expired(v)
+                && v.payload
+                    .vch_sum
+                    .as_deref()
+                    .map(|pinned| payload_hash_eq(pinned, &hash))
+                    .unwrap_or(false)
+        })
     }
 
     /// Remove a token like [`Self::remove_token`] but **keep** its

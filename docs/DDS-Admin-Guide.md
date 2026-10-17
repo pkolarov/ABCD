@@ -1628,7 +1628,7 @@ dds cp --node-url http://127.0.0.1:5551 session-assert \
 
 ### Session Expiry
 
-Sessions have a short lifetime (configurable, default 5 minutes). The node runs an expiry sweep every `expiry_scan_interval_secs` (default 60s) to remove expired sessions from the trust graph.
+Sessions have a short lifetime (configurable, default 5 minutes). The node runs an expiry sweep every `expiry_scan_interval_secs` (default 60s) that removes expired tokens — sessions included — from the trust graph, deletes their bytes and operations from the store, and stops serving them to peers, together with any revocation that named them. The JTI stays marked revoked, so an expired token can never be re-admitted. Since v1.8.3 a node also clears such leftovers from earlier builds at startup; before, every expired session stayed in the anti-entropy cache and was re-served to fresh nodes, which must refuse it.
 
 ---
 
@@ -3900,7 +3900,10 @@ as `sig_ok=false` rather than being silently trusted.
 # Tail the chain, JSONL one-line-per-entry, polling /v1/audit/entries
 # every 5 s. Output keys: ts, action, reason, node_urn, chain_hash,
 # prev_hash, sig_ok, token_cbor_b64. sig_ok is computed locally so a
-# tampered entry surfaces as false.
+# tampered entry surfaces as false. For `*.rejected` and
+# `peer.identity-flood` entries token_cbor_b64 holds the SHA-256 of the
+# refused bytes (the reason ends in "[token sha256 only, N bytes]"),
+# and at most 20 such entries are written per minute (since v1.8.3).
 dds audit tail --since $(date +%s) --format jsonl --follow-interval 5
 
 # Same shape in CEF (ArcSight / Splunk) or RFC 5424 syslog

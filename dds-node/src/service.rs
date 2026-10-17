@@ -4641,94 +4641,91 @@ pub(crate) fn reconcile_roots_against_graph(
     bootstrap_admin_urn: Option<&str>,
 ) -> bool {
     let admin_purpose = dds_core::token::purpose::ADMIN;
-    let mut changed_any = false;
-    // Roots as of the start of this pass. A root demoted during the pass
-    // (its own promotion lapsed) must still count as the promoter of the
-    // sub-admins it vouched, so their demotion cascades in the same pass.
+    // Roots as of the start of this pass.
     let initial_roots: BTreeSet<String> = roots.clone();
-    for _ in 0..64 {
-        // A subject is *root-eligible* iff it holds a live `dds:admin`
-        // vouch issued by a CURRENT trusted root. `!s.expired` is the
-        // clause that M-5 was missing on the swarm side.
-        let eligible = |sub: &str, roots: &BTreeSet<String>| -> bool {
-            g.vouch_summaries_for_subject(sub).iter().any(|s| {
-                s.purpose.as_deref() == Some(admin_purpose)
+    let is_admin_vouch_from_other = |s: &dds_core::trust::VouchSummary, subject: &str| {
+        s.purpose.as_deref() == Some(admin_purpose) && s.issuer != subject
+    };
+    // **Single-node review 2026-10-13.** A root is *promoted through the
+    // graph* only if it holds a `dds:admin` vouch (live or not) issued by
+    // a root of this pass or the bootstrap admin. Vouches are accepted on
+    // signature alone, so counting ANY `dds:admin` vouch let a throw-away
+    // identity mark a config-anchored root as promoted, after which it was
+    // demoted for lacking a live vouch. Self-vouches never count.
+    let promoted_through_graph = |root: &str| -> bool {
+        g.vouch_summaries_for_subject(root).iter().any(|s| {
+            is_admin_vouch_from_other(s, root)
+                && (initial_roots.contains(&s.issuer)
+                    || bootstrap_admin_urn == Some(s.issuer.as_str()))
+        })
+    };
+    // **Third review round (2026-10-17) — grounded closure.** The previous
+    // fixpoint kept any root that held a live `dds:admin` vouch from any
+    // current root, promoted ones included. A delegated admin could
+    // therefore keep itself a root after its promotion was revoked, with a
+    // self-vouch or with a mutual vouch with another delegated admin: each
+    // member of the cycle kept the other eligible. Root status is now
+    // EARNED from the anchors every pass:
+    //
+    // - anchors: the bootstrap admin, and every current root that the
+    //   graph does not show as promoted (config-managed roots);
+    // - the closure adds, until nothing changes, every subject holding a
+    //   live (unrevoked, unexpired) `dds:admin` vouch from a member of the
+    //   closure other than itself;
+    // - burned identities are never added, and burned roots are dropped
+    //   (the bootstrap admin excepted, as before).
+    //
+    // The new root set is the anchors plus the closure, which promotes,
+    // demotes and cascades in one computation.
+    let mut closure: BTreeSet<String> = BTreeSet::new();
+    for r in &initial_roots {
+        if bootstrap_admin_urn == Some(r.as_str()) {
+            closure.insert(r.clone());
+        } else if !g.is_burned(r) && !promoted_through_graph(r) {
+            closure.insert(r.clone());
+        }
+    }
+    // Promotion candidates: subjects of any dds:admin vouch.
+    let mut candidates: BTreeSet<String> = BTreeSet::new();
+    for v in g.vouches_iter() {
+        if v.payload.purpose.as_deref() == Some(admin_purpose) {
+            if let Some(sub) = v.payload.vch_iss.as_deref() {
+                candidates.insert(sub.to_string());
+            }
+        }
+    }
+    loop {
+        let mut grew = false;
+        for sub in &candidates {
+            if closure.contains(sub) || g.is_burned(sub) {
+                continue;
+            }
+            let earned = g.vouch_summaries_for_subject(sub).iter().any(|s| {
+                is_admin_vouch_from_other(s, sub)
                     && !s.revoked
                     && !s.expired
-                    && roots.contains(&s.issuer)
-            })
-        };
-        // **Single-node review 2026-10-13.** A root is *demotable* only if
-        // the graph shows it was promoted through the graph: it holds at
-        // least one `dds:admin` vouch (live or not) issued by an identity
-        // that is a trusted root now, was one when this pass started, or
-        // is the bootstrap admin. The previous rule counted ANY
-        // `dds:admin` vouch targeting the root as proof of promotion.
-        // Vouches are accepted into the replicated graph on signature
-        // alone, so an admitted peer could sign one from a throw-away
-        // identity against a config-anchored root (any `trusted_roots`
-        // entry other than `bootstrap_admin_urn` — on member nodes that
-        // is every root the provisioning bundle seeded), and every node
-        // demoted that root and persisted the demotion to node.toml:
-        // a domain-wide, restart-surviving loss of all grants that
-        // chain through it, from one hostile node. Only a signature by
-        // a real root can now mark a root as promoted.
-        let promoted_through_graph = |root: &str, roots: &BTreeSet<String>| -> bool {
-            g.vouch_summaries_for_subject(root).iter().any(|s| {
-                s.purpose.as_deref() == Some(admin_purpose)
-                    && (roots.contains(&s.issuer)
-                        || initial_roots.contains(&s.issuer)
-                        || bootstrap_admin_urn == Some(s.issuer.as_str()))
-            })
-        };
-
-        // Promotion candidates: subjects of any dds:admin vouch.
-        let mut candidates: BTreeSet<String> = BTreeSet::new();
-        for v in g.vouches_iter() {
-            if v.payload.purpose.as_deref() == Some(admin_purpose) {
-                candidates.insert(v.payload.sub.clone());
+                    && closure.contains(&s.issuer)
+            });
+            if earned {
+                closure.insert(sub.clone());
+                grew = true;
             }
         }
-        let mut to_add: Vec<String> = Vec::new();
-        for sub in candidates {
-            if roots.contains(&sub) || g.is_burned(&sub) {
-                continue;
-            }
-            if eligible(&sub, roots) {
-                to_add.push(sub);
-            }
-        }
-
-        // Demotion: a promoted root (has ≥1 dds:admin vouch) that is no
-        // longer eligible, or is burned.
-        let mut to_remove: Vec<String> = Vec::new();
-        for root in roots.iter() {
-            if bootstrap_admin_urn == Some(root.as_str()) {
-                continue;
-            }
-            if g.is_burned(root) {
-                to_remove.push(root.clone());
-                continue;
-            }
-            if promoted_through_graph(root, roots) && !eligible(root, roots) {
-                to_remove.push(root.clone());
-            }
-        }
-
-        if to_add.is_empty() && to_remove.is_empty() {
+        if !grew {
             break;
         }
-        for urn in &to_add {
-            roots.insert(urn.clone());
-            tracing::info!(subject = %urn, "reconcile: promoted to trusted_roots (replicated dds:admin vouch)");
-        }
-        for urn in &to_remove {
-            roots.remove(urn);
-            tracing::info!(subject = %urn, "reconcile: demoted from trusted_roots (no live dds:admin vouch from a current root)");
-        }
-        changed_any = true;
     }
-    changed_any
+    if closure == *roots {
+        return false;
+    }
+    for urn in closure.difference(roots) {
+        tracing::info!(subject = %urn, "reconcile: promoted to trusted_roots (replicated dds:admin vouch)");
+    }
+    for urn in roots.difference(&closure) {
+        tracing::info!(subject = %urn, "reconcile: demoted from trusted_roots (no live dds:admin vouch chain from an anchored root)");
+    }
+    *roots = closure;
+    true
 }
 
 /// Does this `PolicyScope` match the given device's facts?

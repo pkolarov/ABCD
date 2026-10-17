@@ -602,6 +602,9 @@ pub struct DdsNode {
     /// publisher that the mesh will accept what it gossips. Read by the
     /// macOS end-to-end tool.
     sync_requests_served: u64,
+    /// Rate window for rejection audit entries (see
+    /// `emit_audit_from_ingest`): window start and entries recorded in it.
+    rejection_audit_window: (Instant, u32),
     /// **M-4 (security review)**: sliding-window counter for newly
     /// accepted mDNS peers. `(window_start, count)`: if `now -
     /// window_start >= 60s`, reset and start a fresh window; else
@@ -1275,6 +1278,7 @@ impl DdsNode {
             identity_flood_quarantine: BTreeMap::new(),
             last_unanchored_prune: Instant::now(),
             sync_requests_served: 0,
+            rejection_audit_window: (Instant::now(), 0),
             admission_cert: cert,
             domain,
             mdns_rate: (Instant::now(), 0),
@@ -1464,16 +1468,11 @@ impl DdsNode {
                     self.handle_swarm_event(event);
                 }
                 _ = expiry_interval.tick() => {
-                    let expired = {
-                        let mut g = self.trust_graph.write().expect("trust_graph poisoned");
-                        g.sweep_expired()
-                    };
-                    for jti in &expired {
-                        let _ = self.store.revoke(jti);
-                    }
-                    if !expired.is_empty() {
-                        info!(count = expired.len(), "swept expired tokens");
-                    }
+                    self.expire_and_retire();
+                    let window =
+                        Duration::from_secs(self.config.network.gossip_rate_window_secs.max(1));
+                    self.gossip_rate
+                        .retain(|_, (start, _)| start.elapsed() < window);
                     // **R1** — hourly unanchored-identity prune.
                     if self.config.unanchored_identity_ttl_days > 0
                         && self.last_unanchored_prune.elapsed() >= UNANCHORED_PRUNE_INTERVAL
@@ -1764,8 +1763,21 @@ impl DdsNode {
                 // `try_sync_with` once the peer is verified.
                 self.refresh_peer_count_gauges();
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                info!(%peer_id, "connection closed");
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established,
+                ..
+            } => {
+                info!(%peer_id, num_established, "connection closed");
+                // **Third review round (2026-10-17).** Only the LAST
+                // connection to a peer ends its session. Clearing state on
+                // any close let a peer that keeps a second connection open
+                // reset its gossip budget by flapping the first (and dropped
+                // an honest multi-connection peer's admission while it was
+                // still connected).
+                if num_established > 0 {
+                    return;
+                }
                 // Drop the cooldown so a fresh reconnect immediately
                 // re-syncs without waiting out the throttle.
                 self.sync_last_outbound.remove(&peer_id);
@@ -1791,7 +1803,19 @@ impl DdsNode {
                 // deadline and a fresh gossip budget, and neither map
                 // grows with churn from peers that have gone away.
                 self.unadmitted_since.remove(&peer_id);
-                self.gossip_rate.remove(&peer_id);
+                // The gossip budget window survives a reconnect: a peer that
+                // drops and redials must not get a fresh budget each time
+                // (third review round). An expired window is dropped here, and
+                // the expiry tick sweeps the rest, so the map stays bounded.
+                let window =
+                    Duration::from_secs(self.config.network.gossip_rate_window_secs.max(1));
+                if self
+                    .gossip_rate
+                    .get(&peer_id)
+                    .is_some_and(|(start, _)| start.elapsed() >= window)
+                {
+                    self.gossip_rate.remove(&peer_id);
+                }
                 self.refresh_peer_count_gauges();
             }
             _ => {}
@@ -2691,6 +2715,13 @@ impl DdsNode {
                         continue;
                     }
                 };
+            // Third review round (2026-10-17): a node only ever mints
+            // releases naming itself as publisher, so one naming anybody
+            // else is refused before any KEM work (see `handle_epoch_key_response`).
+            if release.publisher != peer_id.to_string() {
+                crate::telemetry::record_pq_release_installed("publisher_not_sender");
+                continue;
+            }
             match self.install_epoch_key_release(&release, &recipient_str, now_unix) {
                 Ok(InstallOutcome::Inserted) | Ok(InstallOutcome::Rotated) => installed += 1,
                 Ok(InstallOutcome::AlreadyCurrent) | Ok(InstallOutcome::Stale) => {}
@@ -2928,11 +2959,33 @@ impl DdsNode {
             return MessageAcceptance::Ignore;
         }
 
-        // The signed publisher is the party charged for fresh identities;
-        // fall back to the relayer only if gossipsub ever hands us an
-        // unsigned message (it cannot under Strict validation).
-        let origin = message.source.or(Some(*propagation_source));
+        // **Third review round (2026-10-17).** Charge the signed publisher
+        // only when it is a domain member this node knows — a peer it has
+        // admitted directly or holds a verified admission cert for. Strict
+        // validation proves `message.source` signed the message, not that
+        // it is a member: any admitted relayer can sign each message with
+        // a freshly minted libp2p key, and charging that key handed it a
+        // fresh budget per message. An unknown source is charged to the
+        // admitted peer that handed us the message instead, so a hostile
+        // node pays for what it injects, and an honest relayer pays only
+        // for what it has itself accepted (bounded by its own budget).
+        let origin = Some(self.gossip_charge_key(propagation_source, message.source));
         self.handle_gossip_message(&message.topic, &message.data, origin)
+    }
+
+    /// The peer an inbound gossip message is charged to: its signed
+    /// `source` when that is a known domain member, else the relayer.
+    fn gossip_charge_key(&self, propagation_source: &PeerId, source: Option<PeerId>) -> PeerId {
+        match source {
+            Some(src)
+                if src == *propagation_source
+                    || self.admitted_peers.contains(&src)
+                    || self.peer_certs.get(&src.to_string()).is_some() =>
+            {
+                src
+            }
+            _ => *propagation_source,
+        }
     }
 
     /// **H-1** — per-peer sliding-window gossip budget. Returns `true`
@@ -3083,8 +3136,13 @@ impl DdsNode {
             }
             (DdsTopic::AuditLog(..), GossipMessage::AuditLog { entry_bytes }) => {
                 crate::telemetry::record_gossip_message("audit");
-                self.ingest_audit(&entry_bytes);
-                MessageAcceptance::Accept
+                // Third review round (2026-10-17): relay only an entry this
+                // node verified and appended, not every payload on the topic.
+                if self.ingest_audit(&entry_bytes) {
+                    MessageAcceptance::Accept
+                } else {
+                    MessageAcceptance::Ignore
+                }
             }
             _ => {
                 warn!("message type mismatch for topic");
@@ -3387,67 +3445,52 @@ impl DdsNode {
                 }
             }
         }
-        match token.payload.kind {
+        // **Third review round (2026-10-17).** Every root change on the
+        // token path goes through the shared `reconcile_roots_against_graph`,
+        // run on the root set as it stands before the change. The Vouch
+        // branch used to insert the vouch's `sub` whenever its issuer was a
+        // root, without consulting the graph: a sync responder could order a
+        // batch `[revoke(V), V]` so the revocation found no root to demote
+        // and the already-revoked V then promoted its subject, and a vouch
+        // whose `sub` differed from its `vch_iss` promoted an identity the
+        // shared rule (keyed on `vch_iss`) could never demote. Burns did not
+        // update the swarm copy at all until the next guard tick. The gates
+        // below only skip tokens that cannot change the root set.
+        let relevant = match token.payload.kind {
             TokenKind::Vouch => {
-                if token.payload.purpose.as_deref() == Some(admin_purpose)
+                token.payload.purpose.as_deref() == Some(admin_purpose)
                     && self.trusted_roots.contains(&token.payload.iss)
-                    && self.trusted_roots.insert(token.payload.sub.clone())
-                {
-                    info!(
-                        subject = %token.payload.sub,
-                        voucher = %token.payload.iss,
-                        "ingest: promoted dds:admin vouch subject to trusted_roots (in-memory)"
-                    );
-                }
             }
-            TokenKind::Revoke => {
-                let Some(target_jti) = token.payload.revokes.as_deref() else {
-                    return;
-                };
-                // Only a revoked dds:admin vouch whose subject is a current
-                // root can change the root set; anything else is skipped
-                // without the full pass below.
-                let affects_a_root = {
-                    let g = self.trust_graph.read().expect("trust_graph poisoned");
-                    g.vouch_by_jti(target_jti).is_some_and(|v| {
-                        v.payload.purpose.as_deref() == Some(admin_purpose)
-                            && self.trusted_roots.contains(&v.payload.sub)
-                    })
-                };
-                if !affects_a_root {
-                    return;
-                }
-                // **Follow-up review (2026-10-13, second round), finding 2** —
-                // run the shared reconcile (`reconcile_roots_against_graph`)
-                // on the root set as it stands BEFORE any demotion, instead
-                // of removing only the revoked vouch's subject. With
-                // `root → A → B`, demoting A alone left B a root, and the
-                // periodic pass could not fix it afterwards: it treats a
-                // root as demotable only if a current or start-of-pass root
-                // vouched it, and A was already gone. The shared pass
-                // demotes A and cascades to every sub-admin A promoted in
-                // the same call, and keeps the F2 rule (a root nobody
-                // authorised ever vouched is never demoted) because it is
-                // the same function the API side and the guard tick run.
-                let before = self.trusted_roots.len();
-                let changed = {
-                    let g = self.trust_graph.read().expect("trust_graph poisoned");
-                    crate::service::reconcile_roots_against_graph(
-                        &g,
-                        &mut self.trusted_roots,
-                        self.config.bootstrap_admin_urn.as_deref(),
-                    )
-                };
-                if changed {
-                    info!(
-                        target_jti = %target_jti,
-                        roots_before = before,
-                        roots_after = self.trusted_roots.len(),
-                        "ingest: dds:admin vouch revoked — trusted_roots reconciled (in-memory)"
-                    );
-                }
-            }
-            _ => {}
+            TokenKind::Revoke => token.payload.revokes.as_deref().is_some_and(|target_jti| {
+                let g = self.trust_graph.read().expect("trust_graph poisoned");
+                g.vouch_by_jti(target_jti).is_some_and(|v| {
+                    v.payload.purpose.as_deref() == Some(admin_purpose)
+                        && self.trusted_roots.contains(&v.payload.iss)
+                })
+            }),
+            TokenKind::Burn => self.trusted_roots.contains(&token.payload.iss),
+            TokenKind::Attest => false,
+        };
+        if !relevant {
+            return;
+        }
+        let before = self.trusted_roots.len();
+        let changed = {
+            let g = self.trust_graph.read().expect("trust_graph poisoned");
+            crate::service::reconcile_roots_against_graph(
+                &g,
+                &mut self.trusted_roots,
+                self.config.bootstrap_admin_urn.as_deref(),
+            )
+        };
+        if changed {
+            info!(
+                jti = %token.payload.jti,
+                kind = ?token.payload.kind,
+                roots_before = before,
+                roots_after = self.trusted_roots.len(),
+                "ingest: trusted_roots reconciled (in-memory)"
+            );
         }
     }
 
@@ -3488,6 +3531,19 @@ impl DdsNode {
                 token_bytes.to_vec(),
                 Some(format!("validation-failed: {e}")),
             );
+            return IngestOutcome::RejectedTerminal;
+        }
+        // **Third review round (2026-10-17).** A token dated more than the
+        // clock-skew tolerance into the future is refused on every path:
+        // its issuer chooses `iat`, and a far-future one would keep the
+        // identity from ever looking stale or reaching its pruning age.
+        if !iat_not_from_future(token.payload.iat) {
+            warn!(
+                jti = %token.payload.jti,
+                iat = token.payload.iat,
+                "rejecting inbound token: iat is in the future"
+            );
+            crate::telemetry::record_gossip_messages_dropped("future_iat");
             return IngestOutcome::RejectedTerminal;
         }
         // **Single-node review 2026-10-13 — op/token binding.** The op
@@ -3890,6 +3946,89 @@ impl DdsNode {
     /// Failures to load individual operations or their backing tokens are
     /// logged and skipped; the trust graph is already populated via
     /// `LocalService::rehydrate_from_store` so these are non-fatal.
+    /// Sweep expired tokens from the trust graph and retire them from the
+    /// store, the DAG and the sync cache, together with the revocations
+    /// that named them. Returns how many expired tokens were swept.
+    ///
+    /// **Third review round (2026-10-17).** The sweep used to remove an
+    /// expired token from the graph and only mark it revoked in the store.
+    /// Its bytes and operation stayed in the store and the sync cache and
+    /// were served on every anti-entropy round, but no receiving node can
+    /// merge an expired token (`Token::validate` refuses it) or a
+    /// revocation whose target it does not hold, and the requester keeps
+    /// not knowing their op ids. Responses are served oldest first and
+    /// capped, so a backlog of expired tokens — ordinary session vouches,
+    /// or short-lived tokens an attacker mints on purpose — could fill
+    /// every response to a fresh or lagging node and stall its catch-up
+    /// for good. The revoked mark stays, so the JTI is still refused.
+    fn expire_and_retire(&mut self) -> usize {
+        let (expired, revocations) = {
+            let mut g = self.trust_graph.write().expect("trust_graph poisoned");
+            let expired = g.sweep_expired();
+            let mut revocations = Vec::new();
+            for jti in &expired {
+                revocations.extend(g.revocation_token_jtis(jti));
+                g.forget_revocation_tokens(jti);
+            }
+            (expired, revocations)
+        };
+        for jti in &expired {
+            let _ = self.store.revoke(jti);
+            self.retire_payload(jti);
+        }
+        for jti in &revocations {
+            self.retire_payload(jti);
+        }
+        if !expired.is_empty() {
+            info!(
+                count = expired.len(),
+                revocations = revocations.len(),
+                "swept and retired expired tokens"
+            );
+        }
+        expired.len()
+    }
+
+    /// **Test hook** — run one expiry tick's sweep-and-retire now.
+    #[doc(hidden)]
+    pub fn expire_and_retire_for_tests(&mut self) -> usize {
+        self.expire_and_retire()
+    }
+
+    /// Remove a token's bytes and its canonical operation from the store,
+    /// the DAG and the sync cache, so this node stops serving it. The
+    /// store's revoked mark, if any, is separate and stays.
+    fn retire_payload(&mut self, jti: &str) {
+        crate::expiry::delete_token_and_op(&mut self.store, jti);
+        let op_id = dds_net::sync::canonical_op_id(jti);
+        self.dag.remove(&op_id);
+        self.sync_payloads.remove(&op_id);
+    }
+
+    /// Whether a stored token can no longer be merged by any peer: it is
+    /// expired, or it is a revocation whose target is no longer in the
+    /// store (pruned or retired) or is itself expired. Such tokens are
+    /// retired at startup instead of being seeded into the DAG and the
+    /// sync cache (third review round, 2026-10-17). Store I/O errors
+    /// other than "not found" never count as dead.
+    fn stored_token_is_dead(&self, token: &Token, now: u64) -> bool {
+        let expired = |t: &Token| t.payload.exp.is_some_and(|exp| now > exp);
+        if expired(token) {
+            return true;
+        }
+        if token.payload.kind != TokenKind::Revoke {
+            return false;
+        }
+        let Some(target) = token.payload.revokes.as_deref() else {
+            return false;
+        };
+        match self.store.get_token(target) {
+            Ok(t) => expired(&t),
+            Err(dds_store::traits::StoreError::NotFound(_)) => true,
+            Err(_) => false,
+        }
+    }
+
     pub fn seed_dag_from_store(&mut self) {
         let ids = match self.store.operation_ids() {
             Ok(ids) => ids,
@@ -3903,6 +4042,11 @@ impl DdsNode {
         }
 
         // Load each operation and its backing token bytes.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut dead: Vec<(String, bool)> = Vec::new();
         let mut pending: Vec<Operation> = Vec::with_capacity(ids.len());
         let mut cache_pairs: Vec<(Operation, Vec<u8>)> = Vec::with_capacity(ids.len());
         for id in &ids {
@@ -3917,13 +4061,22 @@ impl DdsNode {
             // the token lookup.
             let jti = op.id.strip_prefix("op-").unwrap_or(&op.id);
             let token_bytes = match self.store.get_token(jti) {
-                Ok(t) => match t.to_cbor() {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!("seed_dag_from_store: token to_cbor for {id}: {e}");
+                Ok(t) => {
+                    // Third review round (2026-10-17): never seed what no
+                    // peer can merge; retire it below instead.
+                    if now > 0 && self.stored_token_is_dead(&t, now) {
+                        let expired = t.payload.exp.is_some_and(|exp| now > exp);
+                        dead.push((jti.to_string(), expired));
                         continue;
                     }
-                },
+                    match t.to_cbor() {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!("seed_dag_from_store: token to_cbor for {id}: {e}");
+                            continue;
+                        }
+                    }
+                }
                 Err(e) => {
                     warn!("seed_dag_from_store: get_token for {id}: {e}");
                     continue;
@@ -3967,6 +4120,21 @@ impl DdsNode {
             self.cache_sync_payload(&id, &op, &token_bytes);
         }
 
+        // Retire what was left behind by builds that kept expired tokens
+        // and orphaned revocations in the store (third review round).
+        if !dead.is_empty() {
+            for (jti, expired) in &dead {
+                if *expired {
+                    let _ = self.store.revoke(jti);
+                }
+                crate::expiry::delete_token_and_op(&mut self.store, jti);
+            }
+            info!(
+                retired = dead.len(),
+                "seed_dag_from_store: retired expired tokens and orphaned revocations"
+            );
+        }
+
         // **Divergence repair.** Older builds' anti-entropy path stored
         // the token but never persisted its operation, so a token that
         // arrived via sync had no entry in `operation_ids` — the DAG
@@ -3988,6 +4156,10 @@ impl DdsNode {
     /// materialized in the DAG and persisted. See the call site in
     /// [`Self::seed_dag_from_store`] for the divergence this repairs.
     fn reconcile_missing_operations(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let jtis = match self.store.list_tokens(None) {
             Ok(j) => j,
             Err(e) => {
@@ -4008,6 +4180,13 @@ impl DdsNode {
                     continue;
                 }
             };
+            if now > 0 && self.stored_token_is_dead(&token, now) {
+                if token.payload.exp.is_some_and(|exp| now > exp) {
+                    let _ = self.store.revoke(&jti);
+                }
+                crate::expiry::delete_token_and_op(&mut self.store, &jti);
+                continue;
+            }
             let op = synthetic_op_for_token(&token);
             let token_bytes = match token.to_cbor() {
                 Ok(b) => b,
@@ -4045,6 +4224,20 @@ impl DdsNode {
                 return IngestOutcome::RejectedTerminal;
             }
         };
+        // **Third review round (2026-10-17).** Only revocations belong on
+        // this topic. Any other kind sent here used to reach the trust
+        // graph, the store and the sync cache without the ops-topic gates
+        // (F1 self-issued user-auth, C-3 publisher capability, SC-5,
+        // op binding, the revoked-JTI and stale-unanchored refusals).
+        if token.payload.kind != TokenKind::Revoke {
+            warn!(
+                jti = %token.payload.jti,
+                kind = ?token.payload.kind,
+                "rejecting non-revocation token on the revocations topic"
+            );
+            crate::telemetry::record_gossip_messages_dropped("wrong_kind");
+            return IngestOutcome::RejectedTerminal;
+        }
         if self.legacy_token_refused(&token, "gossip-revocation") {
             self.emit_audit_from_ingest(
                 "revoke.rejected",
@@ -4081,6 +4274,25 @@ impl DdsNode {
                 Some("iat-outside-replay-window".to_string()),
             );
             return IngestOutcome::RejectedTerminal;
+        }
+        // **Third review round (2026-10-17)** — a revocation this node
+        // already stored, or one for a target that is already revoked, is
+        // a duplicate: nothing is stored, relayed or audited again and no
+        // epoch rotation is scheduled. The graph accepts a re-delivered
+        // revocation without complaint, so without this every replay
+        // (re-signed under a new gossip message id, or re-wrapped in a new
+        // enc-v3 envelope) redid all of it mesh-wide.
+        let redundant = self.store.has_token(&token.payload.jti)
+            || token.payload.revokes.as_deref().is_some_and(|target| {
+                self.trust_graph
+                    .read()
+                    .map(|g| g.has_revocation_record(target))
+                    .unwrap_or(false)
+            });
+        if redundant {
+            debug!(jti = %token.payload.jti, "duplicate revocation ignored");
+            crate::telemetry::record_gossip_messages_dropped("duplicate_revocation");
+            return IngestOutcome::Duplicate;
         }
         // **Follow-up review (2026-10-13, second round), finding 1** — the
         // same per-publisher accounting as `ingest_operation` and
@@ -4168,6 +4380,17 @@ impl DdsNode {
                 return IngestOutcome::RejectedTerminal;
             }
         };
+        // **Third review round (2026-10-17).** Only burns belong on this
+        // topic; see the matching check in `ingest_revocation`.
+        if token.payload.kind != TokenKind::Burn {
+            warn!(
+                jti = %token.payload.jti,
+                kind = ?token.payload.kind,
+                "rejecting non-burn token on the burns topic"
+            );
+            crate::telemetry::record_gossip_messages_dropped("wrong_kind");
+            return IngestOutcome::RejectedTerminal;
+        }
         if self.legacy_token_refused(&token, "gossip-burn") {
             self.emit_audit_from_ingest(
                 "burn.rejected",
@@ -4242,6 +4465,9 @@ impl DdsNode {
         if let Err(e) = self.store.put_operation(&op) {
             warn!("put_operation (burn) store error: {e}");
         }
+        // Third review round: a burned root (and what it promoted) leaves
+        // the swarm's root set now, not at the next guard tick.
+        self.reconcile_roots_after_token(&token);
         IngestOutcome::Accepted
     }
 
@@ -4498,7 +4724,11 @@ impl DdsNode {
                 ttl_days * 86_400,
             )
         };
-        for jti in &stats.pruned_jtis {
+        for jti in stats
+            .pruned_jtis
+            .iter()
+            .chain(stats.retired_revocation_jtis.iter())
+        {
             let op_id = dds_net::sync::canonical_op_id(jti);
             self.dag.remove(&op_id);
             self.sync_payloads.remove(&op_id);
@@ -4536,9 +4766,9 @@ impl DdsNode {
         self.is_identity_flood_quarantined(peer, Instant::now())
     }
 
-    fn ingest_audit(&mut self, entry_bytes: &[u8]) {
+    fn ingest_audit(&mut self, entry_bytes: &[u8]) -> bool {
         if !self.config.domain.audit_log_enabled {
-            return;
+            return false;
         }
         // Bounded depth: entry_bytes are peer-supplied via gossip. Security review I-6.
         let entry = match dds_core::cbor_bounded::from_reader::<dds_core::audit::AuditLogEntry, _>(
@@ -4547,7 +4777,7 @@ impl DdsNode {
             Ok(e) => e,
             Err(e) => {
                 warn!("audit entry deserialize failed: {e}");
-                return;
+                return false;
             }
         };
         // **M-21 (security review)**: verify the entry's `node_signature`
@@ -4562,7 +4792,7 @@ impl DdsNode {
                 error = %e,
                 "rejecting forged or malformed audit entry"
             );
-            return;
+            return false;
         }
         // **L-12 (security review)**: the store now enforces
         // `entry.prev_hash == local_chain_head()`. Inbound gossip
@@ -4580,9 +4810,10 @@ impl DdsNode {
                 error = %e,
                 "audit entry refused by store (likely chain mismatch from gossip)"
             );
-            return;
+            return false;
         }
         info!(action = %entry.action, node = %entry.node_urn, "audit log entry appended");
+        true
     }
 
     /// **L-12 (security review)**: emit a locally-chained audit
@@ -4668,6 +4899,37 @@ impl DdsNode {
         let (node_urn, signing_key) = match self.node_identity.as_ref() {
             Some(id) => (id.id.to_urn(), id.signing_key.clone()),
             None => return,
+        };
+        // **Third review round (2026-10-17).** A rejection is a record of
+        // attacker-supplied bytes. Writing them in full, unthrottled, into
+        // the local chain let an admitted peer fill the disk of every node
+        // (policy rejections are relayed), so a rejection entry now records
+        // the SHA-256 of the bytes and its length, and at most
+        // `REJECTION_AUDIT_MAX_PER_WINDOW` rejections are recorded per
+        // window; the rest are counted in telemetry.
+        let rejection = action.ends_with(".rejected") || action == "peer.identity-flood";
+        let (token_bytes, reason) = if rejection {
+            let now = Instant::now();
+            let (start, count) = &mut self.rejection_audit_window;
+            if now.duration_since(*start) >= REJECTION_AUDIT_WINDOW {
+                *start = now;
+                *count = 0;
+            }
+            if *count >= REJECTION_AUDIT_MAX_PER_WINDOW {
+                crate::telemetry::record_gossip_messages_dropped("rejection_audit_suppressed");
+                return;
+            }
+            *count += 1;
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(&token_bytes).to_vec();
+            let note = format!("token sha256 only, {} bytes", token_bytes.len());
+            let reason = Some(match reason {
+                Some(r) => format!("{r} [{note}]"),
+                None => format!("[{note}]"),
+            });
+            (digest, reason)
+        } else {
+            (token_bytes, reason)
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5551,15 +5813,15 @@ impl DdsNode {
                 // the revocations issued during the outage (and
                 // re-requested them every round forever). Only the
                 // forward clock-skew half of M-9 applies on this path.
-                if matches!(token.payload.kind, TokenKind::Revoke | TokenKind::Burn)
-                    && !revocation_iat_not_from_future(token.payload.iat)
-                {
+                // Third review round (2026-10-17): the forward bound now
+                // applies to every kind, not only revoke/burn.
+                if !iat_not_from_future(token.payload.iat) {
                     warn!(
                         %peer,
                         jti = %token.payload.jti,
                         iat = token.payload.iat,
                         kind = ?token.payload.kind,
-                        "sync: dropping revoke/burn payload: iat is in the future"
+                        "sync: dropping payload: iat is in the future"
                     );
                     crate::telemetry::record_sync_payloads_rejected("replay_window");
                     return false;
@@ -6115,6 +6377,18 @@ impl DdsNode {
                         continue;
                     }
                 };
+            // **Third review round (2026-10-17).** Every release a node
+            // mints names itself as publisher, so a release that names
+            // anybody but the peer handing it over is refused before the
+            // hybrid decapsulation. Before, any admitted peer could submit
+            // releases under any number of fresh publisher ids, each costing
+            // a decapsulation and a persisted `peer_releases` entry.
+            if release.publisher != peer.to_string() {
+                debug!(%peer, publisher = %release.publisher, "Phase B.5: release publisher is not the sender");
+                crate::telemetry::record_pq_release_installed("publisher_not_sender");
+                rejected += 1;
+                continue;
+            }
             match self.install_epoch_key_release(&release, &recipient_str, now_unix) {
                 Ok(outcome) => match outcome {
                     InstallOutcome::Inserted | InstallOutcome::Rotated => installed += 1,
@@ -6282,6 +6556,17 @@ impl DdsNode {
     /// Read-only handle to the epoch-key store. Test-only — the live
     /// node owns the store and mutates it through the receive path.
     #[doc(hidden)]
+    /// **Test hook** — run the epoch-key response install pipeline as if
+    /// `peer` had answered our request with `response`.
+    #[doc(hidden)]
+    pub fn handle_epoch_key_response_for_tests(
+        &mut self,
+        peer: PeerId,
+        response: EpochKeyResponse,
+    ) {
+        self.handle_epoch_key_response(peer, response);
+    }
+
     pub fn epoch_keys_for_tests(&self) -> &EpochKeyStore {
         &self.epoch_keys
     }
@@ -6722,8 +7007,14 @@ fn revocation_within_replay_window(iat: u64) -> bool {
     now.saturating_sub(iat) <= REVOCATION_REPLAY_WINDOW_SECS
 }
 
+/// **Third review round (2026-10-17)** — at most this many rejection
+/// entries are written to the local audit chain per
+/// [`REJECTION_AUDIT_WINDOW`]; see `DdsNode::emit_audit_from_ingest`.
+const REJECTION_AUDIT_MAX_PER_WINDOW: u32 = 20;
+const REJECTION_AUDIT_WINDOW: Duration = Duration::from_secs(60);
+
 /// Forward clock-skew tolerance shared by [`revocation_within_replay_window`]
-/// and [`revocation_iat_not_from_future`].
+/// and [`iat_not_from_future`].
 const REVOCATION_FORWARD_SKEW_SECS: u64 = 3600;
 
 /// **Single-node review 2026-10-13** — the forward-skew half of M-9 only:
@@ -6731,7 +7022,7 @@ const REVOCATION_FORWARD_SKEW_SECS: u64 = 3600;
 /// Used by the anti-entropy sync path, where an *old* genuine revocation
 /// is exactly what a node that was offline needs to receive (see the
 /// call site in `apply_decrypted_sync_response`).
-fn revocation_iat_not_from_future(iat: u64) -> bool {
+fn iat_not_from_future(iat: u64) -> bool {
     if iat == 0 {
         return true;
     }
@@ -9977,6 +10268,565 @@ mod r5_sync_quorum_replay_tests {
                     "via_gossip={via_gossip}: a demoted sub-admin's grant confers nothing"
                 );
             }
+        });
+    }
+
+    // ---------- third review round (2026-10-17) ----------
+
+    fn served_op_ids(node: &DdsNode, known: BTreeSet<String>) -> BTreeSet<String> {
+        node.build_sync_response_for_tests(&SyncRequest {
+            known_op_ids: known,
+            heads: BTreeSet::new(),
+        })
+        .payloads
+        .iter()
+        .filter_map(|p| {
+            ciborium::from_reader::<Operation, _>(p.op_bytes.as_slice())
+                .ok()
+                .map(|o| o.id)
+        })
+        .collect()
+    }
+
+    /// Expired tokens, and the revocations that named them, are retired
+    /// from the store, the DAG and the sync cache by the expiry tick, so a
+    /// fresh node is never served payloads it must refuse forever.
+    #[test]
+    fn expiry_tick_retires_expired_tokens_and_their_revocations() {
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("expiry-retire.local", [32u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            let user = Identity::generate("shortlived", &mut OsRng);
+            let now = now_unix();
+            let short = Token::sign(
+                TokenPayload {
+                    iss: user.id.to_urn(),
+                    iss_key: user.public_key.clone(),
+                    jti: format!("short-{}", uuid::Uuid::new_v4()),
+                    sub: user.id.to_urn(),
+                    kind: TokenKind::Attest,
+                    purpose: Some("dds:directory-entry".into()),
+                    vch_iss: None,
+                    vch_sum: None,
+                    revokes: None,
+                    iat: now,
+                    exp: Some(now + 1),
+                    body_type: None,
+                    body_cbor: None,
+                },
+                &user.signing_key,
+            )
+            .unwrap();
+            let jti = short.payload.jti.clone();
+            let rev = revoke_at(&user, &jti, now);
+            let keep = attest_at(&root, now);
+            node.apply_decrypted_sync_response(
+                PeerId::random(),
+                sync_response(vec![
+                    canonical_payload(&short),
+                    canonical_payload(&rev),
+                    canonical_payload(&keep),
+                ]),
+            );
+            let short_op = format!("op-{jti}");
+            let rev_op = format!("op-{}", rev.payload.jti);
+            let served = served_op_ids(&node, BTreeSet::new());
+            assert!(
+                served.contains(&short_op) && served.contains(&rev_op),
+                "test setup"
+            );
+
+            std::thread::sleep(Duration::from_millis(2100));
+            assert_eq!(node.expire_and_retire_for_tests(), 1);
+
+            let served = served_op_ids(&node, BTreeSet::new());
+            assert!(
+                !served.contains(&short_op),
+                "expired token no longer served"
+            );
+            assert!(!served.contains(&rev_op), "its revocation no longer served");
+            assert!(served.contains(&format!("op-{}", keep.payload.jti)));
+            assert!(!node.store.has_token(&jti) && !node.store.has_token(&rev.payload.jti));
+            assert!(!node.store.has_operation(&short_op) && !node.store.has_operation(&rev_op));
+            assert!(node.dag.get(&short_op).is_none() && node.dag.get(&rev_op).is_none());
+            assert!(node.store.is_revoked(&jti), "the revoked mark stays");
+        });
+    }
+
+    /// A pruned identity's self-revocations leave with it (no orphan is
+    /// served), while a revoked attestation that a live root vouch still
+    /// pins is kept with its revocation and reaches a fresh node as
+    /// revoked.
+    #[test]
+    fn prune_leaves_nothing_a_fresh_node_cannot_merge() {
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("prune-orphans.local", [33u8; 32]);
+            let (mut a, _da) = make_node(&dkey, vec![root.id.to_urn()]);
+            let (mut b, _db) = make_node(&dkey, vec![root.id.to_urn()]);
+            let old = now_unix() - 3 * 86_400;
+            let ghost = Identity::generate("ghost", &mut OsRng);
+            let ghost_tok = attest_at(&ghost, old);
+            let ghost_rev = revoke_at(&ghost, &ghost_tok.payload.jti, old + 1);
+            let user = Identity::generate("selfrevoker", &mut OsRng);
+            let user_tok = attest_at(&user, old);
+            let pin = make_vouch(&root, &user, &user_tok, "dds:session", "v-pin");
+            let user_rev = revoke_at(&user, &user_tok.payload.jti, old + 1);
+            a.apply_decrypted_sync_response(
+                PeerId::random(),
+                sync_response(vec![
+                    canonical_payload(&attest_at(&root, old)),
+                    canonical_payload(&ghost_tok),
+                    canonical_payload(&ghost_rev),
+                    canonical_payload(&user_tok),
+                    canonical_payload(&pin),
+                    canonical_payload(&user_rev),
+                ]),
+            );
+            a.config.unanchored_identity_ttl_days = 1;
+            let stats = a.prune_unanchored_identities_for_tests();
+            assert_eq!(stats.pruned_jtis, vec![ghost_tok.payload.jti.clone()]);
+            assert_eq!(
+                stats.retired_revocation_jtis,
+                vec![ghost_rev.payload.jti.clone()]
+            );
+            assert_eq!(stats.kept_pinned_revoked, 1);
+
+            let served = served_op_ids(&a, BTreeSet::new());
+            assert!(!served.contains(&format!("op-{}", ghost_tok.payload.jti)));
+            assert!(
+                !served.contains(&format!("op-{}", ghost_rev.payload.jti)),
+                "an orphaned revocation must not be served"
+            );
+            assert!(served.contains(&format!("op-{}", user_tok.payload.jti)));
+            assert!(served.contains(&format!("op-{}", user_rev.payload.jti)));
+
+            // A fresh node merges everything it is served, so its next
+            // request leaves nothing for A to send.
+            let resp = a.build_sync_response_for_tests(&SyncRequest {
+                known_op_ids: BTreeSet::new(),
+                heads: BTreeSet::new(),
+            });
+            b.apply_decrypted_sync_response(PeerId::random(), resp);
+            let known = b.dag.operation_ids();
+            assert!(
+                served_op_ids(&a, known).is_empty(),
+                "every payload A serves must be mergeable by a fresh node"
+            );
+            let g = b.trust_graph.read().unwrap();
+            assert!(g.is_revoked(&user_tok.payload.jti));
+            assert!(!g.has_effective_vouch(&user.id.to_urn(), &b.trusted_roots));
+        });
+    }
+
+    /// State left by earlier builds — expired tokens and revocations whose
+    /// target is gone — is retired at startup instead of being seeded into
+    /// the DAG and the sync cache.
+    #[test]
+    fn startup_seed_retires_expired_tokens_and_orphaned_revocations() {
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("seed-retire.local", [34u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            let ident = Identity::generate("legacy", &mut OsRng);
+            let now = now_unix();
+            let expired = Token::sign(
+                TokenPayload {
+                    iss: ident.id.to_urn(),
+                    iss_key: ident.public_key.clone(),
+                    jti: "legacy-expired".into(),
+                    sub: ident.id.to_urn(),
+                    kind: TokenKind::Attest,
+                    purpose: None,
+                    vch_iss: None,
+                    vch_sum: None,
+                    revokes: None,
+                    iat: now - 100,
+                    exp: Some(now - 50),
+                    body_type: None,
+                    body_cbor: None,
+                },
+                &ident.signing_key,
+            )
+            .unwrap();
+            let orphan = revoke_at(&ident, "pruned-long-ago", now - 10);
+            let live = attest_at(&ident, now);
+            for t in [&expired, &orphan, &live] {
+                node.store.put_token(t).unwrap();
+                node.store
+                    .put_operation(&synthetic_op_for_token(t))
+                    .unwrap();
+            }
+            node.seed_dag_from_store();
+
+            let served = served_op_ids(&node, BTreeSet::new());
+            assert_eq!(
+                served,
+                [format!("op-{}", live.payload.jti)].into_iter().collect(),
+                "only the live token is seeded"
+            );
+            for jti in ["legacy-expired", orphan.payload.jti.as_str()] {
+                assert!(!node.store.has_token(jti), "{jti} retired from the store");
+                assert!(!node.store.has_operation(&format!("op-{jti}")));
+                assert!(node.dag.get(&format!("op-{jti}")).is_none());
+            }
+            assert!(node.store.is_revoked("legacy-expired"));
+        });
+    }
+
+    /// A delegated admin cannot keep itself a root after its promotion is
+    /// revoked, whether by a self-vouch or by a mutual vouch with another
+    /// delegated admin, on the token path or the periodic pass; a sub-admin
+    /// that a still-legitimate admin co-vouches survives.
+    #[test]
+    fn self_supporting_admin_vouches_do_not_survive_revocation() {
+        use dds_core::token::purpose;
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("admin-cycle.local", [35u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            let now = now_unix();
+            let a = Identity::generate("self-voucher", &mut OsRng);
+            let b = Identity::generate("cycle-b", &mut OsRng);
+            let c = Identity::generate("cycle-c", &mut OsRng);
+            let d = Identity::generate("covouched-d", &mut OsRng);
+            let toks: Vec<Token> = [&root, &a, &b, &c, &d]
+                .iter()
+                .map(|i| attest_at(i, now))
+                .collect();
+            let (a_tok, b_tok, c_tok, d_tok) = (&toks[1], &toks[2], &toks[3], &toks[4]);
+            let peer = PeerId::random();
+            node.apply_decrypted_sync_response(
+                peer,
+                sync_response(toks.iter().map(canonical_payload).collect()),
+            );
+            for batch in [
+                vec![
+                    make_vouch(&root, &a, a_tok, purpose::ADMIN, "v-r-a"),
+                    make_vouch(&root, &b, b_tok, purpose::ADMIN, "v-r-b"),
+                    make_vouch(&root, &d, d_tok, purpose::ADMIN, "v-r-d"),
+                ],
+                vec![
+                    make_vouch(&a, &a, a_tok, purpose::ADMIN, "v-a-a"),
+                    make_vouch(&b, &c, c_tok, purpose::ADMIN, "v-b-c"),
+                    make_vouch(&c, &b, b_tok, purpose::ADMIN, "v-c-b"),
+                    make_vouch(&b, &d, d_tok, purpose::ADMIN, "v-b-d"),
+                ],
+            ] {
+                node.apply_decrypted_sync_response(
+                    peer,
+                    sync_response(batch.iter().map(canonical_payload).collect()),
+                );
+            }
+            for i in [&a, &b, &c, &d] {
+                assert!(node.trusted_roots.contains(&i.id.to_urn()), "test setup");
+            }
+            // Root revokes A's and B's promotions, keeps D's.
+            node.apply_decrypted_sync_response(
+                peer,
+                sync_response(vec![
+                    canonical_payload(&revoke_at(&root, "v-r-a", now)),
+                    canonical_payload(&revoke_at(&root, "v-r-b", now)),
+                ]),
+            );
+            let check = |node: &DdsNode, when: &str| {
+                assert!(
+                    !node.trusted_roots.contains(&a.id.to_urn()),
+                    "{when}: a self-vouch must not keep A a root"
+                );
+                assert!(
+                    !node.trusted_roots.contains(&b.id.to_urn())
+                        && !node.trusted_roots.contains(&c.id.to_urn()),
+                    "{when}: B and C must not keep each other roots"
+                );
+                assert!(
+                    node.trusted_roots.contains(&d.id.to_urn()),
+                    "{when}: D keeps the root's own live vouch"
+                );
+                assert!(node.trusted_roots.contains(&root.id.to_urn()));
+            };
+            check(&node, "token path");
+            node.reconcile_roots_by_expiry_for_tests();
+            check(&node, "periodic pass");
+        });
+    }
+
+    /// A sync responder cannot get a revoked admin vouch to promote its
+    /// subject by ordering the vouch after its revocation in the batch.
+    #[test]
+    fn batch_order_cannot_promote_through_a_revoked_admin_vouch() {
+        use dds_core::token::purpose;
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("batch-order.local", [36u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            let now = now_unix();
+            let a = Identity::generate("offboarded", &mut OsRng);
+            let a_tok = attest_at(&a, now);
+            let v = make_vouch(&root, &a, &a_tok, purpose::ADMIN, "v-r-a");
+            let r = revoke_at(&root, "v-r-a", now);
+            node.apply_decrypted_sync_response(
+                PeerId::random(),
+                sync_response(vec![
+                    canonical_payload(&attest_at(&root, now)),
+                    canonical_payload(&a_tok),
+                    canonical_payload(&r),
+                    canonical_payload(&v),
+                ]),
+            );
+            assert!(node.trust_graph.read().unwrap().is_revoked("v-r-a"));
+            assert!(
+                !node.trusted_roots.contains(&a.id.to_urn()),
+                "a revoked admin vouch must not promote, whatever the batch order"
+            );
+        });
+    }
+
+    fn burn_gossip(node: &DdsNode, token: &Token) -> (libp2p::gossipsub::TopicHash, Vec<u8>) {
+        let msg = GossipMessage::Burn {
+            token_bytes: token.to_cbor().unwrap(),
+        };
+        (
+            node.topics.burns.to_ident_topic().hash(),
+            msg.to_cbor().unwrap(),
+        )
+    }
+
+    /// Only revocations are accepted on the revocations topic and only
+    /// burns on the burns topic; a replayed revocation, or a second one for
+    /// an already-revoked target, is a duplicate that is not stored or
+    /// relayed again.
+    #[test]
+    fn topic_kind_is_enforced_and_revocation_replays_are_duplicates() {
+        use libp2p::gossipsub::MessageAcceptance;
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("topic-kind.local", [37u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            let peer = PeerId::random();
+            node.admit_peer_for_tests(peer);
+            let mallory = Identity::generate("mallory", &mut OsRng);
+            let attest = attest_at(&mallory, now_unix());
+            for (topic, data) in [
+                revocation_gossip(&node, &attest),
+                burn_gossip(&node, &attest),
+            ] {
+                assert!(matches!(
+                    node.handle_gossip_message(&topic, &data, Some(peer)),
+                    MessageAcceptance::Ignore
+                ));
+            }
+            assert!(
+                !knows(&node, &mallory.id.to_urn()),
+                "wrong-kind token never stored"
+            );
+            assert!(!node.store.has_token(&attest.payload.jti));
+
+            // A real revocation, then its replay, then a second revocation
+            // of the same target under a new jti.
+            let user = Identity::generate("user", &mut OsRng);
+            let user_tok = attest_at(&user, now_unix());
+            node.apply_decrypted_sync_response(
+                PeerId::random(),
+                sync_response(vec![canonical_payload(&user_tok)]),
+            );
+            let rev = revoke_at(&user, &user_tok.payload.jti, now_unix());
+            let (topic, data) = revocation_gossip(&node, &rev);
+            assert!(matches!(
+                node.handle_gossip_message(&topic, &data, Some(peer)),
+                MessageAcceptance::Accept
+            ));
+            assert_eq!(
+                node.ingest_revocation(&rev.to_cbor().unwrap(), Some(peer)),
+                IngestOutcome::Duplicate
+            );
+            let mut again = rev.payload.clone();
+            again.jti = format!("revoke-again-{}", uuid::Uuid::new_v4());
+            let again = Token::sign(again, &user.signing_key).unwrap();
+            assert_eq!(
+                node.ingest_revocation(&again.to_cbor().unwrap(), Some(peer)),
+                IngestOutcome::Duplicate
+            );
+            assert!(
+                !node.store.has_token(&again.payload.jti),
+                "redundant revocation not stored"
+            );
+        });
+    }
+
+    /// A relayer that signs each gossip message with a freshly minted
+    /// source key is charged itself: the fresh keys are not known domain
+    /// members, so they cannot hand it a new budget per message.
+    #[test]
+    fn fresh_gossip_source_keys_are_charged_to_the_relayer() {
+        use libp2p::gossipsub::MessageAcceptance;
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("fresh-source.local", [38u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            node.identity_ledger = IdentityLedger::new(Limits {
+                budget: 0,
+                grace: Duration::from_secs(0),
+                hard_cap: 0,
+                token_budget: 2,
+                byte_budget: 0,
+            });
+            let relayer = PeerId::random();
+            node.admit_peer_for_tests(relayer);
+            let ghost = Identity::generate("ghost", &mut OsRng);
+            let mut verdicts = Vec::new();
+            for _ in 0..4 {
+                let p = canonical_payload(&attest_at(&ghost, now_unix()));
+                let msg = libp2p::gossipsub::Message {
+                    source: Some(PeerId::random()),
+                    data: GossipMessage::DirectoryOp {
+                        op_bytes: p.op_bytes,
+                        token_bytes: p.token_bytes,
+                    }
+                    .to_cbor()
+                    .unwrap(),
+                    sequence_number: None,
+                    topic: node.topics.operations.to_ident_topic().hash(),
+                };
+                verdicts.push(node.classify_gossip_message_for_tests(&relayer, &msg));
+            }
+            assert!(matches!(verdicts[0], MessageAcceptance::Accept));
+            assert!(matches!(verdicts[1], MessageAcceptance::Accept));
+            assert!(
+                verdicts[2..]
+                    .iter()
+                    .all(|v| !matches!(v, MessageAcceptance::Accept)),
+                "fresh source keys must not reset the budget"
+            );
+            assert!(node.identity_flood_quarantined_for_tests(&relayer));
+
+            // A known member's own messages are charged to it, not to the
+            // admitted relayer that forwarded them.
+            let member = PeerId::random();
+            node.admit_peer_for_tests(member);
+            let relayer2 = PeerId::random();
+            node.admit_peer_for_tests(relayer2);
+            assert_eq!(node.gossip_charge_key(&relayer2, Some(member)), member);
+            assert_eq!(
+                node.gossip_charge_key(&relayer2, Some(PeerId::random())),
+                relayer2
+            );
+            assert_eq!(node.gossip_charge_key(&relayer2, None), relayer2);
+        });
+    }
+
+    /// Tokens dated beyond the clock-skew tolerance are refused on gossip
+    /// and on sync, and an attestation with a body type this build does
+    /// not know no longer exempts its issuer from pruning.
+    #[test]
+    fn future_dated_tokens_are_refused_and_unknown_body_types_are_prunable() {
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("future-iat.local", [39u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            let ghost = Identity::generate("time-traveller", &mut OsRng);
+            let future = attest_at(&ghost, now_unix() + 30 * 86_400);
+            let p = canonical_payload(&future);
+            assert_eq!(
+                node.ingest_operation(&p.op_bytes, &p.token_bytes, Some(PeerId::random())),
+                IngestOutcome::RejectedTerminal
+            );
+            node.apply_decrypted_sync_response(PeerId::random(), sync_response(vec![p]));
+            assert!(!knows(&node, &ghost.id.to_urn()));
+
+            let mut odd = attest_at(&ghost, now_unix()).payload.clone();
+            odd.body_type = Some("x-made-up:keeps-me-forever".into());
+            odd.body_cbor = Some(vec![0xa0]);
+            let odd = Token::sign(odd, &ghost.signing_key).unwrap();
+            assert!(crate::expiry::is_prunable_token(&odd));
+            let mut join = odd.payload.clone();
+            join.body_type = Some(dds_domain::body_types::DEVICE_JOIN.into());
+            let join = Token::sign(join, &ghost.signing_key).unwrap();
+            assert!(
+                !crate::expiry::is_prunable_token(&join),
+                "known retained types stay exempt"
+            );
+        });
+    }
+
+    /// A rejection is recorded in the local audit chain as a digest, not
+    /// the attacker's bytes, and only up to the per-window limit; a junk
+    /// payload on the audit topic is not relayed.
+    #[test]
+    fn rejection_audits_are_digests_and_rate_limited() {
+        use libp2p::gossipsub::MessageAcceptance;
+        run_with_time(|| {
+            let _g = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe { std::env::remove_var(REQUIRE_ENCRYPTED_KEYS_ENV) };
+            use dds_store::traits::AuditStore;
+            let root = Identity::generate("root", &mut OsRng);
+            let dkey = dds_domain::DomainKey::from_secret_bytes("audit-reject.local", [40u8; 32]);
+            let (mut node, _dir) = make_node(&dkey, vec![root.id.to_urn()]);
+            node.set_node_identity(Identity::generate("node-self", &mut OsRng));
+            let before = node.store.count_audit_entries().unwrap();
+            let mallory = Identity::generate("mallory", &mut OsRng);
+            for _ in 0..(REJECTION_AUDIT_MAX_PER_WINDOW + 10) {
+                // Aliased op id: refused by the op/token binding gate.
+                let t = attest_at(&mallory, now_unix());
+                let p = sync_payload(&format!("op-alias-{}", uuid::Uuid::new_v4()), &t);
+                assert_eq!(
+                    node.ingest_operation(&p.op_bytes, &p.token_bytes, None),
+                    IngestOutcome::RejectedTerminal
+                );
+            }
+            let entries = node.store.list_audit_entries().unwrap();
+            let rejections: Vec<_> = entries[before..]
+                .iter()
+                .filter(|e| e.action.ends_with(".rejected"))
+                .collect();
+            assert_eq!(rejections.len() as u32, REJECTION_AUDIT_MAX_PER_WINDOW);
+            assert!(rejections.iter().all(|e| e.token_bytes.len() == 32));
+
+            let topic = node.topics.audit_log.to_ident_topic().hash();
+            let junk = GossipMessage::AuditLog {
+                entry_bytes: b"not an audit entry".to_vec(),
+            }
+            .to_cbor()
+            .unwrap();
+            assert!(matches!(
+                node.handle_gossip_message(&topic, &junk, None),
+                MessageAcceptance::Ignore
+            ));
         });
     }
 }

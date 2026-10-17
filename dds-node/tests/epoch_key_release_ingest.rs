@@ -631,3 +631,55 @@ fn install_bumps_pq_releases_installed_metric() {
         baseline_schema + 1
     );
 }
+
+/// **Third review round (2026-10-17).** A node only ever mints releases
+/// naming itself as publisher, so a release handed over by a peer other
+/// than its publisher is refused before any KEM work; the same release
+/// handed over by its publisher installs.
+#[test]
+fn release_from_a_peer_other_than_its_publisher_is_refused() {
+    use std::str::FromStr;
+    let domain_key = DomainKey::generate("test-domain", &mut OsRng);
+    let (mut node, _dir) = spawn_node(&domain_key);
+    let recipient_id = node.peer_id.to_string();
+    let kem_pk = node.epoch_keys_for_tests().kem_public().clone();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let (pub_sk, publisher_id) = test_publisher();
+    let mut epoch_key = [0u8; 32];
+    use rand_core::RngCore;
+    OsRng.fill_bytes(&mut epoch_key);
+    let release = mint_release(
+        &pub_sk,
+        &publisher_id,
+        &recipient_id,
+        9,
+        now,
+        now + 86_400,
+        &epoch_key,
+        &kem_pk,
+    );
+    let response = || dds_net::pq_envelope::EpochKeyResponse {
+        releases: vec![release.to_cbor().unwrap()],
+    };
+
+    let stranger = libp2p::PeerId::random();
+    node.handle_epoch_key_response_for_tests(stranger, response());
+    assert!(
+        node.epoch_keys_for_tests()
+            .peer_epoch_key(&publisher_id, 9)
+            .is_none(),
+        "a release relayed by a non-publisher must not install"
+    );
+
+    let publisher = libp2p::PeerId::from_str(&publisher_id).expect("publisher id is a PeerId");
+    node.handle_epoch_key_response_for_tests(publisher, response());
+    assert_eq!(
+        node.epoch_keys_for_tests()
+            .peer_epoch_key(&publisher_id, 9)
+            .copied(),
+        Some(epoch_key)
+    );
+}

@@ -536,6 +536,29 @@ impl AuditStore for RedbBackend {
         })
     }
 
+    /// O(log n) chain head: read only the highest-keyed entry. The trait
+    /// default decodes the whole table, which made every append O(n) and a
+    /// long chain O(n²) (third review round, 2026-10-17).
+    fn audit_chain_head(&self) -> StoreResult<Option<Vec<u8>>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        let table = match read_txn.open_table(AUDIT_LOG) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(StoreError::Io(e.to_string())),
+        };
+        match table.last().map_err(|e| StoreError::Io(e.to_string()))? {
+            Some((_, v)) => {
+                let last: AuditLogEntry = ciborium::from_reader(v.value())
+                    .map_err(|e| StoreError::Serde(format!("audit decode: {e}")))?;
+                Ok(last.chain_hash().ok())
+            }
+            None => Ok(None),
+        }
+    }
+
     fn list_audit_entries(&self) -> StoreResult<Vec<AuditLogEntry>> {
         let read_txn = self
             .db

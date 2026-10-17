@@ -72,21 +72,47 @@ pub struct PruneStats {
     /// `op-<jti>` operations were removed from the store as well). The
     /// caller drops them from its in-memory DAG and sync cache.
     pub pruned_jtis: Vec<String>,
+    /// JTIs of revocation tokens removed from the store (with their
+    /// operations) because their target was pruned. The caller drops
+    /// them from its DAG and sync cache too. The revocation *record* is
+    /// kept in the graph and the store's revoked mark stays.
+    pub retired_revocation_jtis: Vec<String>,
+    /// Revoked tokens kept because a live vouch still pins them (see
+    /// `TrustGraph::attestation_is_pinned`).
+    pub kept_pinned_revoked: usize,
 }
 
 /// Whether an identity's token set is of the kind the pruner may remove:
-/// plain attestations, user-auth attestations and vouches. Any other
-/// document type (device join, policy, software, account bindings, SSO
-/// links, service principals, sessions, self-update) marks an identity
-/// the pruner leaves alone — those are legitimately unvouched or are
-/// gated elsewhere.
+/// plain attestations, user-auth attestations, attestations with a body
+/// type this build does not know, and vouches. A known document type
+/// (device join, policy, software, account bindings, SSO links, service
+/// principals, sessions, self-update) marks an identity the pruner leaves
+/// alone — those are legitimately unvouched or are gated elsewhere.
 pub fn is_prunable_token(token: &dds_core::token::Token) -> bool {
+    use dds_domain::body_types as bt;
+    /// Document types this build knows to be legitimately unvouched or
+    /// gated elsewhere. An attestation carrying a body type outside this
+    /// list is judged like a plain one (third review round, 2026-10-17):
+    /// before, a single attestation with a made-up body type exempted its
+    /// issuer from pruning for good.
+    const RETAINED: &[&str] = &[
+        bt::DEVICE_JOIN,
+        bt::WINDOWS_POLICY,
+        bt::MACOS_POLICY,
+        bt::LINUX_POLICY,
+        bt::MACOS_ACCOUNT_BINDING,
+        bt::SSO_IDENTITY_LINK,
+        bt::SOFTWARE_ASSIGNMENT,
+        bt::SERVICE_PRINCIPAL,
+        bt::SESSION,
+        bt::DDS_SELF_UPDATE,
+    ];
     match token.payload.kind {
         TokenKind::Vouch => true,
-        TokenKind::Attest => matches!(
-            token.payload.body_type.as_deref(),
-            None | Some(dds_domain::body_types::USER_AUTH_ATTESTATION)
-        ),
+        TokenKind::Attest => match token.payload.body_type.as_deref() {
+            None => true,
+            Some(body) => !RETAINED.contains(&body),
+        },
         TokenKind::Revoke | TokenKind::Burn => false,
     }
 }
@@ -141,12 +167,23 @@ where
         if graph.has_effective_vouch(&urn, trusted_roots) {
             continue;
         }
-        let jtis: Vec<String> = {
+        // (jti, keep): a revoked token that a live vouch still pins is
+        // kept with its revocation (third review round, 2026-10-17). If
+        // both were removed, a node that never saw the revocation could be
+        // handed the token and count it under that vouch again.
+        let jtis: Vec<(String, bool)> = {
             let tokens = graph.tokens_issued_by(&urn);
             if tokens.is_empty() || !tokens.iter().all(|t| is_prunable_token(t)) {
                 continue;
             }
-            tokens.iter().map(|t| t.payload.jti.clone()).collect()
+            tokens
+                .iter()
+                .map(|t| {
+                    let jti = t.payload.jti.clone();
+                    let keep = graph.has_revocation_record(&jti) && graph.attestation_is_pinned(t);
+                    (jti, keep)
+                })
+                .collect()
         };
         let Some(since) = graph.unanchored_since(&urn) else {
             continue;
@@ -154,21 +191,33 @@ where
         if now <= since.saturating_add(ttl_secs) {
             continue;
         }
-        for jti in jtis {
+        let mut removed_any = false;
+        for (jti, keep) in jtis {
+            if keep {
+                stats.kept_pinned_revoked += 1;
+                continue;
+            }
             // Keep the revocation record (follow-up review 2026-10-13,
             // finding 1): a pruned token that had been revoked must stay
             // revoked, or a replayed copy would come back live. The
             // store keeps its revoked mark across `delete_token` for the
             // same reason, and both ingest paths refuse a revoked JTI.
             graph.remove_token_keep_revocation(&jti);
-            if let Err(e) = store.delete_token(&jti) {
-                warn!(jti = %jti, "prune: delete_token failed: {e}");
+            delete_token_and_op(store, &jti);
+            stats.pruned_jtis.push(jti.clone());
+            // The revocation tokens that named it go too: no peer that
+            // lacks the target can ever merge them, so serving them would
+            // fill every anti-entropy response to a fresh node with
+            // entries it must refuse (third review round, 2026-10-17).
+            for rj in graph.revocation_token_jtis(&jti) {
+                delete_token_and_op(store, &rj);
+                stats.retired_revocation_jtis.push(rj);
             }
-            let op_id = dds_net::sync::canonical_op_id(&jti);
-            if let Err(e) = store.delete_operation(&op_id) {
-                warn!(op_id = %op_id, "prune: delete_operation failed: {e}");
-            }
-            stats.pruned_jtis.push(jti);
+            graph.forget_revocation_tokens(&jti);
+            removed_any = true;
+        }
+        if !removed_any {
+            continue;
         }
         stats.identities_pruned += 1;
         debug!(identity = %urn, unanchored_since = since, "pruned unanchored identity");
@@ -178,10 +227,28 @@ where
             scanned = stats.identities_scanned,
             identities = stats.identities_pruned,
             tokens = stats.pruned_jtis.len(),
+            revocations = stats.retired_revocation_jtis.len(),
+            kept_pinned_revoked = stats.kept_pinned_revoked,
             "unanchored-identity prune completed"
         );
     }
     stats
+}
+
+/// Delete a token and its canonical `op-<jti>` operation from the store,
+/// logging (not failing) on error. The store's revoked mark, if any, is
+/// separate and stays.
+pub fn delete_token_and_op<S>(store: &mut S, jti: &str)
+where
+    S: TokenStore + OperationStore,
+{
+    if let Err(e) = store.delete_token(jti) {
+        warn!(jti = %jti, "delete_token failed: {e}");
+    }
+    let op_id = dds_net::sync::canonical_op_id(jti);
+    if let Err(e) = store.delete_operation(&op_id) {
+        warn!(op_id = %op_id, "delete_operation failed: {e}");
+    }
 }
 
 /// Long-running async loop that calls `sweep_once` every `interval`.
@@ -560,7 +627,59 @@ mod tests {
         );
 
         // Replay: the graph takes the token back only as a revoked one.
-        graph.add_token(user_tok).unwrap();
+        graph.add_token(user_tok.clone()).unwrap();
+        assert!(graph.is_revoked("a-user"));
+
+        // Third review round: the revocation that named the pruned token
+        // is retired with it, so it is never served to a peer that could
+        // not merge it.
+        assert_eq!(s.retired_revocation_jtis, vec!["r-user".to_string()]);
+        assert!(!store.has_token("r-user"));
+        assert!(!store.has_operation("op-r-user"));
+    }
+
+    /// **Third review round (2026-10-17).** A revoked attestation that a
+    /// live vouch still pins is kept, with its revocation, instead of
+    /// being pruned: if both went, a node that never saw the revocation
+    /// could be handed the attestation and count it under that vouch.
+    #[test]
+    fn prune_keeps_a_revoked_attestation_that_a_live_vouch_still_pins() {
+        let mut graph = TrustGraph::new();
+        let mut store = MemoryBackend::new();
+        let root = Identity::generate("root", &mut OsRng);
+        let roots: BTreeSet<String> = [root.id.to_urn()].into_iter().collect();
+        let protected = BTreeSet::new();
+        let user = Identity::generate("user", &mut OsRng);
+        let t0 = 1_000_000u64;
+        let user_tok = attest_at(&user, "a-user", t0, None);
+        land(&mut graph, &mut store, &user_tok);
+        land(
+            &mut graph,
+            &mut store,
+            &vouch_at(&root, &user, &user_tok, "v-user", t0),
+        );
+        // The user revokes its own enrollment; the root's vouch stays live
+        // but no longer anchors (it pins a revoked attestation).
+        land(
+            &mut graph,
+            &mut store,
+            &revoke_at(&user, "a-user", "r-user", t0 + DAY),
+        );
+        assert!(!graph.has_effective_vouch(&user.id.to_urn(), &roots));
+        assert!(graph.attestation_is_pinned(&user_tok));
+
+        let s = prune_unanchored_once(
+            &mut graph,
+            &mut store,
+            &roots,
+            &protected,
+            t0 + 40 * DAY,
+            30 * DAY,
+        );
+        assert_eq!(s.identities_pruned, 0, "{s:?}");
+        assert_eq!(s.kept_pinned_revoked, 1);
+        assert!(s.pruned_jtis.is_empty() && s.retired_revocation_jtis.is_empty());
+        assert!(store.has_token("a-user") && store.has_token("r-user"));
         assert!(graph.is_revoked("a-user"));
     }
 
